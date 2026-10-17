@@ -245,6 +245,196 @@ test('multipart reassembly requires every durable part and the final part respon
   expect(() => completedAIReadback(e)).toThrow('own receipt')
 })
 
+// AC15 execution discipline is neutral: acknowledgements can finish earlier
+// turns, while only the final part's exact completed JSON proves reassembly.
+function multipartAC15() {
+  const e = ordinaryEvidence()
+  e.seq = 1; e.expected = { case: 'AC15', messages: 1, body: 'x'.repeat(5000) } as any
+  const lengths = [1700, 1700, 1600]
+  const parts = lengths.map((n, i) => `<channel source="slack-channel-router" chat_id="D0AIAC15" ts="123.4" part="${i + 1}/3">${'x'.repeat(n)}</channel>`)
+  e.own = []; e.journal = [{ kind: 'accepted', seq: 1, received_at: 10 }, { kind: 'fixed', seq: 1, parts }]
+  for (const [i, text] of parts.entries()) {
+    const offset = 20 + i * 20, uuid = `part-${i + 1}`
+    const take = e.entry(offset, { type: 'user', uuid, message: { role: 'user', content: text } })
+    const reply = assistant(e, [{ type: 'text', text: JSON.stringify(i === 2 ? e.expected : { status: 'received' }) }], offset + 5, { parentUuid: uuid })
+    e.own.push(take, reply)
+    e.journal.push({ kind: 'sent', seq: 1, part: i + 1, session_id: 'session', transcript_path: take.path, transcript_size: offset - 1, at: offset - 2 },
+      { kind: 'delivered', seq: 1, part: i + 1, receipt: { path: take.path, uuid }, at: offset + 2 })
+  }
+  return e
+}
+const readAC15 = (e: ReturnType<typeof multipartAC15>) => completedAIReadback(e)
+const forbiddenAC15Action = (e: ReturnType<typeof multipartAC15>, offset: number, parentUuid: string, name = 'mcp__slack-channel-router__fetch_messages') =>
+  assistant(e, [{ type: 'tool_use', name, id: 'fetch', input: { chat_id: 'D0AIAC15', limit: 1 } }], offset, { parentUuid })
+
+test('AC15 accepts neutral completed acknowledgements and all three exact receipts plus final complete JSON', () => {
+  const e = multipartAC15()
+  expect(readAC15(e)).toEqual({ seq: 1, part: 3, receipt_uuid: 'part-3', session_id: 'session', actual_model: e.model })
+})
+
+test.each([
+  ['missing earlier part', (e: ReturnType<typeof multipartAC15>) => { e.own.splice(0, 1) }],
+  ['acknowledgement only at final part', (e: ReturnType<typeof multipartAC15>) => { e.own[5]!.value.message.content[0].text = '{"status":"received"}' }],
+  ['partial body', (e: ReturnType<typeof multipartAC15>) => { e.own[5]!.value.message.content[0].text = JSON.stringify({ ...e.expected, body: 'x'.repeat(1600) }) }],
+  ['wrong message count', (e: ReturnType<typeof multipartAC15>) => { e.own[5]!.value.message.content[0].text = JSON.stringify({ ...e.expected, messages: 3 }) }],
+  ['stale foreign answer', (e: ReturnType<typeof multipartAC15>) => { e.own[5]!.path = '/foreign/session.jsonl' }],
+  ['incomplete final answer', (e: ReturnType<typeof multipartAC15>) => { e.own[5]!.value.message.stop_reason = null }],
+  ['history result instead of assistant JSON', (e: ReturnType<typeof multipartAC15>) => { e.own[5]!.value.message.content = [{ type: 'text', text: '{"status":"received"}' }]; e.own.push(e.entry(66, { type: 'user', uuid: 'history', parentUuid: 'reply65', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'fetch', content: JSON.stringify(e.expected) }] } })) }],
+] as const)('AC15 rejects %s', (_name, change) => {
+  const e = multipartAC15(); change(e)
+  expect(() => readAC15(e)).toThrow()
+})
+
+test.each([
+  ['first part', 26, 'reply25'], ['middle part', 46, 'reply45'], ['final part', 66, 'reply65'],
+  ['late action after another input', 90, 'reply25'],
+] as const)('AC15 rejects history retrieval at %s even beside a correct completed final answer', (_name, offset, parent) => {
+  const e = multipartAC15()
+  if (offset === 90) e.own.push(e.entry(80, { type: 'user', uuid: 'later', message: { role: 'user', content: '<channel>unrelated</channel>' } }))
+  e.own.push(forbiddenAC15Action(e, offset, parent))
+  expect(() => readAC15(e)).toThrow('AC15 non-reply tool action')
+})
+
+test.each(['Bash', 'Read', 'Write', 'Agent', 'mcp__other__reply', 'reply'])('AC15 rejects %s despite exact final JSON', name => {
+  const e = multipartAC15(); e.own.push(forbiddenAC15Action(e, 26, 'reply25', name))
+  expect(() => readAC15(e)).toThrow('AC15 non-reply tool action')
+})
+
+test.each([NaN, 24])('AC15 rejects late linked history retrieval with invalid/backdated time %s', at => {
+  const e = multipartAC15()
+  const action = forbiddenAC15Action(e, 90, 'reply25'); action.at = at
+  e.own.push(e.entry(80, { type: 'user', uuid: 'later', parentUuid: 'reply65', message: { role: 'user', content: '<channel>unrelated</channel>' } }), action)
+  expect(() => readAC15(e)).toThrow('AC15 exchange has invalid/stale time')
+})
+
+test.each(['acknowledgement', 'late reply', 'late tool result', 'late system'].flatMap(kind =>
+  [NaN, kind === 'acknowledgement' ? 19 : 24].map(at => [kind, at] as const)))('AC15 rejects invalid/stale %s ancestry time %s', (kind, at) => {
+  const e = multipartAC15()
+  if (kind === 'acknowledgement') e.own[1]!.at = at
+  else {
+    const record = kind === 'late reply'
+      ? assistant(e, [{ type: 'text', text: '{"status":"received"}' }], 90, { uuid: 'late', parentUuid: 'reply25' })
+      : e.entry(90, { type: kind === 'late system' ? 'system' : 'user', uuid: 'late', parentUuid: 'reply25',
+        ...(kind === 'late system' ? { subtype: 'informational' } : { message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'post', content: 'posted' }] } }) })
+    record.at = at
+    e.own.push(e.entry(80, { type: 'user', uuid: 'later', message: { role: 'user', content: '<channel>unrelated</channel>' } }), record,
+      assistant(e, [{ type: 'text', text: 'Received.' }], 91, { parentUuid: 'late' }))
+  }
+  expect(() => readAC15(e)).toThrow('AC15 exchange has invalid/stale time')
+})
+
+test.each([90, NaN, 24])('AC15 ignores next-input actions with time %s when their ancestry stops at that unrelated input', at => {
+  const e = multipartAC15(), action = forbiddenAC15Action(e, 81, 'later'); action.at = at
+  e.own.push(e.entry(80, { type: 'user', uuid: 'later', parentUuid: 'reply65', message: { role: 'user', content: '<channel>unrelated</channel>' } }), action,
+    e.entry(82, { type: 'user', uuid: 'later-result', parentUuid: 'reply81', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'fetch', content: 'unrelated' }] } }),
+    forbiddenAC15Action(e, 83, 'later-result'))
+  expect(readAC15(e).receipt_uuid).toBe('part-3')
+})
+
+test.each([15, 70])('AC15 checks a repeated part at offset %s before or after its durable copy', offset => {
+  const e = multipartAC15()
+  e.journal[2].at = 12; e.journal[2].transcript_size = 0
+  e.own.push(e.entry(offset, { type: 'user', uuid: 'duplicate', message: { role: 'user', content: e.journal[1].parts[0] } }),
+    assistant(e, [{ type: 'text', text: '{"status":"received"}' }], offset + 1, { parentUuid: 'duplicate' }))
+  expect(readAC15(e).receipt_uuid).toBe('part-3')
+  e.own.push(forbiddenAC15Action(e, offset + 2, 'duplicate'))
+  expect(() => readAC15(e)).toThrow('AC15 non-reply tool action')
+})
+
+test.each([NaN, 9])('AC15 fails closed on a duplicate with invalid/stale time %s', at => {
+  const e = multipartAC15(), copy = e.entry(70, { type: 'user', uuid: 'duplicate', message: { role: 'user', content: e.journal[1].parts[0] } })
+  copy.at = at
+  e.own.push(copy, forbiddenAC15Action(e, 71, 'duplicate'))
+  expect(() => readAC15(e)).toThrow('AC15 copy has no exact own native receipt')
+})
+
+test.each(['intermediate', 'late'])('AC15 rejects a %s classifier stop despite exact final JSON', position => {
+  const e = multipartAC15()
+  if (position === 'late') e.own.push(e.entry(80, { type: 'user', uuid: 'later', message: { role: 'user', content: '<channel>unrelated</channel>' } }))
+  e.own.push(e.entry(position === 'late' ? 90 : 26, { type: 'system', uuid: 'stop', subtype: 'model_refusal_no_fallback', parentUuid: 'part-1', refusedUserMessageUuid: 'part-1' }))
+  expect(() => readAC15(e)).toThrow('refusal/API failure')
+})
+
+test('AC15 permits reply acknowledgements and a linked reply/tool-result/completion for the final answer', () => {
+  const e = multipartAC15()
+  for (const i of [1, 3, 5]) {
+    const reply = e.own[i]!, text = reply.value.message.content[0].text
+    reply.value.message.content = [{ type: 'tool_use', name: 'mcp__slack-channel-router__reply', id: `post-${i}`, input: { text } }]
+    reply.value.message.stop_reason = 'tool_use'
+    e.own.push(e.entry(reply.offset + 1, { type: 'user', uuid: `posted-${i}`, parentUuid: reply.value.uuid, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: `post-${i}`, content: 'posted' }] } }),
+      assistant(e, [{ type: 'text', text: 'Posted.' }], reply.offset + 2, { parentUuid: `posted-${i}` }))
+  }
+  expect(readAC15(e).receipt_uuid).toBe('part-3')
+})
+
+test('AC15 scopes tool discipline to its selected exchange and never uses foreign or subagent answers', () => {
+  const e = multipartAC15()
+  const unrelated = e.entry(80, { type: 'user', uuid: 'later', message: { role: 'user', content: '<channel>unrelated</channel>' } })
+  const unrelatedAction = forbiddenAC15Action(e, 81, 'later')
+  const foreignAction = forbiddenAC15Action(e, 82, 'reply25'); foreignAction.path = '/foreign/session.jsonl'
+  const subagentAction = forbiddenAC15Action(e, 83, 'reply25'); subagentAction.value.isSidechain = true
+  e.own.push(unrelated, unrelatedAction, foreignAction, subagentAction)
+  expect(readAC15(e).receipt_uuid).toBe('part-3')
+  e.own[5]!.path = '/scenario/projects/aiac11/subagents/session.jsonl'
+  expect(() => readAC15(e)).toThrow('no completed current-turn')
+})
+
+test('the AC15-only tool restriction does not reject another criterion\'s valid completed readback', () => {
+  const e = ordinaryEvidence()
+  e.reply.value.message.content.push({ type: 'tool_use', name: 'Read', input: { file_path: 'example' } })
+  expect(completedAIReadback(e).receipt_uuid).toBe('case3')
+})
+
+test('AC15 appends only the approved response discipline to its existing request', () => {
+  const root = mkdtempSync(join(tmpdir(), 'ai-ac15-prompt-'))
+  try {
+    const source = readFileSync(new URL('./real-agent/ai-scenario.sh', import.meta.url), 'utf8')
+    const start = source.indexOf('        printf \'\\nFor the x input')
+    const block = source.slice(start, source.indexOf('        real_write_config', start))
+    writeFileSync(join(root, 'CLAUDE.md'), 'Base JSON request.\n')
+    const child = spawnSync('bash', ['-eu', '-c', block], { env: hostSafeChildEnv(root, { tools: ['bash'], extras: { REAL_WORK: root } }), encoding: 'utf8', timeout: 5000 })
+    expect(child.status).toBe(0)
+    expect(readFileSync(join(root, 'CLAUDE.md'), 'utf8')).toBe('Base JSON request.\n\nFor the x input return JSON {case:"AC15",messages:the number of messages received,body:the text received}.\nGive a visible JSON response on every turn. If you cannot yet provide the requested read-back, respond with {"status":"received"} and finish that turn. Do not guess missing content. Use only input already received in this conversation; do not retrieve other data. Use no tool except `reply` to send your response.\n')
+  } finally { rmSync(root, { recursive: true, force: true }) }
+})
+
+test.each([false, true])('actual AC15 scenario checks again after idle, late retrieval=%s', late => {
+  const root = mkdtempSync(join(tmpdir(), 'ai-ac15-shell-'))
+  try {
+    const e = multipartAC15(), data = join(root, 'evidence.json'), observer = join(root, 'observer.ts')
+    writeFileSync(data, JSON.stringify(e))
+    writeFileSync(observer, `import { readFileSync, writeFileSync } from 'node:fs'
+import { completedAIReadback } from ${JSON.stringify(new URL('./real-agent/ai-readback.ts', import.meta.url).pathname)}
+import { parseDeliveryTranscriptRecord, receiptTextMatches } from ${JSON.stringify(new URL('../src/delivery-receipt.ts', import.meta.url).pathname)}
+const [mode, path, expected, seq] = process.argv.slice(2)
+const e = JSON.parse(readFileSync(path, 'utf8'))
+if (mode === 'idle') {
+  if (${late}) e.own.push(${JSON.stringify(forbiddenAC15Action(e, 66, 'reply65'))})
+  writeFileSync(path, JSON.stringify(e))
+} else {
+  e.expected = JSON.parse(readFileSync(expected, 'utf8')); e.seq = Number(seq)
+  e.adapters = { parseDeliveryTranscriptRecord, receiptTextMatches }
+  try { completedAIReadback(e) } catch (error) { console.error(error.message); process.exitCode = 1 }
+}
+`)
+    const source = readFileSync(new URL('./real-agent/ai-scenario.sh', import.meta.url), 'utf8')
+    const start = source.indexOf('        BODY="$(python3')
+    const block = source.slice(start, source.indexOf('    elif [[ "${AI_CRITERION}" == 106', start))
+    const script = join(root, 'scenario.sh')
+    writeFileSync(script, `set -eu
+real_dm() { [[ "$2" == "$(python3 -c 'print("x"*5000,end="")')" ]]; }
+real_wait_delivery() { [[ "$2" == 1 ]]; }
+wait_until() { shift 2; "$@"; }
+ai_readback() { "${process.execPath}" "${observer}" readback "${data}" "$1" "$2"; }
+real_wait_idle() { "${process.execPath}" "${observer}" idle "${data}"; }
+${block}`)
+    const child = spawnSync('bash', [script], { env: hostSafeChildEnv(root, { tools: ['bash', 'python3'], extras: { EXPECTED: root, REAL_LABEL: 'aiac15', REAL_KEY: 'aiac15' } }), encoding: 'utf8', timeout: 10_000 })
+    expect(child.error).toBeUndefined(); expect(child.signal).toBeNull(); expect(child.status).toBe(late ? 1 : 0)
+    expect(child.stdout).toBe('')
+    expect(child.stderr).toBe(late ? 'AC15 non-reply tool action observed\n' : '')
+  } finally { rmSync(root, { recursive: true, force: true }) }
+})
+
 test('a resumed item binds its reply to the receipt session instead of a previous session', () => {
   const e = ordinaryEvidence(), path = '/scenario/projects/aiac11/resumed.jsonl'
   const take = e.entry(40, { type: 'user', uuid: 'resumed-user', sessionId: 'resumed', message: { role: 'user', content: '<channel>resumed request</channel>' } })

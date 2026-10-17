@@ -9,6 +9,65 @@ export function safeSelectedModel(value: string): boolean { return typeof value 
 const stable = (v: any): string => JSON.stringify(v && typeof v === 'object' && !Array.isArray(v)
   ? Object.fromEntries(Object.keys(v).sort().map(k => [k, JSON.parse(stable(v[k]))])) : Array.isArray(v) ? v.map(x => JSON.parse(stable(x))) : v)
 
+// AC15 may acknowledge a part, but retrieval or any other action cannot
+// supply missing context. Inspect every copy's turn and its late descendants;
+// completion/JSON provenance remains the ordinary final-part oracle below.
+function assertAC15Exchange(parts: string[], acceptedAt: number, seq: number, journal: any[], own: TranscriptEntry[], adapters: ReceiptAdapters) {
+  const sends = journal.filter(r => r.kind === 'sent' && r.seq === seq && !r.unknown_outcome)
+  const sessions = new Map<string, TranscriptEntry[]>()
+  for (const send of sends) {
+    const key = JSON.stringify([send.transcript_path, send.session_id])
+    if (!sessions.has(key)) sessions.set(key, own.filter(e => e.path === send.transcript_path && e.value?.sessionId === send.session_id
+      && e.value.isSidechain !== true && !e.path.includes('/subagents/')).sort((a, b) => a.offset - b.offset))
+  }
+  for (const session of sessions.values()) {
+    const copies = session.filter(e => e.kind === 'take-in' && e.text !== undefined
+      && parts.some(text => adapters.receiptTextMatches(e.text!, text)))
+    if (!copies.length) continue
+    const ids = session.map(e => e.value?.uuid).filter(id => typeof id === 'string')
+    check(new Set(ids).size === ids.length, 'AC15 has ambiguous native UUID')
+    for (const copy of copies) {
+      check(typeof copy.uuid === 'string' && copy.value.type === 'user' && copy.value.uuid === copy.uuid
+        && copy.value.isMeta !== true && copy.value.sessionId === basename(copy.path, '.jsonl') && Number.isFinite(copy.at) && copy.at >= acceptedAt,
+      'AC15 copy has no exact own native receipt')
+      check(sends.some(r => r.transcript_path === copy.path && r.session_id === copy.value.sessionId
+        && adapters.receiptTextMatches(copy.text!, parts[r.part - 1]) && Number.isFinite(r.at) && r.at >= acceptedAt && r.at <= copy.at
+        && Number.isSafeInteger(r.transcript_size) && r.transcript_size >= 0 && r.transcript_size <= copy.offset),
+      'AC15 copy has no native send window')
+      const next = session.find(e => e.offset > copy.offset && e.kind === 'take-in' && e.text !== undefined)
+      const linked = (entry: TranscriptEntry): boolean => {
+        const seen = new Set<string>(); let current = entry
+        while (typeof current.value?.parentUuid === 'string' && !seen.has(current.value.parentUuid)) {
+          const parent = current.value.parentUuid
+          if (parent === copy.uuid) return true
+          seen.add(parent)
+          // Discover ancestry from native identity and file order. Bad times
+          // must invalidate linked evidence, never hide it from this exchange.
+          const prior = session.find(e => e.value?.uuid === parent && e.offset < current.offset)
+          if (!prior || prior.kind === 'take-in' && prior.text !== undefined) return false
+          current = prior
+        }
+        return false
+      }
+      for (const e of session.filter(e => e.offset > copy.offset && ((!next || e.offset < next.offset) || linked(e)
+        || e.value?.type === 'system' && e.value.refusedUserMessageUuid === copy.uuid))) {
+        check(!(e.value.type === 'system' && /(?:refusal|fallback|api_error|api_retry)/.test(e.value.subtype ?? '')),
+          'AC15 exchange has refusal/API failure')
+        const parent = session.find(prior => prior.value?.uuid === e.value.parentUuid && prior.offset < e.offset)
+        check(Number.isFinite(e.at) && e.at >= copy.at && (!linked(e)
+          || parent && Number.isFinite(parent.at) && parent.at <= e.at), 'AC15 exchange has invalid/stale time')
+        if (e.value.type !== 'assistant') continue
+        check(Array.isArray(e.value.message?.content), 'AC15 has malformed native assistant content')
+        for (const block of e.value.message.content) {
+          check(block && typeof block === 'object' && typeof block.type === 'string', 'AC15 has malformed native response block')
+          if (block.type === 'tool_use' || block.type === 'server_tool_use') check(block.type === 'tool_use'
+            && block.name === 'mcp__slack-channel-router__reply', 'AC15 non-reply tool action observed')
+        }
+      }
+    }
+  }
+}
+
 export function completedAIReadback({ seq, expected, journal, own, adapters, model }: {
   seq: number; expected: any; journal: any[]; own: TranscriptEntry[]; adapters: ReceiptAdapters; model: string
 }) {
@@ -39,6 +98,7 @@ export function completedAIReadback({ seq, expected, journal, own, adapters, mod
       && Number.isSafeInteger(r.transcript_size) && r.transcript_size >= 0 && r.transcript_size <= take!.offset),
     'AI readback receipt has no native send window')
   }
+  if (expected.case === 'AC15') assertAC15Exchange(fixed.parts, accepted.received_at, seq, journal, own, adapters)
   // Reassembly answers belong to the final delivered part. Explicit seqs also
   // preserve earlier DM checks after a later thread and across resume sessions.
   const receipt = take!

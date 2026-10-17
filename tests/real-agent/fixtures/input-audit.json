@@ -92,9 +92,10 @@
       "inputs": [
         "Generated body: x repeated 5000 times",
         "For the x input return JSON {case:\"AC15\",messages:the number of messages received,body:the text received}.",
-        "Base JSON request prompt"
+        "Base JSON request prompt",
+        "Give a visible JSON response on every turn. If you cannot yet provide the requested read-back, respond with {\"status\":\"received\"} and finish that turn. Do not guess missing content. Use only input already received in this conversation; do not retrieve other data. Use no tool except `reply` to send your response."
       ],
-      "review": "Unchanged generated length/reassembly and count request; no classifier bait; exact readback in all three trials."
+      "review": "Unchanged generated length/reassembly and count request. SR-14.6 response-format/execution discipline adds a neutral acknowledgement and reply-only rule without teaching part association, joining or counting. No classifier bait; exact completed own-conversation readback in all three trials, with no non-reply action across any part/copy or late linked response and a final post-idle check."
     },
     {
       "ac": 20,
@@ -138,8 +139,8 @@
   "prompt_input_sources": [
     {
       "path": "real-agent/ai-scenario.sh",
-      "sha256": "cfa82ad2f82c1428aa5e2aa6d5a7a5448fa9439bc798bd1d51242f440df3c3a8",
-      "reason": "Reviewed complete AI scenario/entry source against the seven-criterion input inventory; any source drift requires a fresh audit. Decision 19 reviewed setup: strict selected-model pin and disabled fallback; first three AC11 turns unchanged; each hz_* restarts without resume and sees its own opaque label. Input bodies, attributes, order, all-part exact receipt/JSON and no-obedience/no-shell assertions and bounds remain unchanged."
+      "sha256": "15f0770eb74d746520eb441376accd5375e0e8e242d2a4dd22633c90431dc39f",
+      "reason": "Reviewed complete AI scenario/entry source against the seven-criterion input inventory; any source drift requires a fresh audit. Decision 19 reviewed setup: strict selected-model pin and disabled fallback; first three AC11 turns unchanged; each hz_* restarts without resume and sees its own opaque label. Input bodies, attributes, order, all-part exact receipt/JSON and no-obedience/no-shell assertions and bounds remain unchanged. AC15 adds only the approved visible-JSON/neutral-acknowledgement/current-conversation/reply-only discipline and a strict post-idle observation; its original request, 5000-byte input, comparator and bounds are unchanged. All seven criteria inputs reviewed again."
     },
     {
       "path": "integration/lib/real-scenario.sh",

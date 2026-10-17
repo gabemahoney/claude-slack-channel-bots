@@ -140,6 +140,7 @@ LABEL
 else
     if [[ "${AI_CRITERION}" == 15 ]]; then
         printf '\nFor the x input return JSON {case:"AC15",messages:the number of messages received,body:the text received}.\n' >> "${REAL_WORK}/CLAUDE.md"
+        printf '%s\n' 'Give a visible JSON response on every turn. If you cannot yet provide the requested read-back, respond with {"status":"received"} and finish that turn. Do not guess missing content. Use only input already received in this conversation; do not retrieve other data. Use no tool except `reply` to send your response.' >> "${REAL_WORK}/CLAUDE.md"
         real_write_config '{"resume_enabled":false}'
     fi
     if [[ "${AI_CRITERION}" == 91 ]]; then
@@ -157,6 +158,8 @@ import json,sys
 json.dump({'case':'AC15','messages':1,'body':'x'*5000},open(sys.argv[1],'w'))
 EXPECT
         wait_until 180 'AC15 reassembly JSON differs' ai_readback "${EXPECTED}/1.json" 1
+        real_wait_idle "${REAL_KEY}"
+        ai_readback "${EXPECTED}/1.json" 1
     elif [[ "${AI_CRITERION}" == 106 ]]; then
         TS="$(date +%s.%6N)"
         real_dm "${REAL_LABEL}" 'Please acknowledge this DM.' "${TS}"

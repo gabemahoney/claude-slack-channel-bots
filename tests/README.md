@@ -832,7 +832,7 @@ observer; the shared `real-case-assertions.ts` comparator is unchanged.
 | `test-104-fmk-real-idle-compact.sh` | Decision 16 native idle capability, genuine context buildup and observed compaction with queued delivery |
 | `test-111-fmk-real-ai-ac11.sh` | Audited AI wrapper copy attributes/body read-back through completed native turns; case_03 also rejects spoof obedience across every copy and late linked response |
 | `test-112-fmk-real-ai-ac12.sh` | Prefix hazards read as text, with no native shell-input or Bash tool action |
-| `test-115-fmk-real-ai-ac15.sh` | Multipart reassembly into one 5,000-character message |
+| `test-115-fmk-real-ai-ac15.sh` | Multipart reassembly into one 5,000-character message; reply-only exchange checks and exact completed final read-back repeated after idle |
 | `test-120-fmk-real-ai-ac20.sh` | Outer sender identity despite body spoofing/attribute quoting |
 | `test-123-fmk-real-ai-ac23.sh` | Sender read-back and reply after compact/resume |
 | `test-191-fmk-real-ai-ac91.sh` | DM/thread replies without an operator prompt file |
@@ -863,7 +863,7 @@ byte-identical, and original `ex3_peer_bot_spoof` stays exact.
 | AI helper or fixture | Contract |
 |---|---|
 | `tests/real-agent/fixtures/wrapper-cases.json` | AI-only 15-case copy with the single approved `hz_bang` body change described above; canonical fixtures remain unchanged. |
-| `tests/real-agent/fixtures/input-audit.json` | Records each of the 15 cases, all seven criteria's generated/inline inputs and prompts, differences and reasons, canonical/AI SHA-256 values and reviewed input-source hashes. |
+| `tests/real-agent/fixtures/input-audit.json` | Records each of the 15 cases, all seven criteria's generated/inline inputs and prompts (including AC15 response/tool discipline), differences and reasons, canonical/AI SHA-256 values and reviewed input-source hashes. |
 | `tests/real-agent/ai-fixture-audit.ts` | Validates the AI copy against the canonical corpus, approved difference, case order/mapping and reviewed source hashes before generation or classifier observation; never rewrites inputs. Input-source changes require a fresh complete audit. |
 | `tests/real-agent/ai-no-shell.ts` | AC11/AC12 observer rejecting native bash records or any assistant Bash tool request, including an action beside otherwise exact JSON. |
 | `tests/real-agent/ai-readback.ts` | Ordinary read-back observer requiring an explicit queue sequence, every part's exact durable native receipt and send window, and exact JSON from the selected model's parent-linked completed response in the final part's own session/path. Records criterion, trial, case and `actual_model` from native completion; leaves the shared comparator unchanged. |
@@ -882,6 +882,25 @@ use each case's sequence, including AC11 case_03 at sequence 3. AC15
 uses sequence 1 and the final multipart receipt; AC23 uses sequences 2/3
 after compact/resume; AC91 checks DM sequence 1 and thread sequence 2 even
 after both arrive; AC106 checks the counting query at sequence 2.
+
+AC15 keeps its original JSON request and adds only SR-14.6 response/tool
+discipline: give visible JSON on every turn; if the requested read-back is
+not yet available, send `{"status":"received"}` and finish that turn. Do not
+guess, retrieve other data or use a tool except `reply`; use only input
+already received in the conversation.
+
+SR-7.2's fixed shipped description alone teaches multipart semantics.
+
+The AC15-only guard checks every part's own native turn, every exact duplicate
+copy and late responses still linked to those turns. It requires valid own
+receipts and send windows, rejects malformed or stale copy timestamps, and
+rejects non-reply tools, classifier stops and refusal/API failures even
+beside an exact final answer.
+
+Earlier acknowledgements cannot satisfy the final read-back: every part must have its exact durable receipt, and the
+final part's own completed turn must return `case:"AC15"`, `messages:1` and
+the exact 5,000-character body. The scenario repeats the strict oracle after
+idle; the 180 s read-back bound, selected model and 3-of-3 requirement apply.
 
 Decision 19 withdraws every classifier-stop pass, including decision 17's
 AC11 `case_03` exception. The original `ex3_peer_bot_spoof` needs a real
@@ -919,7 +938,12 @@ It rejects classifier stops before, beside or after exact JSON, including
 late linked stops, fallback/API errors, synthetic answers and incomplete
 duplicates. Shell controls require sequence 3 and check silent successful
 final observation; a separate control rejects the withdrawn `stop` mode. Its pass does not
-certify an AI trial.
+certify an AI trial. Thirty AC15 controls in this existing test file cover
+completed acknowledgements, all-part receipts, exact final JSON, intermediate
+and late retrieval, non-reply tools, duplicate copies with invalid/stale
+timestamps, classifier stops, permitted reply completion and the actual
+scenario's post-idle check. They also check the generated response/tool
+discipline and that the AC15 restriction stays local to that criterion.
 
 `tests/real-agent/ai-readback-controls.ts` is a manual, unpaid check of the
 actual scenario generator and read-back comparator, outside `/ci` and the
@@ -1055,8 +1079,8 @@ including recorded native-idle skips where the actual capability is unavailable.
 
 The original failed run `real-ai-focused-1792200405256-988946` remains
 FAIL: its fallback to an unavailable model and HTTP 403 are not qualifying
-classifier-stop evidence. Fresh 21-trial AI and complete 58-invocation
-heavy acceptance remain pending. The later decision-17 focused run
+classifier-stop evidence. Complete 58-invocation heavy acceptance remains
+pending. The later decision-17 focused run
 `real-ai-focused-decision17-1792203000685-1259517` also remains FAIL:
 case_03 passed its then-permitted validated classifier-stop path, then
 case_04's exact read-back failed after a classifier stop (1 failed, 20 not run). Decision
@@ -1092,9 +1116,20 @@ Delivery p95 was 3869 ms, within its 10000 ms limit. Duplicate upgrade reads
 exhausted the unchanged 40-call/10-second budget. The own-marker fast path
 passes a deterministic sustained-load regression (typing p95 2880 ms before,
 1567 ms after); the recorded-gap control passes before the fix too.
-Native latency after the fix, fresh full units, paid CI, the focused 21 AI
-trials and complete heavy acceptance remain pending. Unpaid controls and
-the diagnostic do not waive either gate or turn a prior failure into a pass.
+Current focused AI results on `azure/openai/gpt-6-astra`, native 2.1.296,
+with fallback disabled are 18 PASS and three FAIL: AC11, AC12, AC20, AC23,
+AC91 and AC106 each passed all three trials; AC15 failed all three 180 s
+runs. No classifier stop occurred. The observed AC15 sequence after part
+one was an empty assistant turn, a native visible-response follow-up, then
+a permission-held `fetch_messages` request; parts two and three were not
+sent. No production defect is established; the roughly 15-second delay
+before the permission prompt remains unexplained.
+
+The response/tool discipline and observer controls do not change those
+failures. Three fresh AC15 trials and the full 58-invocation heavy run remain
+required; the heavy run has not started and is not waived. The full `/ci`
+PASS on `fc763a36` predates this AC15 test change. Unpaid controls, full unit
+success and earlier diagnostics do not establish fresh AI or heavy acceptance.
 
 Local jobs use the committed `/ci` caps, currently 2 GiB, 2 CPUs and 2,048
 PIDs, with 3 h per job. `docker/Dockerfile.real-agent` and
