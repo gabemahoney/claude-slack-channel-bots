@@ -76,6 +76,10 @@ if model_pin:
                     switchModelsOnFlag=False, fallbackModel=[])
 pathlib.Path(home, '.claude/settings.json').write_text(json.dumps(settings))
 PY
+    if [[ "${REAL_AGENT_AC20_DIAGNOSTICS:-}" == decision21c ]]; then
+        source "${BASH_SOURCE[0]%/*}/../../real-agent/ac20-diagnostics.sh"
+        real_ac20_diagnostics_start
+    fi
 }
 
 # Creates a persona and exposes REAL_{NAME,KEY,WORK,LABEL,CHANNEL,USER,

@@ -156,12 +156,12 @@
   "prompt_input_sources": [
     {
       "path": "real-agent/ai-scenario.sh",
-      "sha256": "4a96b137596887ccbc4705365ad9ac625002aa513015142a1c6bcca91106bef7",
+      "sha256": "0bb5bdef7cab4d99bedb94503ad543fc4d72d8b67e6030036358ae66a3a8fe38",
       "reason": "Reviewed complete AI scenario/entry source against all seven criteria. Decision 19 strict selected-model pin, disabled fallback, first three AC11 turns, isolated hz_* sessions and opaque labels are unchanged. Decision 20 changes only AC15 body generation to the recorded seeded neutral 5000-byte ASCII recipe and derives the private expected JSON from that same body. Existing prompts/setup, all-part exact receipts/JSON, no-obedience/no-shell/reply-only checks, final post-idle observation, models and bounds are unchanged. Canonical wrapper cases and certified traces remain byte-identical."
     },
     {
       "path": "integration/lib/real-scenario.sh",
-      "sha256": "17a582231e84fe59ca1d916e4794bf6085af5450a418d8c37b0e74d350d1567c",
+      "sha256": "ae50f229f86bab4f5bf61821fc8f07a792593dec39be1763fa0ca7bc5a0c5265",
       "reason": "Reviewed complete inline/generated AI input and prompt source; comments and diagnostic strings are not model-visible. Shared persona default acknowledgement prompt has no incidental bait."
     },
     {

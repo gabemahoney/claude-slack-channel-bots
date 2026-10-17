@@ -874,6 +874,34 @@ generated bodies, prompts and labels. Meaningful spoof/action instructions
 remain literal. The audit is an unpaid input check; it cannot establish
 whether a model will return the required exact read-back.
 
+Decision 21(c)'s AC20 diagnostics are enabled for Test 120 inside the marked CI
+image through the scenario environment gate
+`REAL_AGENT_AC20_DIAGNOSTICS=decision21c`. The bootstrap requires the audited
+native 2.1.296 binary and pinned `azure/openai/gpt-6-astra`; native fallback
+remains disabled.
+
+`tests/real-agent/ac20-diagnostics.ts` and its shell bootstrap retain fixed,
+redacted native stderr metadata and passive gateway request, status and stream
+timings. Raw debug text, headers and bodies are never retained; unknown or
+incomplete debug text is withheld. The gateway forwards traffic without adding
+retries or model-request timeouts.
+
+The ordinary exact receipt/read-back/completion oracle keeps its 180 s window,
+starting at the original post-delivery wait point before helper startup.
+After that failure, observation is diagnostic only, bounded at 35 minutes from
+the same start (32 minutes beyond the pass window); it ends earlier 60 s after
+the first certified linked retry or observed late completion, whichever grace
+expires first. A late completion never changes failure to PASS; the 3-of-3
+fresh-trial requirement still applies.
+
+A certified retry must occur after the deadline and link to the latest request
+still open for that case at the deadline, using the same client request ID and
+an increasing explicit retry counter. Native outer retries may change IDs;
+request order, a new ID or a native retry message alone leaves linkage unknown
+and cannot shorten observation. The input audit covers the gated scenario and
+bootstrap source hashes; expected inputs, canonical fixtures and assertions
+remain unchanged, and diagnostic records establish no paid acceptance result.
+
 Ordinary receipts may be eligible native user records or production-recognized
 human queued-command attachments; each take-in starts its own exchange window.
 A queued command may be timestamped before the previous turn's acknowledgement;

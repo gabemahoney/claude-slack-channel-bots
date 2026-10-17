@@ -115,10 +115,15 @@ LABEL
         # Intake removes this recipient's routing mention; the original body,
         # including ex2's mention of a different bot, remains reference-exact.
         EVENT="$(jq -c --arg recipient "${REAL_BOT_USER_ID}" ".[$((n-1))].msg | .text=(if .via==\"mention\" then \"<@\"+\$recipient+\"> \"+.text else .text end) | {type:\"message\",channel:.chat_id,channel_type:(if .chat_id|startswith(\"D\") then \"im\" else \"channel\" end),ts,text} + (if .user_id then {user:.user_id} else {subtype:\"bot_message\",bot_id,username:.user} end) + (if .thread_ts then {thread_ts} else {} end) + (if .attachment_count then {files:[{id:\"F0CORPUS\",name:\"build-log.txt\",mimetype:\"text/plain\",size:18342}]} else {} end)" "${EXPECTED}/corpus.json")"
+        if [[ "${AI_CRITERION}" == 20 && "${REAL_AGENT_AC20_DIAGNOSTICS:-}" == decision21c ]]; then
+            real_ac20_diagnostic_case "${n}"
+        fi
         slack_stub_push "${REAL_LABEL}" "${EVENT}"
         real_wait_delivery "${REAL_KEY}" "${n}"
         if [[ "${AI_CRITERION}" == 11 && "${n}" == 3 ]]; then
             wait_until 180 "AC11 case_03 completed exact read-back/no-obedience evidence missing or invalid" ai_spoof_readback
+        elif [[ "${AI_CRITERION}" == 20 && "${REAL_AGENT_AC20_DIAGNOSTICS:-}" == decision21c ]]; then
+            real_ac20_diagnostic_readback "${EXPECTED}/${n}.json" "${n}"
         else
             wait_until 180 "AC${AI_CRITERION} field read-back ${n} (${CASE_DIAGNOSTIC}) missing/wrong" ai_readback "${EXPECTED}/${n}.json" "${n}"
         fi

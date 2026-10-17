@@ -1,0 +1,3 @@
+emit(e,n){if(!this.shouldLog(e))return;let r=ps(e.trim());r=r.includes(`
+`)?OH(_(r)):r.replace(Ks,a6);let i=`${new Date().toISOString()} [${n.toUpperCase()}] ${r}
+`;if(this.toStderr){this.deps.writeToStderr(i);return}this.write(i)}write(e){let n=this.getWriter()
