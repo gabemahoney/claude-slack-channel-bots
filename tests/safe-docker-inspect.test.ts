@@ -157,6 +157,79 @@ process.exitCode = answer.code
     expect(run(['docker', 'container', 'inspect', 'safe-name'])).toEqual({ code: 1, stdout: '', stderr: '' })
   })
 
+  test('retains the actual failed command exit and sanitized stderr privately, including secrets known only from Env', async () => {
+    answer.code = 17
+    answer.stderr = 'forced-inspect-failure: ' + allSecrets.map(value => `${value}|${JSON.stringify(value).slice(1, -1)}`).join(' ')
+    writeFileSync(fixture, JSON.stringify(answer))
+    const result = await safeDockerInspect(['docker', 'container', 'inspect', 'safe-name'], {
+      cwd: root, env: hostSafeChildEnv(root, { tools: [], pathDirs: [bin], extras: {
+        INSPECT_TEST_FIXTURE: fixture, INSPECT_TEST_ARGV: argvFile,
+      } }),
+    })
+    assertNoLeak(result)
+    for (const value of allSecrets) {
+      expect(result.stderr.includes(value)).toBe(false)
+      expect(result.stderr.includes(JSON.stringify(value).slice(1, -1))).toBe(false)
+    }
+    expect(result).toEqual({ code: 1, text: '', actualExitCode: 17,
+      stderr: 'forced-inspect-failure: ' + allSecrets.map(() => '[REDACTED]|[REDACTED]').join(' '),
+      timedOut: false, outputTruncated: false })
+    expect(JSON.parse(readFileSync(argvFile, 'utf8'))).toEqual(['container', 'inspect', 'safe-name'])
+    expect(run(['docker', 'container', 'inspect', 'safe-name'])).toEqual({ code: 1, stdout: '', stderr: '' })
+  })
+
+  test('withholds a truncated diagnostic ending inside a credential instead of exposing its prefix', async () => {
+    answer.stdout = JSON.stringify([{ Id: id, Config: { Env: [`CUSTOM_TOKEN=${genericSecret}`] } }])
+    answer.stderr = 'forced-bound-failure: ' + genericSecret
+    answer.code = 17
+    writeFileSync(fixture, JSON.stringify(answer))
+    const result = await safeDockerInspect(['docker', 'inspect', 'safe-name'], {
+      cwd: root, maxOutputBytes: Buffer.byteLength(answer.stdout) + Buffer.byteLength('forced-bound-failure: ') + 12,
+      env: hostSafeChildEnv(root, { tools: [], pathDirs: [bin], extras: {
+        INSPECT_TEST_FIXTURE: fixture, INSPECT_TEST_ARGV: argvFile,
+      } }),
+    })
+    // Check a boolean before any diff/assertNoLeak can print the leaked prefix.
+    expect(result.stderr.includes(genericSecret.slice(0, 12))).toBe(false)
+    assertNoLeak(result)
+    expect(result.code).toBe(75)
+    expect(result.text).toBe('')
+    expect(result.outputTruncated).toBe(true)
+    expect(result.timedOut).toBe(false)
+    expect(result.stderr.startsWith('Docker stderr withheld:')).toBe(true)
+  })
+
+  test('withholds stderr when partial inspection leaves an unknown Env secret and bounds escaped descendant pipes', async () => {
+    const pidFile = join(root, 'escaped-pid.json')
+    writeFileSync(join(bin, 'docker'), `#!${process.execPath}
+import { writeFileSync } from 'node:fs'
+process.stdout.write(${JSON.stringify(JSON.stringify(inspected()).slice(0, -1))})
+process.stderr.write(${JSON.stringify('partial-inspect-failure ' + nestedSecret)})
+const child = Bun.spawn([process.execPath, '--eval', 'setInterval(() => {}, 1000)'], {
+  env: {}, detached: true, stdin: 'ignore', stdout: 'inherit', stderr: 'inherit',
+})
+writeFileSync(${JSON.stringify(pidFile)}, JSON.stringify(child.pid))
+await child.exited
+`, { mode: 0o700 })
+    const started = performance.now()
+    try {
+      const result = await safeDockerInspect(['docker', 'inspect', 'safe-name'], {
+        cwd: root, timeoutMs: 250,
+        env: hostSafeChildEnv(root, { tools: [], pathDirs: [bin] }),
+      })
+      assertNoLeak(result)
+      expect(result.stderr.includes(nestedSecret)).toBe(false)
+      expect(result.stderr.includes(JSON.stringify(nestedSecret).slice(1, -1))).toBe(false)
+      expect(result).toEqual({ code: 124, text: '', actualExitCode: null,
+        stderr: 'Docker stderr withheld: incomplete inspection cannot certify credential redaction',
+        timedOut: true, outputTruncated: false })
+      expect(performance.now() - started).toBeLessThan(1_500)
+      expect(existsSync(pidFile)).toBe(true)
+    } finally {
+      if (existsSync(pidFile)) { try { process.kill(JSON.parse(readFileSync(pidFile, 'utf8')), 'SIGKILL') } catch {} }
+    }
+  })
+
   test('rejects invalid UTF-8 after otherwise valid JSON without partial output', () => {
     answer.invalidUtf8 = true
     expect(run(['docker', 'inspect', 'safe-name'])).toEqual({ code: 65, stdout: '', stderr: '' })
@@ -356,7 +429,8 @@ describe('private inspection cancellation with captured process output', () => {
       const result = await safeDockerInspect(['docker', 'inspect', 'safe-name'], { timeoutMs: 1_000, env: {} })
       assertNoLeak({ result, captured })
       expect(parsed).toBe(true)
-      expect(result).toEqual({ code: 124, text: '' })
+      expect(result).toEqual({ code: 124, text: '', actualExitCode: 0,
+        stderr: 'Docker stderr withheld: incomplete inspection cannot certify credential redaction', timedOut: true, outputTruncated: false })
       expect(captured).toEqual([])
       expect(clock.firedCount()).toBe(0)
       expect(clock.pendingCount()).toBe(0)
@@ -389,9 +463,14 @@ describe('private inspection cancellation with captured process output', () => {
         await clock.advance(999); expect(settled).toBe(false)
         await clock.advance(1)
       } else if (kind === 'abort') abort.abort()
+      else if (kind === 'failed child retaining pipes') await clock.advance(25)
       const result = await pending
       assertNoLeak({ result, captured })
-      expect(result).toEqual({ code: kind.includes('timeout') ? 124 : kind === 'failed child retaining pipes' ? 1 : 130, text: '' })
+      const code = kind.includes('timeout') ? 124 : kind === 'failed child retaining pipes' ? 1 : 130
+      expect(result).toEqual({ code, text: '',
+        actualExitCode: kind === 'pipe drain timeout' ? 0 : kind === 'failed child retaining pipes' ? 7 : null,
+        stderr: kind === 'already aborted' ? 'Docker inspection aborted before launch' : 'Docker stderr withheld: incomplete inspection cannot certify credential redaction',
+        timedOut: code === 124, outputTruncated: false })
       expect(captured).toEqual([])
       expect(spawn).toHaveBeenCalledTimes(kind === 'already aborted' ? 0 : 1)
       expect(cancelled).toBe(kind === 'already aborted' ? 0 : 2)
@@ -401,4 +480,51 @@ describe('private inspection cancellation with captured process output', () => {
       spawn.mockRestore(); clear.mockRestore(); timer.mockRestore(); stderr.mockRestore(); stdout.mockRestore()
     }
   })
+
+  test.each(['cap', 'deadline', 'abort', 'read failure', 'cancel rejection', 'cancel never settles'] as const)(
+    '%s withholds a credential fragment even when inspection stdout is complete', async kind => {
+      const clock = createFakeClock(), abort = new AbortController()
+      const fragment = genericSecret.slice(0, 12)
+      let cancelled = 0, pulls = 0
+      const raw = JSON.stringify([{ Id: id, Config: { Env: [`CUSTOM_TOKEN=${genericSecret}`] } }])
+      const timer = spyOn(globalThis, 'setTimeout').mockImplementation(((callback: () => void, ms: number) => clock.setTimeout(callback, ms)) as unknown as typeof setTimeout)
+      const clear = spyOn(globalThis, 'clearTimeout').mockImplementation(handle => clock.clearTimeout(handle))
+      const spawn = spyOn(Bun, 'spawn').mockImplementation((() => ({
+        stdout: new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode(raw)); c.close() } }),
+        stderr: new ReadableStream({
+          start(c) { c.enqueue(new TextEncoder().encode('failure-marker ' + fragment)) },
+          pull(c) { if (kind === 'read failure' && ++pulls > 0) c.error(new Error('synthetic read failure')) },
+          cancel() {
+            cancelled++
+            if (kind === 'cancel rejection') return Promise.reject(new Error('synthetic cancellation failure'))
+            if (kind === 'cancel never settles') return new Promise<void>(() => {})
+          },
+        }),
+        exited: ['cancel rejection', 'cancel never settles'].includes(kind) ? Promise.resolve(17) : new Promise(() => {}),
+        kill() {}, unref() {},
+      })) as unknown as typeof Bun.spawn)
+      try {
+        let settled = false
+        const pending = safeDockerInspect(['docker', 'inspect', 'safe-name'], {
+          timeoutMs: 1_000, env: {}, signal: abort.signal,
+          maxOutputBytes: kind === 'cap' ? Buffer.byteLength(raw) + 1 : undefined,
+        }).then(result => { settled = true; return result })
+        await clock.flush()
+        if (kind === 'deadline') { await clock.advance(999); expect(settled).toBe(false); await clock.advance(1) }
+        if (kind === 'abort') abort.abort()
+        if (kind.startsWith('cancel')) { await clock.advance(24); expect(settled).toBe(false); await clock.advance(1) }
+        const result = await pending
+        // Only boolean assertions run before a diff printer can see a secret prefix.
+        expect(JSON.stringify(result).includes(fragment)).toBe(false)
+        assertNoLeak(result)
+        const code = kind === 'cap' ? 75 : kind === 'deadline' ? 124 : kind === 'abort' ? 130 : 1
+        expect(result).toEqual({ code, text: '', actualExitCode: kind.startsWith('cancel') ? 17 : null,
+          stderr: 'Docker stderr withheld: incomplete inspection cannot certify credential redaction',
+          timedOut: kind === 'deadline', outputTruncated: kind === 'cap' })
+        expect(cancelled).toBe(kind === 'read failure' ? 0 : 1)
+        expect(clock.pendingCount()).toBe(0)
+      } finally { spawn.mockRestore(); clear.mockRestore(); timer.mockRestore() }
+    },
+  )
+
 })

@@ -3,7 +3,7 @@
  * Private Docker inspection boundary for local harnesses and diagnostics.
  * CLI: bun scripts/safe-docker-inspect.ts docker container inspect NAME
  * Only complete, sanitized JSON (or the fixed Id projection) can leave here.
- * Failure returns an empty text and a nonzero code; never log child errors.
+ * Failure returns empty text plus private sanitized diagnostics; the CLI emits no child errors.
  * This scopes inspection callers; it cannot intercept unrelated shell tools.
  */
 import { basename } from 'node:path'
@@ -17,7 +17,16 @@ export interface SafeDockerInspectOptions {
   maxOutputBytes?: number
   signal?: AbortSignal
 }
-export interface SafeDockerInspectResult { code: number; text: string }
+export interface SafeDockerInspectResult {
+  code: number
+  text: string
+  /** Docker's actual exit, independently of wrapper refusal/timeout codes. */
+  actualExitCode: number | null
+  /** Sanitized separately from inspection JSON; never contains Config.Env. */
+  stderr: string
+  timedOut: boolean
+  outputTruncated: boolean
+}
 
 const ID = /^(?:sha256:)?[0-9a-f]{64}$/
 const ANTHROPIC_NAME = /^(?:CI_)?ANTHROPIC_/i
@@ -89,7 +98,7 @@ function sanitizedText(raw: string, projection: Pick<Request, 'idOnly' | 'quoted
     if (value !== '') values.add(value)
     if (values.size > 256) throw new Error()
   }
-  for (const [name, value] of Object.entries(env)) if (ANTHROPIC_NAME.test(name) && value) add(value)
+  for (const [name, value] of Object.entries(env)) if ((ANTHROPIC_NAME.test(name) || CREDENTIAL_NAME.test(name)) && value) add(value)
   let nodes = 0
   const visit = (value: unknown, depth: number): void => {
     check()
@@ -252,19 +261,42 @@ function sanitizedText(raw: string, projection: Pick<Request, 'idOnly' | 'quoted
   return text
 }
 
+/** Sanitize diagnostics through the same private Env/credential boundary. */
+function sanitizedDiagnostic(stderr: string, stdout: Buffer[], env: NodeJS.ProcessEnv, maxOutputBytes: number, complete: boolean): string {
+  // Matching complete secret values cannot certify a prefix cut off by a
+  // collection limit or cancellation, even when inspection stdout parsed.
+  if (!complete) return 'Docker stderr withheld: incomplete inspection cannot certify credential redaction'
+  if (!stderr) return ''
+  try {
+    // stdout may contain additional credential Env entries unavailable to the
+    // caller. Keep it private, but visit those entries before masking stderr.
+    let inspected: unknown = null
+    const raw = Buffer.concat(stdout).toString('utf8')
+    if (raw) { try { inspected = JSON.parse(raw) } catch { return 'Docker stderr withheld: incomplete inspection cannot certify credential redaction' } }
+    const deadline = performance.now() + 50
+    const check = () => { if (performance.now() >= deadline) throw new Error() }
+    const rawDiagnostic = JSON.stringify([{ Id: '0'.repeat(64), Config: { Env: [] }, diagnostic: stderr, inspected }])
+    const safe = sanitizedText(rawDiagnostic, { idOnly: false, quotedId: false }, env,
+      Math.max(maxOutputBytes, Buffer.byteLength(rawDiagnostic) * 2), check)
+    return JSON.parse(safe)[0].diagnostic
+  } catch { return 'Docker stderr withheld: credential redaction could not be certified' }
+}
+
 /**
- * Captures both pipes without a sink or callback that can observe raw bytes.
- * Success: 0; child failure: 1; refused: 64; invalid JSON/schema: 65;
- * output limit: 75; timeout: 124; aborted: 130. All failures have empty text.
+ * Captures both pipes without a raw sink. Wrapper codes remain compatible:
+ * success 0; child failure 1; refused 64; invalid schema 65; output limit 75;
+ * timeout 124; aborted 130. Underlying exit and sanitized stderr stay separate.
+ * Every failure has empty inspection text; the CLI remains silent on failure.
  */
 export async function safeDockerInspect(argv: readonly string[], options: SafeDockerInspectOptions = {}): Promise<SafeDockerInspectResult> {
+  const empty = (code: number, stderr = ''): SafeDockerInspectResult => ({ code, text: '', actualExitCode: null, stderr, timedOut: code === 124, outputTruncated: code === 75 })
   try {
     const parsed = request(argv)
     const timeoutMs = options.timeoutMs ?? TIMEOUT_MS
     const maxOutputBytes = options.maxOutputBytes ?? DEFAULT_OUTPUT_BYTES
     if (!parsed || !Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > TIMEOUT_MS
-      || !Number.isSafeInteger(maxOutputBytes) || maxOutputBytes < 1 || maxOutputBytes > MAX_OUTPUT_BYTES) return { code: 64, text: '' }
-    if (options.signal?.aborted) return { code: 130, text: '' }
+      || !Number.isSafeInteger(maxOutputBytes) || maxOutputBytes < 1 || maxOutputBytes > MAX_OUTPUT_BYTES) return empty(64, 'Docker inspection request refused')
+    if (options.signal?.aborted) return empty(130, 'Docker inspection aborted before launch')
     const deadline = performance.now() + timeoutMs
     const check = () => {
       if (options.signal?.aborted) throw new InspectionFailure(130)
@@ -275,23 +307,27 @@ export async function safeDockerInspect(argv: readonly string[], options: SafeDo
       const child = Bun.spawn(parsed.argv, {
         cwd: options.cwd, env, stdin: 'ignore', stdout: 'pipe', stderr: 'pipe', detached: true,
       })
-      let settled = false, bytes = 0
-      let chunks: Buffer[] = []
+      let settled = false, bytes = 0, actualExitCode: number | null = null
+      let chunks: Buffer[] = [], errors: Buffer[] = []
+      const drained = [false, false]
+      let exitTimer: ReturnType<typeof setTimeout> | undefined
       const readers = [child.stdout.getReader(), child.stderr.getReader()]
       const finish = (code: number, text = '') => {
         if (settled) return
         settled = true
-        clearTimeout(timer)
+        clearTimeout(timer); clearTimeout(exitTimer)
         options.signal?.removeEventListener('abort', abort)
-        chunks = []
         if (code !== 0) {
-          // Descendants can hold the pipe open after Docker exits. Own the group and the pipe deadline.
           if (child.pid) { try { process.kill(-child.pid, 'SIGKILL') } catch {} }
           try { child.kill('SIGKILL') } catch {}
+          // No awaited cancellation: escaped descendants can retain pipes.
           for (const reader of readers) void reader.cancel().catch(() => {})
           child.unref?.()
         }
-        resolve({ code, text })
+        const complete = drained.every(Boolean) && code !== 75 && code !== 124 && code !== 130
+        const diagnostic = sanitizedDiagnostic(Buffer.concat(errors).toString('utf8'), chunks, env, maxOutputBytes, complete)
+        chunks = []; errors = []
+        resolve({ code, text, actualExitCode, stderr: diagnostic || (code ? 'Docker inspection failed without stderr; wrapper code ' + code : ''), timedOut: code === 124, outputTruncated: code === 75 })
       }
       const abort = () => finish(130)
       const timer = setTimeout(() => finish(124), timeoutMs)
@@ -300,18 +336,23 @@ export async function safeDockerInspect(argv: readonly string[], options: SafeDo
         try {
           while (!settled) {
             const { done, value } = await reader.read()
-            if (done || settled) break
+            if (settled) break
+            if (done) { drained[stdout ? 0 : 1] = true; break }
+            const available = maxOutputBytes - bytes
+            ;(stdout ? chunks : errors).push(Buffer.from(value.subarray(0, Math.max(0, available))))
             bytes += value.byteLength
             if (bytes > maxOutputBytes) { finish(75); return }
-            // stderr is consumed privately and discarded, even on success.
-            if (stdout) chunks.push(Buffer.from(value))
           }
         } catch { finish(1) }
-        finally { reader.releaseLock() }
+        finally { try { reader.releaseLock() } catch {} }
       }
+      void child.exited.then(code => {
+        actualExitCode = code
+        // Let already buffered stderr drain first, but never await inherited
+        // pipes indefinitely after a failed Docker process has exited.
+        if (code !== 0 && !settled) exitTimer = setTimeout(() => finish(1), 25)
+      }, () => finish(1))
       const streams = Promise.all(readers.map((reader, index) => consume(reader, index === 0)))
-      // A nonzero exit is immediately refused, even if a descendant retains a pipe.
-      void child.exited.then(code => { if (code !== 0) finish(1) }, () => finish(1))
       void Promise.all([child.exited, streams]).then(([code]) => {
         if (settled) return
         if (code !== 0) { finish(1); return }
@@ -325,7 +366,7 @@ export async function safeDockerInspect(argv: readonly string[], options: SafeDo
       }, () => finish(1))
       if (options.signal?.aborted) abort()
     })
-  } catch { return { code: 1, text: '' } }
+  } catch { return empty(1, 'Docker inspection could not be launched or collected') }
 }
 
 if (import.meta.main) {
