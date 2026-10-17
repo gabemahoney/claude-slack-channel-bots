@@ -505,13 +505,16 @@ function hasBroadcast(text: unknown): boolean {
 
 /**
  * Remove every P's own mention token (`<@P>` and `<@P|label>`) and the
- * whitespace after it from `text`, then trim. Other personas' mentions and
- * broadcasts stay. An empty or unknown ID leaves the text unchanged.
+ * whitespace after it from `text`, preserving all other text. Mention-only
+ * text with surrounding whitespace becomes empty. Other personas' mentions
+ * and broadcasts stay. An empty or unknown ID leaves the text unchanged.
  */
 export function stripPersonaMention(text: string, botUserId: string | undefined): string {
   const pattern = personaMentionPattern(botUserId, 'g')
   if (!pattern) return text
-  return text.split(pattern).map((part, i) => (i === 0 ? part : part.trimStart())).join('').trim()
+  const parts = text.split(pattern)
+  const stripped = parts.map((part, i) => (i === 0 ? part : part.trimStart())).join('')
+  return parts.length > 1 && stripped.trim() === '' ? '' : stripped
 }
 
 /** Escape `value` for literal use inside a regular expression. */

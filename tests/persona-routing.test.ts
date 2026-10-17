@@ -33,6 +33,23 @@ describe('persona routing and durable dedupe', () => {
     expect(facts(h, 'alpha')).toEqual([{ channel: CA, ts: home.ts as string, via: 'receive_all', text: 'home' }, { channel: CS, ts: shared.ts as string, via: 'mention', text: 'shared' }, { channel: dm.channel as string, ts: dm.ts as string, via: 'dm', text: 'direct' }]); expect(facts(h, 'beta')).toEqual([])
     expect(h.all.flatMap(p => p.notifications)).toEqual([]); expect(h.allPosts()).toEqual([]); expect(h.all.flatMap(p => p.stub.calls.reactionsAdd)).toEqual([])
   })
+  test.each(['mention', 'receive_all', 'dm'] as const)('%s preserves a 5000-byte body through durable acceptance and multipart preparation', async via => {
+    const h = harness()
+    const body = '  ' + 'River stones, quiet paths; '.repeat(200).slice(0, 4997) + ' '
+    expect(Buffer.byteLength(body)).toBe(5000)
+    const text = via === 'receive_all' ? body : body.slice(0, 2) + mentionText(h.p('alpha').stub.identity.botUserId) + ' \t\n' + body.slice(2)
+    const event = via === 'dm' ? makeDm({ text }) : makeChannelMessage({ channel: via === 'mention' ? CS : CA, text })
+    await each(h, event)
+    expect(facts(h, 'alpha')).toEqual([{ channel: event.channel as string, ts: event.ts as string, via, text: body }])
+    expect(facts(h, 'beta')).toEqual([])
+    const records = readQueue(dir, h.p('alpha').persona.key)
+    expect(records.filter(record => record.kind === 'accepted')).toEqual([h.queued('alpha')[0]!.accepted])
+    const parts = h.queued('alpha')[0]!.fixed!.parts
+    expect(parts.length).toBeGreaterThan(1)
+    expect(records.filter(record => record.kind === 'fixed')).toEqual([h.queued('alpha')[0]!.fixed!])
+    expect(parts.map(part => /^<channel [^>]*>([\s\S]*)<\/channel>$/.exec(part)![1]!).join('')).toBe(body)
+    expect(h.allPosts()).toEqual([])
+  })
   test.each([false, true])('message/app_mention pair in either order accepts once (%p)', async mentionFirst => {
     const h = harness(); const text = `${mentionText(h.p('alpha').stub.identity.botUserId)} body`; const message = makeChannelMessage({ channel: CS, text }); const app = { ...message, type: 'app_mention' }
     await h.receive(mentionFirst ? app : message, ['alpha']); await h.receive(mentionFirst ? message : app, ['alpha'])
