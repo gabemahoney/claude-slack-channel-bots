@@ -158,8 +158,8 @@ describe('heavy planning and result validation', () => {
 
 describe('heavy execution with fake children', () => {
   let root: string, repo: string, output: string
-  let stdout: string[], calls: { argv: string[]; key: string | undefined; model: string | undefined; aiModel: string | undefined; pid: number; detached: boolean | undefined; tmpdir: string | undefined }[], stage: string | undefined
-  let response: (argv: string[]) => { code?: number; text?: string; hang?: boolean; retainPipes?: boolean; ignoreKill?: boolean }
+  let stdout: string[], stderr: string[], calls: { argv: string[]; key: string | undefined; model: string | undefined; aiModel: string | undefined; pid: number; detached: boolean | undefined; tmpdir: string | undefined }[], stage: string | undefined
+  let response: (argv: string[]) => { code?: number; text?: string; stderr?: string; hang?: boolean; retainPipes?: boolean; ignoreKill?: boolean }
   let latestResponse: () => Promise<Response>
   let activeJobs: number, maxJobs: number
   const clock = createFakeClock()
@@ -175,7 +175,7 @@ describe('heavy execution with fake children', () => {
     for (const dir of ['tests/integration', 'tests/real-agent', 'docker']) mkdirSync(join(repo, dir), { recursive: true })
     for (const name of gateNames()) writeFileSync(join(repo, 'tests/integration', name), '')
     for (const name of heavyNames()) writeFileSync(join(repo, 'tests/real-agent', name), '')
-    stdout = []; calls = []; kills = []; stage = undefined; activeJobs = 0; maxJobs = 0
+    stdout = []; stderr = []; calls = []; kills = []; stage = undefined; activeJobs = 0; maxJobs = 0
     groupKills = []; cancelledPipes = []
     oldEnv = Object.fromEntries(envNames.map(n => [n, process.env[n]]))
     process.env.CI_ANTHROPIC_API_KEY = fakeToken('', 'anthropic')
@@ -192,6 +192,8 @@ describe('heavy execution with fake children', () => {
     restore.push(() => fetchSpy.mockRestore())
     const stdoutSpy = spyOn(process.stdout, 'write').mockImplementation(((text: string) => { stdout.push(String(text)); return true }) as typeof process.stdout.write)
     restore.push(() => stdoutSpy.mockRestore())
+    const stderrSpy = spyOn(process.stderr, 'write').mockImplementation(((text: string) => { stderr.push(String(text)); return true }) as typeof process.stderr.write)
+    restore.push(() => stderrSpy.mockRestore())
     const timerSpy = spyOn(globalThis, 'setTimeout').mockImplementation(((cb: () => void, ms: number) => clock.setTimeout(cb, ms)) as unknown as typeof setTimeout)
     const clearSpy = spyOn(globalThis, 'clearTimeout').mockImplementation(handle => clock.clearTimeout(handle))
     restore.push(() => timerSpy.mockRestore(), () => clearSpy.mockRestore())
@@ -207,6 +209,9 @@ describe('heavy execution with fake children', () => {
       }
       const answer = response(argv)
       let text = answer.text ?? ''
+      if (argv[0] === 'docker' && argv[1] === 'image' && argv[2] === 'inspect' && answer.text === undefined) {
+        text = JSON.stringify([{ Id: 'a'.repeat(64), Config: { Env: [`ANTHROPIC_API_KEY=${fakeToken('', 'inspect-default')}`] } }])
+      }
       if (isJob && answer.text === undefined) {
         text = resultsFor(jobForArgv(argv), options.env?.ANTHROPIC_MODEL, options.env?.REAL_AGENT_AI_MODEL).map(resultLine).join('\n') + '\n'
       }
@@ -217,7 +222,10 @@ describe('heavy execution with fake children', () => {
         if (!answer.hang) { controller.enqueue(new TextEncoder().encode(text)); controller.close(); finish(answer.code ?? 0) }
       }, cancel() { cancelledPipes.push(pid) } })
       return {
-        pid, stdout: out, stderr: new ReadableStream({ start(c) { if (!answer.retainPipes) c.close() }, cancel() { cancelledPipes.push(pid) } }),
+        pid, stdout: out, stderr: new ReadableStream({ start(c) {
+          if (answer.stderr) c.enqueue(new TextEncoder().encode(answer.stderr))
+          if (!answer.retainPipes) c.close()
+        }, cancel() { cancelledPipes.push(pid) } }),
         exited: exited.finally(() => { if (isJob) activeJobs-- }),
         kill(signal: string) { kills.push(signal); if (answer.hang && !answer.ignoreKill) { if (!answer.retainPipes) stream.close(); finish(137) } },
       }
@@ -229,7 +237,7 @@ describe('heavy execution with fake children', () => {
     for (const fn of [...restore].reverse()) fn()
     for (const n of envNames) { if (oldEnv[n] === undefined) delete process.env[n]; else process.env[n] = oldEnv[n] }
     try {
-      assertNoLeak(stdout)
+      assertNoLeak({ stdout, stderr })
       assertNoLeak(calls.map(c => c.argv))
       if (existsSync(output)) assertNoLeak(readdirSync(output).map(n => writtenFile(join(output, n))))
       if (stage) expect(existsSync(stage)).toBe(false)
@@ -279,6 +287,44 @@ describe('heavy execution with fake children', () => {
     expect(stdout.at(-1)).toMatch(/^REAL-AGENT-PLAN /)
     expect(stdout.some(l => l.startsWith('REAL-AGENT-VERDICT'))).toBe(false)
     expect(JSON.parse(readFileSync(join(output, 'plan.json'), 'utf8')).jobs).toHaveLength(3)
+  })
+
+  test('routes image inspection through private full JSON capture before any child line can stream', async () => {
+    // These inspection-only values are absent from the coordinator environment;
+    // ordinary log masking cannot protect them if inspect reaches the streaming runner.
+    const inspectedValues = ['api-key', 'auth-token', 'gateway', 'model', 'future'].map(label => fakeToken('', `inspect-${label}`))
+    response = argv => argv[1] === 'image' && argv[2] === 'inspect' ? {
+      text: JSON.stringify([{ Id: 'a'.repeat(64), Config: { Env: inspectedValues.map((value, i) => `ANTHROPIC_TEST_${i}=${value}`),
+        Labels: { copied: inspectedValues.join(' '), [`copied-${inspectedValues[1]}`]: inspectedValues[2] } },
+        Nested: { Env: [`ANTHROPIC_NESTED=${fakeToken('', 'inspect-nested')}`] } }]),
+      stderr: `private inspect diagnostic ${inspectedValues.join(' ')}\n`,
+    } : {}
+    expect(await run()).toBe(true)
+    assertNoLeak({ stdout, stderr, artifacts: readdirSync(output).map(n => writtenFile(join(output, n))) })
+    expect(stderr).toEqual([])
+    expect(stdout).toContain('a'.repeat(64) + '\n')
+    expect(stdout.some(line => line.includes('private inspect diagnostic'))).toBe(false)
+    expect(calls.find(c => c.argv[1] === 'image' && c.argv[2] === 'inspect')!.argv)
+      .toEqual(['docker', 'image', 'inspect', 'cscb-ci-base:v8'])
+    expect(calls.filter(c => c.argv[0] === 'bash')).toEqual([])
+  })
+
+  test.each(['malformed JSON', 'nonzero exit'] as const)('inspect %s discards both pipes before the existing base-build fallback', async kind => {
+    response = argv => {
+      if (argv[1] === 'image' && argv[2] === 'inspect') return {
+        text: kind === 'malformed JSON' ? `[{"note":"${fakeToken('', 'partial-inspect')}"` : JSON.stringify([{ Id: 'a'.repeat(64), Config: { Env: [] } }]),
+        stderr: fakeToken('', 'inspect-failure-stderr'), code: kind === 'nonzero exit' ? 7 : 0,
+      }
+      return argv[0] === 'bash' ? { code: 1 } : {}
+    }
+    expect(await run()).toBe(false)
+    assertNoLeak({ stdout, stderr })
+    expect(stderr).toEqual([])
+    expect(calls.map(c => c.argv.slice(0, 3))).toEqual([
+      ['docker', 'image', 'inspect'], ['bash', 'scripts/ci-base-build.sh'],
+    ])
+    expect(jobsRun()).toEqual([])
+    expect(stdout.at(-1)).toMatch(/^REAL-AGENT-VERDICT FAIL /)
   })
 
   test.each(['HTTP error', 'malformed version', 'network error'] as const)('latest resolution %s blocks all execution and emits FAIL', async kind => {
@@ -371,19 +417,23 @@ describe('heavy execution with fake children', () => {
     expect(nestedContext).toBeDefined()
     expect(existsSync(nestedContext!)).toBe(true)
     const active = calls.at(-1)!, ownedStage = stage!
+    // A refused private inspect is killed before falling back to the base build.
+    const inspectionKills = step === 'base build' ? [{ pid: -calls[0]!.pid, signal: 'SIGKILL' }] : []
+    expect(groupKills).toEqual(inspectionKills)
     expect(active.detached).toBe(true)
     expect(active.tmpdir).toBe(ownedStage)
     if (kind === 'timeout') await clock.advance(step === 'job' ? MATRIX_TIMEOUT_MS : 30 * 60_000)
     else interruptMatrix(signalHandlers)
     await clock.flush()
     expect(settled).toBe(false)
-    expect(groupKills).toEqual([{ pid: -active.pid, signal: kind === 'timeout' ? 'SIGKILL' : 'SIGTERM' }])
+    expect(groupKills).toEqual([...inspectionKills, { pid: -active.pid, signal: kind === 'timeout' ? 'SIGKILL' : 'SIGTERM' }])
     await clock.advance(999)
     expect(settled).toBe(false)
     await clock.advance(1)
     expect(settled).toBe(true)
     expect(await pending).toBe(false)
     expect(groupKills).toEqual([
+      ...inspectionKills,
       { pid: -active.pid, signal: kind === 'timeout' ? 'SIGKILL' : 'SIGTERM' },
       { pid: -active.pid, signal: 'SIGKILL' },
     ])

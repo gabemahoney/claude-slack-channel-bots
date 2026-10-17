@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 import { createHash } from 'node:crypto'
 import { CPUS_PER_SHARD, SHARD_MEMORY_CAP_BYTES, SHARD_PIDS_LIMIT, checkShardRunList, maskScannedValues, scannedSecretValues } from './ci-run.ts'
+import { isDockerInspectCommand, safeDockerInspect } from './safe-docker-inspect.ts'
 
 export const MATRIX_VERSIONS = ['2.1.280', '2.1.296'] as const
 export const GATE_SLUGS = ['order', 'keys', 'compact', 'restarts', 'crash', 'mcp', 'cron', 'fidelity', 'downgrade'] as const
@@ -185,6 +186,12 @@ export async function runMatrix(options: MatrixOptions): Promise<boolean> {
   const run = async (argv: string[], timeoutMs: number, collect = false, cleanup = false): Promise<{ code: number; text: string }> => {
     if (stopped && !cleanup) throw new Error('Matrix interrupted')
     if (!checkShardRunList(argv, secrets).ok) throw new Error('Matrix child argument list contains a secret')
+    // Inspection must never enter the line-streaming path, including stderr.
+    if (isDockerInspectCommand(argv)) {
+      const result = await safeDockerInspect(argv, { cwd: options.repo, env: childEnv, timeoutMs, signal: aborted.signal })
+      if (result.text) say(result.text.trimEnd())
+      return { code: result.code, text: collect ? result.text : '' }
+    }
     const child = Bun.spawn(argv, { cwd: options.repo, env: childEnv, stdout: 'pipe', stderr: 'pipe', detached: true })
     let finishTermination!: (code: number) => void, forced = false, consuming = true
     const termination = new Promise<number>(resolve => { finishTermination = resolve })
