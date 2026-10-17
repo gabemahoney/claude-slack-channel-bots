@@ -876,8 +876,24 @@ whether a model will return the required exact read-back.
 
 Ordinary receipts may be eligible native user records or production-recognized
 human queued-command attachments; each take-in starts its own exchange window.
-Only recognized informational native records without temporal evidence are
-excluded from timestamp checks; actual evidence still needs valid timestamps.
+A queued command may be timestamped before the previous turn's acknowledgement;
+it still needs its own exact receipt and send window. Resolve ancestry by unique
+UUID parents in the same session/path at strictly preceding file offsets,
+independently of timestamps, and stop at another take-in; earlier turns or
+sessions cannot supply the response.
+
+Only timed `environment`, `model`, `agent_listing_delta`,
+`mcp_instructions_delta`, `skill_listing` and `total_tokens_reminder`
+attachments allow at most 5 ms before both their receipt and immediate parent.
+Assistant, tool-result and system records retain strict timestamp ordering;
+receipt/send checks, exact JSON, model identity, completion and action checks
+remain unchanged.
+
+The only untimed informational exclusions are exact three-field records with
+`type`, `sessionId` and the corresponding string field: `mode`/`mode`,
+`permission-mode`/`permissionMode`, `atis-latch`/`atis`,
+`last-prompt`/`leafUuid` and `ai-title`/`aiTitle`. They carry no timestamp,
+UUID, parent UUID or text; added fields and other untimed records remain checked.
 
 Ordinary answers must belong to the delivered item's own native turn;
 foreign, stale, sidechain, synthetic, API-error or unfinished responses

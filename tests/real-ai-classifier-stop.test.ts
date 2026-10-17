@@ -332,6 +332,106 @@ test.each(['user', 'queued-final'])('AC15 accepts ten untimed native information
   expect(readAC15(e)).toEqual({ seq: 1, part: 3, receipt_uuid: 'part-3', session_id: 'session', actual_model: e.model })
 })
 
+function ac15ClockChain(skew = 1, type = 'total_tokens_reminder') {
+  const e = multipartAC15(), first = e.own[0]!, final = e.own[4]!, reply = e.own[5]!
+  // Captured R6 trial 2: user .773 -> environment .772, and later user
+  // .441 -> total_tokens_reminder .440. File offsets and UUIDs order both.
+  const base = Date.parse('2026-10-17T10:45:33.753Z')
+  for (const row of e.own) row.at += base
+  e.journal[0].received_at += base
+  for (const row of e.journal) if (Number.isFinite(row.at)) row.at += base
+  final.at = Date.parse('2026-10-17T10:45:56.441Z')
+  e.journal[6].at = final.at - 2; e.journal[7].at = final.at + 2
+  reply.at = final.at + 5
+  const attachment = (offset: number, parent: TranscriptEntry, kind: string) => {
+    const row = e.entry(offset, { type: 'attachment', uuid: `native-${offset}`, parentUuid: parent.value.uuid,
+      attachment: { type: kind }, rendered: '', renderedRole: 'user' })
+    row.at = parent.at - skew; row.value.timestamp = new Date(row.at).toISOString()
+    return row
+  }
+  const environment = attachment(21, first, 'environment'), reminder = attachment(61, final, type)
+  // The initial context attachments share the environment's prepared time,
+  // so their clocks precede the receipt but equal their immediate parent.
+  const initial = [environment]
+  for (const [i, kind] of ['model', 'agent_listing_delta', 'mcp_instructions_delta', 'skill_listing'].entries()) {
+    const row = attachment(22 + i, initial.at(-1)!, kind)
+    row.at = environment.at; row.value.timestamp = environment.value.timestamp
+    initial.push(row)
+  }
+  e.own[1]!.offset = 26
+  e.own[1]!.value.parentUuid = initial.at(-1)!.value.uuid
+  reply.value.parentUuid = reminder.value.uuid
+  reply.value.message.content = [{ type: 'tool_use', name: 'mcp__slack-channel-router__reply', id: 'post', input: { text: JSON.stringify(e.expected) } }]
+  reply.value.message.stop_reason = 'tool_use'
+  const result = e.entry(66, { type: 'user', uuid: 'posted', parentUuid: reply.value.uuid,
+    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'post', content: 'posted' }] } })
+  result.at = reply.at + 1
+  const completionMetadata = attachment(67, result, type)
+  const completion = assistant(e, [], 68, { parentUuid: completionMetadata.value.uuid }); completion.at = result.at + 2
+  e.own.push(...initial, reminder, result, completionMetadata, completion)
+  return { e, environment, reminder, result, completionMetadata, completion }
+}
+
+test.each([1, 5])('AC15 follows captured native environment/reminder ancestry and completion with %s ms skew', skew => {
+  const { e, environment, reminder } = ac15ClockChain(skew)
+  expect(environment.value.timestamp).toBe(skew === 1 ? '2026-10-17T10:45:33.772Z' : '2026-10-17T10:45:33.768Z')
+  expect(reminder.value.timestamp).toBe(skew === 1 ? '2026-10-17T10:45:56.440Z' : '2026-10-17T10:45:56.436Z')
+  e.own.reverse() // caller array order also cannot replace native file order
+  expect(readAC15(e)).toEqual({ seq: 1, part: 3, receipt_uuid: 'part-3', session_id: 'session', actual_model: e.model })
+})
+
+test.each([6, 2000])('AC15 rejects native metadata clock skew beyond the 5 ms bound: %s', skew => {
+  expect(() => readAC15(ac15ClockChain(skew).e)).toThrow(/^AC15 exchange has invalid\/stale time$/)
+})
+
+test('AC15 clock skew does not exempt an untimed shutdown cost-state from its exact informational shapes', () => {
+  const { e } = ac15ClockChain(), cost = e.entry(69, { type: 'cost-state', totalCostUSD: 0 })
+  cost.at = NaN; delete cost.value.isSidechain
+  e.own.push(cost)
+  expect(() => readAC15(e)).toThrow(/^AC15 exchange has invalid\/stale time$/)
+})
+
+test.each([
+  ['missing parent', (x: ReturnType<typeof ac15ClockChain>) => { delete x.reminder.value.parentUuid }],
+  ['malformed parent', (x: ReturnType<typeof ac15ClockChain>) => { x.reminder.value.parentUuid = {} }],
+  ['unknown parent', (x: ReturnType<typeof ac15ClockChain>) => { x.reminder.value.parentUuid = 'missing' }],
+  ['future parent', (x: ReturnType<typeof ac15ClockChain>) => { x.reminder.value.parentUuid = x.completion.value.uuid }],
+  ['same-offset parent', (x: ReturnType<typeof ac15ClockChain>) => { x.reminder.offset = 60 }],
+  ['cycle', (x: ReturnType<typeof ac15ClockChain>) => { x.reminder.value.parentUuid = x.e.own[5]!.value.uuid }],
+  ['duplicate UUID', (x: ReturnType<typeof ac15ClockChain>) => { x.e.own.push({ ...x.reminder, offset: 62 }) }],
+  ['wrong turn', (x: ReturnType<typeof ac15ClockChain>) => { x.reminder.value.parentUuid = 'part-2' }],
+  ['wrong session', (x: ReturnType<typeof ac15ClockChain>) => { x.reminder.value.sessionId = 'other' }],
+  ['wrong path', (x: ReturnType<typeof ac15ClockChain>) => { x.reminder.path = '/foreign/session.jsonl' }],
+  ['sidechain', (x: ReturnType<typeof ac15ClockChain>) => { x.reminder.value.isSidechain = true }],
+  ['invalid clock', (x: ReturnType<typeof ac15ClockChain>) => { x.reminder.at = NaN }],
+  ['unrecognized attachment', (x: ReturnType<typeof ac15ClockChain>) => { x.reminder.value.attachment.type = 'unknown' }],
+] as const)('AC15 skew allowance cannot admit %s ancestry', (_name, mutate) => {
+  const x = ac15ClockChain(); mutate(x)
+  expect(() => readAC15(x.e)).toThrow()
+})
+
+test('ordinary completion also follows the native 1 ms chain without using timestamps as ancestry filters', () => {
+  const x = ac15ClockChain()
+  x.e.expected.case = 'ordinary'
+  x.e.own[5]!.value.message.content[0].input.text = JSON.stringify(x.e.expected)
+  expect(completedAIReadback(x.e).receipt_uuid).toBe('part-3')
+  x.completionMetadata.at -= 5
+  expect(() => completedAIReadback(x.e)).toThrow('invalid native assistant response')
+})
+
+test.each(['tool', 'refusal'])('AC15 cannot hide a late %s behind native clock skew after another input', outcome => {
+  const x = ac15ClockChain(), { e } = x
+  const later = e.entry(80, { type: 'user', uuid: 'later', parentUuid: x.completion.value.uuid, message: { content: '<channel>unrelated</channel>' } })
+  later.at = x.completion.at + 10
+  const bridge = e.entry(89, { type: 'attachment', uuid: 'late-bridge', parentUuid: 'reply25', attachment: { type: 'environment' } })
+  bridge.at = e.own[1]!.at - 1
+  const late = outcome === 'tool' ? forbiddenAC15Action(e, 90, 'late-bridge')
+    : e.entry(90, { type: 'system', uuid: 'late-stop', parentUuid: 'late-bridge', subtype: 'model_refusal_no_fallback' })
+  late.at = x.completion.at + 11
+  e.own.push(later, bridge, late)
+  expect(() => readAC15(e)).toThrow(outcome === 'tool' ? /^AC15 non-reply tool action observed$/ : /^AC15 exchange has refusal\/API failure$/)
+})
+
 test.each(['user', 'queued-final'])('AC15 treats the next %s receipt as its own input despite an earlier queued timestamp than its parent acknowledgement', native => {
   const e = multipartAC15(native)
   e.own[3]!.at = 62

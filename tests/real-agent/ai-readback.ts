@@ -31,6 +31,40 @@ function nativeInformation(entry: TranscriptEntry, adapters: ReceiptAdapters): b
     && entry.kind === 'other' && entry.uuid === undefined && entry.text === undefined
 }
 
+function nativeParent(session: TranscriptEntry[], entry: TranscriptEntry): TranscriptEntry | undefined {
+  const id = entry.value?.parentUuid
+  return typeof id === 'string' && id.length > 0
+    ? session.find(prior => prior.value?.uuid === id && prior.offset < entry.offset) : undefined
+}
+
+// UUID identity and strictly preceding file offsets establish ancestry. Resolve
+// the parent before matching the target; timestamps never select the chain.
+function nativeChain(session: TranscriptEntry[], entry: TranscriptEntry, target: TranscriptEntry): TranscriptEntry[] | undefined {
+  const chain: TranscriptEntry[] = [], seen = new Set<TranscriptEntry>()
+  let current = entry
+  while (!seen.has(current)) {
+    seen.add(current)
+    if (current.kind === 'take-in' && current.text !== undefined) return undefined
+    const parent = nativeParent(session, current)
+    if (!parent) return undefined
+    chain.push(current)
+    if (parent === target) return chain
+    current = parent
+  }
+  return undefined
+}
+
+function nativeTime(entry: TranscriptEntry, receipt: TranscriptEntry, parent?: TranscriptEntry): boolean {
+  // Native attachments are prepared before their parent user record is
+  // timestamped. Captured environment/initial context/token reminders differ
+  // by 1 ms. Keep their bounded clock skew separate from ordering/send windows.
+  const skew = entry.value?.type === 'attachment'
+    && ['environment', 'model', 'agent_listing_delta', 'mcp_instructions_delta', 'skill_listing',
+      'total_tokens_reminder'].includes(entry.value.attachment?.type) ? 5 : 0
+  return Number.isFinite(entry.at) && entry.at >= receipt.at - skew
+    && (!parent || Number.isFinite(parent.at) && entry.at >= parent.at - skew)
+}
+
 // AC15 may acknowledge a part, but retrieval or any other action cannot
 // supply missing context. Inspect every copy's turn and its late descendants;
 // completion/JSON provenance remains the ordinary final-part oracle below.
@@ -57,31 +91,15 @@ function assertAC15Exchange(parts: string[], acceptedAt: number, seq: number, jo
         && Number.isSafeInteger(r.transcript_size) && r.transcript_size >= 0 && r.transcript_size <= copy.offset),
       'AC15 copy has no native send window')
       const next = session.find(e => e.offset > copy.offset && e.kind === 'take-in' && e.text !== undefined)
-      const linked = (entry: TranscriptEntry): boolean => {
-        // A queued input can be timestamped before its parent acknowledgement.
-        // Its own receipt/send checks apply; it starts a new exchange here.
-        if (entry.kind === 'take-in' && entry.text !== undefined) return false
-        const seen = new Set<string>(); let current = entry
-        while (typeof current.value?.parentUuid === 'string' && !seen.has(current.value.parentUuid)) {
-          const parent = current.value.parentUuid
-          if (parent === copy.uuid) return true
-          seen.add(parent)
-          // Discover ancestry from native identity and file order. Bad times
-          // must invalidate linked evidence, never hide it from this exchange.
-          const prior = session.find(e => e.value?.uuid === parent && e.offset < current.offset)
-          if (!prior || prior.kind === 'take-in' && prior.text !== undefined) return false
-          current = prior
-        }
-        return false
-      }
+      // Queued commands start their own exchange even if their timestamp is
+      // earlier than the previous acknowledgement; their send checks apply.
+      const linked = (entry: TranscriptEntry) => nativeChain(session, entry, copy) !== undefined
       for (const e of session.filter(e => e.offset > copy.offset && ((!next || e.offset < next.offset) || linked(e)
         || e.value?.type === 'system' && e.value.refusedUserMessageUuid === copy.uuid))) {
         if (nativeInformation(e, adapters)) continue
         check(!(e.value.type === 'system' && /(?:refusal|fallback|api_error|api_retry)/.test(e.value.subtype ?? '')),
           'AC15 exchange has refusal/API failure')
-        const parent = session.find(prior => prior.value?.uuid === e.value.parentUuid && prior.offset < e.offset)
-        check(Number.isFinite(e.at) && e.at >= copy.at && (!linked(e)
-          || parent && Number.isFinite(parent.at) && parent.at <= e.at), 'AC15 exchange has invalid/stale time')
+        check(nativeTime(e, copy, nativeParent(session, e)), 'AC15 exchange has invalid/stale time')
         if (e.value.type !== 'assistant') continue
         check(Array.isArray(e.value.message?.content), 'AC15 has malformed native assistant content')
         for (const block of e.value.message.content) {
@@ -137,18 +155,7 @@ export function completedAIReadback({ seq, expected, journal, own, adapters, mod
   }
   const next = session.find(e => e.offset > receipt.offset && e.kind === 'take-in' && e.text !== undefined)
   const turn = session.filter(e => e.offset > receipt.offset && (!next || e.offset < next.offset))
-  const linked = (entry: TranscriptEntry, target = receipt.uuid): boolean => {
-    const seen = new Set<string>(); let current = entry
-    while (typeof current.value.parentUuid === 'string' && !seen.has(current.value.parentUuid)) {
-      const parent = current.value.parentUuid
-      if (parent === target) return true
-      seen.add(parent)
-      const prior = session.find(e => e.value.uuid === parent && e.offset < current.offset && e.at <= current.at)
-      if (!prior || prior.kind === 'take-in' && prior.text !== undefined) return false
-      current = prior
-    }
-    return false
-  }
+  const linked = (entry: TranscriptEntry, target = receipt) => nativeChain(session, entry, target) !== undefined
   const readbacks: TranscriptEntry[] = []
   let completion: TranscriptEntry | undefined
   for (const e of turn) {
@@ -156,7 +163,9 @@ export function completedAIReadback({ seq, expected, journal, own, adapters, mod
     if (e.value.type !== 'assistant') continue
     check(Number.isFinite(e.at) && e.at >= receipt.at, 'AI readback response has invalid/stale time')
     const v = e.value, message = v.message
-    check(linked(e) && typeof v.uuid === 'string' && v.isMeta !== true && !v.isApiErrorMessage && !v.error
+    const chain = nativeChain(session, e, receipt)
+    check(chain && chain.every(record => nativeTime(record, receipt, nativeParent(session, record)))
+      && typeof v.uuid === 'string' && v.isMeta !== true && !v.isApiErrorMessage && !v.error
       && !v.isSynthetic && message?.role === 'assistant' && message.model === model
       && (v.requestedModel === undefined || v.requestedModel === model)
       && Array.isArray(message.content) && message.content.every((b: any) => b && typeof b === 'object' && typeof b.type === 'string')
@@ -174,7 +183,7 @@ export function completedAIReadback({ seq, expected, journal, own, adapters, mod
     }
     completion = message.stop_reason === 'end_turn' ? e : undefined
   }
-  check(completion && readbacks.some(e => e === completion || linked(completion!, e.value.uuid)
+  check(completion && readbacks.some(e => e === completion || linked(completion!, e)
     || typeof e.value.message.id === 'string' && e.value.message.id.length > 0 && e.value.message.id === completion!.value.message.id),
   'no completed current-turn AI readback for durable receipt')
   return { seq, part: fixed.parts.length, receipt_uuid: receipt.uuid, session_id: receipt.value.sessionId, actual_model: completion.value.message.model }
