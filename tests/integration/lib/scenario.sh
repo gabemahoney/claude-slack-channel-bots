@@ -1246,6 +1246,14 @@ SCENARIO_MCP_SERVER_NAME=slack-channel-router
 
 # The closing assertions every fmk script ends with.
 SCENARIO_CLOSING_ASSERTIONS=(assert_no_server_tmux assert_no_cscb_include_finished assert_no_cscb_delete)
+# D1 drives the delivery modules without a CSCB server. Only these exact
+# entrypoints use its independent positive controls; all others keep the
+# server-backed assertions above.
+case "${TEST_NAME}" in
+    test-41-fmk-real-codex | test-111-fmk-real-codex-ai-ac11 | test-112-fmk-real-codex-ai-ac12 | test-115-fmk-real-codex-ai-ac15 | test-120-fmk-real-codex-ai-ac20 | test-206-fmk-real-codex-ai-ac106)
+        SCENARIO_CLOSING_ASSERTIONS=(assert_codex_d1_safety)
+        ;;
+esac
 
 # agent-director's default stopping window, in seconds (DefaultStoppingWindowSeconds
 # in its internal/config/tmux.go), used when the scenario HOME's config.toml
@@ -4407,6 +4415,50 @@ _scenario_closing_passed() {
         [[ "${name}" == "$1" ]] && return 0
     done
     return 1
+}
+
+# D1's safety evidence comes from the actual harness -> agent-director ->
+# tmux chain. Empty logs, direct harness tmux and destructive global calls
+# cannot satisfy this check. The EXIT trap rechecks the original files.
+assert_codex_d1_safety() {
+    local step=assert_codex_d1_safety ad_lines=() tmux_lines=() parent=() i entry matched spawn=0 send=0 tmux=0
+    local -A harness_calls=()
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    _scenario_query_prep "${step}"
+    (( _SCENARIO_START_COUNT == 0 )) && [[ ! -s "${SCENARIO_CSCB_RECORD}" ]] \
+        || fail "${step}: D1 must not start a CSCB server"
+    _scenario_read_log "${step}" "${SCENARIO_AD_SHIM_LOG}" ad_lines
+    _scenario_read_log "${step}" "${SCENARIO_TMUX_SHIM_LOG}" tmux_lines
+    for i in "${!ad_lines[@]}"; do
+        _scenario_split_line "${ad_lines[i]}"
+        [[ "${_L_KIND}" == call ]] || continue
+        _scenario_decode_words
+        _scenario_ad_verb
+        if [[ "${_L_VERB}" == delete ]] || _scenario_finished_kill_words; then
+            fail "${step}: destructive global agent-director call"
+        fi
+        _scenario_eval_words parent "${_L_PARENT}" || fail "${step}: unreadable parent"
+        [[ "${parent[0]##*/}" == bun && "${parent[1]:-}" == */real-agent/codex-delivery.ts ]] || continue
+        harness_calls["${_L_PID}"]+=" ${_L_US}"
+        [[ "${_L_VERB}" != spawn ]] || spawn=1
+        [[ "${_L_VERB}" != send-keys ]] || send=1
+    done
+    for i in "${!tmux_lines[@]}"; do
+        _scenario_split_line "${tmux_lines[i]}"
+        [[ "${_L_KIND}" == call ]] || continue
+        _scenario_eval_words parent "${_L_PARENT}" || fail "${step}: unreadable tmux parent"
+        [[ "${parent[0]##*/}" == agent-director || "${parent[0]##*/}" == agent-director.real ]] \
+            || fail "${step}: tmux call outside agent-director"
+        matched=0
+        for entry in ${harness_calls[${_L_PPID}]:-}; do
+            (( entry > _L_US )) || matched=1
+        done
+        (( matched )) || fail "${step}: tmux call has no preceding harness agent-director call"
+        tmux=1
+    done
+    (( spawn && send && tmux )) || fail "${step}: missing harness spawn, send-keys or agent-director tmux positive control"
+    _scenario_closing_ran "${step}"
 }
 
 assert_no_server_tmux() {

@@ -593,6 +593,8 @@ tests/
     test-38-fmk-real-cron.sh       # three down-persona fires in order, fire-time timestamps and non-loopback bind
     test-39-fmk-real-fidelity.sh   # Unicode and 850/1,400/1,900-byte bodies, exact receipts with no retype
     test-40-fmk-real-downgrade.sh  # R55/decision 15 downgrade to published 0.16.1 on native Claude 2.1.280
+    test-41-fmk-real-codex.sh      # guarded Codex 0.159.2 D1 receipt-only gate: native observations, FIFO/faults,
+                                   # actual harness SIGKILL/recovery and trailing @/$ fidelity; native gate acceptance pending
     lib/
       real-scenario.sh             # native agent setup, minimal permissions, exact evidence, faults, bounds and once-only EXIT accounting
       scenario.sh                  # shared helper sourced by Test 0 and Tests 5 onwards (see Scenario helper below)
@@ -680,7 +682,7 @@ A new scenario script needs no runner edit, but this layout names every
 There is no Test 11. It is retired, with its driver: CSCB makes no tmux call
 of its own (b.jg5 SRJ-601), and fmk scenarios 3 and 17 replace it (b.jg5
 SRJ-1305). Scenario 3 is Test 15 (`test-15-fmk-prefix-neighbour.sh`);
-scenario 17 is `assert_no_server_tmux` across every fmk script (see Closing
+scenario 17 is `assert_no_server_tmux` across server-backed fmk scripts (see Closing
 assertions).
 
 ### Real Claude gate and heavy legs (b.omv SR-14)
@@ -1242,8 +1244,8 @@ and its image; failed cleanup fails the run. Child process groups are
 terminated on timeout/interruption, with bounded output drain. It runs no
 scheduler jobs today. The future scheduler contract records 8 GiB, 4 CPUs,
 3 h, network on and the key as a scheduler secret, after scheduler secrets
-are available. Codex login/harness integration is E7 work, not supplied by
-this Claude runner.
+are available for Claude only. The Codex extension below remains local Docker
+only; no scheduler job may carry its login.
 
 Output is private `run.log`, `plan.json` and completed `job-N.json` files,
 including the packed package SHA-256, versions and per-scenario results.
@@ -1263,11 +1265,49 @@ on again. E8 documents the executed operator process later. Measured script
 durations belong in `tests/ci-durations.tsv` after an actual run; this
 inventory alone establishes no gate/full-CI or heavy verdict or duration.
 
+### Codex gate and heavy AI
+
+`tests/integration/test-41-fmk-real-codex.sh` is the final D1 gate implementation, discovered by `/ci`. It drives the installed packed wrapper, queue, preparation, engine and Codex receipt matcher through `tests/real-agent/codex-delivery.ts`, with injected persona readings and the existing agent-director shim. It starts no CSCB server or MCP session, passes no home/store override, and launches no production Codex persona. The tag description in `AGENTS.md` and first prompt includes D1's exact sentence: “In this test there is no reply tool; answer only as the test's instructions say.” Fixed product notices and certified fixtures remain unchanged.
+
+The gate first observes native 0.159.2 idle, slash/`@`/`$` popups, `?` shortcuts, one-line and multiline idle/busy drafts, and sending text without Enter without starting a new turn. Its delivery assertions require exact own-session durable receipts and send windows, FIFO, queue completion and official diagnostics, without requiring an assistant answer or completed turn for delivery. It exercises DM/mention/thread items, ten interleaved Slack/interject/cron items, counted swallowed Enter/text faults, a real child harness killed by SIGKILL after text and before Enter, durable recovery using Enter alone, and trailing `@`/`$` bodies without retyping. Independent audits cover all 17 delivery items and actual shim calls.
+
+Native observations completed in `20261017t212743z-ddde5cd6` on Codex 0.159.2 and the then-admitted `gpt-6-astra`; that research run's selective FAIL remains FAIL because its entry then deliberately stopped before the final gate. The final gate and heavy answer oracles are implemented with synthetic controls; they have not yet established native gate, full `/ci` or 15-trial heavy acceptance. Never infer those verdicts or durations from the observation fixture or unit suite.
+
+The five additional heavy scripts live under `tests/real-agent/`, outside `/ci` discovery. `codex-ai-scenario.sh` sources the shared scenario guards, validates the selected model and explicit independent trial 1–3, then calls the same D1 driver. The default full selection in `scripts/real-agent-matrix.ts` executes all five at three trials each alongside 58 Claude invocations, 73 invocations total, and requires the host login/model too.
+
+Use the explicit focused selection for only the 15 Codex trials:
+
+```sh
+bun scripts/real-agent-matrix.ts --codex-only --output <fresh-private-directory>
+```
+
+This uses the existing guarded local Codex lifecycle and skips Claude jobs, runtime-latest fetching and Claude credential admission. Plan/results record `selection: codex-only`, `totalInvocations: 15`, empty `jobs` and null `model`, `aiModel` and `scheduler`. The final line is `REAL-AGENT-CODEX-VERDICT PASS|FAIL <run-id>`; it cannot certify the Claude matrix. Add `--plan` for `REAL-AGENT-CODEX-PLAN <run-id>` without Codex auth/config access or execution. The default selection records `selection: full` and keeps `REAL-AGENT-VERDICT` / `REAL-AGENT-PLAN`; neither plan establishes acceptance.
+
+| Codex heavy script | Required completed native evidence in each trial |
+|---|---|
+| `test-111-fmk-real-codex-ai-ac11.sh` | All 15 audited wrapper cases, exact attributes and received body read-back, each in a fresh native conversation; the spoof case also rejects obedience and tool actions. |
+| `test-112-fmk-real-codex-ai-ac12.sh` | Six prefix cases: `!`, `/`, bare `?`, leading `?`, tab and trailing backslash; exact read-back and no native user-shell-command record, including its contextual-fragment wrapper. |
+| `test-115-fmk-real-codex-ai-ac15.sh` | Decision 20's seeded mixed-word/punctuation 5,000-byte body, three exact parts of 1,700/1,700/1,600 body bytes and each tag at most 1,900 bytes; completed visible non-final acknowledgements before the next part, exact one-message final body and repeated read-back after idle. D1 has no reply tool; no tool call or history fetch is permitted. |
+| `test-120-fmk-real-codex-ai-ac20.sh` | Both peer-bot spoof and quoted-attribute cases, with exact real outer sender/body read-back and no spoof action. |
+| `test-206-fmk-real-codex-ai-ac106.sh` | Two actual identical DM take-ins in independent send windows with distinct receipt offsets and completed native turns, followed by a completed answer counting one logical DM. A queue deduplication alone cannot prove this criterion. |
+
+`codex-ai.ts` keeps inputs and expected JSON private, outside model working files. `codex-evidence.ts` binds the answer and `task_complete` to the exact own session, take-in/send window and selected model, with positive input/output usage. `codex-gate.ts` independently audits delivery without the heavy answer requirement. Stops, refusal/API errors, fallback/model changes, unfinished turns, prohibited tool actions and native shell input cannot count as successful exact AI read-back; there is no classifier-stop acceptance. Require 3 of 3 fresh successes for every criterion and 15 unique scenario/trial result rows. Nonnegative safe-integer duplicate-message counts are reported and aggregated, never alone a failure; duplicated result identities and missing/invalid reports fail.
+
+Each trial emits exactly one `duplicates:` line, `tokens:` with input/output/cache-read/cache-creation counts, `recorded: codex-model <name>`, `recorded: codex-completed true` and `recorded: codex-auth-symlink true`. The coordinator validates native version, actual model, completion, usage and trial identity, records `job-codex.json`, and includes observed duplicate/token totals on failure too. Bounded polls use 120 s ordinarily, 180 s for delivery/completion and 300 s for launch; no unchanged automatic paid retry is permitted.
+
+Popup/overlay and idle/busy draft observations poll the expected classified screen and waiting/working state every 250 ms within the existing 120 s bound; drafts also require the complete expected text. Test 41 and the five exact heavy entrypoints above must call `assert_codex_d1_safety` in their own shell before PASS. It requires no CSCB server or process record, positive harness spawn/send and agent-director tmux evidence, and no tmux outside that chain, finished-row kills or deletes. Empty/malformed logs fail, and the EXIT trap rechecks the original logs after cleanup; see Closing assertions below.
+
+The host login is only the existing single read-write mounted file; the private scratch Codex home keeps its exact auth symlink. The harness creates/copies no Codex config, requires absence before the first spawn, and checks durable native-spawn provenance tied to that private home's inode before later recovery can admit native-written metadata. Amended decision 22 permits only fixed `tui.screen_reader_detection_done` and genuine parent tables with exclusively allowed descendants, even when their names overlap the host. All other host keys and every model/reasoning/profile/provider/auth/unknown key reject it. Native metadata host values are never decoded or copied; only key names and unknown-key counts are recorded. Native CLI `tui.show_tooltips=false` avoids an optional counter without adding a file allowlist key.
+
+Use [the runner's full admission and retirement contract](../docker/README.md#codex-admission-login-and-scratch-lifecycle): selected top-level host model, bounded plain `CODEX_HOST_CONFIG_KEYS`, UID/owner-0600 checks, dedicated test-1/Codex shard, shared 30-minute login lease, survivor refusal, core dumps disabled, additional 2 GiB memory and before/after token scans. Codex always runs in local disposable containers, never a scheduler job. Keep the `CI_ANTHROPIC_*` prefix on the `/ci` runner and every verdict-reader call; `/ci-live` stays in its own container and test workspace. Never export scratch homes or access actual credentials from host tests.
+
+The four synthetic suites are `codex-config-keys.test.ts`, `codex-delivery-controls.test.ts`, `codex-ai-controls.test.ts` and `codex-gate-controls.test.ts`. Host-safety audits pin the seven-module import graph, guarded driver/crash-worker and exactly five heavy entrypoints plus shared helper; secrecy audits retain leak checks for config/model readers, fake login helpers and control suites. See [the testing guide](../docs/testing-guide.md#real-agent-evidence-and-heavy-runner-bomv-sr-14) before adding an execution surface or import. Controls are unpaid and cannot supply native acceptance.
+
 ### fmk scenarios
 
 Each fmk scenario of agent-director's handoff to CSCB, §7 (b.jg5 SRJ-14xx),
 is one script, named here; scenario 14 has no script, and scenario 17 is a
-closing assertion of every fmk script. Test 0 is the harness's
+closing assertion of server-backed fmk scripts. Test 0 is the harness's
 self-check, not a scenario.
 
 Migration fixtures stop all workers and sessions with the still-installed CLI, reconcile every row to `ended` or `missing`, and verify those exact terminal states and metadata survive the released installer. Any later live coverage rebuilds its fixtures after upgrade; no agent runs across installation.
@@ -1304,7 +1344,7 @@ contracts to satisfy a zero-match audit.
 | 14 | none | A stale `serve` after the install. It tests agent-director's own `serve` process, so it is agent-director's to verify: CSCB has no script and runs no check for it (SRJ-1416) |
 | 15 | `test-14-fmk-kill-fails.sh` | A persona removal whose kill fails keeps the row (SRJ-1417) |
 | 16 | `test-14-fmk-kill-fails.sh` | An upgrade's first start with a failing kill keeps every row (SRJ-1417) |
-| 17 | every fmk script | `assert_no_server_tmux`: no bot server makes a tmux call of its own (see Closing assertions) |
+| 17 | server-backed fmk scripts | `assert_no_server_tmux`: no bot server makes a tmux call of its own (see Closing assertions) |
 | 18 | `test-19-fmk-reuse.sh` | A persona removed and re-added comes back fresh by reuse, never resumed (SRJ-1419) |
 | 19 | `test-16-fmk-conflict.sh` | Each kind of leftover session latches its persona, and each clears once it ends (SRJ-1420) |
 | 20 | `test-23-fmk-latch-recheck.sh` | Every latch case is re-checked every interval (45 s here, by a test-only override; 120 s in production) with exactly its call (SRJ-1422) |
@@ -1656,22 +1696,30 @@ shard's store.
 in the worktree (see Script names, prerequisites and canonical order).
 Admission then takes exactly that N for a run with `--shards` or
 `--inject`, or, for a run with neither, the largest N up to it that fits the
-host's memory and CPU (see `docker/README.md`'s `## /ci: the sharded run`).
+host's memory and CPU, down to the isolation minimum: one dedicated shard
+per Codex script plus an ordinary shard when ordinary units are selected
+(see `docker/README.md`'s `## /ci: the sharded run`).
 
 - **test-1 first, in every shard.** Every shard installs the package for
   itself; test-1 belongs to no scheduling unit.
 - **Whole units, balanced.** Every other script goes into exactly one shard,
   inside its scheduling unit, and a unit is never split. Units are placed
-  longest first into the shard with the smallest expected total, from the
+  longest first into the ordinary shard with the smallest expected total, from the
   duration table (see Script names, prerequisites and canonical order, and
   The duration table).
+- **Dedicated Codex unit.** A Codex script's unit contains only that script,
+  with no prerequisite beyond test-1; its shard runs exactly test-1 and it.
+  The current full run needs at least 2 shards; a Codex-only selective run may
+  use one. Only dedicated shards get the login mount.
 - **Per-shard limits.** Each shard has its own wall-time limit (see The
   duration table), and its container its own memory cap, PID limit and CPU
   limit (see `docker/README.md`'s `### Shard containers` and
   `### The per-shard memory cap and out-of-memory kills`).
 - **Nothing shared.** A shard sees only its own results subdirectory,
   `shard-<k>` of the run directory, mounted at `/test-results`, and the
-  run's tarball, read-only. It shares no HOME, agent-director store, tmux
+  run's tarball, read-only. A dedicated Codex shard also has the validated
+  single read-write login-file mount at `/run/codex-login/auth.json`.
+  It shares no HOME, agent-director store, tmux
   server or daemon with another shard, and writes no file another shard
   sees.
 - **Failures stay in their shard.** A shard stops at its own first failing
@@ -1681,8 +1729,8 @@ host's memory and CPU (see `docker/README.md`'s `## /ci: the sharded run`).
   shard.
 - **One merged verdict.** When every shard has ended, the host runner reads
   each shard's files, runs the integrity checks and writes one verdict for
-  the run (see Verdict file format). With `--shards 1` the run keeps the
-  serial order and stops at its first failure.
+  the run (see Verdict file format). A selection permitted to use
+  `--shards 1` keeps serial order and stops at its first failure.
 
 ### The in-container runner and the in-shard files
 
@@ -1762,8 +1810,8 @@ the host runner's own steps. Remove the directory by hand once inspected.
 ### Known-flaky scripts
 
 A script listed here is a known flake. A mismatch between two runs on one
-tree (a default full run and a `--shards 1` run, or the same two runs given
-one `--inject fail:<script>`) is a flake only when a selective run of that
+tree (a default full run and a full run at its isolation-minimum shard count,
+or the same two runs given one `--inject fail:<script>`) is a flake only when a selective run of that
 script alone, repeated three times, both passes and fails at least once. The
 script is then listed here and left out of the parity comparisons of the
 delivery verification, and a default full run that fails only on a listed
@@ -2261,29 +2309,40 @@ itself, how many lines and their numbers.
 | `assert_no_cscb_include_finished` | any finished-row kill, agent-director-admin's `kill-finished` or an agent-director `kill` call carrying `--include-finished` (`-` or `--`, with or without `=<value>`), whose parent is not the scenario's own shell or a subshell of it (a command substitution or pipeline element included): a parent whose command line is `SCENARIO_SHELL_CMDLINE` and that no CSCB process held | some agent-director call's parent is a bot server the scenario started (its version probe) |
 | `assert_no_cscb_delete` | any `delete` call (agent-director-admin's, or an earlier agent-director's) whose parent is not the scenario's own shell or a subshell of it, told apart as for `assert_no_cscb_include_finished`. Any other parent fails, a CSCB process the record does not hold included (a server refused before it wrote its PID file). The harness's own `ad_delete_unusable_row` passes. The failure text is "run delete from a parent other than the scenario's own shell or a subshell of it" | (no positive control) |
 
-Every fmk script ends with all three, in its own shell, whatever the tmux
+Ordinary fmk scripts end with all three, in their own shell, whatever the tmux
 shim's mode. The positive controls keep an empty or bypassed log from passing:
-both need the scenario's own CSCB lines, so every fmk script starts at least
-one bot server, and has agent-director run tmux for at least one of its CSCB
-processes. The trap enforces the ending, after it has set the shim back to
+both need the scenario's own CSCB lines, so these scripts start at least
+one bot server, and have agent-director run tmux for at least one of their CSCB
+processes.
+
+Only the exact names `test-41-fmk-real-codex`, `test-111-fmk-real-codex-ai-ac11`,
+`test-112-fmk-real-codex-ai-ac12`, `test-115-fmk-real-codex-ai-ac15`,
+`test-120-fmk-real-codex-ai-ac20` and `test-206-fmk-real-codex-ai-ac106`
+select `assert_codex_d1_safety` instead. This D1 assertion requires zero server
+starts and an empty CSCB process record, actual harness-parented agent-director
+`spawn` and `send-keys`, and positive tmux calls parented by agent-director
+with a preceding call from the harness. Any tmux outside that chain,
+finished-row kill or delete fails, as do empty or malformed shim logs.
+
+The trap enforces each script's selected closing assertions, after it has set the shim back to
 `log` and stopped every server (its `stop` runs are CSCB processes, logged
 like any other), for every fmk script, nested harness runs included; there
 is no opt-out:
 
-- a script that exits 0 without all three having passed in its own shell,
+- a script that exits 0 without every selected assertion having passed in its own shell,
   over the scenario's own logs and record, fails, its FAIL line naming the
   assertions not passed. An assertion run in a subshell, or pointed at other
   files, does not count;
-- when all three passed, the trap runs them again over the whole logs, so a
+- when the selected assertions passed, the trap runs them again over the original whole logs, so a
   violating line written after them (while the trap stopped a server, for
   example) fails the run with a FAIL line starting
   `after the closing assertions:`.
 
-Scenario 17 (b.jg5 SRJ-1418, AC 19) is `assert_no_server_tmux` across every
-fmk script: the bot server runs no tmux, and answers a startup dialog only
+Scenario 17 (b.jg5 SRJ-1418, AC 19) is `assert_no_server_tmux` across server-backed
+fmk scripts: the bot server runs no tmux, and answers a startup dialog only
 through agent-director (SRJ-401, SRJ-601, SRJ-612). Its static half is
 SRJ-716's audit, `tests/fmk-source-audit.test.ts` (AC 18). AC 16's `/ci`
-half (SRJ-106) is `assert_no_cscb_include_finished` across every fmk script,
+half (SRJ-106) is `assert_no_cscb_include_finished` across server-backed fmk scripts,
 with `tests/fmk-source-audit.test.ts` as its unit half.
 
 CSCB's agent-director calls. `cscb_ad_calls <verb> [<fragment>...]` prints
@@ -2506,8 +2565,9 @@ These hold for every fmk script (b.jg5 SRJ-1401):
   `tmux_shim_mode`; and
   `agent-director-shim.sh` in front of the agent-director binary.
 - It ends with `assert_no_server_tmux`, `assert_no_cscb_include_finished` and
-  `assert_no_cscb_delete`, whatever the shim's mode, and the trap fails a
-  script that skips them (see Closing assertions).
+  `assert_no_cscb_delete`, or `assert_codex_d1_safety` for the exact six
+  Codex D1 entrypoints, whatever the shim's mode. The trap fails a script
+  that skips its required assertions (see Closing assertions).
 - Where a scenario has a human act, the harness plays the human from the
   scenario's own shell, never from a CSCB process: `ad` or `ad_capture` as a
   plain command, in `$( … )` or in a pipeline, never through `timeout` or
@@ -4253,7 +4313,7 @@ duration-table entry.
    install and store, tmux server and shim (see fmk mode under Scenario
    helper), on the release. To start on agent-director 0.10.0, set
    `SCENARIO_AD_START=0.10.0` on its own line before the source line. It
-   follows Rules for every fmk scenario and ends with the three closing
+   follows Rules for every fmk scenario and ordinarily ends with the three closing
    assertions, in the script's own shell, before its PASS line:
    ```bash
    # ... start_server --live, cscb_run, ad / ad_capture as the human, assertions, stop_server ...
@@ -4262,6 +4322,9 @@ duration-table entry.
    assert_no_cscb_delete
    echo "PASS: ${TEST_NAME}"
    ```
+   The exact six Codex D1 entrypoints use `assert_codex_d1_safety` before PASS
+   instead, with no server start; see Closing assertions. New fmk names keep
+   the ordinary three assertions unless the shared exact-name selector is reviewed.
 3. Make it executable. The runner picks it up by name and runs every
    `test-*.sh` through `bash`, so the mode bit is not what makes it run.
 4. Optional: when the script depends on state another script leaves, add a
@@ -4292,8 +4355,9 @@ set each shard's wall-time limit. Scheduling reads the copy in the run's pinned
 test image.
 
 Every shard starts with test-1's estimate, since test-1 runs first in each,
-and a unit's estimate is the sum of its scripts' estimates. Units are placed
-longest first, each into the shard with the smallest expected total so far.
+and a unit's estimate is the sum of its scripts' estimates. Ordinary units are
+placed longest first into the ordinary shard with the smallest expected total.
+Dedicated Codex units occupy the remaining shards with test-1 only.
 Ties between units go by the canonical order of each unit's first script and
 ties between shards to the lowest shard number, so one table, one set of
 scripts and one N always give one assignment.

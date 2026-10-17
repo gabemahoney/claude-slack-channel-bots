@@ -33,13 +33,14 @@ cache as a separate image and don't get invalidated on every CSCB source edit.
 
 - **The heavy run's image** (`docker/Dockerfile.real-agent`,
   `FROM cscb-ci-base:v8`) — a self-contained packed `package.tgz`, tests and
-  `docker/real-agent-job.sh`, tagged `cscb-real-agent:<run-id>` and removed
+  `docker/real-agent-job.sh` and `docker/real-agent-codex-job.sh`, tagged `cscb-real-agent:<run-id>` and removed
   by `scripts/real-agent-matrix.ts`. Jobs select native Claude through
   agent-director, install runtime latest inside the container when needed,
-  and run sequentially with runtime-only credentials. Every heavy bot is
-  pinned to `CI_ANTHROPIC_MODEL` (available Opus 5.5), ignoring the optional
-  `CI_ANTHROPIC_OPUS_MODEL`; refusal fallback is disabled while the safety
-  classifier remains enabled. See
+  and run sequentially with runtime-only credentials. Claude gate/non-AI jobs use
+  `CI_ANTHROPIC_MODEL`; Claude AI uses optional `CI_ANTHROPIC_AI_MODEL`, defaulting
+  to that model, with native fallback disabled and the classifier enabled. The
+  separate local Codex job uses the host-selected model and single-file login
+  lease described below; it never goes to the scheduler. See
   [the heavy invocation](../tests/README.md#heavy-inventory-and-invocation).
 
 `/ci` builds the base only when the tag that `docker/Dockerfile.test`'s `FROM`
@@ -91,7 +92,7 @@ Every path is readable by every user, `testuser` included, except the global cli
 | `/opt/agent-director-0.10.0/agent-director-0.10.0.tgz` | The published agent-director 0.10.0 client, from npm |
 | `/opt/claude-slack-channel-bots-0.10.0/claude-slack-channel-bots-0.10.0.tgz` | The published pre-persona claude-slack-channel-bots 0.10.0 package, from npm |
 | `/opt/claude-code/2.1.280/claude`, `/opt/claude-code/2.1.296/claude` | Native Linux x64 Claude programs, off PATH; manifests supply SHA-256 checks, and each `--version` must match. `DISABLE_AUTOUPDATER=1` is set in the base |
-| `/opt/codex/0.159.2/codex` | Native ELF from the Codex platform npm package, off PATH; build requires `codex-cli 0.159.2`. E7 owns login/harness integration |
+| `/opt/codex/0.159.2/codex` | Native ELF from the Codex platform npm package, off PATH; build requires `codex-cli 0.159.2`. Selected explicitly by the isolated D1 gate and local heavy harness |
 | `/opt/cscb-ci/install-real-agents.sh`, `/opt/cscb-ci/install-real-codex.sh` | Marked-image-only native installers; the Claude installer also supports the heavy job's resolved latest |
 | `/opt/claude-slack-channel-bots-0.16.1/claude-slack-channel-bots-0.16.1.tgz` and `release.json` | Published-before-work downgrade fixture, separate from the retained 0.10.0 fixture. Publication: `2026-10-14T17:20:30.700Z`; SHA-256: `95bd53d19f4950caf8a13a4d9a4b7a8c85d22433ba87dd69cabbba20570e8164`. Build checks the hash/version; record includes registry provenance |
 | `/etc/cscb-ci-image` | The image marker (see [Image marker](#image-marker)) |
@@ -258,8 +259,9 @@ Image marker).
 `ANTHROPIC_MODEL` from the host environment (each via the no-value `--env VAR`
 pass-through form). The bot Claudes spawned by the daemon-under-test consume
 these. Every full `/ci` run uses the key for real model calls in the nine
-`-fmk-real-` scripts; other scripts keep the stub. No OAuth or subscription
-credential is used. A raw `sk-ant-api…` key needs only `ANTHROPIC_API_KEY` — Claude Code
+`-fmk-real-` Claude scripts; ordinary scripts keep the stub. Claude uses no OAuth or
+subscription fallback. The Codex gate uses only its separately admitted existing
+login file and selected model (see [Codex admission](#codex-admission-login-and-scratch-lifecycle)). A raw `sk-ant-api…` key needs only `ANTHROPIC_API_KEY` — Claude Code
 defaults to `api.anthropic.com` when `ANTHROPIC_BASE_URL` is absent. A gateway
 credential (e.g. NVIDIA InferenceHub) additionally requires `ANTHROPIC_BASE_URL`
 and `ANTHROPIC_MODEL` so the bot Claudes hit the gateway rather than
@@ -391,6 +393,30 @@ The sharded `/ci` runner is `scripts/ci-run.ts`. It runs the integration
 scripts in up to 6 capped, isolated shards, normally all from one test image
 it builds per run.
 
+### Codex admission, login and scratch lifecycle
+
+A selected `-fmk-real-codex` script gets its own shard containing exactly test-1 and that script. Its prerequisite unit may contain nothing else. A mixed ordinary/Codex run needs at least one ordinary shard in addition to each dedicated shard; the current full run therefore refuses `--shards 1`. A selection of only test 41 and test-1 may use one shard, but remains selective and cannot establish a full gate result. Automatic admission reduces N only as far as this isolation minimum.
+
+**Host model and key projection.** Both runners use non-empty `CODEX_HOME`, otherwise `$HOME/.codex`, and require a readable, well-formed `config.toml` with a non-empty top-level `model` string matching `[A-Za-z0-9._:/-]+`. There is no inherited override, profile-only selection or fallback model. The bounded scanner decodes only that value; other values, including native metadata values, are lexically skipped. It projects only key paths into `CODEX_HOST_CONFIG_KEYS` (plain environment metadata, at most 128 KiB), alongside plain `CODEX_TEST_MODEL`. Parsing is bounded to 1 MiB, 2,048 paths, depth 32 and 256-byte key segments; malformed or ambiguous TOML/projection refuses admission. The container validates the projection too. Never print host settings or environment values.
+
+`results.json` records `codexModel` as the admitted model, or null when no Codex lease was admitted. `summary.txt` and the heavy log report `recorded: codex-model <name>`; native rollout checks independently require the actual selected model. These records describe the test, not the host's other settings.
+
+**One existing login file.** The runner privately validates the existing `auth.json`: regular, not a symlink, runner-owned, mode 0600 and valid JSON. The image's testuser UID must match the runner UID. It refuses instead of changing ownership or permissions. Only that file is bind-mounted read-write at `/run/codex-login/auth.json`; no Codex home or config is mounted. The scratch Codex home is private mode 0700, with `auth.json` a symlink to exactly that target, checked through preparation, spawn, idle and final cleanup.
+
+Codex 0.159.2 truncates and writes file credentials in place, so token refresh follows that symlink and updates the existing host file. The owner accepts the refresh-write risk: interruption or changed native save semantics can break the login. Never replace this with a copy or read-only mount, which can consume a rotating refresh token while leaving the host stale. Never print, copy, hash, archive, chmod, chown or export the login or its scratch home; put neither in images, repositories or results. Recheck native save behavior before changing the Codex version. A postcheck failure instructs the owner to run `codex login --device-auth` on the host; the test runner never performs host login recovery itself.
+
+**Lease and retirement.** Gate and local heavy runs share process-owned exclusive `flock` on `codex-login.lock` beside the host login. Its 30-minute wait is separate from ordinary admission's 30-second lock wait and included in the runner's build/deadline allowance. The lease covers every login-bearing container through verified retirement, postchecks and secret scanning. A surviving container labelled `cscb.codex-login=true`, stopped or running, or an unverifiable survivor check refuses another run. Failed retirement fails the run and holds the lease until runner exit; exit releases flock, but survivor refusal still protects the next run. Never bypass either guard.
+
+Before launch and after retirement, revalidate valid JSON, device/inode identity, runner ownership and mode 0600. Keep token strings from both reads only in memory for masking and output scans, including refreshed tokens. A postcheck, cleanup or token-scan failure fails the run. Inspect containers/images only through `bun scripts/safe-docker-inspect.ts docker container inspect NAME` or its supported image form; wrapper failure is final, with no raw inspection fallback.
+
+**Native-written scratch config (amended decision 22).** The harness creates no Codex `config.toml` and copies no host settings. It must be absent before first spawn. Later preparation/recovery needs a durable successful-native-spawn receipt tied to the exact private home's device/inode; config presence alone grants nothing. The names-only checker allows only fixed native-written `tui.screen_reader_detection_done` and genuine parent tables containing exclusively allowed descendants. That leaf and its parent may overlap host key names without reading or copying their host values. All other host keys and every model, reasoning, profile/profiles, provider/auth or unknown key reject the script. Scalar/array namespace impostors and unknown descendants also reject it. Record only key names and unknown-key counts. New allowlist entries require native-source or observed-run evidence. Native CLI `tui.show_tooltips=false` avoids the optional startup counter without broadening this allowlist.
+
+**Resources and heavy execution.** Login-bearing containers set `--ulimit core=0`. Each Codex shard adds 2 GiB to the ordinary cap and reservation, currently 4 GiB memory and memory-swap, retaining 2 CPUs and 2,048 PIDs. Admission, concurrent-run commitments, cap reports and OOM accounting include the extra memory. The local heavy job uses the same 4 GiB/2 CPU/2,048 PID bounds, a 3-hour job timeout, exact login mount and verified final stopped/exit/cap reading. Its five AI criteria run three independent trials each; see [Codex gate and heavy AI](../tests/README.md#codex-gate-and-heavy-ai). Nothing carrying the login goes to a scheduler. `/ci-live` runs in its own container against the test workspace, with its existing credentials and isolation.
+
+The explicit coordinator option `--codex-only` selects those 15 local trials, skipping Claude jobs, runtime-latest fetching and Claude credential admission. It keeps the same Codex lease, UID/inspection, mount, token-scan, cleanup and interruption checks, including lease preservation when retirement is unresolved. Plan/results record `selection: codex-only`, empty Claude jobs and null Claude models/scheduler; its `REAL-AGENT-CODEX-VERDICT` and `REAL-AGENT-CODEX-PLAN` prefixes distinguish it from the default 73-invocation full selection. `--plan` accesses no Codex auth/config and establishes no acceptance.
+
+Use the established `CI_ANTHROPIC_*` prefix on the `/ci` runner and **every** `ci-verdict.ts` wait/stop/report/recovery call, as the current CI skill describes. The heavy coordinator reads those CI names directly. Never put credential values in arguments or diagnostic output. Native observation is complete, but the implemented final Codex gate and 15 heavy trials still require integration acceptance; no image tag bump is needed for these source/test-only changes (`cscb-ci-base:v8` remains pinned).
+
 ### Admission: memory, disk and CPU
 
 A run is admitted only when its own files keep the run directory's volume
@@ -400,7 +426,8 @@ or a refusal that says why.
 
 Admission reads the host once, under the admission lock and after the sweep
 (see [The admission lock, reservations and the sweep](#the-admission-lock-reservations-and-the-sweep)).
-Every shard is judged at the per-shard memory cap, 2 GiB to start (see
+Ordinary shards use the per-shard memory cap, 2 GiB to start; each dedicated
+Codex shard adds 2 GiB to its cap and reservation (see
 [The per-shard memory cap and out-of-memory kills](#the-per-shard-memory-cap-and-out-of-memory-kills)
 for the current cap).
 
@@ -479,7 +506,7 @@ The CPU fit counts the CPUs of every other live `/ci` reservation;
 
 | Fit | Passes when |
 |---|---|
-| Memory | U + the commitments + N × the cap + the 1 GiB admission margin ≤ C, and no container blocks every run |
+| Memory | U + the commitments + N × the ordinary cap + 2 GiB per Codex shard + the 1 GiB admission margin ≤ C, and no container blocks every run |
 | Disk | (used + 1 GiB) ÷ (used + available) < 85% on the volume holding the run directory. The 1 GiB is an allowance for the run's own files; the 85% is `/ci`'s own disk line |
 | CPU | The other live reservations' CPUs + 2 × N ≤ the 12 CI CPUs |
 
@@ -492,7 +519,7 @@ watchdog. The disk fit does not depend on N; the memory and CPU fits do.
 
 **Choosing N.** The effective N is the smaller of the requested N and the
 run's scheduling units, at least 1. A run given neither `--shards` nor
-`--inject` takes the largest N, from the effective N down to 1, that passes
+`--inject` takes the largest N, from the effective N down to its isolation minimum, that passes
 both the memory and the CPU fit. A run given `--shards` or `--inject` takes exactly the
 effective N, or is refused. Either run is refused when the disk fit fails.
 
@@ -533,11 +560,11 @@ first makes the first line; each other follows in the detail lines as
 decimal place.
 
 n is the effective N for a run given `--shards` or `--inject`. A run that can
-choose its N is judged at 1 shard, the smallest it could take, so its refusal
-says why not even one shard fits. The memory and CPU refusals name the
+choose its N is judged at its isolation minimum: one shard per Codex script
+plus one for ordinary units when present, otherwise at least one shard. The memory and CPU refusals name the
 largest `--shards` value, at most the effective N, that passes both of those
 fits now (`largest --shards value that fits now: <k>`), or say
-`no --shards value fits now, not even 1`.
+that no value fits at the required isolation minimum.
 
 The memory refusal also gives the ceiling and its source (85% of L
 or `/ci-live`'s 40 GiB line with the lock or container that showed the
@@ -641,7 +668,7 @@ rename), with these keys:
 | `version` | `1` |
 | `runId`, `pid` | the run's RUN_ID and PID |
 | `shards` | N |
-| `memoryBytes` | N × the per-shard memory cap |
+| `memoryBytes` | N × the ordinary per-shard memory cap + 2 GiB per dedicated Codex shard |
 | `cpus` | 2 × N |
 | `kind` | `full` or `selective` |
 
@@ -704,11 +731,12 @@ kinds of run are a source for a new cap, and after delivery only a default
 full run (`/ci` with no arguments) with an out-of-memory kill is a reason to
 raise it.
 
-**The cap.** The cap is one constant, `SHARD_MEMORY_CAP_BYTES` in
-`scripts/ci-run.ts`. It sets each shard container's memory and memory-swap
-limits (see [Shard containers](#shard-containers)) and the memory each shard
-reserves at admission. It starts at 2 GiB, which is also its minimum
-(`MIN_SHARD_MEMORY_CAP_BYTES`).
+**The cap.** `SHARD_MEMORY_CAP_BYTES` in `scripts/ci-run.ts` is the ordinary
+cap, initially 2 GiB and at least `MIN_SHARD_MEMORY_CAP_BYTES`. A dedicated
+Codex shard adds `CODEX_EXTRA_MEMORY_BYTES` (2 GiB), currently giving 4 GiB.
+Both memory and memory-swap limits and admission reservations use the actual
+shard cap. Cap reports and OOM accounting use the source shard's actual cap;
+without a source the report uses the largest scheduled cap.
 
 **Anon peaks.** A shard's anon peak is the highest `anon` across its 30 s
 samples and its final reading (see [Shard containers](#shard-containers)),
@@ -870,20 +898,26 @@ removes itself, and only the runner removes it, after its final reading.
 
 **Mounts.** Each mount is a `--mount type=bind,...`, never `-v`, so Docker
 never creates a missing source: every source is a file or directory the
-runner made. There are exactly two:
+runner made or validated. Every shard has these two:
 
 | Source | Target | Mode |
 |---|---|---|
 | The run's tarball | `/tmp/package.tgz`, the path test-1 installs from | Read-only |
 | The shard's subdirectory, `shard-<k>` in the run directory (created 0700 before any docker command) | `/test-results` | Read-write |
 
-Only a `leak:<k>,<j>` fault adds a mount: shard k's subdirectory, read-only,
+A dedicated Codex shard additionally mounts exactly the validated host login
+file read-write at `/run/codex-login/auth.json`; ordinary shards never do.
+The only other permitted extra mount is a `leak:<k>,<j>` fault: shard k's subdirectory, read-only,
 at `/leak-shard-<k>` in shard j (see
 [`tests/README.md`](../tests/README.md#fault-injection)).
 
 **Credentials.** The list names `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL` and
 `ANTHROPIC_MODEL` by bare name only (`--env <NAME>`), so Docker copies each
-that is set from the runner's environment. No other variable reaches a shard,
+that is set from the runner's environment. The list also names bare
+`CODEX_TEST_MODEL` and `CODEX_HOST_CONFIG_KEYS`. The model is replaced with
+the run's admitted model (or empty without a lease); the names-only projection
+is populated only for Codex shards and empty for ordinary shards. Neither
+is a secret or an inherited override. No other variable reaches a shard,
 and `GH_TOKEN` never does (see
 [Credential env vars passed to the container](#credential-env-vars-passed-to-the-container)).
 

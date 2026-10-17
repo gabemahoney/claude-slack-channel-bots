@@ -2,10 +2,10 @@
  * Parser permutations live in delivery-screen/receipt, gate lifecycle in its
  * own suite. Every timestamp and retry is driven by the injected fake clock. */
 import { afterEach, describe, expect, test } from 'bun:test'
-import { readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { appendFileSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { createDeliveryCallBudget, DeliveryBudgetWait, deliveryTextWasRefused, LAUNCH_SETTLE_MS, ENTER_DELAY_MS, ENTER_ONLY_RETRY_MS, RECEIPT_WAIT_MS, RETYPE_BACKOFF_MS, NOT_NOW_RETRY_MS, IDLE_EVIDENCE_MAX_WAIT_MS, DELIVERY_MAX_AD_CALLS_PER_S, RECONNECT_BLOCKED_NOTICE_MS, DELIVERY_ROW_POLL_MS } from '../src/delivery-engine.ts'
 import { makeEngineHarness, type EngineHarness } from './test-helpers/delivery-engine.ts'
-import { appendTranscript, codexPromptEntry, deliveryPane, endedTurn, promptEntry, queueOperationEntry, replyEntry, writeTranscript } from './test-helpers/working-row-panes.ts'
+import { appendTranscript, codexPromptEntry, deliveryPane, endedTurn, observedCodexPane, observedCodexTurnEntry, promptEntry, queueOperationEntry, replyEntry, transcriptJsonl, writeTranscript } from './test-helpers/working-row-panes.ts'
 import { cannedPermissionRequest, errCallTimeout, errConfigMalformed, errDialogMaybeOpen, errInternal, errInvalidFlags, errPaneChanged, errRelayFallenBack, errSendKeysWhileRelayed, errSpawnNotFound, errSpawnNotInteractive, errSystemInstallDisappeared, errTmuxNotAvailable, errTmuxSendKeys, errTmuxSessionConflict, errTmuxUnresponsive, errUnusableName } from './test-helpers/agent-director-stub.ts'
 
 const harnesses: EngineHarness[] = []
@@ -21,6 +21,129 @@ async function drainTimers(h: EngineHarness) {
   expect(h.queue.openCount('alpha')).toBe(0)
   expect(h.engine.running('alpha')).toBe(false)
 }
+
+// E7 observation run 20261017t212743z-ddde5cd6. Engine consequences use the
+// captured panes and reconstructed safe rollout schema through real adapters;
+// they establish no native gate verdict.
+describe('native Codex adapter consequences', () => {
+  async function sent(h: EngineHarness) {
+    const p = h.p()
+    await h.queue.append('alpha', { v: 1, kind: 'sent', seq: 1, part: 1, attempt: 1, send_kind: 'text', at: h.clock.now(), launch_id: h.lifecycle.launchId('alpha'), session_id: p.row.session_id, transcript_path: p.path, transcript_size: statSync(p.path).size })
+  }
+  test.each([['slash-popup', '/'], ['at-popup', '@'], ['dollar-popup', '$']] as const)('%s holds owned-text Enter recovery until the popup closes', async (label, marker) => {
+    const h = await harness({ configuredAgent: 'claude' }), p = h.p()
+    p.row.agent = 'codex'; p.pane = observedCodexPane(label); p.box = marker
+    await h.accept(marker); await sent(h); await start(h)
+    await h.advance(RECEIPT_WAIT_MS + ENTER_ONLY_RETRY_MS)
+    expect(h.keyCalls()).toEqual([])
+    expect(h.queue.openCount('alpha')).toBe(1)
+    expect(h.events.filter(event => event.type === 'delivered')).toEqual([])
+    p.pane = observedCodexPane(`${label}-after-Escape`)
+    p.keyHook = () => { p.pane = undefined; return undefined }
+    await delivered(h)
+    expect(h.keyCalls().map(call => call.params.key ?? call.params.text)).toEqual(['Enter'])
+    expect(h.textCalls()).toEqual([])
+    expect(h.events.filter(event => event.type === 'delivered').map(event => event.seq)).toEqual([1])
+  })
+  test.each(['shortcuts-overlay', 'busy-multiline-draft'] as const)('%s arriving only on the fresh gate read prevents typing', async label => {
+    const h = await harness(), p = h.p()
+    p.row.agent = 'codex'; p.pane = observedCodexPane('idle-empty')
+    await h.accept(); await h.tick()
+    let readyReads = 0
+    p.readHook = () => {
+      if (h.clock.now() >= LAUNCH_SETTLE_MS && ++readyReads === 2) p.pane = observedCodexPane(label)
+    }
+    p.keyHook = () => { p.pane = undefined; return undefined }
+    await h.advance(LAUNCH_SETTLE_MS + RECEIPT_WAIT_MS)
+    expect(readyReads).toBeGreaterThanOrEqual(2)
+    expect(h.keyCalls()).toEqual([])
+    expect(h.queue.openCount('alpha')).toBe(1)
+    p.readHook = undefined; p.pane = observedCodexPane('idle-empty')
+    await delivered(h)
+    expect(h.keyCalls().map(call => call.params.key ?? call.params.text)).toEqual(['message', 'Enter'])
+  })
+  test('a native multiline own draft gets bounded Enter retries while disconnected, then resumes when the box changes', async () => {
+    const h = await harness(), p = h.p(), text = 'first draft line\nsecond draft line'
+    p.row.agent = 'codex'; p.pane = observedCodexPane('idle-multiline-draft'); p.box = text
+    p.autoReceipt = false; p.retainBox = true; p.connected = false
+    await h.accept(text); await sent(h); await start(h)
+    const retries = Math.ceil(Buffer.byteLength(text) / 1000) + 2
+    await h.until(() => h.keyCalls().length === retries)
+    await h.advance(RECEIPT_WAIT_MS * 2)
+    expect(h.keyCalls().map(call => call.params.key)).toEqual(Array(retries).fill('Enter'))
+    expect(h.textCalls()).toEqual([])
+    const times = h.keyCalls().map(call => call.at)
+    expect(times.slice(1).every((at, index) => at - times[index]! >= ENTER_ONLY_RETRY_MS)).toBe(true)
+    expect(h.queue.openCount('alpha')).toBe(1)
+    expect(h.events.some(event => event.type === 'waiting' && event.reason === 'input')).toBe(true)
+    p.pane = observedCodexPane('idle-one-line-draft'); p.box = 'draft observation'
+    await h.advance(RECEIPT_WAIT_MS)
+    expect(h.keyCalls()).toHaveLength(retries)
+    p.pane = observedCodexPane('idle-multiline-draft'); p.box = text; p.autoReceipt = true; p.retainBox = false
+    p.keyHook = () => { p.pane = undefined; return undefined }
+    await delivered(h)
+    expect(h.keyCalls()).toHaveLength(retries + 1)
+    expect(h.textCalls()).toEqual([])
+    expect(h.calls.filter(call => call.verb === 'reconnect')).toEqual([])
+  })
+  test('native no-new-turn evidence never authorizes retyping into an unsubmitted human draft', async () => {
+    const h = await harness(), p = h.p()
+    p.row.agent = 'codex'; p.pane = observedCodexPane('idle-empty'); p.autoReceipt = false
+    writeTranscript(p.path, [observedCodexTurnEntry('task_started'), observedCodexTurnEntry('task_complete')])
+    let enters = 0
+    p.keyHook = params => {
+      if (params.no_enter) p.pane = undefined
+      else if (params.key === 'Enter' && ++enters === 1) p.pane = observedCodexPane('send-no-new-turn-after-Escape')
+      return undefined
+    }
+    await h.accept(); await start(h); await h.advance(ENTER_DELAY_MS + IDLE_EVIDENCE_MAX_WAIT_MS)
+    expect(h.keyCalls().map(call => call.params.key ?? call.params.text)).toEqual(['message', 'Enter'])
+    expect(h.queue.openCount('alpha')).toBe(1)
+    expect(h.events.filter(event => event.type === 'delivered')).toEqual([])
+    p.pane = observedCodexPane('idle-empty'); p.autoReceipt = true
+    await delivered(h)
+    expect(h.keyCalls().map(call => call.params.key ?? call.params.text)).toEqual(['message', 'Enter', 'message', 'Enter'])
+    expect(h.records().filter(record => record.kind === 'sent').map(record => 'send_kind' in record && record.send_kind)).toEqual(['text', 'retype'])
+  })
+  test.each(['completion', 'idle-evidence-cap'] as const)('active native turn waits for %s before retyping; stale and partial completions cannot release it', async release => {
+    const h = await harness(), p = h.p()
+    p.row.agent = 'codex'; p.pane = observedCodexPane('idle-empty'); p.autoReceipt = false
+    writeTranscript(p.path, [observedCodexTurnEntry('task_complete')])
+    let enters = 0
+    p.keyHook = params => {
+      if (params.no_enter) { p.pane = undefined; if (h.textCalls().length > 1) p.autoReceipt = true }
+      else if (params.key === 'Enter') {
+        p.pane = observedCodexPane('idle-empty')
+        if (++enters === 1) appendTranscript(p.path, [observedCodexTurnEntry('task_started')])
+      }
+      return undefined
+    }
+    await h.accept(); await start(h); await h.advance(ENTER_DELAY_MS)
+    const submittedAt = h.keyCalls().find(call => call.params.key === 'Enter')!.at
+    await h.advance(RECEIPT_WAIT_MS)
+    expect(h.textCalls()).toHaveLength(1)
+    expect(h.lifecycle.owner('alpha')).toBe('free')
+    expect(h.queue.openCount('alpha')).toBe(1)
+    const completion = transcriptJsonl([observedCodexTurnEntry('task_complete')])
+    appendFileSync(p.path, completion.slice(0, -1))
+    await h.advance(DELIVERY_ROW_POLL_MS)
+    expect(h.textCalls()).toHaveLength(1)
+    if (release === 'completion') appendFileSync(p.path, '\n')
+    else {
+      await h.advance(IDLE_EVIDENCE_MAX_WAIT_MS - (h.clock.now() - submittedAt) - 1)
+      expect(h.textCalls()).toHaveLength(1)
+    }
+    await h.until(() => h.textCalls().length === 2)
+    const retypedAt = h.textCalls()[1]!.at
+    expect(retypedAt - submittedAt).toBeGreaterThanOrEqual(release === 'completion' ? RETYPE_BACKOFF_MS[0] : IDLE_EVIDENCE_MAX_WAIT_MS)
+    if (release === 'completion') expect(retypedAt - submittedAt).toBeLessThan(IDLE_EVIDENCE_MAX_WAIT_MS)
+    // Finish the partial line before the retype's exact user receipt arrives.
+    if (release === 'idle-evidence-cap') appendFileSync(p.path, '\n')
+    await delivered(h)
+    expect(h.keyCalls().map(call => call.params.key ?? call.params.text)).toEqual(['message', 'Enter', 'message', 'Enter'])
+    expect(h.records().filter(record => record.kind === 'sent').map(record => 'send_kind' in record && record.send_kind)).toEqual(['text', 'retype'])
+  })
+})
 
 describe('durable FIFO and send sequence', () => {
   test.each([

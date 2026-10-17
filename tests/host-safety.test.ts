@@ -1691,7 +1691,19 @@ const FMK_TEXTS_PATH = join(INTEGRATION_DIR, 'fixtures', 'fmk-texts.ts')
  * built-ins statically: the forced-call driver, the stub's MCP session and
  * the switch-over fixture and the scenario value printer.
  */
-const IMAGE_GUARDED_TS_PATHS: readonly string[] = [FMK_DRIVER_PATH, STUB_MCP_SESSION_PATH, SWITCH_OVER_PATH, FMK_TEXTS_PATH]
+const CODEX_DELIVERY_PATH = join(TESTS_DIR, 'real-agent', 'codex-delivery.ts')
+const IMAGE_GUARDED_TS_PATHS: readonly string[] = [FMK_DRIVER_PATH, STUB_MCP_SESSION_PATH, SWITCH_OVER_PATH, FMK_TEXTS_PATH, CODEX_DELIVERY_PATH]
+const CODEX_IMPORT_ONLY_PATHS = ['codex-guards.ts', 'codex-evidence.ts', 'codex-ai.ts', 'codex-gate.ts'].map(name => join(TESTS_DIR, 'real-agent', name))
+// Every non-node static edge is exact and its destination is audited too.
+const CODEX_IMPORT_GRAPH: Record<string, readonly string[]> = {
+  'tests/real-agent/codex-guards.ts': [],
+  'tests/real-agent/codex-evidence.ts': [],
+  'tests/real-agent/codex-ai.ts': ['./ai-fixture-audit.ts', './codex-evidence.ts'],
+  'tests/real-agent/codex-gate.ts': ['../integration/fixtures/transcript-receipts.ts', './codex-evidence.ts', './codex-ai.ts'],
+  'tests/real-agent/ai-fixture-audit.ts': [],
+  'tests/integration/fixtures/transcript-receipts.ts': [],
+  'src/codex-config-keys.ts': [],
+}
 
 /** The file only the cscb-ci images carry (docker/Dockerfile.test.base). */
 const CI_IMAGE_MARKER = '/etc/cscb-ci-image'
@@ -2795,7 +2807,7 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
     })
 
     test('the audited files: the forced-call driver, the stub’s MCP session, the switch-over fixture and the scenario value printer, all present', () => {
-      expect(FILES).toEqual(['fmk-driver.ts', 'stub-mcp-session.ts', 'switch-over.ts', 'fmk-texts.ts'])
+      expect(FILES).toEqual(['fmk-driver.ts', 'stub-mcp-session.ts', 'switch-over.ts', 'fmk-texts.ts', 'codex-delivery.ts'])
       for (const path of IMAGE_GUARDED_TS_PATHS) expect(existsSync(path)).toBe(true)
     })
 
@@ -2810,6 +2822,244 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
 // test-14's harness addition). The value printer, fmk-texts.ts, is one of
 // IMAGE_GUARDED_TS_PATHS above.
 // ---------------------------------------------------------------------------
+
+/** Pure literal construction only: no state reads, getters, spreads, calls
+ * or immediately invoked closures. Prior literal names may form regex text. */
+function codexPureValue(value: ts.Expression, names: Set<string>): boolean {
+  value = unwrap(value)
+  if (ts.isStringLiteral(value) || ts.isNumericLiteral(value) || ts.isRegularExpressionLiteral(value)
+    || ts.isNoSubstitutionTemplateLiteral(value) || ts.isArrowFunction(value)) return true
+  if (ts.isIdentifier(value)) return names.has(value.text)
+  if (ts.isArrayLiteralExpression(value)) return value.elements.every(v => ts.isExpression(v) && codexPureValue(v, names))
+  if (ts.isBinaryExpression(value)) return [ts.SyntaxKind.AsteriskToken, ts.SyntaxKind.PlusToken].includes(value.operatorToken.kind)
+    && codexPureValue(value.left, names) && codexPureValue(value.right, names)
+  if (ts.isTemplateExpression(value)) return value.templateSpans.every(span => codexPureValue(span.expression, names))
+  if (ts.isCallExpression(value)) return value.expression.getText() === 'Object.freeze'
+    && value.arguments.length === 1 && ts.isArrayLiteralExpression(value.arguments[0]!) && codexPureValue(value.arguments[0]!, names)
+  if (ts.isNewExpression(value)) return value.expression.getText() === 'RegExp'
+    && (value.arguments?.length ?? 0) > 0 && value.arguments!.every(v => codexPureValue(v, names))
+  return false
+}
+
+/** Inspect the complete pinned import graph without importing any module.
+ * Only two existing dual-use helpers may have an exact import.meta.main block;
+ * their CLI bodies are unreachable when imported, without an else branch. */
+function codexHelperFindings(file: string, source: string): string[] {
+  const sf = parse(source, file), findings: string[] = [], names = new Set<string>()
+  const expected = CODEX_IMPORT_GRAPH[file] ?? [], actual: string[] = []
+  for (const statement of sf.statements) {
+    const specifier = staticLoadOf(statement)
+    if (specifier !== undefined) {
+      const text = stringText(specifier)
+      if (text?.startsWith('node:')) continue
+      if (text !== undefined) actual.push(text)
+      if (text === undefined || !expected.includes(text)) findings.push(`${file}:${finding(sf, statement, 'codex-helper-import: unreviewed static import')}`)
+      continue
+    }
+    if (ts.isFunctionDeclaration(statement) || ts.isInterfaceDeclaration(statement) || ts.isTypeAliasDeclaration(statement)) continue
+    if (ts.isVariableStatement(statement) && (statement.declarationList.flags & ts.NodeFlags.Const)
+      && statement.declarationList.declarations.every(declaration => {
+        if (!ts.isIdentifier(declaration.name) || ['Object', 'RegExp'].includes(declaration.name.text) || !declaration.initializer || !codexPureValue(declaration.initializer, names)) return false
+        names.add(declaration.name.text)
+        return true
+      })) continue
+    if (['tests/real-agent/ai-fixture-audit.ts', 'tests/integration/fixtures/transcript-receipts.ts'].includes(file)
+      && ts.isIfStatement(statement) && statement.expression.getText(sf) === 'import.meta.main'
+      && ts.isBlock(statement.thenStatement) && !statement.elseStatement) continue
+    findings.push(`${file}:${finding(sf, statement, 'codex-helper-import: executable statement at import time')}`)
+  }
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) findings.push(`${file}:1: codex-helper-import: static dependency inventory differs`)
+  return findings
+}
+
+/** The heavy shell chain admits the shared scenario first, then image, home,
+ * tmux, model, trial and single-file mount, before starting the guarded driver.
+ * Exact commands deliberately fail closed on a new execution surface. */
+function codexAIShellFindings(source: string): string[] {
+  const commands = shellLogicalLines(source).filter(line => !isShellNonStep(line)).map(line => line.text.trim())
+  const expected = [
+    'source "$(dirname "${BASH_SOURCE[0]}")/../integration/lib/scenario.sh"',
+    'require_ci_image codex-ai',
+    'require_scenario_home codex-ai',
+    '[[ -z "${TMUX+x}" && "${TMUX_TMPDIR:-}" == "${SCENARIO_ROOT}"/* ]] || fail \'Codex requires a private tmux server\'',
+    '[[ "${CODEX_TEST_MODEL:-}" =~ ^[A-Za-z0-9._:/-]+$ ]] || fail \'Codex requires the runner-selected model\'',
+    '[[ "${REAL_AGENT_TRIAL:-}" =~ ^[123]$ ]] || fail \'Codex requires an explicit independent trial 1, 2 or 3\'',
+    '[[ -f /run/codex-login/auth.json ]] || fail \'Codex requires its dedicated single-file login mount\'',
+    'bun "$(dirname "${BASH_SOURCE[0]}")/codex-delivery.ts" ai "${AI_CRITERION}"',
+    '[[ -L "${HOME}/.codex/auth.json" ]] || fail \'scratch Codex auth.json stopped being a symlink\'',
+    'assert_codex_d1_safety',
+    'echo "PASS: ${TEST_NAME}"',
+  ]
+  return JSON.stringify(commands) === JSON.stringify(expected) ? [] : ['codex-ai-scenario.sh: guarded command inventory/order differs']
+}
+
+function codexGateShellFindings(source: string): string[] {
+  const commands = shellLogicalLines(source).filter(line => !isShellNonStep(line)).map(line => line.text.trim())
+  const expected = [
+    'source "$(dirname "$0")/lib/scenario.sh"',
+    'require_ci_image codex-observation',
+    'require_scenario_home codex-observation',
+    '[[ -z "${TMUX+x}" && "${TMUX_TMPDIR:-}" == "${SCENARIO_ROOT}"/* ]] || fail \'Codex requires a private tmux server\'',
+    '[[ "${CODEX_TEST_MODEL:-}" =~ ^[A-Za-z0-9._:/-]+$ ]] || fail \'Codex requires the runner-selected model\'',
+    '[[ -f /run/codex-login/auth.json ]] || fail \'Codex requires its dedicated single-file login mount\'',
+    'bun "$(dirname "$0")/../real-agent/codex-delivery.ts" gate',
+    '[[ -L "${HOME}/.codex/auth.json" ]] || fail \'scratch Codex auth.json stopped being a symlink\'',
+    'assert_codex_d1_safety',
+    'echo "PASS: ${TEST_NAME}"',
+  ]
+  return JSON.stringify(commands) === JSON.stringify(expected) ? [] : ['test-41-fmk-real-codex.sh: guarded command inventory/order differs']
+}
+
+/** Keep only the reviewed literal metadata and one shared source step. */
+function codexAIEntrypointFindings(file: string, ac: number, source: string): string[] {
+  const actual = shellLogicalLines(source).filter(line => line.code.trim()).map(line => line.text.trim())
+  const expected = ['set -euo pipefail', `TEST_NAME="${file.slice(0, -3)}"`, `AI_CRITERION=${ac}`,
+    'source "$(dirname "$0")/codex-ai-scenario.sh"']
+  return JSON.stringify(actual) === JSON.stringify(expected) ? [] : [`${file}: source/metadata inventory differs`]
+}
+
+/** Pin guarded process and signal boundaries, reading syntax only. Runtime
+ * guard refusals live in codex-delivery-controls; units never run this driver. */
+function codexProcessFindings(source: string): string[] {
+  const sf = parse(source), failures = driverGuardFindings('codex-delivery.ts', source)
+  const functions = new Map(sf.statements.filter(ts.isFunctionDeclaration).map(f => [f.name?.text, f]))
+  const body = (name: string) => functions.get(name)?.body?.getText(sf) ?? ''
+  const top = sf.statements.filter(s => !ts.isFunctionDeclaration(s)).map(s => s.getText(sf)).join('\n')
+  const compact = (s: string) => s.replace(/\s+/g, ' ')
+  const order = (text: string, required: string[], label: string) => {
+    let previous = -1
+    for (const fragment of required) {
+      const at = compact(text).indexOf(compact(fragment), previous + 1)
+      if (at < 0 || at <= previous) failures.push(`codex-delivery.ts: ${label}: missing/delayed ${fragment.split('\n')[0]}`)
+      previous = at
+    }
+  }
+  order(top, ["if (!existsSync('/etc/cscb-ci-image'))", "paths = codexContainment(process.env, realpathSync)",
+    "if (!under('/test-repo/node_modules', realpathSync(pkg)))", 'await prepare().catch(startupFailure)',
+    "import(join(pkg, 'src/delivery-engine.ts'))", 'await transport.Client.create().catch(startupFailure)'], 'guard order')
+  order(body('prepare'), ["!existsSync(CODEX_AUTH_MOUNT)", "authContract('prepare')", "Bun.spawn([CODEX_NATIVE, '--version']"], 'version guard')
+  const spawns: string[] = []
+  forEachNode(sf, node => {
+    if (ts.isCallExpression(node) && /^Bun\.(spawn|spawnSync)$/.test(node.expression.getText(sf))) spawns.push(compact(node.getText(sf)))
+  })
+  if (JSON.stringify(spawns) !== JSON.stringify([
+    "Bun.spawn([CODEX_NATIVE, '--version'], { stdout: 'pipe', stderr: 'pipe' })",
+    "Bun.spawn([process.execPath, import.meta.path, 'crash-worker'], { stdout: 'ignore', stderr: 'ignore', env: { ...process.env } })",
+  ])) failures.push('codex-delivery.ts: unreviewed process surface')
+  order(body('gate'), ["stage = 'gate-crash-between-text-and-enter'", 'await stopEngine()',
+    "Bun.spawn([process.execPath, import.meta.path, 'crash-worker']", "check.pid !== child.pid || check.instance !== instance",
+    "c.parent === child.pid && c.instance === instance", "calls.some(c => c.key === 'Enter')",
+    "child.kill('SIGKILL')", 'await child.exited', "child.signalCode !== 'SIGKILL'", "record('harness-crash'", 'await buildEngine()'], 'actual crash boundary')
+  order(body('buildEngine'), ['const result = await client.sendKeys(params)', "if (crashBarrier && params.no_enter && typeof params.text === 'string')",
+    "writeFileSync(join(stateDir, 'crash-after-text.json')", 'await new Promise(() => {})', 'return result'], 'text barrier')
+  if (!top.includes("else if (command === 'crash-worker') await crashWorker()")) failures.push('codex-delivery.ts: crash-worker dispatch missing')
+  return failures
+}
+
+describe('E7 Codex executable inventory and import safety', () => {
+  test('all current Codex harness modules have an explicit execution contract', () => {
+    const actual = filesUnder(join(TESTS_DIR, 'real-agent'), path => /\/codex-[^/]+\.ts$/.test(path)).sort()
+    expect(actual).toEqual([CODEX_DELIVERY_PATH, ...CODEX_IMPORT_ONLY_PATHS].sort())
+    expect(existsSync(join(INTEGRATION_DIR, 'test-41-fmk-real-codex.sh'))).toBe(true)
+  })
+  test.each(Object.keys(CODEX_IMPORT_GRAPH))('%s is safe to import in units without image access', file => {
+    expect(codexHelperFindings(file, readFileSync(join(REPO_ROOT, file), 'utf8'))).toEqual([])
+    for (const edge of CODEX_IMPORT_GRAPH[file]!) expect(Object.keys(CODEX_IMPORT_GRAPH)).toContain(relative(REPO_ROOT, resolve(dirname(join(REPO_ROOT, file)), edge)))
+  })
+  test.each(['tests/real-agent/ai-fixture-audit.ts', 'tests/integration/fixtures/transcript-receipts.ts'])('%s main-only execution cannot become import-time execution', file => {
+    const source = readFileSync(join(REPO_ROOT, file), 'utf8')
+    for (const changed of [source.replace('if (import.meta.main)', 'if (true)'), source.replace('if (import.meta.main)', 'if (!import.meta.main)')]) {
+      expect(changed).not.toBe(source)
+      expect(codexHelperFindings(file, changed).length).toBeGreaterThan(0)
+    }
+  })
+  test('heavy Codex shell inventory is exactly five criterion entrypoints and the guarded shared helper', () => {
+    const actual = readdirSync(join(TESTS_DIR, 'real-agent')).filter(name => /codex.*\.sh$/.test(name)).sort()
+    const expected = [11, 12, 15, 20, 106].map(ac => `test-${100 + ac}-fmk-real-codex-ai-ac${ac}.sh`)
+    expect(actual).toEqual(['codex-ai-scenario.sh', ...expected].sort())
+    for (const [index, ac] of [11, 12, 15, 20, 106].entries()) {
+      const file = expected[index]!, source = readFileSync(join(TESTS_DIR, 'real-agent', file), 'utf8')
+      expect(codexAIEntrypointFindings(file, ac, source)).toEqual([])
+    }
+    expect(codexAIShellFindings(readFileSync(join(TESTS_DIR, 'real-agent/codex-ai-scenario.sh'), 'utf8'))).toEqual([])
+  })
+  test.each([
+    ['missing shared source', 'source "$(dirname "$0")/codex-ai-scenario.sh"', ''],
+    ['state before shared guard', 'set -euo pipefail', 'set -euo pipefail\nmkdir -p /scratch/work'],
+    ['substitution before shared guard', 'AI_CRITERION=11', 'AI_CRITERION=$(read_state)'],
+    ['criterion replacement', 'AI_CRITERION=11', 'AI_CRITERION=12'],
+    ['extra late source', 'AI_CRITERION=11', 'AI_CRITERION=11\nsource other.sh'],
+  ])('heavy entrypoint audit catches %s', (_label, before, after) => {
+    const file = 'test-111-fmk-real-codex-ai-ac11.sh'
+    const source = readFileSync(join(TESTS_DIR, 'real-agent', file), 'utf8'), changed = source.replace(before!, after!)
+    expect(changed).not.toBe(source)
+    expect(codexAIEntrypointFindings(file, 11, changed).length).toBeGreaterThan(0)
+  })
+  test.each(['require_ci_image', 'require_scenario_home', 'TMUX+x', 'CODEX_TEST_MODEL', 'REAL_AGENT_TRIAL', '/run/codex-login/auth.json', 'codex-delivery.ts', '-L', 'assert_codex_d1_safety'])('shared heavy helper refuses a missing or delayed %s check', fragment => {
+    const source = readFileSync(join(TESTS_DIR, 'real-agent/codex-ai-scenario.sh'), 'utf8')
+    const lines = source.split('\n'), at = lines.findIndex(line => line.includes(fragment))
+    expect(at).toBeGreaterThan(0)
+    expect(codexAIShellFindings(lines.filter((_, index) => index !== at).join('\n')).length).toBeGreaterThan(0)
+    const delayed = [...lines]; delayed.push(delayed.splice(at, 1)[0]!)
+    expect(codexAIShellFindings(delayed.join('\n')).length).toBeGreaterThan(0)
+  })
+  test('D1 gate command inventory includes successful closure before PASS', () => {
+    const source = readFileSync(join(INTEGRATION_DIR, 'test-41-fmk-real-codex.sh'), 'utf8')
+    expect(codexGateShellFindings(source)).toEqual([])
+    for (const changed of [source.replace('assert_codex_d1_safety\n', ''),
+      source.replace('assert_codex_d1_safety\necho "PASS: ${TEST_NAME}"', 'echo "PASS: ${TEST_NAME}"\nassert_codex_d1_safety')]) {
+      expect(changed).not.toBe(source)
+      expect(codexGateShellFindings(changed).length).toBeGreaterThan(0)
+    }
+  })
+  test('native version and crash-worker processes run behind containment and the actual SIGKILL barrier', () => {
+    expect(codexProcessFindings(readFileSync(CODEX_DELIVERY_PATH, 'utf8'))).toEqual([])
+  })
+  test.each([
+    ['containment removed', 'paths = codexContainment(process.env, realpathSync)', 'paths = {} as any'],
+    ['packed package guard removed', "if (!under('/test-repo/node_modules', realpathSync(pkg)))", 'if (false)'],
+    ['prepare removed', 'await prepare().catch(startupFailure)', 'void 0'],
+    ['foreign crash PID', 'check.pid !== child.pid || check.instance !== instance', 'check.pid < 0'],
+    ['foreign shim parent', 'c.parent === child.pid && c.instance === instance', 'true'],
+    ['Enter boundary omitted', "calls.some(c => c.key === 'Enter')", 'false'],
+    ['graceful signal', "child.kill('SIGKILL')", "child.kill('SIGTERM')"],
+    ['unverified signal', "child.signalCode !== 'SIGKILL'", 'false'],
+    ['text return unblocked', 'await new Promise(() => {})', 'await Promise.resolve()'],
+    ['new process', "const child = Bun.spawn(", "Bun.spawn(['unexpected'])\n  const child = Bun.spawn("],
+  ])('process audit catches %s', (_label, before, after) => {
+    const source = readFileSync(CODEX_DELIVERY_PATH, 'utf8'), changed = source.replace(before!, after!)
+    expect(changed).not.toBe(source)
+    expect(codexProcessFindings(changed).length).toBeGreaterThan(0)
+  })
+  test.each([
+    "import './codex-delivery.ts'",
+    "import type { Client } from 'agent-director'",
+    "const state = readFileSync('/scratch/state', 'utf8')",
+    "Bun.spawn(['/opt/codex/0.159.2/codex'])",
+    'const home = process.env.HOME',
+    "const Object = () => {}; const frozen = Object.freeze(['marker'])",
+    "await import('./codex-delivery.ts')",
+    "const copied = (() => readFileSync('/scratch/state'))()",
+    "const copied = Object.freeze(readFileSync('/scratch/state'))",
+    "export * from './codex-delivery.ts'",
+    "if (import.meta.main) {} else { Bun.spawn(['unexpected']) }",
+    "const parts = [process.env.HOME]",
+    "const unsafe = `${process.env.HOME}`",
+    "let mutable = 'literal'",
+    "const regex = new RegExp(readFileSync('/scratch/state'))",
+  ])('helper audit rejects import-time access: %s', source => {
+    expect(codexHelperFindings('helper.ts', source).length).toBeGreaterThan(0)
+  })
+  test.each([
+    ['missing marker', (source: string) => source.replace(/if \(!existsSync\('\/etc\/cscb-ci-image'\)\) \{[\s\S]*?\n\}/, '')],
+    ['process before marker', (source: string) => source.replace("if (!existsSync('/etc/cscb-ci-image'))", "Bun.spawn(['/opt/codex/0.159.2/codex'])\nif (!existsSync('/etc/cscb-ci-image'))")],
+    ['production import before marker', (source: string) => `import '../src/delivery-engine.ts'\n${source}`],
+  ] as const)('Codex entrypoint audit rejects %s', (_label, mutate) => {
+    const source = readFileSync(CODEX_DELIVERY_PATH, 'utf8'), changed = mutate(source)
+    expect(changed).not.toBe(source)
+    expect(driverGuardFindings('codex-delivery.ts', changed).length).toBeGreaterThan(0)
+  })
+})
 
 /** scenario.sh's re-point of a symlinked directory under SCENARIO_ROOT: a move. */
 const HOME_GUARDED_REPOINT_HELPERS: readonly string[] = ['repoint_symlink']

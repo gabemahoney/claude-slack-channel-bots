@@ -4,6 +4,7 @@ FROM cscb-ci-base:v8
 COPY package.tgz /tmp/package.tgz
 COPY tests /tests
 COPY docker/real-agent-job.sh /opt/cscb-ci/real-agent-job.sh
+COPY docker/real-agent-codex-job.sh /opt/cscb-ci/real-agent-codex-job.sh
 RUN useradd -m -s /bin/bash testuser && mkdir -p /test-repo && chown testuser:testuser /test-repo
 ENV LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=xterm-256color DISABLE_AUTOUPDATER=1
 WORKDIR /test-repo

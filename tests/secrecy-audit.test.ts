@@ -116,6 +116,7 @@ const CREDENTIALS_HELPER = 'tests/test-helpers/credentials.ts'
  * SCREAMING_CASE constant from one of them makes a suite touching.
  */
 const SOURCE_SURFACES: [RegExp, string][] = [
+  [/^src\/codex-config-keys\.ts$/, 'the names-only Codex config scanner and authorized top-level host model reader'],
   [/^src\/config\.ts$/, 'the persona config loader and record validation'],
   [/^src\/test-mcp-drop\.ts$/, 'the test-only MCP disconnect route, which reads applied persona config and logs and returns the configured persona key'],
   [/^src\/persona-credentials\.ts$/, 'the credentials reader and classifier'],
@@ -183,6 +184,10 @@ const HELPER_SURFACES: Record<string, Record<string, string>> = {
   'tests/test-helpers/persona-routing-harness.ts': { makeRoutingHarness: 'builds sentinel-bearing Slack stubs' },
   'tests/test-helpers/recovery-harness.ts': { makeRecoveryHarness: "builds the recovery harness, which writes agent-director's config.toml and captures the retry timer's, settings reader's and tmux-unresponsive condition's lines" },
   'tests/test-helpers/slack-stub.ts': { makeStubSlackFactory: 'builds Slack clients from tokens' },
+  'tests/test-helpers/ci-run.ts': {
+    makeFakeCodexHome: 'writes fake Codex login and config files under the fixture root',
+    makeFakeCodexLogin: 'builds injected Codex login dependencies with sentinel-bearing tokens',
+  },
 }
 
 /**
@@ -625,6 +630,30 @@ describe('every suite that touches config, credentials or reload calls assertNoL
     const importing = SUITES.filter((file) => touchReasons(file).some((r) => r.includes('tests/test-helpers/channel-delivery.ts')))
     expect(importing).toContain(suite)
     expect(importing.map((file) => [file, callsAssertNoLeak(file), file in EXEMPT])).toEqual(importing.map((file) => [file, true, false]))
+  })
+
+  test.each(['makeFakeCodexHome', 'makeFakeCodexLogin'])('%s consumers must leak-check without an exemption', helper => {
+    const suite = 'tests/ci-run-admission.test.ts'
+    expect(touchReasonsOf(suite, `import { ${helper} as fixture } from './test-helpers/ci-run.ts'`)).toHaveLength(1)
+    expect(touchReasonsOf(suite, `import type { ${helper} } from './test-helpers/ci-run.ts'`)).toEqual([])
+    const importing = SUITES.filter(file => touchReasons(file).some(reason => reason.startsWith(`imports ${helper} from tests/test-helpers/ci-run.ts:`)))
+    expect(importing).toContain(suite)
+    expect(importing.map(file => [file, callsAssertNoLeak(file), file in EXEMPT])).toEqual(importing.map(file => [file, true, false]))
+  })
+
+  test('Codex key/model readers and AI/gate control suites retain leak checks without exemptions', () => {
+    const suite = 'tests/codex-config-keys.test.ts'
+    for (const symbol of ['scanCodexConfigKeys', 'readCodexModel', 'checkCodexScratchConfigKeys']) {
+      expect(touchReasonsOf(suite, `import { ${symbol} as read } from '../src/codex-config-keys.ts'`)).toHaveLength(1)
+      expect(touchReasonsOf(suite, `import type { ${symbol} } from '../src/codex-config-keys.ts'`)).toEqual([])
+    }
+    for (const file of [suite, 'tests/codex-delivery-controls.test.ts', 'tests/codex-ai-controls.test.ts', 'tests/codex-gate-controls.test.ts']) {
+      expect(SUITES).toContain(file)
+      expect(callsAssertNoLeak(file)).toBe(true)
+      expect(file in EXEMPT).toBe(false)
+      const withoutCalls = codeOf(file).replace(/(?<![\w.$])assertNoLeak\s*\(/g, 'void (')
+      expect(callsAssertNoLeak(file, withoutCalls)).toBe(false)
+    }
   })
 
   test("each suite that builds the reload harness leak-checks a run's captured() artifacts", () => {

@@ -7,7 +7,7 @@ import { createDeliveryReceiptReader, DELIVERY_DROP_REASONS, deliveryTranscriptP
 import type { DeliveryAgent } from '../src/delivery-screen.ts'
 import type { DeliveryQueue, QueueItem, SentRecord } from '../src/delivery-queue.ts'
 import { injectedInput, makeQueue } from './test-helpers/delivery-queue.ts'
-import { appendTranscript, codexPromptEntry, codexTurnEntry, endedTurn, pastedText, promptEntry, queuedCommandEntry, queueOperationEntry, replyEntry, toolResultEntry, transcriptJsonl, writeTranscript, type TranscriptEntry } from './test-helpers/working-row-panes.ts'
+import { appendTranscript, codexNativeObservations, codexPromptEntry, codexTurnEntry, endedTurn, observedCodexTurnEntry, pastedText, promptEntry, queuedCommandEntry, queueOperationEntry, replyEntry, toolResultEntry, transcriptJsonl, writeTranscript, type TranscriptEntry } from './test-helpers/working-row-panes.ts'
 
 const cleanups: (() => Promise<void>)[] = []
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup() })
@@ -29,7 +29,7 @@ async function fixture(agent: DeliveryAgent = 'claude', text = 'one\ntwo') {
   const item = (): QueueItem => queue.items('alpha').find(i => i.accepted.seq === seq)!
   const row = { jsonl_path: path, transcript_status: 'present', session_id: 'current', cwd: root }
   async function send(offset = fs.statSync(path).size, sendPath = path) {
-    const record: SentRecord = { v: 1, kind: 'sent', seq, part: 1, attempt: item().nextAttempt, send_kind: 'text', at: 1000, launch_id: 'launch', session_id: 'current', transcript_path: sendPath, transcript_size: offset }
+    const record: SentRecord = { v: 1, kind: 'sent', seq, part: 1, attempt: item().nextAttempt, send_kind: 'text', at: 1000, launch_id: 'launch', session_id: row.session_id, transcript_path: sendPath, transcript_size: offset }
     await queue.append('alpha', record)
     return record
   }
@@ -219,22 +219,95 @@ describe('receipt reader', () => {
     fs.truncateSync(h.path, 0)
     expect(read()).toMatchObject({ availability: 'not-yet-written', records: [], receipt: undefined })
   })
-  test('unreadable cached records cannot newly confirm, and recovery rechecks them', async () => {
-    const h = await fixture()
+  test.each(['claude', 'codex'] as const)('%s unreadable cached records cannot confirm delivery or idleness; recovery rechecks them', async agent => {
+    const h = await fixture(agent)
     await h.send()
-    h.append(promptEntry(h.text))
+    h.append(...(agent === 'codex' ? [codexPromptEntry(h.text), observedCodexTurnEntry('task_complete')] : [promptEntry(h.text), replyEntry()]))
     let refused = false
     const reader = createDeliveryReceiptReader({ fs: { ...fs, openSync: ((...args: any[]) => { if (refused) throw Object.assign(new Error('refused'), { code: 'EACCES' }); return (fs.openSync as any)(...args) }) as typeof fs.openSync } })
-    const read = () => reader.read('claude', h.row, h.item(), 1)
+    const read = () => reader.read(agent, h.row, h.item(), 1)
     expect(read().receipt).toBeDefined()
+    expect(read().idleEvidence).toBe(true)
     refused = true
-    expect(read()).toMatchObject({ availability: 'unreadable', receipt: undefined })
+    expect(read()).toMatchObject({ availability: 'unreadable', receipt: undefined, idleEvidence: false })
     refused = false
     expect(read().receipt).toBeDefined()
+    expect(read().idleEvidence).toBe(true)
   })
   test('Claude discovery uses configured scratch home; Codex does not synthesize a path', async () => {
     const h = await fixture()
     expect(deliveryTranscriptPath('claude', { cwd: h.root, session_id: 'session' }, h.root)).toContain(h.root)
     expect(deliveryTranscriptPath('codex', { cwd: h.root, session_id: 'session' }, h.root)).toBeUndefined()
+  })
+})
+
+// The metadata fixture retains native session/time/offset provenance. These
+// scratch JSONL records reconstruct its safe schema, not a native rollout.
+describe('observed native Codex completion and no-new-turn windows', () => {
+  test('only post-send task_complete ends an active turn; a user receipt is independent of idleness', async () => {
+    const h = await fixture('codex')
+    h.append(codexPromptEntry(h.text), observedCodexTurnEntry('task_complete'))
+    await h.send()
+    expect(h.read()).toMatchObject({ receipt: undefined, idleEvidence: true, notTakenIn: false })
+    h.append(observedCodexTurnEntry('task_started'))
+    expect(h.read()).toMatchObject({ receipt: undefined, idleEvidence: false })
+    h.append(
+      { ...codexPromptEntry(h.text), payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: h.text }] } },
+      { type: 'event_msg', payload: { type: 'item_completed' } },
+    )
+    expect(h.read()).toMatchObject({ receipt: undefined, idleEvidence: false })
+    h.append(codexPromptEntry(h.text))
+    expect(h.read().receipt).toMatchObject({ kind: 'take-in', text: h.text })
+    expect(h.read().idleEvidence).toBe(false)
+    h.append(observedCodexTurnEntry('task_complete'))
+    expect(h.read().idleEvidence).toBe(true)
+    h.append(observedCodexTurnEntry('task_started'))
+    expect(h.read().idleEvidence).toBe(false)
+  })
+  test('the native no-new-turn window stays idle without supplying a receipt', async () => {
+    const h = await fixture('codex')
+    h.row.session_id = codexNativeObservations.noTurn.session
+    h.append(observedCodexTurnEntry('task_started'), codexPromptEntry(h.text), observedCodexTurnEntry('task_complete'))
+    await h.send()
+    // Native no-Enter evidence appended no events; old text remains outside
+    // this send's byte window even though it is an exact matching message.
+    h.append(...codexNativeObservations.noTurn.events)
+    expect(h.read()).toMatchObject({ availability: 'readable', receipt: undefined, idleEvidence: true, notTakenIn: false })
+    expect(h.read()).toMatchObject({ receipt: undefined, idleEvidence: true })
+  })
+  test('a prior-session completion cannot end the current active turn, including after session replacement', async () => {
+    const h = await fixture('codex'), prior = join(h.root, 'prior-codex.jsonl')
+    await h.send()
+    h.append(observedCodexTurnEntry('task_started'))
+    writeTranscript(prior, [observedCodexTurnEntry('task_complete')])
+    const row = { ...h.row, prior_sessions: [{ jsonl_path: prior, session_id: 'prior-session' }] }
+    const read = () => h.reader.read('codex', row, h.item(), 1)
+    expect(read()).toMatchObject({ idleEvidence: false, receipt: undefined })
+    h.append(observedCodexTurnEntry('task_complete'))
+    expect(read().idleEvidence).toBe(true)
+    row.jsonl_path = join(h.root, 'replacement.jsonl'); row.session_id = 'replacement'
+    writeTranscript(row.jsonl_path, [observedCodexTurnEntry('task_started')])
+    expect(read()).toMatchObject({ idleEvidence: false, receipt: undefined })
+    appendTranscript(row.jsonl_path, [observedCodexTurnEntry('task_complete')])
+    expect(read().idleEvidence).toBe(true)
+  })
+  test('partial native turn and receipt records take effect only after the full JSONL line arrives', async () => {
+    const h = await fixture('codex')
+    await h.send()
+    const start = transcriptJsonl([observedCodexTurnEntry('task_started')])
+    fs.appendFileSync(h.path, start.slice(0, -1))
+    expect(h.read().idleEvidence).toBe(true)
+    fs.appendFileSync(h.path, '\n')
+    expect(h.read().idleEvidence).toBe(false)
+    const completion = transcriptJsonl([observedCodexTurnEntry('task_complete')])
+    fs.appendFileSync(h.path, completion.slice(0, -2))
+    expect(h.read()).toMatchObject({ idleEvidence: false, receipt: undefined })
+    fs.appendFileSync(h.path, completion.slice(-2))
+    expect(h.read().idleEvidence).toBe(true)
+    const receipt = transcriptJsonl([codexPromptEntry(h.text)])
+    fs.appendFileSync(h.path, receipt.slice(0, -1))
+    expect(h.read().receipt).toBeUndefined()
+    fs.appendFileSync(h.path, '\n')
+    expect(h.read().receipt).toMatchObject({ kind: 'take-in', text: h.text })
   })
 })

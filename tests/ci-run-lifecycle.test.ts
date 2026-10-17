@@ -142,6 +142,7 @@ import {
   createSignalSource,
   createSpawnRecorder,
   makeRunDir,
+  realScriptFileNames,
   makeStatus,
   runDirIn,
   signalExitStatus,
@@ -441,7 +442,7 @@ describe('E1: ci-run lifecycle', () => {
         env: { TMPDIR: tempDir, ANTHROPIC_API_KEY: fakeToken(RAW_KEY_PREFIX, 'raw'), GH_TOKEN: fakeToken('', 'gh') },
         pid: RUNNER_PID,
         uid: 1000,
-        worktreeRoot: buildWorktree(root).root,
+        worktreeRoot: buildWorktree(root, { scripts: realScriptFileNames().filter(file => !file.includes('-fmk-real-codex')) }).root,
         lockDir,
         readPasswordFile: forbidden('readPasswordFile'),
         readCgroupFile: forbidden('readCgroupFile'),
@@ -5530,7 +5531,7 @@ describe('E13: the composed run (b.t6s E13 T5; b.uqm SR-5.3 to SR-5.9)', () => {
     /** How long a shard's `docker run` takes to answer, by its assigned scripts; default 0. */
     readonly dockerRunDelayMs?: (assigned: readonly string[]) => number
     /** Dependencies over the defaults. */
-    readonly deps?: Partial<Pick<e13.RunnerDeps, 'readVolume' | 'readPasswordFile'>>
+    readonly deps?: Partial<Pick<e13.RunnerDeps, 'readVolume' | 'readPasswordFile' | 'codexLogin'>>
     /** Called after each event of this run is recorded. */
     readonly onEvent?: (event: E13Event, run: E13Run) => void
   }
@@ -5818,6 +5819,7 @@ describe('E13: the composed run (b.t6s E13 T5; b.uqm SR-5.3 to SR-5.9)', () => {
         }, endsAfterMs)
       }
       const mounts = e13.shardMounts(runFaults, runDir, k, tarballPath).map((mount) => ({ source: mount.source, target: mount.target, rw: !mount.readOnly }))
+      if (assigned.some(file => file.includes('-fmk-real-codex'))) mounts.push({ source: e13Path.join(host.home, '.codex/auth.json'), target: '/run/codex-login/auth.json', rw: true })
       return {
         kind: 'start',
         container: {
@@ -5880,6 +5882,7 @@ describe('E13: the composed run (b.t6s E13 T5; b.uqm SR-5.3 to SR-5.9)', () => {
     }
     const deps: e13.RunnerDeps = {
       spawn,
+      codexLogin: options.deps?.codexLogin,
       env,
       pid,
       uid: UID,
@@ -6126,6 +6129,182 @@ describe('E13: the composed run (b.t6s E13 T5; b.uqm SR-5.3 to SR-5.9)', () => {
   // -------------------------------------------------------------------------
   // T5.S1: the sequence, phases, run directory and measurements
   // -------------------------------------------------------------------------
+
+  describe('E7: Codex composed safety lifecycle (b.omv SR-14.7)', () => {
+    const codexScript = 'test-999-fmk-real-codex.sh'
+    function codexRun(host: E13Host, extra: E13RunOptions = {}) {
+      const login = e13Helper.makeFakeCodexLogin(host.clock, UID)
+      const probe = { uid: UID }
+      host.recorder.answerWhen(request => request.argv.includes('id') && request.argv.includes('testuser'), request => ({ stdout: `${probe.uid}\n`, sideEffect: () => { host.docker.addContainer({ name: request.argv[request.argv.indexOf('--name') + 1]!, running: false }) } }))
+      const run = host.run({
+        worktree: { scripts: [e13Helper.realScriptFileName(1), e13Helper.realScriptFileName(2), codexScript] },
+        args: ['--shards', '2'], env: { CODEX_TEST_MODEL: 'inherited-model' }, ...extra,
+        deps: { codexLogin: login.deps, ...extra.deps },
+      })
+      return { run, login, probe }
+    }
+
+    test('ordinary selected scripts require no Codex dependencies and record a null model', async () => {
+      const host = e13Host(), run = host.run({ args: ['test-2'] })
+      await e13RunToEnd(host, run)
+      expect(run.verdict()).toMatch(/: PASS$/)
+      expect(run.results()?.codexModel).toBeNull()
+      expect(run.deps.codexLogin).toBeUndefined()
+      e13Credentials.assertNoLeak(e13Outputs(host, run))
+    })
+
+    test('a Codex shard replaces inherited model, isolates its mount and accounts for its extra memory', async () => {
+      const host = e13Host(), { run, login } = codexRun(host)
+      await e13RunToEnd(host, run)
+      expect(run.verdict()).toBe(e13.PASS_VERDICT)
+      expect(run.results()?.codexModel).toBe('test/model:1')
+      expect(run.assigned.get(2)).toEqual([e13Helper.realScriptFileName(1), codexScript])
+      const spawns = host.recorder.spawns().filter(spawn => spawn.argv.includes('--detach'))
+      expect(spawns).toHaveLength(2)
+      expect(spawns.filter(spawn => spawn.argv.some(arg => arg.includes('/run/codex-login/auth.json')))).toHaveLength(1)
+      const codex = spawns.find(spawn => spawn.argv.includes(codexScript))!
+      expect(codex.env.CODEX_TEST_MODEL).toBe('test/model:1')
+      expect(JSON.parse(codex.env.CODEX_HOST_CONFIG_KEYS!)).toEqual({ version: 1, keys: [['model']] })
+      expect(codex.argv.filter((arg, i) => codex.argv[i - 1] === '--env')).toContain('CODEX_HOST_CONFIG_KEYS')
+      expect(codex.argv.some(arg => arg.includes(codex.env.CODEX_HOST_CONFIG_KEYS!))).toBe(false)
+      expect(codex.argv[codex.argv.indexOf('--ulimit') + 1]).toBe('core=0')
+      expect(codex.argv[codex.argv.indexOf('--memory') + 1]).toBe(String(e13.SHARD_MEMORY_CAP_BYTES + 2 * e13.GIB_BYTES))
+      const ordinary = spawns.find(spawn => !spawn.argv.includes(codexScript))!
+      expect(ordinary.env.CODEX_HOST_CONFIG_KEYS).toBe('')
+      expect(ordinary.argv[ordinary.argv.indexOf('--memory') + 1]).toBe(String(e13.SHARD_MEMORY_CAP_BYTES))
+      expect(login.reads()).toBeGreaterThanOrEqual(3)
+      expect(login.releases()).toBe(1)
+      expect(login.held()).toBe(false)
+      expect(e13Leftovers(host, run)).toEqual({ containers: [], images: [], reservations: [] })
+      e13Credentials.assertNoLeak(e13Outputs(host, run))
+    })
+
+    test.each(['missing-config', 'wrong-owner', 'uid-mismatch'] as const)('Codex %s refuses before any login-mounted shard starts', async kind => {
+      const host = e13Host(), { run, login, probe } = codexRun(host)
+      if (kind === 'missing-config') login.deps.readConfig = () => { throw new Error(e13Credentials.fakeToken('', 'private-config')) }
+      if (kind === 'wrong-owner') login.setLogin({ ...login.login(), identity: { ...login.login().identity, uid: UID + 1 } })
+      if (kind === 'uid-mismatch') probe.uid = UID + 1
+      await e13RunToEnd(host, run)
+      expect(run.verdict()).not.toBe(e13.PASS_VERDICT)
+      expect(host.recorder.spawns().filter(spawn => spawn.argv.includes('--detach'))).toHaveLength(0)
+      expect(login.held()).toBe(false)
+      expect(login.releases()).toBe(kind === 'missing-config' ? 0 : 1)
+      e13Credentials.assertNoLeak(e13Outputs(host, run))
+    })
+
+    test('Codex interrupt while waiting for another login holder stops before any container or reservation', async () => {
+      const host = e13Host(), { run, login } = codexRun(host)
+      login.busyUntil(Infinity)
+      const pending = run.main()
+      await host.clock.flush()
+      expect(login.reads()).toBe(0)
+      run.source.deliver('SIGTERM')
+      await host.clock.advance(250)
+      await pending
+      expect(run.verdict()).not.toBe(e13.PASS_VERDICT)
+      expect(host.recorder.spawns()).toEqual([])
+      expect(login.releases()).toBe(1)
+      expect(login.held()).toBe(false)
+      expect(e13Leftovers(host, run)).toEqual({ containers: [], images: [], reservations: [] })
+      e13Credentials.assertNoLeak(e13Outputs(host, run))
+    })
+
+    test('Codex login-lock wait does not consume the run build/shard deadline', async () => {
+      const host = e13Host(), { run, login } = codexRun(host)
+      login.busyUntil(host.clock.now() + 20 * 60_000)
+      const pending = run.main()
+      await host.clock.advance(20 * 60_000 - 1)
+      expect(host.recorder.spawns()).toEqual([])
+      expect(login.reads()).toBe(0)
+      await host.clock.advance(1)
+      await e13Settle(host, [run], [pending])
+      expect(run.verdict()).toBe(e13.PASS_VERDICT)
+      expect(login.releases()).toBe(1)
+      expect(e13Leftovers(host, run)).toEqual({ containers: [], images: [], reservations: [] })
+      e13Credentials.assertNoLeak(e13Outputs(host, run))
+    })
+
+    test.each(['survivor', 'unreadable'] as const)('Codex %s retirement evidence blocks admission while preserving other containers', async kind => {
+      const host = e13Host(), { run, login } = codexRun(host)
+      if (kind === 'survivor') host.docker.addContainer({ name: 'earlier-codex-login', labels: { 'cscb.codex-login': 'true' } })
+      else host.docker.fail('container-list', { when: argv => argv.includes('label=cscb.codex-login=true') })
+      await e13RunToEnd(host, run)
+      expect(run.verdict()).not.toBe(e13.PASS_VERDICT)
+      expect(run.assigned.size).toBe(0)
+      expect(host.recorder.spawns().some(spawn => spawn.argv.includes('--entrypoint'))).toBe(false)
+      expect(login.releases()).toBe(1)
+      if (kind === 'survivor') expect(host.docker.container('earlier-codex-login')?.running).toBe(true)
+      e13Credentials.assertNoLeak(e13Outputs(host, run))
+    })
+
+    test('Codex lock remains held when repeated retirement failures leave its container alive', async () => {
+      const host = e13Host(), { run, login } = codexRun(host)
+      host.docker.fail('container-remove', { times: 'always', when: argv => argv.some(arg => host.docker.container(arg)?.name === e13.shardContainerName(run.owner, 2)) })
+      await e13RunToEnd(host, run)
+      expect(run.verdict()).not.toBe(e13.PASS_VERDICT)
+      expect(login.held()).toBe(true)
+      expect(login.releases()).toBe(0)
+      expect(host.docker.container(e13.shardContainerName(run.owner, 2))).not.toBeNull()
+      expect(run.logLines().join('\n')).toContain('login lease held until runner exit')
+      e13Credentials.assertNoLeak(e13Outputs(host, run))
+    })
+
+    test('Codex uid-probe cleanup failure prevents login-mounted shard starts and PASS', async () => {
+      const host = e13Host(), { run, login } = codexRun(host)
+      host.docker.fail('container-remove', { when: argv => argv.some(arg => arg.endsWith('-uid')) })
+      await e13RunToEnd(host, run)
+      expect(run.verdict()).not.toBe(e13.PASS_VERDICT)
+      expect(run.assigned.size).toBe(0)
+      expect(login.releases()).toBe(1)
+      e13Credentials.assertNoLeak(e13Outputs(host, run))
+    })
+
+    test.each(['container-remove', 'container-logs'] as const)('Codex retirement %s failure prevents PASS and releases the login lock', async operation => {
+      const host = e13Host(), { run, login } = codexRun(host)
+      host.docker.fail(operation, { when: argv => argv.some(arg => host.docker.container(arg)?.name === e13.shardContainerName(run.owner, 2)) })
+      await e13RunToEnd(host, run)
+      expect(run.verdict()).not.toBe(e13.PASS_VERDICT)
+      expect(login.releases()).toBe(1)
+      expect(login.held()).toBe(false)
+      e13Credentials.assertNoLeak(e13Outputs(host, run))
+    })
+
+    test.each(['script-failure', 'interrupt', 'login-postcheck', 'original-secret', 'rotated-secret'] as const)('Codex %s retires before postcheck and never produces PASS', async kind => {
+      const host = e13Host()
+      let login: ReturnType<typeof e13Helper.makeFakeCodexLogin>
+      const built = codexRun(host, {
+        shard: k => k === 2 ? {
+          ...(kind === 'script-failure' ? { finished: assigned => e13PassEvents(assigned).map(event => event.kind === 'end' && event.fileName === codexScript ? { ...event, result: 'fail' as const } : event) } : {}),
+          scriptLog: () => kind === 'original-secret' ? e13Credentials.fakeToken('', 'codex-access') : kind === 'rotated-secret' ? e13Credentials.fakeToken('', 'rotated-login') : 'safe script output',
+        } : {},
+        onEvent: event => {
+          if (event.what === 'container-run' && event.argv?.includes(codexScript)) {
+            if (kind === 'interrupt') host.clock.setTimeout(() => built.run.source.deliver('SIGTERM'), 1)
+            if (kind === 'login-postcheck') login.setLogin({ ...login.login(), identity: { ...login.login().identity, ino: 11 } })
+            if (kind === 'rotated-secret') login.setLogin({ ...login.login(), json: { access_token: e13Credentials.fakeToken('', 'rotated-login') } })
+          }
+        },
+      })
+      login = built.login
+      const { run } = built
+      const baseRead = login.deps.readLogin
+      let retiredBeforeFinalRead = false
+      login.deps.readLogin = path => {
+        if (run.assigned.has(2) && host.docker.container(e13.shardContainerName(run.owner, 2))?.running !== true) retiredBeforeFinalRead = true
+        return baseRead(path)
+      }
+      await e13RunToEnd(host, run)
+      expect(run.verdict()).not.toBe(e13.PASS_VERDICT)
+      expect(retiredBeforeFinalRead).toBe(true)
+      expect(login.releases()).toBe(1)
+      expect(login.held()).toBe(false)
+      expect(e13Leftovers(host, run)).toEqual({ containers: [], images: [], reservations: [] })
+      // Secret-scan tests intentionally plant fake secrets in per-script output;
+      // assert diagnostics/results are safe, excluding the deliberately rejected artifact.
+      if (kind.endsWith('secret')) e13Credentials.assertNoLeak({ stderr: run.stderr, results: run.results(), verdict: run.verdict(), log: run.logLines() })
+      else e13Credentials.assertNoLeak(e13Outputs(host, run))
+    })
+  })
 
   describe('the sequence, phases, run directory and measurements (SR-5.2, SR-5.3, SR-5.9, SR-4.4)', () => {
     /** Steps 3–12 of a default full run with its base present, up to the shard starts, as the fake records them. */

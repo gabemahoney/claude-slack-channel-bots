@@ -173,6 +173,9 @@ export function createDeliveryReceiptReader(options: { fs?: typeof nodeFs } = {}
             }
             idleEvidence = transcriptTailTurnState(f.tail, f.size <= TRANSCRIPT_TAIL_BYTES) === 'ended' && pending.length === 0
           } else {
+            // b.omv SR-6.4: native 0.159.2 E7 run 20261017t212743z-ddde5cd6
+            // records task_complete after the send; the no-Enter observation
+            // appends no turn. Only the current file's post-send window counts.
             let start = -1, end = -1
             after.forEach((r, i) => { if (r.kind === 'turn-start') start = i; if (r.kind === 'turn-end') end = i })
             idleEvidence = start < 0 || end > start

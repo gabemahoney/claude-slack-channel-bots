@@ -1205,3 +1205,37 @@ describe("section 8's wordings (b.uqm SR-4.1, SR-4.4)", () => {
     assertNoLeak(text)
   })
 })
+
+// b.omv SR-14.7: scheduling must never share the file with an ordinary test.
+describe('E7: dedicated Codex shards', () => {
+  let root: string
+  const codex = 'test-999-fmk-real-codex.sh', second = 'test-998-fmk-real-codex-other.sh'
+  beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'ci-codex-schedule-')) })
+  afterEach(() => { rmSync(root, { recursive: true, force: true }) })
+
+  test.each([2, 3])('%s shards isolate each Codex script while keeping ordinary prerequisites together', count => {
+    const built = buildWorktree(root, { scripts: [realScriptFileName(1), realScriptFileName(2), realScriptFileName(3), codex, ...(count === 3 ? [second] : [])] })
+    const run = validated(built.root, ['--shards', String(count)])
+    const schedule = scheduleRun({ pinned: built.scriptFileNames, table: readFileText(built.durationTablePath), units: run.units, invocation: run.invocation, shards: count })
+    expect(schedule.assignment.map(shard => shard.assigned)).toEqual([
+      [realScriptFileName(1), realScriptFileName(2), realScriptFileName(3)],
+      ...[codex, ...(count === 3 ? [second] : [])].sort().map(file => [realScriptFileName(1), file]),
+    ])
+    assertNoLeak(schedule)
+  })
+
+  test('one selected Codex script fits one dedicated shard', () => {
+    const built = buildWorktree(root, { scripts: [realScriptFileName(1), codex] })
+    const run = validated(built.root, ['--shards', '1', codex])
+    const schedule = scheduleRun({ pinned: built.scriptFileNames, table: readFileText(built.durationTablePath), units: run.units, invocation: run.invocation, shards: 1 })
+    expect(schedule.assignment[0].assigned).toEqual([realScriptFileName(1), codex])
+    assertNoLeak(schedule)
+  })
+
+  test('explicit too-small shard count refuses before scheduling instead of sharing the login', () => {
+    const built = buildWorktree(root, { scripts: [realScriptFileName(1), realScriptFileName(2), codex] })
+    const result = validateRun(['--shards', '1'], built.root, {})
+    expect(result.ok).toBe(false)
+    assertNoLeak(result)
+  })
+})

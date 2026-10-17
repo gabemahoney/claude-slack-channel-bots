@@ -9,6 +9,8 @@ import { tmpdir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 import { createHash } from 'node:crypto'
 import { CPUS_PER_SHARD, SHARD_MEMORY_CAP_BYTES, SHARD_PIDS_LIMIT, checkShardRunList, maskScannedValues, scannedSecretValues } from './ci-run.ts'
+import { acquireCodexLogin, realCodexLoginDeps, assertCodexMounts, assertNoCodexLoginContainers, codexLoginContainerListArgs, CODEX_LOGIN_CONTAINER_LABEL, CODEX_LOGIN_TARGET, CODEX_EXTRA_MEMORY_BYTES, CODEX_VERSION, CODEX_HOST_CONFIG_KEYS_ENV, type CodexLoginLease } from './codex-login.ts'
+import { openLockFile, secretScan, createRunnerLog } from './ci-run.ts'
 import { isDockerInspectCommand, safeDockerInspect } from './safe-docker-inspect.ts'
 
 export const MATRIX_VERSIONS = ['2.1.280', '2.1.296'] as const
@@ -19,6 +21,29 @@ export const HEAVY_SCRIPTS = [
 ] as const
 export const AI_CRITERIA = [11, 12, 15, 20, 23, 91, 106] as const
 export const AI_VERSION = MATRIX_VERSIONS[1]
+export const CODEX_AI_CRITERIA = [11, 12, 15, 20, 106] as const
+export function localCodexExtension(names: readonly string[]): LocalAgentExtension {
+  const invocations = CODEX_AI_CRITERIA.flatMap(ac => [1, 2, 3].map(trial => ({ script: `real-agent/test-${100 + ac}-fmk-real-codex-ai-ac${ac}.sh`, trial, model: 'default' as const })))
+  if (invocations.some(item => !names.includes(basename(item.script)))) throw new Error('Required local Codex AI scenarios are absent')
+  return { agent: 'codex', localOnly: true, invocations }
+}
+export function codexMatrixDockerArgs(name: string, image: string, extension: LocalAgentExtension, source: string): string[] {
+  if (extension.agent !== 'codex' || extension.localOnly !== true || /[,"\u0000-\u001f\u007f]/.test(source) || !source.startsWith('/')) throw new Error('Invalid local Codex job')
+  return ['run', '--init', '--log-driver', 'none', '--name', name, '--label', CODEX_LOGIN_CONTAINER_LABEL, '--ulimit', 'core=0',
+    '--memory', String(Number(MATRIX_MEMORY) + CODEX_EXTRA_MEMORY_BYTES), '--memory-swap', String(Number(MATRIX_MEMORY) + CODEX_EXTRA_MEMORY_BYTES),
+    '--cpus', String(MATRIX_CPUS), '--pids-limit', String(SHARD_PIDS_LIMIT), '--mount', `type=bind,source=${source},target=${CODEX_LOGIN_TARGET}`,
+    '--env', 'CODEX_TEST_MODEL', '--env', CODEX_HOST_CONFIG_KEYS_ENV, '--entrypoint', 'bash', image, '/opt/cscb-ci/real-agent-codex-job.sh',
+    ...extension.invocations.map(item => `${item.script}:${item.trial}`)]
+}
+export function assertCodexJobComplete(extension: LocalAgentExtension, results: readonly MatrixResult[], model: string): void {
+  if (extension.agent !== 'codex' || extension.invocations.length !== 15 || results.length !== 15) throw new Error('Codex job omitted required scenarios/trials')
+  const expected = new Set(CODEX_AI_CRITERIA.flatMap(ac => [1, 2, 3].map(trial => `real-agent/test-${100 + ac}-fmk-real-codex-ai-ac${ac}.sh:${trial}`)))
+  for (const result of results) {
+    const key = `${result.script}:${result.trial}`
+    if (!expected.delete(key) || result.version !== CODEX_VERSION || result.model !== model || result.exit !== 0 || !result.reported || result.agent !== 'codex' || result.completed !== true || typeof result.duplicates !== 'number' || !Number.isSafeInteger(result.duplicates) || result.duplicates < 0 || !result.tokens || result.tokens.input + result.tokens.output <= 0) throw new Error('Codex scenario/trial did not pass its required contract')
+  }
+  if (expected.size) throw new Error('Codex job omitted required scenarios/trials')
+}
 // Local jobs obey the committed /ci shard caps. The future scheduler's
 // distinct 8GiB/4CPU reservation is recorded below (b.omv SR-14.4).
 export const MATRIX_MEMORY = String(SHARD_MEMORY_CAP_BYTES)
@@ -37,12 +62,13 @@ export interface MatrixJob { version: string; runtimeLatest: boolean; invocation
 export interface LocalAgentExtension { agent: string; localOnly: true; invocations: readonly MatrixInvocation[] }
 export interface MatrixResult {
   script: string; trial: number; version: string; model: string; exit: number; reported: boolean
+  agent?: 'codex'; completed?: boolean
   duplicates: number | null; tokens: { input: number; output: number; cache_read: number; cache_creation: number } | null
 }
 function exactVersion(value: string): boolean { return /^[0-9]+\.[0-9]+\.[0-9]+$/.test(value) && !/[\r\n]/.test(value) }
 export function safeModel(value: string): boolean { return /^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,255}$/.test(value) && !/[\r\n]/.test(value) }
 function gateScript(value: string): boolean { return /^integration\/test-[0-9]+-fmk-real-[a-z0-9-]+\.sh$/.test(value) && GATE_SLUGS.some(slug => value.endsWith(`-fmk-real-${slug}.sh`)) }
-function heavyScript(value: string): boolean { return [...HEAVY_SCRIPTS, ...AI_CRITERIA.map(ac => `test-${100 + ac}-fmk-real-ai-ac${ac}.sh`)].some(file => value === `real-agent/${file}`) }
+function heavyScript(value: string): boolean { return [...HEAVY_SCRIPTS, ...AI_CRITERIA.map(ac => `test-${100 + ac}-fmk-real-ai-ac${ac}.sh`), ...CODEX_AI_CRITERIA.map(ac => `test-${100 + ac}-fmk-real-codex-ai-ac${ac}.sh`)].some(file => value === `real-agent/${file}`) }
 export function discoverGateScripts(names: readonly string[]): string[] {
   const real = names.filter(n => /^test-\d+-fmk-real-[a-z0-9-]+\.sh$/.test(n) && !n.endsWith('-codex.sh'))
   if (real.length !== GATE_SLUGS.length) throw new Error('Expected exactly nine Claude real gate scripts')
@@ -80,7 +106,9 @@ export function parseResultLine(line: string, secrets: readonly string[] = []): 
   let value: MatrixResult
   try { value = JSON.parse(line.slice('real-agent-result: '.length)) as MatrixResult }
   catch { throw new Error('Malformed real-agent-result record') }
-  if (!value || Object.keys(value).sort().join(',') !== 'duplicates,exit,model,reported,script,tokens,trial,version'
+  const codex = typeof value?.script === 'string' && /-fmk-real-codex-/.test(value.script)
+  if (!value || Object.keys(value).sort().join(',') !== (codex ? 'agent,completed,duplicates,exit,model,reported,script,tokens,trial,version' : 'duplicates,exit,model,reported,script,tokens,trial,version')
+    || (codex && (value.agent !== 'codex' || typeof value.completed !== 'boolean'))
     || typeof value.script !== 'string' || (!gateScript(value.script) && !heavyScript(value.script))
     || ![1, 2, 3].includes(value.trial) || typeof value.version !== 'string' || !exactVersion(value.version)
     || typeof value.model !== 'string' || !safeModel(value.model)
@@ -89,7 +117,7 @@ export function parseResultLine(line: string, secrets: readonly string[] = []): 
     || (value.tokens === null ? value.reported : !value.tokens || Object.keys(value.tokens).sort().join(',') !== 'cache_creation,cache_read,input,output'
       || Object.values(value.tokens).some(v => !Number.isSafeInteger(v) || v < 0))
     || secrets.some(secret => secret && [value.script, value.version, value.model].some(field => field.includes(secret)))) throw new Error('Malformed real-agent-result record')
-  return { script: value.script, trial: value.trial, version: value.version, model: value.model, exit: value.exit,
+  return { ...(codex ? { agent: 'codex' as const, completed: value.completed } : {}), script: value.script, trial: value.trial, version: value.version, model: value.model, exit: value.exit,
     reported: value.reported, duplicates: value.duplicates, tokens: value.tokens === null ? null : { input: value.tokens.input, output: value.tokens.output,
       cache_read: value.tokens.cache_read, cache_creation: value.tokens.cache_creation } }
 }
@@ -107,7 +135,8 @@ export function matrixDockerArgs(name: string, image: string, job: MatrixJob): s
     ...['ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL', 'REAL_AGENT_AI_MODEL'].flatMap(key => ['--env', key]),
     image, job.version, job.runtimeLatest ? '1' : '0', ...job.invocations.map(i => `${i.script}:${i.trial}:${i.model}`)]
 }
-export interface MatrixOptions { output: string; repo: string; planOnly: boolean }
+export interface MatrixOptions { output: string; repo: string; planOnly: boolean; codexOnly?: boolean }
+const MATRIX_USAGE = 'bun scripts/real-agent-matrix.ts [--output DIR] [--plan] [--codex-only]'
 /** Resolve existing ancestors too: output need not exist yet, but a link may. */
 function resolvedPath(path: string): string {
   let parent = resolve(path)
@@ -137,24 +166,34 @@ function writePrivate(path: string, content: string, secrets: readonly string[])
   try { writeFileSync(fd, content) } finally { closeSync(fd) }
 }
 export function matrixOptions(args: readonly string[], repo = resolve(dirname(import.meta.path), '..')): MatrixOptions {
-  let output = join(tmpdir(), `cscb-real-agent-${new Date().toISOString().replace(/[^0-9]/g, '')}`), planOnly = false
+  let output = join(tmpdir(), `cscb-real-agent-${new Date().toISOString().replace(/[^0-9]/g, '')}`), planOnly = false, codexOnly = false
+  const seen = new Set<string>()
   for (let i = 0; i < args.length; i++) {
-    if (args[i] === '--plan') planOnly = true
-    else if (args[i] === '--output' && args[i + 1]) output = resolve(args[++i]!)
-    else throw new Error('Usage: bun scripts/real-agent-matrix.ts [--output DIR] [--plan]')
+    const option = args[i]!
+    if (seen.has(option)) throw new Error(`Usage: ${MATRIX_USAGE}`)
+    seen.add(option)
+    if (option === '--plan') planOnly = true
+    else if (option === '--codex-only') codexOnly = true
+    else if (option === '--output' && args[i + 1] && !args[i + 1]!.startsWith('-')) output = resolve(args[++i]!)
+    else throw new Error(`Usage: ${MATRIX_USAGE}`)
   }
   // Never permit secrets/logs inside the source checkout, nor /test-results.
   outputDirectory(output, repo)
-  return { output, repo, planOnly }
+  return { output, repo, planOnly, ...(codexOnly ? { codexOnly: true } : {}) }
 }
 export async function runMatrix(options: MatrixOptions): Promise<boolean> {
-  const key = process.env.CI_ANTHROPIC_API_KEY ?? '', model = process.env.CI_ANTHROPIC_MODEL ?? ''
+  // b.omv SR-14.7: focused acceptance uses the same local Codex lifecycle.
+  // Its distinct verdict must never certify the unexecuted Claude matrix.
+  const codexOnly = options.codexOnly === true
+  const selection = codexOnly ? 'codex-only' : 'full'
+  const recordPrefix = codexOnly ? 'REAL-AGENT-CODEX' : 'REAL-AGENT'
+  const key = codexOnly ? '' : process.env.CI_ANTHROPIC_API_KEY ?? '', model = codexOnly ? '' : process.env.CI_ANTHROPIC_MODEL ?? ''
   // Decision 19: an owner-selected available model can run the AI trials.
   // This is explicit routing, never a refusal-triggered or hidden fallback.
-  const explicitAiModel = process.env.CI_ANTHROPIC_AI_MODEL
+  const explicitAiModel = codexOnly ? undefined : process.env.CI_ANTHROPIC_AI_MODEL
   const aiModel = explicitAiModel ?? model
-  const secrets = scannedSecretValues(process.env, { shardVariables: { CI_ANTHROPIC_API_KEY: key } })
-  if (!options.planOnly && (!key || !model || (!key.startsWith('sk-ant-') && !process.env.CI_ANTHROPIC_BASE_URL))) throw new Error('CI_ANTHROPIC_API_KEY, CI_ANTHROPIC_MODEL and gateway base URL are required')
+  const secrets = [...scannedSecretValues(process.env, { shardVariables: { CI_ANTHROPIC_API_KEY: process.env.CI_ANTHROPIC_API_KEY } })]
+  if (!codexOnly && !options.planOnly && (!key || !model || (!key.startsWith('sk-ant-') && !process.env.CI_ANTHROPIC_BASE_URL))) throw new Error('CI_ANTHROPIC_API_KEY, CI_ANTHROPIC_MODEL and gateway base URL are required')
   if ((model && !safeModel(model)) || (explicitAiModel !== undefined && !safeModel(explicitAiModel))
     || secrets.some(secret => [model, aiModel].some(value => value.includes(secret)))) throw new Error('Invalid matrix model identifier')
   let output = outputDirectory(options.output, options.repo)
@@ -167,6 +206,7 @@ export async function runMatrix(options: MatrixOptions): Promise<boolean> {
   const say = (line: string) => { const safe = redact(line); process.stdout.write(safe + '\n'); writeFileSync(logFd, safe + '\n') }
   const runId = `real-${Date.now()}-${process.pid}`
   const stage = mkdtempSync(join(tmpdir(), 'cscb-real-context-'))
+  let codexLogin: CodexLoginLease | null = null, codexRetired = true, codexContainer: string | null = null
   let stopped = false
   let terminateActive: (() => void) | undefined
   const aborted = new AbortController()
@@ -182,8 +222,8 @@ export async function runMatrix(options: MatrixOptions): Promise<boolean> {
   }
   // Own nested mktemp contexts too (notably ci-base-build.sh's extracted
   // install script), even when SIGKILL prevents a shell's normal cleanup.
-  const childEnv = { ...process.env, TMPDIR: stage, ANTHROPIC_API_KEY: key, ANTHROPIC_BASE_URL: process.env.CI_ANTHROPIC_BASE_URL ?? '', ANTHROPIC_MODEL: model, REAL_AGENT_AI_MODEL: aiModel }
-  const run = async (argv: string[], timeoutMs: number, collect = false, cleanup = false): Promise<{ code: number; text: string }> => {
+  const childEnv: Record<string, string | undefined> = { ...process.env, TMPDIR: stage, ANTHROPIC_API_KEY: key, ANTHROPIC_BASE_URL: process.env.CI_ANTHROPIC_BASE_URL ?? '', ANTHROPIC_MODEL: model, REAL_AGENT_AI_MODEL: aiModel }
+  const run = async (argv: string[], timeoutMs: number, collect = false, cleanup = false, privateOutput = false): Promise<{ code: number; text: string }> => {
     if (stopped && !cleanup) throw new Error('Matrix interrupted')
     if (!checkShardRunList(argv, secrets).ok) throw new Error('Matrix child argument list contains a secret')
     // Inspection must never enter the line-streaming path, including stderr.
@@ -203,7 +243,13 @@ export async function runMatrix(options: MatrixOptions): Promise<boolean> {
     const stop = () => terminate('SIGTERM', 143)
     terminateActive = stop
     const timer = setTimeout(() => terminate('SIGKILL', 124), timeoutMs)
-    let output = ''
+    let output = '', bufferedBytes = 0
+    const account = (bytes: number) => {
+      bufferedBytes += bytes
+      // Include both streams' unfinished lines and collected output. Check
+      // each decoded chunk before appending, including unterminated output.
+      if (bufferedBytes > 8 * 1024 ** 2) throw new Error('Matrix output exceeded private buffer limit')
+    }
     const readers: ReadableStreamDefaultReader<Uint8Array>[] = []
     const consume = async (stream: ReadableStream<Uint8Array>) => {
       const reader = stream.getReader(), decoder = new TextDecoder(); let pending = ''
@@ -212,20 +258,30 @@ export async function runMatrix(options: MatrixOptions): Promise<boolean> {
         while (consuming) {
           const { done, value } = await reader.read()
           if (done || !consuming) break
-          pending += decoder.decode(value, { stream: true })
+          const decoded = decoder.decode(value, { stream: true })
+          account(Buffer.byteLength(decoded))
+          pending += decoded
           let n: number
-          while ((n = pending.indexOf('\n')) >= 0) { const line = pending.slice(0, n); pending = pending.slice(n + 1); say(line); if (collect) output += line + '\n' }
+          while ((n = pending.indexOf('\n')) >= 0) { const line = pending.slice(0, n); pending = pending.slice(n + 1); if (!privateOutput) say(line); if (collect) output += line + '\n'; else bufferedBytes -= Buffer.byteLength(line + '\n') }
         }
-        pending += decoder.decode()
-        if (consuming && pending) { say(pending); if (collect) output += pending + '\n' }
+        const tail = decoder.decode()
+        account(Buffer.byteLength(tail))
+        pending += tail
+        if (consuming && pending) { if (!privateOutput) say(pending); if (collect) { account(1); output += pending + '\n' } else bufferedBytes -= Buffer.byteLength(pending) }
       } finally { reader.releaseLock() }
     }
     let drainTimer: ReturnType<typeof setTimeout> | undefined
     const streams = Promise.all([consume(child.stdout), consume(child.stderr)])
-    // Observe failures immediately even while waiting for process exit.
-    void streams.catch(() => {})
+    // A stream failure must kill the producer immediately, even when its
+    // process has not exited and its wall-time limit is hours away.
+    const streamFailure = streams.then(() => new Promise<never>(() => {}), error => {
+      consuming = false
+      killGroup(child, 'SIGKILL')
+      for (const reader of readers) void reader.cancel().catch(() => {})
+      throw error
+    })
     try {
-      const code = await Promise.race([child.exited, termination])
+      const code = await Promise.race([child.exited, termination, streamFailure])
       let drained = false
       await Promise.race([
         streams.then(() => { drained = true }),
@@ -253,16 +309,34 @@ export async function runMatrix(options: MatrixOptions): Promise<boolean> {
   let passed = false, planned = false
   const totals = { input: 0, output: 0, cache_read: 0, cache_creation: 0, duplicates: 0 }
   try {
-    const latestResponse = await fetch('https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases/latest', { signal: AbortSignal.any([aborted.signal, AbortSignal.timeout(30_000)]) })
-    if (!latestResponse.ok) throw new Error('Could not resolve native runtime-latest')
-    const latest = (await latestResponse.text()).trim()
+    if (!options.planOnly) {
+      codexLogin = await acquireCodexLogin({ env: process.env, uid: process.getuid!(), cancelled: () => stopped, deps: realCodexLoginDeps(path => {
+        const opened = openLockFile(path); if (!opened.ok) throw new Error('Codex lock unavailable'); return opened.value
+      }) })
+      secrets.push(...codexLogin.secretValues())
+      masks.push(...secrets, ...secrets.map(value => JSON.stringify(value).slice(1, -1)))
+      childEnv.CODEX_TEST_MODEL = codexLogin.model
+      childEnv[CODEX_HOST_CONFIG_KEYS_ENV] = codexLogin.hostConfigKeys
+      say(`recorded: codex-model ${codexLogin.model}`)
+    }
+    let latest: string | null = null
+    if (!codexOnly) {
+      const latestResponse = await fetch('https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases/latest', { signal: AbortSignal.any([aborted.signal, AbortSignal.timeout(30_000)]) })
+      if (!latestResponse.ok) throw new Error('Could not resolve native runtime-latest')
+      latest = (await latestResponse.text()).trim()
+    }
     if (stopped) throw new Error('Matrix interrupted')
-    const gates = discoverGateScripts(readdirSync(join(options.repo, 'tests/integration')))
+    const gates = codexOnly ? [] : discoverGateScripts(readdirSync(join(options.repo, 'tests/integration')))
     const heavyDir = join(options.repo, 'tests/real-agent')
-    const jobs = matrixPlan(latest, gates, existsSync(heavyDir) ? readdirSync(heavyDir) : [])
-    say(`recorded: matrix ${JSON.stringify({ runId, latest, model, aiModel, jobs: jobs.map(j => ({ version: j.version, runtimeLatest: j.runtimeLatest, scenarios: j.invocations.length })) })}`)
-    writePrivate(join(output, 'plan.json'), JSON.stringify({ runId, model, aiModel, jobs, scheduler: SCHEDULER_JOB_CONTRACT }, null, 2) + '\n', secrets)
+    const heavyNames = existsSync(heavyDir) ? readdirSync(heavyDir) : []
+    const jobs = codexOnly ? [] : matrixPlan(latest!, gates, heavyNames)
+    const localAgents = [localCodexExtension(heavyNames)]
+    const totalInvocations = jobs.reduce((count, job) => count + job.invocations.length, 0) + localAgents.reduce((count, agent) => count + agent.invocations.length, 0)
+    say(`recorded: matrix ${JSON.stringify({ runId, selection, totalInvocations, latest, model: codexOnly ? null : model, aiModel: codexOnly ? null : aiModel, jobs: jobs.map(j => ({ version: j.version, runtimeLatest: j.runtimeLatest, scenarios: j.invocations.length })) })}`)
+    writePrivate(join(output, 'plan.json'), JSON.stringify({ runId, selection, totalInvocations, model: codexOnly ? null : model, aiModel: codexOnly ? null : aiModel, codexModel: codexLogin?.model ?? null, jobs, localAgents, scheduler: codexOnly ? null : SCHEDULER_JOB_CONTRACT }, null, 2) + '\n', secrets)
     if (options.planOnly) { planned = true; return true }
+    const survivors = await run(codexLoginContainerListArgs(), 30_000, true, false, true)
+    assertNoCodexLoginContainers(survivors.code, survivors.text)
     if ((await run(['docker', 'image', 'inspect', 'cscb-ci-base:v8', '--format', '{{.Id}}'], 30_000)).code !== 0) {
       if ((await run(['bash', 'scripts/ci-base-build.sh'], 30 * 60_000)).code !== 0) throw new Error('Heavy base build failed')
     }
@@ -292,31 +366,115 @@ export async function runMatrix(options: MatrixOptions): Promise<boolean> {
           }
           if (answer.code !== 0 || stopped) throw new Error(`Matrix job ${index + 1} failed (exit ${answer.code})`)
           assertJobComplete(job, results, model, aiModel)
-          writePrivate(join(output, `job-${index + 1}.json`), JSON.stringify({ version: job.version, runtimeLatest: job.runtimeLatest, packageSha256, results }, null, 2) + '\n', secrets)
+          writePrivate(join(output, `job-${index + 1}.json`), JSON.stringify({ selection, version: job.version, runtimeLatest: job.runtimeLatest, packageSha256, results }, null, 2) + '\n', secrets)
         } finally {
           const cleanup = await run(['docker', 'rm', '-f', name], 30_000, false, true)
           if (cleanup.code !== 0) throw new Error('Matrix container cleanup failed')
         }
       }
+      if (!codexLogin) throw new Error('Local Codex login was not admitted')
+      const name = `${runId}-codex`, extension = localAgents[0]!
+      // Verify the image UID without the login mounted, before its first use.
+      const uidProbe = `${name}-uid`
+      try {
+        const uid = await run(['docker', 'run', '--name', uidProbe, '--entrypoint', 'id', image, '-u', 'testuser'], 30_000, true)
+        if (uid.code !== 0 || uid.text.trim() !== String(process.getuid!())) throw new Error('Codex image testuser UID does not match runner UID')
+      } finally {
+        if ((await run(['docker', 'rm', '-f', uidProbe], 30_000, false, true)).code !== 0) throw new Error('Codex UID probe cleanup failed')
+      }
+      let answer: { code: number; text: string } = { code: 1, text: '' }
+      let retirementFailed = false
+      const harvest = () => {
+        try { codexLogin!.postcheck() } finally {
+          secrets.push(...codexLogin!.secretValues())
+          masks.push(...secrets, ...secrets.map(value => JSON.stringify(value).slice(1, -1)))
+        }
+      }
+      harvest()
+      codexRetired = false
+      codexContainer = name
+      try {
+        answer = await run(['docker', ...codexMatrixDockerArgs(name, image, extension, codexLogin.source)], MATRIX_TIMEOUT_MS, true, false, true)
+      } finally {
+        try {
+          const inspected = await safeDockerInspect(['docker', 'container', 'inspect', name], { cwd: options.repo, env: childEnv })
+          if (inspected.code !== 0) throw new Error('Codex container inspection refused')
+          const rows = JSON.parse(inspected.text) as { Mounts: { Source: string; Destination: string; RW: boolean }[]; State: { Running: boolean; OOMKilled: boolean; ExitCode: number }; HostConfig: { Memory: number } }[]
+          const row = rows[0]!
+          assertCodexMounts(row.Mounts.map(mount => ({ source: mount.Source, target: mount.Destination, readOnly: !mount.RW })), codexLogin.source)
+          const final = { running: row.State.Running, oomKilled: row.State.OOMKilled, exitCode: row.State.ExitCode, memoryCapBytes: row.HostConfig.Memory }
+          if (final.running && (await run(['docker', 'kill', '--signal', 'KILL', name], 30_000, false, true)).code !== 0) throw new Error('Codex container kill failed')
+          harvest()
+          // Save only masked output; both token generations are now known.
+          writePrivate(join(output, 'codex-docker.log'), redact(answer.text), secrets)
+          writePrivate(join(output, 'codex-final.json'), JSON.stringify(final) + '\n', secrets)
+          if (final.oomKilled) throw new Error('Codex container was killed for out of memory')
+          if (final.running || final.exitCode !== 0) throw new Error('Codex container did not exit successfully')
+          if (final.memoryCapBytes !== Number(MATRIX_MEMORY) + CODEX_EXTRA_MEMORY_BYTES) throw new Error('Codex container memory cap does not match its reservation')
+          say('recorded: codex-final-reading complete')
+        } catch (error) {
+          retirementFailed = true
+          say(`FAIL: ${error instanceof Error ? error.message : 'Codex retirement failed'}`)
+        } finally {
+          try {
+            if ((await run(['docker', 'rm', '-f', name], 30_000, false, true)).code !== 0) throw new Error('Codex container cleanup failed')
+            const survivors = await run(codexLoginContainerListArgs(), 30_000, true, true, true)
+            assertNoCodexLoginContainers(survivors.code, survivors.text)
+            codexRetired = true
+          } finally {
+            harvest()
+          }
+        }
+      }
+      const leaked = secrets.some(secret => secret && (answer.text.includes(secret) || answer.text.includes(JSON.stringify(secret).slice(1, -1))))
+      for (const line of answer.text.split('\n')) if (line) say(line)
+      if (leaked) throw new Error('Codex job output contained a login token')
+      const results = answer.text.split('\n').map(line => parseResultLine(line, secrets)).filter((result): result is MatrixResult => result !== null)
+      for (const result of results) {
+        if (result.duplicates !== null) totals.duplicates += result.duplicates
+        if (result.tokens) for (const field of ['input', 'output', 'cache_read', 'cache_creation'] as const) totals[field] += result.tokens[field]
+      }
+      if (retirementFailed || answer.code !== 0 || stopped) throw new Error(`Codex job failed (exit ${answer.code})`)
+      assertCodexJobComplete(extension, results, codexLogin.model)
+      writePrivate(join(output, 'job-codex.json'), JSON.stringify({ selection, version: CODEX_VERSION, codexModel: codexLogin.model, packageSha256, results }, null, 2) + '\n', secrets)
       passed = true
     } finally {
       if ((await run(['docker', 'image', 'rm', image], 30_000, false, true)).code !== 0) throw new Error('Matrix image cleanup failed')
     }
   } catch (error) { passed = false; say(`FAIL: real-agent-matrix: ${error instanceof Error ? error.message : 'unknown failure'}`) }
   finally {
+    if (codexLogin) {
+      // Retry unresolved removal independently of login validation. A prior
+      // postcheck must never suppress cleanup, and a successful retry still
+      // leaves this run failed for its earlier retirement error.
+      if (!codexRetired && codexContainer) {
+        try {
+          if ((await run(['docker', 'rm', '-f', codexContainer], 30_000, false, true)).code !== 0) throw new Error('cleanup')
+          const survivors = await run(codexLoginContainerListArgs(), 30_000, true, true, true)
+          assertNoCodexLoginContainers(survivors.code, survivors.text)
+          codexRetired = true
+        } catch { passed = false }
+      }
+      try { codexLogin.postcheck() } catch { passed = false; say('FAIL: Codex login postcheck failed; run codex login --device-auth on the host') }
+      secrets.push(...codexLogin.secretValues())
+      masks.push(...secrets, ...secrets.map(value => JSON.stringify(value).slice(1, -1)))
+      if (secretScan(output, secrets, null, createRunnerLog(join(output, 'run.log'))).length) { passed = false; say('FAIL: Codex login secret scan failed') }
+      if (codexRetired) codexLogin.release()
+      else { passed = false; say('FAIL: Codex container retirement unresolved; login lease held until runner exit; subsequent admission refuses surviving login containers') }
+    }
     rmSync(stage, { recursive: true, force: true })
     process.off('SIGINT', interrupt); process.off('SIGTERM', interrupt)
-    if (planned) say(`REAL-AGENT-PLAN ${runId}`)
+    if (planned) say(`${recordPrefix}-PLAN ${runId}`)
     else {
       say(`tokens: ${JSON.stringify(totals)}`)
-      say(`REAL-AGENT-VERDICT ${passed ? 'PASS' : 'FAIL'} ${runId}`)
+      say(`${recordPrefix}-VERDICT ${passed ? 'PASS' : 'FAIL'} ${runId}`)
     }
     closeSync(logFd)
   }
   return passed
 }
 if (import.meta.main) {
-  if (process.argv.includes('--help')) { console.log('bun scripts/real-agent-matrix.ts [--output DIR] [--plan]'); process.exit(0) }
+  if (process.argv.length === 3 && process.argv[2] === '--help') { console.log(MATRIX_USAGE); process.exit(0) }
   try { const options = matrixOptions(process.argv.slice(2)); const passed = await runMatrix(options); process.exit(passed ? 0 : 1) }
-  catch { console.error('FAIL: real-agent-matrix: preflight refused; check credentials, model and output directory'); console.error('REAL-AGENT-VERDICT FAIL preflight'); process.exit(1) }
+  catch { console.error('FAIL: real-agent-matrix: preflight refused; check options, credentials, model and output directory'); console.error(`${process.argv.includes('--codex-only') ? 'REAL-AGENT-CODEX' : 'REAL-AGENT'}-VERDICT FAIL preflight`); process.exit(1) }
 }

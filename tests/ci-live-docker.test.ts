@@ -2831,11 +2831,12 @@ describe('native agent installers and contained heavy image', () => {
     expect(nativeProblems(file === 'claude' ? changed : claude(), file === 'codex' ? changed : codex()).length).toBeGreaterThan(0)
   })
 
-  test('the heavy image copies only the packed package, test tree and entrypoint, and accepts credentials solely at run time', () => {
+  test('the heavy image copies only the packed package, test tree and entrypoints, and accepts credentials solely at run time', () => {
     const instructions = dockerInstructions('docker/Dockerfile.real-agent')
     expect(instructions.filter(i => /^(?:COPY|ADD)\s/.test(i))).toEqual([
       'COPY package.tgz /tmp/package.tgz', 'COPY tests /tests',
       'COPY docker/real-agent-job.sh /opt/cscb-ci/real-agent-job.sh',
+      'COPY docker/real-agent-codex-job.sh /opt/cscb-ci/real-agent-codex-job.sh',
     ])
     expect(instructions.filter(i => /^(?:ARG|ENV)\s/.test(i) && /API_KEY|TOKEN|CI_ANTHROPIC/.test(i))).toEqual([])
     expect(instructions).toContain('ENTRYPOINT ["bash", "/opt/cscb-ci/real-agent-job.sh"]')

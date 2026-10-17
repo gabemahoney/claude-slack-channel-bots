@@ -48,6 +48,9 @@
  * SPDX-License-Identifier: MIT
  */
 
+import { acquireCodexLogin, realCodexLoginDeps, isCodexScript, assertNoCodexLoginContainers, codexLoginContainerListArgs, CODEX_LOGIN_CONTAINER_LABEL, CODEX_LOGIN_LOCK_WAIT_MS, CODEX_LOGIN_TARGET, CODEX_EXTRA_MEMORY_BYTES, CODEX_HOST_CONFIG_KEYS_ENV, decodeCodexHostConfigKeys, type CodexLoginDeps, type CodexLoginLease } from './codex-login.ts'
+export { CODEX_LOGIN_SCRIPTS, CODEX_LOGIN_LOCK_WAIT_MS } from './codex-login.ts'
+import { isDockerInspectCommand, safeDockerInspect } from './safe-docker-inspect.ts'
 import { randomBytes as cryptoRandomBytes } from 'node:crypto'
 import { readFileSync, readlinkSync, realpathSync, statfsSync, writeSync } from 'node:fs'
 import { constants as osConstants } from 'node:os'
@@ -220,6 +223,7 @@ export type SignalOutcome = 'delivered' | 'no-such-process' | 'not-permitted'
  * line. Only `createRealRunnerDeps` binds the real ones.
  */
 export interface RunnerDeps {
+  readonly codexLogin?: CodexLoginDeps
   /** Starts a child process (docker, git, npm, gh, the base-build step) with its own environment and process group. */
   readonly spawn: SpawnFn
   /** The runner's own environment; children get it through the child-environment rule (b.uqm SR-15.4). */
@@ -279,7 +283,12 @@ export function createRealRunnerDeps(): RunnerDeps {
   const uid = process.getuid?.()
   if (uid === undefined) throw new Error('ci-run: this platform gives no user ID')
   return {
-    spawn: spawnChild,
+    spawn: safeRunnerSpawn,
+    codexLogin: realCodexLoginDeps(path => {
+      const opened = openLockFile(path)
+      if (!opened.ok) throw new Error('Codex login lock unavailable')
+      return opened.value
+    }),
     env: { ...process.env },
     pid: process.pid,
     uid,
@@ -309,6 +318,42 @@ export function createRealRunnerDeps(): RunnerDeps {
       writeSync(2, text)
     },
   }
+}
+
+/** Real inspection crosses the sanitizer before selecting runner fields. */
+export function safeRunnerSpawn(request: SpawnRequest): SpawnedChild {
+  if (!isDockerInspectCommand(request.argv)) return spawnChild(request)
+  const index = request.argv.indexOf('--format')
+  const format = index < 0 ? undefined : request.argv[index + 1]
+  if (![CONTAINER_STATE_FORMAT, CONTAINER_INSPECTION_FORMAT, IMAGE_INSPECT_FORMAT].includes(format ?? '')) {
+    return dockerNotStarted('Unsupported safe Docker inspection projection')
+  }
+  const argv = request.argv.filter((_, n) => n !== index && n !== index + 1)
+  return { pid: null, processGroup: null, result: (async () => {
+    const result = await safeDockerInspect(argv, { cwd: request.cwd, env: request.env })
+    if (result.code !== 0) return { exitCode: result.code, stdout: new Uint8Array(), stderr: result.stderr }
+    try {
+      const rows = JSON.parse(result.text) as {
+        Id: string; Name: string; Image: string; RepoTags: string[] | null;
+        Config?: { Labels?: DockerLabels | null };
+        State?: { Status: string; Running: boolean; Pid: number; OOMKilled: boolean; ExitCode: number };
+        HostConfig?: { Memory: number; MemorySwap: number; PidsLimit: number | null; NanoCpus: number;
+          NetworkMode: string; PidMode: string; IpcMode: string; Privileged: boolean; AutoRemove: boolean };
+        Mounts?: { Source: string; Destination: string; RW: boolean }[];
+      }[]
+      const selected = rows.map(row => {
+        const state = row.State, host = row.HostConfig, config = row.Config ?? {}
+        if (format === IMAGE_INSPECT_FORMAT) return { id: row.Id, tags: row.RepoTags, labels: config.Labels ?? null }
+        if (format === CONTAINER_STATE_FORMAT) return { id: row.Id, name: row.Name, status: state?.Status, running: state?.Running,
+          pid: state?.Pid, oomKilled: state?.OOMKilled, exitCode: state?.ExitCode, memoryBytes: host?.Memory, labels: config.Labels }
+        return { name: row.Name, imageId: row.Image, mounts: (row.Mounts ?? []).map((mount) => ({ source: mount.Source, target: mount.Destination, rw: mount.RW })),
+          networkMode: host?.NetworkMode, pidMode: host?.PidMode, ipcMode: host?.IpcMode, privileged: host?.Privileged,
+          memoryBytes: host?.Memory, memorySwapBytes: host?.MemorySwap, pidsLimit: host?.PidsLimit, nanoCpus: host?.NanoCpus,
+          labels: config.Labels, autoRemove: host?.AutoRemove }
+      })
+      return { exitCode: 0, stdout: new TextEncoder().encode(selected.map(row => JSON.stringify(row)).join('\n') + '\n'), stderr: '' }
+    } catch { return { exitCode: 1, stdout: new Uint8Array(), stderr: 'Safe Docker inspection could not be projected' } }
+  })() }
 }
 
 /** A thrown value's message on one line. */
@@ -1565,6 +1610,7 @@ export interface ResultsTiming {
 
 /** `results.json`, exactly b.uqm SR-16.1's keys and nesting. */
 export interface Results {
+  readonly codexModel: string | null
   readonly version: typeof RESULTS_FORMAT_VERSION
   readonly runId: string
   readonly pid: number
@@ -2111,7 +2157,7 @@ export function sortCanonical<T extends string>(names: readonly T[]): T[] {
 export type ChildEnvironmentSource = Readonly<Record<string, string | undefined>>
 
 /** The variables that are never secret, whatever they hold (b.uqm SR-15.1). */
-const NON_SECRET_VARIABLES: readonly string[] = ['ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL']
+export const NON_SECRET_VARIABLES: readonly string[] = ['ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL', 'CODEX_TEST_MODEL', CODEX_HOST_CONFIG_KEYS_ENV]
 
 /** A child's environment: the given one, unchanged, its unset entries left out (b.uqm SR-15.4). */
 export function childEnvironment(env: ChildEnvironmentSource): Record<string, string> {
@@ -2970,6 +3016,7 @@ function resultsShape(): JsonShape {
   const mode = stringShape('a four-digit octal mode', (value) => /^[0-7]{4}$/.test(value))
   const sha256 = hexShape(SHA256_HEX_LENGTH)
   return objectShape({
+    codexModel: nullableShape(stringShape('a Codex model', value => /^[A-Za-z0-9._:/-]+$/.test(value))),
     version: literalShape(RESULTS_FORMAT_VERSION),
     runId: runIdShape(),
     pid: wholeShape(1),
@@ -5368,7 +5415,11 @@ export function validateRun(args: readonly string[], worktreeRoot: string, env: 
 
   const runScripts = runScriptsOf(selected.selection, scripts, headers.prerequisites)
   const units = schedulingUnits(runScripts, headers.prerequisites)
+  const codexUnits = units.filter(unit => unit.scripts.some(script => isCodexScript(script.fileName)))
+  if (codexUnits.some(unit => unit.scripts.length !== 1)) return refused(buildRefusal(null, 'Codex login scripts must have no prerequisites beyond test-1'))
+  const minimumShards = codexUnits.length + (units.length > codexUnits.length ? 1 : 0)
   const requestedShards = invocation.shards ?? MAX_SHARDS
+  if (requestedShards < minimumShards) return refused(buildRefusal(null, `Codex login isolation requires at least ${minimumShards} shards; requested --shards ${requestedShards}`))
   const effectiveShards = effectiveShardCount(requestedShards, units.length)
 
   const faultFailures = checkFaults(invocation.givenFaults, scripts, runScripts, effectiveShards)
@@ -5700,15 +5751,25 @@ export function assignShards(
 
   const most = Math.max(OPTION_RANGE_MIN, placed.length)
   if (shards > most) throw new Error(`assignShards: N ${shards} is above ${most}, the most shards ${placed.length} units fill`)
+  const dedicated = placed.filter(unit => unit.scripts.some(script => isCodexScript(script.fileName)))
+  if (dedicated.some(unit => unit.scripts.length !== 1)) throw new Error('Codex shard may contain only test-1 and one Codex script')
+  const ordinary = placed.filter(unit => !dedicated.includes(unit))
+  if (shards < dedicated.length + (ordinary.length ? 1 : 0)) throw new Error('Insufficient shards for Codex login isolation')
+  const ordinaryShards = shards - dedicated.length
   const test1Seconds = estimates.get(test1FileName) ?? DEFAULT_ESTIMATE_SECONDS
   const totals: number[] = Array.from({ length: shards }, () => test1Seconds)
   const members: Script[][] = Array.from({ length: shards }, () => [])
-  for (const unit of placed) {
+  for (const unit of ordinary) {
     let target = 0
-    for (let k = 1; k < shards; k++) if (totals[k] < totals[target]) target = k
+    for (let k = 1; k < ordinaryShards; k++) if (totals[k] < totals[target]) target = k
     totals[target] += unit.seconds
     members[target].push(...unit.scripts)
   }
+  dedicated.forEach((unit, index) => {
+    const target = ordinaryShards + index
+    members[target].push(...unit.scripts)
+    totals[target] += unit.seconds
+  })
   return members.map((scripts, index) => ({
     shard: index + 1,
     assigned: [test1FileName, ...scripts.sort((a, b) => compareCanonicalNumbers(a.number, b.number)).map((script) => script.fileName)],
@@ -6558,6 +6619,7 @@ export interface ReservationRequest {
   readonly shards: number
   /** The per-shard memory cap in bytes. */
   readonly memoryCapBytes: number
+  readonly extraMemoryBytes?: number
   readonly kind: RunKind
 }
 
@@ -6568,7 +6630,7 @@ export function buildReservation(spec: ReservationRequest): Reservation {
     runId: spec.owner.runId,
     pid: spec.owner.pid,
     shards: spec.shards,
-    memoryBytes: spec.shards * spec.memoryCapBytes,
+    memoryBytes: spec.shards * spec.memoryCapBytes + (spec.extraMemoryBytes ?? 0),
     cpus: CPUS_PER_SHARD * spec.shards,
     kind: spec.kind,
   }
@@ -8162,6 +8224,8 @@ const ADMISSION_LIMIT_ORDER: readonly AdmissionLimit[] = ['memory', 'disk', 'cpu
 
 /** What the run asks of admission (b.uqm SR-3.4, SR-6.7), from E2's validation (`ValidatedRun`) and E1's arguments. */
 export interface AdmissionRequest {
+  readonly minimumShards?: number
+  readonly extraMemoryBytes?: number
   /** r: the `--shards` value, or `MAX_SHARDS` when it is not given (E2's `ValidatedRun.requestedShards`). */
   readonly requestedShards: number
   /** u: the count of the run's scheduling units (E2, b.uqm SR-3.4: `ValidatedRun.units.length`). */
@@ -8194,9 +8258,9 @@ export function freeShardMemoryBytes(figures: AdmissionFigures): number {
  * + the 1 GiB admission margin ≤ C, compared in whole bytes. Any blocking
  * container fails it whatever the readings.
  */
-export function memoryFits(figures: AdmissionFigures, shards: number, capBytes: number): boolean {
+export function memoryFits(figures: AdmissionFigures, shards: number, capBytes: number, extraMemoryBytes = 0): boolean {
   if (figures.commitments.blocking.length > 0) return false
-  const need = BigInt(nonReclaimableMemoryBytes(figures.readings.beforeWorkingSet)) + BigInt(figures.commitments.totalBytes) + BigInt(shards) * BigInt(capBytes) + BigInt(ADMISSION_MARGIN_BYTES)
+  const need = BigInt(nonReclaimableMemoryBytes(figures.readings.beforeWorkingSet)) + BigInt(figures.commitments.totalBytes) + BigInt(shards) * BigInt(capBytes) + BigInt(extraMemoryBytes) + BigInt(ADMISSION_MARGIN_BYTES)
   return need <= BigInt(figures.ceiling.bytes)
 }
 
@@ -8217,17 +8281,17 @@ export function cpuFits(reservedCpus: number, shards: number): boolean {
 }
 
 /** The N-dependent limits that fail at N shards, memory then CPU. */
-function shardFitFailures(figures: AdmissionFigures, shards: number, capBytes: number): ShardFitLimit[] {
+function shardFitFailures(figures: AdmissionFigures, shards: number, capBytes: number, extraMemoryBytes = 0): ShardFitLimit[] {
   const failed: ShardFitLimit[] = []
-  if (!memoryFits(figures, shards, capBytes)) failed.push('memory')
+  if (!memoryFits(figures, shards, capBytes, extraMemoryBytes)) failed.push('memory')
   if (!cpuFits(figures.commitments.reservedCpus, shards)) failed.push('cpu')
   return failed
 }
 
 /** The largest N, from `fromShards` down to 1, that passes both the memory and the CPU fit; null when none does. */
-function largestFittingShards(figures: AdmissionFigures, fromShards: number, capBytes: number): number | null {
-  for (let shards = fromShards; shards >= OPTION_RANGE_MIN; shards--) {
-    if (shardFitFailures(figures, shards, capBytes).length === 0) return shards
+function largestFittingShards(figures: AdmissionFigures, fromShards: number, capBytes: number, minimumShards = OPTION_RANGE_MIN, extraMemoryBytes = 0): number | null {
+  for (let shards = fromShards; shards >= minimumShards; shards--) {
+    if (shardFitFailures(figures, shards, capBytes, extraMemoryBytes).length === 0) return shards
   }
   return null
 }
@@ -8244,6 +8308,8 @@ function assertAdmissionRequest(request: AdmissionRequest): void {
   if (request.effectiveShards > request.requestedShards) throw new Error(`decideAdmission: effectiveShards ${request.effectiveShards} is above requestedShards ${request.requestedShards}`)
   const unitBound = Math.max(OPTION_RANGE_MIN, request.units)
   if (request.effectiveShards > unitBound) throw new Error(`decideAdmission: effectiveShards ${request.effectiveShards} is above max(${OPTION_RANGE_MIN}, units) ${unitBound}`)
+  if (!Number.isSafeInteger(request.extraMemoryBytes ?? 0) || (request.extraMemoryBytes ?? 0) < 0) throw new Error('decideAdmission: invalid extra memory')
+  if (!Number.isSafeInteger(request.minimumShards ?? 1) || (request.minimumShards ?? 1) < 1 || (request.minimumShards ?? 1) > request.effectiveShards) throw new Error('decideAdmission: invalid minimum shards')
   if (request.capBytes === 0) throw new Error('decideAdmission: capBytes is 0')
 }
 
@@ -8326,7 +8392,7 @@ export type AdmissionDecision = AdmittedDecision | RefusedDecision
  */
 export function decideAdmission(admission: AdmissionFigures, request: AdmissionRequest, listResultsDirs: ResultsDirectoryLister): AdmissionDecision {
   assertAdmissionRequest(request)
-  const largest = largestFittingShards(admission, request.effectiveShards, request.capBytes)
+  const largest = largestFittingShards(admission, request.effectiveShards, request.capBytes, request.minimumShards, request.extraMemoryBytes)
   const figures: AdmissionDecisionFigures = {
     request,
     admission,
@@ -8338,13 +8404,13 @@ export function decideAdmission(admission: AdmissionFigures, request: AdmissionR
   // The search starts at the effective N, so a run that cannot choose fits exactly when the largest is the effective N.
   const chosen = request.canChooseShards || largest === request.effectiveShards ? largest : null
   if (!figures.diskFits || chosen === null) {
-    const judgedShards = request.canChooseShards ? OPTION_RANGE_MIN : request.effectiveShards
-    const failed = new Set<AdmissionLimit>(shardFitFailures(admission, judgedShards, request.capBytes))
+    const judgedShards = request.canChooseShards ? (request.minimumShards ?? OPTION_RANGE_MIN) : request.effectiveShards
+    const failed = new Set<AdmissionLimit>(shardFitFailures(admission, judgedShards, request.capBytes, request.extraMemoryBytes))
     if (!figures.diskFits) failed.add('disk')
     const failedLimits = ADMISSION_LIMIT_ORDER.filter((limit) => failed.has(limit))
     return { kind: 'refused', judgedShards, failedLimits, figures, refusal: admissionRefusal(failedLimits, judgedShards, figures, listResultsDirs) }
   }
-  const limitsAtNext = chosen < request.effectiveShards ? shardFitFailures(admission, chosen + 1, request.capBytes) : []
+  const limitsAtNext = chosen < request.effectiveShards ? shardFitFailures(admission, chosen + 1, request.capBytes, request.extraMemoryBytes) : []
   const unitReason: ShardCountReason[] = request.effectiveShards < request.requestedShards ? ['units'] : []
   return {
     kind: 'admitted',
@@ -8682,7 +8748,7 @@ export function memoryRefusalPart(judgedShards: number, figures: AdmissionDecisi
       : [`counted commitments: ${formatGib(commitments.totalBytes)} GiB`, ...commitments.items.map(commitmentText)]
   return {
     kind: 'memory',
-    summary: `${judgedShards} shard(s) need ${formatGib(judgedShards * request.capBytes)} GiB; ${formatGib(figures.freeBytes)} GiB fits under the ${formatGib(admission.ceiling.bytes)} GiB ceiling`,
+    summary: `${judgedShards} shard(s) need ${formatGib(judgedShards * request.capBytes + (request.extraMemoryBytes ?? 0))} GiB; ${formatGib(figures.freeBytes)} GiB fits under the ${formatGib(admission.ceiling.bytes)} GiB ceiling`,
     details: [
       ceilingSourceText(admission.ceiling),
       `pod non-reclaimable memory used by gate: ${formatGib(nonReclaimableMemoryBytes(w))} GiB (anon ${formatGib(w.anonBytes)} GiB, shmem ${formatGib(w.shmemBytes ?? 0)} GiB; anon LRU plus unevictable accounted without double-counting); reclaimable page cache is excluded`,
@@ -9342,6 +9408,8 @@ export function shardPeaks(samples: readonly ShardSample[], final: FinalReading 
 /** One shard as the cap rule and the cap line take it: its anon peak and whether it was killed for out of memory (T3's classification, b.uqm SR-12.2). */
 export interface CapShard {
   readonly shard: number
+  /** Actual shard limit; omitted by older callers using a uniform cap. */
+  readonly capBytes?: number
   readonly anonPeak: ResultsAnonPeak
   /** True only for an out-of-memory kill; an unreadable out-of-memory status is not a kill. */
   readonly killed: boolean
@@ -9397,6 +9465,10 @@ function assertCapInputs(where: string, capUsedBytes: number, shards: readonly C
     if (!Number.isSafeInteger(shard.shard) || shard.shard < 1) throw new Error(`${where}: not a shard number: ${shard.shard}`)
     if (seen.has(shard.shard)) throw new Error(`${where}: shard-${shard.shard} given twice`)
     seen.add(shard.shard)
+    if (shard.capBytes !== undefined) {
+      assertWholeBytes(where, shard.capBytes)
+      if (shard.capBytes === 0) throw new Error(`${where}: shard cap is 0`)
+    }
     assertAnonPeak(where, shard.shard, shard.anonPeak)
   }
 }
@@ -9404,10 +9476,10 @@ function assertCapInputs(where: string, capUsedBytes: number, shards: readonly C
 /**
  * The cap rule over a run's shards (b.uqm SR-8.3), in whole bytes. Each shard
  * counts at its anon peak (`partial` counted, `unknown` not); a killed shard
- * counts at the higher of `capUsedBytes` and its recorded peak (the cap used
+ * counts at the higher of its `capBytes` (or uniform `capUsedBytes`) and its recorded peak (the cap used
  * when its peak is `unknown`). The highest counted value, the lowest shard
  * number on a tie, gives `derivedCapBytes`. Page cache never enters it.
- * `capUsedBytes` is the cap the run used, given by the caller; the rule never
+ * The actual caps are supplied by the caller; the rule never
  * reads the cap constant. Throws for malformed input.
  */
 export function capRule(capUsedBytes: number, shards: readonly CapShard[]): CapRuleResult {
@@ -9417,7 +9489,7 @@ export function capRule(capUsedBytes: number, shards: readonly CapShard[]): CapR
     const recorded = shard.anonPeak.mark === 'unknown' ? null : shard.anonPeak.bytes
     let candidate: CapSource
     if (shard.killed) {
-      candidate = { peakBytes: Math.max(capUsedBytes, recorded ?? 0), shard: shard.shard, pageCacheBytes: null, fromKill: true }
+      candidate = { peakBytes: Math.max(shard.capBytes ?? capUsedBytes, recorded ?? 0), shard: shard.shard, pageCacheBytes: null, fromKill: true }
     } else if (recorded !== null) {
       candidate = { peakBytes: recorded, shard: shard.shard, pageCacheBytes: shard.anonPeak.pageCacheBytes, fromKill: false }
     } else {
@@ -9478,7 +9550,7 @@ export interface CapReportInputs {
   readonly invocation: Invocation
   /** Whether the run passed, E10's pass condition (b.uqm SR-12.3). */
   readonly passed: boolean
-  /** The cap the run used. */
+  /** The actual cap of the source shard, or the largest cap when no source exists. */
   readonly capUsedBytes: number
   /** `capRule(capUsedBytes, shards)`. */
   readonly rule: CapRuleResult
@@ -11450,7 +11522,7 @@ export async function cleanupRunImages(context: RunImageCleanupContext, state: R
 /** The mark between the owner and k in a shard container's name, `cscb-ci-<RUN_ID>-<PID>-s<k>` (b.uqm SR-10.1). */
 export const SHARD_CONTAINER_NAME_SHARD_MARK = '-s'
 /** The variables each shard's `docker run` names by bare name, `--env <NAME>`, and no other (b.uqm SR-10.4). */
-export const SHARD_ENV_NAMES = ['ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL'] as const
+export const SHARD_ENV_NAMES = ['ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL', 'CODEX_TEST_MODEL', CODEX_HOST_CONFIG_KEYS_ENV] as const
 /** The secret credentials by name: never passed to a shard as `NAME=value` (b.uqm SR-10.4, SR-15.1). The base-build token has no variable of its own here; its value is checked like every secret value. */
 export const SECRET_CREDENTIAL_NAMES = ['ANTHROPIC_API_KEY', 'GH_TOKEN'] as const
 /** The in-container runner's option that names a script to fail, as `--fail <file name>` pairs (b.uqm SR-11.2, SR-14.1). */
@@ -11648,6 +11720,7 @@ function bindMountValue(mount: ShardMount): string {
 
 /** What shard k's list is built from: the run's facts as E13 passes them, and its canary. */
 export interface ShardRunPlanInput {
+  readonly codexLoginSource?: string
   readonly owner: Owner
   /** The run directory, which holds each `shard-<k>` subdirectory. */
   readonly runDir: string
@@ -11696,7 +11769,12 @@ export interface ShardRunPlan {
 export function shardRunPlan(input: ShardRunPlanInput): ShardRunPlan {
   const name = dockerOperand(shardContainerName(input.owner, input.shard), 'container name')
   const imageId = imageIdOperand(shardImageId(input.faults, input.shard, input.pinnedImageId, input.driftImageId))
-  const mounts = shardMounts(input.faults, input.runDir, input.shard, input.tarballPath)
+  const codex = input.assigned.some(isCodexScript)
+  if (codex && (!input.codexLoginSource || input.assigned.length !== 2 || !isTestOneName(input.assigned[0]!))) throw new Error('Codex shard requires validated login and dedicated assignment')
+  if (!codex && input.codexLoginSource) throw new Error('Ordinary shard cannot mount Codex login')
+  const mounts = [...shardMounts(input.faults, input.runDir, input.shard, input.tarballPath),
+    ...(codex ? [{ source: input.codexLoginSource!, target: CODEX_LOGIN_TARGET, readOnly: false }] : [])]
+  const cap = SHARD_MEMORY_CAP_BYTES + (codex ? CODEX_EXTRA_MEMORY_BYTES : 0)
   const runnerArguments = shardRunnerArguments(input.shard, input.canary, input.failFileNames, input.assigned)
   const runArguments = [
     '--pull',
@@ -11704,14 +11782,16 @@ export function shardRunPlan(input: ShardRunPlanInput): ShardRunPlan {
     '--name',
     name,
     ...dockerLabelArguments(shardContainerLabels(input.owner)),
+    ...(codex ? ['--label', CODEX_LOGIN_CONTAINER_LABEL] : []),
     '--memory',
-    String(SHARD_MEMORY_CAP_BYTES),
+    String(cap),
     '--memory-swap',
-    String(SHARD_MEMORY_CAP_BYTES),
+    String(cap),
     '--pids-limit',
     String(SHARD_PIDS_LIMIT),
     '--cpus',
     String(CPUS_PER_SHARD),
+    ...(codex ? ['--ulimit', 'core=0'] : []),
     ...mounts.flatMap((mount) => ['--mount', bindMountValue(mount)]),
     ...SHARD_ENV_NAMES.flatMap((envName) => ['--env', envName]),
     imageId,
@@ -11761,6 +11841,9 @@ export type ShardStartDeps = Pick<RunnerDeps, 'spawn' | 'env' | 'worktreeRoot' |
 
 /** What one shard's start takes, beyond its dependencies. */
 export interface ShardStartInput {
+  readonly codexLoginSource?: string
+  readonly codexModel?: string
+  readonly codexHostConfigKeys?: string
   readonly owner: Owner
   readonly runDir: string
   /** Its assignment entry: k and its assigned scripts in run order. */
@@ -11864,12 +11947,19 @@ export async function startShard(deps: ShardStartDeps, input: ShardStartInput): 
       pinnedImageId: input.pinnedImageId,
       driftImageId: input.driftImageId,
       tarballPath: input.tarballPath,
+      codexLoginSource: input.codexLoginSource,
     })
   } catch (err) {
     return failed(canary.value, plannedMounts, `the docker run argument list could not be built: ${dependencyErrorText(err)}`)
   }
 
-  const docker: DockerContext = { spawn: deps.spawn, env: childEnvironment(deps.env), cwd: deps.worktreeRoot }
+  const codex = input.assignment.assigned.some(isCodexScript)
+  if (codex) {
+    try { decodeCodexHostConfigKeys(input.codexHostConfigKeys) }
+    catch { return failed(canary.value, plannedMounts, 'Codex host config key projection is missing or invalid') }
+  }
+  const docker: DockerContext = { spawn: deps.spawn, env: { ...childEnvironment(deps.env), CODEX_TEST_MODEL: input.codexModel ?? '',
+    [CODEX_HOST_CONFIG_KEYS_ENV]: codex ? input.codexHostConfigKeys! : '' }, cwd: deps.worktreeRoot }
   const outcome = await runContainer(docker, plan.runArguments, shardRunListCheck(input.secretValues), input.log)
   if (outcome.kind === 'started') {
     return {
@@ -13058,6 +13148,7 @@ export interface RunModes {
 
 /** Everything `results.json` is assembled from, each value from the Epic that owns it (b.uqm SR-16.1). */
 export interface ResultsInputs {
+  readonly codexModel?: string | null
   readonly runId: string
   /** The runner's PID. */
   readonly pid: number
@@ -13205,6 +13296,7 @@ export function assembleResults(inputs: ResultsInputs): Results {
     runId: inputs.runId,
     pid: inputs.pid,
     packageSha256: inputs.packageSha256,
+    codexModel: inputs.codexModel ?? null,
     images: { pinned: inputs.images.pinnedId, drift: inputs.images.driftId, retag: inputs.images.retagId, retagMoved: inputs.images.retagMoved },
     verdict: inputs.verdict,
     invocation: { args: [...inputs.invocation.args], selective: runKind === 'selective', faults: inputs.invocation.faults.map(faultText) },
@@ -13377,6 +13469,7 @@ function summaryRunFigureLines(results: Results): string[] {
 export function renderSummary(results: Results): string {
   const lines = [
     ...summaryHeadLines(results),
+    ...(results.codexModel ? [`recorded: codex-model ${results.codexModel}`] : []),
     ...summaryProblemLines(results),
     `shard records: ${results.shards.length}`,
     ...results.shards.flatMap(summaryShardLines),
@@ -13545,6 +13638,7 @@ export type IntegrityShard = Pick<ShardEvidence, 'shard' | 'endedNormally' | 'st
 
 /** Everything checks 1–11 judge besides the run directory's files (b.uqm SR-13.2). */
 export interface IntegrityInputs {
+  readonly codexLoginSource?: string | null
   /** The run directory: the only place the evidence reader reads. */
   readonly runDir: string
   /** The run's expected scripts, as file names. */
@@ -13996,11 +14090,20 @@ function shardMountFailures(inputs: IntegrityInputs, shard: number, mounts: read
   }
   let tarballSeen = false
   let resultsSeen = false
+  let loginSeen = false
+  const assigned = inputs.assignment?.find(entry => entry.shard === shard)?.assigned ?? []
+  const codex = assigned.some(isCodexScript)
+  if (codex && (assigned.length !== 2 || !isTestOneName(assigned[0]!))) fail(`${name} is not a dedicated Codex shard`)
   for (const mount of mounts) {
     const source = resolve(mount.source)
     const other = mountedShardDir(source, inputs.runDir)
     if (other !== null && other !== shard) {
       fail(`${name} mounts ${integrityShardName(other)}'s results subdirectory`)
+      continue
+    }
+    if (mount.target === CODEX_LOGIN_TARGET && codex && !loginSeen) {
+      loginSeen = true
+      if (!inputs.codexLoginSource || source !== inputs.codexLoginSource || mount.readOnly) fail(`${name} has an invalid Codex login mount`)
       continue
     }
     if (mount.target === INTEGRITY_RESULTS_MOUNT_TARGET && !resultsSeen) {
@@ -14016,6 +14119,7 @@ function shardMountFailures(inputs: IntegrityInputs, shard: number, mounts: read
     }
     fail(`${name} has an extra mount at ${shownArgument(mount.target)}`)
   }
+  if (codex && !loginSeen) fail(`${name} has no Codex login mount`)
   if (!tarballSeen) fail(`${name} has no tarball mount at ${INTEGRITY_TARBALL_MOUNT_TARGET}`)
   if (!resultsSeen) fail(`${name} has no mount of its results subdirectory at ${INTEGRITY_RESULTS_MOUNT_TARGET}`)
   return failures
@@ -15380,7 +15484,7 @@ export interface ShardRun {
  * guarded, so a throw is logged and changes nothing.
  */
 export interface RunSequenceHooks {
-  /** Once, before step 3: arm the deadline timer and record a signal the traps held during validation. */
+  /** Once, before step 3: arm the deadline including login contention allowance and record a pending signal. */
   readonly onSequenceStart?: (seq: RunSequence) => void
   /** As each step of steps 3–13 begins, before its stop check (`seq.state.baseImage` holds step 4's outcome from `packing` on). */
   readonly onStep?: (seq: RunSequence, step: RunSequenceStep) => void
@@ -15394,6 +15498,9 @@ export interface RunSequenceHooks {
 
 /** The run's state after validation (b.uqm SR-5.3), the one record every step and E13 T2's stops read. */
 export interface RunSequence {
+  codexLogin: CodexLoginLease | null
+  codexRetired: boolean
+  codexLoginWaitMs: number
   readonly deps: RunnerDeps
   readonly run: RunContext
   /** Step 2's validated run (E2). */
@@ -15623,6 +15730,9 @@ function createRunSequence(deps: RunnerDeps, run: RunContext, validated: Validat
     say,
     canaries: createShardCanaryDrawer(deps.randomBytes),
     retirer: createShardRetirer({ deps, runDir: run.runDir, log: say, state }),
+    codexLogin: null,
+    codexRetired: true,
+    codexLoginWaitMs: validated.runScripts.some(script => isCodexScript(script.fileName)) ? CODEX_LOGIN_LOCK_WAIT_MS : 0,
     step: 'docker-check',
     endOfRunStep: null,
     endOfRunStarted: false,
@@ -15754,6 +15864,11 @@ export async function recordRunRefusal(seq: RunSequence, refusal: Refusal): Prom
       await watchdog.stop()
     })
   }
+  postcheckCodex(seq)
+  if (seq.codexLogin) {
+    const leaks = secretScan(seq.run.runDir, seq.codexLogin.secretValues(), seq.state.tarballPath, seq.run.log)
+    if (seq.internalErrorLine || leaks.length) return recordRefusal(seq.run, buildRefusal(null, seq.internalErrorLine ?? 'Codex login secret scan failed'))
+  }
   return recordRefusal(seq.run, refusal)
 }
 
@@ -15796,6 +15911,38 @@ async function refuseUnlessStopped(seq: RunSequence, refusal: Refusal): Promise<
   return { kind: 'refused', exitStatus: await recordRunRefusal(seq, refusal) }
 }
 
+/** Always refresh the in-memory token set after retirement, including retries. */
+function postcheckCodex(seq: RunSequence): void {
+  if (!seq.codexLogin) return
+  try { seq.codexLogin.postcheck() }
+  catch (error) { seq.internalErrorLine = internalErrorFailureLine(dependencyErrorText(error)); seq.say(seq.internalErrorLine) }
+}
+
+/** A login postcheck is not evidence of container removal. Verify separately,
+ * under the login lease, and retry failed cleanup even after a postcheck. */
+async function verifyCodexRetirement(seq: RunSequence): Promise<void> {
+  if (!seq.codexLogin || seq.codexRetired) return
+  try {
+    for (const shard of seq.shards.filter(shard => shard.assignment.assigned.some(isCodexScript))) {
+      const name = shardContainerName(seq.owner, shard.assignment.shard)
+      const state = await inspectContainerState(seq.docker, name)
+      if (!state.ok) throw new Error('Codex container retirement could not be verified')
+      if (state.value !== null) {
+        const removed = await runDocker(seq.docker, ['docker', 'container', 'rm', '--force', name])
+        if (removed.exitCode !== 0) throw new Error('Codex container retirement unresolved')
+        const after = await inspectContainerState(seq.docker, name)
+        if (!after.ok || after.value !== null) throw new Error('Codex container retirement unresolved')
+      }
+    }
+    const survivors = await runDocker(seq.docker, codexLoginContainerListArgs())
+    assertNoCodexLoginContainers(survivors.exitCode, dockerText(survivors.stdout))
+    seq.codexRetired = true
+  } catch {
+    seq.internalErrorLine = internalErrorFailureLine('Codex container retirement unresolved; login lease held until runner exit; subsequent admission refuses surviving login containers')
+    seq.say(seq.internalErrorLine)
+  }
+}
+
 /** What admission asks for (b.uqm SR-3.4, SR-6.7), from the validated run and E1's cap. */
 function admissionRequestOf(validated: ValidatedRun): AdmissionRequest {
   return {
@@ -15804,6 +15951,8 @@ function admissionRequestOf(validated: ValidatedRun): AdmissionRequest {
     effectiveShards: validated.effectiveShards,
     canChooseShards: canChooseShards(validated.invocation),
     capBytes: SHARD_MEMORY_CAP_BYTES,
+    extraMemoryBytes: validated.runScripts.filter(script => isCodexScript(script.fileName)).length * CODEX_EXTRA_MEMORY_BYTES,
+    minimumShards: Math.max(1, validated.units.filter(unit => unit.scripts.some(script => isCodexScript(script.fileName))).length + (validated.units.some(unit => !unit.scripts.some(script => isCodexScript(script.fileName))) ? 1 : 0)),
   }
 }
 
@@ -15819,6 +15968,20 @@ function admissionRequestOf(validated: ValidatedRun): AdmissionRequest {
  */
 async function admitRun(seq: RunSequence): Promise<SequencePartOutcome> {
   const { deps, run, validated } = seq
+  if (validated.runScripts.some(script => isCodexScript(script.fileName))) {
+    if (!deps.codexLogin) return refuseUnlessStopped(seq, buildRefusal(null, 'Codex login dependencies unavailable'))
+    const waitingAtMs = deps.clock.now()
+    try {
+      seq.codexLogin = await acquireCodexLogin({ env: deps.env, uid: deps.uid, deps: deps.codexLogin, cancelled: () => runStopRecorded(seq) })
+      switchOnRunnerLogRedaction(run.log, seq.codexLogin.secretValues())
+      seq.say(`recorded: codex-model ${seq.codexLogin.model}`)
+    } catch (error) { return refuseUnlessStopped(seq, buildRefusal(null, dependencyErrorText(error))) }
+    finally { seq.codexLoginWaitMs = Math.max(0, deps.clock.now() - waitingAtMs) }
+    try {
+      const survivors = await runDocker(seq.docker, codexLoginContainerListArgs())
+      assertNoCodexLoginContainers(survivors.exitCode, dockerText(survivors.stdout))
+    } catch (error) { return refuseUnlessStopped(seq, buildRefusal(null, dependencyErrorText(error))) }
+  }
   // Step 3: docker answers.
   if (enterStep(seq, 'docker-check')) return TO_END_OF_RUN
   const answer = await checkDockerAnswers(seq.docker)
@@ -15865,7 +16028,7 @@ async function admitRun(seq: RunSequence): Promise<SequencePartOutcome> {
   seq.admission = decision
   // Step 10: the reservation, then the watchdog.
   if (enterStep(seq, 'reservation')) return TO_END_OF_RUN
-  const reserved = writeReservation(lockDir, { owner: seq.owner, shards: decision.shards, memoryCapBytes: SHARD_MEMORY_CAP_BYTES, kind: validated.kind })
+  const reserved = writeReservation(lockDir, { owner: seq.owner, shards: decision.shards, memoryCapBytes: SHARD_MEMORY_CAP_BYTES, extraMemoryBytes: admissionRequestOf(validated).extraMemoryBytes, kind: validated.kind })
   if (!reserved.ok) return refuseUnlessStopped(seq, reservationWriteFailedRefusal(reserved.error))
   seq.reservationHeld = true
   const watchdog = createMemoryWatchdog({
@@ -15942,6 +16105,16 @@ async function buildAndStartShards(seq: RunSequence): Promise<SequencePartOutcom
   const readRemoval = await removeReadContainerIfPresent(seq.docker, seq.owner, seq.say)
   if (readRemoval.kind === 'failed') seq.state.cleanupFailures.push(readRemoval.line)
   seq.runScripts = read.readBack.runScripts
+  if (seq.codexLogin) {
+    const probe = `${shardContainerName(seq.owner, 1)}-uid`
+    try {
+      const uid = await runDocker(seq.docker, ['docker', 'run', '--name', probe, ...dockerLabelArguments(shardContainerLabels(seq.owner)), '--memory', String(SHARD_MEMORY_CAP_BYTES), '--memory-swap', String(SHARD_MEMORY_CAP_BYTES), '--cpus', String(CPUS_PER_SHARD), '--pids-limit', String(SHARD_PIDS_LIMIT), '--entrypoint', 'id', pinnedId, '-u', 'testuser'])
+      if (uid.exitCode !== 0 || dockerText(uid.stdout).trim() !== String(deps.uid)) return refuseUnlessStopped(seq, buildRefusal(null, 'Codex image testuser UID does not match the runner UID'))
+    } finally {
+      const removed = await removeContainer(seq.docker, probe)
+      if (!removed.ok) throw new Error('Codex UID probe cleanup failed')
+    }
+  }
   // Scheduling: the phase turns `shards`.
   if (enterStep(seq, 'scheduling')) return TO_END_OF_RUN
   const admission = seq.admission
@@ -15988,7 +16161,7 @@ async function buildAndStartShards(seq: RunSequence): Promise<SequencePartOutcom
   if (enterStep(seq, 'shard-starts')) return TO_END_OF_RUN
   const tarballPath = seq.state.tarballPath
   if (tarballPath === null) throw new Error('step 12 reached with no tarball')
-  const secretValues = secretCredentialSet(deps.env, { baseBuildToken: seq.state.baseBuildToken })
+  const secretValues = new Set([...secretCredentialSet(deps.env, { baseBuildToken: seq.state.baseBuildToken }), ...(seq.codexLogin?.secretValues() ?? [])])
   for (const shard of seq.shards) {
     if (runStopRecorded(seq)) break
     await startOneShard(seq, shard, pinnedId, tarballPath, secretValues)
@@ -16003,6 +16176,11 @@ async function buildAndStartShards(seq: RunSequence): Promise<SequencePartOutcom
 async function startOneShard(seq: RunSequence, shard: ShardRun, pinnedId: string, tarballPath: string, secretValues: ReadonlySet<string>): Promise<void> {
   const k = shard.assignment.shard
   const controller = seq.controller
+  if (shard.assignment.assigned.some(isCodexScript)) {
+    seq.codexLogin?.postcheck()
+    switchOnRunnerLogRedaction(seq.run.log, [...secretValues, ...(seq.codexLogin?.secretValues() ?? [])])
+    seq.codexRetired = false
+  }
   const result = await startShard(seq.deps, {
     owner: seq.owner,
     runDir: seq.run.runDir,
@@ -16012,8 +16190,11 @@ async function startOneShard(seq: RunSequence, shard: ShardRun, pinnedId: string
     pinnedImageId: pinnedId,
     driftImageId: seq.state.images.driftId,
     tarballPath,
-    secretValues,
+    secretValues: [...secretValues, ...(seq.codexLogin?.secretValues() ?? [])],
     canaries: seq.canaries,
+    codexLoginSource: shard.assignment.assigned.some(isCodexScript) ? seq.codexLogin?.source : undefined,
+    codexModel: shard.assignment.assigned.some(isCodexScript) ? seq.codexLogin?.model : undefined,
+    codexHostConfigKeys: shard.assignment.assigned.some(isCodexScript) ? seq.codexLogin?.hostConfigKeys : undefined,
     // The run log itself, whose sink throws when it cannot append, so no unlogged list is spawned (b.uqm SR-10.4).
     log: seq.run.log,
   })
@@ -16228,6 +16409,21 @@ export async function runAfterValidation(deps: RunnerDeps, run: RunContext, vali
     exitStatus = await runSteps(seq)
   } finally {
     releaseAdmissionLock(seq)
+    try {
+      // A thrown end-of-run dependency still cannot strand a login container.
+      if (seq.codexLogin) {
+        try {
+          for (const shard of seq.shards) {
+            if (shard.start !== null && shard.ending === null) void endShard(seq, shard, { kind: 'kill' }, null)
+          }
+          await Promise.allSettled(seq.shards.flatMap(shard => shard.ending ? [shard.ending] : []))
+        } finally {
+          await verifyCodexRetirement(seq)
+          postcheckCodex(seq)
+          secretScan(run.runDir, seq.codexLogin.secretValues(), seq.state.tarballPath, run.log)
+        }
+      }
+    } finally { if (seq.codexRetired) seq.codexLogin?.release() }
   }
   const onSequenceEnd = hooks.onSequenceEnd
   if (onSequenceEnd !== undefined) callRunHook(seq, 'sequence-end', () => onSequenceEnd(seq, exitStatus))
@@ -16359,14 +16555,19 @@ function readRunModes(runDir: string, tarballPath: string | null): RunModes {
 /** The cap line and record (E7, b.uqm SR-8.3, SR-8.4); a throw is logged, and the unknown form is tried before giving up (null). */
 function capReportOf(seq: RunSequence, passed: boolean, shards: readonly CapShard[]): CapReport | null {
   const invocation = seq.validated.invocation
+  const actualShards = shards.map(shard => ({ ...shard, capBytes: SHARD_MEMORY_CAP_BYTES +
+    (seq.shards.find(run => run.assignment.shard === shard.shard)?.assignment.assigned.some(isCodexScript) ? CODEX_EXTRA_MEMORY_BYTES : 0) }))
+  let capUsedBytes = Math.max(SHARD_MEMORY_CAP_BYTES, ...actualShards.map(shard => shard.capBytes))
   try {
-    return buildCapReport({ invocation, passed, capUsedBytes: SHARD_MEMORY_CAP_BYTES, rule: capRule(SHARD_MEMORY_CAP_BYTES, shards), shards })
+    const rule = capRule(SHARD_MEMORY_CAP_BYTES, actualShards)
+    capUsedBytes = actualShards.find(shard => shard.shard === rule.source?.shard)?.capBytes ?? capUsedBytes
+    return buildCapReport({ invocation, passed, capUsedBytes, rule, shards: actualShards })
   } catch (err) {
     sayError(seq, err, 'the cap rule')
   }
   try {
     const unknown = shards.map((shard): CapShard => ({ shard: shard.shard, anonPeak: { bytes: null, pageCacheBytes: null, mark: 'unknown' }, killed: shard.killed }))
-    return buildCapReport({ invocation, passed, capUsedBytes: SHARD_MEMORY_CAP_BYTES, rule: { derivedBytes: null, source: null }, shards: unknown })
+    return buildCapReport({ invocation, passed, capUsedBytes, rule: { derivedBytes: null, source: null }, shards: unknown })
   } catch (err) {
     sayError(seq, err, 'the cap line')
     return null
@@ -16450,6 +16651,7 @@ function composeEndFiles(seq: RunSequence, integrity: IntegrityChecksResult, rep
       pid: deps.pid,
       invocation,
       packageSha256: state.packageSha256,
+      codexModel: seq.codexLogin?.model ?? null,
       images: state.images,
       verdict: line,
       shards: ends.map((end) => ({ evidence: end.evidence, outcome: end.outcome })),
@@ -16573,7 +16775,10 @@ async function endOfRun(seq: RunSequence): Promise<number> {
 
   // Step 2: the integrity checks, `secret-scan` last.
   enterEndOfRunStep(seq, 'integrity')
-  const values = scannedSecretValues(deps.env, { baseBuildToken: state.baseBuildToken })
+  await verifyCodexRetirement(seq)
+  postcheckCodex(seq)
+  if (seq.codexLogin && seq.shards.some(shard => shard.assignment.assigned.some(isCodexScript) && shard.retirement?.kind === 'retired' && (shard.retirement.removal.kind === 'failed' || shard.retirement.logSave.kind !== 'saved' || shard.retirement.kill.kind === 'failed'))) seq.internalErrorLine = internalErrorFailureLine('Codex shard retirement failed')
+  const values = [...scannedSecretValues(deps.env, { baseBuildToken: state.baseBuildToken }), ...(seq.codexLogin?.secretValues() ?? [])]
   const integrity = runEndOfRunIntegrity(seq, firingRecords, values)
 
   // Step 3: the reservation, then the run's images.
@@ -16603,6 +16808,11 @@ async function endOfRun(seq: RunSequence): Promise<number> {
   enterEndOfRunStep(seq, 'verdict')
   if (state.firstStop !== stopWritten) {
     files = composeEndFilesGuarded(seq, integrity, report)
+    writeEndFilesGuarded(seq, files, values)
+  }
+  const lateLeaks = secretScan(run.runDir, values, state.tarballPath, run.log)
+  if (lateLeaks.length) {
+    files = composeEndFilesGuarded(seq, { ...integrity, failures: [...integrity.failures, ...lateLeaks] }, report)
     writeEndFilesGuarded(seq, files, values)
   }
   const written = writeRedactedVerdictFile(run.runDir, files.verdict, values)
@@ -16641,6 +16851,7 @@ function runEndOfRunIntegrity(seq: RunSequence, firingRecords: readonly FiringRe
       runDir: run.runDir,
       expectedScripts: seq.runScripts.map((script) => script.fileName),
       assignment: seq.schedule?.assignment ?? null,
+      codexLoginSource: seq.codexLogin?.source,
       shards,
       pinnedImageId: state.images.pinnedId,
       packageSha256: state.packageSha256,
@@ -16704,6 +16915,8 @@ export function runDeadlineStop(phase: ActiveStatus['phase'], minutes: number): 
 
 /** What the run deadline is computed from (b.uqm SR-5.5). */
 export interface RunDeadlineInput {
+  /** Login contention has its own bounded allowance, separate from builds. */
+  readonly codexLoginWaitMs?: number
   /** Whether step 4 found the base image missing (E8's `missing` form, `missingAtMs` its moment). */
   readonly baseMissing: boolean
   /** T, the run's largest shard limit in whole milliseconds (E4's `Schedule.largestLimitMs`); null before the shards are scheduled. */
@@ -16724,15 +16937,16 @@ export interface RunDeadlineOffset {
  * from whole parts, so the timer's moment is exact.
  */
 export function runDeadlineOffset(input: RunDeadlineInput): RunDeadlineOffset {
+  const waitMs = input.codexLoginWaitMs ?? 0
   const allowanceMinutes = BUILD_ALLOWANCE_MINUTES + (input.baseMissing ? BASE_BUILD_ALLOWANCE_MINUTES : 0)
-  if (input.largestLimitMs === null) return { minutes: allowanceMinutes, ms: allowanceMinutes * MS_PER_MINUTE }
+  if (input.largestLimitMs === null) return { minutes: allowanceMinutes + waitMs / MS_PER_MINUTE, ms: allowanceMinutes * MS_PER_MINUTE + waitMs }
   const fixedMinutes = allowanceMinutes + MERGE_ALLOWANCE_MINUTES
-  return { minutes: fixedMinutes + input.largestLimitMs / MS_PER_MINUTE, ms: fixedMinutes * MS_PER_MINUTE + input.largestLimitMs }
+  return { minutes: fixedMinutes + (input.largestLimitMs + waitMs) / MS_PER_MINUTE, ms: fixedMinutes * MS_PER_MINUTE + input.largestLimitMs + waitMs }
 }
 
 /** The run deadline's input as the run stands (b.uqm SR-5.5). */
-function runDeadlineInputOf(seq: Pick<RunSequence, 'state' | 'schedule'>): RunDeadlineInput {
-  return { baseMissing: seq.state.baseImage?.kind === 'missing', largestLimitMs: seq.schedule?.largestLimitMs ?? null }
+function runDeadlineInputOf(seq: Pick<RunSequence, 'state' | 'schedule' | 'codexLoginWaitMs'>): RunDeadlineInput {
+  return { codexLoginWaitMs: seq.codexLoginWaitMs, baseMissing: seq.state.baseImage?.kind === 'missing', largestLimitMs: seq.schedule?.largestLimitMs ?? null }
 }
 
 /** The status phase as the run stands (b.uqm SR-5.2): `merge` from the start of the end-of-run sequence, else `shards` once scheduled, else `build`. */
@@ -16822,6 +17036,7 @@ export function createRunStopHooks(): RunStopHooks {
   let timer: ClockTimer | null = null
   const removers: (() => void)[] = []
   let baseAllowanceApplied = false
+  let codexWaitApplied = 0
   let disposed = false
   let trapped = false
   /** The run sequence once it has started; null before (validation) and for a refused run. */
@@ -16901,13 +17116,19 @@ export function createRunStopHooks(): RunStopHooks {
     trap,
     onSequenceStart: (seq) => {
       current = seq
-      armDeadline(seq, runDeadlineOffset(runDeadlineInputOf(seq)))
+      codexWaitApplied = seq.codexLoginWaitMs
+      if (seq.codexLoginWaitMs > 0) moveDeadline(seq, 'build')
+      else armDeadline(seq, runDeadlineOffset(runDeadlineInputOf(seq)))
       trap(seq.deps, seq.run.log)
       const received = pending
       pending = null
       if (received !== null) onTrapped(received)
     },
     onStep: (seq) => {
+      if (codexWaitApplied !== seq.codexLoginWaitMs) {
+        codexWaitApplied = seq.codexLoginWaitMs
+        moveDeadline(seq, 'build')
+      }
       if (baseAllowanceApplied || seq.state.baseImage?.kind !== 'missing') return
       baseAllowanceApplied = true
       moveDeadline(seq, 'build')

@@ -363,9 +363,9 @@ describe('module properties (b.uqm SR-1.3)', () => {
     expect(listenerCounts()).toEqual(before)
   })
 
-  test('the runtime loads are only node: built-ins, bun and bun:ffi, and nothing from src/ or ci-live/', () => {
+  test('runtime loads use built-ins and the import-safe Codex policy, with no production modules', () => {
     const specifiers = runtimeSpecifiers(stripComments(runnerSource()))
-    const allowed = (specifier: string): boolean => specifier.startsWith('node:') || specifier === 'bun' || specifier === 'bun:ffi'
+    const allowed = (specifier: string): boolean => specifier.startsWith('node:') || specifier === 'bun' || specifier === 'bun:ffi' || specifier === './codex-login.ts' || specifier === './safe-docker-inspect.ts'
 
     expect(specifiers.length).toBeGreaterThan(0)
     expect(specifiers.filter((specifier) => !allowed(specifier))).toEqual([])
@@ -2007,7 +2007,7 @@ describe('E2: validation stages 2–8 (b.uqm SR-2.3, SR-2.6, SR-3.1, SR-3.2, SR-
     })
 
     test('a run that passes every stage, GH_TOKEN unset, spawns no gh auth token lookup and no other child during validation', async () => {
-      const wt = worktree()
+      const wt = worktree({ scripts: realScriptFileNames().filter(file => !file.includes('-fmk-real-codex')) })
       const env: ChildEnvironmentSource = { ANTHROPIC_API_KEY: gatewayKey(), ANTHROPIC_BASE_URL: GATEWAY_URL }
       expect(validated(wt, [], env).effectiveShards).toBe(MAX_SHARDS)
       const rig = mainRig(wt, env)
@@ -2197,4 +2197,16 @@ describe('E2: validation stages 2–8 (b.uqm SR-2.3, SR-2.6, SR-3.1, SR-3.2, SR-
       },
     )
   })
+})
+
+// b.omv SR-14.7: the selected model is public routing data, never a scan value.
+import { SHARD_ENV_NAMES, NON_SECRET_VARIABLES, scannedSecretValues } from '../scripts/ci-run.ts'
+test('E7: Codex model has one plain shard variable and cannot enter the secret set', () => {
+  const env = { CODEX_TEST_MODEL: 'test/model:1', ANTHROPIC_API_KEY: fakeToken('', 'model-control') }
+  expect(SHARD_ENV_NAMES.filter(name => name === 'CODEX_TEST_MODEL')).toHaveLength(1)
+  expect(NON_SECRET_VARIABLES).toContain('CODEX_TEST_MODEL')
+  expect(scannedSecretValues(env).includes(env.CODEX_TEST_MODEL)).toBe(false)
+  expect(secretCredentialSet(env).has(env.CODEX_TEST_MODEL)).toBe(false)
+  expect(scannedSecretValues(env).includes(env.ANTHROPIC_API_KEY)).toBe(true)
+  assertNoLeak({ variables: SHARD_ENV_NAMES, model: env.CODEX_TEST_MODEL })
 })

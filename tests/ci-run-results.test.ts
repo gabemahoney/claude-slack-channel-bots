@@ -484,6 +484,7 @@ describe('E1: the verdict write (b.uqm SR-5.7)', () => {
 describe('E1: results.json (b.uqm SR-16.1)', () => {
   /** SR-16.1's top-level keys, in its order. */
   const SR_16_1_KEYS = [
+    'codexModel',
     'version',
     'runId',
     'pid',
@@ -728,8 +729,8 @@ describe('E9: shard containers (b.t6s E9 T5; b.uqm SR-10.1 to SR-10.5)', () => {
     ANTHROPIC_MODEL: MODEL,
     GH_TOKEN: SECRETS.ghToken,
   }
-  /** The three variables a shard's list names by bare name (b.uqm SR-10.4). */
-  const SHARD_VARIABLES = ['ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL']
+  /** The shard variables a shard's list names by bare name (b.uqm SR-10.4). */
+  const SHARD_VARIABLES = ['ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL', 'CODEX_TEST_MODEL', 'CODEX_HOST_CONFIG_KEYS']
   /** Test data: the run's start on the fake clock, and its tarball's file name in `package/` (never read: it need not exist). */
   const START_MS = Date.UTC(2026, 9, 8, 12, 0, 0)
   const TARBALL_FILE_NAME = 'claude-slack-channel-bots-e9.tgz'
@@ -760,7 +761,7 @@ describe('E9: shard containers (b.t6s E9 T5; b.uqm SR-10.1 to SR-10.5)', () => {
   }
 
   /** Changes to one start's inputs. */
-  type StartChange = Partial<Omit<e9.ShardStartInput, 'assignment'>>
+  type StartChange = Partial<e9.ShardStartInput>
 
   interface E9Rig {
     readonly clock: e9Clock.FakeClock
@@ -938,7 +939,7 @@ describe('E9: shard containers (b.t6s E9 T5; b.uqm SR-10.1 to SR-10.5)', () => {
       expect(rig.starts.map(({ result }) => result.containerName)).toEqual([...ours, ...theirs])
     })
 
-    test('shard 1’s whole list, in order: no pull, its name and labels, its limits, its two mounts, the three variables by bare name, the pinned image ID, then the runner’s arguments', async () => {
+    test('shard 1’s whole list, in order: no pull, its name and labels, its limits, its two mounts, the shard variables by bare name, the pinned image ID, then the runner’s arguments', async () => {
       const rig = e9Rig()
       const result = await rig.start(1)
 
@@ -1104,7 +1105,7 @@ describe('E9: shard containers (b.t6s E9 T5; b.uqm SR-10.1 to SR-10.5)', () => {
   // --- T5.S2: credentials by bare name and the argument-list check (SR-10.4, SR-15.1) ---
 
   describe('credentials by bare name and the argument-list check (SR-10.4, SR-15.1)', () => {
-    test('each list names exactly ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL and ANTHROPIC_MODEL by bare name, no other variable and no env file; GH_TOKEN is never named though it is set', async () => {
+    test('each list names exactly the shard credentials, model and host-key projection by bare name, no other variable and no env file; GH_TOKEN is never named though it is set', async () => {
       const rig = e9Rig({ env: GATEWAY_ENV })
       await startAll(rig, [1, 2, 3])
 
@@ -1128,9 +1129,40 @@ describe('E9: shard containers (b.t6s E9 T5; b.uqm SR-10.1 to SR-10.5)', () => {
       const spawns = runSpawns(rig)
       expect(spawns).toHaveLength(3)
       for (const spawn of spawns) {
-        expect(spawn.env).toEqual(e9.childEnvironment(env))
+        expect(spawn.env).toEqual({ ...e9.childEnvironment(env), CODEX_TEST_MODEL: '', CODEX_HOST_CONFIG_KEYS: '' })
         expect(spawn.env.ANTHROPIC_API_KEY).toBe(env.ANTHROPIC_API_KEY as string)
       }
+    })
+
+    test.each(['valid', 'missing', 'malformed', 'incomplete'] as const)('Codex host-key metadata %s is checked before docker run and transported only by environment', async kind => {
+      const rig = e9Rig({ env: { ...RAW_KEY_ENV, CODEX_HOST_CONFIG_KEYS: 'inherited-untrusted-projection' } })
+      const projection = JSON.stringify({ version: 1, keys: [['model'], ['profiles'], ['profiles', 'private']] })
+      const result = await rig.start(1, {
+        assignment: { shard: 1, assigned: [rig.assigned(1)[0]!, 'test-999-fmk-real-codex.sh'] },
+        codexLoginSource: join(root, 'fake-login.json'), codexModel: 'test/model:1',
+        codexHostConfigKeys: kind === 'valid' ? projection : kind === 'missing' ? undefined : kind === 'incomplete' ? JSON.stringify({ version: 1, keys: [['model'], ['profiles', 'private']] }) : '{',
+      })
+      if (kind === 'valid') {
+        expect(result.start.kind).toBe('started')
+        const [spawn] = runSpawns(rig)
+        expect(spawn!.env.CODEX_HOST_CONFIG_KEYS).toBe(projection)
+        expect(valuesOf(spawn!.argv, '--env')).toEqual(SHARD_VARIABLES)
+        expect(spawn!.argv.some(arg => arg.includes(projection) || arg.includes('inherited-untrusted-projection'))).toBe(false)
+        expect(rig.logged.some(entry => entry.line.includes(projection))).toBe(false)
+      } else {
+        expect(result.start).toMatchObject({ kind: 'failed-to-start', detail: 'Codex host config key projection is missing or invalid' })
+        expect(rig.recorder.spawns()).toEqual([])
+        expect(rig.logged).toEqual([])
+      }
+    })
+
+    test('ordinary shards clear inherited Codex metadata before spawning', async () => {
+      const rig = e9Rig({ env: { ...RAW_KEY_ENV, CODEX_HOST_CONFIG_KEYS: 'inherited-untrusted-projection', CODEX_TEST_MODEL: 'inherited-model' } })
+      expect((await rig.start(1)).start.kind).toBe('started')
+      const [spawn] = runSpawns(rig)
+      expect(spawn!.env.CODEX_HOST_CONFIG_KEYS).toBe('')
+      expect(spawn!.env.CODEX_TEST_MODEL).toBe('')
+      expect(spawn!.argv.some(arg => arg.includes('inherited-untrusted-projection'))).toBe(false)
     })
 
     test('logging: each shard’s list is written to the runner log, as E1’s docker run line, before its spawn is recorded', async () => {
@@ -2246,7 +2278,7 @@ describe('E10: outcomes, verdict and results (b.t6s E10 T4)', () => {
 
     test('the top level holds exactly SR-16.1’s keys', () => {
       expect(sortedKeys(assembled())).toEqual(
-        ['version', 'runId', 'pid', 'packageSha256', 'images', 'verdict', 'invocation', 'scripts', 'shards', 'shardCount', 'cap', 'workingSet', 'failedReadings', 'modes', 'failures', 'skippedChecks', 'cleanupFailures', 'timing', 'timingSummary'].sort(),
+        ['version', 'runId', 'pid', 'packageSha256', 'codexModel', 'images', 'verdict', 'invocation', 'scripts', 'shards', 'shardCount', 'cap', 'workingSet', 'failedReadings', 'modes', 'failures', 'skippedChecks', 'cleanupFailures', 'timing', 'timingSummary'].sort(),
       )
     })
 
@@ -2864,6 +2896,24 @@ describe('E11: integrity checks and secret-scan (b.uqm SR-13, SR-15.2, SR-15.3)'
     expect(outcome.failures).toEqual([...expected(run.scripts)])
     expect(outcome.skippedChecks).toEqual([])
   }
+
+  test.each(['valid', 'missing', 'readonly', 'wrong-source', 'directory', 'wrong-target', 'duplicate', 'ordinary-shard', 'extra-script'] as const)('E7: Codex mount %s is judged against its dedicated assignment', kind => {
+    const codex = 'test-999-fmk-real-codex.sh'
+    const run = integrityRun({ shards: 1, assigned: scripts => [[scripts.testOne, codex]] })
+    const source = join(root, 'codex-home/auth.json')
+    let inputs: IntegrityEntryInputs = { ...run.inputs, codexLoginSource: source }
+    const mount = { source, target: '/run/codex-login/auth.json', readOnly: false }
+    inputs = withShard(inputs, 1, shard => withInspection(shard, inspection => ({ mounts: [...inspection.mounts, mount] })))
+    if (kind === 'missing') inputs = withShard(inputs, 1, shard => withInspection(shard, inspection => ({ mounts: inspection.mounts.filter(item => item !== mount) })))
+    if (kind === 'readonly') inputs = withShard(inputs, 1, shard => withInspection(shard, inspection => ({ mounts: inspection.mounts.map(item => item === mount ? { ...item, readOnly: true } : item) })))
+    if (kind === 'wrong-source' || kind === 'directory') inputs = withShard(inputs, 1, shard => withInspection(shard, inspection => ({ mounts: inspection.mounts.map(item => item === mount ? { ...item, source: kind === 'directory' ? join(root, 'codex-home') : join(root, 'other-auth.json') } : item) })))
+    if (kind === 'wrong-target') inputs = withShard(inputs, 1, shard => withInspection(shard, inspection => ({ mounts: inspection.mounts.map(item => item === mount ? { ...item, target: '/run/other/auth.json' } : item) })))
+    if (kind === 'duplicate') inputs = withShard(inputs, 1, shard => withInspection(shard, inspection => ({ mounts: [...inspection.mounts, mount] })))
+    if (kind === 'ordinary-shard' || kind === 'extra-script') inputs = { ...inputs, assignment: inputs.assignment!.map(entry => ({ ...entry, assigned: kind === 'ordinary-shard' ? [run.scripts.testOne, run.scripts.others[0]!] : [...entry.assigned, run.scripts.others[0]!] })) }
+    const failures = e11Runner.checkIsolationMounts(inputs)
+    expect(failures.length === 0).toBe(kind === 'valid')
+    e11AssertNoLeak(failures)
+  })
 
   // T3.S1: the clean run, the order, the granularity, the skip rules, fault-fired and the entry spawning nothing.
 
@@ -5221,5 +5271,25 @@ describe('E13: what tests/runner.sh writes (b.t6s E13 T6; b.uqm SR-11.3)', () =>
     ['package lines without the version', (t) => e13Planted(t, '@\\(.version // "")', ''), 'a package line is not <name>@<version>'],
   ])('a runner with %s is reported', (_name, plant, problem) => {
     expect(e13RunnerWriteProblems(plant(runner()))).toContain(problem)
+  })
+})
+
+
+// b.omv SR-14.7: the added field is strict and survives both public artifacts.
+describe('E7: recorded Codex model', () => {
+  test.each([null, 'test/model:1'])('results and summary record %j', codexModel => {
+    const results = makeResults({ runId: RUN_ID, pid: RUNNER_PID, codexModel })
+    const text = serializeResults(results)
+    expect(parseResults(text)).toEqual({ ok: true, value: results })
+    const summary = e10.renderSummary(results)
+    expect(summary.includes('recorded: codex-model')).toBe(codexModel !== null)
+    if (codexModel) expect(summary.split('\n')).toContain(`recorded: codex-model ${codexModel}`)
+    assertNoLeak({ text, summary })
+  })
+  test.each(['', 'bad model', 'bad@model', 1, {}, undefined])('results reject invalid Codex model %#', codexModel => {
+    const value = { ...makeResults({ runId: RUN_ID, pid: RUNNER_PID }), codexModel }
+    const result = parseResults(JSON.stringify(value))
+    expect(result.ok).toBe(false)
+    assertNoLeak(result)
   })
 })

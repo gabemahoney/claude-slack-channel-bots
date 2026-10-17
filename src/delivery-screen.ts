@@ -22,6 +22,60 @@ function observedEmptyClaudeLowerRule(lines: readonly string[], index: number): 
 }
 const menuFooter = /esc to cancel|enter to select|enter to confirm|to navigate/i
 const runningLine = /^[✢✳✶✻✽·*].*…(?:\s|$)|^[✢✳✶✻✽·*].*[……].*(?:\(|tokens|thinking)|esc to interrupt|interrupt.*esc/i
+/** Native Codex 0.159.2, E7 run 20261017t200216z-lglgkb2l:
+ * the slash chooser sits above the current `› /` composer, without a
+ * menu footer. Require its adjacent selected command and option rows;
+ * a slash draft or a historical command alone is not this popup.
+ */
+function observedCodexSlashPopup(lines: readonly string[], composer: number): boolean {
+  if (!/^\s*› \/\s*$/.test(lines[composer]!)) return false
+  let index = composer - 1, options = 0
+  while (index >= 0 && !lines[index]!.trim()) index--
+  for (; index >= 0; index--) {
+    const line = lines[index]!
+    if (/^  \/[a-z][a-z-]* {2,}\S/.test(line)) options++
+    else if (/^› \/[a-z][a-z-]* {2,}\S/.test(line)) return options >= 2
+    else if (!/^ {3,}\S/.test(line)) return false
+  }
+  return false
+}
+/** b.omv SR-5.3: native 0.159.2, E7 run 20261017t212743z-ddde5cd6.
+ * The @/$ choosers put their insert/close hint immediately above the
+ * current composer. Require that hint and its adjacent selected option
+ * block; historical chooser text and a bare @/$ draft are not menus.
+ */
+function observedCodexInsertPopup(lines: readonly string[], composer: number): boolean {
+  const marker = lines[composer]!.match(/^\s*› ([@$])\s*$/)?.[1]
+  if (!marker) return false
+  let index = composer - 1
+  while (index >= 0 && !lines[index]!.trim()) index--
+  const hint = marker === '@' ? 'enter/tab insert · esc close · ↑/↓ select · ←/→ filter' : 'enter insert · esc close'
+  if (lines[index]?.trim() !== hint) return false
+  index--
+  while (index >= 0 && (!lines[index]!.trim() || lines[index]!.trim() === '↓')) index--
+  const option = marker === '@' ? /^  \S.* {2,}\S.* {2,}Skill$/ : /^  \S.* {2,}\[(?:Skill|App)\] \S/
+  const selected = marker === '@' ? /^› \S.* {2,}\S.* {2,}Skill$/ : /^› \S.* {2,}\[(?:Skill|App)\] \S/
+  let options = 0
+  for (; index >= 0; index--) {
+    if (option.test(lines[index]!)) options++
+    else return options >= 2 && selected.test(lines[index]!)
+  }
+  return false
+}
+/** The same native run draws shortcuts above the composer and a close
+ * hint at the bottom. Both boundaries must belong to the current block.
+ */
+function observedCodexShortcutsOverlay(lines: readonly string[], composer: number): boolean {
+  if (lines.at(-1)?.trim() !== '? / esc close') return false
+  let index = composer - 1
+  while (index >= 0 && !lines[index]!.trim()) index--
+  if (lines[index]?.trim() !== '/keymap customize') return false
+  for (index--; index >= 0; index--) {
+    if (/^\s*›(?: |$)/.test(lines[index]!)) return false
+    if (lines[index]!.trim() === 'Keyboard shortcuts') return true
+  }
+  return false
+}
 /** Native Claude wraps the current composer at a column or a word boundary.
  * Resolve only those observed display breaks against the known complete
  * item; an unrelated draft sharing a tag's first visual line is not ours.
@@ -80,6 +134,8 @@ export function readDeliveryScreen(agent: DeliveryAgent, pane: string, ownText?:
   let composer = -1
   for (let i = lines.length - 1; i >= 0; i--) if (/^\s*›(?: |$)/.test(lines[i]!)) { composer = i; break }
   if (composer < 0) return { kind: 'menu', running: false }
+  if (observedCodexSlashPopup(lines, composer)) return { kind: 'menu', running: false }
+  if (observedCodexInsertPopup(lines, composer) || observedCodexShortcutsOverlay(lines, composer)) return { kind: 'menu', running: false }
   const block = lines.slice(composer)
   if (block.some(line => menuFooter.test(line) || /Viewing sub-agent — direct input is disabled/i.test(line))) return { kind: 'menu', running: false }
   const text = [block[0]!.replace(/^\s*› ?/, '')]

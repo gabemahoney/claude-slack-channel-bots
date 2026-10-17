@@ -2,22 +2,35 @@
  * No Docker, agent, agent-director, tmux or model call runs on the host.
  */
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { spawnSync } from 'node:child_process'
 import {
   AI_CRITERIA, GATE_SLUGS, HEAVY_SCRIPTS, MATRIX_CPUS, MATRIX_MEMORY, MATRIX_TIMEOUT_MS,
   MATRIX_VERSIONS, SCHEDULER_JOB_CONTRACT, assertJobComplete, discoverGateScripts,
   matrixDockerArgs, matrixOptions, matrixPlan, safeModel, parseResultLine, runMatrix,
+  CODEX_AI_CRITERIA, localCodexExtension, assertCodexJobComplete, codexMatrixDockerArgs,
   type MatrixJob, type MatrixResult,
 } from '../scripts/real-agent-matrix.ts'
 import { CPUS_PER_SHARD, SHARD_MEMORY_CAP_BYTES, SHARD_PIDS_LIMIT } from '../scripts/ci-run.ts'
+import * as ciRunner from '../scripts/ci-run.ts'
 import { assertNoLeak, fakeToken, writtenFile } from './test-helpers/credentials.ts'
+import { makeFakeCodexHome, probeFlock } from './test-helpers/ci-run.ts'
+import { CODEX_VERSION, CODEX_LOGIN_TARGET, CODEX_EXTRA_MEMORY_BYTES, codexLoginContainerListArgs } from '../scripts/codex-login.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { LIVE_CLAUDE_CODE_VERSION, MIN_CLAUDE_CODE_VERSION } from './test-helpers/agent-director-versions.ts'
+import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
+import { decodeCodexHostConfigKeys } from '../src/codex-config-keys.ts'
 
 const gateNames = () => GATE_SLUGS.map((slug, i) => `test-${32 + i}-fmk-real-${slug}.sh`)
 const heavyNames = () => [...HEAVY_SCRIPTS, ...AI_CRITERIA.map(ac => `test-${100 + ac}-fmk-real-ai-ac${ac}.sh`)]
+const codexNames = () => CODEX_AI_CRITERIA.map(ac => `test-${100 + ac}-fmk-real-codex-ai-ac${ac}.sh`)
+const codexExtension = () => localCodexExtension(codexNames())
+const codexModel = 'test/model:1'
+function codexResults(): MatrixResult[] {
+  return codexExtension().invocations.map(i => ({ script: i.script, trial: i.trial, version: CODEX_VERSION, model: codexModel, agent: 'codex', completed: true, exit: 0, reported: true, duplicates: 0, tokens: { input: 7, output: 3, cache_read: 5, cache_creation: 1 } }))
+}
 const gates = () => discoverGateScripts(gateNames())
 const plan = (latest = '2.1.999') => matrixPlan(latest, gates(), heavyNames())
 const model = 'claude-opus-5-5'
@@ -135,6 +148,33 @@ describe('heavy planning and result validation', () => {
     ['-model', false], ['a'.repeat(257), false], ['model$(command)', false],
   ])('safe selected model %j accepted=%s', (value, expected) => expect(safeModel(value)).toBe(expected))
 
+  test('Codex local manifest contains exactly five criteria with three independent trials each', () => {
+    expect(CODEX_AI_CRITERIA).toEqual([11, 12, 15, 20, 106])
+    expect(codexExtension()).toEqual({ agent: 'codex', localOnly: true, invocations: CODEX_AI_CRITERIA.flatMap(ac => [1, 2, 3].map(trial => ({ script: `real-agent/test-${100 + ac}-fmk-real-codex-ai-ac${ac}.sh`, trial, model: 'default' }))) })
+    for (const name of codexNames()) expect(() => localCodexExtension(codexNames().filter(file => file !== name))).toThrow('absent')
+    const results = codexResults().map(row => parseResultLine(resultLine(row))!)
+    expect(() => assertCodexJobComplete(codexExtension(), results, codexModel)).not.toThrow()
+    expect(plan().flatMap(job => job.invocations).some(item => item.script.includes('codex'))).toBe(false)
+    expect(SCHEDULER_JOB_CONTRACT.plainEnv).not.toContain('CODEX_TEST_MODEL')
+    expect(SCHEDULER_JOB_CONTRACT.plainEnv).not.toContain('CODEX_HOST_CONFIG_KEYS')
+    expect(SCHEDULER_JOB_CONTRACT.context.some(item => item.includes('auth.json'))).toBe(false)
+  })
+
+  test.each([0, 3, Number.MAX_SAFE_INTEGER])('preserves a Codex message-copy count of %s without failing completed trials', duplicates => {
+    const rows = codexResults()
+    rows[0]!.duplicates = duplicates
+    const parsed = rows.map(row => parseResultLine(resultLine(row))!)
+    expect(parsed).toEqual(rows)
+    expect(() => assertCodexJobComplete(codexExtension(), parsed, codexModel)).not.toThrow()
+  })
+
+  test.each([null, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, NaN, '1'])('rejects an invalid Codex message-copy count %j', duplicates => {
+    const rows = codexResults()
+    rows[0]!.duplicates = duplicates as number | null
+    expect(() => parseResultLine(resultLine(rows[0]))).toThrow('Malformed real-agent-result')
+    expect(() => assertCodexJobComplete(codexExtension(), rows, codexModel)).toThrow('did not pass')
+  })
+
   test('local jobs use CI resource caps, bare runtime environment names and a three-hour timeout; future scheduler reserves separately', () => {
     const args = matrixDockerArgs('test-job', 'test-image', plan()[0]!)
     const flag = (name: string) => args[args.indexOf(name) + 1]
@@ -156,16 +196,74 @@ describe('heavy planning and result validation', () => {
   })
 })
 
+describe('Codex entrypoint trial reporting', () => {
+  let root: string
+  beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'codex-trial-report-')) })
+  afterEach(() => { rmSync(root, { recursive: true, force: true }) })
+
+  test.each(['valid', 'missing', 'malformed', 'incomplete'] as const)('entrypoint host-key preflight %s validates the real environment payload', kind => {
+    // Run only the entrypoint's admission program against its repo module.
+    // The surrounding shell/native/container commands are never executed.
+    const entrypoint = readFileSync(join(import.meta.dir, '..', 'docker/real-agent-codex-job.sh'), 'utf8')
+    const program = entrypoint.match(/^gosu testuser bun -e '(.+)'$/m)?.[1]
+    expect(program).toBeDefined()
+    const code = program!.replace('/test-repo/node_modules/claude-slack-channel-bots/src/codex-config-keys.ts', join(import.meta.dir, '..', 'src/codex-config-keys.ts'))
+    const payload = kind === 'valid' ? JSON.stringify({ version: 1, keys: [['model'], ['tui']] })
+      : kind === 'incomplete' ? JSON.stringify({ version: 1, keys: [['model'], ['tui', 'other']] })
+      : kind === 'malformed' ? fakeToken('', 'invalid-projection') : undefined
+    const child = spawnSync(process.execPath, ['-e', code], {
+      env: hostSafeChildEnv(root, { tools: [], extras: payload === undefined ? {} : { CODEX_HOST_CONFIG_KEYS: payload } }),
+      encoding: 'utf8', timeout: 5000,
+    })
+    expect(child.error).toBeUndefined()
+    expect(child.signal).toBeNull()
+    expect(child.status).toBe(kind === 'valid' ? 0 : 64)
+    expect(child.stdout).toBe('')
+    expect(child.stderr).toBe(kind === 'valid' ? '' : 'FAIL: Codex host config key projection is missing or invalid\n')
+    assertNoLeak({ stdout: child.stdout, stderr: child.stderr })
+  })
+
+  test.each([
+    ['0', 0, true], ['4', 4, true], ['-1', -1, false],
+    ['1.5', null, false], ['invalid', null, false],
+  ] as const)('reports message-copy text %j as count %s with completed=%s', (count, expected, valid) => {
+    // Execute only the entrypoint's real report parser, never its container,
+    // package-install, agent-director or native-model commands.
+    const entrypoint = readFileSync(join(import.meta.dir, '..', 'docker/real-agent-codex-job.sh'), 'utf8')
+    const parser = entrypoint.match(/<<'PY'[^\n]*\n([\s\S]*?)\nPY\n/)?.[1]
+    expect(parser).toBeDefined()
+    const log = join(root, 'trial.log')
+    const row = { ...codexResults()[0]!, duplicates: expected, completed: valid, reported: valid }
+    writeFileSync(log, [
+      `duplicates: ${count}`, `tokens: ${JSON.stringify(row.tokens)}`,
+      `recorded: codex-model ${codexModel}`, 'recorded: codex-completed true',
+      'recorded: codex-auth-symlink true',
+    ].join('\n') + '\n')
+    const child = spawnSync('python3', ['-B', '-c', parser!, row.script, String(row.trial), codexModel, '0', log], {
+      env: hostSafeChildEnv(root, { tools: ['python3'] }), encoding: 'utf8', timeout: 5000,
+    })
+    expect(child.error).toBeUndefined()
+    expect(child.signal).toBeNull()
+    expect(child.stderr).toBe('')
+    expect(child.status).toBe(valid ? 0 : 1)
+    const report = JSON.parse(child.stdout.trim().slice('real-agent-result: '.length))
+    expect(report).toMatchObject({ agent: 'codex', duplicates: expected, completed: valid, reported: valid })
+    if (valid) expect(parseResultLine(child.stdout.trim())).toEqual(row)
+    assertNoLeak({ log: writtenFile(log), stdout: child.stdout, stderr: child.stderr })
+  })
+})
+
 describe('heavy execution with fake children', () => {
   let root: string, repo: string, output: string
-  let stdout: string[], stderr: string[], calls: { argv: string[]; key: string | undefined; model: string | undefined; aiModel: string | undefined; pid: number; detached: boolean | undefined; tmpdir: string | undefined }[], stage: string | undefined
+  let stdout: string[], stderr: string[], calls: { argv: string[]; key: string | undefined; model: string | undefined; aiModel: string | undefined; codexModel: string | undefined; hostConfigKeys: string | undefined; pid: number; detached: boolean | undefined; tmpdir: string | undefined }[], stage: string | undefined
   let response: (argv: string[]) => { code?: number; text?: string; stderr?: string; hang?: boolean; retainPipes?: boolean; ignoreKill?: boolean }
   let latestResponse: () => Promise<Response>
   let activeJobs: number, maxJobs: number
   const clock = createFakeClock()
   let kills: string[]
   let groupKills: { pid: number; signal: string | number | undefined }[], cancelledPipes: number[]
-  const envNames = ['CI_ANTHROPIC_API_KEY', 'CI_ANTHROPIC_MODEL', 'CI_ANTHROPIC_BASE_URL', 'CI_ANTHROPIC_OPUS_MODEL', 'CI_ANTHROPIC_AI_MODEL'] as const
+  const envNames = ['CI_ANTHROPIC_API_KEY', 'CI_ANTHROPIC_MODEL', 'CI_ANTHROPIC_BASE_URL', 'CI_ANTHROPIC_OPUS_MODEL', 'CI_ANTHROPIC_AI_MODEL', 'CODEX_HOME', 'CODEX_TEST_MODEL', 'CODEX_HOST_CONFIG_KEYS'] as const
+  let codex: ReturnType<typeof makeFakeCodexHome>
   let oldEnv: Record<string, string | undefined>
   let restore: (() => void)[]
 
@@ -174,10 +272,14 @@ describe('heavy execution with fake children', () => {
     repo = join(root, 'repo'); output = join(root, 'output')
     for (const dir of ['tests/integration', 'tests/real-agent', 'docker']) mkdirSync(join(repo, dir), { recursive: true })
     for (const name of gateNames()) writeFileSync(join(repo, 'tests/integration', name), '')
-    for (const name of heavyNames()) writeFileSync(join(repo, 'tests/real-agent', name), '')
+    for (const name of [...heavyNames(), ...codexNames()]) writeFileSync(join(repo, 'tests/real-agent', name), '')
     stdout = []; stderr = []; calls = []; kills = []; stage = undefined; activeJobs = 0; maxJobs = 0
     groupKills = []; cancelledPipes = []
     oldEnv = Object.fromEntries(envNames.map(n => [n, process.env[n]]))
+    codex = makeFakeCodexHome(root, codexModel)
+    process.env.CODEX_HOME = codex.home
+    process.env.CODEX_TEST_MODEL = 'inherited-model'
+    process.env.CODEX_HOST_CONFIG_KEYS = 'inherited-untrusted-projection'
     process.env.CI_ANTHROPIC_API_KEY = fakeToken('', 'anthropic')
     process.env.CI_ANTHROPIC_MODEL = model
     process.env.CI_ANTHROPIC_BASE_URL = 'https://model.invalid'
@@ -199,9 +301,9 @@ describe('heavy execution with fake children', () => {
     restore.push(() => timerSpy.mockRestore(), () => clearSpy.mockRestore())
     const spawnSpy = spyOn(Bun, 'spawn').mockImplementation(((argv: string[], options: { env?: Record<string, string | undefined>; detached?: boolean }) => {
       const pid = 600_000 + calls.length
-      calls.push({ argv: [...argv], key: options.env?.ANTHROPIC_API_KEY, model: options.env?.ANTHROPIC_MODEL, aiModel: options.env?.REAL_AGENT_AI_MODEL, pid, detached: options.detached, tmpdir: options.env?.TMPDIR })
+      calls.push({ argv: [...argv], key: options.env?.ANTHROPIC_API_KEY, model: options.env?.ANTHROPIC_MODEL, aiModel: options.env?.REAL_AGENT_AI_MODEL, codexModel: options.env?.CODEX_TEST_MODEL, hostConfigKeys: options.env?.CODEX_HOST_CONFIG_KEYS, pid, detached: options.detached, tmpdir: options.env?.TMPDIR })
       stage = options.env?.TMPDIR
-      const isJob = argv[0] === 'docker' && argv[1] === 'run'
+      const isJob = argv[0] === 'docker' && argv[1] === 'run' && !argv.includes('id')
       if (isJob) { activeJobs++; maxJobs = Math.max(maxJobs, activeJobs) }
       if (argv[0] === 'bun') {
         const archive = argv[argv.indexOf('--filename') + 1]!
@@ -212,7 +314,15 @@ describe('heavy execution with fake children', () => {
       if (argv[0] === 'docker' && argv[1] === 'image' && argv[2] === 'inspect' && answer.text === undefined) {
         text = JSON.stringify([{ Id: 'a'.repeat(64), Config: { Env: [`ANTHROPIC_API_KEY=${fakeToken('', 'inspect-default')}`] } }])
       }
-      if (isJob && answer.text === undefined) {
+      if (argv[0] === 'docker' && argv[1] === 'container' && argv[2] === 'inspect' && answer.text === undefined) {
+        text = JSON.stringify([{ Id: 'b'.repeat(64), Image: 'sha256:' + 'a'.repeat(64), Name: '/' + argv[3],
+          State: { Running: false, OOMKilled: false, ExitCode: 0 }, Config: { Env: [], Labels: {} },
+          HostConfig: { Memory: Number(MATRIX_MEMORY) + CODEX_EXTRA_MEMORY_BYTES },
+          Mounts: [{ Type: 'bind', Source: codex.auth, Destination: CODEX_LOGIN_TARGET, RW: true }] }])
+      }
+      if (argv[0] === 'docker' && argv[1] === 'run' && argv.includes('id') && answer.text === undefined) text = String(process.getuid!()) + '\n'
+      if (isJob && argv.includes('/opt/cscb-ci/real-agent-codex-job.sh') && answer.text === undefined) text = codexResults().map(resultLine).join('\n') + '\n'
+      else if (isJob && answer.text === undefined) {
         text = resultsFor(jobForArgv(argv), options.env?.ANTHROPIC_MODEL, options.env?.REAL_AGENT_AI_MODEL).map(resultLine).join('\n') + '\n'
       }
       let finish!: (code: number) => void, stream!: ReadableStreamDefaultController<Uint8Array>
@@ -245,8 +355,9 @@ describe('heavy execution with fake children', () => {
     } finally { rmSync(root, { recursive: true, force: true }) }
   })
 
-  const run = (planOnly = false) => runMatrix({ repo, output, planOnly })
-  const jobsRun = () => calls.filter(c => c.argv[1] === 'run')
+  const run = (planOnly = false, codexOnly = false) => runMatrix({ repo, output, planOnly, codexOnly })
+  const jobsRun = () => calls.filter(c => c.argv[1] === 'run' && !c.argv.includes('id') && !c.argv.includes('/opt/cscb-ci/real-agent-codex-job.sh'))
+  const codexRuns = () => calls.filter(c => c.argv.includes('/opt/cscb-ci/real-agent-codex-job.sh'))
   const interruptMatrix = (before: ReturnType<typeof process.listeners>) => {
     // Invoke only this run's handler: emitting a process signal also reaches
     // unrelated listeners installed by other suites in a combined Bun run.
@@ -258,20 +369,23 @@ describe('heavy execution with fake children', () => {
   test('resolves latest once, packs one production archive, runs sequentially, aggregates every usage/duplicate and ends in one PASS', async () => {
     let fetches = 0
     latestResponse = async () => { fetches++; return new Response('2.1.999\n') }
-    expect(await run()).toBe(true)
+    const passed = await run()
+    expect(stdout.filter(line => line.startsWith('FAIL:'))).toEqual([])
+    expect(passed).toBe(true)
     expect(fetches).toBe(1)
     expect(jobsRun()).toHaveLength(3)
     expect(maxJobs).toBe(1)
     expect(calls.filter(c => c.argv[0] === 'bun')).toHaveLength(1)
-    expect(calls.filter(c => c.argv.slice(0, 3).join(' ') === 'docker rm -f')).toHaveLength(3)
+    expect(calls.filter(c => c.argv.slice(0, 3).join(' ') === 'docker rm -f')).toHaveLength(5)
+    expect(codexRuns()).toHaveLength(1)
     expect(calls.at(-1)!.argv.slice(0, 3)).toEqual(['docker', 'image', 'rm'])
     const count = plan().reduce((sum, j) => sum + j.invocations.length, 0)
     const totals = JSON.parse(stdout.find(l => l.startsWith('tokens: '))!.slice('tokens: '.length))
-    expect(totals).toEqual({ input: count * 7, output: count * 3, cache_read: count * 5, cache_creation: count, duplicates: count * 2 })
+    expect(totals).toEqual({ input: (count + 15) * 7, output: (count + 15) * 3, cache_read: (count + 15) * 5, cache_creation: count + 15, duplicates: count * 2 })
     expect(stdout.filter(l => /^REAL-AGENT-VERDICT /.test(l))).toHaveLength(1)
     expect(stdout.at(-1)).toMatch(/^REAL-AGENT-VERDICT PASS /)
     const reports = readdirSync(output).filter(n => n.startsWith('job-'))
-    expect(reports).toHaveLength(3)
+    expect(reports).toHaveLength(4)
     for (const name of reports) {
       expect(statSync(join(output, name)).mode & 0o777).toBe(0o600)
       expect(JSON.parse(readFileSync(join(output, name), 'utf8')).packageSha256).toMatch(/^[a-f0-9]{64}$/)
@@ -287,6 +401,62 @@ describe('heavy execution with fake children', () => {
     expect(stdout.at(-1)).toMatch(/^REAL-AGENT-PLAN /)
     expect(stdout.some(l => l.startsWith('REAL-AGENT-VERDICT'))).toBe(false)
     expect(JSON.parse(readFileSync(join(output, 'plan.json'), 'utf8')).jobs).toHaveLength(3)
+    expect(JSON.parse(readFileSync(join(output, 'plan.json'), 'utf8'))).toMatchObject({ selection: 'full', totalInvocations: 73 })
+  })
+
+  test('Codex-only plan needs no auth, Claude credential, Claude script or runtime-latest request', async () => {
+    for (const name of envNames.filter(name => name.startsWith('CI_ANTHROPIC'))) delete process.env[name]
+    rmSync(codex.home, { recursive: true, force: true })
+    rmSync(join(repo, 'tests/integration'), { recursive: true, force: true })
+    for (const name of heavyNames()) rmSync(join(repo, 'tests/real-agent', name))
+    let fetches = 0
+    latestResponse = async () => { fetches++; throw new Error('must not fetch') }
+    expect(await run(true, true)).toBe(true)
+    expect(fetches).toBe(0); expect(calls).toEqual([])
+    expect(existsSync(codex.home)).toBe(false)
+    const p = JSON.parse(readFileSync(join(output, 'plan.json'), 'utf8'))
+    expect(p).toMatchObject({ selection: 'codex-only', totalInvocations: 15, model: null, aiModel: null, codexModel: null, jobs: [], scheduler: null, localAgents: [codexExtension()] })
+    expect(stdout.at(-1)).toBe(`REAL-AGENT-CODEX-PLAN ${p.runId}\n`)
+    expect(stdout.some(line => line.includes('-VERDICT'))).toBe(false)
+  })
+
+  test('Codex-only execution runs exactly fifteen trials with the common local safety lifecycle and a distinct verdict', async () => {
+    for (const name of envNames.filter(name => name.startsWith('CI_ANTHROPIC'))) delete process.env[name]
+    // Malformed Claude routing settings must also be irrelevant to this leg.
+    process.env.CI_ANTHROPIC_MODEL = 'unused invalid model'
+    process.env.CI_ANTHROPIC_AI_MODEL = 'unused invalid model'
+    let fetches = 0, lockHeld = false
+    latestResponse = async () => { fetches++; throw new Error('must not fetch') }
+    response = argv => {
+      if (argv.includes('/opt/cscb-ci/real-agent-codex-job.sh')) lockHeld = probeFlock(join(codex.home, 'codex-login.lock')) === 'held'
+      return {}
+    }
+    expect(await run(false, true)).toBe(true)
+    expect(fetches).toBe(0); expect(jobsRun()).toEqual([]); expect(codexRuns()).toHaveLength(1)
+    const args = codexRuns()[0]!.argv, ext = codexExtension()
+    expect(args.slice(args.indexOf('/opt/cscb-ci/real-agent-codex-job.sh') + 1)).toEqual(ext.invocations.map(i => `${i.script}:${i.trial}`))
+    expect(args.filter((_, i) => args[i - 1] === '--mount')).toEqual([`type=bind,source=${codex.auth},target=${CODEX_LOGIN_TARGET}`])
+    expect(args.filter((_, i) => args[i - 1] === '--env')).toEqual(['CODEX_TEST_MODEL', 'CODEX_HOST_CONFIG_KEYS'])
+    expect(lockHeld).toBe(true); expect(probeFlock(join(codex.home, 'codex-login.lock'))).toBe('free')
+    expect(calls.filter(c => c.argv.includes('id'))).toHaveLength(1)
+    expect(calls.filter(c => c.argv[1] === 'container' && c.argv[2] === 'inspect')).toHaveLength(1)
+    expect(calls.filter(c => c.argv[1] === 'rm')).toHaveLength(2)
+    expect(calls.at(-1)!.argv.slice(0, 3)).toEqual(['docker', 'image', 'rm'])
+    const p = JSON.parse(readFileSync(join(output, 'plan.json'), 'utf8'))
+    expect(p).toMatchObject({ selection: 'codex-only', totalInvocations: 15, model: null, aiModel: null, codexModel, jobs: [], scheduler: null, localAgents: [ext] })
+    expect(JSON.parse(readFileSync(join(output, 'job-codex.json'), 'utf8'))).toMatchObject({ selection: 'codex-only', version: CODEX_VERSION, codexModel, results: codexResults() })
+    expect(stdout.at(-1)).toBe(`REAL-AGENT-CODEX-VERDICT PASS ${p.runId}\n`)
+    expect(stdout.some(line => /^REAL-AGENT-VERDICT /.test(line))).toBe(false)
+    expect(calls.every(call => ['bun', 'bash', 'docker'].includes(call.argv[0]!))).toBe(true)
+  })
+
+  test.each([['--codex-only', '--codex-only'], ['--codex-only=true'], ['--codex-only', 'true'], ['--plan', '--plan', '--codex-only']].map(args => [args] as const))('focused option refuses malformed or duplicate argv %j', args => {
+    expect(() => matrixOptions(args, repo)).toThrow('Usage')
+    expect(calls).toEqual([]); expect(existsSync(output)).toBe(false)
+  })
+
+  test('focused options preserve explicit output and plan selection', () => {
+    expect(matrixOptions(['--codex-only', '--plan', '--output', output], repo)).toEqual({ repo, output, planOnly: true, codexOnly: true })
   })
 
   test('routes image inspection through private full JSON capture before any child line can stream', async () => {
@@ -321,7 +491,7 @@ describe('heavy execution with fake children', () => {
     assertNoLeak({ stdout, stderr })
     expect(stderr).toEqual([])
     expect(calls.map(c => c.argv.slice(0, 3))).toEqual([
-      ['docker', 'image', 'inspect'], ['bash', 'scripts/ci-base-build.sh'],
+      ['docker', 'container', 'ls'], ['docker', 'image', 'inspect'], ['bash', 'scripts/ci-base-build.sh'],
     ])
     expect(jobsRun()).toEqual([])
     expect(stdout.at(-1)).toMatch(/^REAL-AGENT-VERDICT FAIL /)
@@ -339,7 +509,7 @@ describe('heavy execution with fake children', () => {
 
   test.each(['nonzero exit', 'missing result', 'failed AI trial', 'unreported usage', 'malformed result'] as const)('job %s stops without a retry, removes container and image, and never writes a success report', async kind => {
     response = argv => {
-      if (argv[1] !== 'run') return {}
+      if (argv[1] !== 'run' || argv.includes('id') || argv.includes('/opt/cscb-ci/real-agent-codex-job.sh')) return {}
       const job = jobForArgv(argv), rows = resultsFor(job)
       if (kind === 'failed AI trial' && !job.invocations.some(i => i.model === 'opus')) return {}
       if (kind === 'nonzero exit') return { code: 1 }
@@ -418,7 +588,7 @@ describe('heavy execution with fake children', () => {
     expect(existsSync(nestedContext!)).toBe(true)
     const active = calls.at(-1)!, ownedStage = stage!
     // A refused private inspect is killed before falling back to the base build.
-    const inspectionKills = step === 'base build' ? [{ pid: -calls[0]!.pid, signal: 'SIGKILL' }] : []
+    const inspectionKills = step === 'base build' ? [{ pid: -calls.find(call => call.argv[1] === 'image' && call.argv[2] === 'inspect')!.pid, signal: 'SIGKILL' }] : []
     expect(groupKills).toEqual(inspectionKills)
     expect(active.detached).toBe(true)
     expect(active.tmpdir).toBe(ownedStage)
@@ -452,7 +622,7 @@ describe('heavy execution with fake children', () => {
 
   test.each(['tokens', 'duplicates', 'both'] as const)('missing %s keeps partial run accounting, explains incompleteness and fails without retry', async missing => {
     response = argv => {
-      if (argv[1] !== 'run') return {}
+      if (argv[1] !== 'run' || argv.includes('id') || argv.includes('/opt/cscb-ci/real-agent-codex-job.sh')) return {}
       const rows = resultsFor(jobForArgv(argv))
       rows[1] = { ...rows[1]!, reported: false,
         ...(missing !== 'duplicates' ? { tokens: null } : {}),
@@ -495,7 +665,7 @@ describe('heavy execution with fake children', () => {
 
   test('a failing scenario still contributes its reported token use and duplicates to the run total', async () => {
     response = argv => {
-      if (argv[1] !== 'run') return {}
+      if (argv[1] !== 'run' || argv.includes('id') || argv.includes('/opt/cscb-ci/real-agent-codex-job.sh')) return {}
       const rows = resultsFor(jobForArgv(argv)).slice(0, 2)
       rows[1]!.exit = 1
       return { code: 1, text: rows.map(resultLine).join('\n') }
@@ -530,7 +700,7 @@ describe('heavy execution with fake children', () => {
     const recorded = JSON.parse(readFileSync(join(output, 'plan.json'), 'utf8'))
     expect([recorded.model, recorded.aiModel]).toEqual([model, selected])
     const rows = readdirSync(output).filter(n => n.startsWith('job-')).flatMap(n => JSON.parse(readFileSync(join(output, n), 'utf8')).results)
-    expect(rows.filter(r => r.script.includes('-ai-ac')).every(r => r.model === selected)).toBe(true)
+    expect(rows.filter(r => r.script.includes('-ai-ac') && r.agent !== 'codex').every(r => r.model === selected)).toBe(true)
     expect(rows.filter(r => !r.script.includes('-ai-ac')).every(r => r.model === model)).toBe(true)
   })
 
@@ -551,7 +721,7 @@ describe('heavy execution with fake children', () => {
     const selected = 'azure/openai/gpt-6-astra'
     process.env.CI_ANTHROPIC_AI_MODEL = selected
     response = argv => {
-      if (argv[1] !== 'run') return {}
+      if (argv[1] !== 'run' || argv.includes('id') || argv.includes('/opt/cscb-ci/real-agent-codex-job.sh')) return {}
       const job = jobForArgv(argv), rows = resultsFor(job, model, selected)
       const at = job.invocations.findIndex(i => (i.model === 'opus') === (kind === 'AI'))
       if (at < 0) return { text: rows.map(resultLine).join('\n') }
@@ -560,6 +730,185 @@ describe('heavy execution with fake children', () => {
     }
     expect(await run()).toBe(false)
     expect(stdout.at(-1)).toMatch(/^REAL-AGENT-VERDICT FAIL /)
+  })
+
+  test('Codex runs once locally after Claude with only its one login mount and recorded model', async () => {
+    const privateValue = fakeToken('', 'host-config-value')
+    writeFileSync(codex.config, `model="${codexModel}"\nmodel_reasoning_effort="${privateValue}"\n[profiles.private]\nendpoint="${privateValue}"\n`)
+    let lockHeld = false
+    response = argv => {
+      if (argv.includes('/opt/cscb-ci/real-agent-codex-job.sh')) lockHeld = probeFlock(join(codex.home, 'codex-login.lock')) === 'held'
+      return {}
+    }
+    expect(await run()).toBe(true)
+    expect(lockHeld).toBe(true)
+    expect(probeFlock(join(codex.home, 'codex-login.lock'))).toBe('free')
+    const call = codexRuns()[0]!, args = call.argv
+    expect(call.codexModel).toBe(codexModel)
+    expect(decodeCodexHostConfigKeys(call.hostConfigKeys)).toEqual([
+      ['model'], ['model_reasoning_effort'], ['profiles', 'private', 'endpoint'], ['profiles', 'private'], ['profiles'],
+    ])
+    expect(args.filter((_, i) => args[i - 1] === '--env')).toEqual(['CODEX_TEST_MODEL', 'CODEX_HOST_CONFIG_KEYS'])
+    expect(args.some(arg => arg.includes(call.hostConfigKeys!) || arg.includes('inherited-untrusted-projection'))).toBe(false)
+    expect(jobsRun().every(call => !call.argv.includes('CODEX_HOST_CONFIG_KEYS'))).toBe(true)
+    assertNoLeak(call.hostConfigKeys)
+    expect(args.filter((_, i) => args[i - 1] === '--mount')).toEqual([`type=bind,source=${codex.auth},target=${CODEX_LOGIN_TARGET}`])
+    expect(args[args.indexOf('--ulimit') + 1]).toBe('core=0')
+    expect(args[args.indexOf('--memory') + 1]).toBe(String(Number(MATRIX_MEMORY) + CODEX_EXTRA_MEMORY_BYTES))
+    expect(args[args.indexOf('--memory-swap') + 1]).toBe(String(Number(MATRIX_MEMORY) + CODEX_EXTRA_MEMORY_BYTES))
+    expect(args).not.toContain('--rm')
+    expect(jobsRun().every(call => !call.argv.includes('--mount') && !call.argv.includes(codex.auth))).toBe(true)
+    expect(calls.every(call => ['bun', 'bash', 'docker'].includes(call.argv[0]!))).toBe(true)
+    const report = JSON.parse(readFileSync(join(output, 'job-codex.json'), 'utf8'))
+    expect(report.codexModel).toBe(codexModel)
+    expect(report.results).toEqual(codexResults())
+    expect(stdout).toContain(`recorded: codex-model ${codexModel}\n`)
+  })
+
+  test('invalid host-key projection refuses the heavy run before build, lock or launch', async () => {
+    writeFileSync(codex.config, `model="${codexModel}"\nmodel="duplicate"\n`)
+    expect(await run()).toBe(false)
+    expect(calls).toEqual([])
+    expect(existsSync(join(codex.home, 'codex-login.lock'))).toBe(false)
+    expect(stdout.at(-1)).toMatch(/^REAL-AGENT-VERDICT FAIL /)
+  })
+
+  test('Codex positive message-copy counts survive reports and contribute to totals without failing the matrix', async () => {
+    const rows = codexResults().map((row, i) => ({ ...row, duplicates: i + 1 }))
+    response = argv => argv.includes('/opt/cscb-ci/real-agent-codex-job.sh')
+      ? { text: rows.map(resultLine).join('\n') } : {}
+    expect(await run()).toBe(true)
+    expect(codexRuns()).toHaveLength(1)
+    expect(JSON.parse(readFileSync(join(output, 'job-codex.json'), 'utf8')).results).toEqual(rows)
+    const claudeCopies = plan().reduce((sum, job) => sum + job.invocations.length * 2, 0)
+    const totals = JSON.parse(stdout.find(line => line.startsWith('tokens: '))!.slice('tokens: '.length))
+    expect(totals.duplicates).toBe(claudeCopies + rows.reduce((sum, row) => sum + row.duplicates, 0))
+    expect(stdout.at(-1)).toMatch(/^REAL-AGENT-VERDICT PASS /)
+  })
+
+  test.each((['missing', 'duplicate-result-row', 'wrong-version', 'wrong-model', 'failed', 'unreported', 'unfinished', 'wrong-agent', 'missing-copy-count', 'negative-copy-count', 'fractional-copy-count', 'unsafe-copy-count', 'missing-usage', 'malformed-usage', 'zero-usage'] as const).flatMap(kind => [false, true].map(codexOnly => [kind, codexOnly] as const)))('Codex %s (codexOnly=%s) evidence blocks PASS and retires without retry', async (kind, codexOnly) => {
+    response = argv => {
+      if (!argv.includes('/opt/cscb-ci/real-agent-codex-job.sh')) return {}
+      const rows = codexResults()
+      const row = rows[rows.length - 1]!
+      if (kind === 'missing') rows.pop()
+      if (kind === 'duplicate-result-row') rows[rows.length - 1] = rows[0]!
+      if (kind === 'wrong-version') row.version = '0.159.1'
+      if (kind === 'wrong-model') row.model = 'other-model'
+      if (kind === 'failed') row.exit = 1
+      if (kind === 'unreported') row.reported = false
+      if (kind === 'unfinished') row.completed = false
+      if (kind === 'wrong-agent') delete row.agent
+      if (kind === 'missing-copy-count') row.duplicates = null
+      if (kind === 'negative-copy-count') row.duplicates = -1
+      if (kind === 'fractional-copy-count') row.duplicates = 0.5
+      if (kind === 'unsafe-copy-count') row.duplicates = Number.MAX_SAFE_INTEGER + 1
+      if (kind === 'missing-usage') row.tokens = null
+      if (kind === 'malformed-usage') row.tokens!.input = -1
+      if (kind === 'zero-usage') row.tokens = { input: 0, output: 0, cache_read: 0, cache_creation: 0 }
+      return { text: rows.map(resultLine).join('\n') }
+    }
+    expect(await run(false, codexOnly)).toBe(false)
+    expect(jobsRun()).toHaveLength(codexOnly ? 0 : 3)
+    expect(codexRuns()).toHaveLength(1)
+    expect(existsSync(join(output, 'job-codex.json'))).toBe(false)
+    expect(probeFlock(join(codex.home, 'codex-login.lock'))).toBe('free')
+    expect(calls.some(call => call.argv[1] === 'rm' && call.argv.at(-1)?.endsWith('-codex'))).toBe(true)
+    expect(stdout.at(-1)).toMatch(codexOnly ? /^REAL-AGENT-CODEX-VERDICT FAIL / : /^REAL-AGENT-VERDICT FAIL /)
+  })
+
+  test.each((['original', 'rotated'] as const).flatMap(kind => [false, true].map(codexOnly => [kind, codexOnly] as const)))('rejects a leaked %s (codexOnly=%s) Codex token while masking every artifact', async (generation, codexOnly) => {
+    response = argv => {
+      if (!argv.includes('/opt/cscb-ci/real-agent-codex-job.sh')) return {}
+      codex.writeLogin('rotated')
+      const secret = generation === 'original' ? codex.tokens.access : fakeToken('', 'codex-access-rotated')
+      return { text: `private diagnostic ${secret}\n` + codexResults().map(resultLine).join('\n') }
+    }
+    expect(await run(false, codexOnly)).toBe(false)
+    expect(readFileSync(join(output, 'codex-docker.log'), 'utf8')).toContain('private diagnostic <redacted>')
+    expect(stdout.at(-1)).toMatch(codexOnly ? /^REAL-AGENT-CODEX-VERDICT FAIL / : /^REAL-AGENT-VERDICT FAIL /)
+  })
+
+  test.each((['invalid-json', 'replacement', 'mode'] as const).flatMap(kind => [false, true].map(codexOnly => [kind, codexOnly] as const)))('post-run login %s (codexOnly=%s) corruption blocks PASS and releases the lock', async (kind, codexOnly) => {
+    response = argv => {
+      if (!argv.includes('/opt/cscb-ci/real-agent-codex-job.sh')) return {}
+      if (kind === 'invalid-json') writeFileSync(codex.auth, fakeToken('', 'broken-login'))
+      if (kind === 'replacement') { renameSync(codex.auth, join(codex.home, 'old-auth')); codex.writeLogin('replacement') }
+      if (kind === 'mode') chmodSync(codex.auth, 0o644)
+      return {}
+    }
+    expect(await run(false, codexOnly)).toBe(false)
+    expect(stdout.join('')).toContain('codex login --device-auth')
+    expect(probeFlock(join(codex.home, 'codex-login.lock'))).toBe('free')
+    expect(existsSync(join(output, 'job-codex.json'))).toBe(false)
+  })
+
+  test.each((['uid', 'uid-cleanup', 'codex-cleanup', 'inspect', 'inspect-exit', 'inspect-running', 'inspect-memory'] as const).flatMap(kind => [false, true].map(codexOnly => [kind, codexOnly] as const)))('Codex %s (codexOnly=%s) failure prevents PASS', async (kind, codexOnly) => {
+    let cleanupFailures = 0
+    response = argv => {
+      if (kind === 'uid' && argv.includes('id')) return { text: String(process.getuid!() + 1) }
+      if (kind === 'uid-cleanup' && argv[1] === 'rm' && argv.at(-1)?.endsWith('-uid')) return { code: 1 }
+      if (kind === 'codex-cleanup' && argv[1] === 'rm' && argv.at(-1)?.endsWith('-codex') && cleanupFailures++ === 0) return { code: 1 }
+      if (argv[1] === 'container' && argv[2] === 'inspect') {
+        if (kind === 'inspect') return { text: 'not JSON' }
+        const state = { Running: kind === 'inspect-running', OOMKilled: false, ExitCode: kind === 'inspect-exit' ? 7 : 0 }
+        const row = { Id: 'b'.repeat(64), Config: { Env: [] }, State: state,
+          Mounts: [{ Source: codex.auth, Destination: CODEX_LOGIN_TARGET, RW: true }],
+          HostConfig: { Memory: kind === 'inspect-memory' ? 1 : Number(MATRIX_MEMORY) + CODEX_EXTRA_MEMORY_BYTES } }
+        return { text: JSON.stringify([row]) }
+      }
+      return {}
+    }
+    expect(await run(false, codexOnly)).toBe(false)
+    expect(stdout.at(-1)).toMatch(codexOnly ? /^REAL-AGENT-CODEX-VERDICT FAIL / : /^REAL-AGENT-VERDICT FAIL /)
+  })
+
+  test.each((['timeout', 'SIGTERM'] as const).flatMap(kind => [false, true].map(codexOnly => [kind, codexOnly] as const)))('Codex %s (codexOnly=%s) retires its local job, postchecks the login and releases the lock', async (kind, codexOnly) => {
+    const before = process.listeners('SIGTERM')
+    response = argv => argv.includes('/opt/cscb-ci/real-agent-codex-job.sh') ? { hang: true } : {}
+    const pending = run(false, codexOnly)
+    for (let i = 0; i < 100 && codexRuns().length === 0; i++) await clock.flush()
+    expect(codexRuns()).toHaveLength(1)
+    if (kind === 'timeout') await clock.advance(MATRIX_TIMEOUT_MS)
+    else interruptMatrix(before)
+    expect(await pending).toBe(false)
+    expect(jobsRun()).toHaveLength(codexOnly ? 0 : 3)
+    expect(codexRuns()).toHaveLength(1)
+    expect(probeFlock(join(codex.home, 'codex-login.lock'))).toBe('free')
+    expect(existsSync(join(output, 'job-codex.json'))).toBe(false)
+    expect(stdout.at(-1)).toMatch(codexOnly ? /^REAL-AGENT-CODEX-VERDICT FAIL / : /^REAL-AGENT-VERDICT FAIL /)
+  })
+
+  test.each((['survivor', 'unreadable'] as const).flatMap(kind => [false, true].map(codexOnly => [kind, codexOnly] as const)))('Codex %s (codexOnly=%s) retirement proof refuses the heavy run before building or launching', async (kind, codexOnly) => {
+    response = argv => argv.join(' ') === codexLoginContainerListArgs().join(' ')
+      ? kind === 'survivor' ? { text: 'earlier-container-id\n' } : { code: 1 } : {}
+    expect(await run(false, codexOnly)).toBe(false)
+    expect(calls.map(call => call.argv)).toEqual([codexLoginContainerListArgs()])
+    expect(jobsRun()).toEqual([])
+    expect(codexRuns()).toEqual([])
+    expect(probeFlock(join(codex.home, 'codex-login.lock'))).toBe('free')
+    expect(stdout.at(-1)).toMatch(codexOnly ? /^REAL-AGENT-CODEX-VERDICT FAIL / : /^REAL-AGENT-VERDICT FAIL /)
+  })
+
+  test.each([false, true])('unresolved retirement preserves the login lease until runner exit (codexOnly=%s)', async codexOnly => {
+    const open = ciRunner.openLockFile
+    let release = () => {}
+    const lockSpy = spyOn(ciRunner, 'openLockFile').mockImplementation(path => {
+      const opened = open(path)
+      if (opened.ok) release = () => opened.value.release()
+      return opened
+    })
+    restore.push(() => lockSpy.mockRestore())
+    response = argv => argv[1] === 'rm' && argv.at(-1)?.endsWith('-codex') ? { code: 1 } : {}
+    try {
+      expect(await run(false, codexOnly)).toBe(false)
+      expect(codexRuns()).toHaveLength(1)
+      expect(jobsRun()).toHaveLength(codexOnly ? 0 : 3)
+      expect(probeFlock(join(codex.home, 'codex-login.lock'))).toBe('held')
+      expect(stdout.join('')).toContain('Codex container retirement unresolved; login lease held until runner exit')
+      expect(stdout.at(-1)).toMatch(codexOnly ? /^REAL-AGENT-CODEX-VERDICT FAIL / : /^REAL-AGENT-VERDICT FAIL /)
+    } finally { release() }
+    expect(probeFlock(join(codex.home, 'codex-login.lock'))).toBe('free')
   })
 
   test('output options forbid checkout and test-results paths and reject unknown or incomplete arguments', () => {

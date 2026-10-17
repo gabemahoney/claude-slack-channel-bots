@@ -3083,6 +3083,30 @@ describe('E6: admission readings, /ci-live, commitments, fits and refusals', () 
       expect(memoryFits(figures, shards, SHARD_MEMORY_CAP_BYTES)).toBe(fits)
     })
 
+    test('E7: Codex extra memory is included at the one-byte admission boundary and in reservations', async () => {
+      const rig = makeAdmission(), figures = await rig.figures()
+      const extra = gibToBytes(2), shards = 2
+      const ceiling = shards * SHARD_MEMORY_CAP_BYTES + extra + ADMISSION_MARGIN_BYTES
+      const exact = { ...figures, ceiling: { ...figures.ceiling, bytes: ceiling } }
+      expect(memoryFits(exact, shards, SHARD_MEMORY_CAP_BYTES, extra)).toBe(true)
+      expect(memoryFits({ ...exact, ceiling: { ...exact.ceiling, bytes: ceiling - 1 } }, shards, SHARD_MEMORY_CAP_BYTES, extra)).toBe(false)
+      const reservation = buildReservation({ owner: LIVE_OWNER, shards, memoryCapBytes: SHARD_MEMORY_CAP_BYTES, extraMemoryBytes: extra, kind: 'full' })
+      expect(reservation.memoryBytes).toBe(shards * SHARD_MEMORY_CAP_BYTES + extra)
+      expect(reservation.cpus).toBe(shards * CPUS_PER_SHARD)
+      assertNoLeak(reservation)
+    })
+
+    test('E7: admission never reduces shards below the dedicated Codex isolation floor', async () => {
+      const rig = makeAdmission(), figures = await rig.figures()
+      const request = { ...defaultFullRun(), minimumShards: 2, extraMemoryBytes: gibToBytes(2) }
+      const ceiling = SHARD_MEMORY_CAP_BYTES + gibToBytes(2) + ADMISSION_MARGIN_BYTES
+      const tight = { ...figures, ceiling: { ...figures.ceiling, bytes: ceiling } }
+      expect(decideAdmission(tight, { ...request, minimumShards: 1 }, rig.listResultsDirs).kind).toBe('admitted')
+      const decision = decideAdmission(tight, request, rig.listResultsDirs)
+      expect(decision.kind).toBe('refused')
+      assertNoLeak(decision)
+    })
+
     test('a blocking container fails the memory fit whatever the readings, so the run is refused for memory', async () => {
       const rig = makeAdmission({ containers: [{ name: `${CI_CONTAINER_NAME_PREFIX}-uncapped`, capGib: null }] })
 
@@ -3734,5 +3758,167 @@ describe('E6: admission readings, /ci-live, commitments, fits and refusals', () 
       expect(refusalLine(refusal)).toStartWith(`${NOT_RUN_PREFIX}memory: ${OPTION_RANGE_MIN} shard(s) need `)
       expect(partIndex(refusal, 'cpu')).toBe(-1)
     })
+  })
+})
+
+// b.omv SR-14.7: the shared admission contract used by /ci and the heavy leg.
+import { acquireCodexLogin, readCodexLogin, CODEX_LOGIN_LOCK_WAIT_MS } from '../scripts/codex-login.ts'
+import { makeFakeCodexHome, makeFakeCodexLogin } from './test-helpers/ci-run.ts'
+import { decodeCodexHostConfigKeys } from '../src/codex-config-keys.ts'
+import { symlinkSync, unlinkSync } from 'node:fs'
+
+describe('E7: Codex login admission', () => {
+  let root: string
+  beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'ci-codex-admission-')) })
+  afterEach(() => { rmSync(root, { recursive: true, force: true }) })
+  const acquire = (fake: ReturnType<typeof makeFakeCodexLogin>, extra = {}) => acquireCodexLogin({ env: { HOME: root }, uid: 1000, deps: fake.deps, ...extra })
+
+  test('lease projects every host namespace and key without carrying their values', async () => {
+    const fake = makeFakeCodexLogin(createFakeClock())
+    const privateValue = fakeToken('', 'host-config-value')
+    fake.deps.readConfig = () => `model="test/model:1"\nmodel_reasoning_effort="${privateValue}"\n[profiles.private]\nprovider = { endpoint = "${privateValue}" }\n`
+    const lease = await acquire(fake, { env: { HOME: root, CODEX_HOST_CONFIG_KEYS: 'untrusted inherited metadata' } })
+    try {
+      expect(lease.model).toBe('test/model:1')
+      expect(decodeCodexHostConfigKeys(lease.hostConfigKeys)).toEqual([
+        ['model'], ['model_reasoning_effort'], ['profiles', 'private', 'provider', 'endpoint'],
+        ['profiles', 'private', 'provider'], ['profiles', 'private'], ['profiles'],
+      ])
+      assertNoLeak({ hostConfigKeys: lease.hostConfigKeys, model: lease.model, events: fake.events })
+    } finally { lease.release() }
+  })
+
+  test.each(['test-model', 'org/model:version', 'model_1.2', '-model'])('reads the top-level model %s without host reasoning settings', async model => {
+    const fake = makeFakeCodexLogin(createFakeClock())
+    const paths: string[] = []
+    fake.deps.readConfig = path => { paths.push(path); return `model = ${JSON.stringify(model)}\nmodel_reasoning_effort = "high"\n[profiles.other]\nmodel = "ignored"\n` }
+    const lease = await acquire(fake, { env: { HOME: root, CODEX_HOME: join(root, 'override'), CODEX_TEST_MODEL: 'inherited' } })
+    expect(paths).toEqual([join(root, 'override/config.toml')])
+    expect(lease.model).toBe(model)
+    expect(fake.held()).toBe(true)
+    lease.release(); lease.release()
+    expect(fake.releases()).toBe(1)
+    expect(lease.secretValues()).toEqual([])
+    assertNoLeak({ model: lease.model, source: lease.source, events: fake.events })
+  })
+
+  test.each(['', '[profiles.only]\nmodel="profile-model"', 'model=1', 'model=""', 'model="bad model"', 'model="bad\\nmodel"', 'model="bad@model"', 'model="bad\\"model"', 'not valid toml'])('refuses unusable top-level config row %# before locking', async text => {
+    const fake = makeFakeCodexLogin(createFakeClock())
+    fake.deps.readConfig = () => text
+    let error: unknown
+    try { await acquire(fake) } catch (caught) { error = caught }
+    expect(error).toBeInstanceOf(Error)
+    expect((error as Error).message).toContain(join(root, '.codex/config.toml'))
+    expect(fake.events).toEqual([])
+    expect(fake.releases()).toBe(0)
+    assertNoLeak(error)
+  })
+
+  test.each(['config', 'login', 'resolve', 'lock'] as const)('masks secret-bearing %s read/lock errors and releases acquired descriptors', async operation => {
+    const fake = makeFakeCodexLogin(createFakeClock())
+    const fail = () => { throw new Error(fakeToken('', 'private-error')) }
+    if (operation === 'config') fake.deps.readConfig = fail
+    if (operation === 'login') fake.deps.readLogin = fail
+    if (operation === 'resolve') fake.deps.resolveLogin = fail
+    if (operation === 'lock') fake.deps.openLock = fail
+    let error: unknown
+    try { await acquire(fake) } catch (caught) { error = caught }
+    expect(error).toBeInstanceOf(Error)
+    expect(fake.held()).toBe(false)
+    expect(fake.releases()).toBe(operation === 'login' || operation === 'resolve' ? 1 : 0)
+    assertNoLeak(error)
+  })
+
+  test.each([{ uid: 1001 }, { mode: 0o644 }, { mode: 0o400 }, { mode: 0o1600 }])('refuses owner/mode patch %j without repairing the login', async patch => {
+    const fake = makeFakeCodexLogin(createFakeClock())
+    fake.setLogin({ ...fake.login(), identity: { ...fake.login().identity, ...patch } })
+    let error: unknown
+    try { await acquire(fake) } catch (caught) { error = caught }
+    expect((error as Error).message).toMatch(/owned.*0600/)
+    expect(fake.releases()).toBe(1)
+    assertNoLeak(error)
+  })
+
+  test('waits to just before the fixed 30-minute lock deadline and takes the released lock', async () => {
+    const clock = createFakeClock(), fake = makeFakeCodexLogin(clock)
+    expect(CODEX_LOGIN_LOCK_WAIT_MS).toBe(30 * 60 * 1000)
+    fake.busyUntil(CODEX_LOGIN_LOCK_WAIT_MS - 250)
+    let settled = false
+    const pending = acquire(fake).then(lease => { settled = true; return lease })
+    await clock.advance(CODEX_LOGIN_LOCK_WAIT_MS - 251)
+    expect(settled).toBe(false)
+    expect(fake.reads()).toBe(0)
+    await clock.advance(1)
+    const lease = await pending
+    expect(fake.held()).toBe(true)
+    lease.release()
+    expect(fake.releases()).toBe(1)
+    assertNoLeak(fake.events)
+  })
+
+  test.each(['timeout', 'interrupt', 'lock-error'] as const)('a waiting %s never reads login and releases the descriptor', async outcome => {
+    const clock = createFakeClock(), fake = makeFakeCodexLogin(clock)
+    fake.busyUntil(Infinity)
+    let stopped = false, error: unknown
+    if (outcome === 'lock-error') fake.deps.openLock = () => ({ tryLock: () => ({ kind: 'error', error: fakeToken('', 'flock-error') }), release: () => { fake.events.push('closed') } })
+    const pending = acquire(fake, { cancelled: () => stopped }).catch(caught => { error = caught })
+    if (outcome === 'timeout') await clock.advance(CODEX_LOGIN_LOCK_WAIT_MS)
+    if (outcome === 'interrupt') { stopped = true; await clock.advance(250) }
+    await pending
+    expect((error as Error).message).toMatch(outcome === 'timeout' ? /30 minutes/ : outcome === 'interrupt' ? /interrupted/ : /lock/)
+    expect(fake.reads()).toBe(0)
+    expect(fake.held()).toBe(false)
+    expect(outcome === 'lock-error' ? fake.events.at(-1) : fake.releases()).toBe(outcome === 'lock-error' ? 'closed' : 1)
+    expect(clock.pendingCount()).toBe(0)
+    assertNoLeak(error)
+  })
+
+  test('postcheck retains both token generations and checks identity after refresh', async () => {
+    const fake = makeFakeCodexLogin(createFakeClock()), lease = await acquire(fake)
+    const original = lease.secretValues(), rotated = fakeToken('', 'rotated-login')
+    fake.setLogin({ ...fake.login(), json: { tokens: { access_token: rotated }, metadata: 'not-secret' } })
+    lease.postcheck()
+    expect(lease.secretValues().includes(rotated)).toBe(true)
+    expect(original.every(value => lease.secretValues().includes(value))).toBe(true)
+    expect(lease.secretValues().includes('not-secret')).toBe(false)
+    // The returned set cannot mutate the lease's scan values.
+    lease.secretValues().splice(0)
+    expect(lease.secretValues().length).toBe(original.length + 1)
+    lease.release()
+    assertNoLeak({ source: lease.source, model: lease.model, events: fake.events })
+  })
+
+  test.each([{ ino: 11 }, { dev: 2 }, { uid: 1001 }, { mode: 0o644 }])('postcheck rejects changed identity %j with the recovery command', async patch => {
+    const fake = makeFakeCodexLogin(createFakeClock()), lease = await acquire(fake)
+    const rotated = fakeToken('', 'postcheck-rotated')
+    fake.setLogin({ identity: { ...fake.login().identity, ...patch }, json: { refresh_token: rotated } })
+    let error: unknown
+    try { lease.postcheck() } catch (caught) { error = caught }
+    expect((error as Error).message).toContain('codex login --device-auth')
+    expect(lease.secretValues().includes(rotated)).toBe(true)
+    lease.release()
+    assertNoLeak(error)
+  })
+
+  test.each(['symlink', 'directory', 'malformed', 'oversize'] as const)('descriptor reader rejects a fake %s login without exposing its bytes', kind => {
+    const fixture = makeFakeCodexHome(root)
+    const target = join(root, 'target')
+    if (kind === 'symlink') { unlinkSync(fixture.auth); writeFileSync(target, '{}'); symlinkSync(target, fixture.auth) }
+    if (kind === 'directory') { unlinkSync(fixture.auth); mkdirSync(fixture.auth) }
+    if (kind === 'malformed') writeFileSync(fixture.auth, fakeToken('', 'invalid-json'))
+    if (kind === 'oversize') writeFileSync(fixture.auth, ' '.repeat(1024 * 1024 + 1))
+    let error: unknown
+    try { readCodexLogin(fixture.auth) } catch (caught) { error = caught }
+    expect(error).toBeInstanceOf(Error)
+    assertNoLeak(error)
+  })
+
+  test('descriptor reader accepts only scratch JSON and reports its identity without copying it', () => {
+    const fixture = makeFakeCodexHome(root)
+    const result = readCodexLogin(fixture.auth)
+    expect(result.identity.mode).toBe(0o600)
+    expect((result.json as { tokens: { access_token: string } }).tokens.access_token === fixture.tokens.access).toBe(true)
+    expect(readdirSync(fixture.home).sort()).toEqual(['auth.json', 'config.toml'])
+    assertNoLeak(result.identity)
   })
 })

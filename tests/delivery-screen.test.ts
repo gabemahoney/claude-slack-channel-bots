@@ -38,7 +38,7 @@ describe('Claude screen contract', () => {
   })
 })
 
-describe('Codex known composer contract (popup research belongs to E7)', () => {
+describe('Codex known composer contract', () => {
   test.each(['', 'Ask Codex to do anything', 'Ask a follow-up question'])('empty placeholder %p with arbitrary configured footer', text => {
     expect(readDeliveryScreen('codex', panes.deliveryPane(text, { agent: 'codex', footer: 'custom worktree status', history: '› old draft\n' }))).toEqual({ kind: 'empty', running: false })
   })
@@ -52,6 +52,87 @@ describe('Codex known composer contract (popup research belongs to E7)', () => {
       expect(readDeliveryScreen('codex', panes.deliveryPane(text, { agent: 'codex' })).kind).toBe('menu')
     }
     expect(readDeliveryScreen('codex', 'No composer')).toEqual({ kind: 'menu', running: false })
+  })
+})
+
+// Native run 20261017t212743z-ddde5cd6, model recorded in paneProvenance.
+// Derived controls below exercise boundaries; they are not native evidence.
+const codexIdle = panes.observedCodexPane('idle-empty')
+const codexSlash = panes.observedCodexPane('slash-popup')
+
+describe('observed native Codex 0.159.2 composer boundaries', () => {
+  test.each([
+    ['idle-empty', 'empty', undefined, false],
+    ['slash-popup', 'menu', undefined, false],
+    ['at-popup', 'menu', undefined, false],
+    ['dollar-popup', 'menu', undefined, false],
+    ['shortcuts-overlay', 'menu', undefined, false],
+    ['slash-popup-after-Escape', 'input', '/', false],
+    ['at-popup-after-Escape', 'input', '@', false],
+    ['dollar-popup-after-Escape', 'input', '$', false],
+    ['shortcuts-overlay-after-Escape', 'empty', undefined, false],
+    ['idle-one-line-draft', 'input', 'draft observation', false],
+    ['idle-one-line-draft-after-Escape', 'input', 'draft observation', false],
+    ['idle-multiline-draft', 'input', 'first draft line\nsecond draft line', false],
+    ['idle-multiline-draft-after-Escape', 'input', 'first draft line\nsecond draft line', false],
+    ['busy-one-line-draft', 'input', 'busy draft observation', true],
+    ['busy-one-line-draft-after-Escape', 'input', 'busy draft observation', false],
+    ['busy-multiline-draft', 'input', 'busy first line\nbusy second line', true],
+    ['busy-multiline-draft-after-Escape', 'input', 'busy first line\nbusy second line', false],
+    ['send-no-new-turn-after-Escape', 'input', 'unsubmitted observation draft', false],
+  ] as const)('%s capture and ANSI-decorated capture retain their verdict', (label, kind, text, running) => {
+    const pane = panes.observedCodexPane(label), expected = { kind, ...(text === undefined ? {} : { text }), running }
+    expect(readDeliveryScreen('codex', pane, '<channel>unrelated in-flight item</channel>')).toEqual(expected)
+    const colored = pane.split('\n').map(line => `\x1b[32m${line}\x1b[0m`).join('\r\n')
+    expect(readDeliveryScreen('codex', `${colored}\n   \n`)).toEqual(expected)
+  })
+  test.each([['slash-popup', '/'], ['at-popup', '@'], ['dollar-popup', '$']] as const)('%s blocks even if its marker belongs to an in-flight item', (label, marker) => {
+    expect(readDeliveryScreen('codex', panes.observedCodexPane(label), marker)).toEqual({ kind: 'menu', running: false })
+  })
+  test.each(['/', '/model', 'a human draft'])('historical chooser cannot hide current input %p', draft => {
+    const pane = panes.deliveryPane(draft, { agent: 'codex', history: codexSlash })
+    expect(readDeliveryScreen('codex', pane)).toEqual({ kind: 'input', text: draft, running: false })
+  })
+  test('historical chooser cannot block the current recorded idle composer', () => {
+    expect(readDeliveryScreen('codex', `${codexSlash}${codexIdle}`)).toEqual({ kind: 'empty', running: false })
+  })
+  test('a historical command and ordinary slash draft do not prove a chooser', () => {
+    const pane = panes.deliveryPane('/', { agent: 'codex', history: '› /model         choose what model and reasoning effort to use\n' })
+    expect(readDeliveryScreen('codex', pane)).toEqual({ kind: 'input', text: '/', running: false })
+  })
+  test.each([['at-popup', '@'], ['dollar-popup', '$'], ['shortcuts-overlay', 'human draft']] as const)('historical %s cannot block a current composer or claim its text', (label, draft) => {
+    const history = panes.observedCodexPane(label)
+    expect(readDeliveryScreen('codex', `${history}${codexIdle}`)).toEqual({ kind: 'empty', running: false })
+    expect(readDeliveryScreen('codex', panes.deliveryPane(draft, { agent: 'codex', history }), '<channel>mine</channel>')).toEqual({ kind: 'input', text: draft, running: false })
+  })
+  test.each([
+    ['idle-multiline-draft', 'first draft line\nsecond draft line', false],
+    ['busy-one-line-draft', 'busy draft observation', true],
+    ['busy-multiline-draft', 'busy first line\nbusy second line', true],
+  ] as const)('%s recognizes ownership only at the current composer', (label, own, running) => {
+    const pane = panes.observedCodexPane(label)
+    expect(readDeliveryScreen('codex', pane, own)).toEqual({ kind: 'own', text: own, running })
+    // A complete historical match must never authorize Enter into new text.
+    expect(readDeliveryScreen('codex', panes.deliveryPane('a new draft', { agent: 'codex', history: pane }), own)).toEqual({ kind: 'input', text: 'a new draft', running })
+  })
+  test.each([
+    ['at-popup', '@'], ['dollar-popup', '$'],
+  ] as const)('%s needs the selected block next to its current hint', (label, marker) => {
+    const pane = panes.observedCodexPane(label)
+    const separated = pane.replace(`\n› ${marker}\n`, `\n  unrelated intervening text\n› ${marker}\n`)
+    expect(readDeliveryScreen('codex', separated)).toEqual({ kind: 'input', text: marker, running: false })
+    const withoutSelection = pane.replace(/^› (?![@$]\s*$).+$/m, '  ordinary unselected row')
+    expect(readDeliveryScreen('codex', withoutSelection)).toEqual({ kind: 'input', text: marker, running: false })
+  })
+  test('shortcuts needs both its adjacent header block and bottom close hint', () => {
+    const pane = panes.observedCodexPane('shortcuts-overlay')
+    expect(readDeliveryScreen('codex', pane.replace('  ? / esc close', '  custom worktree status'))).toEqual({ kind: 'empty', running: false })
+    expect(readDeliveryScreen('codex', pane.replace('  /keymap customize', '› earlier prompt\n  ordinary output'))).toEqual({ kind: 'empty', running: false })
+  })
+  test('native draft keeps its last line while a configured footer occupies only the bottom row', () => {
+    const pane = panes.observedCodexPane('idle-multiline-draft')
+    const footerStart = pane.indexOf('  GPT-6-Astra')
+    expect(readDeliveryScreen('codex', `${pane.slice(0, footerStart)}  custom worktree status\n`)).toEqual({ kind: 'input', text: 'first draft line\nsecond draft line', running: false })
   })
 })
 
