@@ -2,8 +2,9 @@
  * Importing is inert. The CLI reads only SR-14.1 native/journal/log evidence.
  */
 import { existsSync, readFileSync } from 'node:fs'
-import { basename, dirname, join } from 'node:path'
+import { basename, join } from 'node:path'
 import { auditReceipts, packedReceiptAdapters, personaTranscripts, readTranscripts, receiptJournal, transcriptFiles, type ReceiptAdapters, type TranscriptEntry } from '../integration/fixtures/transcript-receipts.ts'
+import { auditedAICorpus } from './ai-fixture-audit.ts'
 
 function check(value: unknown, reason: string): asserts value { if (!value) throw new Error(reason) }
 const blocks = (e: TranscriptEntry): any[] => Array.isArray(e.value?.message?.content) ? e.value.message.content : []
@@ -127,8 +128,8 @@ if (import.meta.main) {
     auditReceipts({ stateDir: state!, key: key!, shimLog: shim!, transcripts: paths, expectedCount: 3 }, all, adapters)
     const own = personaTranscripts(key!, journal, readFileSync(join(state!, 'server.log'), 'utf8').split('\n'), all)
     const corpus = JSON.parse(readFileSync(corpusPath!, 'utf8'))
-    const original = JSON.parse(readFileSync(join(dirname(import.meta.path), '../fixtures/delivery-wrapper/wrapper-cases.json'), 'utf8'))
-    check(stable(corpus) === stable(original), 'original AC11 corpus changed')
+    const { canonical: original, ai } = auditedAICorpus()
+    check(stable(corpus) === stable(ai), 'audited AC11 corpus changed')
     const result = classifierObservation({ criterion: process.env.AI_CRITERION ?? '', trial: process.env.REAL_AGENT_TRIAL ?? '',
       model: process.env.REAL_AGENT_MODEL_PIN ?? '', fixture: original[2], expected: JSON.parse(readFileSync(expectedPath!, 'utf8')),
       journal, own, adapters }, mode!)

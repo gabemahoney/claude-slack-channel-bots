@@ -5,6 +5,13 @@ source "$(dirname "${BASH_SOURCE[0]}")/../integration/lib/real-scenario.sh"
 [[ "${ANTHROPIC_MODEL:-}" =~ (claude-)?opus-5[.-]5 ]] || fail 'AI criteria require Opus 5.5'
 CASE_ASSERT="${SCENARIO_FIXTURES}/real-case-assertions.ts"
 case_assert() { bun "${CASE_ASSERT}" "$1" "${SLACK_STATE_DIR}" "${REAL_KEY}" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" "${@:2}"; }
+# Decision 18: fail before any model launch if the reviewed AI inputs drift.
+bun "${BASH_SOURCE[0]%/*}/ai-fixture-audit.ts"
+# Bind ordinary answers to an explicit durable item, its final part and native
+# turn. The shared transport comparator does not establish response provenance.
+ai_readback() {
+    bun "${BASH_SOURCE[0]%/*}/ai-readback.ts" "${SLACK_STATE_DIR}" "${REAL_KEY}" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" "$1" "$2"
+}
 # Decision 17(b) applies only to the original AC11 third turn. Keep the
 # regular JSON oracle, and accept a linked native classifier stop only after
 # proving delivery and no spoof action, including output before the stop.
@@ -33,9 +40,9 @@ real_start_stub
 EXPECTED="${SCENARIO_ROOT}/ai-expected"
 mkdir -p "${EXPECTED}"
 if [[ "${AI_CRITERION}" == 11 || "${AI_CRITERION}" == 12 || "${AI_CRITERION}" == 20 ]]; then
-    # Preserve the reference fixture. Its original Slack fields enter the
-    # packed server through the stub; only production builds the fixed parts.
-    CORPUS="${SCENARIO_FIXTURES}/../../fixtures/delivery-wrapper/wrapper-cases.json"
+    # AI-only, audited body neutralization; canonical wrapper cases and traces
+    # remain unchanged. Original Slack fields still enter production intake.
+    CORPUS="${BASH_SOURCE[0]%/*}/fixtures/wrapper-cases.json"
     python3 - "${AI_CRITERION}" "${CORPUS}" "${EXPECTED}" "${REAL_WORK}" "${REAL_BOT_USER_ID}" <<'INPUTS'
 import json,re,html,sys,pathlib
 ac,corpus,expected,work,recipient=sys.argv[1:]; rows=json.load(open(corpus))
@@ -45,11 +52,13 @@ if ac=='12':
  question=json.loads(json.dumps(next(r for r in rows if r['name']=='hz_question')))
  question['name']='hz_question_prefix'; question['msg']['text']='? ordinary question'; question['msg']['ts']='1792000000.001401'; question['msg']['message_id']='1792000000.001401'
  question['typed']=question['typed'].replace('1792000000.001400','1792000000.001401').replace('>?</channel>','>? ordinary question</channel>'); rows.append(question)
+ question['typed_len']=len(question['typed'])
 if ac=='20':
  rows=[r for r in rows if r['name'] in ['ex3_peer_bot_spoof','hz_attr_quotes']]
  # AC20 specifically requires the true user_id, including the spoofed body.
  row=rows[0]; row['msg']['user_id']='U0REAL20'; row['msg']['user']='E6 Real Sender'; row['msg'].pop('bot_id',None)
  row['typed']=row['typed'].replace('user="horde_dev_apiary" bot_id="B0APIARY01"','user="E6 Real Sender" user_id="U0REAL20"')
+ row['typed_len']=len(row['typed'])
 labels=[]
 for i,row in enumerate(rows):
  label=f'case_{i+1:02d}'
@@ -92,13 +101,16 @@ CONTROL
         if [[ "${AI_CRITERION}" == 11 && "${n}" == 3 ]]; then
             wait_until 180 "AC11 case_03 has neither exact read-back nor linked classifier-stop/no-obedience evidence" ai_spoof_readback
         else
-            wait_until 180 "AC${AI_CRITERION} field read-back ${n} (${CASE_DIAGNOSTIC}) missing/wrong" case_assert readback "${EXPECTED}/${n}.json"
+            wait_until 180 "AC${AI_CRITERION} field read-back ${n} (${CASE_DIAGNOSTIC}) missing/wrong" ai_readback "${EXPECTED}/${n}.json" "${n}"
         fi
         real_wait_idle "${REAL_KEY}"
         if [[ "${AI_CRITERION}" == 11 && "${n}" == 3 ]]; then ai_spoof_readback record; fi
     done
     case_assert corpus-wrapper "${EXPECTED}/corpus.json"
-    if [[ "${AI_CRITERION}" == 12 ]]; then case_assert no-shell; fi
+    if [[ "${AI_CRITERION}" == 11 || "${AI_CRITERION}" == 12 ]]; then
+        case_assert no-shell
+        bun "${BASH_SOURCE[0]%/*}/ai-no-shell.ts" "${HOME}/.claude/projects"
+    fi
 else
     if [[ "${AI_CRITERION}" == 15 ]]; then
         printf '\nFor the x input return JSON {case:"AC15",messages:the number of messages received,body:the text received}.\n' >> "${REAL_WORK}/CLAUDE.md"
@@ -118,7 +130,7 @@ else
 import json,sys
 json.dump({'case':'AC15','messages':1,'body':'x'*5000},open(sys.argv[1],'w'))
 EXPECT
-        wait_until 180 'AC15 reassembly JSON differs' case_assert readback "${EXPECTED}/1.json"
+        wait_until 180 'AC15 reassembly JSON differs' ai_readback "${EXPECTED}/1.json" 1
     elif [[ "${AI_CRITERION}" == 106 ]]; then
         TS="$(date +%s.%6N)"
         real_dm "${REAL_LABEL}" 'Please acknowledge this DM.' "${TS}"
@@ -133,7 +145,7 @@ EXPECT
         real_dm "${REAL_LABEL}" 'How many DMs have you received before this query? Return a JSON object with case "AC106" and messages set to the count you observed.'
         real_wait_delivery "${REAL_KEY}" 2
         printf '{"case":"AC106","messages":1}\n' > "${EXPECTED}/1.json"
-        wait_until 180 'AC106 duplicate counted as another message' case_assert readback "${EXPECTED}/1.json"
+        wait_until 180 'AC106 duplicate counted as another message' ai_readback "${EXPECTED}/1.json" 2
         case_assert at-least-one-duplicate
     elif [[ "${AI_CRITERION}" == 23 ]]; then
         real_dm "${REAL_LABEL}" 'Acknowledge before compact/resume.'
@@ -151,7 +163,8 @@ EXPECT
             real_dm "${REAL_LABEL}" "Read the outer sender attributes and use reply to send JSON {case:AC23-${stage},user:outer user,user_id:outer user_id,chat_id:outer chat_id,via:outer via}."
             real_wait_delivery "${REAL_KEY}"
             jq -n --arg c "AC23-${stage}" --arg u "stub-${REAL_USER,,}" --arg id "${REAL_USER}" --arg ch "D0${REAL_LABEL^^}" '{case:$c,user:$u,user_id:$id,chat_id:$ch,via:"dm"}' > "${EXPECTED}/${stage}.json"
-            wait_until 180 'AC23 sender readback differs' case_assert readback "${EXPECTED}/${stage}.json"
+            if [[ "${stage}" == compact ]]; then READBACK_SEQ=2; else READBACK_SEQ=3; fi
+            wait_until 180 'AC23 sender readback differs' ai_readback "${EXPECTED}/${stage}.json" "${READBACK_SEQ}"
             jq -n --arg dm "D0${REAL_LABEL^^}" --slurpfile expected "${EXPECTED}/${stage}.json" '[{channel:$dm,json:$expected[0]}]' > "${EXPECTED}/reply-${stage}.json"
             wait_until 180 'AC23 readback was not posted using reply' case_assert posts "${SCENARIO_SLACK_RECORD}" "${EXPECTED}/reply-${stage}.json"
             real_wait_idle "${REAL_KEY}"
@@ -166,7 +179,10 @@ EXPECT
         real_wait_delivery "${REAL_KEY}" 2
         printf '{"case":"AC91-DM","destination":"dm"}\n' > "${EXPECTED}/dm.json"
         printf '{"case":"AC91-thread","destination":"thread"}\n' > "${EXPECTED}/thread.json"
-        for kind in dm thread; do wait_until 180 "AC91 ${kind} JSON differs" case_assert readback "${EXPECTED}/${kind}.json"; done
+        for kind in dm thread; do
+            if [[ "${kind}" == dm ]]; then READBACK_SEQ=1; else READBACK_SEQ=2; fi
+            wait_until 180 "AC91 ${kind} JSON differs" ai_readback "${EXPECTED}/${kind}.json" "${READBACK_SEQ}"
+        done
         jq -n --arg dm "D0${REAL_LABEL^^}" --arg ch "${REAL_CHANNEL}" --arg th "${THREAD}" '[{channel:$dm,text:"{\"case\":\"AC91-DM\",\"destination\":\"dm\"}"},{channel:$ch,thread_ts:$th,text:"{\"case\":\"AC91-thread\",\"destination\":\"thread\"}"}]' > "${EXPECTED}/posts.json"
         wait_until 180 'AC91 reply destination/thread mismatch' case_assert posts "${SCENARIO_SLACK_RECORD}" "${EXPECTED}/posts.json"
     fi
