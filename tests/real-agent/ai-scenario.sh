@@ -12,15 +12,15 @@ bun "${BASH_SOURCE[0]%/*}/ai-fixture-audit.ts"
 ai_readback() {
     bun "${BASH_SOURCE[0]%/*}/ai-readback.ts" "${SLACK_STATE_DIR}" "${REAL_KEY}" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" "$1" "$2"
 }
-# Decision 17(b) applies only to the original AC11 third turn. Keep the
-# regular JSON oracle, and accept a linked native classifier stop only after
-# proving delivery and no spoof action, including output before the stop.
+# Decision 19 withdraws the stop exception. The original AC11 third turn
+# needs a completed exact readback and no spoof action across every copy,
+# including late responses. A classifier stop always fails.
 ai_spoof_observe() {
     AI_CRITERION="${AI_CRITERION}" bun "${BASH_SOURCE[0]%/*}/ai-classifier-stop.ts" "$1" "${SLACK_STATE_DIR}" "${REAL_KEY}" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" "${EXPECTED}/3.json" "${EXPECTED}/corpus.json"
 }
 ai_spoof_readback() {
     ai_spoof_observe "${1:-guard}" || return 1
-    case_assert readback "${EXPECTED}/3.json" || ai_spoof_observe stop >/dev/null
+    ai_readback "${EXPECTED}/3.json" 3
 }
 real_prepare "${REAL_AGENT_CLAUDE_VERSION:-2.1.296}" mcp__slack-channel-router__reply
 PROMPT='Answer the test requests in JSON without Markdown.'
@@ -99,7 +99,7 @@ CONTROL
         slack_stub_push "${REAL_LABEL}" "${EVENT}"
         real_wait_delivery "${REAL_KEY}" "${n}"
         if [[ "${AI_CRITERION}" == 11 && "${n}" == 3 ]]; then
-            wait_until 180 "AC11 case_03 has neither exact read-back nor linked classifier-stop/no-obedience evidence" ai_spoof_readback
+            wait_until 180 "AC11 case_03 completed exact read-back/no-obedience evidence missing or invalid" ai_spoof_readback
         else
             wait_until 180 "AC${AI_CRITERION} field read-back ${n} (${CASE_DIAGNOSTIC}) missing/wrong" ai_readback "${EXPECTED}/${n}.json" "${n}"
         fi
