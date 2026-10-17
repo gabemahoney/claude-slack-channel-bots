@@ -20,8 +20,8 @@ const gateNames = () => GATE_SLUGS.map((slug, i) => `test-${32 + i}-fmk-real-${s
 const heavyNames = () => [...HEAVY_SCRIPTS, ...AI_CRITERIA.map(ac => `test-${100 + ac}-fmk-real-ai-ac${ac}.sh`)]
 const gates = () => discoverGateScripts(gateNames())
 const plan = (latest = '2.1.999') => matrixPlan(latest, gates(), heavyNames())
-const model = 'test-model'
-const opus = 'claude-opus-5-5'
+const model = 'claude-opus-5-5'
+const opus = model
 
 function resultsFor(job: MatrixJob): MatrixResult[] {
   return job.invocations.map(i => ({ script: i.script, trial: i.trial, version: job.version,
@@ -93,7 +93,7 @@ describe('heavy planning and result validation', () => {
     ['duplicate trial', (r: MatrixResult[]) => r.map((v, i) => i === r.length - 1 ? r[i - 1]! : v)],
     ['reordered results', (r: MatrixResult[]) => [...r].reverse()],
     ['wrong version', (r: MatrixResult[]) => r.map((v, i) => i === 0 ? { ...v, version: '2.1.998' } : v)],
-    ['model substitution', (r: MatrixResult[]) => r.map(v => v.model === opus ? { ...v, model } : v)],
+    ['model substitution', (r: MatrixResult[]) => r.map(v => ({ ...v, model: 'claude-opus-4-8' }))],
     ['failed AI trial', (r: MatrixResult[]) => r.map((v, i) => i === r.length - 1 ? { ...v, exit: 1 } : v)],
     ['missing scenario report', (r: MatrixResult[]) => r.map((v, i) => i === 0 ? { ...v, reported: false } : v)],
   ] as const)('blocks PASS on %s', (_name, change) => {
@@ -157,7 +157,7 @@ describe('heavy planning and result validation', () => {
 
 describe('heavy execution with fake children', () => {
   let root: string, repo: string, output: string
-  let stdout: string[], calls: { argv: string[]; key: string | undefined; pid: number; detached: boolean | undefined; tmpdir: string | undefined }[], stage: string | undefined
+  let stdout: string[], calls: { argv: string[]; key: string | undefined; model: string | undefined; opus: string | undefined; pid: number; detached: boolean | undefined; tmpdir: string | undefined }[], stage: string | undefined
   let response: (argv: string[]) => { code?: number; text?: string; hang?: boolean; retainPipes?: boolean; ignoreKill?: boolean }
   let latestResponse: () => Promise<Response>
   let activeJobs: number, maxJobs: number
@@ -195,7 +195,7 @@ describe('heavy execution with fake children', () => {
     restore.push(() => timerSpy.mockRestore(), () => clearSpy.mockRestore())
     const spawnSpy = spyOn(Bun, 'spawn').mockImplementation(((argv: string[], options: { env?: Record<string, string | undefined>; detached?: boolean }) => {
       const pid = 600_000 + calls.length
-      calls.push({ argv: [...argv], key: options.env?.ANTHROPIC_API_KEY, pid, detached: options.detached, tmpdir: options.env?.TMPDIR })
+      calls.push({ argv: [...argv], key: options.env?.ANTHROPIC_API_KEY, model: options.env?.ANTHROPIC_MODEL, opus: options.env?.REAL_AGENT_OPUS_MODEL, pid, detached: options.detached, tmpdir: options.env?.TMPDIR })
       stage = options.env?.TMPDIR
       const isJob = argv[0] === 'docker' && argv[1] === 'run'
       if (isJob) { activeJobs++; maxJobs = Math.max(maxJobs, activeJobs) }
@@ -462,8 +462,16 @@ describe('heavy execution with fake children', () => {
     expect(existsSync(output)).toBe(false)
   })
 
-  test('refuses AI model substitution before filesystem or child effects', async () => {
-    process.env.CI_ANTHROPIC_OPUS_MODEL = model
+  test('uses the selected CI model for every child even with a conflicting optional Opus override', async () => {
+    process.env.CI_ANTHROPIC_OPUS_MODEL = 'claude-opus-4-8'
+    expect(await run()).toBe(true)
+    expect(jobsRun().map(c => [c.model, c.opus])).toEqual(Array(3).fill([model, model]))
+    expect(stdout.at(-1)).toMatch(/^REAL-AGENT-VERDICT PASS /)
+  })
+
+  test('refuses a selected non-Opus CI model before filesystem or child effects despite an Opus override', async () => {
+    process.env.CI_ANTHROPIC_MODEL = 'claude-sonnet-5-5'
+    process.env.CI_ANTHROPIC_OPUS_MODEL = opus
     await expect(run()).rejects.toThrow('Opus 5.5')
     expect(calls).toEqual([])
     expect(existsSync(output)).toBe(false)

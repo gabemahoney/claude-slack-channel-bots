@@ -36,7 +36,10 @@ cache as a separate image and don't get invalidated on every CSCB source edit.
   `docker/real-agent-job.sh`, tagged `cscb-real-agent:<run-id>` and removed
   by `scripts/real-agent-matrix.ts`. Jobs select native Claude through
   agent-director, install runtime latest inside the container when needed,
-  and run sequentially with runtime-only credentials. See
+  and run sequentially with runtime-only credentials. Every heavy bot is
+  pinned to `CI_ANTHROPIC_MODEL` (available Opus 5.5), ignoring the optional
+  `CI_ANTHROPIC_OPUS_MODEL`; refusal fallback is disabled while the safety
+  classifier remains enabled. See
   [the heavy invocation](../tests/README.md#heavy-inventory-and-invocation).
 
 `/ci` builds the base only when the tag that `docker/Dockerfile.test`'s `FROM`

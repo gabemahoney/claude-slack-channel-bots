@@ -14,17 +14,23 @@ actual="$("/opt/claude-code/$version/claude" --version)"
 [[ "${actual%% *}" == "$version" ]] || exit 1
 printf 'recorded: matrix native Claude %s\n' "$actual"
 export REAL_AGENT_CLAUDE_VERSION="$version"
-export REAL_AGENT_OPUS_MODEL
+[[ -n "${ANTHROPIC_MODEL:-}" ]] || exit 64
+# Decision 17: all heavy scenarios, including AI trials, stay on the CI model.
+# Both pinned natives gate refusal fallback on this variable. The classifier
+# still runs; its refusal ends the turn instead of switching to another model.
+export REAL_AGENT_MODEL_PIN="$ANTHROPIC_MODEL"
+export REAL_AGENT_OPUS_MODEL="$ANTHROPIC_MODEL"
+export CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK=1
 export ANTHROPIC_API_KEY ANTHROPIC_BASE_URL ANTHROPIC_MODEL
+printf 'recorded: matrix model pinned %s; refusal fallback disabled\n' "$ANTHROPIC_MODEL"
 # Each scenario creates its own HOME/store/socket and minimal permissions;
 # the root job never launches a bot, AD or tmux itself.
 gosu testuser bun install /tmp/package.tgz > /tmp/real-agent-install.log 2>&1
 gosu testuser /opt/agent-director/check/ad-client-check.sh --package /test-repo/node_modules/claude-slack-channel-bots
 for spec in "$@"; do
     IFS=: read -r script trial model_kind <<< "$spec"
-    [[ "$script" =~ ^(integration|real-agent)/test-[0-9]+-fmk-real-[a-z0-9-]+\.sh$ && "$trial" =~ ^[123]$ ]] || exit 64
+    [[ "$script" =~ ^(integration|real-agent)/test-[0-9]+-fmk-real-[a-z0-9-]+\.sh$ && "$trial" =~ ^[123]$ && "$model_kind" =~ ^(default|opus)$ ]] || exit 64
     model="$ANTHROPIC_MODEL"
-    if [[ "$model_kind" == opus ]]; then model="$REAL_AGENT_OPUS_MODEL"; fi
     log="/tmp/real-agent-script.log"
     rc=0
     gosu testuser env REAL_AGENT_TRIAL="$trial" ANTHROPIC_MODEL="$model" bash "/tests/$script" > "$log" 2>&1 || rc=$?

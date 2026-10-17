@@ -147,7 +147,9 @@ export function matrixOptions(args: readonly string[], repo = resolve(dirname(im
 }
 export async function runMatrix(options: MatrixOptions): Promise<boolean> {
   const key = process.env.CI_ANTHROPIC_API_KEY ?? '', model = process.env.CI_ANTHROPIC_MODEL ?? ''
-  const opus = process.env.CI_ANTHROPIC_OPUS_MODEL ?? (opus55Model(model) ? model : 'claude-opus-5-5')
+  // Decision 17: every heavy invocation uses the CI key's selected model.
+  // An optional Opus override must never redirect an AI trial to another ID.
+  const opus = model || (options.planOnly ? 'claude-opus-5-5' : '')
   const secrets = scannedSecretValues(process.env, { shardVariables: { CI_ANTHROPIC_API_KEY: key } })
   if (!options.planOnly && (!key || !model || (!key.startsWith('sk-ant-') && !process.env.CI_ANTHROPIC_BASE_URL))) throw new Error('CI_ANTHROPIC_API_KEY, CI_ANTHROPIC_MODEL and gateway base URL are required')
   if (!opus55Model(opus)) throw new Error('The AI criteria require Opus 5.5; model substitution is refused')

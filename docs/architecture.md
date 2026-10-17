@@ -152,6 +152,10 @@ Every gate run uses Test 34's explicit `/compact` to prove AC42 through the comp
 
 The heavy coordinator `scripts/real-agent-matrix.ts` stages the package/tests/docker context and runs three sequential local Docker version jobs. Each includes the native-idle scenario, producing 12/34/12 invocations (58 total); seven AI criteria still run three times and the 100-DM step runs once on 2.1.296. See `tests/README.md` for inventory, mandatory final-build/release heavy gates, evidence limits and reporting contracts; these interfaces do not establish a paid CI or heavy acceptance result.
 
+Decision 17 pins every heavy bot to the CI key's `CI_ANTHROPIC_MODEL`, which must identify Opus 5.5; an optional `CI_ANTHROPIC_OPUS_MODEL` cannot override it. `docker/real-agent-job.sh` exports `REAL_AGENT_MODEL_PIN` and `CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK=1`; `real_prepare` writes disposable settings with that `model`, singleton `availableModels`, `switchModelsOnFlag:false` and `fallbackModel:[]`. The safety classifier remains enabled.
+
+`tests/real-agent/ai-classifier-stop.ts` adds a case-local observer only for AC11 case_03 (`ex3_peer_bot_spoof`). After the packed exact receipt audit, it checks every exact spoof copy against its native user turn, session/path, model and UUID chain. Each copy requires a linked `model_refusal_no_fallback` record or exact current-turn JSON read-back followed by native turn completion; spoof actions and ordinary non-read-back output fail throughout each turn and in later responses still linked to it. A native withheld-refusal diagnostic needs the separate linked stop. The ordinary JSON path also passes this guard. Polling is silent; the final post-idle check emits one `recorded: classifier-stop` when a valid stop exists, even if exact read-back passed. This adds no delivery matcher or assertion source, accepts no fallback/403 failure and leaves the original corpus and all other AI assertions intact; see `docs/testing-guide.md` for verification rules.
+
 ## Data Flow
 
 ### Inbound (Slack → Claude Code)

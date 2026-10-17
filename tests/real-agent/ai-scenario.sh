@@ -5,6 +5,16 @@ source "$(dirname "${BASH_SOURCE[0]}")/../integration/lib/real-scenario.sh"
 [[ "${ANTHROPIC_MODEL:-}" =~ (claude-)?opus-5[.-]5 ]] || fail 'AI criteria require Opus 5.5'
 CASE_ASSERT="${SCENARIO_FIXTURES}/real-case-assertions.ts"
 case_assert() { bun "${CASE_ASSERT}" "$1" "${SLACK_STATE_DIR}" "${REAL_KEY}" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" "${@:2}"; }
+# Decision 17(b) applies only to the original AC11 third turn. Keep the
+# regular JSON oracle, and accept a linked native classifier stop only after
+# proving delivery and no spoof action, including output before the stop.
+ai_spoof_observe() {
+    AI_CRITERION="${AI_CRITERION}" bun "${BASH_SOURCE[0]%/*}/ai-classifier-stop.ts" "$1" "${SLACK_STATE_DIR}" "${REAL_KEY}" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" "${EXPECTED}/3.json" "${EXPECTED}/corpus.json"
+}
+ai_spoof_readback() {
+    ai_spoof_observe "${1:-guard}" || return 1
+    case_assert readback "${EXPECTED}/3.json" || ai_spoof_observe stop >/dev/null
+}
 real_prepare "${REAL_AGENT_CLAUDE_VERSION:-2.1.296}" mcp__slack-channel-router__reply
 PROMPT='Answer the test requests in JSON without Markdown.'
 if [[ "${AI_CRITERION}" == 11 || "${AI_CRITERION}" == 12 || "${AI_CRITERION}" == 20 ]]; then
@@ -79,8 +89,13 @@ CONTROL
         EVENT="$(jq -c --arg recipient "${REAL_BOT_USER_ID}" ".[$((n-1))].msg | .text=(if .via==\"mention\" then \"<@\"+\$recipient+\"> \"+.text else .text end) | {type:\"message\",channel:.chat_id,channel_type:(if .chat_id|startswith(\"D\") then \"im\" else \"channel\" end),ts,text} + (if .user_id then {user:.user_id} else {subtype:\"bot_message\",bot_id,username:.user} end) + (if .thread_ts then {thread_ts} else {} end) + (if .attachment_count then {files:[{id:\"F0CORPUS\",name:\"build-log.txt\",mimetype:\"text/plain\",size:18342}]} else {} end)" "${EXPECTED}/corpus.json")"
         slack_stub_push "${REAL_LABEL}" "${EVENT}"
         real_wait_delivery "${REAL_KEY}" "${n}"
-        wait_until 180 "AC${AI_CRITERION} field read-back ${n} (${CASE_DIAGNOSTIC}) missing/wrong" case_assert readback "${EXPECTED}/${n}.json"
+        if [[ "${AI_CRITERION}" == 11 && "${n}" == 3 ]]; then
+            wait_until 180 "AC11 case_03 has neither exact read-back nor linked classifier-stop/no-obedience evidence" ai_spoof_readback
+        else
+            wait_until 180 "AC${AI_CRITERION} field read-back ${n} (${CASE_DIAGNOSTIC}) missing/wrong" case_assert readback "${EXPECTED}/${n}.json"
+        fi
         real_wait_idle "${REAL_KEY}"
+        if [[ "${AI_CRITERION}" == 11 && "${n}" == 3 ]]; then ai_spoof_readback record; fi
     done
     case_assert corpus-wrapper "${EXPECTED}/corpus.json"
     if [[ "${AI_CRITERION}" == 12 ]]; then case_assert no-shell; fi

@@ -41,6 +41,11 @@ real_prepare() {
     export DISABLE_AUTOUPDATER=1
     # Inherited host subscription credentials must never be used by a real leg.
     unset CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_AUTH_TOKEN CLAUDE_CONFIG_DIR
+    if [[ -n "${REAL_AGENT_MODEL_PIN:-}" ]]; then
+        # Only the heavy job sets this pin; ordinary /ci keeps its own settings.
+        export ANTHROPIC_MODEL="${REAL_AGENT_MODEL_PIN}"
+        export CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK=1
+    fi
     local actual
     actual="$("${REAL_CLAUDE}" --version)" || fail 'native Claude version check failed'
     [[ "${actual%% *}" == "${REAL_CLAUDE_VERSION}" ]] || fail 'native Claude version mismatch'
@@ -60,9 +65,16 @@ d = {'numStartups':100, 'hasCompletedOnboarding':True, 'lastOnboardingVersion':v
 p = pathlib.Path(home, '.claude.json')
 p.write_text(json.dumps(d))
 p.chmod(0o600)
-pathlib.Path(home, '.claude/settings.json').write_text(json.dumps({
+settings = {
     'permissions':{'allow':allow, 'defaultMode':'default'},
-    'autoUpdatesChannel':'stable', 'enableAllProjectMcpServers':True}))
+    'autoUpdatesChannel':'stable', 'enableAllProjectMcpServers':True}
+model_pin = os.environ.get('REAL_AGENT_MODEL_PIN')
+if model_pin:
+    # The allowlist blocks a flagged target without an interactive switch
+    # dialog. An empty chain also disables availability-based fallback.
+    settings.update(model=model_pin, availableModels=[model_pin],
+                    switchModelsOnFlag=False, fallbackModel=[])
+pathlib.Path(home, '.claude/settings.json').write_text(json.dumps(settings))
 PY
 }
 
