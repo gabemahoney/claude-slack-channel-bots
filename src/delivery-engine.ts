@@ -43,7 +43,7 @@ export interface DeliveryEngineDeps {
   isUp(key: string): boolean; isLatched(key: string): boolean; isHeld(key: string): boolean; isConnected(key: string): boolean
   prepare(key: string, item: QueueItem): Promise<void>
   onRow?(key: string, row: GetResult): boolean
-  /** E4's shared replacement only, under the engine's client and call budget. */
+  /** E4's shared replacement when a fresh own-row marker is unproved, under the engine's client and call budget. */
   inspectUpgrade?(key: string, row: GetResult, client: DeliveryClient, beforeCall: () => void): Promise<void>
   onReadError?(key: string, error: unknown, verb: 'get' | 'read-pane'): Promise<void>
   onError?(key: string, error: unknown): void
@@ -140,8 +140,10 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
       life.observeRow(key, row)
       if (row.state === 'ended' || row.state === 'missing') restart(key, s)
       if (deps.onRow?.(key, row)) { wait(key, s, 'held'); return false }
-      if (deps.inspectUpgrade) {
-        const markerMissing = row.labels?.tag_prompt !== '1'
+      const markerMissing = row.labels?.tag_prompt !== '1'
+      // b.omv SR-7.6: this fresh own-row get already proves the current
+      // marker. Independent send-gate reads still recheck it before keys.
+      if (deps.inspectUpgrade && (markerMissing || row.instance_id !== deps.instanceId(key))) {
         if (markerMissing) release(s)
         const client = await deps.clientFor(key)
         if (stopped || s.stopped) return false

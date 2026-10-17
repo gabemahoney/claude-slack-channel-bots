@@ -2892,7 +2892,7 @@ export async function handleDeliveryReadError(key: string, error: unknown, verb:
   if (cls === AD_ERROR_CLASS_UNUSABLE_NAME) latchOnUnusableNameRead(key, error, at)
 }
 
-/** Apply the existing own-row rules to an isolated delivery-client reading. */
+/** Apply own-row rules and record upgrade provenance from a fresh delivery-client reading. */
 export function applyDeliveryOwnRowRead(key: string, row: GetResult): boolean {
   const at = { site: 'delivery engine', what: 'get' }
   endKillFailureEpisodeOnRead(key, { state: row.state })
@@ -2902,6 +2902,7 @@ export function applyDeliveryOwnRowRead(key: string, row: GetResult): boolean {
   deliveryLifecycle?.observeRow(key, row)
   const latched = actOnOwnRowRead(key, row, at, true) !== undefined
   checkThisLaunchRowOnRead(key, { state: row.state, launchStartedAt: row.launch_started_at }, latched, at)
+  if (!latched && row.instance_id === personaInstanceId(key)) noteTagPromptReading(key, row)
   return latched
 }
 /** Use the existing reconnect classifier for delivery call errors without

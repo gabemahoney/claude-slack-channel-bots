@@ -1088,9 +1088,13 @@ The original other-55 run remains paused after its first 2.1.280 order
 case failed: typing latency p95 was 2269.602 ms, above the 2000 ms limit,
 although all 53 items arrived FIFO with zero duplicates. Its 54 remaining
 invocations (36 non-AI, 18 AI) are pending; its resolved latest is 2.1.302.
-Fresh full units, the focused 21 AI trials and complete heavy acceptance
-remain pending for this change. Unpaid controls and the diagnostic do not
-waive either gate or turn a prior failure into a pass.
+Delivery p95 was 3869 ms, within its 10000 ms limit. Duplicate upgrade reads
+exhausted the unchanged 40-call/10-second budget. The own-marker fast path
+passes a deterministic sustained-load regression (typing p95 2880 ms before,
+1567 ms after); the recorded-gap control passes before the fix too.
+Native latency after the fix, fresh full units, paid CI, the focused 21 AI
+trials and complete heavy acceptance remain pending. Unpaid controls and
+the diagnostic do not waive either gate or turn a prior failure into a pass.
 
 Local jobs use the committed `/ci` caps, currently 2 GiB, 2 CPUs and 2,048
 PIDs, with 3 h per job. `docker/Dockerfile.real-agent` and

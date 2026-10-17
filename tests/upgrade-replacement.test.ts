@@ -2,8 +2,10 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import type { GetResult, SpawnParams } from 'agent-director'
-import { inspectPersonaUpgrade, isTagUpgradePending, reconnectMcpWithCause, sendPendingRowLapEnter, setDeliveryPersonaLookup, _resetInFlightLaunches } from '../src/session-manager.ts'
+import type { Client, GetResult, SpawnParams } from 'agent-director'
+import { applyDeliveryOwnRowRead, inspectPersonaUpgrade, isTagUpgradePending, reconnectMcpWithCause, sendPendingRowLapEnter, setDeliveryLifecycle, setDeliveryPersonaLookup, _resetInFlightLaunches } from '../src/session-manager.ts'
+import { createDeliveryAdScope } from '../src/delivery-ad-scope.ts'
+import { DELIVERY_MAX_AD_CALLS_PER_S, LAUNCH_SETTLE_MS, RECEIPT_WAIT_MS } from '../src/delivery-engine.ts'
 import { _buildReconnectSessionAdapter } from '../src/server.ts'
 import { latchRowStateRead } from '../src/conflict-latch.ts'
 import { makeRecoveryHarness, personaOf, personaRow, type RecoveryHarness } from './test-helpers/recovery-harness.ts'
@@ -19,7 +21,8 @@ afterEach(async () => { for (const engine of engines.splice(0)) { try { assertNo
 afterEach(() => { setDeliveryPersonaLookup(() => undefined); for (const h of cleanups.splice(0)) { try { assertNoLeak(h.captured()) } finally { h.cleanup() } } })
 
 function fleet(state: string, marked = false) {
-  const h = makeRecoveryHarness({ harnessNow: true })
+  const scope = createDeliveryAdScope()
+  const h = makeRecoveryHarness({ harnessNow: true, deliveryScope: scope })
   cleanups.push(h)
   const [p, q] = h.keys as [string, string]
   const persona = personaOf(h, p)
@@ -49,7 +52,7 @@ function fleet(state: string, marked = false) {
     killFn: () => { kills++; if (refuseKill) return errTmuxKillFailed(); row = { ...row, state: 'ended' }; return cannedKillResult(true) },
     findMissingResult: cannedFindMissing(),
   })
-  return { h, p, q, persona, old, memory, memoryBefore, row: () => row,
+  return { h, p, q, persona, old, memory, memoryBefore, scope, row: () => row,
     change: (patch: Partial<GetResult>) => { row = { ...row, ...patch } },
     refuseKills: () => { refuseKill = true }, fresh: () => fresh, kills: () => kills,
     replacements: (): SpawnParams[] => h.stub.calls.spawnCalls.filter(call => call.reuse_finished === true),
@@ -65,7 +68,231 @@ function kept(f: ReturnType<typeof fleet>) {
   expect(f.h.stub.calls.deleteCalls).toEqual([])
 }
 
+/** The server's actual own-row and async-local upgrade wiring, using the
+ * engine's client rather than the recovery fixture's separate client. */
+async function deliveryFleet(f: ReturnType<typeof fleet>, responseMs?: { get: number; readPane: number; sendKeys: number }) {
+  const engine = await makeEngineHarness({ keys: [f.p], onRow: applyDeliveryOwnRowRead,
+    inspectUpgrade: (key, _row, client, beforeCall) => f.scope.run(key, client as Client, beforeCall, async () => { await inspectPersonaUpgrade(key, f.persona) }),
+  })
+  engines.push(engine)
+  setDeliveryLifecycle(engine.lifecycle)
+  const live = engine.p(f.p)
+  live.path = join(engine.root, `${f.row().session_id}.jsonl`)
+  writeTranscript(live.path, endedTurn())
+  f.change({ jsonl_path: live.path })
+  Object.defineProperty(live, 'row', { get: f.row, configurable: true })
+  if (responseMs) {
+    const client = engine.client(f.p)
+    // Match the native get/read-pane/key response cadence without real waits.
+    // Shared inspectors call this very same client through DeliveryAdScope.
+    const delayed = <P, R>(original: (params: P) => Promise<R>, delay: number) => async (params: P): Promise<R> => {
+      const result = await original(params)
+      await new Promise<void>(resolve => engine.clock.setTimeout(resolve, delay))
+      return result
+    }
+    client.get = delayed(client.get.bind(client), responseMs.get)
+    client.readPane = delayed(client.readPane.bind(client), responseMs.readPane)
+    client.sendKeys = delayed(client.sendKeys.bind(client), responseMs.sendKeys)
+  }
+  return engine
+}
+
+async function driveDelivery(engine: EngineHarness, key: string, until = () => !engine.engine.running(key)) {
+  for (let turn = 0; turn < 4000 && !until(); turn++) {
+    await new Promise<void>(resolve => setImmediate(resolve))
+    await engine.clock.runNext()
+  }
+  if (!until()) throw new Error(JSON.stringify({ at: engine.clock.now(), snapshot: engine.engine.snapshot(key), errors: engine.errors, events: engine.events.slice(-3), pending: engine.clock.pending(), calls: engine.calls.slice(-8) }))
+}
+
+function withinBudget(engine: EngineHarness) {
+  for (const call of engine.calls) expect(engine.calls.filter(other => other.at > call.at - 10000 && other.at <= call.at).length).toBeLessThanOrEqual(DELIVERY_MAX_AD_CALLS_PER_S * 10)
+}
+
 describe('earlier-release replacement', () => {
+  test.each(['recorded window', 'immediate ready followups'] as const)('%s: ready-message cadence meets AC76 with production upgrade reads inside the 40-call budget', async cadence => {
+    const f = fleet('waiting', true)
+    const engine = await deliveryFleet(f, { get: 8, readPane: 25, sendKeys: 25 })
+    // Native280 Test32, decision19 job-01: seq33 -> seq34 idle gap, then
+    // seq34..53's observed receipt-to-next-accept gaps (ms). The second row
+    // uses the existing engine latency regression's 50 ms idle gap, now with
+    // production upgrade wiring. Longer native reply gaps can hide the cost
+    // of redundant gets, so both the recorded and sustained loads matter.
+    const responseGaps = cadence === 'recorded window'
+      ? [2081, 784, 559, 2987, 2050, 797, 3374, 727, 4632, 5753, 2225, 818, 817, 644, 2005, 1292, 835, 535, 2641, 1532]
+      : [2081, ...Array.from({ length: 19 }, () => 50)]
+    const precedingHeads = ['preceding FIFO head']
+    for (const text of precedingHeads) await engine.accept(text, f.p)
+    engine.engine.wake(f.p)
+    await driveDelivery(engine, f.p)
+    const typing: number[] = [], confirmation: number[] = []
+    for (const [i, gap] of responseGaps.entries()) {
+      const before = engine.calls.length
+      await engine.clock.advance(gap)
+      expect(engine.calls).toHaveLength(before)
+      expect(engine.clock.pending()).toEqual([])
+      expect([f.row().state, engine.p(f.p).box]).toEqual(['waiting', ''])
+      const accepted = await engine.accept(`ready DM ${i + 1}`, f.p)
+      engine.engine.wake(f.p)
+      await driveDelivery(engine, f.p)
+      typing.push(engine.textCalls(f.p).at(-1)!.at - accepted.accepted.received_at)
+      const done = engine.events.find(event => event.type === 'item-delivered' && event.seq === accepted.accepted.seq)!
+      expect(done.type).toBe('item-delivered')
+      if (done.type === 'item-delivered') confirmation.push(done.waitMs)
+    }
+    const p95 = (values: number[]) => [...values].sort((a, b) => a - b)[Math.ceil(values.length * .95) - 1]!
+    expect(p95(typing)).toBeLessThanOrEqual(2000)
+    expect(p95(confirmation)).toBeLessThanOrEqual(10000)
+    expect(engine.events.filter(event => event.type === 'delivered').map(event => event.seq)).toEqual(Array.from({ length: precedingHeads.length + 20 }, (_, i) => i + 1))
+    expect(engine.keyCalls(f.p).map(call => call.params.key ?? call.params.text)).toEqual([...precedingHeads, ...responseGaps.map((_, i) => `ready DM ${i + 1}`)].flatMap(text => [text, 'Enter']))
+    expect(engine.queue.openCount(f.p)).toBe(0)
+    expect(engine.errors).toEqual([])
+    withinBudget(engine)
+    expect(f.h.stub.calls.getCalls).toEqual([])
+    kept(f)
+  })
+
+  test('partial budget exhaustion resumes with a fresh composer guard and retains FIFO without duplicate keys', async () => {
+    const f = fleet('waiting', true)
+    const engine = await deliveryFleet(f)
+    for (let i = 0; i < 12; i++) await engine.accept(`burst ${i}`, f.p)
+    engine.engine.wake(f.p)
+    await driveDelivery(engine, f.p, () => engine.calls.length === DELIVERY_MAX_AD_CALLS_PER_S * 10 && engine.clock.pending().some(timer => timer.dueAt === engine.calls[0]!.at + 10000))
+    const paused = engine.calls.length, keys = engine.keyCalls(f.p).length
+    expect(engine.queue.openCount(f.p)).toBeGreaterThan(0)
+    engine.p(f.p).box = 'operator draft during budget pause'
+    const resumesAt = engine.calls[0]!.at + 10000
+    await engine.clock.advanceTo(resumesAt - 1)
+    expect(engine.calls).toHaveLength(paused)
+    await engine.clock.advance(1)
+    await engine.tick(f.p)
+    expect(engine.calls[paused]!.at).toBe(resumesAt)
+    expect(engine.keyCalls(f.p)).toHaveLength(keys)
+    expect(engine.queue.openCount(f.p)).toBeGreaterThan(0)
+    engine.p(f.p).box = ''
+    await driveDelivery(engine, f.p)
+    expect(engine.events.filter(event => event.type === 'delivered').map(event => event.seq)).toEqual(Array.from({ length: 12 }, (_, i) => i + 1))
+    expect(engine.keyCalls(f.p).map(call => call.params.key ?? call.params.text)).toEqual(Array.from({ length: 12 }, (_, i) => [`burst ${i}`, 'Enter']).flat())
+    expect(engine.queue.openCount(f.p)).toBe(0)
+    expect(engine.errors).toEqual([])
+    withinBudget(engine)
+    kept(f)
+  })
+
+  test('a marker disappearing at the independent gate read prevents keys in the earlier conversation', async () => {
+    const f = fleet('waiting', true)
+    const engine = await deliveryFleet(f)
+    await engine.accept('queued before marker loss', f.p)
+    await engine.tick(f.p)
+    let readyPaneReads = 0
+    engine.p(f.p).readHook = () => {
+      if (engine.clock.now() >= LAUNCH_SETTLE_MS && ++readyPaneReads === 1) {
+        const { tag_prompt: _tag, ...labels } = f.row().labels
+        f.change({ state: 'working', labels })
+      }
+    }
+    await engine.advance(LAUNCH_SETTLE_MS + RECEIPT_WAIT_MS)
+    expect(readyPaneReads).toBeGreaterThan(0)
+    expect(engine.keyCalls(f.p)).toEqual([])
+    expect(engine.queue.openCount(f.p)).toBe(1)
+    expect(isTagUpgradePending(f.p)).toBe(true)
+    expect(f.fresh()).toBe(0)
+    expect(f.kills()).toBe(0)
+    kept(f)
+  })
+
+  test.each([undefined, '', '0', 'true', ' 1', 1] as const)('an absent or malformed marker %s retains fresh inspection and never types', async marker => {
+    const f = fleet('working')
+    const labels = { ...f.row().labels }
+    if (marker === undefined) delete labels.tag_prompt
+    else labels.tag_prompt = marker as string
+    f.change({ labels })
+    const engine = await deliveryFleet(f)
+    await engine.accept('held for upgrade', f.p)
+    await engine.tick(f.p)
+    // Pending is only set by the production inspector's fresh scoped read.
+    expect(isTagUpgradePending(f.p)).toBe(true)
+    expect(engine.calls.filter(call => call.verb === 'get')).toHaveLength(2)
+    expect(engine.keyCalls(f.p)).toEqual([])
+    expect(f.h.stub.calls.getCalls).toEqual([])
+    expect(f.fresh()).toBe(0)
+    kept(f)
+  })
+
+  test.each(['busy', 'already current'] as const)('a markerless engine observation followed by a fresh %s row prevents replacement', async change => {
+    const f = fleet('waiting')
+    const engine = await deliveryFleet(f)
+    const client = engine.client(f.p), get = client.get.bind(client)
+    let reads = 0
+    client.get = async params => {
+      const row = await get(params)
+      if (++reads === 1) f.change(change === 'busy' ? { state: 'working' } : { labels: { ...row.labels, tag_prompt: '1' } })
+      return row
+    }
+    await engine.accept('fresh provenance required', f.p)
+    await engine.tick(f.p)
+    expect(reads).toBe(2)
+    expect(engine.keyCalls(f.p)).toEqual([])
+    expect(isTagUpgradePending(f.p)).toBe(change === 'busy')
+    expect(f.kills()).toBe(0)
+    expect(f.fresh()).toBe(0)
+    expect(engine.queue.openCount(f.p)).toBe(1)
+    kept(f)
+  })
+
+  test('a marked response for another instance still requires fresh own-row upgrade inspection', async () => {
+    const f = fleet('working')
+    const engine = await deliveryFleet(f)
+    const client = engine.client(f.p), get = client.get.bind(client)
+    let reads = 0
+    client.get = async params => {
+      const row = await get(params)
+      return ++reads === 1 ? { ...row, instance_id: row.instance_id + '_other', labels: { ...row.labels, tag_prompt: '1' } } : row
+    }
+    await engine.accept('only own provenance counts', f.p)
+    await engine.tick(f.p)
+    expect(reads).toBe(2)
+    expect(isTagUpgradePending(f.p)).toBe(true)
+    expect(engine.keyCalls(f.p)).toEqual([])
+    expect(f.kills()).toBe(0)
+    expect(f.fresh()).toBe(0)
+    kept(f)
+  })
+
+  test.each(['other instance', 'provenance conflict', 'pending without launch start'] as const)('%s cannot clear a previously observed E5 upgrade candidate', async change => {
+    const f = fleet('working')
+    expect(await inspectPersonaUpgrade(f.p, f.persona)).toBe('deferred')
+    f.change({ labels: { ...f.row().labels, tag_prompt: '1' },
+      ...(change === 'other instance' ? { instance_id: f.old.instance_id + '_other' } : {}),
+      ...(change === 'provenance conflict' ? { liveness_note: 'provenance_conflict' as const } : {}),
+      ...(change === 'pending without launch start' ? { state: 'pending' as const, launch_started_at: null } : {}),
+    })
+    expect(applyDeliveryOwnRowRead(f.p, f.row())).toBe(change !== 'other instance')
+    expect(isTagUpgradePending(f.p)).toBe(true)
+    expect(f.fresh()).toBe(0)
+    expect(f.h.stub.calls.sendKeysCalls).toEqual([])
+    kept(f)
+  })
+
+  test('a fresh current delivery reading clears E5 upgrade pending after replacement without another inspector', async () => {
+    const f = fleet('working')
+    expect(await inspectPersonaUpgrade(f.p, f.persona)).toBe('deferred')
+    expect(isTagUpgradePending(f.p)).toBe(true)
+    f.change({ state: 'waiting' })
+    expect(await inspectPersonaUpgrade(f.p, f.persona)).toBe('replacing')
+    await settle(f)
+    expect(f.fresh()).toBe(1)
+    expect(f.row().labels.tag_prompt).toBe('1')
+    // Replacement itself hasn't supplied the later delivery observation.
+    expect(isTagUpgradePending(f.p)).toBe(true)
+    const reads = f.h.stub.calls.getCalls.length
+    expect(applyDeliveryOwnRowRead(f.p, f.row())).toBe(false)
+    expect(isTagUpgradePending(f.p)).toBe(false)
+    expect(f.h.stub.calls.getCalls).toHaveLength(reads)
+    expect(f.fresh()).toBe(1)
+    kept(f)
+  })
+
   test.each(['ended', 'missing'])('%s: never resumes the old conversation, reuses once with the marker, retains memory and later resumes normally', async state => {
     const f = fleet(state)
     expect((await f.h.launch(f.p)).action).toBe('spawned')
@@ -140,12 +367,12 @@ describe('earlier-release replacement', () => {
     kept(f)
   })
 
-  test('a fresh read that turns busy before the checked kill preserves the row', async () => {
+  test.each(['busy', 'already current'] as const)('a fresh read that turns %s before the checked kill preserves the row', async change => {
     const f = fleet('waiting')
     const get = f.h.stub.client.get
     let reads = 0
     f.h.stub.client.get = async params => {
-      if (++reads === 2) f.change({ state: 'working' })
+      if (++reads === 2) f.change(change === 'busy' ? { state: 'working' } : { labels: { ...f.row().labels, tag_prompt: '1' } })
       return get(params)
     }
     expect(await inspectPersonaUpgrade(f.p, f.persona)).toBe('replacing')

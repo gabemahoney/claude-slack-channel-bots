@@ -1140,6 +1140,7 @@ import {
   type StuckLaunchAbort,
 } from '../../src/pending-row.ts'
 import { _resetOutageState, clearOutageFlag, getOutageFlags, initOutageState, resetAllToHealthy, type OutageClass } from '../../src/outage-state.ts'
+import type { DeliveryAdScope } from '../../src/delivery-ad-scope.ts'
 import type { PersonaLifecycleDeps } from '../../src/persona-lifecycle.ts'
 import type { PersonaConnectionStatus } from '../../src/persona-connections.ts'
 import {
@@ -1458,6 +1459,8 @@ const SERVING: PersonaConnectionStatus = Object.freeze({ state: 'up', identity: 
 
 /** Options of `makeRecoveryHarness`; every one is optional. */
 export interface RecoveryHarnessOptions {
+  /** Use the engine's isolated client and call budget in shared upgrade reads, as main() does. */
+  deliveryScope?: DeliveryAdScope
   /** The retry action: `'scripted'` for the scripted action; the full-mode action when unset. */
   action?: UnavailableRetryAction | 'scripted'
   /** The personas (`makeMultiPersonaConfig` specs); two default personas when unset. */
@@ -2642,6 +2645,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   let recheckInstalled = false
   _resetOutageState()
   initOutageState({
+    deliveryScope: options.deliveryScope,
     notify: (key, text) => {
       outageNotices.push({ key, text })
     },
