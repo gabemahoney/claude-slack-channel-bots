@@ -7,14 +7,15 @@ import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 import { classifierObservation, spoofTurn } from './real-agent/ai-classifier-stop.ts'
 import { auditedAICorpus } from './real-agent/ai-fixture-audit.ts'
 import { assertAIReadbackNoShell } from './real-agent/ai-no-shell.ts'
-import { completedAIReadback } from './real-agent/ai-readback.ts'
+import { freshHazardSession } from './real-agent/ai-fresh-session.ts'
+import { completedAIReadback, safeSelectedModel } from './real-agent/ai-readback.ts'
 import { parseDeliveryTranscriptRecord, receiptTextMatches } from '../src/delivery-receipt.ts'
 import type { TranscriptEntry } from './integration/fixtures/transcript-receipts.ts'
 
 // Unpaid native-evidence controls only; no unit result certifies a real AI trial.
 function evidence() {
   const fixture = JSON.parse(readFileSync(new URL('./fixtures/delivery-wrapper/wrapper-cases.json', import.meta.url), 'utf8'))[2]
-  const path = '/scenario/projects/aiac11/session.jsonl', model = 'aws/anthropic/bedrock-claude-opus-5-5'
+  const path = '/scenario/projects/aiac11/session.jsonl', model = 'azure/openai/gpt-6-astra'
   const entry = (offset: number, value: any): TranscriptEntry => ({ path, offset, at: offset,
     value: { sessionId: 'session', isSidechain: false, ...value }, ...parseDeliveryTranscriptRecord('claude', value) })
   const take = entry(20, { type: 'user', uuid: 'case3', message: { role: 'user', content: fixture.typed } })
@@ -46,9 +47,103 @@ function ordinaryEvidence() {
 
 test('ordinary AI readback requires exact fields from its completed receipt-backed native turn', () => {
   const e = ordinaryEvidence()
-  expect(completedAIReadback(e)).toEqual({ seq: 3, part: 1, receipt_uuid: 'case3', session_id: 'session' })
+  expect(completedAIReadback(e)).toEqual({ seq: 3, part: 1, receipt_uuid: 'case3', session_id: 'session', actual_model: e.model })
   e.reply.value.message.content[0].text = JSON.stringify({ ...e.expected, body: e.expected.body + ' ' })
   expect(() => completedAIReadback(e)).toThrow('AI read-back field differs')
+})
+
+test.each(['azure/openai/gpt-6-astra', 'aws/anthropic/bedrock-claude-opus-5-5'])('completed readback records the actual selected model %s and rejects substitution', model => {
+  const e = ordinaryEvidence()
+  e.model = model; e.reply.value.requestedModel = model; e.reply.value.message.model = model
+  expect(completedAIReadback(e).actual_model).toBe(model)
+  expect(spoofTurn(e)).toBeNull()
+  e.reply.value.requestedModel = 'different-model'
+  expect(() => completedAIReadback(e)).toThrow('invalid native assistant response')
+  expect(() => spoofTurn(e)).toThrow('native model substitution')
+})
+
+test.each(['', 'model with spaces', 'model\n', 'model\r', '-model', 'a'.repeat(257), 'model$(command)'])('an invalid selected model %j cannot supply native evidence', model => {
+  const e = ordinaryEvidence(); e.model = model
+  expect(safeSelectedModel(model)).toBe(false)
+  expect(() => completedAIReadback(e)).toThrow('identity missing')
+  expect(() => spoofTurn(e)).toThrow('safe selected model pin')
+})
+
+test('a later corrected readback cannot conceal an earlier incorrect body', () => {
+  const e = ordinaryEvidence()
+  e.reply.value.message.content[0].text = JSON.stringify({ ...e.expected, body: 'incorrect' })
+  e.own.push(assistant(e, [{ type: 'text', text: JSON.stringify(e.expected) }], 26, { parentUuid: e.reply.value.uuid }))
+  expect(() => completedAIReadback(e)).toThrow('AI read-back field differs')
+})
+
+function hazardEvidence(pasted = false) {
+  const e = evidence(), corpus = auditedAICorpus().ai, seq = 4, fixture = corpus[seq - 1]
+  const take = e.entry(20, { type: 'user', uuid: 'hazard', message: { role: 'user',
+    content: pasted ? `<pasted_content id="hazard">\n${fixture.typed}\n</pasted_content id="hazard">` : fixture.typed } })
+  return { seq, corpus, journal: [{ kind: 'delivered', seq, part: 1, receipt: { path: take.path, uuid: take.uuid } },
+    { kind: 'sent', seq, session_id: 'session' }, { kind: 'sent', seq: 3, session_id: 'previous' }],
+    own: [take], adapters: e.adapters, previous: [{ seq: 3, session: 'previous' }], entry: e.entry }
+}
+
+test.each([false, true])('fresh hazard proof accepts only its exact native conversation, pasted=%s', pasted => {
+  const e = hazardEvidence(pasted)
+  expect(freshHazardSession(e)).toMatchObject({ seq: 4, fixture: 'hz_bang', session: 'session', receipt_uuid: 'hazard', channelTakeIns: 1, earlierFixtures: 0 })
+})
+
+test.each([
+  ['azure/openai/gpt-6-astra', 'azure/openai/gpt-6-astra', '1', 0],
+  ['azure/openai/gpt-6-astra', 'claude-opus-5-5', '1', 1],
+  ['model\n', 'model\n', '1', 1],
+  ['azure/openai/gpt-6-astra', 'azure/openai/gpt-6-astra', '0', 1],
+] as const)('actual AI shell validates selected/pinned model and fallback setting %j/%j/%s', (selected, pinned, fallback, status) => {
+  const root = mkdtempSync(join(tmpdir(), 'ai-pin-shell-'))
+  try {
+    const source = readFileSync(new URL('./real-agent/ai-scenario.sh', import.meta.url), 'utf8')
+    const guard = source.slice(source.indexOf('[[ "${REAL_AGENT_MODEL_PIN'), source.indexOf('CASE_ASSERT='))
+    const child = spawnSync('bash', ['-eu', '-c', `fail() { exit 1; }\n${guard}`], {
+      env: hostSafeChildEnv(root, { tools: ['bash'], extras: { ANTHROPIC_MODEL: selected, REAL_AGENT_MODEL_PIN: pinned, CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK: fallback } }),
+      encoding: 'utf8', timeout: 5000,
+    })
+    expect(child.error).toBeUndefined(); expect(child.status).toBe(status)
+  } finally { rmSync(root, { recursive: true, force: true }) }
+})
+
+test('actual hazard restart block leaves the first three together and supplies each hazard only its case label', () => {
+  const root = mkdtempSync(join(tmpdir(), 'ai-isolation-shell-'))
+  try {
+    const source = readFileSync(new URL('./real-agent/ai-scenario.sh', import.meta.url), 'utf8')
+    const restart = source.slice(source.indexOf('        FIXTURE='), source.indexOf('        CASE_DIAGNOSTIC='))
+    const corpus = auditedAICorpus().ai
+    writeFileSync(join(root, 'case-labels.json'), JSON.stringify(corpus.map((r: any, i: number) => ({ fixture: r.name, case: `case_${String(i + 1).padStart(2, '0')}` }))))
+    writeFileSync(join(root, 'CLAUDE.md'), 'Instructions.\nCase labels in sequence: ["case_01", "case_02", "case_03"].\n')
+    const script = join(root, 'isolation.sh')
+    writeFileSync(script, `set -eu
+stop_server() { printf 'stop:%s\\n' "$n"; }
+start_server() { printf 'start:%s\\n' "$n"; }
+real_wait_launch() { printf 'launch:%s:' "$n"; cat "$REAL_WORK/CLAUDE.md"; }
+REAL_KEY=aiac11
+for ((n=1;n<=15;n++)); do
+${restart}
+done
+`)
+    const child = spawnSync('bash', [script], { env: hostSafeChildEnv(root, { tools: ['bash', 'jq', 'python3', 'cat'], extras: { EXPECTED: root, REAL_WORK: root } }), encoding: 'utf8', timeout: 5000 })
+    expect(child.error).toBeUndefined(); expect(child.status).toBe(0)
+    expect(child.stdout.split('\n').filter(line => line.startsWith('stop:'))).toEqual(Array.from({ length: 12 }, (_, i) => `stop:${i + 4}`))
+    for (let n = 4; n <= 15; n++) expect(child.stdout).toContain(`start:${n}\nlaunch:${n}:Instructions.\nCase labels in sequence: ["case_${String(n).padStart(2, '0')}"].`)
+  } finally { rmSync(root, { recursive: true, force: true }) }
+})
+
+test.each([
+  ['earlier send', (e: ReturnType<typeof hazardEvidence>) => { e.journal[2]!.session_id = 'session' }],
+  ['prior hazard session', (e: ReturnType<typeof hazardEvidence>) => { e.previous[0]!.session = 'session' }],
+  ['foreign pasted fixture', (e: ReturnType<typeof hazardEvidence>) => { e.own.push(e.entry(30, { type: 'user', uuid: 'foreign', message: { content: `<pasted_content id="other">\n${e.corpus[4].typed}\n</pasted_content id="other">` } })) }],
+  ['unlisted channel context', (e: ReturnType<typeof hazardEvidence>) => { e.own.push(e.entry(30, { type: 'user', uuid: 'foreign', message: { content: '<pasted_content id="other">\n<channel source="foreign">other</channel>\n</pasted_content id="other">' } })) }],
+  ['wrong native session', (e: ReturnType<typeof hazardEvidence>) => { e.own[0]!.value.sessionId = 'other' }],
+  ['missing receipt', (e: ReturnType<typeof hazardEvidence>) => { e.journal.shift() }],
+  ['ambiguous receipt', (e: ReturnType<typeof hazardEvidence>) => { e.own.push(e.own[0]!) }],
+] as const)('fresh hazard proof rejects %s', (_name, change) => {
+  const e = hazardEvidence(); change(e)
+  expect(() => freshHazardSession(e)).toThrow()
 })
 
 test.each([
@@ -185,7 +280,7 @@ test.each([
   ['different case', (e: any) => { e.expected.case = 'case_04' }],
   ['different fixture', (e: any) => { e.fixture.name = 'hz_tab' }],
   ['wrong trial', (e: any) => { e.trial = '4' }],
-  ['unavailable model', (e: any) => { e.model = 'claude-opus-4-8' }],
+  ['invalid model pin', (e: any) => { e.model = 'model with spaces' }],
   ['changed expected attributes', (e: any) => { e.expected.attributes.user = 'Gabe Mahoney' }],
   ['changed expected body', (e: any) => { e.expected.body = 'safe rewritten body' }],
   ['wrong accepted chat', (e: any) => { e.journal[0].channel = 'DOTHER' }],
@@ -353,7 +448,8 @@ function shellObservation(e: ReturnType<typeof evidence>, exactReadback: boolean
     writeFileSync(data, JSON.stringify(e))
     writeFileSync(observer, `import { readFileSync } from 'node:fs'
 import { classifierObservation } from ${JSON.stringify(new URL('./real-agent/ai-classifier-stop.ts', import.meta.url).pathname)}
-import { completedAIReadback } from ${JSON.stringify(new URL('./real-agent/ai-readback.ts', import.meta.url).pathname)}
+import { freshHazardSession } from './real-agent/ai-fresh-session.ts'
+import { completedAIReadback, safeSelectedModel } from ${JSON.stringify(new URL('./real-agent/ai-readback.ts', import.meta.url).pathname)}
 import { parseDeliveryTranscriptRecord, receiptTextMatches } from ${JSON.stringify(new URL('../src/delivery-receipt.ts', import.meta.url).pathname)}
 const [mode, data, final] = process.argv.slice(2)
 const e = JSON.parse(readFileSync(data, 'utf8'))
@@ -364,7 +460,7 @@ catch (error) { console.error(error.message); process.exitCode = 1 }
 `)
     const source = readFileSync(new URL('./real-agent/ai-scenario.sh', import.meta.url), 'utf8')
     const functions = source.slice(source.indexOf('ai_spoof_observe()'), source.indexOf('real_prepare '))
-    expect(source).toContain('then ai_spoof_readback record; fi')
+    expect(source).toContain('            ai_spoof_readback record\n')
     writeFileSync(script, `set -eu
 ${functions}
 ai_readback() { [[ "$1" == "$EXPECTED/3.json" && "$2" == 3 ]] || return 2; "${process.execPath}" "${observer}" readback "${data}" "$FINAL"; }

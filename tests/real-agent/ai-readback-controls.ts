@@ -5,6 +5,8 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { auditedAICorpus, incidentalBait } from './ai-fixture-audit.ts'
+import { freshHazardSession } from './ai-fresh-session.ts'
+import { packedReceiptAdapters, readTranscripts } from '../integration/fixtures/transcript-receipts.ts'
 
 function check(value: unknown, reason: string): asserts value { if (!value) throw new Error(reason) }
 check(existsSync('/etc/cscb-ci-image'), 'AI read-back controls require the CI image')
@@ -152,7 +154,7 @@ try {
   const foreignPath = join(transcripts, 'foreign.jsonl')
   const native = (type: string, uuid: string, timestamp: number, extra: any = {}) => ({ type, uuid, timestamp, sessionId: 'control', isSidechain: false, ...extra })
   const take = native('user', 'receipt', 20000, { message: { role: 'user', content: ai[3].typed } })
-  const model = 'aws/anthropic/bedrock-claude-opus-5-5'
+  const model = 'azure/openai/gpt-6-astra'
   const reply = (uuid = 'response', timestamp = 30000, extra: any = {}) => native('assistant', uuid, timestamp, { parentUuid: 'receipt', requestedModel: model,
     message: { role: 'assistant', model, stop_reason: 'end_turn', content: [{ type: 'text', text: JSON.stringify(bang) }] }, ...extra })
   const accepted = { kind: 'accepted', seq: 1, source: 'slack', channel: ai[3].msg.chat_id, ts: ai[3].msg.ts, user: ai[3].msg.user_id, received_at: 10000 }
@@ -299,6 +301,23 @@ try {
     console.log('PASS: actual case_03 CLI rejects ' + name)
   }
   console.log('PASS: case_03 requires strict completed seq=3 readback and every-copy no-obedience; no stop-pass mode')
+  // Isolation uses the installed exact matcher, including native pasted_content.
+  // These remain unpaid controlled records, never model/acceptance evidence.
+  const adapters = await packedReceiptAdapters()
+  const isolation = () => freshHazardSession({ seq: 1, corpus: [ai[3], ai[4]], journal: baseJournal,
+    own: readTranscripts([transcript], adapters), adapters, previous: [] })
+  for (const pasted of [false, true]) {
+    const hazard = structuredClone(take)
+    if (pasted) hazard.message.content = '<pasted_content id="hazard">\n' + ai[3].typed + '\n</pasted_content id="hazard">'
+    writeNative([hazard, reply()])
+    check(isolation().session === 'control', 'fresh hazard native/pasted receipt rejected')
+  }
+  writeNative([take, native('user', 'foreign-hazard', 40000, { message: { role: 'user',
+    content: '<pasted_content id="foreign">\n' + ai[4].typed + '\n</pasted_content id="foreign">' } })])
+  let rejected = false
+  try { isolation() } catch { rejected = true }
+  check(rejected, 'foreign pasted hazard accepted in same native conversation')
+  console.log('PASS: packed exact matcher accepts fresh native/pasted hazard and rejects foreign pasted context')
   check(readFileSync(canonicalPath).equals(originalBytes), 'original corpus bytes changed')
   console.log('PASS: original 15-case corpus remains byte-identical; no agent/model calls')
 } finally {

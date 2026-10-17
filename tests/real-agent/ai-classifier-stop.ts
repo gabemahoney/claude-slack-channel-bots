@@ -5,7 +5,7 @@ import { existsSync, readFileSync } from 'node:fs'
 import { basename, join } from 'node:path'
 import { auditReceipts, packedReceiptAdapters, personaTranscripts, readTranscripts, receiptJournal, transcriptFiles, type ReceiptAdapters, type TranscriptEntry } from '../integration/fixtures/transcript-receipts.ts'
 import { auditedAICorpus } from './ai-fixture-audit.ts'
-import { completedAIReadback } from './ai-readback.ts'
+import { completedAIReadback, safeSelectedModel } from './ai-readback.ts'
 
 function check(value: unknown, reason: string): asserts value { if (!value) throw new Error(reason) }
 const blocks = (e: TranscriptEntry): any[] => Array.isArray(e.value?.message?.content) ? e.value.message.content : []
@@ -23,7 +23,7 @@ export function spoofTurn(options: { criterion: string; trial: string; model: st
   const { criterion, trial, model, fixture, expected, journal, own, adapters } = options
   check(criterion === '11' && /^[123]$/.test(trial) && expected?.case === 'case_03'
     && fixture?.name === 'ex3_peer_bot_spoof', 'spoof guard is only AC11 case_03')
-  check(model && /(?:claude-)?opus-5[.-]5(?:$|[-_@])/.test(model), 'classifier observation requires pinned Opus 5.5')
+  check(safeSelectedModel(model), 'spoof observation requires a safe selected model pin')
   const attrs = { source: 'slack-channel-router', ...Object.fromEntries(Object.entries(fixture.msg).filter(([k]) => k !== 'text')) }
   check(stable(expected) === stable({ case: 'case_03', attributes: attrs, body: fixture.typed.slice(fixture.typed.indexOf('>') + 1, -'</channel>'.length) }), 'spoof expectation changed')
   const accepted = journal.find(r => r.kind === 'accepted' && !r.compact && r.seq === 3)

@@ -138,8 +138,8 @@
   "prompt_input_sources": [
     {
       "path": "real-agent/ai-scenario.sh",
-      "sha256": "2f14e5a71c7ddb1ce85196d218a0bd6e94bbd98f7ad4c1365ad2981c6d250adf",
-      "reason": "Reviewed complete AI scenario/entry source against the seven-criterion input inventory; any source drift requires a fresh audit."
+      "sha256": "cfa82ad2f82c1428aa5e2aa6d5a7a5448fa9439bc798bd1d51242f440df3c3a8",
+      "reason": "Reviewed complete AI scenario/entry source against the seven-criterion input inventory; any source drift requires a fresh audit. Decision 19 reviewed setup: strict selected-model pin and disabled fallback; first three AC11 turns unchanged; each hz_* restarts without resume and sees its own opaque label. Input bodies, attributes, order, all-part exact receipt/JSON and no-obedience/no-shell assertions and bounds remain unchanged."
     },
     {
       "path": "integration/lib/real-scenario.sh",

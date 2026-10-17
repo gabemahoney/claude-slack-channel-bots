@@ -8,7 +8,7 @@ import { dirname, join } from 'node:path'
 import {
   AI_CRITERIA, GATE_SLUGS, HEAVY_SCRIPTS, MATRIX_CPUS, MATRIX_MEMORY, MATRIX_TIMEOUT_MS,
   MATRIX_VERSIONS, SCHEDULER_JOB_CONTRACT, assertJobComplete, discoverGateScripts,
-  matrixDockerArgs, matrixOptions, matrixPlan, opus55Model, parseResultLine, runMatrix,
+  matrixDockerArgs, matrixOptions, matrixPlan, safeModel, parseResultLine, runMatrix,
   type MatrixJob, type MatrixResult,
 } from '../scripts/real-agent-matrix.ts'
 import { CPUS_PER_SHARD, SHARD_MEMORY_CAP_BYTES, SHARD_PIDS_LIMIT } from '../scripts/ci-run.ts'
@@ -23,9 +23,9 @@ const plan = (latest = '2.1.999') => matrixPlan(latest, gates(), heavyNames())
 const model = 'claude-opus-5-5'
 const opus = model
 
-function resultsFor(job: MatrixJob): MatrixResult[] {
+function resultsFor(job: MatrixJob, defaultModel = model, aiModel = defaultModel): MatrixResult[] {
   return job.invocations.map(i => ({ script: i.script, trial: i.trial, version: job.version,
-    model: i.model === 'opus' ? opus : model, exit: 0, reported: true, duplicates: 2,
+    model: i.model === 'opus' ? aiModel : defaultModel, exit: 0, reported: true, duplicates: 2,
     tokens: { input: 7, output: 3, cache_read: 5, cache_creation: 1 } }))
 }
 const resultLine = (result: unknown) => `real-agent-result: ${JSON.stringify(result)}`
@@ -55,7 +55,7 @@ describe('heavy planning and result validation', () => {
     expect(jobs[1]!.invocations[0]!.trial).toBe(1)
   })
 
-  test('runs each AI criterion exactly three times on Opus 5.5 across the matrix', () => {
+  test('runs each AI criterion exactly three times using the AI selector across the matrix', () => {
     const invocations = plan().flatMap(job => job.invocations)
     for (const ac of AI_CRITERIA) expect(invocations.filter(i => i.script.endsWith(`-ai-ac${ac}.sh`)))
       .toEqual([1, 2, 3].map(trial => ({ script: `real-agent/test-${100 + ac}-fmk-real-ai-ac${ac}.sh`, trial, model: 'opus' as const })))
@@ -130,9 +130,10 @@ describe('heavy planning and result validation', () => {
   })
 
   test.each([
-    ['claude-opus-5-5', true], ['claude-opus-5.5', true], ['bedrock-claude-opus-5-5-v1', true],
-    ['opus-5.5', true], ['claude-sonnet-5-5', false], ['claude-opus-4-6', false], ['claude-opus-5-50', false],
-  ])('Opus 5.5 model %s accepted=%s', (value, expected) => expect(opus55Model(value)).toBe(expected))
+    ['azure/openai/gpt-6-astra', true], ['claude-opus-5-5', true], ['org/model:version@pin', true],
+    ['', false], ['model with spaces', false], ['model\n', false], ['model\r', false],
+    ['-model', false], ['a'.repeat(257), false], ['model$(command)', false],
+  ])('safe selected model %j accepted=%s', (value, expected) => expect(safeModel(value)).toBe(expected))
 
   test('local jobs use CI resource caps, bare runtime environment names and a three-hour timeout; future scheduler reserves separately', () => {
     const args = matrixDockerArgs('test-job', 'test-image', plan()[0]!)
@@ -148,7 +149,7 @@ describe('heavy planning and result validation', () => {
     expect(args).not.toContain('--rm')
     expect(MATRIX_TIMEOUT_MS).toBe(3 * 60 * 60 * 1000)
     expect(args.flatMap((a, i) => a === '--env' ? [args[i + 1]] : [])).toEqual([
-      'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL', 'REAL_AGENT_OPUS_MODEL',
+      'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL', 'REAL_AGENT_AI_MODEL',
     ])
     expect(SCHEDULER_JOB_CONTRACT).toMatchObject({ memory: '8GiB', cpus: 4, timeout: '3h', network: 'on', secret: 'env:CI_ANTHROPIC_API_KEY:ANTHROPIC_API_KEY' })
     assertNoLeak(args)
@@ -157,14 +158,14 @@ describe('heavy planning and result validation', () => {
 
 describe('heavy execution with fake children', () => {
   let root: string, repo: string, output: string
-  let stdout: string[], calls: { argv: string[]; key: string | undefined; model: string | undefined; opus: string | undefined; pid: number; detached: boolean | undefined; tmpdir: string | undefined }[], stage: string | undefined
+  let stdout: string[], calls: { argv: string[]; key: string | undefined; model: string | undefined; aiModel: string | undefined; pid: number; detached: boolean | undefined; tmpdir: string | undefined }[], stage: string | undefined
   let response: (argv: string[]) => { code?: number; text?: string; hang?: boolean; retainPipes?: boolean; ignoreKill?: boolean }
   let latestResponse: () => Promise<Response>
   let activeJobs: number, maxJobs: number
   const clock = createFakeClock()
   let kills: string[]
   let groupKills: { pid: number; signal: string | number | undefined }[], cancelledPipes: number[]
-  const envNames = ['CI_ANTHROPIC_API_KEY', 'CI_ANTHROPIC_MODEL', 'CI_ANTHROPIC_BASE_URL', 'CI_ANTHROPIC_OPUS_MODEL'] as const
+  const envNames = ['CI_ANTHROPIC_API_KEY', 'CI_ANTHROPIC_MODEL', 'CI_ANTHROPIC_BASE_URL', 'CI_ANTHROPIC_OPUS_MODEL', 'CI_ANTHROPIC_AI_MODEL'] as const
   let oldEnv: Record<string, string | undefined>
   let restore: (() => void)[]
 
@@ -181,6 +182,7 @@ describe('heavy execution with fake children', () => {
     process.env.CI_ANTHROPIC_MODEL = model
     process.env.CI_ANTHROPIC_BASE_URL = 'https://model.invalid'
     process.env.CI_ANTHROPIC_OPUS_MODEL = opus
+    delete process.env.CI_ANTHROPIC_AI_MODEL
     response = () => ({})
     latestResponse = async () => new Response('2.1.999\n')
     restore = []
@@ -195,7 +197,7 @@ describe('heavy execution with fake children', () => {
     restore.push(() => timerSpy.mockRestore(), () => clearSpy.mockRestore())
     const spawnSpy = spyOn(Bun, 'spawn').mockImplementation(((argv: string[], options: { env?: Record<string, string | undefined>; detached?: boolean }) => {
       const pid = 600_000 + calls.length
-      calls.push({ argv: [...argv], key: options.env?.ANTHROPIC_API_KEY, model: options.env?.ANTHROPIC_MODEL, opus: options.env?.REAL_AGENT_OPUS_MODEL, pid, detached: options.detached, tmpdir: options.env?.TMPDIR })
+      calls.push({ argv: [...argv], key: options.env?.ANTHROPIC_API_KEY, model: options.env?.ANTHROPIC_MODEL, aiModel: options.env?.REAL_AGENT_AI_MODEL, pid, detached: options.detached, tmpdir: options.env?.TMPDIR })
       stage = options.env?.TMPDIR
       const isJob = argv[0] === 'docker' && argv[1] === 'run'
       if (isJob) { activeJobs++; maxJobs = Math.max(maxJobs, activeJobs) }
@@ -206,7 +208,7 @@ describe('heavy execution with fake children', () => {
       const answer = response(argv)
       let text = answer.text ?? ''
       if (isJob && answer.text === undefined) {
-        text = resultsFor(jobForArgv(argv)).map(resultLine).join('\n') + '\n'
+        text = resultsFor(jobForArgv(argv), options.env?.ANTHROPIC_MODEL, options.env?.REAL_AGENT_AI_MODEL).map(resultLine).join('\n') + '\n'
       }
       let finish!: (code: number) => void, stream!: ReadableStreamDefaultController<Uint8Array>
       const exited = new Promise<number>(resolve => { finish = resolve })
@@ -462,19 +464,52 @@ describe('heavy execution with fake children', () => {
     expect(existsSync(output)).toBe(false)
   })
 
-  test('uses the selected CI model for every child even with a conflicting optional Opus override', async () => {
+  test('defaults AI routing to the selected CI model and ignores the legacy Opus override', async () => {
     process.env.CI_ANTHROPIC_OPUS_MODEL = 'claude-opus-4-8'
     expect(await run()).toBe(true)
-    expect(jobsRun().map(c => [c.model, c.opus])).toEqual(Array(3).fill([model, model]))
+    expect(jobsRun().map(c => [c.model, c.aiModel])).toEqual(Array(3).fill([model, model]))
     expect(stdout.at(-1)).toMatch(/^REAL-AGENT-VERDICT PASS /)
   })
 
-  test('refuses a selected non-Opus CI model before filesystem or child effects despite an Opus override', async () => {
-    process.env.CI_ANTHROPIC_MODEL = 'claude-sonnet-5-5'
-    process.env.CI_ANTHROPIC_OPUS_MODEL = opus
-    await expect(run()).rejects.toThrow('Opus 5.5')
+  test('accepts an explicitly selected non-Opus AI model while keeping ordinary routing separate', async () => {
+    const selected = 'azure/openai/gpt-6-astra'
+    process.env.CI_ANTHROPIC_AI_MODEL = selected
+    process.env.CI_ANTHROPIC_OPUS_MODEL = 'ignored-legacy-model'
+    expect(await run()).toBe(true)
+    expect(jobsRun().map(c => [c.model, c.aiModel])).toEqual(Array(3).fill([model, selected]))
+    const recorded = JSON.parse(readFileSync(join(output, 'plan.json'), 'utf8'))
+    expect([recorded.model, recorded.aiModel]).toEqual([model, selected])
+    const rows = readdirSync(output).filter(n => n.startsWith('job-')).flatMap(n => JSON.parse(readFileSync(join(output, n), 'utf8')).results)
+    expect(rows.filter(r => r.script.includes('-ai-ac')).every(r => r.model === selected)).toBe(true)
+    expect(rows.filter(r => !r.script.includes('-ai-ac')).every(r => r.model === model)).toBe(true)
+  })
+
+  test('defaults AI to a non-Opus CI model without imposing a family restriction', async () => {
+    process.env.CI_ANTHROPIC_MODEL = 'azure/openai/gpt-6-astra'
+    expect(await run()).toBe(true)
+    expect(jobsRun().map(c => [c.model, c.aiModel])).toEqual(Array(3).fill(['azure/openai/gpt-6-astra', 'azure/openai/gpt-6-astra']))
+  })
+
+  test.each(['', 'model with spaces', 'model\n', 'model\r', '-model', 'a'.repeat(257), 'model$(command)'])('invalid AI override %j refuses before filesystem or child effects', async value => {
+    process.env.CI_ANTHROPIC_AI_MODEL = value
+    await expect(run()).rejects.toThrow('Invalid matrix model identifier')
     expect(calls).toEqual([])
     expect(existsSync(output)).toBe(false)
+  })
+
+  test.each(['AI', 'ordinary'])('a result using the other routing model fails its %s invocation', async kind => {
+    const selected = 'azure/openai/gpt-6-astra'
+    process.env.CI_ANTHROPIC_AI_MODEL = selected
+    response = argv => {
+      if (argv[1] !== 'run') return {}
+      const job = jobForArgv(argv), rows = resultsFor(job, model, selected)
+      const at = job.invocations.findIndex(i => (i.model === 'opus') === (kind === 'AI'))
+      if (at < 0) return { text: rows.map(resultLine).join('\n') }
+      rows[at]!.model = kind === 'AI' ? model : selected
+      return { text: rows.map(resultLine).join('\n') }
+    }
+    expect(await run()).toBe(false)
+    expect(stdout.at(-1)).toMatch(/^REAL-AGENT-VERDICT FAIL /)
   })
 
   test('output options forbid checkout and test-results paths and reject unknown or incomplete arguments', () => {

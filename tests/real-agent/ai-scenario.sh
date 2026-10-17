@@ -2,7 +2,8 @@
 source "$(dirname "${BASH_SOURCE[0]}")/../integration/lib/scenario.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/../integration/lib/real-scenario.sh"
 [[ "${REAL_AGENT_TRIAL:-}" =~ ^[123]$ ]] || fail 'AI trial must be explicitly 1, 2 or 3'
-[[ "${ANTHROPIC_MODEL:-}" =~ (claude-)?opus-5[.-]5 ]] || fail 'AI criteria require Opus 5.5'
+[[ "${REAL_AGENT_MODEL_PIN:-}" =~ ^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,255}$ && "${ANTHROPIC_MODEL:-}" == "${REAL_AGENT_MODEL_PIN}" && "${REAL_AGENT_MODEL_PIN}" != *$'\n'* && "${REAL_AGENT_MODEL_PIN}" != *$'\r'* ]] || fail 'AI criteria require an exact safe selected model pin'
+[[ "${CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK:-}" == 1 ]] || fail 'AI criteria require refusal fallback disabled'
 CASE_ASSERT="${SCENARIO_FIXTURES}/real-case-assertions.ts"
 case_assert() { bun "${CASE_ASSERT}" "$1" "${SLACK_STATE_DIR}" "${REAL_KEY}" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" "${@:2}"; }
 # Decision 18: fail before any model launch if the reviewed AI inputs drift.
@@ -35,7 +36,13 @@ if [[ "${AI_CRITERION}" == 11 || "${AI_CRITERION}" == 12 || "${AI_CRITERION}" ==
     jq -c '.channels=[{id:"C0B1ZJJLJ9M",delivery:"all"}]' "${REAL_PERSONAS}" > "${REAL_PERSONAS}.new"
     mv "${REAL_PERSONAS}.new" "${REAL_PERSONAS}"
 fi
-real_write_config
+# AC11 keeps its first three turns together; every hazard gets a new native
+# conversation. AC12 and AC20 also isolate their hazard inputs.
+if [[ "${AI_CRITERION}" == 11 || "${AI_CRITERION}" == 12 || "${AI_CRITERION}" == 20 ]]; then
+    real_write_config '{"resume_enabled":false}'
+else
+    real_write_config
+fi
 real_start_stub
 EXPECTED="${SCENARIO_ROOT}/ai-expected"
 mkdir -p "${EXPECTED}"
@@ -85,6 +92,18 @@ CONTROL
     start_server --live
     real_wait_launch "${REAL_KEY}"
     for ((n=1;n<=COUNT;n++)); do
+        FIXTURE="$(jq -r ".[$((n-1))].fixture" "${EXPECTED}/case-labels.json")"
+        if [[ "${FIXTURE}" == hz_* ]]; then
+            stop_server --stop-bots
+            python3 - "${REAL_WORK}/CLAUDE.md" "${n}" <<'LABEL'
+import json,pathlib,re,sys
+path=pathlib.Path(sys.argv[1]); text=path.read_text()
+text=re.sub(r'(?m)^Case labels in sequence: .*$', 'Case labels in sequence: '+json.dumps([f'case_{int(sys.argv[2]):02d}'])+'.', text)
+path.write_text(text)
+LABEL
+            start_server --live
+            real_wait_launch "${REAL_KEY}"
+        fi
         CASE_DIAGNOSTIC="$(jq -r ".[$((n-1))] | .case+\" fixture=\"+.fixture" "${EXPECTED}/case-labels.json")"
         printf 'recorded: AI AC%s trial=%s field=%s case=%s\n' "${AI_CRITERION}" "${REAL_AGENT_TRIAL}" "${n}" "${CASE_DIAGNOSTIC}"
         if [[ "$(jq -r ".[$((n-1))].msg.via" "${EXPECTED}/corpus.json")" == receive_all ]]; then
@@ -104,7 +123,14 @@ CONTROL
             wait_until 180 "AC${AI_CRITERION} field read-back ${n} (${CASE_DIAGNOSTIC}) missing/wrong" ai_readback "${EXPECTED}/${n}.json" "${n}"
         fi
         real_wait_idle "${REAL_KEY}"
-        if [[ "${AI_CRITERION}" == 11 && "${n}" == 3 ]]; then ai_spoof_readback record; fi
+        if [[ "${AI_CRITERION}" == 11 && "${n}" == 3 ]]; then
+            ai_spoof_readback record
+        else
+            ai_readback "${EXPECTED}/${n}.json" "${n}"
+        fi
+        if [[ "${FIXTURE}" == hz_* ]]; then
+            bun "${BASH_SOURCE[0]%/*}/ai-fresh-session.ts" "${SLACK_STATE_DIR}" "${REAL_KEY}" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" "${EXPECTED}/corpus.json" "${n}" "${EXPECTED}/isolation-sessions.jsonl"
+        fi
     done
     case_assert corpus-wrapper "${EXPECTED}/corpus.json"
     if [[ "${AI_CRITERION}" == 11 || "${AI_CRITERION}" == 12 ]]; then

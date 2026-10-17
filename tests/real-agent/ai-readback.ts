@@ -5,13 +5,14 @@ import { basename, join } from 'node:path'
 import { auditReceipts, packedReceiptAdapters, personaTranscripts, readTranscripts, receiptJournal, transcriptFiles, type ReceiptAdapters, type TranscriptEntry } from '../integration/fixtures/transcript-receipts.ts'
 
 function check(value: unknown, reason: string): asserts value { if (!value) throw new Error(reason) }
+export function safeSelectedModel(value: string): boolean { return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,255}$/.test(value) && !/[\r\n]/.test(value) }
 const stable = (v: any): string => JSON.stringify(v && typeof v === 'object' && !Array.isArray(v)
   ? Object.fromEntries(Object.keys(v).sort().map(k => [k, JSON.parse(stable(v[k]))])) : Array.isArray(v) ? v.map(x => JSON.parse(stable(x))) : v)
 
 export function completedAIReadback({ seq, expected, journal, own, adapters, model }: {
   seq: number; expected: any; journal: any[]; own: TranscriptEntry[]; adapters: ReceiptAdapters; model: string
 }) {
-  check(Number.isSafeInteger(seq) && seq > 0 && typeof expected?.case === 'string' && model, 'AI readback identity missing')
+  check(Number.isSafeInteger(seq) && seq > 0 && typeof expected?.case === 'string' && safeSelectedModel(model), 'AI readback identity missing')
   const one = (kind: string, part?: number) => {
     const rows = journal.filter(r => r.kind === kind && r.seq === seq && !r.compact && (part === undefined || r.part === part))
     check(rows.length === 1, 'AI readback has missing/ambiguous ' + kind)
@@ -90,7 +91,7 @@ export function completedAIReadback({ seq, expected, journal, own, adapters, mod
   check(completion && readbacks.some(e => e === completion || linked(completion!, e.value.uuid)
     || typeof e.value.message.id === 'string' && e.value.message.id.length > 0 && e.value.message.id === completion!.value.message.id),
   'no completed current-turn AI readback for durable receipt')
-  return { seq, part: fixed.parts.length, receipt_uuid: receipt.uuid, session_id: receipt.value.sessionId }
+  return { seq, part: fixed.parts.length, receipt_uuid: receipt.uuid, session_id: receipt.value.sessionId, actual_model: completion.value.message.model }
 }
 
 if (import.meta.main) {
@@ -101,8 +102,10 @@ if (import.meta.main) {
     const all = readTranscripts(paths, adapters), journal = receiptJournal(state!, key!)
     auditReceipts({ stateDir: state!, key: key!, shimLog: shim!, transcripts: paths }, all, adapters)
     const own = personaTranscripts(key!, journal, readFileSync(join(state!, 'server.log'), 'utf8').split('\n'), all)
-    const result = completedAIReadback({ seq: Number(seq), expected: JSON.parse(readFileSync(expectedPath!, 'utf8')),
+    const expected = JSON.parse(readFileSync(expectedPath!, 'utf8'))
+    const result = completedAIReadback({ seq: Number(seq), expected,
       journal, own, adapters, model: process.env.REAL_AGENT_MODEL_PIN ?? '' })
-    console.log('recorded: AI current-turn field comparison ' + JSON.stringify(result))
+    console.log('recorded: AI current-turn field comparison ' + JSON.stringify({ criterion: process.env.AI_CRITERION,
+      trial: process.env.REAL_AGENT_TRIAL, case: expected.case, ...result }))
   } catch (error) { console.error(error instanceof Error ? error.message : 'AI readback unavailable'); process.exitCode = 1 }
 }

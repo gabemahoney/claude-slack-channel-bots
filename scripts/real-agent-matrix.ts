@@ -26,9 +26,11 @@ export const MATRIX_TIMEOUT_MS = 3 * 60 * 60 * 1000
 export const SCHEDULER_JOB_CONTRACT = {
   memory: '8GiB', cpus: 4, timeout: '3h', network: 'on',
   secret: 'env:CI_ANTHROPIC_API_KEY:ANTHROPIC_API_KEY',
-  plainEnv: ['ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL'],
+  plainEnv: ['ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL', 'REAL_AGENT_AI_MODEL'],
   context: ['package.tgz', 'tests', 'docker', 'pinned agent-director binary and client'],
 } as const
+// Retain the manifest's historical 'opus' selector for compatibility. It now
+// means the explicitly selected AI model, without imposing a model family.
 export interface MatrixInvocation { script: string; trial: number; model: 'default' | 'opus' }
 export interface MatrixJob { version: string; runtimeLatest: boolean; invocations: MatrixInvocation[] }
 export interface LocalAgentExtension { agent: string; localOnly: true; invocations: readonly MatrixInvocation[] }
@@ -37,10 +39,9 @@ export interface MatrixResult {
   duplicates: number | null; tokens: { input: number; output: number; cache_read: number; cache_creation: number } | null
 }
 function exactVersion(value: string): boolean { return /^[0-9]+\.[0-9]+\.[0-9]+$/.test(value) && !/[\r\n]/.test(value) }
-function safeModel(value: string): boolean { return /^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,255}$/.test(value) && !/[\r\n]/.test(value) }
+export function safeModel(value: string): boolean { return /^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,255}$/.test(value) && !/[\r\n]/.test(value) }
 function gateScript(value: string): boolean { return /^integration\/test-[0-9]+-fmk-real-[a-z0-9-]+\.sh$/.test(value) && GATE_SLUGS.some(slug => value.endsWith(`-fmk-real-${slug}.sh`)) }
 function heavyScript(value: string): boolean { return [...HEAVY_SCRIPTS, ...AI_CRITERIA.map(ac => `test-${100 + ac}-fmk-real-ai-ac${ac}.sh`)].some(file => value === `real-agent/${file}`) }
-export function opus55Model(model: string): boolean { return safeModel(model) && /(?:^|[/_-])(?:bedrock-)?claude-opus-5[.-]5(?:$|[-_@])|^opus-5[.-]5$/.test(model) }
 export function discoverGateScripts(names: readonly string[]): string[] {
   const real = names.filter(n => /^test-\d+-fmk-real-[a-z0-9-]+\.sh$/.test(n) && !n.endsWith('-codex.sh'))
   if (real.length !== GATE_SLUGS.length) throw new Error('Expected exactly nine Claude real gate scripts')
@@ -91,18 +92,18 @@ export function parseResultLine(line: string, secrets: readonly string[] = []): 
     reported: value.reported, duplicates: value.duplicates, tokens: value.tokens === null ? null : { input: value.tokens.input, output: value.tokens.output,
       cache_read: value.tokens.cache_read, cache_creation: value.tokens.cache_creation } }
 }
-export function assertJobComplete(job: MatrixJob, results: readonly MatrixResult[], model: string, opus: string): void {
+export function assertJobComplete(job: MatrixJob, results: readonly MatrixResult[], model: string, aiModel: string): void {
   if (results.length !== job.invocations.length) throw new Error('Matrix job omitted required scenarios/trials')
   job.invocations.forEach((invocation, i) => {
     const result = results[i]!
     if (result.script !== invocation.script || result.trial !== invocation.trial || result.version !== job.version
-      || result.model !== (invocation.model === 'opus' ? opus : model) || result.exit !== 0 || !result.reported) throw new Error('Matrix scenario/trial did not pass its required contract')
+      || result.model !== (invocation.model === 'opus' ? aiModel : model) || result.exit !== 0 || !result.reported) throw new Error('Matrix scenario/trial did not pass its required contract')
   })
 }
 export function matrixDockerArgs(name: string, image: string, job: MatrixJob): string[] {
   return ['run', '--init', '--log-driver', 'none', '--name', name,
     '--memory', MATRIX_MEMORY, '--memory-swap', MATRIX_MEMORY, '--cpus', String(MATRIX_CPUS), '--pids-limit', String(SHARD_PIDS_LIMIT),
-    ...['ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL', 'REAL_AGENT_OPUS_MODEL'].flatMap(key => ['--env', key]),
+    ...['ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL', 'REAL_AGENT_AI_MODEL'].flatMap(key => ['--env', key]),
     image, job.version, job.runtimeLatest ? '1' : '0', ...job.invocations.map(i => `${i.script}:${i.trial}:${i.model}`)]
 }
 export interface MatrixOptions { output: string; repo: string; planOnly: boolean }
@@ -147,13 +148,14 @@ export function matrixOptions(args: readonly string[], repo = resolve(dirname(im
 }
 export async function runMatrix(options: MatrixOptions): Promise<boolean> {
   const key = process.env.CI_ANTHROPIC_API_KEY ?? '', model = process.env.CI_ANTHROPIC_MODEL ?? ''
-  // Decision 17: every heavy invocation uses the CI key's selected model.
-  // An optional Opus override must never redirect an AI trial to another ID.
-  const opus = model || (options.planOnly ? 'claude-opus-5-5' : '')
+  // Decision 19: an owner-selected available model can run the AI trials.
+  // This is explicit routing, never a refusal-triggered or hidden fallback.
+  const explicitAiModel = process.env.CI_ANTHROPIC_AI_MODEL
+  const aiModel = explicitAiModel ?? model
   const secrets = scannedSecretValues(process.env, { shardVariables: { CI_ANTHROPIC_API_KEY: key } })
   if (!options.planOnly && (!key || !model || (!key.startsWith('sk-ant-') && !process.env.CI_ANTHROPIC_BASE_URL))) throw new Error('CI_ANTHROPIC_API_KEY, CI_ANTHROPIC_MODEL and gateway base URL are required')
-  if (!opus55Model(opus)) throw new Error('The AI criteria require Opus 5.5; model substitution is refused')
-  if ((model && !safeModel(model)) || secrets.some(secret => [model, opus].some(value => value.includes(secret)))) throw new Error('Invalid matrix model identifier')
+  if ((model && !safeModel(model)) || (explicitAiModel !== undefined && !safeModel(explicitAiModel))
+    || secrets.some(secret => [model, aiModel].some(value => value.includes(secret)))) throw new Error('Invalid matrix model identifier')
   let output = outputDirectory(options.output, options.repo)
   mkdirSync(output, { recursive: true, mode: 0o700 })
   output = outputDirectory(output, options.repo)
@@ -179,7 +181,7 @@ export async function runMatrix(options: MatrixOptions): Promise<boolean> {
   }
   // Own nested mktemp contexts too (notably ci-base-build.sh's extracted
   // install script), even when SIGKILL prevents a shell's normal cleanup.
-  const childEnv = { ...process.env, TMPDIR: stage, ANTHROPIC_API_KEY: key, ANTHROPIC_BASE_URL: process.env.CI_ANTHROPIC_BASE_URL ?? '', ANTHROPIC_MODEL: model, REAL_AGENT_OPUS_MODEL: opus }
+  const childEnv = { ...process.env, TMPDIR: stage, ANTHROPIC_API_KEY: key, ANTHROPIC_BASE_URL: process.env.CI_ANTHROPIC_BASE_URL ?? '', ANTHROPIC_MODEL: model, REAL_AGENT_AI_MODEL: aiModel }
   const run = async (argv: string[], timeoutMs: number, collect = false, cleanup = false): Promise<{ code: number; text: string }> => {
     if (stopped && !cleanup) throw new Error('Matrix interrupted')
     if (!checkShardRunList(argv, secrets).ok) throw new Error('Matrix child argument list contains a secret')
@@ -251,8 +253,8 @@ export async function runMatrix(options: MatrixOptions): Promise<boolean> {
     const gates = discoverGateScripts(readdirSync(join(options.repo, 'tests/integration')))
     const heavyDir = join(options.repo, 'tests/real-agent')
     const jobs = matrixPlan(latest, gates, existsSync(heavyDir) ? readdirSync(heavyDir) : [])
-    say(`recorded: matrix ${JSON.stringify({ runId, latest, model, opus, jobs: jobs.map(j => ({ version: j.version, runtimeLatest: j.runtimeLatest, scenarios: j.invocations.length })) })}`)
-    writePrivate(join(output, 'plan.json'), JSON.stringify({ runId, jobs, scheduler: SCHEDULER_JOB_CONTRACT }, null, 2) + '\n', secrets)
+    say(`recorded: matrix ${JSON.stringify({ runId, latest, model, aiModel, jobs: jobs.map(j => ({ version: j.version, runtimeLatest: j.runtimeLatest, scenarios: j.invocations.length })) })}`)
+    writePrivate(join(output, 'plan.json'), JSON.stringify({ runId, model, aiModel, jobs, scheduler: SCHEDULER_JOB_CONTRACT }, null, 2) + '\n', secrets)
     if (options.planOnly) { planned = true; return true }
     if ((await run(['docker', 'image', 'inspect', 'cscb-ci-base:v8', '--format', '{{.Id}}'], 30_000)).code !== 0) {
       if ((await run(['bash', 'scripts/ci-base-build.sh'], 30 * 60_000)).code !== 0) throw new Error('Heavy base build failed')
@@ -282,7 +284,7 @@ export async function runMatrix(options: MatrixOptions): Promise<boolean> {
             if (result.tokens === null || result.duplicates === null) say('recorded: matrix usage report incomplete; totals include observed reports only')
           }
           if (answer.code !== 0 || stopped) throw new Error(`Matrix job ${index + 1} failed (exit ${answer.code})`)
-          assertJobComplete(job, results, model, opus)
+          assertJobComplete(job, results, model, aiModel)
           writePrivate(join(output, `job-${index + 1}.json`), JSON.stringify({ version: job.version, runtimeLatest: job.runtimeLatest, packageSha256, results }, null, 2) + '\n', secrets)
         } finally {
           const cleanup = await run(['docker', 'rm', '-f', name], 30_000, false, true)
