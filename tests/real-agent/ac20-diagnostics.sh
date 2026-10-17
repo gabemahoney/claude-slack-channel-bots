@@ -17,7 +17,10 @@ real_ac20_diagnostics_start() {
     local wrapper="${SCENARIO_ROOT}/bin/ac20-native"
     cat > "${wrapper}" <<'WRAPPER'
 #!/usr/bin/env bash
-exec bun "${AC20_DIAGNOSTIC_HELPER}" native "${AC20_DIAGNOSTIC_DIR}" /opt/claude-code/2.1.296/claude "$@"
+# The final execve in native() preserves this pane PID for AD's SessionStart
+# association. Raw stderr only crosses an anonymous pipe to the sidecar.
+exec bun "${AC20_DIAGNOSTIC_HELPER}" native "${AC20_DIAGNOSTIC_DIR}" /opt/claude-code/2.1.296/claude "$@" \
+    2> >(exec bun "${AC20_DIAGNOSTIC_HELPER}" collect "${AC20_DIAGNOSTIC_DIR}" "$$")
 WRAPPER
     chmod 700 "${wrapper}"
     python3 - "${SCENARIO_AD_ROOT}/config.toml" "${wrapper}" <<'CONFIG'

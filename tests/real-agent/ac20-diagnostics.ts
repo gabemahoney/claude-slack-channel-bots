@@ -181,24 +181,69 @@ async function native(directory: string, binary: string, args: string[]) {
   if (!integer(ready.port, 65535) || ready.port === 0) throw new Error('AC20 gateway not ready')
   const url = new URL(process.env.ANTHROPIC_BASE_URL!)
   url.protocol = 'http:'; url.hostname = '127.0.0.1'; url.port = String(ready.port)
-  const child = Bun.spawn([binary, '--debug-to-stderr', ...args], { stdin: 'inherit', stdout: 'inherit', stderr: 'pipe', env: { ...process.env, ANTHROPIC_BASE_URL: url.toString() } })
-  const emit = sink(directory, `native-${process.pid}.jsonl`)
-  const projection = nativeDebugProjection(emit, () => ({ atMs: Date.now(), case: scope(directory), process: process.pid }))
-  const stop = (signal: NodeJS.Signals) => { try { child.kill(signal) } catch {} }
-  const term = () => stop('SIGTERM'), interrupt = () => stop('SIGINT')
-  process.on('SIGTERM', term); process.on('SIGINT', interrupt)
-  const reader = child.stderr.getReader()
-  // Attach the rejection handler immediately: a reader can fail while the
-  // native process is still exiting. Never let it erase the eventual exit.
-  const reading = (async () => { try { while (true) { const value = await reader.read(); if (value.done) break; projection.push(value.value) }; return true } finally { projection.end() } })().catch(() => false)
-  let timer: ReturnType<typeof setTimeout> | undefined
+  const collectorReady = join(directory, `native-${process.pid}.ready`), deadline = Date.now() + 5000
+  while (!existsSync(collectorReady) && Date.now() < deadline) await Bun.sleep(20)
+  const collector = JSON.parse(readFileSync(collectorReady, 'utf8'))
+  if (!integer(collector.pid) || collector.pid === 0 || collector.nativePid !== process.pid || collector.started !== nativeProcessIdentity(process.pid)?.started) throw new Error('AC20 native collector unavailable')
+  process.kill(collector.pid, 0)
+  // AD associates SessionStart with the pane PID. Spawning a child here leaves
+  // Bun as that pane process and makes AD reject every native hook. execve
+  // preserves the PID and the terminal descriptors (stderr is the shell's
+  // anonymous pipe to the independent strict collector).
+  process.execve!(binary, [binary, '--debug-to-stderr', ...args], { ...process.env, ANTHROPIC_BASE_URL: url.toString() })
+  throw new Error('AC20 native exec unavailable')
+}
+
+/** /proc's parenthesized comm may itself contain ')' or whitespace. Fields
+ * after its final ')' start at state (field3); starttime is field22. Never
+ * read cmdline or environ to identify the process. */
+export function parseNativeProcessStat(text: string, pid: number) {
+  if (!integer(pid) || pid === 0 || !text.startsWith(`${pid} (`)) throw new Error('AC20 native process identity unavailable')
+  const close = text.lastIndexOf(')'), fields = text.slice(close + 1).trim().split(/\s+/)
+  if (close < 0 || !/^[RSDZTtXxKWPI]$/.test(fields[0]!) || !/^\d+$/.test(fields[19]!)) throw new Error('AC20 native process identity unavailable')
+  return { state: fields[0]!, started: fields[19]! }
+}
+function nativeProcessIdentity(pid: number) {
+  try { return parseNativeProcessStat(readFileSync(`/proc/${pid}/stat`, 'utf8'), pid) }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw error }
+}
+
+/** The shell starts this sidecar before execing native in the pane. No raw
+ * debug file is created. EOF is not evidence of an exit code, and inherited
+ * descendant writers cannot keep collection alive after the pane PID exits. */
+async function collectNative(directory: string, nativePid: number) {
+  if (!integer(nativePid) || nativePid === 0 || nativePid === process.pid) throw new Error('AC20 native identity unavailable')
+  const identity = nativeProcessIdentity(nativePid)
+  if (!identity || /^[ZXx]$/.test(identity.state)) throw new Error('AC20 native identity unavailable')
+  const emit = sink(directory, `native-${nativePid}.jsonl`)
+  const context = () => ({ atMs: Date.now(), case: scope(directory), process: nativePid })
+  const projection = nativeDebugProjection(emit, context)
+  emit({ source: 'native', ...context(), event: 'process_exit_unknown', reason: 'exec_identity_preserved' })
+  const reader = Bun.stdin.stream().getReader()
+  const ready = join(directory, `native-${nativePid}.ready`), temporary = ready + `-${process.pid}.next`
+  writeFileSync(temporary, JSON.stringify({ pid: process.pid, nativePid, started: identity.started }), { mode: 0o600, flag: 'wx' })
+  renameSync(temporary, ready)
+  let ended = false, incomplete = false, vanishedAt: number | undefined
+  const reading = (async () => {
+    try {
+      while (true) { const value = await reader.read(); if (value.done) break; projection.push(value.value) }
+    } catch { incomplete = true }
+    finally { ended = true }
+  })()
   try {
-    const code = await child.exited
-    process.exitCode = code
-    emit({ source: 'native', event: 'process_exit', atMs: Date.now(), case: scope(directory), exitCode: code })
-    const drained = await Promise.race([reading, new Promise<false>(resolve => { timer = setTimeout(() => resolve(false), 1000) })])
-    if (!drained) { emit({ source: 'native', event: 'capture_withheld', reason: 'stream_collection_incomplete', atMs: Date.now(), case: scope(directory) }); void reader.cancel().catch(() => {}) }
-  } finally { clearTimeout(timer); process.off('SIGTERM', term); process.off('SIGINT', interrupt) }
+    while (!ended) {
+      try {
+        const current = nativeProcessIdentity(nativePid)
+        if (!current || current.started !== identity.started || /^[ZXx]$/.test(current.state)) vanishedAt ??= Date.now()
+      } catch { incomplete = true; break }
+      if (vanishedAt !== undefined && Date.now() - vanishedAt >= 1000) { incomplete = true; break }
+      await Promise.race([reading, Bun.sleep(100)])
+    }
+  } finally {
+    if (incomplete) emit({ source: 'native', ...context(), event: 'capture_withheld', reason: 'stream_collection_incomplete' })
+    projection.end()
+    void reader.cancel().catch(() => {})
+  }
 }
 
 if (import.meta.main) {
@@ -215,6 +260,7 @@ if (import.meta.main) {
       if (createHash('sha256').update(readFileSync(args[0])).digest('hex') !== AC20_NATIVE_SHA256) throw new Error('AC20 native binary changed')
       console.log('recorded: AC20 diagnostic native binary sha256=' + AC20_NATIVE_SHA256)
     } else if (command === 'native' && args[0] === '/opt/claude-code/2.1.296/claude') await native(directory, args[0], args.slice(1))
+    else if (command === 'collect' && args.length === 1 && /^\d+$/.test(args[0]!)) await collectNative(directory, Number(args[0]))
     else if (command === 'case' && ['1', '2'].includes(args[0]!)) {
       writeFileSync(join(directory, 'scope.next'), JSON.stringify({ case: Number(args[0]) }), { mode: 0o600 })
       renameSync(join(directory, 'scope.next'), join(directory, 'scope.json'))

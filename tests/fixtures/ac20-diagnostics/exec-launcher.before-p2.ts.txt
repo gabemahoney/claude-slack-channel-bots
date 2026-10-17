@@ -1,0 +1,266 @@
+/** Decision21(c): observation only. No debug text, API headers or bodies are
+ * ever persisted; native stderr is projected to fixed events before exposure.
+ * The ordinary completedAIReadback oracle remains the only completion test. */
+import { appendFileSync, existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { join } from 'node:path'
+import { createServer, request as httpRequest } from 'node:http'
+import { request as httpsRequest } from 'node:https'
+import { completedAIReadback } from './ai-readback.ts'
+import { auditReceipts, packedReceiptAdapters, personaTranscripts, readTranscripts, receiptJournal, transcriptFiles } from '../integration/fixtures/transcript-receipts.ts'
+
+export const AC20_COMPLETION_MS = 180_000
+export const AC20_DIAGNOSTIC_CEILING_MS = 35 * 60_000
+export const AC20_AFTER_RETRY_MS = 60_000
+export const AC20_NATIVE_SHA256 = '24972e3bc859fab2b46ed4c1e51f7d6130f06d3bd550811a114640de3370d0de'
+type Event = { source: 'native' | 'gateway' | 'wait'; event: string; atMs: number; case: number; [key: string]: string | number | boolean }
+type Emit = (event: Event) => void
+const integer = (value: unknown, max = Number.MAX_SAFE_INTEGER): value is number => Number.isSafeInteger(value) && Number(value) >= 0 && Number(value) <= max
+function scope(directory: string): number {
+  const value = JSON.parse(readFileSync(join(directory, 'scope.json'), 'utf8'))
+  if (![0, 1, 2].includes(value.case)) throw new Error('AC20 diagnostic scope unavailable')
+  return value.case
+}
+function sink(directory: string, file: string): Emit {
+  let bytes = 0, capped = false
+  return event => {
+    if (capped) return
+    const line = JSON.stringify(event) + '\n'
+    if (bytes + Buffer.byteLength(line) > 256 * 1024) {
+      capped = true
+      appendFileSync(join(directory, file), JSON.stringify({ source: event.source, event: 'capture_withheld', atMs: Date.now(), case: event.case, reason: 'metadata_limit' }) + '\n', { mode: 0o600 })
+      return
+    }
+    appendFileSync(join(directory, file), line, { mode: 0o600 }); bytes += Buffer.byteLength(line)
+  }
+}
+
+/** Bounded complete-line projection, never a replacement/redaction fallback.
+ * Unknown text and raw/escaped secrets cannot cross this interface: output
+ * contains only fixed enums and small validated numbers. EOF drops its tail. */
+export function nativeDebugProjection(emit: Emit, context: () => { atMs: number; case: number; process: number }) {
+  let pending = Buffer.alloc(0), dropping = false, unknown = 0
+  const output = (event: string, extra: Record<string, number | string> = {}) => emit({ source: 'native', ...context(), event, ...extra })
+  const line = (bytes: Buffer) => {
+    const text = bytes.toString('utf8')
+    if (text.includes('\ufffd')) { output('capture_withheld', { reason: 'invalid_encoding' }); return }
+    const message = text.replace(/^\d{4}-\d\d-\d\dT[0-9:.]+Z \[(?:DEBUG|INFO|WARN|ERROR)\] /, '')
+    if (/^\[API:timing\] dispatching to [a-zA-Z]+ model=[A-Za-z0-9._:/@-]+$/.test(message)) output('dispatch')
+    else if (message === 'Stream started - received first chunk') output('first_chunk')
+    else {
+      const first = message.match(/^\[API:timing\] first byte after (\d{1,8})ms$/)
+      const slow = message.match(/^Slow first byte: no stream chunk (\d{1,5}(?:\.\d)?)s after request sent \(attempt (\d{1,3})\)$/)
+      if (first) output('first_byte', { elapsedMs: Number(first[1]) })
+      else if (slow && Number(slow[2]) > 0) output('slow_first_byte', { elapsedMs: Math.round(Number(slow[1]) * 1000), attempt: Number(slow[2]) })
+      else if (/^\[Anthropic SDK INFO\] \[[^\]\r\n]{1,160}\] connection timed out \(retrying, \d{1,3} attempts remaining\)$/.test(message)) output('retry_scheduled')
+      else if (/^\[Anthropic SDK INFO\] \[[^\]\r\n]{1,160}\] connection timed out - error; no more retries left$/.test(message)) output('request_timeout')
+      else unknown++
+    }
+  }
+  return {
+    push(chunk: Uint8Array) {
+      // A large stream chunk is scanned in bounded slices rather than retained.
+      for (let offset = 0; offset < chunk.length; offset += 4096) {
+        const part = Buffer.from(chunk.subarray(offset, offset + 4096))
+        pending = Buffer.concat([pending, part])
+        let split: number
+        while ((split = pending.indexOf(10)) >= 0) {
+          const value = pending.subarray(0, split); pending = pending.subarray(split + 1)
+          if (!dropping) {
+            if (value.length > 16 * 1024) output('capture_withheld', { reason: 'line_limit' })
+            else line(value)
+          }
+          dropping = false
+        }
+        if (pending.length > 16 * 1024) { pending = Buffer.alloc(0); dropping = true; output('capture_withheld', { reason: 'line_limit' }) }
+      }
+    },
+    end() {
+      if (pending.length || dropping) output('capture_withheld', { reason: 'unterminated_line' })
+      if (unknown) output('unrecognized_withheld', { lines: Math.min(unknown, 1_000_000) })
+      pending = Buffer.alloc(0)
+    },
+  }
+}
+
+/** Only an explicit SDK retry header linked to an earlier client request in
+ * the same case proves retry. A later ordinal/request alone proves nothing.
+ * Identifiers are retained only in RAM; emitted correlations are local ints. */
+export function gatewayCorrelations() {
+  const seen = new Map<string, { logical: number; case: number; retry: number | undefined }>(); let logical = 0
+  return (id: string | undefined, retryHeader: string | undefined, caseNumber: number) => {
+    const count = retryHeader && /^\d{1,3}$/.test(retryHeader) ? Number(retryHeader) : undefined
+    const previous = id && id.length <= 256 ? seen.get(id) : undefined
+    const linked = !!previous && previous.case === caseNumber && count !== undefined && previous.retry !== undefined && count > previous.retry
+    const number = linked ? previous.logical : ++logical
+    if (id && id.length <= 256) {
+      if (seen.size >= 4096) seen.clear()
+      seen.set(id, { logical: number, case: caseNumber, retry: count })
+    }
+    return { logicalRequest: number, retryCount: count, linkedRetry: linked }
+  }
+}
+
+/** node's pipes preserve bytes and backpressure. No body is parsed or copied
+ * into logs; no retries, redirect following or proxy request timeout exists. */
+export function startDiagnosticGateway(upstream: URL, emit: Emit, currentCase: () => number) {
+  if (!['http:', 'https:'].includes(upstream.protocol) || upstream.username || upstream.password) throw new Error('AC20 gateway configuration unavailable')
+  const correlate = gatewayCorrelations(); let ordinal = 0
+  const server = createServer((incoming, downstream) => {
+    const attempt = ++ordinal, caseNumber = currentCase()
+    const header = (name: string) => typeof incoming.headers[name] === 'string' ? incoming.headers[name] as string : undefined
+    const correlation = correlate(header('x-client-request-id'), header('x-stainless-retry-count'), caseNumber)
+    const event = (name: string, extra: Record<string, number> = {}) => emit({ source: 'gateway', event: name, atMs: Date.now(), case: caseNumber, attempt, logicalRequest: correlation.logicalRequest, ...extra })
+    event('request_start', correlation.retryCount === undefined ? {} : { retryCount: correlation.retryCount })
+    if (correlation.linkedRetry) event('client_retry', { retryCount: correlation.retryCount! })
+    const headers = incoming.rawHeaders.slice()
+    for (let i = 0; i < headers.length; i += 2) if (headers[i]!.toLowerCase() === 'host') headers[i + 1] = upstream.host
+    const request = upstream.protocol === 'https:' ? httpsRequest : httpRequest
+    const forward = request({ protocol: upstream.protocol, hostname: upstream.hostname, port: upstream.port || undefined,
+      method: incoming.method, path: incoming.url, headers, setHost: false, agent: false }, response => {
+      event('response_status', { status: response.statusCode ?? 0 })
+      downstream.writeHead(response.statusCode!, response.statusMessage, response.rawHeaders)
+      let chunks = 0, first = 0, last = 0
+      response.on('data', () => { const at = Date.now(); chunks++; last = at; if (!first) { first = at; event('stream_first_chunk') }; event('stream_chunk', { chunks }) })
+      response.on('end', () => event('stream_end', { chunks, firstChunkAtMs: first, lastChunkAtMs: last }))
+      response.on('aborted', () => { event('upstream_aborted'); downstream.destroy() })
+      response.on('error', () => { event('upstream_stream_error'); downstream.destroy() })
+      response.pipe(downstream)
+    })
+    forward.on('socket', socket => socket.once(upstream.protocol === 'https:' ? 'secureConnect' : 'connect', () => event('upstream_connected')))
+    forward.on('finish', () => event('request_body_sent'))
+    incoming.on('aborted', () => { event('client_aborted'); forward.destroy() })
+    incoming.on('error', () => { event('client_stream_error'); forward.destroy() })
+    downstream.on('close', () => { if (!downstream.writableEnded) { event('client_cancelled'); forward.destroy() } })
+    forward.on('error', () => { event('upstream_request_error'); downstream.destroy() })
+    incoming.pipe(forward)
+  })
+  // Incoming message bodies have the native caller's lifetime, not a new
+  // gateway timeout. headersTimeout is likewise not a model-request deadline.
+  server.requestTimeout = 0; server.timeout = 0
+  return server
+}
+
+export interface DiagnosticWaitDeps {
+  startMs?: number
+  now(): number; sleep(ms: number): Promise<void>; completed(): Promise<boolean>
+  retryObserved(): number | undefined; emit: Emit; caseNumber: number
+}
+export function linkedRetryForStalledRequest(events: readonly Event[], caseNumber: number, deadlineMs: number): number | undefined {
+  const closed = new Set(events.filter(row => row.case === caseNumber && row.atMs <= deadlineMs && ['stream_end', 'upstream_aborted', 'upstream_stream_error', 'upstream_request_error', 'client_aborted', 'client_cancelled'].includes(row.event)).map(row => row.logicalRequest))
+  const target = events.filter(row => row.case === caseNumber && row.event === 'request_start' && row.atMs <= deadlineMs && !closed.has(row.logicalRequest)).at(-1)
+  if (!target) return undefined
+  return events.find(row => row.source === 'gateway' && row.event === 'client_retry' && row.case === caseNumber && row.logicalRequest === target.logicalRequest && row.atMs > deadlineMs)?.atMs
+}
+export async function observeAC20Completion(deps: DiagnosticWaitDeps) {
+  const start = deps.startMs ?? deps.now(), deadline = start + AC20_COMPLETION_MS, ceiling = start + AC20_DIAGNOSTIC_CEILING_MS
+  if (!integer(start) || start > deps.now()) throw new Error('AC20 wait start unavailable')
+  const event = (name: string, extra = {}) => deps.emit({ source: 'wait', event: name, atMs: deps.now(), case: deps.caseNumber, ...extra })
+  event('completion_window', { startMs: start, deadlineMs: deadline, ceilingMs: ceiling })
+  while (deps.now() <= deadline) {
+    if (await deps.completed() && deps.now() <= deadline) { event('completed_within_180s'); return true }
+    if (deps.now() >= deadline) break
+    await deps.sleep(Math.min(1000, deadline - deps.now()))
+  }
+  event('failed_180s', { deadlineMs: deadline, ceilingMs: ceiling })
+  // No path after the deadline can return success. No new user input/Enter,
+  // request retry, or scenario/trial is initiated by this observer.
+  let retry: number | undefined, lateCompletion: number | undefined
+  while (deps.now() < ceiling) {
+    if (lateCompletion === undefined && await deps.completed()) { lateCompletion = deps.now(); event('late_completion_diagnostic_only') }
+    retry ??= deps.retryObserved()
+    if (retry !== undefined && deps.now() >= retry + AC20_AFTER_RETRY_MS) { event('grace_complete_after_linked_retry', { retryAtMs: retry }); return false }
+    if (lateCompletion !== undefined && deps.now() >= lateCompletion + AC20_AFTER_RETRY_MS) { event('grace_complete_after_late_completion'); return false }
+    await deps.sleep(Math.min(1000, ceiling - deps.now()))
+  }
+  event('diagnostic_ceiling_reached', { ceilingMs: ceiling, reason: 'no_certified_earlier_stop' }); return false
+}
+
+async function native(directory: string, binary: string, args: string[]) {
+  const ready = JSON.parse(readFileSync(join(directory, 'gateway-ready.json'), 'utf8'))
+  if (!integer(ready.port, 65535) || ready.port === 0) throw new Error('AC20 gateway not ready')
+  const url = new URL(process.env.ANTHROPIC_BASE_URL!)
+  url.protocol = 'http:'; url.hostname = '127.0.0.1'; url.port = String(ready.port)
+  const collectorReady = join(directory, `native-${process.pid}.ready`), deadline = Date.now() + 5000
+  while (!existsSync(collectorReady) && Date.now() < deadline) await Bun.sleep(20)
+  const collector = JSON.parse(readFileSync(collectorReady, 'utf8'))
+  if (!integer(collector.pid) || collector.pid === 0 || collector.nativePid !== process.pid) throw new Error('AC20 native collector unavailable')
+  process.kill(collector.pid, 0)
+  // AD associates SessionStart with the pane PID. Spawning a child here leaves
+  // Bun as that pane process and makes AD reject every native hook. execve
+  // preserves the PID and the terminal descriptors (stderr is the shell's
+  // anonymous pipe to the independent strict collector).
+  process.execve!(binary, [binary, '--debug-to-stderr', ...args], { ...process.env, ANTHROPIC_BASE_URL: url.toString() })
+  throw new Error('AC20 native exec unavailable')
+}
+
+/** The shell starts this sidecar before execing native in the pane. No raw
+ * debug file is created. EOF is not evidence of an exit code, and inherited
+ * descendant writers cannot keep collection alive after the pane PID exits. */
+async function collectNative(directory: string, nativePid: number) {
+  if (!integer(nativePid) || nativePid === 0 || nativePid === process.pid) throw new Error('AC20 native identity unavailable')
+  const emit = sink(directory, `native-${nativePid}.jsonl`)
+  const context = () => ({ atMs: Date.now(), case: scope(directory), process: nativePid })
+  const projection = nativeDebugProjection(emit, context)
+  emit({ source: 'native', ...context(), event: 'process_exit_unknown', reason: 'exec_identity_preserved' })
+  const reader = Bun.stdin.stream().getReader()
+  writeFileSync(join(directory, `native-${nativePid}.ready`), JSON.stringify({ pid: process.pid, nativePid }), { mode: 0o600, flag: 'wx' })
+  let ended = false, incomplete = false, vanishedAt: number | undefined
+  const reading = (async () => {
+    try {
+      while (true) { const value = await reader.read(); if (value.done) break; projection.push(value.value) }
+    } catch { incomplete = true }
+    finally { ended = true }
+  })()
+  try {
+    while (!ended) {
+      try { process.kill(nativePid, 0) } catch { vanishedAt ??= Date.now() }
+      if (vanishedAt !== undefined && Date.now() - vanishedAt >= 1000) { incomplete = true; break }
+      await Promise.race([reading, Bun.sleep(100)])
+    }
+  } finally {
+    if (incomplete) emit({ source: 'native', ...context(), event: 'capture_withheld', reason: 'stream_collection_incomplete' })
+    projection.end()
+    void reader.cancel().catch(() => {})
+  }
+}
+
+if (import.meta.main) {
+  const unavailable = () => { process.stderr.write('AC20 diagnostics unavailable; details withheld\n'); process.exit(1) }
+  process.on('uncaughtException', unavailable); process.on('unhandledRejection', unavailable)
+  try {
+    if (!existsSync('/etc/cscb-ci-image') || process.env.REAL_AGENT_AC20_DIAGNOSTICS !== 'decision21c') throw new Error('AC20 diagnostic execution requires its authorized CI image')
+    const [command, directory, ...args] = process.argv.slice(2)
+    if (!directory || !process.env.SCENARIO_ROOT || !directory.startsWith(process.env.SCENARIO_ROOT + '/')) throw new Error('AC20 diagnostic containment required')
+    if (command === 'gateway') {
+      const server = startDiagnosticGateway(new URL(process.env.ANTHROPIC_BASE_URL!), sink(directory, 'gateway.jsonl'), () => scope(directory))
+      server.listen(0, '127.0.0.1', () => { const address = server.address(); if (!address || typeof address === 'string') throw new Error('AC20 gateway unavailable'); writeFileSync(join(directory, 'gateway-ready.json'), JSON.stringify({ port: address.port }), { mode: 0o600, flag: 'wx' }) })
+    } else if (command === 'verify' && args[0] === '/opt/claude-code/2.1.296/claude') {
+      if (createHash('sha256').update(readFileSync(args[0])).digest('hex') !== AC20_NATIVE_SHA256) throw new Error('AC20 native binary changed')
+      console.log('recorded: AC20 diagnostic native binary sha256=' + AC20_NATIVE_SHA256)
+    } else if (command === 'native' && args[0] === '/opt/claude-code/2.1.296/claude') await native(directory, args[0], args.slice(1))
+    else if (command === 'collect' && args.length === 1 && /^\d+$/.test(args[0]!)) await collectNative(directory, Number(args[0]))
+    else if (command === 'case' && ['1', '2'].includes(args[0]!)) {
+      writeFileSync(join(directory, 'scope.next'), JSON.stringify({ case: Number(args[0]) }), { mode: 0o600 })
+      renameSync(join(directory, 'scope.next'), join(directory, 'scope.json'))
+    }
+    else if (command === 'wait' && args.length === 7) {
+      const [started, state, key, shim, root, expectedPath, seq] = args, caseNumber = Number(seq), waitStarted = Number(started)
+      if (!integer(waitStarted) || waitStarted > Date.now()) throw new Error('AC20 original wait start unavailable')
+      if (![1, 2].includes(caseNumber) || scope(directory) !== caseNumber || process.env.REAL_AGENT_MODEL_PIN !== 'azure/openai/gpt-6-astra') throw new Error('AC20 completion identity changed')
+      const adapters = await packedReceiptAdapters(), expected = JSON.parse(readFileSync(expectedPath!, 'utf8'))
+      const completed = async () => { try {
+        const paths = transcriptFiles(root!), all = readTranscripts(paths, adapters), journal = receiptJournal(state!, key!)
+        auditReceipts({ stateDir: state!, key: key!, shimLog: shim!, transcripts: paths }, all, adapters)
+        const own = personaTranscripts(key!, journal, readFileSync(join(state!, 'server.log'), 'utf8').split('\n'), all)
+        completedAIReadback({ seq: caseNumber, expected, journal, own, adapters, model: process.env.REAL_AGENT_MODEL_PIN! }); return true
+      } catch { return false } }
+      const retryObserved = () => {
+        const events = readFileSync(join(directory, 'gateway.jsonl'), 'utf8').split('\n').slice(0, -1).filter(Boolean).map(line => JSON.parse(line))
+        return linkedRetryForStalledRequest(events, caseNumber, waitStarted + AC20_COMPLETION_MS)
+      }
+      const passed = await observeAC20Completion({ startMs: waitStarted, now: Date.now, sleep: ms => Bun.sleep(ms), completed, retryObserved, emit: sink(directory, `wait-${caseNumber}.jsonl`), caseNumber })
+      if (!passed) { console.error('FAIL: AC20 completion absent within180s; diagnostic observation cannot repair this failure'); process.exitCode = 1 }
+    } else throw new Error('AC20 diagnostic command invalid')
+  } catch { console.error('AC20 diagnostics unavailable; details withheld'); process.exitCode = 1 }
+}

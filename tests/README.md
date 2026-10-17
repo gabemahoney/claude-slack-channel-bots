@@ -886,6 +886,13 @@ timings. Raw debug text, headers and bodies are never retained; unknown or
 incomplete debug text is withheld. The gateway forwards traffic without adding
 retries or model-request timeouts.
 
+The launcher preserves the native pane PID required for agent-director session
+association and starts only after the strict stderr collector is ready. The
+collector checks process start identity and treats a vanished, reused or zombie
+process as ended, allowing at most 1 s of further pipe drainage before
+withholding incomplete capture. Its native exit status is UNKNOWN; pipe EOF
+or collector success does not establish a native exit code.
+
 The ordinary exact receipt/read-back/completion oracle keeps its 180 s window,
 starting at the original post-delivery wait point before helper startup.
 After that failure, observation is diagnostic only, bounded at 35 minutes from

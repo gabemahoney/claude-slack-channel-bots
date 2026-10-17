@@ -1,0 +1,31 @@
+{
+  "offline": true,
+  "network": "none",
+  "targetWasSyntheticShellNotNativeModel": true,
+  "targetStateBeforeReap": "Z",
+  "syntheticTargetExit": 17,
+  "collectorExit": 0,
+  "collectorElapsedMs": 1724,
+  "descendantPipeHoldMs": 4000,
+  "nativeExitClaim": "UNKNOWN",
+  "collectionIncompleteWithheld": true,
+  "stderrBytes": 0,
+  "events": [
+    {
+      "source": "native",
+      "atMs": 1792263089580,
+      "case": 0,
+      "process": 36,
+      "event": "process_exit_unknown",
+      "reason": "exec_identity_preserved"
+    },
+    {
+      "source": "native",
+      "atMs": 1792263091284,
+      "case": 0,
+      "process": 36,
+      "event": "capture_withheld",
+      "reason": "stream_collection_incomplete"
+    }
+  ]
+}

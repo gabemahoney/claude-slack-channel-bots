@@ -1,12 +1,12 @@
 /** Decision21(c) observation controls. No model, native binary or integration driver runs here. */
 import { describe, expect, test } from 'bun:test'
-import { readFileSync, mkdtempSync, rmSync } from 'node:fs'
+import { readFileSync, writeFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { createHash } from 'node:crypto'
 import { createServer, request, type Server } from 'node:http'
 import { spawnSync } from 'node:child_process'
-import { AC20_COMPLETION_MS, AC20_DIAGNOSTIC_CEILING_MS, AC20_AFTER_RETRY_MS, AC20_NATIVE_SHA256, observeAC20Completion, nativeDebugProjection, gatewayCorrelations, linkedRetryForStalledRequest, startDiagnosticGateway } from './real-agent/ac20-diagnostics.ts'
+import { AC20_COMPLETION_MS, AC20_DIAGNOSTIC_CEILING_MS, AC20_AFTER_RETRY_MS, AC20_NATIVE_SHA256, observeAC20Completion, nativeDebugProjection, gatewayCorrelations, linkedRetryForStalledRequest, startDiagnosticGateway, parseNativeProcessStat } from './real-agent/ac20-diagnostics.ts'
 import { assertNoLeak, fakeToken, BOT_TOKEN_PREFIX } from './test-helpers/credentials.ts'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 
@@ -241,45 +241,103 @@ describe('audited native296 request policy fixture', () => {
   })
 })
 
-// Run the exact private native function against in-memory child/pipe seams.
-// No native executable, subprocess or host configuration is involved.
-function nativeSeam(reader: { read(): Promise<{ done: boolean; value?: Uint8Array }>; cancel(): Promise<void> }, code = 17) {
-  const begin = source.indexOf('async function native('), end = source.indexOf('\nif (import.meta.main)', begin)
-  const rows: Row[] = [], listeners = new Set<string>(), calls: unknown[] = []
-  const fakeProcess = { pid: 99, env: { ANTHROPIC_BASE_URL: 'https://example.invalid/base?keep=1' }, exitCode: undefined as number | undefined,
-    on: (name: string) => { listeners.add(name) }, off: (name: string) => { listeners.delete(name) } }
-  const factory = new Function('readFileSync', 'join', 'integer', 'process', 'Bun', 'sink', 'nativeDebugProjection', 'scope', new Bun.Transpiler({ loader: 'ts' }).transformSync(source.slice(begin, end) + '\nreturn native'))
-  const native = factory(() => '{"port":12345}', join, (value: number, max: number) => Number.isSafeInteger(value) && value >= 0 && value <= max, fakeProcess,
-    { spawn: (argv: string[], options: unknown) => { calls.push({ argv, options }); return { exited: Promise.resolve(code), stderr: { getReader: () => reader }, kill: () => {} } } },
-    () => (row: Row) => rows.push(row), nativeDebugProjection, () => 2)
-  return { run: () => native('/owned', '/fake/native', ['--exact-original-arg']), rows, listeners, calls, fakeProcess }
+const nativeFunction = source.slice(source.indexOf('async function native('), source.indexOf('\n/** /proc', source.indexOf('async function native(')))
+const identityFunctions = source.slice(source.indexOf('export function parseNativeProcessStat'), source.indexOf('\n/** The shell starts'))
+const collectorFunction = source.slice(source.indexOf('async function collectNative('), source.indexOf('\nif (import.meta.main)'))
+const integer = (value: unknown, max = Number.MAX_SAFE_INTEGER) => Number.isSafeInteger(value) && Number(value) >= 0 && Number(value) <= max
+function launchSeam(options: { ready?: unknown; appearsAt?: number; alive?: boolean; returns?: boolean; port?: unknown } = {}) {
+  let now = 0, execs = 0; const killed: number[] = [], replaced = {}
+  const environment = { ANTHROPIC_BASE_URL: 'https://example.invalid/base?keep=1', AC20_TEST_SECRET: secret, KEEP: 'same' }
+  let arguments_: unknown, forwarded: Record<string, string> | undefined
+  const native = new Function('readFileSync', 'join', 'integer', 'process', 'Bun', 'existsSync', 'Date', 'nativeProcessIdentity', new Bun.Transpiler({ loader: 'ts' }).transformSync(nativeFunction + '\nreturn native'))(
+    (path: string) => path.endsWith('gateway-ready.json') ? JSON.stringify({ port: options.port ?? 12345 }) : now < (options.appearsAt ?? 0) ? (() => { throw new Error('collector not ready') })() : JSON.stringify(options.ready ?? { pid: 100, nativePid: 99, started: '111' }),
+    join, integer, { pid: 99, env: environment, kill: (pid: number) => { killed.push(pid); if (options.alive === false) throw new Error('collector not live') }, execve: (binary: string, args: string[], env: Record<string, string>) => { execs++; arguments_ = { binary, args }; forwarded = env; if (!options.returns) throw replaced } },
+    { sleep: async (ms: number) => { now += ms } }, () => now >= (options.appearsAt ?? 0), { now: () => now }, () => ({ state: 'S', started: '111' }))
+  return { run: async () => { let execReplaced = false, failed = false; try { await native('/owned', '/owned/stand-in', ['--original', 'space arg']) } catch (error) { execReplaced = error === replaced; failed = !execReplaced }; return { execReplaced, failed } },
+    state: () => ({ now, execs, killed, arguments_, environmentPreserved: forwarded !== undefined && Object.keys(environment).every(key => key === 'ANTHROPIC_BASE_URL' || forwarded![key] === environment[key as keyof typeof environment]), gatewayChangedOnly: forwarded?.ANTHROPIC_BASE_URL === 'http://127.0.0.1:12345/base?keep=1' }) }
 }
-describe('native child status and safe failure evidence', () => {
-  test('fully captured exit17 retains projected stderr and original native arguments/stdio', async () => {
-    let count = 0
-    const seam = nativeSeam({ read: async () => count++ === 0 ? { done: false, value: Buffer.from(`[API:timing] first byte after 17ms\nError ${secret}\n`) } : { done: true }, cancel: async () => {} })
-    await seam.run(); safe(seam.rows); expect(seam.fakeProcess.exitCode).toBe(17); expect(seam.listeners.size).toBe(0)
-    expect(seam.rows.some(row => row.event === 'first_byte' && row.elapsedMs === 17)).toBe(true)
-    expect(seam.rows.some(row => row.event === 'unrecognized_withheld')).toBe(true)
-    expect(seam.rows.find(row => row.event === 'process_exit')).toMatchObject({ exitCode: 17, case: 2 })
-    expect(seam.calls).toEqual([{ argv: ['/fake/native', '--debug-to-stderr', '--exact-original-arg'], options: { stdin: 'inherit', stdout: 'inherit', stderr: 'pipe', env: { ANTHROPIC_BASE_URL: 'http://127.0.0.1:12345/base?keep=1' } } }])
+function collectorSeam(options: { chunks?: Buffer[]; readFailure?: boolean; pending?: boolean; nativePid?: number; vanish?: boolean; state?: string; implementation?: string; releaseAfter?: number; initialState?: string } = {}) {
+  let now = 0, cancelled = 0, index = 0, pendingResolve: ((value: { done: boolean }) => void) | undefined
+  const renames: Array<[string, string]> = []; let identityReads = 0
+  const rows: Row[] = [], writes: Array<{ path: string; value: unknown; options: unknown }> = []
+  const reader = { read: async () => { if (options.readFailure) throw new Error(secret); if (index < (options.chunks?.length ?? 0)) return { done: false, value: options.chunks![index++] }; if (options.pending) return new Promise<{ done: boolean }>(resolve => { pendingResolve = resolve }); return { done: true } }, cancel: async () => { cancelled++; pendingResolve?.({ done: true }) } }
+  const collect = new Function('integer', 'process', 'sink', 'nativeDebugProjection', 'scope', 'Bun', 'writeFileSync', 'join', 'Date', 'renameSync', 'nativeProcessIdentity', new Bun.Transpiler({ loader: 'ts' }).transformSync((options.implementation ? options.implementation.slice(options.implementation.indexOf('async function collectNative('), options.implementation.indexOf('\nif (import.meta.main)')) : collectorFunction) + '\nreturn collectNative'))(
+    integer, { pid: 100, kill: () => { if (options.vanish) throw new Error('gone') } }, () => (row: Row) => rows.push(row), nativeDebugProjection, () => 2,
+    { stdin: { stream: () => ({ getReader: () => reader }) }, sleep: async (ms: number) => { now += ms; if (options.releaseAfter !== undefined && now >= options.releaseAfter) pendingResolve?.({ done: true }) } }, (path: string, data: string, settings: unknown) => writes.push({ path, value: JSON.parse(data), options: settings }), join, { now: () => now }, (from: string, to: string) => renames.push([from, to]), () => { identityReads++; if (identityReads === 1 && options.initialState) { if (options.initialState === 'missing') return undefined; if (options.initialState === 'EACCES') throw new Error(secret); return { state: options.initialState, started: '111' } }; if (identityReads > 1) { if (options.vanish || options.state === 'gone') return undefined; if (options.state === 'EACCES') { if (identityReads > 2) throw new Error(secret); return { state: 'S', started: '111' } }; if (options.state) return { state: options.state === 'reused' ? 'S' : options.state, started: options.state === 'reused' ? '222' : '111' } }; return { state: 'S', started: '111' } })
+  return { run: () => collect('/owned', options.nativePid ?? 99), rows, writes, renames, state: () => ({ now, cancelled }) }
+}
+describe('PID-preserving native launcher and strict collector handshake', () => {
+  test('execs only after readiness, preserving argv and environment without projecting credentials', async () => {
+    const seam = launchSeam({ appearsAt: 200 }); expect(await seam.run()).toEqual({ execReplaced: true, failed: false })
+    const state = seam.state(); safe(state); expect(state).toMatchObject({ now: 200, execs: 1, killed: [100], environmentPreserved: true, gatewayChangedOnly: true, arguments_: { binary: '/owned/stand-in', args: ['/owned/stand-in', '--debug-to-stderr', '--original', 'space arg'] } })
   })
-  test('unterminated secret stderr is never promoted to a complete diagnostic on exit', async () => {
-    let count = 0; const seam = nativeSeam({ read: async () => count++ === 0 ? { done: false, value: Buffer.from(secret.slice(0, 12)) } : { done: true }, cancel: async () => {} })
-    await seam.run(); safe(seam.rows); expect(seam.fakeProcess.exitCode).toBe(17)
-    expect(seam.rows.find(row => row.reason === 'unterminated_line')).toBeDefined()
+  test.each([{ pid: 0, nativePid: 99 }, { pid: -1, nativePid: 99 }, { pid: 1.5, nativePid: 99 }, { pid: '100', nativePid: 99 }, { pid: 100, nativePid: 98 }, {}])('invalid collector readiness %j cannot launch native', async ready => {
+    const seam = launchSeam({ ready }); expect(await seam.run()).toEqual({ execReplaced: false, failed: true }); expect(seam.state().execs).toBe(0)
+  })
+  test('missing readiness has a five-second bound and never execs', async () => {
+    const seam = launchSeam({ appearsAt: 6000 }); expect((await seam.run()).failed).toBe(true); expect(seam.state()).toMatchObject({ now: 5000, execs: 0 })
+  })
+  test('a dead collector or an execve return fails closed', async () => {
+    const dead = launchSeam({ alive: false }); expect((await dead.run()).failed).toBe(true); expect(dead.state().execs).toBe(0)
+    const returned = launchSeam({ returns: true }); expect((await returned.run()).failed).toBe(true); expect(returned.state().execs).toBe(1)
+  })
+  test.each([0, -1, 100, 0.5, NaN])('collector refuses impossible/self PID %s before readiness', async nativePid => {
+    const seam = collectorSeam({ nativePid }); await expect(seam.run()).rejects.toThrow('native identity unavailable'); expect(seam.writes).toEqual([]); expect(seam.rows).toEqual([])
+  })
+  test('collector announces readiness only with an opened pipe and reports exit as unknown', async () => {
+    const seam = collectorSeam({ chunks: [Buffer.from(`[API:timing] first byte after 17ms\nError ${secret}\n`)] }); await seam.run(); safe([seam.rows, seam.writes])
+    expect(seam.writes).toEqual([{ path: '/owned/native-99.ready-100.next', value: { pid: 100, nativePid: 99, started: '111' }, options: { mode: 0o600, flag: 'wx' } }]); expect(seam.renames).toEqual([['/owned/native-99.ready-100.next', '/owned/native-99.ready']])
+    expect(seam.rows[0]).toMatchObject({ event: 'process_exit_unknown', reason: 'exec_identity_preserved', process: 99 })
+    expect(seam.rows.some(row => row.event === 'first_byte' && row.elapsedMs === 17)).toBe(true)
+    expect(seam.rows.some(row => row.event === 'process_exit' || 'exitCode' in row)).toBe(false)
+    expect(seam.rows.some(row => row.event === 'unrecognized_withheld')).toBe(true); expect(seam.state().cancelled).toBe(1)
+  })
+  test('collector read failure retains a fixed diagnostic, never its raw error or invented native status', async () => {
+    const seam = collectorSeam({ readFailure: true }); await seam.run(); safe(seam.rows)
+    expect(seam.rows.some(row => row.event === 'capture_withheld' && row.reason === 'stream_collection_incomplete')).toBe(true)
+    expect(seam.rows.some(row => 'exitCode' in row)).toBe(false); expect(seam.state().cancelled).toBe(1)
+  })
+  test('a vanished pane cannot leave a descendant pipe open beyond the one-second drain bound', async () => {
+    const seam = collectorSeam({ chunks: [Buffer.from(secret.slice(0, 12))], pending: true, vanish: true }); await seam.run(); safe(seam.rows)
+    expect(seam.state().now).toBeGreaterThanOrEqual(1000); expect(seam.state().now).toBeLessThanOrEqual(1200); expect(seam.state().cancelled).toBe(1)
+    expect(seam.rows.some(row => row.reason === 'stream_collection_incomplete')).toBe(true); expect(seam.rows.some(row => row.reason === 'unterminated_line')).toBe(true)
   })
 })
 
-test('native stderr read failure preserves child exit and a fixed nonempty collection diagnostic', async () => {
-  const seam = nativeSeam({ read: async () => { throw new Error(secret) }, cancel: async () => {} })
-  let rejected = false
-  try { await seam.run() } catch { rejected = true }
-  safe(seam.rows)
-  expect(rejected).toBe(false)
-  expect(seam.fakeProcess.exitCode).toBe(17)
-  expect(seam.rows.some(row => row.event === 'capture_withheld' && typeof row.reason === 'string' && row.reason.length > 0)).toBe(true)
-  expect(seam.listeners.size).toBe(0)
+async function processIdentityProbe(mode: 'exec' | 'spawn') {
+  const home = mkdtempSync(join(tmpdir(), 'ac20-identity-'))
+  try {
+    const fixture = join(import.meta.dir, 'fixtures/ac20-diagnostics'), old = readFileSync(join(fixture, 'spawn-launcher.before.ts.txt'), 'utf8')
+    const privateSource = mode === 'exec' ? nativeFunction + '\n' + identityFunctions + '\n' + collectorFunction : old
+    const projection = source.slice(source.indexOf('export function nativeDebugProjection'), source.indexOf('/** Only an explicit SDK')).replace('export function', 'function')
+    const scopeAndSink = source.slice(source.indexOf('function scope('), source.indexOf('/** Bounded complete-line'))
+    const helper = join(home, 'helper.ts'), standIn = join(home, 'stand-in'), wrapper = join(home, 'wrapper.sh')
+    const digest = createHash('sha256').update(secret).digest('hex')
+    writeFileSync(standIn, `#!${process.execPath}\nimport {createHash} from 'node:crypto';import{fstatSync}from'node:fs';console.log(JSON.stringify({nativePid:process.pid,parentPid:process.ppid,args:process.argv.slice(2),credentialUnchanged:createHash('sha256').update(process.env.AC20_TEST_SECRET??'').digest('hex')===${JSON.stringify(digest)},gatewayCorrect:process.env.ANTHROPIC_BASE_URL==='http://127.0.0.1:12345/base?keep=1',stderrPipe:fstatSync(2).isFIFO()}));process.stderr.write('[API:timing] first byte after 17ms\\nError '+process.env.AC20_TEST_SECRET+'\\n'+process.env.AC20_TEST_SECRET?.slice(0,12));process.exit(17)\n`, { mode: 0o700 })
+    writeFileSync(helper, `import {readFileSync,appendFileSync,writeFileSync,existsSync,renameSync} from 'node:fs';import{join}from'node:path';const integer=${integer.toString()};\n${scopeAndSink}\n${projection}\n${privateSource}\nconst [command,directory,...args]=process.argv.slice(2);if(command==='collect')await collectNative(directory!,Number(args[0]));else await native(directory!,process.env.OWNED_STAND_IN!,args.slice(1));\n`)
+    writeFileSync(join(home, 'gateway-ready.json'), '{"port":12345}'); writeFileSync(join(home, 'scope.json'), '{"case":1}')
+    const actualWrapper = shell.slice(shell.indexOf('#!/usr/bin/env bash\n'), shell.indexOf('\nWRAPPER'))
+    const command = mode === 'exec' ? actualWrapper.slice(actualWrapper.indexOf('\n') + 1) : 'exec bun "$AC20_DIAGNOSTIC_HELPER" native "$AC20_DIAGNOSTIC_DIR" /opt/claude-code/2.1.296/claude "$@"'
+    writeFileSync(wrapper, `printf '{"panePid":%s}\\n' "$$"\n${command}\n`)
+    const child = spawnSync('bash', [wrapper, '--original', 'space arg'], { env: hostSafeChildEnv(home, { tools: ['bash', 'bun'], extras: { AC20_DIAGNOSTIC_HELPER: helper, AC20_DIAGNOSTIC_DIR: home, OWNED_STAND_IN: standIn, ANTHROPIC_BASE_URL: 'https://example.invalid/base?keep=1', AC20_TEST_SECRET: secret } }), encoding: 'utf8', timeout: 7000 })
+    safe([child.stdout, child.stderr]); expect(child.error).toBeUndefined(); expect(child.status).toBe(17); expect(child.stderr).toBe('')
+    const [pane, native] = child.stdout.trim().split('\n').map(line => JSON.parse(line))
+    const log = join(home, `native-${pane.panePid}.jsonl`)
+    for (let i = 0; i < 100; i++) { if (existsSync(log) && readFileSync(log, 'utf8').includes('unterminated_line')) break; await Bun.sleep(10) }
+    const rows = readFileSync(log, 'utf8').trim().split('\n').map(line => JSON.parse(line)); safe(rows)
+    return { pane, native, rows }
+  } finally { rmSync(home, { recursive: true, force: true }) }
+}
+test('actual execve and anonymous collector pipe preserve pane PID, native argv, credentials and safe evidence', async () => {
+  const result = await processIdentityProbe('exec'); expect(result.native.nativePid).toBe(result.pane.panePid)
+  expect(result.native).toMatchObject({ args: ['--debug-to-stderr', '--original', 'space arg'], credentialUnchanged: true, gatewayCorrect: true, stderrPipe: true })
+  expect(result.rows.some(row => row.event === 'process_exit_unknown')).toBe(true); expect(result.rows.some(row => 'exitCode' in row)).toBe(false)
+  expect(result.rows.some(row => row.event === 'first_byte')).toBe(true); expect(result.rows.some(row => row.reason === 'unterminated_line')).toBe(true)
+})
+test('captured pre-repair Bun.spawn leaves native below pane PID and fails the AD identity association', async () => {
+  const result = await processIdentityProbe('spawn'); expect(result.native.nativePid === result.pane.panePid).toBe(false); expect(result.native.parentPid).toBe(result.pane.panePid)
+  const directory = join(import.meta.dir, 'fixtures/ac20-diagnostics'), metadata = JSON.parse(readFileSync(join(directory, 'launcher-provenance.json'), 'utf8'))
+  expect(createHash('sha256').update(readFileSync(join(directory, 'spawn-launcher.before.ts.txt'))).digest('hex')).toBe(metadata.capturedFunctionSHA256)
 })
 
 const caseGate = '        if [[ "${AI_CRITERION}" == 20 && "${REAL_AGENT_AC20_DIAGNOSTICS:-}" == decision21c ]]; then\n            real_ac20_diagnostic_case "${n}"\n        fi\n'
@@ -295,13 +353,86 @@ test.each([[20, 'decision21c', 1], [20, '', 1], [20, 'other', 2], [12, 'decision
     expect(result.stdout).toBe(`${enabled ? `scope:${seq}\n` : ''}intake\ndelivery\n${enabled ? `diagnostic:expected/${seq}.json:${seq}` : `ordinary:180:${criterion === 11 && seq === 3 ? 'ai_spoof_readback' : 'ai_readback'}`}\n`)
   } finally { rmSync(home, { recursive: true, force: true }) }
 })
-test('retained descendant stderr pipe is bounded and preserves underlying exit with fixed withheld reason', async () => {
-  let finish!: (value: { done: boolean }) => void, cancelled = false
-  const seam = nativeSeam({ read: () => new Promise(resolve => { finish = resolve }), cancel: async () => { cancelled = true; finish({ done: true }) } })
-  await seam.run(); safe(seam.rows); expect(cancelled).toBe(true); expect(seam.fakeProcess.exitCode).toBe(17)
-  expect(seam.rows.some(row => row.event === 'capture_withheld' && row.reason === 'stream_collection_incomplete')).toBe(true)
-}, 3000)
 test('removing the two gated additions restores the exact previously captured scenario bytes', () => {
   expect(scenario.split(caseGate)).toHaveLength(2); expect(scenario.split(waitGate)).toHaveLength(2)
   expect(createHash('sha256').update(scenario.replace(caseGate, '').replace(waitGate, '')).digest('hex')).toBe('4a96b137596887ccbc4705365ad9ac625002aa513015142a1c6bcca91106bef7')
+})
+
+function procStat(pid: number, state = 'S', started = '111', comm = 'native ) spaced') {
+  return `${pid} (${comm}) ${[state, ...Array(18).fill('0'), started, '0'].join(' ')}\n`
+}
+test.each(['R', 'S', 'Z', 'X', 'x'])('process stat parses state %s and exact start identity despite parentheses/whitespace comm', state => {
+  expect(parseNativeProcessStat(procStat(99, state, '12345678901234567890'), 99)).toEqual({ state, started: '12345678901234567890' })
+})
+test.each(['', '99 missing parentheses', procStat(98), procStat(99, '?'), procStat(99, 'S', '-1'), '99 (name) S 0'])('malformed/mismatched proc stat %s is rejected without using cmdline or environment', text => {
+  expect(() => parseNativeProcessStat(text, 99)).toThrow('process identity unavailable')
+})
+test.each(['gone', 'Z', 'X', 'x', 'reused', 'EACCES'])('held descendant pipe is withheld and bounded after native %s', async state => {
+  const seam = collectorSeam({ state, chunks: [Buffer.from(secret.slice(0, 12))], pending: true }); await seam.run(); safe(seam.rows)
+  expect(seam.state().now).toBeLessThanOrEqual(1200); expect(seam.state().cancelled).toBe(1)
+  expect(seam.rows.some(row => row.reason === 'stream_collection_incomplete')).toBe(true)
+  expect(seam.rows.some(row => row.reason === 'unterminated_line')).toBe(true)
+})
+test('stale readiness with a different native start identity cannot exec', async () => {
+  const seam = launchSeam({ ready: { pid: 100, nativePid: 99, started: 'old' } }); expect((await seam.run()).failed).toBe(true); expect(seam.state().execs).toBe(0)
+})
+async function publishWhileLaunching(implementation: string) {
+  const first = implementation.indexOf('async function native('), native = implementation.slice(first, implementation.indexOf('\n/**', first))
+  const collector = implementation.slice(implementation.indexOf('async function collectNative('), implementation.indexOf('\nif (import.meta.main)'))
+  const files = new Map<string, string>([['/owned/gateway-ready.json', '{"port":12345}']]); let launched: Promise<unknown> | undefined, replaced = false
+  const replacement = {}, fields = ['readFileSync', 'writeFileSync', 'renameSync', 'existsSync', 'join', 'integer', 'process', 'Bun', 'Date', 'sink', 'nativeDebugProjection', 'scope', 'nativeProcessIdentity']
+  const common: Record<string, unknown> = { readFileSync: (path: string) => { if (!files.has(path)) throw new Error('not yet published'); return files.get(path) }, existsSync: (path: string) => files.has(path), join, integer,
+    Bun: { sleep: async () => {}, stdin: { stream: () => ({ getReader: () => ({ read: async () => ({ done: true }), cancel: async () => {} }) }) } }, Date: { now: () => 0 }, sink: () => () => {}, nativeDebugProjection, scope: () => 1, nativeProcessIdentity: () => ({ state: 'S', started: '111' }) }
+  let launch!: () => Promise<unknown>
+  common.writeFileSync = (path: string, data: string) => {
+    // Model the observable empty/truncated interval of a direct open/write.
+    files.set(path, ''); launched ??= launch(); files.set(path, data)
+  }
+  common.renameSync = (from: string, to: string) => { files.set(to, files.get(from)!); files.delete(from) }
+  const build = (body: string, process_: unknown, name: string) => new Function(...fields, new Bun.Transpiler({ loader: 'ts' }).transformSync(body + `\nreturn ${name}`))(...fields.map(field => field === 'process' ? process_ : common[field]))
+  const launcher = build(native, { pid: 99, env: { ANTHROPIC_BASE_URL: 'https://example.invalid' }, kill: () => {}, execve: () => { throw replacement } }, 'native')
+  launch = async () => { try { await launcher('/owned', '/owned/stand-in', []) } catch (error) { replaced = error === replacement } }
+  await build(collector, { pid: 100, kill: () => {} }, 'collectNative')('/owned', 99)
+  await launched; return replaced
+}
+test('atomic readiness publication prevents the actual pre-repair empty-file launch race', async () => {
+  const before = readFileSync(join(import.meta.dir, 'fixtures/ac20-diagnostics/exec-launcher.before-p2.ts.txt'), 'utf8')
+  expect(await publishWhileLaunching(before)).toBe(false)
+  expect(await publishWhileLaunching(source)).toBe(true)
+})
+test('retained native296 network-none proof binds actual accepted AD readiness without executing AD in units', () => {
+  const directory = join(import.meta.dir, 'fixtures/ac20-diagnostics'), metadata = JSON.parse(readFileSync(join(directory, 'launcher-provenance.json'), 'utf8')), bytes = readFileSync(join(directory, 'native-ad-proof.json'))
+  expect(createHash('sha256').update(bytes).digest('hex')).toBe(metadata.nativeADProofSHA256)
+  const proof = JSON.parse(bytes.toString()); safe(proof)
+  expect(proof).toMatchObject({ nativeVersion: '2.1.296', nativeSha256: AC20_NATIVE_SHA256, paneExecutable: '/opt/claude-code/2.1.296/claude', status: { state: 'waiting' }, network: 'none', ignoredHooks: 0, paneGrandparentHooks: 0, caseInputs: 0 })
+  expect(proof.sessionStart).toHaveLength(1); expect(proof.sessionStart[0]).toMatchObject({ event_name: 'SessionStart', upsert_outcome: 'updated' })
+})
+test.each(['Z', 'reused'])('captured old collector mistakes %s PID for live; repaired collector drains within bound', async state => {
+  const before = readFileSync(join(import.meta.dir, 'fixtures/ac20-diagnostics/exec-launcher.before-p2.ts.txt'), 'utf8')
+  const metadata = JSON.parse(readFileSync(join(import.meta.dir, 'fixtures/ac20-diagnostics/launcher-provenance.json'), 'utf8'))
+  expect(createHash('sha256').update(before).digest('hex')).toBe(metadata.beforeP2SourceSHA256)
+  const old = collectorSeam({ implementation: before, state, pending: true, releaseAfter: 2000 }); await old.run(); safe(old.rows)
+  expect(old.state().now).toBeGreaterThanOrEqual(2000); expect(old.rows.some(row => row.reason === 'stream_collection_incomplete')).toBe(false)
+  const fixed = collectorSeam({ state, pending: true, releaseAfter: 2000 }); await fixed.run(); safe(fixed.rows)
+  expect(fixed.state().now).toBeLessThanOrEqual(1200); expect(fixed.rows.some(row => row.reason === 'stream_collection_incomplete')).toBe(true)
+})
+test.each(['Z', 'X', 'x', 'missing', 'EACCES'])('collector cannot publish readiness for initial native %s identity', async initialState => {
+  const seam = collectorSeam({ initialState }); let refused = false
+  try { await seam.run() } catch { refused = true }
+  safe([seam.rows, seam.writes]); expect(refused).toBe(true); expect(seam.writes).toEqual([]); expect(seam.rows).toEqual([])
+})
+test('native metadata storage reaches its byte cap once and cannot persist arbitrary debug bytes', () => {
+  const lines: string[] = [], start = source.indexOf('function sink('), end = source.indexOf('/** Bounded complete-line')
+  const make = new Function('appendFileSync', 'join', 'Date', new Bun.Transpiler({ loader: 'ts' }).transformSync(source.slice(start, end) + '\nreturn sink'))((directory: string, line: string) => lines.push(line), join, { now: () => 0 })
+  const projection = nativeDebugProjection(make('/owned', 'metadata.jsonl'), () => ({ atMs: 0, case: 1, process: 99 }))
+  projection.push(Buffer.from(('[API:timing] first byte after 1ms\n').repeat(10000) + secret + '\n')); projection.end(); safe(lines)
+  expect(lines.reduce((count, line) => count + Buffer.byteLength(line), 0)).toBeLessThan(256 * 1024 + 256)
+  expect(lines.map(line => JSON.parse(line)).filter(row => row.reason === 'metadata_limit')).toHaveLength(1)
+})
+test('retained offline zombie proof reports UNKNOWN and a bounded withheld collection, without claiming a native model result', () => {
+  const directory = join(import.meta.dir, 'fixtures/ac20-diagnostics'), bytes = readFileSync(join(directory, 'zombie-held-pipe-proof.json')), metadata = JSON.parse(readFileSync(join(directory, 'launcher-provenance.json'), 'utf8'))
+  expect(createHash('sha256').update(bytes).digest('hex')).toBe(metadata.zombieHeldPipeProofSHA256)
+  const proof = JSON.parse(bytes.toString()); safe(proof)
+  expect(proof).toMatchObject({ offline: true, network: 'none', targetWasSyntheticShellNotNativeModel: true, targetStateBeforeReap: 'Z', collectorExit: 0, nativeExitClaim: 'UNKNOWN', collectionIncompleteWithheld: true, stderrBytes: 0 })
+  expect(proof.collectorElapsedMs).toBeLessThan(proof.descendantPipeHoldMs)
 })
