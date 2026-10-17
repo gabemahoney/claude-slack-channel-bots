@@ -45,6 +45,43 @@ function ordinaryEvidence() {
   return { ...e, seq: 3, reply }
 }
 
+function queuedTakeIn(entry: TranscriptEntry, explicitHuman = true) {
+  const prompt = entry.text!
+  delete entry.value.message
+  entry.value.type = 'attachment'
+  entry.value.attachment = { type: 'queued_command', prompt,
+    ...(explicitHuman ? { origin: { kind: 'human' } } : {}) }
+  if (explicitHuman) entry.value.origin = { kind: 'human' }
+  Object.assign(entry, parseDeliveryTranscriptRecord('claude', entry.value))
+  return entry
+}
+
+test.each([false, true])('ordinary readback accepts a native queued command, explicit human=%s', explicitHuman => {
+  const e = ordinaryEvidence(); queuedTakeIn(e.take, explicitHuman)
+  expect(completedAIReadback(e)).toEqual({ seq: 3, part: 1, receipt_uuid: 'case3', session_id: 'session', actual_model: e.model })
+})
+
+test.each([
+  ['nonhuman record origin', (e: ReturnType<typeof ordinaryEvidence>) => { e.take.value.origin.kind = 'agent' }],
+  ['nonhuman attachment origin', (e: ReturnType<typeof ordinaryEvidence>) => { e.take.value.attachment.origin.kind = 'agent' }],
+  ['another attachment type', (e: ReturnType<typeof ordinaryEvidence>) => { e.take.value.attachment.type = 'file' }],
+  ['tool result', (e: ReturnType<typeof ordinaryEvidence>) => { e.take.value.type = 'user'; e.take.value.message = { role: 'user', content: [{ type: 'tool_result', content: e.take.text }] } }],
+  ['wrong native text', (e: ReturnType<typeof ordinaryEvidence>) => { e.take.value.attachment.prompt += ' ' }],
+  ['foreign path', (e: ReturnType<typeof ordinaryEvidence>) => { e.take.path = '/foreign/session.jsonl' }],
+  ['wrong session', (e: ReturnType<typeof ordinaryEvidence>) => { e.take.value.sessionId = 'other' }],
+  ['sidechain', (e: ReturnType<typeof ordinaryEvidence>) => { e.take.value.isSidechain = true }],
+  ['subagent', (e: ReturnType<typeof ordinaryEvidence>) => { e.take.path = '/scenario/subagents/session.jsonl'; e.journal[3].receipt.path = e.take.path }],
+  ['invalid timestamp', (e: ReturnType<typeof ordinaryEvidence>) => { e.take.at = NaN }],
+  ['stale timestamp', (e: ReturnType<typeof ordinaryEvidence>) => { e.take.at = 9 }],
+  ['pre-send offset', (e: ReturnType<typeof ordinaryEvidence>) => { e.journal[2].transcript_size = e.take.offset + 1 }],
+  ['wrong response ancestry', (e: ReturnType<typeof ordinaryEvidence>) => { e.reply.value.parentUuid = 'other' }],
+] as const)('queued native receipt still rejects %s', (_name, change) => {
+  const e = ordinaryEvidence(); queuedTakeIn(e.take)
+  expect(completedAIReadback(e).receipt_uuid).toBe('case3')
+  change(e)
+  expect(() => completedAIReadback(e)).toThrow()
+})
+
 test('ordinary AI readback requires exact fields from its completed receipt-backed native turn', () => {
   const e = ordinaryEvidence()
   expect(completedAIReadback(e)).toEqual({ seq: 3, part: 1, receipt_uuid: 'case3', session_id: 'session', actual_model: e.model })
@@ -247,7 +284,7 @@ test('multipart reassembly requires every durable part and the final part respon
 
 // AC15 execution discipline is neutral: acknowledgements can finish earlier
 // turns, while only the final part's exact completed JSON proves reassembly.
-function multipartAC15() {
+function multipartAC15(native = 'user') {
   const e = ordinaryEvidence()
   e.seq = 1; e.expected = { case: 'AC15', messages: 1, body: 'x'.repeat(5000) } as any
   const lengths = [1700, 1700, 1600]
@@ -256,6 +293,7 @@ function multipartAC15() {
   for (const [i, text] of parts.entries()) {
     const offset = 20 + i * 20, uuid = `part-${i + 1}`
     const take = e.entry(offset, { type: 'user', uuid, message: { role: 'user', content: text } })
+    if (native !== 'user' && (native !== 'queued-final' || i === 2)) queuedTakeIn(take, native !== 'queued-implicit')
     const reply = assistant(e, [{ type: 'text', text: JSON.stringify(i === 2 ? e.expected : { status: 'received' }) }], offset + 5, { parentUuid: uuid })
     e.own.push(take, reply)
     e.journal.push({ kind: 'sent', seq: 1, part: i + 1, session_id: 'session', transcript_path: take.path, transcript_size: offset - 1, at: offset - 2 },
@@ -267,9 +305,75 @@ const readAC15 = (e: ReturnType<typeof multipartAC15>) => completedAIReadback(e)
 const forbiddenAC15Action = (e: ReturnType<typeof multipartAC15>, offset: number, parentUuid: string, name = 'mcp__slack-channel-router__fetch_messages') =>
   assistant(e, [{ type: 'tool_use', name, id: 'fetch', input: { chat_id: 'D0AIAC15', limit: 1 } }], offset, { parentUuid })
 
-test('AC15 accepts neutral completed acknowledgements and all three exact receipts plus final complete JSON', () => {
-  const e = multipartAC15()
+// Archived native metadata: no timestamp, UUID or parent UUID. Keep the exact
+// three-field shapes, including the absence of the fixture's isSidechain flag.
+function ac15Information(e: ReturnType<typeof multipartAC15>) {
+  return [26, 66].flatMap(offset => [
+    ['mode', 'mode'], ['permission-mode', 'permissionMode'], ['atis-latch', 'atis'],
+    ['last-prompt', 'leafUuid'], ['ai-title', 'aiTitle'],
+  ].map(([type, field], i) => {
+    const record = e.entry(offset + i, { type, [field!]: 'informational' })
+    delete record.value.isSidechain
+    record.at = NaN
+    return record
+  }))
+}
+
+test.each(['user', 'queued-human', 'queued-implicit', 'queued-final'])('AC15 accepts %s receipts, neutral acknowledgements and final complete JSON', native => {
+  const e = multipartAC15(native)
   expect(readAC15(e)).toEqual({ seq: 1, part: 3, receipt_uuid: 'part-3', session_id: 'session', actual_model: e.model })
+})
+
+test.each(['user', 'queued-final'])('AC15 accepts ten untimed native informational records beside %s receipts', native => {
+  const e = multipartAC15(native)
+  e.own.push(...ac15Information(e))
+  expect(readAC15(e)).toEqual({ seq: 1, part: 3, receipt_uuid: 'part-3', session_id: 'session', actual_model: e.model })
+})
+
+test.each(['user', 'queued-final'])('AC15 treats the next %s receipt as its own input despite an earlier queued timestamp than its parent acknowledgement', native => {
+  const e = multipartAC15(native)
+  e.own[3]!.at = 62
+  e.own[4]!.value.parentUuid = 'reply45'
+  e.own.push(...ac15Information(e))
+  expect(readAC15(e)).toEqual({ seq: 1, part: 3, receipt_uuid: 'part-3', session_id: 'session', actual_model: e.model })
+})
+
+test.each([
+  [NaN, /^AI readback has no exact own native receipt$/],
+  [9, /^AI readback has no exact own native receipt$/],
+  [57, /^AI readback receipt has no native send window$/],
+] as const)('AC15 still rejects a next queued receipt with invalid/stale/pre-send time %s', (at, reason) => {
+  const e = multipartAC15('queued-final')
+  e.own[3]!.at = 62
+  e.own[4]!.value.parentUuid = 'reply45'; e.own[4]!.at = at
+  e.own.push(...ac15Information(e))
+  expect(() => readAC15(e)).toThrow(reason)
+})
+
+test.each([
+  ['unknown type', { type: 'unknown-metadata' }],
+  ['invalid payload', { mode: { type: 'tool_use', name: 'Read' } }],
+  ['native timestamp', { timestamp: 'invalid' }],
+  ['native UUID', { uuid: 'metadata' }],
+  ['native parent UUID', { parentUuid: 'reply25' }],
+  ['assistant action', { message: { role: 'assistant', content: [{ type: 'tool_use', name: 'Read' }] } }],
+  ['queued action', { attachment: { type: 'queued_command', prompt: '<channel>other</channel>' } }],
+  ['classifier fields', { subtype: 'model_refusal_no_fallback', refusedUserMessageUuid: 'part-1' }],
+  ['unknown field', { extra: 'unrecognized' }],
+] as const)('AC15 fails closed on untimed informational lookalikes with %s', (_name, fields) => {
+  const e = multipartAC15('queued-final'), records = ac15Information(e)
+  Object.assign(records[0]!.value, fields)
+  e.own.push(...records)
+  expect(() => readAC15(e)).toThrow(/^AC15 exchange has invalid\/stale time$/)
+})
+
+test.each([NaN, 89])('AC15 rejects action ancestry through informational lookalikes after another input, time=%s', at => {
+  const e = multipartAC15('queued-final'), bridge = ac15Information(e)[0]!
+  bridge.offset = 89; bridge.at = at
+  Object.assign(bridge.value, { uuid: 'bridge', parentUuid: 'reply25' })
+  e.own.push(...ac15Information(e), e.entry(80, { type: 'user', uuid: 'later', message: { role: 'user', content: '<channel>unrelated</channel>' } }),
+    bridge, forbiddenAC15Action(e, 90, 'bridge'))
+  expect(() => readAC15(e)).toThrow(at === 89 ? /^AC15 non-reply tool action observed$/ : /^AC15 exchange has invalid\/stale time$/)
 })
 
 test.each([
@@ -285,14 +389,22 @@ test.each([
   expect(() => readAC15(e)).toThrow()
 })
 
+test('AC15 queued final receipt preserves the recorded 5338-character body failure against 5000 characters', () => {
+  const e = multipartAC15('queued-final')
+  e.own.push(...ac15Information(e))
+  e.own[5]!.value.message.content[0].text = JSON.stringify({ ...e.expected, body: 'x'.repeat(5338) })
+  expect(() => readAC15(e)).toThrow(/^AI read-back field differs$/)
+})
+
 test.each([
   ['first part', 26, 'reply25'], ['middle part', 46, 'reply45'], ['final part', 66, 'reply65'],
   ['late action after another input', 90, 'reply25'],
 ] as const)('AC15 rejects history retrieval at %s even beside a correct completed final answer', (_name, offset, parent) => {
   const e = multipartAC15()
+  e.own.push(...ac15Information(e))
   if (offset === 90) e.own.push(e.entry(80, { type: 'user', uuid: 'later', message: { role: 'user', content: '<channel>unrelated</channel>' } }))
   e.own.push(forbiddenAC15Action(e, offset, parent))
-  expect(() => readAC15(e)).toThrow('AC15 non-reply tool action')
+  expect(() => readAC15(e)).toThrow(/^AC15 non-reply tool action observed$/)
 })
 
 test.each(['Bash', 'Read', 'Write', 'Agent', 'mcp__other__reply', 'reply'])('AC15 rejects %s despite exact final JSON', name => {
@@ -302,14 +414,16 @@ test.each(['Bash', 'Read', 'Write', 'Agent', 'mcp__other__reply', 'reply'])('AC1
 
 test.each([NaN, 24])('AC15 rejects late linked history retrieval with invalid/backdated time %s', at => {
   const e = multipartAC15()
+  e.own.push(...ac15Information(e))
   const action = forbiddenAC15Action(e, 90, 'reply25'); action.at = at
   e.own.push(e.entry(80, { type: 'user', uuid: 'later', parentUuid: 'reply65', message: { role: 'user', content: '<channel>unrelated</channel>' } }), action)
-  expect(() => readAC15(e)).toThrow('AC15 exchange has invalid/stale time')
+  expect(() => readAC15(e)).toThrow(/^AC15 exchange has invalid\/stale time$/)
 })
 
 test.each(['acknowledgement', 'late reply', 'late tool result', 'late system'].flatMap(kind =>
   [NaN, kind === 'acknowledgement' ? 19 : 24].map(at => [kind, at] as const)))('AC15 rejects invalid/stale %s ancestry time %s', (kind, at) => {
   const e = multipartAC15()
+  e.own.push(...ac15Information(e))
   if (kind === 'acknowledgement') e.own[1]!.at = at
   else {
     const record = kind === 'late reply'
@@ -320,7 +434,7 @@ test.each(['acknowledgement', 'late reply', 'late tool result', 'late system'].f
     e.own.push(e.entry(80, { type: 'user', uuid: 'later', message: { role: 'user', content: '<channel>unrelated</channel>' } }), record,
       assistant(e, [{ type: 'text', text: 'Received.' }], 91, { parentUuid: 'late' }))
   }
-  expect(() => readAC15(e)).toThrow('AC15 exchange has invalid/stale time')
+  expect(() => readAC15(e)).toThrow(/^AC15 exchange has invalid\/stale time$/)
 })
 
 test.each([90, NaN, 24])('AC15 ignores next-input actions with time %s when their ancestry stops at that unrelated input', at => {
@@ -331,14 +445,32 @@ test.each([90, NaN, 24])('AC15 ignores next-input actions with time %s when thei
   expect(readAC15(e).receipt_uuid).toBe('part-3')
 })
 
-test.each([15, 70])('AC15 checks a repeated part at offset %s before or after its durable copy', offset => {
+test.each([15, 70].flatMap(offset => ['user', 'queued'].map(native => [offset, native] as const)))('AC15 checks a repeated part at offset %s as %s before or after its durable copy', (offset, native) => {
   const e = multipartAC15()
   e.journal[2].at = 12; e.journal[2].transcript_size = 0
-  e.own.push(e.entry(offset, { type: 'user', uuid: 'duplicate', message: { role: 'user', content: e.journal[1].parts[0] } }),
+  const copy = e.entry(offset, { type: 'user', uuid: 'duplicate', message: { role: 'user', content: e.journal[1].parts[0] } })
+  if (native === 'queued') queuedTakeIn(copy)
+  e.own.push(copy,
     assistant(e, [{ type: 'text', text: '{"status":"received"}' }], offset + 1, { parentUuid: 'duplicate' }))
   expect(readAC15(e).receipt_uuid).toBe('part-3')
   e.own.push(forbiddenAC15Action(e, offset + 2, 'duplicate'))
   expect(() => readAC15(e)).toThrow('AC15 non-reply tool action')
+})
+
+test.each([
+  ['nonhuman record origin', (copy: TranscriptEntry) => { copy.value.origin.kind = 'agent' }],
+  ['nonhuman attachment origin', (copy: TranscriptEntry) => { copy.value.attachment.origin.kind = 'agent' }],
+  ['another attachment type', (copy: TranscriptEntry) => { copy.value.attachment.type = 'file' }],
+  ['wrong native text', (copy: TranscriptEntry) => { copy.value.attachment.prompt += ' ' }],
+  ['invalid timestamp', (copy: TranscriptEntry) => { copy.at = NaN }],
+  ['stale timestamp', (copy: TranscriptEntry) => { copy.at = 9 }],
+] as const)('AC15 rejects a queued duplicate with %s despite exact final JSON', (_name, change) => {
+  const e = multipartAC15('queued-human')
+  const copy = queuedTakeIn(e.entry(70, { type: 'user', uuid: 'duplicate', message: { role: 'user', content: e.journal[1].parts[0] } }))
+  e.own.push(copy)
+  expect(readAC15(e).receipt_uuid).toBe('part-3')
+  change(copy)
+  expect(() => readAC15(e)).toThrow('AC15 copy has no exact own native receipt')
 })
 
 test.each([NaN, 9])('AC15 fails closed on a duplicate with invalid/stale time %s', at => {
@@ -350,9 +482,10 @@ test.each([NaN, 9])('AC15 fails closed on a duplicate with invalid/stale time %s
 
 test.each(['intermediate', 'late'])('AC15 rejects a %s classifier stop despite exact final JSON', position => {
   const e = multipartAC15()
+  e.own.push(...ac15Information(e))
   if (position === 'late') e.own.push(e.entry(80, { type: 'user', uuid: 'later', message: { role: 'user', content: '<channel>unrelated</channel>' } }))
   e.own.push(e.entry(position === 'late' ? 90 : 26, { type: 'system', uuid: 'stop', subtype: 'model_refusal_no_fallback', parentUuid: 'part-1', refusedUserMessageUuid: 'part-1' }))
-  expect(() => readAC15(e)).toThrow('refusal/API failure')
+  expect(() => readAC15(e)).toThrow(/^AC15 exchange has refusal\/API failure$/)
 })
 
 test('AC15 permits reply acknowledgements and a linked reply/tool-result/completion for the final answer', () => {

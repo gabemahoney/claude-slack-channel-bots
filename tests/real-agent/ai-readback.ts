@@ -9,6 +9,28 @@ export function safeSelectedModel(value: string): boolean { return typeof value 
 const stable = (v: any): string => JSON.stringify(v && typeof v === 'object' && !Array.isArray(v)
   ? Object.fromEntries(Object.keys(v).sort().map(k => [k, JSON.parse(stable(v[k]))])) : Array.isArray(v) ? v.map(x => JSON.parse(stable(x))) : v)
 
+// SR-6.2 also records human queued commands as attachments. Reuse the packed
+// production parser so other attachments, tool results and origins stay out.
+function nativeTakeIn(entry: TranscriptEntry, adapters: ReceiptAdapters): boolean {
+  if (entry.value?.type !== 'user' && !(entry.value?.type === 'attachment' && entry.value.attachment?.type === 'queued_command')) return false
+  const parsed = adapters.parseDeliveryTranscriptRecord('claude', entry.value)
+  return parsed.kind === 'take-in' && parsed.uuid === entry.uuid && typeof parsed.text === 'string' && parsed.text === entry.text
+}
+
+// Native session metadata has no temporal or ancestry identity. Only the five
+// observed three-field shapes are informational; added evidence stays checked.
+function nativeInformation(entry: TranscriptEntry, adapters: ReceiptAdapters): boolean {
+  const value = entry.value, field = new Map([
+    ['mode', 'mode'], ['permission-mode', 'permissionMode'], ['atis-latch', 'atis'],
+    ['last-prompt', 'leafUuid'], ['ai-title', 'aiTitle'],
+  ]).get(value.type)
+  if (!field || !Number.isNaN(entry.at) || typeof value.sessionId !== 'string' || typeof value[field] !== 'string'
+    || Object.keys(value).length !== 3 || !Object.keys(value).every(k => k === 'type' || k === 'sessionId' || k === field)) return false
+  const parsed = adapters.parseDeliveryTranscriptRecord('claude', value)
+  return parsed.kind === 'other' && parsed.uuid === undefined && parsed.text === undefined
+    && entry.kind === 'other' && entry.uuid === undefined && entry.text === undefined
+}
+
 // AC15 may acknowledge a part, but retrieval or any other action cannot
 // supply missing context. Inspect every copy's turn and its late descendants;
 // completion/JSON provenance remains the ordinary final-part oracle below.
@@ -27,7 +49,7 @@ function assertAC15Exchange(parts: string[], acceptedAt: number, seq: number, jo
     const ids = session.map(e => e.value?.uuid).filter(id => typeof id === 'string')
     check(new Set(ids).size === ids.length, 'AC15 has ambiguous native UUID')
     for (const copy of copies) {
-      check(typeof copy.uuid === 'string' && copy.value.type === 'user' && copy.value.uuid === copy.uuid
+      check(typeof copy.uuid === 'string' && nativeTakeIn(copy, adapters) && copy.value.uuid === copy.uuid
         && copy.value.isMeta !== true && copy.value.sessionId === basename(copy.path, '.jsonl') && Number.isFinite(copy.at) && copy.at >= acceptedAt,
       'AC15 copy has no exact own native receipt')
       check(sends.some(r => r.transcript_path === copy.path && r.session_id === copy.value.sessionId
@@ -36,6 +58,9 @@ function assertAC15Exchange(parts: string[], acceptedAt: number, seq: number, jo
       'AC15 copy has no native send window')
       const next = session.find(e => e.offset > copy.offset && e.kind === 'take-in' && e.text !== undefined)
       const linked = (entry: TranscriptEntry): boolean => {
+        // A queued input can be timestamped before its parent acknowledgement.
+        // Its own receipt/send checks apply; it starts a new exchange here.
+        if (entry.kind === 'take-in' && entry.text !== undefined) return false
         const seen = new Set<string>(); let current = entry
         while (typeof current.value?.parentUuid === 'string' && !seen.has(current.value.parentUuid)) {
           const parent = current.value.parentUuid
@@ -51,6 +76,7 @@ function assertAC15Exchange(parts: string[], acceptedAt: number, seq: number, jo
       }
       for (const e of session.filter(e => e.offset > copy.offset && ((!next || e.offset < next.offset) || linked(e)
         || e.value?.type === 'system' && e.value.refusedUserMessageUuid === copy.uuid))) {
+        if (nativeInformation(e, adapters)) continue
         check(!(e.value.type === 'system' && /(?:refusal|fallback|api_error|api_retry)/.test(e.value.subtype ?? '')),
           'AC15 exchange has refusal/API failure')
         const parent = session.find(prior => prior.value?.uuid === e.value.parentUuid && prior.offset < e.offset)
@@ -87,7 +113,7 @@ export function completedAIReadback({ seq, expected, journal, own, adapters, mod
     check(matches.length === 1, 'AI readback has missing/ambiguous own receipt')
     take = matches[0]!
     check(take.kind === 'take-in' && typeof take.text === 'string' && adapters.receiptTextMatches(take.text, text)
-      && take.value?.type === 'user' && take.value.isSidechain !== true && take.value.isMeta !== true
+      && nativeTakeIn(take, adapters) && take.value.isSidechain !== true && take.value.isMeta !== true
       && typeof take.uuid === 'string' && take.value.uuid === take.uuid
       && !take.path.includes('/subagents/') && take.value.sessionId === basename(take.path, '.jsonl')
       && Number.isFinite(take.at) && take.at >= accepted.received_at && delivered.at >= take.at,

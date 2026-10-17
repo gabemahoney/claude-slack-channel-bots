@@ -874,10 +874,17 @@ generated bodies, prompts and labels. Meaningful spoof/action instructions
 remain literal. The audit is an unpaid input check; it cannot establish
 whether a model will return the required exact read-back.
 
+Ordinary receipts may be eligible native user records or production-recognized
+human queued-command attachments; each take-in starts its own exchange window.
+Only recognized informational native records without temporal evidence are
+excluded from timestamp checks; actual evidence still needs valid timestamps.
+
 Ordinary answers must belong to the delivered item's own native turn;
 foreign, stale, sidechain, synthetic, API-error or unfinished responses
 cannot supply JSON. A reply-tool answer requires linked native completion;
-streaming records may share the same native message identity. AC11/AC12/AC20
+streaming records may share the same native message identity.
+
+AC11/AC12/AC20
 use each case's sequence, including AC11 case_03 at sequence 3. AC15
 uses sequence 1 and the final multipart receipt; AC23 uses sequences 2/3
 after compact/resume; AC91 checks DM sequence 1 and thread sequence 2 even
@@ -1116,20 +1123,31 @@ Delivery p95 was 3869 ms, within its 10000 ms limit. Duplicate upgrade reads
 exhausted the unchanged 40-call/10-second budget. The own-marker fast path
 passes a deterministic sustained-load regression (typing p95 2880 ms before,
 1567 ms after); the recorded-gap control passes before the fix too.
-Current focused AI results on `azure/openai/gpt-6-astra`, native 2.1.296,
-with fallback disabled are 18 PASS and three FAIL: AC11, AC12, AC20, AC23,
-AC91 and AC106 each passed all three trials; AC15 failed all three 180 s
-runs. No classifier stop occurred. The observed AC15 sequence after part
-one was an empty assistant turn, a native visible-response follow-up, then
-a permission-held `fetch_messages` request; parts two and three were not
-sent. No production defect is established; the roughly 15-second delay
+The previous focused AI run on `azure/openai/gpt-6-astra`, native 2.1.296,
+with fallback disabled recorded 18 PASS and three FAIL: AC11, AC12, AC20,
+AC23, AC91 and AC106 each passed all three trials; AC15 failed all three
+180 s runs. No classifier stop occurred. The observed AC15 sequence after
+part one was an empty assistant turn, a native visible-response follow-up,
+then a permission-held `fetch_messages` request; parts two and three were
+not sent. No production defect is established; the roughly 15-second delay
 before the permission prompt remains unexplained.
 
-The response/tool discipline and observer controls do not change those
-failures. Three fresh AC15 trials and the full 58-invocation heavy run remain
-required; the heavy run has not started and is not waived. The full `/ci`
-PASS on `fc763a36` predates this AC15 test change. Unpaid controls, full unit
-success and earlier diagnostics do not establish fresh AI or heavy acceptance.
+The three fresh AC15 trials in
+`real-decision19-ac15-refocus-1792226929095-183941` also failed (0 PASS,
+3 FAIL), on actual `azure/openai/gpt-6-astra` and native 2.1.296, with zero
+classifier stops and zero duplicates. All three parts were delivered exactly
+in each trial. Trial 1 returned the correct case/message count but a
+5,338-character body instead of 5,000; trial 2 produced no valid required
+JSON; trial 3 returned short bodies of 1,869 and 1,631 characters.
+
+These results preserve the earlier failures and the six other criteria's
+historical 3-of-3 successes. Unpaid replay of the actual native snapshot now
+reaches trial 1's exact-body mismatch, not a pass. The 5,000-character fixture,
+JSON schema, assertions and 3-of-3 requirement are unchanged. No further paid
+run starts before the owner's decision; the full 58-invocation heavy run has
+not started and is not waived. The full `/ci` PASS on `fc763a36` predates these
+AC15 test changes. Unpaid controls, full unit success and earlier diagnostics
+do not establish fresh AI or heavy acceptance.
 
 Local jobs use the committed `/ci` caps, currently 2 GiB, 2 CPUs and 2,048
 PIDs, with 3 h per job. `docker/Dockerfile.real-agent` and
