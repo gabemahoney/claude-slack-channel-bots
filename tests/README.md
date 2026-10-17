@@ -1051,11 +1051,26 @@ assertions retain their bounds.
 Test 104 checks the actual installed binary and its cached rollout after
 launch. It records the binary digest and available native token floor/timer; unsupported
 binaries (including 2.1.280), disabled settings, off/log rollout modes and
-timers beyond 45 minutes produce a specific `recorded:` skip reason. Unknown
-implementation semantics fail for investigation. The scenario requests a 1 h
-cache but never seeds or rewrites rollout flags to enable the feature.
+timers beyond 45 minutes produce a specific `recorded:` skip reason.
 
-For an eligible version, genuine pre-allowed `Read(./idle-budget/**)` tool
+The 2.1.302 policy requires all 32 audited captured fragments and dependencies
+to match; a version number alone establishes no capability or skip. Unknown
+implementation semantics, missing fetched rollout or unknown effective cache
+TTL fail for investigation. Structured proof records the recognized profile,
+actual mode, conclusion and available token, timing, TTL and disabling-setting
+witnesses; the scenario never seeds or rewrites rollout flags.
+
+Ordinary `compact` mode is eligible only with the required 1 h cache and its
+actual timer at or below 45 minutes. Effective TTL follows native settings and
+environment precedence, including forced or per-message 5 m overrides that
+make the idle timer ineligible.
+
+`compact_on_return` performs live background precomputation without emitting a
+compaction-start event; application cannot occur until the required 1 h cache
+expires. Its 60-minute lower bound proves inability to meet this trial's
+45-minute observation bound; it is not an off or unknown rollout mode.
+
+For an eligible capability, genuine pre-allowed `Read(./idle-budget/**)` tool
 calls build the required context. The budget is the latest own request's
 input plus cache-read/cache-creation usage, excluding output and earlier
 requests; total run tokens cannot satisfy it. Test 104 observes an active
