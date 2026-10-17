@@ -5,6 +5,7 @@ TEST_NAME="test-101-fmk-real-busy"
 source "$(dirname "$0")/../integration/lib/scenario.sh"
 source "$(dirname "$0")/../integration/lib/real-scenario.sh"
 CASE_ASSERT="${SCENARIO_FIXTURES}/real-case-assertions.ts"
+BUSY_SETTLED="$(dirname "$0")/test-101-denial-settled.ts"
 case_assert() { bun "${CASE_ASSERT}" "$1" "${SLACK_STATE_DIR}" "${REAL_KEY}" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" "${@:2}"; }
 real_prepare "${REAL_AGENT_CLAUDE_VERSION:-2.1.296}" 'Bash(sleep *)' mcp__slack-channel-router__reply
 # Native Claude can auto-allow harmless printf commands. Force only these
@@ -45,8 +46,15 @@ real_wait_idle "${REAL_KEY}"
 real_dm "${REAL_LABEL}" 'Use Agent to ask a subagent to run Bash printf subagent-deny-probe. Keep its dialog open after the denied tool.'
 wait_until 180 'subagent permission not opened' case_assert subagent-permission "${SCENARIO_SLACK_RECORD}"
 ACTION="$(case_assert relay-action "${SCENARIO_SLACK_RECORD}" deny "${REAL_USER}")"
+printf '%s\n' "${ACTION}" > "${SCENARIO_ROOT}/deny-click.json"
 curl -fsS --max-time 20 -X POST -H 'Content-Type: application/json' --data-binary "${ACTION}" "${SCENARIO_SLACK_STUB_URL}/_push" > "${SCENARIO_ROOT}/deny-action.json"
 wait_until 180 'Deny click did not reach CSCB relay' case_assert relay-decision "${SCENARIO_SLACK_RECORD}" deny
+# A Stop can precede background Agent completion. Observe the actual matching
+# denial and native completion first, then the production-backed idle composer.
+wait_until 180 'denied subagent did not settle after successful relay response' \
+    bun "${BUSY_SETTLED}" "${SLACK_STATE_DIR}" "${REAL_KEY}" \
+    "${HOME}/.claude/projects" "${SCENARIO_SLACK_RECORD}" "${SCENARIO_ROOT}/deny-click.json"
+real_wait_idle "${REAL_KEY}"
 real_dm "${REAL_LABEL}" 'message after denied subagent request'
 wait_until 180 'dialog-hold Delivery stuck was not posted' case_assert dialog-notice "${SCENARIO_SLACK_RECORD}" "${REAL_LABEL}"
 real_ad kill --instance-id "$(real_instance "${REAL_KEY}")" >/dev/null

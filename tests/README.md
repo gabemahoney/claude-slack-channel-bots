@@ -836,6 +836,22 @@ read-back checks compare required fields through `real-case-assertions.ts`.
 | `test-191-fmk-real-ai-ac91.sh` | DM/thread replies without an operator prompt file |
 | `test-206-fmk-real-ai-ac106.sh` | Duplicate copy recognized as one logical DM |
 
+Test 101 pre-allows `Bash(sleep *)` and the Slack reply tool, and sets exact
+`permissions.ask` rules for `Bash(printf permission-probe)` and
+`Bash(printf subagent-deny-probe)` in its disposable HOME. These rules keep
+both deliberate permission prompts observable even when native Claude
+automatically allows benign commands.
+
+Before queueing message six, `tests/real-agent/test-101-denial-settled.ts`
+requires the matching successful Slack Denied update, the native
+`permission-rule` denial and completion of the identity-linked subagent.
+It also requires a completed Agent result or a consumed asynchronous
+completion notification and subsequent main completion, then Test 101 runs
+the existing `real_wait_idle` empty-composer check. This preparation uses
+only the Slack stub record and own native transcripts; the permission hold,
+Allow, Agent Deny, actual `dialog-hold` notice, restart and six-delivery
+assertions retain their bounds.
+
 Test 104 checks the actual installed binary and its cached rollout after
 launch. It records the binary digest and available native token floor/timer; unsupported
 binaries (including 2.1.280), disabled settings, off/log rollout modes and
