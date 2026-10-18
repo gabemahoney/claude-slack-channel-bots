@@ -236,6 +236,28 @@ describe('observed native Claude composer forms', () => {
 // Keep the native header/history, 80-column rules, NBSP and l> residue together.
 const observedSeparatorPane = readFileSync(new URL('./fixtures/claude-observed-separator-pane.txt', import.meta.url), 'utf8')
 
+// Verbatim 2.1.302 pane from real-1792330301504-109565, fidelity-failure-evidence.json
+// (idle_diagnostic.pane). Only the variants below are derived controls.
+const observedShortFooterPane = readFileSync(new URL('./fixtures/claude-2.1.302-empty-residue-pane.txt', import.meta.url), 'utf8')
+
+describe.each([
+  ['captured short footer', observedShortFooterPane],
+  ['agents shortcut footer', observedShortFooterPane.replace('⏸ manual mode on · ? for shortcuts', '⏸ manual mode on · ? for shortcuts · ← for agents')],
+])('native residue with %s', (_name, pane) => {
+  test('the empty composer is ready', () => {
+    expect(readDeliveryScreen('claude', pane)).toEqual({ kind: 'empty', running: false })
+  })
+  test('a draft cannot authorize Enter', () => {
+    expect(readDeliveryScreen('claude', pane.replace('❯\u00a0\n', '❯\u00a0<channel>mine</channel>\n'), '<channel>mine</channel>')).toEqual({ kind: 'menu', running: false })
+  })
+  test('mismatched rule widths cannot prove an empty composer', () => {
+    expect(readDeliveryScreen('claude', pane.replace('─'.repeat(80) + '\n', '─'.repeat(79) + '\n'))).toEqual({ kind: 'menu', running: false })
+  })
+  test('a current selection menu blocks even after the observed idle frame', () => {
+    expect(readDeliveryScreen('claude', `${pane}\n${panes.SELECT_MENU_PANE}`)).toEqual({ kind: 'menu', running: false })
+  })
+})
+
 describe('observed native empty frame after an emoji turn', () => {
   test.each([
     ['verbatim capture', observedSeparatorPane],

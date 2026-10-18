@@ -9,7 +9,8 @@ const rule = (line: string): boolean => /^\s*[─━\-]{8,}\s*$/.test(line)
 /** b.omv SR-5.3/14.2: native 2.1.296 left `l>` over the first two
  * columns of the lower rule after case 10's emoji turn. Recognize only
  * that empty frame: one NBSP prompt row, an intact upper rule of the
- * same width, and the observed manual footer at the bottom. The residue
+ * same width, and the observed manual footer at the bottom (2.1.302
+ * also omits the agents shortcut). The residue
  * is never removed from composer text or accepted around a draft.
  */
 function observedEmptyClaudeLowerRule(lines: readonly string[], index: number): boolean {
@@ -18,7 +19,7 @@ function observedEmptyClaudeLowerRule(lines: readonly string[], index: number): 
     && lines[index - 2] === '─'.repeat(lower.length)
     && lines[index - 1] === '❯\u00a0'
     && index + 2 === lines.length
-    && lines[index + 1]!.trim() === '⏸ manual mode on · ? for shortcuts · ← for agents'
+    && /^⏸ manual mode on · \? for shortcuts(?: · ← for agents)?$/.test(lines[index + 1]!.trim())
 }
 const menuFooter = /esc to cancel|enter to select|enter to confirm|to navigate/i
 const runningLine = /^[✢✳✶✻✽·*].*…(?:\s|$)|^[✢✳✶✻✽·*].*[……].*(?:\(|tokens|thinking)|esc to interrupt|interrupt.*esc/i
