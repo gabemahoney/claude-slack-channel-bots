@@ -224,8 +224,22 @@ _real_connected() {
     grep -F 'Session connected: persona ' "${SLACK_STATE_DIR}/server.log" | grep -qF "(key=$1)"
 }
 real_wait_delivery() {
-    wait_until "${REAL_DELIVERY_WAIT_S}" "real persona $1 has open/unconfirmed deliveries" \
-        bun "${REAL_RECEIPTS}" ready "${SLACK_STATE_DIR}" "$1" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" "${2:-}" "${3:-}"
+    _scenario_check_timeout "${REAL_DELIVERY_WAIT_S}" real_wait_delivery
+    if _scenario_poll_until "${REAL_DELIVERY_WAIT_S}" \
+        bun "${REAL_RECEIPTS}" ready "${SLACK_STATE_DIR}" "$1" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" "${2:-}" "${3:-}"; then return 0; fi
+    # Capture while the live row, composer and receipt files still exist.
+    # Diagnostics cannot turn the expired wait into success or replace FAIL.
+    _real_delivery_diagnostic "$@" || echo 'recorded: delivery diagnostic unavailable'
+    fail "real persona $1 has open/unconfirmed deliveries (not within ${REAL_DELIVERY_WAIT_S}s)"
+}
+_real_delivery_diagnostic() {
+    local pane="${SCENARIO_ROOT}/real-delivery-pane.json" status="${SCENARIO_ROOT}/real-delivery-status.json"
+    real_ad status --instance-id "$(real_instance "$1")" > "${status}" 2>/dev/null || printf '{}\n' > "${status}"
+    real_pane "$1" 40 > "${pane}" 2>/dev/null || printf '{}\n' > "${pane}"
+    bun "${REAL_RECEIPTS}" diagnostic "${SLACK_STATE_DIR}" "$1" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" "${2:-}" "${3:-}" "${pane}" "${status}" \
+        || echo 'recorded: delivery receipt diagnostic unavailable'
+    bun "${SCENARIO_FIXTURES}/real-observations.ts" --idle-diagnostic "${pane}" "${status}" \
+        || echo 'recorded: delivery composer diagnostic unavailable'
 }
 real_assert_no_retype() {
     bun "${REAL_RECEIPTS}" ready "${SLACK_STATE_DIR}" "$1" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" "${2:-}" no-retype \

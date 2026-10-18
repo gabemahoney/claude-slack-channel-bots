@@ -9,7 +9,7 @@ require_scenario_home codex-observation
 [[ "${CODEX_TEST_MODEL:-}" =~ ^[A-Za-z0-9._:/-]+$ ]] || fail 'Codex requires the runner-selected model'
 [[ -f /run/codex-login/auth.json ]] || fail 'Codex requires its dedicated single-file login mount'
 # No real-scenario.sh: D1 has no CSCB server, Slack stub or Claude model calls.
-bun "$(dirname "$0")/../real-agent/codex-delivery.ts" gate
+PATH="${SCENARIO_TMUX_SHIM_BIN}:${PATH}" bun "$(dirname "$0")/../real-agent/codex-delivery.ts" gate
 [[ -L "${HOME}/.codex/auth.json" ]] || fail 'scratch Codex auth.json stopped being a symlink'
 assert_codex_d1_safety
 echo "PASS: ${TEST_NAME}"

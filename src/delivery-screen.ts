@@ -76,18 +76,34 @@ function observedCodexShortcutsOverlay(lines: readonly string[], composer: numbe
   }
   return false
 }
-/** Native Claude wraps the current composer at a column or a word boundary.
+/** Native 0.159.2, E7 run 20261018t002342z-m45phlhp, puts its status above the
+ * bottom hint row, with an empty frame row before the status. Recognize
+ * that extra footer row only in this position, never by scanning drafts
+ * for footer-like words. The bottom row's configured text is arbitrary.
+ */
+function codexFooterStart(block: readonly string[]): number {
+  let footer = block.length - 1
+  if (footer > 1 && block[footer - 2] === ''
+    && /^\s*(?:gpt-|codex-)\S+ (?:default|minimal|low|medium|high|xhigh|max) · \S.*$/i.test(block[footer - 1]!)) footer--
+  // The observed frame has one padding row; additional blank rows belong
+  // to the composer and must participate in complete ownership matching.
+  if (footer > 1 && block[footer - 1] === '') footer--
+  return Math.max(1, footer)
+}
+/** Native Claude and Codex wrap the current composer at a column or word boundary.
+ * Codex 0.159.2: E7 run 20261018t002342z-m45phlhp, swallowed-Enter capture.
  * Resolve only those observed display breaks against the known complete
  * item; an unrelated draft sharing a tag's first visual line is not ours.
  * This is a screen ownership rule, never transcript normalization.
  */
-function renderedOwnText(displayed: string, own: string): boolean {
+function renderedOwnText(displayed: string, own: string, preserveBlankLines = false): boolean {
   const lines = displayed.split('\n')
   let offsets = new Set([0])
   for (let index = 0; index < lines.length; index++) {
     const next = new Set<number>(), line = lines[index]!
+    const separators = index === 0 ? [''] : preserveBlankLines && (!line.trim() || !lines[index - 1]!.trim()) ? ['\n'] : ['', ' ', '\n']
     for (const offset of offsets) {
-      for (const separator of index === 0 ? [''] : ['', ' ', '\n']) {
+      for (const separator of separators) {
         const start = offset + separator.length
         if (own.startsWith(separator, offset) && own.startsWith(line, start)) next.add(start + line.length)
       }
@@ -97,15 +113,15 @@ function renderedOwnText(displayed: string, own: string): boolean {
   }
   return offsets.has(own.length)
 }
-function observation(text: string, own: string | undefined, running: boolean, claude: boolean): DeliveryScreen {
+function observation(text: string, own: string | undefined, running: boolean, claude: boolean, renderedText = text): DeliveryScreen {
   const empty = text.trim() === '' || (claude
     ? /^(?:Try ["“].*["”]|Press up to edit queued messages|Message @\S+…)\s*$/.test(text.trim())
     : /^(?:Ask Codex to do anything|Ask a follow-up question)\s*$/.test(text.trim()))
   if (empty) return { kind: 'empty', running }
-  // Prefix recognition is deliberately conservative: it must start at the
-  // composer, never at a quoted historical prompt. Long-paste drawing is SR-5.4.
+  // Claude prefix/paste recognition stays at the current composer (SR-5.4).
+  // Codex needs the complete rendered item, including every continuation.
   const prefix = own?.split('\n')[0]
-  if (own && ((prefix && text.startsWith(prefix)) || (claude && (text.startsWith('[Pasted text') || renderedOwnText(text, own))))) return { kind: 'own', text, running }
+  if (own && ((claude && ((prefix && text.startsWith(prefix)) || text.startsWith('[Pasted text'))) || renderedOwnText(renderedText, own, !claude))) return { kind: 'own', text, running }
   return { kind: 'input', text, running }
 }
 export function readDeliveryScreen(agent: DeliveryAgent, pane: string, ownText?: string): DeliveryScreen {
@@ -139,11 +155,14 @@ export function readDeliveryScreen(agent: DeliveryAgent, pane: string, ownText?:
   const block = lines.slice(composer)
   if (block.some(line => menuFooter.test(line) || /Viewing sub-agent — direct input is disabled/i.test(line))) return { kind: 'menu', running: false }
   const text = [block[0]!.replace(/^\s*› ?/, '')]
-  // Codex reserves the bottom row for its footer, whose configured text is
-  // arbitrary. It is a position, not the '? for shortcuts' string anchor.
-  for (const line of block.slice(1, block.length > 1 ? -1 : undefined)) {
-    if (/\? for shortcuts|context left|\d+% left|^\s*(?:gpt-|codex-|model:)|esc to interrupt/i.test(line)) break
+  // Keep internal blank rows for complete ownership matching: a human's
+  // added blank line must not disappear as a soft wrap.
+  const renderedText = [...text]
+  // Establish the footer boundary before matching; a human continuation
+  // mentioning a model, context or shortcuts is still composer text.
+  for (const line of block.slice(1, codexFooterStart(block))) {
+    renderedText.push(line.replace(/^  /, ''))
     if (line.trim()) text.push(line.replace(/^  /, ''))
   }
-  return observation(text.join('\n'), ownText, lines.slice(0, composer).some(line => runningLine.test(line) || /esc to interrupt/i.test(line)), false)
+  return observation(text.join('\n'), ownText, lines.slice(0, composer).some(line => runningLine.test(line) || /esc to interrupt/i.test(line)), false, renderedText.join('\n'))
 }

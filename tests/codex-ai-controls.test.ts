@@ -2,7 +2,7 @@
 import { describe, expect, test } from 'bun:test'
 import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
-import { codexAC15Body, codexAC15Message, codexAICases, codexSlackInput, tagReadback, assertCodexAnswer, assertCodexNoShell, assertCodexMultipart, assertCodexDuplicateTakeins } from './real-agent/codex-ai.ts'
+import { codexAC15Body, codexAC15Message, codexAICases, codexSlackInput, tagReadback, assertCodexAnswer, assertCodexNoShell, assertCodexMultipart, assertCodexDuplicateTakeins, codexMultipartSender } from './real-agent/codex-ai.ts'
 import { projectCodexRollout, type CodexWindow } from './real-agent/codex-evidence.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
 import { buildTagParts } from '../src/tag-wrapper.ts'
@@ -10,6 +10,37 @@ import { buildTagParts } from '../src/tag-wrapper.ts'
 const model = 'synthetic-model', session = 'synthetic-session'
 const expected = { case: 'case_01', attributes: { user_id: 'U0REAL' }, body: 'ordinary text' }
 const window: CodexWindow = { session, model, offset: 0, sentAt: 1000, text: '<channel>ordinary text</channel>' }
+
+describe('AC15 completed-part pacing', () => {
+  test('a native acknowledgement holds the next part until completion', async () => {
+    const sent: unknown[] = [], completed: string[] = []
+    let release!: () => void, started!: () => void
+    const acknowledged = new Promise<void>(resolve => { release = resolve })
+    const observing = new Promise<void>(resolve => { started = resolve })
+    const send = codexMultipartSender(async (params: { text?: string; no_enter?: boolean; key?: string }) => { sent.push(params); return 'sent' },
+      async text => { started(); await acknowledged; completed.push(text) })
+    await send({ text: 'first exact part', no_enter: true })
+    const enter = send({ key: 'Enter' })
+    await observing
+    await expect(send({ text: 'next exact part', no_enter: true })).rejects.toThrow('successor preceded completed acknowledgement')
+    expect(sent).toEqual([{ text: 'first exact part', no_enter: true }, { key: 'Enter' }])
+    expect(completed).toEqual([])
+    release(); await enter
+    await send({ text: 'next exact part', no_enter: true }); await send({ key: 'Enter' })
+    expect(completed).toEqual(['first exact part', 'next exact part'])
+    assertNoLeak({ sent, completed })
+  })
+  test('failed completion cannot release a successor part', async () => {
+    const sent: unknown[] = []
+    const send = codexMultipartSender(async (params: { text?: string; no_enter?: boolean; key?: string }) => { sent.push(params) },
+      async () => { throw new Error('synthetic incomplete native turn') })
+    await send({ text: 'first exact part', no_enter: true })
+    await expect(send({ key: 'Enter' })).rejects.toThrow('synthetic incomplete native turn')
+    await expect(send({ text: 'next exact part', no_enter: true })).rejects.toThrow('unacknowledged part')
+    expect(sent).toHaveLength(2)
+    assertNoLeak(sent)
+  })
+})
 function turn(text = window.text, answer: any = expected, at = 1001, id = 'synthetic-turn') {
   const row = (type: string, payload: any, time = at) => ({ type, payload, timestamp: new Date(time).toISOString() })
   return [row('event_msg', { type: 'task_started', turn_id: id }), row('turn_context', { model, turn_id: id }),

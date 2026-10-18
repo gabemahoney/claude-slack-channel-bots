@@ -1,7 +1,7 @@
 /** D1 refusal and evidence controls only. Every rollout below is synthetic;
  * these controls perform no login access, model call or native launch. */
 import { describe, expect, test } from 'bun:test'
-import { mkdtempSync, mkdirSync, rmSync, symlinkSync, realpathSync, readFileSync, writeFileSync, lstatSync, linkSync, chmodSync, renameSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, realpathSync, readFileSync, writeFileSync, lstatSync, linkSync, chmodSync, renameSync, existsSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
@@ -9,10 +9,251 @@ import { codexContainment, codexArguments, configureScratchCodex, createScratchC
 import { checkCodexScratchConfigKeys, encodeCodexHostConfigKeys } from '../src/codex-config-keys.ts'
 import { completedCodexTurn, codexNoTurn, projectCodexRollout, safeCodexEvents } from './real-agent/codex-evidence.ts'
 import { assertNoLeak, fakeToken, BOT_TOKEN_PREFIX } from './test-helpers/credentials.ts'
+import { projectCrashProgress, publishCrashProgress, readCrashProgress, waitForCrashBoundary, type CrashProgress } from './real-agent/codex-crash-barrier.ts'
 
 const session = 'synthetic-session', model = 'synthetic/model', text = 'synthetic exact input', sentAt = 1000
 const hostProjection = encodeCodexHostConfigKeys([['model']])
 const nativeConfig = '[tui]\nscreen_reader_detection_done = true\n'
+
+describe('D1 crash-worker checkpoints and durable-pair boundary (synthetic; no native process)', () => {
+  const progress = (patch: Partial<CrashProgress> = {}): CrashProgress => ({ version: 1, pid: 321, instance: 'cscb_codex_gate',
+    stage: 'startup', firstSeq: null, successorSeq: null, prepared: false, clientReady: false, queueReady: false,
+    textStarted: false, textReturned: false, failed: false, errors: 0, error: 'none', ...patch })
+  function fixture() {
+    const root = mkdtempSync('/tmp/codex-crash-control-'), checkpoint = join(root, 'progress.json'), marker = join(root, 'marker.json')
+    let at = 0
+    const child = { pid: 321, exitCode: null as number | null, signalCode: null as string | null }
+    const diagnostics: any[] = [], order: string[] = []
+    const records = [{ kind: 'accepted', seq: 13 }]
+    const f = {
+      root, checkpoint, marker, child, diagnostics, order, records, at: () => at,
+      advance: (_at: number) => {}, visible: async () => true,
+      sleep: async (ms: number) => { at += ms; f.advance(at) },
+      checkpointAt: (patch: Partial<CrashProgress> = {}) => publishCrashProgress(checkpoint, progress(patch)),
+      boundary: () => {
+        const p = progress({ stage: 'barrier-published', firstSeq: 14, textStarted: true, textReturned: true })
+        publishCrashProgress(marker, p); publishCrashProgress(checkpoint, p)
+        records.push({ kind: 'accepted', seq: 14 })
+      },
+      successor: () => {
+        const p = readCrashProgress(checkpoint, child.pid, 'cscb_codex_gate').value!
+        publishCrashProgress(checkpoint, { ...p, successorSeq: 15 }); records.push({ kind: 'accepted', seq: 15 })
+      },
+      run: async () => {
+        try {
+          return await waitForCrashBoundary({ child, checkpoint, marker, instance: 'cscb_codex_gate', journal: () => records,
+            inputVisible: () => f.visible(), counts: () => ({ queue: records.length, text: 1, enter: 0 }),
+            diagnostic: value => { assertNoLeak(value); diagnostics.push(value); order.push('diagnostic') },
+            bound: () => order.push('bound'), now: () => at, sleep: ms => f.sleep(ms),
+          })
+        } finally { order.push('cleanup'); rmSync(root, { recursive: true, force: true }) }
+      },
+    }
+    return f
+  }
+  test('delayed child startup, successful text return and delayed successor retain both exact durable IDs', async () => {
+    const f = fixture()
+    f.advance = at => {
+      if (at === 250) f.checkpointAt({ stage: 'client-ready' })
+      if (at === 500) {
+        f.boundary()
+        // Old penultimate acceptance chooses unrelated work before successor acceptance.
+        expect(f.records.filter(r => r.kind === 'accepted').at(-2)?.seq).toBe(13)
+      }
+      if (at === 1000) f.successor()
+    }
+    expect(await f.run()).toEqual({ firstSeq: 14, successorSeq: 15 })
+    expect(f.at()).toBe(1000)
+    expect(f.diagnostics).toEqual([{ checkpointStatus: 'valid', markerStatus: 'valid',
+      progress: progress({ stage: 'barrier-published', firstSeq: 14, successorSeq: 15, textStarted: true, textReturned: true }),
+      exit: null, signal: null, counts: { queue: 3, text: 1, enter: 0 } }])
+    expect(f.order).toEqual(['diagnostic', 'cleanup']); expect(existsSync(f.root)).toBe(false)
+  })
+  test('publication between protocol reads never pairs a stale checkpoint with a new marker', () => {
+    const f = fixture(); f.checkpointAt()
+    try {
+      // Intercept only this child's filesystem read: publish after its old
+      // checkpoint bytes have been captured, before the helper's next read.
+      const script = `
+        import { mock } from 'bun:test';
+        import * as fs from 'node:fs';
+        const actualRead = fs.readSync;
+        let protocol, published = false, at = 0;
+        const complete = ${JSON.stringify(progress({ stage: 'barrier-published', firstSeq: 14, successorSeq: 15, textStarted: true, textReturned: true }))};
+        mock.module('node:fs', () => ({ ...fs, readSync(fd, bytes, ...args) {
+          const n = actualRead(fd, bytes, ...args);
+          if (!published && bytes.subarray(0, n).toString().includes('"stage":"startup"')) {
+            published = true;
+            protocol.publishCrashProgress(${JSON.stringify(f.checkpoint)}, complete);
+            protocol.publishCrashProgress(${JSON.stringify(f.marker)}, complete);
+          }
+          return n;
+        } }));
+        protocol = await import(${JSON.stringify(join(import.meta.dir, 'real-agent/codex-crash-barrier.ts'))});
+        const diagnostics = [];
+        const result = await protocol.waitForCrashBoundary({
+          child: ${JSON.stringify(f.child)}, checkpoint: ${JSON.stringify(f.checkpoint)}, marker: ${JSON.stringify(f.marker)},
+          instance: 'cscb_codex_gate', journal: () => [{ kind: 'accepted', seq: 14 }, { kind: 'accepted', seq: 15 }],
+          inputVisible: async () => true, counts: () => ({ queue: 2, text: 1, enter: 0 }),
+          diagnostic: value => diagnostics.push(value), bound: () => { throw new Error('unexpected deadline'); },
+          now: () => at, sleep: async ms => { at += ms; },
+        });
+        console.log(JSON.stringify({ result, published, at, diagnostics }));
+      `
+      const child = spawnSync(process.execPath, ['--eval', script], {
+        env: hostSafeChildEnv(f.root, { tools: [] }), encoding: 'utf8', timeout: 5000,
+      })
+      assertNoLeak({ stdout: child.stdout, stderr: child.stderr })
+      expect(child.error).toBeUndefined(); expect(child.signal).toBeNull(); expect(child.stderr).toBe(''); expect(child.status).toBe(0)
+      expect(JSON.parse(child.stdout)).toEqual({ result: { firstSeq: 14, successorSeq: 15 }, published: true, at: 250,
+        diagnostics: [{ checkpointStatus: 'valid', markerStatus: 'valid',
+          progress: progress({ stage: 'barrier-published', firstSeq: 14, successorSeq: 15, textStarted: true, textReturned: true }),
+          exit: null, signal: null, counts: { queue: 2, text: 1, enter: 0 } }] })
+    } finally { rmSync(f.root, { recursive: true, force: true }) }
+  })
+  test.each([
+    ['ordinary exit', 7, null], ['signal exit', null, 'SIGTERM'], ['unrecognized signal', null, 'foreign-signal'],
+  ] as const)('%s preserves only projected status before cleanup', async (_name, exit, signal) => {
+    const f = fixture(); f.checkpointAt({ stage: 'client-ready' })
+    f.child.exitCode = exit; f.child.signalCode = signal
+    await expect(f.run()).rejects.toThrow('exited before text boundary')
+    expect(f.diagnostics[0]).toMatchObject({ progress: { stage: 'client-ready' }, exit, signal: signal === 'foreign-signal' ? 'other' : signal })
+    expect(f.order).toEqual(['diagnostic', 'cleanup'])
+  })
+  test.each(['live startup stall', 'transport rejection', 'missing marker', 'missing successor', 'invisible input', 'late input'])(
+    '%s keeps the original 180-second failure and diagnostic-before-cleanup order', async kind => {
+      const f = fixture(); f.checkpointAt({ stage: 'queue-ready' })
+      if (kind === 'transport rejection') f.checkpointAt({ stage: 'text-call-start', firstSeq: 14, textStarted: true, errors: 4, error: 'ErrRelayFallenBack' })
+      if (['missing marker', 'missing successor', 'invisible input', 'late input'].includes(kind)) f.boundary()
+      if (kind === 'missing marker') unlinkSync(f.marker)
+      if (['invisible input', 'late input'].includes(kind)) { f.successor(); f.visible = async () => kind === 'late input' && f.at() >= 180000 }
+      await expect(f.run()).rejects.toThrow('observation incomplete within bound')
+      expect(f.at()).toBe(180000); expect(f.order).toEqual(['bound', 'diagnostic', 'cleanup'])
+      expect(f.diagnostics).toHaveLength(1)
+      if (kind === 'transport rejection') expect(f.diagnostics[0].progress).toMatchObject({ stage: 'text-call-start', errors: 4, error: 'ErrRelayFallenBack', textReturned: false })
+      if (kind === 'missing marker') expect(f.diagnostics[0].markerStatus).toBe('missing')
+    })
+  test.each(['foreign PID', 'foreign instance', 'foreign sequence', 'malformed', 'unknown field', 'unreturned text', 'oversize', 'symlink'])(
+    '%s cannot satisfy a boundary or leak malformed protocol contents', async kind => {
+      const f = fixture(); f.boundary(); f.successor()
+      const token = fakeToken(BOT_TOKEN_PREFIX)
+      if (kind === 'foreign PID') publishCrashProgress(f.marker, progress({ pid: 999 }))
+      if (kind === 'foreign instance') writeFileSync(f.marker, JSON.stringify({ ...progress(), instance: token }))
+      if (kind === 'foreign sequence') publishCrashProgress(f.marker, progress({ firstSeq: 12, textStarted: true, textReturned: true }))
+      if (kind === 'malformed') writeFileSync(f.marker, '{' + token)
+      if (kind === 'unknown field') writeFileSync(f.marker, JSON.stringify({ ...progress(), secret: token }))
+      if (kind === 'unreturned text') publishCrashProgress(f.marker, progress())
+      if (kind === 'oversize') writeFileSync(f.marker, token.repeat(1000))
+      if (kind === 'symlink') { unlinkSync(f.marker); symlinkSync(f.checkpoint, f.marker) }
+      await expect(f.run()).rejects.toThrow(/invalid crash protocol|does not match successful text boundary/)
+      expect(f.order).toEqual(['diagnostic', 'cleanup']); assertNoLeak(f.diagnostics)
+    })
+  test('checkpoint publication leaves the target absent or complete during a partial temporary write', () => {
+    const root = mkdtempSync('/tmp/codex-atomic-control-'), file = join(root, 'marker.json')
+    try {
+      const source = readFileSync(join(import.meta.dir, 'real-agent/codex-crash-barrier.ts'), 'utf8')
+      const declaration = source.match(/^export function publishCrashProgress[\s\S]*?^\}/m)![0].replace('export ', '')
+      const observations: string[] = []
+      const publish = new Function('projectCrashProgress', 'writeFileSync', 'renameSync', 'unlinkSync',
+        new Bun.Transpiler({ loader: 'ts' }).transformSync(declaration + '\nreturn publishCrashProgress'))(
+        projectCrashProgress, (temporary: string, body: string, options: any) => {
+          writeFileSync(temporary, body.slice(0, 10), options)
+          observations.push(existsSync(file) ? readFileSync(file, 'utf8') : 'missing')
+          writeFileSync(temporary, body)
+        }, renameSync, unlinkSync)
+      publish(file, progress()); const first = readFileSync(file, 'utf8')
+      publish(file, progress({ stage: 'client-ready' }))
+      expect(observations).toEqual(['missing', first])
+      expect(readCrashProgress(file, 321, 'cscb_codex_gate').value?.stage).toBe('client-ready')
+      expect(lstatSync(file).mode & 0o777).toBe(0o600)
+    } finally { rmSync(root, { recursive: true, force: true }) }
+  })
+  test.each(['success', 'transport rejection', 'arbitrary error'])('actual driver text callback records %s without streams or exception text', async kind => {
+    const root = mkdtempSync('/tmp/codex-driver-checkpoint-')
+    try {
+      const source = readFileSync(join(import.meta.dir, 'real-agent/codex-delivery.ts'), 'utf8')
+      const extract = (name: string) => source.match(new RegExp(`^(?:async )?function ${name}[\\s\\S]*?^\\}`, 'm'))![0]
+      const token = fakeToken(BOT_TOKEN_PREFIX), captured: any = { log: [] }
+      const transport = { ErrDialogMaybeOpen: class extends Error {}, ErrInvalidFlags: class extends Error {},
+        ErrSendKeysWhileRelayed: class extends Error {}, ErrRelayFallenBack: class extends Error {} }
+      let resolve!: (value: unknown) => void, reject!: (error: unknown) => void
+      const result = new Promise((yes, no) => { resolve = yes; reject = no })
+      const program = [
+        `let crashProgress = ${JSON.stringify(progress())};`,
+        "let stage = 'prepare', crashBarrier = true, multipartSend, engines, preparation, queue, lifecycle;",
+        "const process = { argv: ['bun', 'driver', 'crash-worker'] };",
+        'const key = "synthetic", userNames = new Map(), channelNames = new Map();',
+        'const instance = "cscb_codex_gate", work = stateDir;',
+        'const queueModule = { createDeliveryQueue: () => ({ start: async () => {} }) };',
+        'const engineModule = { createDeliveryLifecycle: () => ({}), createDeliveryEngines: options => { captured.options = options; return {}; } };',
+        'const intakeModule = { createDeliveryPreparation: () => ({ recover: async () => {} }) };',
+        'const receivedItem = () => {}, engineEvent = () => {}, log = text => captured.log.push(text);',
+        extract('crashCheckpoint'), extract('crashError'), extract('buildEngine'),
+        'return { buildEngine, stage: () => stage };',
+      ].join('\n')
+      const driver = new Function('stateDir', 'crashProtocol', 'join', 'client', 'transport', 'randomBytes', 'captured',
+        new Bun.Transpiler({ loader: 'ts' }).transformSync(program))(
+        root, { publishCrashProgress }, join, { sendKeys: () => result }, transport, () => ({ toString: () => 'synthetic' }), captured)
+      await driver.buildEngine()
+      expect(readCrashProgress(join(root, 'crash-progress.json'), 321, 'cscb_codex_gate').value?.stage).toBe('queue-ready')
+      const sending = (await captured.options.clientFor()).sendKeys({ no_enter: true, text: token })
+      expect(readCrashProgress(join(root, 'crash-progress.json'), 321, 'cscb_codex_gate').value).toMatchObject({ stage: 'text-call-start', textReturned: false })
+      expect(existsSync(join(root, 'crash-after-text.json'))).toBe(false)
+      if (kind === 'success') {
+        let settled = false
+        void sending.then(() => { settled = true })
+        resolve({})
+        await Promise.resolve(); await Promise.resolve()
+        expect(readCrashProgress(join(root, 'crash-after-text.json'), 321, 'cscb_codex_gate').value).toMatchObject({ stage: 'text-call-return', textReturned: true })
+        expect(driver.stage()).toBe('crash-worker-barrier-published'); expect(settled).toBe(false)
+      } else {
+        const error = kind === 'transport rejection' ? new transport.ErrRelayFallenBack(token) : new Error(token)
+        reject(error)
+        await expect(sending).rejects.toBe(error)
+        captured.options.onError('synthetic', error)
+        expect(readCrashProgress(join(root, 'crash-progress.json'), 321, 'cscb_codex_gate').value).toMatchObject({
+          stage: 'text-call-start', textReturned: false, errors: 1, error: kind === 'transport rejection' ? 'ErrRelayFallenBack' : 'other' })
+        expect(existsSync(join(root, 'crash-after-text.json'))).toBe(false)
+      }
+      const files = [readFileSync(join(root, 'crash-progress.json'), 'utf8'),
+        existsSync(join(root, 'crash-after-text.json')) ? readFileSync(join(root, 'crash-after-text.json'), 'utf8') : '']
+      assertNoLeak({ files, log: captured.log }); expect(JSON.stringify(files)).not.toContain(token)
+    } finally { rmSync(root, { recursive: true, force: true }) }
+  })
+  test.each(['success', 'timeout'])('actual parent gate records child diagnostics before %s SIGKILL and cleanup', async kind => {
+    const f = fixture()
+    try {
+      if (kind === 'success') { f.boundary(); f.successor() }
+      const source = readFileSync(join(import.meta.dir, 'real-agent/codex-delivery.ts'), 'utf8')
+      const begin = source.indexOf('  const child = Bun.spawn('), end = source.indexOf("\n  stage = 'gate-trailing-popup-fidelity'", begin)
+      const shimLog = join(f.root, 'shim.log'); writeFileSync(shimLog, '')
+      const child = { ...f.child, exited: Promise.resolve(137), kill: (signal: string) => {
+        f.order.push(signal); child.exitCode = 137; child.signalCode = signal
+      } }
+      const captures: unknown[] = []
+      // The spawn receiver is a fake; replace only module-local path syntax
+      // so the unchanged gate body can execute in this isolated function.
+      const program = ["const instance = 'cscb_codex_gate', key = 'synthetic';", 'return (async () => {',
+        source.slice(begin, end).replace('import.meta.path', "'synthetic-driver'"), '})()'].join('\n')
+      const invoke = new Function('Bun', 'process', 'crashProtocol', 'stateDir', 'join', 'journal', 'pane', 'codexShimCalls',
+        'readFileSync', 'shimLog', 'record', 'buildEngine', 'queue', 'delivered', 'assertCodexRecovery',
+        new Bun.Transpiler({ loader: 'ts' }).transformSync(program))
+      const result = invoke({ spawn: () => child, sleep: f.sleep }, { execPath: 'synthetic-bun', env: {} },
+        { waitForCrashBoundary: (options: Parameters<typeof waitForCrashBoundary>[0]) => waitForCrashBoundary({ ...options,
+          checkpoint: f.checkpoint, marker: f.marker, now: f.at, sleep: f.sleep }) },
+        f.root, join, () => [...f.records, { kind: 'fixed', seq: 14, parts: ['synthetic exact text'] }],
+        async () => ({ screen: { kind: 'input' } }),
+        () => [{ parent: 321, instance: 'cscb_codex_gate', text: 'synthetic exact text', noEnter: true }],
+        readFileSync, shimLog, (label: string, value: unknown) => { captures.push(value); f.order.push(label) },
+        async () => {}, { items: () => [] }, async () => {}, () => {})
+      if (kind === 'success') await result
+      else await expect(result).rejects.toThrow('observation incomplete within bound')
+      expect(f.order).toEqual(kind === 'success' ? ['crash-worker', 'SIGKILL', 'harness-crash'] : ['bound', 'crash-worker', 'SIGKILL'])
+      expect(child.signalCode).toBe('SIGKILL'); assertNoLeak(captures)
+    } finally { rmSync(f.root, { recursive: true, force: true }) }
+    expect(existsSync(f.root)).toBe(false)
+  })
+})
 const scenarioSource = readFileSync(join(import.meta.dir, 'integration/lib/scenario.sh'), 'utf8')
 function shellFunction(name: string) {
   const declaration = scenarioSource.match(new RegExp(`^${name}\\(\\) \\{[\\s\\S]*?^\\}`, 'm'))?.[0]
@@ -21,6 +262,26 @@ function shellFunction(name: string) {
 }
 
 describe('D1 closing enforcement without a CSCB server (synthetic shell evidence)', () => {
+  test.each(['integration/test-41-fmk-real-codex.sh', 'real-agent/codex-ai-scenario.sh'])('%s gives the harness the tmux shim path', file => {
+    const root = mkdtempSync('/tmp/codex-driver-path-')
+    try {
+      const source = readFileSync(join(import.meta.dir, file), 'utf8')
+      const launch = source.split('\n').find(line => line.includes('codex-delivery.ts') && /\bbun\b/.test(line))!
+      const script = join(root, 'entry.sh'), shim = join(root, 'tmux-shim')
+      mkdirSync(shim)
+      writeFileSync(script, ['set -euo pipefail', 'SCENARIO_TMUX_SHIM_BIN="$1"', 'AI_CRITERION=11',
+        // This shell function never loads the driver or starts Bun, AD or tmux.
+        'bun() { [[ "$PATH" == "$SCENARIO_TMUX_SHIM_BIN":* ]] || return 9; echo synthetic-driver-sees-tmux-shim; }', launch].join('\n'))
+      const child = spawnSync('bash', [script, shim], {
+        env: hostSafeChildEnv(root, { tools: ['bash', 'dirname'] }), encoding: 'utf8', timeout: 5000,
+      })
+      expect(child.error).toBeUndefined(); expect(child.signal).toBeNull()
+      expect(child.status).toBe(0)
+      expect(child.stdout).toBe('synthetic-driver-sees-tmux-shim\n')
+      expect(child.stderr).toBe('')
+      assertNoLeak({ stdout: child.stdout, stderr: child.stderr })
+    } finally { rmSync(root, { recursive: true, force: true }) }
+  })
   function closing(options: { name?: string; before?: string; after?: string; omit?: boolean; subshell?: boolean } = {}) {
     const root = mkdtempSync('/tmp/codex-closing-'), scratch = join(root, 'scenario')
     mkdirSync(scratch)

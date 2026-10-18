@@ -277,6 +277,49 @@ export function percentile(values: number[], quantile: number): number {
   if (!values.length) throw new Error('No latency samples')
   return [...values].sort((a, b) => a - b)[Math.ceil(values.length * quantile) - 1]!
 }
+/** Failure-only projection: no message bodies, paths, IDs, raw errors or AD
+ * objects escape. All counters are bounded independently of queue size. */
+export function deliveryFailureEvidence(options: AuditOptions, entries: readonly TranscriptEntry[], adapters: ReceiptAdapters,
+  row: any = {}, pane?: string, screenReader?: (agent: 'claude', pane: string, own?: string) => { kind: string; running: boolean; text?: string }) {
+  const numeric = (n: any) => Number.isSafeInteger(n) && n >= 0 ? n : null
+  let reason = 'audit-unavailable'
+  try { auditReceipts(options, entries, adapters); reason = 'audit-now-ready-after-deadline' } catch (error) {
+    const message = error instanceof Error ? error.message : ''
+    // Only audit-owned, complete fixed strings survive, never arbitrary error
+    // messages (JSON/parser and filesystem errors can contain private bytes).
+    if (/^Accepted item count differs$/.test(message)) reason = 'accepted-count-differs'
+    else if (/^Item \d+ has no valid message-(received|delivered) timestamp$/.test(message)) reason = message.includes('message-delivered') ? 'missing-delivery-log' : 'missing-receive-log'
+    else if (/^Item \d+ has no fixed parts$/.test(message)) reason = 'missing-fixed-parts'
+    else if (/^Item \d+ part \d+ has no exact transcript receipt$/.test(message)) reason = 'missing-exact-receipt'
+    else if (/^Item \d+ part \d+ is still open$/.test(message)) reason = 'open-part'
+    else if (/^Item \d+ first appearance is out of accept order$/.test(message)) reason = 'receipt-order'
+    else if (/^Item \d+ part \d+ has no shim send$/.test(message)) reason = 'missing-shim-send'
+    else if (message === 'Text fidelity case retyped') reason = 'retyped'
+    else if (message === 'Durable receipt does not identify matching take-in') reason = 'durable-receipt-mismatch'
+  }
+  let journal: any[] = [], journalReadable = true
+  try { journal = receiptJournal(options.stateDir, options.key) } catch { journalReadable = false }
+  const accepted = journal.filter(r => r.kind === 'accepted' && !r.compact).sort((a, b) => a.seq - b.seq)
+  const parts = (item: any): string[] => journal.find(r => r.kind === 'fixed' && r.seq === item.seq)?.parts ?? []
+  const delivered = (seq: number, part: number) => journal.some(r => r.kind === 'delivered' && r.seq === seq && r.part === part)
+  const open = accepted.filter(item => !parts(item).length || parts(item).some((_, i) => !delivered(item.seq, i + 1)))
+  const head = open[0], fixed = head ? parts(head) : [], part = head ? fixed.findIndex((_, i) => !delivered(head.seq, i + 1)) + 1 : 0
+  const own = part > 0 ? fixed[part - 1] : undefined
+  let ownEntries: TranscriptEntry[] = [], sessionEvidenceReadable = true
+  try { ownEntries = personaTranscripts(options.key, journal, readFileSync(join(options.stateDir, 'server.log'), 'utf8').split('\n'), entries) } catch { sessionEvidenceReadable = false }
+  const attempts = head ? journal.filter(r => r.kind === 'sent' && r.seq === head.seq) : []
+  const screen = pane !== undefined && screenReader ? screenReader('claude', pane, own) : undefined
+  return { reason, journalReadable, accepted: accepted.length, expected: numeric(options.expectedCount), open: open.length,
+    head: head ? { seq: numeric(head.seq), parts: fixed.length, part, attempts: attempts.length,
+      recentAttempts: attempts.slice(-8).map(r => ({ attempt: numeric(r.attempt), part: numeric(r.part), at: numeric(r.at),
+        kind: ['text', 'enter', 'retype'].includes(r.send_kind) ? r.send_kind : 'unknown', unknownOutcome: r.unknown_outcome === true,
+        refused: journal.some(other => other.kind === 'refused' && other.seq === head.seq && other.attempt === r.attempt) })),
+      exactReceipts: own === undefined ? 0 : ownEntries.filter(e => e.kind === 'take-in' && typeof e.text === 'string' && e.at >= head.received_at && adapters.receiptTextMatches(e.text, own)).length } : null,
+    sessionEvidenceReadable, sessionEntries: ownEntries.length, sessionTakeins: ownEntries.filter(e => e.kind === 'take-in').length,
+    rowState: ['pending', 'waiting', 'working', 'ended', 'paused'].includes(row?.state) ? row.state : 'unreadable',
+    screen: screen ? { kind: ['empty', 'own', 'input', 'menu'].includes(screen.kind) ? screen.kind : 'unreadable', running: screen.running === true,
+      textLength: typeof screen.text === 'string' ? screen.text.length : null, exactHeadOwnership: own !== undefined && screen.kind === 'own' } : null }
+}
 /** Failure-safe accounting does not require a completed receipt audit. */
 export function reportUsage(stateDir: string, entries: readonly TranscriptEntry[], adapters: ReceiptAdapters, keys: readonly string[] = []) {
   const logPath = join(stateDir, 'server.log')
@@ -317,9 +360,21 @@ if (import.meta.main) {
       console.log(`duplicates: ${result.duplicates}`)
       process.exit(0)
     }
-    const [command, stateDir, key, shimLog, root, count, mode] = process.argv.slice(2)
-    if (!stateDir || !key || !shimLog || !root || !['audit', 'ready', 'latency'].includes(command ?? '')) throw new Error('Usage: transcript-receipts <audit|ready|latency> <state-dir> <key> <shim-log> <transcript-root> [count] [no-retype]')
+    const [command, stateDir, key, shimLog, root, count, mode, paneFile, statusFile] = process.argv.slice(2)
+    if (!stateDir || !key || !shimLog || !root || !['audit', 'ready', 'latency', 'diagnostic'].includes(command ?? '')) throw new Error('Usage: transcript-receipts <audit|ready|latency|diagnostic> <state-dir> <key> <shim-log> <transcript-root> [count] [no-retype]')
     const adapters = await packedReceiptAdapters()
+    if (command === 'diagnostic') {
+      const pkg = resolve(process.env.CSCB_PKG_DIR ?? '/test-repo/node_modules/claude-slack-channel-bots')
+      const { readDeliveryScreen } = await import(join(pkg, 'src/delivery-screen.ts'))
+      const readJSON = (path?: string) => { try { return path ? JSON.parse(readFileSync(path, 'utf8')) : {} } catch { return {} } }
+      let entries: TranscriptEntry[] = [], transcripts: string[] = [], transcriptsReadable = true
+      try { transcripts = transcriptFiles(root); entries = readTranscripts(transcripts, adapters) } catch { transcriptsReadable = false }
+      const pane = readJSON(paneFile).pane
+      const evidence = deliveryFailureEvidence({ stateDir, key, shimLog, transcripts, expectedCount: count ? Number(count) : undefined, noRetype: mode === 'no-retype' }, entries, adapters,
+        readJSON(statusFile), typeof pane === 'string' ? pane : undefined, readDeliveryScreen)
+      console.log(`recorded: delivery diagnostic ${JSON.stringify({ ...evidence, transcriptsReadable })}`)
+      process.exit(0)
+    }
     const transcripts = transcriptFiles(root)
     const entries = readTranscripts(transcripts, adapters)
     const result = auditReceipts({ stateDir, key, shimLog, transcripts, expectedCount: command !== 'latency' && count ? Number(count) : undefined, noRetype: mode === 'no-retype' }, entries, adapters)
@@ -335,7 +390,8 @@ if (import.meta.main) {
       }
     }
   } catch (error) {
-    if (process.argv[2] !== 'ready') console.error(`FAIL: transcript-receipts: ${error instanceof Error ? error.message : 'unknown failure'}`)
+    if (process.argv[2] === 'diagnostic') console.error('recorded: delivery receipt diagnostic unavailable')
+    else if (process.argv[2] !== 'ready') console.error(`FAIL: transcript-receipts: ${error instanceof Error ? error.message : 'unknown failure'}`)
     process.exit(1)
   }
 }

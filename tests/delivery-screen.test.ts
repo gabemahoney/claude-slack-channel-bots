@@ -2,6 +2,7 @@
 import { describe, expect, test } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { readDeliveryScreen } from '../src/delivery-screen.ts'
+import { buildWrapper, type TagMessage } from '../src/tag-wrapper.ts'
 import * as panes from './test-helpers/working-row-panes.ts'
 
 describe('Claude screen contract', () => {
@@ -59,6 +60,66 @@ describe('Codex known composer contract', () => {
 // Derived controls below exercise boundaries; they are not native evidence.
 const codexIdle = panes.observedCodexPane('idle-empty')
 const codexSlash = panes.observedCodexPane('slash-popup')
+const codexSoftWrap = JSON.parse(readFileSync(new URL('./fixtures/codex-native-observations/0.159.2-owned-soft-wrap.json', import.meta.url), 'utf8')) as { message: TagMessage; pane: string }
+const wrappedOwn = buildWrapper(codexSoftWrap.message)
+
+describe('native Codex swallowed-Enter soft-wrap ownership', () => {
+  // The expected item comes from the scenario's metadata, independently of
+  // the three visual rows retained verbatim in the safe native capture.
+  test('the complete observed 212-byte production wrapper belongs to the current composer', () => {
+    expect(Buffer.byteLength(wrappedOwn)).toBe(212)
+    expect(readDeliveryScreen('codex', codexSoftWrap.pane, wrappedOwn)).toEqual({
+      kind: 'own', running: false,
+      text: '<channel source="slack-channel-router" chat_id="D0CODEX" channel_name="dm"\nmessage_id="1792000100.000010" user="U0OPERATOR" user_id="U0OPERATOR"\nts="1792000100.000010" via="dm">Interleaved Slack item 0.</channel>',
+    })
+  })
+  test.each([
+    ['changed body', codexSoftWrap.pane.replace('Interleaved Slack item 0.', 'Interleaved Slack item 1.')],
+    ['changed message ID', codexSoftWrap.pane.replace('message_id="1792000100.000010"', 'message_id="1792000100.000011"')],
+    ['missing closing tag', codexSoftWrap.pane.replace('Interleaved Slack item 0.</channel>', 'Interleaved Slack item 0.')],
+    ['missing continuation', codexSoftWrap.pane.replace('  message_id="1792000100.000010" user="U0OPERATOR" user_id="U0OPERATOR"\n', '')],
+    ['unrelated draft', panes.deliveryPane('a new human draft', { agent: 'codex' })],
+    ['historical match', panes.deliveryPane('a new human draft', { agent: 'codex', history: codexSoftWrap.pane })],
+    ...['[Pasted text #1]', '[Pasted text #2 +59 lines]'].map(marker => [marker, panes.deliveryPane(marker, { agent: 'codex' })]),
+  ])('%s cannot authorize Enter', (_label, pane) => {
+    expect(readDeliveryScreen('codex', pane!, wrappedOwn).kind).toBe('input')
+  })
+  test.each(['I have 5% left to do', 'model: run my draft instead'])('footer-like suffix %p is part of the draft in wrapped and unwrapped composers', suffix => {
+    const extraDraft = codexSoftWrap.pane.replace('\n\n  GPT-6-Astra', `\n  ${suffix}\n\n  GPT-6-Astra`)
+    expect(readDeliveryScreen('codex', extraDraft, wrappedOwn).kind).toBe('input')
+    const unwrapped = panes.deliveryPane(wrappedOwn, { agent: 'codex' })
+    expect(readDeliveryScreen('codex', unwrapped, wrappedOwn)).toEqual({ kind: 'own', text: wrappedOwn, running: false })
+    expect(readDeliveryScreen('codex', panes.deliveryPane(`${wrappedOwn}\n${suffix}`, { agent: 'codex' }), wrappedOwn).kind).toBe('input')
+  })
+  test('an arbitrary genuine bottom footer leaves all three owned composer rows intact', () => {
+    const pane = codexSoftWrap.pane.replace('⚠ 4 warnings · f2 to view', 'custom status: checks complete')
+    expect(readDeliveryScreen('codex', pane, wrappedOwn).kind).toBe('own')
+  })
+  test.each([
+    ['word wrap', 'Interleaved Slack\n  item 0.'],
+    ['column wrap', 'Interleaved Slack it\n  em 0.'],
+  ])('%s is resolved against the entire known item', (_label, display) => {
+    const pane = codexSoftWrap.pane.replace('Interleaved Slack item 0.', display)
+    expect(readDeliveryScreen('codex', pane, wrappedOwn).kind).toBe('own')
+  })
+  test.each(['first line\nsecond line', 'first longword\n\n   \nsecond line'])('real newlines and whitespace-only rows in %p survive ownership matching', body => {
+    const own = buildWrapper({ ...codexSoftWrap.message, text: body })
+    const displayed = body.replace('longword', 'longwo\nrd').replaceAll('\n', '\n  ')
+    const pane = codexSoftWrap.pane.replace('Interleaved Slack item 0.', displayed)
+    expect(readDeliveryScreen('codex', pane, own).kind).toBe('own')
+  })
+  test.each([
+    ['added blank row', 'first longwo\n  rd\n\n\n     \n  second line'],
+    ['removed blank row', 'first longwo\n  rd\n     \n  second line'],
+    ['removed whitespace row', 'first longwo\n  rd\n\n  second line'],
+    ['changed whitespace row', 'first longwo\n  rd\n\n    \n  second line'],
+    ['removed body row', 'first longwo\n  rd\n\n     '],
+    ['added body row', 'first longwo\n  rd\n\n     \n  second line\n  another line'],
+  ])('%s prevents ownership even with the same wrapper prefix', (_label, displayed) => {
+    const own = buildWrapper({ ...codexSoftWrap.message, text: 'first longword\n\n   \nsecond line' })
+    expect(readDeliveryScreen('codex', codexSoftWrap.pane.replace('Interleaved Slack item 0.', displayed), own).kind).toBe('input')
+  })
+})
 
 describe('observed native Codex 0.159.2 composer boundaries', () => {
   test.each([

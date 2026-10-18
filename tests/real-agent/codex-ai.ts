@@ -7,6 +7,27 @@ import { completedCodexTurn, type CodexRollout, type CodexWindow } from './codex
 export function requireEvidence(value: unknown, reason: string): asserts value {
   if (!value) throw new Error(reason)
 }
+
+/** AC15 alone waits for the submitted part's completed native answer before
+ * the production engine may send its successor. Other scenarios retain the
+ * ordinary working-row delivery policy. No expected answer reaches the bot. */
+export function codexMultipartSender<P extends { text?: string; no_enter?: boolean; key?: string }, R>(
+  send: (params: P) => Promise<R>, completed: (text: string) => Promise<unknown>,
+) {
+  let pending: string | undefined, completing = false
+  return async (params: P): Promise<R> => {
+    requireEvidence(!completing, 'AC15 successor preceded completed acknowledgement')
+    if (params.text !== undefined) requireEvidence(pending === undefined, 'AC15 replaced an unacknowledged part')
+    const result = await send(params)
+    if (params.text !== undefined && params.no_enter) pending = params.text
+    else if (params.key === 'Enter' && pending !== undefined) {
+      completing = true
+      try { await completed(pending); pending = undefined }
+      finally { completing = false }
+    }
+    return result
+  }
+}
 const stable = (v: any): string => JSON.stringify(v && typeof v === 'object' && !Array.isArray(v)
   ? Object.fromEntries(Object.keys(v).sort().map(k => [k, JSON.parse(stable(v[k]))]))
   : Array.isArray(v) ? v.map(x => JSON.parse(stable(x))) : v)

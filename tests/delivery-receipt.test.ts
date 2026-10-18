@@ -2,12 +2,17 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import * as fs from 'node:fs'
 import { tmpdir } from 'node:os'
+import { spawnSync } from 'node:child_process'
 import { join } from 'node:path'
 import { createDeliveryReceiptReader, DELIVERY_DROP_REASONS, deliveryTranscriptPath, parseDeliveryTranscriptRecord, receiptTextMatches } from '../src/delivery-receipt.ts'
-import type { DeliveryAgent } from '../src/delivery-screen.ts'
+import { readDeliveryScreen, type DeliveryAgent } from '../src/delivery-screen.ts'
 import type { DeliveryQueue, QueueItem, SentRecord } from '../src/delivery-queue.ts'
+import { buildWrapper, type TagMessage } from '../src/tag-wrapper.ts'
 import { injectedInput, makeQueue } from './test-helpers/delivery-queue.ts'
 import { appendTranscript, codexNativeObservations, codexPromptEntry, codexTurnEntry, endedTurn, observedCodexTurnEntry, pastedText, promptEntry, queuedCommandEntry, queueOperationEntry, replyEntry, toolResultEntry, transcriptJsonl, writeTranscript, type TranscriptEntry } from './test-helpers/working-row-panes.ts'
+import { deliveryFailureEvidence, readTranscripts } from './integration/fixtures/transcript-receipts.ts'
+import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
+import { assertNoLeak, fakeToken, BOT_TOKEN_PREFIX } from './test-helpers/credentials.ts'
 
 const cleanups: (() => Promise<void>)[] = []
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup() })
@@ -36,6 +41,87 @@ async function fixture(agent: DeliveryAgent = 'claude', text = 'one\ntwo') {
   const read = () => reader.read(agent, row, item(), 1, queue.items('alpha'))
   return { root, path, queue, row, reader, item, accept, send, read, text, append: (...entries: TranscriptEntry[]) => appendTranscript(path, entries) }
 }
+
+describe('real delivery timeout evidence (synthetic, no native launch)', () => {
+  const adapters = { receiptTextMatches, parseDeliveryTranscriptRecord }
+  test('projects the unsent head, bounded attempts and exact composer ownership without bodies or arbitrary AD fields', async () => {
+    const secret = fakeToken(BOT_TOKEN_PREFIX, 'deliverydiagnostic'), h = await fixture('claude', secret)
+    fs.writeFileSync(join(h.root, 'server.log'), '')
+    fs.writeFileSync(join(h.root, 'shim.log'), '')
+    const options = { stateDir: h.root, key: 'alpha', shimLog: join(h.root, 'shim.log'), transcripts: [h.path], expectedCount: 1 }
+    const pane = `────────────────\n❯ ${secret}\n────────────────\n  ⏵⏵ bypass permissions on (shift+tab to cycle)`
+    const unsent = deliveryFailureEvidence(options, [], adapters, { state: 'waiting', credentials: secret }, pane, readDeliveryScreen)
+    expect(unsent).toMatchObject({ reason: 'missing-receive-log', accepted: 1, open: 1, head: { seq: 1, part: 1, attempts: 0, exactReceipts: 0 }, rowState: 'waiting', screen: { kind: 'own', exactHeadOwnership: true } })
+    for (let n = 0; n < 12; n++) await h.send()
+    h.append({ ...promptEntry(secret), sessionId: 'current', timestamp: new Date(h.item().accepted.received_at + 1).toISOString() })
+    const evidence = deliveryFailureEvidence(options, readTranscripts([h.path], adapters), adapters, { state: secret }, pane, readDeliveryScreen)
+    expect(evidence.head).toMatchObject({ attempts: 12, exactReceipts: 1 })
+    expect(evidence.head!.recentAttempts).toHaveLength(8)
+    expect(evidence.rowState).toBe('unreadable')
+    expect(JSON.stringify(evidence).length).toBeLessThan(3000)
+    expect(JSON.stringify(evidence).includes(secret)).toBe(false)
+    expect(JSON.stringify(evidence).includes(h.path)).toBe(false)
+    assertNoLeak(evidence)
+    const foreign = deliveryFailureEvidence(options, [{ ...readTranscripts([h.path], adapters)[0]!, path: join(h.root, 'foreign.jsonl') }], adapters)
+    expect(foreign.head!.exactReceipts).toBe(0)
+    const draft = deliveryFailureEvidence(options, [], adapters, {}, pane.replace(secret, 'human draft'), readDeliveryScreen)
+    expect(draft.screen).toMatchObject({ kind: 'input', exactHeadOwnership: false })
+  })
+  test('damaged evidence projects an unavailable reason without echoing parser input', async () => {
+    const h = await fixture(), secret = fakeToken(BOT_TOKEN_PREFIX, 'brokenjournal')
+    fs.writeFileSync(join(h.root, 'queue/alpha.jsonl'), secret)
+    const evidence = deliveryFailureEvidence({ stateDir: h.root, key: 'alpha', shimLog: '', transcripts: [] }, [], adapters)
+    expect(evidence).toMatchObject({ reason: 'audit-unavailable', journalReadable: false, sessionEvidenceReadable: false, head: null, screen: null })
+    assertNoLeak(evidence)
+    expect(JSON.stringify(evidence).includes(secret)).toBe(false)
+  })
+  test.each(['success', 'failure', 'diagnostic-failure'])('%s preserves polling arguments, original failure and cleanup order', mode => {
+    const root = fs.mkdtempSync(join(tmpdir(), 'delivery-wait-control-'))
+    try {
+      const source = fs.readFileSync(join(import.meta.dir, 'integration/lib/real-scenario.sh'), 'utf8')
+      const wait = source.match(/^real_wait_delivery\(\) \{[\s\S]*?^\}/m)![0]
+      const script = ['set -euo pipefail', 'REAL_DELIVERY_WAIT_S=180', 'REAL_RECEIPTS=receipts', 'SLACK_STATE_DIR=state', 'SCENARIO_AD_SHIM_LOG=shim',
+        'fail() { echo "FAIL: $*"; exit 17; }', '_scenario_check_timeout() { [[ "$1" == 180 ]]; }',
+        '_scenario_poll_until() { printf "poll:%s:%s:%s:%s:%s:%s:%s:%s:%s\\n" "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$9" "${10}"; [[ "$MODE" == success ]]; }',
+        '_real_delivery_diagnostic() { echo "evidence-before-cleanup:$*"; [[ "$MODE" != diagnostic-failure ]]; }',
+        'trap \'echo cleanup\' EXIT', wait, 'real_wait_delivery alpha 13 no-retype', 'echo success'].join('\n')
+      const path = join(root, 'control.sh'); fs.writeFileSync(path, script)
+      const child = spawnSync('bash', [path], { env: hostSafeChildEnv(root, { tools: ['bash'], extras: { MODE: mode } }), encoding: 'utf8', timeout: 5000 })
+      expect(child.error).toBeUndefined(); expect(child.signal).toBeNull(); expect(child.stderr).toBe('')
+      const lines = child.stdout.trim().split('\n')
+      expect(lines[0]).toBe('poll:180:bun:receipts:ready:state:alpha:shim:13:no-retype')
+      if (mode === 'success') { expect(child.status).toBe(0); expect(lines.slice(1)).toEqual(['success', 'cleanup']) }
+      else {
+        expect(child.status).toBe(17)
+        expect(lines[1]).toBe('evidence-before-cleanup:alpha 13 no-retype')
+        expect(lines.slice(-2)).toEqual(['FAIL: real persona alpha has open/unconfirmed deliveries (not within 180s)', 'cleanup'])
+        expect(lines.includes('recorded: delivery diagnostic unavailable')).toBe(mode === 'diagnostic-failure')
+      }
+    } finally { fs.rmSync(root, { recursive: true, force: true }) }
+  })
+  test.each(['readable', 'unreadable', 'formatter-failure'])('%s diagnostic captures the bounded live row/pane before the original FAIL', mode => {
+    const root = fs.mkdtempSync(join(tmpdir(), 'delivery-diagnostic-control-'))
+    try {
+      const source = fs.readFileSync(join(import.meta.dir, 'integration/lib/real-scenario.sh'), 'utf8')
+      const declarations = ['real_wait_delivery', '_real_delivery_diagnostic'].map(name => source.match(new RegExp(`^${name}\\(\\) \\{[\\s\\S]*?^\\}`, 'm'))![0]).join('\n')
+      const script = ['set -euo pipefail', 'SCENARIO_ROOT="$1"', 'REAL_DELIVERY_WAIT_S=180', 'REAL_RECEIPTS=receipts', 'SLACK_STATE_DIR=state', 'SCENARIO_AD_SHIM_LOG=shim', 'SCENARIO_FIXTURES=fixtures',
+        'fail() { echo "FAIL: $*"; exit 17; }', '_scenario_check_timeout() { :; }', '_scenario_poll_until() { return 1; }',
+        'real_instance() { echo own-row; }', 'real_ad() { [[ "$*" == "status --instance-id own-row" ]] || return 8; [[ "$MODE" != unreadable ]] || return 1; echo \'{"state":"working","private":"withheld"}\'; }',
+        'real_pane() { [[ "$*" == "alpha 40" ]] || return 8; [[ "$MODE" != unreadable ]] || return 1; echo \'{"pane":"private live composer"}\'; }',
+        'bun() { [[ -s "$SCENARIO_ROOT/real-delivery-status.json" && -s "$SCENARIO_ROOT/real-delivery-pane.json" ]] || return 9; printf "capture:%s:%s\\n" "$1" "$2"; [[ "$MODE" != formatter-failure ]]; }',
+        'trap \'echo cleanup\' EXIT', declarations, 'real_wait_delivery alpha 13 no-retype'].join('\n')
+      const path = join(root, 'control.sh'); fs.writeFileSync(path, script)
+      const child = spawnSync('bash', [path, root], { env: hostSafeChildEnv(root, { tools: ['bash'], extras: { MODE: mode } }), encoding: 'utf8', timeout: 5000 })
+      expect(child.error).toBeUndefined(); expect(child.signal).toBeNull(); expect(child.status).toBe(17); expect(child.stderr).toBe('')
+      const lines = child.stdout.trim().split('\n')
+      expect(lines.indexOf('capture:receipts:diagnostic')).toBe(0)
+      expect(lines.indexOf('capture:fixtures/real-observations.ts:--idle-diagnostic')).toBeGreaterThan(0)
+      expect(lines.slice(-2)).toEqual(['FAIL: real persona alpha has open/unconfirmed deliveries (not within 180s)', 'cleanup'])
+      expect(child.stdout.includes('private')).toBe(false)
+      expect(JSON.parse(fs.readFileSync(join(root, 'real-delivery-status.json'), 'utf8'))).toEqual(mode === 'unreadable' ? {} : { state: 'working', private: 'withheld' })
+    } finally { fs.rmSync(root, { recursive: true, force: true }) }
+  })
+})
 
 describe('exact matching and agent schema', () => {
   test.each([
@@ -76,6 +162,17 @@ describe('exact matching and agent schema', () => {
 })
 
 describe('receipt reader', () => {
+  test('Codex screen soft-wrap ownership never normalizes transcript receipt text', async () => {
+    const capture = JSON.parse(fs.readFileSync(new URL('./fixtures/codex-native-observations/0.159.2-owned-soft-wrap.json', import.meta.url), 'utf8')) as { message: TagMessage }
+    const own = buildWrapper(capture.message), h = await fixture('codex', own)
+    await h.send()
+    // These are display line breaks, not bytes in the accepted message.
+    h.append(codexPromptEntry(own.replace(' message_id=', '\nmessage_id=').replace(' ts=', '\nts=')))
+    expect(h.read().receipt).toBeUndefined()
+    const exactOffset = fs.statSync(h.path).size
+    h.append(codexPromptEntry(own))
+    expect(h.read().receipt).toMatchObject({ path: h.path, offset: exactOffset, text: own })
+  })
   test.each(['claude', 'codex'] as const)('%s needs a post-send record; identical items need distinct identities', async agent => {
     const h = await fixture(agent), entry = agent === 'claude' ? promptEntry : codexPromptEntry
     h.append(entry(h.text))

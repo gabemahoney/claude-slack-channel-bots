@@ -44,6 +44,25 @@ describe('Codex delivery gate receipt audit', () => {
   test('a nonzero duplicate count is reported without alone failing delivery', () => {
     expect(auditCodexDelivery(sample(true))).toMatchObject({ items: 2, duplicates: 1 })
   })
+  test('crash-startup compaction retains the complete audit through the actual completed prefix', () => {
+    const f = sample(), completedPrefix = f.journal.slice(0, 4)
+    const compacted = [{ kind: 'accepted', seq: 1, compact: 'key' }, { kind: 'accepted', seq: 1, compact: 'allocation' }, ...f.journal.slice(4)]
+    expect(auditCodexDelivery({ ...f, journal: compacted })).toMatchObject({ items: 1 })
+    const audit = auditCodexDelivery({ ...f, journal: compacted, completedPrefix })
+    expect(audit).toEqual({ items: 2, duplicates: 0, firstReceipts: f.rollout.records.filter(r => r.role === 'user').map(r => r.offset) })
+    // A restart which retains the prefix must not count it twice either.
+    expect(auditCodexDelivery({ ...f, completedPrefix })).toEqual(audit)
+    assertNoLeak(audit)
+  })
+  test.each(['prefix-unconfirmed', 'prefix-missing-send', 'suffix-send-before-confirmation', 'suffix-call-before-confirmation'])('%s remains rejected across crash compaction', kind => {
+    const f = sample(), completedPrefix = f.journal.slice(0, 4)
+    f.journal = [{ kind: 'accepted', seq: 1, compact: 'key' } as any, ...f.journal.slice(4)]
+    if (kind === 'prefix-unconfirmed') completedPrefix.pop()
+    if (kind === 'prefix-missing-send') completedPrefix.splice(2, 1)
+    if (kind === 'suffix-send-before-confirmation') (f.journal[3] as any).at = 1199
+    if (kind === 'suffix-call-before-confirmation') f.shim = call(1001, texts[0]) + call(1199, texts[1])
+    expect(() => auditCodexDelivery({ ...f, completedPrefix })).toThrow()
+  })
   test.each(['wrong-path', 'foreign-session', 'wrong-text', 'assistant-copy', 'stale-receipt', 'stale-send-offset', 'unconfirmed', 'missing-call',
     'missing-delivered-event', 'missing-official-log', 'foreign-official-log', 'duplicate-official-log', 'send-before-message-delivered', 'call-before-message-delivered', 'out-of-order-first-receipts', 'partial'])('%s rejects apparent delivery', kind => {
     const f = sample(), firstSend = f.journal[2] as any, secondSend = f.journal[6] as any, firstReceipt = f.rollout.records[1]!
@@ -96,22 +115,23 @@ describe('native pane rendering uses bounded observable polling', () => {
   const extract = (name: string) => source.match(new RegExp(`^async function ${name}[\\s\\S]*?^\\}`, 'm'))![0]
   function probe(label: string, frames: { state: string; screen: { kind: string; text?: string }; after?: number }[]) {
     let at = 0, calls = 0
-    const captures: number[] = []
-    const wait = new Function('Date', 'Bun', 'pane', new Bun.Transpiler({ loader: 'ts' }).transformSync(
+    const captures: number[] = [], diagnostics: { label: string; value: unknown }[] = []
+    const wait = new Function('Date', 'Bun', 'pane', 'record', new Bun.Transpiler({ loader: 'ts' }).transformSync(
       extract('poll') + '\n' + extract('observationPane') + '\nreturn observationPane',
     ))({ now: () => at }, { sleep: async (ms: number) => { at += ms } }, async () => {
       captures.push(at)
       const frame = frames[Math.min(calls++, frames.length - 1)]!
       at += frame.after ?? 0
       return frame
-    }) as (label: string, text: string) => Promise<unknown>
-    return { run: () => wait(label, 'first line\nsecond line'), captures, calls: () => calls, at: () => at }
+    }, (label: string, value: unknown) => { diagnostics.push({ label, value }); assertNoLeak({ label, value }) }) as (label: string, text: string) => Promise<unknown>
+    return { run: () => wait(label, 'first line\nsecond line'), captures, diagnostics, calls: () => calls, at: () => at }
   }
   test.each(['slash-popup', 'at-popup', 'dollar-popup', 'shortcuts-overlay', 'idle-multiline-draft', 'busy-multiline-draft'])('%s waits for delayed screen rendering and matching activity', async label => {
     const expected = { state: label.startsWith('busy-') ? 'working' : 'waiting', screen: { kind: label.includes('draft') ? 'input' : 'menu', text: 'first line\nsecond line' } }
     const p = probe(label, [{ state: 'waiting', screen: { kind: 'empty' } }, { ...expected, state: expected.state === 'working' ? 'waiting' : 'working' }, expected])
     expect(await p.run()).toEqual(expected)
     expect(p.captures).toEqual([0, 250, 500])
+    expect(p.diagnostics).toEqual([])
   })
   test('a partially rendered multiline draft cannot satisfy the expected draft', async () => {
     const expected = { state: 'waiting', screen: { kind: 'input', text: 'first line\nsecond line' } }
@@ -125,11 +145,13 @@ describe('native pane rendering uses bounded observable polling', () => {
     const p = probe(label!, [{ state: state!, screen: { kind: kind!, text: 'first line\nsecond line' } }])
     await expect(p.run()).rejects.toThrow('observation incomplete within bound')
     expect(p.at()).toBe(120000); expect(p.calls()).toBe(480)
+    expect(p.diagnostics).toEqual([{ label: 'bound', value: { step: `native ${label} rendering`, milliseconds: 120000 } }])
   })
   test('a read that returns the expected screen after the deadline is refused', async () => {
     const p = probe('at-popup', [{ state: 'waiting', screen: { kind: 'menu' }, after: 120001 }])
     await expect(p.run()).rejects.toThrow('observation incomplete within bound')
     expect(p.calls()).toBe(1)
+    expect(p.diagnostics).toEqual([{ label: 'bound', value: { step: 'native at-popup rendering', milliseconds: 120000 } }])
   })
   test('every popup and draft observation calls the polled capture without fixed render sleeps', () => {
     const observe = extract('observe')

@@ -5,6 +5,7 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import { appendFileSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { createDeliveryCallBudget, DeliveryBudgetWait, deliveryTextWasRefused, LAUNCH_SETTLE_MS, ENTER_DELAY_MS, ENTER_ONLY_RETRY_MS, RECEIPT_WAIT_MS, RETYPE_BACKOFF_MS, NOT_NOW_RETRY_MS, IDLE_EVIDENCE_MAX_WAIT_MS, DELIVERY_MAX_AD_CALLS_PER_S, RECONNECT_BLOCKED_NOTICE_MS, DELIVERY_ROW_POLL_MS } from '../src/delivery-engine.ts'
 import { makeEngineHarness, type EngineHarness } from './test-helpers/delivery-engine.ts'
+import { buildWrapper, type TagMessage } from '../src/tag-wrapper.ts'
 import { appendTranscript, codexPromptEntry, deliveryPane, endedTurn, observedCodexPane, observedCodexTurnEntry, promptEntry, queueOperationEntry, replyEntry, transcriptJsonl, writeTranscript } from './test-helpers/working-row-panes.ts'
 import { cannedPermissionRequest, errCallTimeout, errConfigMalformed, errDialogMaybeOpen, errInternal, errInvalidFlags, errPaneChanged, errRelayFallenBack, errSendKeysWhileRelayed, errSpawnNotFound, errSpawnNotInteractive, errSystemInstallDisappeared, errTmuxNotAvailable, errTmuxSendKeys, errTmuxSessionConflict, errTmuxUnresponsive, errUnusableName } from './test-helpers/agent-director-stub.ts'
 
@@ -30,6 +31,60 @@ describe('native Codex adapter consequences', () => {
     const p = h.p()
     await h.queue.append('alpha', { v: 1, kind: 'sent', seq: 1, part: 1, attempt: 1, send_kind: 'text', at: h.clock.now(), launch_id: h.lifecycle.launchId('alpha'), session_id: p.row.session_id, transcript_path: p.path, transcript_size: statSync(p.path).size })
   }
+  test.each(['lost Enter', 'server crash after lost Enter'] as const)('native soft-wrapped item recovers %s with Enter alone and holds FIFO until the exact receipt is durable', async fault => {
+    const capture = JSON.parse(readFileSync(new URL('./fixtures/codex-native-observations/0.159.2-owned-soft-wrap.json', import.meta.url), 'utf8')) as { message: TagMessage; pane: string }
+    const own = buildWrapper(capture.message), h = await harness({ configuredAgent: 'claude' }), p = h.p()
+    p.row.agent = 'codex'; p.autoReceipt = false; p.retainBox = true; p.lostEnters = 1
+    p.keyHook = params => {
+      if (params.no_enter) p.pane = params.text === own ? capture.pane : undefined
+      // The first Enter is swallowed. The retry consumes the draft, while
+      // its transcript receipt can still be delayed or only partly written.
+      else if (params.key === 'Enter' && h.keyCalls().filter(call => call.params.key === 'Enter').length === 2) {
+        p.pane = undefined; p.retainBox = false
+      }
+      return undefined
+    }
+    await h.accept(own); await h.accept('FIFO successor')
+    await start(h); await h.advance(ENTER_DELAY_MS)
+    expect(h.keyCalls().map(call => call.params.key ?? call.params.text)).toEqual([own, 'Enter'])
+    if (fault === 'server crash after lost Enter') await h.restartServer()
+    await h.until(() => h.keyCalls().length >= 3)
+    expect(h.keyCalls().map(call => call.params.key ?? call.params.text)).toEqual([own, 'Enter', 'Enter'])
+    expect(h.textCalls().map(call => call.params.text)).toEqual([own])
+    expect(h.records().filter(record => record.kind === 'sent').map(record => 'send_kind' in record && record.send_kind)).toEqual(['text', 'enter'])
+    expect(h.queue.openCount('alpha')).toBe(2)
+    expect(h.events.filter(event => event.type === 'delivered')).toEqual([])
+
+    appendTranscript(p.path, [codexPromptEntry(own.replace('item 0.', 'item 1.'))])
+    await h.advance(DELIVERY_ROW_POLL_MS)
+    expect(h.queue.openCount('alpha')).toBe(2)
+    expect(h.textCalls().map(call => call.params.text)).toEqual([own])
+    const receiptOffset = statSync(p.path).size
+    const receipt = transcriptJsonl([codexPromptEntry(own)])
+    appendFileSync(p.path, receipt.slice(0, -1))
+    await h.advance(DELIVERY_ROW_POLL_MS)
+    expect(h.records().filter(record => record.kind === 'delivered')).toEqual([])
+    expect(h.textCalls().map(call => call.params.text)).toEqual([own])
+
+    h.failAppend('delivered')
+    appendFileSync(p.path, '\n')
+    await h.until(() => h.errors.length > 0)
+    expect(h.errors).toHaveLength(1)
+    expect(h.records().filter(record => record.kind === 'delivered')).toEqual([])
+    expect(h.events.filter(event => event.type === 'delivered')).toEqual([])
+    expect(h.queue.openCount('alpha')).toBe(2)
+    expect(h.textCalls().map(call => call.params.text)).toEqual([own])
+
+    p.pane = undefined; p.box = ''; p.retainBox = false; p.autoReceipt = true
+    await delivered(h)
+    expect(h.keyCalls().map(call => call.params.key ?? call.params.text)).toEqual([own, 'Enter', 'Enter', 'FIFO successor', 'Enter'])
+    expect(h.events.filter(event => event.type === 'delivered').map(event => event.seq)).toEqual([1, 2])
+    const records = h.records()
+    expect(records.filter(record => record.kind === 'sent' || record.kind === 'delivered').map(record => [record.kind, record.seq])).toEqual([
+      ['sent', 1], ['sent', 1], ['delivered', 1], ['sent', 2], ['delivered', 2],
+    ])
+    expect(records.find(record => record.kind === 'delivered' && record.seq === 1)).toMatchObject({ receipt: { path: p.path, offset: receiptOffset } })
+  })
   test.each([['slash-popup', '/'], ['at-popup', '@'], ['dollar-popup', '$']] as const)('%s holds owned-text Enter recovery until the popup closes', async (label, marker) => {
     const h = await harness({ configuredAgent: 'claude' }), p = h.p()
     p.row.agent = 'codex'; p.pane = observedCodexPane(label); p.box = marker

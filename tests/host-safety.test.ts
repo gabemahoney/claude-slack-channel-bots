@@ -1693,13 +1693,14 @@ const FMK_TEXTS_PATH = join(INTEGRATION_DIR, 'fixtures', 'fmk-texts.ts')
  */
 const CODEX_DELIVERY_PATH = join(TESTS_DIR, 'real-agent', 'codex-delivery.ts')
 const IMAGE_GUARDED_TS_PATHS: readonly string[] = [FMK_DRIVER_PATH, STUB_MCP_SESSION_PATH, SWITCH_OVER_PATH, FMK_TEXTS_PATH, CODEX_DELIVERY_PATH]
-const CODEX_IMPORT_ONLY_PATHS = ['codex-guards.ts', 'codex-evidence.ts', 'codex-ai.ts', 'codex-gate.ts'].map(name => join(TESTS_DIR, 'real-agent', name))
+const CODEX_IMPORT_ONLY_PATHS = ['codex-guards.ts', 'codex-evidence.ts', 'codex-ai.ts', 'codex-gate.ts', 'codex-crash-barrier.ts'].map(name => join(TESTS_DIR, 'real-agent', name))
 // Every non-node static edge is exact and its destination is audited too.
 const CODEX_IMPORT_GRAPH: Record<string, readonly string[]> = {
   'tests/real-agent/codex-guards.ts': [],
   'tests/real-agent/codex-evidence.ts': [],
   'tests/real-agent/codex-ai.ts': ['./ai-fixture-audit.ts', './codex-evidence.ts'],
   'tests/real-agent/codex-gate.ts': ['../integration/fixtures/transcript-receipts.ts', './codex-evidence.ts', './codex-ai.ts'],
+  'tests/real-agent/codex-crash-barrier.ts': [],
   'tests/real-agent/ai-fixture-audit.ts': [],
   'tests/integration/fixtures/transcript-receipts.ts': [],
   'src/codex-config-keys.ts': [],
@@ -2885,7 +2886,7 @@ function codexAIShellFindings(source: string): string[] {
     '[[ "${CODEX_TEST_MODEL:-}" =~ ^[A-Za-z0-9._:/-]+$ ]] || fail \'Codex requires the runner-selected model\'',
     '[[ "${REAL_AGENT_TRIAL:-}" =~ ^[123]$ ]] || fail \'Codex requires an explicit independent trial 1, 2 or 3\'',
     '[[ -f /run/codex-login/auth.json ]] || fail \'Codex requires its dedicated single-file login mount\'',
-    'bun "$(dirname "${BASH_SOURCE[0]}")/codex-delivery.ts" ai "${AI_CRITERION}"',
+    'PATH="${SCENARIO_TMUX_SHIM_BIN}:${PATH}" bun "$(dirname "${BASH_SOURCE[0]}")/codex-delivery.ts" ai "${AI_CRITERION}"',
     '[[ -L "${HOME}/.codex/auth.json" ]] || fail \'scratch Codex auth.json stopped being a symlink\'',
     'assert_codex_d1_safety',
     'echo "PASS: ${TEST_NAME}"',
@@ -2902,7 +2903,7 @@ function codexGateShellFindings(source: string): string[] {
     '[[ -z "${TMUX+x}" && "${TMUX_TMPDIR:-}" == "${SCENARIO_ROOT}"/* ]] || fail \'Codex requires a private tmux server\'',
     '[[ "${CODEX_TEST_MODEL:-}" =~ ^[A-Za-z0-9._:/-]+$ ]] || fail \'Codex requires the runner-selected model\'',
     '[[ -f /run/codex-login/auth.json ]] || fail \'Codex requires its dedicated single-file login mount\'',
-    'bun "$(dirname "$0")/../real-agent/codex-delivery.ts" gate',
+    'PATH="${SCENARIO_TMUX_SHIM_BIN}:${PATH}" bun "$(dirname "$0")/../real-agent/codex-delivery.ts" gate',
     '[[ -L "${HOME}/.codex/auth.json" ]] || fail \'scratch Codex auth.json stopped being a symlink\'',
     'assert_codex_d1_safety',
     'echo "PASS: ${TEST_NAME}"',
@@ -2947,13 +2948,35 @@ function codexProcessFindings(source: string): string[] {
     "Bun.spawn([process.execPath, import.meta.path, 'crash-worker'], { stdout: 'ignore', stderr: 'ignore', env: { ...process.env } })",
   ])) failures.push('codex-delivery.ts: unreviewed process surface')
   order(body('gate'), ["stage = 'gate-crash-between-text-and-enter'", 'await stopEngine()',
-    "Bun.spawn([process.execPath, import.meta.path, 'crash-worker']", "check.pid !== child.pid || check.instance !== instance",
+    "Bun.spawn([process.execPath, import.meta.path, 'crash-worker']", 'await crashProtocol.waitForCrashBoundary({ child, instance,',
+    "r.kind === 'accepted' && r.seq === pair.firstSeq", "r.kind === 'accepted' && r.seq === pair.successorSeq",
     "c.parent === child.pid && c.instance === instance", "calls.some(c => c.key === 'Enter')",
     "child.kill('SIGKILL')", 'await child.exited', "child.signalCode !== 'SIGKILL'", "record('harness-crash'", 'await buildEngine()'], 'actual crash boundary')
-  order(body('buildEngine'), ['const result = await client.sendKeys(params)', "if (crashBarrier && params.no_enter && typeof params.text === 'string')",
-    "writeFileSync(join(stateDir, 'crash-after-text.json')", 'await new Promise(() => {})', 'return result'], 'text barrier')
+  order(body('buildEngine'), ['const result = await (multipartSend ? multipartSend(params) : client.sendKeys(params))', "if (crashBarrier && params.no_enter && typeof params.text === 'string')",
+    "crashCheckpoint('text-call-return', { textReturned: true })", "crashProtocol.publishCrashProgress(join(stateDir, 'crash-after-text.json'), crashProgress)",
+    'await new Promise(() => {})', 'return result'], 'text barrier')
+  order(body('ai'), ["} else if (ac === 15)", 'multipartSend = oracle.codexMultipartSender',
+    'answers.push(await completedItem(item.accepted.seq, part,', 'const seq = await accept(oracle.codexSlackInput(message))',
+    'await delivered(seq)', 'oracle.assertCodexMultipart(parts, body, answers)', 'finally { multipartSend = undefined }'], 'AC15 completed-part pacing')
   if (!top.includes("else if (command === 'crash-worker') await crashWorker()")) failures.push('codex-delivery.ts: crash-worker dispatch missing')
   return failures
+}
+
+/** Exact protocol boundaries complement the driver's exact process inventory.
+ * Unknown child data never reaches the diagnostic callback. */
+function codexCrashProtocolFindings(source: string): string[] {
+  const required = [
+    'v.pid !== pid', "v.instance !== 'cscb_codex_gate' || v.instance !== instance", 'Object.keys(v).sort().join(',
+    '!stages.includes(v.stage) || !errors.includes(v.error)', 'stat.size > 2048', 'n > 2048',
+    'constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK',
+    "writeFileSync(temporary, JSON.stringify(safe), { mode: 0o600, flag: 'wx' })", 'renameSync(temporary, file)',
+    'const end = options.now() + 180000', 'readCrashProgress(options.checkpoint, options.child.pid, options.instance)',
+    'readCrashProgress(options.marker, options.child.pid, options.instance)',
+    "checkpoint.status === 'invalid' || marker.status === 'invalid'", 'options.child.signalCode !== null',
+    'last.firstSeq !== null && last.successorSeq !== null', "r.kind === 'accepted' && r.seq === seq",
+    'await options.inputVisible() && options.now() <= end', 'catch (error) { diagnostic(); throw error }',
+  ]
+  return required.filter(fragment => !source.includes(fragment)).map(() => 'codex-crash-barrier.ts: unreviewed checkpoint/boundary contract')
 }
 
 describe('E7 Codex executable inventory and import safety', () => {
@@ -3012,22 +3035,46 @@ describe('E7 Codex executable inventory and import safety', () => {
       expect(codexGateShellFindings(changed).length).toBeGreaterThan(0)
     }
   })
+  test('D1 entrypoints reject removal of the harness tmux shim path', () => {
+    for (const [file, inspect] of [['real-agent/codex-ai-scenario.sh', codexAIShellFindings],
+      ['integration/test-41-fmk-real-codex.sh', codexGateShellFindings]] as const) {
+      const source = readFileSync(join(TESTS_DIR, file), 'utf8')
+      const changed = source.replace('PATH="${SCENARIO_TMUX_SHIM_BIN}:${PATH}" ', '')
+      expect(changed).not.toBe(source)
+      expect(inspect(changed).length).toBeGreaterThan(0)
+    }
+  })
   test('native version and crash-worker processes run behind containment and the actual SIGKILL barrier', () => {
     expect(codexProcessFindings(readFileSync(CODEX_DELIVERY_PATH, 'utf8'))).toEqual([])
+  })
+  test('private crash protocol retains identity, atomic publication, bounds and failure diagnostics', () => {
+    expect(codexCrashProtocolFindings(readFileSync(join(TESTS_DIR, 'real-agent/codex-crash-barrier.ts'), 'utf8'))).toEqual([])
+  })
+  test.each([
+    ['foreign PID', 'v.pid !== pid', 'false'], ['foreign instance', "v.instance !== 'cscb_codex_gate' || v.instance !== instance", 'false'],
+    ['unknown fields', 'Object.keys(v).sort().join(', 'Object.values(v).sort().join('],
+    ['non-atomic publication', 'renameSync(temporary, file)', 'void 0'], ['unbounded checkpoint', 'stat.size > 2048', 'false'],
+    ['missing successor', 'last.firstSeq !== null && last.successorSeq !== null', 'last.firstSeq !== null'],
+    ['late boundary', 'await options.inputVisible() && options.now() <= end', 'await options.inputVisible()'],
+    ['lost diagnostics', 'catch (error) { diagnostic(); throw error }', 'catch (error) { throw error }'],
+  ])('private crash protocol audit rejects %s', (_label, before, after) => {
+    const source = readFileSync(join(TESTS_DIR, 'real-agent/codex-crash-barrier.ts'), 'utf8'), changed = source.replace(before!, after!)
+    expect(changed).not.toBe(source); expect(codexCrashProtocolFindings(changed).length).toBeGreaterThan(0)
   })
   test.each([
     ['containment removed', 'paths = codexContainment(process.env, realpathSync)', 'paths = {} as any'],
     ['packed package guard removed', "if (!under('/test-repo/node_modules', realpathSync(pkg)))", 'if (false)'],
     ['prepare removed', 'await prepare().catch(startupFailure)', 'void 0'],
-    ['foreign crash PID', 'check.pid !== child.pid || check.instance !== instance', 'check.pid < 0'],
+    ['explicit durable successor', "r.kind === 'accepted' && r.seq === pair.successorSeq", 'true'],
     ['foreign shim parent', 'c.parent === child.pid && c.instance === instance', 'true'],
     ['Enter boundary omitted', "calls.some(c => c.key === 'Enter')", 'false'],
     ['graceful signal', "child.kill('SIGKILL')", "child.kill('SIGTERM')"],
     ['unverified signal', "child.signalCode !== 'SIGKILL'", 'false'],
     ['text return unblocked', 'await new Promise(() => {})', 'await Promise.resolve()'],
+    ['multipart pacing bypassed', 'const result = await (multipartSend ? multipartSend(params) : client.sendKeys(params))', 'const result = await client.sendKeys(params)'],
     ['new process', "const child = Bun.spawn(", "Bun.spawn(['unexpected'])\n  const child = Bun.spawn("],
   ])('process audit catches %s', (_label, before, after) => {
-    const source = readFileSync(CODEX_DELIVERY_PATH, 'utf8'), changed = source.replace(before!, after!)
+    const source = readFileSync(CODEX_DELIVERY_PATH, 'utf8'), changed = source.replaceAll(before!, after!)
     expect(changed).not.toBe(source)
     expect(codexProcessFindings(changed).length).toBeGreaterThan(0)
   })

@@ -161,8 +161,8 @@
     },
     {
       "path": "integration/lib/real-scenario.sh",
-      "sha256": "ae50f229f86bab4f5bf61821fc8f07a792593dec39be1763fa0ca7bc5a0c5265",
-      "reason": "Reviewed complete inline/generated AI input and prompt source; comments and diagnostic strings are not model-visible. Shared persona default acknowledgement prompt has no incidental bait."
+      "sha256": "098d14897c6d587775f570eba8eb8e1e8569cf6fbdafbcf4bcd21591e5f7786b",
+      "reason": "Reviewed complete inline/generated AI input and prompt source; comments and diagnostic strings are not model-visible. Shared persona default acknowledgement prompt has no incidental bait. E7 adds failure-only delivery diagnostics before cleanup; the original ready predicate, 180-second bound, failure and success behavior remain. Removing only the changed delivery wait and its diagnostic restores the prior reviewed source bytes. All preparation, generated inputs, prompts and the other eight audited sources are byte-identical; no AI criterion or fixture body changes."
     },
     {
       "path": "real-agent/test-111-fmk-real-ai-ac11.sh",

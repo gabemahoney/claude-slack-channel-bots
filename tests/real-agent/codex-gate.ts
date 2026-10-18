@@ -30,9 +30,15 @@ export function codexShimCalls(log: string) {
 }
 
 export function auditCodexDelivery(options: {
-  journal: any[]; rollout: CodexRollout; path: string; instance: string; shim: string; events: any[]; key: string; log: string
+  journal: any[]; completedPrefix?: any[]; rollout: CodexRollout; path: string; instance: string; shim: string; events: any[]; key: string; log: string
 }) {
-  const { journal, rollout, path, instance, events } = options
+  const { rollout, path, instance, events } = options
+  // b.omv SR-14.2: queue startup compacts delivered items during the real
+  // harness crash. Audit their actual earlier journal alongside the surviving
+  // suffix; never restore these historical records to the production queue.
+  const prefix = options.completedPrefix ?? []
+  const lastPrefixSeq = prefix.filter(r => r.kind === 'accepted' && !r.compact).at(-1)?.seq ?? -1
+  const journal = [...prefix, ...options.journal.filter(r => r.seq > lastPrefixSeq)]
   requireEvidence(!rollout.incomplete, 'partial native transcript')
   const accepted = journal.filter(r => r.kind === 'accepted' && !r.compact)
   requireEvidence(accepted.length > 0, 'empty delivery audit')

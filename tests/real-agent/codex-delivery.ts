@@ -19,6 +19,7 @@ if (!under('/test-repo/node_modules', realpathSync(pkg))) {
   console.error('FAIL: codex-delivery: refused: the installed packed package is required')
   process.exit(2)
 }
+const crashProtocol = await import('./codex-crash-barrier.ts')
 
 const codexHome = join(paths.home, '.codex'), work = join(paths.root, 'work', 'codex-delivery')
 const stateDir = join(paths.root, 'codex-delivery-state'), key = 'codex_delivery'
@@ -27,9 +28,29 @@ const liveInstances = new Set<string>()
 const nativeRollouts = new Map<string, import('./codex-evidence.ts').CodexRollout>()
 const userNames = new Map<string, string>(), channelNames = new Map<string, string>()
 let crashBarrier = false
+let multipartSend: ((params: any) => Promise<any>) | undefined
 const shim = join(paths.home, '.config/agent-director/bin/agent-director')
 const shimLog = join(paths.home, '.config/agent-director/bin/agent-director-shim.log')
 let scratchLifecycle: ReturnType<typeof createScratchCodexLifecycle> | undefined
+let crashProgress: import('./codex-crash-barrier.ts').CrashProgress = { version: 1, pid: process.pid, instance: 'cscb_codex_gate',
+  stage: 'startup', firstSeq: null, successorSeq: null, prepared: false, clientReady: false, queueReady: false,
+  textStarted: false, textReturned: false, failed: false, errors: 0, error: 'none' }
+
+function crashCheckpoint(next: string, patch: Partial<typeof crashProgress> = {}) {
+  if (process.argv[2] !== 'crash-worker') return
+  // Acceptance may finish concurrently with the held text call. Keep the
+  // latest transport stage while adding the explicit durable sequence IDs.
+  const preserveStage = crashProgress.textStarted && ['queue-ready', 'first-accepted', 'successor-accepted'].includes(next)
+  crashProgress = { ...crashProgress, ...patch, stage: preserveStage ? crashProgress.stage : next }
+  stage = `crash-worker-${crashProgress.stage}`
+  crashProtocol.publishCrashProgress(join(stateDir, 'crash-progress.json'), crashProgress)
+}
+function crashError(error: unknown) {
+  return error instanceof transport.ErrDialogMaybeOpen ? 'ErrDialogMaybeOpen'
+    : error instanceof transport.ErrInvalidFlags ? 'ErrInvalidFlags'
+    : error instanceof transport.ErrSendKeysWhileRelayed ? 'ErrSendKeysWhileRelayed'
+    : error instanceof transport.ErrRelayFallenBack ? 'ErrRelayFallenBack' : 'other'
+}
 
 function entryExists(path: string) { try { lstatSync(path); return true } catch (e) { if ((e as NodeJS.ErrnoException).code === 'ENOENT') return false; throw e } }
 function privateDirectory(path: string) {
@@ -66,6 +87,7 @@ async function prepare() {
     symlinkSync(CODEX_AUTH_MOUNT, auth)
   }
   privateDirectory(work); privateDirectory(stateDir)
+  crashCheckpoint('startup')
   // The package owns the strict TOML/key policy. No host settings are copied.
   const { checkCodexScratchConfigKeys } = await import(join(pkg, 'src/codex-config-keys.ts'))
   scratchLifecycle = createScratchCodexLifecycle({ root: paths.root, home: codexHome, stateDir,
@@ -84,6 +106,7 @@ async function prepare() {
 }
 
 function startupFailure(): never {
+  try { crashCheckpoint(crashProgress.stage, { failed: true, error: 'preparation', errors: 1 }) } catch { /* no private checkpoint available yet */ }
   console.error('FAIL: codex-delivery: guarded native preparation failed')
   if (entryExists(join(codexHome, 'auth.json'))) {
     try { authSymlink(); console.log('recorded: codex-auth-symlink true') }
@@ -92,6 +115,7 @@ function startupFailure(): never {
   process.exit(1)
 }
 await prepare().catch(startupFailure)
+crashCheckpoint('prepared', { prepared: true })
 // Load only packed production modules after image/scratch/model/auth guards.
 const [engineModule, queueModule, intakeModule, diagnostics, identity, notices, description, evidence, observation, transport, receipts] = await Promise.all([
   import(join(pkg, 'src/delivery-engine.ts')), import(join(pkg, 'src/delivery-queue.ts')),
@@ -102,12 +126,14 @@ const [engineModule, queueModule, intakeModule, diagnostics, identity, notices, 
   import(import.meta.resolve('agent-director', join(pkg, 'src/agent-director-startup.ts'))),
   import('../integration/fixtures/transcript-receipts.ts'),
 ]).catch(startupFailure)
+crashCheckpoint('modules-ready')
 // Deliberately omit storePath/home; Codex's AD hooks resolve through HOME.
 const client = await transport.Client.create().catch(startupFailure)
 if (client.binaryPath !== shim || client.binaryVersion !== '0.12.0') {
   await client.close()
   startupFailure()
 }
+crashCheckpoint('client-ready', { clientReady: true })
 const tagDescription = `${description.TAG_DESCRIPTION}\n${CODEX_NO_REPLY}\n`
 let engines: any, preparation: any, queue: any, lifecycle: any
 const received = new Set<number>()
@@ -142,10 +168,13 @@ async function buildEngine() {
   engines = engineModule.createDeliveryEngines({ queue, lifecycle, clientFor: async () => ({
     get: (params: any) => client.get(params), readPane: (params: any) => client.readPane(params),
     sendKeys: async (params: any) => {
-      const result = await client.sendKeys(params)
+      if (crashBarrier && params.no_enter && typeof params.text === 'string') crashCheckpoint('text-call-start', { textStarted: true })
+      const result = await (multipartSend ? multipartSend(params) : client.sendKeys(params))
       if (crashBarrier && params.no_enter && typeof params.text === 'string') {
         crashBarrier = false
-        writeFileSync(join(stateDir, 'crash-after-text.json'), JSON.stringify({ pid: process.pid, instance, at: Date.now() }), { mode: 0o600 })
+        crashCheckpoint('text-call-return', { textReturned: true })
+        crashProtocol.publishCrashProgress(join(stateDir, 'crash-after-text.json'), crashProgress)
+        crashCheckpoint('barrier-published')
         // The real text call finished; hold its return so no Enter can start.
         // The parent SIGKILLs this harness, leaving the native agent alive.
         await new Promise(() => {})
@@ -159,14 +188,19 @@ async function buildEngine() {
     isRestartPendingOrActive: () => false,
     scheduleRestart: () => { throw new Error('native row ended; observation requires a new contained dispatch') },
     reconnect: async () => { throw new Error('D1 injects connected; no MCP reconnect is permitted') },
-    onError: () => log('[slack] codex-harness-call-failed'), onEvent: engineEvent,
+    onError: (_key: string, error: unknown) => {
+      crashCheckpoint(crashProgress.stage, { error: crashError(error), errors: Math.min(1000000, crashProgress.errors + 1) })
+      log('[slack] codex-harness-call-failed')
+    }, onEvent: engineEvent,
   })
   await preparation.recover([key])
+  crashCheckpoint('queue-ready', { queueReady: true })
 }
 async function stopEngine() { await engines?.stop(); await preparation?.stop(); await lifecycle?.stop(); await queue?.stop() }
 async function poll<T>(step: string, check: () => Promise<T | undefined>, ms = 120000): Promise<T> {
   const end = Date.now() + ms
   while (Date.now() < end) { const result = await check(); if (result !== undefined && Date.now() <= end) return result; await Bun.sleep(250) }
+  record('bound', { step, milliseconds: ms })
   throw new Error(`${step}: observation incomplete within bound`)
 }
 async function row() {
@@ -275,6 +309,10 @@ async function start(label = 'delivery', instructions = 'For observation probes,
 async function accept(input: any) {
   const result = await queue.accept(key, input)
   if (result.status !== 'accepted' || !result.item) throw new Error('queue did not durably accept observation input')
+  if (process.argv[2] === 'crash-worker') {
+    if (crashProgress.firstSeq === null) crashCheckpoint('first-accepted', { firstSeq: result.seq })
+    else crashCheckpoint('successor-accepted', { successorSeq: result.seq })
+  }
   receivedItem(result.item)
   await preparation.prepare(key, result.item)
   return result.seq as number
@@ -414,22 +452,26 @@ async function gate() {
   const { auditCodexDelivery, assertCodexRecovery, codexShimCalls } = await import('./codex-gate.ts')
   assertCodexRecovery(journal(), burst[0]!, 'enter', readFileSync(shimLog, 'utf8'), instance)
   assertCodexRecovery(journal(), burst[1]!, 'retype', readFileSync(shimLog, 'utf8'), instance)
+  const completedPrefix = journal().filter(r => r.seq >= basicSeqs[0]!)
 
   stage = 'gate-crash-between-text-and-enter'
   await stopEngine()
   const child = Bun.spawn([process.execPath, import.meta.path, 'crash-worker'], { stdout: 'ignore', stderr: 'ignore', env: { ...process.env } })
   try {
-    await poll('real child text barrier', async () => {
-      if (child.exitCode !== null) throw new Error('crash worker exited before text boundary')
-      const file = join(stateDir, 'crash-after-text.json')
-      if (!existsSync(file)) return
-      const check = JSON.parse(readFileSync(file, 'utf8'))
-      if (check.pid !== child.pid || check.instance !== instance) throw new Error('foreign crash boundary')
-      const p = await pane('crash-text-before-Enter')
-      return p.screen.kind === 'input' ? check : undefined
-    }, 180000)
-    const beforeKill = journal(), crashItem = beforeKill.filter(r => r.kind === 'accepted').at(-2)
-    if (!crashItem) throw new Error('crash input was not durable')
+    const pair = await crashProtocol.waitForCrashBoundary({ child, instance,
+      checkpoint: join(stateDir, 'crash-progress.json'), marker: join(stateDir, 'crash-after-text.json'),
+      journal, inputVisible: async () => (await pane('crash-text-before-Enter')).screen.kind === 'input',
+      counts: () => {
+        try {
+          const calls = codexShimCalls(readFileSync(shimLog, 'utf8')).filter(c => c.parent === child.pid && c.instance === instance)
+          return { queue: journal().filter(r => r.kind === 'accepted').length, text: calls.filter(c => c.noEnter).length, enter: calls.filter(c => c.key === 'Enter').length }
+        } catch { return { queue: -1, text: -1, enter: -1 } }
+      },
+      diagnostic: value => record('crash-worker', value), bound: () => record('bound', { step: 'real child text barrier', milliseconds: 180000 }),
+      now: () => Date.now(), sleep: ms => Bun.sleep(ms),
+    })
+    const beforeKill = journal(), crashItem = beforeKill.find(r => r.kind === 'accepted' && r.seq === pair.firstSeq)
+    if (!crashItem || !beforeKill.some(r => r.kind === 'accepted' && r.seq === pair.successorSeq)) throw new Error('crash input pair was not durable')
     const typed = beforeKill.find(r => r.kind === 'fixed' && r.seq === crashItem.seq)?.parts[0]
     const calls = codexShimCalls(readFileSync(shimLog, 'utf8')).filter(c => c.parent === child.pid && c.instance === instance)
     if (!calls.some(c => c.text === typed && c.noEnter) || calls.some(c => c.key === 'Enter')) throw new Error('child crash boundary did not precede Enter')
@@ -449,8 +491,9 @@ async function gate() {
     assertCodexRecovery(journal(), seq, 'no-retype', readFileSync(shimLog, 'utf8'), instance)
   }
   if (queue.openCount(key) !== 0) throw new Error('gate retained open items')
+  stage = 'gate-final-audit'
   const current = await rollout()
-  const audit = auditCodexDelivery({ journal: journal().filter(r => r.seq >= basicSeqs[0]!), rollout: current.data, path: current.path,
+  const audit = auditCodexDelivery({ journal: journal().filter(r => r.seq >= basicSeqs[0]!), completedPrefix, rollout: current.data, path: current.path,
     instance, shim: readFileSync(shimLog, 'utf8'), events: eventJournal(), key, log: readFileSync(join(stateDir, 'server.log'), 'utf8') })
   if (audit.items !== 17) throw new Error('gate scenario inventory incomplete')
   record('gate', { assertionsPassed: true, items: audit.items, firstReceipts: audit.firstReceipts, queueEmpty: true })
@@ -510,17 +553,26 @@ async function ai(ac: number) {
     const after = await begin('ai_15', 'Give a visible JSON response on every turn. For received multipart input, acknowledge a nonfinal part with {"status":"received"} and finish the turn. Once complete return {"case":"AC15","messages":the number of messages received,"body":the joined BODY}. Use only input received in this conversation. Do not retrieve other data. Use no tools. Return JSON without Markdown.')
     const message = oracle.codexAC15Message(), body = message.text
     userNames.set(message.user_id, message.user)
-    const seq = await accept(oracle.codexSlackInput(message))
-    await delivered(seq)
-    const parts = queue.item(key, seq).fixed.parts
-    if (parts.length !== 3) throw new Error('AC15 production wrapper did not make three parts')
-    const answers = []
-    for (let n = 1; n <= 3; n++) answers.push(await completedItem(seq, n,
-      n < 3 ? { status: 'received' } : { case: 'AC15', messages: 1, body }, true))
-    oracle.assertCodexMultipart(parts, body, answers)
-    await idle()
-    await completedItem(seq, 3, { case: 'AC15', messages: 1, body }, true)
-    await audit(after)
+    const answers: any[] = []
+    multipartSend = oracle.codexMultipartSender((params: any) => client.sendKeys(params), async text => {
+      const item = queue.items(key).find((item: any) => item.accepted.seq > after && item.fixed?.parts.includes(text))
+      if (!item) throw new Error('AC15 submission has no exact durable part')
+      const part = item.fixed.parts.indexOf(text) + 1
+      if (part !== answers.length + 1) throw new Error('AC15 submission order differs')
+      stage = `AI-AC15-part-${part}-completion`
+      answers.push(await completedItem(item.accepted.seq, part,
+        part < 3 ? { status: 'received' } : { case: 'AC15', messages: 1, body }, true))
+    })
+    try {
+      const seq = await accept(oracle.codexSlackInput(message))
+      await delivered(seq)
+      const parts = queue.item(key, seq).fixed.parts
+      if (parts.length !== 3) throw new Error('AC15 production wrapper did not make three parts')
+      oracle.assertCodexMultipart(parts, body, answers)
+      await idle()
+      await completedItem(seq, 3, { case: 'AC15', messages: 1, body }, true)
+      await audit(after)
+    } finally { multipartSend = undefined }
   } else {
     const after = await begin('ai_106', 'Answer ordinary test requests with JSON without Markdown. Acknowledge a message with {"status":"received"}. When asked for a count, return {"case":"AC106","messages":the number of distinct prior DMs received before the query}. Use no tools.')
     const seq = await accept(dm('Please acknowledge this DM.', 110))
@@ -565,12 +617,14 @@ try {
   } else if (command === 'pane') await pane(file ?? 'manual-observation')
   else throw new Error('usage: codex-delivery observe|start|deliver <private-input.json>|recover|pane <label>')
 } catch (error) {
+  crashCheckpoint(crashProgress.stage, { failed: true, error: crashError(error), errors: Math.min(1000000, crashProgress.errors + 1) })
   // Do not print arbitrary native errors, arguments or raw session content.
   const refused = error instanceof transport.ErrDialogMaybeOpen ? 'ErrDialogMaybeOpen'
     : error instanceof transport.ErrInvalidFlags ? 'ErrInvalidFlags'
     : error instanceof transport.ErrSendKeysWhileRelayed ? 'ErrSendKeysWhileRelayed'
     : error instanceof transport.ErrRelayFallenBack ? 'ErrRelayFallenBack' : 'other'
   record('failure', { stage, key: lastKey, errorClass: refused })
+  try { await pane('failure') } catch { /* no readable current native pane */ }
   try { record('rollout-events-on-failure', evidence.safeCodexEvents((await rollout()).data)) } catch { /* no valid own-session projection */ }
   console.error('FAIL: codex-delivery: native evidence incomplete; inspect retained safe observations')
   process.exitCode = 1
