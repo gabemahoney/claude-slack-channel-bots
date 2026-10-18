@@ -4,6 +4,7 @@
 # native selection, onboarding, transport observations and exact receipts.
 require_ci_image real-scenario
 require_scenario_home real-scenario
+source "${BASH_SOURCE[0]%/*}/real-failure.sh"
 [[ "${TEST_NAME}" == *-fmk-real-* ]] || fail 'real-scenario requires a -fmk-real- script'
 REAL_DELIVERY_WAIT_S=180
 REAL_LAUNCH_WAIT_S=300

@@ -1278,6 +1278,8 @@ _SCENARIO_STATE_DIRS=()   # every state dir a `start` ran in
 _SCENARIO_SERVER_PIDS=()  # daemon PIDs a start reported and no stop_server saw gone
 _SCENARIO_TRACKED_PIDS=() # background processes registered with track_pid
 _SCENARIO_EXIT_HOOKS=()   # functions registered with on_exit
+_SCENARIO_BEFORE_CLEANUP_HOOKS=() # observations while native panes still exist
+_SCENARIO_FAILURE_HOOKS=() # retention after the final exit status is known
 _SCENARIO_BEFORE_START_HOOKS=() # read-only evidence observers registered by real scenarios
 _SCENARIO_LIVE=0          # 1 once a start ran with --live
 _SCENARIO_STATE_COUNT=0
@@ -1394,6 +1396,18 @@ stop_tracked_pid() {
 on_exit() {
     declare -F -- "${1:-}" > /dev/null || fail "on_exit: '${1:-}' is not a function"
     _SCENARIO_EXIT_HOOKS+=("$1")
+}
+# Read-only observations before native processes are stopped. These cannot
+# change the scenario verdict; their failures are diagnostic only.
+on_before_cleanup() {
+    declare -F -- "${1:-}" > /dev/null || fail "on_before_cleanup: not a function"
+    _SCENARIO_BEFORE_CLEANUP_HOOKS+=("$1")
+}
+# Failure retention after closing assertions and exit hooks, before scratch
+# deletion. Receives the final status, including failures found during cleanup.
+on_failure() {
+    declare -F -- "${1:-}" > /dev/null || fail "on_failure: not a function"
+    _SCENARIO_FAILURE_HOOKS+=("$1")
 }
 
 on_before_start() {
@@ -1522,6 +1536,9 @@ _scenario_cleanup() {
     local rc=$? dir pid hook hook_rc
     set +e
     trap - EXIT
+    for hook in ${_SCENARIO_BEFORE_CLEANUP_HOOKS[@]+"${_SCENARIO_BEFORE_CLEANUP_HOOKS[@]}"}; do
+        ( "${hook}" )
+    done
     if [[ "${SCENARIO_FMK}" == 1 ]]; then
         # The stops below run in `log` mode, whatever mode the script left.
         _scenario_tmux_shim_reset
@@ -1566,6 +1583,9 @@ _scenario_cleanup() {
         fi
     done
     if [[ "${rc}" -ne 0 ]]; then
+        for hook in ${_SCENARIO_FAILURE_HOOKS[@]+"${_SCENARIO_FAILURE_HOOKS[@]}"}; do
+            ( "${hook}" "${rc}" ) || echo 'recorded: failure retention unavailable' >&2
+        done
         for dir in ${_SCENARIO_STATE_DIRS[@]+"${_SCENARIO_STATE_DIRS[@]}"}; do
             [[ -f "${dir}/server.log" ]] || continue
             echo "--- ${TEST_NAME}: last ${SCENARIO_LOG_TAIL_LINES} lines of ${dir}/server.log ---" >&2

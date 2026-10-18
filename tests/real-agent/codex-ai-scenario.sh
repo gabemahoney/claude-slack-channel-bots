@@ -1,5 +1,7 @@
 # D1 only: native Codex, installed delivery modules and the scenario's shim.
 source "$(dirname "${BASH_SOURCE[0]}")/../integration/lib/scenario.sh"
+REAL_FAILURE_AGENT=codex
+source "$(dirname "${BASH_SOURCE[0]}")/../integration/lib/real-failure.sh"
 require_ci_image codex-ai
 require_scenario_home codex-ai
 [[ -z "${TMUX+x}" && "${TMUX_TMPDIR:-}" == "${SCENARIO_ROOT}"/* ]] || fail 'Codex requires a private tmux server'

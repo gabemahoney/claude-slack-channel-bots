@@ -2880,6 +2880,7 @@ function codexAIShellFindings(source: string): string[] {
   const commands = shellLogicalLines(source).filter(line => !isShellNonStep(line)).map(line => line.text.trim())
   const expected = [
     'source "$(dirname "${BASH_SOURCE[0]}")/../integration/lib/scenario.sh"',
+    'source "$(dirname "${BASH_SOURCE[0]}")/../integration/lib/real-failure.sh"',
     'require_ci_image codex-ai',
     'require_scenario_home codex-ai',
     '[[ -z "${TMUX+x}" && "${TMUX_TMPDIR:-}" == "${SCENARIO_ROOT}"/* ]] || fail \'Codex requires a private tmux server\'',
@@ -2898,6 +2899,7 @@ function codexGateShellFindings(source: string): string[] {
   const commands = shellLogicalLines(source).filter(line => !isShellNonStep(line)).map(line => line.text.trim())
   const expected = [
     'source "$(dirname "$0")/lib/scenario.sh"',
+    'source "$(dirname "$0")/lib/real-failure.sh"',
     'require_ci_image codex-observation',
     'require_scenario_home codex-observation',
     '[[ -z "${TMUX+x}" && "${TMUX_TMPDIR:-}" == "${SCENARIO_ROOT}"/* ]] || fail \'Codex requires a private tmux server\'',

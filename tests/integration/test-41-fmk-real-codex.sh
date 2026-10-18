@@ -3,6 +3,8 @@
 set -euo pipefail
 TEST_NAME="test-41-fmk-real-codex"
 source "$(dirname "$0")/lib/scenario.sh"
+REAL_FAILURE_AGENT=codex
+source "$(dirname "$0")/lib/real-failure.sh"
 require_ci_image codex-observation
 require_scenario_home codex-observation
 [[ -z "${TMUX+x}" && "${TMUX_TMPDIR:-}" == "${SCENARIO_ROOT}"/* ]] || fail 'Codex requires a private tmux server'

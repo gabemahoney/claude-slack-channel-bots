@@ -20,7 +20,7 @@ if (!under('/test-repo/node_modules', realpathSync(pkg))) {
   process.exit(2)
 }
 const crashProtocol = await import('./codex-crash-barrier.ts')
-const { emitFailureEvidence, diagnosticValue, scrubDiagnosticText } = await import('./ai-failure-diagnostics.ts')
+const { projectFailurePane } = await import('./ai-failure-diagnostics.ts')
 
 const codexHome = join(paths.home, '.codex'), work = join(paths.root, 'work', 'codex-delivery')
 const stateDir = join(paths.root, 'codex-delivery-state'), key = 'codex_delivery'
@@ -625,23 +625,18 @@ try {
     : error instanceof transport.ErrSendKeysWhileRelayed ? 'ErrSendKeysWhileRelayed'
     : error instanceof transport.ErrRelayFallenBack ? 'ErrRelayFallenBack' : 'other'
   record('failure', { stage, key: lastKey, errorClass: refused })
-  try { await pane('failure') } catch { /* no readable current native pane */ }
-  try { record('rollout-events-on-failure', evidence.safeCodexEvents((await rollout()).data)) } catch { /* no valid own-session projection */ }
-  if (process.argv[2] === 'ai') {
-    // The native reader is already restricted to this scratch session. Never
-    // inspect/copy auth.json; only projected rollout records cross this path.
-    let records: unknown[] = []
-    try {
-      records = (await rollout()).data.records.map(r => ({ offset: r.offset, at: r.at, type: diagnosticValue(r.type),
-        kind: diagnosticValue(r.kind), model: diagnosticValue(r.model), role: diagnosticValue(r.role),
-        tool: diagnosticValue(r.tool), failed: r.failed, turn: diagnosticValue(r.turn),
-        ...(r.role === 'assistant' && r.text !== undefined ? { text: scrubDiagnosticText(r.text) } : {}) }))
-    } catch { /* Explicit empty capture below; never invent a native turn. */ }
-    emitFailureEvidence({ agent: 'codex', criterion: process.argv[3], trial: process.env.REAL_AGENT_TRIAL, case: stage }, records)
-  }
   console.error('FAIL: codex-delivery: native evidence incomplete; inspect retained safe observations')
   process.exitCode = 1
 } finally {
+  // Capture while rows still exist, also for failures discovered by cleanup.
+  // The shell's shared failure hook emits these only if the final status fails.
+  const finalPanes = []
+  for (const id of liveInstances) {
+    try { finalPanes.push({ instance: id, ...projectFailurePane((await client.readPane({ instance_id: id, n_lines: 80 })).pane) }) }
+    catch { finalPanes.push({ instance: id, unavailable: true }) }
+  }
+  try { writeFileSync(join(paths.root, 'real-final-panes.jsonl'), (finalPanes.length ? finalPanes : [{ unavailable: true }]).map(p => JSON.stringify(p)).join('\n') + '\n', { mode: 0o600 }) }
+  catch { console.error('recorded: final pane retention unavailable') }
   try { await stopEngine() }
   catch { console.error('FAIL: codex-delivery: engine cleanup failed'); process.exitCode = 1 }
   for (const id of liveInstances) {

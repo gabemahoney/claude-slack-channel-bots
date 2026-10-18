@@ -1,6 +1,6 @@
 /** Failure-only evidence. Never supplies an oracle answer or changes a wait. */
 import { closeSync, constants, existsSync, openSync, readFileSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { basename, join, relative } from 'node:path'
 import type { TranscriptEntry } from '../integration/fixtures/transcript-receipts.ts'
 
 export const AI_FAILURE_PREFIX = 'real-agent-failure-evidence: '
@@ -29,16 +29,78 @@ export function reportFailureOnce(path: string, message: string, emit: (message:
   emit(message)
 }
 
+const fields = (value: any, names: readonly string[]) => Object.fromEntries(names.filter(key => value?.[key] !== undefined).map(key => [key, diagnosticValue(value[key])]))
+const identityFields = ['type', 'subtype', 'uuid', 'parentUuid', 'sessionId', 'session_id', 'agentId', 'agent_id', 'parentAgentId', 'isSidechain',
+  'requestedModel', 'isMeta', 'isApiErrorMessage', 'error', 'isSynthetic', 'refusedUserMessageUuid', 'sourceToolAssistantUUID',
+  'toolDenialKind', 'toolDenialEndsTurn', 'toolDenialMonitorBlocked', 'toolDenialUnanswered', 'toolEndsTurn', 'permissionMode',
+  'stop_reason', 'terminal_reason', 'is_error', 'toolUseID', 'parentToolUseID'] as const
+function contentMetadata(content: unknown): unknown {
+  if (!Array.isArray(content)) return typeof content === 'string' ? '<text withheld>' : diagnosticValue(content)
+  return content.map(b => fields(b, ['type', 'id', 'name', 'tool_use_id', 'is_error']))
+}
+/** Native notification linkage is metadata; summary/result/body text is never retained. */
+export function notificationMetadata(content: unknown) {
+  const text = typeof content === 'string' ? content : Array.isArray(content)
+    ? content.filter(b => b?.type === 'text' && typeof b.text === 'string').map(b => b.text).join('\n') : ''
+  if (!text.includes('<task-notification>')) return undefined
+  return Object.fromEntries(['task-id', 'tool-use-id', 'status'].map(tag => [tag, diagnosticValue(text.match(new RegExp(`<${tag}>([^<]*)</${tag}>`))?.[1])]))
+}
 export function projectClaudeFailure(entry: TranscriptEntry) {
   const v = entry.value, m = v?.message
-  const metadata = Object.fromEntries(['type', 'subtype', 'uuid', 'parentUuid', 'sessionId', 'requestedModel', 'isMeta', 'isApiErrorMessage', 'error', 'isSynthetic', 'refusedUserMessageUuid']
-    .map(key => [key, diagnosticValue(v?.[key])]))
-  return { offset: entry.offset, at: Number.isFinite(entry.at) ? entry.at : null, ...metadata,
-    message: { id: diagnosticValue(m?.id), role: diagnosticValue(m?.role), model: diagnosticValue(m?.model), stop_reason: diagnosticValue(m?.stop_reason),
-      content: Array.isArray(m?.content) ? m.content.map((b: any) => ({ type: diagnosticValue(b?.type),
-        ...(b?.type === 'tool_use' ? { name: diagnosticValue(b.name), ...(b.name === 'mcp__slack-channel-router__reply' && typeof b.input?.text === 'string' ? { reply: scrubDiagnosticText(b.input.text) } : {}) } : {}),
-        ...(v?.type === 'assistant' && b?.type === 'text' && typeof b.text === 'string' ? { text: scrubDiagnosticText(b.text) } : {}),
-      })) : diagnosticValue(m?.content) } }
+  return { stream: basename(entry.path), sidechain: entry.path.includes('/subagents/'), offset: entry.offset,
+    at: Number.isFinite(entry.at) ? entry.at : null, ...fields(v, identityFields),
+    origin: fields(v?.origin, ['kind', 'subkind', 'producer', 'runId']),
+    toolUseResult: fields(v?.toolUseResult, ['agentId', 'status', 'isAsync', 'resolvedModel', 'canContinueAgent']),
+    permissionDecision: typeof v?.permissionDecision === 'object' ? fields(v.permissionDecision, ['behavior', 'type', 'decision']) : diagnosticValue(v?.permissionDecision),
+    toolResultRemedy: fields(v?.toolResultRemedy, ['kind']),
+    data: fields(v?.data, ['type', 'subtype', 'agentId', 'status', 'tool_name', 'tool_use_id', 'decision', 'behavior']),
+    attachment: fields(v?.attachment, ['type', 'agentId', 'taskId', 'status']),
+    request: fields(v?.request, ['subtype', 'tool_name', 'tool_use_id', 'request_id']),
+    permission_denials: Array.isArray(v?.permission_denials) ? v.permission_denials.map((d: unknown) => fields(d, ['tool_name', 'tool_use_id'])) : undefined,
+    notification: notificationMetadata(m?.content),
+    message: { ...fields(m, ['id', 'role', 'model', 'stop_reason']), content: contentMetadata(m?.content) } }
+}
+export function projectCodexFailure(entry: TranscriptEntry) {
+  const v = entry.value, p = v?.payload
+  return { stream: basename(entry.path), offset: entry.offset, at: Number.isFinite(entry.at) ? entry.at : null,
+    ...fields(v, identityFields), payload: { ...fields(p, [...identityFields, 'id', 'role', 'model', 'turn_id', 'call_id', 'name',
+      'status', 'decision', 'approval', 'request_id', 'thread_id', 'parent_thread_id']), content: contentMetadata(p?.content) } }
+}
+/** Preserve the final pane's rows and UI markers, never conversation or draft text.
+ * Unknown text is withheld, including history, menu labels and tool arguments. */
+export function projectFailurePane(pane: unknown) {
+  if (typeof pane !== 'string') return { unavailable: true }
+  const lines = pane.replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, '').replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '').replace(/\r/g, '').split('\n')
+  return { lines: lines.map(line => {
+    if (/^\s*$/.test(line) || /^\s*(?:l>)?[─━-]{8,}\s*$/.test(line)
+      || /^\s*⏸ manual mode on(?: · \? for shortcuts(?: · ← for agents)?)?\s*$/.test(line)) return line
+    const prompt = line.match(/^(\s*[❯›>][ \u00a0]?)(.*)$/)
+    if (prompt) return prompt[1] + (prompt[2] ? '[text withheld]' : '')
+    return '[text withheld]'
+  }) }
+}
+/** Reads only JSONL below the scenario's isolated transcript directory. No
+ * auth/config path or symlink is read. Partial/malformed records stay visible. */
+export async function scenarioFailureRecords(root: string, agent: 'claude' | 'codex') {
+  const { transcriptFiles } = await import('../integration/fixtures/transcript-receipts.ts')
+  const records: unknown[] = []
+  for (const path of transcriptFiles(root)) {
+    let offset = 0
+    let text: string
+    try { text = readFileSync(path, 'utf8') }
+    catch { records.push({ stream: diagnosticValue(basename(path)), unavailable: true }); continue }
+    for (const line of text.split('\n')) {
+      if (line) {
+        try {
+          const value = JSON.parse(line), at = typeof value.timestamp === 'number' ? value.timestamp : Date.parse(value.timestamp ?? '')
+          const entry = { path, offset, at, value, kind: 'other' }
+          records.push({ ...((agent === 'claude' ? projectClaudeFailure : projectCodexFailure)(entry)), stream: relative(root, path).split('/').map(part => diagnosticValue(part)).join('/') })
+        } catch { records.push({ stream: diagnosticValue(basename(path)), offset, malformed: true }) }
+      }
+      offset += Buffer.byteLength(line) + 1
+    }
+  }
+  return records
 }
 
 /** All attempts/copies for the selected item, including late linked responses.
@@ -54,29 +116,37 @@ export function emitFailureEvidence(scope: Record<string, unknown>, records: unk
   for (const record of records) emit(AI_FAILURE_PREFIX + scrubDiagnosticText(JSON.stringify({ ...scope, event: 'transcript', record })))
 }
 
+export async function captureFailureEvidence(agent: 'claude' | 'codex', root: string, scope: Record<string, unknown>, panes: string, emit = console.log) {
+  emitFailureEvidence({ ...scope, agent }, await scenarioFailureRecords(root, agent), emit)
+  let snapshots: unknown[] = []
+  try { snapshots = readFileSync(panes, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line)) }
+  catch { /* Missing panes remain explicit even when transcript capture succeeds. */ }
+  for (const pane of snapshots.length ? snapshots : [{ unavailable: true }]) emit(AI_FAILURE_PREFIX + scrubDiagnosticText(JSON.stringify({ ...scope, agent, event: 'pane', pane })))
+}
+
 /** Called by the coordinator before deleting a failed job's container. The
  * coordinator's mask also knows the Codex login's original/refreshed tokens. */
 export function retainFailureLine(output: string, line: string, redact: (value: string) => string): boolean {
   if (!line.startsWith(AI_FAILURE_PREFIX)) return false
   const value = JSON.parse(line.slice(AI_FAILURE_PREFIX.length))
-  const fd = openSync(join(output, 'ai-failures.jsonl'), constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW, 0o600)
+  const fd = openSync(join(output, 'real-agent-failures.jsonl'), constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW, 0o600)
   try { writeFileSync(fd, redact(scrubDiagnosticText(JSON.stringify(value))) + '\n') }
   finally { closeSync(fd) }
   return true
 }
 
 if (import.meta.main) {
-  // This is invoked by the scenario EXIT hook after the native processes stop,
-  // but before their isolated HOME is removed. It never reads Codex auth.
   try {
     if (!existsSync('/etc/cscb-ci-image')) throw new Error('CI image required')
-    const [state, key, root, sequence, criterion, trial] = process.argv.slice(2)
-    const receipts = await import('../integration/fixtures/transcript-receipts.ts')
-    const journal = receipts.receiptJournal(state!, key!)
-    const last = Math.max(0, ...journal.filter(r => r.kind === 'accepted').map(r => r.seq))
-    const seq = Math.min(Number(sequence) || last, last)
-    const adapters = await receipts.packedReceiptAdapters()
-    const entries = receipts.readTranscripts(receipts.transcriptFiles(root!), adapters, true)
-    emitFailureEvidence({ agent: 'claude', criterion, trial, seq }, claudeFailureRecords(journal, entries, seq))
-  } catch { emitFailureEvidence({ agent: 'claude', criterion: process.argv[6], trial: process.argv[7], unavailable: true }, []) }
+    const [command, agent, root, scenario, trial, panes] = process.argv.slice(2)
+    if (command === 'pane') {
+      const value = JSON.parse(readFileSync(root!, 'utf8'))
+      console.log(JSON.stringify({ key: diagnosticValue(scenario), ...projectFailurePane(value?.pane) }))
+    } else if (command === 'capture' && (agent === 'claude' || agent === 'codex')) {
+      await captureFailureEvidence(agent, root!, { scenario, trial }, panes!)
+    } else throw new Error('Unknown diagnostic command')
+  } catch {
+    if (process.argv[2] === 'pane') console.log(JSON.stringify({ unavailable: true }))
+    else emitFailureEvidence({ agent: diagnosticValue(process.argv[3]), scenario: diagnosticValue(process.argv[5]), unavailable: true }, [])
+  }
 }

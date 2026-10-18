@@ -1,12 +1,6 @@
 # Scenario body shared only by Lane 1's seven AI test scripts.
 source "$(dirname "${BASH_SOURCE[0]}")/../integration/lib/scenario.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/../integration/lib/real-scenario.sh"
-AI_FAILURE_HELPER="${BASH_SOURCE[0]%/*}/ai-failure-diagnostics.ts"
-ai_failure_evidence() {
-    [[ "$1" -ne 0 ]] || return 0
-    bun "${AI_FAILURE_HELPER}" "${SLACK_STATE_DIR}" "${REAL_KEY:-}" "${HOME}/.claude/projects" "${READBACK_SEQ:-${n:-0}}" "${AI_CRITERION}" "${REAL_AGENT_TRIAL:-}"
-}
-on_exit ai_failure_evidence
 [[ "${REAL_AGENT_TRIAL:-}" =~ ^[123]$ ]] || fail 'AI trial must be explicitly 1, 2 or 3'
 [[ "${REAL_AGENT_MODEL_PIN:-}" =~ ^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,255}$ && "${ANTHROPIC_MODEL:-}" == "${REAL_AGENT_MODEL_PIN}" && "${REAL_AGENT_MODEL_PIN}" != *$'\n'* && "${REAL_AGENT_MODEL_PIN}" != *$'\r'* ]] || fail 'AI criteria require an exact safe selected model pin'
 [[ "${CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK:-}" == 1 ]] || fail 'AI criteria require refusal fallback disabled'

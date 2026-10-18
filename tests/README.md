@@ -687,6 +687,17 @@ assertions).
 
 ### Real Claude gate and heavy legs (b.omv SR-14)
 
+Every real-agent failure retains metadata for all main and subagent transcript
+records from its isolated HOME, plus a projected final pane captured before
+retirement. Message text, tool arguments/results and unknown pane text are
+withheld; types, subtypes, stop reasons, models, tool names, permission/denial
+flags, agent IDs and notification links remain. Heavy runs write private
+`real-agent-failures.jsonl` under their output folder; full CI keeps the evidence
+lines in failure logs. Cleanup failures also trigger retention. Missing or
+malformed evidence is marked explicitly and never changes a verdict. See the
+[2.1.302 completion-record audit](fixtures/native-denial-completion/README.md).
+
+
 Tests 32–40 are the nine real Claude gates included in every full `/ci` run.
 They drive the packed CSCB against the loopback Slack stub, select native
 Claude Code 2.1.296 through agent-director's `[launch].claude_path`, and keep
