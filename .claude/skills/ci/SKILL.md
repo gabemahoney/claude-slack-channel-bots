@@ -183,7 +183,7 @@ Take the grace from the stop line's `grace <grace>`: `none` after exit 0,
 `term:<m>` after 20, `kill:<m>` after 21. Then go to step 4. An exit other
 than 0, 20 or 21 is an unknown stop exit (see [Unknown exits](#unknown-exits)).
 
-A runner killed this way is a dead owner, so the next `/ci` run's sweep
+A runner killed this way is a dead runner, so the next `/ci` run's sweep
 removes its containers, reservation and tags.
 
 ### 4. Report
@@ -247,16 +247,11 @@ exit, so polling fails visibly and never gives a wrong outcome.
 Each wait is one Bash call, and so one model turn of the calling session,
 `/publish` and `/publish-prepare` included. That cost is accepted.
 
-A run of m minutes takes about m × 60 ÷ 90 wait calls, plus one per phase
-change (at most two), besides the launch, the report and, after the grace,
-the stop. With the current duration table:
-
-| Run | Wait calls |
-|---|---|
-| A default full run of about 45 min | about 32 |
-| A default full run that runs to its 138 min deadline and the 10 min grace | about 101 |
-| A `--shards 1` run of about 210 min | about 142 |
-| A `--shards 1` run that runs to its 473 min deadline and the grace | up to about 324 |
+A run of m minutes takes about m × 60 ÷ 90 wait calls, plus one per
+phase change (at most two), besides launch, report and, after grace,
+stop. Use the reader's actual deadline; the dedicated Codex shard and
+its login wait change the full-run estimate. A mixed full run cannot
+use `--shards 1`.
 
 ## The verdict reader's verbs
 
@@ -366,28 +361,33 @@ shard container.
 
 ## The parallel run
 
-- **Shards.** Up to 6 shard containers run at once, every one from the one
-  test image the run builds and pins by its image ID. test-1 runs first in
-  every shard, then the shard's other scripts in canonical order: test-1,
-  then test-2, test-3 and test-4, then every other script by ascending number.
-- **Scheduling units.** test-1 is in no unit. The other scripts form units,
-  joined by their `# ci-requires:` lines; a script with no link is a unit of
-  its own. A unit goes whole into one shard. On the current tree test-2 and
-  test-3 form one unit, so 29 scripts give 27 units.
-- **Balance.** Units are placed longest first, each into the shard with the
-  smallest expected total, from `tests/ci-durations.tsv` (2400 s for a script
-  with no entry). The same tree, table, selection and N always give the same
+- **Shards.** Up to 6 shard containers run at once from the one test image
+  the run builds and pins by image ID. Every shard starts with test-1.
+  Each Codex login script gets its own shard containing exactly test-1
+  and that script. Other scripts run on the ordinary shards in canonical
+  order: test-2, test-3 and test-4, then ascending script number.
+- **Scheduling units.** test-1 is in no unit. Other scripts form units
+  joined by their `# ci-requires:` lines; an unlinked script is its own
+  unit. A unit goes whole into one shard. A Codex login script must be
+  its own unit with no prerequisites beyond test-1.
+- **Balance.** Ordinary units are placed longest first into the ordinary
+  shard with the smallest expected total, using `tests/ci-durations.tsv`
+  (2400 s for a script with no entry). Dedicated Codex units occupy the
+  remaining shards. The same tree, table, selection and N give the same
   assignment.
-- **Limits.** Each shard's wall-time limit is 2 × its expected total + 15 min,
-  at least 30 min, from its container's start. `--shard-timeout MINUTES`
-  sets every shard's limit instead.
-- **Deadline.** The run's deadline is 30 min from its start until the shards
-  are scheduled (plus 60 min when the base image must be built), then that
-  plus the largest shard limit plus 15 min: 138 min for a 6-shard run with the
-  current table.
-- **Failures.** A shard stops at its own first failing script; the other
-  shards run on. With `--shards 1` the run keeps the serial order and stops at
-  its first failure.
+- **Limits.** Each shard's wall-time limit is 2 × its expected total +
+  15 min, at least 30 min, from its container's start.
+  `--shard-timeout MINUTES` sets every shard's limit instead.
+- **Deadline.** Before scheduling, the run allows 30 min for builds,
+  plus 60 min when the base image is missing and the separate Codex
+  login-admission wait. Once scheduled it also allows the largest shard
+  limit plus 15 min. Codex runs initially reserve the full 30-minute
+  login-wait allowance; after login admission it becomes the actual
+  elapsed wait. Use the deadline the reader reports.
+- **Failures.** Each shard stops at its first failing script; other
+  shards run on. A permitted one-shard selection keeps serial order and
+  stops at its first failure. A full run containing both ordinary and
+  Codex scripts cannot use `--shards 1`.
 
 Detail: [`tests/README.md`'s Script names, prerequisites and canonical order](../../../tests/README.md#script-names-prerequisites-and-canonical-order),
 [The duration table](../../../tests/README.md#the-duration-table) and
@@ -395,14 +395,19 @@ Detail: [`tests/README.md`'s Script names, prerequisites and canonical order](..
 
 ## How N is chosen
 
-- The requested N is the `--shards` value, else 6. The effective N is the
-  smaller of the requested N and the number of scheduling units, at least 1,
-  so `/ci test-1` runs one shard.
-- With no `--shards` and no `--inject`, the run takes the largest N, from the
-  effective N down to 1, that passes the memory and CPU fits (see
-  [Admission](#admission)), and stays gate-eligible.
-- With `--shards` or any `--inject`, the run takes exactly the effective N,
-  or is refused.
+- The requested N is `--shards`, otherwise 6. The effective N is the
+  smaller of requested N and the number of scheduling units, at least 1.
+  `/ci test-1` therefore runs one shard.
+- Each Codex login script needs one dedicated shard. If ordinary units
+  are selected too, they need at least one additional shard. With the
+  current single Codex entry, a mixed run, including a full run, needs
+  at least 2 shards. `--shards 1` for that selection is refused before
+  admission; selecting only the Codex entry and test-1 may use one shard.
+- With neither `--shards` nor `--inject`, admission chooses the largest
+  fitting N down to that isolation minimum, rather than always down to
+  1. It refuses if the minimum cannot fit. This choice does not change
+  gate eligibility. With `--shards` or any `--inject`, it takes exactly
+  the effective N or refuses.
 
 The timing summary and the run's summary start with the shard-count line,
 `shards: <n> of <r>`, n being the run's N and r the requested N. When n is
@@ -472,10 +477,10 @@ the host and fits the run. Every figure below is a runner constant.
 | Figure | Value |
 |---|---|
 | CPUs | 2 per shard; all live `/ci` runs together hold at most 12 CI CPUs |
-| Memory per shard | The per-shard memory cap, 2 GiB to start (see [The cap line](#the-cap-line)) |
+| Memory per shard | Ordinary cap: 2 GiB. Each dedicated Codex shard adds 2 GiB (currently 4 GiB), for both memory and memory-swap |
 | Admission margin | 1 GiB |
 | Ceiling C | 85% of the pod memory limit (54.4 GiB on the 64 GiB pod); while a `/ci-live` run is active, the lower of that and 40 GiB, `/ci-live`'s working-set stop line |
-| Memory fit | pod non-reclaimable memory U + other runs' commitments + N × the cap + 1 GiB ≤ C |
+| Memory fit | pod non-reclaimable memory U + other runs' commitments + N × the ordinary cap + 2 GiB per Codex shard + 1 GiB margin ≤ C |
 | Stop line | C less 0.5 GiB (53.9 GiB, or 39.5 GiB while `/ci-live` runs). The memory watchdog checks U every 30 s and stops the run there |
 | Disk line | 85%: (used + 1 GiB) ÷ (used + available) must stay under it on the volume holding the run directory |
 | U | The larger of `anon + shmem` and `active_anon + inactive_anon + unevictable` from the pod's `memory.stat`; reclaimable file cache is excluded, locked pages accounted without double-counting |
@@ -485,23 +490,30 @@ set remains diagnostic in readings and results; high reclaimable page cache
 alone does not block admission or stop the run. The sysadmin monitor's
 working-set reading can differ from U.
 
-An active `/ci-live` run counts 13 GiB. Each other live `/ci` run counts its
-reserved memory less what its shards use now. Docker's storage on
+An active `/ci-live` run counts 13 GiB. Each other live `/ci` run counts its reserved memory, including the
+additional 2 GiB for each Codex shard, less what its shards use now. Docker's storage on
 `/var/lib/docker` is not checked. The disk gate uses actual allocated blocks
 plus the 1 GiB allowance, after packing the tarball under the run directory's
 `package` directory. It does not discount temporary usage, and there is no
 disk watchdog.
+
+The Codex shard still counts as one shard and reserves 2 CPUs. Its
+extra memory is included both when choosing N and when writing the
+reservation; reducing ordinary shards does not remove that extra cost.
 
 Detail: [`docker/README.md`'s Admission: memory, disk and CPU](../../../docker/README.md#admission-memory-disk-and-cpu)
 and [The admission lock, reservations and the sweep](../../../docker/README.md#the-admission-lock-reservations-and-the-sweep).
 
 ## Refusals and what to do
 
-A refused run is not runnable: exit 2, `NOT RUN: <reason>`, then its detail
-lines. The runner checks, in order: the arguments, scripts and credentials,
-docker, the base image's prerequisites, packing, the admission lock, the sweep
-and readings, the fits, then the writing of the run's reservation. Only the
-image read-back refuses after the build.
+A refused run is not runnable: exit 2, `NOT RUN: <reason>`, then its
+detail lines. The runner validates arguments, scripts, isolation shard
+count and Claude credentials first. For a Codex selection it then
+validates the host model, takes the login lock, validates the login and
+checks for surviving login containers before the Docker/build/admission
+sequence. Image read-back and the image testuser UID check occur after
+the build and before shards start. Relay the reader's actual outcome;
+runtime postcheck and cleanup failures are failures too.
 
 | Refusal | What to do |
 |---|---|
@@ -513,6 +525,12 @@ image read-back refuses after the build.
 | A `# ci-requires:` refusal: an unknown name, a line naming no script, a cycle, a prerequisite that sorts after its dependent, a second line, or a line outside the header comment block | Fix the named script's header as [`tests/README.md`](../../../tests/README.md#script-names-prerequisites-and-canonical-order) says |
 | A fault refusal: an unknown or out-of-run script, or a shard number outside 1 to the effective N | Name a script of the run, or a shard from 1 to the effective N |
 | A missing or bad credential | See [Credentials](#credentials) |
+| `NOT RUN: Codex login isolation requires at least <n> shards; requested --shards <r>` | Use at least the printed minimum, or choose a smaller script selection. A mixed ordinary/Codex run needs at least 2 shards on the current tree |
+| `Codex login scripts must have no prerequisites beyond test-1` | Correct the Codex script's prerequisite unit; do not combine another script with its login-bearing shard |
+| A missing or invalid Codex model, config-key projection or login | Relay the reason. Provision the existing host login and a valid top-level model through the supported host setup; never print the login, edit the host config, or change permissions yourself |
+| `Another run holds the Codex login; lock stayed busy for 30 minutes` | Wait for that run to retire its container and release the lease, then rerun; do not delete the lock |
+| `An earlier Codex login container remains; retire it before starting another run` or `Could not verify retirement of Codex login containers; admission refused` | Resolve the prior run's cleanup or the failed Docker check first. Inspect only through `bun scripts/safe-docker-inspect.ts docker container inspect NAME`; wrapper failure is final, with no raw inspection fallback |
+| `Codex image testuser UID does not match the runner UID` | Correct the test image/user mismatch before retrying; do not chmod or chown the login |
 | `NOT RUN: docker does not answer: <error>` | Start Docker, check that `docker info` answers, then re-run |
 | `NOT RUN: docker/Dockerfile.test could not be read (<error>): the base image is the one its FROM instruction names` | Restore `docker/Dockerfile.test`, or fix what the error names (its permissions, the volume), then re-run |
 | `NOT RUN: docker/Dockerfile.test has no FROM instruction: …` or `NOT RUN: docker/Dockerfile.test has <n> FROM instructions: …` | Give `docker/Dockerfile.test` exactly one `FROM` instruction, naming the base image, then re-run |
@@ -535,17 +553,22 @@ image read-back refuses after the build.
 | `NOT RUN: the run's reservation could not be written: <error>` | Fix what the error names (the reservation directory under the account's home, the volume), then re-run |
 | An image that differs from the worktree (the script list or a prerequisite line), or `NOT RUN: test image read-back failed: <error>` | The tree changed during the build, or Docker failed: re-run once the tree is settled and Docker answers |
 
-When several of memory, disk and CPU fail, each is given, in that order. A run
-that may choose its N is judged at 1 shard for these messages.
+When several of memory, disk and CPU fail, each is given, in that order. A run that may choose its N is judged at its isolation minimum for
+these messages: at least 1, one dedicated shard per Codex login script,
+and another shard when ordinary units are selected too. A mixed run
+on the current tree is judged at 2 shards.
 
 ### Credentials
 
 The runner reads credentials from its own environment, which the launch
 passes on unchanged.
 
-- `ANTHROPIC_API_KEY` must be set and not empty. The real-agent `-fmk-real-`
-  scripts use it for Claude Code model calls in every full `/ci` run. Other
-  scripts use stub `claude`; the bots do not use Claude Code OAuth.
+- Every full `/ci` run and every release makes real model calls for both
+  Claude Code and Codex. `ANTHROPIC_API_KEY` must be set and not empty
+  for the Claude real-agent scripts; supply it through the existing
+  `CI_ANTHROPIC_*` command prefix below. Other scripts use stub `claude`;
+  the bots do not use Claude Code OAuth. Codex uses the existing host
+  login described below, without an additional API credential.
 - A key that does not begin `sk-ant-` is a gateway credential, not a raw
   Anthropic key, and needs `ANTHROPIC_BASE_URL` (and `ANTHROPIC_MODEL`) set
   too. An empty `ANTHROPIC_BASE_URL` counts as unset.
@@ -556,6 +579,90 @@ passes on unchanged.
   secret.
 - No secret value is written to any file of the run; the reader prints
   `<redacted>` in its place.
+
+When the selected scripts include a file matching
+`-fmk-real-codex.sh` or `-fmk-real-codex-<suffix>.sh`, the runner also
+requires the existing host Codex login and model. It uses non-empty
+`CODEX_HOME`, otherwise `$HOME/.codex`, and reads the top-level `model`
+from that directory's `config.toml`. The model must be a non-empty string
+matching `[A-Za-z0-9._:/-]+`; a missing, unreadable, malformed or invalid
+model refuses the run before a shard starts. The runner supplies this
+value as `CODEX_TEST_MODEL`; it is a plain, non-secret shard variable,
+not an independent model override. `results.json` records `codexModel`
+(null when no Codex login was admitted), and `summary.txt` records
+`recorded: codex-model <name>` when a model was admitted. The model is
+read from the host config for each run, not hard-coded in this skill.
+The bounded scanner decodes only the top-level model value and lexically
+skips every other value. It also sends bounded key paths only as plain
+`CODEX_HOST_CONFIG_KEYS`, at most 128 KiB, by bare `--env` name alongside
+`CODEX_TEST_MODEL`. This projection is validated before launch and inside
+the container; missing, malformed or over-limit projection refuses the run.
+The TOML scan is bounded to 1 MiB, 2,048 paths, depth 32 and 256-byte key
+segments. Never print host config or environment values.
+
+The host `auth.json` must be a regular, non-symlink JSON file owned by
+the runner with mode 0600. The image's `testuser` UID must match the
+runner UID. The runner reads the login privately for validation,
+redaction and secret scanning; never display, copy, hash, archive,
+chmod or chown it, copy its scratch home, put either in an image or
+repository, or use `docker cp` or `docker commit` on them. Never edit
+the host Codex config. If login provisioning is required, relay the
+runner’s instruction that host `codex login` provisioning is required;
+do not launch host Codex yourself. The read-write mount is intentional:
+Codex 0.159.2 refreshes by truncating/writing in place, so the host sees
+rotated tokens through the symlink. The read-write mount preserves token refresh in place; a copy or read-only
+mount can leave the host with a consumed token.
+Recheck native save semantics before changing the Codex version.
+
+Only the dedicated Codex shard gets one additional read-write bind
+mount: the validated host login file at `/run/codex-login/auth.json`.
+Its other mounts remain the read-only package tarball and that shard's
+own results directory. Ordinary shards get no login mount. The scratch
+Codex home uses an `auth.json` symlink to that exact mounted path;
+replacing the symlink fails the scenario. Its home is private mode 0700.
+The harness creates no Codex `config.toml`, copies no host settings and
+requires the file absent before first spawn. Later preparation/recovery
+admits native-written config only with durable successful-spawn provenance
+bound to that private home's device/inode. Only the fixed native leaf
+`tui.screen_reader_detection_done` and genuine parent tables with only
+allowed descendants are permitted. Amended decision 22 permits those native
+key/parent names to overlap host keys, without decoding or copying their
+host values. Every other host key and all model, reasoning, profile/profiles,
+provider/auth and unknown keys fail. Checks record key names and unknown-key
+counts only. Native CLI `tui.show_tooltips=false` prevents the optional
+startup counter without broadening the file allowlist. Codex runs only
+in disposable local CI containers; never send the login or the Codex leg to a job scheduler.
+
+The runner and local heavy coordinator share the exclusive
+`codex-login.lock` in the selected host Codex directory. They wait at
+most 30 minutes for it, separately from the ordinary admission lock's
+30-second wait. A surviving container labelled `cscb.codex-login=true`,
+including a stopped container, refuses another login-bearing run;
+failure to verify retirement also refuses admission. If retirement
+cannot be confirmed, the runner holds the login lease until it exits,
+and subsequent runs still refuse the survivor. Do not bypass either
+check by deleting the lock or starting an unguarded container.
+
+Codex containers disable core dumps with `--ulimit core=0`. Before
+starting the shard and after retirement, the runner revalidates that
+the host login still parses as JSON and has the same device, inode,
+owner and mode 0600. Token strings read before and after the run stay
+in memory for redaction and secret scanning, including refreshed
+tokens. Relay a postcheck or secret-scan failure as a failure; do not
+print credentials or environment values while diagnosing it.
+
+Test 41 now implements native observations and the final receipt-only
+D1 gate, including fault/FIFO/fidelity and actual child SIGKILL/recovery
+checks. Gate delivery assertions do not require model prose or completed
+answers. The five separate heavy criteria AC11/12/15/20/106 require exact
+completed native answers on the admitted model, three independent trials
+each; no stop or fallback counts as acceptance. All 15 AC11 cases run in
+every trial, AC15 uses decision 20's deterministic 5,000-byte body, and
+AC106 requires two actual identical DM take-ins before counting one.
+Report actual verdicts; completed native observation and synthetic controls
+are not final gate, full CI or heavy acceptance.
+
+The heavy leg's AI criteria run on the model set by CI_ANTHROPIC_AI_MODEL (azure/openai/gpt-6-astra for release runs); gate and other scripts use CI_ANTHROPIC_MODEL.
 
 To find a raw key, read Claude Code's own stored key:
 
@@ -664,6 +771,11 @@ cap from measured anon peak: <peak> GiB in shard-<k> (page cache <f> GiB) + 1 Gi
 ```
 
 - It is informational. The runner never changes the cap.
+- The ordinary shard cap and the Codex shard cap differ by 2 GiB. The
+  reported current cap follows the source shard's actual cap when a
+  source exists; without a source it uses the largest scheduled cap.
+  An out-of-memory kill on a Codex shard is counted at its actual cap,
+  not the smaller ordinary cap. The line does not change either cap.
 - It ends with a suffix: none for a passing default full run with every anon
   peak complete; `; source after out-of-memory kill in <shards>` for a default
   full run with any kill; otherwise `; not a valid cap source: <reasons>`,

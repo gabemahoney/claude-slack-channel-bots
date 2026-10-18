@@ -75,8 +75,13 @@ installed Google Chrome, headless; no browser download):
 
 ## Procedure
 
-1. Check docker (`docker info`) and the `/ci` base image (`docker image inspect
-   cscb-ci-base:v8`; if missing, run `/ci` once). Then fetch the binary both
+1. Check docker (`docker info`) and the `/ci` base image with
+   `bun scripts/safe-docker-inspect.ts docker image inspect cscb-ci-base:v8`.
+   If inspection fails, stop and relay the failure; never fall back to
+   raw Docker inspection. If the base is confirmed missing, `/ci` builds
+   it when its prerequisites pass; inspect it again through the wrapper
+   before continuing. A later `/ci` gate failure is still a failure.
+   Then fetch the binary both
    runs below stage in the live image: the `agent-director-linux-amd64` asset
    of the agent-director release the base pins (`ARG AD_VERSION` in
    `docker/Dockerfile.test.base`), downloaded from agent-director's GitHub
