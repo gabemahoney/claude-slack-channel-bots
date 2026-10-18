@@ -3,7 +3,6 @@
 import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, realpathSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { randomBytes } from 'node:crypto'
-import { emitFailureEvidence, diagnosticValue, scrubDiagnosticText } from './ai-failure-diagnostics.ts'
 
 if (!existsSync('/etc/cscb-ci-image')) {
   console.error('FAIL: codex-delivery: refused: /etc/cscb-ci-image is absent')
@@ -21,6 +20,7 @@ if (!under('/test-repo/node_modules', realpathSync(pkg))) {
   process.exit(2)
 }
 const crashProtocol = await import('./codex-crash-barrier.ts')
+const { emitFailureEvidence, diagnosticValue, scrubDiagnosticText } = await import('./ai-failure-diagnostics.ts')
 
 const codexHome = join(paths.home, '.codex'), work = join(paths.root, 'work', 'codex-delivery')
 const stateDir = join(paths.root, 'codex-delivery-state'), key = 'codex_delivery'

@@ -6,6 +6,7 @@ import { spawnSync } from 'node:child_process'
 import { assertNativeSpoofResponse } from './real-agent/ai-classifier-stop.ts'
 import { claudeFailureRecords, diagnosticValue, retainFailureLine, scrubDiagnosticText } from './real-agent/ai-failure-diagnostics.ts'
 import type { TranscriptEntry } from './integration/fixtures/transcript-receipts.ts'
+import { assertNoLeak, fakeToken, BOT_TOKEN_PREFIX } from './test-helpers/credentials.ts'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 
 const model = 'test/model'
@@ -54,7 +55,7 @@ test('each safe field failure is emitted once across separate poll processes', (
 test('metadata diagnostics withhold message-shaped values and scrub tokens', () => {
   expect(diagnosticValue({ text: 'PRIVATE MESSAGE' })).toBe('<object>')
   expect(diagnosticValue('PRIVATE MESSAGE')).toBe('<string withheld>')
-  expect(diagnosticValue('sk-fakeCredential123')).toBe('[REDACTED]')
+  expect(diagnosticValue(fakeToken('sk-'))).toBe('[REDACTED]')
   expect(scrubDiagnosticText('answer secret-value Bearer abc123 access_token="unlisted-value"', { API_KEY: 'secret-value' }))
     .toBe('answer [REDACTED] Bearer [REDACTED] access_token="[REDACTED]"')
 })
@@ -65,12 +66,13 @@ function entry(offset: number, value: any, path = '/private/session.jsonl'): Tra
 test('case projection retains synthetic/error metadata and replies, excludes prompts, tool arguments and foreign sessions', () => {
   const v = valid(); Object.assign(v, { type: 'assistant', parentUuid: 'take', isApiErrorMessage: true, error: 'refusal', isSynthetic: true, isMeta: false })
   v.message.stop_reason = 'refusal'; v.message.model = '<synthetic>'
-  v.message.content = [{ type: 'text', text: 'refused sk-fakeCredential123' }, { type: 'tool_use', name: 'Write', input: { content: 'SECRET ARGUMENT' } },
-    { type: 'tool_use', name: 'mcp__slack-channel-router__reply', input: { text: 'reply xoxb-fakeCredential123' } }]
+  v.message.content = [{ type: 'text', text: `refused ${fakeToken('sk-')}` }, { type: 'tool_use', name: 'Write', input: { content: 'SECRET ARGUMENT' } },
+    { type: 'tool_use', name: 'mcp__slack-channel-router__reply', input: { text: `reply ${fakeToken(BOT_TOKEN_PREFIX)}` } }]
   const records = claudeFailureRecords([{ kind: 'sent', seq: 3, transcript_path: '/private/session.jsonl', transcript_size: 20 }],
     [entry(10, v), entry(20, { type: 'user', message: { content: 'PRIVATE PROMPT' } }), entry(30, v), entry(31, v, '/foreign/session.jsonl')], 3)
   expect(records).toHaveLength(2)
   expect(records[1]).toMatchObject({ type: 'assistant', isApiErrorMessage: true, isSynthetic: true, error: 'refusal', message: { stop_reason: 'refusal', model: '<synthetic>' } })
+  assertNoLeak(records)
   const text = JSON.stringify(records)
   for (const absent of ['PRIVATE PROMPT', 'SECRET ARGUMENT', 'fakeCredential123']) expect(text).not.toContain(absent)
   expect(text).toContain('Write'); expect(text).toContain('refused [REDACTED]'); expect(text).toContain('reply [REDACTED]')

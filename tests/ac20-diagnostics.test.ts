@@ -353,9 +353,11 @@ test.each([[20, 'decision21c', 1], [20, '', 1], [20, 'other', 2], [12, 'decision
     expect(result.stdout).toBe(`${enabled ? `scope:${seq}\n` : ''}intake\ndelivery\n${enabled ? `diagnostic:expected/${seq}.json:${seq}` : `ordinary:180:${criterion === 11 && seq === 3 ? 'ai_spoof_readback' : 'ai_readback'}`}\n`)
   } finally { rmSync(home, { recursive: true, force: true }) }
 })
-test('removing the two gated additions restores the exact previously captured scenario bytes', () => {
+const failureEvidenceHook = "AI_FAILURE_HELPER=\"${BASH_SOURCE[0]%/*}/ai-failure-diagnostics.ts\"\nai_failure_evidence() {\n    [[ \"$1\" -ne 0 ]] || return 0\n    bun \"${AI_FAILURE_HELPER}\" \"${SLACK_STATE_DIR}\" \"${REAL_KEY:-}\" \"${HOME}/.claude/projects\" \"${READBACK_SEQ:-${n:-0}}\" \"${AI_CRITERION}\" \"${REAL_AGENT_TRIAL:-}\"\n}\non_exit ai_failure_evidence\n"
+test('removing only diagnostic additions restores the exact previously captured scenario bytes', () => {
+  expect(scenario.split(failureEvidenceHook)).toHaveLength(2)
   expect(scenario.split(caseGate)).toHaveLength(2); expect(scenario.split(waitGate)).toHaveLength(2)
-  expect(createHash('sha256').update(scenario.replace(caseGate, '').replace(waitGate, '')).digest('hex')).toBe('4a96b137596887ccbc4705365ad9ac625002aa513015142a1c6bcca91106bef7')
+  expect(createHash('sha256').update(scenario.replace(failureEvidenceHook, '').replace(caseGate, '').replace(waitGate, '')).digest('hex')).toBe('4a96b137596887ccbc4705365ad9ac625002aa513015142a1c6bcca91106bef7')
 })
 
 function procStat(pid: number, state = 'S', started = '111', comm = 'native ) spaced') {
