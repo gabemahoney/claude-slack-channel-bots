@@ -31,19 +31,14 @@ A complete `config.json` in declarative mode (`allow_invited_channels` absent), 
       "name": "planner",
       "credentials_file": "~/.config/claude-slack-channel-bots/planner-credentials.json",
       "working_directory": "~/projects/alpha",
-      "channels": [
-        { "id": "C0123456789", "delivery": "all" },
-        { "id": "C0555555555", "delivery": "all" }
-      ],
+      "channels": [{ "id": "C0123456789", "delivery": "all" }, { "id": "C0555555555", "delivery": "all" }],
       "permission_prompts": "C0123456789"
     },
     {
       "name": "reviewer",
       "credentials_file": "~/.config/claude-slack-channel-bots/reviewer-credentials.json",
       "working_directory": "~/projects/beta",
-      "channels": [
-        { "id": "C0555555555", "delivery": "mentions" }
-      ],
+      "channels": [{ "id": "C0555555555", "delivery": "mentions" }],
       "dm": { "enabled": true, "contact": "U0123456789" },
       "permission_prompts": "dm",
       "claude_config_dir": "~/.claude-reviewer",
@@ -61,8 +56,7 @@ A complete `config.json` in declarative mode (`allow_invited_channels` absent), 
   "session_restart_delay": 60,
   "claude_config_dir": "~/.claude-bots",
   "ack_reaction": "eyes",
-  "reply_chunk_limit": 3000,
-  "reply_chunk_mode": "newline"
+  "reply_chunk_limit": 3000, "reply_chunk_mode": "newline"
 }
 ```
 
@@ -144,7 +138,6 @@ Each persona's Slack tokens live in its own credentials file, and `config.json` 
 Write the file with `claude-slack-channel-bots credentials <persona>` in your own terminal, once the persona is declared in `config.json`: the [credentials command](../skills/setup-slack-channel-bots/SKILL.md#credentials-command) of the setup wizard, `setup-slack-channel-bots`. It checks both tokens with Slack and writes the file, mode 0600, only when both pass; see [`claude-slack-channel-bots credentials`](cli.md#claude-slack-channel-bots-credentials).
 
 To rotate a persona's tokens, run the credentials command for it again (see the wizard's [Rotate a persona's tokens](../skills/setup-slack-channel-bots/SKILL.md#rotate-a-personas-tokens)), then confirm the pending change (see [Confirming a change](reload.md#confirming-a-change)). Only that persona reconnects, and no restart is needed.
-
 Never put a token in `config.json`, a ticket or a chat.
 
 The shipped `slack-app-manifest.yml` also grants the `lists:read` and `lists:write` bot scopes, so a bot can read and write, with its own bot token, a Slack List it has been given access to, such as one list shared by all bots. CSCB itself makes no Lists call. An app created from an earlier manifest must have both scopes added and be re-installed; until then, every Lists call fails with `missing_scope`.
@@ -166,8 +159,6 @@ Any number of personas may list the same channel, each with its own `delivery`. 
 - **Off:** DMs to the persona's app are not delivered. The server logs one `persona-dm-dropped` line naming the persona and `dm.enabled`. The persona never opens, reads or posts in a DM.
 - **Group DMs** (DMs with more than one person) are never delivered to any persona, whatever `dm.enabled` says.
 
-In declarative mode, a persona with no `channels` must have `dm.enabled` set to `true`.
-
 `dm.contact` is the person who receives the persona's prompts and notices when its destination is `"dm"`: in declarative mode when `permission_prompts` is `"dm"`, and in fungible mode when `invited.permission_prompts` is `"dm"` or unset. In either mode a `"dm"` destination needs `dm.enabled: true` and a `dm.contact`. `dm.contact` gates nothing else: it doesn't limit who can DM the persona.
 
 Starting a DM with a user (a `reply` to a user ID, or a persona whose destination is `"dm"`) needs the `im:write` bot scope, which the shipped `slack-app-manifest.yml` grants. A `"dm"` destination always opens its DM through Slack before it first posts there, even when the DM already exists. For an app created from an earlier manifest, a `"dm"` persona's prompts and notices are not posted, and a `reply` to a user ID fails with `missing_scope`, until the scope is added and the app is re-installed.
@@ -176,12 +167,12 @@ Receiving DMs and replying in an existing DM (a `D…` ID) work without the scop
 
 ### Permission prompts
 
-This section applies in declarative mode, where `permission_prompts` is required; for fungible mode, see [Permission prompts in fungible mode](channel-modes.md#permission-prompts-in-fungible-mode). It is the persona's destination: its permission prompts and its server notices, such as lost-message notices and restart-limit warnings, are posted there as the persona.
+This section applies in declarative mode, where `permission_prompts` is required; for fungible mode, see [Permission prompts in fungible mode](channel-modes.md#permission-prompts-in-fungible-mode). It is the persona's destination: its permission prompts and its server notices, such as *Message not saved* notices and restart-limit warnings, are posted there as the persona.
 
 - **A channel ID:** one of the persona's own `channels`. Everyone in that channel sees the prompts and notices.
 - **`"dm"`:** a DM from the persona's app to its `dm.contact`. It needs `dm.enabled: true` and a `dm.contact`.
 
-Give each persona a destination that no other persona receives every message in, such as its own channel or `"dm"`. Don't give a persona `delivery: all` in another persona's destination channel. A notice is a Slack post like any other: when two personas each receive every message in the other's destination channel and neither persona's instance can take messages, each loses the other's lost-message notices and posts a notice about it, so they keep posting notices about each other until either instance takes messages again (see [Troubleshooting](troubleshooting.md#troubleshooting)).
+Choose a destination with [channel delivery](#channel-delivery) in mind. If two personas each receive every message in the other’s destination and storing fails, the notices stop after one *Message not saved* each per episode. Further failures are counted in `server.log` (see [Troubleshooting](troubleshooting.md#troubleshooting)).
 
 [Permission Relay](bots.md#permission-relay) covers how prompts are delivered and answered, and [Troubleshooting](troubleshooting.md#troubleshooting) what happens when Slack refuses a post to the destination.
 
@@ -194,7 +185,6 @@ Give each persona a destination that no other persona receives every message in,
 ```sh
 CLAUDE_CONFIG_DIR=~/.claude-reviewer claude auth login --claudeai
 ```
-
 Use `--console` instead of `--claudeai` for a Console account. When neither the persona nor the top level sets one, Claude's own default applies.
 
 - A directory that doesn't exist yet is fine when its parent exists.

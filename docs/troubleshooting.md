@@ -21,7 +21,7 @@ The first start recorded the bad setting, such as `port` or `bind`, before it fa
 The persona is silent. Accepted messages remain queued while its instance is unavailable. Find its key on its `persona-start` line in `server.log` and read its lines: each names a class (such as `persona-credentials-invalid` or `persona-directory-missing`) and the file or directory to fix. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-doesnt-come-up-or-doesnt-answer).
 
 **A persona's instance waits at a startup prompt**
-After each launch the server presses Enter on Claude Code's folder-trust or development-channels prompt, for at most the later of 5 minutes and `pending_grace_seconds` plus 60 s, and types nothing else. For any other prompt, attach with `tmux attach -t =slack_bot_<key>` and answer it. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-personas-instance-waits-at-a-startup-prompt).
+After each launch the server presses Enter on Claude Code's folder-trust prompt, for at most the later of 5 minutes and `pending_grace_seconds` plus 60 s, and types nothing else. For any other prompt, attach with `tmux attach -t =slack_bot_<key>` and answer it. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-personas-instance-waits-at-a-startup-prompt).
 
 **A persona's instance is still starting**
 Normal for a short time after every launch: the server waits it out and never launches a second instance over it. If it hasn't started in time, the persona posts a *Launch stuck* or *Session not starting* notice. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-personas-instance-is-still-starting).
@@ -60,7 +60,7 @@ The server retries the persona on its own (after 30, 60, 120 and 240 s, then eve
 After a removal, rename or path change, or a start whose clean-up could not end an old instance, no persona comes up in that directory until the old instance has ended; the server keeps ending it. If its kill keeps failing, a human follows the "Operator actions" section of agent-director's README. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-waits-on-an-old-instance-in-its-working-directory).
 
 **Bot alive but silently unresponsive (MCP disconnected)**
-The health check reconnects or relaunches such a bot on its own, within about 3–5 minutes at the default settings. With `session_restart_delay` set to `0`, a *Not connected* notice reports it instead. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-bot-alive-but-silently-unresponsive-mcp-disconnected).
+Accepted messages remain queued; a Slack message triggers the configured reconnect too. The health check reconnects or relaunches such a bot on its own, within about 3–5 minutes at the default settings. With `session_restart_delay` set to `0`, a *Not connected* notice reports it instead. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-bot-alive-but-silently-unresponsive-mcp-disconnected).
 
 **Reading the start summary**
 Each start logs one `[slack] startupSessionManager: complete — …` line counting its personas by outcome. `latched`, `retrying`, `waiting on a live-row sequence`, `held on invalid flags` and `fresh as retired keys` are not failures. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-reading-the-start-summary).

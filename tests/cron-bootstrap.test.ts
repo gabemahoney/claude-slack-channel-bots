@@ -228,7 +228,7 @@ describe('scheduled-prompts doc — mandated crontable/scheduler facts', () => {
 
   test('documents durable acceptance independently of a failed store', () => {
     expect(SCHEDULED_SECTION).toContain('Accepted fires stay queued')
-    expect(SCHEDULED_SECTION).toContain('Every accepted fire is kept independently')
+    expect(SCHEDULED_SECTION).toContain('Every accepted fire is an independent item, never merged or dropped')
     expect(SCHEDULED_SECTION).toContain('a failed store is logged as `queue-failed` and is not an accepted item')
   })
 

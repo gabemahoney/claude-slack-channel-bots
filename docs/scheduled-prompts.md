@@ -91,7 +91,7 @@ The prompt-file path resolves as follows:
 
 ## How fires appear
 
-A scheduled fire is queued only for the target persona, as an injected message with no Slack conversation attached. Its `sender` label is `cscb-cron:<prompt-file-basename>` — for a prompt file `standup.md` the sender is `cscb-cron:standup`. This distinguishes a cron tick from a human and from peer-bot traffic. The [Slack Reply Guard](bots.md#slack-reply-guard-stop-hook) never reminds a bot to reply to a scheduled prompt: like every injected message, a fire carries no `via`. Because a fire carries no channel, a prompt file that wants a Slack reply must say where to post it. Each schedule queues its own message independently, so when several schedules match the same minute for the same persona each one is its own queued item.
+The server directly queues a scheduled fire only for the target persona, as an injected message with no Slack conversation attached. Its `sender` label is `cscb-cron:<prompt-file-basename>` — for a prompt file `standup.md` the sender is `cscb-cron:standup`. This distinguishes a cron tick from a human and from peer-bot traffic. The [Slack Reply Guard](bots.md#slack-reply-guard-stop-hook) never reminds a bot to reply to a scheduled prompt: like every injected message, a fire carries no `via`. Because a fire carries no channel, a prompt file that wants a Slack reply must say where to post it. Each schedule queues its own message independently, so when several schedules match the same minute for the same persona each one is its own queued item.
 
 ## The cron log
 
@@ -128,7 +128,7 @@ grep undeliverable ~/.config/claude-slack-channel-bots/cron.log
 
 ## Delivery semantics
 
-- **Accepted fires stay queued.** A configured persona can accept prompts while it is down or disconnected. Every accepted fire is kept independently; a failed store is logged as `queue-failed` and is not an accepted item.
+- **Accepted fires stay queued.** A configured persona can accept prompts while it is down or disconnected. Every accepted fire is an independent item, never merged or dropped, and delivered in FIFO order across all sources, carrying its fire timestamp as `ts`; a failed store is logged as `queue-failed` and is not an accepted item.
 - **Missed fires are skipped, not caught up.** While the server is down, no scheduled prompts fire, and they are not replayed on restart. The `scheduler started, N schedules loaded, M undeliverable (no persona list)` line in the cron log marks when scheduling resumed, bounding the outage window.
 - **Edits take effect within a minute — no restart.** The scheduler checks the crontable fresh on every tick, so an edit by hand or a line appended by a bot starts (or stops) firing within about a minute. The server is never restarted for a schedule change.
 - **Deleting the crontable stops all schedules.** Nothing fires from that moment, a WARN appears in the cron log, and the server re-creates the file empty (with its header) within about two minutes — detection and re-creation happen on separate once-a-minute passes, so the re-create lands up to two tick boundaries after the deletion. Add lines back and they schedule on the next check.

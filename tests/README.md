@@ -691,14 +691,17 @@ Tests 32–40 are the nine real Claude gates included in every full `/ci` run.
 They drive the packed CSCB against the loopback Slack stub, select native
 Claude Code 2.1.296 through agent-director's `[launch].claude_path`, and keep
 the stub first on PATH for ordinary scripts. The downgrade gate explicitly
-selects 2.1.280. Each real script owns an isolated HOME, agent-director
+selects and verifies 2.1.280 with `real_prepare` before either release starts.
+The helper sets agent-director’s `claude_path`; this retained native selection
+governs startup after installing 0.16.1. The script does not restore a pin
+after package installation. Its four R55 phases match the maintained
+[operator downgrade procedure](../docs/migration.md#downgrading-to-an-earlier-release). Each real script owns an isolated HOME, agent-director
 install/store and tmux server, with onboarding completed, the run's key
 approved and only its required permission allow rules; no bypass mode.
 
 Only the run's API key, base URL and model are used (`ANTHROPIC_API_KEY`,
 `ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL`); supply the CI credentials through
-`/ci`'s existing `CI_ANTHROPIC_*` route. These scripts make real model calls,
-whose cost the owner accepted. They clear inherited subscription/OAuth
+`/ci`'s existing `CI_ANTHROPIC_*` route. Every full `/ci` run and release makes real model calls. They clear inherited subscription/OAuth
 credentials. No key goes into an image, repository, log or result file.
 No real bot, agent-director or tmux runs on the host.
 
