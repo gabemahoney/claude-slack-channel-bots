@@ -3,6 +3,7 @@
 import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, realpathSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { randomBytes } from 'node:crypto'
+import { emitFailureEvidence, diagnosticValue, scrubDiagnosticText } from './ai-failure-diagnostics.ts'
 
 if (!existsSync('/etc/cscb-ci-image')) {
   console.error('FAIL: codex-delivery: refused: /etc/cscb-ci-image is absent')
@@ -626,6 +627,18 @@ try {
   record('failure', { stage, key: lastKey, errorClass: refused })
   try { await pane('failure') } catch { /* no readable current native pane */ }
   try { record('rollout-events-on-failure', evidence.safeCodexEvents((await rollout()).data)) } catch { /* no valid own-session projection */ }
+  if (process.argv[2] === 'ai') {
+    // The native reader is already restricted to this scratch session. Never
+    // inspect/copy auth.json; only projected rollout records cross this path.
+    let records: unknown[] = []
+    try {
+      records = (await rollout()).data.records.map(r => ({ offset: r.offset, at: r.at, type: diagnosticValue(r.type),
+        kind: diagnosticValue(r.kind), model: diagnosticValue(r.model), role: diagnosticValue(r.role),
+        tool: diagnosticValue(r.tool), failed: r.failed, turn: diagnosticValue(r.turn),
+        ...(r.role === 'assistant' && r.text !== undefined ? { text: scrubDiagnosticText(r.text) } : {}) }))
+    } catch { /* Explicit empty capture below; never invent a native turn. */ }
+    emitFailureEvidence({ agent: 'codex', criterion: process.argv[3], trial: process.env.REAL_AGENT_TRIAL, case: stage }, records)
+  }
   console.error('FAIL: codex-delivery: native evidence incomplete; inspect retained safe observations')
   process.exitCode = 1
 } finally {

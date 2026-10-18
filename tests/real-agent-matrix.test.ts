@@ -22,6 +22,7 @@ import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { LIVE_CLAUDE_CODE_VERSION, MIN_CLAUDE_CODE_VERSION } from './test-helpers/agent-director-versions.ts'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 import { decodeCodexHostConfigKeys } from '../src/codex-config-keys.ts'
+import { AI_FAILURE_PREFIX } from './real-agent/ai-failure-diagnostics.ts'
 
 const gateNames = () => GATE_SLUGS.map((slug, i) => `test-${32 + i}-fmk-real-${slug}.sh`)
 const heavyNames = () => [...HEAVY_SCRIPTS, ...AI_CRITERIA.map(ac => `test-${100 + ac}-fmk-real-ai-ac${ac}.sh`)]
@@ -402,6 +403,22 @@ describe('heavy execution with fake children', () => {
     expect(stdout.some(l => l.startsWith('REAL-AGENT-VERDICT'))).toBe(false)
     expect(JSON.parse(readFileSync(join(output, 'plan.json'), 'utf8')).jobs).toHaveLength(3)
     expect(JSON.parse(readFileSync(join(output, 'plan.json'), 'utf8'))).toMatchObject({ selection: 'full', totalInvocations: 73 })
+  })
+
+  test.each(['claude', 'codex'])('failed %s job retains scrubbed AI records after container and context cleanup', async agent => {
+    response = argv => (agent === 'codex' ? argv.includes('/opt/cscb-ci/real-agent-codex-job.sh') : argv[1] === 'run' && !argv.includes('id')) ? { code: 1,
+      text: AI_FAILURE_PREFIX + JSON.stringify({ agent, criterion: '11', trial: '1', seq: 3, event: 'transcript',
+        record: { type: 'assistant', message: { stop_reason: 'refusal', text: `refusal ${process.env.CI_ANTHROPIC_API_KEY}` } } }) + '\n' } : {}
+    expect(await run()).toBe(false)
+    expect(jobsRun()).toHaveLength(agent === 'claude' ? 1 : 3)
+    const file = join(output, 'ai-failures.jsonl'), record = JSON.parse(readFileSync(file, 'utf8'))
+    expect(record).toMatchObject({ criterion: '11', seq: 3, record: { message: { stop_reason: 'refusal' } } })
+    expect(record.record.message.text).toContain('refusal')
+    expect(record.record.message.text).not.toContain(process.env.CI_ANTHROPIC_API_KEY)
+    expect(statSync(file).mode & 0o777).toBe(0o600)
+    expect(calls.some(c => c.argv.slice(0, 3).join(' ') === 'docker rm -f')).toBe(true)
+    expect(stdout.join('')).not.toContain('real-agent-failure-evidence:')
+    expect(stdout.at(-1)).toMatch(/^REAL-AGENT-VERDICT FAIL /)
   })
 
   test('Codex-only plan needs no auth, Claude credential, Claude script or runtime-latest request', async () => {

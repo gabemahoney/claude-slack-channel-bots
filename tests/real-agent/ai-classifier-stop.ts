@@ -2,12 +2,33 @@
  * Importing is inert. The CLI reads only SR-14.1 native/journal/log evidence.
  */
 import { existsSync, readFileSync } from 'node:fs'
-import { basename, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
+import { diagnosticValue, reportFailureOnce } from './ai-failure-diagnostics.ts'
 import { auditReceipts, packedReceiptAdapters, personaTranscripts, readTranscripts, receiptJournal, transcriptFiles, type ReceiptAdapters, type TranscriptEntry } from '../integration/fixtures/transcript-receipts.ts'
 import { auditedAICorpus } from './ai-fixture-audit.ts'
 import { completedAIReadback, safeSelectedModel } from './ai-readback.ts'
 
-function check(value: unknown, reason: string): asserts value { if (!value) throw new Error(reason) }
+class SpoofObservationError extends Error {}
+function check(value: unknown, reason: string): asserts value { if (!value) throw new SpoofObservationError(reason) }
+export class SpoofMetadataError extends SpoofObservationError {}
+export function assertNativeSpoofResponse(v: any, model: string): void {
+  const field = (ok: unknown, name: string, value: unknown) => {
+    if (!ok) throw new SpoofMetadataError(`invalid native spoof response: ${name}=${JSON.stringify(diagnosticValue(value))}`)
+  }
+  const m = v.message
+  field(Array.isArray(m?.content), 'message.content.shape', Array.isArray(m?.content) ? '<array>' : typeof m?.content)
+  field(typeof v.uuid === 'string', 'uuid', v.uuid)
+  field(v.isMeta !== true, 'isMeta', v.isMeta)
+  field(!v.isApiErrorMessage, 'isApiErrorMessage', v.isApiErrorMessage)
+  field(!v.error, 'error', v.error)
+  field(!v.isSynthetic, 'isSynthetic', v.isSynthetic)
+  field(m?.role === 'assistant', 'message.role', m?.role)
+  field(m.model === model, 'message.model', m.model)
+  field(v.requestedModel === undefined || v.requestedModel === model, 'requestedModel', v.requestedModel)
+  field(m.content.every((b: any) => b && typeof b === 'object' && typeof b.type === 'string'), 'message.content.blockShape',
+    m.content.map((b: any) => b === null ? 'null' : typeof b !== 'object' ? typeof b : `object:type_${typeof b.type}`).join(':'))
+  field(m.stop_reason === null || m.stop_reason === 'tool_use' || m.stop_reason === 'end_turn', 'message.stop_reason', m.stop_reason)
+}
 const blocks = (e: TranscriptEntry): any[] => Array.isArray(e.value?.message?.content) ? e.value.message.content : []
 const stable = (v: any): string => JSON.stringify(v && typeof v === 'object' && !Array.isArray(v)
   ? Object.fromEntries(Object.keys(v).sort().map(k => [k, JSON.parse(stable(v[k]))])) : Array.isArray(v) ? v.map(x => JSON.parse(stable(x))) : v)
@@ -56,8 +77,9 @@ export function spoofTurn(options: { criterion: string; trial: string; model: st
     // A following case must continue on this same model. Other sessions cannot
     // supply readback evidence or silently replace this session's model.
     for (const e of sameSession.filter(e => e.offset > copy.offset && e.value?.type === 'assistant')) {
-      for (const observed of [e.value.requestedModel, e.value.message?.model]) {
-        if (observed !== undefined && observed !== '<synthetic>') check(observed === model, 'native model substitution observed')
+      for (const [name, observed] of [['requestedModel', e.value.requestedModel], ['message.model', e.value.message?.model]]) {
+        if (observed !== undefined && observed !== '<synthetic>' && observed !== model)
+          throw new SpoofMetadataError(`native model substitution observed: ${name}=${JSON.stringify(diagnosticValue(observed))}`)
       }
     }
     const linked = (entry: TranscriptEntry, target = copy.uuid): boolean => {
@@ -83,14 +105,8 @@ export function spoofTurn(options: { criterion: string; trial: string; model: st
     const readbacks: TranscriptEntry[] = []
     let completion: TranscriptEntry | undefined
     for (const e of response.filter(e => e.value?.type === 'assistant')) {
-      check(Array.isArray(e.value.message?.content), 'malformed native assistant content')
       const v = e.value, message = v.message
-      check(typeof v.uuid === 'string' && v.isMeta !== true && !v.isApiErrorMessage && !v.error && !v.isSynthetic
-        && message?.role === 'assistant' && message.model === model
-        && (v.requestedModel === undefined || v.requestedModel === model)
-        && message.content.every((b: any) => b && typeof b === 'object' && typeof b.type === 'string')
-        && (message.stop_reason === null || message.stop_reason === 'tool_use' || message.stop_reason === 'end_turn'),
-      'invalid native spoof response')
+      assertNativeSpoofResponse(v, model)
       for (const b of blocks(e)) {
         if (b.type === 'tool_use') {
           check(b.name === 'mcp__slack-channel-router__reply'
@@ -138,5 +154,13 @@ if (import.meta.main) {
     classifierObservation({ criterion: process.env.AI_CRITERION ?? '', trial: process.env.REAL_AGENT_TRIAL ?? '',
       model: process.env.REAL_AGENT_MODEL_PIN ?? '', fixture: original[2], expected: JSON.parse(readFileSync(expectedPath!, 'utf8')),
       journal, own, adapters }, mode!)
-  } catch (error) { console.error(error instanceof Error ? error.message : 'classifier observation unavailable'); process.exitCode = 1 }
+  } catch (error) {
+    // Each poll is a new process. Remember emitted diagnostics beside this
+    // scenario's expectations, not in the native transcript or the oracle.
+    const message = error instanceof SpoofObservationError ? error.message : 'classifier observation incomplete'
+    const expected = process.argv[7]
+    try { if (expected) reportFailureOnce(join(dirname(expected), 'spoof-diagnostics.json'), message, console.error) }
+    catch { /* Failure remains failure even if diagnostic deduplication fails. */ }
+    process.exitCode = 1
+  }
 }

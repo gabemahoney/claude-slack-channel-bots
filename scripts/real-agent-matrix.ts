@@ -12,6 +12,7 @@ import { CPUS_PER_SHARD, SHARD_MEMORY_CAP_BYTES, SHARD_PIDS_LIMIT, checkShardRun
 import { acquireCodexLogin, realCodexLoginDeps, assertCodexMounts, assertNoCodexLoginContainers, codexLoginContainerListArgs, CODEX_LOGIN_CONTAINER_LABEL, CODEX_LOGIN_TARGET, CODEX_EXTRA_MEMORY_BYTES, CODEX_VERSION, CODEX_HOST_CONFIG_KEYS_ENV, type CodexLoginLease } from './codex-login.ts'
 import { openLockFile, secretScan, createRunnerLog } from './ci-run.ts'
 import { isDockerInspectCommand, safeDockerInspect } from './safe-docker-inspect.ts'
+import { retainFailureLine } from '../tests/real-agent/ai-failure-diagnostics.ts'
 
 export const MATRIX_VERSIONS = ['2.1.280', '2.1.296'] as const
 export const GATE_SLUGS = ['order', 'keys', 'compact', 'restarts', 'crash', 'mcp', 'cron', 'fidelity', 'downgrade'] as const
@@ -203,7 +204,10 @@ export async function runMatrix(options: MatrixOptions): Promise<boolean> {
   // JSON-escaped copies are masked too, before any child line reaches a sink.
   const masks = [...secrets, ...secrets.map(secret => JSON.stringify(secret).slice(1, -1))]
   const redact = (value: string) => maskScannedValues(value, masks)
-  const say = (line: string) => { const safe = redact(line); process.stdout.write(safe + '\n'); writeFileSync(logFd, safe + '\n') }
+  const say = (line: string) => {
+    if (retainFailureLine(output, line, redact)) return
+    const safe = redact(line); process.stdout.write(safe + '\n'); writeFileSync(logFd, safe + '\n')
+  }
   const runId = `real-${Date.now()}-${process.pid}`
   const stage = mkdtempSync(join(tmpdir(), 'cscb-real-context-'))
   let codexLogin: CodexLoginLease | null = null, codexRetired = true, codexContainer: string | null = null

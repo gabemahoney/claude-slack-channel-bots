@@ -1116,7 +1116,8 @@
 #   row whose pane it has not adopted, and the approver's send-keys adopts it;
 # - no helper sets base-index: no agent-director verb depends on pane indices.
 #
-# Exit hooks: `on_exit <function>` registers extra cleanup (removing files
+# Exit hooks receive the current scenario exit status as their first argument.
+# `on_exit <function>` registers extra cleanup (removing files
 # outside SCENARIO_ROOT, for example). The trap runs the hooks in registration
 # order, each in a subshell, after every server and tracked process is
 # stopped (and, in fmk mode, the scenario's tmux server: a kill-server on
@@ -1553,7 +1554,7 @@ _scenario_cleanup() {
         rc=1
     fi
     for hook in ${_SCENARIO_EXIT_HOOKS[@]+"${_SCENARIO_EXIT_HOOKS[@]}"}; do
-        ( "${hook}" )
+        ( "${hook}" "${rc}" )
         hook_rc=$?
         if [[ "${hook_rc}" -ne 0 ]]; then
             if [[ "${rc}" -eq 0 ]]; then

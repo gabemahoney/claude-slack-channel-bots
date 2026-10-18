@@ -156,8 +156,8 @@
   "prompt_input_sources": [
     {
       "path": "real-agent/ai-scenario.sh",
-      "sha256": "0bb5bdef7cab4d99bedb94503ad543fc4d72d8b67e6030036358ae66a3a8fe38",
-      "reason": "Reviewed complete AI scenario/entry source against all seven criteria. Decision 19 strict selected-model pin, disabled fallback, first three AC11 turns, isolated hz_* sessions and opaque labels are unchanged. Decision 20 changes only AC15 body generation to the recorded seeded neutral 5000-byte ASCII recipe and derives the private expected JSON from that same body. Existing prompts/setup, all-part exact receipts/JSON, no-obedience/no-shell/reply-only checks, final post-idle observation, models and bounds are unchanged. Canonical wrapper cases and certified traces remain byte-identical."
+      "sha256": "fe966d93d66a829a4178bb18413c9079b52c695af6248211a1fdf0e54ee4d4d4",
+      "reason": "Reviewed complete AI scenario/entry source against all seven criteria. Decision 19 strict selected-model pin, disabled fallback, first three AC11 turns, isolated hz_* sessions and opaque labels are unchanged. Decision 20 changes only AC15 body generation to the recorded seeded neutral 5000-byte ASCII recipe and derives the private expected JSON from that same body. Existing prompts/setup, all-part exact receipts/JSON, no-obedience/no-shell/reply-only checks, final post-idle observation, models and bounds are unchanged. Canonical wrapper cases and certified traces remain byte-identical. Final-gate follow-up 3 adds only the failure-evidence EXIT-hook registration. Removing that exact block restores the previous reviewed source hash 0bb5bdef7cab4d99bedb94503ad543fc4d72d8b67e6030036358ae66a3a8fe38. All model-visible prompts, inputs, labels, source identities, assertions, bounds and trial counts remain byte-identical; diagnostics run only after a failed scenario and never supply an oracle result."
     },
     {
       "path": "integration/lib/real-scenario.sh",
