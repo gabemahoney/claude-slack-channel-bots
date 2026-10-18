@@ -691,7 +691,14 @@ Every real-agent failure retains metadata for all main and subagent transcript
 records from its isolated HOME, plus a projected final pane captured before
 retirement. Message text, tool arguments/results and unknown pane text are
 withheld; types, subtypes, stop reasons, models, tool names, permission/denial
-flags, agent IDs and notification links remain. Heavy runs write private
+flags, agent IDs and notification links remain. Structured Claude and Codex
+errors retain identifier fields (`type`, `code`, `name`, `errno`), HTTP status,
+retryability/retry timing, nested error/cause/response metadata, and
+`codex_error_info` (including its tagged HTTP-status variants). Free-text
+`message`, `details`, `additional_details` and `stack` are withheld even when
+they contain a single word; bodies, headers and arbitrary fields are excluded.
+The Codex shapes follow the [0.159.2 error wire schema](https://github.com/openai/codex/blob/rust-v0.159.2/codex-rs/protocol/src/codex_error_info.rs).
+These fields report evidence only and never authorize a retry. Heavy runs write private
 `real-agent-failures.jsonl` under their output folder; full CI keeps the evidence
 lines in failure logs. Cleanup failures also trigger retention. Missing or
 malformed evidence is marked explicitly and never changes a verdict. See the

@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { assertNativeSpoofResponse } from './real-agent/ai-classifier-stop.ts'
-import { claudeFailureRecords, diagnosticValue, projectFailurePane, scenarioFailureRecords, retainFailureLine, scrubDiagnosticText } from './real-agent/ai-failure-diagnostics.ts'
+import { claudeFailureRecords, diagnosticValue, projectClaudeFailure, projectCodexFailure, projectFailurePane, scenarioFailureRecords, retainFailureLine, scrubDiagnosticText } from './real-agent/ai-failure-diagnostics.ts'
 import type { TranscriptEntry } from './integration/fixtures/transcript-receipts.ts'
 import { assertNoLeak, fakeToken, BOT_TOKEN_PREFIX } from './test-helpers/credentials.ts'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
@@ -63,6 +63,65 @@ test('metadata diagnostics withhold message-shaped values and scrub tokens', () 
 function entry(offset: number, value: any, path = '/private/session.jsonl'): TranscriptEntry {
   return { offset, path, value, at: offset, kind: 'other' }
 }
+
+test.each(['rate_limit_exceeded', 'server_overloaded', 'internal_server_error', 'unauthorized',
+  { http_connection_failed: { http_status_code: 503 } },
+  { response_stream_connection_failed: { http_status_code: 429 } },
+  { response_stream_disconnected: { http_status_code: null } },
+  { response_too_many_failed_attempts: { http_status_code: 502 } },
+  { active_turn_not_steerable: { turn_kind: 'compact' } },
+])('Codex retains native error classification %j on error events and failed completion', codex_error_info => {
+  const error = { message: 'PRIVATE', codex_error_info }
+  const direct = projectCodexFailure(entry(10, { type: 'event_msg', payload: { type: 'error', ...error } }))
+  const terminal = projectCodexFailure(entry(20, { type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn', error } }))
+  expect(direct.payload).toMatchObject({ type: 'error', message: '<text withheld>', codex_error_info })
+  expect(terminal.payload).toMatchObject({ type: 'task_complete', turn_id: 'turn', error: { message: '<text withheld>', codex_error_info } })
+  expect(JSON.stringify([direct, terminal])).not.toContain('PRIVATE')
+})
+
+test.each(['claude', 'codex'] as const)('%s preserves structured error facts through capture and retention without free text or tokens', async agent => {
+  const root = mkdtempSync(join(tmpdir(), 'native-error-')), transcripts = join(root, 'transcripts')
+  try {
+    mkdirSync(transcripts)
+    const secret = fakeToken('sk-'), error = { type: 'rate_limit_error', code: 'rate_limit_exceeded', status: 429,
+      http_status: 429, status_code: 429, retryable: true, retry_after_ms: 3000, attempt: 0,
+      cause: { name: 'APIError', code: secret, errno: 'ECONNRESET', retryable: false,
+        response: { statusCode: 503, headers: { authorization: secret }, body: 'PRIVATE BODY' } },
+      error: { type: 'overloaded_error', message: 'PRIVATE MESSAGE' },
+      codex_error_info: { response_stream_disconnected: { http_status_code: null } },
+      message: 'PRIVATE', details: { request: secret }, additional_details: 'PRIVATE DETAIL', stack: 'PRIVATE STACK',
+      access_token: secret, request: { body: 'PRIVATE PROMPT' }, unknown: 'PRIVATE UNKNOWN' }
+    const expected = { type: 'rate_limit_error', code: 'rate_limit_exceeded', status: 429, http_status: 429,
+      status_code: 429, retryable: true, retry_after_ms: 3000, attempt: 0,
+      cause: { name: 'APIError', code: '[REDACTED]', errno: 'ECONNRESET', retryable: false, response: { statusCode: 503 } },
+      error: { type: 'overloaded_error', message: '<text withheld>' },
+      codex_error_info: { response_stream_disconnected: { http_status_code: null } },
+      message: '<text withheld>', details: '<text withheld>', additional_details: '<text withheld>', stack: '<text withheld>' }
+    const value = agent === 'claude'
+      ? { type: 'assistant', isApiErrorMessage: true, error, message: { role: 'assistant', error, content: 'PRIVATE TEXT' } }
+      : { type: 'event_msg', payload: { type: 'task_complete', turn_id: 'turn', error } }
+    writeFileSync(join(transcripts, 'session.jsonl'), JSON.stringify(value) + '\n')
+    const records = await scenarioFailureRecords(transcripts, agent)
+    for (const record of records) retainFailureLine(root, 'real-agent-failure-evidence: ' + JSON.stringify({ event: 'transcript', record }), v => v)
+    const text = readFileSync(join(root, 'real-agent-failures.jsonl'), 'utf8'), retained = JSON.parse(text).record
+    if (agent === 'claude') { expect(retained.error).toEqual(expected); expect(retained.message.error).toEqual(expected) }
+    else expect(retained.payload.error).toEqual(expected)
+    expect(text).not.toContain('PRIVATE'); expect(text).not.toContain(secret)
+    assertNoLeak(retained)
+    expect(statSync(join(root, 'real-agent-failures.jsonl')).mode & 0o777).toBe(0o600)
+  } finally { rmSync(root, { recursive: true, force: true }) }
+})
+
+test('error projection keeps null/false and fails closed for malformed, deep or text-shaped metadata', () => {
+  for (const error of [null, false, 'refusal']) expect(projectClaudeFailure(entry(0, { error }))).toMatchObject({ error })
+  const cyclic: any = { code: 'bounded' }; cyclic.cause = cyclic
+  const result = projectCodexFailure(entry(0, { payload: { error: cyclic, codex_error_info: ['PRIVATE'],
+    code: 'PRIVATE CODE', status: { message: 'PRIVATE' }, retryable: false } }))
+  const text = JSON.stringify(result)
+  expect(text).toContain('<error depth limit>'); expect(text).not.toContain('PRIVATE')
+  expect(result.payload).toMatchObject({ code: '<string withheld>', status: '<object>', retryable: false, codex_error_info: '<array>' })
+})
+
 test('case projection retains synthetic/error metadata without message text, excludes prompts, tool arguments and foreign sessions', () => {
   const v = valid(); Object.assign(v, { type: 'assistant', parentUuid: 'take', isApiErrorMessage: true, error: 'refusal', isSynthetic: true, isMeta: false })
   v.message.stop_reason = 'refusal'; v.message.model = '<synthetic>'

@@ -30,6 +30,29 @@ export function reportFailureOnce(path: string, message: string, emit: (message:
 }
 
 const fields = (value: any, names: readonly string[]) => Object.fromEntries(names.filter(key => value?.[key] !== undefined).map(key => [key, diagnosticValue(value[key])]))
+const errorScalarFields = ['type', 'name', 'code', 'error_type', 'errorType', 'status', 'status_code', 'statusCode',
+  'http_status', 'httpStatus', 'http_status_code', 'httpStatusCode', 'retryable', 'is_retryable', 'isRetryable',
+  'retry_after', 'retryAfter', 'retry_after_ms', 'retryAfterMs', 'attempt', 'retry_attempt', 'errno', 'turn_kind'] as const
+// Codex 0.159.2's externally tagged variants (protocol/src/codex_error_info.rs).
+// Unit variants are strings; these variants carry non-text metadata objects.
+const codexErrorVariants = ['http_connection_failed', 'response_stream_connection_failed', 'response_stream_disconnected',
+  'response_too_many_failed_attempts', 'active_turn_not_steerable'] as const
+const nestedErrorFields = ['error', 'cause', 'response', 'codex_error_info', ...codexErrorVariants] as const
+function errorMetadata(value: unknown, depth: number): unknown {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return diagnosticValue(value)
+  if (depth >= 8) return '<error depth limit>'
+  return errorFields(value, depth + 1)
+}
+/** Keep error classification/status/retry facts, never messages, response bodies,
+ * headers or arbitrary object keys. This is diagnostic evidence, not a retry rule. */
+function errorFields(value: any, depth = 0): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+  return { ...fields(value, errorScalarFields),
+    ...Object.fromEntries(nestedErrorFields.filter(key => value[key] !== undefined)
+      .map(key => [key, errorMetadata(value[key], depth)])),
+    ...Object.fromEntries(['message', 'details', 'additional_details', 'stack'].filter(key => value[key] !== undefined)
+      .map(key => [key, '<text withheld>'])) }
+}
 const identityFields = ['type', 'subtype', 'uuid', 'parentUuid', 'sessionId', 'session_id', 'agentId', 'agent_id', 'parentAgentId', 'isSidechain',
   'requestedModel', 'isMeta', 'isApiErrorMessage', 'error', 'isSynthetic', 'refusedUserMessageUuid', 'sourceToolAssistantUUID',
   'toolDenialKind', 'toolDenialEndsTurn', 'toolDenialMonitorBlocked', 'toolDenialUnanswered', 'toolEndsTurn', 'permissionMode',
@@ -48,7 +71,7 @@ export function notificationMetadata(content: unknown) {
 export function projectClaudeFailure(entry: TranscriptEntry) {
   const v = entry.value, m = v?.message
   return { stream: basename(entry.path), sidechain: entry.path.includes('/subagents/'), offset: entry.offset,
-    at: Number.isFinite(entry.at) ? entry.at : null, ...fields(v, identityFields),
+    at: Number.isFinite(entry.at) ? entry.at : null, ...fields(v, identityFields), ...errorFields(v),
     origin: fields(v?.origin, ['kind', 'subkind', 'producer', 'runId']),
     toolUseResult: fields(v?.toolUseResult, ['agentId', 'status', 'isAsync', 'resolvedModel', 'canContinueAgent']),
     permissionDecision: typeof v?.permissionDecision === 'object' ? fields(v.permissionDecision, ['behavior', 'type', 'decision']) : diagnosticValue(v?.permissionDecision),
@@ -58,13 +81,13 @@ export function projectClaudeFailure(entry: TranscriptEntry) {
     request: fields(v?.request, ['subtype', 'tool_name', 'tool_use_id', 'request_id']),
     permission_denials: Array.isArray(v?.permission_denials) ? v.permission_denials.map((d: unknown) => fields(d, ['tool_name', 'tool_use_id'])) : undefined,
     notification: notificationMetadata(m?.content),
-    message: { ...fields(m, ['id', 'role', 'model', 'stop_reason']), content: contentMetadata(m?.content) } }
+    message: { ...fields(m, ['id', 'role', 'model', 'stop_reason']), ...errorFields(m), content: contentMetadata(m?.content) } }
 }
 export function projectCodexFailure(entry: TranscriptEntry) {
   const v = entry.value, p = v?.payload
   return { stream: basename(entry.path), offset: entry.offset, at: Number.isFinite(entry.at) ? entry.at : null,
-    ...fields(v, identityFields), payload: { ...fields(p, [...identityFields, 'id', 'role', 'model', 'turn_id', 'call_id', 'name',
-      'status', 'decision', 'approval', 'request_id', 'thread_id', 'parent_thread_id']), content: contentMetadata(p?.content) } }
+    ...fields(v, identityFields), ...errorFields(v), payload: { ...fields(p, [...identityFields, 'id', 'role', 'model', 'turn_id', 'call_id', 'name',
+      'status', 'decision', 'approval', 'request_id', 'thread_id', 'parent_thread_id']), ...errorFields(p), content: contentMetadata(p?.content) } }
 }
 /** Preserve the final pane's rows and UI markers, never conversation or draft text.
  * Unknown text is withheld, including history, menu labels and tool arguments. */
