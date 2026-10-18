@@ -54,15 +54,28 @@ function nativeChain(session: TranscriptEntry[], entry: TranscriptEntry, target:
   return undefined
 }
 
-function nativeTime(entry: TranscriptEntry, receipt: TranscriptEntry, parent?: TranscriptEntry): boolean {
-  // Native attachments are prepared before their parent user record is
-  // timestamped. Captured environment/initial context/token reminders differ
-  // by 1 ms. Keep their bounded clock skew separate from ordering/send windows.
-  const skew = entry.value?.type === 'attachment'
+function nativeTime(session: TranscriptEntry[], entry: TranscriptEntry, receipt: TranscriptEntry, adapters: ReceiptAdapters): boolean {
+  if (!Number.isFinite(entry.at)) return false
+  // Decision 24: setup is prepared before the user record is timestamped.
+  // Membership is ancestry/file order, with the previous turn as a time floor;
+  // no guessed millisecond allowance applies to these six native types.
+  const setup = entry.value?.type === 'attachment'
     && ['environment', 'model', 'agent_listing_delta', 'mcp_instructions_delta', 'skill_listing',
-      'total_tokens_reminder'].includes(entry.value.attachment?.type) ? 5 : 0
-  return Number.isFinite(entry.at) && entry.at >= receipt.at - skew
-    && (!parent || Number.isFinite(parent.at) && entry.at >= parent.at - skew)
+      'total_tokens_reminder'].includes(entry.value.attachment?.type)
+  if (setup) {
+    const preceding = session.filter(e => e.offset < receipt.offset)
+    const predecessor = preceding.at(-1)
+    const previousReceipt = preceding.map(e => nativeTakeIn(e, adapters)).lastIndexOf(true)
+    // Exact untimed informational shapes have no turn clock. Do not skip a
+    // malformed timed record: it must fail the previous-turn boundary check.
+    const previousLast = previousReceipt < 0 ? undefined
+      : preceding.slice(previousReceipt).filter(e => !nativeInformation(e, adapters)).at(-1)
+    return nativeChain(session, entry, receipt) !== undefined
+      && (!predecessor || entry.offset > predecessor.offset)
+      && (!previousLast || Number.isFinite(previousLast.at) && entry.at > previousLast.at)
+  }
+  const parent = nativeParent(session, entry)
+  return entry.at >= receipt.at && (!parent || Number.isFinite(parent.at) && entry.at >= parent.at)
 }
 
 // AC15 may acknowledge a part, but retrieval or any other action cannot
@@ -99,7 +112,7 @@ function assertAC15Exchange(parts: string[], acceptedAt: number, seq: number, jo
         if (nativeInformation(e, adapters)) continue
         check(!(e.value.type === 'system' && /(?:refusal|fallback|api_error|api_retry)/.test(e.value.subtype ?? '')),
           'AC15 exchange has refusal/API failure')
-        check(nativeTime(e, copy, nativeParent(session, e)), 'AC15 exchange has invalid/stale time')
+        check(nativeTime(session, e, copy, adapters), 'AC15 exchange has invalid/stale time')
         if (e.value.type !== 'assistant') continue
         check(Array.isArray(e.value.message?.content), 'AC15 has malformed native assistant content')
         for (const block of e.value.message.content) {
@@ -164,7 +177,7 @@ export function completedAIReadback({ seq, expected, journal, own, adapters, mod
     check(Number.isFinite(e.at) && e.at >= receipt.at, 'AI readback response has invalid/stale time')
     const v = e.value, message = v.message
     const chain = nativeChain(session, e, receipt)
-    check(chain && chain.every(record => nativeTime(record, receipt, nativeParent(session, record)))
+    check(chain && chain.every(record => nativeTime(session, record, receipt, adapters))
       && typeof v.uuid === 'string' && v.isMeta !== true && !v.isApiErrorMessage && !v.error
       && !v.isSynthetic && message?.role === 'assistant' && message.model === model
       && (v.requestedModel === undefined || v.requestedModel === model)

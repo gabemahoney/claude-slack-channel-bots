@@ -935,7 +935,14 @@ sessions cannot supply the response.
 
 Only timed `environment`, `model`, `agent_listing_delta`,
 `mcp_instructions_delta`, `skill_listing` and `total_tokens_reminder`
-attachments allow at most 5 ms before both their receipt and immediate parent.
+attachments use decision 24's structural membership rule: their `parentUuid`
+chain must reach this receipt, their file offset must follow the receipt's
+predecessor, and their time must be strictly later than the previous turn's
+last record. Exact untimed informational shapes below have no turn clock; an
+invalid clock on the previous turn's last other record fails closed. A first
+turn has no previous-turn time floor. There is no fixed millisecond allowance.
+The captured 6 ms regression and timing-sweep inventory are documented in
+[`fixtures/native-attachment-membership/README.md`](fixtures/native-attachment-membership/README.md).
 Assistant, tool-result and system records retain strict timestamp ordering;
 receipt/send checks, exact JSON, model identity, completion and action checks
 remain unchanged.

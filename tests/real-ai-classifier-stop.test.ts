@@ -58,6 +58,77 @@ function queuedTakeIn(entry: TranscriptEntry, explicitHuman = true) {
   return entry
 }
 
+// Retained clocks, offsets and UUID links from the failing 6 ms native case.
+// Bodies/journal are synthetic controls, never evidence that the paid AI passed.
+function capturedSetup(criterion: 'ordinary' | 'AC15') {
+  const captured = JSON.parse(readFileSync(new URL('./fixtures/native-attachment-membership/six-ms.json', import.meta.url), 'utf8'))
+  const e = ordinaryEvidence()
+  e.expected.case = criterion
+  const rows: any[] = captured.records.filter((r: any) => Number.isFinite(r.at))
+  const first = rows[0], path = `/scenario/projects/aiac11/${first.sessionId}.jsonl`
+  e.own = rows.map((r, index) => {
+    const value: any = { type: r.type, uuid: r.uuid, parentUuid: r.parentUuid, sessionId: r.sessionId,
+      timestamp: new Date(r.at).toISOString(), isSidechain: false }
+    if (r.type === 'attachment') value.attachment = { type: r.attachmentType }
+    else if (index === 0) value.message = { role: 'user', content: e.take.text }
+    else if (r.type === 'user') value.message = { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'post', content: 'posted' }] }
+    else value.message = { role: 'assistant', model: e.model, stop_reason: r.stopReason,
+      content: r.offset === 32330 ? [{ type: 'tool_use', name: 'mcp__slack-channel-router__reply', id: 'post', input: { text: JSON.stringify(e.expected) } }] : [] }
+    return { path, offset: r.offset, at: r.at, value, ...parseDeliveryTranscriptRecord('claude', value) }
+  })
+  e.journal[0].received_at = first.at - 100
+  Object.assign(e.journal[2], { session_id: first.sessionId, transcript_path: path, at: first.at - 50 })
+  Object.assign(e.journal[3], { receipt: { path, uuid: first.uuid }, at: first.at + 1 })
+  return e
+}
+
+test.each(['ordinary', 'AC15'] as const)('%s accepts the captured 6 ms setup chain through native completion', criterion => {
+  const e = capturedSetup(criterion)
+  expect(completedAIReadback(e).receipt_uuid).toBe('8a133168-9fce-4115-ba1f-3a0d1b9f62a6')
+})
+
+for (const criterion of ['ordinary', 'AC15'] as const) {
+  test.each(['environment', 'model', 'agent_listing_delta', 'mcp_instructions_delta', 'skill_listing', 'total_tokens_reminder'])(
+    `${criterion} setup %s must follow the previous turn and link to this receipt`, type => {
+      const e = capturedSetup(criterion), setup = e.own[1]!, receipt = e.own[0]!
+      setup.value.attachment.type = type
+      const prior = e.entry(100, { type: 'user', uuid: 'previous', sessionId: receipt.value.sessionId, message: { role: 'user', content: 'previous turn' } })
+      prior.path = receipt.path; prior.at = setup.at - 2
+      const last = assistant(e, [], 200, { uuid: 'previous-end', sessionId: receipt.value.sessionId, parentUuid: 'previous' })
+      last.path = receipt.path; last.at = setup.at - 1
+      receipt.value.parentUuid = last.value.uuid
+      e.own.unshift(prior, last)
+      expect(completedAIReadback(e).receipt_uuid).toBe(receipt.uuid!)
+      for (const at of [last.at - 1, last.at]) {
+        const saved = setup.at; setup.at = at
+        expect(() => completedAIReadback(e)).toThrow()
+        setup.at = saved
+      }
+      for (const parent of [undefined, 'missing', 'previous-end']) {
+        setup.value.parentUuid = parent
+        expect(() => completedAIReadback(e)).toThrow()
+      }
+      setup.value.parentUuid = receipt.uuid
+      setup.offset = last.offset
+      expect(() => completedAIReadback(e)).toThrow()
+    })
+
+  test(`${criterion} setup cannot bypass an invalid previous-turn clock or an exact ordinary-record clock`, () => {
+    const e = capturedSetup(criterion), receipt = e.own[0]!, setup = e.own[1]!
+    const prior = e.entry(100, { type: 'user', uuid: 'previous', sessionId: receipt.value.sessionId, message: { role: 'user', content: 'previous turn' } })
+    prior.path = receipt.path; prior.at = NaN
+    e.own.unshift(prior)
+    expect(() => completedAIReadback(e)).toThrow()
+    e.own.shift()
+    setup.value.attachment.type = 'instructions'
+    expect(() => completedAIReadback(e)).toThrow()
+    setup.value.attachment.type = 'environment'
+    const result = e.own.find(r => r.value.type === 'user' && r !== receipt)!
+    result.at = e.own.find(r => r.value.uuid === result.value.parentUuid)!.at - 1
+    expect(() => completedAIReadback(e)).toThrow()
+  })
+}
+
 test.each([false, true])('ordinary readback accepts a native queued command, explicit human=%s', explicitHuman => {
   const e = ordinaryEvidence(); queuedTakeIn(e.take, explicitHuman)
   expect(completedAIReadback(e)).toEqual({ seq: 3, part: 1, receipt_uuid: 'case3', session_id: 'session', actual_model: e.model })
@@ -372,16 +443,12 @@ function ac15ClockChain(skew = 1, type = 'total_tokens_reminder') {
   return { e, environment, reminder, result, completionMetadata, completion }
 }
 
-test.each([1, 5])('AC15 follows captured native environment/reminder ancestry and completion with %s ms skew', skew => {
+test.each([1, 5, 6, 2000])('AC15 follows native environment/reminder ancestry and completion with %s ms preparation lead', skew => {
   const { e, environment, reminder } = ac15ClockChain(skew)
-  expect(environment.value.timestamp).toBe(skew === 1 ? '2026-10-17T10:45:33.772Z' : '2026-10-17T10:45:33.768Z')
-  expect(reminder.value.timestamp).toBe(skew === 1 ? '2026-10-17T10:45:56.440Z' : '2026-10-17T10:45:56.436Z')
+  expect(environment.at).toBe(e.own[0]!.at - skew)
+  expect(reminder.at).toBe(e.own[4]!.at - skew)
   e.own.reverse() // caller array order also cannot replace native file order
   expect(readAC15(e)).toEqual({ seq: 1, part: 3, receipt_uuid: 'part-3', session_id: 'session', actual_model: e.model })
-})
-
-test.each([6, 2000])('AC15 rejects native metadata clock skew beyond the 5 ms bound: %s', skew => {
-  expect(() => readAC15(ac15ClockChain(skew).e)).toThrow(/^AC15 exchange has invalid\/stale time$/)
 })
 
 test('AC15 clock skew does not exempt an untimed shutdown cost-state from its exact informational shapes', () => {
@@ -405,7 +472,7 @@ test.each([
   ['sidechain', (x: ReturnType<typeof ac15ClockChain>) => { x.reminder.value.isSidechain = true }],
   ['invalid clock', (x: ReturnType<typeof ac15ClockChain>) => { x.reminder.at = NaN }],
   ['unrecognized attachment', (x: ReturnType<typeof ac15ClockChain>) => { x.reminder.value.attachment.type = 'unknown' }],
-] as const)('AC15 skew allowance cannot admit %s ancestry', (_name, mutate) => {
+] as const)('AC15 structural setup membership cannot admit %s ancestry', (_name, mutate) => {
   const x = ac15ClockChain(); mutate(x)
   expect(() => readAC15(x.e)).toThrow()
 })
@@ -415,7 +482,7 @@ test('ordinary completion also follows the native 1 ms chain without using times
   x.e.expected.case = 'ordinary'
   x.e.own[5]!.value.message.content[0].input.text = JSON.stringify(x.e.expected)
   expect(completedAIReadback(x.e).receipt_uuid).toBe('part-3')
-  x.completionMetadata.at -= 5
+  x.completionMetadata.at = x.e.own[3]!.at
   expect(() => completedAIReadback(x.e)).toThrow('invalid native assistant response')
 })
 
