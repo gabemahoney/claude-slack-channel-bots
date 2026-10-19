@@ -29,7 +29,9 @@ wait_until 180 'preallowed sleep tool never observed active' case_assert active-
 real_dm "${REAL_LABEL}" 'message while long sleep is running'
 real_wait_delivery "${REAL_KEY}" 2
 real_wait_idle "${REAL_KEY}"
-case_assert busy-proof "${SCENARIO_ROOT}/busy-tool.json" 2
+# Idle UI/state can precede the durable assistant end_turn record. Poll the
+# unchanged proof for at most 180 s; timeout retains its exact final snapshot.
+case_assert busy-proof-wait "${SCENARIO_ROOT}/busy-tool.json" 2
 real_dm "${REAL_LABEL}" 'Use Bash to run printf permission-probe. Wait for approval.'
 wait_until 180 'permission prompt never opened' case_assert permission "${SCENARIO_SLACK_RECORD}"
 MARK="$(date +%s%3N)"

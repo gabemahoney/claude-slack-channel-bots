@@ -137,6 +137,77 @@ const capturedMinimum = capturedTyped.int({ min: 1, wholeValue: true }).parse
 const native302 = (flag: unknown = { mode: 'compact', fireAtFraction: .5 }, settings: Record<string, unknown> = {}, overrides: Record<string, string | undefined> = {}) =>
   idleCapability(captured302, rollout(flag), { promptCacheTtl: '1h', ...settings }, { CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS: '100000', ...overrides })
 
+const captured303 = readFileSync(join(nativeFixtureDir, 'native303-captured-idle-policy.txt'))
+const provenance303 = JSON.parse(readFileSync(join(nativeFixtureDir, 'native303-provenance.json'), 'utf8'))
+const fragments303 = provenance303.fragments as NativeFragment[]
+
+describe('captured native 2.1.303 idle policy', () => {
+  test('all 32 official-release fragments preserve the audit and the single identifier-only change', () => {
+    expect(sha256(readFileSync(join(nativeFixtureDir, 'native303-provenance.json')))).toBe('54c00d5edbb93baa912c2cc703084aac731aede73078328daa98388c584ef70e')
+    expect(captured303.length).toBe(18_822)
+    expect(sha256(captured303)).toBe('717f69dcd8cadddaa156571f5ea85cdc6bdb3a231923a1e337b2cfb9a5917636')
+    const manifest = readFileSync(join(nativeFixtureDir, provenance303.releaseManifest.file))
+    expect(sha256(manifest)).toBe(provenance303.releaseManifest.sha256)
+    expect(JSON.parse(manifest.toString()).platforms['linux-x64']).toEqual({ binary: 'claude',
+      checksum: '375988f457756524234695cf2d8f64ace99c5f68682e47ea24862a843c191450', size: 285_809_912 })
+    expect(provenance303).toMatchObject({ version: '2.1.303', captureVerifiedAgainstBinaryOffsets: true,
+      binaryExecutedByFixtureCapture: false, binaryVendored: false })
+    expect(fragments303).toHaveLength(32)
+    for (const fragment of fragments303) {
+      const bytes = captured303.subarray(fragment.fixtureOffset, fragment.fixtureOffset + fragment.bytes)
+      expect(sha256(bytes)).toBe(fragment.sha256)
+      expect(bytes.toString('latin1').startsWith(fragment.start)).toBe(true)
+      expect(bytes.toString('latin1').endsWith(fragment.end)).toBe(true)
+      expect(fragment.binaryOffset).toBeGreaterThanOrEqual(0)
+      expect(fragment.binaryOffset + fragment.bytes).toBeLessThanOrEqual(provenance303.binaryBytes)
+      const prior = capturedFragment(fragment.name)
+      expect(bytes.toString('latin1')).toBe(fragment.name === 'environment-parser'
+        ? prior.replaceAll('u6s', 'u5s') : prior)
+    }
+  })
+
+  test('the pre-fix detector rejects the captured executable while the repaired detector proves its timing', () => {
+    const previous = readFileSync(join(nativeFixtureDir, provenance303.previousDetector.file), 'utf8')
+    expect(sha256(previous)).toBe(provenance303.previousDetector.sha256)
+    const body = previous.slice(previous.indexOf('const AUDITED_IDLE_RETURN_POLICY'), previous.indexOf('/** Current launch'))
+    const compiled = new Bun.Transpiler({ loader: 'ts' }).transformSync(body.replace('export function idleCapability', 'function idleCapability'))
+    const oldCapability = new Function('createHash', 'IDLE_OBSERVATION_MAX_MS', compiled + ';return idleCapability')(createHash, IDLE_OBSERVATION_MAX_MS) as typeof idleCapability
+    expect(() => oldCapability(captured303, rollout(), { promptCacheTtl: '1h' }, env)).toThrow('needs investigation')
+    expect(idleCapability(captured303, rollout({ mode: 'compact_on_return' }), { promptCacheTtl: '1h' }, env)).toMatchObject({
+      supported: false, proof: { profile: 'native-idle-return-policy-303', conclusion: 'timer-outside-bound',
+        applicationNotBeforeMs: 3_600_000, backgroundNoStartEvent: true, observationMaxMs: 2_700_000 } })
+  })
+
+  test.each(fragments303.map(fragment => [fragment.name, fragment] as const))('a changed %s dependency still fails closed', (_name, fragment) => {
+    const changed = Buffer.from(captured303)
+    changed[fragment.fixtureOffset + Math.floor(fragment.bytes / 2)]! ^= 1
+    expect(() => idleCapability(changed, rollout(), { promptCacheTtl: '1h' }, env)).toThrow('needs investigation')
+  })
+
+  test('an unaudited parser rename, missing dependency or duplicate policy is not accepted', () => {
+    const policy = fragments303[0]!
+    for (const changed of [
+      Buffer.from(captured303.toString('latin1').replaceAll('u5s', 'futureParser'), 'latin1'),
+      captured303.subarray(policy.bytes),
+      Buffer.concat([captured303, captured303.subarray(0, policy.bytes)]),
+    ]) expect(() => idleCapability(changed, rollout(), { promptCacheTtl: '1h' }, env)).toThrow('needs investigation')
+  })
+
+  test('the audited policy preserves every mode, bound, override and disabling-setting outcome', () => {
+    for (const mode of ['off', 'log', 'compact', 'compact_on_return'])
+      for (const fraction of [undefined, .5, .75, .751, 1])
+        for (const overrides of [{}, { CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS: '100_001' },
+          { CLAUDE_CODE_PROMPT_CACHE_TTL: '5m' }, { DISABLE_AUTO_COMPACT: ' on ' }, { CLAUDE_CODE_MESSAGES_PROMPT_CACHE_TTL: '5m' }])
+          for (const settings of [{}, { idleCompaction: false }, { precomputeCompactionEnabled: false }]) {
+            const args = [rollout({ mode, fireAtFraction: fraction }), { promptCacheTtl: '1h', ...settings }, { ...env, ...overrides }] as const
+            const prior = idleCapability(captured302, ...args)
+            expect(idleCapability(captured303, ...args)).toEqual({ ...prior, binarySha256: sha256(captured303),
+              proof: prior.proof && { ...prior.proof, profile: 'native-idle-return-policy-303' } })
+          }
+    expect(() => idleCapability(captured303, {}, { promptCacheTtl: '1h' }, env)).toThrow('rollout value unavailable')
+  })
+})
+
 describe('captured native 2.1.302 idle policy', () => {
   test('fixture and all 32 fragments retain their audited official-release provenance', () => {
     expect(sha256(readFileSync(join(nativeFixtureDir, 'native302-provenance.json')))).toBe('56b2154ce1e63811934d7da0aca82ea1e5aa2a9fbf66d74ffa4dfe57f704802c')

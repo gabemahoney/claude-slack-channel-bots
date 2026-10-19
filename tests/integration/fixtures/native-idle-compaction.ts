@@ -8,7 +8,7 @@ import { packedReceiptAdapters, personaTranscripts, readTranscripts, receiptJour
 
 export const IDLE_OBSERVATION_MAX_MS = 45 * 60_000
 export interface IdleCapabilityProof {
-  profile: 'native-idle-return-policy-302'
+  profile: 'native-idle-return-policy-302' | 'native-idle-return-policy-303'
   mode: 'off' | 'log' | 'compact' | 'compact_on_return'
   conclusion: 'eligible' | 'settings-disabled' | 'rollout-inactive' | 'precompute-disabled' | 'remote-precompute-disabled' | 'timer-outside-bound' | 'cache-ttl-ineligible'
   observationMaxMs: number
@@ -59,14 +59,23 @@ const AUDITED_IDLE_RETURN_POLICY = [
   ["function SYr(e){", "async function*xRn(", "c312e962bbfb45e0e7ff8dfdaf96c12311acfb1340d6574287138024e7b29995"],
   ["iR=lbe(Q.querySource,{agentCacheTtlOverride:Q.agentCacheTtlOverride,", "let wL=!1,mT=", "a7c02cea35083d278016c31a7b91f2848de7f5f15538d0694c790f45ad258a43"],
 ] as const
-function isAuditedIdleReturnPolicy(code: string): boolean {
-  return AUDITED_IDLE_RETURN_POLICY.every(([start, end, sha256]) => {
+// 2.1.303 preserves 31 dependencies byte-for-byte. Only the environment
+// parser's helper declaration/export changes from u6s to u5s. Accept this
+// separately audited exact fingerprint, not arbitrary identifier renaming.
+const AUDITED_ENVIRONMENT_PARSERS = [
+  { profile: 'native-idle-return-policy-302', fragment: AUDITED_IDLE_RETURN_POLICY[3] },
+  { profile: 'native-idle-return-policy-303', fragment: ["function i(n){return{parse:(e)=>n(u(e))}}", "export{u5s,H};", "e5ff60b6463619b21053c47a9c3a21b0af4087c944b6a91ee2c58b1eeb1e6d2f"] },
+] as const
+function auditedIdleReturnProfile(code: string): IdleCapabilityProof['profile'] | undefined {
+  const matches = ([start, end, sha256]: readonly [string, string, string]) => {
     const offset = code.indexOf(start)
     if (offset < 0 || code.indexOf(start, offset + 1) !== -1) return false
     const finish = code.indexOf(end, offset)
     if (finish < 0 || finish + end.length - offset > 12_000) return false
     return createHash('sha256').update(Buffer.from(code.slice(offset, finish + end.length), 'latin1')).digest('hex') === sha256
-  })
+  }
+  if (!AUDITED_IDLE_RETURN_POLICY.every((fragment, index) => index === 3 || matches(fragment))) return undefined
+  return AUDITED_ENVIRONMENT_PARSERS.find(candidate => matches(candidate.fragment))?.profile
 }
 // Mirror the audited typed getter: a whole positive integer, including integer
 // scientific notation and consistently grouped thousands, or undefined. An
@@ -99,7 +108,8 @@ export function idleCapability(binary: Buffer, globalConfig: any, settings: any,
   const code = binary.toString('latin1')
   const policy = code.match(/var ([\w$]+)=200000,([\w$]+)=1e5,([\w$]+)=0\.9,([\w$]+)=0\.5,([\w$]+)=0\.95,[\w$]+=60000;/)
   const body = policy ? code.slice(policy.index, policy.index! + 1100) : ''
-  const returnPolicy = isAuditedIdleReturnPolicy(code)
+  const profile = auditedIdleReturnProfile(code)
+  const returnPolicy = profile !== undefined
   const legacyPolicy = !!policy && body.includes('k("tengu_sunny_locket",null)')
     && body.includes(`Math.max(${policy[2]},`) && body.includes(`Math.min(${policy[5]},Math.max(${policy[4]},`)
     && code.includes('Setting it to true does not turn idle compaction on.')
@@ -111,7 +121,7 @@ export function idleCapability(binary: Buffer, globalConfig: any, settings: any,
   const flag = features?.tengu_sunny_locket
   const mode: IdleCapabilityProof['mode'] = flag?.mode === 'compact' || flag?.mode === 'log' || returnPolicy && flag?.mode === 'compact_on_return' ? flag.mode : 'off'
   const proof = (conclusion: IdleCapabilityProof['conclusion'], extra: Partial<IdleCapabilityProof> = {}): IdleCapabilityProof | undefined => returnPolicy
-    ? { profile: 'native-idle-return-policy-302', mode, conclusion, observationMaxMs: IDLE_OBSERVATION_MAX_MS, ...extra } : undefined
+    ? { profile: profile!, mode, conclusion, observationMaxMs: IDLE_OBSERVATION_MAX_MS, ...extra } : undefined
   const refuse = (reason: string, conclusion: IdleCapabilityProof['conclusion'], extra: Partial<IdleCapabilityProof> = {}) => skip(reason, {
     ...(extra.minTokens !== undefined && { minTokens: extra.minTokens }),
     ...(extra.fireAfterMs !== undefined && { fireAfterMs: extra.fireAfterMs }),

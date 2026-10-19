@@ -1129,6 +1129,13 @@ Test 101 pre-allows `Bash(sleep *)` and the Slack reply tool, and sets exact
 both deliberate permission prompts observable even when native Claude
 automatically allows benign commands.
 
+After the busy message, Test 101 polls its unchanged native evidence predicate
+for at most 180 seconds. An idle composer can precede the durable terminal
+record; a late record may satisfy the predicate within that bound. On timeout,
+it retains the exact final assertion snapshot (checkpoint identity, journal
+metadata and projected native records) through the failure diagnostics. It
+does not reread the transcript after failure or extend the deadline.
+
 Before queueing message six, `tests/real-agent/test-101-denial-settled.ts`
 requires the matching successful Slack Denied update, the native
 `permission-rule` denial and completion of the identity-linked subagent.
@@ -1152,8 +1159,12 @@ launch. It records the binary digest and available native token floor/timer; uns
 binaries (including 2.1.280), disabled settings, off/log rollout modes and
 timers beyond 45 minutes produce a specific `recorded:` skip reason.
 
-The 2.1.302 policy requires all 32 audited captured fragments and dependencies
-to match; a version number alone establishes no capability or skip. Unknown
+The 2.1.302 and 2.1.303 policies require all 32 audited captured fragments and
+dependencies to match. The 2.1.303 binary preserves 31 fragments exactly; its
+environment parser has one audited helper rename. Both exact fingerprints and
+the captured regression are documented in
+[`fixtures/native-idle-compaction/README.md`](fixtures/native-idle-compaction/README.md);
+no arbitrary helper rename is accepted, and a version number alone establishes no capability or skip. Unknown
 implementation semantics, missing fetched rollout or unknown effective cache
 TTL fail for investigation. Structured proof records the recognized profile,
 actual mode, conclusion and available token, timing, TTL and disabling-setting

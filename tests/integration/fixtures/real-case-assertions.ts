@@ -2,6 +2,7 @@
 import { existsSync, readFileSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { auditReceipts, captureReceiptJournal, jsonLines, packedReceiptAdapters, personaTranscripts, readTranscripts, receiptJournal, shimWords, transcriptFiles } from './transcript-receipts.ts'
+import { assertBusyProof, emitBusyProofFailure, pollBusyProof, type BusyProofSnapshot } from './busy-proof.ts'
 import { idleCapability } from './native-idle-compaction.ts'
 const [command, state, key, shim, root, arg = '', arg2 = '', arg3 = ''] = process.argv.slice(2)
 function check(value: unknown, reason: string): asserts value { if (!value) throw new Error(reason) }
@@ -123,7 +124,7 @@ try {
       'native idle preparation has no successful actual Read response')
   } else if(command==='no-shell') {
     check(!(await entries()).some(e=>e.value?.type==='user'&&JSON.stringify(e.value.message?.content).includes('<bash-input>')), 'body entered native bash-input mode')
-  } else if(command==='active-tool'||command==='busy-proof') {
+  } else if(command==='active-tool'||command==='busy-proof'||command==='busy-proof-wait') {
     const adapters=await packedReceiptAdapters(), all=await entries(), j=cumulativeJournal()
     const own=personaTranscripts(key!,j,readFileSync(join(state!,'server.log'),'utf8').split('\n'),all)
       .filter(e=>e.value?.isSidechain!==true)
@@ -138,40 +139,23 @@ try {
       writeFileSync(arg2,JSON.stringify({path:e.path,uuid:e.value.uuid,offset:e.offset,id,at:e.at,observed_at,command:arg}))
       console.log('recorded: active tool '+JSON.stringify({id,at:e.at,observed_at}))
     } else {
-      const selected=JSON.parse(readFileSync(arg,'utf8')), item=j.find(r=>r.kind==='accepted'&&!r.compact&&r.seq===Number(arg2))
-      check(item?.source==='slack'&&Number.isFinite(item.received_at),'busy message acceptance missing')
-      const use=own.find(e=>e.path===selected.path&&e.offset===selected.offset&&e.value?.uuid===selected.uuid&&e.at===selected.at
-        &&blocks(e).some((b:any)=>b.type==='tool_use'&&b.name==='Bash'&&b.id===selected.id&&b.input?.command===selected.command))
-      check(use,'active tool does not belong to this persona/session')
-      const completed=results(selected.id,use.path)
-      check(completed.length===1,'named tool has no unique matching result')
-      const result=completed[0]!
-      check(Number.isFinite(selected.observed_at)&&use.at<=selected.observed_at&&selected.observed_at<=item.received_at
-        &&Number.isFinite(result.at)&&item.received_at<result.at&&result.offset>use.offset,
-        'message was not accepted while the observed tool was active (tool finished before acceptance)')
-      const fixed=j.find(r=>r.kind==='fixed'&&r.seq===item.seq)
-      check(fixed?.parts?.length===1,'busy message has no single fixed part')
-      // The normal receipt audit supplies exact text, shim, durable receipt,
-      // diagnostic and persona/session/path evidence for both messages.
-      const audit=auditReceipts({stateDir:state!,key:key!,shimLog:shim!,transcripts:transcriptFiles(root!),expectedCount:2},all,adapters)
-      const takes=own.filter(e=>e.kind==='take-in'&&e.text!==undefined&&e.at>=item.received_at&&adapters.receiptTextMatches(e.text,fixed.parts[0]))
-      const take=takes[0]
-      check(take&&take.path===use.path&&take.offset>use.offset&&Number.isFinite(take.at),'busy take-in has no same-session timestamp/identity')
-      const ends=own.filter(e=>e.path===use.path&&e.offset>use.offset&&e.value?.type==='assistant'
-        &&['end_turn','stop_sequence','refusal'].includes(e.value.message?.stop_reason)&&!blocks(e).some((b:any)=>b.type==='tool_use'))
-      // Streaming records of one completed message are one turn boundary;
-      // keep its first offset so later copies cannot hide a prior turn end.
-      const byMessage=new Map<string|number,typeof ends[number]>()
-      for(const e of ends) {
-        const id=e.value.message?.id??e.value.uuid??e.offset, prior=byMessage.get(id)
-        if(!prior||e.offset<prior.offset)byMessage.set(id,e)
+      let latestAll=all
+      const prove=(snapshot:BusyProofSnapshot)=>assertBusyProof(snapshot,Number(arg2),
+        ()=>auditReceipts({stateDir:state!,key:key!,shimLog:shim!,transcripts:transcriptFiles(root!),expectedCount:2},latestAll,adapters),
+        adapters.receiptTextMatches)
+      const initial={selected:JSON.parse(readFileSync(arg,'utf8')),journal:j,own}
+      let first=true
+      const read=async()=>{
+        if(first){first=false;return initial}
+        latestAll=await entries()
+        const journal=cumulativeJournal()
+        return {selected:initial.selected,journal,own:personaTranscripts(key!,journal,
+          readFileSync(join(state!,'server.log'),'utf8').split('\n'),latestAll).filter(e=>e.value?.isSidechain!==true)}
       }
-      const boundaries=[...byMessage.values()]
-      check(boundaries.length>0&&boundaries.every(e=>Number.isFinite(e.at)&&e.at>=result.at),'completed tool turn evidence missing/invalid')
-      const before=boundaries.filter(e=>e.offset<take.offset)
-      check(before.length<=1&&before.every(e=>e.at<=take.at),'busy message was taken in later than the next turn')
-      console.log('recorded: busy take-in '+JSON.stringify({tool_use_id:selected.id,tool_started_at:use.at,accepted_at:item.received_at,
-        tool_result_at:result.at,taken_in_at:take.at,turn:before.length===0?'same':'next',duplicates:audit.duplicates}))
+      const result=command==='busy-proof-wait'
+        ? await pollBusyProof(read,prove,(snapshot,timing,error)=>emitBusyProofFailure(snapshot,Number(arg2),timing,error))
+        : prove(initial)
+      console.log('recorded: busy take-in '+JSON.stringify(result))
     }
   } else if(command==='permission'||command==='subagent-permission') {
     const prompts=jsonLines(arg).filter(r=>r.event==='api'&&r.method==='chat.postMessage'&&r.text?.startsWith('🤖🛠️ permission request:'))
