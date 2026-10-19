@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fixtureDifference, readbackMismatch } from './real-agent/ai-mismatch-diagnostics.ts'
 import { AI_FAILURE_PREFIX, retainFailureLine, scrubDiagnosticText } from './real-agent/ai-failure-diagnostics.ts'
-import { fakeToken } from './test-helpers/credentials.ts'
+import { assertNoLeak, fakeToken } from './test-helpers/credentials.ts'
 
 const expected = { case: 'AC15', messages: 1, body: 'amber birch cedar' }
 const digest = (s: string) => createHash('sha256').update(s).digest('hex')
@@ -63,11 +63,13 @@ test('scrubs known and recognizable secrets before excerpt slicing and again at 
   expect(record.actualExcerpt).toBe('<secret-bearing text withheld>')
   const unknownKey = fakeToken('xoxb-')
   const mismatch = readbackMismatch(expected, JSON.stringify({ ...expected, [unknownKey]: token, body: 'amber PRIVATE cedar' }))
+  assertNoLeak({ record, mismatch })
   const root = mkdtempSync(join(tmpdir(), 'ai-mismatch-'))
   try {
     retainFailureLine(root, AI_FAILURE_PREFIX + JSON.stringify({ event: 'readback-mismatch', record: mismatch }),
       text => scrubDiagnosticText(text, { SECRET: 'cedar' }))
     const path = join(root, 'real-agent-failures.jsonl'), text = readFileSync(path, 'utf8')
+    assertNoLeak(text)
     for (const forbidden of [unknownKey, token, 'PRIVATE', 'cedar']) expect(text).not.toContain(forbidden)
     expect(text).toContain('[REDACTED]')
     expect(statSync(path).mode & 0o777).toBe(0o600)
