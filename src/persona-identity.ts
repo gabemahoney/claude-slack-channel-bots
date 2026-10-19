@@ -293,6 +293,10 @@ export const PROMPT_SUGGESTION_OFF_ENV: Readonly<{ CLAUDE_CODE_ENABLE_PROMPT_SUG
   CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: 'false',
 })
 
+/** Fixed launch controls, restored from the row on resume (b.omv SR-7.4). */
+export const AUTOUPDATER_OFF_ENV = Object.freeze({ DISABLE_AUTOUPDATER: '1' as const })
+export const FEEDBACK_SURVEY_OFF_ENV = Object.freeze({ CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY: '1' as const })
+
 /** Inputs to `personaSpawnEnv`. */
 export interface PersonaSpawnEnvInput {
   /** Persona key (not the name). */
@@ -311,7 +315,8 @@ export interface PersonaSpawnEnvInput {
  * Spawn-environment values for a persona (b.av2 SR-2.2): `CSCB_PERSONA` and
  * `CLAUDE_MANAGED_CHANNEL` set to the key, `CSCB_CRONTABLE_PATH` always,
  * `CLAUDE_CONFIG_DIR` only when a directory is configured, and
- * `PROMPT_SUGGESTION_OFF_ENV` always, last. No variable name uses
+ * the frozen prompt-suggestion, auto-updater and feedback-survey controls
+ * always, last (b.omv SR-7.4). No variable name uses
  * agent-director's reserved `AGENT_DIRECTOR_` prefix.
  *
  * Every launch of a persona's Claude takes its environment from here: each
@@ -326,5 +331,7 @@ export function personaSpawnEnv(input: PersonaSpawnEnvInput): Record<string, str
     CLAUDE_MANAGED_CHANNEL: input.key,
     CSCB_CRONTABLE_PATH: input.crontablePath,
     ...PROMPT_SUGGESTION_OFF_ENV,
+    ...AUTOUPDATER_OFF_ENV,
+    ...FEEDBACK_SURVEY_OFF_ENV,
   }
 }

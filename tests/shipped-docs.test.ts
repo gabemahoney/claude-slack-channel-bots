@@ -310,6 +310,14 @@ import { CLEAR_LATCH_TERMS, clearLatchTermsIn } from './test-helpers/clear-latch
 import { UPGRADE_FORMS } from './test-helpers/upgrade-forms.ts'
 import { DELETE_HELPERS, REMOVED_IDENTIFIERS, SOURCE_WORD_RULES, type SourceWordRule } from './test-helpers/source-audit.ts'
 import { CRONTABLE_TEMPLATE_HEADER } from '../src/cron-bootstrap.ts'
+import {
+  buildMessageNotSavedNotice, buildDeliveryStuckNotice, deliveryStuckRemedy, deliveryAge,
+  buildMessageNotTakenInNotice, buildMessagesWaitingNotice,
+  buildQueueRecordUnreadableNotice, MESSAGES_WAITING_STATES,
+  type DeliveryStuckReason,
+} from '../src/delivery-notices.ts'
+import { DELIVERY_STUCK_AFTER_MS, RECONNECT_BLOCKED_NOTICE_MS } from '../src/delivery-constants.ts'
+import { buildNotConnectedNotice } from '../src/session-manager.ts'
 import type { Via } from '../src/delivery-decision.ts'
 import * as registryExports from '../src/registry.ts'
 import {
@@ -414,7 +422,6 @@ import {
   type KillFailureAlertVersion,
   type KillFailureClosing,
 } from '../src/kill-failure-alert.ts'
-import { STATE_WORDING } from '../src/lost-message.ts'
 import { renderLogMessageText } from '../src/persona-connection-errors.ts'
 import {
   abortKillOwnStuckLaunch,
@@ -1585,6 +1592,26 @@ interface TermGroup {
  */
 const FORBIDDEN_TERMS: readonly TermGroup[] = [
   {
+    name: 'accepted-message loss during MCP disconnection',
+    cites: 'b.omv AC64, R44, SR-16',
+    terms: [
+      // Match an affirmed message-loss clause, rather than any sentence that
+      // happens to mention both disconnection and loss. In particular, a
+      // downgrade/storage/corruption condition is not an MCP-loss condition.
+      ['MCP-disconnection message loss', (() => {
+        const messages = String.raw`(?<!\bno\s)(?<!\bno\saccepted\s)(?<!\bno\squeued\s)(?<!\bno\sundelivered\s)\bmessages?(?:\s+(?:sent|received)(?:\s+to\s+it)?)?`
+        const disconnected = String.raw`(?:(?:its|the|their)\s+)?(?:MCP\s+(?:connection\s+)?)?(?:(?:bot|persona|instance)\s+)?(?:is\s+|stays\s+|remains\s+)?(?:disconnect\w*|not\s+connected|isn[\x27’]t\s+connected|down)(?:\s+over\s+MCP)?`
+        const lost = String.raw`(?:are|is|will\s+be|get|gets)\s+(?:lost|dropped|discarded)\b(?!\s+(?:after|because|due\s+to|if)\s+[^.!?;]*\b(?:stor(?:age|ing|ed)|corrupt\w*|downgrad\w*|conversation|transcript)\b)`
+        return new RegExp(String.raw`${messages}\s+(?:while|when|during)\s+${disconnected}\s+${lost}|(?:^|[.!?]\s+)(?:(?:while|when|during)\s+${disconnected},?\s+|(?:it|the\s+bot|the\s+persona)\s+(?:is\s+)?${disconnected},?\s+so\s+)${messages}\s+${lost}`, 'gi')
+      })()],
+    ],
+  },
+  {
+    name: 'the retired stream notice',
+    cites: 'b.omv SR-8.5, SR-9',
+    terms: [['Not receiving messages', /\bnot\s+receiving\s+messages\b/gi]],
+  },
+  {
     name: 'the pre-persona shape',
     cites: 'b.av2 SR-1.7, SR-10.2',
     terms: [
@@ -1895,6 +1922,8 @@ describe(`AC 46: forbidden-term audit (README, skills, manifest, MCP instruction
 describe('AC 46: forbidden-term scanner self-checks', () => {
   /** One sample per term, so a term added to the list needs a sample here. */
   const SAMPLES: Record<string, string> = {
+    'MCP-disconnection message loss': 'Messages sent while its MCP connection is down are lost.',
+    'Not receiving messages': 'A persona posts a *Not receiving messages* notice.',
     routes: 'Set `routes` to a map of channels.',
     default_route: 'Set `default_route` to a channel.',
     default_dm_session: 'Set `default_dm_session`.',
@@ -1972,6 +2001,13 @@ describe('AC 46: forbidden-term scanner self-checks', () => {
     ['pasted agent-director `cwd` output', '{\n  "instance_id": "cscb_alpha",\n  "cwd": "/home/me/work",\n  "label": { "service": "cscb" }\n}'],
     ['the redaction wording, not the name rule', 'A config error never echoes a value that looks like a Slack token.'],
     ['the curl config header line, unindented', 'header = "Authorization: Bearer %s"'],
+    ['b.omv SR-8.1 unsaved-message loss', buildMessageNotSavedNotice('Alpha', 'U0SENDER1')],
+    ['storage failure before acceptance', 'Messages that cannot be stored are lost after Slack stops retrying.'],
+    ['corrupt queue records', 'An unreadable queued record is kept aside and will not be delivered.'],
+    ['explicit downgrade loss', 'Drain the queue before downgrading, or accept that undelivered messages are lost.'],
+    ['MCP wait without loss', 'Messages sent while MCP is down are kept; they are not lost.'],
+    ['b.omv SR-8.8 unreadable-record non-delivery', buildQueueRecordUnreadableNotice('Alpha', 2, '/state/queue/quarantined.jsonl')],
+    ['conversation history loss', 'The transcript is missing; conversation history was lost.'],
   ])('%s is not flagged', (_label, text) => {
     expect(findTerms('sample', text, ALL_FORBIDDEN_TERMS).map(formatHit)).toEqual([])
   })
@@ -4352,7 +4388,6 @@ const HATCH_NOTE_NAMES: [name: string, source: string][] = [
   [CLEAN_RESTART_NOT_RESTARTED_LABEL, 'E33: src/cli-teardown.ts CLEAN_RESTART_NOT_RESTARTED_LABEL (SRJ-906, SRJ-1013)'],
   ...startSummaryCountLabels().map((label): [string, string] => [label, 'E26: src/session-manager.ts startupSummaryEnding (SRJ-1015)']),
   [UNAVAILABLE_RETRY_CAUSE_COLLISION, "E36 T1: src/unavailable-retry.ts UNAVAILABLE_RETRY_CAUSE_COLLISION (the retry cause's rename, reconcile ruling)"],
-  [lostMessageStateLabel('auto-restart-disabled'), "E8, E36 T4: src/lost-message.ts STATE_WORDING['auto-restart-disabled'] (SRJ-1011)"],
 ]
 
 /**
@@ -5318,67 +5353,6 @@ describe("E36 T2: the README's install and startup texts point to the runbook an
       expect(edited).not.toBe(text)
       expect(preflightGateProblems(edited)).not.toEqual([])
     })
-  })
-})
-
-/** A lost-message state's label as the notice and the docs name it: the words between `Recovery: ` and ` —`. */
-function lostMessageStateLabel(state: keyof typeof STATE_WORDING): string {
-  const label = /^Recovery: (.+?) —/.exec(STATE_WORDING[state])?.[1]
-  if (label === undefined) throw new Error(`STATE_WORDING["${state}"] has no "Recovery: <label> —" lead`)
-  return label
-}
-
-/**
- * The claim the E8 note removed, that an `auto-restart disabled` persona will
- * not restart or come back on its own (false since E8 for a persona its
- * UNAVAILABLE retry timer owns). File-local, citing the E8 note.
- */
-const STALE_AUTO_RESTART_CLAIM: readonly [label: string, pattern: RegExp][] = [
-  ['will not restart or come back on its own', /\b(?:will not|won't|does not|doesn't|never|cannot|can't)\s+(?:be\s+)?(?:restart|come back|recover)\w*/gi],
-]
-
-/**
- * The `auto-restart disabled` state in the lost-message recovery states, which
- * live once, in the debugging skill's `No live session` row under "Other lines
- * you may see" (the "Session not restarting after crash" symptom points
- * there): the row's text from the state's label to the next state's
- * (`restart limit reached`). Throws unless exactly one such row holds both.
- */
-function readmeAutoRestartRow(): string {
-  const lead = '| `[slack] No live session for persona '
-  const section = requiredSection(operatorText(DEBUG_SKILL_FILE), '## Other lines you may see', DEBUG_SKILL_FILE)
-  const rows = section.split('\n').filter((line) => line.startsWith(lead))
-  if (rows.length !== 1) throw new Error(`${DEBUG_SKILL_FILE} "## Other lines you may see" has ${rows.length} rows starting ${lead}`)
-  const row = flat(rows[0])
-  const start = row.indexOf(`\`${lostMessageStateLabel('auto-restart-disabled')}\`: `)
-  const end = row.indexOf(`\`${lostMessageStateLabel('restart-limit-reached')}\`: `, start)
-  if (start < 0 || end < 0) throw new Error(`${DEBUG_SKILL_FILE}'s No live session row has no auto-restart disabled state followed by restart limit reached`)
-  return row.slice(start, end)
-}
-
-/** The debugging skill's `auto-restart disabled` state, up to the next state (`restart limit reached`), in its lost-message entry. */
-function debugSkillAutoRestartEntry(): string {
-  const text = flat(operatorText(DEBUG_SKILL_FILE))
-  const start = text.indexOf(`\`${lostMessageStateLabel('auto-restart-disabled')}\`: `)
-  const end = text.indexOf(`\`${lostMessageStateLabel('restart-limit-reached')}\`: `, start)
-  if (start < 0 || end < 0) throw new Error(`${DEBUG_SKILL_FILE} has no lost-message entry with the auto-restart disabled and restart limit reached states`)
-  return text.slice(start, end)
-}
-
-describe("E8: the README's and debugging skill's `auto-restart disabled` text keeps not saying the persona will not restart on its own (b.jg5 SRJ-1011)", () => {
-  test.each([
-    [`${DEBUG_SKILL_FILE}: the lost-message recovery states' row (No live session)`, readmeAutoRestartRow],
-    [`${DEBUG_SKILL_FILE}: the lost-message entry's state`, debugSkillAutoRestartEntry],
-  ] as const)('%s', (_label, passage) => {
-    const text = passage()
-    expect(text).toContain(lostMessageStateLabel('auto-restart-disabled'))
-    expect(termsIn(text, STALE_AUTO_RESTART_CLAIM)).toEqual([])
-  })
-
-  test('self-check: the old claim is reported; the lost-message notice\'s own wording is not', () => {
-    expect(termsIn('`session_restart_delay` is `0`, so the instance will not restart on its own.', STALE_AUTO_RESTART_CLAIM)).not.toEqual([])
-    expect(termsIn("the persona won't come back on its own", STALE_AUTO_RESTART_CLAIM)).not.toEqual([])
-    expect(termsIn(STATE_WORDING['auto-restart-disabled'], STALE_AUTO_RESTART_CLAIM)).toEqual([])
   })
 })
 
@@ -6440,10 +6414,9 @@ const README_SRJ_1103_ROWS: readonly DocRow[] = [
   ]],
 
   // The latch.
-  [`the *${troubleshootingNoticeTitle('CONFLICT_NOTICE_FIRST_LINE_HEAD')()}* entry: a CONFLICT and conflicting labels latch; the persona is ${lostMessageStateLabel('held-for-human')}`, viaSymptom(() => `*${troubleshootingNoticeTitle('CONFLICT_NOTICE_FIRST_LINE_HEAD')()}*`, HELD_CONFLICT_SKILL_HEADING), [
+  [`the *${troubleshootingNoticeTitle('CONFLICT_NOTICE_FIRST_LINE_HEAD')()}* entry: a CONFLICT and conflicting labels latch the persona`, viaSymptom(() => `*${troubleshootingNoticeTitle('CONFLICT_NOTICE_FIRST_LINE_HEAD')()}*`, HELD_CONFLICT_SKILL_HEADING), [
     ci('a session conflict'),
     ci("conflicting labels on the persona's own row"),
-    code(lostMessageStateLabel('held-for-human')),
   ]],
   [`the *${troubleshootingNoticeTitle('CONFLICT_NOTICE_FIRST_LINE_HEAD')()}* entry: the re-check ${LATCH_RECHECK_WORDS} (SRJ-505), how a hold ends, clear-latch, and "Operator actions" for a human only`, viaSymptom(() => `*${troubleshootingNoticeTitle('CONFLICT_NOTICE_FIRST_LINE_HEAD')()}*`, HELD_CONFLICT_SKILL_HEADING), [
     ci(`**The server's own check.** ${LATCH_RECHECK_WORDS}`),
@@ -7422,12 +7395,20 @@ describe('E36 T4: the debugging skill describes the build (b.jg5 SRJ-1104; AC 78
 
 const TESTS_README_FILE = 'tests/README.md'
 const INTEGRATION_DIR = 'tests/integration'
+const REAL_AGENT_DIR = 'tests/real-agent'
 
 /** Every `test-*.sh` file name in tests/integration/, listed read-only, sorted. */
 function integrationScripts(): string[] {
   return readdirSync(resolve(REPO_ROOT, INTEGRATION_DIR))
     .filter((name) => /^test-.*\.sh$/.test(name))
     .sort()
+}
+
+/** Existing integration and heavy real-agent scripts that the README may name. */
+function existingScenarioScripts(): string[] {
+  const heavyScripts = readdirSync(resolve(REPO_ROOT, REAL_AGENT_DIR))
+    .filter((name) => /^test-.*\.sh$/.test(name))
+  return [...integrationScripts(), ...heavyScripts].sort()
 }
 
 /** Whether `text` names the file `name` as a whole name: not inside a longer name, a path ending in it (`tests/integration/<name>`) included. */
@@ -7522,8 +7503,8 @@ describe(`E39 T5: ${TESTS_README_FILE} names every integration script and keeps 
     expect(unnamedScripts(readme(), scripts)).toEqual([])
   })
 
-  test(`every test-<n>-<name>.sh ${TESTS_README_FILE} names exists in ${INTEGRATION_DIR} (no removed script)`, () => {
-    expect(removedScriptsNamed(readme(), integrationScripts())).toEqual([])
+  test(`every test-<n>-<name>.sh ${TESTS_README_FILE} names exists in ${INTEGRATION_DIR} or ${REAL_AGENT_DIR} (no removed script)`, () => {
+    expect(removedScriptsNamed(readme(), existingScenarioScripts())).toEqual([])
   })
 
   test(`no passage of ${TESTS_README_FILE} about the start sweep says it deletes, removes or loses a row`, () => {
@@ -7550,10 +7531,25 @@ describe(`E39 T5: ${TESTS_README_FILE} names every integration script and keeps 
     })
 
     test('a removed script the README names is reported, added to the README or gone from disk', () => {
-      const scripts = integrationScripts()
+      const scripts = existingScenarioScripts()
       const added = `${readme()}\n\`test-11-exact-tmux-targets.sh\` checks the exact tmux targets.\n`
       expect(removedScriptsNamed(added, scripts)).toEqual(['test-11-exact-tmux-targets.sh'])
       expect(removedScriptsNamed(readme(), scripts.filter((name) => name !== 'test-12-bot-hook-absoluteness.sh'))).toEqual(['test-12-bot-hook-absoluteness.sh'])
+    })
+
+    test('an existing heavy script is recognized, and removing it from the inventory is reported', () => {
+      const name = 'test-101-fmk-real-busy.sh'
+      const scripts = existingScenarioScripts()
+      expect(scripts).toContain(name)
+      expect(namesFile(readme(), name)).toBe(true)
+      expect(removedScriptsNamed(`Run \`${REAL_AGENT_DIR}/${name}\`.`, scripts)).toEqual([])
+      expect(removedScriptsNamed(readme(), scripts.filter((script) => script !== name))).toEqual([name])
+    })
+
+    test('a heavy script whose whole name is missing from the README is reported', () => {
+      const name = 'test-101-fmk-real-busy.sh'
+      const edited = readme().replaceAll(name, `${name}.bak`)
+      expect(unnamedScripts(edited, [name])).toEqual([name])
     })
 
     test('the new-script template test-N-<short-name>.sh names no script', () => {
@@ -7688,6 +7684,25 @@ const downgradeStep = (n: number) => (readme: string) => {
   if (step === undefined || !step.startsWith(`${n}. `)) throw new Error(`${USER_DOCS_NAME} "${DOWNGRADE_HEADING}": no step ${n} in place`)
   return step
 }
+
+/** R55's four phases replace the old fungible-only downgrade recipe. */
+const R55_DOWNGRADE_ROWS: readonly DocRow[] = [
+  ['Downgrading: step 1 stops intake and drains received items, or explicitly accepts loss', downgradeStep(1), [
+    /stop sending/i, /server\.log/, /every received (?:item|message)[^.]*delivered/i,
+    /(?:accept|accepting)[^.]*undelivered messages[^.]*lost/i,
+  ]],
+  ['Downgrading: step 2 disables resume and confirms the last-applied configuration on this release', downgradeStep(2), [
+    /(?:this|current) release/i, /`resume_enabled`[^.]*`false`/, /confirm/i, /last-applied/,
+  ]],
+  ['Downgrading: step 3 stops bots before installing the earlier build and restoring its Claude pin', downgradeStep(3), [
+    /stop --stop-bots/, /install[^.]*(?:earlier|older|previous) build/i, /(?:restore|reinstate)[^.]*Claude Code[^.]*pin/i,
+    /stop --stop-bots[^\n]*?install[^\n]*?(?:restore|reinstate)[^\n]*?pin/i,
+  ]],
+  ['Downgrading: step 4 starts fresh with channels before restoring and confirming resume', downgradeStep(4), [
+    /start[^.]*(?:earlier|older|previous) release/i, /(?:new|fresh) conversation/i, /channels/,
+    /`resume_enabled`[^.]*(?:back|`true`)[^.]*confirm/i,
+  ]],
+]
 
 /** The troubleshooting entries b.deo SRI-1105 names, by their titles (T17's closing note). */
 const SILENT_INVITED_TITLE = 'A persona is silent in a channel it was invited to'
@@ -8082,24 +8097,7 @@ const README_DEO_ROWS: readonly DocRow[] = [
     ci('Neither mode serves a malformed channel ID'),
     ci(`${code(CONFIG_FILE_NAME)} can't list such an ID either, so neither mode serves it`),
   ]],
-  [`Downgrading: an earlier release rejects ${MODE_SWITCH_SETTING} and ${FUNGIBLE_SECTION_KEY}, so the record must hold neither`, readmeSection(DOWNGRADE_HEADING), [
-    ci(`An earlier release's loader rejects ${SWITCH} and ${code(FUNGIBLE_SECTION_KEY)} as unknown keys`),
-    ci('so the record must not hold either key when the older build starts'),
-  ]],
-  ['Downgrading: step 1 gives every persona a valid declarative section', downgradeStep(1), [
-    ci('**Give every persona a valid declarative section.**'),
-  ]],
-  [`Downgrading: step 2 removes both keys from ${CONFIG_FILE_NAME}`, downgradeStep(2), [
-    ci(`**Remove ${SWITCH} and every persona's ${code(FUNGIBLE_SECTION_KEY)} from ${code(CONFIG_FILE_NAME)}.**`),
-  ]],
-  ['Downgrading: step 3 confirms the change', downgradeStep(3), [
-    ci('**Confirm the pending change, and wait for its'),
-    ci(`${code(RELOAD_APPLIED)} or ${code(RELOAD_NOOP)} line**`),
-  ]],
-  [`Downgrading: step 4 installs the older build, which ignores ${CHANNEL_DELIVERY_FILE_NAME}`, downgradeStep(4), [
-    ci('**Install the older build and restart the server on it.**'),
-    ci(`The older build ignores ${code(CHANNEL_DELIVERY_FILE_NAME)}`),
-  ]],
+  ...R55_DOWNGRADE_ROWS,
 ]
 
 /** The setup wizard's step on how a change takes effect, found by its title, whatever its number. */
@@ -8405,7 +8403,7 @@ describe('b.deo SRI-1308: the README describes both channel modes (SRI-1101 to S
    * already requires step n's own lead in the nth place, so the order is read
    * there; this case adds only that there are exactly four steps.
    */
-  describe('downgrade steps (SRI-1105)', () => {
+  describe('downgrade steps (b.omv R55)', () => {
     /** The numbers of the downgrade steps, in order, comma-separated. */
     const stepNumbers = (text: string) => downgradeSteps(text).map((step) => /^\d+/.exec(step)![0]).join(',')
 
@@ -8414,7 +8412,7 @@ describe('b.deo SRI-1308: the README describes both channel modes (SRI-1101 to S
     })
 
     test('self-check: a fifth step added fails the step-count case', () => {
-      const edited = withLineEdited(readme(), (line) => line.startsWith('4. **Install the older build'), (line) => `${line}\n5. **Delete the stored-choice file.**`)
+      const edited = withLineEdited(readme(), (line) => line.startsWith('4. '), (line) => `${line}\n5. **Delete the stored-choice file.**`)
       expect(stepNumbers(edited)).toBe('1,2,3,4,5')
     })
 
@@ -8466,6 +8464,54 @@ describe('b.deo SRI-1308: the README describes both channel modes (SRI-1101 to S
 })
 
 
+/** E5 only: the shipped failure catalogue, separate from E8's broad doc migration. */
+describe('b.omv SR-8: shipped delivery and MCP guidance', () => {
+  const skill = () => operatorText(DEBUG_SKILL_FILE)
+  const delivery = () => requiredSection(skill(), '## Delivery notices', DEBUG_SKILL_FILE)
+  const mcp = () => flat(requiredSection(skill(), "## A persona's instance runs but isn't connected", DEBUG_SKILL_FILE))
+  // Check each fixed fragment independently: persona, sender, counts, age and
+  // quarantine path are examples, not a contract on the documentation's sample.
+  const noticeRows = [
+    ['Message not saved', () => buildMessageNotSavedNotice('PLACEHOLDER_PERSONA', 'PLACEHOLDER_SENDER')],
+    ['Delivery stuck', () => buildDeliveryStuckNotice('PLACEHOLDER_PERSONA', 'PLACEHOLDER_KEY', 2, DELIVERY_STUCK_AFTER_MS, 'menu', 3)],
+    ['Message not taken in', () => buildMessageNotTakenInNotice('PLACEHOLDER_PERSONA', 'PLACEHOLDER_SENDER')],
+    ['Messages waiting', () => buildMessagesWaitingNotice('PLACEHOLDER_PERSONA', 2, DELIVERY_STUCK_AFTER_MS, 'down')],
+    ['Queue record unreadable', () => buildQueueRecordUnreadableNotice('PLACEHOLDER_PERSONA', 2, 'PLACEHOLDER_PATH')],
+  ] as const
+  test.each(noticeRows)('%s has its fixed notice guidance and an actionable explanation in the debugging skill', (title, render) => {
+    const section = requiredSection(delivery(), `### ${title}`, DEBUG_SKILL_FILE)
+    const text = render()
+    assertNoLeak(text)
+    const fragments = text.replace(/\b2 (?=(?:queued )?message\(s\))/g, 'PLACEHOLDER_COUNT').replace(deliveryAge(DELIVERY_STUCK_AFTER_MS), 'PLACEHOLDER_AGE').split(/PLACEHOLDER_[A-Z]+/).map(flat).filter(Boolean)
+    for (const fragment of fragments) expect(flat(section)).toContain(fragment)
+    expect(['Meaning', 'Cause', 'Fix'].filter(part => !new RegExp(`^- \\*\\*${part}:\\*\\*\\s+\\S`, 'm').test(section))).toEqual([])
+  })
+  test.each(['menu', 'input', 'relay-off', 'mcp', 'refused', 'transcript', 'queue-unwritable', 'not-taken-in', 'dialog-hold'] as const)(
+    'Delivery stuck documents the fixed %s remedy', (reason: DeliveryStuckReason) => {
+      const section = requiredSection(delivery(), '### Delivery stuck', DEBUG_SKILL_FILE)
+      const remedy = deliveryStuckRemedy(reason, '<key>', 3).replace(/(?<=typed it )3(?= times)/, 'PLACEHOLDER_COUNT')
+      for (const fragment of remedy.split('PLACEHOLDER_COUNT').map(flat).filter(Boolean)) expect(flat(section)).toContain(fragment)
+    },
+  )
+  test.each([...MESSAGES_WAITING_STATES])('Messages waiting includes the state %s', state => {
+    expect(requiredSection(delivery(), '### Messages waiting', DEBUG_SKILL_FILE)).toContain(state)
+  })
+  test.each(['menu', 'input'] as const)('MCP guidance documents the fixed %s reconnect block and continued retries', rule => {
+    const text = buildNotConnectedNotice('<key>', { reason: 'reconnect-blocked', rule })
+    const screen = text.split(' — ')[1]!.split(' CSCB keeps trying the reconnect.')[0]!
+    expect(mcp()).toContain(flat(screen))
+    expect(mcp()).toContain('CSCB keeps trying the reconnect')
+    expect(mcp()).toContain(`${RECONNECT_BLOCKED_NOTICE_MS / 60000} minutes`)
+    expect(mcp()).toContain('reconnect-blocked')
+    expect(mcp()).toContain('Messages sent to it are kept and delivered once it is')
+    expect(mcp()).toContain("can't reply or use its Slack tools until it is connected again")
+  })
+  test('MCP guidance keeps accepted messages while disconnected and omits stream recovery', () => {
+    expect(mcp()).not.toMatch(/messages?[^.]*\b(?:are|is|will be)\s+lost\b/i)
+    expect(mcp()).not.toMatch(/\b(?:message\s+stream|stream\s+gone|streamless)\b/i)
+  })
+})
+
 // b.m2o: maintained release instructions and historical release notes have
 // different contracts. These checks protect the released installer path.
 describe('released agent-director 0.12 migration instructions (b.m2o)', () => {
@@ -8473,17 +8519,16 @@ describe('released agent-director 0.12 migration instructions (b.m2o)', () => {
   const upgrade = () => readRunbookCarrier(RUNBOOK_DOC, migration(), SWITCH_OVER_HEADING, SWITCH_OVER_STEP_COUNT)
   const rollback = () => readRunbookCarrier(RUNBOOK_DOC, migration(), ROLLBACK_HEADING, ROLLBACK_STEP_COUNT)
 
-  // b.9v8: only pre-persona hosts start fresh once. Existing persona rows
-  // resume when their current transcript and unchanged identity permit it.
+  // b.omv SR-7.6: every earlier-release bot starts fresh once; marked rows resume later.
   const resumeRequirements = [
-    'On a host switching over from a pre-persona release (0.10.x)',
-    'Each persona starts fresh once on that host. Pre-persona rows are kept and never resumed.',
-    'On a host already running personas (0.11.0 or later), each persona resumes its conversation when the resume conditions above hold.',
+    'Every earlier-release bot starts a fresh conversation once',
+    'Memory files are kept',
+    '`tag_prompt=1`',
+    'A row without the marker is never resumed',
+    '`working` or `check_permission`',
+    '`waiting`, `pending` or `ask_user`',
+    'Later restarts resume the marked replacement',
     'agent-director get --instance-id cscb_<key>',
-    '`state` as `ended` or `missing`, a non-empty `session_id`, and `transcript_status: present`',
-    "Keep the persona's key, `working_directory` and `claude_config_dir` unchanged, leave `resume_enabled` enabled",
-    "no leftover session has the persona's session name",
-    'check `server.log` for `spawnForPersona: attempting resume for …`',
     "agent-director 0.12.0 resumes only the current session: it no longer falls back to an older session's transcript when the current one is missing.",
   ]
   const resumeGuidanceProblems = (step: string) => resumeRequirements.filter((phrase) => !flat(step).includes(phrase))
@@ -8505,7 +8550,7 @@ describe('released agent-director 0.12 migration instructions (b.m2o)', () => {
     }
   })
 
-  test('step 10 qualifies fresh starts and gives the resume pre-check, post-check and current-session restriction (b.9v8)', () => {
+  test('step 10 documents the one-time tag-prompt upgrade and later marked resume (b.omv SR-7.6)', () => {
     expect(resumeGuidanceProblems(textAt(upgrade(), 'step 10'))).toEqual([])
   })
 
@@ -8561,9 +8606,11 @@ describe('released agent-director 0.12 migration instructions (b.m2o)', () => {
     && !(where === 'step 7' && element.startsWith('the new install check passes'))
     && !where.startsWith('step 8 ›')
   ))('current switch-over %s: %s', (where, element, required) => {
+    // The frozen carrier retains its original attribution. The maintained
+    // runbook uses the launcher; step 1 still pins its user, PATH and HOME.
     const currentRequired = required.map((item) => typeof item === 'string'
       ? item.replaceAll(HISTORICAL_RUNBOOK_CLAUDE, MIN_CLAUDE_CODE_VERSION).replace('the minimum agent-director states for its exec-form hooks', "CSCB's supported minimum")
-      : item instanceof RegExp ? new RegExp(item.source.replaceAll(HISTORICAL_RUNBOOK_CLAUDE.replaceAll('.', '\\.'), MIN_CLAUDE_CODE_VERSION.replaceAll('.', '\\.')).replace('the minimum agent-director states for its exec-form hooks', "CSCB's supported minimum"), item.flags) : item)
+      : item instanceof RegExp ? new RegExp(item.source.replaceAll(HISTORICAL_RUNBOOK_CLAUDE.replaceAll('.', '\\.'), MIN_CLAUDE_CODE_VERSION.replaceAll('.', '\\.')).replace('the minimum agent-director states for its exec-form hooks', "CSCB's supported minimum").replace('by its owner', 'through its launcher'), item.flags) : item)
     expect({ element, missing: missingItems(upgrade(), textAt(upgrade(), where), currentRequired) }).toEqual({ element, missing: [] })
   })
 
@@ -8576,7 +8623,11 @@ describe('released agent-director 0.12 migration instructions (b.m2o)', () => {
       ci('if that start is refused, the new CSCB stays stopped until agent-director has dealt with that worker'),
       ci('then follow the already-upgraded CLI check'),
       '(#arrived-here-from-a-startup-refusal)',
-    ] : required
+    ] : required.map(item => where.startsWith('step 6 ›') && item instanceof RegExp
+      ? new RegExp(item.source.replace(' by its owner', ''), item.flags) : item)
+    if (where === 'step 6 › Stop every other agent' && element.startsWith('no restore while')) {
+      currentRequired.push(ci('Every row must be non-live'), ci('every worker, session, caller, serve and launcher stopped before restoration'), ci('An unresolved row means no go'))
+    }
     expect({ element, missing: missingItems(rollback(), textAt(rollback(), where), currentRequired) }).toEqual({ element, missing: [] })
   })
 
@@ -8632,5 +8683,358 @@ describe('released agent-director 0.12 migration instructions (b.m2o)', () => {
     expect(rollback().frame).not.toContain('emergency downgrade recipe')
     expect(rollback().frame).not.toMatch(/Never restore `state.db`/)
     expect(step).not.toMatch(/stamps schema version 4|drops the thirteen columns/)
+  })
+})
+
+// b.omv SR-7.1/2/4/6: maintained release notes describe this breaking upgrade.
+test('Unreleased records fresh conversations, retained memory and the typed launch contract', () => {
+  const unreleased = readFileSync(join(REPO_ROOT, 'CHANGELOG.md'), 'utf-8').split(/^## \[Unreleased\]|^## Unreleased/m)[1]?.split('\n## ')[0] ?? ''
+  for (const term of ['fresh conversation', 'memory', 'tag_prompt', 'bot-system-prompt.md']) expect(unreleased.toLowerCase()).toContain(term)
+})
+
+const OBSOLETE_SLACK_REDELIVERY = /(?:deduplicat\w*|redeliver\w*|key)[^.]*(?:10|ten)[ -]minutes?|(?:deduplicat\w*|redeliver\w*|key)[^.]*(?:clear\w*|reset\w*|forgotten|forget\w*)[^.]*restart/i
+
+/** Uncovered R44 facts only; E4's marker and E5's fixed notice rows stay above. */
+const QUEUED_DOC_ROWS: readonly (readonly [file: string, heading: HeadingMatch | undefined, element: string, required: readonly (string | RegExp)[], example: string])[] = [
+  [BOTS_DOC, RECEIVING_HEADING, 'CSCB types the tag; channel names and split parts are explained', [
+    /CSCB[^.]*typ\w*[^.]*tag/i, '`channel_name`', /(?:name[^.]*without `#`|without `#`[^.]*name)/i,
+    /`dm`/, /channel ID[^.]*(?:lookup|looked up|name)/i, /`part`[^.]*`k\/n`/,
+  ], 'CSCB types one tag. `channel_name` is the name without `#`, `dm` for DMs, or the channel ID if the name lookup fails. `part` is `k/n`.'],
+  [BOTS_DOC, RECEIVING_HEADING, 'sender identity lets the shared prompt define whose instructions to follow; replies use the tool', [
+    /sender[^.]*ID/i, /prompt[^.]*(?:whose|whom|obey|instructions to follow)/i, /(?:answer|repl)\w*[^.]*`reply`/i,
+  ], "Each message carries its sender's ID. The prompt defines whose instructions to follow. Bots answer through `reply`."],
+  [BOTS_DOC, RECEIVING_HEADING, 'received means stored, delivered means transcript-confirmed; an unconfirmed message may repeat', [
+    /received[^.]*(?:stored|storage|queue)/i, /delivered[^.]*transcript/i, /at.least.once/i,
+    /(?:unconfirmed|can(?:not|'t) confirm)[^.]*offer\w* again/i, /(?:more than once|duplicate)/i,
+  ], 'Received means durably stored in the queue. Delivered means confirmed in the transcript. Delivery is at-least-once: an unconfirmed message is offered again and may arrive more than once.'],
+  [BOTS_DOC, RECEIVING_HEADING, 'Slack redelivery adds no second queue item across server restarts, unlike an unconfirmed reoffer', [
+    /Slack redeliver\w*[^.]*(?:no second (?:queue |queued )?item|never add\w* (?:a )?second (?:queue |queued )?item)/i,
+    /redeliver\w*[^.]*across server restarts/i,
+    /key[^.]*at least 24 hours after intake/i,
+    /paired channel @mention adds no second item/i,
+  ], 'Slack redeliveries add no second queue item across server restarts. Each accepted message keeps its key for at least 24 hours after intake; the paired channel @mention adds no second item.'],
+  [BOTS_DOC, RECEIVING_HEADING, 'FIFO and one in flight hold across sources; a blocked head never expires', [
+    /(?:strict[^.]*order|first.in.first.out|FIFO)/i, /one (?:message|item) in flight/i,
+    /(?:next|later)[^.]*(?:confirm|delivered)/i, /(?:no age cutoff|never expires|no expiry)/i,
+    /(?:Slack[^.]*interject[^.]*scheduled|every source)/i,
+  ], 'Strict order covers every source. There is one message in flight; the next waits until the previous is confirmed delivered. There is no age cutoff.'],
+  [BOTS_DOC, RECEIVING_HEADING, 'MCP disconnection holds messages for delivery once connected', [
+    /messages[^.]*wait[^.]*MCP|MCP[^.]*messages[^.]*wait/i, /deliver\w*[^.]*once[^.]*connected/i,
+  ], 'Messages wait while disconnected over MCP and are delivered once connected.'],
+  [BOTS_DOC, '## Interject', 'each request is independent, even when sender and text repeat', [
+    /each[^.]*request[^.]*(?:own|independent|separate)/i, /(?:same|identical)[^.]*sender[^.]*text/i, /never (?:merged|deduplicated)/i,
+  ], 'Each request is its own item, even with the same sender and text. Requests are never merged.'],
+  [BOTS_DOC, '## Interject', 'HTTP success acknowledges storage and storage failure is 500', [
+    /200/, /(?:durable storage|durably stored)/i, /(?:not delivery|not a delivery)/i,
+    /\| 500 \|/, 'Message not stored', /\| 404 \|[^\n]*applied configuration/,
+  ], 'After durable storage, 200 acknowledges storage, not delivery.\n| 500 | Message not stored |\n| 404 | No persona in the applied configuration |'],
+  [BOTS_DOC, '## Slack Reply Guard (Stop hook)', 'guard recognises CSCB tags, mid-turn input and pasted forms', [
+    /CSCB[^.]*typ/i, /mid.turn/i, /past\w*/i,
+  ], 'CSCB types the tag. The guard recognises mid-turn input and pasted forms.'],
+  [SERVER_SETTINGS_DOC, '## Server-wide settings', 'bind keeps clear-latch loopback and scheduled queueing independent of HTTP', [
+    /`bind`[^|\n]*\|[^\n]*clear-latch/, /clear-latch[^.]*loopback/i,
+    /(?:scheduled|cron)[^.]*(?:directly|in.process)[^.]*queue/i,
+    /(?:scheduled|cron)[^.]*(?:independent of|does not (?:use|need)|no)[^.]*(?:HTTP|loopback)/i,
+  ], '| `bind` | string | loopback for clear-latch |\nclear-latch needs loopback. Scheduled prompts directly queue. Cron does not need HTTP.'],
+  [SERVER_SETTINGS_DOC, '## Server-wide settings', 'dropped MCP reconnects on a Slack message; zero leaves messages waiting', [
+    /Slack message[^.]*reconnect/i, /(?:`0`|zero)[^.]*(?:no reconnect|disabl\w*[^.]*reconnect)/i,
+    /messages[^.]*wait[^.]*(?:reconnect|restart)/i,
+  ], 'A Slack message triggers reconnect. At `0` no reconnect is made. Messages wait until reconnection or restart.'],
+  [SERVER_SETTINGS_DOC, '## Server-wide settings', 'tag instructions always survive prompt mode and one shared file supplies obedience instructions', [
+    /tag description[^.]*always/i, /`system_prompt_mode`/, /`none`/,
+    /(?:one|same|single|shared) file[^.]*every persona/i, /(?:whom|whose)[^.]*(?:obey|follow)/i,
+  ], 'The tag description is always carried, with `system_prompt_mode` `none` included. One file serves every persona and defines whom to obey.'],
+  [SERVER_SETTINGS_DOC, '## Server-wide settings', 'acknowledgement waits for the whole transcript receipt and an early reply suppresses it', [
+    /`ack_reaction`[^\n]*transcript[^\n]*whole message/i, /reply before delivery[^.]*suppress/i,
+  ], '| `ack_reaction` | Its transcript confirms the whole message first; a reply before delivery suppresses the later reaction. |'],
+  [SERVER_SETTINGS_DOC, "# Server settings", 'privacy: undelivered and removed-persona text persists, delivered text is removed within 24 hours', [
+    /undelivered[^.]*(?:kept|retain)[^.]*(?:until delivered|until delivery)/i,
+    /removed persona[^.]*queue/i, /delivered[^.]*(?:removed|deleted)[^.]*(?:within|no later than) 24 hours/i,
+  ], "Undelivered text is kept until delivered. A removed persona's queue is retained too. Delivered text is removed within 24 hours."],
+  [SERVER_SETTINGS_DOC, "# Server settings", 'privacy: native transcript/history and message-bearing server log remain', [
+    /transcript/i, /prompt history/i, /Claude Code[^.]*config directory/i,
+    /server\.log[^.]*message text/i, /received.event/, /dispatch/, '/interject',
+  ], "Typed text stays in the native transcript and prompt history, in Claude Code's config directory. server.log holds message text in received-event, dispatch and /interject lines."],
+  [CONFIGURATION_DOC, '### Permission prompts', 'destinations use Message not saved and mutual storage-failure notices end after one each per episode', [
+    /Message not saved/, /one[^.]*(?:each|per persona)[^.]*episode/i,
+  ], 'Message not saved notices stop after one each per episode.'],
+  [CHANNEL_MODES_DOC, FUNGIBLE_PROMPTS_HEADING, 'fungible destinations receive the current storage-failure notice', [
+    'Message not saved',
+  ], 'The destination receives Message not saved notices.'],
+  [RELOAD_DOC, '## Reading the preview', 'a removed persona line includes the exact retained-queue clause', [
+    /DESTRUCTIVE:[^.]*removed[^.]*\d+ open queued items? kept/, /delivered only if a persona with the same key is added again/,
+  ], 'DESTRUCTIVE: persona "scribe" is removed: 2 open queued items kept, delivered only if a persona with the same key is added again.'],
+  [RELOAD_DOC, '## Files beside the config file', 'queue path and retained message text are in the state-file reference', [
+    /queue\/(?:<key>|<persona.key>)\.jsonl/, /message text/i,
+  ], '| `queue/<key>.jsonl` | Durable queue with message text |'],
+  [RELOAD_DOC, '## Destructive changes', 'removal keeps the queue and same-key restoration resumes delivery', [
+    /queue[^.]*(?:kept|retain)/i, /same key[^.]*deliver/i,
+  ], 'The queue is kept when a persona is removed. Add a persona with the same key to deliver its messages.'],
+  [RELOAD_DOC, '## Size limit', 'the queue is read in full without the config-file cap', [
+    /queue[^.]*(?:read in full|no size cap)/i,
+  ], 'The queue is read in full with no size cap.'],
+  [SCHEDULED_PROMPTS_DOC, '## Delivery semantics', 'accepted fires are independent FIFO items with the fire timestamp; stopped-server misses are distinct', [
+    /(?:each|every) accepted fire[^.]*(?:own|independent|separate)/i, /(?:in order|FIFO|first.in.first.out)/i,
+    /`ts`[^.]*fire|fire[^.]*`ts`/i, /(?:missed fires|while the server is down)/i,
+  ], 'Each accepted fire is its own item, delivered in order; `ts` is the fire time. Missed fires while the server is down are not replayed.'],
+  [SCHEDULED_PROMPTS_DOC, '## The cron log', 'queue outcomes describe storage and the summary counts queued/failed', [
+    /\| `queued` \|[^\n]*stor/i, /\| `queue-failed` \|[^\n]*stor/i, '`queued=N failed=M`',
+  ], '| `queued` | stored |\n| `queue-failed` | storing failed |\nSummary: `queued=N failed=M`.'],
+  [SCHEDULED_PROMPTS_DOC, '## How fires appear', 'the server queues fires directly rather than posting HTTP requests', [
+    /server[^.]*(?:directly[^.]*queue|queue[^.]*itself)/i,
+  ], 'The server directly queues each fire.'],
+  [DEBUG_SKILL_FILE, '### Message not saved', 'an hour of failed storage can disable Slack event subscriptions', [
+    /(?:hour|60 minutes)/i, /Slack[^.]*(?:disable|switch off)[^.]*event subscriptions/i,
+  ], 'After an hour of failed storage, Slack may disable event subscriptions.'],
+  [DEBUG_SKILL_FILE, '## Symptom reference', 'the restart-limit entry retains accepted messages', [
+    /(?:at the cap|restart limit)[^.]*messages[^.]*(?:kept|queue|retain)/i,
+  ], 'At the cap, accepted messages are kept in the queue.'],
+  [DEBUG_SKILL_FILE, '### Symptom: A persona\'s instance waits at a startup prompt', 'an unanswered startup prompt has the launch notices', [
+    'Launch stuck', 'Session not starting',
+  ], 'An unanswered startup prompt is reported by Launch stuck or Session not starting.'],
+  [DEBUG_SKILL_FILE, '### Symptom: Bots come back with no memory of the prior conversation after a reboot', 'upgrade replaces earlier-release conversations once, keeping memory', [
+    /upgrade[^.]*(?:one|once)[^.]*(?:new|fresh) conversation|(?:new|fresh) conversation[^.]*once[^.]*upgrade/i, /memory files[^.]*kept/i,
+  ], 'At upgrade, each bot gets one fresh conversation. Memory files are kept.'],
+  [DEBUG_SKILL_FILE, '## Persona diagnostic classes', 'delivery diagnostics explain storage, receipt, retype and unreadable records without text', [
+    '`message-received`', '`message-delivered`', '`message-retyped`', '`message-not-taken-in`', '`queue-record-unreadable`',
+    /metadata only/i, /never carry message text/i, /transcript[^.]*confirm/i, /quarantine/i,
+  ], '`message-received`, `message-delivered`, `message-retyped`, `message-not-taken-in`, `queue-record-unreadable` carry metadata only; they never carry message text. The transcript confirms delivery; unreadable bytes stay in quarantine.'],
+  [RUNBOOK_DOC, '### Upgrading to personas', 'upgrade permits removing the Claude Code pin', [
+    /(?:remove|drop)[^.]*Claude Code[^.]*pin/i,
+  ], 'After upgrading, remove the Claude Code version pin.'],
+  [CHANGELOG_FILE, '## Unreleased', 'remaining breaking changes, durable delivery and downgrade instructions are released together', [
+    '/interject', /agent-director[^.]*0\.12\.0/, /channels[^.]*flag/i,
+    /durable/i, /(?:strict[^.]*order|ordered|FIFO)/i, /at.least.once/i,
+    /scheduled[^.]*queue/i, 'queued', 'queue-failed', 'queued=N failed=M', '`bind`',
+    'Not receiving messages', 'Message not saved', 'Delivery stuck', 'Message not taken in', 'Messages waiting', 'Queue record unreadable',
+    /(?:remove|drop)[^.]*Claude Code[^.]*pin/i, 'docs/migration.md#downgrading-to-an-earlier-release',
+  ], '/interject answers change; agent-director 0.12.0 is required. No channels launch flag. Durable ordered at-least-once delivery. Scheduled fires queue: queued, queue-failed, queued=N failed=M, independent of `bind`. Not receiving messages retired. Message not saved; Delivery stuck; Message not taken in; Messages waiting; Queue record unreadable. Remove the Claude Code pin. Follow docs/migration.md#downgrading-to-an-earlier-release.'],
+]
+
+describe('b.omv R44: queued-delivery documentation', () => {
+  test.each(QUEUED_DOC_ROWS)('%s: %s — %s', (file, heading, element, required) => {
+    const passage = heading === undefined ? flat : sectionOf(file, heading)
+    expect({ file, element, missing: docRowProblems(passage, required, operatorText(file)) }).toEqual({ file, element, missing: [] })
+  })
+
+  // These controls remain runnable before the documentation pass: representative
+  // prose is mutated in memory, never by changing a shipped file on disk.
+  test.each(QUEUED_DOC_ROWS)('sensitivity: %s %s — %s', (file, heading, _element, required, example) => {
+    const passage = heading === undefined ? flat : sectionOf(file, heading)
+    const text = `${heading ?? '# Example'}\n\n${example}`
+    expect(docRowProblems(passage, required, text)).toEqual([])
+    for (const item of required) {
+      const pattern = typeof item === 'string' ? new RegExp(escapeRegExp(item), 'g') : new RegExp(item.source, `${item.flags.replace('g', '')}g`)
+      const edited = text.replace(pattern, '')
+      expect(edited).not.toBe(text)
+      expect(docRowProblems(passage, [item], edited).length).toBeGreaterThan(0)
+    }
+  })
+
+  test('the interject error table has exactly the supported responses and no session-unavailable answer', () => {
+    const section = requiredSection(operatorText(BOTS_DOC), '### Error conditions', BOTS_DOC)
+    expect(firstTable(section).rows.map(row => Number(row[0])).sort((a, b) => a - b)).toEqual([400, 403, 404, 405, 413, 500])
+    const edited = `${section.trimEnd()}\n| 503 | No session |`
+    expect(firstTable(edited).rows.map(row => Number(row[0]))).toContain(503)
+  })
+
+  test.each([
+    [SCHEDULED_PROMPTS_DOC, '## The cron log', /`(?:delivered|no-session|http-error)`/i],
+    [BOTS_DOC, '## Interject', /(?:scheduler|scheduled prompt)[^.]*POST/i],
+    [DEBUG_SKILL_FILE, "### Symptom: A persona's instance waits at a startup prompt", /development.channels/i],
+    [CONFIGURATION_DOC, '### Permission prompts', /(?:keep posting|until either instance takes messages)/i],
+    [BOTS_DOC, RECEIVING_HEADING, OBSOLETE_SLACK_REDELIVERY],
+  ] as const)('%s %s drops its obsolete delivery advice', (file, heading, obsolete) => {
+    expect(requiredSection(operatorText(file), heading, file)).not.toMatch(obsolete)
+  })
+
+  test.each([
+    'Slack redelivery adds no second queue item for only 10 minutes; keys are then forgotten.',
+    'Slack redeliveries add no second queue item, but deduplication is reset on restart.',
+  ])('sensitivity: the receiving contract rejects obsolete deduplication qualifications: %s', advice => {
+    const original = operatorText(BOTS_DOC)
+    const edited = original.replace(RECEIVING_HEADING, `${RECEIVING_HEADING}\n\n${advice}`)
+    expect(edited).not.toBe(original)
+    expect(requiredSection(edited, RECEIVING_HEADING, BOTS_DOC)).toMatch(OBSOLETE_SLACK_REDELIVERY)
+  })
+})
+
+describe('b.omv AC64: MCP-loss wording sensitivity', () => {
+  test.each([
+    'Messages sent while its MCP connection is down are lost.',
+    'Messages received when the bot is disconnected are dropped.',
+    'It is not connected over MCP, so messages are lost.',
+    'While disconnected, messages sent to it will be discarded.',
+    'Messages sent while MCP is down\nare lost.',
+    'Messages sent while MCP is down are not lost. Messages sent while MCP is down are lost.',
+    'Messages sent while MCP is down are lost because it is disconnected.',
+    'Messages received during MCP disconnection are dropped.',
+  ])('the existing forbidden-term audit rejects %s', text => {
+    expect(findTerms('sample', text, ALL_FORBIDDEN_TERMS).map(hit => hit.term)).toContain('MCP-disconnection message loss')
+  })
+  test.each([
+    'No messages sent while its MCP connection is down are lost.',
+    'No accepted messages sent while MCP is down are lost.',
+    'No undelivered messages sent while MCP is down are lost.',
+    'Messages sent while MCP is down are never lost.',
+    'Messages sent while MCP is down are not lost.',
+    'After downgrading while MCP is disconnected, undelivered messages are lost.',
+    'Messages that cannot be stored while MCP is down are lost after Slack stops retrying.',
+    'Messages sent while MCP is down are lost because storage fails before acceptance.',
+    'Messages sent while MCP is down are lost after downgrading.',
+    'While disconnected, corrupt queued messages are lost from delivery; unreadable bytes remain in quarantine.',
+    'While disconnected, messages sent to it are lost due to queue corruption.',
+    'While MCP is disconnected, conversation history is lost if its transcript is deleted.',
+  ])('the existing forbidden-term audit preserves qualified or negated loss: %s', text => {
+    expect(findTerms('sample', text, ALL_FORBIDDEN_TERMS)).toEqual([])
+  })
+})
+
+/** Ordered executable evidence, deliberately excluding comments and status text. */
+const DOWNGRADE_OPERATIONS: readonly (readonly [label: string, pattern: RegExp])[] = [
+  [`native ${MIN_CLAUDE_CODE_VERSION} selected before either start`, new RegExp(`^real_prepare ${escapeRegExp(MIN_CLAUDE_CODE_VERSION)}$`, 'm')],
+  ['current release starts', /^start_server --live$/m],
+  ['queue emptiness is required', /^\[\[ ! -e .*\/queue\/.*\|\| ! -s .*\]\] \|\| fail 'downgrade requires empty queues'$/m],
+  ['resume is disabled on the current release', /^real_write_config '\{"resume_enabled":false\}'$/m],
+  ['disable-resume change is confirmed', /^mv .*config\.json\.pending" .*config\.json\.apply"$/m],
+  ['last-applied false is observed before stopping', /^wait_until .*jq -e '\.resume_enabled == false' .*config\.json\.last-applied"$/m],
+  ['server and bots stop', /^stop_server --stop-bots$/m],
+  ['previous tarball is selected', /^PREVIOUS="\/opt\/claude-slack-channel-bots-0\.16\.1\/claude-slack-channel-bots-0\.16\.1\.tgz"$/m],
+  ['previous tarball is bound to the installed package manifest', /^printf '\{"private":true,"dependencies":\{"claude-slack-channel-bots":"file:%s"\}\}\\n' "\$\{PREVIOUS\}" > "\$\{INSTALL\}\/package\.json"$/m],
+  ['previous package is installed', /^\(cd "\$\{INSTALL\}" && bun install --ignore-scripts .*\)$/m],
+  ['CLI changes to the installed previous build', /^SCENARIO_CLI="\$\{INSTALL\}\/node_modules\/\.bin\/claude-slack-channel-bots"$/m],
+  ['previous release starts', /^start_server --live$/m],
+  ['previous bot finishes launching', /^real_wait_launch "\$\{REAL_KEY\}"$/m],
+  ['fresh start is asserted rather than resume', /^\[\[ .*cscb_ad_count_between .* resume\).* == 0 \]\] \|\| fail /m],
+  ['actual previous launch templates are read', /^python3 - "\$\{SCENARIO_AD_SHIM_LOG\}" "\$\{OLD_MARK\}" <<'CHECK'$/m],
+  ['previous launch has the channels flag and router', /^assert any\('--dangerously-load-development-channels' in words and 'server:slack-channel-router' in words for words in templates\)/m],
+  ['previous release load errors fail', /^! grep -Ei 'failed to load config\|invalid persona config\|load error' /m],
+  ['resume is restored after fresh startup', /^jq '\.resume_enabled = true' .*\| write_config$/m],
+  ['restore-resume change is confirmed', /^mv .*config\.json\.pending" .*config\.json\.apply"$/m],
+  ['last-applied true is observed', /^wait_until .*jq -e '\.resume_enabled == true' .*config\.json\.last-applied"$/m],
+]
+
+function downgradeExecutableText(text: string): string {
+  return text.split('\n').filter(line => !/^\s*(?:#|echo\b|printf\s+['"]recorded:)/.test(line)).join('\n')
+}
+
+function downgradeOperationProblems(script: string): string[] {
+  const executable = downgradeExecutableText(script)
+  let after = 0
+  return DOWNGRADE_OPERATIONS.flatMap(([label, pattern]) => {
+    const found = pattern.exec(executable.slice(after))
+    if (found === null) return [`missing or out of order: ${label}`]
+    after += found.index + found[0].length
+    return []
+  })
+}
+
+describe('b.omv R55: documented downgrade matches the executed safety barriers', () => {
+  const script = () => readRepoFile('tests/integration/test-40-fmk-real-downgrade.sh')
+  const helper = () => downgradeExecutableText(readRepoFile('tests/integration/lib/real-scenario.sh'))
+
+  test('test-40 performs the four safety phases in order', () => {
+    expect(downgradeOperationProblems(script())).toEqual([])
+    expect(downgradeOperationProblems(downgradeExecutableText(script()))).toEqual([])
+  })
+
+  const documentedPhases = `${DOWNGRADE_HEADING}\n
+1. Stop sending; wait until server.log shows every received item delivered, or accept that undelivered messages are lost.
+2. On the current release set \`resume_enabled\` to \`false\`, confirm the change and check last-applied.
+3. Run \`claude-slack-channel-bots stop --stop-bots\`, install the earlier build, and restore the Claude Code pin.
+4. Start the earlier release in a fresh conversation with channels; set \`resume_enabled\` back and confirm the change.
+`
+  test.each(R55_DOWNGRADE_ROWS)('sensitivity: %s loses each safety obligation when omitted', (_element, passage, required) => {
+    expect(docRowProblems(passage, required, documentedPhases)).toEqual([])
+    for (const item of required.map(resolveItem)) {
+      const pattern = typeof item === 'string' ? new RegExp(escapeRegExp(item), 'g') : new RegExp(item.source, `${item.flags.replace('g', '')}g`)
+      const edited = documentedPhases.replace(pattern, '')
+      expect(edited).not.toBe(documentedPhases)
+      expect(docRowProblems(passage, [item], edited).length).toBeGreaterThan(0)
+    }
+  })
+
+  test.each(DOWNGRADE_OPERATIONS)('sensitivity: removing the executable %s fails even when its words survive in a comment', (_label, pattern) => {
+    // Repeated operations (start, mv, launch) must all remain real operations.
+    const edited = script().replace(new RegExp(pattern.source, `${pattern.flags}g`), match => `# ${match}`)
+    expect(edited).not.toBe(script())
+    expect(downgradeOperationProblems(edited).length).toBeGreaterThan(0)
+  })
+
+  test.each([
+    ['deleted', (_line: string): string => ''],
+    ['wrong manifest target', (line: string): string => line.replace('${INSTALL}/package.json', '${SCENARIO_ROOT}/package.json')],
+    ['wrong package dependency', (line: string): string => line.replace('"${PREVIOUS}"', '"${CURRENT}"')],
+  ] as const)('sensitivity: the previous package binding cannot be %s', (_how, edit) => {
+    const label = 'previous tarball is bound to the installed package manifest'
+    const pattern = DOWNGRADE_OPERATIONS.find(([name]) => name === label)![1]
+    const original = script()
+    const edited = original.replace(pattern, edit)
+    expect(edited).not.toBe(original)
+    expect(downgradeOperationProblems(edited)).toContain(`missing or out of order: ${label}`)
+  })
+
+  test('sensitivity: installation before stopping and restoring resume before old startup both fail', () => {
+    const text = script()
+    const stop = text.match(/^stop_server --stop-bots$/m)![0]
+    const install = text.match(/^\(cd .*bun install.*$/m)![0]
+    const restore = text.match(/^jq '\.resume_enabled = true'.*$/m)![0]
+    const cli = text.match(/^SCENARIO_CLI=.*$/m)![0]
+    for (const [earlier, later] of [[stop, install], [cli, restore]]) {
+      const swapped = text.replace(earlier, 'SWAP_OPERATION').replace(later, earlier).replace('SWAP_OPERATION', later)
+      expect(downgradeOperationProblems(swapped).length).toBeGreaterThan(0)
+    }
+  })
+
+  // real_prepare selects the actual executable once during setup. It does not
+  // reinstall a pin after the old package: the same AD launch config governs it.
+  const nativeSelection = [
+    /^\s*REAL_CLAUDE_VERSION="\$\{1:-/m,
+    /^\s*REAL_CLAUDE="\/opt\/claude-code\/\$\{REAL_CLAUDE_VERSION\}\/claude"$/m,
+    /^\s*actual="\$\("\$\{REAL_CLAUDE\}" --version\)" \|\| fail /m,
+    /^\s*\[\[ "\$\{actual%% \*\}" == "\$\{REAL_CLAUDE_VERSION\}" \]\] \|\| fail /m,
+    /^\s*python3 - "\$\{HOME\}" "\$\{SCENARIO_AD_ROOT\}\/config\.toml" "\$\{REAL_CLAUDE\}" "\$\{REAL_CLAUDE_VERSION\}"/m,
+    /^p\.write_text\(old \+ '\\n\[launch\]\\nclaude_path = ' \+ json\.dumps\(native\) \+ '\\n'\)$/m,
+  ]
+  test('real_prepare binds and checks the selected native executable in AD config; test-40 keeps that selection', () => {
+    const prepare = helper().split('real_prepare() {')[1]?.split('\n}\n')[0] ?? ''
+    expect(lacking(prepare, nativeSelection)).toEqual([])
+    const executable = downgradeExecutableText(script())
+    expect(executable.match(/^real_prepare\b.*$/gm)).toEqual([`real_prepare ${MIN_CLAUDE_CODE_VERSION}`])
+    expect(executable).not.toMatch(/^(?:REAL_CLAUDE(?:_VERSION)?=|.*claude_path\s*=)/m)
+  })
+  test.each(nativeSelection)('sensitivity: native version selection cannot lose executable %s', pattern => {
+    const prepare = helper().split('real_prepare() {')[1]?.split('\n}\n')[0] ?? ''
+    expect(lacking(prepare, nativeSelection)).toEqual([])
+    const edited = prepare.replace(pattern, '')
+    expect(edited).not.toBe(prepare)
+    expect(lacking(edited, [pattern])).toHaveLength(1)
+  })
+
+  test('schema precautions are conditional on the older target, without an install-and-resume shortcut', () => {
+    const text = flat(requiredSection(operatorText(RUNBOOK_DOC), DOWNGRADE_HEADING, RUNBOOK_DOC))
+    expect(text).toMatch(/(?:if|when)[^.]*(?:target|release|build)[^.]*(?:reject|support|understand)/i)
+    expect(text).toContain('`allow_invited_channels`')
+    expect(text).toContain('`invited`')
+    expect(text).toMatch(/valid declarative (?:section|configuration)/i)
+    expect(text).toMatch(/remov\w*[^.]*`allow_invited_channels`[^.]*`invited`/i)
+    expect(text).toMatch(/last-applied[^.]*(?:neither|without)|(?:neither|without)[^.]*last-applied/i)
+    expect(text).not.toMatch(/An earlier release's loader rejects/)
+    expect(text).not.toMatch(/never held either key[^.]*install the older build and restart/i)
+    const step4 = downgradeStep(4)(operatorText(RUNBOOK_DOC))
+    expect(step4).toMatch(/start[^.]*(?:fresh|new conversation)[\s\S]*resume_enabled[\s\S]*confirm/i)
+  })
+
+  test('the maintained downgrade copy matches word for word, with only its intro and relative links normalised', () => {
+    const changelog = operatorText(CHANGELOG_FILE)
+    const entry = requiredSection(changelog, /^## 0\.12\.0 \(\d{4}-\d{2}-\d{2}\)$/, CHANGELOG_FILE)
+    const copy = requiredSection(entry, DOWNGRADE_HEADING, CHANGELOG_FILE)
+    const intro = copy.split('\n').filter(line => MAINTAINED_COPY.test(line))
+    expect(intro).toHaveLength(1)
+    expect(intro[0]).toContain('(docs/migration.md#downgrading-to-an-earlier-release)')
+    const current = requiredSection(operatorText(RUNBOOK_DOC), DOWNGRADE_HEADING, RUNBOOK_DOC)
+    expect(asReadmeText(copy).trim()).toBe(current.trim())
+    expect(asReadmeText(copy.replace('1. ', '1. Changed instruction. ')).trim()).not.toBe(current.trim())
+    expect(asReadmeText(copy.replace('2. ', '2.\n3. ')).trim()).not.toBe(current.trim())
   })
 })

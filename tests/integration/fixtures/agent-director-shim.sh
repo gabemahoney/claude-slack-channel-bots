@@ -113,4 +113,71 @@ if ! { /usr/bin/flock -x 9 && printf '%s\n' "${line}" >&9; } 9>> "${log}"; then
     exit 70
 fi
 
+# b.omv SR-14.1: adjacent counted faults, with a stable lock inode while
+# the data file is replaced atomically. No fault configuration comes from
+# the environment, including the client's scrubbed version-probe calls.
+faults="${log%.log}.faults"
+action=''
+argv=("$@")
+verb_index=0
+# The pinned client prefixes verbs with --store-path and its value. Keep
+# those global arguments in the real invocation and in the call log.
+while (( verb_index < ${#argv[@]} )); do
+    case "${argv[verb_index]}" in
+        --store-path|--home|--tmux-command|--create-if-missing) verb_index=$((verb_index + 2)) ;;
+        --store-path=*|--home=*|--tmux-command=*|--create-if-missing=*) verb_index=$((verb_index + 1)) ;;
+        *) break ;;
+    esac
+done
+call_verb="${argv[verb_index]:-}"
+if [[ -f "${faults}" ]]; then
+    exec 8> "${faults}.lock" || exit 70
+    /usr/bin/flock -x 8 || exit 70
+    rules=()
+    mapfile -t rules < "${faults}" || exit 70
+    for i in "${!rules[@]}"; do
+        [[ -z "${rules[i]}" || "${rules[i]}" == \#* ]] && continue
+        read -r verb match candidate count extra <<< "${rules[i]}"
+        if [[ -n "${extra}" || ! "${count}" =~ ^[0-9]+$ || ${#count} -gt 6 ]]; then
+            printf 'agent-director-shim: invalid fault rule\n' >&2
+            exit 70
+        fi
+        case "${candidate}" in
+            swallow|unknown-typed|unknown-untyped) ;;
+            delay=*) [[ "${candidate#delay=}" =~ ^[0-9]{1,6}$ ]] || exit 70 ;;
+            *) exit 70 ;;
+        esac
+        [[ "${verb}" == "${call_verb}" && "${count}" -gt 0 ]] || continue
+        matches=0
+        case "${match}" in
+            '*') matches=1 ;;
+            no_enter) for arg in "$@"; do [[ "${arg}" == --no-enter ]] && matches=1; done ;;
+            key=*) previous=''; for arg in "$@"; do
+                [[ "${previous}" == --key && "${arg}" == "${match#key=}" ]] && matches=1
+                previous="${arg}"
+            done ;;
+            *) printf 'agent-director-shim: invalid fault matcher\n' >&2; exit 70 ;;
+        esac
+        (( matches )) || continue
+        action="${candidate}"
+        rules[i]="${verb} ${match} ${candidate} $((10#${count} - 1))"
+        printf '%s\n' "${rules[@]}" > "${faults}.$$" || exit 70
+        /usr/bin/mv -f "${faults}.$$" "${faults}" || exit 70
+        printf -v fault_words '%q %q %q %q' "${verb}" "${match}" "${candidate}" "${count}"
+        printf -v fault_line 'fault\t%s\t%s\t%s\t%s\t%s' "${EPOCHREALTIME/,/.}" "$$" "${PPID}" "${parent}" "${fault_words}"
+        { /usr/bin/flock -x 9 && printf '%s\n' "${fault_line}" >&9; } 9>> "${log}" || exit 70
+        break
+    done
+    /usr/bin/flock -u 8
+    exec 8>&-
+fi
+case "${action}" in
+    swallow) printf '{}\n'; exit 0 ;;
+    delay=*) ms="${action#delay=}"; printf -v seconds '%d.%03d' "$((10#${ms}/1000))" "$((10#${ms}%1000))"; /usr/bin/sleep "${seconds}" ;;
+    unknown-typed) "${real}" "$@" >/dev/null 2>/dev/null || true ;;
+esac
+if [[ "${action}" == unknown-typed || "${action}" == unknown-untyped ]]; then
+    /usr/bin/cat "${log%/*}/agent-director-unresponsive.json" >&2 || exit 70
+    exit 1
+fi
 exec -a "$0" "${real}" "$@"

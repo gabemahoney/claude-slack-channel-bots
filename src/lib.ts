@@ -3,7 +3,7 @@
  *
  * All functions here are side-effect-free (or accept their dependencies as
  * parameters) so they can be imported by tests without starting the Slack
- * socket or loading credentials: the stream-presence check, the file
+ * socket or loading credentials: the file
  * exfiltration guard, text chunking and attachment-name sanitising.
  *
  * SPDX-License-Identifier: MIT
@@ -11,20 +11,6 @@
 
 import { resolve, sep } from 'path'
 import { resolveRealPath, tryResolveRealPath } from './config.ts'
-
-// ---------------------------------------------------------------------------
-// MCP transport stream presence
-// ---------------------------------------------------------------------------
-
-// True iff the standalone GET SSE stream entry "_GET_stream" is present in the
-// MCP SDK transport's internal _streamMapping. Used by persona-routing.ts's
-// dispatch path (on the exact session it sends to) and its stream-presence
-// probe (`hasSessionStream`) to detect silent-drop conditions before
-// forwarding a Slack message.
-export function hasGetStreamKey(transport: unknown): boolean {
-  const mapping = (transport as any)?._streamMapping
-  return typeof mapping?.has === 'function' && mapping.has('_GET_stream')
-}
 
 // ---------------------------------------------------------------------------
 // Security — assertSendable (file exfiltration guard)

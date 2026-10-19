@@ -210,6 +210,8 @@ export {
   ErrSpawnNotFound,
   ErrSpawnNotInteractive,
   ErrSendKeysWhileRelayed,
+  ErrDialogMaybeOpen,
+  ErrPaneChanged,
   ErrNoSessionId,
   ErrJsonlMissing,
   ErrJsonlNeverWritten,

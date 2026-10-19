@@ -185,7 +185,7 @@ describe('SRJ-1010\'s text (pin)', () => {
       [SLOW_RECOVERY_RESET_OTHER_VERDICT]: 'a restart run ended with a verdict other than escalate-dead',
       [SLOW_RECOVERY_RESET_PENDING_REPROBE]: "an escalate-dead verdict's re-probe read the row pending, which is not counted",
       [SLOW_RECOVERY_RESET_PENDING_PROBE]: "a restart run's liveness probe read the row pending",
-      [SLOW_RECOVERY_RESET_HEALTHY]: 'a health check found the session live, connected and with its stream',
+      [SLOW_RECOVERY_RESET_HEALTHY]: 'a health check found the session live and connected',
       [SLOW_RECOVERY_RESET_LATCHED]: 'the persona latched',
     })
   })

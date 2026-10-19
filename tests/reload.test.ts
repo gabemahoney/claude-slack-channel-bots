@@ -1,3 +1,4 @@
+import { queueRetentionClause } from '../src/reload-preview-clauses.ts'
 /**
  * reload.test.ts — The reload controller's start rules (b.av2 SR-8.7), the
  * record-start real-path collisions (SR-1.5, record-start part), the SR-5.2
@@ -334,7 +335,7 @@ function personaRef(name: string): string {
 
 /** The `DESTRUCTIVE:` line of a removed persona: it will be retired (b.jg5 SRJ-1510), from the exported clause. */
 function removedLine(name: string): string {
-  return `${DESTRUCTIVE_PREFIX} ${personaRef(name)} is removed: ${REMOVED_RETIRED_CLAUSE}.`
+  return `${DESTRUCTIVE_PREFIX} ${personaRef(name)} is removed: ${REMOVED_RETIRED_CLAUSE}; ${queueRetentionClause(0)}.`
 }
 
 /**

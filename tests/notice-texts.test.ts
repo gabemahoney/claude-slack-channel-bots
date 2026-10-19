@@ -17,7 +17,7 @@
  * closing and each form, with no description and with both, and its survivor
  * version for each pid list and closing (SRJ-1007); the `ErrInvalidFlags` hold
  * (SRJ-1008); the unclassified-error alert (SRJ-1009); slow recovery
- * (SRJ-1010); the lost-message notice in each state (SRJ-1011); the
+ * (SRJ-1010); typed delivery notices (b.omv SR-8); the
  * permission wedge warning (SRJ-1012); the startup-errors entries' texts
  * (SRJ-1013); the stuck-launch posts, the held
  * one with and without the attach line (SRJ-1017); the `ad-config-malformed`
@@ -26,7 +26,7 @@
  * the all-clear (SRJ-1021); and, under SRJ-1001 (whose rules hold for every
  * server notice posted to Slack), the persona prefix, every outage onset and
  * the all-clear, the spawn-failure notice for each remediation and the
- * restart-cap notice, b.f2b's not-connected notice in its six renderings,
+ * restart-cap notice, b.f2b's not-connected notice in every rendering,
  * the JSONL persistence safeguard's three notices (SRJ-122: they name no
  * command and keep their text) and the `ErrJsonlMissing` diagnosis's three
  * notices (SRJ-712: LOST and both INCONCLUSIVE shapes, each quoting
@@ -142,6 +142,16 @@ import {
   unusableNameNoticeText,
 } from '../src/conflict-latch.ts'
 import { INVALID_FLAGS_HOLD_ALERT_TEXT } from '../src/invalid-flags-hold.ts'
+import {
+  buildMessageNotSavedNotice,
+  buildDeliveryStuckNotice,
+  buildMessageNotTakenInNotice,
+  buildMessagesWaitingNotice,
+  buildQueueRecordUnreadableNotice,
+  MESSAGES_WAITING_STATES,
+  type DeliveryStuckReason,
+} from '../src/delivery-notices.ts'
+import { DELIVERY_STUCK_AFTER_MS } from '../src/delivery-constants.ts'
 import { runJsonlPersistenceSafeguard, runPersonaStorageCheck, UNATTRIBUTABLE_ZERO_REASON } from '../src/jsonl-persistence-check.ts'
 import {
   KILL_FAILURE_CLOSING_CLI_TEARDOWN,
@@ -158,7 +168,6 @@ import {
   type KillFailureClosing,
 } from '../src/kill-failure-alert.ts'
 import { KILL_RETRY_ALERT_ORDINARY } from '../src/kill-retry.ts'
-import { buildLostMessageNotice, LOST_MESSAGE_STATES } from '../src/lost-message.ts'
 import {
   OLD_LIFE_WAIT_AT_FIND_MISSING,
   OLD_LIFE_WAIT_AT_GET,
@@ -478,13 +487,6 @@ function slowRecoveryEntries(): NoticeEntry[] {
   return [entry('SRJ-1010', 'slowRecoveryText', 'the post', () => slowRecoveryText(KEY))]
 }
 
-/** SRJ-1011: the lost-message notice in every state. */
-function lostMessageEntries(): NoticeEntry[] {
-  return LOST_MESSAGE_STATES.map((state) =>
-    entry('SRJ-1011', 'buildLostMessageNotice', state, () => buildLostMessageNotice('stub-user', state)),
-  )
-}
-
 /** SRJ-1012: the permission wedge warning, for a persona whose name and key differ. */
 function wedgeWarningEntries(): NoticeEntry[] {
   return [
@@ -698,7 +700,7 @@ function notConnectedCause(notice: NotConnectedNotice): string {
   return notice.cause
 }
 
-/** b.f2b's not-connected notice in each of its six renderings: each reason, and each `autoRestartDisabled` or `streamless` form. */
+/** b.omv SR-8.5: all retained-message MCP variants, including both screen blocks. */
 function notConnectedVariants(): readonly (readonly [label: string, notice: NotConnectedNotice])[] {
   // A real cause, as a launch wait that timed out on an unreadable row words it.
   const cause = notConnectedCause(
@@ -710,7 +712,8 @@ function notConnectedVariants(): readonly (readonly [label: string, notice: NotC
     ['unproven-idle', { reason: 'unproven-idle', autoRestartDisabled: false, heldMs: UNPROVEN_IDLE_NOTICE_AFTER_MS }],
     ['unproven-idle, auto-restart disabled', { reason: 'unproven-idle', autoRestartDisabled: true, heldMs: UNPROVEN_IDLE_NOTICE_AFTER_MS }],
     ['auto-restart-disabled, disconnected', { reason: 'auto-restart-disabled', cause }],
-    ['auto-restart-disabled, streamless', { reason: 'auto-restart-disabled', cause, streamless: true }],
+    ['reconnect-blocked, menu', { reason: 'reconnect-blocked', rule: 'menu' }],
+    ['reconnect-blocked, input', { reason: 'reconnect-blocked', rule: 'input' }],
   ]
 }
 
@@ -719,6 +722,24 @@ function notConnectedEntries(): NoticeEntry[] {
   return notConnectedVariants().map(([label, notice]) =>
     entry('SRJ-1001', 'buildNotConnectedNotice', label, () => buildNotConnectedNotice(KEY, notice)),
   )
+}
+
+/** b.omv SR-8: variants join the existing catalogue and all its safety checks. */
+const DELIVERY_STUCK_REASONS: readonly DeliveryStuckReason[] = [
+  'menu', 'input', 'relay-off', 'mcp', 'refused', 'transcript',
+  'queue-unwritable', 'not-taken-in', 'dialog-hold',
+]
+function deliveryEntries(): NoticeEntry[] {
+  return [
+    entry('SRJ-1001', buildMessageNotSavedNotice.name, 'store failed', () => buildMessageNotSavedNotice(PERSONA.name, 'U0SENDER1')),
+    ...DELIVERY_STUCK_REASONS.map((reason) => entry('SRJ-1001', buildDeliveryStuckNotice.name, reason, () =>
+      buildDeliveryStuckNotice(PERSONA.name, KEY, 2, DELIVERY_STUCK_AFTER_MS + 1, reason, 3))),
+    entry('SRJ-1001', buildMessageNotTakenInNotice.name, 'unconfirmed first retype', () => buildMessageNotTakenInNotice(PERSONA.name, 'U0SENDER1')),
+    ...MESSAGES_WAITING_STATES.map((state) => entry('SRJ-1001', buildMessagesWaitingNotice.name, state, () =>
+      buildMessagesWaitingNotice(PERSONA.name, 2, DELIVERY_STUCK_AFTER_MS, state))),
+    entry('SRJ-1001', buildQueueRecordUnreadableNotice.name, 'unreadable accepted record', () =>
+      buildQueueRecordUnreadableNotice(PERSONA.name, 2, '/scratch/queue/quarantined.jsonl')),
+  ]
 }
 
 /** The JSONL persistence safeguard's three notices (b.zak; SRJ-122 keeps their text): one per variant. */
@@ -924,6 +945,7 @@ const NOTICE_CATALOGUE: readonly NoticeEntry[] = Object.freeze([
   ...commonEntries(),
   ...spawnFailureEntries(),
   ...notConnectedEntries(),
+  ...deliveryEntries(),
   ...jsonlSafeguardEntries(),
   ...jsonlDiagnosisEntries(),
   ...capEntries(),
@@ -935,7 +957,6 @@ const NOTICE_CATALOGUE: readonly NoticeEntry[] = Object.freeze([
   ...invalidFlagsEntries(),
   ...unclassifiedEntries(),
   ...slowRecoveryEntries(),
-  ...lostMessageEntries(),
   ...wedgeWarningEntries(),
   ...startupErrorEntries(),
   ...stuckLaunchEntries(),
@@ -947,6 +968,7 @@ const NOTICE_CATALOGUE: readonly NoticeEntry[] = Object.freeze([
 
 /** The SRJ-10xx ids from SRJ-1001 to SRJ-1021 with no notice builder in the catalogue, each with its reason. */
 const NOT_APPLICABLE: Readonly<Partial<Record<NoticeSrj, string>>> = Object.freeze({
+  'SRJ-1011': 'SR-4.2 removes Message lost; accepted inputs remain in the queue and recovery posts nothing.',
   'SRJ-1002': 'log-only routing: it routes other notices and has no text of its own',
   'SRJ-1014': 'log lines, not notices: each is asserted with its behaviour',
   'SRJ-1015': 'the start summary line is a server-log line, not a notice',
@@ -967,12 +989,16 @@ const GUARDED_IDS: readonly NoticeSrj[] = Array.from({ length: 21 - 1 + 1 }, (_,
  */
 const NAMED_SLACK_NOTICES: readonly string[] = Object.freeze([
   buildWedgeWarningText.name,
-  buildLostMessageNotice.name,
   'ONSET_TEMPLATES',
   'ALL_CLEAR_TEMPLATE',
   spawnFailureNoticeText.name,
   restartCapReachedNoticeText.name,
   buildNotConnectedNotice.name,
+  buildMessageNotSavedNotice.name,
+  buildDeliveryStuckNotice.name,
+  buildMessageNotTakenInNotice.name,
+  buildMessagesWaitingNotice.name,
+  buildQueueRecordUnreadableNotice.name,
   runPersonaStorageCheck.name,
   runJsonlPersistenceSafeguard.name,
   jsonlTranscriptLostNoticeText.name,
@@ -1127,12 +1153,17 @@ describe('the notice catalogue is complete (SRJ-1001 to SRJ-1021, and every name
     expect(NAMED_SLACK_NOTICES.filter((name) => !builders.has(name))).toEqual([])
   })
 
-  test('the named notices are catalogued in every variant: each outage onset, each lost-message state, each not-connected rendering, each JSONL safeguard notice', () => {
+  test.each(notConnectedEntries().map(e => [titleOf(e), e] as const))('b.omv SR-8.5: %s never claims disconnected messages are lost or needs a stream', (_title, e) => {
+    expect(e.render()).not.toMatch(/\blost\b|not receiving messages|\bstream(?:less)?\b/i)
+  })
+
+  test('the named notices are catalogued in every variant: outage, MCP, delivery and JSONL notices', () => {
     const variantsOf = (...builders: string[]) => NOTICE_CATALOGUE.filter((e) => builders.includes(e.builder)).map((e) => e.variant)
     expect(variantsOf('ONSET_TEMPLATES')).toEqual(expect.arrayContaining(OUTAGE_CLASS_ORDER.map((outage) => `${outage} onset`)))
-    expect(variantsOf(buildLostMessageNotice.name)).toEqual(expect.arrayContaining([...LOST_MESSAGE_STATES]))
     expect(variantsOf(buildNotConnectedNotice.name)).toEqual(notConnectedVariants().map(([label]) => label))
-    expect(new Set(notConnectedVariants().map(([, notice]) => notice.reason))).toEqual(new Set(['blocked-on-prompt', 'unproven-idle', 'auto-restart-disabled']))
+    expect(new Set(notConnectedVariants().map(([, notice]) => notice.reason))).toEqual(new Set(['blocked-on-prompt', 'unproven-idle', 'auto-restart-disabled', 'reconnect-blocked']))
+    expect(variantsOf(buildDeliveryStuckNotice.name)).toEqual([...DELIVERY_STUCK_REASONS])
+    expect(variantsOf(buildMessagesWaitingNotice.name)).toEqual([...MESSAGES_WAITING_STATES])
     expect(variantsOf(runPersonaStorageCheck.name, runJsonlPersistenceSafeguard.name)).toEqual([JSONL_NON_PERSISTENT, JSONL_STALE_PATH, JSONL_LOST])
   })
 
@@ -1260,6 +1291,7 @@ const SESSION_ENDING_FREE_BUILDERS: readonly string[] = Object.freeze([
   launchStartNotRecordedNoticeText.name,
   stuckLaunchRelaunchingText.name,
   stuckLaunchHeldText.name,
+  buildDeliveryStuckNotice.name,
 ])
 
 /**

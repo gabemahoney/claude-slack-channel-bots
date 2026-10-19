@@ -1,4 +1,8 @@
 import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
+import { TRUST_DIALOG_PANE } from './test-helpers/working-row-panes.ts'
+import { MCP_SERVER_NAME } from '../src/config.ts'
+import { useImmediateTypingLifecycle } from './test-helpers/legacy-typing.ts'
+useImmediateTypingLifecycle()
 /**
  * conflict-latch.test.ts — CONFLICT case recognition (b.jg5 SRJ-507), the
  * `tests/conflict-latch.test.ts` half of SRJ-1303, and the latch record
@@ -683,7 +687,6 @@ import {
   APPROVER_STOP_CAP,
   APPROVER_STOP_LATCHED,
   DIALOG_POLL_INTERVAL_MS,
-  TRUST_DIALOG_NEEDLE,
   _resetNotConnectedEpisodes,
   isLaunchInFlight,
   notifyPersonaNotConnected,
@@ -2630,6 +2633,14 @@ function makeAutomatedPathsRun(options: Omit<RecoveryHarnessOptions, 'restartDep
   const working = new Set<string>()
   const noLaunchStart = new Set<string>()
   const pending = new Set<string>()
+  // b.omv SR-7.6: startup's fresh get proofs see the status script's row.
+  const get = h.stub.client.get.bind(h.stub.client)
+  h.stub.client.get = async params => {
+    const row = await get(params)
+    return pending.has(String(params.instance_id))
+      ? { ...row, state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE }).launch_started_at }
+      : row
+  }
   const statusErrors = new Map<string, Error>()
   const statusErrorsOnce = new Map<string, Error>()
   const spawn = h.stub.client.spawn.bind(h.stub.client)
@@ -2800,7 +2811,6 @@ async function runHealthTick({ h, killRow }: AutomatedPathsRun): Promise<{ sched
   initHealthCheck({
     isSessionAlive: _buildIsSessionAliveAdapter(() => h.config),
     isSessionConnected: () => false,
-    hasSessionStream: () => false,
     isRestartPendingOrActive,
     isLaunchInFlight,
     isLatched: (key) => h.latch.isLatched(key),
@@ -3304,12 +3314,12 @@ describe('SRJ-1016, SRJ-502: P\'s latch and relatch end its open stuck-launch ep
 // harness's latch's latched query bound as `main()` binds it
 // ---------------------------------------------------------------------------
 
-describe('SRJ-502, SRJ-1011: a message lost while P is latched reports held for a human and fires no restart (recovery harness)', () => {
+describe('SRJ-502, SRJ-1011: an accepted message while P is latched stays queued and fires no restart (recovery harness)', () => {
   const leftoverRow = rowWhere(
     (row) => row.refusedOperation === REFUSED_OPERATION_PLAIN_SPAWN && row.stubCase === 'scan-leftover' && row.rowState === LATCH_ROW_STATE_NO_ROW,
   )
 
-  test('a CONFLICT at P’s spawn latches P; a message lost then reports held for a human with its exported wording at P’s destination, asks for no restart and makes no call, and nothing fires for P afterwards; Q’s lost message reports its own state after its one row read', async () => {
+  test('a CONFLICT at P’s spawn latches P; an accepted message stays queued without a notice, restart or call, and nothing fires for P afterwards; Q makes its own row read', async () => {
     const h = makeRecoveryHarness()
     harnesses.push(h)
     expect(h.config.session_restart_delay).toBe(0)
@@ -3322,12 +3332,9 @@ describe('SRJ-502, SRJ-1011: a message lost while P is latched reports held for 
 
     // Ignoring the latch would report the delay 0's auto-restart disabled; a
     // restart request is seen even though the latched restart module arms none.
-    const lost = await expectLostMessageReports(h, p, 'held-for-human')
-    const persona = personaOf(h, p)
-    expect(posts(h.slack(p)).map((post) => [post.channel, post.text])).toEqual([
-      [persona.permission_prompts, formatPersonaNotice(persona, lost.notice)],
-    ])
-    expect(h.lostMessageNotices).toEqual([{ key: p, text: lost.notice }])
+    await expectLostMessageReports(h, p, 'held-for-human')
+    expect(posts(h.slack(p))).toEqual([])
+    expect(h.lostMessageNotices).toEqual([])
     expect(h.episodeNotices).toEqual([{ key: p, text: leftoverRow.notice.text }])
 
     // Nothing fires for P afterwards: several retry waits on, no attempt, no call, nothing pending.
@@ -3339,8 +3346,8 @@ describe('SRJ-502, SRJ-1011: a message lost while P is latched reports held for 
     // its message makes the routing's one row read (SRJ-1011), a `status` of
     // Q's instance, which reads no row (dead), not `pending`.
     await expectLostMessageReports(h, q, 'auto-restart-disabled')
-    expect(h.slack(q).calls.postMessage).toHaveLength(1)
-    expect(h.slack(p).calls.postMessage).toHaveLength(1)
+    expect(h.slack(q).calls.postMessage).toHaveLength(0)
+    expect(h.slack(p).calls.postMessage).toHaveLength(0)
     expect(h.latch.isLatched(q)).toBe(false)
     expect(personaCallCounts(h, q)).toEqual({ statusCalls: 1 })
     // The latched P's own calls are still those of its launch.
@@ -3416,7 +3423,7 @@ describe('SRJ-512: an UNUSABLE NAME from resume and from the working-row read-pa
     expect(qCalls).toEqual([...Q_CALLS_ON_EVERY_PATH])
   })
 
-  test.each(UNUSABLE_LATCH_WAYS)('P latched by %s: a message lost then reports held for a human with its exported wording at P\'s destination, with no status read and no restart; Q\'s lost message reports its own state', async (_label, row, latchScript) => {
+  test.each(UNUSABLE_LATCH_WAYS)('P latched by %s: an accepted message stays queued without a notice, status read or restart; Q makes its own row read', async (_label, row, latchScript) => {
     const h = makeRecoveryHarness()
     harnesses.push(h)
     expect(h.config.session_restart_delay).toBe(0)
@@ -3430,9 +3437,8 @@ describe('SRJ-512: an UNUSABLE NAME from resume and from the working-row read-pa
     expect(h.latch.record(p)).toEqual(row.record(p))
     const pCallsAtLatch = personaCallCounts(h, p)
 
-    const lost = await expectLostMessageReports(h, p, 'held-for-human')
-    const persona = personaOf(h, p)
-    expect(posts(h.slack(p)).map((post) => [post.channel, post.text])).toEqual([[persona.permission_prompts, formatPersonaNotice(persona, lost.notice)]])
+    await expectLostMessageReports(h, p, 'held-for-human')
+    expect(posts(h.slack(p))).toEqual([])
     expect(h.restartAsks.filter((key) => key === p)).toEqual([])
     expect([isRestartPendingOrActive(p), personaCallCounts(h, p)]).toEqual([false, pCallsAtLatch])
     expect(h.episodeNotices).toEqual([{ key: p, text: row.notice(p) }])
@@ -3541,7 +3547,10 @@ describe('SRJ-118, SRJ-505: a CONFLICT or UNUSABLE NAME at the reconnect\'s send
     expect(tick.qCalls).toEqual({ statusCalls: 1 })
     h.script(collided(h, personaOf(h, q), { state: 'waiting' }))
     expect(await h.launch(q)).toEqual({ key: q, action: 'reconnected' })
-    expect(h.stub.calls.sendKeysCalls.filter((call) => call.instance_id === personaInstanceId(q))).toHaveLength(1)
+    expect(h.stub.calls.sendKeysCalls.filter((call) => call.instance_id === personaInstanceId(q))).toEqual([
+      { instance_id: personaInstanceId(q), text: `/mcp reconnect ${MCP_SERVER_NAME}`, no_enter: true },
+      { instance_id: personaInstanceId(q), key: 'Enter' },
+    ])
   })
 })
 
@@ -4618,11 +4627,10 @@ describe('SRJ-513, SRJ-1011: a message lost for P whose row reads pending with n
     expect(getFailureCount(p)).toBe(0)
   }
 
-  test('with nothing latched, the message\'s one status read latches P and the message reports held for a human at P\'s destination, with no restart; one SRJ-1020 post; Q reports its own state', async () => {
+  test('with nothing latched, the message\'s one status read latches P and the accepted message stays queued with no intake notice or restart; one SRJ-1020 episode post; Q makes its own row read', async () => {
     const { h, p, q } = makeLostRun(pNoLaunchStartStatus)
-    const lost = await expectLostMessageReports(h, p, 'held-for-human', { calls: { statusCalls: 1 } })
-    const persona = personaOf(h, p)
-    expect(posts(h.slack(p)).map((post) => [post.channel, post.text])).toEqual([[persona.permission_prompts, formatPersonaNotice(persona, lost.notice)]])
+    await expectLostMessageReports(h, p, 'held-for-human', { calls: { statusCalls: 1 } })
+    expect(posts(h.slack(p))).toEqual([])
     expect(h.latch.record(p)).toEqual(launchStartRecord(p))
     expect(h.episodeNotices).toEqual([{ key: p, text: launchStartNotRecordedNoticeText(p) }])
     expectNoRestartFor(h, p)
@@ -4693,8 +4701,9 @@ function approverVerbOf(site: string): ApproverVerb {
   return site.slice('approver '.length) as ApproverVerb
 }
 
-/** The calls one approver lap makes up to and including its call at `verb`, by verb (one each). */
+/** Calls through `verb`, including fresh marked-row and pane proofs before Enter (b.omv SR-7.6). */
 function lapCallsThrough(verb: ApproverVerb): Record<string, number> {
+  if (verb === 'send-keys') return { statusCalls: 1, getCalls: 2, readPaneCalls: 2, sendKeysCalls: 1 }
   const verbs = APPROVER_SITES.map(approverVerbOf)
   return Object.fromEntries(verbs.slice(0, verbs.indexOf(verb) + 1).map((v) => [APPROVER_VERB_CALLS[v], 1]))
 }
@@ -4746,7 +4755,7 @@ const APPROVER_LATCH_CASES: ReadonlyArray<readonly [string, ApproverLatchCase]> 
  */
 function approverMeets(run: AutomatedPathsRun, key: string, verb: ApproverVerb, err: Error): void {
   const { h } = run
-  h.script({ readPaneResults: [cannedReadPaneResult(TRUST_DIALOG_NEEDLE)] })
+  h.script({ readPaneResults: [cannedReadPaneResult(TRUST_DIALOG_PANE)] })
   const id = personaInstanceId(key)
   const client = h.stub.client
   if (verb === 'status') {
@@ -4877,7 +4886,7 @@ describe('the dialog approver\'s latches: its own CONFLICT or UNUSABLE NAME latc
     const [p, q] = h.keys as [string, string]
     run.readPending(p)
     run.readPending(q)
-    h.script({ readPaneResults: [cannedReadPaneResult(TRUST_DIALOG_NEEDLE)] })
+    h.script({ readPaneResults: [cannedReadPaneResult(TRUST_DIALOG_PANE)] })
     let pAtLatch: Record<string, number> | undefined
     const latchNow = async (): Promise<void> => {
       await latchP(run, p)
@@ -5340,11 +5349,11 @@ describe('the not-resumable step\'s re-read latches (recovery harness; SRJ-710, 
     expect([h.latch.isLatched(q), personaCallCounts(h, q)]).toEqual([false, {}])
   }
 
-  /** P's launch: the colliding spawn, the collision `get` reading P's `waiting` row, its reconnect's GONE, the find-missing run, the `resume`'s ErrSpawnNotResumable and its re-read reading `reread`. */
+  /** P's collision and fresh reconnect gets both read waiting; after GONE and resume's ErrSpawnNotResumable, the re-read sees `reread`. */
   function scriptReread(h: RecoveryHarness, p: string, reread: Record<string, unknown>): void {
     h.script({
       ...collided(h, personaOf(h, p), { state: 'waiting' }),
-      getQueue: [cannedOk(cannedGetResult({ state: 'waiting' }, personaOf(h, p), h.home))],
+      getQueue: Array.from({ length: 3 }, () => cannedOk(cannedGetResult({ state: 'waiting' }, personaOf(h, p), h.home))),
       getResult: cannedGetResult(reread, personaOf(h, p), h.home),
       sendKeysError: errTmuxSendKeys(),
       resumeError: errSpawnNotResumable(),
@@ -5352,7 +5361,7 @@ describe('the not-resumable step\'s re-read latches (recovery harness; SRJ-710, 
   }
 
   /** The ladder's calls up to the re-read: nothing after it. */
-  const LADDER_TO_REREAD = ['spawn', 'get', 'sendKeys', 'findMissing', 'resume', 'get']
+  const LADDER_TO_REREAD = ['spawn', 'get', 'get', 'readPane', 'readPane', 'get', 'sendKeys', 'findMissing', 'resume', 'get']
 
   test('the re-read carries a provenance_conflict note: P latches once with the shared own-row read\'s record ("conflicting labels", slack_bot_<key>, no description) and one post; no sequence starts, though the path holds dead evidence; no call after the re-read', async () => {
     const { h, p, q } = makeRun()
@@ -5664,14 +5673,19 @@ function recheckCallMethods(entry: RecheckEntry): string[] {
       return ['readPane']
     case RECHECK_CALL_FINISHED_ROW: {
       const launch = LAUNCH_CALL_METHOD[finishedRowEntryFor(entry.name).call]
-      return launch === undefined ? ['get'] : ['get', launch]
+      return launch === undefined ? ['get'] : ['get', ...guardedLaunchCalls(launch)]
     }
     case RECHECK_CALL_RESTART_DECISION:
       // The run's first call: the restart path's liveness read of the row.
       return ['status']
     default:
-      return [LAUNCH_CALL_METHOD[entry.decision.call]!]
+      return guardedLaunchCalls(LAUNCH_CALL_METHOD[entry.decision.call]!)
   }
+}
+
+/** E4 adds a fresh provenance proof immediately before each resume retry. */
+function guardedLaunchCalls(verb: string): string[] {
+  return verb === 'resume' ? ['get', 'resume'] : [verb]
 }
 
 /** The parameters persona `key`'s re-check call for `entry` must carry, checked on the row model's record; undefined for a call with none checked here. */
@@ -5863,7 +5877,6 @@ describe('the re-check timer: its cadence, P\'s serializer turn and its stops (r
     initHealthCheck({
       isSessionAlive: _buildIsSessionAliveAdapter(() => h.config),
       isSessionConnected: () => false,
-      hasSessionStream: () => false,
       isRestartPendingOrActive,
       isLaunchInFlight,
       isLatched: (key) => h.latch.isLatched(key),
@@ -6045,13 +6058,13 @@ describe('"not this launch\'s session": status only, the refused call never repe
     model.setState(rowStateOfReading('missing'))
     scriptLaunchAnswer(model, RECHECK_CALL_RESUME, missing.answers!.noInformation[0]!.answer())
     let round = await recheckRound(h, p)
-    expect(round.verbs).toEqual(['status', 'get', 'resume'])
+    expect(round.verbs).toEqual(['status', 'get', 'get', 'resume'])
     expectStillLatched(run, round.at)
     // Retried again at the next finished round; the leftover still runs, so it relatches with one new post, its record the resume's and the row the get read.
     const leftover = missing.answers!.relatches.find((answer) => answer.latchCase === LATCH_CASE_LEFTOVER)!
     scriptLaunchAnswer(model, RECHECK_CALL_RESUME, leftover.answer())
     round = await recheckRound(h, p)
-    expect(round.verbs).toEqual(['status', 'get', 'resume'])
+    expect(round.verbs).toEqual(['status', 'get', 'get', 'resume'])
     expect(h.latch.record(p)).toMatchObject({ latchCase: LATCH_CASE_LEFTOVER, refusedOperation: REFUSED_OPERATION_RESUME, rowState: latchRowStateRead(LIVENESS_DEAD_ROW_MISSING) })
     expect([h.episodeNotices.length, h.latchRecheck.pendingTimers(), h.latchRecheck.nextDueAt()]).toEqual([2, 1, round.at + LATCH_RECHECK_INTERVAL_MS])
     verbs.push(...personaCallsFrom(h, p, 0).map((call) => call.verb))
@@ -6193,8 +6206,8 @@ const RECHECK_ANSWER_SITES: readonly RecheckAnswerSite[] = [
   { name: 'the lap read-pane', row: conflictingLabelsResumeRow, state: AGENT_DIRECTOR_PENDING_STATE, verb: 'read-pane', verbs: ['get', 'readPane'], options: (answers) => ({ readPane: answers }) },
   { name: 'the plain spawn', row: scanLeftoverRow, state: PENDING_ROW_MODEL_NO_ROW, verb: 'spawn', verbs: ['status', 'spawn'], script: (model, answer) => model.scriptPlainSpawns(answer) },
   { name: 'the reuse', row: anotherStoreReuseRow, state: LIVENESS_DEAD_ROW_ENDED, verb: 'spawn', verbs: ['status', 'spawn'], script: (model, answer) => model.scriptReuseSpawns(answer) },
-  { name: 'the resume', row: anotherStoreResumeRow, state: LIVENESS_DEAD_ROW_ENDED, verb: 'resume', verbs: ['status', 'resume'], script: (model, answer) => model.scriptResumes(answer) },
-  { name: 'the finished-row retry\'s resume', row: statusOnlyRow, state: LIVENESS_DEAD_ROW_MISSING, verb: 'resume', verbs: ['status', 'get', 'resume'], script: (model, answer) => model.scriptResumes(answer) },
+  { name: 'the resume', row: anotherStoreResumeRow, state: LIVENESS_DEAD_ROW_ENDED, verb: 'resume', verbs: ['status', 'get', 'resume'], script: (model, answer) => model.scriptResumes(answer) },
+  { name: 'the finished-row retry\'s resume', row: statusOnlyRow, state: LIVENESS_DEAD_ROW_MISSING, verb: 'resume', verbs: ['status', 'get', 'get', 'resume'], script: (model, answer) => model.scriptResumes(answer) },
   // Its get finds no row: the plain first spawn.
   { name: 'the finished-row retry\'s plain spawn', row: statusOnlyRow, state: PENDING_ROW_MODEL_NO_ROW, verb: 'spawn', verbs: ['status', 'get', 'spawn'], script: (model, answer) => model.scriptPlainSpawns(answer) },
   // Its get reads ended with no session id: the reuse.
@@ -6314,7 +6327,7 @@ describe('the round line names step 1\'s outcome and the call: a spawn latch\'s 
   })
 
   test.each([
-    ['missing', RECHECK_CALL_RESUME, ['status', 'get', 'resume']],
+    ['missing', RECHECK_CALL_RESUME, ['status', 'get', 'get', 'resume']],
     ['no row', RECHECK_CALL_PLAIN_SPAWN, ['status', 'get', 'spawn']],
   ] as const)('a "not this launch\'s session" latch whose step 1 reads %s: one round line, step=finished-row-retry, the finished-row retry and the launch its get decided as its call', async (reading, launch, verbs) => {
     const row = statusOnlyRow()
@@ -6907,7 +6920,8 @@ describe('a retry at the cadence that is not refused: no post before it, no find
     await h.advanceToRecheck()
 
     const verbs: string[] = personaCallsFrom(h, p, from).map((call) => call.verb)
-    expect(verbs.slice(0, 2)).toEqual([row.recheck.readVerb, LAUNCH_CALL_METHOD[entry.decision.call]!])
+    const expected = [row.recheck.readVerb, ...guardedLaunchCalls(LAUNCH_CALL_METHOD[entry.decision.call]!)]
+    expect(verbs.slice(0, expected.length)).toEqual(expected)
     expect([verbs.filter((verb) => LAUNCH_VERBS.has(verb)).length, verbs.includes('findMissing')]).toEqual([1, false])
     // P was still latched with only its latch post when the retry was made.
     expect(watched.filter((call) => LAUNCH_VERBS.has(call.verb)).map((call) => [call.posts, call.latched])).toEqual([[1, true]])
@@ -6938,10 +6952,12 @@ describe('"not this launch\'s session": no post before its finished-row retry or
     await h.advanceToRecheck()
 
     const verbs: string[] = personaCallsFrom(h, p, from).map((call) => call.verb)
-    expect(verbs.slice(0, 3)).toEqual(['status', 'get', LAUNCH_CALL_METHOD[entry.call]!])
+    const expected = ['status', 'get', ...guardedLaunchCalls(LAUNCH_CALL_METHOD[entry.call]!)]
+    expect(verbs.slice(0, expected.length)).toEqual(expected)
     expect([verbs.filter((verb) => LAUNCH_VERBS.has(verb)).length, verbs.includes('findMissing')]).toEqual([1, false])
     expect(watched.filter((call) => call.verb === 'get' || LAUNCH_VERBS.has(call.verb)).map((call) => [call.verb, call.posts, call.latched])).toEqual([
       ['get', 1, true],
+      ...(entry.call === RECHECK_CALL_RESUME ? [['get', 1, true]] : []),
       [LAUNCH_CALL_METHOD[entry.call]!, 1, true],
     ])
     expect(answer.reason).toEqual(LATCH_RECOVERY_REASON_RELAUNCH_NOT_REFUSED)
@@ -6956,7 +6972,7 @@ describe('"not this launch\'s session": no post before its finished-row retry or
     const leftover = missing.answers!.relatches.find((relatch) => relatch.latchCase === LATCH_CASE_LEFTOVER)!
     const { h, p, model, record } = latchForRecheck(statusOnlyRow(), { state: LIVENESS_DEAD_ROW_MISSING, resumes: [leftover.answer()] })
     let round = await recheckRound(h, p)
-    expect(round.verbs).toEqual(['status', 'get', 'resume'])
+    expect(round.verbs).toEqual(['status', 'get', 'get', 'resume'])
     const relatched = h.latch.record(p)!
     expect(relatched.latchCase).toBe(LATCH_CASE_LEFTOVER)
     expect(h.episodeNotices.map((notice) => notice.text).filter((text) => text.startsWith(CONFLICT_RECOVERY_HEAD) || text.startsWith(HOLD_RECOVERY_HEAD))).toEqual([])
@@ -6964,7 +6980,7 @@ describe('"not this launch\'s session": no post before its finished-row retry or
     // The resume latch on a row read missing: the next round retries the resume, which is not refused.
     model.setState(LIVENESS_DEAD_ROW_MISSING)
     round = await recheckRound(h, p)
-    expect(round.verbs.slice(0, 2)).toEqual(['status', 'resume'])
+    expect(round.verbs.slice(0, 3)).toEqual(['status', 'get', 'resume'])
     expect(h.episodeNotices.slice(2)).toEqual([recoveryPost(p, relatched, LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED)])
     expect(record.latchCase).toBe(LATCH_CASE_NOT_THIS_LAUNCH)
     await stopApprover(h, p)
@@ -7004,12 +7020,13 @@ describe('a probe that finds the condition cleared: one bypassing find-missing, 
     const retry = expectedClearedProbeRetry(record.refusedOperation, entry.reading, false)
     const verbs: string[] = personaCallsFrom(h, p, from).map((call) => call.verb)
     const first = retry === RECHECK_CALL_RESTART_DECISION ? 'status' : LAUNCH_CALL_METHOD[retry]!
-    expect(verbs.slice(0, 4)).toEqual([row.recheck.readVerb, 'readPane', 'findMissing', first])
+    const expected = [row.recheck.readVerb, 'readPane', 'findMissing', ...guardedLaunchCalls(first)]
+    expect(verbs.slice(0, expected.length)).toEqual(expected)
     // The find-missing and the retry are made with P still latched and only its latch post.
-    expect(watched.slice(2, 4).map((call) => [call.verb, call.posts, call.latched])).toEqual([
-      ['findMissing', 1, true],
-      [first, 1, true],
-    ])
+    const guardedRetry = ['findMissing', ...guardedLaunchCalls(first)]
+    expect(watched.slice(2, 2 + guardedRetry.length).map((call) => [call.verb, call.posts, call.latched])).toEqual(
+      guardedRetry.map(verb => [verb, 1, true]),
+    )
     if (retry !== RECHECK_CALL_RESTART_DECISION) {
       expect([verbs.filter((verb) => verb === 'findMissing').length, verbs.filter((verb) => LAUNCH_VERBS.has(verb)).length]).toEqual([1, 1])
     }
@@ -7066,7 +7083,7 @@ describe('the cleared probe\'s find-missing and single retry: a refused run hold
     const { h, p, record } = latchForRecheck(ownIdResumeRow(), { state: LIVENESS_DEAD_ROW_ENDED, readPane: [RECHECK_GONE_ANSWER.answer()] })
     const watched = watchCalls(h, p)
     const round = await recheckRound(h, p)
-    expect(round.verbs.slice(0, 4)).toEqual(['status', 'readPane', 'findMissing', 'resume'])
+    expect(round.verbs.slice(0, 5)).toEqual(['status', 'readPane', 'findMissing', 'get', 'resume'])
     expect(watched.find((call) => call.verb === 'findMissing')?.latched).toBe(true)
     expect(h.episodeNotices.slice(1)).toEqual([recoveryPost(p, record, LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED)])
     await stopApprover(h, p)
@@ -7076,7 +7093,7 @@ describe('the cleared probe\'s find-missing and single retry: a refused run hold
     const { h, p, record } = latchForRecheck(ownIdResumeRow(), { state: LIVENESS_DEAD_ROW_ENDED, readPane: [RECHECK_GONE_ANSWER.answer()] })
     failFindMissing(h, errSpawnNotFound())
     const round = await recheckRound(h, p)
-    expect(round.verbs.slice(0, 4)).toEqual(['status', 'readPane', 'findMissing', 'resume'])
+    expect(round.verbs.slice(0, 5)).toEqual(['status', 'readPane', 'findMissing', 'get', 'resume'])
     expect(h.episodeNotices.slice(1)).toEqual([recoveryPost(p, record, LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED)])
     await stopApprover(h, p)
   })
@@ -7104,14 +7121,14 @@ describe('the cleared probe\'s find-missing and single retry: a refused run hold
     const { h, p, model, record } = run
     refuse(model, row.build())
     let round = await recheckRound(h, p)
-    expect(round.verbs).toEqual(['status', 'readPane', 'findMissing', verb])
+    expect(round.verbs).toEqual(['status', 'readPane', 'findMissing', ...guardedLaunchCalls(verb)])
     expect(h.latch.record(p)).toEqual({ ...record, probeDropped: true })
     expect(h.episodeNotices).toHaveLength(1)
     expect(h.errors.filter((line) => line === latchRecheckProbeDroppedLine(personaRefOf(h, p)))).toHaveLength(1)
     // The probe dropped: the latched operation itself, no read-pane and no find-missing; refused again, still no post.
     refuse(model, row.build())
     round = await recheckRound(h, p)
-    expect(round.verbs).toEqual(['status', verb])
+    expect(round.verbs).toEqual(['status', ...guardedLaunchCalls(verb)])
     expect(h.episodeNotices).toHaveLength(1)
     model.setState(AGENT_DIRECTOR_PENDING_STATE)
     round = await recheckRound(h, p)
@@ -7119,7 +7136,8 @@ describe('the cleared probe\'s find-missing and single retry: a refused run hold
     // Ended again: retried, not refused, it clears with one post.
     model.setState(LIVENESS_DEAD_ROW_ENDED)
     round = await recheckRound(h, p)
-    expect(round.verbs.slice(0, 2)).toEqual(['status', verb])
+    const expected = ['status', ...guardedLaunchCalls(verb)]
+    expect(round.verbs.slice(0, expected.length)).toEqual(expected)
     expect(h.episodeNotices.slice(1)).toEqual([recoveryPost(p, record, LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED)])
     await stopApprover(h, p)
   })
@@ -7167,7 +7185,8 @@ describe('the cleared probe\'s find-missing and single retry: a refused run hold
     }
     model.setState(LIVENESS_DEAD_ROW_ENDED)
     const round = await recheckRound(h, p)
-    expect(round.verbs.slice(0, 4)).toEqual(['status', 'readPane', 'findMissing', verb])
+    const expected = ['status', 'readPane', 'findMissing', ...guardedLaunchCalls(verb)]
+    expect(round.verbs.slice(0, expected.length)).toEqual(expected)
     expect(round.verbs.filter((v) => v === 'findMissing' || LAUNCH_VERBS.has(v))).toEqual(['findMissing', verb])
     expect(h.episodeNotices.slice(1)).toEqual([recoveryPost(p, record, LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED)])
     await stopApprover(h, p)
@@ -7223,7 +7242,7 @@ describe('bug b.xkd: at the restart cap a round still reads, so the latch can st
     forgetFailures(p)
     round = await recheckRound(h, p)
 
-    expect(round.verbs.slice(0, 4)).toEqual(['status', 'readPane', 'findMissing', 'resume'])
+    expect(round.verbs.slice(0, 5)).toEqual(['status', 'readPane', 'findMissing', 'get', 'resume'])
     expect(recheckAtCapLinesOf(h, p)).toHaveLength(1)
     expect(h.episodeNotices.slice(1)).toEqual([recoveryPost(p, record, LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED)])
     expectClearedState(h, p)
@@ -7433,7 +7452,6 @@ describe('the after-clear job runs in P\'s serializer turn right after the round
     initHealthCheck({
       isSessionAlive: _buildIsSessionAliveAdapter(() => h.config),
       isSessionConnected: () => false,
-      hasSessionStream: () => false,
       isRestartPendingOrActive,
       isLaunchInFlight,
       isLatched: (key) => h.latch.isLatched(key),

@@ -32,7 +32,7 @@
 # naming the directory wins. The selection reads no environment variable, so
 # it holds whatever environment tmux or agent-director gives the worker. A
 # directory with no selection, or a stub with no such file beside it (Test 4,
-# Test 10, Test 12, Test 29), runs `dev-channels`. The modes:
+# Test 10, Test 12, Test 29), runs `at-once`. The modes:
 #
 #   dev-channels         print the dev-channels warning dialog, byte-identical
 #                        to tests/fixtures/dev-channels-pane-2.1.120.txt, which
@@ -60,9 +60,10 @@
 #                        directory is trusted when
 #                        `projects[<dir>].hasTrustDialogAccepted` is `true` for
 #                        its real path or for $PWD.
+#   startup-trust        always show the supported trust prompt; Enter reports in.
 #   transcript-on-first-message
 #                        (a harness addition)
-#                        as `dev-channels` (the same dialog, reporting in on
+#                        as `startup-trust` (the same dialog, reporting in on
 #                        the first line that reaches stdin), except that
 #                        reporting in writes no transcript: until the first
 #                        message, every SessionStart (the report-in's and the
@@ -348,6 +349,7 @@ MODE_AT_ONCE=at-once
 MODE_SILENT=silent
 MODE_UNRECOGNISED=unrecognised-dialog
 MODE_FOLDER_TRUST=folder-trust
+MODE_STARTUP_TRUST=startup-trust
 # A harness addition.
 MODE_TRANSCRIPT_ON_FIRST_MESSAGE=transcript-on-first-message
 MODE_LINGER_ON_EXIT=linger-on-exit
@@ -369,20 +371,20 @@ printf -v launch_args_line '%q ' "$@"
 { /usr/bin/flock -x 9 && printf '%s\n' "${launch_args_line% }" >&9; } 9>> "${STUB_LAUNCH_ARGS_FILE}" 2> /dev/null \
     || printf 'stub-claude[%s]: could not record the launch arguments in %s\n' "$$" "${STUB_LAUNCH_ARGS_FILE}" >&2
 
-MODE="${MODE_DEV_CHANNELS}"
+MODE="${MODE_AT_ONCE}"
 if [[ -f "${STUB_MODES_FILE}" ]]; then
     while IFS=$'\t' read -r sel_mode sel_dir; do
         [[ "${sel_dir}" == "${REALCWD}" ]] && MODE="${sel_mode}"
     done < "${STUB_MODES_FILE}"
 fi
 case "${MODE}" in
-    "${MODE_DEV_CHANNELS}" | "${MODE_AT_ONCE}" | "${MODE_SILENT}" | "${MODE_UNRECOGNISED}" | "${MODE_FOLDER_TRUST}") ;;
+    "${MODE_DEV_CHANNELS}" | "${MODE_AT_ONCE}" | "${MODE_SILENT}" | "${MODE_UNRECOGNISED}" | "${MODE_FOLDER_TRUST}" | "${MODE_STARTUP_TRUST}") ;;
     "${MODE_TRANSCRIPT_ON_FIRST_MESSAGE}") ;;
     "${MODE_LINGER_ON_EXIT}") ;;
     *)
         printf 'stub-claude: unknown mode %q selected for %s; running %s\n' \
-            "${MODE}" "${REALCWD}" "${MODE_DEV_CHANNELS}" >&2
-        MODE="${MODE_DEV_CHANNELS}"
+            "${MODE}" "${REALCWD}" "${MODE_AT_ONCE}" >&2
+        MODE="${MODE_AT_ONCE}"
         ;;
 esac
 
@@ -792,7 +794,15 @@ close_mcp_session() {
     fi
 }
 
-trap 'close_mcp_session; rm -f "${HOOK_FILE}" "${STATUS_OUT}" "${STATUS_OUT}.err"' EXIT
+KEY_READER_PID=""
+close_key_reader() {
+    if [[ -n "${KEY_READER_PID}" ]]; then
+        kill "${KEY_READER_PID}" 2> /dev/null || true
+        wait "${KEY_READER_PID}" 2> /dev/null || true
+    fi
+}
+
+trap 'close_key_reader; close_mcp_session; rm -f "${HOOK_FILE}" "${STATUS_OUT}" "${STATUS_OUT}.err"' EXIT
 
 # ---------------------------------------------------------------------------
 # Reporting in, and the read loop
@@ -808,10 +818,49 @@ report_in() {
     REPORTED=1
     AWAITING_ENTER=0
     fire_session_start
-    echo "Listening for channel messages from: server:slack-channel-router"
+    draw_composer
     open_mcp_session
     start_refire
 }
+
+# b.omv SR-13.6: the Linux composer is visible to delivery-screen.ts. Read
+# raw keys below so literal LF belongs to the message; CR alone submits it.
+# C-u is the clear used by agent-director's pause path.
+composer=""
+draw_composer() {
+    # Keep the report-in banner visible above the box: the harness reads it
+    # after answering a startup dialog. FIFO self-check output stays plain.
+    if [[ -t 1 ]]; then
+        printf '\033[H\033[2J'
+    fi
+    printf '%s\n' 'Listening for channel messages from: server:slack-channel-router'
+    printf '%s\n' '────────────────────────────────────────────────────────────────────────'
+    printf '❯ %s\n' "${composer}"
+    printf '%s\n' '────────────────────────────────────────────────────────────────────────'
+    printf '%s\n' '  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents'
+}
+
+append_user_receipt() {
+    local text="$1" uuid timestamp
+    TRANSCRIPT_DUE=1
+    ensure_transcript
+    uuid="$(cat /proc/sys/kernel/random/uuid)"
+    timestamp="$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)"
+    jq -nc --arg text "${text}" --arg uuid "${uuid}" --arg session "${SESSION_ID}" --arg timestamp "${timestamp}" \
+        '{type:"user",isSidechain:false,origin:{kind:"human"},uuid:$uuid,timestamp:$timestamp,sessionId:$session,message:{role:"user",content:$text}}' \
+        >> "${TRANSCRIPT}"
+}
+
+# Disable terminal translations before reporting in: a prompt answer may be
+# queued as soon as SessionStart fires. Literal LF is text; tmux's Enter is CR.
+if [[ -t 0 ]]; then
+    stty -icanon -echo -icrnl -inlcr -igncr min 1 time 0
+    # Bash's character read re-enables ICRNL on a terminal. Read through a
+    # pipe instead, so CR stays Enter and a literal LF stays draft content.
+    # The forwarding child reads the original terminal and is reaped on exit.
+    exec < <(exec cat)
+    KEY_READER_PID=$!
+fi
 
 case "${MODE}" in
     "${MODE_DEV_CHANNELS}")
@@ -825,12 +874,22 @@ case "${MODE}" in
         fi
         ;;
     "${MODE_TRANSCRIPT_ON_FIRST_MESSAGE}")
-        show_dialog print_dev_channels_dialog
+        show_dialog print_trust_dialog
         AWAITING_ENTER=1
         ;;
     "${MODE_UNRECOGNISED}")
         show_dialog print_unrecognised_dialog
         AWAITING_ENTER=1
+        ;;
+    "${MODE_STARTUP_TRUST}")
+        if (( DIALOG_DELAY_S > 0 )); then
+            print_delay_screen
+            now_ms
+            DIALOG_DUE_MS=$(( NOW_MS + DIALOG_DELAY_S * 1000 ))
+        else
+            show_dialog print_trust_dialog
+            AWAITING_ENTER=1
+        fi
         ;;
     "${MODE_FOLDER_TRUST}")
         if folder_trusted; then
@@ -864,7 +923,7 @@ RELEASED=0
 linger_after_exit() {
     local rc
     trap 'RELEASED=1' USR1
-    trap 'close_mcp_session; rm -f "${HOOK_FILE}" "${STATUS_OUT}" "${STATUS_OUT}.err" "${LINGER_MARKER}"' EXIT
+    trap 'close_key_reader; close_mcp_session; rm -f "${HOOK_FILE}" "${STATUS_OUT}" "${STATUS_OUT}.err" "${LINGER_MARKER}"' EXIT
     { printf '%s\n' "${REALCWD}" > "${LINGER_MARKER}.tmp" && mv -f -- "${LINGER_MARKER}.tmp" "${LINGER_MARKER}"; } 2> /dev/null \
         || printf 'stub-claude[%s]: could not write %s\n' "$$" "${LINGER_MARKER}" >&2
     fire_session_end
@@ -879,10 +938,10 @@ linger_after_exit() {
     exit 0
 }
 
-# handle_line <line>: one line from stdin.
+# handle_line <line>: the complete submitted composer (literal LFs retained).
 handle_line() {
     local line="$1"
-    if [[ "${line}" == "${SENTINEL}" ]]; then
+    if [[ "${line}" == *"${SENTINEL}"* ]]; then
         [[ "${MODE}" == "${MODE_SILENT}" ]] || fire_session_end
         exit 0
     fi
@@ -892,10 +951,8 @@ handle_line() {
     # transcript-on-first-message: the first message after reporting in
     # writes the transcript; a slash command (a line starting with `/`, such
     # as `/exit` or `/mcp reconnect`) is no message.
-    if (( REPORTED )) && [[ "${MODE}" == "${MODE_TRANSCRIPT_ON_FIRST_MESSAGE}" \
-        && "${line}" =~ [^[:space:]] && ! "${line}" =~ ^[[:space:]]*/ ]]; then
-        TRANSCRIPT_DUE=1
-        ensure_transcript
+    if (( REPORTED )) && [[ "${line}" =~ [^[:space:]] && ! "${line}" =~ ^[[:space:]]*/ ]]; then
+        append_user_receipt "${line}"
     fi
     if (( AWAITING_ENTER )); then
         clear_answered_dialog
@@ -907,28 +964,52 @@ handle_line() {
 
 # Read loop. While the dialog delay runs, each read waits at most until the
 # dialog is due, and once it is due the dialog is shown. While the re-fire
-# runs, each read waits at most until the next tick, and a read that times
-# out runs the tick. In either wait, the part of a line read by the timeout
-# (none from a terminal, which hands over whole lines) is kept for the next
-# read.
-partial=""
+# runs, each read waits at most until the next tick. A timeout cannot discard
+# a partially typed message: each completed key is already in the composer.
+handle_key() {
+    case "$1" in
+        $'\r')
+            local submitted="${composer}"
+            composer=""
+            handle_line "${submitted}"
+            (( REPORTED )) && draw_composer
+            ;;
+        $'\025')
+            composer=""
+            (( REPORTED )) && draw_composer
+            ;;
+        $'\177'|$'\b')
+            composer="${composer%?}"
+            (( REPORTED )) && draw_composer
+            ;;
+        *)
+            composer+="$1"
+            (( REPORTED )) && draw_composer
+            ;;
+    esac
+    return 0
+}
+
 while :; do
-    line=""
+    key=""
     if (( DIALOG_DUE_MS > 0 )); then
         now_ms
         wait_ms=$(( DIALOG_DUE_MS - NOW_MS ))
         if (( wait_ms <= 0 )); then
             DIALOG_DUE_MS=0
             clear_screen
-            show_dialog print_dev_channels_dialog
+            if [[ "${MODE}" == "${MODE_STARTUP_TRUST}" ]]; then
+                show_dialog print_trust_dialog
+            else
+                show_dialog print_dev_channels_dialog
+            fi
             AWAITING_ENTER=1
             continue
         fi
         printf -v wait_s '%d.%03d' $(( wait_ms / 1000 )) $(( wait_ms % 1000 ))
-        IFS= read -r -t "${wait_s}" line
+        IFS= read -r -N 1 -t "${wait_s}" key
         rc=$?
         if (( rc > 128 )); then
-            partial+="${line}"
             continue
         fi
     elif (( REFIRE_ON )); then
@@ -941,21 +1022,18 @@ while :; do
             continue
         fi
         printf -v wait_s '%d.%03d' $(( wait_ms / 1000 )) $(( wait_ms % 1000 ))
-        IFS= read -r -t "${wait_s}" line
+        IFS= read -r -N 1 -t "${wait_s}" key
         rc=$?
         if (( rc > 128 )); then
-            partial+="${line}"
             continue
         fi
     else
-        IFS= read -r line
+        IFS= read -r -N 1 key
         rc=$?
     fi
     # stdin closed (tmux pane killed): exit.
     (( rc == 0 )) || break
-    line="${partial}${line}"
-    partial=""
-    handle_line "${line}"
+    handle_key "${key}"
 done
 
 exit 0

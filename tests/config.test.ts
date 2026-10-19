@@ -1441,12 +1441,13 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
     const MS_KEYS = TEST_TIMER_OVERRIDE_KEYS.filter((key) => key.endsWith('_ms'))
     const S_KEYS = TEST_TIMER_OVERRIDE_KEYS.filter((key) => key.endsWith('_s'))
 
-    test('the key is named, the five keys are the ticket\'s, and it is not a documented top-level key', () => {
+    test('the key is named, the six keys include the delivery-stuck timer, and it is not a documented top-level key', () => {
       expect(TEST_TIMER_OVERRIDES_KEY).toBe('test_timer_overrides')
       expect([...TEST_TIMER_OVERRIDE_KEYS]).toEqual([
         'latch_recheck_interval_ms',
         'ad_version_recheck_interval_ms',
         'dialog_ready_timeout_ms',
+        'delivery_stuck_after_ms',
         'unavailable_retry_base_s',
         'unavailable_retry_ceiling_s',
       ])
@@ -1467,11 +1468,12 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
       }
     })
 
-    test('all five keys together load as given (the test-26 refused-leg set)', () => {
+    test('all six keys together load as given (b.omv SR-14.1)', () => {
       const block = {
         latch_recheck_interval_ms: 45_000,
         ad_version_recheck_interval_ms: 20_000,
         dialog_ready_timeout_ms: 120_000,
+        delivery_stuck_after_ms: 7_000,
         unavailable_retry_base_s: 5,
         unavailable_retry_ceiling_s: 60,
       }

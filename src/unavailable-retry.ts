@@ -52,7 +52,7 @@
  *   timer, unless its last row read was `pending` or a `kill-failed` cause is
  *   recorded (b.jg5 SRJ-306); then it is kept with its due time and one kept
  *   line says why. A `reading` the end brings (a health tick or a retry that
- *   found the row live out of `pending`, connected with its stream, or
+ *   found the row live out of `pending`, connected, or
  *   `pending` from a successful launch call) becomes the last row read
  *   first, so a stale `pending` read does not keep the timer and a launch's
  *   fresh `pending` row does. While the persona's retry is running, the end and its reading are
@@ -226,9 +226,9 @@
  * In full mode the restart module's retry entry then reruns the restart
  * path's decision, with the "blocks a retry" check (`isInFlight`) as its
  * first step, and
- * its outcome decides: a persona already connected with its stream, or
+ * its outcome decides: a persona already connected, or
  * reconnected, has nothing left to recover (stop; a persona already
- * connected with its stream, whose row read `live`, also ends its
+ * connected, whose row read `live`, also ends its
  * `tmux-unresponsive` condition through the optional end hook,
  * `FullModeRetryDeps.endTmuxUnresponsive`, b.jg5 SRJ-310); capped, not up, a declined
  * launch or shutting down stop too; a launch in flight, a refused launch, a
@@ -707,7 +707,7 @@ export type UnavailableRetryPendingStep =
 // Stop reasons (b.jg5 SRJ-305)
 // ---------------------------------------------------------------------------
 
-/** A retry found the persona connected with its stream, or its reconnect succeeded. */
+/** A retry found the persona connected, or its reconnect succeeded. */
 export const UNAVAILABLE_RETRY_STOP_RECOVERED = 'nothing left to recover'
 
 /** The persona is at the restart cap, reached through counted launch failures. */
@@ -1835,18 +1835,13 @@ export interface FullModeRetryDeps {
    * `endTmuxUnresponsive`. Absent: not connected (nothing is ended there).
    */
   isSessionConnected?: (key: string) => boolean
-  /**
-   * Whether the persona's session has its message stream (production:
-   * `hasSessionStream`). Read as `isSessionConnected` is. Absent: no stream.
-   */
-  hasSessionStream?: (key: string) => boolean
+
   /**
    * End the persona's `tmux-unresponsive` condition (b.jg5 SRJ-310 rule 2,
    * retry half), with the live reading the retry found: called when a
-   * full-mode retry finds the persona already connected with its stream on a
+   * full-mode retry finds the persona already connected on a
    * `live` reading (`LIVENESS_LIVE`), and when a pending-only retry reads the
-   * row live out of `pending` (its state) with the session connected with its
-   * stream. Production binds the condition's end (reason `retry`) and the
+   * row live out of `pending` (its state) with the session connected. Production binds the condition's end (reason `retry`) and the
    * clear of the persona's `tmux-unavailable` outage with the same reading
    * (b.jg5 SRJ-311, SRJ-312). Absent: nothing is called. A throw is
    * swallowed and changes nothing about the retry's answer.
@@ -1971,7 +1966,7 @@ async function retryActionRun(
     // start latches at that read, so it never reaches `pendingOnlyAnswer`;
     // a row under an unconfigured key latches nothing and still does.
     if (latched(key, deps.isLatched)) return stopWith(UNAVAILABLE_RETRY_STOP_LATCHED)
-    if (isLiveOutOfPending(row.state) && probe(key, deps.isSessionConnected) && probe(key, deps.hasSessionStream)) {
+    if (isLiveOutOfPending(row.state) && probe(key, deps.isSessionConnected)) {
       endCondition(key, row.state, deps.endTmuxUnresponsive)
     }
     const restart = (): Promise<unknown> => deps.retry(key, cwd, deps.isInFlight, deps.retryBlockCause)
@@ -1988,7 +1983,7 @@ async function retryActionRun(
   }
   const outcome = await deps.retry(key, cwd, deps.isInFlight, deps.retryBlockCause)
   // b.jg5 SRJ-303, SRJ-310: `already-connected` is answered only for a `live`
-  // reading (never `pending`) whose session is connected with its stream.
+  // reading (never `pending`) whose session is connected.
   if (outcome === 'already-connected') endCondition(key, LIVENESS_LIVE, deps.endTmuxUnresponsive)
   return answerFor(outcome, () => readRetryBlockCause(key, deps.retryBlockCause))
 }

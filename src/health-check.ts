@@ -81,15 +81,10 @@ export interface HealthCheckDeps {
    * passes to `initHealthCheck` (registry entry with `connected === true`).
    */
   isSessionConnected(key: string): boolean
-  /**
-   * Returns true when the persona's session has its standalone GET SSE stream
-   * (`_GET_stream`) present in the transport. A session can be
-   * `isSessionConnected === true` while the SDK has silently dropped the stream
-   * map entry (b.9cj); such a connected-but-streamless row cannot receive
-   * messages and must be routed to recovery, so the tick treats it exactly like
-   * the alive-but-disconnected case. Returns false when there is no session.
-   */
-  hasSessionStream(key: string): boolean
+
+  /** b.omv SR-7.6: inspect even connected rows; true defers ordinary health recovery. */
+  inspectUpgrade?(key: string): Promise<boolean>
+  isReconnectDeferred?(key: string): boolean
   isRestartPendingOrActive(key: string): boolean
   /**
    * True while anything is in flight for the persona (b.f2b, b.jg5 SRJ-315;
@@ -111,7 +106,7 @@ export interface HealthCheckDeps {
    * b.jg5 SRJ-315, SRJ-502: true while the persona is latched (production:
    * the server's latch's `isLatched`). A no-attempt reason, checked first:
    * the tick still runs the working-directory check and reads the persona's
-   * liveness, connection and stream, and a healthy one takes the healthy
+   * liveness, connection and a healthy one takes the healthy
    * branch, but for any other reading it never calls `scheduleRestart`,
    * `notifyNotConnected` or `armRetryTimer` for it. Only an answer of exactly
    * `true` is latched; a throw ends the persona's work for the tick (logged),
@@ -122,9 +117,9 @@ export interface HealthCheckDeps {
    * b.jg5 SRJ-315, SRJ-207: true while the persona is held on
    * `ErrInvalidFlags` (production: the server's hold's `isHeld`). A
    * no-attempt reason, checked right after `isLatched`: the tick still runs
-   * the working-directory check and reads the persona's liveness, connection
-   * and stream, and a healthy one takes the healthy branch, but for any other
-   * reading (`dead`, `pending`, disconnected or streamless) it never calls
+   * the working-directory check and reads the persona's liveness and connection,
+   * and a healthy one takes the healthy branch, but for any other
+   * reading (`dead`, `pending`, disconnected) it never calls
    * `scheduleRestart`, `notifyNotConnected` or `armRetryTimer` for it. Only an
    * answer of exactly `true` is held; a throw ends the persona's work for the
    * tick (logged), before any read. Absent: no persona is held.
@@ -162,12 +157,11 @@ export interface HealthCheckDeps {
   /**
    * b.f2b: raise the persona's not-connected notice (production:
    * `notifyDisconnectedWithAutoRestartDisabled`, once per episode), worded
-   * for `cause`: its MCP session is not connected (`disconnected`), or it is
-   * connected but has no message stream (`streamless`, b.9cj). The episode
+   * for `cause`: its MCP session is not connected (`disconnected`). The episode
    * ends when its MCP session registers again, when the tick finds it
    * deliverable again (`endNotConnectedEpisode`) or when it is torn down.
    */
-  notifyNotConnected?(key: string, cause: 'disconnected' | 'streamless'): void
+  notifyNotConnected?(key: string, cause: 'disconnected'): void
   /**
    * b.f2b: end the persona's not-connected episode (production:
    * `forgetNotConnectedEpisode`), called on every tick that finds it alive,
@@ -189,9 +183,9 @@ export interface HealthCheckDeps {
    * b.jg5 SRJ-310 rule 2 (tick half): end the persona's `tmux-unresponsive`
    * condition (production: the condition's end, reason `tick`, with the
    * tick's `live` reading), called on every tick that finds it `live`
-   * (never `pending`), connected and with its stream. A condition that does
+   * (never `pending`), connected. A condition that does
    * not hold is left alone by the callee. A `pending`, `unknown` or `dead`
-   * reading, and a disconnected or streamless session, never call it.
+   * reading, and a disconnected session, never call it.
    * Absent: nothing is called.
    */
   endTmuxUnresponsive?(key: string): void
@@ -577,6 +571,11 @@ async function runHealthCheckTick(): Promise<void> {
           console.error(`[slack] health-check: liveness unknown for persona=${key}${failure} — skipping it this tick; not read as dead`)
           continue
         }
+        // b.omv SR-7.6: an old connected bot still needs provenance inspection.
+        if (!holdOff && reading !== LIVENESS_DEAD && await deps.inspectUpgrade?.(key)) {
+          disconnectedStreak.delete(key)
+          continue
+        }
         // `live` and `pending` take the alive branches below; only `live`
         // is ever counted healthy (b.jg5 SRJ-314).
         const alive = reading !== LIVENESS_DEAD
@@ -598,10 +597,10 @@ async function runHealthCheckTick(): Promise<void> {
         // paths so they don't race on the same persona.
         // (Read once: b.f2b words the delay-0 notice by it.)
         const connected = alive && deps.isSessionConnected(key)
-        const deliverable = connected && deps.hasSessionStream(key)
+        const deliverable = connected
         if (holdOff && (!alive || !deliverable || pending)) {
           // b.jg5 SRJ-315: a no-attempt reason holds and the persona is not
-          // healthy (`dead`, `pending`, disconnected or streamless): no
+          // healthy (`dead`, `pending`, disconnected): no
           // `scheduleRestart`, and no not-connected notice, which only
           // accompanies an attempt. Drop the streak, as every skip does, so
           // a later attempt starts a fresh two-tick count. With
@@ -616,25 +615,8 @@ async function runHealthCheckTick(): Promise<void> {
           disconnectedStreak.delete(key)
           deps.scheduleRestart(key, cwd)
         } else if (!deliverable || pending) {
-          // Alive but not deliverable: either MCP-disconnected (b.9a7) OR
-          // connected-but-streamless — the SDK silently dropped the
-          // `_GET_stream` map entry so messages cannot reach the bot (b.9cj).
-          //
-          // b.jg5 SRJ-314: a `pending` row is never counted healthy, so one
-          // connected with its stream lands here too: its session has not
-          // started. It takes the same streak, then `scheduleRestart`,
-          // whose run hands it to the `pending` deferral (never relaunched,
-          // never scheduled as dead), and it never ends the not-connected
-          // episode.
-          // Both land here and share the SAME two-consecutive-tick guard:
-          // HAZARD 1 — a session between registerSession and its stream
-          // re-opening is legitimately streamless for a moment and must not be
-          // poked mid-boot. Require two CONSECUTIVE ticks before acting (see
-          // disconnectedStreak doc comment). scheduleRestart then does the
-          // right thing per case — reconnect a disconnected row, or recover a
-          // streamless one (restartWorkSteps' connected-and-stream check in
-          // restart.ts no longer waves the latter through).
-          //
+          // b.omv SR-9: disconnected and pending rows share the existing
+          // two-consecutive-tick debounce. A pending row is never healthy.
           // b.f2b: a reconnect deferred on a `working` row returns
           // 'transient', and restart.ts never re-enters on it; this tick is
           // the retry driver. While the adapter holds an idle run for the
@@ -648,17 +630,15 @@ async function runHealthCheckTick(): Promise<void> {
             // b.f2b: with auto-restart disabled scheduleRestart only logs and
             // returns, so nothing would reconnect this persona: report it
             // (the notice is raised once per episode), worded for why it is
-            // undeliverable. A `pending` row connected with its stream gets
-            // no notice: it is neither disconnected nor streamless, so
-            // either wording would be false.
-            if (!deliverable && deps.isAutoRestartDisabled?.() === true) {
-              deps.notifyNotConnected?.(key, connected ? 'streamless' : 'disconnected')
+            // disconnected. A connected pending row gets no notice.
+            if (!deliverable && deps.isAutoRestartDisabled?.() === true && !deps.isReconnectDeferred?.(key)) {
+              deps.notifyNotConnected?.(key, 'disconnected')
             }
           } else {
             disconnectedStreak.set(key, streak)
           }
         } else {
-          // `live`, connected, AND stream present — healthy. Reset any pending
+          // `live` and connected — healthy (b.omv SR-9). Reset any pending
           // streak so a transient one-tick blip never accumulates toward the
           // threshold. b.f2b: its not-connected episode, if any, is over.
           // b.jg5 SRJ-310: so is its tmux-unresponsive condition, if it holds.
@@ -666,8 +646,7 @@ async function runHealthCheckTick(): Promise<void> {
           // observation that clears `tmux-unavailable` (with its single
           // all-clear when that empties the persona's flags), carrying the
           // tick's `live` reading so the retry timer's stop sees a row live
-          // out of `pending`. No other reading, and no disconnected or
-          // streamless session, clears it.
+          // out of `pending`. No other reading or disconnected session clears it.
           disconnectedStreak.delete(key)
           deps.endNotConnectedEpisode?.(key)
           deps.endTmuxUnresponsive?.(key)

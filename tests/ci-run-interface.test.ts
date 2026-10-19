@@ -363,9 +363,9 @@ describe('module properties (b.uqm SR-1.3)', () => {
     expect(listenerCounts()).toEqual(before)
   })
 
-  test('the runtime loads are only node: built-ins, bun and bun:ffi, and nothing from src/ or ci-live/', () => {
+  test('runtime loads use built-ins and the import-safe Codex policy, with no production modules', () => {
     const specifiers = runtimeSpecifiers(stripComments(runnerSource()))
-    const allowed = (specifier: string): boolean => specifier.startsWith('node:') || specifier === 'bun' || specifier === 'bun:ffi'
+    const allowed = (specifier: string): boolean => specifier.startsWith('node:') || specifier === 'bun' || specifier === 'bun:ffi' || specifier === './codex-login.ts' || specifier === './safe-docker-inspect.ts'
 
     expect(specifiers.length).toBeGreaterThan(0)
     expect(specifiers.filter((specifier) => !allowed(specifier))).toEqual([])
@@ -1528,6 +1528,17 @@ describe('E2: validation stages 2–8 (b.uqm SR-2.3, SR-2.6, SR-3.1, SR-3.2, SR-
       expect(namesOf(validated(wt, [numberForm(0)]).runScripts)).toEqual(files(1, 0))
     })
 
+    test('heavy real-agent scripts outside tests/integration never enter an ordinary CI assignment', () => {
+      const wt = worktree()
+      const heavy = join(wt, 'tests', 'real-agent')
+      mkdirSync(heavy, { recursive: true })
+      for (const name of ['test-101-fmk-real-busy.sh', 'test-111-fmk-real-ai-ac11.sh'])
+        writeFileSync(join(heavy, name), minimalScriptText(name))
+      const run = validated(wt)
+      expect(namesOf(run.scripts)).toEqual(realScriptFileNames())
+      expect(namesOf(run.runScripts)).toEqual(realScriptFileNames())
+    })
+
     test.each(['test-5.sh', 'test-05-x.sh', 'test-x-y.sh'])('%s breaks the naming rule: the run is refused naming it', async (name) => {
       const { refusal } = await refused(worktree({ extraScripts: [name] }))
 
@@ -1827,7 +1838,7 @@ describe('E2: validation stages 2–8 (b.uqm SR-2.3, SR-2.6, SR-3.1, SR-3.2, SR-
       expect({ requested: run.requestedShards, units: run.units.length, effective: run.effectiveShards }).toEqual(expected())
     })
 
-    test('the current tree, copied from the repository, passes every stage: 30 scripts, 28 units, test-2 and test-3 in one unit', () => {
+    test('the current tree, copied from the repository, passes every stage with every script and test-2 and test-3 in one unit', () => {
       const source = join(REPO_ROOT, INTEGRATION_DIR_PATH)
       const entries = readdirSync(source, { withFileTypes: true }).filter((entry) => matchesScriptGlob(entry.name))
       expect(entries.filter((entry) => !entry.isFile()).map((entry) => entry.name)).toEqual([])
@@ -1837,8 +1848,9 @@ describe('E2: validation stages 2–8 (b.uqm SR-2.3, SR-2.6, SR-3.1, SR-3.2, SR-
 
       const run = validated(join(copy, '..', '..'))
 
-      expect(run.scripts.length).toBe(30)
-      expect(run.units.length).toBe(28)
+      expect(run.scripts.map(script => script.fileName).sort()).toEqual(entries.map(entry => entry.name).sort())
+      // test-1 is a shard prelude; test-2 and test-3 share the one non-singleton unit below.
+      expect(run.units.length).toBe(entries.length - 2)
       expect(unitsOf(run).filter((unit) => unit.length > 1)).toEqual([files(2, 3)])
       expect(run.prerequisites.get(scriptFile(3))).toEqual(files(2))
     })
@@ -1995,7 +2007,7 @@ describe('E2: validation stages 2–8 (b.uqm SR-2.3, SR-2.6, SR-3.1, SR-3.2, SR-
     })
 
     test('a run that passes every stage, GH_TOKEN unset, spawns no gh auth token lookup and no other child during validation', async () => {
-      const wt = worktree()
+      const wt = worktree({ scripts: realScriptFileNames().filter(file => !file.includes('-fmk-real-codex')) })
       const env: ChildEnvironmentSource = { ANTHROPIC_API_KEY: gatewayKey(), ANTHROPIC_BASE_URL: GATEWAY_URL }
       expect(validated(wt, [], env).effectiveShards).toBe(MAX_SHARDS)
       const rig = mainRig(wt, env)
@@ -2185,4 +2197,16 @@ describe('E2: validation stages 2–8 (b.uqm SR-2.3, SR-2.6, SR-3.1, SR-3.2, SR-
       },
     )
   })
+})
+
+// b.omv SR-14.7: the selected model is public routing data, never a scan value.
+import { SHARD_ENV_NAMES, NON_SECRET_VARIABLES, scannedSecretValues } from '../scripts/ci-run.ts'
+test('E7: Codex model has one plain shard variable and cannot enter the secret set', () => {
+  const env = { CODEX_TEST_MODEL: 'test/model:1', ANTHROPIC_API_KEY: fakeToken('', 'model-control') }
+  expect(SHARD_ENV_NAMES.filter(name => name === 'CODEX_TEST_MODEL')).toHaveLength(1)
+  expect(NON_SECRET_VARIABLES).toContain('CODEX_TEST_MODEL')
+  expect(scannedSecretValues(env).includes(env.CODEX_TEST_MODEL)).toBe(false)
+  expect(secretCredentialSet(env).has(env.CODEX_TEST_MODEL)).toBe(false)
+  expect(scannedSecretValues(env).includes(env.ANTHROPIC_API_KEY)).toBe(true)
+  assertNoLeak({ variables: SHARD_ENV_NAMES, model: env.CODEX_TEST_MODEL })
 })

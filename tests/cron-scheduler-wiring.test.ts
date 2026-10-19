@@ -147,3 +147,12 @@ describe('main() runs on the crontable the loader resolved', () => {
     }
   })
 })
+
+test('production cron intake binds the shared durable accept function with no HTTP port, hostname or deadline dependency', () => {
+  const props = new Map(objectProperties(onlyCallArguments(SERVER_CODE, 'createCronDispatcher')))
+  expect([...props.keys()].sort()).toEqual(['accept', 'cronLog', 'cronTablePath', 'resolveTarget'].sort())
+  expect(props.get('accept')).toMatch(/^\(key, input\)\s*=>\s*deliveryPreparation!\.accept\(key, input\)$/)
+  const dispatcher = srcModules().get('cron-dispatch.ts')!
+  expect(dispatcher).toBeDefined()
+  expect(indicesOf(/\bfetch\s*\(|\bhttps?\s*\.\s*request\s*\(/g, dispatcher)).toEqual([])
+})

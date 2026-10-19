@@ -1116,7 +1116,8 @@
 #   row whose pane it has not adopted, and the approver's send-keys adopts it;
 # - no helper sets base-index: no agent-director verb depends on pane indices.
 #
-# Exit hooks: `on_exit <function>` registers extra cleanup (removing files
+# Exit hooks receive the current scenario exit status as their first argument.
+# `on_exit <function>` registers extra cleanup (removing files
 # outside SCENARIO_ROOT, for example). The trap runs the hooks in registration
 # order, each in a subshell, after every server and tracked process is
 # stopped (and, in fmk mode, the scenario's tmux server: a kill-server on
@@ -1212,8 +1213,10 @@ STUB_MODE_AT_ONCE=at-once
 STUB_MODE_SILENT=silent
 STUB_MODE_UNRECOGNISED=unrecognised-dialog
 STUB_MODE_FOLDER_TRUST=folder-trust
+# b.omv SR-13.6: forced supported trust dialog, independent of pre-trust.
+STUB_MODE_STARTUP_TRUST=startup-trust
 SCENARIO_STUB_MODES=("${STUB_MODE_DEV_CHANNELS}" "${STUB_MODE_AT_ONCE}" "${STUB_MODE_SILENT}"
-    "${STUB_MODE_UNRECOGNISED}" "${STUB_MODE_FOLDER_TRUST}")
+    "${STUB_MODE_UNRECOGNISED}" "${STUB_MODE_FOLDER_TRUST}" "${STUB_MODE_STARTUP_TRUST}")
 # Harness additions: the stub mode that writes
 # its transcript only at the first message after reporting in, and the
 # stub's exit sentinel line (fixtures/stub-claude.sh SENTINEL), which a
@@ -1244,6 +1247,14 @@ SCENARIO_MCP_SERVER_NAME=slack-channel-router
 
 # The closing assertions every fmk script ends with.
 SCENARIO_CLOSING_ASSERTIONS=(assert_no_server_tmux assert_no_cscb_include_finished assert_no_cscb_delete)
+# D1 drives the delivery modules without a CSCB server. Only these exact
+# entrypoints use its independent positive controls; all others keep the
+# server-backed assertions above.
+case "${TEST_NAME}" in
+    test-41-fmk-real-codex | test-111-fmk-real-codex-ai-ac11 | test-112-fmk-real-codex-ai-ac12 | test-115-fmk-real-codex-ai-ac15 | test-120-fmk-real-codex-ai-ac20 | test-206-fmk-real-codex-ai-ac106)
+        SCENARIO_CLOSING_ASSERTIONS=(assert_codex_d1_safety)
+        ;;
+esac
 
 # agent-director's default stopping window, in seconds (DefaultStoppingWindowSeconds
 # in its internal/config/tmux.go), used when the scenario HOME's config.toml
@@ -1267,6 +1278,9 @@ _SCENARIO_STATE_DIRS=()   # every state dir a `start` ran in
 _SCENARIO_SERVER_PIDS=()  # daemon PIDs a start reported and no stop_server saw gone
 _SCENARIO_TRACKED_PIDS=() # background processes registered with track_pid
 _SCENARIO_EXIT_HOOKS=()   # functions registered with on_exit
+_SCENARIO_BEFORE_CLEANUP_HOOKS=() # observations while native panes still exist
+_SCENARIO_FAILURE_HOOKS=() # retention after the final exit status is known
+_SCENARIO_BEFORE_START_HOOKS=() # read-only evidence observers registered by real scenarios
 _SCENARIO_LIVE=0          # 1 once a start ran with --live
 _SCENARIO_STATE_COUNT=0
 _SCENARIO_START_COUNT=0
@@ -1382,6 +1396,23 @@ stop_tracked_pid() {
 on_exit() {
     declare -F -- "${1:-}" > /dev/null || fail "on_exit: '${1:-}' is not a function"
     _SCENARIO_EXIT_HOOKS+=("$1")
+}
+# Read-only observations before native processes are stopped. These cannot
+# change the scenario verdict; their failures are diagnostic only.
+on_before_cleanup() {
+    declare -F -- "${1:-}" > /dev/null || fail "on_before_cleanup: not a function"
+    _SCENARIO_BEFORE_CLEANUP_HOOKS+=("$1")
+}
+# Failure retention after closing assertions and exit hooks, before scratch
+# deletion. Receives the final status, including failures found during cleanup.
+on_failure() {
+    declare -F -- "${1:-}" > /dev/null || fail "on_failure: not a function"
+    _SCENARIO_FAILURE_HOOKS+=("$1")
+}
+
+on_before_start() {
+    declare -F -- "${1:-}" > /dev/null || fail "on_before_start: '${1:-}' is not a function"
+    _SCENARIO_BEFORE_START_HOOKS+=("$1")
 }
 
 # ---------------------------------------------------------------------------
@@ -1505,6 +1536,9 @@ _scenario_cleanup() {
     local rc=$? dir pid hook hook_rc
     set +e
     trap - EXIT
+    for hook in ${_SCENARIO_BEFORE_CLEANUP_HOOKS[@]+"${_SCENARIO_BEFORE_CLEANUP_HOOKS[@]}"}; do
+        ( "${hook}" )
+    done
     if [[ "${SCENARIO_FMK}" == 1 ]]; then
         # The stops below run in `log` mode, whatever mode the script left.
         _scenario_tmux_shim_reset
@@ -1537,7 +1571,7 @@ _scenario_cleanup() {
         rc=1
     fi
     for hook in ${_SCENARIO_EXIT_HOOKS[@]+"${_SCENARIO_EXIT_HOOKS[@]}"}; do
-        ( "${hook}" )
+        ( "${hook}" "${rc}" )
         hook_rc=$?
         if [[ "${hook_rc}" -ne 0 ]]; then
             if [[ "${rc}" -eq 0 ]]; then
@@ -1549,6 +1583,9 @@ _scenario_cleanup() {
         fi
     done
     if [[ "${rc}" -ne 0 ]]; then
+        for hook in ${_SCENARIO_FAILURE_HOOKS[@]+"${_SCENARIO_FAILURE_HOOKS[@]}"}; do
+            ( "${hook}" "${rc}" ) || echo 'recorded: failure retention unavailable' >&2
+        done
         for dir in ${_SCENARIO_STATE_DIRS[@]+"${_SCENARIO_STATE_DIRS[@]}"}; do
             [[ -f "${dir}/server.log" ]] || continue
             echo "--- ${TEST_NAME}: last ${SCENARIO_LOG_TAIL_LINES} lines of ${dir}/server.log ---" >&2
@@ -1917,6 +1954,10 @@ run_start() {
     esac
     [[ "${SLACK_STATE_DIR}" == "${SCENARIO_ROOT}"/* ]] \
         || fail "run_start: SLACK_STATE_DIR ${SLACK_STATE_DIR} is not under ${SCENARIO_ROOT}"
+    local hook
+    for hook in ${_SCENARIO_BEFORE_START_HOOKS[@]+"${_SCENARIO_BEFORE_START_HOOKS[@]}"}; do
+        "${hook}" || fail "run_start: evidence hook ${hook} failed"
+    done
     _SCENARIO_START_COUNT=$(( _SCENARIO_START_COUNT + 1 ))
     START_OUT="${SCENARIO_ROOT}/start.${_SCENARIO_START_COUNT}.out"
     # Registered before the start: a start that reports failure may still
@@ -2427,6 +2468,7 @@ install_ad_shim() {
     require_ci_image "${step}"
     require_scenario_home "${step}"
     _scenario_shim_over "${SCENARIO_AD_ROOT}/bin/agent-director" "${step}"
+    _scenario_place "${SCENARIO_FIXTURES}/agent-director-unresponsive.json" "${SCENARIO_AD_ROOT}/bin/agent-director-unresponsive.json" "${step}: captured envelope"
 }
 
 install_ad_admin_shim() {
@@ -2488,12 +2530,14 @@ _scenario_ad_contract() {
             SCENARIO_AD_ID_FLAG=--claude-instance-id
             SCENARIO_AD_ID_COLUMN=claude_instance_id
             SCENARIO_AD_SESSION_KEY=claude_session_id
+            SCENARIO_AD_ARGS_KEY=claude_args
             ;;
         *)
             SCENARIO_AD_ROOT="${HOME}/.config/agent-director"
             SCENARIO_AD_ID_FLAG=--instance-id
             SCENARIO_AD_ID_COLUMN=instance_id
             SCENARIO_AD_SESSION_KEY=session_id
+            SCENARIO_AD_ARGS_KEY=agent_args
             ;;
     esac
     SCENARIO_AD_BIN="${SCENARIO_AD_ROOT}/bin/agent-director"
@@ -4394,6 +4438,50 @@ _scenario_closing_passed() {
     return 1
 }
 
+# D1's safety evidence comes from the actual harness -> agent-director ->
+# tmux chain. Empty logs, direct harness tmux and destructive global calls
+# cannot satisfy this check. The EXIT trap rechecks the original files.
+assert_codex_d1_safety() {
+    local step=assert_codex_d1_safety ad_lines=() tmux_lines=() parent=() i entry matched spawn=0 send=0 tmux=0
+    local -A harness_calls=()
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
+    _scenario_query_prep "${step}"
+    (( _SCENARIO_START_COUNT == 0 )) && [[ ! -s "${SCENARIO_CSCB_RECORD}" ]] \
+        || fail "${step}: D1 must not start a CSCB server"
+    _scenario_read_log "${step}" "${SCENARIO_AD_SHIM_LOG}" ad_lines
+    _scenario_read_log "${step}" "${SCENARIO_TMUX_SHIM_LOG}" tmux_lines
+    for i in "${!ad_lines[@]}"; do
+        _scenario_split_line "${ad_lines[i]}"
+        [[ "${_L_KIND}" == call ]] || continue
+        _scenario_decode_words
+        _scenario_ad_verb
+        if [[ "${_L_VERB}" == delete ]] || _scenario_finished_kill_words; then
+            fail "${step}: destructive global agent-director call"
+        fi
+        _scenario_eval_words parent "${_L_PARENT}" || fail "${step}: unreadable parent"
+        [[ "${parent[0]##*/}" == bun && "${parent[1]:-}" == */real-agent/codex-delivery.ts ]] || continue
+        harness_calls["${_L_PID}"]+=" ${_L_US}"
+        [[ "${_L_VERB}" != spawn ]] || spawn=1
+        [[ "${_L_VERB}" != send-keys ]] || send=1
+    done
+    for i in "${!tmux_lines[@]}"; do
+        _scenario_split_line "${tmux_lines[i]}"
+        [[ "${_L_KIND}" == call ]] || continue
+        _scenario_eval_words parent "${_L_PARENT}" || fail "${step}: unreadable tmux parent"
+        [[ "${parent[0]##*/}" == agent-director || "${parent[0]##*/}" == agent-director.real ]] \
+            || fail "${step}: tmux call outside agent-director"
+        matched=0
+        for entry in ${harness_calls[${_L_PPID}]:-}; do
+            (( entry > _L_US )) || matched=1
+        done
+        (( matched )) || fail "${step}: tmux call has no preceding harness agent-director call"
+        tmux=1
+    done
+    (( spawn && send && tmux )) || fail "${step}: missing harness spawn, send-keys or agent-director tmux positive control"
+    _scenario_closing_ran "${step}"
+}
+
 assert_no_server_tmux() {
     local step=assert_no_server_tmux ad_lines=() tmux_lines=() bad=() i j best entry control=0 parent=()
     # Each agent-director call line by its PID: "<us>:<1 when a CSCB process ran it, else 0>".
@@ -4956,6 +5044,59 @@ ad_cscb_calls() {
     _scenario_cscb_ad_rows ad_cscb_calls "${id}" "" "${from}" "${to}"
 }
 
+# _scenario_assert_reconnect_rows <step> <server-pid> <delay-ms> <full-lines> <rows>:
+# inspect an already-filtered ad_cscb_calls table for one persona/window.
+# b.omv SR-5.3/5.4/5.5: existing waiting-row proof, fresh screen, text with
+# no_enter, delayed Enter. Extra reads are allowed for earlier refused runs;
+# every read/key must retain the server parent and AD's dialog guards.
+_scenario_assert_reconnect_rows() {
+    local step="$1" server="$2" delay="$3" full="$4" rows="$5"
+    local pos time parent verb id args words=() i text key no_enter reads=0 sends=0 typed_at=0 n_lines
+    while IFS=$'\t' read -r pos time parent verb id args; do
+        [[ -n "${pos}" ]] || continue
+        [[ "${verb}" == read-pane || "${verb}" == send-keys ]] || continue
+        [[ "${parent}" == "${server}" ]] || fail "${step}: ${verb} has parent ${parent}, not server ${server}"
+        _scenario_eval_words words "${args}" || fail "${step}: cannot decode ${verb} arguments"
+        text=""
+        key=""
+        no_enter=0
+        n_lines=""
+        for (( i = 0; i < ${#words[@]}; i++ )); do
+            case "${words[i]}" in
+                --text) text="${words[i + 1]:-}" ;;
+                --key) key="${words[i + 1]:-}" ;;
+                --no-enter) no_enter=1 ;;
+                --n-lines) n_lines="${words[i + 1]:-}" ;;
+                --allow-pending|--allow-pending=*|--expect-pane-sha256|--expect-pane-sha256=*)
+                    fail "${step}: ${verb} bypasses the ordinary dialog guard: ${args}"
+                    ;;
+            esac
+        done
+        if [[ "${verb}" == read-pane ]]; then
+            [[ "${n_lines}" == "${full}" ]] || fail "${step}: reconnect read-pane is not ${full} lines: ${args}"
+            (( sends == 0 )) || fail "${step}: a pane read interrupted the reconnect's keys"
+            reads=$(( reads + 1 ))
+            continue
+        fi
+        _scenario_to_us "${time}" || fail "${step}: invalid key timestamp ${time}"
+        sends=$(( sends + 1 ))
+        if (( sends == 1 )); then
+            (( reads >= 2 )) || fail "${step}: reconnect typed without waiting-row proof and a fresh screen"
+            [[ "${text}" == '/mcp reconnect '?* && -z "${key}" && "${no_enter}" == 1 ]] \
+                || fail "${step}: first reconnect key is not no_enter text: ${args}"
+            typed_at="${_SCENARIO_US}"
+        elif (( sends == 2 )); then
+            [[ "${key}" == Enter && -z "${text}" && "${no_enter}" == 0 ]] \
+                || fail "${step}: second reconnect key is not Enter alone: ${args}"
+            (( _SCENARIO_US - typed_at >= delay * 1000 )) \
+                || fail "${step}: reconnect Enter came before ${delay} ms"
+        else
+            fail "${step}: more than one reconnect text/Enter pair in the window"
+        fi
+    done <<< "${rows}"
+    (( sends == 2 )) || fail "${step}: reconnect has ${sends} key calls, not text then Enter"
+}
+
 # True when `ad_cscb_calls <instance-id>` holds at least <min> rows of <verb>;
 # sets _SCENARIO_FOUND to how many it holds.
 _scenario_ad_cscb_at_least() {
@@ -5508,3 +5649,17 @@ export SCENARIO_PORT
 if [[ "${SCENARIO_FMK}" == 1 ]]; then
     write_mcp_config "${SCENARIO_PORT}"
 fi
+
+# queue_accepted <persona-key>: durable accepted records only, normalized across compaction.
+# Both modes: new_state_dir keeps SLACK_STATE_DIR under SCENARIO_ROOT; this
+# read-only helper needs no scenario HOME in the shared-mode scripts.
+queue_accepted() {
+    require_ci_image "queue_accepted"
+    local key="${1:-}" file
+    [[ "${key}" =~ ^[a-z0-9_]+$ ]] || fail "queue_accepted: invalid persona key"
+    file="${SLACK_STATE_DIR}/queue/${key}.jsonl"
+    [[ -e "${file}" || -L "${file}" ]] || return 0
+    [[ -f "${file}" && ! -L "${file}" ]] || fail "queue_accepted: not a regular queue file"
+    jq -cS 'select(.v == 1 and .kind == "accepted" and .compact == null) | del(.attempt_high_watermark)' "${file}" \
+        || fail "queue_accepted: could not read accepted queue records"
+}

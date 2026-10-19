@@ -27,3 +27,8 @@ export const REMOVED_RETIRED_CLAUSE = 'the persona will be retired: its session 
 /** What a destructive modify's line says the confirmation does to the persona (b.jg5 SRJ-1510). */
 export const DESTRUCTIVE_RETIRED_CLAUSE =
   'the persona will be retired and brought up fresh: its session stopped and never resumed'
+
+/** b.omv SR-3.7: retained work remains bound to its original key. */
+export function queueRetentionClause(count: number): string {
+  return `${count} open queued item${count === 1 ? '' : 's'} kept, delivered only if a persona with the same key is added again`
+}

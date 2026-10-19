@@ -1,0 +1,1 @@
+-d2e, --debug-to-stderr","(deprecated) Enable debug mode (to stderr)").argParser(Boolean).hideHelp().implies({debug:!0})).option("--debug-file <path>","Write debug logs to a specific file path (implicitly enables debug mode)",()=>!0).option("--verbose

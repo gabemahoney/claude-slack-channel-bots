@@ -203,8 +203,9 @@
 #                    stub still runs.
 #   mcp_end          `stub_type_exit` types the sentinel into that pane: the
 #                    server logs the session's end, the stub and its current
-#                    client are gone and /interject answers 503: the persona
-#                    reads not connected. The start is stopped with
+#                    client are gone and /interject answers 200, appending
+#                    one accepted queue record despite the ended session.
+#                    The start is stopped with
 #                    --stop-bots.
 #   slack_stub_record
 #                    the Slack stub (fixtures/slack-stub-server.ts) records a
@@ -1567,6 +1568,7 @@ EOF
 leg_tmux_and_store() {
     local step="tmux and store" work row_socket info sock_path store_id got
     work="$(make_workdir self-check)"
+    stub_mode "${work}" "${STUB_MODE_STARTUP_TRUST}"
     ad_capture spawn --agent claude --cwd "${work}" --instance-id "${T0_ROW_ID}" \
         --tmux-session-name "${T0_SESSION}" --no-pre-trust --label "t0=spawned"
     if (( AD_RC != 0 )); then
@@ -1621,7 +1623,7 @@ leg_reinstall() {
     (( AD_RC == 0 )) || fail "${step}: cannot read the fixture before quiescence"
     work="$(jq -er '.cwd' "${AD_OUT}")"
     worker_pid="$("${SCENARIO_REAL_TMUX}" display-message -p -t "=${T0_SESSION}:" '#{pane_pid}')"
-    # The default stub waits at the dev-channels dialog. A kill while it is
+    # This fixture uses an explicit dialog mode. A kill while it is
     # pending leaves find-missing inside the 60 s launch grace, even once
     # the worker is gone. Complete startup before the bounded shutdown.
     stub_press_enter "${T0_SESSION}"
@@ -2110,6 +2112,7 @@ leg_live_start() {
     config_dir="${SCENARIO_ROOT}/claude-config"
     mkdir -p "${config_dir}"
     work="$(make_workdir live)"
+    stub_mode "${work}" "${STUB_MODE_STARTUP_TRUST}"
 
     # The Slack stub: one token pair, answered ok; any other refused.
     start_slack_stub "${SCENARIO_ROOT}/slack-stub" livev1
@@ -2197,6 +2200,7 @@ leg_mcp_session() {
     config_dir="${SCENARIO_ROOT}/claude-config-mcp"
     mkdir -p "${config_dir}"
     work="$(make_workdir mcp)"
+    stub_mode "${work}" "${STUB_MODE_STARTUP_TRUST}"
     ref="$(persona_ref "${MCP_NAME}")"
     connected="$(matcher "[slack] Session connected: persona ${ref}")"
 
@@ -2333,9 +2337,9 @@ mcp_new_client() {
 }
 
 # The mcp_session leg's stub ends (the sentinel, through `stub_type_exit`):
-# its session ends with it, and the persona reads not connected.
+# its session ends with it, and /interject still durably accepts for it.
 leg_mcp_end() {
-    local step="MCP session end" ref disconnected n
+    local step="MCP session end" ref disconnected n key accepted_before
     ref="$(persona_ref "${MCP_NAME}")"
     disconnected="$(matcher "[slack] Session disconnected" ": persona ${ref}")"
     n="$(count_log "${disconnected}")"
@@ -2343,7 +2347,14 @@ leg_mcp_end() {
     wait_for_count "${disconnected}" "$(( n + 1 ))" "${MCP_END_WAIT_S}" "${step}: the server never saw ${ref}'s session end"
     wait_until 10 "${step}: the stub ${MCP_STUB_PID} still runs after the sentinel" _scenario_pid_gone "${MCP_STUB_PID}"
     wait_until 10 "${step}: the MCP session client ${MCP_CLIENT_PID} outlived the stub" _scenario_pid_gone "${MCP_CLIENT_PID}"
-    expect_interject "${MCP_NAME}" 503 "${step}: after the stub ended"
+    key="$(persona_key "${MCP_NAME}")"
+    accepted_before="$(queue_accepted "${key}" | jq -s 'length')"
+    expect_interject "${MCP_NAME}" 200 "${step}: after the stub ended"
+    queue_accepted "${key}" > "${SCENARIO_ROOT}/mcp-ended-accepted.jsonl"
+    jq -se --argjson want "$(( accepted_before + 1 ))" --arg text "${TEST_NAME} interject" \
+        'length == $want and (last | .source == "interject" and .text == $text)' \
+        "${SCENARIO_ROOT}/mcp-ended-accepted.jsonl" > /dev/null \
+        || fail "${step}: /interject did not append exactly one accepted queue record after the session ended"
 
     stop_server --stop-bots
     stop_tracked_pid "${SLACK_STUB_PID}" 10 "${step}: the Slack stub did not exit on SIGTERM"
@@ -2409,22 +2420,34 @@ leg_stub_direct() {
     got="$("${SCENARIO_BIN}/claude" --version)" || fail "${step}: claude --version exited non-zero"
     [[ "${got}" == "2.1.280 (Claude Code)" ]] || fail "${step}: claude --version printed '${got}'"
 
-    # A directory with no selection: the dev-channels dialog, byte for byte,
-    # on its output and in its record of the dialogs it showed.
+    # A directory with no selection reports in immediately, with no dialog.
     dir="$(make_workdir stub-default)"
     (cd "${dir}" && exec "${SCENARIO_BIN}/claude" < /dev/null) > "${out}" 2> "${err}" &
     pid=$!
     wait "${pid}" || rc=$?
-    (( rc == 0 )) || fail "${step}: the stub in a directory with no selection exited ${rc}"
-    cmp -s -- "${fixture}" "${out}" || fail "${step}: with no selection the stub's output is not ${fixture##*/}, byte for byte"
+    (( rc == 0 )) || fail "${step}: default at-once stub exited ${rc}"
+    grep -qxF "Listening for channel messages from: server:slack-channel-router" "${out}" \
+        || fail "${step}: default stub did not report in immediately"
+    [[ ! -s "${SCENARIO_BIN}/${SCENARIO_STUB_SHOWN_DIALOGS_PREFIX}${pid}" ]] \
+        || fail "${step}: default stub showed a dialog"
+    [[ ! -s "${err}" ]] || fail "${step}: default stub wrote to standard error"
+
+    # Explicit dev mode preserves the dialog bytes and the shown-dialog record.
+    dir="$(make_workdir stub-dev-dialog)"
+    stub_mode "${dir}" "${STUB_MODE_DEV_CHANNELS}"
+    (cd "${dir}" && exec "${SCENARIO_BIN}/claude" < /dev/null) > "${out}" 2> "${err}" &
+    pid=$!
+    wait "${pid}" || rc=$?
+    (( rc == 0 )) || fail "${step}: the explicit dev stub exited ${rc}"
+    cmp -s -- "${fixture}" "${out}" || fail "${step}: the explicit dev stub's output is not ${fixture##*/}, byte for byte"
     cmp -s -- "${fixture}" "${SCENARIO_BIN}/${SCENARIO_STUB_SHOWN_DIALOGS_PREFIX}${pid}" \
         || fail "${step}: the stub's record of the dialogs it showed (${SCENARIO_STUB_SHOWN_DIALOGS_PREFIX}${pid}) is not ${fixture##*/}, byte for byte"
-    [[ ! -s "${err}" ]] || fail "${step}: with no selection the stub wrote to standard error: $(head -c 300 "${err}")"
+    [[ ! -s "${err}" ]] || fail "${step}: the explicit dev stub wrote to standard error: $(head -c 300 "${err}")"
 
     # Silent: no output, no SessionStart, and the sentinel fires no SessionEnd.
     dir="$(make_workdir stub-silent)"
     stub_mode "${dir}" "${STUB_MODE_SILENT}"
-    (cd "${dir}" && printf 'hello\n__CSCB_TEST_EXIT__\n' | "${SCENARIO_BIN}/claude" --settings "${settings}") \
+    (cd "${dir}" && printf 'hello\r__CSCB_TEST_EXIT__\r' | "${SCENARIO_BIN}/claude" --settings "${settings}") \
         > "${out}" 2> "${err}" || rc=$?
     (( rc == 0 )) || fail "${step}: the silent stub exited ${rc}"
     [[ ! -s "${out}" && ! -s "${err}" ]] || fail "${step}: the silent stub printed: $(head -c 300 "${out}" "${err}")"
@@ -2437,7 +2460,7 @@ leg_stub_direct() {
     dir="$(make_workdir stub-no-id)"
     stub_mode "${dir}" "${STUB_MODE_AT_ONCE}"
     before="$(line_count "${SCENARIO_AD_SHIM_LOG}")"
-    (cd "${dir}" && { sleep "$(seconds_plus "${REFIRE_PERIOD_S}" 1.5)"; echo __CSCB_TEST_EXIT__; } \
+    (cd "${dir}" && { sleep "$(seconds_plus "${REFIRE_PERIOD_S}" 1.5)"; printf '__CSCB_TEST_EXIT__\r'; } \
         | env -u AGENT_DIRECTOR_INSTANCE_ID "${SCENARIO_BIN}/claude" --settings "${settings}") > "${out}" 2> "${err}" || rc=$?
     (( rc == 0 )) || fail "${step}: the at-once stub exited ${rc}"
     grep -qxF "Listening for channel messages from: server:slack-channel-router" "${out}" \
@@ -2453,6 +2476,7 @@ leg_stub_direct() {
 
     stub_direct_delay "${step}: dialog delay" "${fixture}"
     stub_direct_linger "${step}: linger on exit"
+    stub_direct_composer "${step}: composer"
 }
 
 # fifo_stub <step> <dir> <name> <settings>: start the stub in <dir> from the
@@ -2468,6 +2492,50 @@ fifo_stub() {
     FIFO_PID=$!
     track_pid "${FIFO_PID}"
     exec {FIFO_FD}> "${fifo}"
+}
+
+# b.omv SR-13.6: exact main-user receipt, with meaningful LFs retained.
+stub_user_receipt_matches() {
+    jq -se --arg text "$2" '
+        [.[] | select(.type == "user")] as $users |
+        ($users | length) == 1 and $users[0].isSidechain == false and
+        $users[0].origin.kind == "human" and
+        $users[0].message.role == "user" and $users[0].message.content == $text
+    ' "$1" > /dev/null
+}
+
+# Exercise the complete worker read loop in the image, including no_enter
+# text arriving before its CR. All transcript paths belong to this HOME.
+stub_direct_composer() {
+    local step="$1" dir name=stub-composer mark key transcript rc=0 files=()
+    local text=$'<channel source="slack">\n  first line\nsecond line\n</channel>\n'
+    dir="$(make_workdir "${name}")"
+    mark="${SCENARIO_ROOT}/${name}-mark"
+    stub_mode "${dir}" "${STUB_MODE_AT_ONCE}"
+    fifo_stub "${step}" "${dir}" "${name}" "$(linger_settings "${mark}")"
+    wait_until 10 "${step}: no SessionStart" test -s "${mark}.start"
+    key="$(printf '%s' "$(realpath -e -- "${dir}")" | sed 's#[/._]#-#g')"
+    files=("${HOME}/.claude/projects/${key}/"*.jsonl)
+    (( ${#files[@]} == 1 )) && [[ -f "${files[0]}" ]] \
+        || fail "${step}: no unique transcript for the stub's working directory"
+    transcript="${files[0]}"
+    printf '%s' "${text}" >&"${FIFO_FD}"
+    wait_until 10 "${step}: no_enter text never appeared in the composer" \
+        grep -qF '</channel>' "${SCENARIO_ROOT}/${name}.out"
+    [[ "$(jq -s '[.[] | select(.type == "user")] | length' "${transcript}")" == 0 ]] \
+        || fail "${step}: LF submitted text before Enter"
+    printf '\r' >&"${FIFO_FD}"
+    wait_until 10 "${step}: CR did not write exactly one LF-preserving receipt" \
+        stub_user_receipt_matches "${transcript}" "${text}"
+    # A blank Enter writes no second user record; the sentinel still ends it.
+    printf '\r__CSCB_TEST_EXIT__\r' >&"${FIFO_FD}"
+    wait "${FIFO_PID}" || rc=$?
+    exec {FIFO_FD}>&-
+    (( rc == 0 )) || fail "${step}: stub exited ${rc} on the sentinel"
+    stub_user_receipt_matches "${transcript}" "${text}" \
+        || fail "${step}: blank Enter or sentinel wrote another user record"
+    [[ "$(cat -- "${mark}.end")" == "${FIFO_PID}" ]] \
+        || fail "${step}: sentinel did not fire exactly one SessionEnd from the worker"
 }
 
 # linger_settings <mark>: --settings JSON whose SessionStart and SessionEnd
@@ -2503,11 +2571,11 @@ stub_direct_linger() {
     stub_mode "${dir}" "${STUB_MODE_AT_ONCE}"
     fifo_stub "${step}" "${dir}" "${name}" "$(linger_settings "${mark}")"
     wait_until 10 "${step}: the at-once stub never fired SessionStart" test -s "${mark}.start"
-    printf '\x15/exit\n' >&"${FIFO_FD}"
+    printf '\x15/exit\r' >&"${FIFO_FD}"
     sleep "${STUB_LINGER_HOLD_S}"
     pid_alive "${FIFO_PID}" || fail "${step}: the at-once stub ended on a /exit line"
     [[ ! -e "${mark}.end" ]] || fail "${step}: the at-once stub fired SessionEnd on a /exit line"
-    printf '__CSCB_TEST_EXIT__\n' >&"${FIFO_FD}"
+    printf '__CSCB_TEST_EXIT__\r' >&"${FIFO_FD}"
     wait "${FIFO_PID}" || rc=$?
     exec {FIFO_FD}>&-
     (( rc == 0 )) || fail "${step}: the at-once stub exited ${rc} on the sentinel"
@@ -2525,7 +2593,7 @@ stub_direct_linger() {
         || fail "${step}: the linger-on-exit stub printed no banner: $(head -c 300 "${SCENARIO_ROOT}/${name}.out")"
     [[ "$(cat -- "${mark}.start")" == "${FIFO_PID}" ]] \
         || fail "${step}: the linger-on-exit stub's SessionStart record is '$(tr '\n' ' ' < "${mark}.start")', not once from its process ${FIFO_PID}"
-    printf '/exit\n' >&"${FIFO_FD}"
+    printf '/exit\r' >&"${FIFO_FD}"
     wait_until 10 "${step}: the linger-on-exit stub never fired SessionEnd on /exit" test -s "${mark}.end"
     marker="${SCENARIO_BIN}/${SCENARIO_STUB_LINGER_PREFIX}${FIFO_PID}"
     wait_until 10 "${step}: the linger-on-exit stub wrote no lingering marker ${marker}" test -f "${marker}"
@@ -2536,7 +2604,7 @@ stub_direct_linger() {
         || fail "${step}: the linger-on-exit stub's SessionEnd record is '$(tr '\n' ' ' < "${mark}.end")', not once from its process ${FIFO_PID}"
     # Lines while it lingers are ignored: it still runs STUB_LINGER_HOLD_S
     # after them.
-    printf 'hello\n/exit\n' >&"${FIFO_FD}"
+    printf 'hello\r/exit\r' >&"${FIFO_FD}"
     sleep "${STUB_LINGER_HOLD_S}"
     pid_alive "${FIFO_PID}" \
         || fail "${step}: the linger-on-exit stub ended within ${STUB_LINGER_HOLD_S}s of the lines written while it lingered, before its release"
@@ -2569,8 +2637,9 @@ stub_direct_delay() {
     grep -qF -- "${dev}" "${fixture}" || fail "${step}: ${fixture##*/} does not hold the dev-channels needle '${dev}'"
 
     dir="$(make_workdir stub-delay)"
+    stub_mode "${dir}" "${STUB_MODE_DEV_CHANNELS}"
     stub_dialog_delay "${dir}" "${STUB_DELAY_S}"
-    (cd "${dir}" && { sleep "$(( STUB_DELAY_S + 2 ))"; echo __CSCB_TEST_EXIT__; } | "${SCENARIO_BIN}/claude") \
+    (cd "${dir}" && { sleep "$(( STUB_DELAY_S + 2 ))"; printf '__CSCB_TEST_EXIT__\r'; } | "${SCENARIO_BIN}/claude") \
         > "${out}" 2> "${err}" &
     pid=$!
     track_pid "${pid}"
@@ -2609,10 +2678,11 @@ leg_stub_helpers() {
     file="${SCENARIO_BIN}/stub-claude-modes"
     [[ "$(tail -n 1 "${file}")" == "${STUB_MODE_AT_ONCE}"$'\t'"$(realpath -e -- "${dir}")" ]] \
         || fail "${step}: the selection file's last line is '$(tail -n 1 "${file}")'"
-    got="$(cd "${dir}" && printf '__CSCB_TEST_EXIT__\n' | "${SCENARIO_BIN}/claude")" \
+    got="$(cd "${dir}" && printf '__CSCB_TEST_EXIT__\r' | "${SCENARIO_BIN}/claude")" \
         || fail "${step}: the stub in ${dir} exited non-zero"
-    [[ "${got}" == "Listening for channel messages from: server:slack-channel-router" ]] \
-        || fail "${step}: after silent then at-once, the stub printed '${got}', not the at-once banner"
+    [[ "${got}" == "Listening for channel messages from: server:slack-channel-router"$'\n'* \
+        && "${got}" == *$'\n❯ \n'* && "${got}" == *'← for agents' ]] \
+        || fail "${step}: after silent then at-once, the stub did not print its banner and empty Linux composer: ${got}"
 
     # The dialog delay's setter: its refusals, and the last setting of a
     # directory wins (written as a whole number).
@@ -4083,7 +4153,206 @@ leg_tmux_server_steps() {
 # Run
 # ---------------------------------------------------------------------------
 
+# b.omv SR-14.1: counted fault contract, exercised in this one container check.
+# This tiny binary is an input fixture: no real agent or alternate store is started.
+leg_real_fault_contract() {
+    local dir="${SCENARIO_ROOT}/fault-controls" shim faults n pid pids=() rc start elapsed
+    mkdir -p "${dir}"
+    shim="${dir}/agent-director"
+    faults="${dir}/agent-director-shim.faults"
+    cp "${SCENARIO_FIXTURES}/agent-director-shim.sh" "${shim}"
+    cp "${SCENARIO_FIXTURES}/agent-director-unresponsive.json" "${dir}/agent-director-unresponsive.json"
+    cat > "${dir}/agent-director.real" <<'REAL'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${0%/*}/effects"
+printf '{"effect":true}\n'
+REAL
+    chmod 700 "${shim}" "${dir}/agent-director.real"
+    printf 'send-keys no_enter swallow 1\n' > "${faults}"
+    "${shim}" send-keys --text swallowed --no-enter > "${dir}/out"
+    [[ ! -e "${dir}/effects" ]] || fail 'swallow ran the real binary'
+    "${shim}" send-keys --text passed --no-enter > "${dir}/out"
+    [[ "$(wc -l < "${dir}/effects")" == 1 ]] || fail 'consumed swallow repeated'
+    for action in unknown-typed unknown-untyped; do
+        printf 'send-keys * %s 1\n' "${action}" > "${faults}"
+        rc=0
+        "${shim}" send-keys --text "${action}" --no-enter > "${dir}/out" 2> "${dir}/err" || rc=$?
+        [[ "${rc}" == 1 ]] || fail 'unknown outcome did not fail'
+        cmp "${dir}/err" "${SCENARIO_FIXTURES}/agent-director-unresponsive.json" || fail 'unknown envelope differs from real capture'
+    done
+    [[ "$(wc -l < "${dir}/effects")" == 2 ]] || fail 'unknown typed/untyped effects differ'
+    printf 'send-keys key=Enter delay=250 1\n' > "${faults}"
+    start="$(date +%s%3N)"
+    "${shim}" send-keys --key Enter > "${dir}/out"
+    elapsed=$(( $(date +%s%3N) - start ))
+    (( elapsed >= 250 )) || fail 'delayed call ran early'
+    printf 'send-keys no_enter swallow 3\n' > "${faults}"
+    for n in {1..12}; do
+        "${shim}" send-keys --text "concurrent-${n}" --no-enter > "${dir}/out-${n}" &
+        pids+=("$!")
+    done
+    for pid in "${pids[@]}"; do wait "${pid}" || fail 'concurrent shim call failed'; done
+    [[ "$(wc -l < "${dir}/effects")" == 12 ]] || fail 'concurrent calls double-consumed or lost a count'
+    [[ "$(cat "${faults}")" == 'send-keys no_enter swallow 0' ]] || fail 'concurrent count not exhausted exactly'
+    echo "recorded: fault effects/concurrency passed; delay_ms=${elapsed}"
+}
+
+leg_real_receipt_controls() {
+    bun "${SCENARIO_FIXTURES}/real-case-assertions.ts" selfcheck "${SCENARIO_ROOT}"
+}
+
+leg_real_native_idle_controls() {
+    bun "${SCENARIO_FIXTURES}/real-case-assertions.ts" native-idle-selfcheck "${SCENARIO_ROOT}" \
+        /opt/claude-code/2.1.280/claude /opt/claude-code/2.1.296/claude
+}
+
+leg_real_idle_diagnostic_controls() (
+    # Exercise the real wait/formatter without starting a bot or calling AD.
+    # The enclosing self-check already owns the image and scratch HOME.
+    TEST_NAME='test-0-fmk-real-idle-diagnostic-controls'
+    on_exit() { :; }
+    on_before_start() { :; }
+    source "${SCENARIO_FIXTURES}/../lib/real-scenario.sh"
+    local dir="${SCENARIO_ROOT}/idle-diagnostic-controls" rc mode
+    mkdir -p "${dir}"
+    export CONTROL_AUTH_SECRET="$(fake_token app idle)"$'\n"private\\value'
+    export CONTROL_SLACK_FAKE="$(fake_token bot diagnostic)"
+    bun - "${dir}" "${SCENARIO_FIXTURES}" <<'FIXTURES'
+import { join } from 'node:path'
+import { writeFileSync } from 'node:fs'
+const [dir, fixtures] = process.argv.slice(2)
+// Keep this control independent of checkout-only transcript/version helpers:
+// the CI image contains /tests and the installed package, with no /src tree.
+const deliveryPane = (text: string, history = '') => `${history}────────────────
+❯ ${text}
+────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle)`
+const { redactRealObservation } = await import(join(fixtures, 'real-observations.ts'))
+const secret = process.env.CONTROL_AUTH_SECRET!
+for (const form of [secret, JSON.stringify(secret).slice(1, -1)]) {
+  const redacted = redactRealObservation(`before ${form} after`, process.env)
+  if (redacted !== 'before <redacted> after') throw new Error('runtime secret masking failed')
+}
+for (const [name, pane] of [
+  ['empty', deliveryPane('')],
+  ['draft', deliveryPane('draft', `${secret} ${process.env.CONTROL_SLACK_FAKE!} wss://wss-stub.invalid/link/?ticket=SCENARIOFAKE\n`)],
+  ['huge', deliveryPane('draft', `${secret} ${'bounded '.repeat(8000)}\n`)],
+]) writeFileSync(join(dir, `${name}.json`), JSON.stringify({ pane }))
+writeFileSync(join(dir, 'status.json'), JSON.stringify({ state: 'waiting' }))
+FIXTURES
+    real_instance() { echo 'idle-control'; }
+    real_ad() { cat "${dir}/status.json"; }
+    real_pane() {
+        [[ "$2" == 40 ]] || fail 'idle diagnostic requested an unbounded pane'
+        if [[ "${mode}" == unreadable ]]; then return 1; fi
+        cat "${dir}/${mode}.json"
+    }
+    # One actual observation per control; avoid wall-clock waiting here.
+    _scenario_poll_until() { "$2" "$3"; }
+    mode=empty
+    real_wait_idle control 1 > "${dir}/success.out" 2>&1
+    [[ ! -s "${dir}/success.out" && ! -e "${SCENARIO_ROOT}/real-idle-pane.json" ]] \
+        || fail 'successful idle wait emitted failure diagnostics'
+    bun "${SCENARIO_FIXTURES}/real-observations.ts" "${dir}/empty.json" > "${dir}/ordinary.out"
+    for mode in draft unreadable; do
+        rc=0
+        (real_wait_idle control 1) > "${dir}/${mode}.out" 2>&1 || rc=$?
+        [[ "${rc}" == 1 ]] || fail 'failed idle wait lost its failure status'
+    done
+    bun "${SCENARIO_FIXTURES}/real-observations.ts" --idle-diagnostic "${dir}/huge.json" "${dir}/status.json" > "${dir}/huge.out"
+    bun - "${dir}" "${SCENARIO_FIXTURES}" <<'CHECK_DIAGNOSTICS'
+import { join } from 'node:path'
+import { readFileSync } from 'node:fs'
+const [dir, fixtures] = process.argv.slice(2)
+// All control credentials come from the harness's fake_token, so these
+// assertions need no checkout-only unit helper or its source imports.
+const assertNoLeak = (output: string) => {
+  for (const secret of [process.env.CONTROL_AUTH_SECRET!, process.env.CONTROL_SLACK_FAKE!]) {
+    if (output.includes(secret) || output.includes(JSON.stringify(secret).slice(1, -1))) throw new Error('diagnostic leaked a control credential')
+  }
+  if (/SCENARIOFAKE|private/i.test(output)) throw new Error('diagnostic leaked a control marker')
+}
+const check = (ok: boolean, why: string) => { if (!ok) throw new Error(why) }
+const ordinaryText = readFileSync(join(dir, 'ordinary.out'), 'utf8')
+assertNoLeak(ordinaryText)
+const ordinary = JSON.parse(ordinaryText)
+check(JSON.stringify(Object.keys(ordinary).sort()) === JSON.stringify(['pane', 'screen']), 'ordinary observation shape changed')
+check(ordinary.screen.kind === 'empty' && ordinary.screen.running === false, 'ordinary idle observation changed')
+for (const mode of ['draft', 'unreadable', 'huge']) {
+  const output = readFileSync(join(dir, `${mode}.out`), 'utf8')
+  assertNoLeak(output)
+  check(!output.includes('private') && !output.includes('SCENARIOFAKE'), 'diagnostic leaked runtime secret fragments')
+  const lines = output.trim().split('\n'), prefix = 'recorded: idle diagnostic '
+  check(lines[0].startsWith(prefix), 'failure evidence missing')
+  if (mode === 'huge') {
+    check(lines.length === 1 && lines[0].length <= prefix.length + 24000 + ' [truncated]'.length && lines[0].endsWith(' [truncated]'), 'diagnostic output is unbounded')
+    continue
+  }
+  check(lines.length === 2 && lines[1].startsWith('FAIL:'), 'diagnostic changed idle-wait failure')
+  const evidence = JSON.parse(lines[0].slice(prefix.length))
+  check(evidence.state === 'waiting', 'last row state was not retained')
+  if (mode === 'unreadable') check(evidence.pane === null && evidence.screen === null, 'unreadable pane invented idle proof')
+  else check(evidence.screen.kind !== 'empty' && evidence.pane.includes('<redacted>') && evidence.pane.includes('<redacted-token>') && evidence.pane.includes('<redacted-url>'), 'draft evidence lost screen or redaction')
+}
+console.log('recorded: idle diagnostics failure-only, bounded, redacted; unreadable pane unproved')
+CHECK_DIAGNOSTICS
+)
+
+nested_real_usage() {
+    source "${SCENARIO_FIXTURES}/../lib/real-scenario.sh"
+    nested_stand_in
+    # No accepted items: this exercises the downgrade's launch-only report.
+    # Final usage is written only on teardown, so an early report loses it.
+    mkdir -p "${HOME}/.claude/projects/control"
+    python3 - "${HOME}/.claude/projects/control/launch.jsonl" "${SCENARIO_ROOT}/usage-ready" <<'USAGE' &
+import json,pathlib,signal,sys,time
+transcript,ready=map(pathlib.Path,sys.argv[1:])
+def append(input_tokens,output_tokens):
+ with transcript.open('a') as f:
+  f.write(json.dumps({'type':'assistant','timestamp':'2026-10-16T00:00:00Z','message':{'id':'launch-message','role':'assistant','content':[], 'usage':{'input_tokens':input_tokens,'output_tokens':output_tokens,'cache_read_input_tokens':2,'cache_creation_input_tokens':1}}})+'\n')
+def finish(*_):
+ append(7,11)
+ raise SystemExit(0)
+signal.signal(signal.SIGTERM,finish)
+append(2,3)
+ready.touch()
+while True: signal.pause()
+USAGE
+    track_pid "$!"
+    wait_for_file "${SCENARIO_ROOT}/usage-ready" 10 'usage control did not start'
+    real_finish
+    if [[ "${TEST_NAME}" == *-failure ]]; then exit 23; fi
+}
+
+leg_real_usage_controls() {
+    local outcome want
+    for outcome in success failure; do
+        want=0
+        if [[ "${outcome}" == failure ]]; then want=23; fi
+        run_nested "test-0-fmk-real-usage-${outcome}" release nested_real_usage nested_stand_in
+        if [[ "${NESTED_RC}" != "${want}" ]]; then
+            sed 's/^/  | /' "${NESTED_OUT}" >&2
+            fail "launch-only ${outcome} changed its exit status to ${NESTED_RC}"
+        fi
+        [[ "$(grep -c '^tokens: ' "${NESTED_OUT}")" == 1 ]] || fail "launch-only ${outcome} did not report usage exactly once"
+        [[ "$(grep -c '^duplicates: ' "${NESTED_OUT}")" == 1 ]] || fail "launch-only ${outcome} did not report duplicates exactly once"
+        python3 - "${NESTED_OUT}" <<'CHECK_USAGE'
+import json,sys
+lines=open(sys.argv[1]).read().splitlines()
+usage=json.loads(next(l.removeprefix('tokens: ') for l in lines if l.startswith('tokens: ')))
+assert usage=={'input':7,'output':11,'cache_read':2,'cache_creation':1}, 'report missed final teardown usage or double-counted streamed usage'
+assert 'duplicates: 0' in lines, 'launch-only report invented duplicates'
+CHECK_USAGE
+        echo "recorded: launch-only ${outcome} reports final usage once; original exit=${want}"
+    done
+}
+
 LEGS=(
+    real_fault_contract
+    real_receipt_controls
+    real_native_idle_controls
+    real_idle_diagnostic_controls
+    real_usage_controls
     isolation
     real_binary
     setup_install

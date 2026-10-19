@@ -20,7 +20,7 @@
  * file's only literal notice text. The `auto-restart-disabled` wording is
  * checked by keyword for what SRJ-1011 (hatch A3) requires it to name.
  *
- * buildLostMessageNotice: each state's notice carries exactly that state's
+ * The retired notice builder is absent; the decision table remains.
  * wording and no other state's, and a sender label with line breaks still
  * gives a one-line notice.
  *
@@ -35,14 +35,12 @@
 import { describe, expect, test } from 'bun:test'
 
 import {
-  buildLostMessageNotice,
   decideEarlyLostMessageState,
   decideLostMessageState,
   firesHumanTriggeredRestart,
   LOST_MESSAGE_STATES,
   type LostMessageRecoveryQueries,
   type LostMessageState,
-  STATE_WORDING,
 } from '../src/lost-message.ts'
 
 /** Every decision input, in the order the decision asks them. */
@@ -191,83 +189,7 @@ describe('firesHumanTriggeredRestart (b.jg5 SRJ-1501)', () => {
   })
 })
 
-describe('the exported states and wordings', () => {
-  test('pin: SRJ-1011\'s ten states in order and its five new wordings, byte for byte', () => {
-    expect([...LOST_MESSAGE_STATES]).toEqual([
-      'not-up',
-      'held-for-human',
-      'cannot-launch',
-      'kill-failed',
-      'not-answering',
-      'session-starting',
-      'restarting',
-      'auto-restart-disabled',
-      'restart-limit-reached',
-      'starting-now',
-    ])
-    expect(STATE_WORDING['held-for-human']).toBe(
-      'Recovery: held for a human — this persona is held until a human resolves a problem with its tmux session or agent-director row; no restart was started.',
-    )
-    expect(STATE_WORDING['cannot-launch']).toBe(
-      'Recovery: cannot launch — the host\'s agent-director rejected this persona\'s launch; no restart was started.',
-    )
-    expect(STATE_WORDING['kill-failed']).toBe(
-      'Recovery: kill failed — a kill of a worker this persona depends on failed, and that worker may still be running; no restart was started.',
-    )
-    expect(STATE_WORDING['not-answering']).toBe(
-      'Recovery: not answering — agent-director or tmux is not answering for this persona, tmux is not available, or agent-director refuses its config file; CSCB is retrying, and no restart was started.',
-    )
-    expect(STATE_WORDING['session-starting']).toBe(
-      'Recovery: starting — this persona\'s session is starting but has not come up yet; CSCB is checking with agent-director, and no restart was started.',
-    )
-  })
-
-  test('the list and the wordings are read-only; every state has one wording, distinct and not inside another', () => {
-    expect(Object.isFrozen(LOST_MESSAGE_STATES)).toBe(true)
-    expect(Object.isFrozen(STATE_WORDING)).toBe(true)
-    expect(Object.keys(STATE_WORDING).sort()).toEqual([...LOST_MESSAGE_STATES].sort())
-    for (const s of LOST_MESSAGE_STATES) {
-      const others = LOST_MESSAGE_STATES.filter((o) => o !== s && STATE_WORDING[o].includes(STATE_WORDING[s]))
-      expect(others).toEqual([])
-    }
-  })
-
-  test('b.g57: the not-up wording says no restart was started and the instance is launched once the persona recovers, never "starting now"', () => {
-    const w = STATE_WORDING['not-up']
-    expect(w).toMatch(/no restart was started/)
-    expect(w).toMatch(/launched once it recovers/)
-    expect(w).not.toMatch(/starting now/i)
-  })
-
-  test('hatch A3: the auto-restart-disabled wording names session_restart_delay 0, the retry that brings back a persona CSCB is already retrying, and the server restart', () => {
-    const w = STATE_WORDING['auto-restart-disabled']
-    expect(w).toMatch(/no restart was started/)
-    expect(w).toContain('session_restart_delay is 0')
-    expect(w).toMatch(/already retrying/)
-    expect(w).toMatch(/retry succeeds/)
-    expect(w).toMatch(/server restart/)
-    expect(w).not.toMatch(/will not restart on its own/)
-  })
-})
-
-describe('buildLostMessageNotice', () => {
-  test.each(LOST_MESSAGE_STATES.map((s) => [s] as const))(
-    '%s: the notice carries exactly that state\'s wording and stays on one line',
-    (state) => {
-      const notice = buildLostMessageNotice('stub-user', state)
-      expect(LOST_MESSAGE_STATES.filter((o) => notice.includes(STATE_WORDING[o]))).toEqual([state])
-      expect(notice).not.toMatch(/[\r\n]/)
-    },
-  )
-
-  const LABELS = ['first\nsecond', 'first \r\n  second', 'first\n\n\nsecond', 'first\rsecond', 'first\n  second']
-  test.each(LOST_MESSAGE_STATES.map((s, i) => [LABELS[i % LABELS.length]!, s] as const))(
-    'a sender label with line breaks stays on one line: label %j (%s)',
-    (label, state) => {
-      const notice = buildLostMessageNotice(label, state)
-      expect(notice).not.toMatch(/[\r\n]/)
-      expect(notice).toContain('first second')
-      expect(notice).toContain(STATE_WORDING[state])
-    },
-  )
+test('the recovery states are immutable and contain the ten decision outcomes', () => {
+  expect(Object.isFrozen(LOST_MESSAGE_STATES)).toBe(true)
+  expect(LOST_MESSAGE_STATES).toEqual(['not-up', 'held-for-human', 'cannot-launch', 'kill-failed', 'not-answering', 'session-starting', 'restarting', 'auto-restart-disabled', 'restart-limit-reached', 'starting-now'])
 })

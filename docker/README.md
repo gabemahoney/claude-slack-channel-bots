@@ -6,20 +6,21 @@ cache as a separate image and don't get invalidated on every CSCB source edit.
 
 ## Images
 
-- **`cscb-ci-base:v7`** (built from `docker/Dockerfile.test.base`) — slow base
-  layers (apt deps incl. tmux, bun, nodejs, cozempic, agent-director). Built
-  lazily once per host. ~1+ GB. No CSCB source inside. From the repo build
-  context it reads one file, `docker/ad-client-check.sh`, and no
-  `package.json`. What it holds is in
+- **`cscb-ci-base:v8`** (built from `docker/Dockerfile.test.base`) — slow base
+  layers (apt deps incl. tmux, bun, nodejs, cozempic, agent-director and native
+  Claude/Codex versions). Built lazily once per host. No checkout source
+  inside; published CSCB tarballs are fixtures. From the repo build context
+  it reads `docker/ad-client-check.sh`, `docker/install-real-agents.sh` and
+  `docker/install-real-codex.sh`, and no `package.json`. What it holds is in
   [What the base holds](#what-the-base-holds).
 - **The run's test image** (built from `docker/Dockerfile.test`,
-  `FROM cscb-ci-base:v7`) — adds `docker/entrypoint.sh`, `tests/`,
+  `FROM cscb-ci-base:v8`) — adds `docker/entrypoint.sh`, `tests/`,
   `testplans/`, the `testuser` account, and the `ENTRYPOINT`. Each `/ci` run
   builds its own, once, with the owner label `cscb-ci-owner=<RUN_ID>-<PID>`,
   tags it only `cscb-ci-run:<RUN_ID>-<PID>-test`, and removes it at the run's
   end (see [The run's images and tags](#the-runs-images-and-tags)). The build
   should complete in under 10 s on a warm base.
-- **`cscb-ci-live:v1`** (built from `docker/Dockerfile.live`, `FROM cscb-ci-base:v7`)
+- **`cscb-ci-live:v2`** (built from `docker/Dockerfile.live`, `FROM cscb-ci-base:v8`)
   — the `/ci-live` image (see [/ci-live](#ci-live-the-live-slack-acceptance-run)
   below). It adds Claude Code at a pinned version with auto-update off, the
   agent-director binary the runner stages, checked against the release's
@@ -29,6 +30,18 @@ cache as a separate image and don't get invalidated on every CSCB source edit.
   and the testplan's shell helpers and pre-flight adapted to the container.
   The package under test is not in the image; the runner mounts its tarball.
   Built on every `/ci-live` run.
+
+- **The heavy run's image** (`docker/Dockerfile.real-agent`,
+  `FROM cscb-ci-base:v8`) — a self-contained packed `package.tgz`, tests and
+  `docker/real-agent-job.sh` and `docker/real-agent-codex-job.sh`, tagged `cscb-real-agent:<run-id>` and removed
+  by `scripts/real-agent-matrix.ts`. Jobs select native Claude through
+  agent-director, install runtime latest inside the container when needed,
+  and run sequentially with runtime-only credentials. Claude gate/non-AI jobs use
+  `CI_ANTHROPIC_MODEL`; Claude AI uses optional `CI_ANTHROPIC_AI_MODEL`, defaulting
+  to that model, with native fallback disabled and the classifier enabled. The
+  separate local Codex job uses the host-selected model and single-file login
+  lease described below; it never goes to the scheduler. See
+  [the heavy invocation](../tests/README.md#heavy-inventory-and-invocation).
 
 `/ci` builds the base only when the tag that `docker/Dockerfile.test`'s `FROM`
 line names is missing locally, through the base-build step
@@ -51,8 +64,9 @@ the live image build, where it is checked (see
 [The live image's agent-director](#the-live-images-agent-director)).
 
 The base build fetches bun, agent-director 0.10.0's binary and the release's
-two binaries from GitHub, and the release's client tarball and two 0.10.0
-tarballs from the npm registry, and `/ci` runs it with
+two binaries from GitHub, native Claude releases from their distribution
+service, and the release's client, two 0.10.0 fixtures, the 0.16.1 downgrade
+fixture and native Codex platform package from the npm registry. `/ci` runs it with
 `docker build --network=host`. On some hosts the default docker bridge network
 intermittently fails those fetches with SSL/timeout errors even when the host
 itself reaches the same URLs fine; host networking sidesteps that. It affects
@@ -77,10 +91,19 @@ Every path is readable by every user, `testuser` included, except the global cli
 | `/opt/agent-director-0.10.0/bin/agent-director` | agent-director 0.10.0's binary, off `PATH` |
 | `/opt/agent-director-0.10.0/agent-director-0.10.0.tgz` | The published agent-director 0.10.0 client, from npm |
 | `/opt/claude-slack-channel-bots-0.10.0/claude-slack-channel-bots-0.10.0.tgz` | The published pre-persona claude-slack-channel-bots 0.10.0 package, from npm |
+| `/opt/claude-code/2.1.280/claude`, `/opt/claude-code/2.1.296/claude` | Native Linux x64 Claude programs, off PATH; manifests supply SHA-256 checks, and each `--version` must match. `DISABLE_AUTOUPDATER=1` is set in the base |
+| `/opt/codex/0.159.2/codex` | Native ELF from the Codex platform npm package, off PATH; build requires `codex-cli 0.159.2`. Selected explicitly by the isolated D1 gate and local heavy harness |
+| `/opt/cscb-ci/install-real-agents.sh`, `/opt/cscb-ci/install-real-codex.sh` | Marked-image-only native installers; the Claude installer also supports the heavy job's resolved latest |
+| `/opt/claude-slack-channel-bots-0.16.1/claude-slack-channel-bots-0.16.1.tgz` and `release.json` | Published-before-work downgrade fixture, separate from the retained 0.10.0 fixture. Publication: `2026-10-14T17:20:30.700Z`; SHA-256: `95bd53d19f4950caf8a13a4d9a4b7a8c85d22433ba87dd69cabbba20570e8164`. Build checks the hash/version; record includes registry provenance |
 | `/etc/cscb-ci-image` | The image marker (see [Image marker](#image-marker)) |
 
 It also installs `sqlite3` (the harness's store reads and edits) and `file`
-(the install script's pre-flight) with apt. The 0.10.0 legs are unchanged:
+(the install script's pre-flight) with apt. Native agent directories stay off
+PATH. Ordinary scenarios retain their stub
+`claude`; real scenarios select `[launch].claude_path` explicitly and check
+the native version again. No login or API credential is baked into an image.
+
+The 0.10.0 legs are unchanged:
 the 0.10.0 tarballs are fetched by exact version with
 `npm pack --ignore-scripts`, and nothing in the base installs them. The
 release's install leaves no store behind: `install.sh` runs with a throwaway
@@ -155,7 +178,7 @@ it stop with an `ERROR:` line naming the missing context.
   `--from-release v<AD_VERSION> --sha256 <AD_SHA256> --admin-sha256 <AD_ADMIN_SHA256> --no-hooks --no-symlink`,
   with a throwaway `HOME` and, for that one command, a stand-in `claude` on
   `PATH` (the script's pre-flight only prints `claude --version`, and the
-  base has no Claude Code). The script downloads `agent-director-linux-amd64`
+  native agents are not on PATH). The script downloads `agent-director-linux-amd64`
   and `agent-director-admin-linux-amd64` from agent-director's GitHub release
   (no token) and checks them against the two pins. The build copies the
   binary to `/opt/agent-director/bin` and the admin binary to
@@ -190,7 +213,7 @@ git -C "$CSCB_AD_SRC_DIR" show "v$AD_VERSION:skills/install-agent-director/insta
 GH_TOKEN="$(gh auth token)" docker build --network=host \
   --secret id=gh_token,env=GH_TOKEN --progress=quiet \
   --build-context agent-director-install="$AD_INSTALL_CTX" \
-  -f docker/Dockerfile.test.base -t cscb-ci-base:v7 .
+  -f docker/Dockerfile.test.base -t cscb-ci-base:v8 .
 rm -rf "$AD_INSTALL_CTX"
 ```
 
@@ -210,7 +233,7 @@ rm -rf "$AD_INSTALL_CTX"
   that message, and every other check's `ERROR:` line: rerun with
   `--progress=plain` to see which step failed and why.
 - **Check an image by counts only**, never by printing its history:
-  `docker history --no-trunc cscb-ci-base:v7 | grep -c GH_TOKEN=` prints `0`.
+  `docker history --no-trunc cscb-ci-base:v8 | grep -c GH_TOKEN=` prints `0`.
 - **Earlier tags are retired.** Nothing names `v4` or an earlier tag. Tags
   before `v4` took the token as a build-arg, so their image history held its
   value, as did every image built on them; they are removed from the hosts
@@ -235,7 +258,10 @@ Image marker).
 `/ci`'s `docker run` step forwards `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, and
 `ANTHROPIC_MODEL` from the host environment (each via the no-value `--env VAR`
 pass-through form). The bot Claudes spawned by the daemon-under-test consume
-these. A raw `sk-ant-api…` key needs only `ANTHROPIC_API_KEY` — Claude Code
+these. Every full `/ci` run uses the key for real model calls in the nine
+`-fmk-real-` Claude scripts; ordinary scripts keep the stub. Claude uses no OAuth or
+subscription fallback. The Codex gate uses only its separately admitted existing
+login file and selected model (see [Codex admission](#codex-admission-login-and-scratch-lifecycle)). A raw `sk-ant-api…` key needs only `ANTHROPIC_API_KEY` — Claude Code
 defaults to `api.anthropic.com` when `ANTHROPIC_BASE_URL` is absent. A gateway
 credential (e.g. NVIDIA InferenceHub) additionally requires `ANTHROPIC_BASE_URL`
 and `ANTHROPIC_MODEL` so the bot Claudes hit the gateway rather than
@@ -247,12 +273,14 @@ against Anthropic's direct endpoint.
 
 ## When to bump the base image version
 
-Bump `cscb-ci-base`'s version tag (e.g. `v7` → `v8`) whenever you change
+Bump `cscb-ci-base`'s version tag (next, `v8` → `v9`) whenever you change
 `docker/Dockerfile.test.base`, its pins included: the release's
 `AD_VERSION`, `AD_COMMIT`, `AD_SHA256`, `AD_ADMIN_SHA256`,
 `AD_INSTALL_SH_SHA256` and `AD_CLIENT_TGZ_SHA256`, and the 0.10.0 legs'
-`AD_PREV_VERSION` and `CSCB_PREV_VERSION`, or its one repo input,
-`docker/ad-client-check.sh`. `/ci` builds a base only when its
+`AD_PREV_VERSION` and `CSCB_PREV_VERSION`, the downgrade fixture's
+`CSCB_DOWNGRADE_VERSION`/`CSCB_DOWNGRADE_SHA256`, native agent versions, or
+its repo inputs `docker/ad-client-check.sh`, `docker/install-real-agents.sh`
+and `docker/install-real-codex.sh`. `/ci` builds a base only when its
 tag is missing, so without a bump every host keeps testing the base it
 already has. The base reads no `package.json`, so a change there needs no
 bump. There is **no** automatic version derivation — bump it manually in
@@ -261,7 +289,7 @@ every place that names it:
 1. The `FROM` line in `docker/Dockerfile.test`.
 2. The `BASE_TAG` variable in `scripts/ci-base-build.sh`, the base-build
    step, and the tag wherever `.claude/skills/ci/SKILL.md` names it.
-3. The `FROM` line in `docker/Dockerfile.live`.
+3. The `FROM` lines in `docker/Dockerfile.live` and `docker/Dockerfile.real-agent`, and the base inspection tag in `scripts/real-agent-matrix.ts`.
 4. `BASE_IMAGE` in `ci-live/lib/docker.ts`.
 5. The tag in `.claude/skills/ci-live/SKILL.md` (twice) and in
    `ci-live/README.md`'s "Where you start".
@@ -298,7 +326,8 @@ skill types a commit, and when an image file, the base-build step, a
 `ci-live/lib` module or a skill pins a release candidate.
 
 Common reasons to bump: a new agent-director release, a change of the 0.10.0
-pins, a change to `docker/ad-client-check.sh`, bumping the bun
+or downgrade pins, native agent versions/installers, a change to
+`docker/ad-client-check.sh`, bumping the bun
 installer, changing the nodejs major, adding/removing an apt package, or
 changing the cozempic install.
 
@@ -308,7 +337,7 @@ still name it keep using it.
 
 ## When to bump the live image version
 
-Bump `cscb-ci-live`'s numbered tag (e.g. `v1` → `v2`) when changing
+Bump `cscb-ci-live`'s numbered tag (e.g. `v2` → `v3`) when changing
 `docker/Dockerfile.live`'s `CLAUDE_CODE_VERSION` pin. Update `LIVE_IMAGE` in
 `ci-live/lib/docker.ts` and every live-image tag in this file together.
 `/ci-live` builds the live image on every run; the numbered tag identifies
@@ -319,7 +348,7 @@ the pin revision. A live-only pin change leaves `cscb-ci-base`'s tag alone.
 To simulate a fresh host, remove the base tag by its name, and nothing else:
 
 ```sh
-docker rmi cscb-ci-base:v7
+docker rmi cscb-ci-base:v8
 /ci   # with CSCB_AD_SRC_DIR set; or run the hand build above
 ```
 
@@ -334,7 +363,7 @@ build comes near it, raise an issue.
 After a `/ci` run, confirm the base layers are intact:
 
 ```sh
-docker history cscb-ci-base:v7
+docker history cscb-ci-base:v8
 ```
 
 Then edit a comment in (e.g.) `tests/integration/test-1-install-startup.sh`
@@ -347,7 +376,7 @@ docker build -f docker/Dockerfile.test -t "$WARM_TAG" .
 ```
 
 This should complete in seconds, and needs neither build context nor the
-token. `docker history cscb-ci-base:v7` should show the same layer IDs as
+token. `docker history cscb-ci-base:v8` should show the same layer IDs as
 before — proof the source edit didn't invalidate the base. Then remove the
 tag by its name:
 
@@ -364,6 +393,36 @@ The sharded `/ci` runner is `scripts/ci-run.ts`. It runs the integration
 scripts in up to 6 capped, isolated shards, normally all from one test image
 it builds per run.
 
+### Codex admission, login and scratch lifecycle
+
+A selected `-fmk-real-codex` script gets its own shard containing exactly test-1 and that script. Its prerequisite unit may contain nothing else. A mixed ordinary/Codex run needs at least one ordinary shard in addition to each dedicated shard; the current full run therefore refuses `--shards 1`. A selection of only test 41 and test-1 may use one shard, but remains selective and cannot establish a full gate result. Automatic admission reduces N only as far as this isolation minimum.
+
+**Host model and key projection.** Both runners use non-empty `CODEX_HOME`, otherwise `$HOME/.codex`, and require a readable, well-formed `config.toml` with a non-empty top-level `model` string matching `[A-Za-z0-9._:/-]+`. There is no inherited override, profile-only selection or fallback model. The bounded scanner decodes only that value; other values, including native metadata values, are lexically skipped. It projects only key paths into `CODEX_HOST_CONFIG_KEYS` (plain environment metadata, at most 128 KiB), alongside plain `CODEX_TEST_MODEL`. Parsing is bounded to 1 MiB, 2,048 paths, depth 32 and 256-byte key segments; malformed or ambiguous TOML/projection refuses admission. The container validates the projection too. Never print host settings or environment values.
+
+`results.json` records `codexModel` as the admitted model, or null when no Codex lease was admitted. `summary.txt` and the heavy log report `recorded: codex-model <name>`; native rollout checks independently require the actual selected model. These records describe the test, not the host's other settings.
+
+**One existing login file.** The runner privately validates the existing `auth.json`: regular, not a symlink, runner-owned, mode 0600 and valid JSON. The image's testuser UID must match the runner UID. It refuses instead of changing ownership or permissions. Only that file is bind-mounted read-write at `/run/codex-login/auth.json`; no Codex home or config is mounted. The scratch Codex home is private mode 0700, with `auth.json` a symlink to exactly that target, checked through preparation, spawn, idle and final cleanup.
+
+Codex 0.159.2 truncates and writes file credentials in place, so token refresh follows that symlink and updates the existing host file. The owner accepts the refresh-write risk: interruption or changed native save semantics can break the login. Never replace this with a copy or read-only mount, which can consume a rotating refresh token while leaving the host stale. Never print, copy, hash, archive, chmod, chown or export the login or its scratch home; put neither in images, repositories or results. Recheck native save behavior before changing the Codex version. A postcheck failure instructs the owner to run `codex login --device-auth` on the host; the test runner never performs host login recovery itself.
+
+**Lease and retirement.** Gate and local heavy runs share process-owned exclusive `flock` on `codex-login.lock` beside the host login. Its 30-minute wait is separate from ordinary admission's 30-second lock wait and included in the runner's build/deadline allowance. The lease covers every login-bearing container through verified retirement, postchecks and secret scanning. A surviving container labelled `cscb.codex-login=true`, stopped or running, or an unverifiable survivor check refuses another run. Failed retirement fails the run and holds the lease until runner exit; exit releases flock, but survivor refusal still protects the next run. Never bypass either guard.
+
+Before launch and after retirement, revalidate valid JSON, device/inode identity, runner ownership and mode 0600. Keep token strings from both reads only in memory for masking and output scans, including refreshed tokens. A postcheck, cleanup or token-scan failure fails the run. Inspect containers/images only through `bun scripts/safe-docker-inspect.ts docker container inspect NAME` or its supported image form; wrapper failure is final, with no raw inspection fallback.
+
+**Native-written scratch config (amended decision 22).** The harness creates no Codex `config.toml` and copies no host settings. It must be absent before first spawn. Later preparation/recovery needs a durable successful-native-spawn receipt tied to the exact private home's device/inode; config presence alone grants nothing. The names-only checker allows only fixed native-written `tui.screen_reader_detection_done` and genuine parent tables containing exclusively allowed descendants. That leaf and its parent may overlap host key names without reading or copying their host values. All other host keys and every model, reasoning, profile/profiles, provider/auth or unknown key reject the script. Scalar/array namespace impostors and unknown descendants also reject it. Record only key names and unknown-key counts. New allowlist entries require native-source or observed-run evidence. Native CLI `tui.show_tooltips=false` avoids the optional startup counter without broadening this allowlist.
+
+**Resources and heavy execution.** Login-bearing containers set `--ulimit core=0`. Each Codex shard adds 2 GiB to the ordinary cap and reservation, currently 4 GiB memory and memory-swap, retaining 2 CPUs and 2,048 PIDs. Admission, concurrent-run commitments, cap reports and OOM accounting include the extra memory. The local heavy job uses the same 4 GiB/2 CPU/2,048 PID bounds, a 3-hour job timeout, exact login mount and verified final stopped/exit/cap reading. Its five AI criteria run three independent trials each; see [Codex gate and heavy AI](../tests/README.md#codex-gate-and-heavy-ai). Nothing carrying the login goes to a scheduler. `/ci-live` runs in its own container against the test workspace, with its existing credentials and isolation.
+
+The explicit coordinator option `--codex-only` selects those 15 local trials, skipping Claude jobs, runtime-latest fetching and Claude credential admission. It keeps the same Codex lease, UID/inspection, mount, token-scan, cleanup and interruption checks, including lease preservation when retirement is unresolved. Plan/results record `selection: codex-only`, empty Claude jobs and null Claude models/scheduler; its `REAL-AGENT-CODEX-VERDICT` and `REAL-AGENT-CODEX-PLAN` prefixes distinguish it from the default 73-invocation full selection. `--plan` accesses no Codex auth/config and establishes no acceptance.
+
+Use the established `CI_ANTHROPIC_*` prefix on the `/ci` runner and **every** `ci-verdict.ts` wait/stop/report/recovery call, as the current CI skill describes. The heavy coordinator reads those CI names directly. Never put credential values in arguments or diagnostic output.
+
+Final E7 acceptance passed: default full `/ci` `20261018t042311z-fik3tlbb` (no selection arguments, reader exit 0) passed all 46 executions in 2,521.526 s, including the 17-item native Codex fault/recovery/fidelity gate. Focused local heavy `real-1792299930887-3167396` ended `REAL-AGENT-CODEX-VERDICT PASS`: 15 unique completed native trials, AC11/12/15/20/106 each 3 of 3, in 1,726.57 s, on Codex 0.159.2 / `gpt-6-astra`.
+
+All 441 heavy auth/config checks and 15 final symlink checks passed, along with full CI's 48 checks. The login stayed the single existing read-write file bind, never copied, printed, hashed or scheduled; host config stayed unchanged.
+
+Both runners retired, no active/login containers remained, and unit scratch/build context were removed. The 886 recorded source/test identities stayed unchanged through validation. See [final evidence, unit/typecheck results and historical failures](../docs/testing-guide.md#e7-final-acceptance-evidence). Base `cscb-ci-base:v8` remains pinned; no image tag edit is needed.
+
 ### Admission: memory, disk and CPU
 
 A run is admitted only when its own files keep the run directory's volume
@@ -373,7 +432,8 @@ or a refusal that says why.
 
 Admission reads the host once, under the admission lock and after the sweep
 (see [The admission lock, reservations and the sweep](#the-admission-lock-reservations-and-the-sweep)).
-Every shard is judged at the per-shard memory cap, 2 GiB to start (see
+Ordinary shards use the per-shard memory cap, 2 GiB to start; each dedicated
+Codex shard adds 2 GiB to its cap and reservation (see
 [The per-shard memory cap and out-of-memory kills](#the-per-shard-memory-cap-and-out-of-memory-kills)
 for the current cap).
 
@@ -452,7 +512,7 @@ The CPU fit counts the CPUs of every other live `/ci` reservation;
 
 | Fit | Passes when |
 |---|---|
-| Memory | U + the commitments + N × the cap + the 1 GiB admission margin ≤ C, and no container blocks every run |
+| Memory | U + the commitments + N × the ordinary cap + 2 GiB per Codex shard + the 1 GiB admission margin ≤ C, and no container blocks every run |
 | Disk | (used + 1 GiB) ÷ (used + available) < 85% on the volume holding the run directory. The 1 GiB is an allowance for the run's own files; the 85% is `/ci`'s own disk line |
 | CPU | The other live reservations' CPUs + 2 × N ≤ the 12 CI CPUs |
 
@@ -465,7 +525,7 @@ watchdog. The disk fit does not depend on N; the memory and CPU fits do.
 
 **Choosing N.** The effective N is the smaller of the requested N and the
 run's scheduling units, at least 1. A run given neither `--shards` nor
-`--inject` takes the largest N, from the effective N down to 1, that passes
+`--inject` takes the largest N, from the effective N down to its isolation minimum, that passes
 both the memory and the CPU fit. A run given `--shards` or `--inject` takes exactly the
 effective N, or is refused. Either run is refused when the disk fit fails.
 
@@ -506,11 +566,11 @@ first makes the first line; each other follows in the detail lines as
 decimal place.
 
 n is the effective N for a run given `--shards` or `--inject`. A run that can
-choose its N is judged at 1 shard, the smallest it could take, so its refusal
-says why not even one shard fits. The memory and CPU refusals name the
+choose its N is judged at its isolation minimum: one shard per Codex script
+plus one for ordinary units when present, otherwise at least one shard. The memory and CPU refusals name the
 largest `--shards` value, at most the effective N, that passes both of those
 fits now (`largest --shards value that fits now: <k>`), or say
-`no --shards value fits now, not even 1`.
+that no value fits at the required isolation minimum.
 
 The memory refusal also gives the ceiling and its source (85% of L
 or `/ci-live`'s 40 GiB line with the lock or container that showed the
@@ -614,7 +674,7 @@ rename), with these keys:
 | `version` | `1` |
 | `runId`, `pid` | the run's RUN_ID and PID |
 | `shards` | N |
-| `memoryBytes` | N × the per-shard memory cap |
+| `memoryBytes` | N × the ordinary per-shard memory cap + 2 GiB per dedicated Codex shard |
 | `cpus` | 2 × N |
 | `kind` | `full` or `selective` |
 
@@ -654,8 +714,8 @@ The sweep never touches:
 
 - anything whose owner is alive;
 - any `cscb-live=1` container, or any container without `cscb-ci=1`;
-- any other tag shape, such as `cscb-ci:latest`, `cscb-ci-base:v7`,
-  `cscb-ci-live:v1` or a lane tag like `cscb-ci-l5:m5`;
+- any other tag shape, such as `cscb-ci:latest`, `cscb-ci-base:v8`,
+  `cscb-ci-live:v2` or a lane tag like `cscb-ci-l5:m5`;
 - an image that still has a tag, or an image with no owner label;
 - any file beside the lock but a dead owner's reservation;
 - the run directories of swept runs, which are kept.
@@ -677,11 +737,12 @@ kinds of run are a source for a new cap, and after delivery only a default
 full run (`/ci` with no arguments) with an out-of-memory kill is a reason to
 raise it.
 
-**The cap.** The cap is one constant, `SHARD_MEMORY_CAP_BYTES` in
-`scripts/ci-run.ts`. It sets each shard container's memory and memory-swap
-limits (see [Shard containers](#shard-containers)) and the memory each shard
-reserves at admission. It starts at 2 GiB, which is also its minimum
-(`MIN_SHARD_MEMORY_CAP_BYTES`).
+**The cap.** `SHARD_MEMORY_CAP_BYTES` in `scripts/ci-run.ts` is the ordinary
+cap, initially 2 GiB and at least `MIN_SHARD_MEMORY_CAP_BYTES`. A dedicated
+Codex shard adds `CODEX_EXTRA_MEMORY_BYTES` (2 GiB), currently giving 4 GiB.
+Both memory and memory-swap limits and admission reservations use the actual
+shard cap. Cap reports and OOM accounting use the source shard's actual cap;
+without a source the report uses the largest scheduled cap.
 
 **Anon peaks.** A shard's anon peak is the highest `anon` across its 30 s
 samples and its final reading (see [Shard containers](#shard-containers)),
@@ -843,20 +904,26 @@ removes itself, and only the runner removes it, after its final reading.
 
 **Mounts.** Each mount is a `--mount type=bind,...`, never `-v`, so Docker
 never creates a missing source: every source is a file or directory the
-runner made. There are exactly two:
+runner made or validated. Every shard has these two:
 
 | Source | Target | Mode |
 |---|---|---|
 | The run's tarball | `/tmp/package.tgz`, the path test-1 installs from | Read-only |
 | The shard's subdirectory, `shard-<k>` in the run directory (created 0700 before any docker command) | `/test-results` | Read-write |
 
-Only a `leak:<k>,<j>` fault adds a mount: shard k's subdirectory, read-only,
+A dedicated Codex shard additionally mounts exactly the validated host login
+file read-write at `/run/codex-login/auth.json`; ordinary shards never do.
+The only other permitted extra mount is a `leak:<k>,<j>` fault: shard k's subdirectory, read-only,
 at `/leak-shard-<k>` in shard j (see
 [`tests/README.md`](../tests/README.md#fault-injection)).
 
 **Credentials.** The list names `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL` and
 `ANTHROPIC_MODEL` by bare name only (`--env <NAME>`), so Docker copies each
-that is set from the runner's environment. No other variable reaches a shard,
+that is set from the runner's environment. The list also names bare
+`CODEX_TEST_MODEL` and `CODEX_HOST_CONFIG_KEYS`. The model is replaced with
+the run's admitted model (or empty without a lease); the names-only projection
+is populated only for Codex shards and empty for ordinary shards. Neither
+is a secret or an inherited override. No other variable reaches a shard,
 and `GH_TOKEN` never does (see
 [Credential env vars passed to the container](#credential-env-vars-passed-to-the-container)).
 
@@ -1037,7 +1104,7 @@ tag goes and no container, even a stopped one, uses it.
 Cleanup and the sweep never touch:
 
 - `cscb-ci:latest`, the base tag (the one `docker/Dockerfile.test`'s `FROM`
-  line names) or `cscb-ci-live:v1`;
+  line names) or `cscb-ci-live:v2`;
 - lane tags, such as `cscb-ci-l5:m5`, or the `cscb-ci-warm:*` tags of
   [Verifying warm-cache parity](#verifying-warm-cache-parity);
 - any image that still has a tag, any image without an owner label, a live
@@ -1428,7 +1495,7 @@ checks against it.
   - Anything else (a missing or malformed release record, steps 1
     (tarball) to 4 (exports), a missing check script, the check's refusal or
     usage error):
-    `ERROR: the base image's global agent-director client or its ad-client check failed (the line above names what failed): the base image cscb-ci-base:v7 predates this tree's docker/Dockerfile.test.base or docker/ad-client-check.sh; bump the base image version as the When to bump the base image version section of docker/README.md describes`.
+    `ERROR: the base image's global agent-director client or its ad-client check failed (the line above names what failed): the base image cscb-ci-base:v8 predates this tree's docker/Dockerfile.test.base or docker/ad-client-check.sh; bump the base image version as the When to bump the base image version section of docker/README.md describes`.
 
   Whichever line it is, the run reports a `container` FAIL row for the failed
   build, `docker build of the live image failed (exit N)`, followed by what
@@ -1446,9 +1513,9 @@ checks against it.
   `no agent-director binary to stage in the live image: none was given with --agent-director-binary, and none was found at ~/.config/agent-director/bin/agent-director or on PATH; give the binary to stage with --agent-director-binary <path>, then rerun`.
 
 **Claude Code.** The live image installs Claude Code at the build arg
-`CLAUDE_CODE_VERSION`, pinned at `2.1.280` in `docker/Dockerfile.live`; the
-runner passes no override. `2.1.280` is CSCB's supported minimum and the
-fleet version used for real Slack channel delivery. agent-director's hooks
+`CLAUDE_CODE_VERSION`, pinned at `2.1.296` in `docker/Dockerfile.live`; the
+runner passes no override. The live checks exercise typed delivery with this
+version. agent-director's hooks
 are exec form, which Claude Code runs from `2.1.139`.
 
 ### Secrets

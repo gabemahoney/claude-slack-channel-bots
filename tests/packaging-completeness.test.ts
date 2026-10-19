@@ -19,8 +19,10 @@
  *      include every runtime src/*.ts file in the repo. This is the general
  *      guard against the whole class of bug: a future new src file silently
  *      excluded by the package.json `files` globs would ship a broken tarball
- *      without anyone noticing. Hermetic where possible; shells out to npm for
- *      the authoritative file list and skips cleanly if npm is unavailable.
+ *      without anyone noticing. A hermetic companion checks package.json's
+ *      inclusion and exclusion patterns for every runtime source file, including
+ *      the tag-wrapper, delivery-queue, delivery-intake and delivery-notices modules. The npm
+ *      probe gives the authoritative file list and skips only if npm is absent.
  *
  * b.av2 AC 27 guard (SR-12, SR-13.5): the shipped debugging skill
  * `skills/debug-slack-channel-bots/SKILL.md` must be in the npm pack list
@@ -136,6 +138,7 @@ import {
   PERSONA_CHANNEL_DELIVERY_SET,
   PERSONA_DESTINATION_FAILED,
   PERSONA_DIAGNOSTIC_CLASSES,
+  DELIVERY_DIAGNOSTIC_CLASSES,
   PERSONA_INVITED_CHANNEL,
   UNCLAIMED_CHANNEL,
   channelDeliverySetCause,
@@ -416,6 +419,13 @@ describe('b.q9t: npm pack ships every runtime src file', () => {
       expect(missing).toEqual([])
     },
   )
+
+  test('(hermetic): package.json files covers every runtime src/*.ts file with no ! entry excluding it', () => {
+    const runtimeFiles = runtimeSrcFiles()
+    expect(runtimeFiles.length).toBeGreaterThan(0)
+    const files = readPkg().files ?? []
+    expect(runtimeFiles.filter((rel) => !filesCover(files, rel))).toEqual([])
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -537,19 +547,28 @@ describe('b.av2 SR-12: the credentials script ships in the package', () => {
 function skillHasClassHeading(label: string): boolean {
   const text = readFileSync(resolve(REPO_ROOT, SKILL_REL), 'utf-8')
   const re = new RegExp(
-    `^#{2,4} [^\\n]*(?<![\\w-])${escapeRegExp(label)}(?![\\w-])`,
-    'm',
+    `(?<![\\w-])${escapeRegExp(label)}(?![\\w-])`,
   )
-  return re.test(text)
+  return headings(text).some((heading) => heading.level >= 2 && heading.level <= 4 && re.test(heading.title))
 }
 
 describe('b.av2 AC 27: the debugging skill covers every persona diagnostic class', () => {
+  test('b.omv SR-8.6: delivery diagnostic labels belong to the audited persona catalogue', () => {
+    expect(DELIVERY_DIAGNOSTIC_CLASSES.length).toBeGreaterThan(0)
+    expect(new Set(DELIVERY_DIAGNOSTIC_CLASSES).size).toBe(DELIVERY_DIAGNOSTIC_CLASSES.length)
+    expect(PERSONA_DIAGNOSTIC_CLASSES).toEqual(expect.arrayContaining([...DELIVERY_DIAGNOSTIC_CLASSES]))
+  })
   // Labels come from the exported closed set, never a hand-copied list, so a
   // class added later without a skill entry fails here (b.av2 SR-12).
   test.each([...PERSONA_DIAGNOSTIC_CLASSES])(
     'AC 27: the skill has a heading for class %s',
     (label) => {
       expect(skillHasClassHeading(label)).toBe(true)
+      if ((DELIVERY_DIAGNOSTIC_CLASSES as readonly string[]).includes(label)) {
+        const entry = requiredSection(debugSkill(), classHeading(label), SKILL_REL)
+        expect(['Line', 'Meaning', 'Cause', 'Fix'].filter((part) => !new RegExp(`^- \\*\\*${part}:\\*\\*\\s+\\S`, 'm').test(entry))).toEqual([])
+        expect(entry).toContain(`[slack] ${label}:`)
+      }
     },
   )
 })
@@ -783,7 +802,6 @@ function triageStep(text: string, n: number): string {
  * `invited.permission_prompts`, or `"dm"` when it is absent.
  */
 const DESTINATION_PASSAGES: [string, (text: string) => string][] = [
-  ['Triage step 1', (text) => triageStep(text, 1)],
   [`the \`${PERSONA_DESTINATION_FAILED}\` entry's fungible-mode <dest>`, (text) => destinationFailedBullet(text, '- **Fungible mode:**')],
   [`the \`${PERSONA_DESTINATION_FAILED}\` entry's not_in_channel fix`, (text) => destinationFailedBullet(text, '- `not_in_channel`:')],
   [
@@ -809,7 +827,6 @@ const DESTINATION_PASSAGES: [string, (text: string) => string][] = [
         `${SKILL_REL}, under "## A persona can't open a DM",`,
       ),
   ],
-  ['"Two personas post lost-message notices about each other"', (text) => requiredSection(text, '### Two personas post lost-message notices about each other', SKILL_REL)],
   [
     "the silence entry's loop-guard row",
     (text) => rowHolding(requiredSection(text, `## ${SILENCE_TITLE}`, SKILL_REL), '| **The loop guard**', `${SKILL_REL}, under "## ${SILENCE_TITLE}",`),

@@ -10,8 +10,8 @@
 # shim; agent-director-admin behind the same shim), store and tmux server, all
 # under SCENARIO_ROOT. The tmux shim stays in `log` mode, first on every CSCB
 # process's PATH. One persona, PERSONA_NAME, whose working directory selects
-# the stub's `dev-channels` mode (STUB_MODE_DEV_CHANNELS: the stub holds at
-# the dev-channels dialog until the dialog approver's Enter, then reports in).
+# the stub's `startup-trust` mode (STUB_MODE_DEV_CHANNELS: the stub holds at
+# the startup-trust dialog until the dialog approver's Enter, then reports in).
 # A live start against the Slack stub (fixtures/slack-stub-server.ts, one
 # token pair answered ok), with `health_check_interval` 0 (ruling S3: no leg
 # needs a health tick; the latch re-check runs on its own timer whatever the
@@ -111,7 +111,8 @@
 #   6. The cleared probe (SRJ-1412 B (5), (6); SRJ-506, SRJ-1005; AC 5). From
 #      the end of the second re-check to the first CSCB `resume` after it, the
 #      bot server makes exactly `status`, the one-line `read-pane`,
-#      `find-missing` and `resume`, in that order, once each; the round logs
+#      `find-missing`, the fresh provenance `get`, and `resume`, in that
+#      order, once each; the round logs
 #      the probe cleared on PANE_READ_GONE (the pane read's outcome for
 #      agent-director's ErrTmuxCaptureFailed) with its retry; the resumed
 #      launch proceeds (the approver clears the new stub's dialog and the row
@@ -468,7 +469,8 @@ mkdir -m 700 "${CREDS}" || fail "${STEP}: could not create ${CREDS}"
 CONFIG_DIR="${SCENARIO_ROOT}/claude-config"
 mkdir -p "${CONFIG_DIR}" || fail "${STEP}: could not create ${CONFIG_DIR}"
 WORK="$(make_workdir wrong)"
-stub_mode "${WORK}" "${STUB_MODE_DEV_CHANNELS}"
+stub_mode "${WORK}" "${STUB_MODE_STARTUP_TRUST}"
+stub_mode "${WORK}" "${STUB_MODE_STARTUP_TRUST}"
 
 # The [tmux] table, before the server starts: both keys at their minimums.
 write_ad_settings "${TMUX_PAIRS[@]}"
@@ -666,7 +668,7 @@ answer="$(jq -c '.' "${AD_KILL_OUT}")"
 echo "${TEST_NAME}: ${STEP}: kill-finished answered ${answer}"
 
 # ---------------------------------------------------------------------------
-# Leg 6: the cleared probe, one find-missing and one resume, one recovery post
+# Leg 6: the cleared probe, fresh provenance get and resume, one recovery post
 # ---------------------------------------------------------------------------
 
 STEP="leg 6 (cleared probe)"
@@ -681,7 +683,7 @@ for i in "${!WIN_VERBS[@]}"; do
         break
     fi
 done
-expect_window "${STEP}: from the second re-check to its resume" status read-pane find-missing resume
+expect_window "${STEP}: from the second re-check to its resume" status read-pane find-missing get resume
 wait_for_log "${ROUND_CLEARED}" "${POST_WAIT_S}" "${STEP}: the round logged no probe cleared on ${READ_GONE}"
 wait_until "${REPORT_WAIT_S}" "${STEP}: the resumed row never reported in (waiting)" row_reads waiting
 expect_status "${STEP}" waiting

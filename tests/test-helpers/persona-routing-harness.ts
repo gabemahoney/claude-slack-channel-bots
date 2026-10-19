@@ -215,6 +215,8 @@
  * SPDX-License-Identifier: MIT
  */
 
+import { createDeliveryQueue, type QueueItem } from '../../src/delivery-queue.ts'
+import { createDeliveryPreparation, type DeliveryPreparationDeps } from '../../src/delivery-intake.ts'
 import { join, resolve } from 'node:path'
 import type { Database } from 'bun:sqlite'
 import type { WebClient } from '@slack/web-api'
@@ -238,7 +240,7 @@ import { loadChannelDeliveryStore, type ChannelDeliveryStore } from '../../src/c
 import { createPersonaRouting, type PersonaRoutingDeps } from '../../src/persona-routing.ts'
 import { formatPersonaNotice, type PersonaNotifier } from '../../src/persona-notifier.ts'
 import type { PersonaDestinationHold } from '../../src/persona-destination-hold.ts'
-import { LOST_MESSAGE_STATES, STATE_WORDING, type LostMessageState } from '../../src/lost-message.ts'
+import { LOST_MESSAGE_STATES, type LostMessageState } from '../../src/lost-message.ts'
 import { createConflictLatch, type ConflictLatch } from '../../src/conflict-latch.ts'
 import { createInvalidFlagsHold, type InvalidFlagsHold } from '../../src/invalid-flags-hold.ts'
 import {
@@ -311,17 +313,6 @@ const SERVING_CONNECTION: PersonaConnectionStatus = { state: 'up', identity: { b
  * the list `src/lost-message.ts` exports, re-exported, never a copy.
  */
 export { LOST_MESSAGE_STATES }
-
-/**
- * The one recovery state a notice text identifies: the state whose exported
- * wording (`STATE_WORDING`) the text contains, or `none` / `several`. Whole
- * wordings are matched, so `session-starting`'s wording is never taken for
- * `starting-now`'s, whose opening words it shares.
- */
-export function stateOf(text: string | undefined): LostMessageState | 'none' | 'several' {
-  const found = LOST_MESSAGE_STATES.filter((s) => (text ?? '').includes(STATE_WORDING[s]))
-  return found.length === 1 ? found[0]! : found.length === 0 ? 'none' : 'several'
-}
 
 /**
  * What a recovery state needs of the harness it is arranged on: the up check
@@ -648,7 +639,6 @@ export function makeRestartDeps(opts: RestartFakeOptions = {}): RestartDeps & Re
     },
     isSessionAlive: async () => LIVENESS_READING_DEAD,
     isSessionConnected: () => false,
-    hasSessionStream: () => false,
     reconnectSession: async () => 'success',
     killSession: async () => ({ kind: KILL_OUTCOME_KILLED, killSent: true }),
     launchSession: async (key, cwd, sessionId) => {
@@ -700,7 +690,9 @@ export interface RoutingHarnessOptions {
   /** The archive DB the archive seam writes to; the seam is a no-op without one. */
   archiveDb?: Database
   /** Replaces the user-name lookup (default: `users.info` on P's client from `clientFor`, the user ID when it has none). */
-  resolveUserName?: PersonaRoutingDeps['resolveUserName']
+  resolveUserName?: DeliveryPreparationDeps['resolveUserName']
+  /** Lookup timer dependency; independent from recovery timers. */
+  preparationClock?: DeliveryPreparationDeps['clock']
   /** Server-wide config overrides (e.g. `session_restart_delay`). */
   overrides?: Partial<Omit<PersonaConfig, 'personas'>>
   /** Initial `h.restartDelayS`. Default `FAST_RESTART_DELAY_S`. */
@@ -708,9 +700,9 @@ export interface RoutingHarnessOptions {
   /** Replaces the restart deps' launch outcome, e.g. a promise held open. */
   launchSession?: RestartFakeOptions['launchSession']
   /** Clock for the per-persona dedupe stores (e.g. a fake clock's `now`); default the module's (`Date.now`). */
-  dedupeClock?: PersonaRoutingDeps['dedupeClock']
+  dedupeClock?: () => number
   /** Replaces the routing's `notify` (default: the real notifier, `h.notifier.notify`); calls are still recorded in `h.notices`. */
-  notify?: PersonaRoutingDeps['notify']
+  notify?: PersonaNotifier['notify']
   /** The routing's up predicate (b.av2 SR-6.4, bug b.g57); absent, as by default (and without `upCheck`), every persona counts as up. */
   isPersonaUp?: PersonaRoutingDeps['isPersonaUp']
   /**
@@ -843,6 +835,8 @@ export interface HarnessPost {
 }
 
 export interface RoutingHarness {
+  queue: ReturnType<typeof createDeliveryQueue>
+  queued(name: string): QueueItem[]
   /** The applied config the routing reads at call time; set to null for none, or edit it. */
   config: PersonaConfig | null
   /** The persona handle by name. */
@@ -1132,7 +1126,11 @@ export function makeRoutingHarness(
     }
   }
 
+  const queue = createDeliveryQueue({ stateDir: baseDir, now: opts.dedupeClock })
+  const queueReady = queue.start()
   const h: RoutingHarness = {
+    queue,
+    queued: name => queue.items(byName(name).persona.key),
     config,
     p: byName,
     all: handles,
@@ -1167,14 +1165,13 @@ export function makeRoutingHarness(
     retryArmed: keySet(opts.retryArmed ?? config.personas.map((p) => p.name)),
     restartDelayS: opts.restartDelayS ?? FAST_RESTART_DELAY_S,
     archiveWrites: [],
-    receive: (event, names, ack, envelope) => routing.receive(
+    receive: async (event, names, ack, envelope) => { await queueReady; return routing.receive(
       event,
       ack ?? (() => { h.order.push('ack') }),
       h.keys(names ?? handles.map((x) => x.persona.name)),
       envelopeFlagOf(envelope),
-    ),
-    receiveKeys: (event, keys, envelope) =>
-      routing.receive(event, () => { h.order.push('ack') }, keys, envelopeFlagOf(envelope)),
+    ) },
+    receiveKeys: async (event, keys, envelope) => { await queueReady; return routing.receive(event, () => { h.order.push('ack') }, keys, envelopeFlagOf(envelope)) },
     setMode: (mode) => {
       h.config = configIn(mode)
     },
@@ -1209,11 +1206,11 @@ export function makeRoutingHarness(
     }),
   }
 
-  const notify: PersonaRoutingDeps['notify'] = opts.notify ?? ((key, text, options) => notifier.notify(key, text, options))
+  const notify: PersonaNotifier['notify'] = opts.notify ?? ((key, text, options) => notifier.notify(key, text, options))
   const resolver = (key: string) => createNameResolver(byKey(key)!.stub.web as unknown as NameResolverWebClient)
   // As server.ts: the lookup goes through the persona's client, and a persona
   // with no client (not validated yet, dry run) gets the user ID.
-  const resolveUserName: PersonaRoutingDeps['resolveUserName'] = async (key, userId) => {
+  const resolveUserName: DeliveryPreparationDeps['resolveUserName'] = async (key, userId) => {
     const client = webClientFor(key)
     return client ? createNameResolver(client as unknown as NameResolverWebClient).resolveUserName(userId) : userId
   }
@@ -1241,7 +1238,10 @@ export function makeRoutingHarness(
       },
     })
   }
+  const preparation = createDeliveryPreparation({ queue, clock: opts.preparationClock, clientFor: webClientFor, resolveUserName: opts.resolveUserName ?? resolveUserName })
   const routing = createPersonaRouting({
+    queue,
+    prepare: preparation.prepare,
     getPersonaConfig: () => {
       h.order.push('config')
       return h.config
@@ -1252,20 +1252,12 @@ export function makeRoutingHarness(
       h.order.push(`identity:${key}`)
       return byKey(key)?.stub.identity
     },
-    clientFor: webClientFor,
-    resolveUserName: opts.resolveUserName ?? resolveUserName,
     archive: (key, event) => {
       h.order.push(`archive:${key}`)
       if (opts.archiveDb) h.archiveWrites.push(archiveSlackMessage(opts.archiveDb, event as SlackMessageEvent, resolver(key)))
     },
-    getReplySettings,
-    notify: (key, text, options) => {
-      h.notices.push({ key, text })
-      h.readOrder.push(`notice:${key}`)
-      return notify(key, text, options)
-    },
     log,
-    dedupeClock: opts.dedupeClock,
+    now: opts.dedupeClock,
     isPersonaUp: opts.isPersonaUp ?? upCheck,
     // As main() binds them, each asked with the persona key at call time.
     isLatched: (key) => h.latch.isLatched(key),

@@ -61,6 +61,7 @@ import * as channelDelivery from '../src/channel-delivery.ts'
 import * as config from '../src/config.ts'
 import * as conflictLatch from '../src/conflict-latch.ts'
 import * as deliveryDecision from '../src/delivery-decision.ts'
+import * as deliveryConstants from '../src/delivery-constants.ts'
 import * as installCheckLabels from '../src/install-check-labels.ts'
 import * as installCheck from '../src/install-check.ts'
 import * as installSkillPointer from '../src/install-skill-pointer.ts'
@@ -102,6 +103,7 @@ const MODULES: Readonly<Record<string, Readonly<Record<string, unknown>>>> = {
   'config.ts': config,
   'conflict-latch.ts': conflictLatch,
   'delivery-decision.ts': deliveryDecision,
+  'delivery-constants.ts': deliveryConstants,
   'install-check-labels.ts': installCheckLabels,
   'invalid-flags-hold.ts': invalidFlagsHold,
   'live-row-sequence.ts': liveRowSequence,
@@ -438,8 +440,8 @@ describe("the printer's references (tests/integration/fixtures/fmk-texts.ts)", (
       expect(adSettings.AD_TMUX_KEYS).toContain('stopping_window_seconds')
     },
     'ad-settings.ts:AD_SETTING_MINIMUMS:defined': () => {
-      const minimums: Readonly<Record<string, unknown>> = adSettings.AD_SETTING_MINIMUMS
-      for (const key of ['starting_session_seconds', 'stopping_window_seconds']) {
+      const minimums = adSettings.AD_SETTING_MINIMUMS
+      for (const key of ['starting_session_seconds', 'stopping_window_seconds'] as const) {
         const minimum = Object.hasOwn(minimums, key) ? minimums[key] : undefined
         expect(typeof minimum === 'bigint' || typeof minimum === 'number').toBe(true)
         expect(Number(minimum)).toBeGreaterThan(0)

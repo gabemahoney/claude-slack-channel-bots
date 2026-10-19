@@ -34,6 +34,8 @@
 
 import type { DeliveryMode } from './config.ts'
 import type { FungibleChannelType, FungibleRefusal } from './delivery-decision.ts'
+import type { AcceptedRecord } from './delivery-queue.ts'
+import { redactSlackLogText } from './slack-log-redaction.ts'
 import { renderPersonaRef } from './persona-identity.ts'
 
 // ---------------------------------------------------------------------------
@@ -156,8 +158,37 @@ export const PERSONA_INVITED_CHANNEL = 'persona-invited-channel'
  */
 export const PERSONA_CHANNEL_DELIVERY_SET = 'persona-channel-delivery-set'
 
+export const MESSAGE_NOT_SAVED = 'message-not-saved'
+export const MESSAGE_RECEIVED = 'message-received'
+export const MESSAGE_DELIVERED = 'message-delivered'
+export const MESSAGE_RETYPED = 'message-retyped'
+export const MESSAGE_NOT_TAKEN_IN = 'message-not-taken-in'
+export const DELIVERY_STUCK = 'delivery-stuck'
+export const MESSAGES_WAITING = 'messages-waiting'
+export const QUEUE_RECORD_UNREADABLE = 'queue-record-unreadable'
+export const QUEUE_UNWRITABLE = 'queue-unwritable'
+export const QUEUE_KEPT = 'queue-kept'
+export const SYSTEM_PROMPT_UNWRITABLE = 'system-prompt-unwritable'
+export const DELIVERY_DIAGNOSTIC_CLASSES = [MESSAGE_NOT_SAVED, MESSAGE_RECEIVED, MESSAGE_DELIVERED, MESSAGE_RETYPED, MESSAGE_NOT_TAKEN_IN, DELIVERY_STUCK, QUEUE_RECORD_UNREADABLE, QUEUE_UNWRITABLE, QUEUE_KEPT, SYSTEM_PROMPT_UNWRITABLE] as const
+export type DeliveryDiagnosticClass = typeof DELIVERY_DIAGNOSTIC_CLASSES[number]
+const safe = (text: string): string => redactSlackLogText(text).replace(/[\r\n]/g, ' ')
+/** Explicit metadata allowlist: redaction alone is not message-body exclusion. */
+export function deliveryIdentity(a: Pick<AcceptedRecord, 'source' | 'channel' | 'sender' | 'ts' | 'user' | 'bot_id'>): string {
+  return `source=${a.source} ${a.source === 'slack' ? `chat_id=${JSON.stringify(safe(a.channel ?? ''))}` : `sender=${JSON.stringify(safe(a.sender ?? ''))}`} ts=${JSON.stringify(safe(a.ts))} sender_id=${JSON.stringify(safe(a.user ?? a.bot_id ?? a.sender ?? 'unknown'))}`
+}
+export function buildDeliveryDiagnostic(kind: DeliveryDiagnosticClass, persona: string, identity: string, detail = ''): string {
+  return `[slack] ${kind}: persona=${safe(persona)} ${safe(identity)}${detail ? ` ${safe(detail)}` : ''}`.trimEnd()
+}
+export function buildQueuedMessageRetryLine(key: string): string {
+  return `[slack] Queued message: persona=${safe(key)} has its tmux-unavailable outage raised with no retry timer — no restart scheduled; arming one (b.jg5 SRJ-311)`
+}
+export function queueErrorCode(error: unknown): string {
+  try { const code = (error as { code?: unknown })?.code; return typeof code === 'string' && /^[A-Z0-9_]+$/.test(code) ? code : 'unknown' } catch { return 'unknown' }
+}
+
 /** Every persona diagnostic class label, in a fixed order. */
 export const PERSONA_DIAGNOSTIC_CLASSES = [
+  ...DELIVERY_DIAGNOSTIC_CLASSES,
   PERSONA_START,
   PERSONA_CREDENTIALS_MISSING,
   PERSONA_CREDENTIALS_UNREADABLE,

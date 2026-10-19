@@ -401,14 +401,14 @@ describe('SR-3.1: each connection\'s inbound events reach the intake with its ow
   test('the single-socket fan-out is gone: a message in a channel both personas hear (`all`), received on A\'s connection, reaches A\'s session only; the same on B\'s reaches B\'s only (real persona-routing)', async () => {
     const h = harness()
     await bringUpBoth(h)
-    const { routing, logs, notifications: sessions } = makeManagedRouting(h, dir)
+    const { routing, logs, queue: sessions } = makeManagedRouting(h, dir)
     plugRouter(h, routing)
 
     const first = makeChannelMessage({ channel: CS, text: 'for whoever received it' })
     await h.stub(h.A).socket.deliver(first)
 
-    expect(sessions.get(h.A.key)!.map((n) => n.params.meta.message_id)).toEqual([first.ts as string])
-    expect(sessions.get(h.B.key)).toEqual([])
+    expect(sessions.items(h.A.key)!.map((n) => n.accepted.ts)).toEqual([first.ts as string])
+    expect(sessions.items(h.B.key)).toEqual([])
     // The user-name lookup ran on the receiving persona's client only.
     expect(h.stub(h.A).calls.usersInfo).toHaveLength(1)
     expect(slackCalls(h.stub(h.B))).toBe(1) // B's own auth.test at bring-up, nothing since
@@ -417,8 +417,8 @@ describe('SR-3.1: each connection\'s inbound events reach the intake with its ow
     const second = makeChannelMessage({ channel: CS, text: 'again' })
     await h.stub(h.B).socket.deliver(second)
 
-    expect(sessions.get(h.B.key)!.map((n) => n.params.meta.message_id)).toEqual([second.ts as string])
-    expect(sessions.get(h.A.key)).toHaveLength(1)
+    expect(sessions.items(h.B.key)!.map((n) => n.accepted.ts)).toEqual([second.ts as string])
+    expect(sessions.items(h.A.key)).toHaveLength(1)
     expect(h.stub(h.B).calls.usersInfo).toHaveLength(1)
     expect(h.stub(h.B).socket.acks).toHaveLength(1)
     assertNoLeak({ logs })
@@ -428,7 +428,7 @@ describe('SR-3.1: each connection\'s inbound events reach the intake with its ow
     const h = harness()
     await bringUpBoth(h)
     const archived: string[] = []
-    const { routing, notifications: sessions } = makeManagedRouting(h, dir, { archive: (key) => void archived.push(key) })
+    const { routing, queue: sessions } = makeManagedRouting(h, dir, { archive: (key) => void archived.push(key) })
     const { router } = plugRouter(h, routing)
     const before = slackCalls(h.stub(h.A), h.stub(h.B))
     const ack = recordingAck()
@@ -437,7 +437,7 @@ describe('SR-3.1: each connection\'s inbound events reach the intake with its ow
 
     expect(ack.count()).toBe(1)
     expect(archived).toEqual([])
-    expect([...sessions.values()].flat()).toEqual([])
+    expect(sessions.keys().flatMap(key => sessions.items(key))).toEqual([])
     expect(slackCalls(h.stub(h.A), h.stub(h.B))).toBe(before)
   })
 
@@ -1273,15 +1273,15 @@ describe('SR-4.1: archive rows are written with the receiving persona\'s name re
     await waitFor(() => rows().length > 0)
 
     expect(rows()).toEqual([row])
-    expect(h.stub(h.A).calls.conversationsInfo).toEqual([{ channel: CS }])
+    expect(h.stub(h.A).calls.conversationsInfo).toEqual([{ channel: CS }, { channel: CS }])
     expect(h.stub(h.A).calls.usersInfo.length).toBeGreaterThanOrEqual(1)
     expect(slackCalls(h.stub(h.B))).toBe(bBefore)
 
     await h.stub(h.B).socket.deliver(event)
     await waitFor(() => h.stub(h.B).calls.conversationsInfo.length > 0)
 
-    expect(h.stub(h.B).calls.conversationsInfo).toEqual([{ channel: CS }])
-    expect(h.stub(h.A).calls.conversationsInfo).toHaveLength(1)
+    expect(h.stub(h.B).calls.conversationsInfo).toEqual([{ channel: CS }, { channel: CS }])
+    expect(h.stub(h.A).calls.conversationsInfo).toHaveLength(2)
     expect(rows()).toEqual([row])
     expect(errors).toEqual([])
   })
@@ -1289,8 +1289,7 @@ describe('SR-4.1: archive rows are written with the receiving persona\'s name re
   test('each persona\'s resolver is built at most once: two messages in one channel on A\'s connection look the channel up once on A\'s client (its cache survives), and A\'s and B\'s resolvers differ', async () => {
     const { h, rows } = archiveHarness()
     await bringUpBoth(h)
-    // Only the archive looks channels up (`conversations.info`); the pipeline's user lookup
-    // would muddy a `users.info` count.
+    // The archive resolver and durable preparation each cache one channel lookup.
     const archiveLookups = () => h.stub(h.A).calls.conversationsInfo.length
 
     await h.stub(h.A).socket.deliver(makeChannelMessage({ channel: CA, ts: '1700000001.000001' }))
@@ -1299,7 +1298,7 @@ describe('SR-4.1: archive rows are written with the receiving persona\'s name re
     await waitFor(() => rows().length === 2)
 
     expect(rows()).toHaveLength(2)
-    expect(archiveLookups()).toBe(1)
+    expect(archiveLookups()).toBe(2)
 
     const source = createPersonaNameResolverSource(h.clientFor)
     expect(source.resolverFor(h.A.key)).toBe(source.resolverFor(h.A.key))

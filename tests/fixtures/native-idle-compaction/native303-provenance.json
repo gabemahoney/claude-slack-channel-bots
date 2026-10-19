@@ -1,0 +1,320 @@
+{
+  "version": "2.1.303",
+  "platform": "linux-x64",
+  "binaryUrl": "https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases/2.1.303/linux-x64/claude",
+  "manifestUrl": "https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases/2.1.303/manifest.json",
+  "binarySha256": "375988f457756524234695cf2d8f64ace99c5f68682e47ea24862a843c191450",
+  "binaryBytes": 285809912,
+  "releaseManifest": {
+    "file": "native303-release-manifest.json",
+    "sha256": "54d00d789ff0b78557f3b58ae12e012af12dbe0a07388f52d1d239c024aa166a"
+  },
+  "capturedFixture": {
+    "file": "native303-captured-idle-policy.txt",
+    "bytes": 18822,
+    "sha256": "717f69dcd8cadddaa156571f5ea85cdc6bdb3a231923a1e337b2cfb9a5917636"
+  },
+  "previousDetector": {
+    "file": "native-idle-compaction.before303.ts.txt",
+    "bytes": 17960,
+    "sha256": "f44300201e4dab19f8ade9decccb0054a94778ad65ce1a83a2b90fa32cea7709"
+  },
+  "fragments": [
+    {
+      "name": "policy",
+      "binaryOffset": 244231028,
+      "fixtureOffset": 0,
+      "bytes": 2883,
+      "sha256": "41c89bdfaaf804e7d33598b16233d32b067bb5a103afef32bbd55eb9d97e68b8",
+      "start": "var i1o=200000,",
+      "end": "var Ext=new lt(()=>new J2t);"
+    },
+    {
+      "name": "settings",
+      "binaryOffset": 238540056,
+      "fixtureOffset": 2884,
+      "bytes": 706,
+      "sha256": "e5258fac052b94dc221ae6cb26c6ad694617b8ff3676a318d8db027365523b3d",
+      "start": "function uh(){return Boolean(Ne(process.env.DISABLE_COMPACT)",
+      "end": "function dFs(){"
+    },
+    {
+      "name": "integer-parser",
+      "binaryOffset": 233961665,
+      "fixtureOffset": 3591,
+      "bytes": 360,
+      "sha256": "9091af4fa258032951da7468f05828db076931322f33d2868f3cd33208b7df17",
+      "start": "var g=/^[+-]?",
+      "end": "function JW(e){"
+    },
+    {
+      "name": "environment-parser",
+      "binaryOffset": 234168170,
+      "fixtureOffset": 3952,
+      "bytes": 773,
+      "sha256": "e5ff60b6463619b21053c47a9c3a21b0af4087c944b6a91ee2c58b1eeb1e6d2f",
+      "start": "function i(n){return{parse:(e)=>n(u(e))}}",
+      "end": "export{u5s,H};"
+    },
+    {
+      "name": "boolean-parser",
+      "binaryOffset": 233784041,
+      "fixtureOffset": 4726,
+      "bytes": 308,
+      "sha256": "cd5df39c7e0a5ad6316000a8a3d2ace4e09ba838bf15fbdc807fb8f559cfd101",
+      "start": "function Ne(e){if(!e)return!1;if(typeof e===",
+      "end": "function fE(e){"
+    },
+    {
+      "name": "cache-ttl",
+      "binaryOffset": 244949865,
+      "fixtureOffset": 5035,
+      "bytes": 615,
+      "sha256": "742e333e2ae864de7c4df32222b355af1daa1d5f4bb5592dd22181e6d53b0516",
+      "start": "function F7(e){return a.CLAUDE_CODE_MESSAGES_PROMPT_CACHE_TTL",
+      "end": "function lpe(e,"
+    },
+    {
+      "name": "cache-durations",
+      "binaryOffset": 238047176,
+      "fixtureOffset": 5651,
+      "bytes": 325,
+      "sha256": "c06d3b21f535cc12f94cc04b71dbaa4204757d15afe5c455a907e0b69777ca57",
+      "start": "var FU=300000,wx=3600000;",
+      "end": "var RLs="
+    },
+    {
+      "name": "cache-expiry",
+      "binaryOffset": 238050054,
+      "fixtureOffset": 5977,
+      "bytes": 773,
+      "sha256": "1efd612abb9a62d3fcf83fc57577b50b36064be6aea2001d7a4a002a6f66a125",
+      "start": "summary(e){let n=this.cacheReadTokens",
+      "end": "class M{#e=new Map;"
+    },
+    {
+      "name": "rollout-reader",
+      "binaryOffset": 237339757,
+      "fixtureOffset": 6751,
+      "bytes": 827,
+      "sha256": "1ca20dc6617d4fd62c492114a753fd65a68bc9e585a00af79f59aac03a6b19f3",
+      "start": "getFeatureValueWithSource(e,n){",
+      "end": "async checkGateCachedOrBlocking(e){"
+    },
+    {
+      "name": "settings-reader",
+      "binaryOffset": 238069164,
+      "fixtureOffset": 7579,
+      "bytes": 796,
+      "sha256": "4b47b14da8fbcd245b438c5362dd6dc8b2d4db9cf96068c558b3a9a2e5b377a5",
+      "start": "var AEe=[\"theme\",\"editorMode\"",
+      "end": "export{AEe,bs,Nq};"
+    },
+    {
+      "name": "precompute",
+      "binaryOffset": 245955450,
+      "fixtureOffset": 8376,
+      "bytes": 556,
+      "sha256": "809ebaaf46ccc235a0bcc9b4046b5193d5c36f02bd4bdc6515ada51b4eff9a63",
+      "start": "async function Jys(e,n){",
+      "end": "class zet extends Error"
+    },
+    {
+      "name": "minimum-getter-export",
+      "binaryOffset": 234197298,
+      "fixtureOffset": 8933,
+      "bytes": 85,
+      "sha256": "b083889a7837169891847d33fe3146db6984bde761bb1b9a30f8a54a8387243c",
+      "start": "CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS:()=>gc,",
+      "end": "CLAUDE_CODE_IDLE_THRESHOLD_MINUTES:()=>Si,"
+    },
+    {
+      "name": "minimum-getter-type",
+      "binaryOffset": 234234051,
+      "fixtureOffset": 9019,
+      "bytes": 42,
+      "sha256": "6ddf7dd443ce03056a24909c822d99d1356e4ed4f63c21c2e439e3ced21dc979",
+      "start": "gc=H.int({min:1,wholeValue:!0})",
+      "end": ",vc=H.str()"
+    },
+    {
+      "name": "ttl-getter-export",
+      "binaryOffset": 234183664,
+      "fixtureOffset": 9062,
+      "bytes": 77,
+      "sha256": "b1a3729009f92fa3f473b35cd0c9de0f9379ee2bd52bcccde8321c26ce96517c",
+      "start": "CLAUDE_CODE_PROMPT_CACHE_TTL:()=>$C,",
+      "end": "CLAUDE_CODE_PROPAGATE_TRACEPARENT:()=>CC,"
+    },
+    {
+      "name": "ttl-getter-type",
+      "binaryOffset": 234230494,
+      "fixtureOffset": 9140,
+      "bytes": 30,
+      "sha256": "08cb2818e0c1176d6df1597f4ab41ebd47bae3f26510dc1dd8c2df8b946731b5",
+      "start": "$C=H.enum(RZe),",
+      "end": "qC=H.enum(RZe),"
+    },
+    {
+      "name": "ttl-enum",
+      "binaryOffset": 234226129,
+      "fixtureOffset": 9171,
+      "bytes": 38,
+      "sha256": "527f83c80d37e08911c1251da04f432c2da01605cc847dab046c4008477e6e7e",
+      "start": "var RZe=[\"5m\",\"1h\"];",
+      "end": "var q_=H.triBool()"
+    },
+    {
+      "name": "setting-description",
+      "binaryOffset": 234755330,
+      "fixtureOffset": 9210,
+      "bytes": 218,
+      "sha256": "98a4beff1ab34ad123e1f2ecf1a61e8210d9997cc8b2de62047327d7df76bcf2",
+      "start": "idleCompaction:()=>M().optional().describe(",
+      "end": "switchModelsOnFlag:()=>"
+    },
+    {
+      "name": "background-events",
+      "binaryOffset": 245949798,
+      "fixtureOffset": 9429,
+      "bytes": 108,
+      "sha256": "d1d6abcc541e463c8ff1d8d9a868b0e5c95122a12d4883e2212d16cef96226f9",
+      "start": "function Bqr(e,n){return{...e,abortController:n,onCompactEvent:void 0,onRetryStatus:void 0}}",
+      "end": "function wuo(e){"
+    },
+    {
+      "name": "background-summary",
+      "binaryOffset": 245950209,
+      "fixtureOffset": 9538,
+      "bytes": 5241,
+      "sha256": "d28a86a5237df3e7125b3267b36b5c72e324fe5bdc6f20b5e659097ac9642b8d",
+      "start": "function gbr(e){",
+      "end": ";return H.put(K,jt),!0}"
+    },
+    {
+      "name": "application-expiry",
+      "binaryOffset": 244132450,
+      "fixtureOffset": 14780,
+      "bytes": 354,
+      "sha256": "4888b0d9dba0680e27bf1bd44de269650753b53e0efc70810541b70f1153312f",
+      "start": "function Gqe(e,n){",
+      "end": "function qao(e){"
+    },
+    {
+      "name": "application-guard",
+      "binaryOffset": 245957730,
+      "fixtureOffset": 15135,
+      "bytes": 2364,
+      "sha256": "4b53152e2ca7f2d360efc4df0ef8fac4906b83c3a09aa9cda2a8a9981c97ecb0",
+      "start": "async function Euo(e){",
+      "end": "function Wqr(e,n,r,s){"
+    },
+    {
+      "name": "request-clock",
+      "binaryOffset": 233901258,
+      "fixtureOffset": 17500,
+      "bytes": 582,
+      "sha256": "c5bff88e53960c63af73537c95ff3ac39f27f29ab9fd9fdfae27df1682f8fea1",
+      "start": "function X4(){",
+      "end": "function LDe(){"
+    },
+    {
+      "name": "remote-getter-export",
+      "binaryOffset": 234199441,
+      "fixtureOffset": 18083,
+      "bytes": 62,
+      "sha256": "0d0c6a60ba20f8b93da53ad47761f7d6309abc5d0cb7a5d2f8a4d3dbb19e3c81",
+      "start": "CLAUDE_CODE_REMOTE:()=>TS,",
+      "end": "CLAUDE_CODE_REMOTE_ENVIRONMENT_TYPE:"
+    },
+    {
+      "name": "remote-getter-type",
+      "binaryOffset": 234235653,
+      "fixtureOffset": 18146,
+      "bytes": 24,
+      "sha256": "a0836e10128312bff27305e8588cb3f995c73398312a4d190e41b0126b6fca5a",
+      "start": "TS=H.bool(),",
+      "end": "LS=H.bool(),"
+    },
+    {
+      "name": "disable-getter-export",
+      "binaryOffset": 234186564,
+      "fixtureOffset": 18171,
+      "bytes": 57,
+      "sha256": "4eaed1d729cc062e1d0b2f4741272e9f57408403e74ade29199558e462508bf5",
+      "start": "DISABLE_AUTO_COMPACT:()=>UC,",
+      "end": "DISABLE_BRIEF_MODE_STOP_HOOK:"
+    },
+    {
+      "name": "disable-getter-type",
+      "binaryOffset": 234230101,
+      "fixtureOffset": 18229,
+      "bytes": 24,
+      "sha256": "91566d1b3770c53a4af8dabcf835c00dd92a94694f99b37783f8a4d63a7e693e",
+      "start": "UC=H.bool(),",
+      "end": "xC=H.bool(),"
+    },
+    {
+      "name": "force-ttl-getter-export",
+      "binaryOffset": 234187761,
+      "fixtureOffset": 18254,
+      "bytes": 41,
+      "sha256": "f9ee11aeef5061d1df1688fd3128a55a8ee358a38500854d8aa684e423948b11",
+      "start": "FORCE_PROMPT_CACHING_5M:()=>sD,",
+      "end": "FORCE_VCR:"
+    },
+    {
+      "name": "force-ttl-getter-type",
+      "binaryOffset": 234230613,
+      "fixtureOffset": 18296,
+      "bytes": 24,
+      "sha256": "d52e7f6df95dc86b299c99e4252841a64ef8d470339b0e25c48859a7e5571d16",
+      "start": "sD=H.bool(),",
+      "end": "CD=H.bool(),"
+    },
+    {
+      "name": "messages-ttl-getter-export",
+      "binaryOffset": 234182764,
+      "fixtureOffset": 18321,
+      "bytes": 76,
+      "sha256": "326d21a782c6b497a475b39945cff3a081c1bea66f38dc5321306cc3af377f59",
+      "start": "CLAUDE_CODE_MESSAGES_PROMPT_CACHE_TTL:()=>tD,",
+      "end": "CLAUDE_CODE_MODEL_CAPABILITIES:"
+    },
+    {
+      "name": "messages-ttl-getter-type",
+      "binaryOffset": 234230524,
+      "fixtureOffset": 18398,
+      "bytes": 30,
+      "sha256": "988dcb99c646ff61960ab6e7c6061130941409e5fc0b68c255320cef54fa1283",
+      "start": "tD=H.enum([\"5m\"]),",
+      "end": "oD=H.bool(),"
+    },
+    {
+      "name": "messages-ttl-boundary",
+      "binaryOffset": 246111614,
+      "fixtureOffset": 18429,
+      "bytes": 124,
+      "sha256": "c312e962bbfb45e0e7ff8dfdaf96c12311acfb1340d6574287138024e7b29995",
+      "start": "function SYr(e){",
+      "end": "async function*xRn("
+    },
+    {
+      "name": "messages-ttl-request",
+      "binaryOffset": 246128802,
+      "fixtureOffset": 18554,
+      "bytes": 267,
+      "sha256": "a7c02cea35083d278016c31a7b91f2848de7f5f15538d0694c790f45ad258a43",
+      "start": "iR=lbe(Q.querySource,{agentCacheTtlOverride:Q.agentCacheTtlOverride,",
+      "end": "let wL=!1,mT="
+    }
+  ],
+  "captureVerifiedAgainstBinaryOffsets": true,
+  "binaryExecutedByFixtureCapture": false,
+  "binaryVendored": false,
+  "auditDeltaFrom302": {
+    "identicalFragments": 31,
+    "changedFragment": "environment-parser",
+    "change": "Only the helper declaration and export rename u6s to u5s; parser and all idle policy semantics are unchanged."
+  }
+}

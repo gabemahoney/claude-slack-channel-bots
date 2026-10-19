@@ -298,6 +298,11 @@ async function preparePersona(context: ForcedCallContext): Promise<PreparedPerso
       console.error(`[${DRIVER_NAME}] outage-notice persona=${noticeKey}: ${text}`)
     },
   })
+  // b.omv SR-7.2: the integration driver installs the daemon's launch gate.
+  const preparePrompt = await packageFunction<(config: unknown, stateDir: string) => string>(context, 'bot-system-prompt.ts', 'prepareBotSystemPrompt')
+  const stateDir = await packageFunction<() => string>(context, 'config.ts', 'resolveServerStateDir')
+  const installPromptGate = await packageFunction<(prepare: (key: string) => void) => void>(context, 'session-manager.ts', 'setSystemPromptPreparer')
+  installPromptGate(() => { preparePrompt(config, stateDir()) })
   return { persona, config, key }
 }
 

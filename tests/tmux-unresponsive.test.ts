@@ -1,4 +1,7 @@
 import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
+import { IDLE_PANE, TRUST_DIALOG_PANE } from './test-helpers/working-row-panes.ts'
+import { useImmediateTypingLifecycle } from './test-helpers/legacy-typing.ts'
+useImmediateTypingLifecycle()
 /**
  * tmux-unresponsive.test.ts — The per-persona `tmux-unresponsive` condition
  * and its three notices (b.jg5 SRJ-307 to SRJ-310, SRJ-1006; AC 25, AC 26,
@@ -211,7 +214,6 @@ import {
   SPAWN_ACTION_RETRYING,
   thisLaunchRowLiveLine,
   thisLaunchRowOf,
-  TRUST_DIALOG_NEEDLE,
   type ApproverVerb,
 } from '../src/session-manager.ts'
 import { RETRY_BLOCK_OLD_LIFE_WAIT } from '../src/unavailable-retry.ts'
@@ -429,12 +431,16 @@ const RESTART_RUN_ROWS = ['working', 'waiting', 'check_permission'] as const
 /**
  * One restart run's calls on P's live `row` (not connected) whose `read-pane`
  * is refused: the liveness read and the reconnect adapter's state read, the
- * one `read-pane`, and on a `waiting` row the reconnect's `send-keys`, which
- * the refused read lets go ahead (a `check_permission` row's refused read is
- * taken as alive and deferred). No kill or spawn.
+ * one `read-pane`, E4's provenance `get`, and on a `waiting` row the fresh
+ * reconnect row and pane checks. The failed fresh screen stops all keys
+ * (b.omv SR-5.5, SR-7.6); a `check_permission` row's refused read is taken
+ * as alive and deferred.
+ * No kill or spawn.
  */
-function restartRunPaneReadCalls(row: (typeof RESTART_RUN_ROWS)[number]): Record<string, number> {
-  return { statusCalls: 2, readPaneCalls: 1, ...(row === 'waiting' ? { sendKeysCalls: 1 } : {}) }
+function restartRunPaneReadCalls(row: (typeof RESTART_RUN_ROWS)[number], readable = false): Record<string, number> {
+  return row === 'waiting'
+    ? { statusCalls: 2, getCalls: readable ? 4 : 2, readPaneCalls: 3, ...(readable ? { sendKeysCalls: 2 } : {}) }
+    : { statusCalls: 2, getCalls: readable && row === 'working' ? 2 : 1, readPaneCalls: 1 }
 }
 
 describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
@@ -496,9 +502,8 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
   // The restart run (the harness's default retry action) reads a live
   // `working`, `waiting` or `check_permission` row's pane with one
   // `read-pane` (b.jg5 SRJ-603, SRJ-604, SRJ-606) inside its recovery
-  // attempt. A `waiting` row's refused read lets the reconnect go ahead, so
-  // its `send-keys` is refused too here: a `send-keys` that succeeded would
-  // end the condition in the same run.
+  // attempt. A `waiting` row also reaches the fresh delivery-screen check,
+  // whose failed read blocks all keys and preserves the condition.
   const restartRunPaneReads = RESTART_RUN_ROWS.flatMap((row) =>
     TMUX_STARTING_FORMS.map(([what, make]) => [what, row, make] as const),
   )
@@ -761,13 +766,14 @@ describe('tmux-unresponsive: what starts it (SRJ-307)', () => {
     ['AC 27: ErrCallTimeout', 'status', errCallTimeout],
   ])('%s answering the dialog approver’s %s, after the launch returned, starts nothing, posts nothing and arms nothing beyond the launch’s pending-only watch', async (_what, verb, make) => {
     const { h, p, b } = build()
-    const pending = { statusResult: cannedStatusResult({ state: 'pending' }) }
+    // b.omv SR-7.6: startup Enter requires a fresh marked pending row.
+    const pending = { statusResult: cannedStatusResult({ state: 'pending' }), getResult: personaRow(h, p, { state: 'pending' }) }
     h.script(
       verb === 'status'
         ? { statusError: make(verb) }
         : verb === 'read-pane'
           ? { ...pending, readPaneError: make(verb) }
-          : { ...pending, readPaneResults: [cannedReadPaneResult(TRUST_DIALOG_NEEDLE)], sendKeysError: make(verb) },
+          : { ...pending, readPaneResults: [cannedReadPaneResult(TRUST_DIALOG_PANE)], sendKeysError: make(verb) },
     )
 
     expect(await h.launch(p)).toMatchObject({ key: p, action: 'spawned' })
@@ -1116,8 +1122,8 @@ describe('tmux-unresponsive: what ends it (SRJ-310)', () => {
   // live again.
   const restartRunEnds = RESTART_RUN_ROWS.flatMap((row) =>
     ([
-      ['a pane', { readPaneResults: [cannedReadPaneResult('')] }, { statusCalls: 2, readPaneCalls: 1, ...(row === 'waiting' ? { sendKeysCalls: 1 } : {}) }],
-      ['GONE (ErrTmuxCaptureFailed)', { readPaneError: errTmuxCaptureFailed() }, { statusCalls: 3, readPaneCalls: 1, findMissingCalls: 1 }],
+      ['a pane', { readPaneResults: [cannedReadPaneResult(IDLE_PANE)] }, restartRunPaneReadCalls(row, true)],
+      ['GONE (ErrTmuxCaptureFailed)', { readPaneError: errTmuxCaptureFailed() }, { statusCalls: 3, getCalls: 1, readPaneCalls: 1, findMissingCalls: 1 }],
     ] satisfies Array<[string, RecoveryStubScript, Record<string, number>]>).flatMap(([what, answer, calls]) => [
       [what, row, 'before any onset', answer, calls, false],
       [what, row, 'after its onset', answer, calls, true],
@@ -2055,7 +2061,6 @@ async function healthTick(h: RecoveryHarness, key: string): Promise<string[]> {
     },
     isSessionAlive: async () => LIVENESS_READING_DEAD,
     isSessionConnected: () => false,
-    hasSessionStream: () => false,
     isRestartPendingOrActive: () => false,
     isLaunchInFlight: () => false,
     isAtCap: (k) => isAtCap(k, RESTART_FAILURE_CAP),

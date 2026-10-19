@@ -1,0 +1,12 @@
+{
+  "beforeSourceCommit": "bd1e9f2f0dadf12fb08887fc7cd0b8274caf6cee",
+  "beforeSourceSHA256": "304514562f323939ccbc64ace759d7c9281034149438e3f9cee09fe40749471c",
+  "capturedFunctionSHA256": "972c3c49508fab2d40317338b5d2471bd3763835f0ee8b2849a0b600fbfe4995",
+  "nativeADProofSHA256": "53a22ea4ba8612ba6c1ed1fb6603c5587442054d15d23711272c566aac34d0cc",
+  "proofNetwork": "none",
+  "nativeBinaryExecutedByUnitTests": false,
+  "beforeP2SourceSHA256": "1b7bd25bcd2c1937d7f2e36830e7e0eaf30e9199ebd293337e308f15b8a792e7",
+  "proofSourceSHA256": "bb216a73db68e3e4dc32a96e7f4a6f5c1951038c99f5b4a904a571ec47cabf98",
+  "proofScope": "Native/AD PID association only, network none, retained older product image; not current product qualification",
+  "zombieHeldPipeProofSHA256": "a326d443169e1a757a2133e147b2beecb0c9c0367d7976c568dd2cd66dcc68c3"
+}

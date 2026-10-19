@@ -1,45 +1,6 @@
-/**
- * interject.ts — The `/interject` request handler (b.av2 SR-9.1, SR-9.2,
- * SR-10.2).
- *
- * `/interject` injects a message into one persona's live Claude session from
- * localhost. The body names the persona by name or key (`persona`), carries
- * the `message` and an optional `sender` label. The handler answers:
- *
- *   405  any method but POST
- *   403  a remote address other than 127.0.0.1, ::1 or ::ffff:127.*
- *   413  a UTF-8 body over INTERJECT_BODY_CAP_BYTES
- *   400  invalid JSON, or a missing/non-string/empty `persona` or `message`
- *        (a body that still carries only the old `channel` field gets the
- *        `persona` error)
- *   404  no applied persona has that name or key (or no persona config)
- *   503  the persona is not up (b.av2 SR-6.4; checked before the session
- *        lookup, so a still-registered session of a not-up persona gets
- *        nothing), or it has no registered, connected session
- *   200  `{ ok: true, persona: <name> }` after one notification is sent
- *
- * The notification goes to the named persona's session only, as
- * `notifications/claude/channel` with meta `user` (the sender label) and `ts`
- * and nothing else: no `chat_id`, `message_id` or `via` (SR-9.2). The reply
- * guard tells injected messages from delivered Slack messages by the absence
- * of `via`, not by `user` or `ts`.
- *
- * A request for a persona that is not up is refused with 503 and the body
- * `{ error: 'Persona is not up', persona: <name> }`, and one line is logged:
- *
- *   [slack] /interject: refused for persona "<name>" (key=<key>) — the persona is not up; nothing delivered
- *
- * Side-effect free (b.av2 SR-13.1): importing this module reads no file,
- * environment variable or config, binds nothing and logs nothing. The
- * persona config, the up check, the session lookup, the clock and the logger
- * are injected per call. It never imports server.ts.
- *
- * SPDX-License-Identifier: MIT
- */
-
+/** Durable localhost injection; 200 means stored, before delivery (b.omv SR-4.3). */
 import type { Persona } from './config.ts'
-import type { SessionEntry } from './registry.ts'
-import { describeThrownValue } from './persona-connection-errors.ts'
+import type { QueueAccept } from './delivery-queue.ts'
 import { renderPersonaRef, resolvePersonaTarget } from './persona-identity.ts'
 
 // ---------------------------------------------------------------------------
@@ -56,9 +17,6 @@ export const INTERJECT_BODY_CAP_BYTES = 32768
 /** Sender label used when the body carries no non-empty string `sender`. */
 export const DEFAULT_INTERJECT_SENDER = 'interject'
 
-/** MCP notification method that carries an injected message to a session. */
-const CHANNEL_NOTIFICATION_METHOD = 'notifications/claude/channel'
-
 /** Characters of message text the delivery log line shows. */
 const DELIVERY_LOG_TEXT_LENGTH = 80
 
@@ -69,9 +27,6 @@ const DELIVERY_LOG_TEXT_LENGTH = 80
 /** The persona fields the handler reads. */
 export type InterjectPersona = Pick<Persona, 'name' | 'key'>
 
-/** The session fields the handler reads. */
-export type InterjectSession = Pick<SessionEntry, 'connected' | 'server'>
-
 /** Dependencies of `handleInterject`, injected per call. */
 export interface InterjectDeps {
   /**
@@ -80,13 +35,8 @@ export interface InterjectDeps {
    * unknown (404).
    */
   getPersonaConfig: () => { personas: readonly InterjectPersona[] } | null
-  /**
-   * Whether the persona with this key is up (b.av2 SR-6.4); production passes
-   * `createPersonaUpPredicate`. Asked before the session lookup.
-   */
-  isPersonaUp: (key: string) => boolean
-  /** The registry lookup by persona key (`getSessionByPersona` in production). */
-  getSessionByPersona: (key: string) => InterjectSession | undefined
+  /** Durable shared injected intake (b.omv SR-4.3). */
+  accept: QueueAccept
   /** Clock in epoch milliseconds for the `ts` meta value. Defaults to `Date.now`. */
   now?: () => number
   /** Line logger. Defaults to `console.error`. */
@@ -111,14 +61,6 @@ function jsonResponse(status: number, body: Record<string, unknown>): Response {
  */
 export function isLocalAddress(address: string): boolean {
   return address === '127.0.0.1' || address === '::1' || address.startsWith('::ffff:127.')
-}
-
-/**
- * The `ts` meta value for an injected message: the string form of the epoch
- * milliseconds divided by 1000 (at most three fractional digits).
- */
-function interjectTs(nowMs: number): string {
-  return String(nowMs / 1000)
 }
 
 // ---------------------------------------------------------------------------
@@ -169,37 +111,17 @@ export async function handleInterject(
   const log = deps.log ?? ((line: string) => console.error(line))
   const ref = renderPersonaRef(persona.name, persona.key)
 
-  // b.av2 SR-6.4: a persona that is not up is refused before the session
-  // lookup, even when its instance's session is still registered.
-  if (!deps.isPersonaUp(persona.key)) {
-    log(`[slack] /interject: refused for persona ${ref} — the persona is not up; nothing delivered`)
-    return jsonResponse(503, { error: 'Persona is not up', persona: persona.name })
-  }
-
-  const session = deps.getSessionByPersona(persona.key)
-  if (!session || !session.connected) {
-    return jsonResponse(503, { error: 'No active session for this persona' })
-  }
-
   const senderLabel = typeof sender === 'string' && sender ? sender : DEFAULT_INTERJECT_SENDER
-  const meta: Record<string, string> = {
-    user: senderLabel,
-    ts: interjectTs((deps.now ?? Date.now)()),
+  try {
+    const result = await deps.accept(persona.key, { source: 'interject', sender: senderLabel, text: message, received_at: (deps.now ?? Date.now)() })
+    if (result.status === 'failed') return jsonResponse(500, { error: 'Message not stored' })
+  } catch {
+    return jsonResponse(500, { error: 'Message not stored' })
   }
 
   log(
-    `[slack] /interject: delivering to persona ${ref} sender="${senderLabel}" ` +
+    `[slack] /interject: queued for persona ${ref} sender="${senderLabel}" ` +
       `message="${message.slice(0, DELIVERY_LOG_TEXT_LENGTH)}"`,
   )
-  const sent = session.server.notification({
-    method: CHANNEL_NOTIFICATION_METHOD,
-    params: { content: message, meta },
-  })
-  // Not awaited, as before: the 200 means "handed to the session". A later
-  // rejection is logged, never left unhandled.
-  void Promise.resolve(sent).catch((err: unknown) => {
-    log(`[slack] /interject: notification to persona ${ref} failed: ${describeThrownValue(err)}`)
-  })
-
   return jsonResponse(200, { ok: true, persona: persona.name })
 }

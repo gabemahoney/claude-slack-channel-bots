@@ -1475,14 +1475,14 @@ function dockerFormHeads(): DockerFormHeads {
 /** One recognised form, with its operands. */
 type DockerForm =
   | { readonly kind: 'version' }
-  | { readonly kind: 'container-list' }
+  | { readonly kind: 'container-list'; readonly codexOnly?: boolean }
   | { readonly kind: 'container-state'; readonly refs: readonly string[] }
   | { readonly kind: 'container-inspection'; readonly ref: string }
   | { readonly kind: 'container-create'; readonly name: string; readonly labels: Record<string, string>; readonly image: string }
   | { readonly kind: 'container-copy'; readonly ref: string; readonly path: string }
   | { readonly kind: 'container-kill'; readonly ref: string; readonly signal: SentSignal }
   | { readonly kind: 'container-logs'; readonly ref: string }
-  | { readonly kind: 'container-remove'; readonly ref: string }
+  | { readonly kind: 'container-remove'; readonly ref: string; readonly force?: boolean }
   | { readonly kind: 'container-run'; readonly runArguments: readonly string[] }
   | { readonly kind: 'image-inspect'; readonly refs: readonly string[] }
   | { readonly kind: 'image-list'; readonly filters: readonly ImageListFilter[]; readonly filterTexts: readonly string[] }
@@ -1568,6 +1568,7 @@ function matchDockerForm(request: SpawnRequest): DockerForm | null {
 
   if (exactly(dockerAnswersArgs)) return { kind: 'version' }
   if (exactly(containerListArgs)) return { kind: 'container-list' }
+  if (exactly(codexLoginContainerListArgs)) return { kind: 'container-list', codexOnly: true }
   const state = after(heads.stateInspect)
   if (state !== null && state.length > 0 && exactly(() => containerStateInspectArgs(state))) return { kind: 'container-state', refs: state }
   const inspection = after(heads.inspection)
@@ -1597,6 +1598,7 @@ function matchDockerForm(request: SpawnRequest): DockerForm | null {
   }
   const logs = after(heads.logs)
   if (logs?.length === 1 && exactly(() => containerLogsArgs(logs[0]!))) return { kind: 'container-logs', ref: logs[0]! }
+  if (argv.length === 5 && argv.slice(0, 4).join(' ') === 'docker container rm --force') return { kind: 'container-remove', ref: argv[4]!, force: true }
   const remove = after(heads.remove)
   if (remove?.length === 1 && exactly(() => containerRemoveArgs(remove[0]!))) return { kind: 'container-remove', ref: remove[0]! }
   const run = after(heads.run)
@@ -2172,7 +2174,7 @@ export function createFakeDocker(recorder: SpawnRecorder, options: FakeDockerOpt
       case 'version':
         return answered(`${serverVersion}\n`)
       case 'container-list':
-        return answered(linesText([...containers.keys()]))
+        return answered(linesText([...containers.values()].filter(container => !form.codexOnly || container.labels['cscb.codex-login'] === 'true').map(container => container.id)))
       case 'container-state': {
         const found: string[] = []
         const missing: string[] = []
@@ -2224,6 +2226,7 @@ export function createFakeDocker(recorder: SpawnRecorder, options: FakeDockerOpt
       case 'container-remove': {
         const container = findContainer(form.ref)
         if (container === null) return noSuchContainer(form.ref)
+        if (container.running && form.force) takeSignal(processes, clock, container.pid, 'SIGKILL')
         if (container.running) {
           return refused(1, [`Error response from daemon: cannot remove container "/${container.name}": container is running: stop the container before removing or force remove`])
         }
@@ -2994,6 +2997,7 @@ export function makeResults(spec: ResultsSpec, runDir?: string): Results {
     runId: spec.runId,
     pid: spec.pid,
     packageSha256: null,
+    codexModel: null,
     images: { pinned: null, drift: null, retag: null, retagMoved: false },
     verdict: '',
     invocation: { args: [], selective: false, faults: [] },
@@ -5212,4 +5216,42 @@ export function buildSampleSequence(root: string, fakes: SampleSequenceFakes, sp
       return { reading, resultFile: readResultFile(join(runDir, `${SHARD_DIR_PREFIX}${shard}`)) }
     },
   }
+}
+
+
+// b.omv SR-14.7: only fake login/config bytes, always below a caller's scratch root.
+import { fakeToken } from './credentials.ts'
+import { codexLoginContainerListArgs, type CodexLoginDeps, type LoginRead } from '../../scripts/codex-login.ts'
+export function makeFakeCodexHome(root: string, model = 'test/model:1') {
+  const home = join(root, 'codex-home')
+  mkdirSync(home, { recursive: true, mode: 0o700 })
+  const config = join(home, 'config.toml'), auth = join(home, 'auth.json')
+  const tokens = { access: fakeToken('', 'codex-access'), refresh: fakeToken('', 'codex-refresh') }
+  writeFileSync(config, `model = ${JSON.stringify(model)}\nmodel_reasoning_effort = "high"\n`, { mode: 0o600 })
+  const writeLogin = (generation = 'initial') => writeFileSync(auth, JSON.stringify({ tokens: {
+    access_token: generation === 'initial' ? tokens.access : fakeToken('', `codex-access-${generation}`),
+    refresh_token: generation === 'initial' ? tokens.refresh : fakeToken('', `codex-refresh-${generation}`),
+  } }), { mode: 0o600 })
+  writeLogin()
+  return { home, config, auth, model, tokens, env: { CODEX_HOME: home }, writeLogin }
+}
+export function makeFakeCodexLogin(clock: RunnerClock, uid = 1000) {
+  let held = false, releases = 0, reads = 0, busyUntil = 0
+  const events: string[] = []
+  let login: LoginRead = { identity: { dev: 1, ino: 10, uid, mode: 0o600 }, json: {
+    tokens: { access_token: fakeToken('', 'codex-access'), refresh_token: fakeToken('', 'codex-refresh') },
+  } }
+  const deps: CodexLoginDeps = {
+    readConfig: () => { events.push('config'); return 'model = "test/model:1"\n' },
+    readLogin: () => { events.push('read'); reads++; return login },
+    resolveLogin: path => path,
+    openLock: () => ({ tryLock: () => {
+      if (clock.now() < busyUntil) return { kind: 'held' }
+      held = true; events.push('locked'); return { kind: 'taken' }
+    }, release: () => { held = false; releases++; events.push('released') } }),
+    now: () => clock.now(), sleep: ms => new Promise(resolve => clock.setTimeout(resolve, ms)),
+  }
+  return { deps, events, held: () => held, releases: () => releases, reads: () => reads,
+    setLogin: (value: LoginRead) => { login = value }, login: () => login,
+    busyUntil: (value: number) => { busyUntil = value } }
 }

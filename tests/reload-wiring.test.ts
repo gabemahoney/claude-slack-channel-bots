@@ -213,7 +213,7 @@ function startTimeConfig(): string {
     new RegExp(
       `^\\(?\\s*(\\w+)\\s*\\)?\\s*=>\\s*\\{\\s*` +
         `if\\s*\\(\\s*(\\w+)\\s*===\\s*undefined\\s*\\)\\s*throw\\s+new\\s+Error\\s*\\(\\s*'[^']*'\\s*\\)\\s*;?\\s*` +
-        `${loaded}\\s*=\\s*configInEffect\\s*\\(\\s*\\2\\s*,\\s*\\1\\s*\\)\\s*;?\\s*\\}$`,
+        `${loaded}\\s*=\\s*configInEffect\\s*\\(\\s*\\2\\s*,\\s*\\1\\s*\\)\\s*;?\\s*void\\s+deliveryPreparation\\?\\.recover\\(\\1\\.personas\\.map\\(p\\s*=>\\s*p\\.key\\)\\)\\s*;?\\s*\\}$`,
     ),
   )
   expect(swap).not.toBeNull()
@@ -491,7 +491,7 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
       // change nothing the server serves.
       ['bringUps', constOf('createPersonaBringUpController')],
       ['connections', constOf('createPersonaConnectionManager')],
-      ['routing', constOf('createPersonaRouting')],
+      ['routing', `{ ...${constOf('createPersonaRouting')}, forget: key => { ${constOf('createPersonaRouting')}.forget(key); deliveryReporting?.forget(key); deliveryPreparation?.forget(key); void deliveryEngines?.forget(key); deliveryLifecycle?.forget(key) } }`],
       ['destinations', constOf('createPersonaDestinations')],
       ['destinationHold', constOf('createPersonaDestinationHold')],
       ['notifier', notifier],
@@ -613,11 +613,11 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
     // its launch in flight would start), first: the session manager's approver
     // stop for that key with the teardown reason, not a stub, not another
     // key's or every persona's stop (imported above, not shadowed).
-    const stopApprover = (props.get('stopApprover') ?? '').match(
-      /^\(?(\w+)\)? => stopDialogApprover\((\w+), APPROVER_STOP_TEARDOWN\)$/,
-    )
+    const stopBody = props.get('stopApprover') ?? ''
+    const stopApprover = stopBody.match(/^async \(?(\w+)\)? => \{ const (\w+) = /)
     expect(stopApprover).not.toBeNull()
-    expect(stopApprover![2]).toBe(stopApprover![1])
+    const [, stopKey, stoppingDelivery] = stopApprover!
+    expect(stopBody).toBe(`async (${stopKey}) => { const ${stoppingDelivery} = deliveryEngines?.forget(${stopKey}); deliveryLifecycle?.forget(${stopKey}); await stopDialogApprover(${stopKey}, APPROVER_STOP_TEARDOWN); await ${stoppingDelivery} }`)
 
     // b.jg5 SRJ-706, SRJ-715: optional in the deps, so only this pin makes
     // sure a production teardown stops the key's live-row sequence (right
@@ -853,11 +853,11 @@ describe('server.ts binds apply step 1\'s approver stop, and no src file keeps t
   // tests/reload-apply.test.ts; what the stop does in
   // tests/approve-trust-folder-dialog.test.ts.
   test('the reload controller\'s stopApprover is exactly the session manager\'s approver stop for the key it is given, with the retired-key reason (imported, not shadowed)', () => {
-    const stop = (controllerProps().get('stopApprover') ?? '').match(
-      /^\(?(\w+)\)? => stopDialogApprover\((\w+), APPROVER_STOP_RETIRED_KEY\)$/,
-    )
+    const body = controllerProps().get('stopApprover') ?? ''
+    const stop = body.match(/^async \(?(\w+)\)? => \{ const (\w+) = /)
     expect(stop).not.toBeNull()
-    expect(stop![2]).toBe(stop![1])
+    const [, key, stopping] = stop!
+    expect(body).toBe(`async (${key}) => { const ${stopping} = deliveryEngines?.forget(${key}); deliveryLifecycle?.forget(${key}); await stopDialogApprover(${key}, APPROVER_STOP_RETIRED_KEY); await ${stopping} }`)
     for (const name of ['stopDialogApprover', 'APPROVER_STOP_RETIRED_KEY']) {
       expect([name, importSource(SERVER_CODE, name)]).toEqual([name, './session-manager.ts'])
       expect([name, indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${name}\\b`, 'g'), SERVER_CODE)]).toEqual([name, []])
@@ -1083,14 +1083,18 @@ describe('AC 61: server-wide settings keep their start-time values after a confi
   // the accessor itself (not a value taken once, not a stand-in), so each
   // use reads it again.
   test.each([
-    ['the persona routing (the inbound ack reaction)', () => onlyCallProps('createPersonaRouting')],
     ['the MCP session tools (the reply tool\'s chunking and ack removal)', () => constObjectProps('sessionToolDeps')],
   ])('%s get getReplySettings: getReplySettings, the one accessor', (_consumer, props) => {
     expect(props().get('getReplySettings')).toBe('getReplySettings')
     // Nothing in server.ts calls it (a value read once and handed on): the
     // only `getReplySettings(` is its declaration.
-    expect(anyCallOf('getReplySettings')).toEqual(indicesOf(/(?<=\bfunction\s+)getReplySettings\s*\(/g, SERVER_CODE))
-    expect(anyCallOf('getReplySettings')).toHaveLength(1)
+    const reads = anyCallOf('getReplySettings')
+    const declaration = indicesOf(/(?<=\bfunction\s+)getReplySettings\s*\(/g, SERVER_CODE)
+    expect(reads).toHaveLength(declaration.length + 1)
+    const reporting = callsOf(SERVER_CODE, 'createDeliveryReporting')[0]!
+    const [open, close] = balancedAfter(SERVER_CODE, reporting, '(', ')')
+    expect(reads.filter(at => at > open && at < close)).toHaveLength(1)
+    expect(anyCallOf('getReplySettings')).toHaveLength(2)
   })
 
   test('getReplySettings, declared once at module scope, is exactly `return replySettingsOf(<applied config holder>)`, with config.ts\'s replySettingsOf', () => {
@@ -1182,4 +1186,10 @@ describe('replySettingsOf (b.av2 SR-1.6)', () => {
 
     expect(replySettingsOf(rest as PersonaConfig)).toEqual({ ...DEFAULTS, ack_reaction: 'eyes' })
   })
+})
+
+test('production removal previews consume queue counts as facts and confirmation exposes the retained event', () => {
+  const props = controllerProps()
+  expect(props.get('queueOpenCount')).toMatch(/^key\s*=>\s*deliveryQueue\?\.openCount\(key\)\s*\?\?\s*0$/)
+  expect(props.get('onQueueRetained')).toMatch(/^key\s*=>\s*deliveryQueue\?\.retained\(key\)$/)
 })

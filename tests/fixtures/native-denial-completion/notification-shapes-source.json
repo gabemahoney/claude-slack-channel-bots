@@ -1,0 +1,239 @@
+[
+  {
+    "version": "2.1.280",
+    "platform": "linux-x64",
+    "url": "https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases/2.1.280/linux-x64/claude",
+    "binaryBytes": 233709640,
+    "binarySha256": "1e08503dbdf3c2cb0d706d32f3408277388d1c76ef108673e8fe42c1b322925b",
+    "fragments": [
+      {
+        "name": "queued-record",
+        "offset": 200700355,
+        "bytes": 693,
+        "sha256": "eb8e21b3e2b88558096a969907d2131c8f06bd43bd70a2a84df35afbc5db5a56",
+        "source": "type:\"queued_command\",prompt:B,source_uuid:h.uuid||aNe(),imagePasteIds:y.length>0?w:void 0,fileAttachments:h.fileAttachments,inlinedImagePaths:h.inlinedImagePaths,commandMode:h.mode,origin:OB(h.origin),timestamp:h.timestamp,isMeta:h.isMeta,...h.usage&&{usage:h.usage},...L&&{taskDelivery:L},...h.verifiedSlackHumanTurn&&{verifiedSlackHumanTurn:!0},...h.projectsUserTurn&&{projectsUserTurn:!0},...h.hearthRelayRows&&{hearthRelayRows:h.hearthRelayRows},...h.hearthRelayThreadTs&&{hearthRelayThreadTs:h.hearthRelayThreadTs},...h.hearthRelayMessageIds&&{hearthRelayMessageIds:h.hearthRelayMessageIds},...h.mode===\"prompt\"&&!h.isMeta&&aw(h.origin)&&!h.verifiedSlackHumanTurn&&sNe()&&{humanTurn:!0}}"
+      },
+      {
+        "name": "queued-to-user",
+        "offset": 201351868,
+        "bytes": 1503,
+        "sha256": "408fb00946cfc1da4fe192365d2e62852f44ddfd4af556f597f08e5e834acb5b",
+        "source": "case\"queued_command\":{if(e.renderedByBatchHead)return[];if(w7(e)){let B=obr(e);if(B===void 0)return[];return ui([Ae({content:`${Muo(B.source)}\n${$2(B.text)}`,isMeta:!0,origin:e.origin,uuid:e.source_uuid})])}let s=Array.isArray(e.inlinedImagePaths)?e.inlinedImagePaths.filter((B)=>typeof B===\"string\"):[],g=s.length===0?[]:[Ae({content:Fa(h3t(s)),isMeta:!0})],h=cce(e.origin,e.commandMode),y=h!==void 0&&!gE(h)||e.isMeta?{isMeta:!0}:{},w=(B)=>gE(h)&&e.isMeta!==!0&&e.verifiedSlackHumanTurn!==!0?B:$Rn(B),M=z5t(e),L=M?(B)=>B:ui;if(e.batchedRelayPrompts){let B=M?`${Rqt}${w(e.batchedRelayPrompts.join(`\n\n`))}`:e.batchedRelayPrompts.map((j)=>uRe(w(j),h,{verifiedSlackHumanTurn:e.verifiedSlackHumanTurn,isMeta:e.isMeta,inHumanTurn:n?.inHumanTurn})).join(`\n\n`);return L([Ae({content:B,...y,origin:h,uuid:e.source_uuid})])}if(Array.isArray(e.prompt)){let B=e.prompt.filter((ve)=>ve.type===\"text\"),j=B.map((ve)=>ve.text).join(`\n`),he=e.prompt.filter((ve)=>ve.type===\"image\"),_e=[{type:\"text\",text:uRe(w(j),h,{verifiedSlackHumanTurn:e.verifiedSlackHumanTurn,isMeta:e.isMeta,inHumanTurn:n?.inHumanTurn,hearthServerEnvelope:e.hearthRelayMessageIds!==void 0,hearthJoinedTextBlocks:B.length>1})},...he];return[...L([Ae({content:_e,...y,origin:h,uuid:e.source_uuid})]),...g]}return[...L([Ae({content:uRe(w(String(e.prompt)),h,{verifiedSlackHumanTurn:e.verifiedSlackHumanTurn,isMeta:e.isMeta,inHumanTurn:n?.inHumanTurn,hearthServerEnvelope:e.hearthRelayMessageIds!==void 0}),...y,origin:h,uuid:e.source_uuid})]),...g]}"
+      },
+      {
+        "name": "notification-serialization",
+        "offset": 197579230,
+        "bytes": 245,
+        "sha256": "91780671454d3d44989b910b3f3b461cad1358da2b27f49cffb1d47a5b742a62",
+        "source": "function Ci({taskId:n,toolUseId:s,taskType:r,outputFile:e,status:i,summary:t,body:u,trailing:d}){let f=[[F8,n],[U8,s],[dse,r],[Gho,e],[DE,i],[f0,t]],o=`<${Uu}>`;for(let[a,T]of f)if(T)o+=`\n<${a}>${T}</${a}>`;return`${o}${u??\"\"}\n</${Uu}>${d??\"\"}`}"
+      },
+      {
+        "name": "tag-F8",
+        "offset": 190677136,
+        "bytes": 12,
+        "sha256": "45ed97f99954c8331627e863b8039b6c3cecf39b9596817d5891125172482f17",
+        "source": "F8=\"task-id\""
+      },
+      {
+        "name": "tag-U8",
+        "offset": 190677149,
+        "bytes": 16,
+        "sha256": "9dfe934d802404b90e2f1691c8e909b5560d45253293613a0b5314891c3e9834",
+        "source": "U8=\"tool-use-id\""
+      },
+      {
+        "name": "tag-dse",
+        "offset": 190677166,
+        "bytes": 15,
+        "sha256": "fcddbadc30b9c285b002343328efb809624401e016a01e21c523388c72695153",
+        "source": "dse=\"task-type\""
+      },
+      {
+        "name": "tag-Gho",
+        "offset": 190677301,
+        "bytes": 17,
+        "sha256": "e10de09bcd0cbfeb29fc1ceeb84c3310ba7e771b9889cf192c3e3a35947537ba",
+        "source": "Gho=\"output-file\""
+      },
+      {
+        "name": "tag-DE",
+        "offset": 190677319,
+        "bytes": 11,
+        "sha256": "2591006926007bd68615d0e6994fc90a056012f53daa60d184c9261189189c07",
+        "source": "DE=\"status\""
+      },
+      {
+        "name": "tag-f0",
+        "offset": 190677331,
+        "bytes": 12,
+        "sha256": "8e08ef386313f2b1d31955293b94937be28880a6cac4f51baef8dfc440eea7cf",
+        "source": "f0=\"summary\""
+      },
+      {
+        "name": "tag-Uu",
+        "offset": 190677113,
+        "bytes": 22,
+        "sha256": "ac2789a854cb1f640aaf7d40d587caaec67c0fce6200b1883e88cbf89a38a331",
+        "source": "Uu=\"task-notification\""
+      }
+    ]
+  },
+  {
+    "version": "2.1.296",
+    "platform": "linux-x64",
+    "url": "https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases/2.1.296/linux-x64/claude",
+    "binaryBytes": 257068216,
+    "binarySha256": "24972e3bc859fab2b46ed4c1e51f7d6130f06d3bd550811a114640de3370d0de",
+    "fragments": [
+      {
+        "name": "queued-record",
+        "offset": 219249281,
+        "bytes": 1061,
+        "sha256": "e11288fa8c9b97703e5c458dab077bd511d99af8adb111b0be1b0087a14f04f3",
+        "source": "type:\"queued_command\",prompt:ke,source_uuid:G,delivery_id:H.deliveryId,imagePasteIds:V.length>0?Y:void 0,fileAttachments:H.fileAttachments,inlinedImagePaths:H.inlinedImagePaths,commandMode:H.mode,origin:q3(H.origin),...H.runId!==void 0&&{runId:H.runId},timestamp:H.timestamp,isMeta:H.isMeta,...H.usage&&{usage:H.usage},..._e&&{taskDelivery:_e},...H.verifiedSlackHumanTurn&&{verifiedSlackHumanTurn:!0},...H.projectsUserTurn&&{projectsUserTurn:!0},...H.inputSource!==void 0&&{inputSource:H.inputSource},...H.origin?.kind===\"peer\"&&(h||y&&H.origin.senderTaskId===void 0)&&{sendMessageToolAbsent:!0},...H.hearthRelayRows&&{hearthRelayRows:H.hearthRelayRows},...H.hearthRelayThreadTs&&{hearthRelayThreadTs:H.hearthRelayThreadTs},...H.hearthRelayMessageIds&&{hearthRelayMessageIds:H.hearthRelayMessageIds},...H.mode===\"prompt\"&&!H.isMeta&&pm(H.origin)&&!H.verifiedSlackHumanTurn&&!$Et((typeof ke===\"string\"?ke:Ao(ke,`\n`)).trimStart())&&FXe()&&{humanTurn:!0},...FBn({origin:H.origin,isMeta:H.isMeta,verifiedSlackHumanTurn:H.verifiedSlackHumanTurn,commandMode:H.mode})}"
+      },
+      {
+        "name": "queued-to-user",
+        "offset": 220080049,
+        "bytes": 1719,
+        "sha256": "c8e16834850b26c571bebcedb00e9fb672c4d9b56df3ef607a4e9e1919528a06",
+        "source": "case\"queued_command\":{if(e.renderedByBatchHead)return[];let{reminderId:s}=e,h=cpt(s)?(he)=>Qqr(he,s):yl;if(Yoe(e)){let he=BBn(e);if(he===void 0)return[];return h([xe({content:`${iks(he.source)}\n${Oee(he.text)}`,isMeta:!0,origin:e.origin,uuid:e.source_uuid})])}let y=Array.isArray(e.inlinedImagePaths)?e.inlinedImagePaths.filter((he)=>typeof he===\"string\"):[],S=y.length===0?[]:[xe({content:Yl(uLn(y)),isMeta:!0})],w=dW(e.origin,e.commandMode,e.runId),H=w!==void 0&&!SS(w)||e.isMeta?{isMeta:!0}:{},G=(he)=>SS(w)&&e.isMeta!==!0&&e.verifiedSlackHumanTurn!==!0?he:kXt(he),V=bZe(e),Y=V?(he)=>he:h;if(e.batchedRelayPrompts){let he=V?`${fRn}${G(e.batchedRelayPrompts.join(`\n\n`))}`:e.batchedRelayPrompts.map((_e)=>Jhe(G(_e),w,{verifiedSlackHumanTurn:e.verifiedSlackHumanTurn,isMeta:e.isMeta,inHumanTurn:n?.inHumanTurn})).join(`\n\n`);return Y([xe({content:he,...H,origin:w,uuid:e.source_uuid})])}if(Array.isArray(e.prompt)){let he=e.prompt.filter((Te)=>Te.type===\"text\"),_e=he.map((Te)=>Te.text).join(`\n`),ke=e.prompt.filter((Te)=>Te.type===\"image\"),be=[{type:\"text\",text:Jhe(G(_e),w,{verifiedSlackHumanTurn:e.verifiedSlackHumanTurn,isMeta:e.isMeta,inHumanTurn:n?.inHumanTurn,hearthServerEnvelope:e.hearthRelayMessageIds!==void 0,hearthJoinedTextBlocks:he.length>1,sendMessageToolAbsent:e.sendMessageToolAbsent,wholeMessage:e.prompt.length===1})},...ke];return[...Y([xe({content:be,...H,origin:w,uuid:e.source_uuid})]),...S]}return[...Y([xe({content:Jhe(G(String(e.prompt)),w,{verifiedSlackHumanTurn:e.verifiedSlackHumanTurn,isMeta:e.isMeta,inHumanTurn:n?.inHumanTurn,hearthServerEnvelope:e.hearthRelayMessageIds!==void 0,sendMessageToolAbsent:e.sendMessageToolAbsent,wholeMessage:!0}),...H,origin:w,uuid:e.source_uuid})]),...S]}"
+      },
+      {
+        "name": "notification-serialization",
+        "offset": 215596795,
+        "bytes": 244,
+        "sha256": "323b8e8cbd9212fb6789b7c58c94040f1f96e7cc97a1c53f58ff59a931306270",
+        "source": "function Fi({taskId:n,toolUseId:s,taskType:r,outputFile:e,status:i,summary:t,body:u,trailing:d}){let f=[[ZF,n],[eU,s],[IN,r],[Ipe,e],[ow,i],[ZE,t]],o=`<${Fu}>`;for(let[a,T]of f)if(T)o+=`\n<${a}>${T}</${a}>`;return`${o}${u??\"\"}\n</${Fu}>${d??\"\"}`}"
+      },
+      {
+        "name": "tag-ZF",
+        "offset": 207501427,
+        "bytes": 12,
+        "sha256": "4f572df08d6020309963060b39c199a3b52f5b246ac27bb51927c3ce0b1d3393",
+        "source": "ZF=\"task-id\""
+      },
+      {
+        "name": "tag-eU",
+        "offset": 207501440,
+        "bytes": 16,
+        "sha256": "d59d0d0b6243929bd1e08568822fa75f1d2146b88b225c4cc5ccd1beb7f6228b",
+        "source": "eU=\"tool-use-id\""
+      },
+      {
+        "name": "tag-IN",
+        "offset": 207501457,
+        "bytes": 14,
+        "sha256": "e4d90f8db4e7106ae9b05b32dd99063debd3312e56acdf731a226bf3d24a69c1",
+        "source": "IN=\"task-type\""
+      },
+      {
+        "name": "tag-Ipe",
+        "offset": 207501589,
+        "bytes": 17,
+        "sha256": "5a3172fa8cd13e31f83dbe21f964811f7dd8f42e1505bf3e819ac43f0bf9cc8a",
+        "source": "Ipe=\"output-file\""
+      },
+      {
+        "name": "tag-ow",
+        "offset": 207501607,
+        "bytes": 11,
+        "sha256": "a3ff764873e5053b03fab6cf32763115e763488f9473b03dca68ae66dc7abcc2",
+        "source": "ow=\"status\""
+      },
+      {
+        "name": "tag-ZE",
+        "offset": 207501619,
+        "bytes": 12,
+        "sha256": "045ba1324fd2f858db599f493e3ff70c5dcb7e61eea656b94f22b3d67242a2d3",
+        "source": "ZE=\"summary\""
+      },
+      {
+        "name": "tag-Fu",
+        "offset": 207501404,
+        "bytes": 22,
+        "sha256": "b912dd3d0a06bb163a0c1843cc01f452f76257ac59e3afdd919a932acbffb7aa",
+        "source": "Fu=\"task-notification\""
+      }
+    ]
+  },
+  {
+    "version": "2.1.302",
+    "platform": "linux-x64",
+    "url": "https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases/2.1.302/linux-x64/claude",
+    "binaryBytes": 285793528,
+    "binarySha256": "60d7eb7f12fbb28a52533fe8be5884097403562aa02dc73991a021c7067e29a5",
+    "fragments": [
+      {
+        "name": "queued-record",
+        "offset": 246788233,
+        "bytes": 1203,
+        "sha256": "c023a437926615036f46b1eeeddffea050c3143a2b3687dd246d6251c27442a8",
+        "source": "type:\"queued_command\",prompt:Se,source_uuid:K,delivery_id:H.deliveryId,imagePasteIds:V.length>0?Q:void 0,fileAttachments:H.fileAttachments,inlinedImagePaths:H.inlinedImagePaths,commandMode:H.mode,origin:H9(H.origin),...ke!==void 0&&ke!==(typeof H.value===\"string\"?H.value:Oo(H.value,`\n`))&&{promptRewritten:!0},...H.runId!==void 0&&{runId:H.runId},timestamp:H.timestamp,isMeta:H.isMeta,...H.usage&&{usage:H.usage},...be&&{taskDelivery:be},...H.verifiedSlackHumanTurn&&{verifiedSlackHumanTurn:!0},...H.projectsUserTurn&&{projectsUserTurn:!0},...H.inputSource!==void 0&&{inputSource:H.inputSource},...H.origin?.kind===\"peer\"&&(h||y&&H.origin.senderTaskId===void 0)&&{sendMessageToolAbsent:!0},...H.hearthRelayRows&&{hearthRelayRows:H.hearthRelayRows},...H.hearthRelayThreadTs&&{hearthRelayThreadTs:H.hearthRelayThreadTs},...H.hearthRelayMessageIds&&{hearthRelayMessageIds:H.hearthRelayMessageIds},...H.mode===\"prompt\"&&!H.isMeta&&yf(H.origin)&&!H.verifiedSlackHumanTurn&&!UIt((typeof Se===\"string\"?Se:Oo(Se,`\n`)).trimStart())&&irt()&&{humanTurn:!0},...Kv(H.origin)&&JIn()&&{besideToolResults:!0},...d5n({origin:H.origin,isMeta:H.isMeta,verifiedSlackHumanTurn:H.verifiedSlackHumanTurn,commandMode:H.mode})}"
+      },
+      {
+        "name": "queued-to-user",
+        "offset": 247627569,
+        "bytes": 2339,
+        "sha256": "d572d356e1034b3e0ca277d3c2c7517166536cd1660d758bc653f8dd7eb893c5",
+        "source": "case\"queued_command\":{if(e.renderedByBatchHead)return[];let{reminderId:s}=e,h=jbt(s)?(_e)=>ASs(_e,s):Pl;if(Ute(e)){let _e=u5n(e);if(_e===void 0)return[];return h([Ce({content:`${hWs(_e.source)}\n${Bie(_e.text)}`,isMeta:!0,origin:e.origin,uuid:e.source_uuid})])}let y=Array.isArray(e.inlinedImagePaths)?e.inlinedImagePaths.filter((_e)=>typeof _e===\"string\"):[],S=y.length===0?[]:[Ce({content:sd(_6n(y)),isMeta:!0})],w=sG(e.origin,e.commandMode,e.runId),H=w!==void 0&&!qy(w)||e.isMeta?{isMeta:!0}:{},K=(_e)=>qy(w)&&e.isMeta!==!0&&e.verifiedSlackHumanTurn!==!0?_e:ssn(_e),V=Mct(e),Q=V||Oct(e)?(_e)=>_e:h;if(e.batchedRelayPrompts){let _e=V?`${v$n}${K(e.batchedRelayPrompts.join(`\n\n`))}`:e.batchedRelayPrompts.map((ke)=>hwe(K(ke),w,{verifiedSlackHumanTurn:e.verifiedSlackHumanTurn,isMeta:e.isMeta,inHumanTurn:n?.inHumanTurn})).join(`\n\n`);return Q([Ce({content:_e,...H,origin:w,uuid:e.source_uuid})])}if(Array.isArray(e.prompt)){let _e=e.prompt.filter((Re)=>Re.type===\"text\"),ke=_e.map((Re)=>Re.text).join(`\n`),Se=yf(w)&&e.isMeta!==!0&&(e.verifiedSlackHumanTurn!==!0||e.projectsUserTurn===!0),be=e.prompt.flatMap((Re)=>{if(Re.type===\"image\")return[Re];if(Re.type!==\"document\"||!Se)return[];if(e.verifiedSlackHumanTurn!==!0)return[{type:\"document\",source:Re.source,...Re.title!=null&&{title:Re.title},...Re.context!=null&&{context:Re.context},...Re.citations!=null&&{citations:Re.citations}}];if(Re.source?.type!==\"text\"||typeof Re.source.data!==\"string\")return[];return[{type:\"document\",...typeof Re.title===\"string\"&&{title:K(Re.title)},...typeof Re.context===\"string\"&&{context:K(Re.context)},source:{type:\"text\",media_type:\"text/plain\",data:K(Re.source.data)}}]}),Te=[{type:\"text\",text:hwe(K(ke),w,{verifiedSlackHumanTurn:e.verifiedSlackHumanTurn,isMeta:e.isMeta,inHumanTurn:n?.inHumanTurn,hearthServerEnvelope:e.hearthRelayMessageIds!==void 0,hearthJoinedTextBlocks:_e.length>1,sendMessageToolAbsent:e.sendMessageToolAbsent,wholeMessage:e.prompt.length===1})},...be];return[...Q([Ce({content:Te,...H,origin:w,uuid:e.source_uuid})]),...S]}return[...Q([Ce({content:hwe(K(String(e.prompt)),w,{verifiedSlackHumanTurn:e.verifiedSlackHumanTurn,isMeta:e.isMeta,inHumanTurn:n?.inHumanTurn,hearthServerEnvelope:e.hearthRelayMessageIds!==void 0,sendMessageToolAbsent:e.sendMessageToolAbsent,wholeMessage:!0}),...H,origin:w,uuid:e.source_uuid})]),...S]}"
+      },
+      {
+        "name": "notification-serialization",
+        "offset": 242045020,
+        "bytes": 244,
+        "sha256": "4bb3bc1de1f1b81c8b2d7149c174717b5db816ae093eb885889073ec96661fdc",
+        "source": "function li({taskId:e,toolUseId:s,taskType:r,outputFile:n,status:i,summary:t,body:u,trailing:p}){let d=[[pL,e],[q2,s],[cH,r],[wDe,n],[sS,i],[W_,t]],o=`<${Lc}>`;for(let[a,T]of d)if(T)o+=`\n<${a}>${T}</${a}>`;return`${o}${u??\"\"}\n</${Lc}>${p??\"\"}`}"
+      },
+      {
+        "name": "tag-pL",
+        "offset": 234092239,
+        "bytes": 12,
+        "sha256": "91a764b2aa69a1a0b2e2eb3b414b566944b1982ebb92596c51f70b939e41e90d",
+        "source": "pL=\"task-id\""
+      },
+      {
+        "name": "tag-q2",
+        "offset": 234092252,
+        "bytes": 16,
+        "sha256": "703c19a20e0ab43072cf21fe581265323d3ad71b8abe8278d253bfb4a24d9587",
+        "source": "q2=\"tool-use-id\""
+      },
+      {
+        "name": "tag-cH",
+        "offset": 234092269,
+        "bytes": 14,
+        "sha256": "1e7ce503149a6fa83f3569fad6909ac07254a6096fe340c6a3bd0bffdfe93307",
+        "source": "cH=\"task-type\""
+      },
+      {
+        "name": "tag-wDe",
+        "offset": 234092401,
+        "bytes": 17,
+        "sha256": "5a6e69b94446b4b657787c7466e651240ff8755b5ff089437b4178a93ad60991",
+        "source": "wDe=\"output-file\""
+      },
+      {
+        "name": "tag-sS",
+        "offset": 234092419,
+        "bytes": 11,
+        "sha256": "667957094b15d42c077a18052f1e2b826de0fd3fefb76b2413beda5d60cfbce5",
+        "source": "sS=\"status\""
+      },
+      {
+        "name": "tag-W_",
+        "offset": 234092431,
+        "bytes": 12,
+        "sha256": "01a4a1e13ea6e79f6e6fc0f43527838d4003213070b51908534161e4f03fa4e7",
+        "source": "W_=\"summary\""
+      },
+      {
+        "name": "tag-Lc",
+        "offset": 234092216,
+        "bytes": 22,
+        "sha256": "53ceca3d4b87c3b88113cd6bc3cf567e51e372336be0e056df41533049f40c25",
+        "source": "Lc=\"task-notification\""
+      }
+    ]
+  }
+]

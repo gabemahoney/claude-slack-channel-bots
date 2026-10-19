@@ -21,7 +21,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { appendFileSync, writeFileSync } from 'node:fs'
+import { appendFileSync, readFileSync, writeFileSync } from 'node:fs'
 
 import { MIN_CLAUDE_CODE_VERSION } from './agent-director-versions.ts'
 
@@ -240,7 +240,7 @@ export function withLastLine(line: string): string {
 }
 
 /** Claude Code's prompt box on Linux (2.1.280): the `❯` prompt, and the footer. */
-const LINUX_PROMPT_BOX = [
+export const LINUX_PROMPT_BOX = [
   '────────────────────────────────────────────────────────────────────────',
   '❯ ',
   '────────────────────────────────────────────────────────────────────────',
@@ -458,4 +458,56 @@ export function writeTranscript(path: string, entries: readonly TranscriptEntry[
 /** Append `entries` to the transcript at `path`, as Claude Code does while a session runs. */
 export function appendTranscript(path: string, entries: readonly TranscriptEntry[]): void {
   appendFileSync(path, transcriptJsonl(entries))
+}
+
+/** Concrete composer drawings, shared by delivery, replay and reconnect tests
+ * (b.omv SR-5.3/5.4). No long/tall-paste research assumptions are added here. */
+export function deliveryPane(text = '', options: { agent?: 'claude' | 'codex'; running?: boolean; marker?: '>' | '❯'; footer?: string; history?: string } = {}): string {
+  const history = options.history ?? (options.running ? '✻ Thinking… (2s · ↓ 100 tokens)\n' : '')
+  if (options.agent === 'codex') return `${history}› ${text.replace(/\n/g, '\n  ')}\n${options.footer ?? '? for shortcuts'}`
+  const [upper, , lower, footer] = LINUX_PROMPT_BOX
+  return `${history}${upper}\n${options.marker ?? '❯'} ${text.replace(/\n/g, '\n  ')}\n${lower}\n${options.footer ?? footer}`
+}
+
+export function queuedCommandEntry(text: string, extra: TranscriptEntry = {}): TranscriptEntry {
+  return { ...hookAttachmentEntry('queued_command'), attachment: { type: 'queued_command', prompt: text }, ...extra }
+}
+export function queueOperationEntry(operation: string, text: string, reason?: string): TranscriptEntry {
+  return { type: 'queue-operation', operation, content: text, ...(reason ? { reason } : {}) }
+}
+export function codexPromptEntry(text: string): TranscriptEntry {
+  return { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] } }
+}
+export function codexTurnEntry(type: 'task_started' | 'task_complete'): TranscriptEntry {
+  return { type: 'event_msg', payload: { type } }
+}
+
+/** Safe native 0.159.2 captures from E7's contained observation run. The
+ * recorded screen verdicts predate the adapter correction, so tests supply
+ * their own expectations. This fixture is observation evidence, not a gate PASS.
+ */
+export const codexNativeObservations = JSON.parse(readFileSync(new URL('../fixtures/codex-native-observations/0.159.2.json', import.meta.url), 'utf8')) as {
+  readonly paneProvenance: Readonly<{ runId: string; model: string }>
+  readonly panes: readonly Readonly<{ label: string; pane: string; session: string; at: number; state: 'waiting' | 'working' }>[]
+  readonly completedTurn: Readonly<{ session: string; send: Readonly<{ at: number; offset: number }>; completion: Readonly<{ turn: string }> }>
+  readonly noTurn: Readonly<{ session: string; afterOffset: number; size: number; events: readonly TranscriptEntry[] }>
+  readonly nativeEventMetadata: readonly Readonly<{ type: string; kind: string; at: number; turn?: string }>[]
+}
+
+export function observedCodexPane(label: string): string {
+  const capture = codexNativeObservations.panes.find(pane => pane.label === label)
+  if (!capture) throw new Error(`Missing recorded Codex pane: ${label}`)
+  return capture.pane
+}
+
+/** Reconstruct only the recorded event's safe schema fields, not its raw
+ * rollout or original byte offsets. Scratch JSONL obtains its own offsets.
+ */
+export function observedCodexTurnEntry(type: 'task_started' | 'task_complete'): TranscriptEntry {
+  const event = codexNativeObservations.nativeEventMetadata.find(event => event.type === 'event_msg' && event.kind === type && event.turn === codexNativeObservations.completedTurn.completion.turn)
+  if (!event) throw new Error(`Missing recorded Codex turn event: ${type}`)
+  return { ...codexTurnEntry(type), timestamp: new Date(event.at).toISOString(), payload: { type, turn_id: event.turn } }
+}
+export function pastedText(text: string, id = 'abcd'): string {
+  return `<pasted_content id="${id}">\n${text}\n</pasted_content id="${id}">`
 }

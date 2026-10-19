@@ -1,3 +1,7 @@
+import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
+import { IDLE_PANE } from './test-helpers/working-row-panes.ts'
+import { useImmediateTypingLifecycle } from './test-helpers/legacy-typing.ts'
+useImmediateTypingLifecycle()
 /**
  * persona-connections.test.ts — persona credentials file and bring-up
  * pre-checks.
@@ -1356,8 +1360,14 @@ describe('no writes', () => {
 // ---------------------------------------------------------------------------
 
 describe('diagnostic lines', () => {
-  test('the label set is exactly the start, credentials, Slack-validation, connection, directory, unclaimed-channel, DM-drop, destination-failed, credentials-change-failed, config-dir-unresolvable, persona-invited-channel and persona-channel-delivery-set classes', () => {
+  test('the persona and typed-delivery diagnostic label set is exactly the declared classes', () => {
     expect([...PERSONA_DIAGNOSTIC_CLASSES].sort()).toEqual([
+      'delivery-stuck',
+      'message-delivered',
+      'message-not-saved',
+      'message-not-taken-in',
+      'message-received',
+      'message-retyped',
       'persona-channel-delivery-set',
       'persona-config-dir-unresolvable',
       'persona-connection-lost',
@@ -1374,6 +1384,10 @@ describe('diagnostic lines', () => {
       'persona-invited-channel',
       'persona-slack-unreachable',
       'persona-start',
+      'queue-kept',
+      'queue-record-unreadable',
+      'queue-unwritable',
+      'system-prompt-unwritable',
       'unclaimed-channel',
     ])
   })
@@ -6448,6 +6462,7 @@ describe('bring-up outcomes (E5)', () => {
     consoleLines = []
     console.error = (...args: unknown[]) => void consoleLines.push(args.map(String).join(' '))
     ad = installStubSpawnPath(join(dir, 'home'))
+    Object.defineProperty(ad.calls, 'readPaneResults', { value: [cannedReadPaneResult(IDLE_PANE)], writable: true, configurable: true, enumerable: false })
     _resetBackoffState()
     _resetRegistry()
     sessionNotices = []
@@ -6922,10 +6937,10 @@ describe('bring-up outcomes (E5)', () => {
     // Rows: the row's state, how the row spells A's directory, what the ladder does with it and
     // the calls it makes for A's instance (the spawn is the one that collides with the row).
     test.each<[string, 'waiting' | 'ended', 'configured' | 'old symlink target', 'reconnected' | 'resumed', Record<string, number>]>([
-      ['a waiting row is reconnected', 'waiting', 'configured', 'reconnected', { spawn: 1, get: 1, sendKeys: 1 }],
+      ['a waiting row is reconnected', 'waiting', 'configured', 'reconnected', { spawn: 1, get: 4, readPane: 2, sendKeys: 2 }],
       // The status read is the resumed instance's dialog check.
       ['an ended row is resumed', 'ended', 'configured', 'resumed', { spawn: 1, get: 1, resume: 1, status: 1 }],
-      ['a waiting row recorded under the target of a working_directory symlink that now dangles is reconnected', 'waiting', 'old symlink target', 'reconnected', { spawn: 1, get: 1, sendKeys: 1 }],
+      ['a waiting row recorded under the target of a working_directory symlink that now dangles is reconnected', 'waiting', 'old symlink target', 'reconnected', { spawn: 1, get: 4, readPane: 2, sendKeys: 2 }],
     ])('AC 23, AC 24: a directory-broken persona’s surviving row is kept, and once its directory exists it comes up with no confirmation and its launch reuses the row — %s, with no kill, delete or fresh spawn; its instance, refused while it retried, is then admitted', async (_label, state, spelling, action, reuseCalls) => {
       let launched: Awaited<ReturnType<typeof spawnForPersona>> | undefined
       const f: BringUpFixture = makeBringUpFixture({

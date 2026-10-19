@@ -56,6 +56,13 @@
 
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js'
 
+import { randomBytes } from 'node:crypto'
+import { prepareBotSystemPrompt, botSystemPromptPath } from './bot-system-prompt.ts'
+import type { Client } from 'agent-director'
+import { createDeliveryEngines, createDeliveryLifecycle, type DeliveryEngines, type DeliveryLifecycle, type DeliveryEngineEvent } from './delivery-engine.ts'
+import { createDeliveryAdScope } from './delivery-ad-scope.ts'
+import { parseLaunchStart } from './pending-row.ts'
+import { setDeliveryLifecycle, setDeliveryPersonaLookup, inspectPersonaUpgrade, isTagUpgradePending, hasNotConnectedEpisode, applyDeliveryOwnRowRead, handleDeliveryKeyError, handleDeliveryReadError, classifyWorkingPane } from './session-manager.ts'
 import type { WebClient } from '@slack/web-api'
 import { join, resolve } from 'path'
 import { fileURLToPath } from 'url'
@@ -77,7 +84,7 @@ import {
   type ServerSettings,
   MCP_SERVER_NAME,
 } from './config.ts'
-import { personaInstanceId, renderPersonaRef, resolvePersonaTarget } from './persona-identity.ts'
+import { personaInstanceId, renderPersonaRef, resolvePersonaTarget, resolveClaudeConfigDir } from './persona-identity.ts'
 import {
   APPROVER_STOP_RETIRED_KEY,
   APPROVER_STOP_TEARDOWN,
@@ -153,6 +160,7 @@ import {
   waitsOnKillFailedHold,
   setPreLaunchReplyGuard,
   setPreLaunchTrustPatcher,
+  setSystemPromptPreparer,
   setRetiredKeyStore,
   setSessionNotifier,
   spawnForPersona,
@@ -216,7 +224,11 @@ import {
 import { createPersonaDestinations } from './persona-destination.ts'
 import { createPersonaDestinationHold } from './persona-destination-hold.ts'
 import { createSlowRecoveryTracker } from './slow-recovery.ts'
-import { createPersonaRouting, hasSessionStream } from './persona-routing.ts'
+import { createDeliveryReporting } from './delivery-notices.ts'
+import { buildDeliveryDiagnostic, buildQueuedMessageRetryLine, SYSTEM_PROMPT_UNWRITABLE, queueErrorCode } from './persona-diagnostics.ts'
+import { createPersonaRouting } from './persona-routing.ts'
+import { createDeliveryQueue, type DeliveryQueue, type QueueEvent } from './delivery-queue.ts'
+import { createDeliveryPreparation, type DeliveryPreparation } from './delivery-intake.ts'
 import {
   createPersonaConnectionManager,
   SYSTEM_PERSONA_CONNECTION_CLOCK,
@@ -231,6 +243,7 @@ import {
 import { KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN, KILL_FAILURE_CONTEXT_RECOVERY } from './kill-failure-alert.ts'
 import { resolveSlackApiUrlOverride } from './persona-slack-clients.ts'
 import { createUnhandledRejectionHandler, describeThrownValue, renderLogMessageText } from './persona-connection-errors.ts'
+import { redactSlackLogText } from './slack-log-redaction.ts'
 import { createPersonaEventRouter } from './persona-event-router.ts'
 import {
   composePersonaStatusListeners,
@@ -291,7 +304,7 @@ import {
   stopHookLaunchPass,
   teardownPersonaReplyGuard,
 } from './stop-hook-bootstrap.ts'
-import { forgetPersonaPrompts, startPermissionPoller, stopPermissionPoller } from './permission-poller.ts'
+import { forgetPersonaPrompts, startPermissionPoller, stopPermissionPoller, hasNativePromptWarning } from './permission-poller.ts'
 import {
   initRestart,
   scheduleRestart,
@@ -335,7 +348,7 @@ import {
 import { forgetFailures, isAtCap as backoffIsAtCap } from './backoff.ts'
 import { isDryRun } from './tokens.ts'
 import { checkPidConflict, writePidFile, removePidFile } from './pid.ts'
-import { consumeAck, forgetPersonaAcks } from './ack-tracker.ts'
+import { createDeliveryAckCallback, consumeAck, forgetPersonaAcks } from './ack-tracker.ts'
 import {
   openArchiveDatabase,
   createPersonaArchiveWriter,
@@ -360,7 +373,7 @@ import {
   type SessionToolDeps,
   type SessionEntry,
 } from './registry.ts'
-import { buildPersonaClientOrExit, runAgentDirectorStartupGate } from './agent-director-startup.ts'
+import { buildPersonaClientOrExit, runAgentDirectorStartupGate, createDeliveryClientFactory } from './agent-director-startup.ts'
 import { disposeAdVersionRecheck, installAdVersionRecheck, onAdVersionChanged } from './ad-version-gate.ts'
 import { installTestTimerOverrides } from './test-timer-overrides.ts'
 import {
@@ -384,6 +397,7 @@ import {
   serverPortWriteFailedLine,
   writeServerPortRecord,
 } from './clear-latch.ts'
+import { handleTestMcpDrop, TEST_MCP_DROP_ROUTE, TEST_MCP_DROP_START_LINE } from './test-mcp-drop.ts'
 import { createCronScheduler, type CronScheduler } from './cron-scheduler.ts'
 import { repointLogging } from './logging.ts'
 import {
@@ -698,11 +712,13 @@ function assertSendable(filePath: string): void {
 // Resolve user display name
 // ---------------------------------------------------------------------------
 
-// One cache for every persona: the server serves one workspace (b.av2 SR-11).
-const userNameCache = new Map<string, string>()
+// Persona-scoped names: credentials and workspaces may differ (b.omv SR-2.1).
+const userNameCache = new WeakMap<WebClient, Map<string, string>>()
 
 async function lookupUserName(client: WebClient, userId: string): Promise<string> {
-  if (userNameCache.has(userId)) return userNameCache.get(userId)!
+  let cache = userNameCache.get(client)
+  if (!cache) { cache = new Map(); userNameCache.set(client, cache) }
+  if (cache.has(userId)) return cache.get(userId)!
   try {
     const res = await client.users.info({ user: userId })
     const name =
@@ -710,7 +726,7 @@ async function lookupUserName(client: WebClient, userId: string): Promise<string
       res.user?.profile?.real_name ||
       res.user?.name ||
       userId
-    userNameCache.set(userId, name)
+    cache.set(userId, name)
     return name
   } catch {
     return userId
@@ -1163,17 +1179,37 @@ async function handleInitialized(
  * and `app_mention` event to it with the receiving persona as the only
  * receiver.
  */
+// Holders are populated in main(), after the duplicate-server guard and before admission.
+let deliveryQueue: DeliveryQueue | undefined
+let deliveryPreparation: DeliveryPreparation | undefined
+let deliveryEngines: DeliveryEngines | undefined
+let deliveryLifecycle: DeliveryLifecycle | undefined
+/** Test seam: share one typing gate and launch identity with the session manager; undefined resets both. */
+export function _setDeliveryLifecycle(value: DeliveryLifecycle | undefined): void {
+  deliveryLifecycle = value
+  setDeliveryLifecycle(value)
+}
+let deliveryReporting: ReturnType<typeof createDeliveryReporting> | undefined
+const bufferedQueueEvents: QueueEvent[] = []
+let deliveryClients: ReturnType<typeof createDeliveryClientFactory> | undefined
+export const deliveryEngineEvents = { emit: (event: DeliveryEngineEvent): void => { deliveryReporting?.engineEvent(event) } }
+/** E5 binds event handling here; E2 supplies facts without notices or wording. */
+export const deliveryQueueEvents = { emit: (event: QueueEvent): void => { if (deliveryReporting) deliveryReporting.queueEvent(event); else bufferedQueueEvents.push(event) } }
+/** E3's engine binds this hook after startup; until then queued work waits. */
+export const deliveryQueueWake = { wake: (_key: string): void => {} }
 const personaRouting = createPersonaRouting({
   getPersonaConfig: () => personaConfig,
   getBotIdentity: identityFor,
-  clientFor,
-  resolveUserName: resolvePersonaUserName,
+  queue: {
+    accept: (key, input) => {
+      if (!deliveryQueue) return Promise.resolve({ status: 'failed' as const, error: new Error('Queue not started') })
+      return deliveryQueue.accept(key, input)
+    },
+    lookupSlackKey: (key, slackKey) => deliveryQueue?.lookupSlackKey(key, slackKey),
+  },
+  prepare: (key, item) => deliveryPreparation?.prepare(key, item) ?? Promise.resolve(),
+  onReceived: (key, item) => deliveryReporting?.received(key, item),
   archive: (key, event) => archiveWrite?.(key, event),
-  getReplySettings,
-  // Lost-message notices go through the one notifier. It is built further
-  // down, so it is read at call time: naming it here would throw while this
-  // module is still loading.
-  notify: (key, text, options) => personaNotifier.notify(key, text, options),
   log: (line) => console.error(line),
   // b.av2 SR-4.2 beside b.deo SRI-305, SRI-403: the stored choices and their
   // readability, read at each fungible-mode event through the holder main()
@@ -1235,7 +1271,7 @@ const personaRouting = createPersonaRouting({
     armMissingTmuxUnavailableRetry(
       key,
       tmuxUnavailableRetryDeps,
-      `[slack] Lost message: persona=${key} has its tmux-unavailable outage raised with no retry timer — no restart scheduled; arming one (b.jg5 SRJ-311)`,
+      buildQueuedMessageRetryLine(key),
     )
   },
   // b.jg5 SRJ-1011 state 4: P's kill-failure episode is open (the ordinary
@@ -1470,6 +1506,14 @@ async function shutdown(reason: string, exitCode = 0): Promise<void> {
     httpServer.stop(true)
     httpServer = null
   }
+
+  // b.omv SR-3.3: finish fixation and drain the shared writers after every
+  // synchronous stop above, before closing the transports and clients.
+  const deliveryStopping = deliveryEngines?.stop()
+  await deliveryPreparation?.stop()
+  await deliveryStopping
+  await deliveryClients?.close()
+  await deliveryQueue?.stop()
 
   // Close all pending (not yet routed) MCP transports
   for (const pending of getAllPendingSessions()) {
@@ -2261,9 +2305,15 @@ export function _buildReconnectSessionAdapter(
   getPersona?: (key: string) => Persona | undefined,
   isLatched?: (key: string) => boolean,
   appliedPersona: (key: string) => Persona | undefined = getAppliedPersona,
+  options: { noNotice?: boolean } = {},
 ):(key: string) => Promise<'success' | ReconnectEscalateDead | 'transient' | 'pending'> {
   // `key` is the persona key.
-  return async (key: string) => {
+  const run: (key: string) => Promise<'success' | ReconnectEscalateDead | 'transient' | 'pending'> = async (key: string) => {
+    const upgrade = await inspectPersonaUpgrade(key, getPersona?.(key) ?? appliedPersona(key))
+    if (upgrade !== 'current') { deliveryLifecycle?.defer(key); return 'transient' }
+    if (getSessionByPersona(key)?.connected === true) { deliveryLifecycle?.clearDeferred(key); return 'success' }
+    if (deliveryLifecycle?.owner(key) !== undefined && deliveryLifecycle.owner(key) !== 'free') { deliveryLifecycle.defer(key); return 'transient' }
+    if (deliveryLifecycle && !await deliveryLifecycle.recoverBeforeReconnect(key)) { deliveryLifecycle.defer(key); return 'transient' }
     let state: string
     // b.jg5 SRJ-115: a `pending` row's raw launch start, for `deferPendingRow`.
     let launchStartedAt: string | undefined
@@ -2309,11 +2359,12 @@ export function _buildReconnectSessionAdapter(
     }
     // b.jdc: likewise the run of deferrals on a row waiting on a prompt.
     if (!PROMPT_ROW_STATES.has(state)) endPromptRowDeferral(key)
+    const workingLaunch = state === 'working' ? { launchId: deliveryLifecycle?.launchId(key) } : undefined
     if (state === 'working') {
-      const verdict = await workingReconnectVerdict(key, getPersona, latchedNow)
+      const verdict = await workingReconnectVerdict(key, getPersona, latchedNow, options.noNotice)
       if (verdict !== 'reconnect') return verdict
     } else if (PROMPT_ROW_STATES.has(state)) {
-      return promptRowReconnectVerdict(key, state, latchedNow)
+      return promptRowReconnectVerdict(key, state, latchedNow, options.noNotice)
     } else if (state === 'pending') {
       // A deliberate deviation from b.jg5 SRJ-410 ("at each retry"): no
       // pending-row rule run here. This branch is reached only in a race,
@@ -2323,7 +2374,7 @@ export function _buildReconnectSessionAdapter(
       await deferPendingRow(key, launchStartedAt, appliedPersona, { mayRunRule: false })
       return 'pending'
     } else if (state === 'waiting') {
-      const check = await checkWaitingRowPane(key, latchedNow)
+      const check = await checkWaitingRowPane(key, latchedNow, options)
       // b.f2b: its pane shows a running turn or a prompt, or the read latched
       // the persona, met ENVIRONMENT, or carried the stop mark of a version
       // re-check that decided the server stops (b.jg5 SRJ-205); logged
@@ -2384,7 +2435,7 @@ export function _buildReconnectSessionAdapter(
     if (oldLifeNow !== undefined) return replaceOwnRowOldLife(key, state, oldLifeNow)
     // b.jg5 SRJ-118, SRJ-501: the reconnect's last read is this adapter's
     // `status` read (`waiting`, or a stale `working` row).
-    const result = await reconnectMcpWithCause(key, latchRowStateRead(state))
+    const result = await reconnectMcpWithCause(key, latchRowStateRead(state), undefined, { workingChecked: workingLaunch })
     if (result.outcome === 'ok') return 'success'
     if (result.outcome === 'dead-session') {
       // b.sv7: trigger the internal memoized findMissing sweep (b.m4r) before
@@ -2416,6 +2467,16 @@ export function _buildReconnectSessionAdapter(
     }
     // b.jg5 SRJ-118: 'transient' — nothing typed, no sweep, nothing counted.
     return 'transient'
+  }
+  return async key => {
+    // Pause prior screen-only time; only this run's real screen finding
+    // resumes it. Failed reads and other guards never count as screen time.
+    if (deliveryLifecycle?.deferred(key)) deliveryLifecycle.defer(key)
+    const result = await run(key)
+    if (result === 'transient' || result === 'pending') {
+      if (!deliveryLifecycle?.deferred(key)) deliveryLifecycle?.defer(key)
+    } else deliveryLifecycle?.clearDeferred(key)
+    return result
   }
 }
 
@@ -2685,6 +2746,7 @@ async function promptRowReconnectVerdict(
   key: string,
   state: string,
   latchedNow: () => boolean,
+  noNotice = false,
 ): Promise<ReconnectEscalateDead | 'transient'> {
   if (isLaunchInFlight(key)) {
     console.error(`[slack] reconnectSession: persona=${key} is ${state} and a launch for it is in flight — deferring to a later tick (b.jdc)`)
@@ -2710,7 +2772,7 @@ async function promptRowReconnectVerdict(
   if (latchedNow()) return 'transient'
   switch (read.kind) {
     case PANE_READ_PANE:
-      return promptRowDeferral(key, state, latchedNow)
+      return promptRowDeferral(key, state, latchedNow, noNotice, true)
     case PANE_READ_GONE:
       endPromptRowDeferral(key)
       console.error(promptRowPaneGoneLine(key, state, read))
@@ -2723,7 +2785,7 @@ async function promptRowReconnectVerdict(
     case PANE_READ_CONFIG:
     case PANE_READ_UNCLASSIFIED:
       console.error(promptRowTakenAsAliveLine(key, state, read))
-      return promptRowDeferral(key, state, latchedNow)
+      return promptRowDeferral(key, state, latchedNow, noNotice)
     case PANE_READ_ENVIRONMENT:
       console.error(promptRowPaneReadEnvironmentLine(key, state, read))
       return 'transient'
@@ -2748,6 +2810,8 @@ async function promptRowDeferral(
   key: string,
   state: string,
   latchedNow: () => boolean,
+  noNotice = false,
+  paneRead = false,
 ): Promise<ReconnectEscalateDead | 'transient'> {
   const deferral = await checkPromptRowDeferral(key, state)
   if (deferral === 'escalate') return escalateDeadWith(DEAD_SESSION_CAUSE_ROW_READ_FINISHED)
@@ -2757,7 +2821,10 @@ async function promptRowDeferral(
   // b.jg5 SRJ-502: latched elsewhere while the read or the deferral check was
   // awaited (the gate logs its line): no notice.
   if (latchedNow()) return 'transient'
-  return deferPromptRow(key, state)
+  // b.omv SR-5.5: a failed read preserves prompt-row liveness retries,
+  // but only a prompt row with a readable pane starts screen-block time.
+  deliveryLifecycle?.defer(key, paneRead ? 'menu' : undefined)
+  return deferPromptRow(key, state, noNotice)
 }
 
 /**
@@ -2844,11 +2911,11 @@ export function promptRowLatchedLine(key: string, state: string): string {
  * its later attempts reconnect a `waiting` row, or a `working` row the
  * positive-idle rule shows stale.
  */
-function deferPromptRow(key: string, state: string): 'transient' {
+function deferPromptRow(key: string, state: string, noNotice = false): 'transient' {
   console.error(
     `[slack] reconnectSession: persona=${key} is ${state} — its session waits on a prompt or dialog; not typing /mcp reconnect into it, deferring to a later tick (b.f2b/b.rmy)`,
   )
-  notifyPersonaNotConnected(key, { reason: 'blocked-on-prompt', autoRestartDisabled: false })
+  if (!noNotice) notifyPersonaNotConnected(key, { reason: 'blocked-on-prompt', autoRestartDisabled: false })
   return 'transient'
 }
 
@@ -3152,6 +3219,7 @@ async function workingReconnectVerdict(
   key: string,
   getPersona: ((key: string) => Persona | undefined) | undefined,
   latchedNow: () => boolean,
+  noNotice = false,
 ): Promise<ReconnectEscalateDead | 'transient' | 'reconnect'> {
   if (isLaunchInFlight(key)) {
     console.error(`[slack] reconnectSession: persona=${key} is working and a launch for it is in flight — deferring /mcp reconnect to a later tick (b.d61)`)
@@ -3187,10 +3255,11 @@ async function workingReconnectVerdict(
   }
   switch (read.kind) {
     case PANE_READ_PANE:
+      if (classifyWorkingPane(read.pane) === 'prompt') deliveryLifecycle?.defer(key, 'menu')
       // b.f2b: the fold on this pane (and the transcript, for an idle one),
       // kept across attempts; `checkWorkingRowPane` logs what it found (a
       // running turn logs the b.9a7 deferral line).
-      return (await checkWorkingRowPane(key, read.pane, { persona: getPersona?.(key), latchedNow })) === 'reconnect'
+      return (await checkWorkingRowPane(key, read.pane, { persona: getPersona?.(key), latchedNow, noNotice })) === 'reconnect'
         ? 'reconnect'
         : 'transient'
     case PANE_READ_GONE:
@@ -3207,7 +3276,7 @@ async function workingReconnectVerdict(
       )
       // b.f2b: held back from the row once more; a long run is reported. The
       // restart path runs only with auto-restart on.
-      noteWorkingRowDeferral(key, false)
+      if (!noNotice) noteWorkingRowDeferral(key, false)
       return 'transient'
     case PANE_READ_ENVIRONMENT:
     case PANE_READ_UNCLASSIFIED:
@@ -3370,6 +3439,19 @@ export async function main(): Promise<void> {
   // Bun.serve). A duplicate start must fail fast without mutating shared state.
   checkPidConflict(PID_FILE)
 
+  // b.omv SR-3.6: replay and compact every journal before Slack/HTTP admission.
+  deliveryQueue = createDeliveryQueue({ stateDir: STATE_DIR, onEvent: event => deliveryQueueEvents.emit(event) })
+  await deliveryQueue.start()
+  deliveryQueue.startMaintenance()
+  deliveryPreparation = createDeliveryPreparation({
+    queue: deliveryQueue,
+    onReceived: (key, item) => deliveryReporting?.received(key, item),
+    resolveUserName: resolvePersonaUserName,
+    clientFor,
+    wake: key => deliveryQueueWake.wake(key),
+    onPending: key => deliveryEngines?.wake(key),
+  })
+
   // b.jg5 SRJ-801, SRJ-802: the retired-key record (retired-keys.json in the
   // state directory) is read once here, after the PID check (so a duplicate
   // start reads nothing) and before the reload controller's start resolution
@@ -3439,13 +3521,15 @@ export async function main(): Promise<void> {
   const reload = createReloadController({
     paths: reloadFilePaths(CONFIG_PATH),
     retiredKeys,
+    queueOpenCount: key => deliveryQueue?.openCount(key) ?? 0,
+    onQueueRetained: key => deliveryQueue?.retained(key),
     // b.jg5 SRJ-809: apply step 1 begins its old-life holds in the one hold
     // set, once the last-applied rewrite has succeeded.
     oldLifeHolds,
     // b.jg5 SRJ-808, SRJ-404: apply step 1 stops the dialog approver of each
     // key it records, right after the record and before the last-applied
     // rewrite and the teardown's kill; no pending-row rule run follows.
-    stopApprover: (key) => stopDialogApprover(key, APPROVER_STOP_RETIRED_KEY),
+    stopApprover: async (key) => { const stopping = deliveryEngines?.forget(key); deliveryLifecycle?.forget(key); await stopDialogApprover(key, APPROVER_STOP_RETIRED_KEY); await stopping },
     // b.av2 SR-8.6 as amended by b.jg5 SRJ-1511, beside b.deo SRI-406,
     // SRI-408 and SRI-502: a confirmed apply's step 1 writes the unwritten
     // drops of a key it brings up, drops the retired keys' stored choices and
@@ -3505,6 +3589,7 @@ export async function main(): Promise<void> {
     onApplied: (config) => {
       if (appliedConfig === undefined) throw new Error('a confirmed apply ran before the start resolved its configuration')
       personaConfig = configInEffect(appliedConfig, config)
+      void deliveryPreparation?.recover(config.personas.map(p => p.key))
     },
   })
   reloadController = reload
@@ -3518,11 +3603,27 @@ export async function main(): Promise<void> {
   // (installed before the configuration was read) and sets B's floor. The
   // latch re-check and the retry timers below take their values from it.
   const testTimers = installTestTimerOverrides(personaConfig.test_timer_overrides, (line) => console.error(line))
+  const testMcpDropEnabled = personaConfig.test_mcp_drop_endpoint === true
+  if (testMcpDropEnabled) console.error(TEST_MCP_DROP_START_LINE)
   // b.av2 SR-6.2: the trust patch precedes every launch. Installed as soon as
   // the persona config is set — before the Slack connections, Bun.serve and
   // initRestart — so no launch path (start, restart or a human trigger) can
   // run unpatched.
   setPreLaunchTrustPatcher(trustPatchPersona)
+  // b.omv SR-7.2: startup failure is local; every launch retries the write and fails closed.
+  const prepareSystemPrompt = (key: string): void => {
+    try {
+      if (personaConfig === null) throw new Error('persona configuration unavailable')
+      prepareBotSystemPrompt(personaConfig, STATE_DIR)
+    } catch (err) {
+      const code = redactSlackLogText(queueErrorCode(err))
+      console.error(buildDeliveryDiagnostic(SYSTEM_PROMPT_UNWRITABLE, key, `path=${JSON.stringify(botSystemPromptPath(STATE_DIR))} code=${code}`))
+      throw err
+    }
+  }
+  setSystemPromptPreparer(prepareSystemPrompt)
+  try { prepareSystemPrompt('server-start') } catch { /* persona launches retry independently */ }
+
   // b.av2 SR-9.4: the reply-guard steps (record, launched-with dir, hook
   // install) run immediately before each spawn or resume. The step gets a
   // getter for the applied persona set (read at the launch and again by its
@@ -3957,7 +4058,6 @@ export async function main(): Promise<void> {
       retryBlockCause: personaRetryBlockCause,
       readRow: readPersonaRowState,
       isSessionConnected: (key) => getSessionByPersona(key)?.connected === true,
-      hasSessionStream,
       endTmuxUnresponsive: (key, reading) => {
         tmuxUnresponsive.end(key, TMUX_UNRESPONSIVE_END_RETRY, reading)
         clearOutageFlag(key, 'tmux-unavailable', reading)
@@ -4099,7 +4199,9 @@ export async function main(): Promise<void> {
   // reading the clear brought (the live reading of a tick or a retry that
   // found the row healthy, or a launch call's `pending`), so the timer stops
   // unless its `pending` or kill-failure exception holds.
+  const deliveryScope = createDeliveryAdScope()
   initOutageState({
+    deliveryScope,
     // b.jg5 SRJ-1002, SRJ-1003: each onset and all-clear carries its phase
     // and classes, so the notifier writes the all-clear of an outage whose
     // onset a persona teardown's window routed as that onset was.
@@ -4116,6 +4218,73 @@ export async function main(): Promise<void> {
       }
     },
   })
+
+
+  // b.omv SR-5/6: one gate for every automatic key path, independent
+  // delivery clients and retry ownership even with health checks disabled.
+  deliveryReporting = createDeliveryReporting({
+    queue: deliveryQueue!, episodes: noticeEpisodes,
+    persona: getAppliedPersona,
+    state: key => ({
+      up: !shuttingDown && isPersonaUp(key),
+      latched: conflictLatch.isLatched(key), invalidFlags: invalidFlagsHold.isHeld(key),
+      killFailed: personaKillFailureAlerts?.isOpen(key) === true || waitsOnKillFailedHold(key),
+      oldLife: isOwnRowOldLifeHeld(key) || !!(getAppliedPersona(key) && oldLifeHeldDirectory(getAppliedPersona(key)!.working_directory)), upgrade: isTagUpgradePending(key),
+      atRestartLimit: backoffIsAtCap(key, RESTART_FAILURE_CAP), restartsOff: personaConfig?.session_restart_delay === 0,
+      outage: getOutageFlags(key).size > 0,
+      prompt: hasNotConnectedEpisode(key) || hasNativePromptWarning(key),
+      launch: noticeEpisodes.isOpen(key, 'stuck-launch') || isLaunchInFlight(key),
+    }),
+    stuckAfterMs: testTimers.deliveryStuckAfterMs,
+    log: line => console.error(line),
+    notify: (key, text) => personaNotifier.notify(key, text),
+    reconnectBlocked: (key, rule) => { notifyPersonaNotConnected(key, { reason: 'reconnect-blocked', rule }) },
+    delivered: createDeliveryAckCallback({ getReaction: () => getReplySettings().ack_reaction, clientFor }),
+  })
+  for (const event of bufferedQueueEvents.splice(0)) deliveryReporting.queueEvent(event)
+  deliveryReporting.startupFindings(deliveryQueue!.startupFindings())
+  deliveryLifecycle = createDeliveryLifecycle({
+    startId: randomBytes(16).toString('hex'), parseLaunchStart,
+    onReconnectScreen: (key, reason, blockedMs) => deliveryEngineEvents.emit({ type: 'reconnect-screen', key, reason, blockedMs }),
+    onError: error => console.error(`[slack] deferred reconnect failed: ${describeThrownValue(error)}`),
+  })
+  setDeliveryLifecycle(deliveryLifecycle)
+  setDeliveryPersonaLookup(getAppliedPersona)
+  deliveryClients = createDeliveryClientFactory(agentDirectorCallTimeoutMsOf(personaConfig))
+  const deferredReconnect = _buildReconnectSessionAdapter(getAppliedPersona, key => conflictLatch.isLatched(key), getAppliedPersona, { noNotice: true })
+  deliveryEngines = createDeliveryEngines({
+    queue: deliveryQueue!, lifecycle: deliveryLifecycle,
+    clientFor: key => deliveryClients!.clientFor(key),
+    call: (key, verb, client, run) => withOutageDetection(key, undefined, verb, c => run(c), { client: client as Client, armsNothing: { personaConfigured: () => !!getAppliedPersona(key) } }),
+    instanceId: personaInstanceId,
+    persona: key => { const p = getAppliedPersona(key); return p ? { cwd: p.working_directory, configDir: resolveClaudeConfigDir(p.claude_config_dir) } : undefined },
+    isUp: key => !shuttingDown && isPersonaUp(key),
+    isLatched: key => conflictLatch.isLatched(key),
+    isHeld: key => invalidFlagsHold.isHeld(key) || personaKillFailureAlerts?.isOpen(key) === true || waitsOnKillFailedHold(key) || isOwnRowOldLifeHeld(key),
+    isConnected: key => getSessionByPersona(key)?.connected === true,
+    // The engine can notice a newly accepted head while its Slack handler
+    // is still acknowledging it. Only post-ack intake/recovery may start
+    // name lookups; an unfixed head waits for that owner's durable wake.
+    prepare: (key, item) => deliveryPreparation!.owns(key, item.accepted.seq) ? deliveryPreparation!.prepare(key, item) : Promise.resolve(),
+    onRow: applyDeliveryOwnRowRead,
+    inspectUpgrade: (key, _row, client, beforeCall) => deliveryScope.run(key, client as Client, beforeCall, async () => { await inspectPersonaUpgrade(key, getAppliedPersona(key)) }),
+    onKeyError: handleDeliveryKeyError,
+    onReadError: handleDeliveryReadError,
+    isRestartPendingOrActive, scheduleRestart,
+    onEvent: event => deliveryEngineEvents.emit(event),
+    onError: (key, error) => console.error(`[slack] delivery persona=${key}: ${describeThrownValue(error)}`),
+    reconnect: (key, client, beforeCall) => deliveryScope.run(key, client as Client, beforeCall, async () => {
+      const result = await deferredReconnect(key)
+      if (typeof result === 'object' && !isRestartPendingOrActive(key)) {
+        const p = getAppliedPersona(key)
+        if (p) scheduleRestart(key, p.working_directory)
+      }
+    }),
+  })
+  deliveryQueueWake.wake = key => deliveryEngines?.wake(key)
+  // Retained in-flight items need recovery before launch reconnects; an
+  // accepted-only head has no keys to recover and is fixed after bring-up.
+  for (const p of personaConfig.personas) if (deliveryQueue!.items(p.key).some(i => !i.delivered && i.records.some(r => r.kind === 'sent'))) deliveryEngines.wake(p.key)
   setSessionNotifier(personaNotifier.notify)
 
   // b.av2 SR-3.1: one Slack connection per persona. Each connection's
@@ -4202,7 +4371,7 @@ export async function main(): Promise<void> {
     serialize: personaLifecycle.run,
     bringUps: personaBringUps,
     connections: manager,
-    routing: personaRouting,
+    routing: { ...personaRouting, forget: key => { personaRouting.forget(key); deliveryReporting?.forget(key); deliveryPreparation?.forget(key); void deliveryEngines?.forget(key); deliveryLifecycle?.forget(key) } },
     destinations: personaDestinations,
     destinationHold: personaDestinationHold,
     notifier: personaNotifier,
@@ -4213,7 +4382,7 @@ export async function main(): Promise<void> {
     whenLaunchSettled,
     // b.jg5 SRJ-404, SRJ-715: a teardown stops the key's dialog approver
     // first, and the one its launch in flight would start.
-    stopApprover: (key) => stopDialogApprover(key, APPROVER_STOP_TEARDOWN),
+    stopApprover: async (key) => { const stopping = deliveryEngines?.forget(key); deliveryLifecycle?.forget(key); await stopDialogApprover(key, APPROVER_STOP_TEARDOWN); await stopping },
     // b.jg5 SRJ-706, SRJ-715: right after the approver, the key's live-row
     // sequence, before the wait for its launch in flight; the teardown waits
     // for the sequence's call in flight to return.
@@ -4329,6 +4498,24 @@ export async function main(): Promise<void> {
     async fetch(req: Request, server: { requestIP(r: Request): { address: string } | null; timeout(req: Request, seconds: number): void }): Promise<Response> {
       const url = new URL(req.url)
       const mcpSid = req.headers.get('mcp-session-id')
+      if (testMcpDropEnabled && url.pathname === TEST_MCP_DROP_ROUTE) {
+        return handleTestMcpDrop(req, server.requestIP(req)?.address, {
+          getPersonaConfig: () => personaConfig,
+          log: (line) => console.error(line),
+          disconnect: async (key) => {
+            const entry = getSessionByPersona(key)
+            if (!entry?.connected) return
+            const sessionId = entry.transport.sessionId
+            if (!sessionId) throw new Error('No MCP session ID')
+            // Exercise the SDK's actual client DELETE path: it invokes
+            // onsessionclosed BEFORE closing, preserving normal reconnect.
+            const response = await entry.transport.handleRequest(new Request('http://127.0.0.1/mcp', {
+              method: 'DELETE', headers: { 'mcp-session-id': sessionId },
+            }))
+            if (!response.ok) throw new Error('MCP session termination refused')
+          },
+        })
+      }
       if (isHttpVerbose()) {
         console.error(`[slack] HTTP ${req.method} ${url.pathname} session=${mcpSid ?? '(none)'}`)
       }
@@ -4341,8 +4528,7 @@ export async function main(): Promise<void> {
       if (url.pathname === '/interject') {
         return handleInterject(req, server.requestIP(req)?.address, {
           getPersonaConfig: () => personaConfig,
-          isPersonaUp,
-          getSessionByPersona,
+          accept: (key, input) => deliveryPreparation!.accept(key, input),
         })
       }
 
@@ -4438,25 +4624,14 @@ export async function main(): Promise<void> {
   console.error(JSON.stringify({ mcpServers: { [MCP_SERVER_NAME]: { type: 'http', url: `http://${mcpHost}:${mcpPort}/mcp` } } }, null, 2))
   console.error('')
   console.error('Then launch Claude from a project directory with:')
-  console.error(`  claude --mcp-config ~/.claude/slack-mcp.json --dangerously-load-development-channels server:${MCP_SERVER_NAME}`)
+  console.error(`  claude --mcp-config ~/.claude/slack-mcp.json`)
   console.error('')
 
-  // Cron scheduler — the once-per-minute dispatch tick (b.he5). It is its
-  // own /interject client, so it MUST start only AFTER Bun.serve() is listening
-  // (unlike startPermissionPoller, which starts before Bun.serve — do not copy
-  // that placement). Uses the ACTUAL bound port (httpServer.port) so port-0
-  // configs still reach the right listener. Any construction/start failure is
-  // non-fatal — the server keeps serving without a scheduler.
-  // scheduler.start() also owns the crontable bootstrap (the sole ensure-exists
-  // caller) and is failure-isolated internally.
+  // b.omv SR-4.4: scheduler acceptance goes directly to the shared queue.
   try {
     const cronLog = createCronLog(personaConfig.cron_log_path, { maxBytes: personaConfig.cron_log_max_bytes })
-    // Prefer the ACTUAL bound port (covers port-0 configs); fall back to the
-    // requested port only if Bun leaves it undefined (never expected once the
-    // server is listening).
-    const boundPort = httpServer.port ?? mcpPort
     const dispatcher = createCronDispatcher({
-      port: boundPort,
+      accept: (key, input) => deliveryPreparation!.accept(key, input),
       cronLog,
       cronTablePath: personaConfig.cron_table_path,
       // Resolved against the applied persona config at each fire.
@@ -4492,22 +4667,16 @@ export async function main(): Promise<void> {
   // persona's connection.
   personaRowLiveness = isSessionAliveAdapter
 
-  // b.9cj: the restart guard and the health-check tick share persona-routing's
-  // stream-presence probe (`hasSessionStream`), the same `_GET_stream` check
-  // the dispatch path applies to the session it sends to, so a
-  // connected-but-streamless session is treated as unhealthy, not "healed",
-  // everywhere alike.
-
   // Initialize restart module with library-backed adapters. Every key is a
   // persona key.
   initRestart({
     canRestart: canRelaunch,
     isSessionAlive: isSessionAliveAdapter,
+    inspectUpgrade: async key => (await inspectPersonaUpgrade(key)) !== 'current',
     isSessionConnected: (key) => {
       const session = getSessionByPersona(key)
       return session?.connected === true
     },
-    hasSessionStream,
     // b.f2b: the persona locates a `working` row's transcript (its
     // claude_config_dir) for the positive-idle rule.
     reconnectSession: _buildReconnectSessionAdapter(getAppliedPersona, (key) => conflictLatch.isLatched(key)),
@@ -4693,6 +4862,8 @@ export async function main(): Promise<void> {
   // Initialize and start the health-check poller.
   initHealthCheck({
     isSessionAlive: isSessionAliveAdapter,
+    isReconnectDeferred: key => !!deliveryLifecycle?.deferred(key),
+    inspectUpgrade: async key => (await inspectPersonaUpgrade(key)) !== 'current',
     // b.9a7: same connectedness adapter wired into initRestart above
     // (registry entry with connected === true). Lets the tick notice
     // alive-but-disconnected rows and route them to scheduleRestart.
@@ -4700,9 +4871,6 @@ export async function main(): Promise<void> {
       const session = getSessionByPersona(key)
       return session?.connected === true
     },
-    // b.9cj: same stream-presence probe wired into initRestart above, so the
-    // tick can notice connected-but-streamless rows and route them to recovery.
-    hasSessionStream,
     isRestartPendingOrActive,
     // b.f2b, b.jg5 SRJ-315: "in flight for P", a running dialog approver
     // included (SRJ-401). Work in flight owns the session (a start launch
@@ -4723,7 +4891,7 @@ export async function main(): Promise<void> {
     armRetryTimer: armEnvironmentRetryTimer,
     // b.f2b: with session_restart_delay 0 scheduleRestart does nothing, so an
     // alive persona the tick would reconnect gets the not-connected notice
-    // (once per episode, worded for a disconnected or a streamless session)
+    // (once per episode, for a disconnected session)
     // instead of being left down silently; the episode ends when the tick
     // finds it deliverable again.
     isAutoRestartDisabled: () => appliedConfig.session_restart_delay === 0,
@@ -4777,6 +4945,8 @@ export async function main(): Promise<void> {
   // run, the credentials files it references) with what is applied and keeps
   // config.json.pending in step, and applies a change the operator confirmed.
   reload.startDetection()
+  // Fix accepted-only items with the clients available after bring-up, including retained keys.
+  await deliveryPreparation?.recover()
 }
 
 if (import.meta.main) {

@@ -68,7 +68,7 @@ In fungible mode, a persona's channel delivery for a channel sets which messages
 
 ## Permission prompts in fungible mode
 
-In fungible mode, a persona's destination is its `invited.permission_prompts`, `"dm"` when it is absent. Its permission prompts and its server notices, such as lost-message notices and restart-limit warnings, are posted there as the persona. See the `invited.permission_prompts` row in [Persona fields](configuration.md#persona-fields).
+In fungible mode, a persona's destination is its `invited.permission_prompts`, `"dm"` when it is absent. Its permission prompts and its server notices, such as *Message not saved* notices and restart-limit warnings, are posted there as the persona. See the `invited.permission_prompts` row in [Persona fields](configuration.md#persona-fields).
 
 - **A channel ID:** any channel; it needs no listing and no DMs. Invite the persona's app to it, or Slack refuses the posts (see "A permission prompt or notice doesn't arrive" in [Troubleshooting](troubleshooting.md#troubleshooting)). Everyone in that channel sees the prompts and notices.
 - **`"dm"`, written or by default:** a DM from the persona's app to its `dm.contact`. It needs `dm.enabled: true` and a `dm.contact`.

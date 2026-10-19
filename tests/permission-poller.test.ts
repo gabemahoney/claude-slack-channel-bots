@@ -1013,9 +1013,9 @@ describe('poller tick — persona routing (b.av2 SR-7.1)', () => {
     expect(slackCalls(stubA, stubB, stubD)).toBe(0)
   })
 
-  test('a row in the default canned form (labels exactly service and persona, the default fixture cwd) routes by its persona label', async () => {
+  test('a row in the default canned form (current launch labels, the default fixture cwd) routes by its persona label', async () => {
     const row = cannedListRow({ instance_id: INSTANCE_A, state: 'check_permission' })
-    expect(row.labels).toEqual({ service: 'cscb', persona: KEY_A })
+    expect(row.labels).toEqual({ service: 'cscb', persona: KEY_A, tag_prompt: '1' })
     expect(row.cwd).toBe(defaultCannedRowCwd())
     scriptPostTs(stubA, POST_TS)
     const ivl = startPoller(() => ({
@@ -4354,7 +4354,7 @@ describe('poller tick — a persona that is not up (b.av2 SR-6.4)', () => {
     // E3's handling of a row with no persona label, and of one naming no applied persona, is unchanged.
     s.extraRows.push(
       cannedListRow({ instance_id: 'cscb_unlabelled', state: 'check_permission', labels: { service: 'cscb' } }),
-      cannedListRow({ instance_id: 'cscb_absent', state: 'check_permission', labels: { service: 'cscb', persona: 'absent' } }),
+      cannedListRow({ instance_id: 'cscb_absent', state: 'check_permission', labels: { tag_prompt: '1', service: 'cscb', persona: 'absent' } }),
     )
     await s.ivl.tick()
 

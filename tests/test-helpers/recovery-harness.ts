@@ -1,3 +1,7 @@
+import { createDeliveryQueue } from '../../src/delivery-queue.ts'
+import { createDeliveryPreparation } from '../../src/delivery-intake.ts'
+import { cannedReadPaneResult } from './ad-results.ts'
+import { IDLE_PANE } from './working-row-panes.ts'
 /**
  * test-helpers/recovery-harness.ts — `makeRecoveryHarness`, the recovery
  * harness (b.jg5 SRJ-1304): the UNAVAILABLE retry timer and the recovery
@@ -28,8 +32,8 @@
  *   skips a retry, SRJ-401), with that cause query as `retryBlockCause` (the
  *   skip's again-reason and the restart retry's skip line), and the condition's
  *   retry hooks: the
- *   connection and stream probes (`isSessionConnected` and
- *   `hasSessionStream`, both over `setConnected`) and `endTmuxUnresponsive`,
+ *   connection and stream probes (`isSessionConnected`
+ *   over `setConnected`) and `endTmuxUnresponsive`,
  *   the condition's end with reason `TMUX_UNRESPONSIVE_END_RETRY` and the
  *   retry's reading followed by the clear of the persona's
  *   `tmux-unavailable` outage with that reading (b.jg5 SRJ-311, SRJ-312),
@@ -133,7 +137,7 @@
  *   configured persona up at first) and the live applied set (its lines go
  *   to `lines`). `setConnected(key, connected)` controls whether the
  *   persona's session is registered as connected with its message stream
- *   (`isSessionConnected` and `hasSessionStream`; none at first).
+ *   (`isSessionConnected`; none at first).
  * - Drivers, each as the server does it: `shutdown()` raises the
  *   shutting-down flag, closes the live-row sequence registry
  *   (`close()`, not awaited: every sequence's stop signal is set, so none
@@ -800,84 +804,22 @@
  *   when a launch or a run is still in flight at the bound, or an approver
  *   neither sleeps nor has stopped (one held in a call). A retry whose
  *   launch goes on past a spawn needs it before the clock moves on.
- * - `loseMessage(key)`, the lost-message driver (b.jg5 SRJ-1011): one Slack
- *   message, a human's in persona `key`'s first channel, handed to the real
- *   `createPersonaRouting` with no session registered for the persona, so it
- *   takes the no-session branch and is lost. The routing is built at the
- *   first call, bound as `main()` binds it: the up predicate is the real
- *   `createPersonaUpPredicate` over the same serving connection, bring-up
- *   outcome (`setUp`) and live applied set as the relaunch gate; `isLatched`
- *   is `latch`'s latched query; `isTmuxUnresponsive` is the condition's
- *   `holds`; `isRetryArmed` is the controller's `isArmed`, exactly true
- *   (b.jg5 SRJ-1011 as amended: state 5 applies only while P's retry timer
- *   is armed, and never at the restart cap, which the routing reads from the
- *   real backoff state); `isLaunchOrApproverRunning` is the session manager's
- *   `isLaunchInFlight` or `isDialogApproverRunning` (the approver runs after
- *   its launch call returned, SRJ-401); the
- *   restart guards and `scheduleRestart` are the restart module the harness
- *   initialised, and the outage flags are the outage state's. The read gate's
- *   in-flight member (`isWorkInFlight`) is "in flight for P" (as `main()`'s
- *   `isPersonaWorkInFlight`: "blocks a retry", which the full-mode retry
- *   action receives, or a running dialog approver), and the one row read
- *   (`readRowLiveness`) is the harness's liveness adapter, the restart deps'
- *   default `isSessionAlive` (b.jg5 SRJ-1011, SRJ-115); a
- *   `restartDeps.isSessionAlive` replacement does not reach it. So when states
- *   1 to 5 are clear and nothing is in flight for the persona, the message
- *   makes one stub `status` call (in `calls` and in `stub.calls.status`),
- *   outside any launch or recovery attempt, answered by the stub's `status`
- *   knobs (`script({ statusResult })`, `statusQueue`, `statusError` or
- *   `statusFn`; e.g. `cannedStatusResult({ state: 'pending' })` for state 6,
- *   a row that shows the stub's default launch start, so it latches no one);
- *   while a launch's spawn is held open (`holdSpawns(stub.client)` and a
- *   `launch(key)` not yet settled) a launch is in flight, and while P's
- *   dialog approver runs (after a launch, until it stops) the approver is,
- *   so the message reports `session-starting` and no read is made.
- *   Its `armRetryTimerIfMissing` (b.jg5 SRJ-311) is bound as `main()` binds
- *   it: nothing while the harness is shutting down (`shutdown()`), else the
- *   server's one check (`armMissingTmuxUnavailableRetry`) over the harness's
- *   own holders, as `main()`'s `tmuxUnavailableRetryDeps`: the outage
- *   state's `tmux-unavailable` flag, the controller's `isArmed`, `latch`'s
- *   latched query, "in flight for P", and an arm straight to the
- *   controller with `UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT` (not through the
- *   trigger sink, so not in `triggers`), its one line to `console.error`
- *   (`errors`). So a message lost with the persona's `tmux-unavailable`
- *   flag raised, no timer armed, below the restart cap, not latched and
- *   nothing in flight arms its timer before the state is decided, and so
- *   reports `not-answering`, with no restart asked for.
- *   Its `isKillFailed` (b.jg5 SRJ-1011 state 4, SRJ-812) is bound as
- *   `main()` binds it: the harness's kill-failure alerts' "episode open"
- *   query (`killFailureOpen`, below) or the session manager's
- *   `waitsOnKillFailedHold` (P waits on an old-life hold marked kill-failed),
- *   read at call time, so a message lost while P's kill-failure episode is
- *   open, or while P waits on a hold whose old key's kill failed, reports
- *   `kill-failed`.
- *   Its `isSequenceOrWaitRunning` (b.jg5 SRJ-706, SRJ-811, SRJ-1011) is the
- *   session manager's `isSequenceOrOldLifeWaitRunning`, read at call time as
- *   `main()` binds it, so a message lost while P's live-row sequence, or an
- *   old-life wait step for a hold P waits on, runs reports `restarting`, and
- *   since either is in "in flight for P" no row read is made; state 6's
- *   `isLaunchOrApproverRunning` does not include them.
- *   Its `isHeldOnInvalidFlags` (b.jg5 SRJ-1011 state 3, SRJ-207) is the
- *   harness's hold's held query, read at call time as `main()` binds it, so
- *   a message lost while P is held reports `cannot-launch`.
- *   Each persona has its own Slack stub (`slack(key)`, leak marker on) as its
- *   client and bot identity; the routing's `notify` records each notice in
- *   `lostMessageNotices` (`{ key, text }`, the body without the persona
- *   prefix) and hands it to the real persona notifier (`makeNotifierStack`,
- *   its destination hold on the harness clock), which posts it with the
- *   persona's own stub. The routing's lines go to `lines`. It throws when a
- *   session is registered for the persona, or when the message raised no
- *   notice, or one for another persona. It resolves, once the notice is
- *   raised, with `LostMessageOutcome`: the state the notice reports
- *   (`stateOf`, from the routing harness), the notice body, whether the
- *   routing asked the restart module for the persona's restart
- *   (`restartRequested`: `scheduleRestart` asks the restart deps' latched
- *   query first, before any other gate, and the harness records every such
- *   ask, so a request is seen even for a latched persona or with the delay
- *   0, where none is armed), whether a restart of it is pending or running
- *   afterwards (`isRestartPendingOrActive`), and the stub calls the message
- *   made (by verb, as `callCountsSince`). `restartAsks` holds every such ask,
- *   by key, in order, a direct `scheduleRestart` call's included.
+ * - `loseMessage(key)` retains its legacy name as the disconnected Slack
+ *   intake driver (b.omv SR-4.2). It hands one distinct event in the persona's
+ *   first channel to the real routing and real durable queue, with no MCP
+ *   session registered. Storage and ack precede the existing recovery
+ *   decision. The up predicate, latch, retry controller, in-flight gates,
+ *   liveness adapter, holds and restart module are the same ones used by the
+ *   harness's recovery paths. It makes the decision's permitted one `status`
+ *   read of the persona's own instance, and requests a human restart only
+ *   for `starting-now`. It returns `LostMessageOutcome`: the accepted-row
+ *   delta, acknowledgment, restart request/pending facts and exact stub call
+ *   deltas. It asserts that intake emits no lost-message notice. Other
+ *   recovery episode notices still use the harness notifier as before.
+ *   `restartAsks` records the restart module's latched query, including
+ *   direct `scheduleRestart` calls; `restartRequested` counts only asks made
+ *   while this input was handled. A registered MCP session is refused by
+ *   this driver so the case cannot silently exercise another branch.
  * - `outageNotices`: the outage state's notices, `{ key, text }`, in order.
  * - `episodeNotices`: the notice episodes' posts, `{ key, text }`, in order
  *   (production posts them through the persona notifier).
@@ -1017,8 +959,8 @@
  * `dispatcherBugWordingIn` (every captured line, `console.error`
  * line, notice and startup-errors entry carrying `DISPATCHER_BUG_WORDING`,
  * which no post or line may give a collision, b.jg5 SRJ-713),
- * `expectLostMessageReports` (lose one message through the driver
- * and assert its state, its stub calls, by default none in states 1 to 5 and
+ * `expectLostMessageReports` (accept one disconnected message through the
+ * driver and assert durable storage, acknowledgment and its stub calls, by default none in states 1 to 5 and
  * one `status` of the persona's instance after them, and no restart asked
  * for or pending unless `restartRequested`; resolves with the outcome), `collided` (the stub answers of a launch whose optimistic spawn
  * collides), `callCounts` (the stub's calls by verb), `personaCallCounts`
@@ -1188,7 +1130,7 @@ import {
   type KillFailureAlertVersion,
   type KillFailureClosing,
 } from '../../src/kill-failure-alert.ts'
-import { LOST_MESSAGE_STATES, STATE_WORDING, type LostMessageState } from '../../src/lost-message.ts'
+import { LOST_MESSAGE_STATES, type LostMessageState } from '../../src/lost-message.ts'
 import {
   createPendingRowRule,
   endStuckLaunchEpisodeForLatch,
@@ -1198,6 +1140,7 @@ import {
   type StuckLaunchAbort,
 } from '../../src/pending-row.ts'
 import { _resetOutageState, clearOutageFlag, getOutageFlags, initOutageState, resetAllToHealthy, type OutageClass } from '../../src/outage-state.ts'
+import type { DeliveryAdScope } from '../../src/delivery-ad-scope.ts'
 import type { PersonaLifecycleDeps } from '../../src/persona-lifecycle.ts'
 import type { PersonaConnectionStatus } from '../../src/persona-connections.ts'
 import {
@@ -1444,7 +1387,6 @@ import { builtAround } from './line-parts.ts'
 import { makeMultiPersonaConfig, type PersonaSpec } from './persona-config.ts'
 import { makeNotifierStack } from './persona-notifier.ts'
 import { launchStartText, type PendingRowModel } from './pending-row-model.ts'
-import { stateOf } from './persona-routing-harness.ts'
 import { makeChannelMessage, makeStubSlack, type StubSlack } from './slack-stub.ts'
 import { writeRetiredKeysRecord, type RetiredKeySeed } from './retired-keys.ts'
 
@@ -1517,6 +1459,8 @@ const SERVING: PersonaConnectionStatus = Object.freeze({ state: 'up', identity: 
 
 /** Options of `makeRecoveryHarness`; every one is optional. */
 export interface RecoveryHarnessOptions {
+  /** Use the engine's isolated client and call budget in shared upgrade reads, as main() does. */
+  deliveryScope?: DeliveryAdScope
   /** The retry action: `'scripted'` for the scripted action; the full-mode action when unset. */
   action?: UnavailableRetryAction | 'scripted'
   /** The personas (`makeMultiPersonaConfig` specs); two default personas when unset. */
@@ -1730,12 +1674,11 @@ export type RecoveryLatchEvent =
   | { readonly step: 'hold'; readonly key: string; readonly hold: RecoveryLatchHold }
   | { readonly step: 'notice'; readonly key: string; readonly text: string }
 
-/** What `loseMessage` resolves with: one lost message for one persona, as the driver saw it. */
+/** One disconnected Slack intake outcome, including durable acceptance and recovery facts. */
 export interface LostMessageOutcome {
-  /** The state the notice reports, identified by `stateOf`. */
-  readonly state: ReturnType<typeof stateOf>
-  /** The notice body the routing raised (no persona prefix). */
-  readonly notice: string
+  /** Real durable accepted-row delta from this input. */
+  readonly stored: number
+  readonly acknowledged: boolean
   /** Whether the routing asked the restart module for the persona's restart (`scheduleRestart`), armed or not. */
   readonly restartRequested: boolean
   /** Whether a restart of the persona is pending or running once the message was handled. */
@@ -1776,6 +1719,7 @@ export interface RecoverySequenceRun {
 
 /** The driver's pieces, built at the first `loseMessage`. */
 interface LostMessageDriver {
+  readonly queue: ReturnType<typeof createDeliveryQueue>
   readonly routing: PersonaRouting
   readonly hold: PersonaDestinationHold
 }
@@ -1971,6 +1915,8 @@ export interface RecoveryHarness {
    * the one member `main()` hands the reload controller. Answers the hold.
    */
   beginOldLifeHold(begin: OldLifeHoldBegin): OldLifeHold
+  /** Mark a held old row as a failed kill, as the old-life wait does. */
+  markOldLifeKillFailed(instanceId: string): boolean
   /**
    * Run the start sweep as `main()` runs it (`reconcileOrphans` over the
    * applied configuration on `killRetryClock`, driven with `drive`), its
@@ -1999,6 +1945,7 @@ export interface RecoveryHarness {
    * Lose one Slack message for persona `key` through the real routing's
    * no-session branch, bound as `main()` binds it; see the module comment.
    */
+  queued(key: string): ReturnType<ReturnType<typeof createDeliveryQueue>['items']>
   loseMessage(key: string): Promise<LostMessageOutcome>
   /**
    * Every ask of the restart deps' latched query, by key, in order: what
@@ -2291,7 +2238,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     isInFlight: isPersonaRetryBlocked,
     retryBlockCause: personaRetryBlockCause,
     isSessionConnected: (key) => connected.has(key),
-    hasSessionStream: (key) => connected.has(key),
+
     endTmuxUnresponsive: (key, reading) => {
       tmuxUnresponsive.end(key, TMUX_UNRESPONSIVE_END_RETRY, reading)
       clearOutageFlag(key, 'tmux-unavailable', reading)
@@ -2564,6 +2511,9 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   const oldLifeHolds = createOldLifeHoldSet({ log: (line) => console.error(line) })
 
   const stub = installStubSpawnPath(home)
+  // b.omv SR-5.3: an ordinary live terminal has an empty composer. Explicit
+  // pane/error scripts replace this non-enumerable knob as usual.
+  Object.defineProperty(stub.calls, 'readPaneResults', { value: [cannedReadPaneResult(IDLE_PANE)], writable: true, configurable: true, enumerable: false })
   // Every agent-director verb of the stub client is wrapped, in place, so
   // each call is stamped with the harness clock when it is made (b.jg5
   // SRJ-410, AC 33: the cadence of a persona's calls), before the stub
@@ -2695,6 +2645,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   let recheckInstalled = false
   _resetOutageState()
   initOutageState({
+    deliveryScope: options.deliveryScope,
     notify: (key, text) => {
       outageNotices.push({ key, text })
     },
@@ -2862,7 +2813,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     canRestart: canRelaunch,
     isSessionAlive: isSessionAliveAdapter,
     isSessionConnected: (key) => connected.has(key),
-    hasSessionStream: (key) => connected.has(key),
+
     // As main() builds it: with the latch's latched query (b.jg5 SRJ-502).
     reconnectSession: _buildReconnectSessionAdapter(appliedPersona, (key) => latch.isLatched(key), appliedPersona),
     killSession: _buildKillSessionAdapter(appliedPersona, killRetryClock),
@@ -3191,6 +3142,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       entryStep: request.entryStep ?? LIVE_ROW_SEQUENCE_ENTRY_KILL,
       keepsConversation: request.keepsConversation ?? false,
       retiredKey: request.retiredKey ?? false,
+      tagUpgrade: false,
       launches: request.launches ?? true,
       alertContext: request.alertContext ?? KILL_FAILURE_CONTEXT_RECOVERY,
       ...(request.retiredAtStart === undefined ? {} : { retiredAtStart: request.retiredAtStart }),
@@ -3266,23 +3218,17 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   function driver(): LostMessageDriver {
     if (lostMessageDriver !== undefined) return lostMessageDriver
     const { notifier, hold } = makeNotifierStack({ getPersona: appliedPersona, clientFor: slackClientFor, getPersonaConfig: appliedConfig, clock, log })
-    const routing = createPersonaRouting({
+    const queue = createDeliveryQueue({ stateDir, now: clock.now })
+    const ready = queue.start()
+    const preparation = createDeliveryPreparation({ queue, clientFor: slackClientFor, resolveUserName: async (_key, userId) => userId })
+    const core = createPersonaRouting({
       getPersonaConfig: appliedConfig,
-      getBotIdentity: (key) => slackStubs.get(key)?.identity,
-      clientFor: slackClientFor,
-      // As server.ts: `users.info` through the persona's client.
-      resolveUserName: async (key, userId) => {
-        const client = slackClientFor(key)
-        return client ? createNameResolver(client as unknown as NameResolverWebClient).resolveUserName(userId) : userId
-      },
+      getBotIdentity: key => slackStubs.get(key)?.identity,
+      queue: { lookupSlackKey: queue.lookupSlackKey, accept: async (key, input) => { await ready; return queue.accept(key, input) } },
+      prepare: preparation.prepare,
       archive: () => {},
-      getReplySettings: () => replySettingsOf(appliedConfig()),
-      notify: (key, text, noticeOptions) => {
-        lostMessageNotices.push({ key, text })
-        return notifier.notify(key, text, noticeOptions)
-      },
       log,
-      dedupeClock: () => clock.now(),
+      now: clock.now,
       isPersonaUp: createPersonaUpPredicate({ status: () => SERVING }, upQuery),
       isLatched: (key) => latch.isLatched(key),
       isTmuxUnresponsive: (key) => tmuxUnresponsive.holds(key),
@@ -3316,7 +3262,8 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
         armMissingTmuxUnavailableRetry(key, tmuxUnavailableRetryDeps, lostMessageArmLine(key))
       },
     })
-    lostMessageDriver = { routing, hold }
+    const routing = { ...core, receive: async (...args: Parameters<typeof core.receive>) => { await ready; return core.receive(...args) } }
+    lostMessageDriver = { routing, hold, queue }
     return lostMessageDriver
   }
 
@@ -3333,21 +3280,19 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     }
     const channel = persona.channels[0]?.id
     if (channel === undefined) throw new Error(`recovery harness: persona ${key} lists no channel to receive a message in`)
-    const { routing } = driver()
+    const { routing, queue } = driver()
+    const storedBefore = queue.items(key).length
     const noticesBefore = lostMessageNotices.length
     const asksBefore = restartLatchedAsks.length
     const callsBefore = stubCallCounts()
     lostMessageCount += 1
     const event = makeChannelMessage({ channel, ts: `1700000000.${String(lostMessageCount).padStart(6, '0')}` })
-    await routing.receive(event, () => {}, key)
-    const raised = lostMessageNotices.slice(noticesBefore)
-    if (raised.length !== 1 || raised[0]!.key !== key) {
-      throw new Error(`recovery harness: losing a message for ${key} raised ${JSON.stringify(raised.map((n) => n.key))}, not one notice for it`)
-    }
-    const notice = raised[0]!.text
+    let acknowledged = false
+    await routing.receive(event, () => { acknowledged = true }, key)
+    expect(lostMessageNotices.slice(noticesBefore)).toEqual([])
     return {
-      state: stateOf(notice),
-      notice,
+      stored: queue.items(key).length - storedBefore,
+      acknowledged,
       restartRequested: restartLatchedAsks.slice(asksBefore).includes(key),
       restartPending: isRestartPendingOrActive(key),
       calls: callCountsSince(stubCallCounts(), callsBefore),
@@ -3418,6 +3363,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     // As main() hands the reload controller the set (b.jg5 SRJ-809): apply
     // step 1 begins its holds through `begin` alone.
     beginOldLifeHold: (begin) => oldLifeHolds.begin(begin),
+    markOldLifeKillFailed: (instanceId) => oldLifeHolds.markKillFailed(instanceId),
     // As main() runs it (b.jg5 SRJ-714): over the applied configuration, on
     // the kill-retry clock, its shutdown query the shutting-down flag.
     startSweep: (isShuttingDown = () => shuttingDown) => drive(reconcileOrphans(appliedConfig(), killRetryClock, isShuttingDown)),
@@ -3482,6 +3428,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     slowRecovery: Object.freeze({ count: (key: string) => slowRecovery.count(key), isOpen: (key: string) => slowRecovery.isOpen(key) }),
     lostMessageNotices,
     slack: slackStubOf,
+    queued: key => lostMessageDriver?.queue.items(key) ?? [],
     loseMessage,
     restartAsks: restartLatchedAsks,
     serializer,
@@ -3778,6 +3725,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       episodes.forgetAll()
       waitUnclassifiedErrors.close()
       lostMessageDriver?.hold.cancelAll()
+      void lostMessageDriver?.queue.stop()
       lostMessageDriver = undefined
       // The version re-check first, so its own timer is not counted as left
       // pending (it is armed for as long as it is installed).
@@ -4013,9 +3961,9 @@ export function dispatcherBugWordingIn(h: RecoveryHarness): string[] {
 const EARLY_LOST_MESSAGE_STATES: readonly LostMessageState[] = LOST_MESSAGE_STATES.slice(0, LOST_MESSAGE_STATES.indexOf('session-starting'))
 
 /**
- * Lose one message for persona `key` through the driver (`h.loseMessage`)
- * and assert what it reports: `state`, with its exported wording; exactly
- * the stub calls `opts.calls` (by verb), by default none in states 1 to 5
+ * Accept one disconnected message through `h.loseMessage` and assert one
+ * stored row, acknowledgment, no lost-message notice, and the exact stub
+ * calls `opts.calls` (by verb), by default none for `state` in states 1 to 5
  * and, in any later state, one `statusCalls`, the routing's row read (b.jg5
  * SRJ-1011; nothing in flight for the persona), every `status` among them of
  * the persona's own instance; and no restart asked for or pending, unless
@@ -4033,8 +3981,8 @@ export async function expectLostMessageReports(
   const statusBefore = h.stub.calls.statusCalls.length
   const outcome = await h.loseMessage(key)
   expect([key, outcome]).toEqual([key, {
-    state,
-    notice: expect.stringContaining(STATE_WORDING[state]),
+    stored: 1,
+    acknowledged: true,
     restartRequested,
     restartPending: restartRequested ? expect.any(Boolean) : false,
     calls,

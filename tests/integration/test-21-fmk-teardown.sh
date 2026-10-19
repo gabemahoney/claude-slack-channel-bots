@@ -40,10 +40,10 @@
 #   next start applies config.json as it stands (docs/reload.md); that
 #   start's sweep kills the earlier leg's live rows (absent personas), in
 #   `log`, so no earlier persona's teardown enters a later leg's lines;
-# - stub workers: `dev-channels` (the reporting stub: the approver's Enter
+# - stub workers: `startup-trust` (the reporting stub: the approver's Enter
 #   makes it report in) for A, B, C, E, F and G; D runs `unrecognised-dialog`
 #   (CSCB's approver never answers it, so D's row stays `pending` at that
-#   dialog), then `dev-channels` for its recovery. The stub ignores `pause`'s
+#   dialog), then `startup-trust` for its recovery. The stub ignores `pause`'s
 #   `/exit` (its exit sentinel is `__CSCB_TEST_EXIT__`);
 # - checks read only their own leg's ids and window: server.log,
 #   startup-errors.log and clean_restart.log from the leg's mark line,
@@ -135,7 +135,7 @@
 #      answers ErrSpawnNotPausable (its escalation line in the CLI's output),
 #      the one CLI-parented `kill` that follows succeeds, the command exits 0,
 #      the server is gone and D's session is gone. D's directory switched to
-#      `dev-channels`; a start. Waited until D's row reads `waiting`, bounded
+#      `startup-trust`; a start. Waited until D's row reads `waiting`, bounded
 #      at D_RECOVER_WAIT_S (below). Then: no CSCB `kill` naming D after the
 #      restart's mark; no harness `find-missing` in the whole run (SRJ-1401:
 #      D is unlatched, so CSCB's own pending-row runs mark it); exactly one
@@ -269,13 +269,14 @@ mkdir -p "${CFG_ROOT}"
 
 # t21_persona <prefix> <short> <channel>: set <prefix>_NAME, _LABEL,
 # _CHANNEL, _WORK, _CFG, _KEY, _ID and _SESSION for one persona, write its
-# credentials file and select `dev-channels` for its working directory.
+# credentials file and select `startup-trust` for its working directory.
 t21_persona() {
     local p="$1" short="$2" channel="$3" key value work
     printf -v "${p}_NAME" '%s' "${SCENARIO_TAG}${short}"
     printf -v "${p}_LABEL" '%s' "${SCENARIO_TAG}${short}1"
     printf -v "${p}_CHANNEL" '%s' "${channel}"
     work="$(make_workdir "${SCENARIO_TAG}${short}_work")"
+    stub_mode "${work}" "${STUB_MODE_STARTUP_TRUST}"
     printf -v "${p}_WORK" '%s' "${work}"
     printf -v "${p}_CFG" '%s' "${CFG_ROOT}/${SCENARIO_TAG}${short}_cfg"
     mkdir -p "${CFG_ROOT}/${SCENARIO_TAG}${short}_cfg"
@@ -285,7 +286,7 @@ t21_persona() {
     printf -v "${p}_ID" '%s' "${value}"
     t21_value value personaTmuxSessionName "${key}"
     printf -v "${p}_SESSION" '%s' "${value}"
-    stub_mode "${work}" "${STUB_MODE_DEV_CHANNELS}"
+    stub_mode "${work}" "${STUB_MODE_STARTUP_TRUST}"
     printf '{"bot_token": "%s", "app_token": "%s"}\n' \
         "$(fake_token bot "${SCENARIO_TAG}${short}1")" "$(fake_token app "${SCENARIO_TAG}${short}1")" \
         | write_file "${CREDS_DIR}/${SCENARIO_TAG}${short}1.json" 600
@@ -1003,7 +1004,7 @@ t21_pending_leg() {
     echo "${TEST_NAME}: NOTE: ${step}: after the kill ${D_ID} reads '$(t21_row_state "${D_ID}")'"
 
     # The next server: D's directory reports in now.
-    stub_mode "${D_WORK}" "${STUB_MODE_DEV_CHANNELS}"
+    stub_mode "${D_WORK}" "${STUB_MODE_STARTUP_TRUST}"
     t21_mark
     mark="${MARK_TIME}"
     t21_start_and_wait 1

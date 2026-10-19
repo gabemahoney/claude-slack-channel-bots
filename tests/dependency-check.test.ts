@@ -64,6 +64,7 @@ import {
   runAgentDirectorStartupGate,
   buildPersonaClient,
   buildPersonaClientOrExit,
+  createDeliveryClientFactory,
   checkErrorCatalog,
   DEFAULT_STATE_DB_PATH,
   REFUSAL_KIND_BELOW_PHASE1_FLOOR,
@@ -1684,5 +1685,74 @@ describe('b.jg5 SRJ-213 / SRJ-121: buildPersonaClient and buildPersonaClientOrEx
     expect(gate.closes()).toBe(1)
     expect(records).toEqual([])
     expect(exits).toEqual([])
+  })
+})
+
+// b.omv SR-5.1 / D8: engines own independent clients and never replace the
+// recovery singleton. Pending construction is also owned by shutdown.
+describe('delivery client factory', () => {
+  afterEach(() => resetClientForTests())
+
+  test('lazily caches per persona with the configured timeout and filtered logger, independently of the singleton', async () => {
+    const gate = makeCloseCountingStubClient()
+    const gateCalls: RecordedClientOptions = []
+    await runStartupGate(makePassingGateDeps({ createClient: makeStubCreateClient({ client: gate.client, calls: gateCalls }) }))
+    const clients = [makeCloseCountingStubClient(), makeCloseCountingStubClient()]
+    const calls: RecordedClientOptions = []
+    const closed: unknown[] = []
+    const factory = createDeliveryClientFactory(MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS, {
+      createClient: async options => { calls.push(options); return clients[calls.length - 1]!.client },
+      closeClient: client => { closed.push(client) },
+    })
+    expect(calls).toEqual([])
+    const a = factory.clientFor('A')
+    expect(factory.clientFor('A')).toBe(a)
+    const [first, second] = await Promise.all([a, factory.clientFor('B')])
+    expect(first as unknown).toBe(clients[0]!.client)
+    expect(second as unknown).toBe(clients[1]!.client)
+    expect(first).not.toBe(second)
+    expect(calls.map(call => call.callTimeoutMs)).toEqual([MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS, MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS])
+    expect(calls.map(optionsBesideCallTimeout)).toEqual([optionsBesideCallTimeout(gateCalls[0]!), optionsBesideCallTimeout(gateCalls[0]!)])
+    expect(calls.every(call => call.logger !== undefined)).toBe(true)
+    expect(getClient() as unknown).toBe(gate.client)
+    expect(gate.closes()).toBe(0)
+    await factory.close()
+    await factory.close()
+    expect(closed).toEqual(clients.map(client => client.client))
+    await expect(factory.clientFor('C')).rejects.toThrow('Delivery clients are closed')
+  })
+
+  test('a failed construction is retried for that persona without changing another persona', async () => {
+    const good = makeCloseCountingStubClient()
+    let attempts = 0
+    const factory = createDeliveryClientFactory(DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS, {
+      createClient: async () => { if (++attempts === 1) throw errSystemInstallNotFound(); return good.client },
+      closeClient: () => {},
+    })
+    await expect(factory.clientFor('A')).rejects.toThrow()
+    expect(await factory.clientFor('B') as unknown).toBe(good.client)
+    expect(await factory.clientFor('B') as unknown).toBe(good.client)
+    expect(attempts).toBe(2)
+    expect(await factory.clientFor('A') as unknown).toBe(good.client)
+    expect(attempts).toBe(3)
+    await factory.close()
+  })
+
+  test('shutdown awaits construction, closes its result once, and rejects the pending request', async () => {
+    const stub = makeCloseCountingStubClient()
+    let resolve!: (client: unknown) => void
+    const closed: unknown[] = []
+    const factory = createDeliveryClientFactory(DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS, {
+      createClient: () => new Promise(done => { resolve = done }),
+      closeClient: client => { closed.push(client) },
+    })
+    const request = factory.clientFor('A')
+    const refused = request.then(() => undefined, error => error)
+    const closing = factory.close()
+    expect(closed).toEqual([])
+    resolve(stub.client)
+    await closing
+    expect(await refused).toEqual(new Error('Delivery clients are closed'))
+    expect(closed).toEqual([stub.client])
   })
 })

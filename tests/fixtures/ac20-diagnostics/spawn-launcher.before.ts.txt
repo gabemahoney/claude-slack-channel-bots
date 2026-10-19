@@ -1,0 +1,24 @@
+async function native(directory: string, binary: string, args: string[]) {
+  const ready = JSON.parse(readFileSync(join(directory, 'gateway-ready.json'), 'utf8'))
+  if (!integer(ready.port, 65535) || ready.port === 0) throw new Error('AC20 gateway not ready')
+  const url = new URL(process.env.ANTHROPIC_BASE_URL!)
+  url.protocol = 'http:'; url.hostname = '127.0.0.1'; url.port = String(ready.port)
+  const child = Bun.spawn([binary, '--debug-to-stderr', ...args], { stdin: 'inherit', stdout: 'inherit', stderr: 'pipe', env: { ...process.env, ANTHROPIC_BASE_URL: url.toString() } })
+  const emit = sink(directory, `native-${process.pid}.jsonl`)
+  const projection = nativeDebugProjection(emit, () => ({ atMs: Date.now(), case: scope(directory), process: process.pid }))
+  const stop = (signal: NodeJS.Signals) => { try { child.kill(signal) } catch {} }
+  const term = () => stop('SIGTERM'), interrupt = () => stop('SIGINT')
+  process.on('SIGTERM', term); process.on('SIGINT', interrupt)
+  const reader = child.stderr.getReader()
+  // Attach the rejection handler immediately: a reader can fail while the
+  // native process is still exiting. Never let it erase the eventual exit.
+  const reading = (async () => { try { while (true) { const value = await reader.read(); if (value.done) break; projection.push(value.value) }; return true } finally { projection.end() } })().catch(() => false)
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    const code = await child.exited
+    process.exitCode = code
+    emit({ source: 'native', event: 'process_exit', atMs: Date.now(), case: scope(directory), exitCode: code })
+    const drained = await Promise.race([reading, new Promise<false>(resolve => { timer = setTimeout(() => resolve(false), 1000) })])
+    if (!drained) { emit({ source: 'native', event: 'capture_withheld', reason: 'stream_collection_incomplete', atMs: Date.now(), case: scope(directory) }); void reader.cancel().catch(() => {}) }
+  } finally { clearTimeout(timer); process.off('SIGTERM', term); process.off('SIGINT', interrupt) }
+}

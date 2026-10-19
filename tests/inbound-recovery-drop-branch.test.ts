@@ -1,4 +1,5 @@
 import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
+import { TRUST_DIALOG_PANE } from './test-helpers/working-row-panes.ts'
 /**
  * inbound-recovery-drop-branch.test.ts — lost messages (b.av2 SR-4.6, SR-7.3,
  * SR-7.2 part; b.kvq and b.9cj recovery, keyed per persona). The AC 26
@@ -81,7 +82,7 @@ import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
  * path's own read still keeps a launch off a `pending` row after a failed
  * routing read. State 4 (b.jg5 SRJ-1011, SRJ-704) runs there too, the
  * driver's kill-failed input bound to the harness's kill-failure alerts'
- * episode: a message lost after the ordinary alert (the restart path's one
+ * episode: an item accepted after the ordinary alert (the restart path's one
  * try, or a live-row sequence's tries ending in `ErrTmuxUnresponsive` after a
  * survivor-naming failure) reports `kill-failed`; after the survivor version,
  * or once the episode ended, it never does; a CONFLICT latch gives
@@ -92,7 +93,7 @@ import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
  * launch included; a latch beats it, and once the sequence has ended the
  * one read is made again. State 3 (b.jg5 SRJ-1011, SRJ-207) runs there too,
  * the driver's held-on-invalid-flags input bound to the harness's one
- * `ErrInvalidFlags` hold: a message lost while P is held through a real
+ * `ErrInvalidFlags` hold: an item accepted while P is held through a real
  * reuse reports `cannot-launch` with no restart and no call; above an open
  * kill-failure episode it still does; under a latch `held-for-human` comes
  * first; once the binary's version changes and the hold ends it never does.
@@ -216,7 +217,6 @@ import {
   makeRoutingHarness,
   putAtRestartCap,
   resetRoutingState,
-  stateOf,
   waitFor,
   LOST_MESSAGE_STATES,
   LOST_STATE_SETUPS,
@@ -232,7 +232,6 @@ import {
   APPROVER_STOP_LIVE,
   APPROVER_STOP_TEARDOWN,
   DIALOG_POLL_INTERVAL_MS,
-  TRUST_DIALOG_NEEDLE,
   isLaunchInFlight,
   readPersonaRowState,
   stopDialogApprover,
@@ -467,10 +466,6 @@ function dmFrom(user: string, channel: string): SlackEvent {
 }
 
 /** Every captured post as (persona whose stub posted, conversation, recovery state). */
-function lostNotices(h: Harness): { key: string; channel: string; state: string }[] {
-  return h.allPosts().map((p) => ({ key: p.key, channel: p.channel, state: stateOf(p.text) }))
-}
-
 /** The first persona (beta) got no restart and made no Slack call of any kind. */
 function expectBetaUntouched(h: Harness): void {
   expect(isRestartPendingOrActive(h.beta.key)).toBe(false)
@@ -482,37 +477,17 @@ function expectBetaUntouched(h: Harness): void {
  * SR-7.2), says a message was lost, names `sender` with no mention, identifies
  * `state` and no other, and no Slack call anywhere carries the message text.
  */
-function expectNoticeText(h: Harness, text: string | undefined, sender: string, state: LostMessageState): void {
-  expect(text).toContain(renderPersonaRef(h.alpha.name, h.alpha.key))
-  expect(text).toMatch(/\blost\b/i)
-  expect(text).toContain(sender)
-  expect(text).not.toContain('<@')
-  expect(stateOf(text)).toBe(state)
-  expect(JSON.stringify(h.all.map((x) => x.stub.callLog))).not.toContain(MESSAGE_MARKER)
-}
-
 /**
  * AC 26: the lost message made exactly one Slack post, alpha's notice, at its
  * destination (for `dm`, the conversation `conversations.open` returned for
  * the contact), through alpha's own client with no username or icon override,
  * and nothing in `source`. Beta made no Slack call.
  */
-function expectOneLostNotice(
-  h: Harness,
-  want: { destination: Destination; source: string; sender: string; state: LostMessageState },
-): void {
-  const posts = h.allPosts()
-  expect(posts.map((p) => ({ key: p.key, channel: p.channel }))).toEqual([
-    { key: h.alpha.key, channel: destinationId(want.destination) },
-  ])
-  expect(h.postsTo(want.source)).toEqual([])
-  const stub = h.p('alpha').stub
-  for (const args of stub.calls.postMessage) {
-    expect(Object.keys(args ?? {}).filter((k) => /^(username|icon_emoji|icon_url)$/.test(k))).toEqual([])
-  }
-  expect(stub.calls.conversationsOpen).toEqual(want.destination === 'dm' ? [{ users: CONTACT }] : [])
-  expectBetaUntouched(h)
-  expectNoticeText(h, posts[0]!.text, want.sender, want.state)
+function expectStoredWithoutNotice(h: Harness, want: { destination: Destination; source: string; sender: string; state: LostMessageState }): void {
+ expect(h.allPosts()).toEqual([])
+ expect(h.notices).toEqual([])
+ expect(h.queue.openCount(h.alpha.key)).toBeGreaterThan(0)
+ expect(h.queued('beta')).toEqual([])
 }
 
 /** `persona-destination-failed` start lines, and its `cleared:` lines. */
@@ -558,74 +533,6 @@ afterEach(async () => {
     resetRoutingState()
     rmSync(dir, { recursive: true, force: true })
   }
-})
-
-// ===========================================================================
-// AC 26 — a lost message produces exactly one post: the notice, at the
-// persona's destination, naming the sender. Both drop branches × a channel or
-// DM source × a channel or `dm` destination. A channel source is the shared
-// coordination channel, never the destination; a DM source is a DM from a
-// user other than the contact, so it is never the destination DM either.
-// ===========================================================================
-
-describe('AC 26: a lost message is reported once, at the persona\'s destination, never in the source conversation', () => {
-  const matrix: [Branch, 'channel' | 'DM', Destination][] = []
-  for (const branch of ['no session', 'streamless'] as const) {
-    for (const source of ['channel', 'DM'] as const) {
-      for (const destination of ['channel', 'dm'] as const) matrix.push([branch, source, destination])
-    }
-  }
-
-  test.each(matrix)(
-    'AC 26: %s, a %s source, a %s destination: one notice through alpha\'s client at the destination, nothing in the source, recovery in the right cwd',
-    async (branch, source, destination) => {
-      const h = makeHarness({ branch, destination })
-      const [event, sourceId] = source === 'channel'
-        ? [messageIn(SHARED), SHARED]
-        : [dmFrom(DM_SENDER, SOURCE_DM), SOURCE_DM]
-
-      await h.deliver(event, h.alpha.key)
-
-      expectOneLostNotice(h, { destination, source: sourceId, sender: STUB_USER_NAME, state: 'starting-now' })
-      // The sender's name came from users.info on alpha's own stub.
-      expect(h.p('alpha').stub.calls.usersInfo.map((c) => c?.user)).toEqual([source === 'channel' ? HUMAN : DM_SENDER])
-      // A lost message is never handed to a session.
-      expect(h.p('alpha').notifications).toEqual([])
-      await waitFor(() => h.launches.length > 0)
-      expect(h.launches).toEqual([{ key: h.alpha.key, cwd: expectedLaunchCwd(h, branch) }])
-    },
-  )
-
-  test('AC 26: the contact DMs a persona whose destination is `dm`: that one conversation gets exactly one post, the notice', async () => {
-    const h = makeHarness({ destination: 'dm' })
-    const conversation = stubOpenedDmId(CONTACT)
-
-    await h.deliver(dmFrom(CONTACT, conversation), h.alpha.key)
-
-    expect(lostNotices(h)).toEqual([{ key: h.alpha.key, channel: conversation, state: 'starting-now' }])
-    expectNoticeText(h, h.allPosts()[0]!.text, STUB_USER_NAME, 'starting-now')
-    expectBetaUntouched(h)
-  })
-
-  test('AC 26: one message lost on both personas\' connections: each persona posts its own notice through its own client at its own destination, nothing in the shared channel', async () => {
-    const h = makeHarness()
-    // Beta is `mentions` in the shared channel, so it gets the message by mention.
-    const event = messageIn(SHARED, `${mentionText(h.p('beta').stub.identity.botUserId)} ${MESSAGE_MARKER}`)
-
-    await h.deliver(event, [h.beta.key, h.alpha.key])
-
-    expect(lostNotices(h)).toEqual([
-      { key: h.beta.key, channel: BETA_MENTIONS, state: 'starting-now' },
-      { key: h.alpha.key, channel: ALPHA_HOME, state: 'starting-now' },
-    ])
-    expect(h.postsTo(SHARED)).toEqual([])
-    const [betaPost, alphaPost] = h.allPosts()
-    expect(betaPost!.text).toContain(renderPersonaRef(h.beta.name, h.beta.key))
-    expect(betaPost!.text).not.toContain(renderPersonaRef(h.alpha.name, h.alpha.key))
-    expect(alphaPost!.text).not.toContain(renderPersonaRef(h.beta.name, h.beta.key))
-    expect(isRestartPendingOrActive(h.alpha.key)).toBe(true)
-    expect(isRestartPendingOrActive(h.beta.key)).toBe(true)
-  })
 })
 
 // ===========================================================================
@@ -761,7 +668,7 @@ function arrangeState(h: Harness, state: LostMessageState): Promise<void> | void
   return LOST_STATE_SETUPS[state].arrange(h, h.alpha.key, h.alpha.working_directory)
 }
 
-describe('AC 26: the notice reports the recovery state', () => {
+describe('AC 26: recovery selects the recovery state', () => {
   const table: [LostMessageState, Destination][] = LOST_MESSAGE_STATES.flatMap((s) => (['channel', 'dm'] as const).map((d): [LostMessageState, Destination] => [s, d]))
 
   test.each(table)(
@@ -774,7 +681,7 @@ describe('AC 26: the notice reports the recovery state', () => {
 
       await h.deliver(messageIn(SHARED), h.alpha.key)
 
-      expectOneLostNotice(h, { destination, source: SHARED, sender: STUB_USER_NAME, state })
+      expectStoredWithoutNotice(h, { destination, source: SHARED, sender: STUB_USER_NAME, state })
       // Only "starting now" asks the relaunch gate (it schedules the restart).
       expect(h.restartAsks.slice(asksBefore)).toEqual(state === 'starting-now' ? [h.alpha.key] : [])
       expect(isRestartPendingOrActive(h.alpha.key)).toBe(setup.pending)
@@ -786,7 +693,7 @@ describe('AC 26: the notice reports the recovery state', () => {
 })
 
 // ===========================================================================
-// b.jg5 SRJ-1011 state 5 (hatch notes E11, E12) — a message lost while P is
+// b.jg5 SRJ-1011 state 5 (hatch notes E11, E12) — an item accepted while P is
 // not answering, from each of its three sources: its `tmux-unresponsive`
 // condition holding (E10), its `tmux-unavailable` outage raised (SRJ-311) or
 // its `ad-config-malformed` outage raised (SRJ-316). No restart is asked for,
@@ -796,7 +703,7 @@ describe('AC 26: the notice reports the recovery state', () => {
 // episode, or another outage class, is not a source.
 // ===========================================================================
 
-describe('b.jg5 SRJ-1011 state 5: a message lost while the persona is not answering starts no restart', () => {
+describe('b.jg5 SRJ-1011 state 5: an item accepted while the persona is not answering starts no restart', () => {
   const SOURCES: [typeof STATE_5_SOURCES[number]][] = STATE_5_SOURCES.map((source) => [source])
 
   test.each(SOURCES)(
@@ -808,7 +715,7 @@ describe('b.jg5 SRJ-1011 state 5: a message lost while the persona is not answer
 
       await h.deliver(messageIn(SHARED), h.alpha.key)
 
-      expectOneLostNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state: 'not-answering' })
+      expectStoredWithoutNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state: 'not-answering' })
       expect(h.restartAsks.slice(asksBefore)).toEqual([])
       expect(isRestartPendingOrActive(h.alpha.key)).toBe(false)
       await Bun.sleep(WAIT_MS)
@@ -817,10 +724,7 @@ describe('b.jg5 SRJ-1011 state 5: a message lost while the persona is not answer
       INPUTS[source].clear(h, h.alpha.key)
       await h.deliver(messageIn(SHARED), h.alpha.key)
 
-      expect(lostNotices(h)).toEqual([
-        { key: h.alpha.key, channel: ALPHA_HOME, state: 'not-answering' },
-        { key: h.alpha.key, channel: ALPHA_HOME, state: 'starting-now' },
-      ])
+
       expect(h.postsTo(SHARED)).toEqual([])
       await waitFor(() => h.launches.length > 0)
       await Bun.sleep(WAIT_MS)
@@ -843,7 +747,7 @@ describe('b.jg5 SRJ-1011 state 5: a message lost while the persona is not answer
       await h.deliver(messageIn(SHARED), h.alpha.key)
 
       expect(h.episodes.isOpen(h.alpha.key, PERSONA_EPISODE_KIND_UNCLASSIFIED_ERROR)).toBe(true)
-      expectOneLostNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state })
+      expectStoredWithoutNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state })
       await Bun.sleep(WAIT_MS)
       expect(h.launches).toHaveLength(launches)
     },
@@ -858,7 +762,7 @@ describe('b.jg5 SRJ-1011 state 5: a message lost while the persona is not answer
 
       await h.deliver(messageIn(SHARED), h.alpha.key)
 
-      expectOneLostNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state: 'starting-now' })
+      expectStoredWithoutNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state: 'starting-now' })
       // The outage's onset went to the outage state's sink, never to Slack.
       expect(h.outageNotices.map((n) => n.key)).toEqual([h.alpha.key])
     },
@@ -909,7 +813,7 @@ describe('b.jg5 SRJ-1011 as amended: state 5 applies only while the retry timer 
 
       await h.deliver(messageIn(SHARED), h.alpha.key)
 
-      expectOneLostNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state: 'restart-limit-reached' })
+      expectStoredWithoutNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state: 'restart-limit-reached' })
       // States 1 to 5 did not apply, so the one read was made.
       expect(h.rowReads).toEqual([h.alpha.key])
       expect(h.retryTimerArms).toEqual([])
@@ -936,7 +840,7 @@ describe('b.jg5 SRJ-1011 as amended: state 5 applies only while the retry timer 
 
       await h.deliver(messageIn(SHARED), h.alpha.key)
 
-      expectOneLostNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state })
+      expectStoredWithoutNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state })
       expect(h.retryTimerArms).toEqual(h.keys(armAsks))
       expect(h.retryArmed.has(h.alpha.key)).toBe(state === 'not-answering')
       // Not answering is decided at the read gate's check, with no read; a
@@ -951,13 +855,13 @@ describe('b.jg5 SRJ-1011 as amended: state 5 applies only while the retry timer 
 })
 
 // ===========================================================================
-// b.jg5 SRJ-1011 state 2 (hatch note E13; SRJ-502) — a message lost while P
+// b.jg5 SRJ-1011 state 2 (hatch note E13; SRJ-502) — an item accepted while P
 // is latched reads E13's latch instance: a CONFLICT and E13's two declared
 // hold cases each give `held-for-human`, and no restart. After the latch's
 // silent forget, the next lost message starts a restart.
 // ===========================================================================
 
-describe('b.jg5 SRJ-1011 state 2: a message lost while the persona is latched starts no restart', () => {
+describe('b.jg5 SRJ-1011 state 2: an item accepted while the persona is latched starts no restart', () => {
   const conflictRow = CONFLICT_CASE_ROWS.find((row) => row.latchCase === LATCH_CASE_LEFTOVER)!
   const LATCHES: [string, (h: Harness) => void][] = [
     [
@@ -979,7 +883,7 @@ describe('b.jg5 SRJ-1011 state 2: a message lost while the persona is latched st
 
       await h.deliver(messageIn(SHARED), h.alpha.key)
 
-      expectOneLostNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state: 'held-for-human' })
+      expectStoredWithoutNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state: 'held-for-human' })
       expect(h.restartAsks).toEqual([])
       expect(isRestartPendingOrActive(h.alpha.key)).toBe(false)
       await Bun.sleep(WAIT_MS)
@@ -988,7 +892,7 @@ describe('b.jg5 SRJ-1011 state 2: a message lost while the persona is latched st
       expect(h.latch.forget(h.alpha.key)).toBe(true)
       await h.deliver(messageIn(SHARED), h.alpha.key)
 
-      expect(lostNotices(h).map((n) => n.state)).toEqual(['held-for-human', 'starting-now'])
+
       await waitFor(() => h.launches.length > 0)
       expect(h.launches).toEqual([{ key: h.alpha.key, cwd: h.alpha.working_directory }])
       expectBetaUntouched(h)
@@ -1003,10 +907,7 @@ describe('b.jg5 SRJ-1011 state 2: a message lost while the persona is latched st
 
     await h.deliver(event, [h.beta.key, h.alpha.key])
 
-    expect(lostNotices(h)).toEqual([
-      { key: h.beta.key, channel: BETA_MENTIONS, state: 'starting-now' },
-      { key: h.alpha.key, channel: ALPHA_HOME, state: 'held-for-human' },
-    ])
+
     expect(h.postsTo(SHARED)).toEqual([])
     expect(h.restartAsks).toEqual([h.beta.key])
     expect(isRestartPendingOrActive(h.beta.key)).toBe(true)
@@ -1046,10 +947,7 @@ describe('b.jg5 SRJ-1011: the first state that applies is reported', () => {
     ;(INPUTS[first] as StateInput).clear!(h, h.alpha.key)
     await h.deliver(messageIn(SHARED), h.alpha.key)
 
-    expect(lostNotices(h)).toEqual([
-      { key: h.alpha.key, channel: ALPHA_HOME, state: firstState },
-      { key: h.alpha.key, channel: ALPHA_HOME, state: secondState },
-    ])
+
     expect(h.restartAsks.slice(asksBefore)).toEqual([])
     expect(isRestartPendingOrActive(h.alpha.key)).toBe(pendingBefore)
     await Bun.sleep(WAIT_MS)
@@ -1068,7 +966,7 @@ describe('b.jg5 SRJ-1011: the first state that applies is reported', () => {
 
       await h.deliver(messageIn(SHARED), h.alpha.key)
 
-      expect(lostNotices(h)).toEqual([{ key: h.alpha.key, channel: ALPHA_HOME, state: 'starting-now' }])
+
       expect(isRestartPendingOrActive(h.alpha.key)).toBe(true)
       await waitFor(() => h.launches.some((l) => l.key === h.alpha.key))
       expect(h.launches.filter((l) => l.key === h.alpha.key)).toEqual([{ key: h.alpha.key, cwd: h.alpha.working_directory }])
@@ -1112,8 +1010,8 @@ describe('b.jg5 SRJ-1011 state 6 by the read: a row reading `pending` reports se
 
     await h.deliver(messageIn(SHARED), h.alpha.key)
 
-    expectOneLostNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state: 'session-starting' })
-    expect(h.readOrder).toEqual([`read:${h.alpha.key}`, `notice:${h.alpha.key}`])
+    expectStoredWithoutNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state: 'session-starting' })
+    expect(h.readOrder).toEqual([`read:${h.alpha.key}`])
     expect(h.restartAsks.slice(asksBefore)).toEqual([])
     expect(isRestartPendingOrActive(h.alpha.key)).toBe(pending)
     await Bun.sleep(WAIT_MS) // a restart the message scheduled would have launched by now
@@ -1129,8 +1027,8 @@ describe('b.jg5 SRJ-1011 state 6 by the read: a row reading `pending` reports se
 
     await h.deliver(messageIn(SHARED), h.alpha.key)
 
-    expectOneLostNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state: 'starting-now' })
-    expect(h.readOrder).toEqual([`read:${h.alpha.key}`, `notice:${h.alpha.key}`])
+    expectStoredWithoutNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state: 'starting-now' })
+    expect(h.readOrder).toEqual([`read:${h.alpha.key}`])
     expect(h.restartAsks).toEqual([h.alpha.key])
     await waitFor(() => h.launches.length > 0)
     await Bun.sleep(WAIT_MS)
@@ -1159,14 +1057,14 @@ describe('b.jg5 SRJ-1011: a failed row read leaves state 6 out', () => {
     NEXT.map(([nextLabel, input, state]): [string, string, LostMessageState, RowReadAnswer, InputName | undefined] => [label, nextLabel, state, answer, input]),
   )
 
-  test.each(table)('%s, with %s: the notice reports %s; only starting now asks for a restart, which launches once', async (_label, _nextLabel, state, answer, input) => {
+  test.each(table)('%s, with %s: recovery selects %s; only starting now asks for a restart, which launches once', async (_label, _nextLabel, state, answer, input) => {
     const h = makeHarness({ ...(input === undefined ? {} : inputOpts(input)), rowRead: { alpha: answer } })
     if (input !== undefined) INPUTS[input].set(h, h.alpha.key)
     const asksBefore = h.restartAsks.length
 
     await h.deliver(messageIn(SHARED), h.alpha.key)
 
-    expectOneLostNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state })
+    expectStoredWithoutNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state })
     expect(h.rowReads).toEqual([h.alpha.key])
     expect(h.restartAsks.slice(asksBefore)).toEqual(state === 'starting-now' ? [h.alpha.key] : [])
     expect(isRestartPendingOrActive(h.alpha.key)).toBe(state !== 'auto-restart-disabled')
@@ -1209,7 +1107,7 @@ describe('b.jg5 SRJ-1011: the state is decided again after the read', () => {
     ),
   )
 
-  test.each(table)('AC 68: %s while the read runs, which then answers %s: the notice reports the earlier state, and no restart is asked for, scheduled or launched', async (_label, _answerName, input, state, answer) => {
+  test.each(table)('AC 68: %s while the read runs, which then answers %s: recovery selects the earlier state, and no restart is asked for, scheduled or launched', async (_label, _answerName, input, state, answer) => {
     const h = makeHarness({
       ...inputOpts(input),
       rowRead: { alpha: { answer, during: (hh, key) => INPUTS[input].set(hh as Harness, key) } },
@@ -1217,8 +1115,8 @@ describe('b.jg5 SRJ-1011: the state is decided again after the read', () => {
 
     await h.deliver(messageIn(SHARED), h.alpha.key)
 
-    expectOneLostNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state })
-    expect(h.readOrder).toEqual([`read:${h.alpha.key}`, `notice:${h.alpha.key}`])
+    expectStoredWithoutNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state })
+    expect(h.readOrder).toEqual([`read:${h.alpha.key}`])
     expect(h.restartAsks).toEqual([])
     expect(isRestartPendingOrActive(h.alpha.key)).toBe(false)
     await Bun.sleep(WAIT_MS)
@@ -1248,8 +1146,8 @@ describe('b.jg5 SRJ-1011: the state is decided again after the read', () => {
     // One scheduleRestart reached the relaunch gate (a second would have asked it again).
     expect(h.restartAsks).toEqual([h.alpha.key])
     expect(isRestartPendingOrActive(h.alpha.key)).toBe(true)
-    expect(lostNotices(h).map((n) => n.state).sort()).toEqual(['restarting', 'starting-now'])
-    expect(lostNotices(h).every((n) => n.key === h.alpha.key && n.channel === ALPHA_HOME)).toBe(true)
+
+
     expectBetaUntouched(h)
   })
 })
@@ -1263,7 +1161,7 @@ describe('b.jg5 SRJ-1011: the state is decided again after the read', () => {
 // launches once, in the state-6-by-read describe above), arranged as the
 // shared state table (`LOST_STATE_SETUPS`) arranges it, with the restart
 // module able to launch (fast delay) and its relaunch gate recording every
-// ask, a lost message asks for, schedules and launches nothing. The row read
+// ask, a queued Slack item asks for, schedules and launches nothing. The row read
 // is bound in every row and would answer live (a restart's input): only the
 // early state keeps it from being made.
 // ===========================================================================
@@ -1283,7 +1181,7 @@ describe('AC 68: no human-triggered restart fires in states 2 to 6 (b.jg5 SRJ-15
 
     await h.deliver(messageIn(SHARED), h.alpha.key)
 
-    expectOneLostNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state })
+    expectStoredWithoutNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state })
     expect(h.rowReads).toEqual([])
     expect(h.restartAsks.slice(asksBefore)).toEqual([])
     expect(isRestartPendingOrActive(h.alpha.key)).toBe(pendingBefore)
@@ -1344,7 +1242,8 @@ describe('b.jg5 SRJ-1011 through the recovery harness: the read is the liveness 
     const hold = holdSpawns(h.stub.client)
     const launch = h.launch(key)
     await hold.entered(id)
-    h.script({ statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE }), readPaneResults: [cannedReadPaneResult(TRUST_DIALOG_NEEDLE)] })
+    // b.omv SR-7.6: fresh startup Enter proofs see the same pending row.
+    h.script({ statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE }), getResult: personaRow(h, key, { state: AGENT_DIRECTOR_PENDING_STATE }), readPaneResults: [cannedReadPaneResult(TRUST_DIALOG_PANE)] })
 
     // A launch running is state 6 with no read.
     await expectLostMessageReports(h, key, 'session-starting', { calls: {} })
@@ -1483,7 +1382,7 @@ describe('b.jg5 SRJ-1011 through the recovery harness: the read is the liveness 
 // ===========================================================================
 // b.jg5 SRJ-807 at the lost-message read (SRJ-115, SRJ-1011): the routing's
 // one row read is the liveness adapter's `status`, whose own-row step clears
-// a retired key's entry, so a message lost for P whose key is recorded with
+// a retired key's entry, so an item accepted for P whose key is recorded with
 // its mark set, its row read live other than `pending`, clears P's entry
 // (durably, with the store's one line naming the adapter's read) and reports
 // what it reports today; a `pending` row reports session starting and clears
@@ -1531,18 +1430,18 @@ describe('b.jg5 SRJ-807: the lost-message read clears a retired key\'s entry on 
 })
 
 // ===========================================================================
-// b.jg5 SRJ-805 at the lost-message trigger: a message lost for P whose key
+// b.jg5 SRJ-805 at the lost-message trigger: an item accepted for P whose key
 // is recorded as retired, with no mark, asks for P's human-triggered restart
 // as for any persona; that restart never resumes P and never types into its
 // old life. With P's row `ended`, its launch is one reuse of P's own id; with
 // the row live, the restart path's reconnect adapter starts the live-row
-// sequence (with the retired-key flag) and types nothing, and a message lost
+// sequence (with the retired-key flag) and types nothing, and an item accepted
 // while that sequence runs reports restarting with no read and no second
 // restart. On the recovery harness, at a short `session_restart_delay` so
 // the asked-for restart runs.
 // ===========================================================================
 
-describe('b.jg5 SRJ-805: a message lost for a retired key asks for a restart that never resumes it or types into its old life', () => {
+describe('b.jg5 SRJ-805: an item accepted for a retired key asks for a restart that never resumes it or types into its old life', () => {
   test('P\'s row ended with a session id: the message reports starting now and asks for P\'s restart, whose launch is one reuse of cscb_<key>, no resume or keystroke; fresh-retired, with P\'s mark set', async () => {
     const h = makeRecovery({ sessionRestartDelay: FAST_DELAY_S, resumeEnabled: true })
     const [key] = h.keys as [string]
@@ -1605,7 +1504,7 @@ describe('b.jg5 SRJ-805: a message lost for a retired key asks for a restart tha
 // so the asked-for restart runs.
 // ===========================================================================
 
-describe('b.jg5 SRJ-409, SRJ-411: a message lost for P whose restart reads P\'s row pending', () => {
+describe('b.jg5 SRJ-409, SRJ-411: an item accepted for P whose restart reads P\'s row pending', () => {
   /** A harness whose routing read of P fails and whose restart read finds P's row `pending`; P's `get`s answer `row`, then `missing`. */
   function build(row: (h: RecoveryHarness, key: string) => CannedGetResult, retired = false): { h: RecoveryHarness; key: string; ref: string } {
     const h = makeRecovery({ sessionRestartDelay: FAST_DELAY_S })
@@ -1659,7 +1558,7 @@ describe('b.jg5 SRJ-409, SRJ-411: a message lost for P whose restart reads P\'s 
 })
 
 // ===========================================================================
-// b.jg5 SRJ-1011 state 4, SRJ-704 (E20 T3): a message lost while P's
+// b.jg5 SRJ-1011 state 4, SRJ-704 (E20 T3): an item accepted while P's
 // kill-failure episode is open reports `kill-failed`
 //
 // Through the recovery harness's lost-message driver, whose `isKillFailed` is
@@ -1685,14 +1584,14 @@ async function afterRestartKillFailed(options: RecoveryHarnessOptions = {}): Pro
   return { h, key, readRow: probe.readRow }
 }
 
-describe('b.jg5 SRJ-1011 state 4: a message lost after the kill-failure alert reports kill failed, through the real routing', () => {
+describe('b.jg5 SRJ-1011 state 4: an item accepted after the kill-failure alert reports kill failed, through the real routing', () => {
   /** P's launch meeting its row read `waiting` in another directory, the step-1 kill of the sequence it starts answering `kills` in order; the sequence is driven to its end. */
   async function sequenceKill(h: RecoveryHarness, key: string, ...kills: Error[]): Promise<void> {
     scriptLiveRowElsewhere(h, key, { killQueue: kills.map((err) => cannedErr(err)) })
     await launchThroughSequence(h, key)
   }
 
-  test('ErrTmuxKillFailed that stands at the restart path\'s kill: after the ordinary alert, a lost message reports kill failed with its wording; no human-triggered restart fires, with the delay above 0', async () => {
+  test('ErrTmuxKillFailed that stands at the restart path\'s kill: after the ordinary alert, a queued Slack item reports kill failed with its wording; no human-triggered restart fires, with the delay above 0', async () => {
     const { h, key } = await afterRestartKillFailed({ sessionRestartDelay: FAST_DELAY_S })
     expect(h.episodeNotices).toHaveLength(1)
 
@@ -1702,7 +1601,7 @@ describe('b.jg5 SRJ-1011 state 4: a message lost after the kill-failure alert re
     expect(h.stub.calls.spawnCalls).toEqual([])
   })
 
-  test('a survivor-naming failure, then ErrTmuxUnresponsive twice, at the live-row sequence\'s kill of a row read live, started at a replacement site: the ordinary alert, then a lost message reports kill failed', async () => {
+  test('a survivor-naming failure, then ErrTmuxUnresponsive twice, at the live-row sequence\'s kill of a row read live, started at a replacement site: the ordinary alert, then a queued Slack item reports kill failed', async () => {
     const h = makeRecovery({ sessionRestartDelay: FAST_DELAY_S })
     const [key] = h.keys as [string]
 
@@ -1713,7 +1612,7 @@ describe('b.jg5 SRJ-1011 state 4: a message lost after the kill-failure alert re
     expect(isRestartPendingOrActive(key)).toBe(false)
   })
 
-  test('a survivor-naming failure, then a read of ended, at the live-row sequence\'s kill of a row read live, started at a replacement site: the survivor version opens no episode, and a message lost afterwards reports the state the launch left, never kill failed', async () => {
+  test('a survivor-naming failure, then a read of ended, at the live-row sequence\'s kill of a row read live, started at a replacement site: the survivor version opens no episode, and an item accepted afterwards reports the state the launch left, never kill failed', async () => {
     const h = makeRecovery()
     const [key] = h.keys as [string]
     h.script({ statusQueue: [cannedOk(cannedStatusResult({ state: 'ended' }))] })
@@ -1726,7 +1625,7 @@ describe('b.jg5 SRJ-1011 state 4: a message lost after the kill-failure alert re
     await expectLostMessageReports(h, key, 'auto-restart-disabled')
   })
 
-  test('a survivor-naming failure, then CONFLICT, at the live-row sequence\'s kill of a row read live, started at a replacement site: P latched and its kill-failure episode open, a lost message reports held for a human, not kill failed', async () => {
+  test('a survivor-naming failure, then CONFLICT, at the live-row sequence\'s kill of a row read live, started at a replacement site: P latched and its kill-failure episode open, a queued Slack item reports held for a human, not kill failed', async () => {
     const h = makeRecovery({ sessionRestartDelay: FAST_DELAY_S })
     const [key] = h.keys as [string]
 
@@ -1738,7 +1637,7 @@ describe('b.jg5 SRJ-1011 state 4: a message lost after the kill-failure alert re
     expect(isRestartPendingOrActive(key)).toBe(false)
   })
 
-  test('after the episode ends (a later restart run\'s liveness read of ended, which launches P with no kill), a lost message no longer reports kill failed', async () => {
+  test('after the episode ends (a later restart run\'s liveness read of ended, which launches P with no kill), a queued Slack item no longer reports kill failed', async () => {
     const { h, key, readRow } = await afterRestartKillFailed()
     expect(h.killFailureOpen(key)).toBe(true)
 
@@ -1756,7 +1655,7 @@ describe('b.jg5 SRJ-1011 state 4: a message lost after the kill-failure alert re
 })
 
 // ===========================================================================
-// b.jg5 SRJ-1011 state 3, SRJ-207: a message lost while P is held
+// b.jg5 SRJ-1011 state 3, SRJ-207: an item accepted while P is held
 // on ErrInvalidFlags reports `cannot-launch`
 //
 // Through the recovery harness's lost-message driver, whose held-on-invalid-
@@ -1769,8 +1668,8 @@ describe('b.jg5 SRJ-1011 state 4: a message lost after the kill-failure alert re
 // and wordings come from src/lost-message.ts (`expectLostMessageReports`).
 // ===========================================================================
 
-describe('b.jg5 SRJ-1011 state 3, SRJ-207: a message lost while P is held on ErrInvalidFlags reports cannot launch, through the real routing', () => {
-  test('P held through a reuse: a lost message reports cannot launch with its wording; no restart is asked for, scheduled or launched, and no stub call is made for P', async () => {
+describe('b.jg5 SRJ-1011 state 3, SRJ-207: an item accepted while P is held on ErrInvalidFlags reports cannot launch, through the real routing', () => {
+  test('P held through a reuse: a queued Slack item reports cannot launch with its wording; no restart is asked for, scheduled or launched, and no stub call is made for P', async () => {
     const h = makeRecovery({ sessionRestartDelay: FAST_DELAY_S })
     const [key] = h.keys as [string]
     h.versionRecheck()
@@ -1812,7 +1711,7 @@ describe('b.jg5 SRJ-1011 state 3, SRJ-207: a message lost while P is held on Err
     expect(isRestartPendingOrActive(key)).toBe(false)
   })
 
-  test('after the binary\'s version changes and the hold ends (P retried at once, its launch refused), a lost message no longer reports cannot launch', async () => {
+  test('after the binary\'s version changes and the hold ends (P retried at once, its launch refused), a queued Slack item no longer reports cannot launch', async () => {
     const h = makeRecovery()
     const [key] = h.keys as [string]
     const rc = h.versionRecheck()
@@ -1834,7 +1733,7 @@ describe('b.jg5 SRJ-1011 state 3, SRJ-207: a message lost while P is held on Err
 })
 
 // ===========================================================================
-// b.jg5 SRJ-706, SRJ-1011 (E21 T2): a message lost while P's live-row
+// b.jg5 SRJ-706, SRJ-1011 (E21 T2): an item accepted while P's live-row
 // sequence runs reports `restarting`
 //
 // Through the recovery harness's lost-message driver, whose sequence/wait
@@ -1847,7 +1746,7 @@ describe('b.jg5 SRJ-1011 state 3, SRJ-207: a message lost while P is held on Err
 // ended the message is decided as before, with the one read.
 // ===========================================================================
 
-describe('b.jg5 SRJ-706, SRJ-1011: a message lost while P\'s live-row sequence runs reports restarting, with no status read and no restart, through the real routing', () => {
+describe('b.jg5 SRJ-706, SRJ-1011: an item accepted while P\'s live-row sequence runs reports restarting, with no status read and no restart, through the real routing', () => {
   /** Release P's held run with its row placed in `ids` and drive the sequence to its end (its next `get` reads the row missing). */
   async function endHeldSequence(h: RecoveryHarness, key: string, hold: FindMissingHold, outcome: Promise<unknown>): Promise<void> {
     hold.release(cannedFindMissing({ rows: { [personaInstanceId(key)]: 'ids' } }))
@@ -1936,8 +1835,8 @@ describe('b.jg5 SRJ-706, SRJ-1011: a message lost while P\'s live-row sequence r
 // tests/server-startup-wiring.test.ts.
 // ===========================================================================
 
-describe('not up: a lost message for a persona that is not up starts no restart', () => {
-  test.each(['no session', 'streamless'] as const)(
+describe('not up: a queued Slack item for a persona that is not up starts no restart', () => {
+  test.each(['no session'] as const)(
     'b.g57 REGRESSION: %s, alpha not up while its connection still delivers: three messages each get exactly the not-up notice at the destination, no restart is asked for, scheduled or launched and nothing is delivered; once alpha is up, the next lost message starts now',
     async (branch) => {
       const h = makeHarness({ branch, notUp: ['alpha'] })
@@ -1950,8 +1849,7 @@ describe('not up: a lost message for a persona that is not up starts no restart'
 
       for (let i = 0; i < 3; i++) await h.deliver(messageIn(SHARED, `message ${i} ${MESSAGE_MARKER}`), h.alpha.key)
 
-      expect(lostNotices(h)).toEqual(Array.from({ length: 3 }, () => ({ key: h.alpha.key, channel: ALPHA_HOME, state: 'not-up' })))
-      for (const post of h.allPosts()) expectNoticeText(h, post.text, STUB_USER_NAME, 'not-up')
+
       expect(h.postsTo(SHARED)).toEqual([])
       expect(h.upAsks).toEqual([h.alpha.key, h.alpha.key, h.alpha.key])
       expect(isRestartPendingOrActive(h.alpha.key)).toBe(false)
@@ -1964,7 +1862,7 @@ describe('not up: a lost message for a persona that is not up starts no restart'
       // Control: the same persona, up again, is restarted by its next lost message.
       h.notUp.delete(h.alpha.key)
       await h.deliver(messageIn(SHARED), h.alpha.key)
-      expect(lostNotices(h).map((n) => n.state)).toEqual(['not-up', 'not-up', 'not-up', 'starting-now'])
+
       expect(isRestartPendingOrActive(h.alpha.key)).toBe(true)
       await waitFor(() => deps.launches.length > 0)
       expect(deps.launches).toEqual([{ key: h.alpha.key, cwd: expectedLaunchCwd(h, branch) }])
@@ -1979,10 +1877,7 @@ describe('not up: a lost message for a persona that is not up starts no restart'
 
     await h.deliver(event, [h.beta.key, h.alpha.key])
 
-    expect(lostNotices(h)).toEqual([
-      { key: h.beta.key, channel: BETA_MENTIONS, state: 'starting-now' },
-      { key: h.alpha.key, channel: ALPHA_HOME, state: 'not-up' },
-    ])
+
     expect(h.postsTo(SHARED)).toEqual([])
     expect(h.upAsks).toEqual([h.beta.key, h.alpha.key])
     expect(isRestartPendingOrActive(h.beta.key)).toBe(true)
@@ -2009,7 +1904,7 @@ describe('not up: a lost message for a persona that is not up starts no restart'
     await h.receiveKeys(messageIn(SHARED), [notUp.key])
 
     expect(asked).toEqual([notUp.key])
-    expect(h.allPosts().map((p) => stateOf(p.text))).toEqual(['not-up'])
+
     expect(isRestartPendingOrActive(notUp.key)).toBe(false)
   })
 
@@ -2023,72 +1918,11 @@ describe('not up: a lost message for a persona that is not up starts no restart'
 
     await h.deliver(messageIn(SHARED), h.alpha.key)
 
-    expectOneLostNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state: 'restart-limit-reached' })
+    expectStoredWithoutNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state: 'restart-limit-reached' })
     expect(h.upAsks).toEqual([h.alpha.key])
     await Bun.sleep(WAIT_MS)
     expect(h.launches).toEqual([])
   })
-})
-
-// ===========================================================================
-// AC 26 — the sender. A readable name: the `users.info` name through the
-// persona's own client; the user ID when the lookup fails; a webhook or bot
-// post's username, bot profile name or bot ID. Slack's control characters in
-// a sender-chosen name are escaped, so the notice never mentions anyone.
-// ===========================================================================
-
-describe('AC 26: the notice names the sender readably, with no mention', () => {
-  test.each<[string, () => SlackEvent, string]>([
-    ['a webhook post, by its username', () => makeWebhookPost({ channel: SHARED, text: MESSAGE_MARKER }), 'stub-webhook'],
-    [
-      'a bot post with no username, by its bot profile name',
-      () => makeWebhookPost({ channel: SHARED, text: MESSAGE_MARKER, username: undefined, bot_profile: { name: 'stub-hook-profile' } }),
-      'stub-hook-profile',
-    ],
-    ['a bot post with no name at all, by its bot ID', () => makeWebhookPost({ channel: SHARED, text: MESSAGE_MARKER, username: undefined }), 'B0STUBHOOK'],
-  ])('AC 26: %s', async (_label, build, sender) => {
-    const h = makeHarness()
-
-    await h.deliver(build(), h.alpha.key)
-
-    expectOneLostNotice(h, { destination: 'channel', source: SHARED, sender, state: 'starting-now' })
-  })
-
-  test('AC 26: a sender-chosen name carrying `<!channel>`, a user mention and `&` is escaped in the notice, so it pings no one', async () => {
-    const h = makeHarness()
-    const username = '<!channel> <@U0VICTIM1> & co'
-
-    await h.deliver(makeWebhookPost({ channel: SHARED, text: MESSAGE_MARKER, username }), h.alpha.key)
-
-    expectOneLostNotice(h, { destination: 'channel', source: SHARED, sender: '&lt;!channel&gt; &lt;@U0VICTIM1&gt; &amp; co', state: 'starting-now' })
-    const text = h.allPosts()[0]!.text!
-    expect(text).not.toContain('<!channel>')
-    expect(text).not.toContain('<@U0VICTIM1>')
-  })
-
-  test.each(['no session', 'streamless'] as const)(
-    'AC 26: %s, the user-name lookup rejects: the human-triggered restart still starts and exactly one notice names the user ID, with one token-safe line that keeps the error\'s message, redacted',
-    async (branch) => {
-      const h = makeHarness({
-        branch,
-        resolveUserName: async () => { throw new Error(`users.info failed (${sentinelInMessage('users-info')})`) },
-      })
-
-      await h.deliver(messageIn(SHARED), h.alpha.key)
-
-      expectOneLostNotice(h, { destination: 'channel', source: SHARED, sender: HUMAN, state: 'starting-now' })
-      expect(h.notices).toHaveLength(1)
-      const ref = renderPersonaRef(h.alpha.name, h.alpha.key)
-      const lookupLines = h.logs.filter((l) => l.includes(`user-name lookup for persona ${ref} failed, using the user ID`))
-      expect(lookupLines).toHaveLength(1)
-      // The error's message is kept, redacted (the sentinel is in no log line: the teardown leak check).
-      expect(lookupLines[0]).toContain('users.info failed')
-      expect(h.logs.filter((l) => l.includes('error handling event'))).toEqual([])
-      expect(isRestartPendingOrActive(h.alpha.key)).toBe(true)
-      await waitFor(() => h.launches.length > 0)
-      expect(h.launches).toEqual([{ key: h.alpha.key, cwd: expectedLaunchCwd(h, branch) }])
-    },
-  )
 })
 
 // ===========================================================================
@@ -2110,7 +1944,7 @@ describe('b.kvq (1) a qualifying message for a sessionless persona triggers reco
     expect(isRestartPendingOrActive(ALPHA_SECOND)).toBe(false)
     // … and for no other persona.
     expectBetaUntouched(h)
-    expect(lostNotices(h)).toEqual([{ key: h.alpha.key, channel: ALPHA_HOME, state: 'starting-now' }])
+
 
     // And the timer really fires and launches in the persona's working directory.
     await Bun.sleep(WAIT_MS)
@@ -2123,7 +1957,7 @@ describe('b.kvq (1) a qualifying message for a sessionless persona triggers reco
 
     await h.deliver(messageIn(SHARED), h.alpha.key)
 
-    expectOneLostNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state: 'starting-now' })
+    expectStoredWithoutNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state: 'starting-now' })
     await Bun.sleep(WAIT_MS)
     expect(h.launches.map((c) => c.cwd)).toEqual([h.alpha.working_directory])
   })
@@ -2139,7 +1973,7 @@ describe('b.kvq (1) a qualifying message for a sessionless persona triggers reco
 
       // The guard read the persona's pending state: "restarting", not "starting now".
       // Keyed on the source channel, it would have found nothing pending.
-      expect(lostNotices(h)).toEqual([{ key: h.alpha.key, channel: ALPHA_HOME, state: 'restarting' }])
+
       expectBetaUntouched(h)
     },
   )
@@ -2156,7 +1990,7 @@ describe('b.kvq (1) a qualifying message for a sessionless persona triggers reco
 
       expect(isRestartPendingOrActive(h.alpha.key)).toBe(false)
       expect(isRestartPendingOrActive(channel)).toBe(false)
-      expect(lostNotices(h)).toEqual([{ key: h.alpha.key, channel: ALPHA_HOME, state: 'restart-limit-reached' }])
+
       expectBetaUntouched(h)
       await Bun.sleep(WAIT_MS)
       expect(h.launches).toHaveLength(0)
@@ -2211,10 +2045,7 @@ describe('b.kvq (3) second message while restart pending/active does not stack a
     await h.deliver(messageIn(SHARED), h.alpha.key)
 
     expect(isRestartPendingOrActive(h.alpha.key)).toBe(true)
-    expect(lostNotices(h)).toEqual([
-      { key: h.alpha.key, channel: ALPHA_HOME, state: 'starting-now' },
-      { key: h.alpha.key, channel: ALPHA_HOME, state: 'restarting' },
-    ])
+
     // Only the first message asked for a restart.
     expect(h.restartAsks).toEqual([h.alpha.key])
     expectBetaUntouched(h)
@@ -2238,13 +2069,13 @@ describe('b.kvq (3) second message while restart pending/active does not stack a
     // Still exactly one launch despite the second message, which asked for no restart.
     expect(h.launches).toHaveLength(1)
     expect(h.restartAsks.slice(asksBefore)).toEqual([])
-    expect(lostNotices(h).map((n) => n.state)).toEqual(['starting-now', 'session-starting'])
+
     expectBetaUntouched(h)
   })
 })
 
 // ===========================================================================
-// b.av2 SR-4.1 — a duplicate of a lost message triggers nothing more.
+// b.av2 SR-4.1 — a duplicate of a queued Slack item triggers nothing more.
 // A channel mention reaches the persona as a `message` and an `app_mention`
 // with the same (channel, ts), and Slack may redeliver either. The persona's
 // dedupe store sits before the lost-message branch, so the pair and any later
@@ -2252,7 +2083,7 @@ describe('b.kvq (3) second message while restart pending/active does not stack a
 // ===========================================================================
 
 describe('b.kvq x SR-4.1 a duplicated mention for a sessionless persona recovers once', () => {
-  test('AC 26: a `message` then `app_mention` of the same mention: one notice and one launch; a redelivery after the launch adds nothing', async () => {
+  test('AC 26: a `message` then `app_mention` of the same mention: one queued item and one launch; a redelivery after the launch adds nothing', async () => {
     const h = makeHarness()
     const text = `${mentionText(h.p('alpha').stub.identity.botUserId)} are you there? ${MESSAGE_MARKER}`
     const message = makeChannelMessage({ channel: SHARED, text })
@@ -2264,7 +2095,7 @@ describe('b.kvq x SR-4.1 a duplicated mention for a sessionless persona recovers
 
     // Without dedupe the app_mention would find the restart pending and raise
     // a second, "restarting" notice.
-    expectOneLostNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state: 'starting-now' })
+    expectStoredWithoutNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state: 'starting-now' })
     expect(isRestartPendingOrActive(h.alpha.key)).toBe(true)
     await Bun.sleep(WAIT_MS)
     expect(h.launches).toEqual([{ key: h.alpha.key, cwd: h.alpha.working_directory }])
@@ -2277,98 +2108,10 @@ describe('b.kvq x SR-4.1 a duplicated mention for a sessionless persona recovers
     await h.deliver(mention, h.alpha.key)
 
     expect(isRestartPendingOrActive(h.alpha.key)).toBe(false)
-    expect(h.notices).toHaveLength(1)
-    expect(h.allPosts()).toHaveLength(1)
+    expect(h.allPosts()).toEqual([])
+    expect(h.allPosts()).toEqual([])
     expect(h.launches).toHaveLength(1)
     expect(h.logs).toEqual(logsBefore)
-    expectBetaUntouched(h)
-  })
-})
-
-// ===========================================================================
-// Required behavior 4 — b.av2 SR-7.2: the lost-message notice joins the
-// persona's notice set. Raised before the persona's client is validated, it is
-// held and posted once the persona is flushed; a destination that fails holds
-// and retries it on the destination hold (on its fake clock). Either way it
-// lands once at the destination and never in the source conversation, and
-// recovery does not wait for it.
-// ===========================================================================
-
-describe('b.kvq (4) SR-7.2: the lost-message notice is held and retried like every persona notice', () => {
-  test.each(['channel', 'dm'] as const)(
-    'AC 26: raised before the persona\'s client is validated (%s destination): nothing is posted, recovery still starts, and the flush posts it once at the destination, naming the sender by user ID',
-    async (destination) => {
-      const h = makeHarness({ destination, restartDelayS: SLOW_DELAY_S })
-      h.clients.setUnavailable(h.alpha.key)
-
-      await h.deliver(messageIn(SHARED), h.alpha.key)
-
-      expect(isRestartPendingOrActive(h.alpha.key)).toBe(true)
-      expect(h.notices).toHaveLength(1)
-      // With no client there is no Slack call at all: no post, no open, no
-      // users.info (the sender is its user ID, as in src/server.ts).
-      expect(h.p('alpha').stub.callLog).toEqual([])
-
-      h.clients.setUnavailable(h.alpha.key, false)
-      await h.notifier.flush(h.alpha.key)
-
-      expectOneLostNotice(h, { destination, source: SHARED, sender: HUMAN, state: 'starting-now' })
-      expect(h.p('alpha').stub.calls.usersInfo).toEqual([])
-      expect(h.holdClock.pendingCount()).toBe(0)
-    },
-  )
-
-  test.each<[Destination, WebApiOutcome, 'post' | 'open']>([
-    ['channel', { kind: 'platform', error: 'not_in_channel' }, 'post'],
-    ['dm', { kind: 'platform', error: 'missing_scope' }, 'open'],
-  ])(
-    'AC 26: a %s destination that fails (%j) holds the notice under one persona-destination-failed line; the retry on the fake clock posts it once there, never in the source',
-    async (destination, failure, queue) => {
-      const h = makeHarness({ destination, restartDelayS: SLOW_DELAY_S })
-      h.p('alpha').stub.script[queue].push(failure)
-      const dest = destinationId(destination)
-
-      await h.deliver(messageIn(SHARED), h.alpha.key)
-
-      expect(isRestartPendingOrActive(h.alpha.key)).toBe(true)
-      expect(failedLines(h)).toHaveLength(1)
-      expect(h.hold.view(h.alpha.key)).toMatchObject({ held: true, heldNotices: 1 })
-      expect(h.holdClock.pending().map((t) => t.delayMs)).toEqual([5_000])
-      // Any attempt so far (the failed channel post) was at the destination.
-      const attempted = h.allPosts().length
-      expect(h.allPosts().every((p) => p.key === h.alpha.key && p.channel === dest)).toBe(true)
-
-      await h.holdClock.runNext()
-
-      expect(lostNotices(h).slice(attempted)).toEqual([{ key: h.alpha.key, channel: dest, state: 'starting-now' }])
-      expect(h.allPosts().every((p) => p.key === h.alpha.key && p.channel === dest)).toBe(true)
-      expect(h.postsTo(SHARED)).toEqual([])
-      expectBetaUntouched(h)
-      expectNoticeText(h, h.allPosts().at(-1)!.text, STUB_USER_NAME, 'starting-now')
-      expect(failedLines(h)).toHaveLength(1)
-      expect(clearedLines(h)).toHaveLength(1)
-      expect(h.hold.view(h.alpha.key)).toMatchObject({ held: false, heldNotices: 0 })
-      expect(h.holdClock.pendingCount()).toBe(0)
-    },
-  )
-
-  test.each<[string, RoutingHarnessOptions['notify']]>([
-    ['throws', () => { throw new Error(`notice sink failed (${sentinelInMessage('notice-sink')})`) }],
-    ['rejects', async () => { throw new Error(`notice sink failed (${sentinelInMessage('notice-sink')})`) }],
-  ])('a notice sink that %s is logged once naming the persona and keeping the error\'s message, redacted and token-safe; never thrown, and recovery still happens', async (_label, notify) => {
-    const h = makeHarness({ restartDelayS: SLOW_DELAY_S, notify })
-
-    await h.deliver(messageIn(SHARED), h.alpha.key)
-
-    expect(isRestartPendingOrActive(h.alpha.key)).toBe(true)
-    expect(h.notices).toHaveLength(1)
-    expect(h.allPosts()).toEqual([])
-    const ref = renderPersonaRef(h.alpha.name, h.alpha.key)
-    const sinkLines = h.logs.filter((l) => l.includes(`lost-message notice for persona ${ref} failed`))
-    expect(sinkLines).toHaveLength(1)
-    // The error's message is kept, redacted (the sentinel is in no log line: the teardown leak check).
-    expect(sinkLines[0]).toContain('notice sink failed')
-    expect(h.logs.filter((l) => l.includes('error handling event'))).toEqual([])
     expectBetaUntouched(h)
   })
 })
@@ -2386,7 +2129,7 @@ describe('b.kvq (5) auto-restart disabled (delay 0) path', () => {
     await h.deliver(messageIn(ALPHA_SECOND), h.alpha.key)
 
     expect(isRestartPendingOrActive(h.alpha.key)).toBe(false)
-    expect(lostNotices(h)).toEqual([{ key: h.alpha.key, channel: ALPHA_HOME, state: 'auto-restart-disabled' }])
+
     expectBetaUntouched(h)
     await Bun.sleep(WAIT_MS)
     expect(h.launches).toHaveLength(0)
@@ -2414,7 +2157,7 @@ describe('b.kvq (5) auto-restart disabled (delay 0) path', () => {
 // ===========================================================================
 
 describe('SR-8.6: a message dropped for a key outside the applied set arms no restart timer', () => {
-  test('alpha removed from the applied set (still up and serving): a lost message schedules nothing and launches nothing; once applied again, a lost message arms the timer and launches', async () => {
+  test('alpha removed from the applied set (still up and serving): a queued Slack item schedules nothing and launches nothing; once applied again, a queued Slack item arms the timer and launches', async () => {
     const h = makeHarness()
     const UP: PersonaConnectionStatus = { state: 'up', identity: { botUserId: 'U0APPLIED', botId: 'B0APPLIED' } }
     const applied = new Set([h.beta.key])
@@ -2456,14 +2199,14 @@ describe('SR-8.6: a message dropped for a key outside the applied set arms no re
 
 describe('b.kvq (6) humanTrigger delay clamp (DOWN only)', () => {
   const realSetTimeout = globalThis.setTimeout
-  let capturedDelayMs: number | null = null
+  let capturedDelays: number[] = []
 
   beforeEach(() => {
-    capturedDelayMs = null
+    capturedDelays = []
     // Capture the delay, but do NOT actually arm a real timer (return a stub
     // handle) so the launch never fires during these timing-only tests.
     globalThis.setTimeout = ((_fn: (...a: unknown[]) => void, ms?: number) => {
-      capturedDelayMs = ms ?? 0
+      capturedDelays.push(ms ?? 0)
       return 0 as unknown as ReturnType<typeof setTimeout>
     }) as unknown as typeof setTimeout
   })
@@ -2481,19 +2224,19 @@ describe('b.kvq (6) humanTrigger delay clamp (DOWN only)', () => {
     scheduleRestart('kvq_cap900', '/tmp/kvq-session', undefined, { humanTrigger: true })
 
     // Computed backoff was 900s; humanTrigger clamps it to the 5s ceiling.
-    expect(capturedDelayMs).toBe(HUMAN_TRIGGER_DELAY_CEILING * 1000)
+    expect(capturedDelays).toContain(HUMAN_TRIGGER_DELAY_CEILING * 1000)
   })
 
-  test('a lost message is a human trigger: in the 900s regime, the restart it starts waits only HUMAN_TRIGGER_DELAY_CEILING', async () => {
+  test('a queued Slack item is a human trigger: in the 900s regime, the restart it starts waits only HUMAN_TRIGGER_DELAY_CEILING', async () => {
     const h = makeHarness({ restartDelayS: 60 })
     // Four failures (one below the cap): the plain backoff would be 900s.
     for (let i = 0; i < 4; i++) recordFailure(h.alpha.key)
 
     await h.deliver(messageIn(SHARED), h.alpha.key)
 
-    expect(lostNotices(h)).toEqual([{ key: h.alpha.key, channel: ALPHA_HOME, state: 'starting-now' }])
+
     expect(isRestartPendingOrActive(h.alpha.key)).toBe(true)
-    expect(capturedDelayMs).toBe(HUMAN_TRIGGER_DELAY_CEILING * 1000)
+    expect(capturedDelays).toContain(HUMAN_TRIGGER_DELAY_CEILING * 1000)
   })
 
   test('a NON-human trigger in the same 900s regime is NOT clamped', () => {
@@ -2502,7 +2245,7 @@ describe('b.kvq (6) humanTrigger delay clamp (DOWN only)', () => {
 
     scheduleRestart('kvq_cap900', '/tmp/kvq-session') // no opts → not human
 
-    expect(capturedDelayMs).toBe(900 * 1000)
+    expect(capturedDelays).toContain(900 * 1000)
   })
 
   test('a delay already below the ceiling is NOT raised by humanTrigger', () => {
@@ -2512,8 +2255,8 @@ describe('b.kvq (6) humanTrigger delay clamp (DOWN only)', () => {
 
     scheduleRestart('kvq_small', '/tmp/kvq-session', undefined, { humanTrigger: true })
 
-    expect(capturedDelayMs).toBe(1 * 1000)
-    expect(capturedDelayMs).toBeLessThan(HUMAN_TRIGGER_DELAY_CEILING * 1000)
+    expect(capturedDelays).toContain(1 * 1000)
+    expect(capturedDelays[0]).toBeLessThan(HUMAN_TRIGGER_DELAY_CEILING * 1000)
   })
 })
 
@@ -2557,17 +2300,8 @@ describe('b.kvq (7) server.ts holds no copy of the lost-message branch', () => {
     expect(indicesOf(/\.receive\s*\(/g, SERVER_CODE)).toEqual([])
   })
 
-  test('the restart guard and the health check take the stream probe from the routing module', () => {
-    expect(SERVER_SRC).toMatch(
-      /import\s*\{[^}]*\bhasSessionStream\b[^}]*\}\s*from\s*['"]\.\/persona-routing\.ts['"]/,
-    )
-    // No local probe that could drift from the module's.
-    expect(indicesOf(/(?:function|const|let)\s+hasSessionStream\w*\b/g, SERVER_CODE)).toEqual([])
-    for (const init of ['initRestart', 'initHealthCheck']) {
-      const block = SERVER_CODE.match(new RegExp(`\\b${init}\\(\\{[\\s\\S]*?\\n\\s*\\}\\)`))
-      expect(block).not.toBeNull()
-      expect(block![0]).toMatch(/\bhasSessionStream\s*(?:,|:\s*hasSessionStream\b)/)
-    }
+  test('server recovery has no standalone stream probe (b.omv SR-9)', () => {
+    expect(SERVER_CODE).not.toMatch(/\bhasSessionStream\b/)
   })
 })
 
@@ -2610,12 +2344,13 @@ const Q_HOLDS: ReadonlyArray<readonly [string, QHold]> = [
 ]
 
 /** Every lost-message notice went to Q, one per message; the wait posted nothing. */
-function expectOnlyQNotices(h: RecoveryHarness, q: string, messages: number): void {
-  expect(h.lostMessageNotices.map((n) => n.key)).toEqual(Array.from({ length: messages }, () => q))
-  expect([h.episodeNotices, h.notices]).toEqual([[], []])
+function expectOnlyQQueued(h: RecoveryHarness, q: string, messages: number): void {
+  expect(h.lostMessageNotices).toEqual([])
+  expect(h.queued(q)).toHaveLength(messages)
+  expect(h.notices).toEqual([])
 }
 
-describe('b.jg5 SRJ-812, SRJ-1011 (AC 54): a message lost while Q waits on an old-life hold, before any kill of the old key failed: today\'s states, and restarting while a wait step runs', () => {
+describe('b.jg5 SRJ-812, SRJ-1011 (AC 54): an item accepted while Q waits on an old-life hold, before any kill of the old key failed: today\'s states, and restarting while a wait step runs', () => {
   test.each(Q_HOLDS)('the hold %s: no wait step, today\'s state with Q\'s one read; a wait step running (its run held), restarting with no read, Q\'s own row read pending or not; once the run lists the row in ids and the hold ends, today\'s state again', async (_label, begin) => {
     const h = makeRecovery()
     const [q, b] = h.keys as [string, string]
@@ -2636,11 +2371,11 @@ describe('b.jg5 SRJ-812, SRJ-1011 (AC 54): a message lost while Q waits on an ol
     await h.driveSequence(outcome)
     expect(h.oldLifeHolds.holdOf(id)).toBeUndefined()
     await expectLostMessageReports(h, q, 'auto-restart-disabled')
-    expectOnlyQNotices(h, q, 4)
+    expectOnlyQQueued(h, q, 4)
   })
 })
 
-describe('b.jg5 SRJ-812, SRJ-1011 state 4 (AC 54): once the old key\'s kill failed, a message lost for a persona waiting on the hold reports kill failed, until the hold ends', () => {
+describe('b.jg5 SRJ-812, SRJ-1011 state 4 (AC 54): once the old key\'s kill failed, an item accepted for a persona waiting on the hold reports kill failed, until the hold ends', () => {
   test.each<[string, (h: RecoveryHarness, q: string, b: string) => Promise<string>]>([
     ['the wait\'s own kill (ErrTmuxKillFailed after its tries)', async (h, q, b) => {
       const id = await Q_HOLDS[0]![1](h, q, b)
@@ -2658,7 +2393,7 @@ describe('b.jg5 SRJ-812, SRJ-1011 state 4 (AC 54): once the old key\'s kill fail
       h.script({ killError: errTmuxKillFailed() })
       return Q_HOLDS[1]![1](h, q, b)
     }],
-  ])('%s: the hold is marked; a lost message reports kill failed with its wording and no read; another call\'s read of the old row ended ends the hold, and the next message reports today\'s state', async (_label, fail) => {
+  ])('%s: the hold is marked; a queued Slack item reports kill failed with its wording and no read; another call\'s read of the old row ended ends the hold, and the next message reports today\'s state', async (_label, fail) => {
     const h = makeRecovery()
     const [q, b] = h.keys as [string, string]
     const id = await fail(h, q, b)
@@ -2671,14 +2406,14 @@ describe('b.jg5 SRJ-812, SRJ-1011 state 4 (AC 54): once the old key\'s kill fail
 
     noteOldLifeRowRead(id, { kind: OLD_LIFE_ROW_READ_STATE, state: LIVENESS_DEAD_ROW_ENDED }, 'another call')
     await expectLostMessageReports(h, q, 'auto-restart-disabled')
-    expect([h.episodeNotices, h.notices]).toEqual([[], []])
+    expect(h.notices).toEqual([])
   })
 
   test.each<[string, (h: RecoveryHarness, row: CannedGetResult) => void]>([
     ['a survivor-naming ErrTmuxKillFailed, then a success (the survivor version)', (h, row) => h.script({ killQueue: [cannedErr(errTmuxKillFailed(undefined, 'pane-process-survived')), cannedOk(cannedKillResult(true))], getResult: row })],
     ['a CONFLICT', (h, row) => h.script({ killError: errTmuxSessionConflict('kill', 'not-this-launch'), getResult: row })],
     ['a success with kill_sent false', (h, row) => h.script({ killResult: cannedKillResult(false), getResult: row })],
-  ])('the wait\'s kill answering %s, its round then stopped by a run that did not judge the pending old row: the hold goes on unmarked, and a lost message reports today\'s state, never kill failed', async (_label, arrange) => {
+  ])('the wait\'s kill answering %s, its round then stopped by a run that did not judge the pending old row: the hold goes on unmarked, and a queued Slack item reports today\'s state, never kill failed', async (_label, arrange) => {
     const h = makeRecovery()
     const [q, b] = h.keys as [string, string]
     await pastSampleGrace(h)
@@ -2689,7 +2424,8 @@ describe('b.jg5 SRJ-812, SRJ-1011 state 4 (AC 54): once the old key\'s kill fail
 
     expect(h.oldLifeHolds.holdOf(id)?.killFailed).toBe(false)
     await expectLostMessageReports(h, q, 'auto-restart-disabled')
-    expect(h.lostMessageNotices.map((n) => n.key)).toEqual([q])
+    expect(h.lostMessageNotices).toEqual([])
+    expect(h.queued(q)).toHaveLength(1)
   })
 })
 
@@ -2709,8 +2445,8 @@ describe('b.jg5 SRJ-812, SRJ-1011 state 4 (AC 54): once the old key\'s kill fail
 // destination; B's stub sees nothing.
 // ===========================================================================
 
-describe('b.jg5 SRJ-812, SRJ-810 (AC 54): a restart a lost message triggers while Q waits on a hold launches nothing, and Q comes up only once the hold ends, at once', () => {
-  test.each(Q_HOLDS)('the hold %s: the message reports starting now and asks for Q\'s restart, which launches nothing, starts the wait and arms Q\'s timer; the hold\'s end retries Q at once and Q comes up; one post, the notice', async (_label, begin) => {
+describe('b.jg5 SRJ-812, SRJ-810 (AC 54): a restart a queued Slack item triggers while Q waits on a hold launches nothing, and Q comes up only once the hold ends, at once', () => {
+  test.each(Q_HOLDS)('the hold %s: the message reports starting now and asks for Q\'s restart, which launches nothing, starts the wait and arms Q\'s timer; the hold\'s end retries Q at once and Q comes up; no message-lost post', async (_label, begin) => {
     const h = makeRecovery({ sessionRestartDelay: FAST_DELAY_S })
     const [q, b] = h.keys as [string, string]
     const id = await begin(h, q, b)
@@ -2736,8 +2472,8 @@ describe('b.jg5 SRJ-812, SRJ-810 (AC 54): a restart a lost message triggers whil
     expect(h.stub.calls.spawnCalls.map((params) => params.instance_id)).toEqual([personaInstanceId(q)])
     await h.runApproverToStop(q)
     h.controller.stopAll('the case is over')
-    expectOnlyQNotices(h, q, 1)
-    expect(h.slack(q).callLog.filter((call) => call.method === 'chat.postMessage')).toHaveLength(1)
+    expectOnlyQQueued(h, q, 1)
+    expect(h.slack(q).callLog.filter((call) => call.method === 'chat.postMessage')).toHaveLength(0)
     expect(h.slack(b).callLog).toEqual([])
   })
 })

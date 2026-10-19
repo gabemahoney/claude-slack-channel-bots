@@ -92,6 +92,7 @@ import {
   FUNGIBLE_TARGET_REFUSAL,
   isSlackHostedFileUrl,
   MCP_INSTRUCTIONS,
+  MCP_INSTRUCTIONS_MAX_CHARS,
   SET_CHANNEL_DELIVERY_TOOL,
   slackRefusalToolErrorText,
   type PersonaTargetAction,
@@ -100,7 +101,7 @@ import {
   type SessionEntry,
   type SessionToolDeps,
 } from '../src/registry.ts'
-import { trackAck, consumeAck, _resetAckTracker } from '../src/ack-tracker.ts'
+import { trackAck, consumeAck, _resetAckTracker, addDeliveryAck } from '../src/ack-tracker.ts'
 import {
   makeFungiblePersona,
   makeMultiPersonaConfig,
@@ -2797,54 +2798,31 @@ describe('tool list and instructions', () => {
     expect(client.getInstructions()).toBe(MCP_INSTRUCTIONS)
   })
 
-  test('the example tag in the instructions carries source="<MCP server name>", as the harness renders it', () => {
-    expect(MCP_INSTRUCTIONS).toContain(`source="${MCP_SERVER_NAME}"`)
-  })
-
-  test('instructions still say to pass chat_id back', async () => {
+  // b.omv SR-7.1/3: negotiated tools only; the system prompt owns full tag semantics.
+  test('the compact contract retains all nine points in order and every tool/via value under its cap', async () => {
     const { client } = await openPersonaSession(h.alpha)
-
-    const instructions = client.getInstructions() ?? ''
-
-    expect(instructions).toContain('Reply with the reply tool — pass chat_id back.')
-  })
-
-  // b.av2 SR-12: the tag attributes, the via values (channel and dm) and persona mentions.
-  // Key tokens only, so harmless rewording does not break the case.
-  test('instructions name chat_id, user_id, bot_id and via, list the channel and dm via values and say <@ID> reaches a user or persona', async () => {
-    const { client } = await openPersonaSession(h.alpha)
-
-    const instructions = client.getInstructions() ?? ''
-
-    for (const token of ['chat_id', 'user_id', 'bot_id', 'via']) expect(instructions).toMatch(new RegExp(`\\b${token}\\b`))
-    // The sentence that lists the via values, so a stray word elsewhere cannot satisfy it.
-    const viaList = instructions.split('\n').find((line) => /^via\b/.test(line)) ?? ''
-    for (const value of ['mention', 'broadcast', 'receive_all_shared', 'receive_all']) {
-      expect(viaList).toMatch(new RegExp(`\\b${value} \\(`))
+    expect(client.getServerCapabilities()).toEqual({ tools: {} })
+    expect(MCP_INSTRUCTIONS_MAX_CHARS).toBe(2048)
+    expect(MCP_INSTRUCTIONS.length).toBeLessThanOrEqual(MCP_INSTRUCTIONS_MAX_CHARS)
+    const points = [
+      'The sender reads Slack', 'Messages arrive as the <channel> tag described in the system prompt',
+      'via:', '<@ID>', 'attachment_count', 'You may act', 'With DMs on', 'Pass message_id', 'reply accepts files',
+    ]
+    let last = -1
+    for (const point of points) {
+      const at = MCP_INSTRUCTIONS.indexOf(point)
+      expect(at).toBeGreaterThan(last)
+      last = at
     }
-    // E6: dm (a direct message to the persona) is a via value too.
-    expect(viaList).toMatch(/\bdm \(/)
-    expect(instructions).toMatch(/<@ID>[^\n]*mentions a Slack user or another persona/)
-  })
-
-  // b.av2 SR-5.1 / SR-12: the reply targets. Key phrases only.
-  test('instructions name a DM conversation and a user ID as reply targets and say a persona with DMs off has no DM target', async () => {
-    const { client } = await openPersonaSession(h.alpha)
-
-    const instructions = client.getInstructions() ?? ''
-
-    expect(instructions).toMatch(/DMs are on[^\n]*reply in a DM conversation[^\n]*\(a D\.\.\. chat_id\)/)
-    expect(instructions).toMatch(/pass a user ID \(U\.\.\. or W\.\.\.\) as reply's chat_id/)
-    expect(instructions).toMatch(/DMs are off, you have no DM target/)
-  })
-
-  test('instructions say a message without via is an injected prompt needing no reply unless it asks', async () => {
-    const { client } = await openPersonaSession(h.alpha)
-
-    const instructions = client.getInstructions() ?? ''
-
-    expect(instructions).toMatch(/without via is an injected prompt/)
-    expect(instructions).toMatch(/no reply unless it asks/)
+    for (const token of ['channel_name', 'part', 'chat_id', 'thread_ts', 'reply', 'download_attachment', SET_CHANNEL_DELIVERY_TOOL, 'react', 'edit_message', 'fetch_messages', 'files']) expect(MCP_INSTRUCTIONS).toContain(token)
+    const via = MCP_INSTRUCTIONS.split('\n').find(line => line.startsWith('via:'))!
+    for (const value of ['dm', 'mention', 'broadcast', 'receive_all_shared', 'receive_all']) expect(via).toMatch(new RegExp(`\\b${value} =`))
+    expect(MCP_INSTRUCTIONS).toMatch(/<@ID> mentions a Slack user or persona/)
+    expect(MCP_INSTRUCTIONS).toMatch(/user ID \(U\.\.\. or W\.\.\.\) as chat_id/)
+    expect(MCP_INSTRUCTIONS).toContain('With DMs off you have no DM target. Any other target is refused.')
+    expect(MCP_INSTRUCTIONS).toContain('to reply to remove the ack reaction')
+    expect(MCP_INSTRUCTIONS).not.toContain('source=')
+    assertNoLeak(MCP_INSTRUCTIONS)
   })
 })
 
@@ -2876,11 +2854,42 @@ describe('session instructions in both channel modes (b.av2 SR-12; b.deo SRI-604
   })
 
   test('the text says where the persona may act, with invited channels off and on, and that the channel-delivery tool sets how closely the persona listens in a channel, called when someone there asks', () => {
-    expect(MCP_INSTRUCTIONS).toMatch(/every channel message you receive comes from a channel you may act in/)
-    expect(MCP_INSTRUCTIONS).toMatch(/invited channels off[^\n]*the channels your persona is configured into/)
-    expect(MCP_INSTRUCTIONS).toMatch(/invited channels on[^\n]*any channel your persona's Slack app is a member of[^\n]*Slack refuses the others/)
+    expect(MCP_INSTRUCTIONS).toMatch(/You may act in every channel you receive/)
+    expect(MCP_INSTRUCTIONS).toMatch(/invited channels off[^\n]*these are your configured channels/)
+    expect(MCP_INSTRUCTIONS).toMatch(/with it on[^\n]*channels your Slack app belongs to[^\n]*Slack refuses others/)
     expect(MCP_INSTRUCTIONS).toMatch(
-      new RegExp(`${literal(SET_CHANNEL_DELIVERY_TOOL)} sets how closely you listen in a channel[^\\n]*when someone in that channel asks`),
+      new RegExp(`${literal(SET_CHANNEL_DELIVERY_TOOL)} sets listening to mentions[^\\n]*when someone in that channel asks`),
     )
+  })
+})
+
+// b.omv SR-8.7: registry records only successful replies, using the resolved target.
+describe('reply before delivery', () => {
+  test.each([A_ALL, USER_U])('successful reply to %s suppresses only the calling persona in the resolved conversation', async target => {
+    applyPersona(h.alpha, true)
+    if (target === USER_U) stubOf(h.alpha).script.open.push(openedDm(OPENED_DM))
+    const session = await openWithSettings(h.alpha)
+    const result = await session.call('reply', { chat_id: target, text: 'early', message_id: MSG_TS })
+    expect(result.isError).toBeUndefined()
+    const channel = target === USER_U ? OPENED_DM : A_ALL
+    const adds: string[] = []
+    for (const [key, conversation] of [[h.alpha.key, channel], [h.beta.key, channel], [h.alpha.key, 'C0OTHER01']]) {
+      await addDeliveryAck(key!, conversation!, MSG_TS, async () => { adds.push(key! + ':' + conversation) }, async () => {})
+    }
+    expect(adds).toEqual([h.beta.key + ':' + channel, h.alpha.key + ':C0OTHER01'])
+    expect(stubOf(h.alpha).calls.postMessage).toMatchObject([{ channel }])
+    expect(stubOf(h.beta).calls.postMessage).toEqual([])
+    assertNoLeak({ result, lines: h.lines })
+  })
+  test('failed reply cannot suppress the later delivery reaction', async () => {
+    stubOf(h.alpha).web.chat.postMessage = async () => { throw new Error('Slack refused') }
+    const session = await openWithSettings(h.alpha)
+    const result = await session.call('reply', { chat_id: A_ALL, text: 'early', message_id: MSG_TS })
+    expect(result.isError).toBe(true)
+    let added = false
+    await addDeliveryAck(h.alpha.key, A_ALL, MSG_TS, async () => { added = true }, async () => {})
+    expect(added).toBe(true)
+    expect(stubOf(h.beta).calls.postMessage).toEqual([])
+    assertNoLeak({ result, lines: h.lines })
   })
 })

@@ -97,6 +97,8 @@ export interface SharedState {
   dRowKept?: boolean
   /** Check 24 setup: the original session_restart_delay (JSON), for the teardown. */
   origDelay?: string
+  /** Check 24: the original accepted item, retained through the guarded recovery restart. */
+  waitingMessage?: { ts: string; seq?: number; mark: string }
   /** The installed package version and the tarball it came from. */
   packageVersion?: string
   /** The personas brought up in this run (Check 1: A, B, C; Check 25: D), for Check 29a's transcripts. */

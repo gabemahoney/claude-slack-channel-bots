@@ -1,3 +1,5 @@
+import { createDeliveryQueue, type QueueItem, type QueueEvent } from '../../src/delivery-queue.ts'
+import { createDeliveryPreparation } from '../../src/delivery-intake.ts'
 /**
  * test-helpers/reload-harness.ts — The shared reload harness (b.av2 SR-13.4,
  * b.deo SRI-1203):
@@ -1818,6 +1820,9 @@ export type ReloadRetryTimersView = Pick<UnavailableRetryController, 'view' | 'i
 
 /** One server start over the harness's files; see the file comment. */
 export interface ReloadRun {
+  queue: ReturnType<typeof createDeliveryQueue>
+  queueEvents: QueueEvent[]
+  queued(name: string): QueueItem[]
   /** The real reload controller. */
   readonly controller: ReloadController
   /** The real bring-up controller the start pass drives. */
@@ -2778,16 +2783,18 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     // `personaConfig` at call time, so after an apply the start's values
     // (configInEffect). No ack reaction unless the start's config sets one.
     const getReplySettings = (): ReplySettings => replySettingsOf(serverConfig())
-    const routing = createPersonaRouting({
+    const queueEvents: QueueEvent[] = []
+    const queue = createDeliveryQueue({stateDir, now: connections.clock.now, onEvent: event => queueEvents.push(event)})
+    const queueReady = queue.start()
+    const preparation = createDeliveryPreparation({queue, clientFor, resolveUserName})
+    const coreRouting = createPersonaRouting({
       getPersonaConfig: appliedConfig,
       getBotIdentity: identityFor,
-      clientFor,
-      resolveUserName,
+      queue,
+      prepare: preparation.prepare,
       archive: () => undefined,
-      getReplySettings,
-      notify: (key, text, options) => noticeStack.notifier.notify(key, text, options),
       log,
-      dedupeClock: () => connections.clock.now(),
+      now: connections.clock.now,
       // As server.ts wires it (b.av2 SR-4.2 beside b.deo SRI-305, SRI-403,
       // SRI-1203): the stored choices and their readability, read at each
       // fungible-mode event from the run's one stored-choice store (the one
@@ -2798,6 +2805,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       // As server.ts wires it: a lost message for a persona that is not up restarts nothing.
       isPersonaUp,
     })
+    const routing = {...coreRouting, receive: async (...args: Parameters<typeof coreRouting.receive>) => {await queueReady; return coreRouting.receive(...args)}}
     connections.onEvent = createPersonaEventRouter({ routing, clientFor, getPersona: getAppliedPersona, log })
     connections.onStatus = composePersonaStatusListeners(
       createPersonaUpFlushListener(noticeStack.notifier),
@@ -3482,6 +3490,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     }
     const approverStops: ReloadApproverStop[] = []
     controller = createReloadController({
+      queueOpenCount: queue.openCount,
+      onQueueRetained: key => queue.retained(key),
       paths,
       retiredKeys,
       // As main() passes it (b.deo SRI-406, SRI-408, SRI-502): an accessor
@@ -3531,6 +3541,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       onApplied: (config) => {
         appliedConfigs.push(config)
         runOpts.onApplied?.(config)
+        void preparation.recover(config.personas.map(p => p.key))
         const hook = applyHook
         applyHook = undefined
         hook?.(config)
@@ -3665,6 +3676,9 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
 
     let stopped = false
     const run: ReloadRun = {
+      queue,
+      queueEvents,
+      queued: name => queue.items(personaKey(name)),
       controller,
       bringUps,
       connections,
@@ -3710,12 +3724,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       composition,
       registerSession: registerRunSession,
       session: (name) => getSessionByPersona(personaKey(name)),
-      deliveries: (name) =>
-        (notificationsByKey.get(personaKey(name)) ?? []).map((n) => ({
-          chat_id: n.params.meta['chat_id']!,
-          via: n.params.meta['via'],
-          content: n.params.content,
-        })),
+      deliveries: name => queue.items(personaKey(name)).map(i => ({chat_id:i.accepted.channel!,via:i.accepted.via,content:i.accepted.text})),
       async deliver(name, event, envelope) {
         registryTouched = true
         await run.stub(name).socket.deliver(event, envelope)
@@ -3894,6 +3903,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       async stop() {
         if (stopped) return
         stopped = true
+        await preparation.stop()
+        await queue.stop()
         // The server stopped at `opts.stopBeforeWrite`: nothing it wrote after that point survives.
         if (stopImage !== undefined && !stopImagePutBack) {
           stopImagePutBack = true
@@ -4068,7 +4079,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         state: 'ended',
         cwd: persona.working_directory,
         labels: {
-          service: 'cscb',
+          tag_prompt: '1', service: 'cscb',
           persona: personaKey(persona.name),
           [CONFIG_DIR_LABEL]: personaConfigDirLabelValue(persona.claude_config_dir, home),
         },

@@ -242,7 +242,6 @@ function planWith(overrides: Partial<ValidChangePlan>): ValidChangePlan {
   return {
     valid: true,
     added: [],
-    removed: [],
     destructive: [],
     inPlace: [],
     credentials: [],
@@ -253,6 +252,7 @@ function planWith(overrides: Partial<ValidChangePlan>): ValidChangePlan {
     noEffectiveChange: false,
     configDirsChanged: false,
     ...overrides,
+    removed: (overrides.removed ?? []).map(p => ({ queueOpenCount: 0, ...p })),
   }
 }
 
@@ -438,7 +438,7 @@ describe('removed and renamed personas', () => {
     if (!plan.valid) throw new Error('expected a valid plan')
 
     const removal =
-      'DESTRUCTIVE: persona "bravo" (key=bravo) is removed: the persona will be retired: its session stopped and never resumed.'
+      'DESTRUCTIVE: persona "bravo" (key=bravo) is removed: the persona will be retired: its session stopped and never resumed; 0 open queued items kept, delivered only if a persona with the same key is added again.'
     const modify =
       'DESTRUCTIVE: persona "Ops Bot" (key=ops) name changed and working_directory changed to "/srv/ops/work-2": ' +
       'the persona will be retired and brought up fresh: its session stopped and never resumed.'
@@ -460,7 +460,7 @@ describe('removed and renamed personas', () => {
   test('a name change that changes the key is a removal of the old key and an addition of the new', () => {
     const { plan, lines } = preview(edited((c) => (entry(c, 'bravo').name = 'bravo_two')))
 
-    expect(plan.removed).toEqual([ref('bravo', 1)])
+    expect(plan.removed).toEqual([{ ...ref('bravo', 1), queueOpenCount: 0 }])
     expect(plan.added).toEqual([{ ...ref('bravo_two', 1), cannotComeUp: [] }])
     expect(plan.destructive).toEqual([])
     expect(changePlanCounts(plan)).toEqual(counts({ added: 1, removed: 1 }))
@@ -1462,7 +1462,7 @@ describe('server-wide settings', () => {
 
       const mode = channelModeOf(after)
       expect(plan.settings).toEqual([{ name: MODE_SWITCH_SETTING, mode, personas: [] }])
-      expect(plan.removed).toEqual(baseRefs())
+      expect(plan.removed).toEqual(baseRefs().map(p => ({ ...p, queueOpenCount: 0 })))
       expect(plan.added.map((p) => p.key)).toEqual(['delta'])
       expect(lines[0]).toBe(header({ added: 1, removed: 3, settings: 1 }))
       expect(lines.at(-1)).toBe(modeSwitchLine(mode, []))
@@ -1585,12 +1585,26 @@ describe('classification across a switch change, the resolved and section compar
     ['the block added', undefined, { dialog_ready_timeout_ms: 120_000 }],
     ['the block removed', { dialog_ready_timeout_ms: 120_000 }, undefined],
     ['a value changed', { unavailable_retry_base_s: 5, unavailable_retry_ceiling_s: 60 }, { unavailable_retry_base_s: 6, unavailable_retry_ceiling_s: 60 }],
+    ['delivery-stuck timer added (b.omv SR-14.1)', undefined, { delivery_stuck_after_ms: 7_000 }],
+    ['delivery-stuck timer removed (b.omv SR-14.1)', { delivery_stuck_after_ms: 7_000 }, undefined],
+    ['delivery-stuck timer changed (b.omv SR-14.1)', { delivery_stuck_after_ms: 7_000 }, { delivery_stuck_after_ms: 9_000 }],
   ])('test_timer_overrides %s is no effective change (b.2nr)', (_label, from, to) => {
     const withBlock = (block: Record<string, number> | undefined) => edited((c) => { if (block !== undefined) (c as Record<string, unknown>)['test_timer_overrides'] = block })
     const { plan, lines } = previewBetween(withBlock(from), withBlock(to))
 
     expect(plan).toEqual(planWith({ unchanged: baseRefs(), noEffectiveChange: true }))
     expect(lines).toEqual([NO_EFFECT_LINE])
+  })
+
+  test('a delivery-stuck override beside a real change stays out of the settings count and preview (b.omv SR-14.1)', () => {
+    const { plan, lines } = preview(edited((c) => {
+      c.port = 3200
+      c.test_timer_overrides = { delivery_stuck_after_ms: 7_000 }
+    }))
+
+    expect(plan.settings).toEqual([{ name: 'port' }])
+    expect(changePlanCounts(plan)).toEqual(counts({ settings: 1 }))
+    expect(lines).toEqual(preview(edited((c) => { c.port = 3200 })).lines)
   })
 
   test.each<[string, boolean | undefined, boolean | undefined, (b: PersonaInput) => void, (b: PersonaInput) => void, InPlaceSetting]>([
@@ -2075,7 +2089,7 @@ describe('a combined edit', () => {
         'server-wide settings: 1 changed',
     )
     expect(lines[0]).toBe(header(changePlanCounts(plan)))
-    expect(lines.filter((l) => l.includes(' is added'))).toHaveLength(2)
+    expect(lines.filter((l) => l.startsWith('persona ') && l.includes(' is added'))).toHaveLength(2)
     expect(lines.filter((l) => l.includes(' is removed:'))).toHaveLength(1)
     expect(destructiveLines(lines)).toHaveLength(2)
     expect(lines.filter((l) => l.includes('applied in place immediately'))).toHaveLength(1)
@@ -2224,4 +2238,12 @@ describe('no preview line says "destroyed"', () => {
     ]
     expect(forms.filter((form) => /destroyed/i.test(form))).toEqual([])
   })
+})
+
+test('removal receives the open queue count as a pure fact and previews exact same-key retention', () => {
+  const asked: string[] = []
+  const { plan, lines } = preview(edited(c => c.personas.splice(1, 1)), facts({ queueOpenCount: key => { asked.push(key); return 3 } }))
+  expect(asked).toEqual(['bravo'])
+  expect(plan.removed).toEqual([{ ...ref('bravo', 1), queueOpenCount: 3 }])
+  expect(lines[1]).toBe('DESTRUCTIVE: persona "bravo" (key=bravo) is removed: the persona will be retired: its session stopped and never resumed; 3 open queued items kept, delivered only if a persona with the same key is added again.')
 })

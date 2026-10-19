@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Test 4: NON-dry-run fresh and resumed launches held at the dev-channels
+# Test 4: NON-dry-run fresh and resumed launches held at the startup-trust
 # dialog, each cleared by CSCB's dialog approver through agent-director on the
 # launch's `pending` row.
 #
@@ -21,7 +21,7 @@
 # DRIVER_WORKING_DIRECTORY) through the installed package's persona resolver;
 # its instance is cscb_<persona key>.
 # A stub `claude` on PATH stands in for the model: it prints the exact
-# dev-channels dialog and fires agent-director's SessionStart hooks on Enter,
+# startup-trust dialog and fires agent-director's SessionStart hooks on Enter,
 # so the test is deterministic and does not burn the Anthropic API.
 #
 # Requires tmux in the image (docker/Dockerfile.test.base).
@@ -84,10 +84,11 @@ command -v claude >/dev/null 2>&1 \
 # The stub-claude dialog text must stay byte-identical to the needle the
 # approver matches; assert the needle is present in the stub.
 grep -q "I am using this for local development" "${STUB_BIN_DIR}/claude" \
-    || fail "stub claude does not emit the dev-channels needle"
+    || fail "stub claude does not emit the startup-trust needle"
 
 # --- Persona working directory ---------------------------------------------
 mkdir -p "${DRIVER_WORKING_DIRECTORY}"
+printf 'startup-trust\t%s\n' "$(realpath -e -- "${DRIVER_WORKING_DIRECTORY}")" > "${STUB_BIN_DIR}/stub-claude-modes"
 git -C "${DRIVER_WORKING_DIRECTORY}" init -q 2>/dev/null || true
 
 # --- Run the driver (NON-dry-run: SLACK_DRY_RUN deliberately unset) --------
@@ -95,6 +96,7 @@ git -C "${DRIVER_WORKING_DIRECTORY}" init -q 2>/dev/null || true
 # shown on failure; keep stdout (DRIVER: markers) for the phase asserts.
 set +e
 CSCB_PKG_DIR="${PKG_DIR}" \
+DRIVER_STUB_MODES_FILE="${STUB_BIN_DIR}/stub-claude-modes" \
 DRIVER_PERSONA="${DRIVER_PERSONA}" \
 DRIVER_PERSONA_CHANNEL="${DRIVER_PERSONA_CHANNEL}" \
 DRIVER_WORKING_DIRECTORY="${DRIVER_WORKING_DIRECTORY}" \
@@ -122,7 +124,7 @@ fi
 # 1. Fresh launch: the approver cleared the dialog on the `pending` row
 #    through agent-director, and the row went live.
 printf '%s\n' "${DRIVER_OUT}" | grep -q '^DRIVER: PHASE1_OK' \
-    || fail "phase 1: the approver did not clear the dev-channels dialog on the fresh launch's pending row"
+    || fail "phase 1: the approver did not clear the startup-trust dialog on the fresh launch's pending row"
 
 # 2. Precondition held: the row went ended/missing with a session_id (resumable).
 printf '%s\n' "${DRIVER_OUT}" | grep -q '^DRIVER: PRECONDITION_OK' \
@@ -131,7 +133,7 @@ printf '%s\n' "${DRIVER_OUT}" | grep -q '^DRIVER: PRECONDITION_OK' \
 # 3. Resumed launch: the approver cleared the dialog again on the resumed
 #    `pending` row, kept that row's launch start, and the row went live.
 printf '%s\n' "${DRIVER_OUT}" | grep -q '^DRIVER: PHASE2_OK' \
-    || fail "phase 2: the approver did not clear the dev-channels dialog on the resumed launch's pending row"
+    || fail "phase 2: the approver did not clear the startup-trust dialog on the resumed launch's pending row"
 
 # 4. Both launches carried `--system-prompt-snapshot off` (the template
 #    installed from a config without `fresh_system_prompt`): the stub recorded
@@ -140,14 +142,20 @@ printf '%s\n' "${DRIVER_OUT}" | grep -q '^DRIVER: PHASE2_OK' \
 test -f "${LAUNCH_ARGS_FILE}" \
     || fail "launch arguments: the stub recorded no launch (${LAUNCH_ARGS_FILE} is absent)"
 LAUNCH_COUNT="$(wc -l < "${LAUNCH_ARGS_FILE}")"
-[ "${LAUNCH_COUNT}" -eq 2 ] \
-    || fail "launch arguments: expected 2 recorded launches (fresh, resumed), found ${LAUNCH_COUNT}: $(cat "${LAUNCH_ARGS_FILE}")"
+[ "${LAUNCH_COUNT}" -eq 3 ] \
+    || fail "launch arguments: expected 3 recorded launches (fresh, resumed, refused dev dialog), found ${LAUNCH_COUNT}: $(cat "${LAUNCH_ARGS_FILE}")"
 launch_no=0
-for launch_label in fresh resumed; do
+for launch_label in fresh resumed refused-dev; do
     launch_no=$((launch_no + 1))
     launch_line="$(sed -n "${launch_no}p" "${LAUNCH_ARGS_FILE}")"
+    [[ "${launch_line}" != *--dangerously-load-development-channels* && "${launch_line}" != *server:slack-channel-router* ]] \
+        || fail "${launch_label}: launch carried channel arguments"
+    [[ "$(grep -o -- '--append-system-prompt-file' <<< "${launch_line}" | wc -l)" == 1 ]] \
+        || fail "${launch_label}: launch needs exactly one composed prompt path"
     printf '%s\n' "${launch_line}" | grep -Eq '(^| )--system-prompt-snapshot off( |$)' \
         || fail "launch arguments: the ${launch_label} launch lacks adjacent '--system-prompt-snapshot off': ${launch_line}"
 done
 
+printf '%s\n' "${DRIVER_OUT}" | grep -q '^DRIVER: DEV_DIALOG_REFUSED_OK' \
+    || fail "the deliberately unsupported dev dialog was answered"
 echo "PASS: ${TEST_NAME}"

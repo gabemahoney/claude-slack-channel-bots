@@ -41,8 +41,8 @@
  *   escalate-dead verdict whose re-probe read `pending` (whose notice is the
  *   stuck-launch post, SRJ-1017). The count is reset; an open episode stays
  *   open.
- * - `noteHealthy(key)`: a health-check tick found P `live`, connected and
- *   with its stream. The count is reset; an open episode stays open.
+ * - `noteHealthy(key)`: a health-check tick found P `live` and connected.
+ *   The count is reset; an open episode stays open.
  * - `endForLatch(key)`: P latched. The count is reset and the episode ends
  *   silently.
  * - `count(key)` and `isOpen(key)` read the state, for tests.
@@ -110,13 +110,13 @@ export function slowRecoveryText(key: string): string {
 export const SLOW_RECOVERY_RESET_ROW_DEAD = 'row-dead'
 /** Reset reason: the `dead` reading from `ErrSystemInstallDisappeared` (`noteInstallGone`). */
 export const SLOW_RECOVERY_RESET_INSTALL_GONE = 'install-gone'
-/** Reset reason: a run whose reconnect ended with another verdict, or that found the persona already connected with its stream (`noteOther`). */
+/** Reset reason: a run whose reconnect ended with another verdict, or that found the persona already connected (`noteOther`). */
 export const SLOW_RECOVERY_RESET_OTHER_VERDICT = RESTART_SLOW_RECOVERY_OTHER_VERDICT
 /** Reset reason: an escalate-dead verdict whose re-probe read `pending` (`noteOther`). */
 export const SLOW_RECOVERY_RESET_PENDING_REPROBE = RESTART_SLOW_RECOVERY_OTHER_PENDING_REPROBE
 /** Reset reason: a run whose first liveness probe read `pending` (`noteOther`). */
 export const SLOW_RECOVERY_RESET_PENDING_PROBE = RESTART_SLOW_RECOVERY_OTHER_PENDING_PROBE
-/** Reset reason: a health-check tick found the persona `live`, connected and with its stream (`noteHealthy`). */
+/** Reset reason: a health-check tick found the persona `live` and connected (`noteHealthy`). */
 export const SLOW_RECOVERY_RESET_HEALTHY = 'healthy'
 /** Reset reason: the persona latched (`endForLatch`). */
 export const SLOW_RECOVERY_RESET_LATCHED = 'latched'
@@ -136,7 +136,7 @@ export const SLOW_RECOVERY_RESET_TEXT: Readonly<Record<SlowRecoveryResetReason, 
   [SLOW_RECOVERY_RESET_OTHER_VERDICT]: 'a restart run ended with a verdict other than escalate-dead',
   [SLOW_RECOVERY_RESET_PENDING_REPROBE]: "an escalate-dead verdict's re-probe read the row pending, which is not counted",
   [SLOW_RECOVERY_RESET_PENDING_PROBE]: "a restart run's liveness probe read the row pending",
-  [SLOW_RECOVERY_RESET_HEALTHY]: 'a health check found the session live, connected and with its stream',
+  [SLOW_RECOVERY_RESET_HEALTHY]: 'a health check found the session live and connected',
   [SLOW_RECOVERY_RESET_LATCHED]: 'the persona latched',
 })
 
@@ -212,7 +212,7 @@ export interface SlowRecoveryTracker extends RestartSlowRecoveryObserver {
   noteInstallGone(key: string): void
   /** Another verdict, a session already connected, or a `pending` first probe or re-probe: reset the count; an open episode stays open. */
   noteOther(key: string, reason: SlowRecoveryOtherReason): void
-  /** A health-check tick found the persona `live`, connected and with its stream: reset the count; an open episode stays open. */
+  /** A health-check tick found the persona `live` and connected: reset the count; an open episode stays open. */
   noteHealthy(key: string): void
   /** The persona latched: reset the count and end the episode silently. */
   endForLatch(key: string): void

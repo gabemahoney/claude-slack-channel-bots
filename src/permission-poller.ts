@@ -453,6 +453,11 @@ function perRequestRecords(): PerRequestRecord[] {
 }
 /** instance_id → wedge-detector state (b.fae F4). */
 const wedgeStates = new Map<string, WedgeState>()
+/** Authoritative warning latch for delivery notice suppression (b.omv SR-8.2). */
+export function hasNativePromptWarning(key: string): boolean {
+  return [...wedgeStates.values()].some(state => state.personaKey === key && state.warningFired)
+}
+
 /** Keys of the personas in a not-up skip episode, for its start and end lines (b.av2 SR-6.4). */
 const notUpSkipping = new Set<string>()
 /**

@@ -103,11 +103,18 @@ const {
   _whenDialogApproverStopped,
   APPROVER_STOP_LIVE,
   DIALOG_SLOW_POLL_INTERVAL_MS,
+  setSystemPromptPreparer,
+  _setDialogReadyTimeoutMs,
+  APPROVER_STOP_CAP,
 } = await import(`${PKG}/src/session-manager.ts`)
 const { adGraceMsInEffect, adLaunchBoundMsInEffect } = await import(`${PKG}/src/ad-settings.ts`)
 const { parseLaunchStart } = await import(`${PKG}/src/pending-row.ts`)
 const { personaInstanceId, personaKey } = await import(`${PKG}/src/persona-identity.ts`)
-const { resolvePersonaConfig } = await import(`${PKG}/src/config.ts`)
+const { resolvePersonaConfig, resolveServerStateDir } = await import(`${PKG}/src/config.ts`)
+const { prepareBotSystemPrompt } = await import(`${PKG}/src/bot-system-prompt.ts`)
+const { writeFileSync, readFileSync } = await import('node:fs')
+const { join } = await import('node:path')
+const { homedir } = await import('node:os')
 const { getClient } = await import(`${PKG}/src/agent-director-client.ts`)
 
 const LIVE_STATES = new Set(['waiting', 'working', 'ask_user', 'check_permission'])
@@ -258,6 +265,7 @@ async function main(): Promise<void> {
   // from the persona config, as the daemon does. The session manager's
   // pre-launch trust patcher stays uninstalled (no patch runs): stub-claude
   // prints only the dev-channels dialog, never the trust dialog.
+  setSystemPromptPreparer(() => prepareBotSystemPrompt(personaCfg, resolveServerStateDir()))
   await installSlackChannelBotTemplate(personaCfg)
 
   const instanceId = personaInstanceId(key)
@@ -346,9 +354,28 @@ async function main(): Promise<void> {
   const s2 = await expectLive('phase2', instanceId)
   console.log(`DRIVER: PHASE2_OK action=${r2.action} state=${s2} launch_start_ms=${kept2}`)
 
-  // Best-effort cleanup: end the session so the pane does not linger. The row
-  // is kept, ended.
-  try { await getClient().kill({ instance_id: instanceId }) } catch { /* ignore */ }
+  // End cleanly before the deliberately unsupported launch, retaining its row.
+  await getClient().sendKeys({ instance_id: instanceId, text: '__CSCB_TEST_EXIT__' })
+  const negativeDeadline = Date.now() + 20000
+  while (!TERMINAL.has(await statusState(instanceId)) && Date.now() < negativeDeadline) await new Promise(r => setTimeout(r, 300))
+  if (!TERMINAL.has(await statusState(instanceId))) driverFail('phase3 precondition never reached a terminal row')
+  // b.omv SR-7.5/SR-13.6: exactly one deliberately unsupported dev dialog.
+  // The two positive phases above use explicit startup-trust mode.
+  const modeFile = process.env['DRIVER_STUB_MODES_FILE']
+  if (!modeFile) driverFail('phase3 missing stub mode file')
+  writeFileSync(modeFile, `dev-channels\t${WORKING_DIRECTORY}\n`)
+  _setDialogReadyTimeoutMs(2000)
+  const trailPath = join(homedir(), '.config', 'agent-director', 'ad-trail.jsonl')
+  const before = readFileSync(trailPath, 'utf8').split('\n').length
+  const r3 = await spawnForPersona(persona, personaCfg, false)
+  expectAction('phase3', r3.action, 'resumed')
+  const outcome = await _whenDialogApproverStopped(key)
+  if (outcome?.reason !== APPROVER_STOP_CAP) driverFail(`phase3 dev dialog was not left unanswered: ${outcome?.reason}`)
+  if (await statusState(instanceId) !== PENDING_STATE) driverFail('phase3 dev dialog unexpectedly reported in')
+  const after = readFileSync(trailPath, 'utf8').split('\n').slice(before - 1).filter(Boolean).map(line => JSON.parse(line))
+  if (after.some(row => row.event === 'ad.send_keys.called' && row.instance_id === instanceId)) driverFail('phase3 CSCB answered the dev dialog')
+  console.log('DRIVER: DEV_DIALOG_REFUSED_OK')
+  try { await getClient().kill({ instance_id: instanceId }) } catch { /* row retained */ }
   console.log('DRIVER: DONE')
   process.exit(0)
 }

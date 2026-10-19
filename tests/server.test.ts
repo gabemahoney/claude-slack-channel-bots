@@ -1,5 +1,11 @@
 import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
+import { createDeliveryLifecycle } from '../src/delivery-lifecycle.ts'
+import { NOT_NOW_RETRY_MS, RECONNECT_BLOCKED_NOTICE_MS } from '../src/delivery-constants.ts'
+import { _setDeliveryLifecycle as setDeliveryLifecycle } from '../src/server.ts'
+
+import { useImmediateTypingLifecycle } from './test-helpers/legacy-typing.ts'
+useImmediateTypingLifecycle()
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, relative, resolve } from 'node:path'
@@ -1597,6 +1603,8 @@ describe('_buildReconnectSessionAdapter', () => {
     statusState?: string
     /** When set, each status probe rejects with it instead (read at each probe). */
     statusError?: Error
+    /** Suppress notices while retaining the reconnect's ordinary liveness checks. */
+    noNotice?: boolean
     sendKeysThrows?: Error
     /** Errors the send-keys calls answer in turn, before `sendKeysThrows` or success. */
     sendKeysErrors?: Error[]
@@ -1673,11 +1681,11 @@ describe('_buildReconnectSessionAdapter', () => {
       spawnCalls,
       resumeCalls,
       // Read at each pane read, so a test may change them between attempts.
-      get readPaneResults() { return opts.pane === undefined ? undefined : [cannedReadPaneResult(opts.pane)] },
+      get readPaneResults() { return [cannedReadPaneResult(opts.pane ?? IDLE_PANE)] },
       get readPaneError() { return opts.paneError },
       readPaneQueue: opts.paneQueue,
       getCalls,
-      getResult: opts.getRow ?? (opts.row === undefined ? undefined : cannedGetResult({ instance_id: 'cscb_C1', state: 'working', ...opts.row })),
+      get getResult() { return opts.getRow && findMissingCalls.length === 0 ? { ...opts.getRow, liveness_note: undefined } : opts.getRow ?? cannedGetResult({ instance_id: 'cscb_C1', state: opts.statusState ?? 'waiting', ...opts.row, ...('launchStartedAt' in opts ? { launch_started_at: opts.launchStartedAt } : {}) }) },
     })
     _resetOutageState()
     const triggers = opts.triggers
@@ -1692,7 +1700,7 @@ describe('_buildReconnectSessionAdapter', () => {
       // (b.av2 SR-2.2); its persona lookup only locates a `working` row's
       // transcript (b.f2b). Its latched query is asked right before
       // `/mcp reconnect` is typed (b.jg5 SRJ-502).
-      adapter: _buildReconnectSessionAdapter(opts.getPersona, opts.isLatched),
+      adapter: _buildReconnectSessionAdapter(opts.getPersona, opts.isLatched, undefined, { noNotice: opts.noNotice }),
       statusCalls,
       sendKeysCalls,
       findMissingCalls,
@@ -1753,6 +1761,74 @@ describe('_buildReconnectSessionAdapter', () => {
     _resetNotConnectedEpisodes()
     _resetNow()
     rmSync(dir, { recursive: true, force: true })
+  })
+
+  // b.omv SR-5.5: the timer caller suppresses notices, never pane checks or
+  // the existing prompt-row sweep. No health-check tick drives these retries.
+  test.each([...PROMPT_ROW_STATES].flatMap(state =>
+    (['gone', 'absent', 'unreadable', 'prompt', 'ordinary-notice'] as const).map(mode => ({ state, mode })),
+  ))('prompt-row timer preserves liveness with notice suppression: $state / $mode', async ({ state, mode }) => {
+    const clock = createFakeClock({ flushTurns: 150 })
+    _setNow(clock.now)
+    const raised: Array<{ key: string; text: string }> = []
+    const screens: Array<{ key: string; screen: 'input' | 'menu'; blockedMs: number }> = []
+    const answers: AdapterAnswer[] = []
+    const life = createDeliveryLifecycle({
+      startId: 'prompt-row-timer', clock,
+      onReconnectScreen: (key, screen, blockedMs) => { screens.push({ key, screen, blockedMs }) },
+    })
+    setDeliveryLifecycle(life)
+    setSessionNotifier((key, text) => { raised.push({ key, text }) })
+    const opts: Parameters<typeof makeHarness>[0] = {
+      statusState: state, statusAfterSweep: mode === 'unreadable' ? 'missing' : state,
+      pane: PERMISSION_PANE, noNotice: mode !== 'ordinary-notice',
+      paneError: mode === 'gone' ? paneGone() : mode === 'absent' ? errSpawnNotFound()
+        : mode === 'unreadable' ? errCallTimeout('read-pane') : undefined,
+    }
+    const h = makeHarness(opts)
+    life.setReconnect(async key => { answers.push(await h.adapter(key)) })
+    try {
+      const captured = await capturingErrorArgs(async () => {
+        const first = await h.adapter('C1')
+        expect(h.readPaneCalls).toEqual(probePaneReads(1))
+        if (mode === 'gone' || mode === 'absent') {
+          expect(first).toEqual(escalatedWith(mode === 'gone' ? 'prompt-row-tmux-gone' : ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ))
+          expect(h.findMissingCalls).toHaveLength(1)
+          expect(life.deferred('C1')).toBeUndefined()
+        } else {
+          expect(first).toBe('transient')
+          await clock.advance(RECONNECT_BLOCKED_NOTICE_MS)
+          expect(h.readPaneCalls).toEqual(probePaneReads(1 + RECONNECT_BLOCKED_NOTICE_MS / NOT_NOW_RETRY_MS[0]))
+          expect(life.deferred('C1')).toEqual({ due: false, screen: mode === 'unreadable' ? undefined : 'menu', blockedMs: mode === 'unreadable' ? 0 : RECONNECT_BLOCKED_NOTICE_MS })
+          if (mode === 'unreadable') {
+            expect(screens).toEqual([])
+            await clock.advanceTo(PROMPT_ROW_SWEEP_AFTER_MS)
+            expect(answers.at(-1)).toEqual(escalatedWith(DEAD_SESSION_CAUSE_ROW_READ_FINISHED))
+          } else {
+            expect(screens.at(-1)).toEqual({ key: 'C1', screen: 'menu', blockedMs: RECONNECT_BLOCKED_NOTICE_MS })
+            opts.paneError = paneGone()
+            await clock.advance(NOT_NOW_RETRY_MS[0])
+            expect(answers.at(-1)).toEqual(escalatedWith('prompt-row-tmux-gone'))
+          }
+          expect(h.findMissingCalls).toHaveLength(1)
+          expect(life.deferred('C1')).toBeUndefined()
+        }
+        const reads = h.readPaneCalls.length
+        await clock.advance(RECONNECT_BLOCKED_NOTICE_MS)
+        expect(h.readPaneCalls).toHaveLength(reads)
+        expect(clock.pending()).toEqual([])
+        expect(h.sendKeysCalls).toEqual([])
+        expect(h.killCalls).toEqual([])
+        expect(h.spawnCalls).toEqual([])
+        expect(h.resumeCalls).toEqual([])
+        expect(raised).toHaveLength(mode === 'ordinary-notice' ? 1 : 0)
+        if (mode === 'ordinary-notice') expect(raised[0]!.text).toStartWith(':warning: *Waiting on a prompt*')
+      })
+      assertNoLeak({ lines: stringLines(captured.errArgs), raised, screens, answers })
+    } finally {
+      await life.stop()
+      setSessionNotifier(undefined)
+    }
   })
 
   test.each<[string, Parameters<typeof makeHarness>[0]]>([
@@ -1822,7 +1898,7 @@ describe('_buildReconnectSessionAdapter', () => {
       const result = await adapter('C1')
 
       expect(result).toBe('transient')
-      expect(statusCalls.map((c) => c.instance_id)).toEqual(['cscb_C1'])
+      expect(statusCalls).toEqual([])
       expect(readPaneCalls).toEqual([])
       expect(findMissingCalls).toHaveLength(0)
       expect(sendKeysCalls).toHaveLength(0)
@@ -1842,8 +1918,8 @@ describe('_buildReconnectSessionAdapter', () => {
     expect(result).toBe('success')
     expect(statusCalls).toHaveLength(1)
     // b.jg5 SRJ-604: one read of its own pane first.
-    expect(readPaneCalls).toEqual(fullPaneReads(1))
-    expect(sendKeysCalls).toHaveLength(1)
+    expect(readPaneCalls).toEqual(fullPaneReads(3))
+    expect(sendKeysCalls).toHaveLength(2)
     expect(sendKeysCalls[0].text).toContain('/mcp reconnect')
     // Both the probe and the reconnect address cscb_<key>.
     expect(statusCalls[0].instance_id).toBe('cscb_C1')
@@ -1961,7 +2037,7 @@ describe('_buildReconnectSessionAdapter', () => {
     const h = await reconnectCapturing({})
 
     expect(h.result).toBe('success')
-    expect(h.sendKeysCalls.map((c) => [c.instance_id, c.text])).toEqual([[personaInstanceId('C1'), `/mcp reconnect ${MCP_SERVER_NAME}`]])
+    expect(h.sendKeysCalls).toEqual([{ instance_id: personaInstanceId('C1'), text: `/mcp reconnect ${MCP_SERVER_NAME}`, no_enter: true }, { instance_id: personaInstanceId('C1'), key: 'Enter' }])
     expect(h.findMissingCalls).toEqual([])
     expect(h.raised).toEqual([])
     assertNoLeak({ errArgs: h.errArgs })
@@ -2078,7 +2154,7 @@ describe('_buildReconnectSessionAdapter', () => {
     const h = await reconnectCapturing({ statusState: state, sendKeysThrows: errSpawnNotInteractive('send-keys') })
 
     expect(h.result).toEqual(escalatedWith('row-not-interactive'))
-    expect(h.sendKeysCalls.map((c) => c.instance_id)).toEqual(['cscb_C1'])
+    expect(h.sendKeysCalls.map((c) => c.instance_id)).toEqual(state === 'missing' ? [] : ['cscb_C1'])
     expect(h.findMissingCalls).toHaveLength(1)
     expect(h.raised).toEqual([])
     const lines = escalateDeadLines(stringLines(h.errArgs))
@@ -2232,7 +2308,7 @@ describe('_buildReconnectSessionAdapter', () => {
 
     expect(result).toBe('success')
     expect(statusCalls.map((c) => c.instance_id)).toEqual([personaInstanceId('ops_bot')])
-    expect(sendKeysCalls.map((c) => c.instance_id)).toEqual(['cscb_ops_bot'])
+    expect(sendKeysCalls.map((c) => c.instance_id)).toEqual(['cscb_ops_bot', 'cscb_ops_bot'])
   })
 
   // b.f2b: a `working` row can be stale (agent-director left it `working`
@@ -2278,8 +2354,8 @@ describe('_buildReconnectSessionAdapter', () => {
       await clock.advance(30_000)
       expect(await h.adapter('C1')).toBe('success')
 
-      expect(h.readPaneCalls).toEqual(fullPaneReads(3))
-      expect(h.sendKeysCalls.map((c) => [c.instance_id, c.text])).toEqual([['cscb_C1', `/mcp reconnect ${MCP_SERVER_NAME}`]])
+      expect(h.readPaneCalls).toEqual(fullPaneReads(4))
+      expect(h.sendKeysCalls).toEqual([{ instance_id: personaInstanceId('C1'), text: `/mcp reconnect ${MCP_SERVER_NAME}`, no_enter: true }, { instance_id: personaInstanceId('C1'), key: 'Enter' }])
       expect(h.findMissingCalls).toHaveLength(0)
       expect(raised).toEqual([])
     })
@@ -2300,7 +2376,7 @@ describe('_buildReconnectSessionAdapter', () => {
       })
 
       expect(await attempts(h.adapter, 2, STALE_WORKING_WINDOW_MS)).toEqual(['transient', 'success'])
-      expect(looked).toEqual(['C1', 'C1'])
+      expect(looked).toEqual(['C1', 'C1', 'C1', 'C1'])
     })
 
     test("b.rmy: a working row whose pane shows a running turn is never typed into, however long, though its transcript ends with a completed turn: 'transient' on every attempt, one read-pane each", async () => {
@@ -2340,7 +2416,7 @@ describe('_buildReconnectSessionAdapter', () => {
       verdicts.push(await h.adapter('C1'))
 
       expect(verdicts).toEqual(['transient', 'success', 'transient', 'success'])
-      expect(h.sendKeysCalls).toHaveLength(2)
+      expect(h.sendKeysCalls).toHaveLength(4)
     })
 
     // b.f2b: at a non-zero delay nothing else escalates a `working` row whose
@@ -2713,7 +2789,7 @@ describe('_buildReconnectSessionAdapter', () => {
       const { h, verdict, lines } = await workingAfterRun(errInvalidFlags('read-pane'), { inside: true })
 
       expect(verdict).toBe('transient')
-      expect(callOrder).toEqual(['status', 'readPane', 'resolveSystemBinary'])
+      expect(callOrder).toEqual(['get', 'status', 'readPane', 'resolveSystemBinary'])
       expect(stops).toHaveLength(1)
       expect(unprovenIdleNotices()).toEqual([])
       expect(h.readPaneCalls).toEqual(fullPaneReads(2))
@@ -2745,9 +2821,9 @@ describe('_buildReconnectSessionAdapter', () => {
       const { verdict, lines } = await attempt(h)
 
       expect(verdict).toBe('success')
-      expect(flagsAtTyping).toEqual([[...flags]])
-      expect(h.sendKeysCalls.map((c) => [c.instance_id, c.text])).toEqual([['cscb_C1', `/mcp reconnect ${MCP_SERVER_NAME}`]])
-      expect(h.readPaneCalls).toEqual(fullPaneReads(1))
+      expect(flagsAtTyping).toEqual([[], []])
+      expect(h.sendKeysCalls.map((c) => [c.instance_id, c.text])).toEqual([['cscb_C1', `/mcp reconnect ${MCP_SERVER_NAME}`], ['cscb_C1', undefined]])
+      expect(h.readPaneCalls).toEqual(fullPaneReads(3))
       expect(h.findMissingCalls).toEqual([])
       expect(latch.isLatched('C1')).toBe(false)
       expect(raised).toEqual([])
@@ -2772,12 +2848,12 @@ describe('_buildReconnectSessionAdapter', () => {
 
     test("a waiting row, a read-pane ErrInvalidFlags whose version re-check decides that the server stops, inside C1's recovery attempt → 'transient' with nothing typed: the status read, the read-pane and the re-check are the attempt's only calls; one stop; nothing swept, latched, armed or posted; one line saying the server stops", async () => {
       const stops = installRecheck({ version: OLD_AD_VERSION })
-      const h = cellHarness('waiting', { paneError: errInvalidFlags('read-pane') })
+      const h = cellHarness('waiting', { pane: IDLE_PANE, paneQueue: [cannedErr(errInvalidFlags('read-pane'))] })
 
       const { verdict, lines } = await attempt(h, true)
 
       expect(verdict).toBe('transient')
-      expect(callOrder).toEqual(['status', 'readPane', 'resolveSystemBinary'])
+      expect(callOrder).toEqual(['get', 'status', 'readPane', 'resolveSystemBinary'])
       expect(stops).toHaveLength(1)
       expect(h.sendKeysCalls).toEqual([])
       expect(h.readPaneCalls).toEqual(fullPaneReads(1))
@@ -2790,14 +2866,14 @@ describe('_buildReconnectSessionAdapter', () => {
 
     test("control: a waiting row, a read-pane ErrInvalidFlags whose version re-check passes (no stop mark) → the reconnect goes ahead on the row alone: the re-check, then /mcp reconnect typed → 'success'; no stop; one line naming the class", async () => {
       const stops = installRecheck({ version: PHASE1_RC_VERSION })
-      const h = cellHarness('waiting', { paneError: errInvalidFlags('read-pane') })
+      const h = cellHarness('waiting', { pane: IDLE_PANE, paneQueue: [cannedErr(errInvalidFlags('read-pane'))] })
 
       const { verdict, lines } = await attempt(h, true)
 
       expect(verdict).toBe('success')
-      expect(callOrder).toEqual(['status', 'readPane', 'resolveSystemBinary', 'sendKeys'])
+      expect(callOrder).toEqual(['get', 'status', 'readPane', 'resolveSystemBinary', 'get', 'readPane', 'readPane', 'get', 'sendKeys', 'get', 'sendKeys'])
       expect(stops).toEqual([])
-      expect(h.sendKeysCalls.map((c) => [c.instance_id, c.text])).toEqual([['cscb_C1', `/mcp reconnect ${MCP_SERVER_NAME}`]])
+      expect(h.sendKeysCalls).toEqual([{ instance_id: 'cscb_C1', text: `/mcp reconnect ${MCP_SERVER_NAME}`, no_enter: true }, { instance_id: 'cscb_C1', key: 'Enter' }])
       expect(stoppingLines(lines, 'waiting')).toEqual([])
       expect(classLines(lines, 'is waiting and reading its pane failed: ', AD_ERROR_CLASS_UNCLASSIFIED).filter((l) => l.includes(' — reconnecting on the waiting row alone '))).toHaveLength(1)
     })
@@ -2919,7 +2995,7 @@ describe('_buildReconnectSessionAdapter', () => {
       const { verdict, lines } = await attempt(h, true)
 
       expect(verdict).toBe('transient')
-      expect(callOrder).toEqual(['status', 'readPane', 'sendKeys'])
+      expect(callOrder).toEqual(['get', 'status', 'readPane', 'get', 'readPane', 'readPane', 'get', 'sendKeys'])
       expectLatchedOnceAt(record, notice)
       expect(h.findMissingCalls).toEqual([])
       expect(raised).toEqual([])
@@ -3117,7 +3193,7 @@ describe('_buildReconnectSessionAdapter', () => {
       const { verdict, lines } = await attempt(h, true)
 
       expect(verdict).toBe('transient')
-      expect(callOrder).toEqual(['status', 'readPane', 'resolveSystemBinary'])
+      expect(callOrder).toEqual(['get', 'status', 'readPane', 'resolveSystemBinary'])
       expect(stops).toHaveLength(1)
       expect([raised, posts]).toEqual([[], []])
       expect(h.findMissingCalls).toEqual([])
@@ -3135,7 +3211,7 @@ describe('_buildReconnectSessionAdapter', () => {
       const { verdict, lines } = await attempt(h, true)
 
       expect(verdict).toBe('transient')
-      expect(callOrder).toEqual(['status', 'readPane', 'resolveSystemBinary'])
+      expect(callOrder).toEqual(['get', 'status', 'readPane', 'resolveSystemBinary'])
       expect(stops).toEqual([])
       expect(noticeKeys()).toEqual(['C1'])
       const unclassified: PaneReadFailure = { kind: PANE_READ_UNCLASSIFIED, errorClass: AD_ERROR_CLASS_UNCLASSIFIED, description: describeAdFailureForLog(err) }
@@ -3241,13 +3317,13 @@ describe('_buildReconnectSessionAdapter', () => {
       }
 
       const PATHS: readonly BackstopPath[] = [
-        ['a waiting row whose read-pane answers an idle pane', 'waiting', () => (cannedReadPaneResult(IDLE_PANE)), undefined, () => fullPaneReads(1), []],
+        ['a waiting row whose read-pane answers an idle pane', 'waiting', () => (cannedReadPaneResult(IDLE_PANE)), undefined, () => fullPaneReads(3), []],
         ...NO_PANE.map(([label, build, cause]): BackstopPath => [
           `a waiting row whose read-pane gives no pane, ${label}`,
           'waiting',
-          () => ({ paneError: build() }),
+          () => ({ pane: IDLE_PANE, paneQueue: [cannedErr(build())] }),
           undefined,
-          () => fullPaneReads(1),
+          () => fullPaneReads(3),
           [{ key: 'C1', kind: cause }],
         ]),
         [
@@ -3260,7 +3336,7 @@ describe('_buildReconnectSessionAdapter', () => {
             expect(hasPendingWorkingRowEvidence('C1')).toBe(true)
             await clock.advance(STALE_WORKING_WINDOW_MS)
           },
-          () => fullPaneReads(2),
+          () => fullPaneReads(3),
           [],
         ],
         ...PROMPT_STATES.map((state): BackstopPath => [
@@ -3268,7 +3344,7 @@ describe('_buildReconnectSessionAdapter', () => {
           'waiting',
           () => ({ statusState: state, pane: IDLE_PANE }),
           promptRowLeadIn,
-          () => [...probePaneReads(2), ...fullPaneReads(1)],
+          () => [...probePaneReads(2), ...fullPaneReads(3)],
           [],
         ]),
       ]
@@ -3427,9 +3503,7 @@ describe('_buildReconnectSessionAdapter', () => {
         expect(h.findMissingCalls).toEqual([])
         expect(h.sendKeysCalls).toEqual([])
         expect(raised).toEqual([])
-        expect(adapterLines()).toEqual([
-          '[slack] reconnectSession: persona=C1 is check_permission and a launch for it is in flight — deferring to a later tick (b.jdc)',
-        ])
+        expect(adapterLines()).toEqual([])
       } finally {
         // Settle the held launch before teardown.
         held.releaseAll()
@@ -3509,7 +3583,7 @@ describe('_buildReconnectSessionAdapter', () => {
 
         expect(latch.isLatched('C1')).toBe(latched)
         expect(h.findMissingCalls).toHaveLength(1)
-        expect(h.getCalls.map((c) => c.instance_id)).toEqual([personaInstanceId('C1')])
+        expect(h.getCalls.map((c) => c.instance_id)).toEqual(Array(3).fill(personaInstanceId('C1')))
         // One status read per attempt, and one more after the sweep unless C1 latched.
         expect(h.statusCalls).toHaveLength(latched ? 2 : 3)
         expect(h.sendKeysCalls).toEqual([])
@@ -3590,8 +3664,8 @@ describe('_buildReconnectSessionAdapter', () => {
     }
 
     const SWEEP_SITES: ReadonlyArray<readonly [string, SweepSite]> = [
-      ['dead-session (one ErrTmuxSendKeys)', { opts: () => ({ statusState: 'waiting', sendKeysThrows: errTmuxSendKeys() }), minutes: [0], prefix: 'escalate-dead', paneReads: 1, sendKeys: 1, raised: [], verdict: 'dead-session' }],
-      ['row-not-interactive (ErrSpawnNotInteractive)', { opts: () => ({ statusState: 'waiting', sendKeysThrows: errSpawnNotInteractive('send-keys') }), minutes: [0], prefix: 'escalate-dead', paneReads: 1, sendKeys: 1, raised: [], verdict: 'row-not-interactive' }],
+      ['dead-session (one ErrTmuxSendKeys)', { opts: () => ({ statusState: 'waiting', sendKeysThrows: errTmuxSendKeys() }), minutes: [0], prefix: 'escalate-dead', paneReads: 3, sendKeys: 1, raised: [], verdict: 'dead-session' }],
+      ['row-not-interactive (ErrSpawnNotInteractive)', { opts: () => ({ statusState: 'waiting', sendKeysThrows: errSpawnNotInteractive('send-keys') }), minutes: [0], prefix: 'escalate-dead', paneReads: 3, sendKeys: 1, raised: [], verdict: 'row-not-interactive' }],
       ['working-tmux-gone (read-pane GONE)', { opts: () => ({ statusState: 'working', paneError: paneGone() }), minutes: [0], prefix: 'escalate-dead', paneReads: 1, sendKeys: 0, raised: [], verdict: 'working-tmux-gone' }],
       ['waiting-row-pane-gone (read-pane GONE)', { opts: () => ({ statusState: 'waiting', paneError: paneGone() }), minutes: [0], prefix: 'escalate-dead', paneReads: 1, sendKeys: 0, raised: [], verdict: ESCALATE_DEAD_WAITING_ROW_PANE_GONE }],
       ['row-absent-at-pane-read (a working row, ErrSpawnNotFound)', { opts: () => ({ statusState: 'working', paneError: errSpawnNotFound() }), minutes: [0], prefix: 'escalate-dead', paneReads: 1, sendKeys: 0, raised: [], verdict: ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ }],
@@ -3810,16 +3884,17 @@ describe('_buildReconnectSessionAdapter', () => {
       const stub = h.stub as unknown as Record<string, (params: unknown) => Promise<unknown>>
       for (const name of ['status', 'readPane', 'get', 'findMissing', 'sendKeys']) {
         const real = stub[name]!.bind(h.stub)
+        let reads = 0
         stub[name] = async (params) => {
           events.push(name)
-          if (name === landing) latch.latched = true
+          if (name === landing && (name !== 'get' || ++reads === 2)) latch.latched = true
           return real(params)
         }
       }
     }
 
     /** An attempt's calls up to the query right after its status read, and right after its pane read. */
-    const AFTER_READ = ['status', 'isLatched'] as const
+    const AFTER_READ = ['get', 'status', 'isLatched'] as const
     const AFTER_PANE_READ = [...AFTER_READ, 'readPane', 'isLatched'] as const
 
     // The persona is not latched when the attempt starts; the latch is set
@@ -3935,9 +4010,9 @@ describe('_buildReconnectSessionAdapter', () => {
       const { result, errArgs } = await capturingErrorArgs(() => h.adapter('C1'))
 
       expect(result).toBe('success')
-      expect(events).toEqual([...AFTER_READ, 'readPane', 'isLatched', 'sendKeys'])
+      expect(events).toEqual([...AFTER_READ, 'readPane', 'isLatched', 'get', 'readPane', 'readPane', 'get', 'sendKeys', 'get', 'sendKeys'])
       expect(latch.asked).toEqual(['C1', 'C1'])
-      expect(h.sendKeysCalls.map((c) => [c.instance_id, c.text])).toEqual([['cscb_C1', `/mcp reconnect ${MCP_SERVER_NAME}`]])
+      expect(h.sendKeysCalls).toEqual([{ instance_id: 'cscb_C1', text: `/mcp reconnect ${MCP_SERVER_NAME}`, no_enter: true }, { instance_id: 'cscb_C1', key: 'Enter' }])
       expect(latchedLines(errArgs)).toEqual([])
     })
 
@@ -3953,7 +4028,7 @@ describe('_buildReconnectSessionAdapter', () => {
       expect(verdicts).toEqual(['transient', 'success'])
       expect([askedFirst, latch.asked.length - askedFirst]).toEqual([3, 3])
       expect(new Set(latch.asked)).toEqual(new Set(['C1']))
-      expect(h.sendKeysCalls).toHaveLength(1)
+      expect(h.sendKeysCalls).toHaveLength(2)
     })
 
     test("no latched query passed: a waiting row is reconnected as before → 'success', with no latched line", async () => {
@@ -3964,7 +4039,7 @@ describe('_buildReconnectSessionAdapter', () => {
       const { result, errArgs } = await capturingErrorArgs(() => adapter('C1'))
 
       expect(result).toBe('success')
-      expect(h.sendKeysCalls.map((c) => [c.instance_id, c.text])).toEqual([['cscb_C1', `/mcp reconnect ${MCP_SERVER_NAME}`]])
+      expect(h.sendKeysCalls).toEqual([{ instance_id: 'cscb_C1', text: `/mcp reconnect ${MCP_SERVER_NAME}`, no_enter: true }, { instance_id: 'cscb_C1', key: 'Enter' }])
       expect(stringLines(errArgs)).toEqual([`[slack] reconnecting MCP server "${MCP_SERVER_NAME}": persona=C1`])
     })
 
@@ -4174,7 +4249,9 @@ describe('b.jg5 SRJ-115, SRJ-512, SRJ-513: a latching own-row status at the live
   function install(c1Status: Error | StatusResult): StubCallLog {
     const log = makeStubCallLog()
     const stub = makeStubClient({
+      readPaneResults: [cannedReadPaneResult(IDLE_PANE)],
       ...log,
+      getFn: ({ instance_id }) => cannedGetResult({ instance_id }),
       statusFn: ({ instance_id }) =>
         instance_id === personaInstanceId('C1') ? c1Status : cannedStatusResult({ state: 'waiting' }),
       sendKeysResult: {},
@@ -4264,19 +4341,20 @@ describe('b.jg5 SRJ-115, SRJ-512, SRJ-513: a latching own-row status at the live
       const again = await run(() => runInAttempt('C1', 'recovery', () => adapter('C1')))
 
       expect([c1.result, again.result]).toEqual(['transient', 'transient'])
-      expect(log.statusCalls.map((c) => c.instance_id)).toEqual(['cscb_C1', 'cscb_C1'])
+      expect(log.statusCalls.map((c) => c.instance_id)).toEqual(['cscb_C1'])
+      expect(log.getCalls.map((c) => c.instance_id)).toEqual(['cscb_C1'])
       expect(stubCallCount(log)).toBe(2)
       expect(tmuxTouchingCallsIn(log)).toEqual([])
       expectLatchedOnce(c)
       expect(c1.lines).toEqual([c.stepLine(RECONNECT_SITE, answer, 'the persona latched')])
-      expect(again.lines).toEqual([c.stepLine(RECONNECT_SITE, answer, 'the persona was already latched with this case')])
+      expect(again.lines).toEqual([])
       expect(raised).toEqual([])
 
       // C2's waiting row: `/mcp reconnect` is typed into C2 alone.
       const c2 = await run(() => runInAttempt('C2', 'recovery', () => adapter('C2')))
 
       expect(c2.result).toBe('success')
-      expect(log.sendKeysCalls.map((c) => c.instance_id)).toEqual(['cscb_C2'])
+      expect(log.sendKeysCalls.map((c) => c.instance_id)).toEqual(['cscb_C2', 'cscb_C2'])
       expect(latch.isLatched('C2')).toBe(false)
       expect(posts).toHaveLength(1)
     },
@@ -4323,6 +4401,16 @@ describe('b.jg5 SRJ-115, SRJ-512, SRJ-513: a latching own-row status at the live
       const again = await run(() => runInAttempt('C1', 'recovery', () => adapter('C1')))
 
       expect([first.result, again.result]).toEqual([verdict, verdict])
+      if (_adapterName === 'reconnect adapter') {
+        // An existing latch now stops the reconnect before any AD read.
+        expect(latch.record('C1')?.latchCase).not.toBe(c.record('C1').latchCase)
+        expect(episodes.isOpen('C1', oldKind)).toBe(true)
+        expect(posts).toEqual([{ key: 'C1', text: preNotice() }])
+        expect([first.lines, again.lines]).toEqual([[], []])
+        expect(stubCallCount(log)).toBe(0)
+        expect(raised).toEqual([])
+        return
+      }
       expect(latch.record('C1')).toEqual(c.record('C1'))
       expect(episodes.isOpen('C1', oldKind)).toBe(false)
       expect(episodes.isOpen('C1', newKind)).toBe(true)
@@ -4438,6 +4526,8 @@ describe('b.jg5 SRJ-704, SRJ-1016: the liveness and reconnect adapters\' own-row
   /** A stub whose `status` answers `answer` for `key`'s row (thrown when an error) and `waiting` for every other row; every send-keys succeeds. */
   function install(key: string, answer: Error | StatusResult): void {
     const stub = makeStubClient({
+      readPaneResults: [cannedReadPaneResult(IDLE_PANE)],
+      getFn: ({ instance_id }) => cannedGetResult({ instance_id, ...(instance_id === personaInstanceId(key) ? answer : {}) }),
       statusFn: ({ instance_id }) => (instance_id === personaInstanceId(key) ? answer : cannedStatusResult({ state: 'waiting' })),
       sendKeysResult: {},
     })
@@ -4554,6 +4644,8 @@ describe('b.jg5 SRJ-1016, SRJ-1017: the liveness and reconnect adapters\' own-ro
   /** A stub whose `status` answers `answer` for `key`'s row and `waiting` for every other row; every send-keys succeeds. */
   function install(key: string, answer: StatusResult): void {
     const stub = makeStubClient({
+      readPaneResults: [cannedReadPaneResult(IDLE_PANE)],
+      getFn: ({ instance_id }) => cannedGetResult({ instance_id, ...(instance_id === personaInstanceId(key) ? answer : {}) }),
       statusFn: ({ instance_id }) => (instance_id === personaInstanceId(key) ? answer : cannedStatusResult({ state: 'waiting' })),
       sendKeysResult: {},
     })
@@ -4668,7 +4760,9 @@ describe('b.jg5 SRJ-807, SRJ-115: the liveness and reconnect adapters clear a re
   function install(answer: Error | StatusResult): StubCallLog {
     const log = makeStubCallLog()
     const stub = makeStubClient({
+      readPaneResults: [cannedReadPaneResult(IDLE_PANE)],
       ...log,
+      getFn: ({ instance_id }) => instance_id === personaInstanceId('C1') && answer instanceof Error ? answer : cannedGetResult({ instance_id, ...(instance_id === personaInstanceId('C1') ? answer : {}) }),
       statusFn: ({ instance_id }) => (instance_id === personaInstanceId('C1') ? answer : cannedStatusResult({ state: 'waiting' })),
       sendKeysResult: {},
     })
@@ -4735,8 +4829,8 @@ describe('b.jg5 SRJ-807, SRJ-115: the liveness and reconnect adapters clear a re
 
     expect(await reconnectRead('C1')).toBe('success')
 
-    expect(log.sendKeysCalls.map((c) => c.instance_id)).toEqual(['cscb_C1'])
-    expectC1Cleared('waiting', RECONNECT_SITE)
+    expect(log.sendKeysCalls.map((c) => c.instance_id)).toEqual(['cscb_C1', 'cscb_C1'])
+    expectC1Cleared('waiting', { site: 'tag upgrade', what: 'fresh get' })
   })
 
   test.each<[string, () => Error | StatusResult, AdapterAnswer]>([
@@ -4806,6 +4900,8 @@ describe('b.jg5 SRJ-809, SRJ-115: the liveness and reconnect adapters\' own-row 
   /** A stub whose `status` answers `answer` for C1's row (thrown when an error) and `waiting` for every other row; every send-keys succeeds. */
   function install(answer: Error | StatusResult): void {
     const stub = makeStubClient({
+      readPaneResults: [cannedReadPaneResult(IDLE_PANE)],
+      getFn: ({ instance_id }) => instance_id === personaInstanceId('C1') && answer instanceof Error ? answer : cannedGetResult({ instance_id, cwd: config.personas.find((p) => personaInstanceId(p.key) === instance_id)?.working_directory, ...(instance_id === personaInstanceId('C1') ? answer : {}) }),
       statusFn: ({ instance_id }) => (instance_id === personaInstanceId('C1') ? answer : cannedStatusResult({ state: 'waiting' })),
       sendKeysResult: {},
     })
@@ -4818,7 +4914,7 @@ describe('b.jg5 SRJ-809, SRJ-115: the liveness and reconnect adapters\' own-row 
   /** The two adapters, each with the read name its own-row step gives, reading `key`'s row outside any attempt. */
   const ADAPTERS: ReadonlyArray<readonly [string, string, (key: string) => Promise<unknown>]> = [
     ['the liveness adapter', `${LIVENESS_STATUS_SITE.site}: ${LIVENESS_STATUS_SITE.what}`, (key) => _buildIsSessionAliveAdapter(() => config)(key)],
-    ['the reconnect adapter', `${RECONNECT_STATUS_SITE.site}: ${RECONNECT_STATUS_SITE.what}`, (key) => _buildReconnectSessionAdapter(undefined, () => false)(key)],
+    ['the reconnect adapter', 'tag upgrade: fresh get', (key) => _buildReconnectSessionAdapter(undefined, () => false)(key)],
   ]
 
   async function read(adapter: (key: string) => Promise<unknown>, key: string): Promise<void> {
@@ -4978,7 +5074,7 @@ describe('b.jg5 SRJ-805: the reconnect adapter starts the live-row sequence for 
     expect(h.retiredEntry(q).recorded).toBe(false)
   })
 
-  test('a second call while P\'s sequence runs (its first run held): transient again, with nothing typed and no second sequence; its line names the start\'s already-running answer', async () => {
+  test('a second call while P\'s sequence runs (its first run held): transient again, with nothing typed and no second sequence; the new inspection stops before another start request', async () => {
     const { h, p } = retiredReconnect('waiting')
     const hold = holdFindMissing(h.stub.client)
 
@@ -4986,7 +5082,7 @@ describe('b.jg5 SRJ-805: the reconnect adapter starts the live-row sequence for 
     await h.driveSequence(hold.entered(1))
     expect(await reconnect(h, p)).toBe('transient')
 
-    expect(oldLifeLinesIn(h)).toEqual([oldLifeLine(p, 'waiting', LIVE_ROW_START_STARTED), oldLifeLine(p, 'waiting', LIVE_ROW_START_ALREADY_RUNNING)])
+    expect(oldLifeLinesIn(h)).toEqual([oldLifeLine(p, 'waiting', LIVE_ROW_START_STARTED)])
     expect(h.stub.calls.sendKeysCalls).toEqual([])
     expect([h.stub.calls.killCalls.length, h.sequenceRunning(p)]).toEqual([1, true])
     hold.release(cannedFindMissing({ rows: { [personaInstanceId(p)]: 'ids' } }))
@@ -5002,11 +5098,12 @@ describe('b.jg5 SRJ-805: the reconnect adapter starts the live-row sequence for 
   ] as const)('%s, its row reading waiting: the ordinary reconnect, success with one send-keys, and no sequence', async (_label, marked) => {
     const { h, p, q } = retiredReconnect('waiting', true)
     const key = marked ? p : q
-    if (marked) h.failRetiredKeyWrites()
+    h.script({ getFn: ({ instance_id }) => personaRow(h, instance_id === personaInstanceId(p) ? p : q, { state: 'waiting' }) })
+    if (marked) h.failRetiredKeyWrites(5)
 
     expect(await reconnect(h, key)).toBe('success')
 
-    expect(h.stub.calls.sendKeysCalls.map((call) => call.instance_id)).toEqual([personaInstanceId(key)])
+    expect(h.stub.calls.sendKeysCalls.map((call) => call.instance_id)).toEqual([personaInstanceId(key), personaInstanceId(key)])
     expect([h.sequenceRunning(key), oldLifeLinesIn(h)]).toEqual([false, []])
     if (marked) expect(h.retiredEntry(p)).toMatchObject({ recorded: true, marked: true })
   })
@@ -5023,7 +5120,7 @@ describe('b.jg5 SRJ-805: the reconnect adapter starts the live-row sequence for 
     expect(await _buildReconnectSessionAdapter(undefined, (k) => h.latch.isLatched(k), applied)(p)).toBe('pending')
 
     expect([h.stub.calls.sendKeysCalls, h.stub.calls.readPaneCalls, oldLifeLinesIn(h)]).toEqual([[], [], []])
-    expect(h.stub.calls.getCalls).toEqual([{ instance_id: personaInstanceId(p) }])
+    expect(h.stub.calls.getCalls).toEqual(Array(2).fill({ instance_id: personaInstanceId(p) }))
     expect(starts).toEqual([pendingRowStartRequest(h, p, { retiredKey: true, retiredAtStart: { recorded: true, marked: false, generation: 1 } })])
     expect([h.triggers, h.controller.isArmed(p), getFailureCount(p)]).toEqual([[], false, 0])
   })
@@ -5054,6 +5151,7 @@ function pendingRowStartRequest(
     lastReadState: AGENT_DIRECTOR_PENDING_STATE,
     entryStep: LIVE_ROW_SEQUENCE_ENTRY_KILL,
     keepsConversation: false,
+    tagUpgrade: false,
     ...fields,
     belowCapAtStart: true,
     launches: true,
@@ -5141,7 +5239,7 @@ describe('b.jg5 SRJ-409, SRJ-411: the reconnect adapter\'s pending branch and de
       expectPendingOnlyWatch(h, p)
       expect(h.controller.view(p)).toMatchObject({ mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, causes: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW] })
       expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }])
-      expect(h.stub.calls.getCalls).toEqual([{ instance_id: personaInstanceId(p) }])
+      expect(h.stub.calls.getCalls).toEqual(Array(_origin === 'the reconnect adapter' ? 2 : 1).fill({ instance_id: personaInstanceId(p) }))
       expectNothingLaunchedOrTyped(h, p)
       expect(h.sequenceRunning(p)).toBe(false)
       expect(deferralLinesOf(h, p)).toEqual([expect.stringContaining(`its row reads pending (launch started ${launch}) — `)])
@@ -5233,7 +5331,7 @@ describe('b.jg5 SRJ-409, SRJ-411: the reconnect adapter\'s pending branch and de
   // at the deferral, whose `status` read carried a launch start, the `get`
   // shows none and latches P.
   test.each([
-    ['the reconnect adapter, its status showing no launch start', ORIGINS[0]![1], SAMPLE_LAUNCH_START_NONE, 'transient', 0],
+    ['the reconnect adapter, its status showing no launch start', ORIGINS[0]![1], SAMPLE_LAUNCH_START_NONE, 'transient', 1],
     ['deferPendingRow, its get showing no launch start', ORIGINS[1]![1], SAMPLE_LAUNCH_START_WHOLE, 'pending', 1],
   ] as const)('%s: P latches; nothing armed, no sequence, nothing typed', async (_label, call, statusLaunch, answer, gets) => {
     const { h, p } = pendingP(statusLaunch, { launch_started_at: SAMPLE_LAUNCH_START_NONE })
@@ -5525,7 +5623,7 @@ describe('b.jg5 SRJ-810: the reconnect adapter starts the live-row sequence for 
 
     h.script({ statusResult: cannedStatusResult({ state: 'waiting' }) })
     expect(await reconnect(h, q)).toBe('success')
-    expect(h.stub.calls.sendKeysCalls.map((call) => call.instance_id)).toEqual([personaInstanceId(q)])
+    expect(h.stub.calls.sendKeysCalls.map((call) => call.instance_id)).toEqual([personaInstanceId(q), personaInstanceId(q)])
   })
 
   test('a second call while P\'s sequence runs (its first run held): transient again, no second sequence and nothing typed; once the run lists the row in its ids the hold ends and the sequence ends in its launch', async () => {
@@ -5537,7 +5635,7 @@ describe('b.jg5 SRJ-810: the reconnect adapter starts the live-row sequence for 
     await h.driveSequence(hold.entered(1))
     expect(await reconnect(h, p)).toBe('transient')
 
-    expect(heldLinesIn(h)).toEqual([reconnectHeldOwnRowLine(p, 'waiting', LIVE_ROW_START_STARTED), reconnectHeldOwnRowLine(p, 'waiting', LIVE_ROW_START_ALREADY_RUNNING)])
+    expect(heldLinesIn(h)).toEqual([reconnectHeldOwnRowLine(p, 'waiting', LIVE_ROW_START_STARTED)])
     expect([h.stub.calls.sendKeysCalls, h.stub.calls.killCalls.length, h.sequenceRunning(p)]).toEqual([[], 1, true])
     hold.release(cannedFindMissing({ rows: { [personaInstanceId(p)]: 'ids' } }))
     expect(await h.driveSequence(h.sequenceSettled(p))).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED })
@@ -5545,7 +5643,7 @@ describe('b.jg5 SRJ-810: the reconnect adapter starts the live-row sequence for 
     await h.runApproverToStop(p)
   })
 
-  test('while the old-life wait runs on P\'s own row (its first run held): transient, no sequence starts and nothing is typed; the start entry arms P\'s timer with the old-life cause, uncounted; the line names already-running', async () => {
+  test('while the old-life wait runs on P\'s own row (its first run held): transient, no sequence starts, no additional retry is armed and nothing is typed; the existing wait keeps exclusive ownership', async () => {
     const { h, p } = heldOwnRow('waiting')
     h.script({ getResult: cannedGetResult({ instance_id: personaInstanceId(p), cwd: h.home }) })
     const hold = holdFindMissing(h.stub.client)
@@ -5555,10 +5653,10 @@ describe('b.jg5 SRJ-810: the reconnect adapter starts the live-row sequence for 
 
     expect(await reconnect(h, p)).toBe('transient')
 
-    expect(heldLinesIn(h)).toEqual([reconnectHeldOwnRowLine(p, 'waiting', LIVE_ROW_START_ALREADY_RUNNING)])
+    expect(heldLinesIn(h)).toEqual([])
     // The wait is still the one thing running on the id: no kill or call beyond its own.
     expect([h.oldLifeWaitRunning(personaInstanceId(p)), h.stub.calls.sendKeysCalls, h.stub.calls.killCalls.length]).toEqual([true, [], kills])
-    expect([h.triggers, h.controller.isArmed(p), getFailureCount(p)]).toEqual([[{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD }], true, 0])
+    expect([h.triggers, h.controller.isArmed(p), getFailureCount(p)]).toEqual([[], false, 0])
     hold.release(cannedFindMissing({ rows: { [personaInstanceId(p)]: 'ids' } }))
     await h.driveSequence(wait)
     expect(h.oldLifeHolds.holdOf(personaInstanceId(p))).toBeUndefined()
@@ -5686,6 +5784,7 @@ describe('_buildKillSessionAdapter: the checked kill\'s outcome (b.jg5 SRJ-110, 
   ): StubClient {
     killErr = killError
     const stub = makeStubClient({
+      readPaneResults: [cannedReadPaneResult(IDLE_PANE)],
       killCalls,
       statusCalls,
       killError,

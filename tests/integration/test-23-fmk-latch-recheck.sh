@@ -7,7 +7,8 @@
 #
 # With `health_check_interval` 0, every latched persona's re-check, one
 # interval apart, makes one read of its row (`status`) and exactly the call
-# SRJ-505's table names for its latch, and no other call, as the
+# SRJ-505's table names for its latch, with the b.omv SR-7 fresh provenance
+# `get` immediately before every `resume`, and no other call, as the
 # agent-director shim's log shows (CSCB-parented lines only):
 #   - a same-case re-refusal, or a probe that still finds the condition,
 #     posts nothing;
@@ -49,8 +50,8 @@
 #   script requires, exactly once, after every start (start_live);
 # - the tmux shim first on every CSCB process's PATH, in `log` mode
 #   throughout;
-# - the stub as `claude`: `dev-channels` (no selection, the default) in every
-#   persona's working directory, so it prints the dev-channels dialog and
+# - the stub as `claude`: explicitly `startup-trust` in every
+#   persona's working directory, so it prints the startup-trust dialog and
 #   reports in only on Enter (CSCB's approver), except the pane-not-found
 #   persona's, set to `at-once` before its clear, for its relaunch, Part 1's
 #   note persona's, `at-once` (its pane then shows no answered dialog, which
@@ -730,6 +731,7 @@ prepare_persona() {
     local key="$1" label="${PERSONA_TOKEN[$1]}" creds="${SCENARIO_ROOT}/credentials"
     [[ -d "${creds}" ]] || mkdir -m 700 "${creds}"
     PERSONA_WORK[${key}]="$(make_workdir "${key}")"
+    stub_mode "${PERSONA_WORK[${key}]}" "${STUB_MODE_STARTUP_TRUST}"
     PERSONA_CREDS[${key}]="${creds}/${key}.json"
     printf '{"bot_token": "%s", "app_token": "%s"}\n' "$(fake_token bot "${label}")" "$(fake_token app "${label}")" \
         | write_file "${PERSONA_CREDS[${key}]}" 600
@@ -946,7 +948,8 @@ round_call_is() {
 # order, one read of the row (READ_OF: `get` for a "conflicting labels"
 # latch, else `status`) then one call of the persona's table call (CALL_OF,
 # as round_call_is reads it) per round, or, for RECHECK_CALL_NONE, one read
-# alone per round, and no other call; fails otherwise, and on a read with no
+# alone per round. A resume has exactly one fresh provenance `get` between
+# the read and the resume. No other call is allowed; fails otherwise, and on a read with no
 # call after it. Prints one line per round,
 # `<status-pos> <status-us> <call-pos> <call-us>` (the read's own for a
 # round with no call).
@@ -963,7 +966,10 @@ latch_rounds() {
                 printf '%s %s %s %s\n' "${s_pos}" "${s_us}" "${s_pos}" "${s_us}"
             else
                 want="${call}"
+                [[ "${call}" != "${CALL_RESUME}" ]] || want=get
             fi
+        elif [[ "${want}" == get && "${verb}" == get ]]; then
+            want="${call}"
         elif [[ "${want}" == "${call}" && "${call}" != "${CALL_NONE}" ]] && round_call_is "${call}" "${verb}" "${args}"; then
             us="$(us_of "${time}")" || exit 1
             printf '%s %s %s %s\n' "${s_pos}" "${s_us}" "${pos}" "${us}"
@@ -2721,14 +2727,19 @@ check_launched() {
     echo "${TEST_NAME}: ${step}: ${id} reads waiting with session_id ${ROW_SID}; one recovery post"
 }
 
-# check_retry_clear <key>: the batched round: its first two calls of the id
-# are one `status` then the table's call, at the cadence, with no CSCB
+# check_retry_clear <key>: the batched round: its first calls of the id
+# are one `status`, a fresh provenance `get` for a resume, then the table's call, at the cadence, with no CSCB
 # `find-missing` between them; the call launches (check_launched).
 check_retry_clear() {
-    local key="$1" step="part 2: $1's clear (the batched round)" id="${PERSONA_ID[$1]}" rows s_pos s_time s_verb c_pos c_time c_verb c_args between
+    local key="$1" step="part 2: $1's clear (the batched round)" id="${PERSONA_ID[$1]}" rows s_pos s_time s_verb c_pos c_time c_verb c_args between call_line=2 g_verb
     rows="$(ad_cscb_calls "${id}" "${FREE_MARK[${key}]}")" || exit 1
     IFS=$'\t' read -r s_pos s_time _ s_verb _ <<< "$(sed -n 1p <<< "${rows}")"
-    IFS=$'\t' read -r c_pos c_time _ c_verb _ c_args <<< "$(sed -n 2p <<< "${rows}")"
+    if [[ "${CALL_OF[${key}]}" == "${CALL_RESUME}" ]]; then
+        IFS=$'\t' read -r _ _ _ g_verb _ <<< "$(sed -n 2p <<< "${rows}")"
+        [[ "${g_verb}" == get ]] || { sed 's/^/  | /' <<< "${rows}" >&2; fail "${step}: the resume has no fresh provenance get after its status"; }
+        call_line=3
+    fi
+    IFS=$'\t' read -r c_pos c_time _ c_verb _ c_args <<< "$(sed -n "${call_line}p" <<< "${rows}")"
     if [[ "${s_verb}" != status ]] || ! round_call_is "${CALL_OF[${key}]}" "${c_verb}" "${c_args}"; then
         sed 's/^/  | /' <<< "${rows}" >&2
         fail "${step}: the round's first calls of ${id} are '${s_verb}' and '${c_verb}', not status then ${CALL_OF[${key}]}"
@@ -2761,8 +2772,8 @@ check_probe_clear() {
     f_pos="$(field_of 1 "${fm}")"
     (( f_pos > p_pos )) || fail "${step}: the find-missing at shim line ${f_pos} comes before the probe at ${p_pos}"
     # Then exactly one retry, and no call of the id between the probe and the
-    # find-missing. The own-id persona's retry is one `resume`, its first
-    # call after the find-missing. The pane-not-found persona's is one run
+    # find-missing. The own-id persona's retry is one fresh provenance `get`
+    # then one `resume` after the find-missing. The pane-not-found persona's is one run
     # of the restart path's decision: one launch that launches (here a
     # `resume`, the row having a session id), its ladder's first plain spawn
     # before it, which meets the row, recorded.
@@ -2776,8 +2787,8 @@ check_probe_clear() {
     r_pos="$(field_of 1 "${launches}")"
     spawns="$(verb_rows spawn "${r_rows}")" || exit 1
     if [[ "${RETRY_OF[${key}]}" == "${CALL_RESUME}" ]]; then
-        [[ -z "${spawns}" && "$(sed -n 1p <<< "${r_rows}" | cut -f 1)" == "${r_pos}" ]] \
-            || { sed 's/^/  | /' <<< "${r_rows}" >&2; fail "${step}: the retry after the find-missing is not one resume"; }
+        [[ -z "${spawns}" && "$(field_of 4 "${r_rows}" | head -n 2 | tr '\n' ' ')" == "get resume " ]] \
+            || { sed 's/^/  | /' <<< "${r_rows}" >&2; fail "${step}: the retry after the find-missing is not one fresh provenance get then one resume"; }
     else
         while IFS=$'\t' read -r pos _ _ verb _ args; do
             [[ -n "${pos}" ]] || continue
@@ -2968,22 +2979,23 @@ relabel_quiet_rounds() {
 }
 
 # relabel_retry_round <step> <key>: at CALL_I, the finished-row retry's
-# round: one `status`, one `get`, then one `resume`, at the cadence, its
+# round: one `status`, one finished-row `get`, one fresh provenance `get`,
+# then one `resume`, at the cadence, its
 # status after the loop's first find-missing; advances CALL_I and PREV_US.
 relabel_retry_round() {
     local step="$1" key="$2" i="${CALL_I}"
-    if [[ "${CALL_VERB[i]:-}" != status || "${CALL_VERB[i + 1]:-}" != get || "${CALL_VERB[i + 2]:-}" != resume ]]; then
+    if [[ "${CALL_VERB[i]:-}" != status || "${CALL_VERB[i + 1]:-}" != get || "${CALL_VERB[i + 2]:-}" != get || "${CALL_VERB[i + 3]:-}" != resume ]]; then
         calls_of "${key}" "${FREE_MARK[${key}]}"
-        fail "${step}: the round after the row read missing is '${CALL_VERB[i]:-} ${CALL_VERB[i + 1]:-} ${CALL_VERB[i + 2]:-}', not status, get, resume"
+        fail "${step}: the round after the row read missing is '${CALL_VERB[i]:-} ${CALL_VERB[i + 1]:-} ${CALL_VERB[i + 2]:-} ${CALL_VERB[i + 3]:-}', not status, get, get, resume"
     fi
     (( CALL_POS[i] > LOOP_FIRST_POS )) \
         || fail "${step}: the finished-row retry's status (shim line ${CALL_POS[i]}) is not after the loop's first find-missing (${LOOP_FIRST_POS})"
     check_cadence "${step}: the finished-row retry (get)" "${PREV_US[${key}]}" "${CALL_US[i]}" "${CALL_US[i + 1]}" get
-    (( CALL_US[i + 2] - CALL_US[i] <= SETTLE_S * 1000000 )) \
-        || fail "${step}: the finished-row retry's resume came $(secs_of $(( CALL_US[i + 2] - CALL_US[i] ))) s after its status, more than the ${SETTLE_S} s settle"
-    echo "${TEST_NAME}: ${step}: the finished-row retry: status at shim line ${CALL_POS[i]}, get at ${CALL_POS[i + 1]}, resume at ${CALL_POS[i + 2]}"
+    (( CALL_US[i + 3] - CALL_US[i] <= SETTLE_S * 1000000 )) \
+        || fail "${step}: the finished-row retry's resume came $(secs_of $(( CALL_US[i + 3] - CALL_US[i] ))) s after its status, more than the ${SETTLE_S} s settle"
+    echo "${TEST_NAME}: ${step}: the finished-row retry: status at shim line ${CALL_POS[i]}, get at ${CALL_POS[i + 1]}, provenance get at ${CALL_POS[i + 2]}, resume at ${CALL_POS[i + 3]}"
     PREV_US[${key}]="${CALL_US[i]}"
-    CALL_I=$(( i + 3 ))
+    CALL_I=$(( i + 4 ))
 }
 
 # check_relabel_relatch: leg 1 (see the header): after its pane's respawn and
@@ -3002,13 +3014,13 @@ check_relabel_relatch() {
     relabel_quiet_rounds "${step}" "${key}"
     relabel_retry_round "${step}" "${key}"
     while (( CALL_I < len )); do
-        if [[ "${CALL_VERB[CALL_I]}" != status || "${CALL_VERB[CALL_I + 1]:-}" != resume ]]; then
+        if [[ "${CALL_VERB[CALL_I]}" != status || "${CALL_VERB[CALL_I + 1]:-}" != get || "${CALL_VERB[CALL_I + 2]:-}" != resume ]]; then
             sed 's/^/  | /' <<< "${rows}" >&2
-            fail "${step}: a round after the relatch is '${CALL_VERB[CALL_I]} ${CALL_VERB[CALL_I + 1]:-}', not status then resume"
+            fail "${step}: a round after the relatch is '${CALL_VERB[CALL_I]} ${CALL_VERB[CALL_I + 1]:-} ${CALL_VERB[CALL_I + 2]:-}', not status, get, resume"
         fi
-        check_cadence "${step}: a round of the new case" "${PREV_US[${key}]}" "${CALL_US[CALL_I]}" "${CALL_US[CALL_I + 1]}" "${CALL_RESUME}"
+        check_cadence "${step}: a round of the new case" "${PREV_US[${key}]}" "${CALL_US[CALL_I]}" "${CALL_US[CALL_I + 2]}" "${CALL_RESUME}"
         PREV_US[${key}]="${CALL_US[CALL_I]}"
-        CALL_I=$(( CALL_I + 2 ))
+        CALL_I=$(( CALL_I + 3 ))
         f=$(( f + 1 ))
     done
     (( f == FOLLOW_ROUNDS )) || fail "${step}: ${f} round(s) of the new case in the shim's log, not the ${FOLLOW_ROUNDS} round line(s)"

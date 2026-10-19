@@ -122,6 +122,7 @@
  */
 
 import type { Client } from 'agent-director'
+import type { DeliveryAdScope } from './delivery-ad-scope.ts'
 import {
   AD_ERROR_CLASS_CONFIG,
   AD_ERROR_CLASS_DIRECTORY,
@@ -192,6 +193,8 @@ interface PersonaEntry {
 
 /** Dependencies injected via `initOutageState` — wires the module to production Slack + AD. */
 export interface OutageStateDeps {
+  /** E3 reconnects reuse the same guards on their own client's budget. */
+  deliveryScope?: DeliveryAdScope
   /**
    * Fire-and-forget notice for the persona with this key: synchronous, and
    * errors MUST be handled internally by the caller. Production wires the
@@ -272,6 +275,8 @@ export interface ReportAgentDirectorErrorOptions {
 
 /** Options of {@link withOutageDetection}. */
 export interface OutageDetectionOptions {
+  /** Independent persona delivery client; does not replace the singleton. */
+  readonly client?: Client
   /**
    * Present for a call made outside every launch or recovery attempt that
    * must arm nothing: a persona teardown's kill (b.jg5 SRJ-110, SRJ-301;
@@ -803,8 +808,18 @@ export async function withOutageDetection<T>(
       'outage-state: withOutageDetection called before initOutageState — caller-site bug',
     )
   }
+  const scoped = deps.deliveryScope?.current(key)
+  // Budget exhaustion is a local scheduling decision, never an AD outage.
+  scoped?.beforeCall()
+  const effectiveOptions = scoped ? { ...options, armsNothing: options?.armsNothing ?? { personaConfigured: () => true } } : options
   try {
-    const result = await fn(deps.getClient())
+    const selected = options?.client ?? scoped?.client
+    let answer: T
+    if (selected) answer = await fn(selected)
+    else {
+      const result = await fn(deps.getClient())
+      answer = result
+    }
     clearOutageFlag(key, 'ad-unreachable')
     clearOutageFlag(key, AD_CONFIG_MALFORMED)
     if (isTmuxTouchingCall(call)) {
@@ -813,10 +828,10 @@ export async function withOutageDetection<T>(
       clearOutageFlag(key, 'tmux-unavailable', reading)
       endTmuxUnresponsive(key, reading)
     }
-    return result
+    return answer
   } catch (err) {
     const { errorClass } = classifyAdError(err)
-    const armsNothing = options?.armsNothing
+    const armsNothing = effectiveOptions?.armsNothing
     // b.jg5 SRJ-110 (hatch A3): a call that arms nothing raises an
     // ENVIRONMENT or CONFIG outage only for a configured persona.
     const raisesOutage = armsNothing === undefined || armsNothingPersonaConfigured(armsNothing)
@@ -955,6 +970,11 @@ export function reportUnclassifiedAtSite(
   // b.jg5 SRJ-313, SRJ-505: a latch re-check's answer feeds no episode.
   if (!isInsideLatchRecheck(key)) sendUnclassified(key, err, classification)
   return armed
+}
+
+/** Prompt preparation refused a launch; existing retry backoff, no AD error episode (b.omv SR-7.2). */
+export function reportSystemPromptFailureAtSite(key: string, err: unknown): boolean {
+  return reportAttemptCause(key, { kind: 'system-prompt-unwritable', error: err }, undefined, deps?.triggerSink)
 }
 
 /**

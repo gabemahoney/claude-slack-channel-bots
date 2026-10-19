@@ -95,7 +95,7 @@ Extra live evidence (unit-verified in SR-14 as amended by b.deo SRI-1301 to SRI-
 | 7 | `@here` and `@channel` reach each mention-only persona once | Check 10 |
 | 8 | A persona's own broadcast doesn't wake it; the other persona gets it once | Check 11 |
 | 20 | No credential value in the config file, the record, the pending file, the wizard session, the persona transcripts or any log line | Check 29a; also Checks S1, S2, 25 (step 5) and 28 (steps 2 and 7) |
-| 26 | A message to a persona whose instance is down is reported at its destination, not in the channel | Check 24 |
+| 26 (b.omv SR-13.6) | A down persona retains the original message, posts one Messages waiting notice at its destination, then confirms that same item after recovery | Check 24 and its blocking teardown |
 | 35 | A DM to a persona with DMs off is dropped with a `persona-dm-dropped` line | Check 15 |
 | 47 | The server starts and serves with the token environment variables unset | Part 1.4 and Check 1; `guard` refuses every start in a shell that has one (Part 1.3) |
 | 57 | A confirmed removal tears down only that persona | Check 27 |
@@ -126,7 +126,7 @@ part before it leaves.
 5. **Part 5: A receive-all in both channels.** Check 13.
 6. **Part 6: Open access.** Check 14.
 7. **Part 7: DMs and DM prompts.** Checks 15–16, "Turn A's DMs on", Checks 17–23.
-8. **Part 8: Lost message.** Check 24 and its teardown.
+8. **Part 8: Retained message.** Check 24 and its blocking recovery teardown.
 9. **Part 9: Runtime add and remove.** Check 25, Check 26 (optional), Check 27.
 10. **Part 10: Reboot.** Check 28.
 11. **Part 11: Invited channels.** Checks 30–34.
@@ -141,7 +141,7 @@ The order satisfies every constraint the checks have:
 - Checks 15 and 16 run while A's DMs are off, before "Turn A's DMs on".
 - Check 18 (C's first prompt opens the DM with C) runs before Check 19, the first DM the operator sends to C.
 - Check 16 (A may not message the second test user) runs before Check 20 (A opens that DM).
-- Check 24's teardown restores auto-restart before Part 9.
+- Check 24's teardown restores auto-restart and confirms the original queued item's timestamp and sequence against the transcript before Part 9. Stop if that recovery fails; the retained head blocks later items.
 - Part 9 ends with the applied set back to A, B and C and nothing pending, which Check 28 needs. The optional Check 26 runs on the disposable persona D, before D's removal.
 - Part 11 runs after Check 28, from the state it leaves: A, B and C applied and nothing pending. The switch is absent until Check 30, so every check before it runs with the switch absent.
 - Check 34 restores the `config.json` bytes Check 30 copied, and archives the run channel, before Check 29a.
@@ -366,7 +366,7 @@ tags() {
          elif .type == "attachment" and .attachment.type? == "queued_command" then .attachment.prompt
          else empty end
          | if type == "string" then . else (.[]? | .text? // empty) end' "$t" \
-    | grep -oE '<channel source="slack[^"]*"[^>]*>' | grep -F " ts=\"$2\""
+    | grep -oE '<channel source="slack-channel-router"[^>]*>' | grep -F " ts=\"$2\""
 }
 
 # tagstext a|b|c|d 'TEXT': the tag of every delivered message whose content
@@ -380,7 +380,7 @@ tagstext() {
          else empty end
          | if type == "string" then . else (.[]? | .text? // empty) end
          | select(contains($s))' "$t" \
-    | grep -oE '<channel source="slack[^"]*"[^>]*>'
+    | grep -oE '<channel source="slack-channel-router"[^>]*>'
 }
 
 # replies a|b|c|d: every reply tool call in the persona's current
@@ -753,9 +753,13 @@ The persona's session transcript is the authoritative record of what reached
 the persona. Every delivered Slack message appears in it as a user entry
 whose content starts with a `<channel …>` tag, or, when it arrived while the
 persona was mid-turn, as a `queued_command` attachment whose prompt does. The
-count of those tags for a message's `<TS>` is its delivery count, and the
+tags for a message's `<TS>` identify its transcript appearances, and the
 tag's attributes give its `chat_id`, `via` and the author's `user_id` or
-`bot_id`.
+`bot_id`. Typed tags use `source="slack-channel-router"`. The queue is strict
+FIFO with one item in flight per persona; confirmation requires transcript
+evidence. Delivery is at least once: an unconfirmed attempt may be retyped.
+The normal one-tag checks below exercise a successful attempt, not an
+exactly-once guarantee across failures (b.omv SR-13.6 and the review answers).
 
 - **Delivered tags:** `tags <persona> <TS>` (Part 1.3). For an edited message, whose tag may not carry the `<TS>` from its link, `tagstext <persona> '<text>'`. Both read only `type == "user"` entries and `queued_command` attachments: the transcript also records a `queue-operation` entry for each incoming message, which would double the count.
 - **Tool calls and tool errors:** `replies <persona>`. Each line is one `reply` call, with its `chat_id`, whether the result was an error, and the result text the server returned. A check picks out its call by target, for example `replies a | grep -F 'chat_id=<SECOND_USER_ID>' | tail -n 1`. A refusal is returned to the persona only, never logged, so the transcript is where it is read. Claude Code may wrap an MCP error's text, so a check matches the expected text with "contains", not as the whole result.
@@ -796,11 +800,12 @@ more than once since the mark; read the rotated files by hand for that step
 and record it in Notes:
 
 - `[slack] RAW message event persona=<key>: …` and `[slack] RAW app_mention event persona=<key>: …`: one per event the persona's connection received. The text after the colon is the first 300 characters of the event JSON.
-- `[slack] Dispatching to persona "<name>" (key=<key>) chat_id=<channel> …`: one per message delivered to that persona.
+- `[slack] message-received: persona="<name>" (key=<key>) source=slack chat_id="<channel>" ts="<TS>" sender_id="<sender>"`: one per durably accepted item, including one acceptance for a paired `message` / `app_mention` event.
+- `[slack] message-delivered: persona="<name>" (key=<key>) source=slack chat_id="<channel>" ts="<TS>" sender_id="<sender>"`: transcript-confirmed delivery. Match the full persona, source, channel, timestamp and sender fields; a body excerpt or an unrelated timestamp is not evidence.
 - `[slack] persona "<name>" (key=<key>) dropped message from channel=<channel> user=<U…>: <reason>` (or `bot_id=<B…>` for an author without a user): one per message the persona's pipeline dropped, for example with reason `own` or `not-mentioned`.
 
 A duplicate event, such as the second of a `message` / `app_mention` pair,
-logs its RAW line and nothing else.
+logs its RAW line and adds no second acceptance or received diagnostic.
 
 ### 2.2 Config edits after the first start
 
@@ -1128,7 +1133,7 @@ Expected:
 
 - `server.log` has two RAW lines for `persona=persona_a` with this `<TS>`: one `RAW message event` and one `RAW app_mention event`. If the `ts` is outside a line's prefix, match that line by its time.
 - `tags a <TS>` prints exactly one tag, with `via="mention"` and `user_id="<OPERATOR_USER_ID>"`.
-- Exactly one `Dispatching to persona "persona_a" (key=persona_a) chat_id=<COORDINATION_CHANNEL_ID>` line appears for the message (its `text=` field shows the message text).
+- Exactly one `message-received` and one `message-delivered` line match `persona="persona_a" (key=persona_a) source=slack chat_id="<COORDINATION_CHANNEL_ID>" ts="<TS>" sender_id="<OPERATOR_USER_ID>"`. The transcript tag confirms the same item; neither diagnostic carries message text.
 - A replies "once" in coordination one time, under A's name and avatar.
 
 Pass: Slack sent two events, and A received the message exactly once.
@@ -1191,7 +1196,7 @@ Expected:
 - B replies in coordination under B's own name and avatar, which differ from A's, and its reply mentions A.
 - `tags a <TS of B's reply>` prints exactly one tag, with `via="mention"` and `user_id="<B_BOT_USER_ID>"` (or B's `bot_id`), and A answers it.
 - The later posts checked in step 3 are each delivered exactly once to the persona they mention, with `via="mention"`.
-- Every turn is delivered: no turn goes unanswered until the stop, and each has its `Dispatching to persona` line.
+- Every turn is delivered: no turn goes unanswered until the stop, and each has matching `message-received` and transcript-backed `message-delivered` metadata for its persona, conversation, timestamp and sender.
 - No server-side limit, counter or throttle message appears, in Slack or in `server.log`. The step 5 search returns no line about bot-to-bot delivery. Judge each match it returns; Slack API rate-limit lines unrelated to delivery are not a failure but go in Notes.
 
 Whether the personas obey the stop message is the bots' behaviour, not the
@@ -1273,7 +1278,7 @@ Steps:
    ```sh
    tags a <TS_W1>; tags a <TS_W2>
    tags b <TS_W2>
-   since "$MARK2" | grep -F 'Dispatching to persona "persona_a"'
+   since "$MARK2" | grep -E 'message-(received|delivered): persona="persona_a" \(key=persona_a\) source=slack '
    since "$MARK2" | grep -F 'persona "persona_b" (key=persona_b) dropped message from channel=<COORDINATION_CHANNEL_ID>'
    agent-director list --label service=cscb
    [ "$(tmux list-panes -t slack_bot_persona_a -F '#{pane_pid}')" = "$PANE_BEFORE" ] && echo 'same instance'
@@ -1306,7 +1311,7 @@ Expected:
 - Step 3 prints A's channels with coordination's `delivery` now `all`.
 - Step 4's preview, after its two header lines and a blank line, is `A configuration change is pending; nothing has been applied. personas: 0 added, 0 removed, 0 destructively modified, 1 modified in place, 0 with changed credentials; server-wide settings: 0 changed.` and `persona "persona_a" (key=persona_a): delivery changed: applied in place immediately, instance kept.`
 - Step 5 prints those two preview lines, each prefixed `[slack] reload-preview: `, then exactly two more lines: `[slack] persona "persona_a" (key=persona_a): updated in place (delivery); its instance, Slack connection and MCP session are kept` and `[slack] reload-applied: applied the confirmed configuration change without a restart (personas: 0 added, 0 removed, 0 destructively modified, 1 modified in place, 0 with changed credentials; server-wide settings: 0 changed); the last-applied record "<path of config.json>.last-applied" now holds it`. No `persona-start`, `persona teardown`, `Session disconnected` or `spawnForPersona` line. `cmp` prints `recorded`.
-- Step 7: A replies "home-seen" in A-home and "coord-seen" in coordination, each under A's name and avatar. `tags a <TS_W1>` prints exactly one tag, with `chat_id="<A_HOME_CHANNEL_ID>"` and `via="receive_all"`; `tags a <TS_W2>` prints exactly one, with `chat_id="<COORDINATION_CHANNEL_ID>"` and `via="receive_all"`. `tags b <TS_W2>` prints nothing, and the drop grep prints a line ending `user=<OPERATOR_USER_ID>: not-mentioned` for the operator's message: B, mentions-only, still gets nothing unaddressed. (A second B drop line, for A's own "coord-seen" reply, may follow; it is expected.) The `Dispatching` grep prints exactly two lines, one per message. The list still has exactly one row for A, `cscb_persona_a`, and `same instance` is printed.
+- Step 7: A replies "home-seen" in A-home and "coord-seen" in coordination, each under A's name and avatar. `tags a <TS_W1>` prints exactly one tag, with `chat_id="<A_HOME_CHANNEL_ID>"` and `via="receive_all"`; `tags a <TS_W2>` prints exactly one, with `chat_id="<COORDINATION_CHANNEL_ID>"` and `via="receive_all"`. `tags b <TS_W2>` prints nothing, and the drop grep prints a line ending `user=<OPERATOR_USER_ID>: not-mentioned` for the operator's message: B, mentions-only, still gets nothing unaddressed. (A second B drop line, for A's own "coord-seen" reply, may follow; it is expected.) The diagnostic grep prints one `message-received` and one `message-delivered` line for each of the two messages; match `<A_HOME_CHANNEL_ID>` with `<TS_W1>` and `<COORDINATION_CHANNEL_ID>` with `<TS_W2>`, both with `sender_id="<OPERATOR_USER_ID>"`. The list still has exactly one row for A, `cscb_persona_a`, and `same instance` is printed.
 - Step 9: the first command prints one `[slack] persona "persona_a" (key=persona_a): updated in place (delivery); …` line and one `[slack] reload-applied: …` line with the same counts as step 5, and nothing else. The record shows coordination's `delivery` as `mentions` again. `same server` and `same instance` are printed. `tags a <TS_W3>` prints nothing: A is mentions-only in coordination again. A answers "driftwood" in A-home.
 
 A second row for A, a changed pane process or server PID, or any
@@ -1485,7 +1490,7 @@ Steps:
 
    ```sh
    since "$MARK" | grep -F 'persona-dm-dropped:' | grep -F 'ts=<TS>'
-   since "$MARK" | grep -F 'Dispatching to persona "persona_a"' | grep -F 'chat_id=<A_DM_ID>'
+   since "$MARK" | grep -E 'message-(received|delivered): persona="persona_a" ' | grep -F 'chat_id="<A_DM_ID>" ts="<TS>"'
    tags a <TS>
    since "$MARK" | grep -E 'persona=persona_(b|c):' | grep -F '<TS>'
    ```
@@ -1689,11 +1694,11 @@ Steps:
    tags c <TS>
    replies c
    since "$START_MARK" | grep -F '(key=persona_c)' \
-     | grep -oE 'chat_id=[A-Z0-9]+|channel=[A-Z0-9]+|in (channel|conversation) [A-Z0-9]+' | sort -u
+     | grep -oE 'chat_id="[A-Z0-9]+"|channel=[A-Z0-9]+|in (channel|conversation) [A-Z0-9]+' | sort -u
    since "$START_MARK" | grep -F 'unclaimed-channel: personas[2] "persona_c"'
    ```
 
-   The third command lists every conversation ID on C's lines since that start: its `Dispatching to persona "persona_c" (key=persona_c) chat_id=…` lines, any `dropped message from channel=…` line, and any `persona-dm-dropped` or `unclaimed-channel` line (`… in conversation …` / `… in channel …`). The RAW lines are not used: they keep only the first 300 characters of the event, which usually cut off its `"channel"` field.
+   The third command lists every conversation ID on C's lines since that start: its `message-received` and transcript-backed `message-delivered` lines with `persona="persona_c" (key=persona_c)` and `chat_id="…"`, any `dropped message from channel=…` line, and any `persona-dm-dropped` or `unclaimed-channel` line (`… in conversation …` / `… in channel …`). The RAW lines are not used: they keep only the first 300 characters of the event, which usually cut off its `"channel"` field.
 
 4. In the test workspace's channel browser, open every channel (A-home, coordination and the workspace's default channels) and look at its member list.
 
@@ -1745,8 +1750,9 @@ reaches it as a new mention, once. A is mentions-only in coordination (Check
 
 An edited message's delivered tag may not carry the `<TS>` from the
 message's link, so this check counts deliveries with `tagstext` (Part
-1.3), keyed on the text `edit check`. The `Dispatching` lines
-carry no `via`; they only corroborate the count.
+1.3), keyed on the text `edit check` inside the transcript. Use the tag's
+actual timestamp with `message-received` and `message-delivered` metadata
+for A and coordination; neither diagnostic carries `via` or a message body.
 
 Steps:
 
@@ -1758,7 +1764,7 @@ Steps:
    tagstext a 'edit check'
    tagstext b 'edit check'
    tags a <TS>
-   since "$MARK" | grep -F 'Dispatching to persona "persona_a"' | grep -F 'edit check'
+   since "$MARK" | grep -E 'message-(received|delivered): persona="persona_a" ' | grep -F 'chat_id="<COORDINATION_CHANNEL_ID>" ts="<TAG_TS>" sender_id="<OPERATOR_USER_ID>"'
    ```
 
 4. Observation only: edit the message again to fix a typo while keeping the mention (for example "@CSCB Test A edit check: reply with the word edited!"). Wait two minutes and run `tagstext a 'edit check'` again.
@@ -1766,7 +1772,7 @@ Steps:
 Expected:
 
 - Step 2: `tagstext a 'edit check'` prints nothing (A is mentions-only in coordination).
-- Step 3: `tagstext a 'edit check'` prints exactly one tag, with `via="mention"` and `user_id="<OPERATOR_USER_ID>"`. `tagstext b 'edit check'` prints nothing. The `grep` prints exactly one line. A replies "edited" in coordination once, under its own name and avatar.
+- Step 3: `tagstext a 'edit check'` prints exactly one tag, with `via="mention"` and `user_id="<OPERATOR_USER_ID>"`. `tagstext b 'edit check'` prints nothing. Set `<TAG_TS>` from that tag; the `grep` prints one received and one delivered diagnostic with its exact metadata. A replies "edited" in coordination once, under its own name and avatar.
 - Record in Notes whether `tags a <TS>` printed that same tag, or nothing (the tag's `ts` differs from `<TS>`; record the tag's `ts`). Either is acceptable.
 
 Step 4 is not part of the pass. Record in Notes how many tags
@@ -1834,15 +1840,13 @@ Pass: both prompts were pending at once, each at its own persona's destination u
 
 ---
 
-## Part 8: Lost message
+## Part 8: Retained message
 
-This check verifies AC 26 and b.av2 SR-4.6 (a message that finds no live,
-stream-bearing session is not delivered, and recovery follows the
-human-trigger rules) and SR-7.3 (the persona's permission-prompt destination
-is told that a message was lost, who sent it and the recovery state, with no
-message text, and nothing else is posted in the source conversation). It also
-checks, in passing, SR-7.2 (the notice is posted under the persona's own
-identity) and SR-4.5 (a lost message gets no acknowledgement reaction).
+This check verifies b.omv SR-13.6's replacement for AC 26: a message to a
+down persona stays durably queued. One fixed E5 *Messages waiting* notice
+goes to the persona's permission-prompt destination under its identity,
+without the message body. No receipt reaction or delivery is reported before
+transcript confirmation. Recovery must deliver the original retained item.
 
 State at the start: the server that is already running after Part 7, with
 A's DMs on. The check's own teardown brings A back, so Part 9 starts from a
@@ -1877,7 +1881,7 @@ then restarts the test server with the "Guarded restart" (Part 2.3):
 A's destination is A-home (`"permission_prompts": "<A_HOME_CHANNEL_ID>"`). A
 is mentions-only in coordination, so the message must mention A.
 
-### Check 24: a message to a downed persona is reported at its destination, not in the channel (AC 26)
+### Check 24: a downed persona retains the message and reports it at its destination (AC 26, b.omv SR-13.6)
 
 Steps:
 
@@ -1890,34 +1894,39 @@ Steps:
    ```
 
 4. Record where the log ends again: `MARK2=$(mark)`.
-5. As the operator, in coordination, post "@CSCB Test A lost-message check lost-marker-7Q3Z, reply with the word back." The marker `lost-marker-7Q3Z` is how the notice is checked for message text. Work out the message's `<TS>`.
-6. Wait two minutes, watching A-home and coordination. Then run:
+5. As the operator, in coordination, post "@CSCB Test A waiting-message check waiting-marker-7Q3Z, reply with the word back." Record the original message's `<TS>` immediately and keep `MARK2` for recovery. Send no replacement message.
+6. Wait two minutes, watching A-home and coordination. Then read the correlated metadata and the queue:
 
    ```sh
-   since "$MARK2" | grep -F 'No live session for persona "persona_a" (key=persona_a)'
-   since "$MARK2" | grep -F 'DROP: no _GET_stream for persona "persona_a"'
-   since "$MARK2" | grep -F 'Dispatching to persona "persona_a"'
-   since "$MARK2" | grep -F 'persona-destination-failed:'
-   since "$MARK2" | grep -F 'Scheduling restart for persona=persona_a'
+   since "$MARK2" | grep -E 'message-(received|delivered): persona="persona_a" ' | grep -F 'source=slack chat_id="<COORDINATION_CHANNEL_ID>" ts="<TS>" sender_id="<OPERATOR_USER_ID>"'
+   jq -cs --arg channel '<COORDINATION_CHANNEL_ID>' --arg ts '<TS>' --arg sender '<OPERATOR_USER_ID>' '
+     . as $all
+     | [.[] | select(.kind == "accepted" and .compact == null and .source == "slack"
+         and .channel == $channel and .ts == $ts and .user == $sender
+         and .key.chat_id == $channel and .key.ts == $ts)] as $items
+     | {accepted: ($items | length), seqs: ($items | map(.seq)),
+        attempts: [$all[] | select(.kind == "sent" or .kind == "delivered")
+          | select(.seq as $seq | $items | any(.seq == $seq))],
+        allAccepted: ([$all[] | select(.kind == "accepted" and .compact == null)] | length)}' "$S/queue/persona_a.jsonl"
+   since "$MARK2" | grep -E 'persona-destination-failed:|Scheduling restart for persona=persona_a|Relaunching session for persona=persona_a|spawnForPersona:.*"persona_a"|Session connected: persona "persona_a"'
    tags a <TS>
    ```
 
-7. Look at the message in coordination for any reaction, and at A-home and coordination for every post made after it.
+   Record the sole accepted sequence as `<ORIGINAL_SEQ>`. Verify independently that every earlier accepted item in A's journal already has every fixed part receipted; the original is A's only outstanding item. Historical confirmed items may remain in the journal, so `allAccepted` need not be 1.
+7. Look at the original message in coordination for reactions, and at A-home and coordination for every post made after it, including threads.
 
 Expected:
 
-- Step 3 prints a `[slack] Session disconnected` line for `persona "persona_a" (key=persona_a)` and at least one `[slack] Auto-restart disabled (delay=0) — skipping restart for persona=persona_a` line. A does not come back while the check runs.
-- Step 6's first command prints exactly one line: `[slack] No live session for persona "persona_a" (key=persona_a) chat_id=<COORDINATION_CHANNEL_ID> — dropping message`. (If it prints nothing and the second command prints a `[slack] DROP: no _GET_stream for persona "persona_a" (key=persona_a) chat_id=<COORDINATION_CHANNEL_ID> …` line instead, A's session was still registered without its stream; that branch reports the same way, so the rest of the check applies. Record which line appeared in Notes.)
-- On the `No live session` path, the `Dispatching` command prints nothing. On the DROP path, it prints exactly one `[slack] Dispatching to persona "persona_a" (key=persona_a) chat_id=<COORDINATION_CHANNEL_ID> … hasGetStream=false …` line, logged just before the DROP line.
-- The `persona-destination-failed` and `Scheduling restart` commands print nothing, and `tags a <TS>` prints nothing: the message was not delivered, and no restart was started.
-- Exactly one new message appears in A-home: the lost-message notice, posted by app A (A's name and avatar). It reads, as Slack renders it: `Persona "persona_a" (key=persona_a): ⚠️ Message lost — a message from <sender> was not delivered to this persona's instance and was not saved; it will not be delivered later. Recovery: auto-restart disabled — the instance will not restart on its own; restart the server to recover.`
-- `<sender>` is the operator's Slack name as the workspace shows it (display name, else full name), or `<OPERATOR_USER_ID>` if the name can't be looked up. It is plain text, not an @-mention.
-- The notice doesn't contain `lost-marker-7Q3Z` or any other words from the message.
-- Nothing appears in coordination after the operator's message: no reply, notice or other post from A, B, C or the server, including in a thread.
-- The message in coordination has no reaction from A: the configured `ack_reaction` emoji is not on it.
+- Step 3 prints A's `Session disconnected` and `Auto-restart disabled (delay=0)` lines. A stays down throughout the observation.
+- Exactly one `message-received` diagnostic matches the original persona, channel, timestamp and sender. The queue has exactly one full acceptance of that item and no sent attempt, receipt or compacted delivered key for it. No correlated `message-delivered` line or transcript tag exists yet.
+- The lifecycle grep and `tags` print nothing: no destination failure, scheduled restart, relaunch, spawn, reconnect or premature delivery.
+- Exactly one new message appears in A-home, posted by app A with A's name and avatar. Its exact fixed E5 mrkdwn is `:warning: *Messages waiting* — 1 message(s) for "persona_a" (key=persona_a) are waiting; the oldest has waited <AGE>. The persona is down with automatic restarts off. The messages are kept and delivered once the persona is up.` The age uses the server's elapsed-age format (`<n>s`, `<n>m` or `<n>h <n>m`).
+- The notice contains neither `waiting-marker-7Q3Z` nor any message-body words, and does not @-mention the sender.
+- Coordination gets no post from A, B, C or the server, including threaded posts. The original message has no `eyes` reaction from A before recovery.
 
-A notice in coordination, a second lost-message notice, or the marker in the
-notice fails this check. So does an `ack_reaction` on the message.
+A second waiting notice, a notice in coordination, message text in the
+notice, or a premature receipt reaction fails this check. Keep the original
+queue item and its identity for teardown even if an assertion fails.
 
 Teardown for this check (operator step on the test host), run whatever the result:
 
@@ -1934,17 +1943,19 @@ Teardown for this check (operator step on the test host), run whatever the resul
 
    Wait about 10 s, read the preview with `showpending` (the same two preview lines as the setup's step 3), and confirm it, only if the guard passes: `if guard; then mv "$S/config.json.pending" "$S/config.json.apply"; fi`. Wait about 10 s; `since "$MARK" | grep -F 'reload-applied:'` prints one line whose counts end `server-wide settings: 1 changed)`. Without the confirmation, the next start runs the record with a delay of 0, and auto-restart stays off.
 3. Run the "Guarded restart" (Part 2.3), with its Expected items. A's instance is brought up again, resumed or fresh-spawned, and the restored delay is in effect.
-4. In A-home, post "Reply with the word back." A replies "back" in A-home under its own name and avatar.
+4. Wait up to five minutes for the **original** coordination item. `tags a <TS>` must show `source="slack-channel-router"`, `chat_id="<COORDINATION_CHANNEL_ID>"`, the original `ts` and `user_id="<OPERATOR_USER_ID>"`. There must be exactly one matching `message-delivered` diagnostic since `MARK2`; a reply alone is insufficient.
+5. Confirm the same `<ORIGINAL_SEQ>` in `$S/queue/persona_a.jsonl`: its full acceptance has a `fixed` record with nonempty parts and a `delivered` record for every part, each with a transcript receipt path and UUID or offset. If startup compaction replaced that content, require the retained `accepted` record with `compact="key"`, matching channel, original timestamp and sequence, and numeric `delivered_at`; still require the matching transcript tag and diagnostic. The original item must have zero outstanding parts.
 
-If A doesn't answer after the restart, record that in Notes: later parts
-need all three personas up.
+This teardown is blocking: do not enter Part 9 unless the original item's
+transcript-backed confirmation succeeds. Record its timestamp and sequence
+in Notes. Preserve the queue and report failure if it remains outstanding;
+a new message that happens to get a reply does not prove recovery.
 
-Pass: A's instance was down with auto-restart off, the message was dropped
-with the `No live session` (or `DROP: no _GET_stream`) line, exactly one
-lost-message notice naming the operator and "auto-restart disabled" appeared
-in A-home under A's identity without the marker, nothing was posted in
-coordination, the message got no `ack_reaction`, and A answered again after
-the teardown.
+Pass: A retained the original item while down, posted exactly the fixed
+waiting notice at A-home without body text, made no premature delivery,
+reaction or restart, and confirmed that same item after the delay was
+restored and the server restarted. Recovery delivers to coordination with
+the original routing tag; the alert stays private to A-home.
 
 
 ---
@@ -2175,13 +2186,13 @@ Steps:
    MARK2=$(mark)
    ```
 
-7. In D-home, post "@CSCB Test D reply with the word gone." In the operator's DM with app D, send "Reply with the word gone." Wait two minutes, then run `since "$MARK2" | grep -E 'persona=persona_d:|Dispatching to persona "persona_d"|persona-dm-dropped: .*"persona_d"'`.
+7. In D-home, post "@CSCB Test D reply with the word gone." In the operator's DM with app D, send "Reply with the word gone." Wait two minutes, then run `since "$MARK2" | grep -E 'persona=persona_d:|message-(received|delivered): persona="persona_d"|persona-dm-dropped: .*"persona_d"'`.
 8. If step 2 ran, click **Allow** on D's prompt. Wait one minute, then run `ls ~/cscb-live/d/removal-prompt.txt`.
 9. In A-home, post "What word did I ask you to remember? Reply with just that word."
 
 Expected:
 
-- Step 4: the pending file's preview is `A configuration change is pending; nothing has been applied. personas: 0 added, 1 removed, 0 destructively modified, 0 modified in place, 0 with changed credentials; server-wide settings: 0 changed.` and `DESTRUCTIVE: persona "persona_d" (key=persona_d) is removed: the persona will be retired: its session stopped and never resumed.` The `grep` prints the same two lines once each, prefixed `[slack] reload-preview: `. Nothing about it appears in Slack.
+- Step 4: the pending file's preview is `A configuration change is pending; nothing has been applied. personas: 0 added, 1 removed, 0 destructively modified, 0 modified in place, 0 with changed credentials; server-wide settings: 0 changed.` and `DESTRUCTIVE: persona "persona_d" (key=persona_d) is removed: the persona will be retired: its session stopped and never resumed; 0 open queued items kept, delivered only if a persona with the same key is added again.` The `grep` prints the same two lines once each, prefixed `[slack] reload-preview: `. Nothing about it appears in Slack.
 - Step 6 prints `[slack] persona teardown of "persona_d" (key=persona_d): starting`, `[slack] persona teardown of "persona_d" (key=persona_d): complete` (not `complete, with <n> failed step(s)`), exactly one `[slack] persona teardown of "persona_d" (key=persona_d): agent-director kill of cscb_persona_d: <outcome> after <n> kill(s); the row is kept (b.jg5 SRJ-715)` line (a `… kill of cscb_persona_d failed: …` line is not one), and one `[slack] reload-applied: …` line whose counts read `personas: 0 added, 1 removed, 0 destructively modified, 0 modified in place, 0 with changed credentials; server-wide settings: 0 changed`. A `Session disconnected` line for `persona "persona_d" (key=persona_d)` may also appear; record it in Notes. No line names `persona_a`, `persona_b` or `persona_c`, and there is no `persona-start` line.
 - `recorded` and `same server` are printed, `find-missing` exits 0, and `ls` reports that neither `config.json.pending` nor `config.json.apply` exists.
 - The list has exactly four rows: `cscb_persona_a`, `cscb_persona_b` and `cscb_persona_c`, with the instance IDs recorded in Check 25 step 1, each with its persona label and still live; and exactly one `cscb_persona_d` row, carrying a `persona` label naming `persona_d`, kept and not live: its state is `ended` or `missing`. The teardown killed D's row and kept it.
@@ -2367,7 +2378,7 @@ Expected:
 
 - Step 1: `test host` and `recorded` are printed. `ls` reports that `config.json.pending` does not exist. The record names `persona_a`, `persona_b` and `persona_c`. The list has one live row per configured persona, `cscb_persona_a`, `cscb_persona_b` and `cscb_persona_c`, each carrying its persona's label, plus, when Check 27's step 1 list had a `cscb_persona_d` row (live or not, whether or not D connected in Check 25), D's kept row `cscb_persona_d`, not live (state `ended` or `missing`): Check 27's teardown killed it and kept it. When that list had no row for D, the list has no row for D. It has no other row.
 - Step 2: the credentials command prints both `ok` lines and `Wrote <home>/.config/claude-slack-channel-bots/persona_b-credentials.json with mode 0600. …`. After its two header lines and a blank line, the pending file's preview is `A configuration change is pending; nothing has been applied. personas: 0 added, 0 removed, 0 destructively modified, 0 modified in place, 1 with changed credentials; server-wide settings: 0 changed.` and `persona "persona_b" (key=persona_b): credentials file "<home>/.config/claude-slack-channel-bots/persona_b-credentials.json" changed: a new connection opens, then the old one closes, instance kept.` The preview names B and the file path and no token, and the `tokcount` prints `0`. The log has the same two lines, prefixed `[slack] reload-preview: `, and no `persona-start`, `Session disconnected`, `persona teardown` or `reload-applied` line: nothing was applied. B replies "still-here" in coordination under its own name and avatar: B keeps serving on its current connection.
-- Step 3: `config.json.pending` has exactly one `DESTRUCTIVE:` line, `DESTRUCTIVE: persona "persona_c" (key=persona_c) is removed: the persona will be retired: its session stopped and never resumed.`, and B's credentials line after it. Its first line's counts read `personas: 0 added, 1 removed, 0 destructively modified, 0 modified in place, 1 with changed credentials; server-wide settings: 0 changed`. The log has exactly one `[slack] reload-preview:` line with that `DESTRUCTIVE:` line, not repeated over the six checks. There is no `persona-start` or `Session disconnected` line, and the list has the same rows as at step 1, C's row still live and D's kept row (if any) still not live: nothing was applied.
+- Step 3: `config.json.pending` has exactly one `DESTRUCTIVE:` line, `DESTRUCTIVE: persona "persona_c" (key=persona_c) is removed: the persona will be retired: its session stopped and never resumed; 0 open queued items kept, delivered only if a persona with the same key is added again.`, and B's credentials line after it. Its first line's counts read `personas: 0 added, 1 removed, 0 destructively modified, 0 modified in place, 1 with changed credentials; server-wide settings: 0 changed`. The log has exactly one `[slack] reload-preview:` line with that `DESTRUCTIVE:` line, not repeated over the six checks. There is no `persona-start` or `Session disconnected` line, and the list has the same rows as at step 1, C's row still live and D's kept row (if any) still not live: nothing was applied.
 - Step 5: `running` is printed. The log has one `[slack] Starting from the last-applied record "<path of config.json>.last-applied"` line and no `No last-applied record` line. It has `[slack] Loaded persona config: 3 persona(s)` and one `[slack] persona-start: personas[<i>] "<name>" (key=<key>): bring-up starting` line for each of `persona_a`, `persona_b` and `persona_c`. It has one `[slack] startupSessionManager: complete — 3 persona(s): …` line ending `0 failed, 0 not brought up, 0 not reconnected, 0 latched, 0 retrying, 0 waiting on a live-row sequence, 0 held on invalid flags, 0 fresh as retired keys`, and no failure line, none for B included: B connected with its credentials file as it stands, the `cscb-live-rotated` token. It has at least one `[slack] Session connected: persona "persona_b" (key=persona_b)` line. The list has exactly one live row for each of the three personas, C included, plus D's kept row, not live, when step 1 had it, and no other row. Record the summary line's resumed and fresh counts in Notes. One exception, a transient the server recovers from: when Slack was unreachable for a persona at the start, the summary counts it in `not brought up` and the log has its `persona-slack-unreachable` line (and its `cleared:` line). If that persona then logs `[slack] persona "<name>" (key=<key>): up after its bring-up retry (Slack) — launching` and its `Session connected` line appears within the wait, the summary may end `0 failed, <n> not brought up, 0 not reconnected, 0 latched, 0 retrying, 0 waiting on a live-row sequence, 0 held on invalid flags, 0 fresh as retired keys`, `<n>` being the number of such personas, and their `persona-slack-unreachable` lines up to that retry are not failure lines. Record it in Notes. Any other failure line, or a persona that doesn't connect, still fails this step.
 - Step 6: `config.json.pending` is present again. Its first line's counts read `personas: 0 added, 1 removed, 0 destructively modified, 0 modified in place, 0 with changed credentials; server-wide settings: 0 changed`, it has C's `DESTRUCTIVE:` line, and nothing names `persona_b` (the count prints `0`): the start applied B's credentials change, so it is no longer pending, while the unconfirmed removal of C still is. The log has exactly one `[slack] reload-preview:` line with that `DESTRUCTIVE:` line since the reboot: the first check after the start found the edit and logged it once. `cmp` reports that the files differ, and the record still names all three personas.
 - Step 7: A answers "rebooted" in A-home, B in coordination and C in the DM with C, each under its own name and avatar. After the older token is revoked, B answers "rotated" in coordination and the `grep` prints nothing: B's connection runs on the new token. No post in Slack mentions a pending change, a preview, `DESTRUCTIVE` or the configuration. All three counts print `0`.

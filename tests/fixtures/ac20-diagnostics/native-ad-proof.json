@@ -1,0 +1,32 @@
+{
+  "panePid": 329,
+  "paneExecutable": "/opt/claude-code/2.1.296/claude",
+  "nativeVersion": "2.1.296",
+  "nativeSha256": "24972e3bc859fab2b46ed4c1e51f7d6130f06d3bd550811a114640de3370d0de",
+  "status": {
+    "state": "waiting"
+  },
+  "sessionStart": [
+    {
+      "event": "ad.hook.fired",
+      "event_name": "SessionStart",
+      "instance_id": "cscb_aiac20",
+      "matcher": [
+        "*"
+      ],
+      "relay_mode": "off",
+      "request_token": null,
+      "session_id": "58eb58f0-f7cf-4e24-a58a-bdc156a2250c",
+      "source": "ad_hook",
+      "tool_name": null,
+      "ts": "2026-10-17T18:51:00.608Z",
+      "upsert_outcome": "updated"
+    }
+  ],
+  "stateTransitions": [],
+  "ignoredHooks": 0,
+  "paneGrandparentHooks": 0,
+  "readiness": "actual AD accepted SessionStart and original _real_empty passed; no CSCB/MCP transport needed for this isolated identity regression",
+  "network": "none",
+  "caseInputs": 0
+}

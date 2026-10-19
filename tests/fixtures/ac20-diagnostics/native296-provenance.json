@@ -1,0 +1,137 @@
+{
+  "version": "2.1.296",
+  "binarySha256": "24972e3bc859fab2b46ed4c1e51f7d6130f06d3bd550811a114640de3370d0de",
+  "binaryBytes": 257068216,
+  "retainedImageId": "sha256:4644f1b79ef000d79aa13977d6d53337d19b2eaf65ede2d7aa706d7e5b5cfcad",
+  "hostBinaryReadOnly": true,
+  "hostBinaryExecuted": false,
+  "networkNoneImageVersion": "2.1.296 (Claude Code)",
+  "networkNoneImageBinarySha256": "24972e3bc859fab2b46ed4c1e51f7d6130f06d3bd550811a114640de3370d0de",
+  "noBinaryCopy": true,
+  "fragments": [
+    {
+      "name": "debug-stderr-sink",
+      "file": "native296-debug-stderr-sink.txt",
+      "binaryOffset": 207324801,
+      "bytes": 262,
+      "sha256": "64393d5c80c99958c696d27eb4c3b946715fc61242976472b6a0c2313fdcc47b",
+      "start": "emit(e,n){if(!this.shouldLog(e))return;",
+      "end": "write(e){let n=this.getWriter()"
+    },
+    {
+      "name": "sdk-logger",
+      "file": "native296-sdk-logger.txt",
+      "binaryOffset": 211569603,
+      "bytes": 292,
+      "sha256": "ab9ed3e6c385dab41f727490e3eed36a675498a016812b7cbd9bca0cc2587df5",
+      "start": "function Lt(){return{error:(e,...r)=>console.error(\"[Anthropic SDK ERROR]\"",
+      "end": "async function eF({apiKey:"
+    },
+    {
+      "name": "timeout-watchdogs",
+      "file": "native296-timeout-watchdogs.txt",
+      "binaryOffset": 211580789,
+      "bytes": 918,
+      "sha256": "ea5ae8ef4e5c61de28c35837025231cabacf3b12d81d7509744d1e41af637d6e",
+      "start": "function BJt(){",
+      "end": "var cw=32768,"
+    },
+    {
+      "name": "first-byte-budget",
+      "file": "native296-first-byte-budget.txt",
+      "binaryOffset": 211581958,
+      "bytes": 528,
+      "sha256": "5bf78101de25b6bc9903b17acf94d7608a4de26f1ec3558e86b57a80c04b74d5",
+      "start": "function mw({clientRequestId:",
+      "end": "async function hw("
+    },
+    {
+      "name": "sdk-retry-delay",
+      "file": "native296-sdk-retry-delay.txt",
+      "binaryOffset": 211489653,
+      "bytes": 563,
+      "sha256": "eccc393d92e9a3f8aa9427df1308592a881bd5f686bc0c57b562a9991c1c060b",
+      "start": "async retryRequest(r,n,s,h){",
+      "end": "calculateNonstreamingTimeout("
+    },
+    {
+      "name": "sdk-client-timeout",
+      "file": "native296-sdk-client-timeout.txt",
+      "binaryOffset": 211571583,
+      "bytes": 284,
+      "sha256": "98d403b23a0451d28c14a7c0ca5c14476a1945f321705b17f32d0344e8ccd329",
+      "start": "Yl=um()?.body_idle_timeout,Ge={",
+      "end": "if(Me===\"gateway\")"
+    },
+    {
+      "name": "debug-flag",
+      "file": "native296-debug-flag.txt",
+      "binaryOffset": 225719309,
+      "bytes": 251,
+      "sha256": "d4503b1e9595301ad47ab7a925c3bda94bcb078d88f82cc1c41976bb67a8c658",
+      "start": "-d2e, --debug-to-stderr",
+      "end": "--verbose"
+    },
+    {
+      "name": "retry-request-header",
+      "file": "native296-retry-request-header.txt",
+      "binaryOffset": 211491217,
+      "bytes": 417,
+      "sha256": "f7f1223a2a404e44af831460aab2504121fd975eaa02d752a2963a3b78c0a377",
+      "start": "async buildHeaders({options:r,method:n,bodyHeaders:s,retryCount:h}){",
+      "end": "await this.authHeaders(r)"
+    },
+    {
+      "name": "client-request-id",
+      "file": "native296-client-request-id.txt",
+      "binaryOffset": 211548614,
+      "bytes": 37,
+      "sha256": "e1adf5f5bf1d8318775dd15858d592eb14e57d32ec8beaaef6a4a26331c17af2",
+      "start": "var sbe=\"x-client-request-id\";",
+      "end": "var Jb="
+    },
+    {
+      "name": "native-attempt-headers",
+      "file": "native296-native-attempt-headers.txt",
+      "binaryOffset": 218355495,
+      "bytes": 238,
+      "sha256": "9604b141fe2e56ca063f687b41202ff4a1dadd952c324a8c16c1f606b9f5ddd2",
+      "start": "function oln(e,n){",
+      "end": "function rln(e,n,r){"
+    },
+    {
+      "name": "main-sdk-retries-disabled",
+      "file": "native296-main-sdk-retries-disabled.txt",
+      "binaryOffset": 218356417,
+      "bytes": 359,
+      "sha256": "8431224feb0be5ee8c4744b46821cba79ef3d03de1667824a9a8c0d1d68b356b",
+      "start": "async function*lyr(e,n,r,s,h,y){",
+      "end": "async(Y,he,_e)=>"
+    },
+    {
+      "name": "main-outer-retry-loop",
+      "file": "native296-main-outer-retry-loop.txt",
+      "binaryOffset": 218322024,
+      "bytes": 671,
+      "sha256": "00310328cd04bd9dde1da299e4db0320eaa1f574ee501e0dc5c0a271cf378f43",
+      "start": "async function*ybe(e,n,r){",
+      "end": "let Cn=h.now();"
+    }
+  ],
+  "completionWindowMs": 180000,
+  "diagnosticCeilingMs": 2100000,
+  "graceAfterLinkedRetryOrLateCompletionMs": 60000,
+  "defaultApiTimeoutMs": 600000,
+  "byteIdleClampMaximumMs": 1800000,
+  "defaultFirstSdkRetryDelayRangeMs": [
+    375,
+    500
+  ],
+  "nativeTimeoutsAndRetriesUnchanged": true,
+  "limitations": [
+    "Actual API/rollout timeout overrides or Retry-After may exceed observation ceiling; absent certified linked retry, report the hard ceiling and unknown.",
+    "Main model calls use native outer retries with potentially absent/new client-request IDs. Same-ID SDK retry correlation may be unavailable. Unknown linkage is retained and observation uses the hard ceiling; no request ordinal is treated as retry."
+  ],
+  "mainModelSdkRetries": 0,
+  "nativeOuterRetryLoop": true
+}

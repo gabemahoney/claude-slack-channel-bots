@@ -1,3 +1,7 @@
+import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
+import { IDLE_PANE } from './test-helpers/working-row-panes.ts'
+import { useImmediateTypingLifecycle } from './test-helpers/legacy-typing.ts'
+useImmediateTypingLifecycle()
 /**
  * restart.test.ts — Tests for auto-restart scheduling logic.
  *
@@ -223,7 +227,11 @@ import {
   _resetOutageState,
   initOutageState,
 } from '../src/outage-state.ts'
-import { makeStubClient } from './test-helpers/agent-director-stub.ts'
+import { makeStubClient as makeBaseStubClient } from './test-helpers/agent-director-stub.ts'
+
+function makeStubClient(options: Parameters<typeof makeBaseStubClient>[0] = {}) {
+  return makeBaseStubClient({ readPaneResults: [cannedReadPaneResult(IDLE_PANE)], ...options })
+}
 import { AD_ERROR_CLASS_UNAVAILABLE, AD_ERROR_CLASS_UNCLASSIFIED, CSCB_UNKNOWN_ERROR_NAME, describeAgentDirectorFailure } from '../src/ad-error-class.ts'
 import {
   cannedErr,
@@ -426,7 +434,6 @@ const KILL_SUCCEEDED: KillSuccessOutcome = { kind: KILL_OUTCOME_KILLED, killSent
 type DepsOpts = {
   isSessionAliveResult?: LivenessReading  // default: LIVENESS_READING_DEAD (session is dead)
   isSessionConnectedResult?: boolean  // default: false (not yet reconnected)
-  hasSessionStreamResult?: boolean  // default: true (stream present — prior semantics)
   launchSessionResult?: LaunchSessionResult  // default: true (launch succeeds); 'skipped': the relaunch gate declined
   launchSession?: (key: string, cwd: string, sessionId?: string, deadEvidence?: CarriedDeadEvidence) => Promise<LaunchSessionResult>  // override entire launchSession
   killSession?: (key: string, lastRead: DeadLivenessReading) => Promise<KillSessionResult>  // runs after the capture (e.g. the real kill adapter), given the run's dead reading; its answer is the kill's (default: KILL_SUCCEEDED)
@@ -492,9 +499,6 @@ function makeDeps(opts: DepsOpts = {}): RestartDeps & {
     },
     isSessionConnected(_key) {
       return opts.isSessionConnectedResult ?? false
-    },
-    hasSessionStream(_key) {
-      return opts.hasSessionStreamResult ?? true
     },
     async reconnectSession(key) {
       reconnectSessionCalls.push(key)
@@ -751,45 +755,15 @@ describe('scheduleRestart', () => {
     expect(isRestartPendingOrActive('test_bot_1')).toBe(false)
   })
 
-  // b.9cj: the "already reconnected" early return is only taken when the session
-  // is connected AND its standalone GET stream is present. A connected-but-
-  // streamless session (the exact state scheduleRestart is invoked for) must NOT
-  // be waved through — it proceeds to recovery.
-  test('b.9cj: alive + connected + stream present — skips reconnect (already-healed guard holds)', async () => {
-    const deps = makeDeps({
-      isSessionAliveResult: LIVENESS_READING_LIVE,
-      isSessionConnectedResult: true,
-      hasSessionStreamResult: true,
-    })
+  // b.omv SR-9: connection alone makes a live session deliverable.
+  test('live and connected skips reconnect without a stream dependency', async () => {
+    const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_LIVE, isSessionConnectedResult: true })
     initRestart(deps)
-
     scheduleRestart('test_bot_1', '/cwd/test')
     await Bun.sleep(WAIT_MS)
-
-    // Genuinely healed: the guard returns before any recovery action.
-    expect(deps.reconnectSessionCalls).toHaveLength(0)
-    expect(deps.launchSessionCalls).toHaveLength(0)
-    expect(deps.killSessionCalls).toHaveLength(0)
-  })
-
-  test('b.9cj REGRESSION: alive + connected but STREAMLESS — recovery proceeds (no already-reconnected short-circuit)', async () => {
-    // Pre-fix, restart.ts skipped whenever isSessionConnected was true, so this
-    // connected-but-streamless session took the "already reconnected" early
-    // return and never recovered. Post-fix the guard also requires the stream,
-    // so recovery proceeds: alive → reconnectSession is called.
-    const deps = makeDeps({
-      isSessionAliveResult: LIVENESS_READING_LIVE,
-      isSessionConnectedResult: true,
-      hasSessionStreamResult: false,
-    })
-    initRestart(deps)
-
-    scheduleRestart('test_bot_1', '/cwd/test')
-    await Bun.sleep(WAIT_MS)
-
-    // The alive branch ran reconnectSession — the guard did NOT short-circuit.
-    expect(deps.reconnectSessionCalls).toEqual(['test_bot_1'])
-    expect(deps.launchSessionCalls).toHaveLength(0)
+    expect(deps.reconnectSessionCalls).toEqual([])
+    expect(deps.launchSessionCalls).toEqual([])
+    expect(deps.killSessionCalls).toEqual([])
   })
 
   // b.jg5 SRJ-110, SRJ-314: a `dead` reading of a row gets no kill (every
@@ -1133,7 +1107,6 @@ describe('isRestartPendingOrActive', () => {
       canRestart: () => true,
       isSessionAlive: (_key) => alivePromise,  // never resolves until we say so
       isSessionConnected: () => false,
-      hasSessionStream: () => true,
       reconnectSession: async () => {},
       killSession: async () => KILL_SUCCEEDED,
       launchSession: async () => true,
@@ -2371,7 +2344,6 @@ describe('not-up guard through the real relaunch gate and adapters: no agent-dir
       canRestart: gate,
       isSessionAlive: _buildIsSessionAliveAdapter(() => config),
       isSessionConnected: () => false,
-      hasSessionStream: () => false,
       reconnectSession: _buildReconnectSessionAdapter(),
       killSession: _buildKillSessionAdapter(),
       launchSession: (key) => launchPersonaSession(key, config, { canLaunch: gate }),
@@ -2415,7 +2387,7 @@ describe('not-up guard through the real relaunch gate and adapters: no agent-dir
     // B: the liveness probe and the reconnect adapter's probe, then one
     // `/mcp reconnect`; never killed or respawned.
     expect(callsFor(statusCalls, b)).toHaveLength(2)
-    expect(callsFor(sendKeysCalls, b)).toHaveLength(1)
+    expect(callsFor(sendKeysCalls, b)).toHaveLength(2)
     expect(getFailureCount(b.key)).toBe(0)
   })
 
@@ -2462,7 +2434,7 @@ describe('not-up guard through the real relaunch gate and adapters: no agent-dir
 
     // Control: B is probed and reconnected exactly as today.
     expect(callsFor(statusCalls, b)).toHaveLength(2)
-    expect(callsFor(sendKeysCalls, b)).toHaveLength(1)
+    expect(callsFor(sendKeysCalls, b)).toHaveLength(2)
     expect(getFailureCount(b.key)).toBe(0)
     expect(isRestartPendingOrActive(b.key)).toBe(false)
   })
@@ -2497,7 +2469,7 @@ describe('not-up guard through the real relaunch gate and adapters: no agent-dir
 
     // Control: B is probed and reconnected exactly as today.
     expect(callsFor(statusCalls, b)).toHaveLength(2)
-    expect(callsFor(sendKeysCalls, b)).toHaveLength(1)
+    expect(callsFor(sendKeysCalls, b)).toHaveLength(2)
     expect(getFailureCount(b.key)).toBe(0)
   })
 
@@ -2762,7 +2734,6 @@ describe('escalate-dead internal recovery via real adapter (b.sv7)', () => {
       canRestart: () => true,
       async isSessionAlive() { return alive },
       isSessionConnected() { return false },
-      hasSessionStream() { return true },
       reconnectSession,
       async killSession(key) { killSessionCalls.push(key); return KILL_SUCCEEDED },
       async launchSession(key) { launchSessionCalls.push(key); return true },
@@ -2929,7 +2900,7 @@ describe('b.jg5 SRJ-610, SRJ-1010: a row the escalate-dead sweep leaves in unver
       statusFn: () => ({ state: 'working' }),
       readPaneError: errTmuxCaptureFailed(),
       findMissingResult: cannedFindMissing({ rows: { [instanceId]: 'unverified_ids' } }),
-      getFn: () => cannedGetResult({ instance_id: instanceId, state: 'working', liveness_note: noteOfRun(run) }),
+      getFn: () => cannedGetResult({ instance_id: instanceId, state: 'working', liveness_note: log.findMissingCalls.length >= run ? noteOfRun(run) : nonLatchingNotes[0] }),
     })
     _resetOutageState()
     initOutageState({ notify: () => {}, getClient: () => stub as unknown as Client })
@@ -2943,7 +2914,6 @@ describe('b.jg5 SRJ-610, SRJ-1010: a row the escalate-dead sweep leaves in unver
       canRestart: () => true,
       isSessionAlive: _buildIsSessionAliveAdapter(() => config),
       isSessionConnected: () => connectedOnRun(run),
-      hasSessionStream: () => connectedOnRun(run),
       reconnectSession: _buildReconnectSessionAdapter(),
       async killSession(key) { kills.push(key); return KILL_SUCCEEDED },
       async launchSession(key) { launches.push(key); return true },
@@ -2972,7 +2942,7 @@ describe('b.jg5 SRJ-610, SRJ-1010: a row the escalate-dead sweep leaves in unver
       // The probe, the adapter's state read, its read-pane, the sweep and its
       // get of P's own row, then the re-probe: nothing typed, deleted, killed
       // or launched.
-      expect(runs.stubCalls()).toEqual({ statusCalls: 3 * run, readPaneCalls: run, findMissingCalls: run, getCalls: run })
+      expect(runs.stubCalls()).toEqual({ statusCalls: 3 * run, readPaneCalls: run, findMissingCalls: run, getCalls: 2 * run })
       expect(runs.posts).toEqual(run >= SLOW_RECOVERY_POST_THRESHOLD ? [[runs.KEY, slowRecoveryText(runs.KEY)]] : [])
       expect(errLines.filter((l) => l === reprobeLiveLine(runs.KEY))).toHaveLength(run)
     }
@@ -3013,7 +2983,7 @@ describe('b.jg5 SRJ-610, SRJ-1010: a row the escalate-dead sweep leaves in unver
     ])
     // The healed run's probe only: no state read, read-pane, sweep or get.
     const escalated = total - 1
-    expect(runs.stubCalls()).toEqual({ statusCalls: 3 * escalated + 1, readPaneCalls: escalated, findMissingCalls: escalated, getCalls: escalated })
+    expect(runs.stubCalls()).toEqual({ statusCalls: 3 * escalated + 1, readPaneCalls: escalated, findMissingCalls: escalated, getCalls: 2 * escalated })
     expect(errLines.filter((l) => l === slowRecoveryCountResetLine(runs.KEY, healedRun - 1, SLOW_RECOVERY_RESET_OTHER_VERDICT))).toHaveLength(1)
     expect(errLines.filter((l) => l === slowRecoveryNoticePostedLine(runs.KEY, SLOW_RECOVERY_POST_THRESHOLD))).toHaveLength(1)
     expect(runs.kills).toEqual([])
@@ -3034,7 +3004,7 @@ describe('b.jg5 SRJ-610, SRJ-1010: a row the escalate-dead sweep leaves in unver
     expect(latch.isLatched(runs.KEY)).toBe(true)
     // The ticks before as in the demo; the latching tick with no re-probe; no
     // agent-director call after it.
-    expect(runs.stubCalls()).toEqual({ statusCalls: 3 * latchRun - 1, readPaneCalls: latchRun, findMissingCalls: latchRun, getCalls: latchRun })
+    expect(runs.stubCalls()).toEqual({ statusCalls: 3 * latchRun - 1, readPaneCalls: latchRun, findMissingCalls: latchRun, getCalls: 2 * latchRun })
     expect(runs.outcomes).toEqual([...Array(latchRun - 1).fill(RESTART_OUTCOME_RECONNECT_DEFERRED), RESTART_OUTCOME_LATCHED])
     expect(errLines.filter((l) => l.startsWith(`[slack] Not scheduling restart for persona=${runs.KEY} — the persona is latched`))).toHaveLength(RUNS - latchRun)
     expect(runs.posts).toEqual([])
@@ -3128,7 +3098,6 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
       canRestart: () => true,
       isSessionAlive: _buildIsSessionAliveAdapter(() => config),
       isSessionConnected: () => false,
-      hasSessionStream: () => false,
       reconnectSession: _buildReconnectSessionAdapter(),
       async killSession(key) { kills.push(key); return KILL_SUCCEEDED },
       async launchSession(key, _cwd, _sessionId, deadEvidence) { launches.push(key); carriedIn.push(deadEvidence); return launchResult },
@@ -3168,7 +3137,7 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
 
     // The probe, the adapter's state read, its read-pane and sweep, then the
     // re-probe; nothing is typed into a pane that no longer exists.
-    expect(run.stubCalls()).toEqual({ statusCalls: 3, readPaneCalls: 1, findMissingCalls: 1 })
+    expect(run.stubCalls()).toEqual({ getCalls: 1, statusCalls: 3, readPaneCalls: 1, findMissingCalls: 1 })
     expect(run.paneReads()).toEqual([[personaInstanceId(run.KEY), FULL_PANE_READ_LINES]])
     expect(escalateLines()).toHaveLength(1)
     expect(escalateLines(verdict)).toHaveLength(1)
@@ -3197,7 +3166,7 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
 
     await run.tick()
 
-    expect(run.stubCalls()).toEqual({ statusCalls: 3, readPaneCalls: 1, findMissingCalls: 1 })
+    expect(run.stubCalls()).toEqual({ getCalls: 1, statusCalls: 3, readPaneCalls: 1, findMissingCalls: 1 })
     expect(escalateLines()).toHaveLength(1)
     expect(escalateLines(ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ)).toHaveLength(1)
     expect(run.kills).toEqual([])
@@ -3222,7 +3191,7 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
 
     await run.tick()
 
-    expect(run.stubCalls()).toEqual({ statusCalls: 2, readPaneCalls: 1 })
+    expect(run.stubCalls()).toEqual({ getCalls: 1, statusCalls: 2, readPaneCalls: 1 })
     expect(escalateLines()).toEqual([])
     expect(run.kills).toEqual([])
     expect(run.launches).toEqual([])
@@ -3264,7 +3233,7 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
 
       await run.tick()
 
-      expect(run.stubCalls()).toEqual({ statusCalls: 3, readPaneCalls: 1, findMissingCalls: 1 })
+      expect(run.stubCalls()).toEqual({ getCalls: 1, statusCalls: 3, readPaneCalls: 1, findMissingCalls: 1 })
       expect(run.paneReads()).toEqual([[personaInstanceId(run.KEY), PROBE_PANE_READ_LINES]])
       expect(escalateLines()).toHaveLength(1)
       expect(escalateLines('prompt-row-tmux-gone')).toHaveLength(1)
@@ -3287,7 +3256,7 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
 
       await run.tick()
 
-      expect(run.stubCalls()).toEqual({ statusCalls: 2, readPaneCalls: 1 })
+      expect(run.stubCalls()).toEqual({ getCalls: 1, statusCalls: 2, readPaneCalls: 1 })
       expect(run.paneReads()).toEqual([[personaInstanceId(run.KEY), PROBE_PANE_READ_LINES]])
       expect(escalateLines()).toEqual([])
       expect(raised).toEqual([run.KEY])
@@ -3339,7 +3308,7 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
     // The first probe, the reconnect adapter's state read and read-pane, and
     // the re-probe (the first-probe case stops, or goes straight to the kill,
     // after one).
-    expect(run.stubCalls()).toEqual(probe === 'first probe' ? { statusCalls: 1 } : { statusCalls: 3, readPaneCalls: 1, findMissingCalls: 1 })
+    expect(run.stubCalls()).toEqual(probe === 'first probe' ? { statusCalls: 1 } : { getCalls: 1, statusCalls: 3, readPaneCalls: 1, findMissingCalls: 1 })
     expect(run.kills).toEqual(installGone ? [run.KEY] : [])
     expect(run.launches).toEqual(dead ? [run.KEY] : [])
     expect(run.carriedIn).toEqual(!dead ? [] : installGone && probe === 're-probe' ? [carriedDeadEvidenceOf(WORKING_TMUX_GONE)] : [undefined])
@@ -3423,7 +3392,6 @@ describe('b.dup: a persona whose row is ended just before its reconnect lands is
       canRestart: () => true,
       isSessionAlive: _buildIsSessionAliveAdapter(() => config),
       isSessionConnected: () => false,
-      hasSessionStream: () => false,
       reconnectSession: _buildReconnectSessionAdapter(),
       async killSession(key) { killSessionCalls.push(key); return KILL_SUCCEEDED },
       async launchSession(key, _cwd, _sessionId, deadEvidence) { launchSessionCalls.push(key); carriedIn.push(deadEvidence); return true },
@@ -3572,7 +3540,7 @@ describe('b.jg5 SRJ-611: on the recovery harness, the relaunch after escalate-de
     expect(h.errors.filter((l) => l.includes(` on resume for ${ref} — re-read: `))).toEqual([
       spawnNotResumableLine('[slack] spawnForPersona:', ref, describeAgentDirectorFailure(errSpawnNotResumable()), reread, held, lostRaceOutcome(true)),
     ])
-    expect(calls.getCalls).toHaveLength(2)
+    expect(calls.getCalls).toHaveLength(3)
     expect(calls.deleteCalls).toEqual([])
     await h.settle()
   })
@@ -3658,6 +3626,8 @@ describe('b.jg5 SRJ-611, SRJ-710: the restart path\'s relaunch after each escala
     h.script({
       spawnQueue: [cannedErr<SpawnResult>(errInstanceIdCollision())],
       getQueue: [
+        cannedOk(cannedGetResult({ state: reach.state }, persona, h.home)),
+        ...(reach.script.sendKeysError ? Array(2).fill(cannedOk(cannedGetResult({ state: 'waiting' }, persona, h.home))) : []),
         cannedOk(cannedGetResult({ state: LIVENESS_DEAD_ROW_ENDED }, persona, h.home)),
         cannedOk(cannedGetResult(reread(h, persona), persona, h.home)),
       ],
@@ -3722,8 +3692,8 @@ describe('b.jg5 SRJ-611, SRJ-710: the restart path\'s relaunch after each escala
     h.script({
       spawnQueue: [cannedErr<SpawnResult>(errInstanceIdCollision())],
       getQueue: [
-        cannedOk(cannedGetResult({ state: 'waiting' }, persona, h.home)),
-        cannedOk(cannedGetResult({ state: 'waiting' }, persona, h.home)),
+        cannedOk(cannedGetResult({ state: 'working' }, persona, h.home)),
+        ...Array(4).fill(cannedOk(cannedGetResult({ state: 'waiting' }, persona, h.home))),
       ],
       getResult: cannedGetResult({ state: LIVENESS_DEAD_ROW_ENDED, session_id: 'a-session-id' }, persona, h.home),
       statusFn: () => {
@@ -4795,7 +4765,7 @@ describe('restart: the reply-guard record holds the effective value before the r
    * installed over it; and a stub AD client whose row is gone (`row: 'gone'`,
    * the spawn succeeds) or `ended` (the spawn collides and the row resumes).
    */
-  function setup(stopHookBootstrap: boolean, row: 'gone' | 'ended'): { config: PersonaConfig; a: Persona } {
+  function setup(stopHookBootstrap: boolean, row: 'gone' | 'ended' | 'waiting'): { config: PersonaConfig; a: Persona } {
     const config = makeMultiPersonaConfig(
       [{ name: 'Alpha Desk', claude_config_dir: configDir, stop_hook_bootstrap: stopHookBootstrap }],
       dir,
@@ -4810,7 +4780,7 @@ describe('restart: the reply-guard record holds the effective value before the r
       resumeCalls,
       sendKeysCalls,
       spawnQueue: row === 'ended' ? [cannedErr<SpawnResult>(errInstanceIdCollision())] : undefined,
-      getResult: cannedGetResult({ state: 'ended' }, a, dir),
+      getResult: cannedGetResult({ state: row === 'waiting' ? 'waiting' : 'ended' }, a, dir),
     }), (call) => {
       events.push(call)
       seen.push({ call, record: rg.readRecord(a.key), launchedWith: getLaunchedWithDir(a.key) })
@@ -4860,7 +4830,7 @@ describe('restart: the reply-guard record holds the effective value before the r
   })
 
   test('live session: the restart reconnects through the real adapter — no launch, no reply-guard step, no record', async () => {
-    const { a } = setup(true, 'gone')
+    const { a } = setup(true, 'waiting')
     const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_LIVE })
     deps.reconnectSession = _buildReconnectSessionAdapter()
     initRestart(deps)
@@ -4868,7 +4838,7 @@ describe('restart: the reply-guard record holds the effective value before the r
     scheduleRestart(a.key, a.working_directory)
     await waitFor(() => sendKeysCalls.length > 0 && !isRestartPendingOrActive(a.key))
 
-    expect(sendKeysCalls.map((c) => c.instance_id)).toEqual([personaInstanceId(a.key)])
+    expect(sendKeysCalls.map((c) => c.instance_id)).toEqual([personaInstanceId(a.key), personaInstanceId(a.key)])
     expect(deps.killSessionCalls).toEqual([])
     expect(deps.launchSessionCalls).toEqual([])
     expect(events).toEqual([])
@@ -4945,6 +4915,7 @@ describe('restart: the reply-guard record holds the effective value before the r
     expect(spawnCalls[2]!.extra_env?.['CLAUDE_CONFIG_DIR']).toBe(newDir)
     expect(spawnCalls[2]!.label).toEqual([
       'service=cscb',
+      'tag_prompt=1',
       `persona=${a.key}`,
       `config_dir=${configDirLabelValue(join(realpathSync(dir), 'claude-config-new'))}`,
     ])
@@ -5106,7 +5077,6 @@ describe('b.g57: a restart with an unresolvable claude_config_dir', () => {
       canRestart: gate,
       isSessionAlive: _buildIsSessionAliveAdapter(() => h.config),
       isSessionConnected: () => false,
-      hasSessionStream: () => false,
       reconnectSession: _buildReconnectSessionAdapter(),
       killSession: _buildKillSessionAdapter((key) => h.getPersona(key)),
       launchSession: (key) => launchPersonaSession(key, h.config!, { canLaunch: gate }),
@@ -5905,7 +5875,7 @@ describe('b.jg5 SRJ-303: runRestartRetry reruns the restart decision without the
 
   test('the row reads live and P is connected with its stream → already-connected: no reconnect, kill or launch, nothing counted', async () => {
     recordFailure(P)
-    const deps = retryDeps({ isSessionAliveResult: LIVENESS_READING_LIVE, isSessionConnectedResult: true, hasSessionStreamResult: true })
+    const deps = retryDeps({ isSessionAliveResult: LIVENESS_READING_LIVE, isSessionConnectedResult: true })
     initRestart(deps)
 
     expect(await runRestartRetry(P, CWD, notInFlight)).toBe(RESTART_OUTCOME_ALREADY_CONNECTED)
@@ -6490,8 +6460,7 @@ describe('b.jg5 SRJ-314: an unknown or thrown liveness probe kills and launches 
 // session has not started) hands the row to the `pending` deferral
 // (`RestartDeps.deferPendingRow`) once, with its reading (the launch start
 // carried), whatever the session's connection shows: connected with its
-// stream (never "already reconnected"), connected but streamless, or
-// disconnected. Nothing is reconnected, killed or launched, no success or
+// connection (never "already reconnected"), or disconnected. Nothing is reconnected, killed or launched, no success or
 // failure is recorded, nothing is armed, and the work answers
 // `RESTART_OUTCOME_PENDING_DEFERRED`. The connection is never read. A
 // deferral that throws is logged by its redacted description and changes
@@ -6524,11 +6493,10 @@ describe('b.jg5 SRJ-115: a pending reading goes to the pending deferral whatever
     cancelAllRestartTimers()
   })
 
-  /** P's connection as the registry shows it: [label, connected, stream present]. */
-  const CONNECTIONS: ReadonlyArray<readonly [string, boolean, boolean]> = [
-    ['connected with its stream', true, true],
-    ['connected but streamless', true, false],
-    ['disconnected', false, true],
+  /** P's connection as the registry shows it: [label, connected present]. */
+  const CONNECTIONS: ReadonlyArray<readonly [string, boolean]> = [
+    ['connected', true],
+    ['disconnected', false],
   ]
   const LAUNCH_STARTS: ReadonlyArray<readonly [string, string | undefined]> = [
     ['with a launch start', SAMPLE_LAUNCH_START_FRACTIONAL],
@@ -6541,7 +6509,7 @@ describe('b.jg5 SRJ-115: a pending reading goes to the pending deferral whatever
    * `reading`, P's connection as given (each read recorded) and launches
    * failing, so a launch would be counted.
    */
-  function pendingDeps(reading: LivenessReading, connected: boolean, stream: boolean, restartDelay = 0): {
+  function pendingDeps(reading: LivenessReading, connected: boolean, restartDelay = 0): {
     deps: ReturnType<typeof makeDeps>
     deferred: Array<[string, PendingLivenessReading]>
     connectionReads: string[]
@@ -6550,7 +6518,6 @@ describe('b.jg5 SRJ-115: a pending reading goes to the pending deferral whatever
     const deferred: Array<[string, PendingLivenessReading]> = []
     const connectionReads: string[] = []
     deps.isSessionConnected = (key) => { connectionReads.push(`connected:${key}`); return connected }
-    deps.hasSessionStream = (key) => { connectionReads.push(`stream:${key}`); return stream }
     deps.deferPendingRow = (key, r) => { deferred.push([key, r]) }
     return { deps, deferred, connectionReads }
   }
@@ -6572,13 +6539,13 @@ describe('b.jg5 SRJ-115: a pending reading goes to the pending deferral whatever
     errLines.filter((l) => !l.startsWith('[slack] Scheduling restart') && !l.startsWith(DEFER_FAILED))
 
   const DEFER_CASES = ENTRIES.flatMap((entry) =>
-    CONNECTIONS.flatMap(([conn, connected, stream]) =>
-      LAUNCH_STARTS.map(([startLabel, start]) => [entry, conn, startLabel, connected, stream, start] as const)))
+    CONNECTIONS.flatMap(([conn, connected]) =>
+      LAUNCH_STARTS.map(([startLabel, start]) => [entry, conn, startLabel, connected, start] as const)))
 
-  test.each(DEFER_CASES)('through %s, a pending first probe, P %s, %s → the deferral once with the key and the reading; no reconnect, kill or launch; nothing counted or armed; the connection never read; pending-deferred', async (entry, _conn, _startLabel, connected, stream, start) => {
+  test.each(DEFER_CASES)('through %s, a pending first probe, P %s, %s → the deferral once with the key and the reading; no reconnect, kill or launch; nothing counted or armed; the connection never read; pending-deferred', async (entry, _conn, _startLabel, connected, start) => {
     recordFailure(P)
     const reading = pendingLivenessReading(start)
-    const { deps, deferred, connectionReads } = pendingDeps(reading, connected, stream, entry === 'the retry entry' ? 0 : FAST_DELAY_S)
+    const { deps, deferred, connectionReads } = pendingDeps(reading, connected, entry === 'the retry entry' ? 0 : FAST_DELAY_S)
     initRestart(deps)
 
     if (entry === 'the retry entry') {
@@ -6608,7 +6575,7 @@ describe('b.jg5 SRJ-115: a pending reading goes to the pending deferral whatever
   ])('the probe\'s pending reading carries %s', async (_label, raw, handedStart) => {
     recordFailure(P)
     const reading = { kind: LIVENESS_PENDING, launchStartedAt: raw } as unknown as LivenessReading
-    const { deps, deferred } = pendingDeps(reading, true, true)
+    const { deps, deferred } = pendingDeps(reading, true)
     initRestart(deps)
 
     expect(await runRestartRetry(P, CWD, notInFlight)).toBe(RESTART_OUTCOME_PENDING_DEFERRED)
@@ -6619,10 +6586,10 @@ describe('b.jg5 SRJ-115: a pending reading goes to the pending deferral whatever
     expectNothingDone(deps)
   })
 
-  test.each(CONNECTIONS)('a deferral that throws, P %s → one redacted line; still no reconnect, kill or launch, nothing counted or armed; pending-deferred', async (_conn, connected, stream) => {
+  test.each(CONNECTIONS)('a deferral that throws, P %s → one redacted line; still no reconnect, kill or launch, nothing counted or armed; pending-deferred', async (_conn, connected) => {
     recordFailure(P)
     const thrown = Object.assign(new Error(`defer refused (${sentinelInMessage('defer')})`), { note: LEAK_SENTINEL })
-    const { deps, deferred, connectionReads } = pendingDeps(pendingLivenessReading(SAMPLE_LAUNCH_START_FRACTIONAL), connected, stream)
+    const { deps, deferred, connectionReads } = pendingDeps(pendingLivenessReading(SAMPLE_LAUNCH_START_FRACTIONAL), connected)
     deps.deferPendingRow = (key, r) => {
       deferred.push([key, r])
       throw thrown
@@ -6641,9 +6608,9 @@ describe('b.jg5 SRJ-115: a pending reading goes to the pending deferral whatever
     assertNoLeak({ errArgs })
   })
 
-  test.each(CONNECTIONS)('no deferral member, P %s → nothing called or logged; still no reconnect, kill or launch, nothing counted or armed; pending-deferred', async (_conn, connected, stream) => {
+  test.each(CONNECTIONS)('no deferral member, P %s → nothing called or logged; still no reconnect, kill or launch, nothing counted or armed; pending-deferred', async (_conn, connected) => {
     recordFailure(P)
-    const { deps, connectionReads } = pendingDeps(pendingLivenessReading(SAMPLE_LAUNCH_START_FRACTIONAL), connected, stream)
+    const { deps, connectionReads } = pendingDeps(pendingLivenessReading(SAMPLE_LAUNCH_START_FRACTIONAL), connected)
     delete deps.deferPendingRow
     initRestart(deps)
 
@@ -6664,8 +6631,8 @@ describe('b.jg5 SRJ-115: a pending reading goes to the pending deferral whatever
 
   /** `pendingDeps` whose probe at `point` reads `reading`: at the re-probe, the first probe reads `live` and the reconnect answers escalate-dead with dead evidence. */
   function pendingAt(point: ProbePoint, reading: LivenessReading): ReturnType<typeof pendingDeps> {
-    if (point === 'the first probe') return pendingDeps(reading, false, true)
-    const built = pendingDeps(LIVENESS_READING_LIVE, false, true)
+    if (point === 'the first probe') return pendingDeps(reading, false)
+    const built = pendingDeps(LIVENESS_READING_LIVE, false)
     const { deps } = built
     deps.isSessionAlive = async (key) => {
       deps.isSessionAliveCalls.push(key)
@@ -6759,14 +6726,13 @@ describe('b.jg5 SRJ-115: a pending reading goes to the pending deferral whatever
   // `live` and `dead` never reach the deferral: a connected `live` row with
   // its stream is still already-connected, another `live` row is reconnected,
   // and a `dead` one is launched and counted, as before (with no kill, b.jg5 SRJ-314).
-  test.each<[string, LivenessReading, boolean, boolean, RestartRetryOutcome]>([
-    ['live, connected with its stream → already-connected, no reconnect', LIVENESS_READING_LIVE, true, true, RESTART_OUTCOME_ALREADY_CONNECTED],
-    ['live, connected but streamless → reconnected', LIVENESS_READING_LIVE, true, false, RESTART_OUTCOME_RECONNECTED],
-    ['live, disconnected → reconnected', LIVENESS_READING_LIVE, false, true, RESTART_OUTCOME_RECONNECTED],
-    ['dead → a launch (no kill for a dead reading that is no install-gone one), the failed launch counted', LIVENESS_READING_DEAD, false, true, RESTART_OUTCOME_COUNTED_FAILURE],
-  ])('%s; the deferral is never called', async (_label, reading, connected, stream, outcome) => {
+  test.each<[string, LivenessReading, boolean, RestartRetryOutcome]>([
+    ['live, connected with its stream → already-connected, no reconnect', LIVENESS_READING_LIVE, true, RESTART_OUTCOME_ALREADY_CONNECTED],
+    ['live, disconnected → reconnected', LIVENESS_READING_LIVE, false, RESTART_OUTCOME_RECONNECTED],
+    ['dead → a launch (no kill for a dead reading that is no install-gone one), the failed launch counted', LIVENESS_READING_DEAD, false, RESTART_OUTCOME_COUNTED_FAILURE],
+  ])('%s; the deferral is never called', async (_label, reading, connected, outcome) => {
     recordFailure(P)
-    const { deps, deferred } = pendingDeps(reading, connected, stream)
+    const { deps, deferred } = pendingDeps(reading, connected)
     deps.reconnectSession = async (key) => { deps.reconnectSessionCalls.push(key); return 'success' }
     initRestart(deps)
 
@@ -6806,10 +6772,10 @@ describe('b.jg5 SRJ-115: a pending reading goes to the pending deferral whatever
       rmSync(dir, { recursive: true, force: true })
     })
 
-    const REAL_CASES = CONNECTIONS.flatMap(([conn, connected, stream]) =>
-      LAUNCH_STARTS.map(([startLabel, start]) => [conn, startLabel, connected, stream, start] as const))
+    const REAL_CASES = CONNECTIONS.flatMap(([conn, connected]) =>
+      LAUNCH_STARTS.map(([startLabel, start]) => [conn, startLabel, connected, start] as const))
 
-    test.each(REAL_CASES)('status answers pending, P %s, %s, its key one no configured persona uses → one status read and no other agent-director call; no kill or launch; nothing counted; one deferral line; pending-deferred', async (_conn, _startLabel, connected, stream, start) => {
+    test.each(REAL_CASES)('status answers pending, P %s, %s, its key one no configured persona uses → one status read and no other agent-director call; no kill or launch; nothing counted; one deferral line; pending-deferred', async (_conn, _startLabel, connected, start) => {
       const config = makeMultiPersonaConfig([{ name: 'alpha_bot' }], dir)
       const KEY = config.personas[0]!.key
       const log = makeStubCallLog()
@@ -6827,7 +6793,6 @@ describe('b.jg5 SRJ-115: a pending reading goes to the pending deferral whatever
         canRestart: () => true,
         isSessionAlive: _buildIsSessionAliveAdapter(() => config),
         isSessionConnected: () => connected,
-        hasSessionStream: () => stream,
         reconnectSession: _buildReconnectSessionAdapter(),
         async killSession(key) { killSessionCalls.push(key); return KILL_SUCCEEDED },
         async launchSession(key) { launchSessionCalls.push(key); return false },
@@ -6989,7 +6954,8 @@ describe('b.jg5 SRJ-409, SRJ-411: on the recovery harness, a pending reading at 
     let gets = 0
     h.script({
       getFn: () => {
-        const row = rows[gets++]
+        if (point !== 'the first probe' && gets === 0) { gets++; return personaRow(h, p, { state: 'working' }) }
+        const row = rows[gets++ - (point === 'the first probe' ? 0 : 1)]
         return row === undefined ? personaRow(h, p, { state: LIVENESS_DEAD_ROW_MISSING }) : row(h, p)
       },
       ...(point === 'the first probe'
@@ -7024,7 +6990,7 @@ describe('b.jg5 SRJ-409, SRJ-411: on the recovery harness, a pending reading at 
 
     expectReprobeLine(h, p, point)
     expectOneDeferral(h, p)
-    expect(h.stub.calls.getCalls).toHaveLength(1)
+    expect(h.stub.calls.getCalls).toHaveLength(point === 'the first probe' ? 1 : 2)
     expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }])
     expectPendingOnlyWatch(h, p)
     expect([h.stub.calls.killCalls, h.stub.calls.spawnCalls, h.stub.calls.resumeCalls, h.stub.calls.sendKeysCalls]).toEqual([[], [], [], []])
@@ -7621,7 +7587,7 @@ describe('b.jg5 SRJ-105, SRJ-313: an UNAVAILABLE or UNCLASSIFIED kill, send-keys
       // no sweep, no kill, no spawn or resume.
       expect(h.stub.calls.statusCalls).toHaveLength(2)
       expect(h.stub.calls.sendKeysCalls).toHaveLength(1)
-      expect(Object.keys(callCounts(h)).sort()).toEqual(['readPaneCalls', 'sendKeysCalls', 'statusCalls'])
+      expect(callCounts(h)).toEqual({ getCalls: 3, readPaneCalls: 3, sendKeysCalls: 1, statusCalls: 2 })
       expect(h.errors.filter((l) => l.startsWith('[slack] escalate-dead'))).toEqual([])
       expect(h.triggers).toEqual([{ key: p, kind: cause }])
       expectNothingCounted(h, p)
@@ -9106,7 +9072,7 @@ describe('b.jg5 SRJ-512, SRJ-513: a restart run whose own liveness read latches 
     ['the first probe', { liveReads: 0, paneGone: false, calls: { statusCalls: 1 } }],
     // The probe reads working (live, P not connected), the reconnect adapter
     // reads working too; its read-pane answers GONE and it sweeps once.
-    ["b.d61's re-probe after an escalate-dead reconnect", { liveReads: 2, paneGone: true, calls: { statusCalls: 3, readPaneCalls: 1, findMissingCalls: 1 } }],
+    ["b.d61's re-probe after an escalate-dead reconnect", { liveReads: 2, paneGone: true, calls: { getCalls: 1, statusCalls: 3, readPaneCalls: 1, findMissingCalls: 1 } }],
   ]
 
   test.each(RESTART_ENTRIES.flatMap(([entry, run]) => PROBES.map(([probe, opts]) => [entry, probe, run, opts] as const)))(
@@ -9775,7 +9741,7 @@ describe('b.jg5 SRJ-505, SRJ-502: the latch re-check\'s own run of the restart p
 
       expect(refused()).toBe(refuseAtRead)
       expect(statusCalls.map((c) => c.instance_id)).toEqual([personaInstanceId(P)])
-      expect(sendKeysCalls.map((c) => c.instance_id)).toEqual(refuseAtRead ? [] : [personaInstanceId(P)])
+      expect(sendKeysCalls.map((c) => c.instance_id)).toEqual(refuseAtRead ? [] : [personaInstanceId(P), personaInstanceId(P)])
       if (refuseAtRead) expect(readPaneCalls).toEqual([])
       expect(deps.killSessionCalls).toEqual([])
       expect(deps.launchSessionCalls).toEqual([])
@@ -10332,7 +10298,6 @@ describe('b.4q8: a resumed launch counts once its row reports in, and resumes th
       isShuttingDown: () => false,
       isSessionAlive: _buildIsSessionAliveAdapter(() => loop.h.config),
       isSessionConnected: () => false,
-      hasSessionStream: () => false,
       isRestartPendingOrActive,
       isLaunchInFlight,
       isAtCap: (k) => isAtCap(k, RESTART_FAILURE_CAP),
@@ -10791,5 +10756,54 @@ describe('b.4q8: a read that settles a resumed launch before its hand-over: noth
     expect(getFailureCount(a.key)).toBe(after)
     expect(resumeEndedLinesOf(errLines, ref)).toEqual(after === 1 ? [resumeEndedUnreportedLine(at, ref, state, 1)] : [])
     expect(countedLinesOf(errLines, a.key)).toHaveLength(after)
+  })
+})
+
+// b.omv SR-7.6: dead evidence takes the existing launch path even with
+// an installed upgrade inspector; live/pending and unknown keep their gates.
+describe('E4 guard: restart liveness with upgrade inspection installed', () => {
+  let dir: string
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'e4-restart-inspection-')) })
+  afterEach(() => { cancelAllRestartTimers(); resetClientForTests(); rmSync(dir, { recursive: true, force: true }) })
+
+  test.each([
+    ['absent row', errSpawnNotFound(), false],
+    ['ended row', cannedStatusResult({ state: 'ended' }), false],
+    ['missing row', cannedStatusResult({ state: 'missing' }), false],
+    ['dead without a row read (install gone)', errSystemInstallDisappeared('status'), true],
+  ] as const)('%s bypasses inspection and launches through ordinary recovery', async (_label, answer, killRequired) => {
+    const config = makeMultiPersonaConfig([{ name: 'upgrade_probe_bot' }], dir)
+    const persona = config.personas[0]!
+    const calls = makeStubCallLog()
+    setClientForTests(makeStubClient({ ...calls, statusFn: () => answer }) as unknown as Client)
+    const deps = makeDeps()
+    deps.isSessionAlive = _buildIsSessionAliveAdapter(() => config)
+    const inspections: string[] = []
+    deps.inspectUpgrade = async key => { inspections.push(key); throw new Error('dead row must bypass upgrade inspection') }
+    recordFailure(persona.key)
+    initRestart(deps)
+    expect(await runRestartRetry(persona.key, persona.working_directory, () => false)).toBe(RESTART_OUTCOME_LAUNCHED)
+    expect(calls.statusCalls).toEqual([{ instance_id: personaInstanceId(persona.key) }])
+    expect(inspections).toEqual([])
+    expect(deps.killSessionCalls).toEqual(killRequired ? [persona.key] : [])
+    expect(deps.launchSessionCalls).toEqual([{ key: persona.key, cwd: persona.working_directory, sessionId: undefined }])
+    expect(deps.reconnectSessionCalls).toEqual([])
+    expect(getFailureCount(persona.key)).toBe(0)
+  })
+
+  test.each([
+    ['live', LIVENESS_READING_LIVE, RESTART_OUTCOME_RECONNECT_DEFERRED, true],
+    ['pending', LIVENESS_READING_PENDING, RESTART_OUTCOME_RECONNECT_DEFERRED, true],
+    ['unknown', LIVENESS_READING_UNKNOWN, RESTART_OUTCOME_LIVENESS_UNKNOWN, false],
+  ] as const)('%s retains the inspection or unknown-read gate', async (_label, reading, expected, inspected) => {
+    const deps = makeDeps({ isSessionAliveResult: reading, isSessionConnectedResult: true })
+    const inspections: string[] = []
+    deps.inspectUpgrade = async key => { inspections.push(key); return true }
+    initRestart(deps)
+    expect(await runRestartRetry('upgrade_probe_bot', dir, () => false)).toBe(expected)
+    expect(inspections).toEqual(inspected ? ['upgrade_probe_bot'] : [])
+    expect([deps.killSessionCalls, deps.launchSessionCalls, deps.reconnectSessionCalls]).toEqual([[], [], []])
+    expect(deps.armRetryTimerCalls).toEqual(inspected ? [] : ['upgrade_probe_bot'])
+    expect(getFailureCount('upgrade_probe_bot')).toBe(0)
   })
 })

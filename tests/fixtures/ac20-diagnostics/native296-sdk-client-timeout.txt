@@ -1,0 +1,1 @@
+Yl=um()?.body_idle_timeout,Ge={defaultHeaders:re,maxRetries:r,timeout:V_r()??600000,dangerouslyAllowBrowser:!0,fetchOptions:na({forAnthropicAPI:!0,hasBodyIdleWatchdog:K_r(Me),bodyIdleTimeout:typeof Yl==="boolean"?Yl:void 0,url:aw(Me,n,hr)}),...pr&&{fetch:pr},..._P};if(Me==="gateway")

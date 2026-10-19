@@ -90,7 +90,7 @@
 #   by agent-director's own hooks or by CSCB's own runs.
 #
 # Stub modes (fixtures/stub-claude.sh): each persona's first life runs
-# `dev-channels` (the reporting stub: the approver's Enter makes it report in,
+# `startup-trust` (the reporting stub: the approver's Enter makes it report in,
 # and it writes its transcript before SessionStart). Its new life runs
 # `transcript-on-first-message` (a harness addition): the same dialog and report-in, but no transcript until a message is
 # typed, so the new life's SessionStart finds no transcript, as a real
@@ -100,7 +100,7 @@
 # exits, and the row reads `ended`. In scenario 12's legs, G's first life
 # and its leftover run `silent` (no dialog and no hook: the row keeps no
 # session id, and a read of the leftover's pane shows no dialog for CSCB to
-# answer) and G's new life `dev-channels`; H's lives run `dev-channels`. In
+# answer) and G's new life `startup-trust`; H's lives run `startup-trust`. In
 # scenario 18 every life of J and K runs `transcript-on-first-message`, and
 # the harness types a first message into each first life (`stub_type_line`),
 # which writes its transcript.
@@ -175,7 +175,7 @@
 #        whose `@ad_owner` names an earlier launch of G's id with the store's
 #        own id (`ad_store_id`, `ad_owner_label`) and whose pane carries
 #        `@ad_pane` (`ad_pane_label`), its worker the `silent` stub in G's
-#        directory, and then selects `dev-channels` for G's directory;
+#        directory, and then selects `startup-trust` for G's directory;
 #     3. CSCB's own pending-row runs mark the row `missing` past G; its
 #        `resume` answers ErrNoSessionId and the reuse spawn follows, refused
 #        while the leftover runs; the harness waits for at least two refused
@@ -464,7 +464,7 @@ mkdir -p "${CFG_ROOT}"
 # t19_persona <prefix> <short> <channel>: set <prefix>_NAME, _LABEL, _CREDS,
 # _CHANNEL, _WORK, _CFG, _KEY, _ID and _SESSION for one persona, write its
 # credentials file and its Claude config's `.claude.json`, and select
-# `dev-channels` for its working directory.
+# `startup-trust` for its working directory.
 t19_persona() {
     local p="$1" short="$2" channel="$3" key value work cfg
     printf -v "${p}_NAME" '%s' "${SCENARIO_TAG}${short}"
@@ -472,6 +472,7 @@ t19_persona() {
     printf -v "${p}_CREDS" '%s' "${CREDS_DIR}/${SCENARIO_TAG}${short}1.json"
     printf -v "${p}_CHANNEL" '%s' "${channel}"
     work="$(make_workdir "${SCENARIO_TAG}${short}_work")"
+    stub_mode "${work}" "${STUB_MODE_STARTUP_TRUST}"
     printf -v "${p}_WORK" '%s' "${work}"
     cfg="${CFG_ROOT}/${SCENARIO_TAG}${short}_cfg"
     printf -v "${p}_CFG" '%s' "${cfg}"
@@ -483,7 +484,7 @@ t19_persona() {
     printf -v "${p}_ID" '%s' "${value}"
     t19_value value personaTmuxSessionName "${key}"
     printf -v "${p}_SESSION" '%s' "${value}"
-    stub_mode "${work}" "${STUB_MODE_DEV_CHANNELS}"
+    stub_mode "${work}" "${STUB_MODE_STARTUP_TRUST}"
     printf '{"bot_token": "%s", "app_token": "%s"}\n' \
         "$(fake_token bot "${SCENARIO_TAG}${short}1")" "$(fake_token app "${SCENARIO_TAG}${short}1")" \
         | write_file "${CREDS_DIR}/${SCENARIO_TAG}${short}1.json" 600
@@ -889,22 +890,27 @@ t19_transcripts_hold() {
 
 t19_harness_check() {
     local step="harness check" dir pane before out
+    require_ci_image "${step}"
+    require_scenario_home "${step}"
     dir="$(make_workdir "${SCENARIO_TAG}selfcheck_work")"
+    stub_mode "${dir}" "${STUB_MODE_STARTUP_TRUST}"
     stub_mode "${dir}" "${STUB_MODE_TRANSCRIPT_ON_FIRST_MESSAGE}"
     before="$(t19_transcripts)"
     seed_unlabelled -c "${dir}" "${SCENARIO_TAG}_selfcheck" "${SCENARIO_BIN}/claude" > /dev/null
     pane="${SEEDED_PANE_ID}"
     # The stub's own texts (fixtures/stub-claude.sh): its dialog's first line,
     # and the banner it prints on reporting in.
-    wait_until "${TRANSCRIPT_WAIT_S}" "${step}: the stub never showed its dialog" t19_pane_shows "${pane}" 'WARNING: Loading development channels'
+    wait_until "${TRANSCRIPT_WAIT_S}" "${step}: the stub never showed its dialog" t19_pane_shows "${pane}" 'Yes, I trust this folder'
     [[ "$(t19_transcripts)" == "${before}" ]] || fail "${step}: a transcript was written at the dialog"
     stub_press_enter "${pane}"
     wait_until "${TRANSCRIPT_WAIT_S}" "${step}: the stub never reported in after Enter" t19_pane_shows "${pane}" 'Listening for channel messages from:'
     [[ "$(t19_transcripts)" == "${before}" ]] || fail "${step}: a transcript was written at report-in"
-    # A slash command typed into the pane (CSCB's `pause` types `/exit`) is no
-    # message: once the pane shows it, no transcript follows for the hold.
-    stub_type_line "${pane}" "/exit"
+    # Observe the slash command's draft before Enter clears the composer.
+    # Submitting it (as CSCB's `pause` does) must create no transcript.
+    "${SCENARIO_REAL_TMUX}" send-keys -t "${pane}" -l -- "/exit" \
+        || fail "${step}: could not type /exit into the stub's pane"
     wait_until "${TRANSCRIPT_WAIT_S}" "${step}: the pane never showed the typed /exit" t19_pane_shows "${pane}" "/exit"
+    stub_press_enter "${pane}"
     t19_transcripts_hold "${before}" "${SLASH_HOLD_S}" "${step}: after a typed /exit"
     stub_type_line "${pane}" "a first message"
     wait_until "${TRANSCRIPT_WAIT_S}" "${step}: no transcript after a typed line" t19_transcripts_are "$(( before + 1 ))"
@@ -1301,7 +1307,7 @@ t19_leg_missing_row() {
     t19_watch_start "${id}" "${watch}"
 
     # 2. Before G: the sentinel ends the silent worker (no hook) and its
-    #    session; the leftover is seeded; `dev-channels` is selected.
+    #    session; the leftover is seeded; `startup-trust` is selected.
     stub_type_line "${session}" "${STUB_EXIT_SENTINEL}"
     wait_until "${ENDED_WAIT_S}" "${step}: ${session} is still there after the exit sentinel" t19_no_session "${session}"
     seed_leftover -c "${work}" "${session}" "${id}" "${SCENARIO_BIN}/claude" > "${SCENARIO_ROOT}/seed-G.out"
@@ -1310,7 +1316,7 @@ t19_leg_missing_row() {
     awk -v e="${elapsed}" -v g="${GRACE_S}" 'BEGIN { exit !(e + 0 < g + 0) }' \
         || fail "${step}: the leftover was seeded ${elapsed} s after ${id}'s launch start, not before G (${GRACE_S} s)"
     t19_row_is "${id}" pending || fail "${step}: ${id} reads '$(t19_row_state "${id}")' after the leftover was seeded, not pending"
-    stub_mode "${work}" "${STUB_MODE_DEV_CHANNELS}"
+    stub_mode "${work}" "${STUB_MODE_STARTUP_TRUST}"
     echo "${TEST_NAME}: ${step}: the silent worker ended and the leftover ${leftover_sid} (pane ${SEEDED_PANE_ID}, token ${SEEDED_TOKEN}, store ${SEEDED_STORE_ID}) seeded ${elapsed} s after ${id}'s launch start (G ${GRACE_S} s)"
 
     # 3. CSCB's own runs mark the row missing; its resume and reuse follow,

@@ -367,6 +367,8 @@ afterEach(() => {
 describe('once per episode, for every declared kind', () => {
   test('every kind label is distinct, so no two kinds share a latch', () => {
     expect(new Set(PERSONA_EPISODE_KINDS).size).toBe(PERSONA_EPISODE_KINDS.length)
+    // b.omv SR-8: these kinds participate in every shared lifecycle row below.
+    expect(PERSONA_EPISODE_KINDS).toEqual(expect.arrayContaining(['message-not-saved', 'delivery-stuck', 'messages-waiting']))
   })
 
   test.each(eachKind)('%s posts once per episode however often asked, and once more after end and begin', (kind) => {

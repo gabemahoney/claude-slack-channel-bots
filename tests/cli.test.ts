@@ -390,6 +390,9 @@ beforeAll(() => {
     savedTokenEnv[name] = process.env[name]
     delete process.env[name]
   }
+  // Seed an inherited marker before the first case: afterEach cannot protect
+  // that case, and production's leaked-marker guard must not hide the gap.
+  process.env['_CLI_DAEMON_CHILD'] = '1'
 })
 
 afterAll(() => {
@@ -432,6 +435,7 @@ let currentClock: FakeClock | null
 let unexpectedDials: Array<[port: number, persona: string]>
 
 beforeEach(() => {
+  delete process.env['_CLI_DAEMON_CHILD']
   currentClock = null
   unexpectedDials = []
   root = mkdtempSync(join(tmpdir(), 'cscb-cli-'))
@@ -1105,6 +1109,17 @@ const callTimesOf = (b: Bundle, verb: string, id: string = opsId()): number[] =>
 // ---------------------------------------------------------------------------
 
 describe('start — pre-flight', () => {
+  test('clears an inherited daemon-child marker before the first case', async () => {
+    // Check before calling start(), which could otherwise clear a leaked
+    // marker itself and let a broken fixture setup pass on a normal child.
+    expect(process.env['_CLI_DAEMON_CHILD']).toBeUndefined()
+    const b = makeDeps()
+    await expect(createCli(b.deps).start()).rejects.toBeInstanceOf(ExitError)
+    expect(b.daemonSpawns).toHaveLength(1)
+    expect(b.startServerCalled).toBe(false)
+    expect(b.exitCodes).toEqual([0])
+  })
+
   test.each([
     ['unset', undefined],
     ['set to placeholders', 'placeholder-not-a-credential'],

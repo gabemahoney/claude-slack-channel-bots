@@ -151,8 +151,8 @@ afterEach(() => {
   expect(leftPending.filter((count) => count !== 0)).toEqual([])
 })
 
-function makeHome(): string {
-  const home = mkdtempSync(join(osTempDir(), 'ad-settings-test-'))
+function makeHome(suffix = ''): string {
+  const home = mkdtempSync(join(osTempDir(), `ad-settings-test-${suffix}`))
   tempDirs.push(home)
   return home
 }
@@ -169,8 +169,7 @@ interface ReaderRig {
   readCount(): number
 }
 
-function makeReaderRig(fs?: Partial<PersonaConfigFs>): ReaderRig {
-  const home = makeHome()
+function makeReaderRig(fs?: Partial<PersonaConfigFs>, home = makeHome()): ReaderRig {
   const lines: string[] = []
   let reads = 0
   const reader = createAdSettingsReader({
@@ -558,8 +557,8 @@ describe('ad settings: runs of refused reads', () => {
 const TMUX_KEY_ROWS = AD_TMUX_KEYS.map((key) => [key])
 
 describe('ad settings: the values line (b.jg5 SRJ-1014, SRJ-209)', () => {
-  test('the line names the path and each of the nine keys with its value and unit, and nothing of [pause]', () => {
-    const rig = makeReaderRig()
+  test.each(['', `ji${CHANGED_PAUSE_SECONDS}e7-`])('the line names the path and each of the nine keys with its value and unit, and nothing of [pause] (temp prefix %s)', suffix => {
+    const rig = makeReaderRig(undefined, makeHome(suffix))
     rig.write(CHANGED_FILE)
     rig.read()
     expect(rig.lines).toEqual([valuesLine(rig, CHANGED_TMUX)])
@@ -568,7 +567,8 @@ describe('ad settings: the values line (b.jg5 SRJ-1014, SRJ-209)', () => {
     expect(line).toContain(`"${rig.path}"`)
     for (const key of AD_TMUX_KEYS) expect(line).toContain(`${key} ${CHANGED_TMUX[key]} ${adTmuxKeyUnit(key)}`)
     expect(line).not.toContain(AD_PAUSE_TIMEOUT_KEY)
-    expect(line).not.toContain(String(CHANGED_PAUSE_SECONDS))
+    // The required path can contain the same digits in its random suffix.
+    expect(line.replace(`"${rig.path}"`, '')).not.toContain(String(CHANGED_PAUSE_SECONDS))
   })
 
   test('a second read with the same values logs nothing more', () => {

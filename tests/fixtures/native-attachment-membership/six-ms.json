@@ -1,0 +1,156 @@
+{
+  "run": "real-1792351999727-2797927",
+  "scenario": "test-111-fmk-real-ai-ac11",
+  "trial": 2,
+  "version": "2.1.296",
+  "records": [
+    {
+      "offset": 507,
+      "at": 1792356158071,
+      "type": "user",
+      "sessionId": "a6f3471b-bf5d-45c8-a16a-2b1e112f100e",
+      "uuid": "8a133168-9fce-4115-ba1f-3a0d1b9f62a6",
+      "parentUuid": null
+    },
+    {
+      "offset": 1357,
+      "at": 1792356158065,
+      "type": "attachment",
+      "sessionId": "a6f3471b-bf5d-45c8-a16a-2b1e112f100e",
+      "uuid": "a66cbabd-f003-4ba4-8ab0-257179b8098d",
+      "parentUuid": "8a133168-9fce-4115-ba1f-3a0d1b9f62a6",
+      "attachmentType": "environment"
+    },
+    {
+      "offset": 2805,
+      "at": 1792356158065,
+      "type": "attachment",
+      "sessionId": "a6f3471b-bf5d-45c8-a16a-2b1e112f100e",
+      "uuid": "0a9d693a-611a-4e89-a9be-d9f53b87f07e",
+      "parentUuid": "a66cbabd-f003-4ba4-8ab0-257179b8098d",
+      "attachmentType": "model"
+    },
+    {
+      "offset": 3508,
+      "at": 1792356158065,
+      "type": "attachment",
+      "sessionId": "a6f3471b-bf5d-45c8-a16a-2b1e112f100e",
+      "uuid": "376e1169-b5bf-454f-a7fe-b34b03a4df9d",
+      "parentUuid": "0a9d693a-611a-4e89-a9be-d9f53b87f07e",
+      "attachmentType": "agent_listing_delta"
+    },
+    {
+      "offset": 9562,
+      "at": 1792356158065,
+      "type": "attachment",
+      "sessionId": "a6f3471b-bf5d-45c8-a16a-2b1e112f100e",
+      "uuid": "cf137181-1613-4d21-963f-c78cec54f9c6",
+      "parentUuid": "376e1169-b5bf-454f-a7fe-b34b03a4df9d",
+      "attachmentType": "mcp_instructions_delta"
+    },
+    {
+      "offset": 13644,
+      "at": 1792356158065,
+      "type": "attachment",
+      "sessionId": "a6f3471b-bf5d-45c8-a16a-2b1e112f100e",
+      "uuid": "e9ffe24b-21bd-4a95-9148-867a8438d5aa",
+      "parentUuid": "cf137181-1613-4d21-963f-c78cec54f9c6",
+      "attachmentType": "skill_listing"
+    },
+    {
+      "offset": 27079,
+      "at": 1792356158102,
+      "type": "attachment",
+      "sessionId": "a6f3471b-bf5d-45c8-a16a-2b1e112f100e",
+      "uuid": "f1e3f3e5-33ef-45bf-85e5-80d2038773c1",
+      "parentUuid": "e9ffe24b-21bd-4a95-9148-867a8438d5aa",
+      "attachmentType": "instructions"
+    },
+    {
+      "offset": 29005,
+      "at": 1792356158102,
+      "type": "attachment",
+      "sessionId": "a6f3471b-bf5d-45c8-a16a-2b1e112f100e",
+      "uuid": "c293a22a-563a-48d5-8704-36a0da7f7b70",
+      "parentUuid": "f1e3f3e5-33ef-45bf-85e5-80d2038773c1",
+      "attachmentType": "session_context"
+    },
+    {
+      "offset": 30395,
+      "at": 1792356158103,
+      "type": "attachment",
+      "sessionId": "a6f3471b-bf5d-45c8-a16a-2b1e112f100e",
+      "uuid": "a8149979-61ff-4cbd-8c3a-c6c580851781",
+      "parentUuid": "c293a22a-563a-48d5-8704-36a0da7f7b70",
+      "attachmentType": "date"
+    },
+    {
+      "offset": 30984,
+      "at": 1792356158104,
+      "type": "attachment",
+      "sessionId": "a6f3471b-bf5d-45c8-a16a-2b1e112f100e",
+      "uuid": "0c34f1f5-1811-43bb-9d3b-eb2f41aa33fa",
+      "parentUuid": "a8149979-61ff-4cbd-8c3a-c6c580851781",
+      "attachmentType": "remote_session_change"
+    },
+    {
+      "offset": 32330,
+      "at": 1792356166719,
+      "type": "assistant",
+      "sessionId": "a6f3471b-bf5d-45c8-a16a-2b1e112f100e",
+      "uuid": "5efa6b9d-cced-4812-814e-be4a6ec5949f",
+      "parentUuid": "0c34f1f5-1811-43bb-9d3b-eb2f41aa33fa",
+      "stopReason": "tool_use"
+    },
+    {
+      "offset": 34467,
+      "at": 1792356166732,
+      "type": "assistant",
+      "sessionId": "a6f3471b-bf5d-45c8-a16a-2b1e112f100e",
+      "uuid": "d2bb588c-e99a-44fe-8086-373791c6a184",
+      "parentUuid": "5efa6b9d-cced-4812-814e-be4a6ec5949f",
+      "stopReason": "tool_use"
+    },
+    {
+      "offset": 35628,
+      "at": 1792356166763,
+      "type": "user",
+      "sessionId": "a6f3471b-bf5d-45c8-a16a-2b1e112f100e",
+      "uuid": "07d5bb7a-1fc9-4e5c-993f-19138fea635e",
+      "parentUuid": "5efa6b9d-cced-4812-814e-be4a6ec5949f"
+    },
+    {
+      "offset": 36541,
+      "at": null,
+      "type": "last-prompt",
+      "sessionId": "a6f3471b-bf5d-45c8-a16a-2b1e112f100e"
+    },
+    {
+      "offset": 36665,
+      "at": null,
+      "type": "mode",
+      "sessionId": "a6f3471b-bf5d-45c8-a16a-2b1e112f100e"
+    },
+    {
+      "offset": 36748,
+      "at": null,
+      "type": "permission-mode",
+      "sessionId": "a6f3471b-bf5d-45c8-a16a-2b1e112f100e"
+    },
+    {
+      "offset": 36853,
+      "at": null,
+      "type": "atis-latch",
+      "sessionId": "a6f3471b-bf5d-45c8-a16a-2b1e112f100e"
+    },
+    {
+      "offset": 36936,
+      "at": 1792356171015,
+      "type": "assistant",
+      "sessionId": "a6f3471b-bf5d-45c8-a16a-2b1e112f100e",
+      "uuid": "1ca7612a-9244-4f58-8986-be473a7c2658",
+      "parentUuid": "07d5bb7a-1fc9-4e5c-993f-19138fea635e",
+      "stopReason": "end_turn"
+    }
+  ]
+}

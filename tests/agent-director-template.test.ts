@@ -43,7 +43,8 @@ import {
   installSlackChannelBotTemplate,
   refreshSlackChannelBotTemplate,
 } from '../src/agent-director-template.ts'
-import type { PersonaConfig } from '../src/config.ts'
+import { resolveServerStateDir, type PersonaConfig } from '../src/config.ts'
+import { botSystemPromptPath } from '../src/bot-system-prompt.ts'
 import {
   cannedMakeTemplate,
   errTemplateMalformed,
@@ -88,10 +89,9 @@ describe('buildTemplateParams (SR-3.1)', () => {
     expect(params.deny).toEqual(['AskUserQuestion'])
     expect(params.overwrite).toBe(true)
     expect(params.agent_args).toEqual([
-      '--dangerously-load-development-channels',
-      'server:slack-channel-router',
       '--mcp-config',
       '/abs/mcp.json',
+      '--append-system-prompt-file', botSystemPromptPath(resolveServerStateDir()),
     ])
     // CSCB_CRONTABLE_PATH is spawn-time-only env (buildSpawnParams' extra_env),
     // never template env — the template omits env entirely by design.
@@ -188,26 +188,13 @@ describe('deriveMemoryReadAllowRules over personas', () => {
 // ---------------------------------------------------------------------------
 
 describe('buildTemplateParams: --system-prompt-snapshot off (b.b1j SR-2)', () => {
-  const BASE = ['--dangerously-load-development-channels', 'server:slack-channel-router', '--mcp-config', '/abs/mcp.json']
+  // b.omv SR-7.1/2: operator readability affects composition, never argv.
   const PAIR = ['--system-prompt-snapshot', 'off']
   const FILE = '/etc/cscb/extra.md'
-
-  // The four SR-2.1 append-flag cases. `args` is today's array for the case;
-  // the pair is the only thing the setting adds to it.
-  type Row = [
-    label: string,
-    overrides: Partial<PersonaConfig>,
-    readable: boolean,
-    args: string[],
-    warnings: number,
-    probed: boolean,
-  ]
-  const rows: Row[] = [
-    ['"none"', { system_prompt_mode: 'none', append_system_prompt_file: FILE }, true, BASE, 0, false],
-    ['"append" with a readable file', { system_prompt_mode: 'append', append_system_prompt_file: FILE }, true,
-      [...BASE, '--append-system-prompt-file', FILE], 0, true],
-    ['"append" with an unreadable file', { system_prompt_mode: 'append', append_system_prompt_file: FILE }, false, BASE, 1, true],
-    ['"append" with no file', { system_prompt_mode: 'append' }, true, BASE, 0, false],
+  const rows: [string, Partial<PersonaConfig>][] = [
+    ['none', { system_prompt_mode: 'none', append_system_prompt_file: FILE }],
+    ['append configured', { system_prompt_mode: 'append', append_system_prompt_file: FILE }],
+    ['append unset', { system_prompt_mode: 'append' }],
   ]
 
   // 'absent' is a configuration without the field, as an older caller builds one.
@@ -217,27 +204,21 @@ describe('buildTemplateParams: --system-prompt-snapshot off (b.b1j SR-2)', () =>
     ['false', false, false],
   ] as const
 
-  test.each(rows.flatMap(([label, ...rest]) => settings.map(([setting, value, pair]) => [label, setting, value, pair, ...rest] as const)))(
-    '%s, fresh_system_prompt %s: the SR-2.1 array, with the pair last only when the setting is not false',
-    (_label, _setting, value, pair, overrides, readable, args, warnings, probed) => {
+  test.each(rows.flatMap(([label, overrides]) => settings.map(([setting, value, pair]) => [label, setting, value, pair, overrides] as const)))(
+    '%s, fresh_system_prompt %s: one generated append flag and optional snapshot pair last',
+    (_label, _setting, value, pair, overrides) => {
       const cfg = makePersonaConfig({ mcp_config_path: '/abs/mcp.json', ...overrides }, baseDir)
       if (value === undefined) delete (cfg as Partial<PersonaConfig>).fresh_system_prompt
       else cfg.fresh_system_prompt = value
-      const logged: string[] = []
-      let accessSyncCalls = 0
       const params = buildTemplateParams(cfg, {
-        accessSync: () => { accessSyncCalls++; if (!readable) throw new Error('EACCES') },
-        stderrWrite: (msg) => logged.push(msg),
+        accessSync: () => { throw new Error('operator reads belong to composition') },
+        stderrWrite: () => { throw new Error('composition owns warnings') },
       })
+      const args = ['--mcp-config', '/abs/mcp.json', '--append-system-prompt-file', botSystemPromptPath(resolveServerStateDir())]
       expect(params.agent_args).toEqual(pair ? [...args, ...PAIR] : args)
-      // The pair is the same single occurrence at the end, and the probe and its warning are the setting's no-ops.
-      expect(params.agent_args!.filter((a) => a === '--system-prompt-snapshot')).toHaveLength(pair ? 1 : 0)
-      expect(accessSyncCalls).toBe(probed ? 1 : 0)
-      expect(logged).toHaveLength(warnings)
-      if (warnings > 0) {
-        expect(logged[0]).toContain('not readable')
-        expect(logged[0]).toContain(FILE)
-      }
+      expect(params.agent_args!.filter(a => a === '--append-system-prompt-file')).toHaveLength(1)
+      expect(params.agent_args).not.toContain('--dangerously-load-development-channels')
+      expect(params.agent_args).not.toContain('server:slack-channel-router')
     },
   )
 })
@@ -273,10 +254,9 @@ describe('installSlackChannelBotTemplate (SR-3.2)', () => {
     expect(params.deny).toEqual(['AskUserQuestion'])
     expect(params.overwrite).toBe(true)
     expect(params.agent_args).toEqual([
-      '--dangerously-load-development-channels',
-      'server:slack-channel-router',
       '--mcp-config',
       '/abs/mcp.json',
+      '--append-system-prompt-file', botSystemPromptPath(resolveServerStateDir()),
     ])
   })
 
@@ -297,12 +277,10 @@ describe('installSlackChannelBotTemplate (SR-3.2)', () => {
     expect(makeTemplateCalls.length).toBe(1)
     expect(result.params).toEqual(makeTemplateCalls[0])
     expect(makeTemplateCalls[0]!.agent_args).toEqual([
-      '--dangerously-load-development-channels',
-      'server:slack-channel-router',
       '--mcp-config',
       '/abs/mcp.json',
       '--append-system-prompt-file',
-      '/etc/cscb/extra.md',
+      botSystemPromptPath(resolveServerStateDir()),
       '--system-prompt-snapshot',
       'off',
     ])
@@ -442,17 +420,18 @@ describe('refreshSlackChannelBotTemplate (b.av2 SR-8.6 step 5)', () => {
     ['start installed the append flag; the applied config turns system prompts off and moves the MCP config',
       (b) => [{ mcp_config_path: join(b, 'boot-mcp.json'), system_prompt_mode: 'append', append_system_prompt_file: join(b, 'boot-append.md'), fresh_system_prompt: false }, true],
       (b) => ({ mcp_config_path: join(b, 'applied-mcp.json'), system_prompt_mode: 'none', append_system_prompt_file: join(b, 'applied-append.md') }),
-      (b) => ['--dangerously-load-development-channels', 'server:slack-channel-router', '--mcp-config', join(b, 'boot-mcp.json'),
-        '--append-system-prompt-file', join(b, 'boot-append.md')]],
+      (b) => ['--mcp-config', join(b, 'boot-mcp.json'),
+        '--append-system-prompt-file', botSystemPromptPath(resolveServerStateDir())]],
     ['start omitted an unreadable append file; the applied config names a readable one (not probed again)',
       (b) => [{ mcp_config_path: join(b, 'boot-mcp.json'), system_prompt_mode: 'append', append_system_prompt_file: join(b, 'boot-append.md'), fresh_system_prompt: false }, false],
       (b) => ({ mcp_config_path: join(b, 'applied-mcp.json'), system_prompt_mode: 'append', append_system_prompt_file: join(b, 'applied-append.md') }),
-      (b) => ['--dangerously-load-development-channels', 'server:slack-channel-router', '--mcp-config', join(b, 'boot-mcp.json')]],
+      (b) => ['--mcp-config', join(b, 'boot-mcp.json'), '--append-system-prompt-file', botSystemPromptPath(resolveServerStateDir())]],
     // b.b1j SR-2.3: fresh_system_prompt is start-time-only; the pair the start installed survives the applied config turning it off.
     ['start installed the snapshot pair; the applied config turns fresh_system_prompt off (the pair is kept)',
       (b) => [{ mcp_config_path: join(b, 'boot-mcp.json'), system_prompt_mode: 'none', fresh_system_prompt: true }, true],
       (b) => ({ mcp_config_path: join(b, 'applied-mcp.json'), system_prompt_mode: 'none', fresh_system_prompt: false }),
-      (b) => ['--dangerously-load-development-channels', 'server:slack-channel-router', '--mcp-config', join(b, 'boot-mcp.json'),
+      (b) => ['--mcp-config', join(b, 'boot-mcp.json'),
+        '--append-system-prompt-file', botSystemPromptPath(resolveServerStateDir()),
         '--system-prompt-snapshot', 'off']],
   ]
 

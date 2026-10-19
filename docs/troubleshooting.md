@@ -18,10 +18,10 @@ The first start recorded the bad setting, such as `port` or `bind`, before it fa
 `server.log` shows `Session connected with CWD "<path>" — no matching persona`: the session's working directory is no persona's `working_directory`, compared by real path. A `Session refused: …` line instead means an old instance may still run in that directory (see "A persona waits on an old instance in its working directory"). [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-session-connects-but-has-no-persona).
 
 **A persona doesn't come up or doesn't answer**
-The persona is silent, `/interject` returns 503 for it, or its scheduled prompts log `no-session`; nothing is posted to Slack. Find its key on its `persona-start` line in `server.log` and read its lines: each names a class (such as `persona-credentials-invalid` or `persona-directory-missing`) and the file or directory to fix. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-doesnt-come-up-or-doesnt-answer).
+The persona is silent. Accepted messages remain queued while its instance is unavailable. Find its key on its `persona-start` line in `server.log` and read its lines: each names a class (such as `persona-credentials-invalid` or `persona-directory-missing`) and the file or directory to fix. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-doesnt-come-up-or-doesnt-answer).
 
 **A persona's instance waits at a startup prompt**
-After each launch the server presses Enter on Claude Code's folder-trust or development-channels prompt, for at most the later of 5 minutes and `pending_grace_seconds` plus 60 s, and types nothing else. For any other prompt, attach with `tmux attach -t =slack_bot_<key>` and answer it. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-personas-instance-waits-at-a-startup-prompt).
+After each launch the server presses Enter on Claude Code's folder-trust prompt, for at most the later of 5 minutes and `pending_grace_seconds` plus 60 s, and types nothing else. For any other prompt, attach with `tmux attach -t =slack_bot_<key>` and answer it. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-personas-instance-waits-at-a-startup-prompt).
 
 **A persona's instance is still starting**
 Normal for a short time after every launch: the server waits it out and never launches a second instance over it. If it hasn't started in time, the persona posts a *Launch stuck* or *Session not starting* notice. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-personas-instance-is-still-starting).
@@ -51,7 +51,7 @@ Slack refused a post to the persona's destination; a `persona-destination-failed
 The bot is stuck on a Claude Code prompt that never reached Slack. A human reads it with `agent-director read-pane --instance-id <id>`, ends the session with `agent-director kill --instance-id <id>` and checks the result; on an error, don't delete or respawn, and never use `send-keys`. The server then brings the persona up again. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-bot-appears-dead--posts-a-blocked-on-a-native-claude-code-permission-prompt-warning).
 
 **Session not restarting after crash**
-Restarts back off from `session_restart_delay`, and after 5 failed launches in a row the persona posts `SpawnCapReached` and automatic restarts stop. Fix the cause, then restart the server (`claude-slack-channel-bots stop && claude-slack-channel-bots start`) to clear the limit. Each message lost meanwhile gets one lost-message notice naming the recovery state. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-session-not-restarting-after-crash).
+Restarts back off from `session_restart_delay`, and after 5 failed launches in a row the persona posts `SpawnCapReached` and automatic restarts stop. Fix the cause, then restart the server (`claude-slack-channel-bots stop && claude-slack-channel-bots start`) to clear the limit. Accepted messages remain queued while the persona cannot receive them. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-session-not-restarting-after-crash).
 
 **A persona is retried after agent-director refuses it**
 The server retries the persona on its own (after 30, 60, 120 and 240 s, then every 300 s) and never counts it toward the restart limit. If it never clears, check that `agent-director version` answers and fix agent-director; no server restart is needed. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-is-retried-after-agent-director-refuses-it).
@@ -60,13 +60,16 @@ The server retries the persona on its own (after 30, 60, 120 and 240 s, then eve
 After a removal, rename or path change, or a start whose clean-up could not end an old instance, no persona comes up in that directory until the old instance has ended; the server keeps ending it. If its kill keeps failing, a human follows the "Operator actions" section of agent-director's README. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-waits-on-an-old-instance-in-its-working-directory).
 
 **Bot alive but silently unresponsive (MCP disconnected)**
-The health check reconnects or relaunches such a bot on its own, within about 3–5 minutes at the default settings. With `session_restart_delay` set to `0`, a *Not connected* or *Not receiving messages* notice reports it instead. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-bot-alive-but-silently-unresponsive-mcp-disconnected).
+Accepted messages remain queued; a Slack message triggers the configured reconnect too. The health check reconnects or relaunches such a bot on its own, within about 3–5 minutes at the default settings. With `session_restart_delay` set to `0`, a *Not connected* notice reports it instead. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-bot-alive-but-silently-unresponsive-mcp-disconnected).
 
 **Reading the start summary**
 Each start logs one `[slack] startupSessionManager: complete — …` line counting its personas by outcome. `latched`, `retrying`, `waiting on a live-row sequence`, `held on invalid flags` and `fresh as retired keys` are not failures. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-reading-the-start-summary).
 
-**A persona posts a *Waiting on a prompt*, *Not connected* or *Not receiving messages* notice**
-The session runs, but messages can't reach it. A human attaches with `tmux attach -t =slack_bot_<key>`, deals with anything on screen and, if it stays disconnected, types `/mcp reconnect slack-channel-router`, or restarts the server. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-posts-a-waiting-on-a-prompt-not-connected-or-not-receiving-messages-notice).
+**Delivery notices or delivery diagnostic lines**
+For *Message not saved*, check the server disk; for *Delivery stuck* or *Message not taken in*, follow the notice's remedy; for *Messages waiting*, resolve the persona's state; for *Queue record unreadable*, preserve its file and ask the senders to resend. Accepted messages stay queued in order. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-delivery-notices-or-delivery-diagnostic-lines).
+
+**A persona posts a *Waiting on a prompt* or *Not connected* notice**
+The session runs but is disconnected; accepted messages are kept until it reconnects. A human attaches with `tmux attach -t =slack_bot_<key>`, deals with anything on screen and, if it stays disconnected, types `/mcp reconnect slack-channel-router`, or restarts the server. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-posts-a-waiting-on-a-prompt-or-not-connected-notice).
 
 **A persona posts a *Not answering*, *Still not answering* or *Answering again* notice**
 agent-director or tmux is not answering for this persona's session; the server keeps retrying and posts *Answering again* when it recovers. After *Still not answering*, a human checks tmux and agent-director with read-only commands only. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-posts-a-not-answering-still-not-answering-or-answering-again-notice).

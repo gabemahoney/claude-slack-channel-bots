@@ -1,0 +1,1 @@
+function oln(e,n){let r=ERe(),s=r?aX():void 0,h=e&&(r||a.CLAUDE_CODE_PROPAGATE_TRACEPARENT)?Zro(e):void 0;return Bpr(e,{attempt:n,clientRequestId:s}),{headers:{...s&&{[sbe]:s},...h&&{traceparent:h}},clientRequestId:s}}function rln(e,n,r){

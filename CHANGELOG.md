@@ -6,6 +6,22 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 ## Unreleased
 
+### Earlier-release bots start a fresh conversation once (breaking)
+
+Every earlier-release bot starts a fresh conversation once at upgrade, including existing personas. Memory files are kept; the old conversation context is not retained. Later restarts resume the marked replacement under the normal resume conditions. Follow the maintained [switch-over step 10](docs/migration.md#step-10-start-the-new-cscb) for the row checks and verification.
+
+Every new conversation carries `tag_prompt=1` and loads the shared composed prompt, `bot-system-prompt.md`, with CSCB's tag description and the applicable operator text. CSCB regenerates it before every spawn, reuse and resume; a failed write blocks that launch until a retry succeeds. The launch uses one `--append-system-prompt-file` in every prompt mode.
+
+### Queued terminal delivery
+
+- **Durable, ordered, at-least-once delivery.** Every accepted Slack message, `/interject` request and scheduled fire is stored in `queue/<key>.jsonl`. Each persona has one item in flight, in strict FIFO order; an unconfirmed item is offered again and may appear more than once. Queued items never expire, including after persona removal.
+- **`/interject` answers change.** HTTP 200 with `{ "ok": true, "persona": "<name>" }` confirms storage, including while the bot is down; HTTP 500 means storage failed. The two 503 responses are removed. Identical requests remain separate items.
+- **agent-director 0.12.0 or later is required.** Bots launch without the channels flag; Claude Code no longer needs channels permission. Remove the Claude Code version pin after upgrading.
+- **Scheduled prompts are queued directly by the server.** Each fire is independent, delivered in order and carries its fire time as `ts`; scheduling no longer depends on HTTP or `bind`. The cron log records `queued` or `queue-failed` and `queued=N failed=M` summaries; `delivered`, `no-session` and `http-error` outcomes are retired.
+- **Delivery notices replace `Message lost`.** New notices are *Message not saved*, *Delivery stuck*, *Message not taken in*, *Messages waiting* and *Queue record unreadable*. *Not receiving messages* is retired. *Waiting on a prompt* and both *Not connected* variants now say the bot cannot reply or use its Slack tools until connected again, and messages are kept and delivered once connected. Startup prompts retain *Launch stuck* / *Session not starting*.
+- **Downgrading needs a fresh launch.** Follow [Downgrading to an earlier release](docs/migration.md#downgrading-to-an-earlier-release): drain queues or accept undelivered loss, confirm `resume_enabled: false`, stop with bots, install the earlier build and restore its Claude Code pin, start fresh with channels, then restore and confirm resume.
+- The maintained switch-over now starts every earlier-release bot fresh once, and the downgrade runbook follows this safety order. The frozen 0.11.0 switch-over and rollback copies remain as published; follow [Migration](docs/migration.md#migration).
+
 ---
 
 ## 0.16.1 (2026-10-14)
@@ -221,12 +237,13 @@ The top-level setting `allow_invited_channels` picks the channel mode for every 
 
 The section [Downgrading to an earlier release](docs/migration.md#downgrading-to-an-earlier-release) of docs/migration.md is the maintained copy of this runbook; this copy carries the same steps and words.
 
-An earlier release's loader rejects `allow_invited_channels` and `invited` as unknown keys, and a restarted server runs the last-applied record, so the record must not hold either key when the older build starts. A host whose `config.json` has never held either key downgrades as from any release: install the older build and restart the server on it. Otherwise, follow these steps in order, with the server running:
+Earlier releases ignore this release’s queue and can resume a bot without their required channels launch, leaving it unable to receive messages. Follow all four phases in order, including when the configuration already fits the target release.
 
-1. **Give every persona a valid declarative section.** Turning fungible mode off is checked by the declarative rules, so each persona needs a `permission_prompts`, and `channels` unless its `dm.enabled` is `true`, that pass them (see [Load-time rules](docs/configuration.md#load-time-rules)).
-2. **Remove `allow_invited_channels` and every persona's `invited` from `config.json`.**
-3. **Confirm the pending change, and wait for its `reload-applied` or `reload-noop` line** (see [Confirming a change](docs/reload.md#confirming-a-change)). Either one means the last-applied record holds the configuration without the two keys. A host that was already in declarative mode confirms as `reload-noop`.
-4. **Install the older build and restart the server on it.** For example, `bun install -g claude-slack-channel-bots@<version>`, then `claude-slack-channel-bots stop` and `claude-slack-channel-bots start`. The older build ignores `channel-delivery.json`, so the file can stay where it is.
+1. **Stop sending and empty the queues.** Wait until `server.log` shows every received item delivered. Otherwise explicitly accept that undelivered messages are lost when using the earlier release.
+2. **Disable resume on the current release.** Set `resume_enabled` to `false` in `config.json`, [confirm the pending change](docs/reload.md#confirming-a-change), and verify `config.json.last-applied` holds `resume_enabled: false`. Keep the current server running until this is applied.
+   If the target release does not support these settings, first give every persona a valid declarative section (`permission_prompts`, and `channels` unless `dm.enabled` is `true`; see [Load-time rules](docs/configuration.md#load-time-rules)), remove `allow_invited_channels` and every persona’s `invited`, confirm, and ensure the last-applied record holds neither. These precautions do not replace any phase.
+3. **Stop with the bots, then install and pin the earlier build.** Run `claude-slack-channel-bots stop --stop-bots` and verify it succeeds, install the earlier build (for example `bun install -g claude-slack-channel-bots@<version>`), then restore its required Claude Code version pin before starting it.
+4. **Start the earlier release fresh with channels, then restore resume.** Run `claude-slack-channel-bots start`; verify every bot starts a new conversation with that release’s channels launch and no configuration load error. Only then set `resume_enabled` back to its previous value and confirm the change. The earlier build ignores `channel-delivery.json`; leave it in place.
 
 ---
 

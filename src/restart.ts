@@ -272,7 +272,7 @@ export const CLEAN_EXIT_RELAUNCH_DELAY = 3
 export const RESTART_OUTCOME_SHUTTING_DOWN = 'shutting-down'
 /** The persona is not up (or not applied): its instance and row were left as they are. */
 export const RESTART_OUTCOME_NOT_UP = 'not-up'
-/** The row reads live and the session is connected with its stream: nothing to do. */
+/** The row reads live and the session is connected: nothing to do. */
 export const RESTART_OUTCOME_ALREADY_CONNECTED = 'already-connected'
 /** The row read live and the reconnect succeeded (a success was recorded). */
 export const RESTART_OUTCOME_RECONNECTED = 'reconnected'
@@ -437,16 +437,10 @@ export interface RestartDeps {
    * launch or accounting, and calls `armRetryTimer`.
    */
   isSessionAlive(key: string): Promise<LivenessReading>
+  /** b.omv SR-7.6: read provenance before pending/connected shortcuts. */
+  inspectUpgrade?(key: string): Promise<boolean>
   /** Check if the session already has a live MCP connection in the registry. */
   isSessionConnected(key: string): boolean
-  /**
-   * Check if the session's standalone GET SSE stream (`_GET_stream`) is present
-   * in its transport. A session can be `connected === true` in the registry
-   * while the SDK has silently deleted the stream map entry — in that state
-   * messages cannot reach the bot, so it must NOT count as "already reconnected"
-   * (b.9cj). Returns false when there is no session at all.
-   */
-  hasSessionStream(key: string): boolean
   /**
    * Attempt to reconnect the MCP session. Returns a discriminated result so
    * restart.ts can call recordSuccess on the 'success' path. `'pending'`: the
@@ -705,7 +699,7 @@ export interface RestartDeps {
   slowRecovery?: RestartSlowRecoveryObserver
 }
 
-/** `RestartSlowRecoveryObserver.noteOther`'s reason: a run whose reconnect ended with a verdict other than 'escalate-dead', or that found the session already connected with its stream. */
+/** `RestartSlowRecoveryObserver.noteOther`'s reason: a run whose reconnect ended with a verdict other than 'escalate-dead', or that found the session already connected. */
 export const RESTART_SLOW_RECOVERY_OTHER_VERDICT = 'other-verdict'
 /** `RestartSlowRecoveryObserver.noteOther`'s reason: an 'escalate-dead' verdict whose re-probe read `pending` (not counted, b.jg5 SRJ-610). */
 export const RESTART_SLOW_RECOVERY_OTHER_PENDING_REPROBE = 'pending-reprobe'
@@ -730,7 +724,7 @@ export interface RestartSlowRecoveryObserver {
   noteDead(key: string): unknown
   /** The `dead` reading from `ErrSystemInstallDisappeared`, which reads no row. */
   noteInstallGone(key: string): unknown
-  /** A run whose reconnect ended with another verdict or that found the session already connected with its stream, a run whose first probe read `pending`, or an 'escalate-dead' verdict whose re-probe read `pending`. */
+  /** A run whose reconnect ended with another verdict or that found the session already connected, a run whose first probe read `pending`, or an 'escalate-dead' verdict whose re-probe read `pending`. */
   noteOther(key: string, reason: SlowRecoveryOtherReason): unknown
 }
 
@@ -1421,7 +1415,7 @@ async function runNow<T>(_key: string, operation: () => T | Promise<T>): Promise
  * 0 too) and no restart timer is armed, cleared or needed. Before `initRestart` it answers
  * `RESTART_OUTCOME_NOT_INITIALISED` and logs. Rejects only when the
  * serializer or an unguarded dependency (`isShuttingDown`, `canRestart`,
- * `isSessionConnected`, `hasSessionStream`, `onCapReached`) throws.
+ * `isSessionConnected`, `onCapReached`) throws.
  */
 export async function runRestartRetry(
   key: string,
@@ -1724,6 +1718,9 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
     return RESTART_OUTCOME_LIVENESS_UNKNOWN
   }
 
+  // b.omv SR-7.6: markerless rows never self-heal through the connected shortcut.
+  if (probe.kind !== LIVENESS_DEAD && await d.inspectUpgrade?.(key)) return RESTART_OUTCOME_RECONNECT_DEFERRED
+
   // b.jg5 SRJ-314: the row reads `pending`, so its session has not started.
   // It goes to the `pending` deferral whatever the session's connection
   // shows (a connected `pending` row is never "already reconnected"): no
@@ -1757,13 +1754,8 @@ async function restartWorkSteps(d: RestartDeps, key: string, cwd: string, sessio
   let escalation: EscalateDeadAnswer | undefined
   let deadRead = goneAfterDeferral === undefined ? deadReadingOf(probe) : deadLivenessReading(goneAfterDeferral)
   if (probe.kind !== LIVENESS_DEAD && goneAfterDeferral === undefined) {
-    // If the session already re-established its MCP connection (e.g. Claude
-    // Code refreshed the SSE stream on its own), skip the reconnect. A
-    // session is only truly healed when it is connected AND its standalone
-    // GET SSE stream is present: a connected-but-streamless session (b.9cj)
-    // cannot receive messages, so it must proceed to recovery rather than be
-    // waved through as "already reconnected".
-    if (d.isSessionConnected(key) && d.hasSessionStream(key)) {
+    // b.omv SR-9: the MCP connection alone is enough to skip reconnecting.
+    if (d.isSessionConnected(key)) {
       console.error(`[slack] Session already reconnected — skipping restart for persona=${key}`)
       // b.jg5 SRJ-610: the persona healed on its own, a verdict other than
       // 'escalate-dead': the slow-recovery count resets; an open episode

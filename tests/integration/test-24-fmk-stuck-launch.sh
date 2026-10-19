@@ -37,7 +37,7 @@
 #   config.toml, so no `[tmux]` table);
 # - the tmux shim first on every CSCB process's PATH, in `log` mode
 #   throughout;
-# - the stub as `claude`: `dev-channels` (no selection) in a working
+# - the stub as `claude`: `startup-trust` (no selection) in a working
 #   directory until a leg selects `unrecognised-dialog` (a startup dialog no
 #   approver needle matches; it reports in on the first line that reaches its
 #   stdin) or `at-once` there (`stub_mode`; a stub reads its directory's
@@ -62,7 +62,7 @@
 # The own-launch leg (`leg_own_stuck_launch`), in run order, persona P
 # (working directory `own`). Steps marked [harness] are the harness playing a
 # human from the scenario's own shell; no CSCB process makes them.
-#   1. The live start brings P up: the stub holds at the dev-channels dialog,
+#   1. The live start brings P up: the stub holds at the startup-trust dialog,
 #      the approver clears it, the row reads `waiting` with a
 #      session_id, the server registers the stub's MCP session as P's,
 #      and the bring-up's approver has stopped (no bot-server pane read of P
@@ -1204,6 +1204,7 @@ leg_own_stuck_launch() {
     mkdir -m 700 "${creds}"
     start_slack_stub "${SCENARIO_ROOT}/slack-stub-own" "${P_SUFFIX}"
     work="$(make_workdir own)"
+    stub_mode "${work}" "${STUB_MODE_STARTUP_TRUST}"
     creds_file="$(write_credentials "${creds}" "${P_SUFFIX}")"
     write_personas_config "$(persona_json "${P_NAME}" "${creds_file}" "${work}" "${P_CHANNEL}")"
 
@@ -1405,6 +1406,7 @@ leg_other_process() {
     mkdir -m 700 "${creds}"
     start_slack_stub "${SCENARIO_ROOT}/slack-stub-other" "${Q_SUFFIX}"
     work="$(make_workdir other)"
+    stub_mode "${work}" "${STUB_MODE_STARTUP_TRUST}"
     creds_file="$(write_credentials "${creds}" "${Q_SUFFIX}")"
     write_personas_config "$(persona_json "${Q_NAME}" "${creds_file}" "${work}" "${Q_CHANNEL}")"
 
@@ -1708,7 +1710,9 @@ legs_relabelled_session_and_grouped_viewer() {
     mkdir -m 700 "${creds}"
     start_slack_stub "${SCENARIO_ROOT}/slack-stub-rv" "${R_SUFFIX}" "${V_SUFFIX}"
     r_work="$(make_workdir relabel)"
+    stub_mode "${r_work}" "${STUB_MODE_STARTUP_TRUST}"
     v_work="$(make_workdir viewer)"
+    stub_mode "${v_work}" "${STUB_MODE_STARTUP_TRUST}"
     r_creds="$(write_credentials "${creds}" "${R_SUFFIX}")"
     v_creds="$(write_credentials "${creds}" "${V_SUFFIX}")"
     write_personas_config "$(persona_json "${R_NAME}" "${r_creds}" "${r_work}" "${R_CHANNEL}")" \

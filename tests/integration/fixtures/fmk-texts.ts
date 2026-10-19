@@ -300,6 +300,7 @@
  *   invitedChannelCause <channel> <public|private> <delivery>
  *                                                src/persona-diagnostics.ts: its cause
  *   PERSONA_CHANNEL_DELIVERY_SET                 src/persona-diagnostics.ts, the class label
+ *   MESSAGE_RECEIVED, MESSAGE_DELIVERED          src/persona-diagnostics.ts, delivery evidence labels
  *   channelDeliverySetCause <channel> <before> <after> <delivery>
  *                                                src/persona-diagnostics.ts: its cause; <before>
  *                                                is the package's NO_STORED_CHOICE for no stored
@@ -542,6 +543,8 @@
  *                                                a spawn-failure notice (several lines)
  *   FULL_PANE_READ_LINES                         src/pane-read.ts, in decimal: the line count of a
  *                                                full pane read (the waiting-row check's)
+ *   ENTER_DELAY_MS                              src/delivery-constants.ts, reconnect's delay
+ *                                                between text/no_enter and Enter (b.omv SR-5.4)
  *
  * The fixed-argument entries of scenarios 2, 6, 7, 9, 12, 15, 16 and 18
  * (`ARGS_ENTRIES`; test-14, test-18, test-19 and test-21). Each takes
@@ -3782,7 +3785,7 @@ async function personaDefaultConfigDirLabels(key: string, home: string): Promise
   const configDirPrefix = await stringExport('persona-identity.ts', 'CONFIG_DIR_LABEL_PREFIX')
   const labelOf = await functionExport('session-manager.ts', 'personaConfigDirLabelValue')
   const label = builtText('session-manager.ts', 'personaConfigDirLabelValue', labelOf(undefined, home))
-  return [service, `${personaPrefix}${key}`, `${configDirPrefix}${label}`].join('\n')
+  return [service, 'tag_prompt=1', `${personaPrefix}${key}`, `${configDirPrefix}${label}`].join('\n')
 }
 
 /** The one-function entries, by the name a script passes. */
@@ -4155,6 +4158,8 @@ const ENTRIES: Readonly<Record<string, Entry>> = joinEntryTables({
   tmuxUnresponsiveAlertText: unresponsiveAlert,
   restartCapReachedNoticeText: builderEntry('session-manager.ts', 'restartCapReachedNoticeText', []),
   FULL_PANE_READ_LINES: constantEntry('pane-read.ts', 'FULL_PANE_READ_LINES'),
+  // b.omv SR-5.4: reconnect's text and Enter use the production delay.
+  ENTER_DELAY_MS: constantEntry('delivery-constants.ts', 'ENTER_DELAY_MS'),
   // Scenario 8 (test-20-fmk-old-binary.sh).
   classifyAdError: adErrorClass,
   // Scenario 23 (test-20-fmk-old-binary.sh).
@@ -4208,6 +4213,8 @@ const ENTRIES: Readonly<Record<string, Entry>> = joinEntryTables({
   PERSONA_INVITED_CHANNEL: constantEntry('persona-diagnostics.ts', 'PERSONA_INVITED_CHANNEL'),
   invitedChannelCause: invitedCause,
   PERSONA_CHANNEL_DELIVERY_SET: constantEntry('persona-diagnostics.ts', 'PERSONA_CHANNEL_DELIVERY_SET'),
+  MESSAGE_RECEIVED: constantEntry('persona-diagnostics.ts', 'MESSAGE_RECEIVED'),
+  MESSAGE_DELIVERED: constantEntry('persona-diagnostics.ts', 'MESSAGE_DELIVERED'),
   channelDeliverySetCause: deliverySetCause,
   NO_STORED_CHOICE: constantEntry('persona-diagnostics.ts', 'NO_STORED_CHOICE'),
   SET_CHANNEL_DELIVERY_TOOL: constantEntry('channel-delivery.ts', 'SET_CHANNEL_DELIVERY_TOOL'),

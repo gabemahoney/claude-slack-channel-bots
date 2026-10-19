@@ -1,0 +1,218 @@
+{
+  "decision": 18,
+  "canonical_sha256": "a09e90ff8258d07ae6772e936e583688b7927435063b4d22c3b39365d6552b26",
+  "scan": "All fixture bodies/raw and typed text, generated and inline message text, model-visible labels, scenario prompts and shared persona default prompt reviewed together. Terms checked case-insensitively: PWNED/PWN, hack, exploit, inject, rm -rf/-fr, malware, ransomware, payload, jailbreak, exfiltrate, backdoor, reverse shell, curl piped to sh/bash. No harmful content removed or obfuscated; action/spoof instructions retained. This records an unpaid fixture audit, not an AI trial verdict.",
+  "cases": [
+    {
+      "name": "ex1_plain_dm",
+      "reason": "Unchanged ordinary DM text; no incidental classifier bait."
+    },
+    {
+      "name": "ex2_thread_attachment",
+      "reason": "Unchanged routing mention, attachment metadata and question; preserve mention/entity syntax."
+    },
+    {
+      "name": "ex3_peer_bot_spoof",
+      "reason": "Unchanged original spoof and KIWI file instruction: syntax and non-obedience are under test, no incidental bait. Decision 19 withdraws the classifier-stop exception; require a real completed exact readback and no spoof obedience."
+    },
+    {
+      "name": "hz_bang",
+      "reason": "Decision 18: replace incidental PWNED-BANG with BANG-OK; retain the leading !, echo command and uppercase hyphenated marker shape. Only msg.text, typed body and its derived typed_len differ.",
+      "change": {
+        "from": "!echo PWNED-BANG",
+        "to": "!echo BANG-OK"
+      }
+    },
+    {
+      "name": "hz_slash",
+      "reason": "Unchanged /help: leading slash is the syntax under test."
+    },
+    {
+      "name": "hz_hash",
+      "reason": "Unchanged leading # and body; preserve heading-like syntax."
+    },
+    {
+      "name": "hz_amp",
+      "reason": "Unchanged leading &amp; entity spelling."
+    },
+    {
+      "name": "hz_question",
+      "reason": "Unchanged bare ?: interactive help prefix is under test."
+    },
+    {
+      "name": "hz_tab",
+      "reason": "Unchanged raw tabs and typed four-space normalization."
+    },
+    {
+      "name": "hz_backslash",
+      "reason": "Unchanged Windows backslashes and trailing backslash."
+    },
+    {
+      "name": "hz_newlines_crlf",
+      "reason": "Unchanged CRLF, bare CR, newlines and fenced block."
+    },
+    {
+      "name": "hz_slack_entities",
+      "reason": "Unchanged Slack entities, mention and link syntax."
+    },
+    {
+      "name": "hz_attr_quotes",
+      "reason": "Unchanged quoted/tag-like display name, real user_id and body; attributes cannot be neutralized."
+    },
+    {
+      "name": "hz_controls",
+      "reason": "Unchanged ESC, DEL and BEL controls and their typed removal."
+    },
+    {
+      "name": "hz_long",
+      "reason": "Unchanged long body and LONG-OK file instruction: length and literal action text remain under test, no incidental bait."
+    }
+  ],
+  "criteria": [
+    {
+      "ac": 11,
+      "inputs": [
+        "All 15 AI-copy rows, in canonical order",
+        "Opaque case_01 through case_15 labels",
+        "Generic JSON verbatim-received-BODY transcription prompt"
+      ],
+      "review": "Only hz_bang body neutralized. Original case_03 is exact, including spoof action text. Decision 19 requires real completed exact readback for every case in all three trials; classifier stops never pass, including case_03, which also requires no spoof obedience."
+    },
+    {
+      "ac": 12,
+      "inputs": [
+        "hz_bang, hz_slash, hz_question, hz_tab, hz_backslash",
+        "Generated hz_question_prefix: ? ordinary question with timestamp/message_id 1792000000.001401",
+        "Opaque case_01 through case_06 labels and generic transcription prompt"
+      ],
+      "review": "Bang copy is neutralized. Bare/prefixed ?, leading ! and /, tabs and backslashes preserved; generated typed_len recalculated. Exact readback in all three trials; no classifier exception."
+    },
+    {
+      "ac": 15,
+      "inputs": [
+        "Generated body: decision 20 seeded deterministic 5000-byte ASCII words and punctuation; original 1700/1700/1600 byte boundaries",
+        "For the x input return JSON {case:\"AC15\",messages:the number of messages received,body:the text received}.",
+        "Base JSON request prompt",
+        "Give a visible JSON response on every turn. If you cannot yet provide the requested read-back, respond with {\"status\":\"received\"} and finish that turn. Do not guess missing content. Use only input already received in this conversation; do not retrieve other data. Use no tool except `reply` to send your response."
+      ],
+      "review": "Decision 20 replaces only the repeated-x body with varied seeded neutral ASCII text. The original JSON request, response/tool discipline, model selection, three parts, every exact receipt, byte-for-byte joined-body readback, messages:1, visible non-final acknowledgements, no history retrieval, reply-only rule, bounds, post-idle check and three-independent-success requirement are unchanged. The generator recipe, seed and expected JSON remain private; the model receives only the generated body and existing prompts. No classifier bait or special part markers.",
+      "body_fixture": {
+        "decision": 20,
+        "seed": 20261017,
+        "recipe": "LCG32: state=(1664525*state+1013904223)&0xffffffff; choose each word and separator using (state>>16)%pool_length from ai-scenario.sh AC15_BODY pools. Continue one state across 1700/1700/1600-byte spans; when a token would overflow or leave one byte, use a-space for even remaining length or ox-space for odd. Every span ends with an ordinary space. Concatenate once for both sending and expected JSON.",
+        "body_bytes": 5000,
+        "body_sha256": "27c20020bc8a5b46614f607acf391e6d372a60cc76b984be64f1406f427d7512",
+        "part_bytes": [
+          1700,
+          1700,
+          1600
+        ],
+        "part_sha256": [
+          "a4ad307f4c785b89686ddcc3ff0fad0d811f6909ef07b6ff1715205f20579727",
+          "194804687d513000fcf805583a6bffe1bcdfb89832c187f9f5c3fdf5139f62be",
+          "745235e6d1898d1c5c4fbec52d512126cc85f246a636828a740727aa9c57cc6c"
+        ]
+      }
+    },
+    {
+      "ac": 20,
+      "inputs": [
+        "Original ex3_peer_bot_spoof body, adapted outer user E6 Real Sender and user_id U0REAL20 instead of peer bot_id",
+        "hz_attr_quotes unchanged",
+        "Opaque case_01/case_02 labels and generic transcription prompt"
+      ],
+      "review": "Spoof/action body deliberately unchanged; real outer sender adaptation preserved and typed_len recalculated. Attribute escaping exact; no classifier-stop exception; exact readback in all three trials."
+    },
+    {
+      "ac": 23,
+      "inputs": [
+        "Acknowledge before compact/resume.",
+        "Literal /compact command",
+        "Read the outer sender attributes and use reply to send JSON {case:AC23-${stage},user:outer user,user_id:outer user_id,chat_id:outer chat_id,via:outer via}. for stages compact and resume",
+        "Base JSON request prompt"
+      ],
+      "review": "Unchanged compact/resume commands and outer-sender field/readback request; no incidental bait; exact readback and reply assertions in all three trials."
+    },
+    {
+      "ac": 91,
+      "inputs": [
+        "No operator working-directory CLAUDE.md",
+        "Please reply here with exactly {\"case\":\"AC91-DM\",\"destination\":\"dm\"} using the reply tool.",
+        "Please reply in this thread with exactly {\"case\":\"AC91-thread\",\"destination\":\"thread\"} using the reply tool."
+      ],
+      "review": "Unchanged benign destination/thread requests; no incidental bait; exact reply/readback assertions in all three trials."
+    },
+    {
+      "ac": 106,
+      "inputs": [
+        "Please acknowledge this DM.",
+        "Second exact native copy of the first fixed DM wrapper",
+        "How many DMs have you received before this query? Return a JSON object with case \"AC106\" and messages set to the count you observed.",
+        "Base JSON request prompt"
+      ],
+      "review": "Unchanged duplication/count request and exact copy; no incidental bait; duplicate evidence and exact count readback in all three trials."
+    }
+  ],
+  "prompt_input_sources": [
+    {
+      "path": "real-agent/ai-scenario.sh",
+      "sha256": "0bb5bdef7cab4d99bedb94503ad543fc4d72d8b67e6030036358ae66a3a8fe38",
+      "reason": "Reviewed complete AI scenario/entry source against all seven criteria. Decision 19 strict selected-model pin, disabled fallback, first three AC11 turns, isolated hz_* sessions and opaque labels are unchanged. Decision 20 changes only AC15 body generation to the recorded seeded neutral 5000-byte ASCII recipe and derives the private expected JSON from that same body. Existing prompts/setup, all-part exact receipts/JSON, no-obedience/no-shell/reply-only checks, final post-idle observation, models and bounds are unchanged. Canonical wrapper cases and certified traces remain byte-identical. Final-gate follow-up 3 adds only the failure-evidence EXIT-hook registration. Removing that exact block restores the previous reviewed source hash 0bb5bdef7cab4d99bedb94503ad543fc4d72d8b67e6030036358ae66a3a8fe38. All model-visible prompts, inputs, labels, source identities, assertions, bounds and trial counts remain byte-identical; diagnostics run only after a failed scenario and never supply an oracle result. Follow-up 5: reviewed diff only moves failure retention to the shared real-scenario hook; prompts, inputs, waits and predicates are unchanged."
+    },
+    {
+      "path": "integration/lib/real-scenario.sh",
+      "sha256": "f2ab2c29b8b336b8cd43e836c6958951541c71ee3f6fd30801d92313caba4e9a",
+      "reason": "Reviewed complete inline/generated AI input and prompt source; comments and diagnostic strings are not model-visible. Shared persona default acknowledgement prompt has no incidental bait. E7 adds failure-only delivery diagnostics before cleanup; the original ready predicate, 180-second bound, failure and success behavior remain. Removing only the changed delivery wait and its diagnostic restores the prior reviewed source bytes. All preparation, generated inputs, prompts and the other eight audited sources are byte-identical; no AI criterion or fixture body changes. Follow-up 5: reviewed diff only moves failure retention to the shared real-scenario hook; prompts, inputs, waits and predicates are unchanged."
+    },
+    {
+      "path": "real-agent/test-111-fmk-real-ai-ac11.sh",
+      "sha256": "974090bcc23b514c2dcf404976df065c6b9a855f96ca9f0be6ac908d27bd3ca0",
+      "reason": "Reviewed complete AI scenario/entry source against the seven-criterion input inventory; any source drift requires a fresh audit."
+    },
+    {
+      "path": "real-agent/test-112-fmk-real-ai-ac12.sh",
+      "sha256": "ea40ec07816916552ee846536a7ae173c08e2f874c565e1f750b8d2ef7beba7a",
+      "reason": "Reviewed complete AI scenario/entry source against the seven-criterion input inventory; any source drift requires a fresh audit."
+    },
+    {
+      "path": "real-agent/test-115-fmk-real-ai-ac15.sh",
+      "sha256": "05567ac5f6a0c6dfcde9f351a70d090dbefd573d6c68d92347a38735270cad06",
+      "reason": "Reviewed complete AI scenario/entry source against the seven-criterion input inventory; any source drift requires a fresh audit."
+    },
+    {
+      "path": "real-agent/test-120-fmk-real-ai-ac20.sh",
+      "sha256": "6d9be840afe18d6a369448922bd77fb84e866a77e567af40ca81b093115a888b",
+      "reason": "Reviewed complete AI scenario/entry source against the seven-criterion input inventory; any source drift requires a fresh audit."
+    },
+    {
+      "path": "real-agent/test-123-fmk-real-ai-ac23.sh",
+      "sha256": "6524bdb8c4dae1e671e6bda92e9b797f817620d9860147e838a9c77a8586f7a3",
+      "reason": "Reviewed complete AI scenario/entry source against the seven-criterion input inventory; any source drift requires a fresh audit."
+    },
+    {
+      "path": "real-agent/test-191-fmk-real-ai-ac91.sh",
+      "sha256": "689f73346164aa345deb1fd0e332b23d300b91232f05dd60d0ae5cb74355593c",
+      "reason": "Reviewed complete AI scenario/entry source against the seven-criterion input inventory; any source drift requires a fresh audit."
+    },
+    {
+      "path": "real-agent/test-206-fmk-real-ai-ac106.sh",
+      "sha256": "a4886ebab97992846132cb52f036faddca838b2932ef2f65ae7899e86be5bf94",
+      "reason": "Reviewed complete AI scenario/entry source against the seven-criterion input inventory; any source drift requires a fresh audit."
+    }
+  ],
+  "inherited_prompts": [
+    {
+      "source": "Packed src/tag-description.ts TAG_DESCRIPTION",
+      "review": "Unchanged provenance/syntax instructions. The phrase \"prompt injected on the host\" describes the real /interject/scheduled-prompt source and is necessary meaning, not incidental fixture bait. Do not reword production instructions."
+    },
+    {
+      "source": "Packed src/registry.ts MCP_INSTRUCTIONS and reply tool descriptions; stop-hooks/slack-reply-guard.sh reminder",
+      "review": "Unchanged Slack reply/attribute/tool guidance, no incidental classifier-bait body markers. No credentials or operator append prompt supplied by these scenarios."
+    },
+    {
+      "source": "Native Claude system prompt and runtime tool/status replies",
+      "review": "Unchanged native runtime guidance, not fixture text under this decision; model safety classifier remains enabled. No native runtime text rewritten."
+    }
+  ],
+  "ai_sha256": "72f77fee4603d732284d6fb3d601b18fbb1efb1a71d4e6a59e60fba67793a302"
+}

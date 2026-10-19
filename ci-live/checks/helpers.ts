@@ -15,7 +15,7 @@
 
 // The two src/ modules below import nothing, so the runner loads no Slack SDK
 // or agent-director client on the host; no other src/ module is imported here.
-import { DESTRUCTIVE_PREFIX, REMOVED_RETIRED_CLAUSE } from '../../src/reload-preview-clauses.ts'
+import { DESTRUCTIVE_PREFIX, queueRetentionClause, REMOVED_RETIRED_CLAUSE } from '../../src/reload-preview-clauses.ts'
 import { startupSummaryEnding, type StartupSummaryEndingCounts } from '../../src/startup-summary-ending.ts'
 import { CONTAINER_STATE_DIR } from '../lib/live-config.ts'
 import { isFrom, messageText, type HumanSession, type SlackMessage } from '../lib/human-session.ts'
@@ -550,13 +550,14 @@ export function previewHeader(counts: Parameters<typeof countsText>[0]): string 
  * A persona's removal line in the reload preview, as src/reload-plan.ts's
  * `removedLine` renders it (b.jg5 SRJ-1510): `DESTRUCTIVE: persona "<name>"
  * (key=<key>) is removed: the persona will be retired: its session stopped
- * and never resumed.`. The prefix and the retired clause are src/'s own
+ * and never resumed; <count> open queued items kept, delivered only if a
+ * persona with the same key is added again.`. The prefix and clauses are src/'s own
  * (`src/reload-preview-clauses.ts`); the persona reference is the checks'
  * name-and-key form.
  */
-export function removedPreviewLine(letter: PersonaLetter): string {
+export function removedPreviewLine(letter: PersonaLetter, queueOpenCount = 0): string {
   const n = personaName(letter)
-  return `${DESTRUCTIVE_PREFIX} persona "${n}" (key=${n}) is removed: ${REMOVED_RETIRED_CLAUSE}.`
+  return `${DESTRUCTIVE_PREFIX} persona "${n}" (key=${n}) is removed: ${REMOVED_RETIRED_CLAUSE}; ${queueRetentionClause(queueOpenCount)}.`
 }
 
 export function appliedLine(counts: Parameters<typeof countsText>[0]): string {
