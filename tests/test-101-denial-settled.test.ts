@@ -1,6 +1,21 @@
 import { expect, test } from 'bun:test'
 import { denialSettled } from './real-agent/test-101-denial-settled.ts'
 import type { TranscriptEntry } from './integration/fixtures/transcript-receipts.ts'
+import { createHash } from 'node:crypto'
+import sourceAudit from './fixtures/native-denial-completion/notification-shapes-source.json'
+import { assertNoLeak } from './test-helpers/credentials.ts'
+
+const shapes = ['user string', 'user blocks', 'queued string', 'queued blocks'] as const
+function shapeNotification(e: ReturnType<typeof evidence>, shape: typeof shapes[number]) {
+  const v = e.own[3]!.value
+  if (v.type !== 'user') return // Negative queue bookkeeping must stay unconsumed.
+  let content = v.message.content
+  if (shape.endsWith('blocks')) content = [{ type: 'text', text: content }]
+  if (shape.startsWith('queued')) {
+    delete v.message
+    v.type = 'attachment'; v.attachment = { type: 'queued_command', commandMode: 'task-notification', prompt: content }
+  } else v.message.content = content
+}
 
 // b.omv SR-14.2 case 8: a main Stop while an async Agent runs is not readiness.
 function evidence() {
@@ -25,11 +40,14 @@ function evidence() {
 }
 function observe(e: ReturnType<typeof evidence>) { return denialSettled('busy', e.action, e.slack, e.own, [...e.own, ...e.side]) }
 
-test('matching actual denial, sidechain completion and consumed main completion permit the subsequent idle check', () => {
-  expect(observe(evidence())).toMatchObject({ request_token: 'request1', agent_id: 'agent1', session_id: 'session', subagent_completed_at: 8, main_completed_at: 10 })
+test.each([...shapes])('%s matching denial, sidechain completion and consumed main completion permit the idle check', shape => {
+  const e = evidence(); shapeNotification(e, shape)
+  const result = observe(e)
+  expect(result).toMatchObject({ request_token: 'request1', agent_id: 'agent1', session_id: 'session', subagent_completed_at: 8, main_completed_at: 10 })
+  assertNoLeak(result)
 })
 
-test.each([
+const negatives = [
   ['denial call incomplete', (e: any) => { e.decision.method = 'chat.postMessage' }],
   ['denial failed', (e: any) => { e.decision.answer = 'error' }],
   ['denial not delivered', (e: any) => { e.decision.status = 500 }],
@@ -50,7 +68,39 @@ test.each([
   ['notification for different agent', (e: any) => { e.own[3].value.message.content = e.own[3].value.message.content.replace('agent1', 'other') }],
   ['notification for different Agent call', (e: any) => { e.own[3].value.message.content = e.own[3].value.message.content.replace('launch1', 'other') }],
   ['main still running after completion', (e: any) => { e.own.pop() }],
-] as const)('refuses %s', (_name, change) => {
-  const e = evidence(); change(e)
+  ['notification before Agent launch result', (e: any) => { e.own[3].offset = 1 }],
+  ['notification before denied tool record', (e: any) => { e.own[3].at = 3 }],
+  ['notification before subagent completion', (e: any) => { e.own[3].at = 7 }],
+  ['untimed notification', (e: any) => { e.own[3].at = NaN }],
+  ['foreign notification session', (e: any) => { e.own[3].value.sessionId = 'other' }],
+  ['foreign notification stream', (e: any) => { e.own[3].path = '/other/session.jsonl' }],
+  ['sidechain notification in main stream', (e: any) => { e.own[3].value.isSidechain = true }],
+  ['unlinked notification', (e: any) => { e.own[3].value.message.content = '<task-notification><status>completed</status></task-notification>' }],
+  ['failed notification', (e: any) => { e.own[3].value.message.content = e.own[3].value.message.content.replace('completed', 'failed') }],
+  ['IDs only in result prose', (e: any) => { e.own[3].value.message.content = '<task-notification><result>' + e.own[3].value.message.content + '</result></task-notification>' }],
+  ['ambiguous notifications', (e: any) => { e.own[3].value.message.content += e.own[3].value.message.content }],
+  ['conflicting duplicated identity', (e: any) => { e.own[3].value.message.content = e.own[3].value.message.content.replace('<status>', '<task-id>other</task-id><status>') }],
+] as const
+test.each(shapes.flatMap(shape => negatives.map(([name, change]) => [shape, name, change] as const)))('%s refuses %s', (shape, _name, change) => {
+  const e = evidence(); change(e); shapeNotification(e, shape)
   expect(() => observe(e)).toThrow()
+})
+
+for (const audit of sourceAudit) test.each([...shapes])(`${audit.version} audited serializer supports %s with either native linkage ID`, shape => {
+  for (const fragment of audit.fragments) {
+    expect(Buffer.byteLength(fragment.source)).toBe(fragment.bytes)
+    expect(createHash('sha256').update(fragment.source).digest('hex')).toBe(fragment.sha256)
+  }
+  const serializer = audit.fragments.find(f => f.name === 'notification-serialization')!.source
+  const tags = audit.fragments.filter(f => f.name.startsWith('tag-')).map(f => f.source).join(',')
+  // Execute only the captured pure serializer with fixture IDs, never a client.
+  const serialize = new Function(`const ${tags}; return (${serializer});`)() as (fields: Record<string, string>) => string
+  for (const ids of [{ taskId: 'agent1', toolUseId: 'launch1' }, { taskId: 'agent1' }, { toolUseId: 'launch1' }]) {
+    const e = evidence()
+    e.own[3]!.value.message.content = serialize({ ...ids, status: 'completed' } as Record<string, string>)
+    shapeNotification(e, shape)
+    const result = observe(e)
+    expect(result.agent_id).toBe('agent1')
+    assertNoLeak(result)
+  }
 })

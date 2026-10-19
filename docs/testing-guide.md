@@ -299,6 +299,20 @@ The full inventory and invocation are in [tests/README.md](../tests/README.md#re
 | `docker/install-real-agents.sh`, `docker/install-real-codex.sh` | Native version/checksum or ELF/version checks inside marked images; native paths stay off PATH and ordinary stub behavior remains. Static image checks live in `tests/ci-live-docker.test.ts` and `tests/ci-run-interface.test.ts`. |
 | `scripts/real-agent-matrix.ts`, `docker/Dockerfile.real-agent`, `docker/real-agent-job.sh` | Runtime-latest resolved per invocation; three sequential version jobs, all gate/busy/reply/native-idle cases per job (12/34/12 invocations, 58 total), 21 AI trials and one 100-DM step on 2.1.296 only. Pin gate/non-AI bots to `CI_ANTHROPIC_MODEL`; AI bots use optional `CI_ANTHROPIC_AI_MODEL`, defaulting to the CI model and passed as `REAL_AGENT_AI_MODEL`. Validate safe exact IDs and strict result model identity; ignore `CI_ANTHROPIC_OPUS_MODEL`. The legacy `model: "opus"` invocation value selects the AI category only. The job sets `REAL_AGENT_MODEL_PIN` and `CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK=1`; disposable scenario settings use the pin for `model` and singleton `availableModels`, with `switchModelsOnFlag:false` and `fallbackModel:[]`. The classifier remains enabled. Missing usage is null, failed cleanup is fatal, logs are masked and output symlinks/checkout or `/test-results/` paths refused. |
 
+Test101 completion accepts consumed task notifications in user content or
+`queued_command` prompts, with matching task/Agent-call IDs, own-session
+identity, and ordering after the denied tool and sidechain completion. The
+[three-version source audit and observer sweep](../tests/fixtures/native-denial-completion/README.md)
+records the supported shapes and unchanged observers. Failure retention keeps
+only notification linkage/status and attachment identity through all scrubs.
+
+Use heavy `--keep-going` only to collect remaining diagnostic invocations after
+failures; it never retries or waives a failed result. The plan records the mode,
+failed Claude jobs keep `failed-job-<index>.json`, and retained failure records
+carry job/version identity. Subsequent version jobs and Codex run after scenario
+failures; admission/build, interruption and container cleanup failures remain
+fatal. A full PASS still requires every original invocation to pass.
+
 Codex admission and the amended decision-22 config policy are documented once in [docker/README.md](../docker/README.md#codex-admission-login-and-scratch-lifecycle). Never read actual host credentials or settings in host unit tests: use `makeFakeCodexHome` and `makeFakeCodexLogin` from `tests/test-helpers/ci-run.ts`, injected dependencies and `assertNoLeak`. The names-only `CODEX_HOST_CONFIG_KEYS` projection is plain runtime environment metadata, never host values. Use the existing `CI_ANTHROPIC_*` prefix on the `/ci` runner and every verdict-reader call; the local heavy coordinator reads those CI names directly. Codex is always local, contained and excluded from scheduler jobs. `/ci-live` retains its own container and test workspace.
 
 Only test 41 and the five named Codex heavy entrypoints select `assert_codex_d1_safety` as their closing assertion. Require no CSCB server or process record, positive harness spawn/send and agent-director tmux calls, no tmux outside the harness-to-agent-director chain, and no finished-row kills or deletes; empty or malformed logs fail. The assertion must pass in the script's own shell, and the EXIT trap rechecks the original logs after cleanup. Ordinary fmk scenarios keep all three server-backed closers.

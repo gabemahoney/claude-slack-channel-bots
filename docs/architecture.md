@@ -147,7 +147,7 @@ on the host. See `docs/testing-guide.md`, The /ci-live runner.
 
 The E6 real-agent harness (`tests/integration/lib/real-scenario.sh`) drives the packed production install inside CI containers. `fixtures/transcript-receipts.ts` imports that install's `delivery-receipt.ts`; assertions correlate the persona, observed launch/session, transcript directory and full message identity before counting exact take-ins. `real-observations.ts` uses the packed screen adapter, and `real-case-assertions.ts` supplies deterministic case checks and negative self-checks.
 
-Failure-only `tests/real-agent/ai-failure-diagnostics.ts` projects Claude/Codex transcript metadata before scenario cleanup. Structured errors preserve allowlisted classification, HTTP status and retry fields, nested causes and Codex error-info variants; free-text messages, bodies, headers and tokens are withheld. These records survive in full-CI failure logs or the heavy runner's private `real-agent-failures.jsonl`. They neither supply oracle answers nor initiate retries.
+Failure-only `tests/real-agent/ai-failure-diagnostics.ts` projects Claude/Codex transcript metadata before scenario cleanup. Structured errors preserve allowlisted classification, HTTP status and retry fields, nested causes and Codex error-info variants; free-text messages, bodies, headers and tokens are withheld. Notification header IDs/status survive from user content and consumed `queued_command` prompts; result/summary prose cannot supply linkage. These records survive in full-CI failure logs or the heavy runner's private `real-agent-failures.jsonl`, annotated with its job/version. They neither supply oracle answers nor initiate retries.
 
 AI read-back mismatches additionally retain lengths, parsed-JSON/schema facts, SHA-256 hashes and a classified first difference through `ai-mismatch-diagnostics.ts`. Excerpts are limited to 80 code units of fixture-derived vocabulary/punctuation, masked before slicing, and pass the existing secret scrubs. Repeated identical observations are deduplicated across polling processes. A provisional mismatch can precede a successful response; only the scenario's final verdict determines its result. These observations do not change the exact decoded-field comparison or completion/provenance checks.
 
@@ -156,6 +156,15 @@ Real scenarios register a `scenario.sh` before-start observer that captures raw 
 Every gate run uses Test 34's explicit `/compact` to prove AC42 through the compaction-record, re-check and retype-spacing paths (decision 16). Heavy-only Test 104 uses `fixtures/native-idle-compaction.ts` to inspect the installed binary and actual cached rollout after launch, recording specific unsupported/disabled/off/log/over-bound skips and failing unknown implementation semantics. Genuine pre-allowed Read calls build the native context budget from the latest own request's input/cache usage; no rollout is seeded and no summed run usage, old launch, foreign path or subagent can satisfy the observation. Native start observation is bounded at 45 minutes; a new own-session boundary and queued deliveries share a 120 s deadline from observed active start.
 
 The heavy coordinator `scripts/real-agent-matrix.ts` stages the package/tests/docker context and runs three sequential local Docker version jobs. Each includes the native-idle scenario, producing 12/34/12 invocations (58 total); seven AI criteria still run three times and the 100-DM step runs once on 2.1.296. See `tests/README.md` for inventory, mandatory final-build/release heavy gates, evidence limits and reporting contracts; these interfaces do not establish a paid CI or heavy acceptance result.
+
+Diagnostic `--keep-going` continues remaining Claude invocations and version jobs
+after scenario failures, then reaches the existing local Codex leg. It retains
+failed-job reports and per-scenario evidence without retries or changing any
+oracle. A failure remains sticky through the final verdict; only a complete
+zero-failure matrix passes. Build/admission, interruption and container cleanup
+failures remain fatal. Test101's shared notification reader accepts the audited
+user and consumed-attachment shapes, with matching identity and post-denial
+completion ordering; queue bookkeeping alone is never completion.
 
 **Safe Docker inspection.** `scripts/safe-docker-inspect.ts` owns a private `Bun.spawn` with both streams piped; it validates complete JSON, removes every case-insensitive `Env` field recursively and removes `ANTHROPIC_*`/`CI_ANTHROPIC_*` fields. It masks copies of those values and credential values discovered in inspected Env entries in retained keys/strings, including embedded JSON; child stderr is discarded. Only a complete sanitized result or a fixed local Id projection may leave the boundary; failures return empty text and a nonzero code, with byte, deadline and cancellation bounds covering capture and sanitization.
 

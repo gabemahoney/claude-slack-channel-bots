@@ -197,6 +197,46 @@ describe('heavy planning and result validation', () => {
   })
 })
 
+test.each([false, true].flatMap(keepGoing => ['exit', 'missing report'].map(failure => [keepGoing, failure] as const)))('Claude entrypoint keep-going=%s handles %s and preserves failure status', (keepGoing, failure) => {
+  const root = mkdtempSync(join(tmpdir(), 'claude-job-loop-'))
+  try {
+    const entrypoint = readFileSync(join(import.meta.dir, '..', 'docker/real-agent-job.sh'), 'utf8')
+    const loop = entrypoint.slice(entrypoint.indexOf('failed=0\n')).replace('log="/tmp/real-agent-script.log"', 'log="$trial_log"')
+    expect(loop.startsWith('failed=0\n')).toBe(true)
+    // Execute the actual scenario/report loop. Only the scenario launch is
+    // stubbed; no install, Docker, agent, model or host state is involved.
+    const program = `set -euo pipefail
+keep_going="$1"
+failure="$2"
+visited="$3"
+trial_log="$4"
+shift 4
+version=${MIN_CLAUDE_CODE_VERSION}
+default_model=test/model
+ai_model=test/ai
+gosu() {
+  printf '%s\\n' "$script" >> "$visited"
+  if [[ "$script" == *test-101-* && "$failure" == 'missing report' ]]; then return 0; fi
+  printf 'duplicates: 0\\ntokens: {"input":1,"output":1,"cache_read":0,"cache_creation":0}\\n'
+  if [[ "$script" == *test-101-* && "$failure" == exit ]]; then return 7; fi
+}
+${loop}`
+    const scripts = ['test-101-fmk-real-busy.sh', 'test-102-fmk-real-replies.sh', 'test-104-fmk-real-idle-compact.sh'].map(name => `real-agent/${name}`)
+    const visited = join(root, 'visited'), log = join(root, 'trial.log')
+    const child = spawnSync('bash', ['-c', program, 'job-loop', keepGoing ? '1' : '0', failure, visited, log,
+      ...scripts.map(script => `${script}:1:default`)], { env: hostSafeChildEnv(root, { tools: ['bash', 'python3', 'cat', 'rm'] }), encoding: 'utf8', timeout: 10000 })
+    expect(child.error).toBeUndefined(); expect(child.signal).toBeNull(); expect(child.status).toBe(1)
+    expect(child.stderr).toBe('')
+    expect(readFileSync(visited, 'utf8').trim().split('\n')).toEqual(keepGoing ? scripts : scripts.slice(0, 1))
+    const results = child.stdout.split('\n').map(line => parseResultLine(line)).filter(Boolean)
+    expect(results).toHaveLength(keepGoing ? 3 : 1)
+    expect(results[0]).toMatchObject({ exit: failure === 'exit' ? 7 : 0, reported: failure === 'exit' })
+    if (keepGoing) expect(results.slice(1).every(row => row!.exit === 0 && row!.reported)).toBe(true)
+    expect(existsSync(log)).toBe(false)
+    assertNoLeak({ stdout: child.stdout, stderr: child.stderr, results, visited: writtenFile(visited) })
+  } finally { rmSync(root, { recursive: true, force: true }) }
+})
+
 describe('Codex entrypoint trial reporting', () => {
   let root: string
   beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'codex-trial-report-')) })
@@ -356,7 +396,7 @@ describe('heavy execution with fake children', () => {
     } finally { rmSync(root, { recursive: true, force: true }) }
   })
 
-  const run = (planOnly = false, codexOnly = false) => runMatrix({ repo, output, planOnly, codexOnly })
+  const run = (planOnly = false, codexOnly = false, keepGoing = false) => runMatrix({ repo, output, planOnly, codexOnly, keepGoing })
   const jobsRun = () => calls.filter(c => c.argv[1] === 'run' && !c.argv.includes('id') && !c.argv.includes('/opt/cscb-ci/real-agent-codex-job.sh'))
   const codexRuns = () => calls.filter(c => c.argv.includes('/opt/cscb-ci/real-agent-codex-job.sh'))
   const interruptMatrix = (before: ReturnType<typeof process.listeners>) => {
@@ -543,6 +583,50 @@ describe('heavy execution with fake children', () => {
     expect(stdout.at(-1)).toMatch(/^REAL-AGENT-VERDICT FAIL /)
   })
 
+  test.each(['nonzero exit', 'missing result', 'failed AI trial', 'malformed result'] as const)('keep-going retains %s failures, executes subsequent versions and Codex once, and cannot pass', async kind => {
+    response = argv => {
+      if (argv[1] !== 'run' || argv.includes('id') || argv.includes('/opt/cscb-ci/real-agent-codex-job.sh')) return {}
+      const job = jobForArgv(argv)
+      if (job.runtimeLatest) return {}
+      const rows = resultsFor(job)
+      if (kind === 'missing result') rows.pop()
+      if (kind === 'failed AI trial') rows.at(-1)!.exit = 1
+      const evidence = AI_FAILURE_PREFIX + JSON.stringify({ scenario: 'same-scenario', trial: 1, event: 'transcript', record: { agentId: 'child', type: 'assistant' } })
+      return { code: kind === 'nonzero exit' ? 1 : 0,
+        text: evidence + '\n' + (kind === 'malformed result' ? 'real-agent-result: {\n' : rows.map(resultLine).join('\n')) }
+    }
+    expect(await run(false, false, true)).toBe(false)
+    expect(jobsRun()).toHaveLength(3); expect(codexRuns()).toHaveLength(1); expect(maxJobs).toBe(1)
+    expect(jobsRun().every(c => c.argv.includes('--keep-going'))).toBe(true)
+    const retained = readFileSync(join(output, 'real-agent-failures.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line))
+    expect(retained.map(r => [r.job, r.version, r.scenario])).toEqual([[1, MIN_CLAUDE_CODE_VERSION, 'same-scenario'], [2, LIVE_CLAUDE_CODE_VERSION, 'same-scenario']])
+    expect(JSON.parse(readFileSync(join(output, 'plan.json'), 'utf8'))).toMatchObject({ keepGoing: true, totalInvocations: 73 })
+    for (const index of [1, 2]) {
+      expect(existsSync(join(output, `job-${index}.json`))).toBe(false)
+      expect(JSON.parse(readFileSync(join(output, `failed-job-${index}.json`), 'utf8')).error).toBeTruthy()
+    }
+    expect(existsSync(join(output, 'job-3.json'))).toBe(true)
+    expect(existsSync(join(output, 'job-codex.json'))).toBe(true)
+    expect(stdout.filter(l => /^REAL-AGENT-VERDICT /.test(l))).toHaveLength(1)
+    expect(stdout.at(-1)).toMatch(/^REAL-AGENT-VERDICT FAIL /)
+    assertNoLeak(retained)
+  })
+
+  test('keep-going passes only when the entire unchanged matrix passes', async () => {
+    expect(matrixOptions(['--keep-going', '--output', output], repo)).toEqual({ repo, output, planOnly: false, keepGoing: true })
+    expect(() => matrixOptions(['--keep-going', '--keep-going'], repo)).toThrow('Usage')
+    expect(await run(false, false, true)).toBe(true)
+    expect(jobsRun()).toHaveLength(3); expect(codexRuns()).toHaveLength(1)
+    expect(stdout.at(-1)).toMatch(/^REAL-AGENT-VERDICT PASS /)
+  })
+
+  test('keep-going still stops after a container cleanup failure', async () => {
+    response = argv => argv[1] === 'rm' ? { code: 1 } : {}
+    expect(await run(false, false, true)).toBe(false)
+    expect(jobsRun()).toHaveLength(1); expect(codexRuns()).toHaveLength(0)
+    expect(stdout.at(-1)).toMatch(/^REAL-AGENT-VERDICT FAIL /)
+  })
+
   test.each(['base build', 'pack', 'image build'] as const)('%s failure has no scenario retry and cleans its context', async kind => {
     response = argv => {
       if (kind === 'base build' && (argv[2] === 'inspect' || argv[0] === 'bash')) return { code: 1 }
@@ -555,7 +639,7 @@ describe('heavy execution with fake children', () => {
     expect(stdout.at(-1)).toMatch(/^REAL-AGENT-VERDICT FAIL /)
   })
 
-  test.each(['timeout', 'SIGTERM'] as const)('%s kills the active child and cleans up without starting the next version', async kind => {
+  test.each([['timeout', false], ['SIGTERM', false], ['SIGTERM', true]] as const)('%s (keep-going=%s) kills the active child and cleans up without starting the next version', async (kind, keepGoing) => {
     let unrelatedSignals = 0
     const unrelated = () => { unrelatedSignals++ }
     process.on('SIGTERM', unrelated)
@@ -563,7 +647,7 @@ describe('heavy execution with fake children', () => {
     const before = process.listenerCount('SIGTERM')
     const signalHandlers = process.listeners('SIGTERM')
     response = argv => argv[1] === 'run' ? { hang: true } : {}
-    const pending = run()
+    const pending = run(false, false, keepGoing)
     for (let i = 0; i < 10 && jobsRun().length === 0; i++) await clock.flush()
     expect(jobsRun()).toHaveLength(1)
     if (kind === 'timeout') {

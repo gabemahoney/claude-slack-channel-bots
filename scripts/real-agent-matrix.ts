@@ -130,14 +130,14 @@ export function assertJobComplete(job: MatrixJob, results: readonly MatrixResult
       || result.model !== (invocation.model === 'opus' ? aiModel : model) || result.exit !== 0 || !result.reported) throw new Error('Matrix scenario/trial did not pass its required contract')
   })
 }
-export function matrixDockerArgs(name: string, image: string, job: MatrixJob): string[] {
+export function matrixDockerArgs(name: string, image: string, job: MatrixJob, keepGoing = false): string[] {
   return ['run', '--init', '--log-driver', 'none', '--name', name,
     '--memory', MATRIX_MEMORY, '--memory-swap', MATRIX_MEMORY, '--cpus', String(MATRIX_CPUS), '--pids-limit', String(SHARD_PIDS_LIMIT),
     ...['ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL', 'REAL_AGENT_AI_MODEL'].flatMap(key => ['--env', key]),
-    image, job.version, job.runtimeLatest ? '1' : '0', ...job.invocations.map(i => `${i.script}:${i.trial}:${i.model}`)]
+    image, job.version, job.runtimeLatest ? '1' : '0', ...(keepGoing ? ['--keep-going'] : []), ...job.invocations.map(i => `${i.script}:${i.trial}:${i.model}`)]
 }
-export interface MatrixOptions { output: string; repo: string; planOnly: boolean; codexOnly?: boolean }
-const MATRIX_USAGE = 'bun scripts/real-agent-matrix.ts [--output DIR] [--plan] [--codex-only]'
+export interface MatrixOptions { output: string; repo: string; planOnly: boolean; codexOnly?: boolean; keepGoing?: boolean }
+const MATRIX_USAGE = 'bun scripts/real-agent-matrix.ts [--output DIR] [--plan] [--codex-only] [--keep-going]'
 /** Resolve existing ancestors too: output need not exist yet, but a link may. */
 function resolvedPath(path: string): string {
   let parent = resolve(path)
@@ -167,7 +167,7 @@ function writePrivate(path: string, content: string, secrets: readonly string[])
   try { writeFileSync(fd, content) } finally { closeSync(fd) }
 }
 export function matrixOptions(args: readonly string[], repo = resolve(dirname(import.meta.path), '..')): MatrixOptions {
-  let output = join(tmpdir(), `cscb-real-agent-${new Date().toISOString().replace(/[^0-9]/g, '')}`), planOnly = false, codexOnly = false
+  let output = join(tmpdir(), `cscb-real-agent-${new Date().toISOString().replace(/[^0-9]/g, '')}`), planOnly = false, codexOnly = false, keepGoing = false
   const seen = new Set<string>()
   for (let i = 0; i < args.length; i++) {
     const option = args[i]!
@@ -175,12 +175,13 @@ export function matrixOptions(args: readonly string[], repo = resolve(dirname(im
     seen.add(option)
     if (option === '--plan') planOnly = true
     else if (option === '--codex-only') codexOnly = true
+    else if (option === '--keep-going') keepGoing = true
     else if (option === '--output' && args[i + 1] && !args[i + 1]!.startsWith('-')) output = resolve(args[++i]!)
     else throw new Error(`Usage: ${MATRIX_USAGE}`)
   }
   // Never permit secrets/logs inside the source checkout, nor /test-results.
   outputDirectory(output, repo)
-  return { output, repo, planOnly, ...(codexOnly ? { codexOnly: true } : {}) }
+  return { output, repo, planOnly, ...(codexOnly ? { codexOnly: true } : {}), ...(keepGoing ? { keepGoing: true } : {}) }
 }
 export async function runMatrix(options: MatrixOptions): Promise<boolean> {
   // b.omv SR-14.7: focused acceptance uses the same local Codex lifecycle.
@@ -204,8 +205,9 @@ export async function runMatrix(options: MatrixOptions): Promise<boolean> {
   // JSON-escaped copies are masked too, before any child line reaches a sink.
   const masks = [...secrets, ...secrets.map(secret => JSON.stringify(secret).slice(1, -1))]
   const redact = (value: string) => maskScannedValues(value, masks)
+  let evidenceContext: Record<string, unknown> = {}
   const say = (line: string) => {
-    if (retainFailureLine(output, line, redact)) return
+    if (retainFailureLine(output, line, redact, evidenceContext)) return
     const safe = redact(line); process.stdout.write(safe + '\n'); writeFileSync(logFd, safe + '\n')
   }
   const runId = `real-${Date.now()}-${process.pid}`
@@ -310,7 +312,7 @@ export async function runMatrix(options: MatrixOptions): Promise<boolean> {
   }
   const interrupt = () => { stopped = true; aborted.abort(); terminateActive?.() }
   process.on('SIGINT', interrupt); process.on('SIGTERM', interrupt)
-  let passed = false, planned = false
+  let passed = false, planned = false, jobFailed = false
   const totals = { input: 0, output: 0, cache_read: 0, cache_creation: 0, duplicates: 0 }
   try {
     if (!options.planOnly) {
@@ -337,7 +339,7 @@ export async function runMatrix(options: MatrixOptions): Promise<boolean> {
     const localAgents = [localCodexExtension(heavyNames)]
     const totalInvocations = jobs.reduce((count, job) => count + job.invocations.length, 0) + localAgents.reduce((count, agent) => count + agent.invocations.length, 0)
     say(`recorded: matrix ${JSON.stringify({ runId, selection, totalInvocations, latest, model: codexOnly ? null : model, aiModel: codexOnly ? null : aiModel, jobs: jobs.map(j => ({ version: j.version, runtimeLatest: j.runtimeLatest, scenarios: j.invocations.length })) })}`)
-    writePrivate(join(output, 'plan.json'), JSON.stringify({ runId, selection, totalInvocations, model: codexOnly ? null : model, aiModel: codexOnly ? null : aiModel, codexModel: codexLogin?.model ?? null, jobs, localAgents, scheduler: codexOnly ? null : SCHEDULER_JOB_CONTRACT }, null, 2) + '\n', secrets)
+    writePrivate(join(output, 'plan.json'), JSON.stringify({ runId, selection, totalInvocations, keepGoing: options.keepGoing === true, model: codexOnly ? null : model, aiModel: codexOnly ? null : aiModel, codexModel: codexLogin?.model ?? null, jobs, localAgents, scheduler: codexOnly ? null : SCHEDULER_JOB_CONTRACT }, null, 2) + '\n', secrets)
     if (options.planOnly) { planned = true; return true }
     const survivors = await run(codexLoginContainerListArgs(), 30_000, true, false, true)
     assertNoCodexLoginContainers(survivors.code, survivors.text)
@@ -355,10 +357,13 @@ export async function runMatrix(options: MatrixOptions): Promise<boolean> {
       for (let index = 0; index < jobs.length; index++) {
         if (stopped) throw new Error('Matrix interrupted')
         const job = jobs[index]!, name = `${runId}-${index + 1}`
+        evidenceContext = { job: index + 1, version: job.version, runtimeLatest: job.runtimeLatest }
         say(`recorded: matrix-job ${JSON.stringify({ index: index + 1, version: job.version, runtimeLatest: job.runtimeLatest })}`)
+        const results: MatrixResult[] = []
+        let jobExit: number | null = null
         try {
-          const answer = await run(['docker', ...matrixDockerArgs(name, image, job)], MATRIX_TIMEOUT_MS, true)
-          const results: MatrixResult[] = []
+          const answer = await run(['docker', ...matrixDockerArgs(name, image, job, options.keepGoing)], MATRIX_TIMEOUT_MS, true)
+          jobExit = answer.code
           for (const line of answer.text.split('\n')) {
             const result = parseResultLine(line, secrets)
             if (!result) continue
@@ -371,6 +376,15 @@ export async function runMatrix(options: MatrixOptions): Promise<boolean> {
           if (answer.code !== 0 || stopped) throw new Error(`Matrix job ${index + 1} failed (exit ${answer.code})`)
           assertJobComplete(job, results, model, aiModel)
           writePrivate(join(output, `job-${index + 1}.json`), JSON.stringify({ selection, version: job.version, runtimeLatest: job.runtimeLatest, packageSha256, results }, null, 2) + '\n', secrets)
+        } catch (error) {
+          if (!options.keepGoing || stopped) throw error
+          jobFailed = true
+          // Diagnosis continues once per invocation; failures are never retried
+          // or converted to passing jobs. Cleanup failures still stop the run.
+          say(`FAIL: matrix job ${index + 1}; continuing remaining invocations for diagnosis`)
+          writePrivate(join(output, `failed-job-${index + 1}.json`), JSON.stringify({ selection, version: job.version,
+            runtimeLatest: job.runtimeLatest, packageSha256, exit: jobExit,
+            error: error instanceof Error ? error.message : 'Matrix job failed', results }, null, 2) + '\n', secrets)
         } finally {
           const cleanup = await run(['docker', 'rm', '-f', name], 30_000, false, true)
           if (cleanup.code !== 0) throw new Error('Matrix container cleanup failed')
@@ -378,6 +392,7 @@ export async function runMatrix(options: MatrixOptions): Promise<boolean> {
       }
       if (!codexLogin) throw new Error('Local Codex login was not admitted')
       const name = `${runId}-codex`, extension = localAgents[0]!
+      evidenceContext = { job: 'codex', version: CODEX_VERSION }
       // Verify the image UID without the login mounted, before its first use.
       const uidProbe = `${name}-uid`
       try {
@@ -441,7 +456,7 @@ export async function runMatrix(options: MatrixOptions): Promise<boolean> {
       if (retirementFailed || answer.code !== 0 || stopped) throw new Error(`Codex job failed (exit ${answer.code})`)
       assertCodexJobComplete(extension, results, codexLogin.model)
       writePrivate(join(output, 'job-codex.json'), JSON.stringify({ selection, version: CODEX_VERSION, codexModel: codexLogin.model, packageSha256, results }, null, 2) + '\n', secrets)
-      passed = true
+      passed = !jobFailed
     } finally {
       if ((await run(['docker', 'image', 'rm', image], 30_000, false, true)).code !== 0) throw new Error('Matrix image cleanup failed')
     }

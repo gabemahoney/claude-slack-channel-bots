@@ -702,7 +702,11 @@ These fields report evidence only and never authorize a retry. Heavy runs write 
 `real-agent-failures.jsonl` under their output folder; full CI keeps the evidence
 lines in failure logs. Cleanup failures also trigger retention. Missing or
 malformed evidence is marked explicitly and never changes a verdict. See the
-[2.1.302 completion-record audit](fixtures/native-denial-completion/README.md).
+[native completion-record audit](fixtures/native-denial-completion/README.md).
+Notification linkage is retained from both user content and consumed
+`queued_command` prompts, including task/Agent-call IDs and status, without
+summary/result prose. Heavy evidence includes the coordinator's job and version
+so repeated scenarios remain distinguishable when collecting multiple failures.
 
 AI read-back polling also emits deduplicated `readback-mismatch` records through
 the same private retention path. They include JSON parse status and keys,
@@ -1129,7 +1133,15 @@ Before queueing message six, `tests/real-agent/test-101-denial-settled.ts`
 requires the matching successful Slack Denied update, the native
 `permission-rule` denial and completion of the identity-linked subagent.
 It also requires a completed Agent result or a consumed asynchronous
-completion notification and subsequent main completion, then Test 101 runs
+completion notification and subsequent main completion. It uses the same
+observer for user records and `queued_command` attachments (string or
+text-block content). A completed notification must identify this agent or its
+Agent call, every supplied ID must agree, and it must follow the denial and
+sidechain completion in this session. An unlinked, earlier, foreign or merely
+enqueued notification cannot pass. The native 2.1.280/296/302 source audit and
+the completion-observer sweep are recorded in
+[`fixtures/native-denial-completion/README.md`](fixtures/native-denial-completion/README.md).
+Test 101 then runs
 the existing `real_wait_idle` empty-composer check. This preparation uses
 only the Slack stub record and own native transcripts; the permission hold,
 Allow, Agent Deny, actual `dialog-hold` notice, restart and six-delivery
@@ -1190,6 +1202,17 @@ the legacy invocation selector `model: "opus"` identifies the AI category
 only. `--plan` resolves runtime latest and writes the plan without building
 or running bots; it is not acceptance evidence. Use a fresh output
 directory each time.
+
+For diagnosis, add `--keep-going` to execute remaining invocations after a
+scenario failure, without retries. Claude jobs finish their remaining trials,
+and the coordinator proceeds to subsequent versions and the local Codex leg
+(whose job already collects all 15 trials). The plan records `keepGoing`;
+failed Claude jobs write `failed-job-<index>.json`, and each scenario's redacted
+failure evidence remains retained. Any failed, missing, malformed or unreported
+result still makes the final verdict FAIL; only zero failures across the full
+unchanged matrix can pass. Preflight, build, interruption and container-cleanup
+failures still stop execution. The default remains stop on the first failed
+Claude job. This option changes diagnostic coverage, never the acceptance bar.
 
 The coordinator passes the AI selection as `REAL_AGENT_AI_MODEL`.
 `docker/real-agent-job.sh` sets each invocation's `ANTHROPIC_MODEL` and

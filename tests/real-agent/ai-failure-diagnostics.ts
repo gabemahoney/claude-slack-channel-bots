@@ -2,6 +2,7 @@
 import { closeSync, constants, existsSync, openSync, readFileSync, writeFileSync } from 'node:fs'
 import { basename, join, relative } from 'node:path'
 import type { TranscriptEntry } from '../integration/fixtures/transcript-receipts.ts'
+import { taskNotificationFields } from './native-task-notification.ts'
 
 export const AI_FAILURE_PREFIX = 'real-agent-failure-evidence: '
 export function scrubDiagnosticText(text: string, env: NodeJS.ProcessEnv = process.env): string {
@@ -63,10 +64,8 @@ function contentMetadata(content: unknown): unknown {
 }
 /** Native notification linkage is metadata; summary/result/body text is never retained. */
 export function notificationMetadata(content: unknown) {
-  const text = typeof content === 'string' ? content : Array.isArray(content)
-    ? content.filter(b => b?.type === 'text' && typeof b.text === 'string').map(b => b.text).join('\n') : ''
-  if (!text.includes('<task-notification>')) return undefined
-  return Object.fromEntries(['task-id', 'tool-use-id', 'status'].map(tag => [tag, diagnosticValue(text.match(new RegExp(`<${tag}>([^<]*)</${tag}>`))?.[1])]))
+  const notification = taskNotificationFields(content)
+  return notification && Object.fromEntries(Object.entries(notification).map(([key, value]) => [key, diagnosticValue(value)]))
 }
 export function projectClaudeFailure(entry: TranscriptEntry) {
   const v = entry.value, m = v?.message
@@ -77,10 +76,10 @@ export function projectClaudeFailure(entry: TranscriptEntry) {
     permissionDecision: typeof v?.permissionDecision === 'object' ? fields(v.permissionDecision, ['behavior', 'type', 'decision']) : diagnosticValue(v?.permissionDecision),
     toolResultRemedy: fields(v?.toolResultRemedy, ['kind']),
     data: fields(v?.data, ['type', 'subtype', 'agentId', 'status', 'tool_name', 'tool_use_id', 'decision', 'behavior']),
-    attachment: fields(v?.attachment, ['type', 'agentId', 'taskId', 'status']),
+    attachment: fields(v?.attachment, ['type', 'agentId', 'taskId', 'status', 'commandMode', 'source_uuid']),
     request: fields(v?.request, ['subtype', 'tool_name', 'tool_use_id', 'request_id']),
     permission_denials: Array.isArray(v?.permission_denials) ? v.permission_denials.map((d: unknown) => fields(d, ['tool_name', 'tool_use_id'])) : undefined,
-    notification: notificationMetadata(m?.content),
+    notification: notificationMetadata(v?.type === 'attachment' && v.attachment?.type === 'queued_command' ? v.attachment.prompt : m?.content),
     message: { ...fields(m, ['id', 'role', 'model', 'stop_reason']), ...errorFields(m), content: contentMetadata(m?.content) } }
 }
 export function projectCodexFailure(entry: TranscriptEntry) {
@@ -149,9 +148,9 @@ export async function captureFailureEvidence(agent: 'claude' | 'codex', root: st
 
 /** Called by the coordinator before deleting a failed job's container. The
  * coordinator's mask also knows the Codex login's original/refreshed tokens. */
-export function retainFailureLine(output: string, line: string, redact: (value: string) => string): boolean {
+export function retainFailureLine(output: string, line: string, redact: (value: string) => string, context: Record<string, unknown> = {}): boolean {
   if (!line.startsWith(AI_FAILURE_PREFIX)) return false
-  const value = JSON.parse(line.slice(AI_FAILURE_PREFIX.length))
+  const value = { ...JSON.parse(line.slice(AI_FAILURE_PREFIX.length)), ...context }
   const fd = openSync(join(output, 'real-agent-failures.jsonl'), constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW, 0o600)
   try { writeFileSync(fd, redact(scrubDiagnosticText(JSON.stringify(value))) + '\n') }
   finally { closeSync(fd) }

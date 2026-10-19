@@ -64,6 +64,28 @@ function entry(offset: number, value: any, path = '/private/session.jsonl'): Tra
   return { offset, path, value, at: offset, kind: 'other' }
 }
 
+test.each(['user string', 'user blocks', 'queued string', 'queued blocks'])('%s notification retention keeps linkage only and scrubs IDs', async shape => {
+  const root = mkdtempSync(join(tmpdir(), 'notification-evidence-'))
+  try {
+    const transcripts = join(root, 'transcripts'); mkdirSync(transcripts)
+    const secret = fakeToken('sk-'), text = `<task-notification><task-id>child</task-id><tool-use-id>agent-call</tool-use-id><status>completed</status><summary>PRIVATE SUMMARY</summary><result>PRIVATE ${secret}</result></task-notification>`
+    const content = shape.endsWith('blocks') ? [{ type: 'text', text }, { type: 'image', source: secret }] : text
+    const value = shape.startsWith('queued')
+      ? { type: 'attachment', attachment: { type: 'queued_command', commandMode: 'task-notification', taskId: 'child', agentId: 'owner', source_uuid: 'notification', prompt: content } }
+      : { type: 'user', message: { content } }
+    writeFileSync(join(transcripts, 'session.jsonl'), JSON.stringify(value) + '\n' + JSON.stringify(value).replaceAll('child', secret) + '\n')
+    const records = await scenarioFailureRecords(transcripts, 'claude')
+    for (const record of records) retainFailureLine(root, 'real-agent-failure-evidence: ' + JSON.stringify({ event: 'transcript', record }), v => v)
+    const output = readFileSync(join(root, 'real-agent-failures.jsonl'), 'utf8')
+    const retained = output.trim().split('\n').map(line => JSON.parse(line).record)
+    expect(retained[0].notification).toEqual({ 'task-id': 'child', 'tool-use-id': 'agent-call', status: 'completed' })
+    expect(retained[1].notification['task-id']).toBe('[REDACTED]')
+    if (shape.startsWith('queued')) expect(retained[0].attachment).toEqual({ type: 'queued_command', commandMode: 'task-notification', taskId: 'child', agentId: 'owner', source_uuid: 'notification' })
+    expect(output).not.toContain('PRIVATE'); expect(output).not.toContain(secret)
+    assertNoLeak({ records, retained, output })
+  } finally { rmSync(root, { recursive: true, force: true }) }
+})
+
 test.each(['rate_limit_exceeded', 'server_overloaded', 'internal_server_error', 'unauthorized',
   { http_connection_failed: { http_status_code: 503 } },
   { response_stream_connection_failed: { http_status_code: 429 } },

@@ -4,6 +4,7 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
 import { jsonLines, packedReceiptAdapters, personaTranscripts, readTranscripts, receiptJournal, transcriptFiles, type TranscriptEntry } from '../integration/fixtures/transcript-receipts.ts'
+import { nativeTaskNotificationContent, taskNotificationFields } from './native-task-notification.ts'
 
 const blocks = (entry: TranscriptEntry): any[] => Array.isArray(entry.value?.message?.content) ? entry.value.message.content : []
 const ended = (entry: TranscriptEntry) => entry.value?.type === 'assistant'
@@ -46,14 +47,20 @@ export function denialSettled(key: string, action: any, slack: any[], own: Trans
       && entry.value.toolDenialKind === 'permission-rule' && entry.at >= Date.parse(pushed.ts)
       && blocks(entry).some(block => block.type === 'tool_result' && block.tool_use_id === probeId && block.is_error === true))
     const complete = denied && side.find(entry => entry.offset > denied.offset && ended(entry))
-    if (!complete) continue
+    if (!denied || !complete) continue
     let mainAfter = result.offset
     if (result.value.toolUseResult.isAsync === true || result.value.toolUseResult.status === 'async_launched') {
-      const notification = own.find(entry => entry.path === launch.path && entry.offset > result.offset && entry.value?.type === 'user'
-        && typeof entry.value.message?.content === 'string' && entry.value.message.content.includes('<task-notification>')
-        && entry.value.message.content.includes(`<task-id>${agent}</task-id>`)
-        && entry.value.message.content.includes(`<tool-use-id>${use.id}</tool-use-id>`)
-        && entry.value.message.content.includes('<status>completed</status>') && entry.at >= complete.at)
+      const notification = own.find(entry => {
+        if (entry.path !== launch.path || entry.offset <= result.offset || entry.value?.sessionId !== session
+          || entry.value?.isSidechain === true || !Number.isFinite(entry.at) || entry.at < complete.at || entry.at < denied.at) return false
+        const fields = taskNotificationFields(nativeTaskNotificationContent(entry.value))
+        if (fields?.status !== 'completed') return false
+        // Native serializers omit absent optional IDs. At least one must link
+        // this Agent call; any other supplied identity must agree as well.
+        const task = fields['task-id'], tool = fields['tool-use-id']
+        return (task === agent || tool === use.id)
+          && (task === undefined || task === agent) && (tool === undefined || tool === use.id)
+      })
       if (!notification) continue
       mainAfter = notification.offset
     } else if (result.value.toolUseResult.status !== 'completed') continue

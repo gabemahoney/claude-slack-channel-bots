@@ -5,6 +5,8 @@ set -euo pipefail
 version="$1"
 latest="$2"
 shift 2
+keep_going=0
+if [[ "${1:-}" == --keep-going ]]; then keep_going=1; shift; fi
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 64
 if [[ "$latest" == 1 && ! -x "/opt/claude-code/$version/claude" ]]; then
     # Latest was resolved once by the coordinator, never resolved again here.
@@ -28,6 +30,7 @@ export ANTHROPIC_API_KEY ANTHROPIC_BASE_URL
 # the root job never launches a bot, AD or tmux itself.
 gosu testuser bun install /tmp/package.tgz > /tmp/real-agent-install.log 2>&1
 gosu testuser /opt/agent-director/check/ad-client-check.sh --package /test-repo/node_modules/claude-slack-channel-bots
+failed=0
 for spec in "$@"; do
     IFS=: read -r script trial model_kind <<< "$spec"
     [[ "$script" =~ ^(integration|real-agent)/test-[0-9]+-fmk-real-[a-z0-9-]+\.sh$ && "$trial" =~ ^[123]$ && "$model_kind" =~ ^(default|opus)$ ]] || exit 64
@@ -38,7 +41,8 @@ for spec in "$@"; do
     rc=0
     gosu testuser env REAL_AGENT_TRIAL="$trial" ANTHROPIC_MODEL="$model" REAL_AGENT_MODEL_PIN="$model" bash "/tests/$script" > "$log" 2>&1 || rc=$?
     cat "$log"
-    python3 - "$script" "$trial" "$version" "$model" "$rc" "$log" <<'PY'
+    status=0
+    python3 - "$script" "$trial" "$version" "$model" "$rc" "$log" <<'PY' || status=$?
 import json,sys
 script,trial,version,model,rc,path=sys.argv[1:]
 lines=open(path).read().splitlines()
@@ -68,4 +72,9 @@ print('real-agent-result: '+json.dumps(result,separators=(',',':')))
 if int(rc)!=0 or not valid: sys.exit(1)
 PY
     rm -f "$log"
+    if [[ "$status" != 0 ]]; then
+        failed=1
+        if [[ "$keep_going" != 1 ]]; then exit 1; fi
+    fi
 done
+exit "$failed"
