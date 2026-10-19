@@ -704,6 +704,26 @@ lines in failure logs. Cleanup failures also trigger retention. Missing or
 malformed evidence is marked explicitly and never changes a verdict. See the
 [2.1.302 completion-record audit](fixtures/native-denial-completion/README.md).
 
+AI read-back polling also emits deduplicated `readback-mismatch` records through
+the same private retention path. They include JSON parse status and keys,
+missing-body/acknowledgement facts, mismatched schema keys, expected/actual
+decoded-body lengths and SHA-256 hashes, response length/hash, and the first
+differing UTF-16 offset. Differences distinguish whitespace-only changes,
+truncation, insertion, deletion and substitution. Each excerpt spans at most
+80 code units around that offset; only whole words and punctuation from the
+expected fixture survive, with other text masked before slicing. Secret-bearing
+inputs have their excerpts withheld, and all existing token/secret scrubs still
+apply at emission and coordinator retention. Unknown JSON key spellings are
+withheld while their count and lengths remain observable.
+
+These are observations, not trial verdicts: an early missing response can be
+followed by a successful final read-back. The AC15 checker already accepts
+reordered JSON keys, outer newlines, JSON code fences and equivalent string
+escaping. It compares decoded fields and requires the exact body, including
+body whitespace; no body normalization or completion/provenance relaxation is
+applied for diagnostics. `ai-mismatch-diagnostics.test.ts` and the AC15 controls
+in `real-ai-classifier-stop.test.ts` exercise these distinctions.
+
 
 Tests 32–40 are the nine real Claude gates included in every full `/ci` run.
 They drive the packed CSCB against the loopback Slack stub, select native

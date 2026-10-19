@@ -565,6 +565,36 @@ test('AC15 queued final receipt preserves the recorded 5338-character body failu
   expect(() => readAC15(e)).toThrow(/^AI read-back field differs$/)
 })
 
+test.each(['key order', 'outer newline', 'code fences', 'JSON escaping'])('AC15 accepts equivalent %s representation', representation => {
+  const e = multipartAC15('queued-final')
+  let text = JSON.stringify({ body: e.expected.body, messages: 1, case: 'AC15' })
+  if (representation === 'outer newline') text = '\n' + text + '\n'
+  if (representation === 'code fences') text = '```json\n' + text + '\n```'
+  if (representation === 'JSON escaping') text = text.replace(/x/g, '\\u0078')
+  e.own[5]!.value.message.content[0].text = text
+  expect(readAC15(e).part).toBe(3)
+})
+
+test.each([' ', '\n'])('AC15 still rejects extra body whitespace %j with diagnostic evidence', suffix => {
+  const e = multipartAC15('queued-final'), records: any[] = []
+  e.own[5]!.value.message.content[0].text = JSON.stringify({ ...e.expected, body: e.expected.body + suffix })
+  expect(() => completedAIReadback({ ...e, onMismatch: r => records.push(r) })).toThrow(/^AI read-back field differs$/)
+  expect(records).toHaveLength(1)
+  expect(records[0]).toMatchObject({ difference: 'whitespace-only', firstDifferenceOffset: 5000,
+    expectedLength: 5000, actualLength: 5001, parsedJSON: true })
+})
+
+test('AC15 retains final acknowledgement diagnostics without accepting it or changing the failure', () => {
+  const e = multipartAC15('queued-final'), records: any[] = []
+  e.own[5]!.value.message.content[0].text = '{"status":"received"}'
+  expect(() => completedAIReadback({ ...e, onMismatch: r => records.push(r) })).toThrow(/^no completed current-turn AI readback for durable receipt$/)
+  expect(records).toHaveLength(1)
+  expect(records[0]).toMatchObject({ replyKind: 'missing-body', keys: ['status'], stopReason: 'end_turn', expectedLength: 5000, actualLength: 0 })
+  expect(() => completedAIReadback({ ...e, onMismatch: () => { throw new Error('diagnostic broken') } })).toThrow(/^no completed current-turn AI readback for durable receipt$/)
+  e.own[5]!.value.message.content[0].text = JSON.stringify(e.expected)
+  expect(completedAIReadback({ ...e, onMismatch: () => { throw new Error('must be silent on pass') } }).part).toBe(3)
+})
+
 test.each([
   ['first part', 26, 'reply25'], ['middle part', 46, 'reply45'], ['final part', 66, 'reply65'],
   ['late action after another input', 90, 'reply25'],

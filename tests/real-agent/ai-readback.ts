@@ -3,6 +3,8 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { basename, join } from 'node:path'
 import { auditReceipts, packedReceiptAdapters, personaTranscripts, readTranscripts, receiptJournal, transcriptFiles, type ReceiptAdapters, type TranscriptEntry } from '../integration/fixtures/transcript-receipts.ts'
+import { parseReadbackJSON, readbackMismatch } from './ai-mismatch-diagnostics.ts'
+import { AI_FAILURE_PREFIX, diagnosticValue, reportFailureOnce, scrubDiagnosticText } from './ai-failure-diagnostics.ts'
 
 function check(value: unknown, reason: string): asserts value { if (!value) throw new Error(reason) }
 export function safeSelectedModel(value: string): boolean { return typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,255}$/.test(value) && !/[\r\n]/.test(value) }
@@ -125,8 +127,9 @@ function assertAC15Exchange(parts: string[], acceptedAt: number, seq: number, jo
   }
 }
 
-export function completedAIReadback({ seq, expected, journal, own, adapters, model }: {
+export function completedAIReadback({ seq, expected, journal, own, adapters, model, onMismatch }: {
   seq: number; expected: any; journal: any[]; own: TranscriptEntry[]; adapters: ReceiptAdapters; model: string
+  onMismatch?: (record: ReturnType<typeof readbackMismatch> & { responseUuid?: unknown; stopReason?: unknown }) => void
 }) {
   check(Number.isSafeInteger(seq) && seq > 0 && typeof expected?.case === 'string' && safeSelectedModel(model), 'AI readback identity missing')
   const one = (kind: string, part?: number) => {
@@ -170,6 +173,18 @@ export function completedAIReadback({ seq, expected, journal, own, adapters, mod
   const turn = session.filter(e => e.offset > receipt.offset && (!next || e.offset < next.offset))
   const linked = (entry: TranscriptEntry, target = receipt) => nativeChain(session, entry, target) !== undefined
   const readbacks: TranscriptEntry[] = []
+  const candidates: { text: string; entry: TranscriptEntry }[] = []
+  const mismatch = (reason: string): never => {
+    if (onMismatch) {
+      // Diagnostic errors cannot replace the original failure or create a pass.
+      try {
+        if (!candidates.length) onMismatch(readbackMismatch(expected, undefined))
+        for (const { text, entry } of candidates) onMismatch({ ...readbackMismatch(expected, text),
+          responseUuid: diagnosticValue(entry.value.uuid), stopReason: diagnosticValue(entry.value.message?.stop_reason) })
+      } catch { /* the unchanged oracle failure still follows */ }
+    }
+    throw new Error(reason)
+  }
   let completion: TranscriptEntry | undefined
   for (const e of turn) {
     check(!(e.value.type === 'system' && /(?:refusal|fallback|api_error|api_retry)/.test(e.value.subtype ?? '')), 'AI readback turn has refusal/API failure')
@@ -188,18 +203,19 @@ export function completedAIReadback({ seq, expected, journal, own, adapters, mod
       const text = block.type === 'text' ? block.text : block.type === 'tool_use' && block.name === 'mcp__slack-channel-router__reply' ? block.input?.text : undefined
       if (text === undefined) continue
       check(typeof text === 'string', 'AI readback has malformed response text')
+      candidates.push({ text, entry: e })
       let value: any
-      try { value = JSON.parse(text.trim().replace(/^```(?:json)?\s*|\s*```$/g, '')) } catch { continue }
+      try { value = parseReadbackJSON(text) } catch { continue }
       if (value?.case !== expected.case) continue
-      check(Object.keys(expected).every(k => stable(value[k]) === stable(expected[k])), 'AI read-back field differs')
+      if (!Object.keys(expected).every(k => stable(value[k]) === stable(expected[k]))) mismatch('AI read-back field differs')
       readbacks.push(e)
     }
     completion = message.stop_reason === 'end_turn' ? e : undefined
   }
-  check(completion && readbacks.some(e => e === completion || linked(completion!, e)
-    || typeof e.value.message.id === 'string' && e.value.message.id.length > 0 && e.value.message.id === completion!.value.message.id),
-  'no completed current-turn AI readback for durable receipt')
-  return { seq, part: fixed.parts.length, receipt_uuid: receipt.uuid, session_id: receipt.value.sessionId, actual_model: completion.value.message.model }
+  if (!(completion && readbacks.some(e => e === completion || linked(completion!, e)
+    || typeof e.value.message.id === 'string' && e.value.message.id.length > 0 && e.value.message.id === completion!.value.message.id)))
+    mismatch('no completed current-turn AI readback for durable receipt')
+  return { seq, part: fixed.parts.length, receipt_uuid: receipt.uuid, session_id: receipt.value.sessionId, actual_model: completion!.value.message.model }
 }
 
 if (import.meta.main) {
@@ -212,7 +228,11 @@ if (import.meta.main) {
     const own = personaTranscripts(key!, journal, readFileSync(join(state!, 'server.log'), 'utf8').split('\n'), all)
     const expected = JSON.parse(readFileSync(expectedPath!, 'utf8'))
     const result = completedAIReadback({ seq: Number(seq), expected,
-      journal, own, adapters, model: process.env.REAL_AGENT_MODEL_PIN ?? '' })
+      journal, own, adapters, model: process.env.REAL_AGENT_MODEL_PIN ?? '', onMismatch: record => {
+        const line = AI_FAILURE_PREFIX + scrubDiagnosticText(JSON.stringify({ event: 'readback-mismatch',
+          agent: 'claude', scenario: 'ai-readback', case: expected.case, seq: Number(seq), trial: process.env.REAL_AGENT_TRIAL, record }))
+        reportFailureOnce(join(state!, 'ai-readback-mismatches.json'), line, console.log)
+      } })
     console.log('recorded: AI current-turn field comparison ' + JSON.stringify({ criterion: process.env.AI_CRITERION,
       trial: process.env.REAL_AGENT_TRIAL, case: expected.case, ...result }))
   } catch (error) { console.error(error instanceof Error ? error.message : 'AI readback unavailable'); process.exitCode = 1 }
