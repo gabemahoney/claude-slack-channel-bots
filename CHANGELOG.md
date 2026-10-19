@@ -6,6 +6,10 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 ## Unreleased
 
+---
+
+## 0.17.0 (2026-10-19)
+
 ### Earlier-release bots start a fresh conversation once (breaking)
 
 Every earlier-release bot starts a fresh conversation once at upgrade, including existing personas. Memory files are kept; the old conversation context is not retained. Later restarts resume the marked replacement under the normal resume conditions. Follow the maintained [switch-over step 10](docs/migration.md#step-10-start-the-new-cscb) for the row checks and verification.
