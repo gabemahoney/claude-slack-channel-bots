@@ -965,16 +965,18 @@ Only timed `environment`, `model`, `agent_listing_delta`,
 attachments use decision 24's structural membership rule: their `parentUuid`
 chain must reach this receipt, their file offset must follow the receipt's
 predecessor, and their time must be strictly later than the previous turn's
-last record. Exact untimed informational shapes below have no turn clock; an
-invalid clock on the previous turn's last other record fails closed. A first
-turn has no previous-turn time floor. There is no fixed millisecond allowance.
-The captured 6 ms regression and timing-sweep inventory are documented in
+last record with a finite timestamp, as amended on 2026-10-19. Untimed
+bookkeeping records such as `cost-state`, `last-prompt` and
+`file-history-snapshot` are skipped when choosing that floor. A first turn,
+or a previous turn with no finite timestamp, has no previous-turn time floor. There is no fixed millisecond allowance.
+The captured 6 ms and AC23 resume regressions and timing-sweep inventory are documented in
 [`fixtures/native-attachment-membership/README.md`](fixtures/native-attachment-membership/README.md).
 Assistant, tool-result and system records retain strict timestamp ordering;
 receipt/send checks, exact JSON, model identity, completion and action checks
 remain unchanged.
 
-The only untimed informational exclusions are exact three-field records with
+For checks within the current exchange (separate from selecting the previous-turn
+floor), the only untimed informational exclusions are exact three-field records with
 `type`, `sessionId` and the corresponding string field: `mode`/`mode`,
 `permission-mode`/`permissionMode`, `atis-latch`/`atis`,
 `last-prompt`/`leafUuid` and `ai-title`/`aiTitle`. They carry no timestamp,

@@ -68,13 +68,13 @@ function nativeTime(session: TranscriptEntry[], entry: TranscriptEntry, receipt:
     const preceding = session.filter(e => e.offset < receipt.offset)
     const predecessor = preceding.at(-1)
     const previousReceipt = preceding.map(e => nativeTakeIn(e, adapters)).lastIndexOf(true)
-    // Exact untimed informational shapes have no turn clock. Do not skip a
-    // malformed timed record: it must fail the previous-turn boundary check.
+    // Decision 24's amendment: untimed shutdown/bookkeeping records have no
+    // clock. Only the last finite timestamp in the previous turn sets the floor.
     const previousLast = previousReceipt < 0 ? undefined
-      : preceding.slice(previousReceipt).filter(e => !nativeInformation(e, adapters)).at(-1)
+      : preceding.slice(previousReceipt).filter(e => Number.isFinite(e.at)).at(-1)
     return nativeChain(session, entry, receipt) !== undefined
       && (!predecessor || entry.offset > predecessor.offset)
-      && (!previousLast || Number.isFinite(previousLast.at) && entry.at > previousLast.at)
+      && (!previousLast || entry.at > previousLast.at)
   }
   const parent = nativeParent(session, entry)
   return entry.at >= receipt.at && (!parent || Number.isFinite(parent.at) && entry.at >= parent.at)

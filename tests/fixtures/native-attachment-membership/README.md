@@ -14,11 +14,26 @@ in the fixture but omitted from this replay; separate controls exercise its
 exact informational shapes. This regression proves the checker accepts the
 captured ancestry, not that the paid trial's original answer was correct.
 Ordinary and AC15 controls cover all six allowed attachment types, an earlier
-turn (both a wrong parent and a timestamp at/before its last record), no receipt
-link, invalid prior clock, stale offsets, and unchanged exact clocks for other
-records. Existing controls cover duplicate UUIDs, cycles, foreign sessions,
+turn (both a wrong parent and a timestamp at/before its last finite timestamp),
+no receipt link, untimed prior bookkeeping, stale offsets, and unchanged exact
+clocks for other records. Existing controls cover duplicate UUIDs, cycles, foreign sessions,
 sidechains, queued commands and late forbidden actions. Preparation leads of
 1, 5, 6 and 2000 ms pass when structural membership holds.
+
+`ac23-resume.json` projects the clocks, offsets, UUID links, native record types
+and stop reasons from AC23 trial 1 in `real-1792374703137-1207869`, Claude
+2.1.296. Source: `/tmp/omv-final12-heavy-skgkpnm_/real-agent-failures.jsonl`.
+The resumed receipt is at offset 78964; its linked `skill_listing` is at 79949,
+stamped 1 ms earlier. Shutdown `cost-state`, `last-prompt` and
+`file-history-snapshot` records have no timestamp. The previous turn's final
+finite timestamp belongs to `turn_duration` at offset 76861. Both ordinary
+read-back and AC15 controls replay this shape with synthetic input, journal,
+and reply text, and reject a floor at/after the attachment or a parent from
+the earlier turn. All six setup types also retain their floor and ancestry
+controls with untimed bookkeeping interposed. This proves the amended checker
+behavior; the original paid resume reply's correctness remains unverified.
+Current-exchange validation still rejects untimed records outside the existing
+five exact informational shapes; the amendment changes only floor selection.
 
 ## Timestamp sweep
 
@@ -30,7 +45,7 @@ generation arithmetic was distinguished from predicates on observed records.
 
 | Location | Figure and classification | Action |
 | --- | --- | --- |
-| `tests/real-agent/ai-readback.ts`, `nativeTime`, ordinary read-back and `assertAC15Exchange` | 5 ms before receipt/immediate parent, six native attachment types. **Jitter guess**, not an SRD pass bound. This was the only allowance found on native transcript/rollout clocks. | Replaced at both call sites by decision 24: receipt ancestry, offset after receipt predecessor, time strictly after the previous turn's last non-informational record. Regressions above. |
+| `tests/real-agent/ai-readback.ts`, `nativeTime`, ordinary read-back and `assertAC15Exchange` | 5 ms before receipt/immediate parent, six native attachment types. **Jitter guess**, not an SRD pass bound. This was the only allowance found on native transcript/rollout clocks. | Replaced at both call sites by decision 24: receipt ancestry, offset after receipt predecessor, time strictly after the previous turn's last record with a finite timestamp (2026-10-19 amendment); untimed bookkeeping does not set the floor. Regressions above. |
 | `tests/real-agent/codex-evidence.ts`, `completedCodexTurn`; `codex-delivery.ts`, completion polling | 180000 ms from the send through native completion. **Real completion bound**, SR-14.6 and AI completion decisions 19/21. Exact send/receipt/assistant/turn-ID checks have no jitter allowance. | Unchanged. |
 | `tests/real-agent/ai-scenario.sh`, read-back waits; `ac20-diagnostics.ts`, `AC20_COMPLETION_MS` | 180 s / 180000 ms completed exact read-back deadline. **Real pass bound**, SR-14.6 and decision 21. Ordinary Claude uses observable polling; AC20 separately records the deadline. | Unchanged. |
 | `tests/integration/fixtures/transcript-receipts.ts`, latency | p95 typing start <=2000 ms and delivery <=10000 ms. **Real pass bounds**, AC76 / SR-14.3–4; no subtraction from a native timestamp to admit an earlier record. | Unchanged. |

@@ -87,7 +87,50 @@ test.each(['ordinary', 'AC15'] as const)('%s accepts the captured 6 ms setup cha
   expect(completedAIReadback(e).receipt_uuid).toBe('8a133168-9fce-4115-ba1f-3a0d1b9f62a6')
 })
 
+// AC23's resume boundary: the native shutdown bookkeeping has no timestamp.
+// Only clocks/offsets/UUIDs are captured; bodies and receipts below are synthetic.
+function capturedResume(criterion: 'ordinary' | 'AC15') {
+  const captured = JSON.parse(readFileSync(new URL('./fixtures/native-attachment-membership/ac23-resume.json', import.meta.url), 'utf8'))
+  const e = ordinaryEvidence()
+  e.expected.case = criterion === 'AC15' ? 'AC15' : captured.case
+  const receipt = captured.records.find((r: any) => r.uuid === captured.receiptUuid)
+  const path = `/scenario/projects/aiac23/${receipt.sessionId}.jsonl`
+  e.own = captured.records.map((r: any, index: number) => {
+    const value: any = { type: r.type, ...Object.fromEntries(['uuid', 'parentUuid', 'sessionId', 'subtype']
+      .filter(k => r[k] !== undefined).map(k => [k, r[k]])) }
+    if (Number.isFinite(r.at)) value.timestamp = new Date(r.at).toISOString()
+    if (r.type === 'attachment') value.attachment = { type: r.attachmentType }
+    else if (r.type === 'user') value.message = { role: 'user', content: r.uuid === captured.receiptUuid ? e.take.text
+      : index === 0 ? 'previous turn' : [{ type: 'tool_result', tool_use_id: 'post', content: 'posted' }] }
+    else if (r.type === 'assistant') value.message = { role: 'assistant', model: e.model, stop_reason: r.stopReason,
+      content: r.stopReason === 'tool_use' ? [{ type: 'tool_use', name: 'mcp__slack-channel-router__reply', id: 'post', input: { text: JSON.stringify(e.expected) } }] : [] }
+    else if (r.type === 'last-prompt') value.leafUuid = 'previous-end'
+    return { path, offset: r.offset, at: r.at === null ? NaN : r.at, value, ...parseDeliveryTranscriptRecord('claude', value) }
+  })
+  e.journal[0].received_at = receipt.at - 100
+  Object.assign(e.journal[2], { session_id: receipt.sessionId, transcript_path: path, at: receipt.at - 50, transcript_size: receipt.offset - 1 })
+  Object.assign(e.journal[3], { receipt: { path, uuid: receipt.uuid }, at: receipt.at + 1 })
+  return e
+}
+
+test.each(['ordinary', 'AC15'] as const)('%s accepts the captured AC23 resume boundary with untimed shutdown records', criterion => {
+  expect(completedAIReadback(capturedResume(criterion)).receipt_uuid).toBe('ccfbcc34-f52c-4e76-985e-d717837c9e9e')
+})
+
 for (const criterion of ['ordinary', 'AC15'] as const) {
+  test(`${criterion} resume uses the last finite previous-turn clock and rejects an earlier-turn attachment`, () => {
+    const e = capturedResume(criterion), setup = e.own.find(r => r.value.type === 'attachment')!
+    const lastTimed = e.own.find(r => r.offset === 76861)!, saved = lastTimed.at
+    expect(completedAIReadback(e).receipt_uuid).toBe(setup.value.parentUuid)
+    for (const at of [setup.at, setup.at + 1]) {
+      lastTimed.at = at
+      expect(() => completedAIReadback(e)).toThrow()
+    }
+    lastTimed.at = saved
+    setup.value.parentUuid = lastTimed.value.uuid
+    expect(() => completedAIReadback(e)).toThrow()
+  })
+
   test.each(['environment', 'model', 'agent_listing_delta', 'mcp_instructions_delta', 'skill_listing', 'total_tokens_reminder'])(
     `${criterion} setup %s must follow the previous turn and link to this receipt`, type => {
       const e = capturedSetup(criterion), setup = e.own[1]!, receipt = e.own[0]!
@@ -97,7 +140,9 @@ for (const criterion of ['ordinary', 'AC15'] as const) {
       const last = assistant(e, [], 200, { uuid: 'previous-end', sessionId: receipt.value.sessionId, parentUuid: 'previous' })
       last.path = receipt.path; last.at = setup.at - 1
       receipt.value.parentUuid = last.value.uuid
-      e.own.unshift(prior, last)
+      const bookkeeping = e.entry(201, { type: 'cost-state', sessionId: receipt.value.sessionId })
+      bookkeeping.path = receipt.path; bookkeeping.at = NaN
+      e.own.unshift(prior, last, bookkeeping)
       expect(completedAIReadback(e).receipt_uuid).toBe(receipt.uuid!)
       for (const at of [last.at - 1, last.at]) {
         const saved = setup.at; setup.at = at
@@ -113,12 +158,12 @@ for (const criterion of ['ordinary', 'AC15'] as const) {
       expect(() => completedAIReadback(e)).toThrow()
     })
 
-  test(`${criterion} setup cannot bypass an invalid previous-turn clock or an exact ordinary-record clock`, () => {
+  test(`${criterion} setup skips a nonfinite prior clock but keeps exact ordinary-record clocks`, () => {
     const e = capturedSetup(criterion), receipt = e.own[0]!, setup = e.own[1]!
     const prior = e.entry(100, { type: 'user', uuid: 'previous', sessionId: receipt.value.sessionId, message: { role: 'user', content: 'previous turn' } })
     prior.path = receipt.path; prior.at = NaN
     e.own.unshift(prior)
-    expect(() => completedAIReadback(e)).toThrow()
+    expect(completedAIReadback(e).receipt_uuid).toBe(receipt.uuid!)
     e.own.shift()
     setup.value.attachment.type = 'instructions'
     expect(() => completedAIReadback(e)).toThrow()
