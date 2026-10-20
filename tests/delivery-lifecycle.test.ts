@@ -146,3 +146,37 @@ test('concurrent and nested reconnect scopes keep each persona client and budget
   expect(counts).toEqual([1, 2])
   expect(scope.current('alpha')).toBeUndefined(); expect(scope.current('beta')).toBeUndefined()
 })
+
+
+describe('retained reconnect input ownership', () => {
+  test.each(['new-launch', 'new-session', 'new-stamp', 'ended', 'missing', 'teardown'] as const)(
+    '%s cancels the old command continuation while preserving the sibling', event => {
+      const { life } = harness()
+      for (const key of ['alpha', 'beta']) {
+        life.observeRow(key, { state: 'waiting', session_id: 'old-session', launch_started_at: '2026-10-15T01:00:00Z' })
+        life.rememberReconnectInput(key, { launch: life.launchId(key), session: 'old-session' })
+      }
+      if (event === 'new-launch') life.beforeLaunch('alpha')
+      else if (event === 'teardown') life.forget('alpha')
+      else life.observeRow('alpha', { state: event === 'ended' || event === 'missing' ? event : 'waiting', session_id: event === 'new-session' ? 'new-session' : 'old-session', launch_started_at: event === 'new-stamp' ? '2026-10-15T02:00:00Z' : '2026-10-15T01:00:00Z' })
+      expect(life.reconnectInput('alpha')).toBeUndefined()
+      expect(life.reconnectInput('beta')).toBeDefined()
+      expect(life.acquire('beta', 'delivery')).toBeUndefined()
+    },
+  )
+  test('a pending command keeps its retry timer when a connected engine takes ownership', async () => {
+    const { life, clock, calls } = harness()
+    life.rememberReconnectInput('alpha', { launch: life.launchId('alpha'), session: 's1' })
+    life.setReconnect(async key => { calls.push({ key, at: clock.now() }); life.clearReconnectInput(key); life.clearDeferred(key) })
+    life.defer('alpha')
+    life.engineRunning('alpha', true)
+    expect(life.acquire('alpha', 'delivery')).toBeUndefined()
+    await clock.advance(NOT_NOW_RETRY_MS[0])
+    expect(calls).toEqual([{ key: 'alpha', at: NOT_NOW_RETRY_MS[0] }])
+    expect(life.reconnectInput('alpha')).toBeUndefined()
+    expect(clock.pendingCount()).toBe(0)
+    const release = life.acquire('alpha', 'delivery')
+    expect(release).toBeDefined()
+    release?.()
+  })
+})

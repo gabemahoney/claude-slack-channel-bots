@@ -91,7 +91,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     reader: DeliveryReceiptReader; receiptTarget?: DeliveryPair; receiptAttempt?: number; deadlines: Partial<Record<DeliveryTimer, number>>; budget: () => void
     rowAt: number; waitingAt?: number; notNowStep: number; retryStep: number; appendRetryStep: number; lastSeq?: number; lastPart?: number
     pending?: { record: QueueRecord; complete(): void }; lease?: () => void; timer?: unknown; busy?: Promise<void>; stopped: boolean
-    restarted?: string; receiptWorking: boolean; pollAfter: number; snapshot?: DeliveryPolicyKnowledge; lastRetypeEvent?: number; dialogHold: boolean; dialogMaybeOpen: boolean
+    restarted?: string; receiptWorking: boolean; pollAfter: number; snapshot?: DeliveryPolicyKnowledge; lastRetypeEvent?: number; dialogHold: boolean; dialogMaybeOpen: boolean; recoveringReconnect?: boolean
   }
   const states = new Map<string, State>(), budgets = new Map<string, () => void>()
   // Empty queues retire their engine, not the already observed launch. Keep
@@ -431,7 +431,10 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
         }
         if (action === 'deferReconnect') {
           release(s)
-          await life.retryReconnect(key); break
+          // This tick may be awaited by that same reconnect's recovery hook.
+          // Let the enclosing attempt continue instead of joining its promise.
+          if (!s.recoveringReconnect) await life.retryReconnect(key)
+          break
         }
         if (action === 'stopAbsent') { release(s); wait(key, s, 'state'); break }
         if (s.e.phase === 'enter') {
@@ -484,7 +487,8 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
       }
       // A reconnect rerun from this engine cannot wait on its own tick.
       if (s.busy) return reconciled()
-      await api.tick(key)
+      s.recoveringReconnect = true
+      try { await api.tick(key) } finally { s.recoveringReconnect = false }
       return reconciled()
     },
     async forget(key) { launches.delete(key); const s = states.get(key); if (!s) { life.forget(key); return }; s.stopped = true; if (s.timer !== undefined) clock.clearTimeout(s.timer); release(s); await s.busy; states.delete(key); life.engineRunning(key, false); life.forget(key) },

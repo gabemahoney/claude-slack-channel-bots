@@ -1,3 +1,4 @@
+import { MCP_SERVER_NAME } from '../src/config.ts'
 /** b.omv SR-5/6: production executor over a durable queue and real adapters.
  * Receipt permutations and gate lifecycle live in their
  * own suite. Every timestamp and retry is driven by the injected fake clock. */
@@ -690,4 +691,102 @@ describe('AD authority regressions', () => {
     expect(h.textCalls()).toHaveLength(1)
     expect(h.records().filter(r => r.kind === 'delivered')).toHaveLength(1)
   })
+})
+
+
+describe('disconnected delivery draft is recovered before reconnect control text', () => {
+  test.each(['none', 'refused-enter', 'unknown-enter'] as const)(
+    '%s: recovery retries Enter without repeating retained delivery text and keeps the FIFO head until its exact receipt', async fault => {
+      const h = await harness()
+      await h.accept('retained delivery')
+      const p = h.p()
+      p.connected = false
+      p.autoReceipt = false
+      p.box = 'retained delivery'
+      await h.queue.append('alpha', {
+        v: 1, kind: 'sent', seq: 1, part: 1, attempt: 1, send_kind: 'text', at: 0,
+        launch_id: 'old-start:1', session_id: p.row.session_id, transcript_path: p.path, transcript_size: 0,
+      })
+      let enters = 0
+      p.keyHook = params => {
+        if (params.key === 'Enter' && ++enters === 1) {
+          if (fault === 'refused-enter') return errDialogMaybeOpen()
+          if (fault === 'unknown-enter') return errCallTimeout('send-keys')
+        }
+        return undefined
+      }
+      expect(await h.engine.recoverBeforeReconnect('alpha')).toBe(false)
+      expect(h.keyCalls()).toEqual([])
+      await h.advance(LAUNCH_SETTLE_MS)
+      if (fault !== 'none') {
+        expect(await h.engine.recoverBeforeReconnect('alpha')).toBe(false)
+        await h.until(() => enters >= 2)
+      }
+      await h.advance(RECEIPT_WAIT_MS + 1000)
+      expect(await h.engine.recoverBeforeReconnect('alpha')).toBe(true)
+      expect(h.keyCalls().map(c => c.params)).toEqual(Array.from({ length: fault === 'none' ? 1 : 2 }, () => ({ instance_id: 'cscb_alpha', key: 'Enter' })))
+      expect(h.queue.openCount('alpha')).toBe(1)
+      expect(h.p().box).toBe('')
+      expect(h.calls.filter(c => c.verb === 'read-pane')).toEqual([])
+      expect(h.events.filter(e => e.type === 'delivered')).toEqual([])
+    },
+  )
+})
+
+
+test('a reconnect timer outlived by a six-second AD read resumes its retained command once and shuts down', async () => {
+  const h = await harness()
+  await h.accept('delivery before reconnect')
+  const p = h.p()
+  p.connected = false
+  p.autoReceipt = false
+  p.box = 'delivery before reconnect'
+  await h.queue.append('alpha', { v: 1, kind: 'sent', seq: 1, part: 1, attempt: 1, send_kind: 'text', at: 0,
+    launch_id: 'previous-start:1', session_id: p.row.session_id, transcript_path: p.path, transcript_size: 0 })
+  expect(await h.engine.recoverBeforeReconnect('alpha')).toBe(false)
+  await h.advance(LAUNCH_SETTLE_MS + RECEIPT_WAIT_MS + 1000)
+  expect(await h.engine.recoverBeforeReconnect('alpha')).toBe(true)
+  expect(h.keyCalls().map(c => c.params)).toEqual([{ instance_id: 'cscb_alpha', key: 'Enter' }])
+
+  // Let the lifecycle timer be the next driver, with the previous delivery
+  // reconciled and a reconnect text already retained in the terminal.
+  for (const timer of h.clock.pending()) h.clock.clearTimeout(timer)
+  const command = `/mcp reconnect ${MCP_SERVER_NAME}`
+  p.box = command
+  h.lifecycle.rememberReconnectInput('alpha', { launch: h.lifecycle.launchId('alpha'), session: p.row.session_id })
+  let reads = 0, reading = 0, maxReading = 0, callbacks = 0, settled = false
+  const submitted: string[] = []
+  const get = h.client().get.bind(h.client())
+  h.client().get = async params => {
+    reads++; reading++; maxReading = Math.max(maxReading, reading)
+    try {
+      if (reads === 1) await new Promise<void>(resolve => h.clock.setTimeout(resolve, 6000))
+      return await get(params)
+    } finally { reading-- }
+  }
+  p.keyHook = params => { if (params.key === 'Enter') submitted.push(p.box); return undefined }
+  h.lifecycle.setReconnect(async key => {
+    callbacks++
+    expect(await h.lifecycle.recoverBeforeReconnect(key)).toBe(true)
+    await h.client().sendKeys({ instance_id: 'cscb_alpha', key: 'Enter' })
+    h.lifecycle.clearReconnectInput(key)
+    h.lifecycle.clearDeferred(key)
+    settled = true
+  })
+  h.lifecycle.defer('alpha')
+  await h.clock.advance(NOT_NOW_RETRY_MS[0])
+  expect([callbacks, reads, settled]).toEqual([1, 1, false])
+  await h.clock.advance(6000)
+  for (let turn = 0; !settled && turn < 100; turn++) await new Promise<void>(resolve => setImmediate(resolve))
+  expect(settled).toBe(true)
+  expect(submitted).toEqual([command])
+  expect([callbacks, maxReading, p.box]).toEqual([1, 1, ''])
+  expect(h.textCalls()).toEqual([])
+  expect(h.queue.openCount('alpha')).toBe(1)
+  expect(h.errors).toEqual([])
+  let stopped = false
+  const stopping = h.engine.stop().then(() => { stopped = true })
+  await h.clock.flush()
+  expect(stopped).toBe(true)
+  await stopping
 })
