@@ -87,6 +87,54 @@ describe('real delivery timeout evidence (synthetic, no native launch)', () => {
       expect(child.status).toBe(state === 'waiting' ? 0 : 1)
     } finally { fs.rmSync(root, { recursive: true, force: true }) }
   })
+  test.each([
+    ['old waiting row', { session_id: 'old-session' }, false],
+    ['old working row', { state: 'working', session_id: 'old-session' }, false],
+    ['new pending row', { state: 'pending' }, false],
+    ['new ended row', { state: 'ended' }, false],
+    ['unbound row', { session_id: '' }, false],
+    ['missing session', { session_id: null }, false],
+    ['foreign row', { instance_id: 'neighbour-row' }, false],
+    ['untagged row', { labels: {} }, false],
+    ['new waiting session', {}, true],
+    ['new working session', { state: 'working' }, true],
+  ] as const)('replacement launch rejects historical connection plus %s', (_label, patch, ready) => {
+    const root = fs.mkdtempSync(join(tmpdir(), 'replacement-launch-control-'))
+    try {
+      const source = fs.readFileSync(join(import.meta.dir, 'integration/lib/real-scenario.sh'), 'utf8')
+      const connected = source.match(/^_real_connected\(\) \{[\s\S]*?^\}/m)![0]
+      fs.writeFileSync(join(root, 'server.log'), '[historical] Session connected: persona "alpha" (key=alpha)\n')
+      const row = { instance_id: 'own-row', state: 'waiting', session_id: 'new-session', labels: { tag_prompt: '1' }, ...patch }
+      const script = ['set -euo pipefail', 'SLACK_STATE_DIR="$HOME"', 'real_instance() { echo own-row; }',
+        'real_ad() { case "$*" in "status --instance-id own-row") echo \'{"state":"waiting"}\';; "get --instance-id own-row") printf "%s\\n" "$ROW";; *) exit 9;; esac; }',
+        connected, '_real_connected alpha old-session'].join('\n')
+      const path = join(root, 'control.sh'); fs.writeFileSync(path, script)
+      const child = spawnSync('bash', [path], { env: hostSafeChildEnv(root, { tools: ['bash', 'jq', 'grep'], extras: { ROW: JSON.stringify(row) } }), encoding: 'utf8', timeout: 5000 })
+      expect(child.error).toBeUndefined(); expect(child.signal).toBeNull()
+      expect(child.stderr).toBe(''); expect(child.stdout).toBe('')
+      expect(child.status).toBe(ready ? 0 : 1)
+      assertNoLeak({ stdout: child.stdout, stderr: child.stderr })
+    } finally { fs.rmSync(root, { recursive: true, force: true }) }
+  })
+  test('replacement launch waits through the old live row and new pending row before AD binds a new session', () => {
+    const root = fs.mkdtempSync(join(tmpdir(), 'replacement-sequence-control-'))
+    try {
+      const source = fs.readFileSync(join(import.meta.dir, 'integration/lib/real-scenario.sh'), 'utf8')
+      const extract = (name: string) => source.match(new RegExp(`^${name}\\(\\) \\{[\\s\\S]*?^\\}`, 'm'))![0]
+      fs.writeFileSync(join(root, 'server.log'), '[historical] Session connected: persona "alpha" (key=alpha)\n')
+      const script = ['set -euo pipefail', 'SLACK_STATE_DIR="$HOME"', 'REAL_LAUNCH_WAIT_S=300', 'real_instance() { echo own-row; }',
+        'real_ad() { case "$*" in "status --instance-id own-row") printf \'{"state":"%s"}\\n\' "$ROW_STATE";; "get --instance-id own-row") printf \'{"instance_id":"own-row","state":"%s","session_id":"%s","labels":{"tag_prompt":"1"}}\\n\' "$ROW_STATE" "$ROW_SESSION";; *) exit 9;; esac; }',
+        // No time passes: each explicit AD answer advances the actual predicate.
+        'wait_until() { [[ "$1" == 300 ]]; shift 2; [[ "$*" == "_real_connected alpha old-session" ]]; ROW_STATE=waiting; ROW_SESSION=old-session; if "$@"; then exit 10; fi; echo old-rejected; ROW_STATE=pending; ROW_SESSION=""; if "$@"; then exit 11; fi; echo pending-rejected; ROW_STATE=waiting; ROW_SESSION=new-session; "$@"; echo new-bound; }',
+        'real_wait_idle() { [[ "$*" == "alpha 300" ]]; echo ad-waiting; }', extract('_real_connected'), extract('real_wait_launch'),
+        'real_wait_launch alpha old-session'].join('\n')
+      const path = join(root, 'control.sh'); fs.writeFileSync(path, script)
+      const child = spawnSync('bash', [path], { env: hostSafeChildEnv(root, { tools: ['bash', 'jq', 'grep'] }), encoding: 'utf8', timeout: 5000 })
+      expect(child.error).toBeUndefined(); expect(child.signal).toBeNull(); expect(child.status).toBe(0)
+      expect(child.stderr).toBe(''); expect(child.stdout).toBe('old-rejected\npending-rejected\nnew-bound\nad-waiting\n')
+      assertNoLeak({ stdout: child.stdout, stderr: child.stderr })
+    } finally { fs.rmSync(root, { recursive: true, force: true }) }
+  })
   test.each(['success', 'failure', 'diagnostic-failure'])('%s preserves polling arguments, original failure and cleanup order', mode => {
     const root = fs.mkdtempSync(join(tmpdir(), 'delivery-wait-control-'))
     try {

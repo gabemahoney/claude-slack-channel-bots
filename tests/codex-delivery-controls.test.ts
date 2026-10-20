@@ -390,6 +390,80 @@ describe('D1 scratch and model refusal contract', () => {
 })
 
 describe('D1 scratch preparation and disposable observation cleanup', () => {
+  test.each(['ended', 'missing', 'still live', 'kill failure', 'sweep failure'] as const)('gate retires the observation before spawning: %s', async outcome => {
+    const source = readFileSync(join(import.meta.dir, 'real-agent/codex-delivery.ts'), 'utf8')
+    const extract = (name: string) => source.match(new RegExp(`^(?:async )?function ${name}[\\s\\S]*?^\\}`, 'm'))![0]
+    // Execute the driver's actual transition and retirement functions, with
+    // every native boundary injected. Never import its guarded entrypoint.
+    const gate = extract('gate').split("  stage = 'gate-ac2'")[0] + '}\n'
+    expect(gate).toContain("await start('gate')")
+    const stop = source.match(/^async function stopEngine\(\).*$/m)![0]
+    const events: string[] = [], records: unknown[] = [], live = new Set(['cscb_codex_delivery'])
+    let releaseKill!: () => void, reachedKill!: () => void, releaseSweep!: () => void, reachedSweep!: () => void
+    const killing = new Promise<void>(resolve => { releaseKill = resolve })
+    const killReached = new Promise<void>(resolve => { reachedKill = resolve })
+    const sweeping = new Promise<void>(resolve => { releaseSweep = resolve })
+    const sweepReached = new Promise<void>(resolve => { reachedSweep = resolve })
+    const failure = new Error('synthetic retirement failure')
+    let state = 'waiting', sweeps = 0
+    const client = {
+      kill: async ({ instance_id }: { instance_id: string }) => {
+        expect(instance_id).toBe('cscb_codex_delivery')
+        events.push('kill'); reachedKill(); await killing
+        if (outcome === 'kill failure') throw failure
+      },
+      findMissing: async () => {
+        events.push('sweep'); sweeps++
+        if (sweeps === 2) { reachedSweep(); await sweeping }
+        if (outcome === 'sweep failure') throw failure
+        if (sweeps >= 2 && (outcome === 'ended' || outcome === 'missing')) state = outcome
+      },
+      get: async ({ instance_id }: { instance_id: string }) => {
+        expect(instance_id).toBe('cscb_codex_delivery'); events.push(`get:${state}`)
+        return { instance_id, agent: 'codex', labels: { tag_prompt: '1' }, relay_mode: 'on', cwd: '/synthetic/work', state }
+      },
+    }
+    const stopOwner = (name: string) => ({ stop: async () => { events.push(`stop:${name}`) } })
+    const program = [
+      "let instance = 'cscb_codex_delivery', stage = 'prepare', lastKey = null; const work = '/synthetic/work';",
+      "const observe = async completion => { events.push(`observe:${completion}`); };",
+      "const start = async label => { events.push(`spawn:${label}`); };",
+      "const buildEngine = async () => { events.push('build:gate'); };",
+      'const rollout = async () => { events.push("retain:rollout"); };',
+      'const record = (_label, value) => records.push(value);',
+      'const poll = async (_label, check) => { for (let n = 0; n < 3; n++) { const value = await check(); if (value !== undefined) return value; } throw failure; };',
+      stop, extract('row'), extract('retired'), extract('retire'), gate, 'return gate;',
+    ].join('\n')
+    const run = new Function('client', 'codexRetirementCheckpoint', 'liveInstances', 'events', 'records', 'failure', 'engines', 'preparation', 'lifecycle', 'queue',
+      new Bun.Transpiler({ loader: 'ts' }).transformSync(program))(
+      client, codexRetirementCheckpoint, live, events, records, failure,
+      stopOwner('engine'), stopOwner('preparation'), stopOwner('lifecycle'), stopOwner('queue'))
+    const result = run().then(() => null, (error: unknown) => error)
+    await killReached
+    expect(events).toEqual(['observe:false', 'stop:engine', 'stop:preparation', 'stop:lifecycle', 'stop:queue', 'kill'])
+    expect(live.has('cscb_codex_delivery')).toBe(true)
+    releaseKill()
+    if (outcome !== 'kill failure' && outcome !== 'sweep failure') {
+      await sweepReached
+      expect(events.slice(-3)).toEqual(['sweep', 'get:waiting', 'sweep'])
+      expect(events.some(event => event.startsWith('spawn:'))).toBe(false)
+      expect(live.has('cscb_codex_delivery')).toBe(true)
+      releaseSweep()
+    }
+    const error = await result
+    if (outcome === 'ended' || outcome === 'missing') {
+      expect(error).toBeNull()
+      expect(events.slice(-5)).toEqual([`get:${outcome}`, 'retain:rollout', `get:${outcome}`, 'spawn:gate', 'build:gate'])
+      expect(live.size).toBe(0)
+      expect(records).toEqual([{ label: 'delivery', instance: 'cscb_codex_delivery', method: 'kill-and-find-missing', state: outcome, retired: true }])
+    } else {
+      expect(error).toBe(failure)
+      expect(events.some(event => event.startsWith('spawn:'))).toBe(false)
+      expect(live.has('cscb_codex_delivery')).toBe(true)
+      expect(records).toEqual([])
+    }
+    assertNoLeak({ events, records, error })
+  })
   test.each(['absent', 'existing', 'escaped-parent', 'symlink', 'hardlink'])('%s AD config stays inside scratch', kind => {
     const root = mkdtempSync('/tmp/codex-config-')
     try {

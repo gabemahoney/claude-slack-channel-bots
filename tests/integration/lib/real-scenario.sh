@@ -157,7 +157,9 @@ real_ad() {
 real_instance() { bun "${SCENARIO_FIXTURES}/fmk-texts.ts" personaInstanceId "$1"; }
 real_wait_launch() {
     # Persona names need not equal their derived key: match by key alone.
-    wait_until "${REAL_LAUNCH_WAIT_S}" "real persona $1 never launched/connected" _real_connected "$1"
+    # A replacement also needs AD to report a new native session. A still-live
+    # old row and a historical MCP connection do not finish its live-row sequence.
+    wait_until "${REAL_LAUNCH_WAIT_S}" "real persona $1 never launched/connected" _real_connected "$1" "${2:-}"
     real_wait_idle "$1" "${REAL_LAUNCH_WAIT_S}"
 }
 _real_waiting() {
@@ -179,9 +181,17 @@ real_record_state() {
     bun "${SCENARIO_FIXTURES}/real-observations.ts" "${status}" || fail 'cannot observe AD state'
 }
 _real_connected() {
-    local status
+    local status row instance
     status="$(real_ad status --instance-id "$(real_instance "$1")" 2>/dev/null)" || return 1
     jq -e '.state == "waiting" or .state == "working"' <<< "${status}" >/dev/null || return 1
+    if [[ -n "${2:-}" ]]; then
+        instance="$(real_instance "$1")"
+        row="$(real_ad get --instance-id "${instance}" 2>/dev/null)" || return 1
+        jq -e --arg instance "${instance}" --arg old_session "$2" \
+            '.instance_id == $instance and (.state == "waiting" or .state == "working")
+             and .labels.tag_prompt == "1" and (.session_id | type == "string" and length > 0)
+             and .session_id != $old_session' <<< "${row}" >/dev/null || return 1
+    fi
     grep -F 'Session connected: persona ' "${SLACK_STATE_DIR}/server.log" | grep -qF "(key=$1)"
 }
 real_wait_delivery() {

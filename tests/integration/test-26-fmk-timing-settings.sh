@@ -1361,15 +1361,35 @@ launch_answer_at() {
 }
 
 hooks_brought_up() {
-    local step="$1" x="$2" n
+    local step="$1" x="$2" n session events
     wait_until "${REPORT_WAIT_S}" "${step}: ${SCENARIO_TAG}_${x} never reported in after its launch timeout" row_state_is "${ID[${x}]}" waiting
+    ad_capture get --instance-id "${ID[${x}]}"
+    (( AD_RC == 0 )) || fail "${step}: cannot read the recovered row"
+    session="$(jq -er '.session_id | select(type == "string" and length > 0)' "${AD_OUT}")" \
+        || fail "${step}: the recovered row has no session identity"
+    events="$(ad_trail_events ad.hook.fired "${ID[${x}]}")" || exit 1
+    jq -e -s --arg session "${session}" 'any(.[]; .event_name == "SessionStart" and
+        .session_id == $session and .upsert_outcome == "updated")' <<< "${events}" > /dev/null \
+        || fail "${step}: no applied SessionStart for the recovered session ${session}"
     n="$(cscb_calls_between "$3" "$(now_s)" send-keys --instance-id "${ID[${x}]}")"
     (( n == 0 )) || fail "${step}: ${SCENARIO_TAG}_${x} required ${n} automatic startup key call(s)"
 }
 
+# The lost create reply leaves AD with no recorded pane identity, so a
+# SessionStart cannot apply until AD adopts it or a later launch succeeds.
+# Keep the fault through the timeout's exact pending-get proof, then let the
+# normal pending/live-row recovery sequence run against a healthy fixture.
+release_timed_out_launch_fixture() {
+    local step="$1" x="$2" launch_start="$3" error="${4:-ErrCallTimeout}"
+    expect_get_after_timeout_line "${step}" "${x}" "${error}" "${launch_start}"
+    tmux_shim_mode log
+    stub_report_delay "${WORK[${x}]}" 0
+}
+
 leg_call_timeout_low() {
     local step="call-timeout-30000" x=t1 line warn_t elapsed get_line t_get readings state start_raw stopped_m deadline
-    local t prev last reads n_pending n_live first_waiting
+    local t prev last reads n_pending n_live first_waiting first_launch_start="" released=0
+    local event_time event_state event_t transitions
     leg "${step}"
     readings="${SCENARIO_ROOT}/${x}-row-readings.tsv"
     start_call_timeout_leg "${step}" "${x}" "${CALL_TIMEOUT_LOW_MS}"
@@ -1402,7 +1422,15 @@ leg_call_timeout_low() {
             state="$(jq -r '.state // empty' "${AD_OUT}")"
             start_raw="$(jq -r '.launch_started_at // empty' "${AD_OUT}")"
         fi
+        if [[ "${state}" == pending && -z "${first_launch_start}" ]]; then
+            first_launch_start="${start_raw}"
+        fi
         printf '%s\t%s\t%s\n' "$(now_s)" "${state:-none}" "${start_raw:-none}" >> "${readings}"
+        if (( ! released )) && [[ -n "${first_launch_start}" ]] &&
+            _scenario_log_has "$(launch_answer_line "${x}" ErrCallTimeout)"; then
+            release_timed_out_launch_fixture "${step}" "${x}" "${first_launch_start}"
+            released=1
+        fi
         [[ "${state}" == waiting ]] && _scenario_log_has "${stopped_m}" && break
         (( SECONDS < deadline )) || fail "${step}: T1 was not up with its retry timer stopped by the leg's bound (last read '${state}')"
         sleep 1
@@ -1438,9 +1466,19 @@ leg_call_timeout_low() {
         call_fields "${step}" "${line}"
         t="${CALL_T}"
         time_before "${T_CALL}" "${t}" || continue
-        last="$(awk -F'\t' -v t="${t}" '$1 < t { s = $2 } END { print s }' "${readings}")"
+        # AD's transition trail preserves a finished interval even when it
+        # falls between the harness's one-second samples.
+        transitions="$(ad_trail_events ad.spawn.state_transition "${ID[${x}]}")" || exit 1
+        last=""
+        while IFS=$'\t' read -r event_time event_state; do
+            [[ -n "${event_time}" ]] || continue
+            event_t="$(date -u -d "${event_time}" +%s.%6N)" || fail "${step}: invalid AD transition timestamp"
+            if time_before "${prev}" "${event_t}" && time_before "${event_t}" "${t}"; then
+                last="${event_state}"
+            fi
+        done < <(jq -r '[.ts, .new_state] | @tsv' <<< "${transitions}")
         [[ "${last}" == ended || "${last}" == missing ]] \
-            || fail "${step}: a CSCB ${CALL_VERB} of T1 at +$(seconds_between "${T_CALL}" "${t}")s, while the harness read its row '${last:-nothing}'"
+            || fail "${step}: a CSCB ${CALL_VERB} of T1 at +$(seconds_between "${T_CALL}" "${t}")s without AD ended/missing evidence after its previous launch (last transition '${last:-none}')"
         reads=$(( $(cscb_calls_between "${prev}" "${t}" get --instance-id "${ID[${x}]}") + $(cscb_calls_between "${prev}" "${t}" status --instance-id "${ID[${x}]}") ))
         (( reads >= 1 )) || fail "${step}: a CSCB ${CALL_VERB} of T1 at +$(seconds_between "${T_CALL}" "${t}")s with no CSCB read of its row before it"
         prev="${t}"
@@ -1448,7 +1486,7 @@ leg_call_timeout_low() {
     n_pending="$(awk -F'\t' '$2 == "pending"' "${readings}" | wc -l | tr -d ' ')"
     n_live="$(awk -F'\t' '$2 != "pending" && $2 != "ended" && $2 != "missing" && $2 != "none"' "${readings}" | wc -l | tr -d ' ')"
     first_waiting="$(awk -F'\t' '$2 == "waiting" { print $1; exit }' "${readings}")"
-    echo "${TEST_NAME}: ${step}: T1's row read ${n_pending} time(s) pending and ${n_live} time(s) live (waiting from +$(seconds_between "${T_CALL}" "${first_waiting}")s), never ended or missing; $(( $(cscb_ad_count spawn --instance-id "${ID[${x}]}") + $(cscb_ad_count resume --instance-id "${ID[${x}]}") )) CSCB launch call(s) of T1 in all"
+    echo "${TEST_NAME}: ${step}: T1's row read ${n_pending} time(s) pending and ${n_live} time(s) live (waiting from +$(seconds_between "${T_CALL}" "${first_waiting}")s); $(( $(cscb_ad_count spawn --instance-id "${ID[${x}]}") + $(cscb_ad_count resume --instance-id "${ID[${x}]}") )) CSCB launch call(s) of T1 in all"
     echo "${TEST_NAME}: ${step}: T1's retry timer: $(log_lines "${stopped_m}" | tail -n 1 | cut -c1-200)"
     print_cscb_calls "${T_CALL}" "$(now_s)" "${step}: CSCB's calls from T1's spawn until its timer stopped (recorded)"
 }
@@ -1477,6 +1515,7 @@ leg_call_timeout_high() {
     time_before "${elapsed}" "${CALL_HIGH_S}" || fail "${step}: T2's spawn ended ${elapsed}s after its call, not before the call timeout (${CALL_HIGH_S}s)"
 
     expect_get_after_timeout_line "${step}" "${x}" ErrTmuxUnresponsive "${start_raw}"
+    release_timed_out_launch_fixture "${step}" "${x}" "${start_raw}" ErrTmuxUnresponsive
     get_line="$(first_cscb_call_at_or_after "${T_CALL}" get --instance-id "${ID[${x}]}")"
     [[ -n "${get_line}" ]] || fail "${step}: no CSCB get of T2 after its launch timeout"
     call_fields "${step}" "${get_line}"

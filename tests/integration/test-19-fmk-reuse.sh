@@ -611,6 +611,9 @@ t19_leg() {
     # 3. The new life's mode, a plain stop, the mark and a start, with the
     #    background get reading from before it.
     stub_mode "${!work_var}" "${STUB_MODE_TRANSCRIPT_ON_FIRST_MESSAGE}"
+    # Keep the new launch pending long enough for the authoritative sampler;
+    # immediate SessionStart can otherwise fall between two AD get calls.
+    stub_report_delay "${!work_var}" 2
     stop_server
     t19_mark
     poll="${SCENARIO_ROOT}/poll-${p}.jsonl"

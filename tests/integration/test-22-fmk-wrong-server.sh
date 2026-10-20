@@ -354,7 +354,7 @@ wait_until "${REPORT_WAIT_S}" "${STEP}: row ${INSTANCE_ID} never reported in (wa
 expect_status "${STEP}" waiting
 note_worker "${STEP}"
 n="$(cscb_ad_count send-keys "--instance-id ${INSTANCE_ID}")"
-(( n >= 1 )) || fail "${STEP}: no CSCB send-keys cleared the stub's dialog"
+(( n == 0 )) || fail "${STEP}: ${n} automatic startup key call(s) reached the reporting fixture"
 
 # ---------------------------------------------------------------------------
 # Leg 2: part A, find-missing from another tmux environment

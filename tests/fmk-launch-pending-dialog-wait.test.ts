@@ -39,8 +39,12 @@ describe('test-26 waits for its exact asynchronous recovery-get result', () => {
       'first_cscb_call_at_or_after() { local t; read -r t < "$clock"; if [[ "$kind" != missing-call ]] && { [[ "$kind" != delayed-call ]] || (( t >= 1000 )); }; then echo matching-get; fi; }',
       'call_fields() { [[ "$2" == matching-get ]] || fail wrong-call; CALL_T=2; }',
       'hooks_brought_up() { echo hooks-verified; }',
+      'declare -A WORK=([t2]=synthetic_work)',
+      'tmux_shim_mode() { [[ "$1" == log ]] || fail wrong-mode; echo fixture-released; }',
+      'stub_report_delay() { [[ "$1 $2" == "synthetic_work 0" ]] || fail wrong-delay; }',
       declaration(scenario, '_scenario_poll_until'), declaration(scenario, '_scenario_check_timeout'),
-      declaration(scenario, 'wait_until'), declaration(scenario, '_scenario_log_has'), actualHelper, actualBlock,
+      declaration(scenario, 'wait_until'), declaration(scenario, '_scenario_log_has'), actualHelper,
+      declaration(source, 'release_timed_out_launch_fixture'), actualBlock,
       'printf "elapsed-ms=%s\\n" "$(cat "$clock")"',
     ].join('\n')
     try {
@@ -56,6 +60,7 @@ describe('test-26 waits for its exact asynchronous recovery-get result', () => {
     const old = probe(kind, true), current = probe(kind)
     expect(old.status).toBe(1); expect(current.status).toBe(0)
     expect(current.stdout).toContain('hooks-verified'); expect(current.clock).toBe(2000)
+    expect(current.stdout).toContain('fixture-released')
   })
   test('already completed recovery passes without waiting', () => {
     for (const old of [true, false]) {
@@ -69,5 +74,6 @@ describe('test-26 waits for its exact asynchronous recovery-get result', () => {
     expect(current.status).toBe(1)
     expect(current.clock).toBe(kind === 'duplicate' ? 0 : 30000)
     expect(current.stdout).not.toContain('hooks-verified')
+    expect(current.stdout).not.toContain('fixture-released')
   })
 })

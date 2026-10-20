@@ -342,6 +342,9 @@ async function summary(duplicates: number, completed: boolean) {
 async function gate() {
   await observe(false)
   await stopEngine()
+  // This probe and the gate share a workdir. Retire its AD row before the
+  // next spawn; stopping delivery alone leaves the native process alive.
+  await retire('delivery')
   await start('gate')
   await buildEngine()
   stage = 'gate-ac2'

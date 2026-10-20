@@ -92,7 +92,9 @@ SLACK_RECORD_FILLER=200
 REFIRE_ID="t0-refire"
 NOLS_ID="t0-refire-nols"
 NOROW_ID="t0-refire-no-row"
-REFIRE_PATHS=(at-once trusted-config-dir trusted-home dev-channels unrecognised folder-trust)
+# Only the supported at-once fixture starts a reporting worker. Retired UI
+# modes must not leave phantom entries in the re-fire and cleanup checks.
+REFIRE_PATHS=(at-once)
 # G: agent-director's default pending_grace_seconds (the self-check writes no
 # ~/.config/agent-director/config.toml before the re-fire legs end; the hold leg
 # checks there is none).

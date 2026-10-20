@@ -292,6 +292,11 @@ step_stop_bots() {
 }
 
 # Step 4 [harness]: the neighbour, made by hand with the server stopped.
+neighbour_reported() {
+    NB_HOOKS="$(ad_trail_events ad.hook.fired "${NB_ID}")" || exit 1
+    (( $(rows_count "${NB_HOOKS}") >= 1 ))
+}
+
 step_make_neighbour() {
     local step="step 4: the neighbour" dir
     NB_SESSION="${DEV_SESSION}_x"
@@ -309,12 +314,14 @@ step_make_neighbour() {
     NB_PANE="${PART_PANE}"
     NB_PID="${PART_PID}"
     wait_until "${NB_WAIT_S}" "${step}: the neighbour's pane process ${NB_PID} never became the stub" stub_running "${NB_PID}"
-    read_row "${step}" "${NB_ID}"
-    [[ "${ROW_STATE}" == pending ]] || fail "${step}: ${NB_ID} reads '${ROW_STATE}', not pending"
+    wait_row "${step}" "${NB_WAIT_S}" "${NB_ID}" waiting
+    NB_AD_SID="${ROW_SID}"
+    [[ -n "${NB_AD_SID}" ]] || fail "${step}: the reported neighbour has no session id"
     [[ "${ROW_SESSION}" == "${NB_SESSION}" ]] || fail "${step}: ${NB_ID} records session '${ROW_SESSION}', not ${NB_SESSION}"
     [[ "$(jq -n --argjson l "${ROW_LABELS:-null}" '$l // [] | length')" == 0 ]] \
         || fail "${step}: ${NB_ID} carries labels ${ROW_LABELS}"
-    echo "${TEST_NAME}: ${step}: ${NB_ID} reads pending in ${NB_SESSION} (${NB_SID}, window ${NB_WID}, pane ${NB_PANE}, stub ${NB_PID}); tmux shim mark ${TMUX_MARK}"
+    wait_until "${NB_WAIT_S}" "${step}: no SessionStart record for the neighbour" neighbour_reported
+    echo "${TEST_NAME}: ${step}: ${NB_ID} reads waiting in ${NB_SESSION} (${NB_SID}, window ${NB_WID}, pane ${NB_PANE}, stub ${NB_PID}); tmux shim mark ${TMUX_MARK}"
 }
 
 # Step 5: the second life resumes dev beside the neighbour.
@@ -413,12 +420,11 @@ step_checks() {
     found="$(ad_cscb_verb_between list "${RESTART_MARK}" -)" || exit 1
     (( $(rows_count "${found}") >= 1 )) || fail "${step}: positive control: no CSCB list call in the restart leg"
 
-    # The trail: dev's worker reported in; the neighbour's never did.
+    # Both fixtures report in themselves; CSCB adds no neighbour hook.
     events="$(ad_trail_events ad.hook.fired "${DEV_ID}")" || exit 1
     (( $(rows_count "${events}") >= 1 )) || fail "${step}: positive control: the trail holds no ad.hook.fired record for ${DEV_ID}"
     events="$(ad_trail_events ad.hook.fired "${NB_ID}")" || exit 1
-    n="$(rows_count "${events}")"
-    (( n == 0 )) || fail "${step}: the trail holds ${n} ad.hook.fired record(s) for the neighbour ${NB_ID}"
+    [[ "${events}" == "${NB_HOOKS}" ]] || fail "${step}: the neighbour's hook trail changed after its own report-in"
 
     # No tmux command CSCB caused reads from, types into, kills or respawns
     # the neighbour, by its session name, session id, window id or pane id.
@@ -433,9 +439,10 @@ step_checks() {
     [[ -n "${control}" ]] || fail "${step}: positive control: tmux_shim_targets found no command acting on dev's ${DEV_SESSION}, ${DEV_SID2}, ${DEV_WID2} or ${DEV_PANE2}"
     echo "${TEST_NAME}: ${step}: tmux commands acting on dev from the neighbour's creation on: ${control}"
 
-    # The neighbour is untouched: pending, the same session, pane and stub.
+    # The neighbour is untouched: waiting, the same AD session, pane and stub.
     read_row "${step}" "${NB_ID}"
-    [[ "${ROW_STATE}" == pending ]] || fail "${step}: the neighbour ${NB_ID} reads '${ROW_STATE}', not pending"
+    [[ "${ROW_STATE}" == waiting && "${ROW_SID}" == "${NB_AD_SID}" && "${ROW_SESSION}" == "${NB_SESSION}" ]] \
+        || fail "${step}: the neighbour's reported state or session identity changed"
     session_parts "${step}" "${NB_SESSION}"
     [[ "${PART_SID} ${PART_WID} ${PART_PANE} ${PART_PID}" == "${NB_SID} ${NB_WID} ${NB_PANE} ${NB_PID}" ]] \
         || fail "${step}: the neighbour's session reads ${PART_SID} ${PART_WID} ${PART_PANE} ${PART_PID}, not ${NB_SID} ${NB_WID} ${NB_PANE} ${NB_PID}"
