@@ -72,7 +72,6 @@ import {
   type PersonaDmInput,
 } from '../src/config.ts'
 import type { Via } from '../src/delivery-decision.ts'
-import { FUNGIBLE_MODE_ZERO_REASON } from '../src/jsonl-persistence-check.ts'
 import { FUNGIBLE_DESTINATION_SETTING } from '../src/persona-destination.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
 import {
@@ -215,7 +214,6 @@ const TERM_LIST: readonly Term[] = [
   ...CHANNEL_MODES.map((mode) => ({ label: `modeSwitchLine(${mode})`, text: modeSwitchLineHead(mode) })),
   ...Object.entries(FUNGIBLE_REFUSAL_TEXTS).map(([refusal, text]) => ({ label: `FUNGIBLE_REFUSAL_TEXTS ${refusal}`, text })),
   { label: 'FUNGIBLE_TARGET_REFUSAL', text: FUNGIBLE_TARGET_REFUSAL },
-  { label: 'FUNGIBLE_MODE_ZERO_REASON', text: FUNGIBLE_MODE_ZERO_REASON },
 ]
 
 /**

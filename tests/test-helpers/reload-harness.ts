@@ -136,7 +136,7 @@ import {
   type SessionEntry,
   type SessionToolDeps,
 } from '../../src/registry.ts'
-import { _resetConfiguredPersonaQuery, _resetFindMissingMemo, _resetInFlightLaunches, _resetInvalidFlagsHold, _resetLiveRowSequenceRegistry, _resetOldLifeHolds, _resetOldLifeWaitBindings, _resetPreLaunchReplyGuard, _resetPreLaunchTrustPatcher, _resetRetiredKeyStore, _resetSpawnHomeDir, _setSpawnHomeDir, buildLiveRowSequenceDeps, checkLaunchConfigDir, createOldLifeHoldEndRetry, forgetOldLifeWaits, isLiveRowSequenceRunning, oldLifeHeldDirectory, personaRetryBlockCause, killPersonaInstanceForTeardown, launchSession, oldLifeHoldStep, personaConfigDirLabelValue, setConfigDirUnresolvableHook, setConfiguredPersonaQuery, setConflictLatch, setInvalidFlagsHold, setLiveRowSequenceRegistry, setOldLifeHolds, setOldLifeWaitBindings, setPreLaunchReplyGuard, setPreLaunchTrustPatcher, setRetiredKeyStore, setSessionNotifier, SPAWN_ACTION_FRESH_RETIRED, spawnForPersona, startLiveRowSequence, stopLiveRowSequence, whenLaunchSettled, type SpawnPersonaResult } from '../../src/session-manager.ts'
+import { _resetConfiguredPersonaQuery, _resetFindMissingMemo, _resetInFlightLaunches, _resetInvalidFlagsHold, _resetLiveRowSequenceRegistry, _resetOldLifeHolds, _resetOldLifeWaitBindings, _resetPreLaunchReplyGuard, _resetRetiredKeyStore, _resetSpawnHomeDir, _setSpawnHomeDir, buildLiveRowSequenceDeps, checkLaunchConfigDir, createOldLifeHoldEndRetry, forgetOldLifeWaits, isLiveRowSequenceRunning, oldLifeHeldDirectory, personaRetryBlockCause, killPersonaInstanceForTeardown, launchSession, oldLifeHoldStep, personaConfigDirLabelValue, setConfigDirUnresolvableHook, setConfiguredPersonaQuery, setConflictLatch, setInvalidFlagsHold, setLiveRowSequenceRegistry, setOldLifeHolds, setOldLifeWaitBindings, setPreLaunchReplyGuard, setRetiredKeyStore, setSessionNotifier, SPAWN_ACTION_FRESH_RETIRED, spawnForPersona, startLiveRowSequence, stopLiveRowSequence, whenLaunchSettled, type SpawnPersonaResult } from '../../src/session-manager.ts'
 import {
   _resetLaunchedWithDirs,
   getLaunchedWithDir,
@@ -144,7 +144,6 @@ import {
   stopHookLaunchPass,
   teardownPersonaReplyGuard,
 } from '../../src/stop-hook-bootstrap.ts'
-import { trustPatchPersona } from '../../src/trust-bootstrap.ts'
 import type { ApplyBringUpOptions, ApplyStepSlots, InPlaceApplyInput } from '../../src/reload-apply.ts'
 import { composePendingFile, parsePendingFingerprint } from '../../src/reload-fingerprint.ts'
 import { DESTRUCTIVE_PREFIX, PENDING_PREVIEW_TITLE, type InPlaceSetting } from '../../src/reload-plan.ts'
@@ -3185,7 +3184,6 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       _resetInFlightLaunches()
       _resetLaunchedWithDirs()
       _resetFindMissingMemo()
-      setPreLaunchTrustPatcher(trustPatchPersona)
       setPreLaunchReplyGuard((persona) => {
         const config = serverConfig()
         return config === undefined ? undefined : preLaunchReplyGuard(persona, () => serverConfig()?.personas, stateDir)
@@ -3586,7 +3584,6 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
           _resetSpawnHomeDir()
           _resetLaunchedWithDirs()
           _resetFindMissingMemo()
-          _resetPreLaunchTrustPatcher()
           _resetPreLaunchReplyGuard()
           setConfigDirUnresolvableHook(undefined)
           setSessionNotifier(undefined)

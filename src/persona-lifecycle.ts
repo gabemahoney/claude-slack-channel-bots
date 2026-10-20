@@ -238,7 +238,7 @@
  * A persona with only next-launch changes (`claude_config_dir`,
  * `stop_hook_bootstrap`, own or inherited) gets no operation: step 1's swap
  * of the applied set is what its next launch reads (the spawn environment and
- * `config_dir` label, the SR-6.2 label check before a resume, the trust patch,
+ * `config_dir` label, the SR-6.2 label check before a resume, AD pre-trust,
  * the reply-guard record and hook install, the transcript diagnosis), and its
  * running instance keeps what it launched with.
  *

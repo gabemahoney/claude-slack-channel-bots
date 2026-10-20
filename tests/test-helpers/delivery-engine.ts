@@ -58,7 +58,7 @@ export async function makeEngineHarness(options: { keys?: string[]; constants?: 
     })
     return [key, { ...state, stub, state }] as const
   }))
-  let lifecycle = createDeliveryLifecycle({ startId: `server-${start}`, clock })
+  let lifecycle = createDeliveryLifecycle({ clock })
   const preparation = createDeliveryPreparation({ queue, clock, clientFor: () => undefined,
     resolveUserName: async () => { order.push('lookup'); return 'sender' },
     onPending: key => engines?.wake(key), wake: key => engines?.wake(key),
@@ -108,7 +108,7 @@ export async function makeEngineHarness(options: { keys?: string[]; constants?: 
       realQueue = await makeQueue(root, { now: clock.now })
       const append = queue.append
       Object.assign(queue, realQueue, { append })
-      lifecycle = createDeliveryLifecycle({ startId: `server-${++start}`, clock }); build()
+      lifecycle = createDeliveryLifecycle({ clock }); build()
       for (const key of personas.keys()) engines.wake(key)
     },
     async cleanup() { await engines.stop(); await preparation.stop(); await queue.stop(); if (!options.stateDir) rmSync(root, { recursive: true, force: true }) },

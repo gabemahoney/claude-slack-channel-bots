@@ -44,7 +44,7 @@ export interface QueueAllocationRecord extends BaseRecord {
 export interface FixedRecord extends BaseRecord { kind: 'fixed'; parts: string[] }
 export interface SentRecord extends BaseRecord {
   kind: 'sent'; attempt: number; part: number; send_kind: 'text' | 'enter' | 'retype'
-  at: number; launch_id: string; session_id: string; transcript_path: string; transcript_size: number
+  at: number; session_id: string; transcript_path: string; transcript_size: number
 }
 /** A damaged send remains evidence of an unknown outcome, across compaction/restart. */
 export interface UnknownSentRecord extends BaseRecord {
@@ -121,7 +121,7 @@ export function isQueueRecord(value: unknown): value is QueueRecord {
     case 'sent':
       if (!positive(r.attempt) || !number(r.at)) return false
       if (r.unknown_outcome === true) return object(r.quarantine) && str(r.quarantine.path) && positive(r.quarantine.line)
-      return positive(r.part) && ['text', 'enter', 'retype'].includes(String(r.send_kind)) && str(r.launch_id) && str(r.session_id) && str(r.transcript_path) && integer(r.transcript_size)
+      return positive(r.part) && ['text', 'enter', 'retype'].includes(String(r.send_kind)) && str(r.session_id) && str(r.transcript_path) && integer(r.transcript_size)
     case 'delivered': return positive(r.part) && number(r.at) && object(r.receipt) && str(r.receipt.path) && (str(r.receipt.uuid) || integer(r.receipt.offset))
     case 'refused': return positive(r.attempt) && number(r.at)
     case 'noticed': return number(r.at)

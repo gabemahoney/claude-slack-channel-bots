@@ -1,6 +1,5 @@
 /** Shared ownership of every automatic keystroke (b.omv SR-5.5/6.6). */
 import { NOT_NOW_RETRY_MS } from './delivery-constants.ts'
-import { parseLaunchStart } from './pending-row.ts'
 
 export { NOT_NOW_RETRY_MS } from './delivery-constants.ts'
 export interface DeliveryClock {
@@ -12,13 +11,16 @@ export const systemDeliveryClock: DeliveryClock = {
   now: Date.now, setTimeout: (cb, ms) => setTimeout(cb, ms), clearTimeout: id => clearTimeout(id as ReturnType<typeof setTimeout>),
 }
 export type TypingOwner = 'delivery' | 'reconnect'
-export interface ReconnectInput { launch: string; session: string; launchStartedAt?: string | null }
+export interface DeliveryRowObservation { state: string; session_id?: string; launch_started_at?: string | null }
+export interface ReconnectInput { session: string; launchStartedAt?: string | null }
 export interface DeliveryLifecycle {
   active(key?: string): boolean
   pause(ms: number): Promise<void>
-  launchId(key: string): string
-  beforeLaunch(key: string): string
-  observeRow(key: string, row: { state: string; session_id?: string; launch_started_at?: string | null }): string
+  activate(key: string): void
+  observeRow(key: string, row: DeliveryRowObservation): void
+  setRelaunchObserver(callback: (key: string, row: DeliveryRowObservation) => void): void
+  setFirstWaitingObserver(callback: (key: string, row: DeliveryRowObservation) => void): void
+  matchesRow(key: string, row: DeliveryRowObservation): boolean
   hasWaited(key: string): boolean
   owner(key: string): TypingOwner | 'free'
   acquire(key: string, owner: TypingOwner): (() => void) | undefined
@@ -37,15 +39,17 @@ export interface DeliveryLifecycle {
   stop(): Promise<void>
 }
 export function createDeliveryLifecycle(options: {
-  startId: string; clock?: DeliveryClock; parseLaunchStart?: (value: unknown) => number | undefined
+  clock?: DeliveryClock
   onError?: (error: unknown) => void
 }): DeliveryLifecycle {
   const clock = options.clock ?? systemDeliveryClock
-  interface State { n: number; state?: string; session?: string; stamps: Set<number>; waited: boolean; owner: TypingOwner | 'free'; lease?: object; running: boolean; disabled?: boolean; deferred?: { dueAt: number }; timer?: unknown; reconnecting?: Promise<void>; reconnectInput?: ReconnectInput }
+  interface State { state?: string; session?: string; launchStartedAt?: string | null; waited: boolean; owner: TypingOwner | 'free'; lease?: object; running: boolean; disabled?: boolean; deferred?: { dueAt: number }; timer?: unknown; reconnecting?: Promise<void>; reconnectInput?: ReconnectInput }
   const states = new Map<string, State>()
   let stopped = false, reconnect: ((key: string) => Promise<void>) | undefined, recovery: ((key: string) => Promise<boolean>) | undefined
+  let relaunchObserver: ((key: string, row: DeliveryRowObservation) => void) | undefined
+  let firstWaitingObserver: ((key: string, row: DeliveryRowObservation) => void) | undefined
   const pauses = new Map<unknown, () => void>()
-  function state(key: string): State { let s = states.get(key); if (!s) { s = { n: 0, stamps: new Set(), waited: false, owner: 'free', running: false }; states.set(key, s) }; return s }
+  function state(key: string): State { let s = states.get(key); if (!s) { s = { waited: false, owner: 'free', running: false }; states.set(key, s) }; return s }
   function cancel(s: State): void { if (s.timer !== undefined) clock.clearTimeout(s.timer); s.timer = undefined }
   function arm(key: string, s: State): void {
     cancel(s)
@@ -57,17 +61,30 @@ export function createDeliveryLifecycle(options: {
   const api: DeliveryLifecycle = {
     active: key => !stopped && (key === undefined || !state(key).disabled),
     pause(ms) { return new Promise<void>(resolve => { if (stopped) { resolve(); return }; const timer = clock.setTimeout(() => { pauses.delete(timer); resolve() }, ms); pauses.set(timer, resolve) }) },
-    launchId: key => `${options.startId}:${state(key).n}`,
-    beforeLaunch(key) { const s = state(key); s.disabled = false; s.n++; s.waited = false; s.state = 'pending'; s.reconnectInput = undefined; return api.launchId(key) },
+    activate(key) { state(key).disabled = false },
     observeRow(key, row) {
-      const s = state(key), stamp = (options.parseLaunchStart ?? parseLaunchStart)(row.launch_started_at)
-      const changed = (s.state !== undefined && row.state === 'pending' && s.state !== 'pending') || (stamp !== undefined && !s.stamps.has(stamp)) || (s.session !== undefined && row.session_id !== undefined && row.session_id !== s.session)
-      if (changed) { s.n++; s.waited = false; s.reconnectInput = undefined }
-      if (stamp !== undefined) s.stamps.add(stamp)
-      s.state = row.state; if (row.session_id !== undefined) s.session = row.session_id
+      const s = state(key)
+      const changed = (['pending', 'ended', 'missing'].includes(row.state) && row.state !== s.state) ||
+        (s.session !== undefined && row.session_id !== undefined && row.session_id !== s.session)
+      if (changed) {
+        s.waited = false; s.reconnectInput = undefined
+        // An AD-observed transition invalidates any keys awaiting an old lease.
+        s.owner = 'free'; s.lease = undefined
+      }
+      const firstWaiting = row.state === 'waiting' && !s.waited
+      s.state = row.state
+      if (row.session_id !== undefined) s.session = row.session_id
+      if (row.launch_started_at !== undefined) s.launchStartedAt = row.launch_started_at
       if (row.state === 'waiting') s.waited = true
+      if (changed) relaunchObserver?.(key, row)
+      if (firstWaiting) firstWaitingObserver?.(key, row)
       if (row.state === 'ended' || row.state === 'missing') { api.clearDeferred(key); s.reconnectInput = undefined }
-      return api.launchId(key)
+    },
+    setRelaunchObserver(callback) { relaunchObserver = callback },
+    setFirstWaitingObserver(callback) { firstWaitingObserver = callback },
+    matchesRow(key, row) {
+      const s = state(key)
+      return s.state === row.state && s.session === row.session_id && s.launchStartedAt === row.launch_started_at
     },
     hasWaited: key => state(key).waited,
     owner: key => state(key).owner,

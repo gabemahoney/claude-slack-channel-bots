@@ -17,9 +17,9 @@ test('launch timing diagnostics preserve structured engine evidence without post
   // b.omv SR-14.2: the real-agent timing assertion consumes these JSON facts.
   const r = await run()
   const events = [
-    { type: 'launch-observed' as const, key: r.alpha, launchId: 'launch:"one"', sessionId: 'session\\one', at: 137 },
-    { type: 'launch-first-waiting' as const, key: r.alpha, launchId: 'launch:"one"', sessionId: 'session\\one', at: 971 },
-    { type: 'launch-observed' as const, key: r.beta, launchId: 'launch-two', sessionId: 'session-two', at: 2001 },
+    { type: 'launch-observed' as const, key: r.alpha, sessionId: 'session\\one', at: 137 },
+    { type: 'launch-first-waiting' as const, key: r.alpha, sessionId: 'session\\one', at: 971 },
+    { type: 'launch-observed' as const, key: r.beta, sessionId: 'session-two', at: 2001 },
   ]
   for (const event of events) r.reporting.engineEvent(event)
   await r.flush()
@@ -27,7 +27,7 @@ test('launch timing diagnostics preserve structured engine evidence without post
   for (const [i, event] of events.entries()) {
     const prefix = `[slack] delivery-${event.type}: `
     expect(r.logs[i]!.startsWith(prefix)).toBe(true)
-    expect(JSON.parse(r.logs[i]!.slice(prefix.length))).toEqual({ key: event.key, launch_id: event.launchId, session_id: event.sessionId, at: event.at })
+    expect(JSON.parse(r.logs[i]!.slice(prefix.length))).toEqual({ key: event.key, session_id: event.sessionId, at: event.at })
   }
   expect(r.h.totalPosts()).toBe(0)
   expect(r.queue.items(r.alpha)).toEqual([])

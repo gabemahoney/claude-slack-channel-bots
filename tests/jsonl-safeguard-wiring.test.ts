@@ -57,6 +57,7 @@ import {
   loadedConfigName,
   mainBody,
   onlyCallArguments,
+  objectProperties,
   splitTopLevel,
   startResolution,
   stripComments,
@@ -98,12 +99,22 @@ function startBringUpAt(): number {
 /** Every start-time pass SR-6.2 requires to run over the applied personas. */
 const START_PASSES = [
   'installSlackChannelBotTemplate',
-  'trustBootstrap',
   'runJsonlPersistenceSafeguard',
   'stopHookBootstrap',
 ] as const
 
 describe('server.ts wires the JSONL-persistence safeguard', () => {
+  test('passes the restart module\'s live shutdown query to the per-persona safeguard', () => {
+    const args = splitTopLevel(onlyCallArguments(SERVER_CODE, 'runJsonlPersistenceSafeguard'))
+    expect(args).toHaveLength(3)
+    const safeguard = objectProperties(args[2]!)
+    const restartArgs = splitTopLevel(onlyCallArguments(SERVER_CODE, 'initRestart'))
+    const restart = objectProperties(restartArgs[0]!)
+    const query = safeguard.get('isShuttingDown')
+    expect(query).toMatch(/^\(\) => \w+$/)
+    expect(query).toBe(restart.get('isShuttingDown'))
+  })
+
   test('imports runJsonlPersistenceSafeguard from the safeguard module', () => {
     // The import regex subsumes a bare `toContain` name check.
     expect(SERVER_SRC).toMatch(
@@ -122,7 +133,7 @@ describe('server.ts wires the JSONL-persistence safeguard', () => {
 })
 
 describe('server.ts runs every start-time pass over the applied personas (b.av2 SR-6.2)', () => {
-  test.each(['trustBootstrap', 'stopHookBootstrap', 'runJsonlPersistenceSafeguard'])(
+  test.each(['stopHookBootstrap', 'runJsonlPersistenceSafeguard'])(
     'every %s call comes BEFORE the start bring-up (`<controller>.runStartBringUp()` in main())',
     (pass) => {
       const passCalls = callsOf(pass)
@@ -153,44 +164,11 @@ describe('server.ts runs every start-time pass over the applied personas (b.av2 
   )
 })
 
-describe('server.ts installs the pre-launch trust patcher (b.av2 SR-6.2)', () => {
-  /** The setter call carrying the single-persona trust patch. */
-  const INSTALL = /\bsetPreLaunchTrustPatcher\s*\(\s*trustPatchPersona\b/g
-
-  test('imports the setter from the session manager and the patch from trust-bootstrap', () => {
-    expect(SERVER_CODE).toMatch(
-      /import\s*\{[^}]*\bsetPreLaunchTrustPatcher\b[^}]*\}\s*from\s*['"]\.\/session-manager\.ts['"]/,
-    )
-    expect(SERVER_CODE).toMatch(
-      /import\s*\{[^}]*\btrustPatchPersona\b[^}]*\}\s*from\s*['"]\.\/trust-bootstrap\.ts['"]/,
-    )
-  })
-
-  test('installs trustPatchPersona as the pre-launch trust patcher', () => {
-    expect(indicesOf(INSTALL, SERVER_CODE).length).toBeGreaterThan(0)
-    // Every install carries the persona trust patch, never something else.
-    const args = firstArgsOf('setPreLaunchTrustPatcher')
-    expect(args.length).toBeGreaterThan(0)
-    for (const arg of args) expect(arg).toBe('trustPatchPersona')
-  })
-
-  test.each([
-    ['the template install', 'installSlackChannelBotTemplate'],
-    ['the persona Slack connections', 'createPersonaConnectionManager'],
-    ['Bun.serve', 'Bun\\.serve'],
-    ['initRestart', 'initRestart'],
-    ['the start bring-up', 'runStartBringUp'],
-  ])('installs the patcher BEFORE %s', (_label, anchor) => {
-    const [install] = indicesOf(INSTALL, SERVER_CODE)
-    expect(install).toBeDefined()
-    expect(install!).toBeLessThan(firstCallOf(anchor))
-  })
+test('AD owns pre-trust: server installs no native trust writer', () => {
+  expect(SERVER_CODE).not.toMatch(/\b(?:trustBootstrap|trustPatchPersona|setPreLaunchTrustPatcher)\b/)
 })
 
 describe('server.ts installs the pre-launch reply guard with its state dir (b.av2 SR-9.4, SR-6.2)', () => {
-  /** The whole trust-patcher install statement, then the reply-guard setter call. */
-  const TRUST_THEN_GUARD = /\bsetPreLaunchTrustPatcher\s*\(\s*trustPatchPersona\s*\)\s*;?\s*setPreLaunchReplyGuard\s*\(/g
-
   test('imports the setter from the session manager and the step from stop-hook-bootstrap', () => {
     expect(SERVER_CODE).toMatch(
       /import\s*\{[^}]*\bsetPreLaunchReplyGuard\b[^}]*\}\s*from\s*['"]\.\/session-manager\.ts['"]/,
@@ -204,14 +182,12 @@ describe('server.ts installs the pre-launch reply guard with its state dir (b.av
     expect(SERVER_CODE).toMatch(/\bconst\s+STATE_DIR\s*=\s*resolveServerStateDir\s*\(\s*\)/)
   })
 
-  test('installs trust, the shared prompt gate and the reply guard once in that order', () => {
+  test('installs the shared prompt gate and the reply guard once in that order', () => {
     expect(() => onlyCallArguments(SERVER_CODE, 'setPreLaunchReplyGuard')).not.toThrow()
     expect(() => onlyCallArguments(SERVER_CODE, 'setSystemPromptPreparer')).not.toThrow()
-    const trust = SERVER_CODE.indexOf('setPreLaunchTrustPatcher(trustPatchPersona)')
     const prompt = SERVER_CODE.indexOf('setSystemPromptPreparer(prepareSystemPrompt)')
     const guard = SERVER_CODE.indexOf('setPreLaunchReplyGuard(', prompt)
-    expect(trust).toBeGreaterThan(-1)
-    expect(prompt).toBeGreaterThan(trust)
+    expect(prompt).toBeGreaterThan(-1)
     expect(guard).toBeGreaterThan(prompt)
     expect(SERVER_CODE).toContain("prepareSystemPrompt('server-start')")
   })

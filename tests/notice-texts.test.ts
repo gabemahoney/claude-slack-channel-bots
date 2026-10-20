@@ -27,9 +27,9 @@
  * server notice posted to Slack), the persona prefix, every outage onset and
  * the all-clear, the spawn-failure notice for each remediation and the
  * restart-cap notice, b.f2b's not-connected notice in every rendering,
- * the JSONL persistence safeguard's three notices (SRJ-122: they name no
+ * the JSONL persistence safeguard's storage and AD-reference notices (SRJ-122: they name no
  * command and keep their text) and the `ErrJsonlMissing` diagnosis's three
- * notices (SRJ-712: LOST and both INCONCLUSIVE shapes, each quoting
+ * notices (SRJ-712: both uncertainty shapes, each quoting
  * agent-director and naming no command). The teardown window's notices
  * (SRJ-1003) are the kill outcome's one-line renderings. Each builder that quotes
  * agent-director also has one redaction-and-cap row (`CAP_VARIANT`): a
@@ -158,7 +158,7 @@ import {
   type DeliveryStuckReason,
 } from '../src/delivery-notices.ts'
 import { INVALID_FLAGS_HOLD_ALERT_TEXT } from '../src/invalid-flags-hold.ts'
-import { runJsonlPersistenceSafeguard, runPersonaStorageCheck, UNATTRIBUTABLE_ZERO_REASON } from '../src/jsonl-persistence-check.ts'
+import { runJsonlPersistenceSafeguard, runPersonaStorageCheck } from '../src/jsonl-persistence-check.ts'
 import {
   KILL_FAILURE_CLOSING_CLI_TEARDOWN,
   KILL_FAILURE_CLOSING_DESTINATION,
@@ -217,7 +217,6 @@ import {
   jsonlCandidatesInconclusiveNoticeText,
   jsonlCandidatesText,
   jsonlRowAbsentInconclusiveNoticeText,
-  jsonlTranscriptLostNoticeText,
   restartCapReachedNoticeText,
   spawnFailureNoticeText,
   waitTimedOutUnreadReport,
@@ -737,10 +736,9 @@ function deliveryEntries(): NoticeEntry[] {
   ]
 }
 
-/** The JSONL persistence safeguard's three notices (b.zak; SRJ-122 keeps their text): one per variant. */
+/** The JSONL persistence safeguard's storage and AD-reference notices (b.zak; SRJ-122 keeps their text): one per variant. */
 const JSONL_NON_PERSISTENT = 'non-persistent storage'
-const JSONL_STALE_PATH = 'stale transcript path'
-const JSONL_LOST = 'lost transcript'
+const JSONL_ROTATED = 'AD rotated transcript reference'
 
 /** Where the safeguard's persona lives: never created, so every path resolves lexically. */
 const JSONL_BASE_DIR = '/notice-texts-jsonl'
@@ -753,7 +751,7 @@ const EXT4_MOUNTINFO = '1 0 8:1 / / rw - ext4 /dev/sda1 rw\n'
  * The safeguard's notices as its notice seam receives them, by variant. It
  * has no pure builder, so it runs once here with every effect injected: a
  * capturing seam, no startup-errors record, a fixed mount table, a stub row
- * and stub file and archive reads. Nothing is read from or written to disk
+ * with AD transcript status supplied by the row. Nothing is read from or written to disk
  * but path resolution, and nothing is posted.
  */
 async function renderJsonlSafeguardNotices(): Promise<ReadonlyMap<string, string>> {
@@ -765,21 +763,13 @@ async function renderJsonlSafeguardNotices(): Promise<ReadonlyMap<string, string
   }
   const noRecord = (): void => {}
   runPersonaStorageCheck(persona, capture(JSONL_NON_PERSISTENT), { readMountinfo: () => TMPFS_MOUNTINFO, recordStartupError: noRecord, home: JSONL_HOME })
-  const row = cannedGetResult({ state: 'live', jsonl_path: `${JSONL_BASE_DIR}/claude/projects/stale.jsonl`, session_id: 'sess-notice' }, persona, JSONL_HOME)
-  const layer2 = (variant: string, deps: { statFn?: (path: string) => boolean; archiveCountSince?: () => number | null }) =>
-    runJsonlPersistenceSafeguard(config, capture(variant), {
-      readMountinfo: () => EXT4_MOUNTINFO,
-      getRow: async () => row,
-      statFn: () => false,
-      archiveCountSince: () => null,
-      recordStartupError: noRecord,
-      home: JSONL_HOME,
-      ...deps,
-    })
-  // The recorded path is gone but the transcript is at the resolved one.
-  await layer2(JSONL_STALE_PATH, { statFn: (path) => path !== row.jsonl_path })
-  // No transcript anywhere, and the archive shows messages since the launch.
-  await layer2(JSONL_LOST, { archiveCountSince: () => 3 })
+  const row = cannedGetResult({ state: 'ended', transcript_status: 'rotated', jsonl_path: '', session_id: 'sess-notice' }, persona, JSONL_HOME)
+  await runJsonlPersistenceSafeguard(config, capture(JSONL_ROTATED), {
+    readMountinfo: () => EXT4_MOUNTINFO,
+    getRow: async () => row,
+    recordStartupError: noRecord,
+    home: JSONL_HOME,
+  })
   return texts
 }
 
@@ -796,8 +786,7 @@ function jsonlSafeguardNotice(variant: string): string {
 function jsonlSafeguardEntries(): NoticeEntry[] {
   return [
     entry('SRJ-1001', 'runPersonaStorageCheck', JSONL_NON_PERSISTENT, () => jsonlSafeguardNotice(JSONL_NON_PERSISTENT)),
-    entry('SRJ-1001', 'runJsonlPersistenceSafeguard', JSONL_STALE_PATH, () => jsonlSafeguardNotice(JSONL_STALE_PATH)),
-    entry('SRJ-1001', 'runJsonlPersistenceSafeguard', JSONL_LOST, () => jsonlSafeguardNotice(JSONL_LOST)),
+    entry('SRJ-1001', 'runJsonlPersistenceSafeguard', JSONL_ROTATED, () => jsonlSafeguardNotice(JSONL_ROTATED)),
   ]
 }
 
@@ -824,21 +813,17 @@ function jsonlPathsTried(label: string): string {
 const JSONL_SAMPLE_PROVENANCE = 'sample provenance of the paths below'
 
 /**
- * SRJ-1001 (SRJ-712): the `ErrJsonlMissing` diagnosis's persona notices, LOST
- * and both INCONCLUSIVE shapes, each quoting agent-director's paths or
+ * SRJ-1001 (SRJ-712): the `ErrJsonlMissing` diagnosis's two uncertainty notices, each quoting agent-director's paths or
  * description, which hold a fake token and {@link JSONL_SLACK_CONTROLS};
  * they name no command.
  */
 function jsonlDiagnosisEntries(): NoticeEntry[] {
   return [
-    entry('SRJ-1001', 'jsonlTranscriptLostNoticeText', 'lost, token-bearing paths', () =>
-      jsonlTranscriptLostNoticeText(3, jsonlPathsTried('jsonl-lost')),
-    ),
     entry('SRJ-1001', 'jsonlRowAbsentInconclusiveNoticeText', 'inconclusive, row absent, token-bearing description', () =>
       jsonlRowAbsentInconclusiveNoticeText(withToken(`${errJsonlMissing().errDescription} ${JSONL_SLACK_CONTROLS}`, 'jsonl-row-absent')),
     ),
     entry('SRJ-1001', 'jsonlCandidatesInconclusiveNoticeText', 'inconclusive, unattributable zero, token-bearing candidates', () =>
-      jsonlCandidatesInconclusiveNoticeText(UNATTRIBUTABLE_ZERO_REASON, JSONL_SAMPLE_PROVENANCE, jsonlPathsTried('jsonl-candidates')),
+      jsonlCandidatesInconclusiveNoticeText('agent-director references do not verify transcript readability', JSONL_SAMPLE_PROVENANCE, jsonlPathsTried('jsonl-candidates')),
     ),
   ]
 }
@@ -920,12 +905,11 @@ function capEntries(): NoticeEntry[] {
     entry('SRJ-1001', 'spawnFailureNoticeText', CAP_VARIANT, () =>
       spawnFailureNoticeText(errGeneric('spawn', 'ErrFromALaterBinary', overCapDescription('cap-spawn'))),
     ),
-    entry('SRJ-1001', 'jsonlTranscriptLostNoticeText', CAP_VARIANT, () => jsonlTranscriptLostNoticeText(3, overCapDescription('cap-jsonl-lost'))),
     entry('SRJ-1001', 'jsonlRowAbsentInconclusiveNoticeText', CAP_VARIANT, () =>
       jsonlRowAbsentInconclusiveNoticeText(overCapDescription('cap-jsonl-row-absent')),
     ),
     entry('SRJ-1001', 'jsonlCandidatesInconclusiveNoticeText', CAP_VARIANT, () =>
-      jsonlCandidatesInconclusiveNoticeText(UNATTRIBUTABLE_ZERO_REASON, JSONL_SAMPLE_PROVENANCE, overCapDescription('cap-jsonl-candidates')),
+      jsonlCandidatesInconclusiveNoticeText('agent-director references do not verify transcript readability', JSONL_SAMPLE_PROVENANCE, overCapDescription('cap-jsonl-candidates')),
     ),
   ]
 }
@@ -996,14 +980,12 @@ const NAMED_SLACK_NOTICES: readonly string[] = Object.freeze([
   buildQueueRecordUnreadableNotice.name,
   runPersonaStorageCheck.name,
   runJsonlPersistenceSafeguard.name,
-  jsonlTranscriptLostNoticeText.name,
   jsonlRowAbsentInconclusiveNoticeText.name,
   jsonlCandidatesInconclusiveNoticeText.name,
 ])
 
 /** The `ErrJsonlMissing` diagnosis's notice builders (SRJ-712), each of which quotes agent-director. */
 const JSONL_DIAGNOSIS_BUILDERS: readonly string[] = Object.freeze([
-  jsonlTranscriptLostNoticeText.name,
   jsonlRowAbsentInconclusiveNoticeText.name,
   jsonlCandidatesInconclusiveNoticeText.name,
 ])
@@ -1025,11 +1007,9 @@ const SLACK_QUOTING_NOTICES: readonly (readonly [title: string, render: (descrip
   ['SRJ-1018 adConfigMalformedOnset', (description) => adConfigMalformedOnset(errUnknownErrorName('ErrConfigMalformed', description))],
   ['SRJ-1019 unusableNameNoticeText', (description) => unusableNameNoticeText(KEY, description)],
   ['SRJ-1001 spawnFailureNoticeText', (description) => spawnFailureNoticeText(errGeneric('spawn', 'ErrTmuxSessionCreate', description))],
-  ['SRJ-712 jsonlTranscriptLostNoticeText (a candidate\'s path)', (description) =>
-    jsonlTranscriptLostNoticeText(2, jsonlCandidatesText([{ source: 'persisted', path: description, note: 'ENOENT' }]))],
   ['SRJ-712 jsonlCandidatesInconclusiveNoticeText (a candidate\'s note)', (description) =>
     jsonlCandidatesInconclusiveNoticeText(
-      UNATTRIBUTABLE_ZERO_REASON,
+      'agent-director references do not verify transcript readability',
       JSONL_SAMPLE_PROVENANCE,
       jsonlCandidatesText([{ source: 'persisted', path: '/data/proj/sess.jsonl', note: description }]),
     )],
@@ -1159,7 +1139,7 @@ describe('the notice catalogue is complete (SRJ-1001 to SRJ-1021, and every name
     expect(new Set(notConnectedVariants().map(([, notice]) => notice.reason))).toEqual(new Set(['blocked-on-prompt', 'auto-restart-disabled']))
     expect(variantsOf(buildDeliveryStuckNotice.name)).toEqual([...DELIVERY_STUCK_REASONS])
     expect(variantsOf(buildMessagesWaitingNotice.name)).toEqual([...MESSAGES_WAITING_STATES])
-    expect(variantsOf(runPersonaStorageCheck.name, runJsonlPersistenceSafeguard.name)).toEqual([JSONL_NON_PERSISTENT, JSONL_STALE_PATH, JSONL_LOST])
+    expect(variantsOf(runPersonaStorageCheck.name, runJsonlPersistenceSafeguard.name)).toEqual([JSONL_NON_PERSISTENT, JSONL_ROTATED])
   })
 
   test('each ErrJsonlMissing diagnosis notice (SRJ-712) is a named Slack notice with a quoting row and a redaction-and-cap row', () => {

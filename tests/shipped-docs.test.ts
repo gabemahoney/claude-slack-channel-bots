@@ -352,7 +352,6 @@ import {
   PUBLISHING_HOST_BLOCK_POINTER,
 } from '../src/install-check.ts'
 import { INVALID_FLAGS_HOLD_ALERT_TEXT } from '../src/invalid-flags-hold.ts'
-import { FUNGIBLE_MODE_ZERO_REASON } from '../src/jsonl-persistence-check.ts'
 import {
   KILL_FAILURE_CLOSING_CLI_TEARDOWN,
   KILL_FAILURE_CLOSING_DESTINATION,
@@ -6291,14 +6290,15 @@ const README_SRJ_1103_ROWS: readonly DocRow[] = [
     ci(`\`agent-director\` ${PHASE1_FLOOR_VERSION} or later`),
     ci('installed system-wide'),
   ]],
-  ['prerequisites: this release and agent-director Phase 1 are installed, and rolled back, together; CSCB changes no agent-director code (SRJ-1515)', unitOf(USER_DOCS_NAME, PREREQUISITES_HEADING, '- [`agent-director`]'), [
-    ci('installed on the host together with it, and the two are rolled back together'),
+  ['migration: this release and agent-director Phase 1 are installed, and rolled back, together; CSCB changes no agent-director code (SRJ-1515)', unitOf(RUNBOOK_DOC, SWITCH_OVER_HEADING, 'This release requires'), [
+    ci('requires agent-director Phase 1, installed on the host together with it'),
+    ci('The two are installed together, by this runbook'),
+    ci('rolled back together'),
     ci('CSCB changes no agent-director code'),
   ]],
-  ['prerequisites: every agent and long-running agent-director process stopped before either binary change and started again after it (HO C15; ADA question 9)', unitOf(USER_DOCS_NAME, PREREQUISITES_HEADING, '- [`agent-director`]'), [
-    ci(`every agent on the host, with every long-running agent-director process (${code('agent-director serve')} included), is stopped before either binary change`),
-    ci("the Phase 1 install, and the rollback's restore of the previous binary"),
-    ci('and started again after it'),
+  ['migration: every agent and long-running agent-director process stopped before either binary change and started again after it (HO C15; ADA question 9)', sectionOf(RUNBOOK_DOC, MIGRATION_HEADING), [
+    ci(`every agent on the host, with every long-running agent-director process (${code('agent-director serve')} included), is stopped before either binary change and started again after it`),
+    ci(`every agent on the host, with every long-running agent-director process (${code('agent-director serve')} included), is stopped before the previous binary is restored and started again after it`),
   ]],
   [`prerequisites: tmux ${vocab('tmuxMinimum')} or later, with remain-on-exit off (HO rev 17)`, unitOf(USER_DOCS_NAME, PREREQUISITES_HEADING, '- [tmux]'), [
     ci(`tmux ${vocab('tmuxMinimum')} or later, with ${vocab('remainOnExit')} off`),
@@ -6459,7 +6459,7 @@ const README_REVERTS: readonly [row: string, how: string, edit: (readme: string)
     readme.replace(/^- \[Claude Code\]\(([^)]+)\) [^\n]*$/m, '- [Claude Code]($1) installed and authenticated')],
   [readmeRow('prerequisites: Claude Code'), 'an older Claude Code version', (readme) =>
     readme.replace(`) ${MIN_CLAUDE_CODE_VERSION} or later for the workers`, `) ${HISTORICAL_VERSIONS.execFormHooksClaudeCode} or later for the workers`)],
-  [readmeRow('prerequisites: every agent'), 'the C15 sentence dropped', (readme) => readme.replace(/ Every agent on the host, with every long-running agent-director process [^\n]*?started again after it\./, '')],
+  [readmeRow('migration: every agent'), 'the C15 sentence dropped', (readme) => readme.replace(/^- Every agent on the host, with every long-running agent-director process [^\n]*?before either binary change and started again after it\./m, '')],
   [readmeRow('prerequisites: tmux'), 'the tmux line dropped', (readme) => readme.replace(/^- \[tmux\][^\n]*\n/m, '')],
   ...[
     [CLEAR_LATCH_DIAL_HOST, code(ALL_INTERFACES_BIND)],
@@ -7079,7 +7079,7 @@ describe(`${TROUBLESHOOTING_DOC} indexes the debugging skill's "${SYMPTOM_REFERE
   })
 })
 
-describe('E36 T4: the README describes the build (b.jg5 SRJ-1103; AC 78, AC 79)', () => {
+describe('E36 T4: the user docs describe the build (b.jg5 SRJ-1103; AC 78, AC 79)', () => {
   const readme = () => referenceText()
 
   test.each(README_SRJ_1103_ROWS)('%s', (element, passage, required) => {
@@ -7129,7 +7129,7 @@ describe('E36 T4: the README describes the build (b.jg5 SRJ-1103; AC 78, AC 79)'
   })
 
   describe('self-checks', () => {
-    test.each(README_SRJ_1103_ROWS)('%s: each of its items, cut from its passage in the README, is reported by the row', (element, passage, required) => {
+    test.each(README_SRJ_1103_ROWS)('%s: each of its items, cut from its maintained documentation passage, is reported by the row', (element, passage, required) => {
       for (const item of required.map(resolveItem)) {
         const edited = withItemCut(readme(), passage, item)
         expect({ element, item: String(item), reported: docRowProblems(passage, required, edited).includes(`lacks ${String(item)}`) }).toEqual({ element, item: String(item), reported: true })
@@ -7624,19 +7624,6 @@ const SILENT_INVITED_TITLE = 'A persona is silent in a channel it was invited to
 const RECEIVES_EVERYTHING_TITLE = 'A persona receives every message in a channel'
 const UNCLAIMED_ENTRY_TITLE = 'Messages in a channel no persona is configured into are not delivered'
 
-/**
- * The part of `FUNGIBLE_MODE_ZERO_REASON` (src/jsonl-persistence-check.ts,
- * b.deo SRI-704) the README's `jsonl-diagnosis-inconclusive` item quotes:
- * the reason up to "and the configuration cannot predict its traffic".
- * Throws when the reason holds no such phrase (its row's item, built when
- * the row runs).
- */
-function fungibleZeroReasonQuoted(): string {
-  const [quoted, rest] = FUNGIBLE_MODE_ZERO_REASON.split(' and the configuration cannot predict')
-  if (rest === undefined) throw new Error(`FUNGIBLE_MODE_ZERO_REASON has no "and the configuration cannot predict": ${FUNGIBLE_MODE_ZERO_REASON}`)
-  return quoted
-}
-
 /** The sample persona the preview lines are rendered with: `toolTextSample()`'s name and key (from `makePersona`). */
 function previewSample(): { name: string; key: string } {
   const { name, key } = toolTextSample()
@@ -7901,10 +7888,7 @@ const README_DEO_ROWS: readonly DocRow[] = [
     ci("On a host whose Claude Code permission settings don't allow the server's tools as a group"),
     ci(`the first ${TOOL} call raises a permission prompt, in either mode`),
   ]],
-  [`Startup errors: the ${JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS} item gives the fungible-mode reason (FUNGIBLE_MODE_ZERO_REASON, SRI-704)`, (readme) => readmeLabelItem(SKILL_STARTUP_ERRORS_HEADING, JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS, readme), [
-    fungibleZeroReasonQuoted,
-    ci('so the archive counts no channel and a zero count proves nothing'),
-  ]],
+
 
   // SRI-1103, Reload outside "What a confirmation applies" (T20 S6).
   [`Files beside the config file: ${CHANNEL_DELIVERY_FILE_NAME}, what it holds, only the server writes it, never edit it by hand`, tableRowOf('## Files beside the config file', `${code(CHANNEL_DELIVERY_FILE_NAME)} |`), [
@@ -8420,6 +8404,7 @@ describe('released agent-director 0.12 migration instructions (b.m2o)', () => {
   const migration = () => operatorText(RUNBOOK_DOC)
   const upgrade = () => readRunbookCarrier(RUNBOOK_DOC, migration(), SWITCH_OVER_HEADING, SWITCH_OVER_STEP_COUNT)
   const rollback = () => readRunbookCarrier(RUNBOOK_DOC, migration(), ROLLBACK_HEADING, ROLLBACK_STEP_COUNT)
+  const workerReleaseNotes = requiredSection(operatorText(CHANGELOG_FILE), /^## 0\.16\.0 \(/, CHANGELOG_FILE)
 
   // b.omv SR-7.6: every earlier-release bot starts fresh once; marked rows resume later.
   const resumeRequirements = [
@@ -8435,20 +8420,37 @@ describe('released agent-director 0.12 migration instructions (b.m2o)', () => {
   ]
   const resumeGuidanceProblems = (step: string) => resumeRequirements.filter((phrase) => !flat(step).includes(phrase))
   const workerFloorProblems = (passage: string) => [
-    `${MIN_CLAUDE_CODE_VERSION} or later`, '2.1.139',
+    `${MIN_CLAUDE_CODE_VERSION} or later`,
   ].filter((phrase) => !passage.includes(phrase))
+  const workerHookProblems = (passage: string) => [
+    HISTORICAL_VERSIONS.execFormHooksClaudeCode, 'exec-form hooks', '`pending`',
+  ].filter((phrase) => !flat(passage).toLowerCase().includes(phrase))
 
   test('the supported Claude Code floor agrees across worker prerequisites, migration and released notes (b.9v8)', () => {
     const passages = [
       userDocsText().split('\n').find((line) => line.startsWith('- [Claude Code]')) ?? '',
       textAt(upgrade(), 'step 1 › Claude Code'),
-      readFileSync(join(REPO_ROOT, 'CHANGELOG.md'), 'utf-8').split('## 0.16.0')[1]?.split('## 0.15.1')[0] ?? '',
+      workerReleaseNotes,
     ]
     for (const passage of passages) {
       expect(workerFloorProblems(passage)).toEqual([])
       expect(passage).not.toContain('2.1.296 or later')
       const oldFloor = passage.replaceAll(MIN_CLAUDE_CODE_VERSION, '2.1.296')
       expect(workerFloorProblems(oldFloor)).toContain(`${MIN_CLAUDE_CODE_VERSION} or later`)
+    }
+  })
+
+  test('the exec-form hook cutoff and pending-launch diagnosis remain in migration, released notes and the debugging skill (b.9v8)', () => {
+    const passages = [
+      textAt(upgrade(), 'step 1 › Claude Code'),
+      workerReleaseNotes,
+      requiredSection(operatorText(DEBUG_SKILL_FILE), '### Symptom: Installation fails or launches stay pending', DEBUG_SKILL_FILE),
+    ]
+    for (const passage of passages) {
+      expect(workerHookProblems(passage)).toEqual([])
+      for (const phrase of [HISTORICAL_VERSIONS.execFormHooksClaudeCode, 'exec-form hooks', '`pending`']) {
+        expect(workerHookProblems(flat(passage).toLowerCase().replaceAll(phrase, ''))).toContain(phrase)
+      }
     }
   })
 

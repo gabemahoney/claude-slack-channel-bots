@@ -33,7 +33,7 @@ async function fixture(agent: DeliveryAgent = 'claude', text = 'one\ntwo') {
   const item = (): QueueItem => queue.items('alpha').find(i => i.accepted.seq === seq)!
   const row = { jsonl_path: path, transcript_status: 'present', session_id: 'current', cwd: root }
   async function send(offset = fs.statSync(path).size, sendPath = path) {
-    const record: SentRecord = { v: 1, kind: 'sent', seq, part: 1, attempt: item().nextAttempt, send_kind: 'text', at: 1000, launch_id: 'launch', session_id: row.session_id, transcript_path: sendPath, transcript_size: offset }
+    const record: SentRecord = { v: 1, kind: 'sent', seq, part: 1, attempt: item().nextAttempt, send_kind: 'text', at: 1000, session_id: row.session_id, transcript_path: sendPath, transcript_size: offset }
     await queue.append('alpha', record)
     return record
   }
@@ -362,9 +362,10 @@ describe('receipt reader', () => {
     expect(read()).toEqual(readable)
   })
 
-  test('Claude discovery uses configured scratch home; Codex does not synthesize a path', async () => {
-    const h = await fixture()
-    expect(deliveryTranscriptPath('claude', { cwd: h.root, session_id: 'session' }, h.root)).toContain(h.root)
-    expect(deliveryTranscriptPath('codex', { cwd: h.root, session_id: 'session' }, h.root)).toBeUndefined()
+  test('both agents use AD transcript references without synthesizing a native path', () => {
+    for (const agent of ['claude', 'codex'] as const) {
+      expect(deliveryTranscriptPath(agent, { cwd: '/work', session_id: 'session' })).toBeUndefined()
+      expect(deliveryTranscriptPath(agent, { session_id: 'different-session', jsonl_path: '/ad/opaque.jsonl' })).toBe('/ad/opaque.jsonl')
+    }
   })
 })

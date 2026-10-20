@@ -8,7 +8,7 @@ import { createFakeClock } from './fake-clock.ts'
 export function useImmediateTypingLifecycle(): void {
   let life: DeliveryLifecycle
   beforeEach(() => {
-    life = createDeliveryLifecycle({ startId: 'legacy-recovery', clock: createFakeClock() })
+    life = createDeliveryLifecycle({ clock: createFakeClock() })
     _setDeliveryLifecycle({ ...life, pause: async () => {} })
   })
   afterEach(async () => {

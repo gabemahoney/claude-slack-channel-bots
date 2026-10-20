@@ -219,10 +219,8 @@
  * `checkLaunchConfigDir`); when it cannot be resolved the launch makes no
  * agent-director call, keeps the row, hands the persona to the installed
  * hook (`setConfigDirUnresolvableHook`: the bring-up controller holds it
- * `retrying` and re-checks) and returns `deferred`. Every ladder run first
- * calls the installed pre-launch trust patcher (`setPreLaunchTrustPatcher`,
- * b.av2 SR-6.2), so the persona's `.claude.json` trust flags are set before
- * any spawn or resume.
+ * `retrying` and re-checks) and returns `deferred`. Agent-director owns
+ * pre-trust for every spawn and resume.
  * Immediately before each `client.spawn` / `client.resume` it calls the
  * installed pre-launch reply guard (`setPreLaunchReplyGuard`, b.av2 SR-9.4):
  * the persona's reply-guard record, launched-with dir and managed Stop hook.
@@ -432,7 +430,7 @@ import type {
   StatusResult,
 } from 'agent-director'
 import type { PreTrust } from './ad-phase1-types.ts'
-import { checkCozempicAvailable, resolveJsonlPath } from './cozempic.ts'
+import { describeTranscriptReference } from './session-transcript.ts'
 import {
   type Persona,
   type PersonaConfig,
@@ -960,14 +958,8 @@ import {
   adLaunchBoundMsInEffect,
   type NeverEarlyWaitClock,
 } from './ad-settings.ts'
-import {
-  makeDefaultArchiveCount,
-  personaArchiveEvidenceScope,
-  rfc3339ToEpochSeconds,
-  unattributableZeroReason,
-} from './jsonl-persistence-check.ts'
 import { startupSummaryEnding, type StartupSummaryEndingCounts } from './startup-summary-ending.ts'
-import { realpathSync, statSync } from 'node:fs'
+import { realpathSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { resolve as resolvePath } from 'node:path'
 
@@ -1552,7 +1544,7 @@ function heldGateReadingOf(key: string): { readonly failure?: string } | undefin
  * held on `ErrInvalidFlags` (a held query that throws counts as held) and is
  * not latched (the latched gate answers for a latched one), log one line
  * (`invalidFlagsHeldNoLaunchLine`) and answer the `held` result: no
- * agent-director call, no trust patch, no reply-guard step, no record
+ * agent-director call, no reply-guard step, no record
  * written, nothing armed and nothing counted. Otherwise undefined.
  */
 function heldResult(key: string, ref: string, site: string): SpawnPersonaResult | undefined {
@@ -2866,9 +2858,9 @@ export async function handleDeliveryKeyError(key: string, error: unknown, row: G
  * even when the launch's reconnect deferred before that key completed.
  * The engine retains ownership on false; no restart-delay policy applies
  * to completing this recovery of the existing launch. */
-export function recoverDeliveryGone(key: string, row: GetResult, launch: string): boolean {
+export function recoverDeliveryGone(key: string, row: GetResult): boolean {
   const life = deliveryLifecycle, persona = configuredPersonaForDelivery(key)
-  if (!persona || !life?.active(key) || life.launchId(key) !== launch || life.owner(key) !== 'free' ||
+  if (!persona || !life?.active(key) || !life.matchesRow(key, row) || life.owner(key) !== 'free' ||
       row.instance_id !== personaInstanceId(key) || isKnownUnapplied(key) || !personaUpNow(key) ||
       personaLatchedNow(key) || heldGateReadingOf(key) !== undefined || waitsOnKillFailedHold(key) ||
       isOwnRowOldLifeHeld(key) || isLaunchInFlight(key) || isAtCap(key, RESTART_FAILURE_CAP)) return false
@@ -2892,6 +2884,7 @@ export async function readPersonaOwnRow(key: string, at: OwnRowReadSite): Promis
       return isAdErrorInstance(err, ErrSpawnNotFound) ? { kind: OWN_ROW_READ_ABSENT } : { kind: OWN_ROW_READ_REFUSED, error: err }
     }
     if (isAdErrorInstance(err, ErrSpawnNotFound)) {
+      if (deliveryLifecycle?.active(key)) deliveryLifecycle.observeRow(key, { state: 'missing' })
       // b.jg5 SRJ-704, SRJ-1016: the row is gone; the kill-failure episode ends.
       endKillFailureEpisodeOnRead(key, { thrown: err })
       // b.4q8: a resumed launch whose row is gone ended before reporting in.
@@ -3165,7 +3158,10 @@ export function applyOwnRowStatusStep(key: string, answer: OwnRowStatusAnswer, a
     noteOldLifeStatusAnswer(key, answer, at)
     if ('thrown' in answer) {
       // b.jg5 SRJ-310 rule 3: no row is no longer this launch's row.
-      if (isAdErrorInstance(answer.thrown, ErrSpawnNotFound)) checkThisLaunchRowOnRead(key, THIS_LAUNCH_ROW_READ_ABSENT, false, at)
+      if (isAdErrorInstance(answer.thrown, ErrSpawnNotFound)) {
+        if (deliveryLifecycle?.active(key)) deliveryLifecycle.observeRow(key, { state: 'missing' })
+        checkThisLaunchRowOnRead(key, THIS_LAUNCH_ROW_READ_ABSENT, false, at)
+      }
       return latchOnUnusableNameRead(key, answer.thrown, at)
     }
     const row = { ...answer.result, instance_id: personaInstanceId(key) }
@@ -3723,7 +3719,7 @@ export async function reconnectMcpWithCause(
   if (read.kind !== OWN_ROW_READ_ROW || read.latched) return defer()
   const row = read.row
   const priorInput = getInput()
-  if (priorInput && (priorInput.launch !== (life?.launchId(key) ?? '') || priorInput.session !== row.session_id || priorInput.launchStartedAt !== row.launch_started_at)) clearInput()
+  if (priorInput && (priorInput.session !== row.session_id || priorInput.launchStartedAt !== row.launch_started_at)) clearInput()
   if (noteTagPromptReading(key, row) && !AGENT_DIRECTOR_DEAD_STATES.has(row.state)) {
     await inspectPersonaUpgrade(key)
     return defer()
@@ -3731,24 +3727,23 @@ export async function reconnectMcpWithCause(
   if (life && !await life.recoverBeforeReconnect(key)) return defer()
   if (AGENT_DIRECTOR_DEAD_STATES.has(row.state)) { clearInput(); life?.clearDeferred(key); return { outcome: 'dead-session', deadCause: DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE } }
   if (row.state !== 'waiting' || row.relay_mode !== 'on') return defer()
-  const reading: DeliveryReading = { row: row.state, relay: true, marker: row.labels?.tag_prompt === '1', mcp: false, up: true, latched: personaLatchedNow(key), held: isOwnRowOldLifeHeld(key) || heldGateReadingOf(key) !== undefined || waitsOnKillFailedHold(key), readable: true, receipts: [], launch: '', session: row.session_id, gate: life?.owner(key) ?? 'free', offset: 0, records: [] }
+  const reading: DeliveryReading = { row: row.state, relay: true, marker: row.labels?.tag_prompt === '1', mcp: false, up: true, latched: personaLatchedNow(key), held: isOwnRowOldLifeHeld(key) || heldGateReadingOf(key) !== undefined || waitsOnKillFailedHold(key), readable: true, receipts: [], relaunch: false, session: row.session_id, gate: life?.owner(key) ?? 'free', offset: 0, records: [] }
   const gateChoice = decideGate({ p: { accepted: [], fixed: [], sent: [], refused: [], delivered: [] }, e: createDeliveryPolicyState(), r: reading, g: { owner: life?.owner(key) ?? 'free', stage: 'none', deferred: true, due: true }, writer: { kind: 'none' }, compact: 'none' })
   if (gateChoice !== 'runReconnect') return defer()
   const release = life?.acquire(key, 'reconnect')
   if (life && !release) return defer()
   let input = getInput(), textCall = false
-  const launch = life?.launchId(key) ?? ''
   try {
     const textRow = await readPersonaOwnRow(key, { site: 'reconnect', what: 'before text' })
     if (textRow.kind !== OWN_ROW_READ_ROW || textRow.latched || textRow.row.labels?.tag_prompt !== '1' || textRow.row.relay_mode !== 'on' ||
         textRow.row.session_id !== row.session_id || textRow.row.launch_started_at !== row.launch_started_at ||
         textRow.row.state !== 'waiting' || personaLatchedNow(key) ||
         isOwnRowOldLifeHeld(key) || heldGateReadingOf(key) !== undefined || waitsOnKillFailedHold(key) ||
-        (life && (!life.active(key) || life.owner(key) !== 'reconnect' || life.launchId(key) !== launch))) return defer()
+        (life && (!life.active(key) || life.owner(key) !== 'reconnect'))) return defer()
     if (!input) {
       // Save intent before the call: an uncertain result may have left text
       // in AD's input. Every retry of this launch must finish with Enter.
-      input = { launch, session: row.session_id, launchStartedAt: row.launch_started_at }
+      input = { session: row.session_id, launchStartedAt: row.launch_started_at }
       if (life) life.rememberReconnectInput(key, input)
       else standaloneReconnectInputs.set(key, input)
       console.error(reconnectStartLine(ref))
@@ -3767,7 +3762,7 @@ export async function reconnectMcpWithCause(
         enterRow.row.session_id !== row.session_id || enterRow.row.launch_started_at !== row.launch_started_at ||
         enterRow.row.state !== 'waiting' || personaLatchedNow(key) ||
         isOwnRowOldLifeHeld(key) || heldGateReadingOf(key) !== undefined || waitsOnKillFailedHold(key) ||
-        (life && (!life.active(key) || life.owner(key) !== 'reconnect' || life.launchId(key) !== launch || getInput() !== input))) return defer()
+        (life && (!life.active(key) || life.owner(key) !== 'reconnect' || getInput() !== input))) return defer()
     await withOutageDetection(key, undefined, 'send-keys', client => client.sendKeys({ instance_id: personaInstanceId(key), key: 'Enter' }))
     if (getInput() === input) clearInput()
     life?.clearDeferred(key)
@@ -6293,7 +6288,7 @@ export interface SpawnPersonaResult {
     /**
      * b.jg5 SRJ-706: a live-row sequence runs for the persona
      * (`isLiveRowSequenceRunning`), so no other launch for it starts: no
-     * agent-director call, no trust patch, no reply-guard step, no record
+     * agent-director call, no reply-guard step, no record
      * written, and nothing armed. Not a failure: `launchSession` maps it to
      * the uncounted `'refused'` (SRJ-1015), so a retry that meets it re-arms
      * the persona's retry timer (SRJ-302), and the start pass counts it
@@ -7509,9 +7504,6 @@ export async function plainSpawnOutcomeAt<R>(site: PlainSpawnSite<R>): Promise<S
 // ErrJsonlMissing diagnostic (bug b.wrb)
 // ---------------------------------------------------------------------------
 
-/** The startup-errors class of a lost transcript: a resume met `ErrJsonlMissing` after provable activity (b.wrb; b.jg5 SRJ-712). */
-export const JSONL_TRANSCRIPT_LOST_ENTRY_CLASS = 'jsonl-transcript-lost-on-resume'
-
 /** The startup-errors class of an inconclusive lost-transcript diagnosis (b.fwu; b.jg5 SRJ-712). */
 export const JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS = 'jsonl-diagnosis-inconclusive'
 
@@ -7526,13 +7518,12 @@ export const JSONL_DIAGNOSIS_REUSE_WORDING =
   'brought up fresh by a reuse spawn of the same instance, and its row is kept (its prior sessions retained in the same life)'
 
 /** What the lost-transcript diagnosis concluded (b.wrb, b.fwu). */
-type JsonlDiagnosisVerdict = 'lost' | 'never-created' | 'inconclusive'
+type JsonlDiagnosisVerdict = 'inconclusive'
 
 /**
  * The lost-transcript diagnosis's answer when it read the row (or found
  * none): its verdict, and the persona notice it holds back until the reuse
- * spawn after it succeeds (`notice`; absent for `never-created`, which posts
- * none). Its log line and startup-errors entry were written already.
+ * spawn after it succeeds (`notice`). Its log line and startup-errors entry were written already.
  */
 interface JsonlDiagnosis {
   readonly verdict: JsonlDiagnosisVerdict
@@ -7550,14 +7541,12 @@ const AD_JSONL_CANDIDATE_SOURCES: readonly AdJsonlCandidateSource[] = [
   'fallback',
 ]
 
-/** One transcript candidate resume tried (or that we recomputed locally). */
+/** One transcript candidate agent-director reported trying on resume. */
 export interface JsonlCandidate {
-  /** Provenance as reported by AD (see AdJsonlCandidateSource), or a
-   *  'locally-computed(…)' label when we reconstructed it ourselves because
-   *  AD's message lacked detail. */
+  /** Provenance as reported by agent-director (see AdJsonlCandidateSource). */
   source: string
   path: string
-  /** The stat error AD reported, or our own local stat result label. */
+  /** The stat error agent-director reported. */
   note: string
 }
 
@@ -7568,7 +7557,7 @@ export interface JsonlCandidate {
  * Returns [] when the description does not carry the enumerated detail — the
  * case for any AD whose ErrJsonlMissing message predates the per-candidate
  * enumeration delivered by AD bug b.1ba. Callers MUST treat [] as "AD gave no
- * path detail" and degrade to locally-computed candidates, never as "no paths".
+ * path detail", never as proof that no paths exist. Quote AD's description instead.
  *
  * Strictly non-throwing and version-agnostic: it keys off the literal
  * `persisted` / `fallback` source tokens, not any version string.
@@ -7601,8 +7590,8 @@ export const JSONL_NO_CANDIDATES_TEXT = '(no transcript path could be determined
  * path read from its row), so each is rendered by `renderLogMessageText`
  * (redacted, on one line, capped) before it is joined, for the log line and
  * the startup-errors entry. Not escaped for Slack: a notice quotes the joined
- * text through its own builder (`jsonlTranscriptLostNoticeText`,
- * `jsonlCandidatesInconclusiveNoticeText`, `jsonlRowAbsentInconclusiveNoticeText`),
+ * text through its own builder (`jsonlCandidatesInconclusiveNoticeText`,
+ * `jsonlRowAbsentInconclusiveNoticeText`),
  * which caps the quote as one and escapes it once. Pure; never throws.
  */
 export function jsonlCandidatesText(candidates: readonly JsonlCandidate[]): string {
@@ -7612,74 +7601,15 @@ export function jsonlCandidatesText(candidates: readonly JsonlCandidate[]): stri
     .join('; ')
 }
 
-/** A row's `started_at` as the diagnosis's texts quote it: rendered by `renderLogMessageText`, or `(none)` when absent or empty. Pure. */
-function jsonlStartedAtText(startedAt: unknown): string {
-  return renderLogMessageText(startedAt) || '(none)'
-}
-
-/** Local stat label: what WE see at a path right now (never claims AD tried it). */
-function localStatNote(path: string): string {
-  try {
-    const st = statSync(path)
-    if (st.isFile() && st.size > 0) return `locally present, ${st.size} bytes`
-    if (st.isFile()) return 'locally present but empty'
-    return 'locally present but not a regular file'
-  } catch (err) {
-    const code = (err as { code?: string })?.code
-    return code ? `locally absent (${code})` : 'locally absent'
-  }
-}
-
 /**
- * b.wrb, b.jg5 SRJ-712: make an `ErrJsonlMissing` resume failure legible.
- * Reads the persona's row, logs which transcript path(s) were tried and their
- * provenance, and classifies the loss as never-created (expected, lossless),
- * lost (real context destroyed, operator-visible) or inconclusive. The
- * persona is then brought up fresh by a reuse spawn of its own id, which
- * keeps its row and prior sessions in the same life (`JSONL_DIAGNOSIS_REUSE_WORDING`).
- *
- * It runs before that reuse spawn, because the reuse resets the row it reads
- * (its `jsonl_path`, session id, `cwd` and `started_at`). Never throws.
- *
- * The log line and the startup-errors entry (`JSONL_TRANSCRIPT_LOST_ENTRY_CLASS`,
- * `JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS`, at start only) are written here.
- * The persona notice of a `lost` or `inconclusive` verdict is not posted
- * here: it is answered as `notice`, and the caller posts it only once the
- * reuse spawn has brought the persona up (`noTranscriptReuse`), since the
- * notice says the persona was brought up fresh.
- *
- * b.jg5 SRJ-105/SRJ-114: the row `get` is one of SRJ-114's sites, made
- * through the shared own-row read (`readPersonaOwnRow`). No diagnosis is
- * reported (no startup-errors entry, no persona notice, no amnesia count)
- * when it latched the persona (a `provenance_conflict` note on its own row,
- * or an UNUSABLE NAME answer, b.jg5 SRJ-512, which records the state
- * unreadable): the diagnosis answers `latched`, and the caller launches
- * nothing (b.jg5 SRJ-502). The same when the persona latched elsewhere while
- * the get was awaited (`latchedAfterOwnRowRead`, its one line). Nor when it
- * failed with a refusal (`refusalAt` with verb `get`: any error but
- * `ErrSpawnNotFound` and an UNUSABLE NAME answer, a CONFIG answer included,
- * b.jg5 SRJ-316): the diagnosis answers the refusal result, and the caller
- * launches nothing (SRJ-105); any other failure, none today, answers
- * `failed` the same way, with one line and no spawn-failure notice.
- * `ErrSpawnNotFound` (the row is absent) gives 'inconclusive', its reason
- * saying the row is absent.
- *
- * `read.lastRead` is set to what the `get` read (b.jg5 SRJ-501): the state
- * the reuse spawn after it records if it latches.
- *
- * @returns the diagnosis (`JsonlDiagnosis`): 'lost' when the row had
- *          provable prior activity but no transcript survives (loud),
- *          'never-created' when the archive was consulted and proved
- *          idle-since-spawn (quiet, evidence-based lossless), 'inconclusive'
- *          when not enough evidence could be gathered to decide either way
- *          (loud-but-uncertain: the diagnosis machinery itself is degraded,
- *          which correlates with the storage faults that cause loss); or the
- *          ladder's result (`failed` or `latched`) when the row `get` failed
- *          or latched the persona.
+ * Describe AD's resume refusal before a reuse resets the row. AD's own-row
+ * read still controls refusal and latch handling. An ErrJsonlMissing says the
+ * current transcript was unavailable to resume; it does not establish actual
+ * history loss. Report AD references and candidate facts without local lookup
+ * or Slack archive evidence, and retain uncertainty in the operator notice.
  */
 async function diagnoseJsonlMissing(
   persona: Persona,
-  config: PersonaConfig,
   err: AgentDirectorError,
   isStartup: boolean,
   read: { lastRead?: LatchRowState },
@@ -7738,122 +7668,11 @@ async function diagnoseJsonlMissing(
   // the diagnosis, whose texts say it is, is not reported either.
   if (ownRead.latched) return { key, action: 'latched' }
 
-  // --- 3. Assemble the candidate list to log. ----------------------------
-  // The persona's effective claude_config_dir (per-persona, else top-level);
-  // undefined makes resolveJsonlPath use the home-directory default.
-  const effectiveConfigDir = persona.claude_config_dir
-  const candidates: JsonlCandidate[] = [...adCandidates]
-
-  if (adCandidates.length === 0) {
-    // pre-b.1ba / shape-mismatch path: AD gave no enumerated detail.
-    // Reconstruct what WE can, clearly labelled as locally computed — never
-    // claim it is what AD tried.
-    if (row.jsonl_path) {
-      candidates.push({
-        source: 'locally-computed(persisted-column)',
-        path: row.jsonl_path,
-        note: localStatNote(row.jsonl_path),
-      })
-    }
-    if (row.session_id) {
-      const fallback = resolveJsonlPath(row.cwd, row.session_id, effectiveConfigDir)
-      if (fallback !== row.jsonl_path) {
-        candidates.push({
-          source: 'locally-computed(config-dir fallback)',
-          path: fallback,
-          note: localStatNote(fallback),
-        })
-      }
-    }
-  }
-
-  // b.jg5 SRJ-1001: every field rendered (redacted, capped) for the log line,
-  // the startup-errors entry and, escaped once more, the notice.
-  const candidateStr = jsonlCandidatesText(candidates)
-  const detailProvenance =
-    adCandidates.length > 0
-      ? 'paths+sources reported by agent-director'
-      : 'agent-director gave no path detail (pre-b.1ba message shape); paths below are locally computed'
-
-  // --- 4. Classify never-created vs lost via message-archive evidence. ----
-  // Reuse b.zak's archive-count helper (message_archive_db, read-only, absent
-  // file → null == no evidence). started_at bounds "since spawn".
-  const startedAtEpoch = row.started_at ? rfc3339ToEpochSeconds(row.started_at) : null
-  // b.av2 SR-7.4: count only the persona's `delivery: all` channels; a zero
-  // count is evidence of idleness only when the archive can see all of the
-  // persona's traffic (no `mentions` channel, DMs off). b.deo SRI-704: in
-  // fungible mode no channel is counted, so the count is 0 and never
-  // attributable, and the diagnosis is never `lost`. The mode is read from
-  // `config`, the configuration in effect at this launch (b.deo SRI-201); no
-  // persona section is read here.
-  const mode = channelModeOf(config)
-  const scope = personaArchiveEvidenceScope(persona, mode)
-  const archiveCount = makeDefaultArchiveCount(config)
-  const counted = startedAtEpoch === null ? null : archiveCount(scope.channelIds, startedAtEpoch, ref)
-  const archivedSinceSpawn = counted !== null && mode === 'fungible' ? 0 : counted
-
-  if (archivedSinceSpawn !== null && archivedSinceSpawn > 0) {
-    // LOST: conversation provably happened since spawn, yet no transcript
-    // survives. Real context destroyed — must be operator-visible.
-    const detail =
-      `${ref} instance=${instanceId}: resume threw ErrJsonlMissing and the persona is ` +
-      `${JSONL_DIAGNOSIS_REUSE_WORDING}, but the message archive holds ${archivedSinceSpawn} message(s) since spawn ` +
-      `(started_at=${jsonlStartedAtText(row.started_at)}). Conversation history was LOST. Transcript candidates tried ` +
-      `(${detailProvenance}): ${candidateStr}.`
-    console.error(`[slack] ErrJsonlMissing diagnostic: ${detail}`)
-    // Operator-visible signal — reuse the existing startup-errors mechanism.
-    if (isStartup) recordStartupError(JSONL_TRANSCRIPT_LOST_ENTRY_CLASS, detail, describeAgentDirectorFailure(err))
-    // And a persona notice so it is not buried in logs, posted once the
-    // reuse spawn has brought the persona up (`jsonlTranscriptLostNoticeText`).
-    return { verdict: 'lost', notice: jsonlTranscriptLostNoticeText(archivedSinceSpawn, candidateStr) }
-  }
-
-  // Below archivedSinceSpawn is 0 or null. Only an attributable 0 (archive
-  // consulted, no activity since spawn in channels that carry all of the
-  // persona's traffic) is evidence-based never-created. null means we never got
-  // a usable count, and an unattributable 0 proves nothing — both are
-  // INCONCLUSIVE, not reassurance.
-  if (archivedSinceSpawn === 0 && scope.zeroIsAttributable) {
-    // NEVER-CREATED (evidence-based): the archive was consulted and proved zero
-    // archived activity since spawn. Claude writes the .jsonl lazily on first
-    // message; a persona idle since spawn simply never had one. Expected and
-    // lossless — quiet log, no error, no persona notice; counted with the
-    // diagnosed amnesia (`fresh-after-amnesia`).
-    console.error(
-      `[slack] ErrJsonlMissing diagnostic: ${ref} instance=${instanceId} — transcript never ` +
-        `created (archive consulted: 0 archived messages since spawn). Nothing to lose; the persona is ` +
-        `${JSONL_DIAGNOSIS_REUSE_WORDING}. Transcript candidates tried (${detailProvenance}): ${candidateStr}.`,
-    )
-    return { verdict: 'never-created' }
-  }
-
-  // INCONCLUSIVE: we could not gather enough evidence to decide loss vs
-  // never-created. Determine WHY — the operator needs the actionable cause.
-  //   (b) started_at absent/unparseable → could not bound "since spawn". The
-  //       row's started_at is agent-director's text, so it is quoted
-  //       through renderLogMessageText (redacted, on one line, capped); the
-  //       notice escapes the whole reason for Slack (`jsonlInconclusiveNoticeText`).
-  //   (c-config) no message_archive_db configured → diagnosis is structurally
-  //              impossible; actionable "turn on the archive" hint.
-  //   (c-other) archive configured but file-missing / unreadable / query threw.
-  //   (d) b.av2 SR-7.4: a 0 count the archive cannot attribute to the persona;
-  //       in fungible mode every count (b.deo SRI-704, `FUNGIBLE_MODE_ZERO_REASON`).
-  let reason: string
-  if (startedAtEpoch === null) {
-    reason =
-      `the row's started_at is absent or unparseable (started_at=${jsonlStartedAtText(row.started_at)}), ` +
-      `so "since spawn" could not be bounded and the archive was not consulted`
-  } else if (archivedSinceSpawn === 0) {
-    reason = unattributableZeroReason(mode)
-  } else if (!config.message_archive_db) {
-    reason =
-      `no message archive is configured (message_archive_db unset), so there is no evidence source to ` +
-      `consult — enable the message archive to make transcript-loss diagnosis possible`
-  } else {
-    reason =
-      `the message archive (${config.message_archive_db}) could not be consulted (missing file, ` +
-      `unreadable, or the count query failed) — see prior archive-count error line`
-  }
+  const candidateStr = adCandidates.length > 0
+    ? jsonlCandidatesText(adCandidates)
+    : renderLogMessageText(err.errDescription) || '(no candidate detail from agent-director)'
+  const detailProvenance = 'reported by agent-director'
+  const reason = `${describeTranscriptReference(row)}; ErrJsonlMissing does not establish whether prior conversation history was lost`
   reportInconclusiveDiagnosis(ref, instanceId, jsonlCandidatesReasonLead(reason, detailProvenance) + candidateStr, isStartup, err)
   return { verdict: 'inconclusive', notice: jsonlCandidatesInconclusiveNoticeText(reason, detailProvenance, candidateStr) }
 }
@@ -7895,7 +7714,7 @@ function jsonlCandidatesReasonLead(reason: string, detailProvenance: string): st
 /**
  * The INCONCLUSIVE diagnosis notice text: `reasonLead` (CSCB's own words,
  * which may hold a value from agent-director's row already rendered through
- * `renderLogMessageText`, or the configured archive path) followed by
+ * `renderLogMessageText`) followed by
  * `quoted` (text taken from agent-director's description or row) through
  * `renderLogMessageText` (redacted, on one line, capped at
  * `MAX_LOGGED_MESSAGE_LENGTH`; b.jg5 SRJ-1001). Each is then escaped once
@@ -7928,8 +7747,7 @@ export function jsonlRowAbsentInconclusiveNoticeText(adReported: string): string
 
 /**
  * b.fwu, b.jg5 SRJ-712: the persona notice of an `ErrJsonlMissing`
- * diagnosis that is INCONCLUSIVE with the row read (no usable or
- * attributable archive count): the "Transcript candidates tried" shape, with
+ * diagnosis that is INCONCLUSIVE with the row read: the "Transcript candidates tried" shape, with
  * CSCB's `reason`, the candidates' `detailProvenance`, and `candidates` (the
  * paths tried, from agent-director's description or row) through
  * `renderLogMessageText` (b.jg5 SRJ-1001), the reason and the quoted text
@@ -7938,23 +7756,6 @@ export function jsonlRowAbsentInconclusiveNoticeText(adReported: string): string
  */
 export function jsonlCandidatesInconclusiveNoticeText(reason: string, detailProvenance: string, candidates: string): string {
   return jsonlInconclusiveNoticeText(jsonlCandidatesReasonLead(reason, detailProvenance), candidates)
-}
-
-/**
- * b.fwu, b.jg5 SRJ-712: the persona notice of a LOST `ErrJsonlMissing`
- * diagnosis (the archive holds `archivedSinceSpawn` messages since spawn,
- * yet no transcript survives): the "Paths tried" shape, with `pathsTried`
- * (taken from agent-director's description or row) redacted and capped
- * through `renderLogMessageText` (b.jg5 SRJ-1001), then escaped for Slack
- * (`escapeSlackControlCharacters`). Pure; exported for the notice catalogue.
- */
-export function jsonlTranscriptLostNoticeText(archivedSinceSpawn: number, pathsTried: string): string {
-  return (
-    `⚠️ CSCB: on restart my conversation transcript could not be found, but the message archive shows ` +
-    `${archivedSinceSpawn} message(s) since I started — my conversation memory has been lost and I ` +
-    `was ${JSONL_DIAGNOSIS_REUSE_WORDING}. An operator should investigate transcript storage. Paths tried: ` +
-    escapeSlackControlCharacters(renderLogMessageText(pathsTried))
-  )
 }
 
 // ---------------------------------------------------------------------------
@@ -7979,8 +7780,6 @@ interface NoTranscriptReuseOptions {
   readonly isStartup: boolean
   /** The row state the caller last read before the `resume` (the diagnosis's read replaces it when it makes one); `NOTHING_READ` at the forced `resume`, which read nothing. */
   readonly lastRead: LastRowRead
-  /** True when the caller ran the pre-launch trust patch in this launch attempt. */
-  readonly trustPatchRan: boolean
   /** The store's reading of the key when the launch attempt started, for the reuse (`ReuseSpawnOptions.retiredAtStart`, b.jg5 SRJ-806). */
   readonly retiredAtStart: RetiredKeyAttemptStart | undefined
   /**
@@ -8011,9 +7810,8 @@ interface NoTranscriptReuseOptions {
  *     b.jg5 SRJ-806) is answered as it is, after any of the three answers
  *     (SRJ-112's success row): no amnesia result, and the diagnosis's
  *     persona notice is not posted, with one line when it had one.
- *   - A `spawned` success answers `fresh-after-amnesia` after
- *     `ErrJsonlMissing` (`fresh-after-inconclusive-amnesia` for an
- *     inconclusive diagnosis), and only then posts the diagnosis's persona
+ *   - A `spawned` success answers `fresh-after-inconclusive-amnesia` after
+ *     `ErrJsonlMissing`, and only then posts the diagnosis's persona
  *     notice, which says the persona was brought up fresh; `spawned` for the
  *     other two answers, which lost no history.
  *   - Every other answer is the reuse spawn's (SRJ-112, `reuseSpawnFailedAt`),
@@ -8033,14 +7831,13 @@ async function noTranscriptReuse(
   // b.jg5 SRJ-501: the diagnosis `get`, when made, is the last read before the reuse.
   const diagnosisRead: { lastRead?: LatchRowState } = {}
   if (isAdErrorInstance(err, ErrJsonlMissing)) {
-    const diagnosed = await diagnoseJsonlMissing(persona, config, err, options.isStartup, diagnosisRead)
+    const diagnosed = await diagnoseJsonlMissing(persona, err, options.isStartup, diagnosisRead)
     if ('action' in diagnosed) return diagnosed
     diagnosis = diagnosed
   }
   const result = await reuseSpawnForPersona(persona, config, {
     isStartup: options.isStartup,
     lastRead: diagnosisRead.lastRead ?? options.lastRead,
-    trustPatchRan: options.trustPatchRan,
     retiredAtStart: options.retiredAtStart,
     forcedWhat: options.forcedWhat,
   })
@@ -8057,11 +7854,10 @@ async function noTranscriptReuse(
   if (diagnosis === undefined || result.action !== 'spawned') return result
   // b.jg5 SRJ-712: the persona is up, so the notice that says so is posted now.
   if (diagnosis.notice !== undefined) sendPersonaNotice(key, diagnosis.notice)
-  // b.fwu: amnesia, not a clean spawn, so the start summary counts it apart:
-  // 'lost' and 'never-created' are diagnosed, 'inconclusive' is not.
+  // ErrJsonlMissing supplies no authoritative history-loss verdict.
   return {
     key,
-    action: diagnosis.verdict === 'inconclusive' ? 'fresh-after-inconclusive-amnesia' : 'fresh-after-amnesia',
+    action: 'fresh-after-inconclusive-amnesia',
   }
 }
 
@@ -8366,7 +8162,7 @@ async function replacePersonaRow(
       `[slack] spawnForPersona: replacing the row of ${ref} (${replacing}; last read ${describeLatchRowState(lastRead)}): a reuse spawn of the same id; nothing is deleted (b.jg5 SRJ-707)`,
     )
     return reuseFinishedRow(run, REUSE_SPAWN_WHAT, () =>
-      reuseSpawnForPersona(persona, config, { isStartup, lastRead, trustPatchRan: true, retiredAtStart: run.retiredAtStart }),
+      reuseSpawnForPersona(persona, config, { isStartup, lastRead, retiredAtStart: run.retiredAtStart }),
     )
   }
   const retired = retiredKey ?? retiredKeyReadingOf(key).recorded
@@ -8781,7 +8577,7 @@ async function resumeOrFreshSpawn(
   if (endedInARow >= UNREPORTED_RESUME_FALLBACK_AFTER) {
     console.error(unreportedResumeFallbackLine(ref, endedInARow))
     return reuseFinishedRow(run, UNREPORTED_RESUME_REUSE_WHAT, () =>
-      reuseSpawnForPersona(persona, config, { isStartup, lastRead, trustPatchRan: true, retiredAtStart: run.retiredAtStart }),
+      reuseSpawnForPersona(persona, config, { isStartup, lastRead, retiredAtStart: run.retiredAtStart }),
     )
   }
 
@@ -8810,7 +8606,7 @@ async function resumeOrFreshSpawn(
       // a CONFLICT latches with the refused operation "reuse spawn" (b.jg5
       // SRJ-501); a collision re-runs get-then-act once.
       return reuseFinishedRow(run, `${REUSE_SPAWN_WHAT} after its resume's no-transcript answer`, () =>
-        noTranscriptReuse(persona, config, err, { isStartup, lastRead, trustPatchRan: true, retiredAtStart: run.retiredAtStart }),
+        noTranscriptReuse(persona, config, err, { isStartup, lastRead, retiredAtStart: run.retiredAtStart }),
       )
     },
     notResumable: (err) => spawnNotResumableAtLadder(run, err, deadEvidence),
@@ -8851,7 +8647,7 @@ function retiredKeyAtResumeSite(run: LadderRun, lastRead: LatchRowState, retired
     `[slack] spawnForPersona: ${ref}'s key is retired (${describeRetiredMark(retired)}; last read ${describeLatchRowState(lastRead)}) — not resuming: a reuse spawn of the same id first; nothing is deleted (b.jg5 SRJ-805)`,
   )
   return reuseFinishedRow(run, RETIRED_KEY_REUSE_WHAT, () =>
-    reuseSpawnForPersona(persona, config, { isStartup, lastRead, trustPatchRan: true, retiredAtStart: run.retiredAtStart }),
+    reuseSpawnForPersona(persona, config, { isStartup, lastRead, retiredAtStart: run.retiredAtStart }),
   )
 }
 
@@ -10757,44 +10553,6 @@ function promptFailureResult(key: string, err: unknown): SpawnPersonaResult | un
 }
 
 // ---------------------------------------------------------------------------
-// Pre-launch trust patch (b.av2 SR-6.2)
-// ---------------------------------------------------------------------------
-
-/** Patches the persona's `.claude.json` trust flags before a launch. */
-export type PreLaunchTrustPatcher = (persona: Persona) => void
-
-/**
- * The one pre-launch trust patcher. Production installs the single-persona
- * trust patch (`trustPatchPersona` in `src/trust-bootstrap.ts`). With none
- * installed (unit tests, the integration driver) no patch runs and nothing
- * is written.
- */
-let preLaunchTrustPatcher: PreLaunchTrustPatcher | undefined
-
-/** Install the pre-launch trust patcher (production: `server.ts`). */
-export function setPreLaunchTrustPatcher(patcher: PreLaunchTrustPatcher): void {
-  preLaunchTrustPatcher = patcher
-}
-
-/** Test-only seam: remove any installed pre-launch trust patcher. */
-export function _resetPreLaunchTrustPatcher(): void {
-  preLaunchTrustPatcher = undefined
-}
-
-/**
- * Run the installed pre-launch trust patcher for `persona`. A throw is logged
- * with the persona reference and never reaches the ladder.
- */
-function runPreLaunchTrustPatch(persona: Persona, ref: string): void {
-  if (!preLaunchTrustPatcher) return
-  try {
-    preLaunchTrustPatcher(persona)
-  } catch (err) {
-    console.error(`[slack] spawnForPersona: pre-launch trust patch failed for ${ref} — launching anyway: ${describeThrownValue(err)}`)
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Pre-launch reply guard (b.av2 SR-9.4, SR-6.2)
 // ---------------------------------------------------------------------------
 
@@ -11058,7 +10816,7 @@ async function launchCallWithWindow<T>(
     reportSystemPromptFailureAtSite(key, err)
     throw new SystemPromptPreparationError('system-prompt-unwritable')
   }
-  deliveryLifecycle?.beforeLaunch(key)
+  deliveryLifecycle?.activate(key)
   const keptThisLaunchRow = thisLaunchRows.get(key)
   const keptOwnLaunch = ownLaunches.get(key)
   thisLaunchRows.delete(key)
@@ -11300,12 +11058,12 @@ export async function spawnForPersona(
   if (held !== undefined) return held
   // b.jg5 SRJ-706: while P's live-row sequence runs (its own step-6 launch in
   // flight included), no other launch for P starts or joins one: no
-  // agent-director call, no trust patch, no reply-guard step, no record.
+  // agent-director call, no reply-guard step, no record.
   // A latched persona still gets the latched gate's answer.
   const sequenceWaiting = sequenceWaitingResult(key, ref, 'spawnForPersona')
   if (sequenceWaiting !== undefined) return sequenceWaiting
   // b.jg5 SRJ-810, SRJ-1502: while an old life may still run in P's working
-  // directory, P is not brought up: no agent-director call, no trust patch,
+  // directory, P is not brought up: no agent-director call,
   // no reply-guard step, no record. P is recorded as waiting, the hold's wait
   // is started and P's retry timer armed. A hold on P's own row is not this
   // gate's (SRJ-805's retired-key rule). A latched persona still gets the
@@ -11324,7 +11082,7 @@ export async function spawnForPersona(
 
   // b.jg5 SRJ-502: a latched persona is not launched, whoever asks (the start
   // pass, the bring-up controller, an apply's bring-up, a restart, a retry):
-  // no trust patch, no reply-guard step, no config-dir hold and no
+  // no reply-guard step, no config-dir hold and no
   // agent-director call. A latch that cannot be read counts as latched.
   const latched = latchGateReadingOf(key)
   if (latched !== undefined) {
@@ -11456,11 +11214,6 @@ function runPersonaLadder(
   const { key } = persona
   const params = buildSpawnParams(persona, config, configDirLabel)
 
-  // b.av2 SR-6.2: the trust patch precedes every launch. Running it once here,
-  // before the first agent-director spawn or resume this ladder can make,
-  // covers every path below (the patch is idempotent).
-  runPreLaunchTrustPatch(persona, ref)
-
   // b.jg5 SRJ-805, SRJ-806: while the key is recorded its first launch is a
   // reuse spawn, never a plain spawn and never a `resume`; this launch
   // decision also writes again a mark held only in memory. Its reading and
@@ -11569,7 +11322,6 @@ async function retiredKeyFirstLaunch(run: LadderRun, retired: RetiredKeyReading)
   const reused = await reuseSpawnForPersona(persona, config, {
     isStartup,
     lastRead: NOTHING_READ,
-    trustPatchRan: true,
     firstLaunch: true,
     retiredAtStart: run.retiredAtStart,
   })
@@ -11900,12 +11652,6 @@ export interface ReuseSpawnOptions {
    */
   readonly lastRead: LatchRowState | undefined
   /**
-   * True when the caller has already run the pre-launch trust patch in this
-   * launch attempt (the collision ladder at its start; a `resume` that went
-   * on to the reuse). Otherwise the reuse runs it once before its call.
-   */
-  readonly trustPatchRan?: boolean
-  /**
    * True for a retired key's first launch (b.jg5 SRJ-805): its collision
    * undoes the reply-guard steps it ran (b.av2 SR-9.4), as the plain first
    * spawn's collision does.
@@ -11952,8 +11698,6 @@ export async function reuseSpawnForPersona(
   // spawn flag builder, `pkg/ts-bun-client/src/internal/argv.ts` at
   // agent-director tag `v0.11.0`, as read from its packed client).
   const params: SpawnParams = { ...buildSpawnParams(persona, config, configDirLabel), reuse_finished: true }
-  // b.av2 SR-6.2: the trust patch precedes every launch, once per attempt.
-  if (options.trustPatchRan !== true) runPreLaunchTrustPatch(persona, ref)
   let launched: SpawnResult
   // b.av2 SR-9.4: the reply guard immediately before the call; a retired
   // key's first launch undoes it on a collision, as the plain first spawn does.
@@ -12407,7 +12151,7 @@ function launchHoldsOn(persona: OldLifeHoldPersona): OldLifeHold[] {
  *     with what was done for its wait, and the timer
  *     (`oldLifeHoldLaunchLine`);
  * and it answers true. Otherwise it answers false with nothing done. Makes
- * no agent-director call: no trust patch, no reply-guard step and no record
+ * no agent-director call: no reply-guard step and no record
  * write precede or follow it. Never throws.
  *
  * With `options.latchRecheck`, asked by a latch re-check's own launch of the
@@ -12996,9 +12740,7 @@ async function sequenceLaunchCall(
   params: SpawnParams,
 ): Promise<LiveRowSequenceLaunchEntryResult> {
   const { key } = persona
-  if (request.kind === LIVE_ROW_LAUNCH_REUSE) return sequenceReuse(persona, config, request.lastRead, false, request.retiredAtStart)
-  // b.av2 SR-6.2: the trust patch precedes every launch.
-  runPreLaunchTrustPatch(persona, ref)
+  if (request.kind === LIVE_ROW_LAUNCH_REUSE) return sequenceReuse(persona, config, request.lastRead, request.retiredAtStart)
   console.error(`${LIVE_ROW_SEQUENCE_LOG_PREFIX} resuming ${ref} (b.jg5 SRJ-705)`)
   // b.jg5 SRJ-113, SRJ-301, SRJ-409 (HO rev 28): the handler's
   // `resumeFailedAt` marks an `ErrTmuxSessionCreate` result `countedClass`
@@ -13021,7 +12763,6 @@ async function sequenceLaunchCall(
       const reused = await noTranscriptReuse(persona, config, err, {
         isStartup: false,
         lastRead: request.lastRead,
-        trustPatchRan: true,
         retiredAtStart: request.retiredAtStart,
       })
       return sequenceReuseAnswer(persona, reused)
@@ -13091,8 +12832,7 @@ async function sequenceNotResumable(key: string, ref: string, err: unknown): Pro
 
 /**
  * The sequence's reuse spawn (`reuseSpawnForPersona`) of the `reuse` kind,
- * with `lastRead`, the row state the sequence last read; `trustPatchRan`
- * when this attempt already ran the trust patch; `retiredAtStart`, the
+ * with `lastRead`, the row state the sequence last read; `retiredAtStart`, the
  * store's reading of the key when the sequence's launch attempt began
  * (b.jg5 SRJ-806). Its answer is read as `sequenceReuseAnswer` reads it.
  * Never throws.
@@ -13101,12 +12841,11 @@ async function sequenceReuse(
   persona: Persona,
   config: PersonaConfig,
   lastRead: LatchRowState,
-  trustPatchRan: boolean,
   retiredAtStart: RetiredKeyAttemptStart | undefined,
 ): Promise<LiveRowSequenceLaunchEntryResult> {
   return sequenceReuseAnswer(
     persona,
-    await reuseSpawnForPersona(persona, config, { isStartup: false, lastRead, trustPatchRan, retiredAtStart }),
+    await reuseSpawnForPersona(persona, config, { isStartup: false, lastRead, retiredAtStart }),
   )
 }
 
@@ -15920,10 +15659,7 @@ export interface StartupSessionManagerResult {
    * (b.jg5 SRJ-1015).
    */
   freshSpawned: number
-  /** Fresh spawns that REPLACED a resume because the transcript was missing
-   *  (ErrJsonlMissing amnesia) and diagnosis was CONCLUSIVE ('lost' or
-   *  evidence-based 'never-created') — separated so they are never hidden in
-   *  "ok". */
+  /** Legacy outcome count retained for summary compatibility; production no longer infers history loss. */
   freshAfterAmnesia: number
   /** b.fwu: fresh spawns that REPLACED a resume after ErrJsonlMissing amnesia
    *  where diagnosis was INCONCLUSIVE — we could not determine whether prior
@@ -16076,15 +15812,12 @@ export function startLaunchNotStartedForShutdownLine(ref: string): string {
  * The one summary line is `startupSummaryLine`'s.
  *
  * Per-persona launch failures are logged and recorded in startup-errors.log
- * but never crash the server. cozempic availability is probed in the
- * background (non-blocking).
+ * but never crash the server.
  */
 export async function startupSessionManager(
   config: PersonaConfig,
   options?: { concurrency?: number; bringUp?: StartupBringUpDeps; isShuttingDown?: () => boolean },
 ): Promise<StartupSessionManagerResult> {
-  await checkCozempicAvailable()
-
   const personas = config.personas
   const concurrency = options?.concurrency ?? 3
 
@@ -16269,8 +16002,7 @@ export async function startupSessionManager(
   console.error(startupSummaryLine(personas.length, counts))
   if (freshAfterAmnesia > 0) {
     // Loud, grep-friendly signal that some personas lost their resume target.
-    // Per-persona "lost vs never-created" detail was already emitted (and, for
-    // 'lost', recorded to startup-errors) by diagnoseJsonlMissing.
+    // Per-persona AD reference facts were already emitted by diagnoseJsonlMissing.
     console.error(
       `[slack] startupSessionManager: ${freshAfterAmnesia} persona(s) were fresh-spawned after ErrJsonlMissing ` +
         `(transcript could not be resumed) — see per-persona "ErrJsonlMissing diagnostic" lines above.`,
@@ -16278,9 +16010,8 @@ export async function startupSessionManager(
   }
   if (freshAfterInconclusiveAmnesia > 0) {
     // b.fwu: a separate, louder signal — these personas were fresh-spawned but
-    // the diagnosis machinery could not tell whether history was destroyed. That
-    // degraded-diagnosis condition correlates with the storage faults that cause
-    // real loss, so it warrants its own attention. Each was recorded to
+    // agent-director reported an unavailable resume transcript. Actual history
+    // loss is unverified. Each was recorded to
     // startup-errors as JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS.
     console.error(
       `[slack] startupSessionManager: ${freshAfterInconclusiveAmnesia} persona(s) were fresh-spawned after ` +
@@ -17199,8 +16930,7 @@ async function latchRecheckClearedProbeRetry(
  * waits for it through `whenLaunchSettled`) and runs as a launch attempt
  * (`runInAttempt`), as `spawnForPersona`'s ladder does; with a launch already
  * in flight for the persona, a dry run or a `claude_config_dir` that does not
- * resolve, no call is made. The pre-launch trust patch runs once before a
- * plain spawn or a `resume` (the reuse runs its own). Answers the launch's
+ * resolve, no call is made. Agent-director owns pre-trust. Answers the launch's
  * action, or why none was made. Never throws.
  *
  *   [slack] latch-recheck: <ref> is at the restart cap — no <call> in this re-check; the persona stays latched (b.av2 SR-6.3; b.jg5 SRJ-505, SRJ-506)
@@ -17292,8 +17022,6 @@ async function latchRecheckLaunchCall(
     const reused = await reuseSpawnForPersona(persona, config, { isStartup: false, lastRead })
     return isReuseSpawnCollided(reused) ? latchRecheckCollided(key, ref, REUSE_SPAWN_WHAT) : reused
   }
-  // b.av2 SR-6.2: the trust patch precedes every launch.
-  runPreLaunchTrustPatch(persona, ref)
   if (call === RECHECK_CALL_PLAIN_SPAWN) {
     return plainSpawnOutcomeAt<SpawnPersonaResult>({
       persona,
@@ -17351,7 +17079,7 @@ async function latchRecheckLaunchCall(
       console.error(
         `${LATCH_RECHECK_RESUME_HEAD} ${describeAgentDirectorFailure(err)} on the re-check's resume of ${ref} — a reuse spawn of the same id follows; nothing is deleted (b.jg5 SRJ-707, SRJ-506)`,
       )
-      const reused = await noTranscriptReuse(persona, config, err, { isStartup: false, lastRead, trustPatchRan: true, retiredAtStart: undefined })
+      const reused = await noTranscriptReuse(persona, config, err, { isStartup: false, lastRead, retiredAtStart: undefined })
       return isReuseSpawnCollided(reused) ? latchRecheckCollided(key, ref, REUSE_SPAWN_WHAT) : reused
     },
     notResumable: () => {
@@ -18305,7 +18033,7 @@ async function runForcedLaunch(
  * production path calls it.
  *
  * It runs as `runForcedLaunch` runs a launch, through the production
- * `resume` path: the pre-launch trust patch, then the one `resume` outcome
+ * `resume` path: the one `resume` outcome
  * handler (`resumeAtSite`, b.jg5 SRJ-113) with the plain spawn's parameters
  * (`buildSpawnParams`), which makes the call through `launchWithReplyGuard`
  * (the reply guard, the launch-call window, spawn detection with its outage
@@ -18337,8 +18065,6 @@ export function _forceResumeForPersona(persona: Persona, config: PersonaConfig):
   const { key } = persona
   return runForcedLaunch(persona, FORCED_RESUME_WHAT, (ref, configDirLabel) => {
     const params = buildSpawnParams(persona, config, configDirLabel)
-    // b.av2 SR-6.2: the trust patch precedes every launch.
-    runPreLaunchTrustPatch(persona, ref)
     return resumeAtSite<SpawnPersonaResult>({
       persona,
       isStartup: false,
@@ -18354,7 +18080,6 @@ export function _forceResumeForPersona(persona: Persona, config: PersonaConfig):
         const reused = await noTranscriptReuse(persona, config, err, {
           isStartup: false,
           lastRead: NOTHING_READ,
-          trustPatchRan: true,
           retiredAtStart: undefined,
           forcedWhat: FORCED_RESUME_WHAT,
         })
@@ -18381,7 +18106,7 @@ export function _forceResumeForPersona(persona: Persona, config: PersonaConfig):
  * It runs as `runForcedLaunch` runs a launch, through the one reuse launch
  * (`reuseSpawnForPersona`, b.jg5 SRJ-112, SRJ-708): its `claude_config_dir`
  * check, the parameters `buildSpawnParams` gives with only `reuse_finished`
- * added, the pre-launch trust patch and reply guard, the call through the
+ * added, the reply guard, the call through the
  * launch-call window and spawn detection, and SRJ-112's outcome table by
  * class (`reuseSpawnFailedAt`: `ErrInvalidFlags` takes the version re-check
  * and the hold decision; a CONFLICT or UNUSABLE NAME latches after the one

@@ -1,28 +1,28 @@
 import { describe, expect, test } from 'bun:test'
 import { assertResetKeyRecovery, assertSwallowedEnterRecovery, assertUnknownKeyRecovery } from './integration/fixtures/real-case-assertions.ts'
 import { makeEngineHarness } from './test-helpers/delivery-engine.ts'
-import { ENTER_DELAY_MS, LAUNCH_SETTLE_MS } from '../src/delivery-engine.ts'
+import { ENTER_DELAY_MS } from '../src/delivery-engine.ts'
 
 const instance = 'cscb_control'
 const fault = { at: 2000, words: ['send-keys', 'key=Enter', 'swallow'] }
 const key = (at: number, kind: 'enter' | 'text', id = instance) => ({
   at, words: ['send-keys', '--instance-id', id, ...(kind === 'enter' ? ['--key', 'Enter'] : ['--text', 'message', '--no-enter'])],
 })
-const text = { kind: 'sent', seq: 1, part: 1, send_kind: 'text', launch_id: 'launch', at: 1000 }
+const text = { kind: 'sent', seq: 1, part: 1, send_kind: 'text', session_id: 'native-session', at: 1000 }
 const enter = { ...text, send_kind: 'enter', at: 12000 }
 
 describe('real key recovery proof', () => {
   function resetFixture() {
-    const sent = (at: number, send_kind: string, launch_id = 'new-launch') => ({
-      kind: 'sent', seq: 4, part: 1, session_id: 'native-session', launch_id, send_kind, at,
+    const sent = (at: number, send_kind: string) => ({
+      kind: 'sent', seq: 4, part: 1, session_id: 'native-session', send_kind, at,
     })
     return {
-      journal: [sent(0, 'text', 'old-launch'), sent(20500, 'retype', 'old-launch'), sent(81000, 'retype', 'old-launch'),
+      journal: [sent(0, 'text'), sent(20500, 'retype'), sent(81000, 'retype'),
         sent(101000, 'enter'), sent(111000, 'retype'), sent(141500, 'enter'), sent(171500, 'retype')],
       calls: [key(101000, 'enter'), key(111000, 'text'), key(111500, 'enter'), key(141500, 'enter'), key(171500, 'text')]
         .map((call, n) => ({ ...call, pid: String(n + 1) })),
       faults: [{ at: 111000, pid: '2', words: ['send-keys', 'no_enter', 'swallow'] }],
-      waiting: [{ key: 'control', launch_id: 'new-launch', session_id: 'native-session', at: 100000 }],
+      waiting: [{ key: 'control', session_id: 'native-session', at: 100000 }],
     }
   }
   function proveReset(f: ReturnType<typeof resetFixture>) {
@@ -32,7 +32,7 @@ describe('real key recovery proof', () => {
   test('restart proves the reset 10s wait and both 30s recovery stages even with a 60.5s text gap', () => {
     const f = resetFixture()
     expect(f.journal.at(-1)!.at - f.journal[4]!.at).toBe(60500)
-    expect(proveReset(f)).toMatchObject({ launch: 'new-launch', stages: [10000, 30000, 30000] })
+    expect(proveReset(f)).toMatchObject({ session: 'native-session', stages: [10000, 30000, 30000] })
   })
 
   test('reset oracle accepts the production executor recovery sequence after an interrupted growing episode', async () => {
@@ -40,10 +40,10 @@ describe('real key recovery proof', () => {
     try {
       const item = await h.accept('message', 'control')
       const p = h.p('control'); p.autoReceipt = false
-      await h.tick('control'); await h.advance(LAUNCH_SETTLE_MS)
+      await h.tick('control')
       await h.until(() => h.textCalls('control').length === 3)
       // A native launch loses the swallowed draft but retains its journal.
-      h.lifecycle.beforeLaunch('control'); p.box = ''
+      h.lifecycle.observeRow('control', { state: 'pending' }); p.box = ''
       let swallowed = false
       p.keyHook = params => {
         if (params.no_enter && !swallowed) { swallowed = true; p.box = ''; p.autoReceipt = false }
@@ -54,7 +54,7 @@ describe('real key recovery proof', () => {
       const calls = h.keyCalls('control').map((call, n) => ({ ...key(call.at, call.params.no_enter ? 'text' : 'enter'), pid: String(n) }))
       const first = calls.filter(call => call.words.includes('--no-enter'))[3]!
       const waiting = h.events.flatMap(event => event.type === 'launch-first-waiting'
-        ? [{ key: event.key, launch_id: event.launchId, session_id: event.sessionId, at: event.at }] : [])
+        ? [{ key: event.key, session_id: event.sessionId, at: event.at }] : [])
       const proof = assertResetKeyRecovery(h.records('control'), calls,
         [{ at: first.at, pid: first.pid, words: ['send-keys', 'no_enter', 'swallow'] }], waiting, item.accepted.seq, instance)
       expect(proof.stages).toEqual([10000, 30000, 30000])
@@ -68,8 +68,6 @@ describe('real key recovery proof', () => {
     ['missing second recovery', (f: ReturnType<typeof resetFixture>) => { f.journal.splice(5, 1) }],
     ['wrong part', (f: ReturnType<typeof resetFixture>) => { f.journal[5]!.part = 2 }],
     ['wrong native session', (f: ReturnType<typeof resetFixture>) => { f.journal[5]!.session_id = 'other' }],
-    ['wrong launch', (f: ReturnType<typeof resetFixture>) => { f.journal[5]!.launch_id = 'other' }],
-    ['no new launch', (f: ReturnType<typeof resetFixture>) => { for (const r of f.journal) r.launch_id = 'old-launch' }],
     ['no growing old episode', (f: ReturnType<typeof resetFixture>) => { f.journal.splice(0, 2) }],
     ['no observed launch', (f: ReturnType<typeof resetFixture>) => { f.waiting.length = 0 }],
     ['wrong observed persona', (f: ReturnType<typeof resetFixture>) => { f.waiting[0]!.key = 'other' }],
@@ -130,7 +128,7 @@ describe('real key recovery proof', () => {
     ['early recovery', [text, { ...enter, at: 11999 }], [key(11999, 'enter'), key(13000, 'enter')], [fault]],
     ['early retype before later Enter', [text, enter], [key(11999, 'text'), key(13000, 'enter')], [fault]],
     ['another part', [text, { ...enter, part: 2 }], [key(12000, 'enter')], [fault]],
-    ['another launch', [text, { ...enter, launch_id: 'other' }], [key(12000, 'enter')], [fault]],
+    ['another launch', [text, { ...enter, session_id: 'other' }], [key(12000, 'enter')], [fault]],
     ['no injected fault', [text, enter], [key(12000, 'enter')], []],
   ])('swallowed Enter proof rejects %s', (_, journal, calls, faults) => {
     expect(() => assertSwallowedEnterRecovery(journal, calls, faults, 1, instance)).toThrow('durable Enter-only recovery')

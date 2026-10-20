@@ -42,6 +42,19 @@ describe('six record schemas', () => {
   })
   test.each(['{', 'null', '[]', '{"v":1,"seq":1,"kind":"future"}'])('invalid line %s is unreadable', line => expect(parseQueueRecord(line)).toBeUndefined())
 })
+test.each([false, true])('b.d6n: sent journal with legacy launch_id=%s replays as an unconfirmed send and survives compaction', async legacy => {
+  const sent = legacy ? { ...sentRecord(), launch_id: 'old-server:42' } : sentRecord()
+  expect(parseQueueRecord(JSON.stringify(sent))).toEqual(sent)
+  seedQueue(dir, [accepted(), { v: 1, kind: 'fixed', seq: 1, parts: ['message'] }, sent])
+  const q = await open()
+  expect(q.openCount('alpha')).toBe(1)
+  expect(q.item('alpha', 1)!.records.filter(r => r.kind === 'sent')).toEqual([sent])
+  await q.compact('alpha')
+  await q.stop()
+  const replay = await open()
+  expect(replay.openCount('alpha')).toBe(1)
+  expect(replay.item('alpha', 1)!.records.filter(r => r.kind === 'sent')).toEqual([sent])
+})
 test('real file acceptance fsyncs file and new directory, enforces permissions and survives restart', async () => {
   const synced: string[] = []; const paths = new Map<number, string>()
   const seam = { ...fs, openSync: (...args: Parameters<typeof fs.openSync>) => { const fd = fs.openSync(...args); paths.set(fd, String(args[0])); return fd }, fsyncSync: (fd: number) => { synced.push(paths.get(fd)!); fs.fsyncSync(fd) } } as typeof fs

@@ -1053,7 +1053,6 @@ describe('main() installs the runtime agent-director version re-check right afte
     ['the reload detection tick (<controller>.startDetection)', (controller) => new RegExp(`\\b${controller}\\s*\\.\\s*startDetection\\s*\\(`, 'g')],
     ['the boot template install (installSlackChannelBotTemplate)', () => /(?<![\w.$])installSlackChannelBotTemplate\s*\(/g],
     ['the start sweep (reconcileOrphans)', () => /(?<![\w.$])reconcileOrphans\s*\(/g],
-    ['the trust bootstrap (trustBootstrap)', () => /(?<![\w.$])trustBootstrap\s*\(/g],
     ['the JSONL-persistence safeguard (runJsonlPersistenceSafeguard)', () => /(?<![\w.$])runJsonlPersistenceSafeguard\s*\(/g],
     ['the Stop-hook bootstrap (stopHookBootstrap)', () => /(?<![\w.$])stopHookBootstrap\s*\(/g],
   ])('main() starts %s only if no shutdown has begun: an `if (shuttingDown) return` in main()\'s own statement list after the last await before the call', (_what, callPattern) => {

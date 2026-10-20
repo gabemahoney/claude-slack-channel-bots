@@ -46,7 +46,7 @@ import {
   type RetiredKeyAttemptStart,
 } from '../src/live-row-sequence.ts'
 import { _buildReconnectSessionAdapter, _setDeliveryLifecycle as setDeliveryLifecycle } from '../src/server.ts'
-import { _resetConfigDirFs, _resetConfiguredPersonaQuery, _resetFindMissingMemo, _resetInFlightLaunches, _resetLiveRowSequenceRegistry, _resetNotConnectedEpisodes, _resetNow, _resetPreLaunchReplyGuard, _resetPreLaunchTrustPatcher, _resetSpawnHomeDir, _resetWaitForWaitingTimeoutMs, _setConfigDirFs, _setFindMissingMemoTtlMs, _setNow, _setSpawnHomeDir, _setWaitForWaitingTimeoutMs, AGENT_DIRECTOR_LIVE_STATES, buildLiveRowSequenceDeps, bypassingFindMissingSweep, cancelWorkingRowWait, CARRIED_DEAD_EVIDENCE_NONE, carriedDeadEvidenceOf, checkLaunchConfigDir, checkPromptRowDeferral, compareRowToPersona, ConfigDirUnresolvableError, DEAD_EVIDENCE_NONE, DEAD_EVIDENCE_READ_BY_COLLISION_GET, DEAD_EVIDENCE_READ_BY_PATH, DEAD_EVIDENCE_READ_BY_POST_SWEEP_GET, DEAD_EVIDENCE_READ_BY_PROMPT_ROW_REREAD, DEAD_EVIDENCE_VOIDED_BY_RESUME_NOT_FOUND, DEAD_EVIDENCE_VOIDED_BY_RETIRED_KEY_FIRST_LAUNCH, DEAD_EVIDENCE_VOIDED_BY_REUSE_COLLISION_RERUN, DEAD_EVIDENCE_VOIDED_BY_ROW_NOT_INTERACTIVE, DEAD_SESSION_CAUSE_PROMPT_ROW_LADDER_GONE, DEAD_SESSION_CAUSE_ROW_ABSENT, DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE, DEAD_SESSION_CAUSE_ROW_READ_FINISHED, DEAD_SESSION_CAUSE_TMUX_GONE, DEAD_SESSION_CAUSES, deadEvidenceReadByCause, deadEvidenceVoidedLine, deadEvidenceVoidingRead, deadSessionRouteLine, decideNotResumable, describeDeadEvidence, describePersonaRowReread, ESCALATE_DEAD_EVIDENCE, ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ, ESCALATE_DEAD_VERDICTS,  escalateDeadSweepLine, escalateDeadVerdictOfCause, FIND_MISSING_LATCHED, FIND_MISSING_MEMO_TTL_MS, FIND_MISSING_REFUSED, FIND_MISSING_ROW_JUDGED_ALIVE, FIND_MISSING_ROW_LEFT_LIVE, FIND_MISSING_ROW_MARKED_MISSING, FIND_MISSING_ROW_NOT_JUDGED, findMissingRunReadName, forgetNotConnectedEpisode, handleDeliveryKeyError, handleDeliveryReadError, isDeadEvidence, isLaunchInFlight, isLiveRowSequenceRunning, joinedLaunchDropsDeadEvidenceLine, JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS, JSONL_DIAGNOSIS_REUSE_WORDING, JSONL_TRANSCRIPT_LOST_ENTRY_CLASS, KILL_CONTEXT_TEARDOWN, killPersonaInstance, killPersonaInstanceForTeardown, LAUNCH_VERB_RESUME, LAUNCH_VERB_REUSE_SPAWN, LAUNCH_VERB_SPAWN, launchForLiveRowSequence, launchSession, LIVE_ROW_START_NOT_INSTALLED, lostRaceOutcome, NOT_RESUMABLE_LATCHED, NOT_RESUMABLE_LOST_RACE, NOT_RESUMABLE_PENDING, NOT_RESUMABLE_PENDING_OUTCOME, NOT_RESUMABLE_SEQUENCE, notifyDisconnectedWithAutoRestartDisabled, notifyPersonaNotConnected, notifyRestartCapReached, notifySpawnFailure, notResumableSequenceOutcome, ORPHAN_CLEANUP_LIST_FAILED_LABEL, OWN_ROW_READ_ABSENT, OWN_ROW_READ_ROW, OWN_ROW_STATUS_ABSENT, OWN_ROW_STATUS_LATCHED, OWN_ROW_STATUS_REFUSED, OWN_ROW_STATUS_STATE, personaConfigDirLabelValue, plainSpawnCollisionLine, PRE_TRUST_LOG_PREFIX, preTrustLogLine, PROMPT_ROW_STATES, PROMPT_ROW_SWEEP_AFTER_MS, promptRowLadderAfterSweepLine, promptRowLadderLatchedLine, promptRowLadderNoActionLine, promptRowLadderNoPaneLine, promptRowLadderStoppingLine, readFindMissingRow, readPersonaOwnRow, readPersonaOwnRowStatus, readPersonaRowState, reconcileOrphans, RECONNECT_NOT_THIS_LAUNCH_NOTE, reconnectConflictLine, reconnectGoneLine, reconnectInvalidFlagsLine, reconnectLatchedLine, reconnectMcp, reconnectMcpWithCause, reconnectNotInteractiveLine, reconnectRowAbsentLine, reconnectStartLine, reconnectTransientLine, reconnectUnusableNameLine, REPLACE_REREAD_FINISHED_OUTCOME, REPLACE_REREAD_PENDING_OUTCOME, REPLACE_REREAD_REFUSED_OUTCOME, replaceRereadLine, resumeNotFoundSpawnLine, ROW_REREAD_FINISHED, ROW_REREAD_LATCHED, ROW_REREAD_LIVE, ROW_REREAD_PENDING, ROW_REREAD_REFUSED, ROW_REREAD_UNKNOWN, SEQUENCE_NOT_RESUMABLE_LOST_RACE_OUTCOME, sequenceLaunchAtCapLine, setConfigDirUnresolvableHook, setConfiguredPersonaQuery, setConflictLatch, setKillFailureAlerts, setPreLaunchReplyGuard, setPreLaunchTrustPatcher, setSessionNotifier, SPAWN_CAP_REACHED_REMEDIATION, SPAWN_FAILURE_DEFAULT_REMEDIATION, SPAWN_NOT_FOUND_REMEDIATION, spawnFailureNoticeText, spawnForPersona, spawnNotResumableLine, startLiveRowSequence, STARTUP_ERROR_SPAWN_FAILED, startupSessionManager, stopLiveRowSequence, sweepDeadTmuxChannel, transientReconnectLine, WAIT_OUTCOME_LATCHED, waitEndedDisconnectedLine, waitEndedOnStateReport, waitForWaitingAndReconnect, waitForWaitingAndReconnectWithCause, waitPollStatusErrorLine, waitRowAbsentLine, waitRowFinishedLine, waitTimedOutUnreadReport, whenLaunchSettled, type CarriedDeadEvidence, type ConfigDirUnresolvableHook, type DeadEvidenceSource, type DeadSessionCause, type FindMissingRowReading, type LaunchVerb, type NotConnectedNotice, type OwnRowReadSite, type PersonaRowReread, type PersonaTeardownKillResult, type ReconnectResult, type SessionConflictLatch, type SpawnPersonaResult, type StartupPersonaOutcome } from '../src/session-manager.ts'
+import { _resetConfigDirFs, _resetConfiguredPersonaQuery, _resetFindMissingMemo, _resetInFlightLaunches, _resetLiveRowSequenceRegistry, _resetNotConnectedEpisodes, _resetNow, _resetPreLaunchReplyGuard, _resetSpawnHomeDir, _resetWaitForWaitingTimeoutMs, _setConfigDirFs, _setFindMissingMemoTtlMs, _setNow, _setSpawnHomeDir, _setWaitForWaitingTimeoutMs, AGENT_DIRECTOR_LIVE_STATES, buildLiveRowSequenceDeps, bypassingFindMissingSweep, cancelWorkingRowWait, CARRIED_DEAD_EVIDENCE_NONE, carriedDeadEvidenceOf, checkLaunchConfigDir, checkPromptRowDeferral, compareRowToPersona, ConfigDirUnresolvableError, DEAD_EVIDENCE_NONE, DEAD_EVIDENCE_READ_BY_COLLISION_GET, DEAD_EVIDENCE_READ_BY_PATH, DEAD_EVIDENCE_READ_BY_POST_SWEEP_GET, DEAD_EVIDENCE_READ_BY_PROMPT_ROW_REREAD, DEAD_EVIDENCE_VOIDED_BY_RESUME_NOT_FOUND, DEAD_EVIDENCE_VOIDED_BY_RETIRED_KEY_FIRST_LAUNCH, DEAD_EVIDENCE_VOIDED_BY_REUSE_COLLISION_RERUN, DEAD_EVIDENCE_VOIDED_BY_ROW_NOT_INTERACTIVE, DEAD_SESSION_CAUSE_PROMPT_ROW_LADDER_GONE, DEAD_SESSION_CAUSE_ROW_ABSENT, DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE, DEAD_SESSION_CAUSE_ROW_READ_FINISHED, DEAD_SESSION_CAUSE_TMUX_GONE, DEAD_SESSION_CAUSES, deadEvidenceReadByCause, deadEvidenceVoidedLine, deadEvidenceVoidingRead, deadSessionRouteLine, decideNotResumable, describeDeadEvidence, describePersonaRowReread, ESCALATE_DEAD_EVIDENCE, ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ, ESCALATE_DEAD_VERDICTS,  escalateDeadSweepLine, escalateDeadVerdictOfCause, FIND_MISSING_LATCHED, FIND_MISSING_MEMO_TTL_MS, FIND_MISSING_REFUSED, FIND_MISSING_ROW_JUDGED_ALIVE, FIND_MISSING_ROW_LEFT_LIVE, FIND_MISSING_ROW_MARKED_MISSING, FIND_MISSING_ROW_NOT_JUDGED, findMissingRunReadName, forgetNotConnectedEpisode, handleDeliveryKeyError, handleDeliveryReadError, isDeadEvidence, isLaunchInFlight, isLiveRowSequenceRunning, joinedLaunchDropsDeadEvidenceLine, JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS, JSONL_DIAGNOSIS_REUSE_WORDING, KILL_CONTEXT_TEARDOWN, killPersonaInstance, killPersonaInstanceForTeardown, LAUNCH_VERB_RESUME, LAUNCH_VERB_REUSE_SPAWN, LAUNCH_VERB_SPAWN, launchForLiveRowSequence, launchSession, LIVE_ROW_START_NOT_INSTALLED, lostRaceOutcome, NOT_RESUMABLE_LATCHED, NOT_RESUMABLE_LOST_RACE, NOT_RESUMABLE_PENDING, NOT_RESUMABLE_PENDING_OUTCOME, NOT_RESUMABLE_SEQUENCE, notifyDisconnectedWithAutoRestartDisabled, notifyPersonaNotConnected, notifyRestartCapReached, notifySpawnFailure, notResumableSequenceOutcome, ORPHAN_CLEANUP_LIST_FAILED_LABEL, OWN_ROW_READ_ABSENT, OWN_ROW_READ_ROW, OWN_ROW_STATUS_ABSENT, OWN_ROW_STATUS_LATCHED, OWN_ROW_STATUS_REFUSED, OWN_ROW_STATUS_STATE, personaConfigDirLabelValue, plainSpawnCollisionLine, PRE_TRUST_LOG_PREFIX, preTrustLogLine, PROMPT_ROW_STATES, PROMPT_ROW_SWEEP_AFTER_MS, promptRowLadderAfterSweepLine, promptRowLadderLatchedLine, promptRowLadderNoActionLine, promptRowLadderNoPaneLine, promptRowLadderStoppingLine, readFindMissingRow, readPersonaOwnRow, readPersonaOwnRowStatus, readPersonaRowState, reconcileOrphans, RECONNECT_NOT_THIS_LAUNCH_NOTE, reconnectConflictLine, reconnectGoneLine, reconnectInvalidFlagsLine, reconnectLatchedLine, reconnectMcp, reconnectMcpWithCause, reconnectNotInteractiveLine, reconnectRowAbsentLine, reconnectStartLine, reconnectTransientLine, reconnectUnusableNameLine, REPLACE_REREAD_FINISHED_OUTCOME, REPLACE_REREAD_PENDING_OUTCOME, REPLACE_REREAD_REFUSED_OUTCOME, replaceRereadLine, resumeNotFoundSpawnLine, ROW_REREAD_FINISHED, ROW_REREAD_LATCHED, ROW_REREAD_LIVE, ROW_REREAD_PENDING, ROW_REREAD_REFUSED, ROW_REREAD_UNKNOWN, SEQUENCE_NOT_RESUMABLE_LOST_RACE_OUTCOME, sequenceLaunchAtCapLine, setConfigDirUnresolvableHook, setConfiguredPersonaQuery, setConflictLatch, setKillFailureAlerts, setPreLaunchReplyGuard, setSessionNotifier, SPAWN_CAP_REACHED_REMEDIATION, SPAWN_FAILURE_DEFAULT_REMEDIATION, SPAWN_NOT_FOUND_REMEDIATION, spawnFailureNoticeText, spawnForPersona, spawnNotResumableLine, startLiveRowSequence, STARTUP_ERROR_SPAWN_FAILED, startupSessionManager, stopLiveRowSequence, sweepDeadTmuxChannel, transientReconnectLine, WAIT_OUTCOME_LATCHED, waitEndedDisconnectedLine, waitEndedOnStateReport, waitForWaitingAndReconnect, waitForWaitingAndReconnectWithCause, waitPollStatusErrorLine, waitRowAbsentLine, waitRowFinishedLine, waitTimedOutUnreadReport, whenLaunchSettled, type CarriedDeadEvidence, type ConfigDirUnresolvableHook, type DeadEvidenceSource, type DeadSessionCause, type FindMissingRowReading, type LaunchVerb, type NotConnectedNotice, type OwnRowReadSite, type PersonaRowReread, type PersonaTeardownKillResult, type ReconnectResult, type SessionConflictLatch, type SpawnPersonaResult, type StartupPersonaOutcome } from '../src/session-manager.ts'
 import { useImmediateTypingLifecycle } from './test-helpers/legacy-typing.ts'
 useImmediateTypingLifecycle()
 
@@ -158,7 +158,6 @@ import {
   type LatchRowState,
   type RefusedOperation
 } from '../src/conflict-latch.ts'
-import { resolveJsonlPath } from '../src/cozempic.ts'
 import { AD_BELOW_PHASE1_FLOOR } from '../src/install-check-labels.ts'
 import {
   describeHoldVersion,
@@ -167,7 +166,7 @@ import {
   invalidFlagsHoldEndLine,
   invalidFlagsHoldSetLine,
 } from '../src/invalid-flags-hold.ts'
-import { FUNGIBLE_MODE_ZERO_REASON, runJsonlPersistenceSafeguard, UNATTRIBUTABLE_ZERO_REASON } from '../src/jsonl-persistence-check.ts'
+import { runJsonlPersistenceSafeguard } from '../src/jsonl-persistence-check.ts'
 import {
   KILL_FAILURE_CLOSING_DESTINATION,
   KILL_FAILURE_CLOSING_DESTINATION_LATCHED,
@@ -296,7 +295,7 @@ import {
 import { RETIRED_ENTRY_CLEARING_STATES } from '../src/row-read-rules.ts'
 import {
   _forceResumeForPersona, _forceReuseSpawnForPersona, _resetInvalidFlagsHold, _resetOldLifeHolds, _resetOldLifeWaitBindings, _resetRetiredKeyStore, abortKillOwnStuckLaunch, buildOldLifeWaitDeps, buildPendingRowRuleDeps, COLLISION_GET_SITE, createOldLifeHoldEndRetry, createOldLifeWaitRecord,
-  ensureOldLifeWait, forgetLaunchCalls, isCscbOwnLaunch, isOldLifeWaitRunningFor, isOwnRowOldLifeHeld, isSequenceOrOldLifeWaitRunning, JSONL_NO_CANDIDATES_TEXT, jsonlCandidatesInconclusiveNoticeText, jsonlCandidatesText, jsonlTranscriptLostNoticeText, ladderRuleRetryingLine, LATCH_RECHECK_AT_CAP,
+  ensureOldLifeWait, forgetLaunchCalls, isCscbOwnLaunch, isOldLifeWaitRunningFor, isOwnRowOldLifeHeld, isSequenceOrOldLifeWaitRunning, JSONL_NO_CANDIDATES_TEXT, jsonlCandidatesInconclusiveNoticeText, jsonlCandidatesText, ladderRuleRetryingLine, LATCH_RECHECK_AT_CAP,
   LATCH_RECHECK_OBSERVER_FAILED,
   LATCH_RECHECK_STATUS_READ_SITE, latchedElsewhereDuringCallLine, latchedLaunchSkipLine, latchEntryQueryFailedLine, latchRecheckAtCapLine,
   latchRecheckNotUpLine,
@@ -586,6 +585,8 @@ function installStub(opts: StubClientOptions = {}): StubClient {
   return stub
 }
 
+const JSONL_TRANSCRIPT_LOST_ENTRY_CLASS = 'jsonl-transcript-lost' // retired diagnostic: must stay absent
+
 /**
  * Per-test temp directory: `baseDir` for the persona fixtures and the parent
  * of any working, config or home directory a test creates. Removed in afterEach.
@@ -719,7 +720,6 @@ afterEach(() => {
 
   _resetOutageState()
   _resetSpawnHomeDir()
-  _resetPreLaunchTrustPatcher()
   _resetPreLaunchReplyGuard()
   _resetLaunchedWithDirs()
   _resetConfigDirFs()
@@ -2262,16 +2262,14 @@ describe('collision ladder: config_dir guard before resume (b.av2 SR-6.2, AC 48)
 })
 
 // ---------------------------------------------------------------------------
-// b.av2 SR-6.2 — the pre-launch trust patch precedes every launch
+// b.av2 SR-6.2 — AD owns native pre-trust on every launch
 // ---------------------------------------------------------------------------
 //
-// The seam is empty by default (and reset in afterEach), so no test here
-// installs the production trust patch or writes a `.claude.json`. Order is
-// read from one shared event log: the recording patcher and the stub's
-// `spawn` / `resume` all append to it.
+// Native config is fixture data only. Every launch path preserves its bytes;
+// launch ordering comes from the AD stub's spawn and resume calls.
 
 /** One entry of the shared launch-order log. */
-type LaunchEvent = 'patch' | 'spawn' | 'resume'
+type LaunchEvent = 'spawn' | 'resume'
 
 /**
  * Append 'spawn' / 'resume' to `events` on each such call through `stub`, then
@@ -2281,20 +2279,7 @@ function recordLaunchCalls(stub: StubClient, events: LaunchEvent[]): StubClient 
   return observeLaunchCalls(stub, (call) => events.push(call))
 }
 
-/**
- * Install a recording pre-launch trust patcher: each call appends 'patch' to
- * `events`. Returns the personas it was called with, in order.
- */
-function installRecordingPatcher(events: LaunchEvent[]): Persona[] {
-  const patched: Persona[] = []
-  setPreLaunchTrustPatcher((persona) => {
-    events.push('patch')
-    patched.push(persona)
-  })
-  return patched
-}
-
-describe('pre-launch trust patch (b.av2 SR-6.2)', () => {
+describe('AD pre-trust ownership (b.d6n)', () => {
   /** One launch path: how to reach it, what it returns and the expected launch-order log. */
   interface LaunchPath {
     install: (cfg: PersonaConfig, calls: LadderCalls) => StubClient
@@ -2315,26 +2300,26 @@ describe('pre-launch trust patch (b.av2 SR-6.2)', () => {
       install: (_cfg, calls) => installStub({ ...calls }),
       launch: spawnC,
       expected: { key: 'C', action: 'spawned' },
-      events: ['patch', 'spawn'],
+      events: ['spawn'],
     }],
     ['resume of an ended row', {
       install: (cfg, calls) => installResumeEntry('ended', personaRow(cfg, 'C'), calls),
       launch: spawnC,
       expected: { key: 'C', action: 'resumed' },
-      events: ['patch', 'spawn', 'resume'],
+      events: ['spawn', 'resume'],
     }],
     ['dead-session recovery from a waiting row that resumes', {
       install: (cfg, calls) => installResumeEntry('waiting (dead session)', personaRow(cfg, 'C'), calls),
       launch: spawnC,
       expected: { key: 'C', action: 'resumed' },
-      events: ['patch', 'spawn', 'resume'],
+      events: ['spawn', 'resume'],
     }],
     ['restart launchSession adapter, resume of an ended row', {
       install: (cfg, calls) => installResumeEntry('ended', personaRow(cfg, 'C'), calls),
       launch: (cfg) => launchSession('C', cfg),
       // b.4q8: counted once its row reports in.
       expected: LAUNCH_RESUMED_UNREPORTED,
-      events: ['patch', 'spawn', 'resume'],
+      events: ['spawn', 'resume'],
     }],
     ['the reuse spawn after resume ErrJsonlMissing and its diagnosis (b.jg5 SRJ-712)', {
       install: (cfg, calls) =>
@@ -2349,159 +2334,23 @@ describe('pre-launch trust patch (b.av2 SR-6.2)', () => {
         }),
       launch: spawnC,
       expected: { key: 'C', action: 'fresh-after-inconclusive-amnesia' },
-      events: ['patch', 'spawn', 'resume', 'spawn'],
+      events: ['spawn', 'resume', 'spawn'],
     }],
   ]
 
-  test.each(LAUNCH_PATHS)('%s: patched once, for the persona, before its first spawn or resume', async (_name, path) => {
+  test.each(LAUNCH_PATHS)('%s leaves native trust bytes unchanged and lets AD own pre-trust', async (_name, path) => {
     captureStartupErrors()
     const { cfg, configDir } = labelConfig()
-    const persona = personaOf(cfg, 'C')
+    const nativeConfig = join(configDir, '.claude.json')
+    const bytes = '{"projects":{"existing":{"hasTrustDialogAccepted":false}},"unrelated":"keep"}\n'
+    writeFileSync(nativeConfig, bytes)
     const events: LaunchEvent[] = []
-    const patched = installRecordingPatcher(events)
-    recordLaunchCalls(path.install(cfg, newLadderCalls()), events)
-
-    let result: unknown
-    await withCapturedErr(async () => {
-      result = await path.launch(cfg)
-    })
-
-    expect(result).toEqual(path.expected)
-    // Exactly one patch, and it comes before every agent-director launch call.
+    const calls = newLadderCalls()
+    recordLaunchCalls(path.install(cfg, calls), events)
+    expect(await path.launch(cfg)).toEqual(path.expected)
     expect(events).toEqual(path.events)
-    expect(patched).toHaveLength(1)
-    // For the persona being launched: its effective config dir and working directory.
-    expect(patched[0]).toBe(persona)
-    expect(patched[0]!.claude_config_dir).toBe(configDir)
-    expect(patched[0]!.working_directory).toBe(persona.working_directory)
-  })
-
-  test('a persona whose claude_config_dir overrides the top-level one is patched for its own directory; one that inherits gets the top-level one', async () => {
-    useSpawnHome()
-    const topLevel = fixtureSubdir('top-level-config')
-    const own = fixtureSubdir('persona-config')
-    const cfg = makeStandInPersonaConfig(
-      {
-        C: { working_directory: fixtureSubdir('work-c'), claude_config_dir: own },
-        D: { working_directory: fixtureSubdir('work-d') },
-      },
-      fixtureDir,
-      { claude_config_dir: topLevel },
-    )
-    const spawnCalls: import('agent-director').SpawnParams[] = []
-    installStub({ spawnCalls })
-    const patched = installRecordingPatcher([])
-
-    expect(await spawnForPersona(personaOf(cfg, 'C'), cfg)).toEqual({ key: 'C', action: 'spawned' })
-    expect(await spawnForPersona(personaOf(cfg, 'D'), cfg)).toEqual({ key: 'D', action: 'spawned' })
-
-    expect(patched.map((p) => [p.key, p.claude_config_dir, p.working_directory])).toEqual([
-      ['C', own, personaOf(cfg, 'C').working_directory],
-      ['D', topLevel, personaOf(cfg, 'D').working_directory],
-    ])
-    // The patched directory is the one the launch runs under.
-    expect(spawnCalls.map((p) => p.extra_env?.['CLAUDE_CONFIG_DIR'])).toEqual([own, topLevel])
-  })
-
-  test('dry run: the patcher is never called and nothing is launched', async () => {
-    process.env['SLACK_DRY_RUN'] = '1'
-    const { cfg } = labelConfig()
-    const calls = newLadderCalls()
-    installStub({ ...calls })
-    const patched = installRecordingPatcher([])
-
-    await withCapturedErr(async () => {
-      expect(await spawnForPersona(personaOf(cfg, 'C'), cfg)).toEqual({ key: 'C', action: 'no-op' })
-      expect(await launchSession('C', cfg)).toBe(true)
-    })
-
-    expect(patched).toHaveLength(0)
-    expect(calls.spawnCalls).toHaveLength(0)
-    expect(calls.resumeCalls).toHaveLength(0)
-  })
-
-  test('a caller that joins a launch in flight does not patch again; the next ladder patches once more', async () => {
-    const { cfg } = labelConfig()
-    const persona = personaOf(cfg, 'C')
-    let spawnsSeen = 0
-    const stub = installStub({})
-    // Hold only the first spawn open, so the second caller joins that ladder.
-    const held = holdSpawns(stub, () => spawnsSeen++ === 0)
-    const events: LaunchEvent[] = []
-    const patched = installRecordingPatcher(events)
-    recordLaunchCalls(stub, events)
-
-    let results!: Awaited<ReturnType<typeof spawnForPersona>>[]
-    const errLog = await withCapturedErr(async () => {
-      const a = spawnForPersona(persona, cfg)
-      const b = spawnForPersona(persona, cfg)
-      await held.entered('cscb_C')
-      held.release('cscb_C')
-      results = await Promise.all([a, b])
-    })
-
-    expect(results[1]).toBe(results[0])
-    expect(errLog).toContain(`launch already in flight for ${renderPersonaRef('C', 'C')} — joining it`)
-    expect(events).toEqual(['patch', 'spawn'])
-    expect(patched).toEqual([persona])
-
-    // A later call is a new ladder: patched once, before its spawn.
-    expect(await spawnForPersona(persona, cfg)).toEqual({ key: 'C', action: 'spawned' })
-    expect(events).toEqual(['patch', 'spawn', 'patch', 'spawn'])
-  })
-
-  test.each([
-    ['fresh spawn', 'spawned'],
-    ['resume of an ended row', 'resumed'],
-  ] as const)('a patcher that throws is logged and the launch goes on (%s → %s)', async (path, action) => {
-    const readLog = captureStartupErrors()
-    const { cfg } = labelConfig()
-    const calls = newLadderCalls()
-    if (path === 'fresh spawn') installStub({ ...calls })
-    else installResumeEntry('ended', personaRow(cfg, 'C'), calls)
-    let attempts = 0
-    setPreLaunchTrustPatcher(() => {
-      attempts++
-      throw Object.assign(new Error('trust patch exploded'), { code: 'EACCES' })
-    })
-
-    let result!: Awaited<ReturnType<typeof spawnForPersona>>
-    const errLog = await withCapturedErr(async () => {
-      result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
-    })
-
-    // The ladder outcome is what it would be with no patcher at all.
-    expect(result).toEqual({ key: 'C', action })
-    expect(attempts).toBe(1)
-    expect(calls.spawnCalls).toHaveLength(1)
-    expect(calls.resumeCalls).toHaveLength(action === 'resumed' ? 1 : 0)
-    expect(errLog).toContain(
-      `spawnForPersona: pre-launch trust patch failed for ${renderPersonaRef('C', 'C')} — launching anyway: `,
-    )
-    // Described the safe-to-log way: its type and code.
-    expect(errLog).toContain('launching anyway: Error code=EACCES')
-    // Logged only: no startup error, no spawn-failure notice.
-    expect(readLog()).toBe('')
-    expect(notices).toHaveLength(0)
-  })
-
-  test("with no patcher installed (the default, and after the test-only reset) no patch runs and the persona's .claude.json is untouched", async () => {
-    const { cfg, configDir } = labelConfig()
-    // A patchable file in the persona's config dir: any trust patch would add
-    // the working directory to `projects`.
-    const claudeJson = join(configDir, '.claude.json')
-    writeFileSync(claudeJson, '{"projects":{}}')
-    const before = readFileSync(claudeJson)
-    const patched = installRecordingPatcher([])
-    _resetPreLaunchTrustPatcher()
-    const calls = newLadderCalls()
-    installStub({ ...calls })
-
-    expect(await spawnForPersona(personaOf(cfg, 'C'), cfg)).toEqual({ key: 'C', action: 'spawned' })
-
-    expect(patched).toHaveLength(0)
-    expect(calls.spawnCalls).toHaveLength(1)
-    expect(readFileSync(claudeJson).equals(before)).toBe(true)
+    expect(readFileSync(nativeConfig, 'utf8')).toBe(bytes)
+    expect(calls.spawnCalls.every(call => call.no_pre_trust !== true)).toBe(true)
   })
 })
 
@@ -3130,10 +2979,9 @@ describe('launchSession: the relaunch gate (canLaunch)', () => {
     const readLog = captureStartupErrors()
     const { cfg } = labelConfig()
     const events: LaunchEvent[] = []
-    const patched = installRecordingPatcher(events)
     const calls = newLadderCalls()
     recordLaunchCalls(installStub({ ...calls }), events)
-    return { cfg, events, patched, calls, readLog }
+    return { cfg, events, calls, readLog }
   }
 
   test('canLaunch false: \'skipped\' — the gate is asked once with the key; no trust patch, no agent-director call, no notice, no startup error', async () => {
@@ -3148,14 +2996,13 @@ describe('launchSession: the relaunch gate (canLaunch)', () => {
     expect(result).toBe('skipped')
     expect(asked).toEqual(['C'])
     expect(f.events).toEqual([])
-    expect(f.patched).toEqual([])
     expect(f.calls).toEqual(newLadderCalls())
     expect(notices).toEqual([])
     expect(f.readLog()).toBe('')
     expect(errLog).toBe('')
   })
 
-  test('canLaunch true: launched as without a gate — patched once, then spawned; true', async () => {
+  test('canLaunch true: spawned through the launch gate; true', async () => {
     const f = gateFixture()
 
     let result: LaunchSessionResult | undefined
@@ -3164,7 +3011,7 @@ describe('launchSession: the relaunch gate (canLaunch)', () => {
     })
 
     expect(result).toBe(true)
-    expect(f.events).toEqual(['patch', 'spawn'])
+    expect(f.events).toEqual(['spawn'])
     expect(f.calls.spawnCalls.map((p) => p.instance_id)).toEqual(['cscb_C'])
   })
 
@@ -3179,7 +3026,6 @@ describe('launchSession: the relaunch gate (canLaunch)', () => {
 
     expect(asked).toEqual(['C_UNKNOWN'])
     expect(f.events).toEqual([])
-    expect(f.patched).toEqual([])
     expect(f.calls).toEqual(newLadderCalls())
     expect(notices).toEqual([])
   })
@@ -3214,7 +3060,7 @@ describe('launchSession: a key outside the applied set (b.av2 SR-8.6)', () => {
     )
     let appliedSet: readonly Persona[] = cfg.personas
     const events: Array<LaunchEvent | 'guard' | 'undo'> = []
-    setPreLaunchTrustPatcher(() => void events.push('patch'))
+
     const rg = makeReplyGuardRecordDir({ parentDir: fixtureDir })
     installRecordingReplyGuard(() => appliedSet, rg.stateDir, events)
     const calls = makeStubCallLog()
@@ -3256,7 +3102,7 @@ describe('launchSession: a key outside the applied set (b.av2 SR-8.6)', () => {
     expect(errLog).toBe('')
   })
 
-  test('control: an applied key through the same gate is patched, guarded and spawned as before; true', async () => {
+  test('control: an applied key through the same gate is guarded and spawned; true', async () => {
     const f = appliedFixture()
 
     let result: LaunchSessionResult | undefined
@@ -3266,7 +3112,7 @@ describe('launchSession: a key outside the applied set (b.av2 SR-8.6)', () => {
 
     expect(result).toBe(true)
     expect(f.gateLines).toEqual([])
-    expect(f.events).toEqual(['patch', 'guard', 'spawn'])
+    expect(f.events).toEqual(['guard', 'spawn'])
     expect(f.calls.spawnCalls.map((p) => p.instance_id)).toEqual([GUARD_INSTANCE])
     expect(f.rg.readRecord(GUARD_KEY)).toBe('true')
     expect(getLaunchedWithDir(GUARD_KEY)).toBe(f.configDir)
@@ -6060,7 +5906,7 @@ describe('b.g57: an unresolvable claude_config_dir keeps the row and skips the l
     // The row the persona's last spawn left: its label matches the directory.
     const row = personaRow(cfg, GUARD_KEY)
     const events: string[] = []
-    setPreLaunchTrustPatcher(() => void events.push('patch'))
+
     const rg = makeReplyGuardRecordDir({ parentDir: fixtureDir })
     installRecordingReplyGuard(cfg.personas, rg.stateDir, events)
     const held: Array<Parameters<ConfigDirUnresolvableHook>> = []
@@ -9393,8 +9239,7 @@ describe('wrapper-migration: spawn/resume success-clear (Group C)', () => {
 // When resume throws ErrJsonlMissing, CSCB brings the persona up fresh by one
 // reuse spawn of the same id, after the diagnosis (b.jg5 SRJ-707, SRJ-712),
 // and: (1) logs which transcript path(s) were tried and their source; (2)
-// classifies never-created (quiet, lossless) vs lost (operator-visible) vs
-// unknown (row fetch failed); (3) counts the launch as its own
+// reports AD transcript references while retaining uncertainty about actual loss; (3) counts the launch as its own
 // 'fresh-after-amnesia' bucket instead of folding it into "ok". The order of
 // the diagnosis and the reuse, and the texts, are the SRJ-712 describe's.
 // ---------------------------------------------------------------------------
@@ -9452,1532 +9297,103 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     })
   }
 
-  // --- Regression requirement (designated) --------------------------------
-  // Pre-fix: ErrJsonlMissing → action 'spawned', folded into succeeded/"ok",
-  // and StartupSessionManagerResult had no freshAfterAmnesia field. This test
-  // asserts the dedicated 'fresh-after-amnesia' action AND the separate
-  // freshAfterAmnesia counter — both undefined/wrong pre-fix, so it FAILS pre-fix
-  // and PASSES post-fix. (Verified by inspecting HEAD:src/session-manager.ts,
-  // whose ErrJsonlMissing branch returns { action: 'spawned' } and whose result
-  // shape is { succeeded, failed, perChannel } only.)
-  // b.fwu: this config sets NO message_archive_db, so makeDefaultArchiveCount
-  // yields null and the diagnosis is INCONCLUSIVE (case c-config: no archive is
-  // configured, so there is no evidence source to consult). It must land in the
-  // dedicated freshAfterInconclusiveAmnesia bucket — never folded into the
-  // known-cause freshAfterAmnesia. Pre-fix (no 'inconclusive' classification,
-  // no separate counter, no 'fresh-after-inconclusive-amnesia' action) this
-  // FAILS; post-fix it PASSES.
-  test('REGRESSION: ErrJsonlMissing fresh-spawn with no archive configured is counted as fresh-after-inconclusive-amnesia, not fresh-after-amnesia', async () => {
-    captureStartupErrors()
-    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
-    installAmnesia({
-      cfg,
-      getResult: { jsonl_path: '/data/proj/sess-1.jsonl', session_id: 'sess-1', cwd: CWD },
-    })
-    const result = await startupSessionManager(cfg, { concurrency: 1 })
-
-    expect(result.freshAfterInconclusiveAmnesia).toBe(1)
-    expect(result.freshAfterAmnesia).toBe(0)
-    expect(result.freshSpawned).toBe(0)
-    expect(result.resumed).toBe(0)
-    expect(result.failed).toBe(0)
-    // Still counted toward liveness, but distinctly bucketed.
-    expect(result.succeeded).toBe(1)
-    expect(result.perPersona).toEqual([
-      { key: CH, action: 'fresh-after-inconclusive-amnesia' },
-    ])
-  })
-
-  // --- Honest counters tallied separately ---------------------------------
-  test('startup counters: resumed / fresh-spawned / fresh-after-amnesia / failed are tallied separately', async () => {
-    captureStartupErrors()
-    let getIdx = 0
-    const stub = installStub({
-      // C1 fresh (clean spawn), C2 collision→resumed, C3 collision→ErrJsonlMissing
-      // amnesia, C4 spawn throws → failed.
-      spawnQueue: [
-        cannedOk<StubSpawnResult>({ instance_id: 'cscb_C1' }),
-        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<StubSpawnResult>({ instance_id: 'cscb_C3' }),
-        cannedErr<import('agent-director').SpawnResult>(errGeneric('spawn', 'ErrSpawnBroken')),
-      ],
-    })
-    // C2 resumes cleanly; C3 resume throws ErrJsonlMissing.
-    stub.resume = async (params) => {
-      if (params.instance_id === 'cscb_C3') throw errJsonlMissing()
-      return { instance_id: params.instance_id }
-    }
-    const cfg = makeStandInPersonaConfig(
-      {
-        C1: { working_directory: '/x1' },
-        C2: { working_directory: '/x2' },
-        C3: { working_directory: '/x3' },
-        C4: { working_directory: '/x4' },
-      },
-      fixtureDir,
-    )
-    // Both collision gets return an `ended` row for their own persona.
-    const personaGet = personaRowsGet(cfg, { state: 'ended' })
-    stub.get = async (params) => {
-      getIdx++
-      return personaGet(params)
-    }
+  test.each([0, 4, undefined])('b.d6n: archive count %s leaves history unverified, preserves the row, and counts the replacement separately', async archived => {
+    const readLog = captureStartupErrors()
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir,
+      archived === undefined ? {} : { message_archive_db: makeArchiveWithMessagesSince('2026-09-20T05:00:00Z', archived) })
+    const calls = newLadderCalls(), order: string[] = []
+    const stub = installAmnesia({ cfg, ...calls, getResult: {
+      jsonl_path: '/ad/opaque/current-rollout.jsonl', session_id: 'current-session', cwd: CWD,
+      transcript_status: 'rotated', started_at: '2026-09-20T05:00:00Z',
+      prior_sessions: [{ session_id: 'old-session', jsonl_path: '/ad/history.jsonl' }],
+    } })
+    const originalGet = stub.get.bind(stub), originalSpawn = stub.spawn.bind(stub)
+    stub.get = async params => { order.push('get'); return originalGet(params) }
+    stub.spawn = async params => { order.push(params.reuse_finished ? 'reuse' : 'spawn'); return originalSpawn(params) }
     let result!: Awaited<ReturnType<typeof startupSessionManager>>
-    const errLog = await withCapturedErr(async () => {
-      result = await startupSessionManager(cfg, { concurrency: 1 })
-    })
-
-    expect(result.freshSpawned).toBe(1) // C1
-    expect(result.resumed).toBe(1) // C2
-    // C3: ErrJsonlMissing with no message_archive_db configured → the diagnosis
-    // is inconclusive (c-config), so it lands in the dedicated inconclusive
-    // bucket, not freshAfterAmnesia.
-    expect(result.freshAfterInconclusiveAmnesia).toBe(1) // C3
-    expect(result.freshAfterAmnesia).toBe(0)
-    expect(result.failed).toBe(1) // C4
-    expect(result.succeeded).toBe(3)
-    // C2's collision recovery does one get(); C3's collision recovery plus its
-    // ErrJsonlMissing diagnostic each do one → 3 get() calls total.
-    expect(getIdx).toBe(3)
-
-    // AC 3: the honest summary line reports every bucket separately (never
-    // folding amnesia into a generic "ok"), splitting diagnosed
-    // (fresh-after-amnesia) from undiagnosable (fresh-after-inconclusive-amnesia).
-    expect(errLog).toContain(
-      'startupSessionManager: complete — 4 persona(s): 1 resumed, 1 fresh-spawned, ' +
-        '0 fresh-after-amnesia, 1 fresh-after-inconclusive-amnesia, ' +
-        '0 reconnected, 0 no-op, 1 failed, 0 not brought up',
-    )
-    // Because freshAfterInconclusiveAmnesia > 0, its loud grep-friendly
-    // follow-up line fires (the freshAfterAmnesia line does not — count is 0).
-    expect(errLog).toContain(
-      '1 persona(s) were fresh-spawned after ErrJsonlMissing WITHOUT a conclusive diagnosis',
-    )
-    expect(errLog).not.toContain(
-      '1 persona(s) were fresh-spawned after ErrJsonlMissing (transcript could not be resumed)',
-    )
-  })
-
-  // --- Message-shape coverage: all three AD source tokens (b.hcq) ---------
-  // AD v0.10.0's formatJsonlAttempts stamps three source tokens — persisted,
-  // fallback and history. Pre-fix the parser anchored on persisted|fallback
-  // only, so every `history` candidate (the archived-session evidence that
-  // distinguishes "lost" from "never written") was silently dropped.
-
-  /** Render one AD attempt the way formatJsonlAttempts does. */
-  function adAttempt(source: string, path: string): string {
-    return `${source} ${path} (no such file or directory)`
-  }
-
-  /** Drive the amnesia diagnostic with `desc` and return the captured log. */
-  async function logForDescription(desc: string): Promise<string> {
-    return withCapturedErr(async () => {
-      const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
-      installAmnesia({
-        cfg,
-        jsonlDescription: desc,
-        getResult: { jsonl_path: '/data/proj/sess-1.jsonl', session_id: 'sess-1', cwd: CWD },
-      })
-      await spawnForPersona(personaOf(cfg, CH), cfg, true)
-    })
-  }
-
-  test('0.12 resume candidates include only persisted and fallback, ignoring older history', async () => {
-    captureStartupErrors()
-    const attempts = [
-      adAttempt('persisted', '/data/proj/sess-1.jsonl'),
-      adAttempt('fallback', '/home/u/.claude/projects/-repo-wrb/sess-1.jsonl'),
-      adAttempt('history', '/home/u/.claude/projects/-old-repo/sess-0.jsonl'),
-    ]
-    const log = await logForDescription(`no transcript found: ${attempts.join('; ')}`)
-    // Exactly the three AD candidates, joined in AD's order — nothing dropped,
-    // nothing reordered, no locally-computed padding.
-    expect(log).toContain(
-      `Transcript candidates tried (paths+sources reported by agent-director): ${attempts.slice(0, 2).join('; ')}.`,
-    )
-    expect(log).not.toContain('locally-computed')
-  })
-
-  test('history-only description gives no latest-session evidence and computes current candidates', async () => {
-    captureStartupErrors()
-    const attempt = adAttempt('history', '/home/u/.claude/projects/-old-repo/sess-0.jsonl')
-    const log = await logForDescription(`no transcript found: ${attempt}`)
-    expect(log).toContain('agent-director gave no path detail')
-    expect(log).toContain('locally-computed')
-    const candidates = log.split('Transcript candidates tried').slice(1).join('Transcript candidates tried')
-    expect(candidates).not.toContain('history /home/u/.claude/projects/-old-repo/sess-0.jsonl')
+    const errLog = await withCapturedErr(async () => { result = await startupSessionManager(cfg, { concurrency: 1 }) })
+    expect(result.perPersona).toEqual([{ key: CH, action: 'fresh-after-inconclusive-amnesia' }])
+    expect([result.freshAfterAmnesia, result.freshAfterInconclusiveAmnesia, result.failed]).toEqual([0, 1, 0])
+    expect(calls.deleteCalls).toEqual([])
+    expect(calls.spawnCalls.map(p => p.reuse_finished)).toEqual([undefined, true])
+    expect(order).toEqual(['spawn', 'get', 'get', 'reuse'])
+    expect(countStartupEntries(readLog(), JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toBe(1)
+    expect(readLog()).toContain('transcript_status=rotated')
+    expect(readLog()).toContain('jsonl_path=/ad/opaque/current-rollout.jsonl')
+    expect(readLog()).toContain('prior_sessions=1')
+    expect(readLog()).toContain('does not establish whether prior conversation history was lost')
+    expect(readLog()).not.toContain(JSONL_TRANSCRIPT_LOST_ENTRY_CLASS)
+    expect(errLog).not.toMatch(/history.*LOST|transcript never created|locally-computed|archive (?:holds|shows)/)
+    expect(notices).toHaveLength(1)
+    expect(notices[0]!.text).toContain(JSONL_DIAGNOSIS_REUSE_WORDING)
   })
 
   test.each([
-    ['history: /p/sess.jsonl - missing', 'source token not followed by a path + parens'],
-    ['archived /p/sess.jsonl (no such file or directory)', 'unknown source token'],
-    ['history(/p/sess.jsonl)', 'no whitespace-separated path'],
-  ])('malformed description (%s) parses to no AD candidates without throwing', async (desc) => {
-    captureStartupErrors()
-    const log = await logForDescription(desc)
-    // Non-throwing: the diagnostic still ran and degraded honestly to locally
-    // computed candidates rather than claiming AD reported none.
-    expect(log).toContain('agent-director gave no path detail')
-    expect(log).toContain('locally-computed(persisted-column) /data/proj/sess-1.jsonl')
-    expect(log).not.toContain('paths+sources reported by agent-director')
-  })
-
-  // --- Message-shape coverage: plain non-enumerated format ----------------
-  // A pre-b.1ba AD's ErrJsonlMissing carries no per-candidate enumeration. The
-  // diagnostic must degrade to locally-computed candidates, label them
-  // honestly, and never throw (spawnForPersona still completes the amnesia
-  // fresh-spawn).
-  test('plain non-enumerated ErrJsonlMissing message: degrades to honest locally-computed candidates, no throw', async () => {
-    captureStartupErrors()
-    const log = await withCapturedErr(async () => {
-      const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
-      installAmnesia({
-        cfg,
-        jsonlDescription: 'jsonl missing', // no <source> <path> (<err>) enumeration
-        getResult: { jsonl_path: '/data/proj/sess-2.jsonl', session_id: 'sess-2', cwd: CWD },
-      })
-      const result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
-      // Never throws — the fresh-spawn still happens. No message_archive_db is
-      // configured here, so the diagnosis is inconclusive (c-config).
-      expect(result.action).toBe('fresh-after-inconclusive-amnesia')
-    })
-    // Honest provenance clause + locally-computed labels for both persisted
-    // column and config-dir fallback.
-    expect(log).toContain('agent-director gave no path detail')
-    expect(log).toContain('locally-computed(persisted-column) /data/proj/sess-2.jsonl')
-    expect(log).toContain('locally-computed(config-dir fallback)')
-  })
-
-  // --- Classification triad: never-created (quiet) ------------------------
-  // No archived messages since spawn → lossless. Quiet: no startup-error, no
-  // persona notice; action still fresh-after-amnesia.
-  test('never-created: 0 archived messages since spawn → quiet (no startup-error, no persona notice)', async () => {
-    const readLog = captureStartupErrors()
-    const dbPath = makeArchiveWithMessagesSince('2026-09-20T05:00:00Z', 0)
-    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir, { message_archive_db: dbPath })
-    installAmnesia({
-      cfg,
-      getResult: {
-        jsonl_path: '/data/proj/sess-3.jsonl',
-        session_id: 'sess-3',
-        cwd: CWD,
-        started_at: '2026-09-20T05:00:00Z',
-      },
-    })
-    const result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
-
-    // b.fwu: evidence-based never-created is the DIAGNOSED-lossless case — it
-    // stays quiet and is bucketed as the ordinary fresh-after-amnesia action,
-    // NOT the undiagnosable fresh-after-inconclusive-amnesia.
-    expect(result.action).toBe('fresh-after-amnesia')
-    expect(notices).toHaveLength(0) // no persona notice at all
-    const log = readLog()
-    expect(log).not.toContain(JSONL_TRANSCRIPT_LOST_ENTRY_CLASS) // quiet
-    expect(log).not.toContain(JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS) // not inconclusive
-  })
-
-  // --- Classification triad: lost (loud) ----------------------------------
-  // Archived messages > 0 since spawn → real context destroyed. Loud:
-  // recordStartupError('jsonl-transcript-lost-on-resume') + a persona notice to
-  // the persona's destination (b.av2 SR-7.2). The startup error is recorded
-  // only when isStartup=true, so this drives that.
-  test('lost: archived messages since spawn > 0 → startup-error recorded + persona notice to the destination', async () => {
-    const readLog = captureStartupErrors()
-    // Four post-spawn messages under its destination, its only `delivery: all`
-    // channel (what is counted, b.av2 SR-7.4), and four under the persona key,
-    // which is not a channel of the persona and is not counted: the count is 4.
-    const startedAt = '2026-09-20T05:00:00Z'
-    const boundary = Date.parse(startedAt) / 1000
-    const rows = [1, 2, 3, 4].flatMap((i) => [
-      { ts: boundary + i, channel: NOTICE_KEY },
-      { ts: boundary + i, channel: NOTICE_DEST },
-    ])
-    const archive = buildTempArchiveDb(rows, NOTICE_KEY)
-    archiveCleanups.push(archive.cleanup)
-    const cfg = makeNoticeConfig({ message_archive_db: archive.dbPath })
-    installAmnesia({
-      cfg,
-      key: NOTICE_KEY,
-      getResult: {
-        jsonl_path: '/data/proj/sess-4.jsonl',
-        session_id: 'sess-4',
-        // cwd: the notice persona's own working directory (personaRow).
-        started_at: startedAt,
-      },
-    })
-    const h = installNoticeNotifier(cfg)
-    const result = await spawnForPersona(personaOf(cfg, NOTICE_KEY), cfg, true)
-    await settleNotices()
-
-    expect(result.action).toBe('fresh-after-amnesia')
-    // Operator-visible: startup-error entry embedding the archived count.
-    const log = readLog()
-    expect(log).toContain(JSONL_TRANSCRIPT_LOST_ENTRY_CLASS)
-    expect(log).toContain('4 message(s)')
-    // And a persona notice to the persona's destination only.
-    const text = expectOneNoticeToDestination(h)
-    expect(text).toContain('message archive shows 4 message(s) since I started')
-    expect(text).toContain('my conversation memory has been lost')
-    expect(text).not.toContain('could not determine whether my prior')
-  })
-
-  // --- Classification triad: inconclusive (row fetch finds no row) --------
-  // b.fwu case (a): the diagnostic get() finds no row → the row cannot be
-  // consulted, so we cannot classify loss vs never-created. Must not throw;
-  // the reuse spawn still brings the persona up, bucketed as the dedicated
-  // 'fresh-after-inconclusive-amnesia' action. With no row, the reuse is an
-  // ordinary fresh spawn of the same id (b.jg5 SRJ-112). b.jg5 SRJ-105, SRJ-114: only
-  // `ErrSpawnNotFound` (the row is absent) reaches it; every other error at
-  // that get, a CONFIG answer included (b.jg5 SRJ-316), is a refusal, and an
-  // UNUSABLE NAME answer latches the persona (b.jg5 SRJ-512; the AC 20 case
-  // below).
-  test('inconclusive (a): the diagnostic row fetch finds no row (ErrSpawnNotFound) → no throw, fresh-after-inconclusive-amnesia', async () => {
-    captureStartupErrors()
-    const spawnCalls: import('agent-director').SpawnParams[] = []
-    const deleteCalls: StubDeleteParams[] = []
-    // First get() (collision recovery) returns ended; second get() (diagnostic)
-    // finds no row.
-    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
-    let getCalls = 0
-    installDiagnosisGetFailure(cfg, () => {
-      getCalls++
-      return errSpawnNotFound()
-    }, { spawnCalls, deleteCalls })
-    const result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
-
-    expect(result.action).toBe('fresh-after-inconclusive-amnesia')
-    expect(deleteCalls).toEqual([])
-    // The colliding optimistic spawn, then the one reuse spawn of the same id.
-    expect(spawnCalls.map((call) => [call.instance_id, call.reuse_finished])).toEqual([
-      [`cscb_${CH}`, undefined],
-      [`cscb_${CH}`, true],
-    ])
-    expect(getCalls).toBe(1) // the diagnostic get, after the collision get
-  })
-
-  // ==========================================================================
-  // b.fwu requirement 6: for EACH of the three inconclusive conditions —
-  // (a) row-fetch failure, (b) unparseable/absent started_at, (c) archive
-  // unavailable — assert BOTH the startup counter (freshAfterInconclusiveAmnesia
-  // increments, freshAfterAmnesia does not) AND the startup-error record
-  // (jsonl-diagnosis-inconclusive with a condition-specific detail).
-  // ==========================================================================
-
-  // (a) row-fetch finds no row, driven through startupSessionManager so the
-  // counter is observable. The diagnostic get() (second get) answers
-  // ErrSpawnNotFound; the collision recovery get() (first) succeeds so the
-  // amnesia path is reached at all.
-  test('inconclusive (a) via startup: the row fetch finds no row (ErrSpawnNotFound) → counter + jsonl-diagnosis-inconclusive record', async () => {
+    'jsonl missing',
+    'history /ad/old.jsonl (no such file or directory)',
+    'archived /ad/current.jsonl (missing)',
+    'history(/ad/current.jsonl)',
+  ])('AD detail %s stays reported detail without reconstructing native candidates', async description => {
     const readLog = captureStartupErrors()
     const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
-    installDiagnosisGetFailure(cfg, () => errSpawnNotFound(), { spawnCalls: [], deleteCalls: [] })
-    const result = await startupSessionManager(cfg, { concurrency: 1 })
-
-    expect(result.freshAfterInconclusiveAmnesia).toBe(1)
-    expect(result.freshAfterAmnesia).toBe(0)
-    const entry = onlyStartupEntry(readLog(), JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)
-    // Detail names WHICH condition: the row is absent.
-    expect(entry).toContain('the agent-director row is absent (ErrSpawnNotFound)')
-  })
-
-  // b.jg5 SRJ-105's CONFIG row, SRJ-114, SRJ-316: a CONFIG answer at the
-  // diagnostic get is a refusal, not an inconclusive diagnosis: the start pass
-  // counts the persona failed and in neither amnesia counter, writes no
-  // jsonl-diagnosis-inconclusive or spawn-failed entry, deletes nothing and
-  // spawns nothing fresh, posts no notice, and the wrapper raises CH's
-  // ad-config-malformed outage with one onset.
-  test('b.jg5 SRJ-105, SRJ-316: inconclusive (a) via startup with a CONFIG answer at the row fetch → refused: no amnesia counter, no jsonl-diagnosis-inconclusive record, no delete or fresh spawn, no notice, one ad-config-malformed onset', async () => {
-    const readLog = captureStartupErrors()
-    const spawnCalls: import('agent-director').SpawnParams[] = []
-    const deleteCalls: StubDeleteParams[] = []
-    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
-    const err = errConfigMalformed()
-    installDiagnosisGetFailure(cfg, () => err, { spawnCalls, deleteCalls })
-
-    const result = await startupSessionManager(cfg, { concurrency: 1 })
-
-    expect(result.perPersona).toEqual([{ key: CH, action: 'failed' }])
-    expect(result.failed).toBe(1)
-    expect(result.freshAfterInconclusiveAmnesia).toBe(0)
-    expect(result.freshAfterAmnesia).toBe(0)
-    expect(deleteCalls).toEqual([])
-    expect(spawnCalls).toHaveLength(1) // the colliding optimistic spawn only
-    const log = readLog()
-    expect(countStartupEntries(log, JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toBe(0)
-    expect(countStartupEntries(log, STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
-    expect(notices).toEqual([])
-    expect([...getOutageFlags(CH)]).toEqual(['ad-config-malformed'])
-    expect(outageEmissions).toEqual([{ key: CH, text: adConfigMalformedOnset(err) }])
-  })
-
-  /**
-   * Stub an ErrJsonlMissing launch of CH: the collision get (the first get)
-   * reads an `ended` row, the resume answers ErrJsonlMissing(`jsonlDescription`)
-   * and the diagnostic get (every later get) throws `makeErr()`. Records the
-   * spawns and deletes in `calls`.
-   */
-  function installDiagnosisGetFailure(
-    cfg: PersonaConfig,
-    makeErr: () => unknown,
-    calls: { spawnCalls: import('agent-director').SpawnParams[]; deleteCalls: StubDeleteParams[] },
-    jsonlDescription?: string,
-  ): void {
-    const stub = installStub({
-      spawnCalls: calls.spawnCalls,
-      deleteCalls: calls.deleteCalls,
-      spawnQueue: [
-        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<StubSpawnResult>({ instance_id: `cscb_${CH}` }),
-      ],
-      resumeError: errJsonlMissing(jsonlDescription),
-    })
-    let getCalls = 0
-    stub.get = async (params) => {
-      getCalls++
-      if (getCalls >= 2) throw makeErr()
-      return personaRowsGet(cfg, { state: 'ended' })(params)
-    }
-  }
-
-  /** Run `fn` with console.error captured as argument lists; restores it after. */
-  async function withErrArgs(fn: () => Promise<void>): Promise<unknown[][]> {
-    const errArgs: unknown[][] = []
-    const orig = console.error
-    console.error = (...args: unknown[]) => { errArgs.push(args) }
-    try {
-      await fn()
-    } finally {
-      console.error = orig
-    }
-    return errArgs
-  }
-
-  const quoted = (text: string): string => `message=${JSON.stringify(text)}`
-  /**
-   * How describeAgentDirectorFailure names an `ErrUnknownErrorName` (the form
-   * a CONFIG or UNUSABLE NAME answer takes): its errName and the client's own
-   * description; the envelope's description is not shown.
-   */
-
-  // AC 20 (b.av2 SR-10.3) with b.jg5 SRJ-105, SRJ-512: an UNUSABLE NAME
-  // answer at the row fetch is no read error and reaches no inconclusive
-  // report: it latches the persona, so no diagnosis is reported (no
-  // inconclusive line, record or notice) and nothing is deleted or spawned.
-  // Its one UNUSABLE NAME line names it by describeAdFailureForLog — the
-  // reported name and the redacted description, as the launch sites' refusal
-  // lines give it (b.jg5 SRJ-104) — and the latch's record holds the classification's
-  // redacted description; never the thrown value's raw message, description
-  // or envelope, which carry fake tokens here.
-  const leakyConfig = (): unknown => errUnknownErrorName('ErrConfigMalformed', adDescription())
-  const leakyUnusableName = (): unknown => errInternal(`${UNUSABLE_RECORDED_NAME_PHRASE} is empty; ${adDescription()}`)
-  test('AC 20, b.jg5 SRJ-512: row fetch answers UNUSABLE NAME whose envelope description holds a URL and a fake token → latched, no diagnosis reported: its one UNUSABLE NAME line names it redacted, the latch record holds the redacted description; no delete, spawn, notice or startup entry; nothing leaks', async () => {
-    const readLog = captureStartupErrors()
-    const latchLines: string[] = []
-    const latch = createConflictLatch({ log: (line) => latchLines.push(line) })
-    setConflictLatch(latch)
-    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
-    const spawnCalls: import('agent-director').SpawnParams[] = []
-    const deleteCalls: StubDeleteParams[] = []
-    installDiagnosisGetFailure(cfg, leakyUnusableName, { spawnCalls, deleteCalls })
-    const shown = describeAdFailureForLog(leakyUnusableName())
-    let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
-    const errArgs = await withErrArgs(async () => {
-      result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
-    })
-
-    expect(result).toStrictEqual({ key: CH, action: 'latched' })
-    const prefix = `[slack] spawnForPersona: ErrJsonlMissing diagnosis get for ${renderPersonaRef(personaOf(cfg, CH).name, CH)}: `
-    const lines = errArgs.map((args) => args.map(String).join(' ')).filter((l) => l.startsWith(prefix))
-    expect(lines).toHaveLength(1)
-    expect(lines[0]).not.toContain('\n')
-    expect(lines[0]!.slice(prefix.length).split(' — UNUSABLE NAME: ')[0]).toBe(shown)
-    expect(lines[0]).toEndWith(' — UNUSABLE NAME: the persona latched; nothing more is called for it (b.jg5 SRJ-105, SRJ-512)')
-    const record = latch.record(CH)
-    expect(record).toMatchObject({ latchCase: LATCH_CASE_UNUSABLE_RECORDED_NAME, refusedOperation: REFUSED_OPERATION_NONE, rowState: LATCH_ROW_STATE_UNREADABLE })
-    expect(record?.description).toContain(REDACTED_URL_PLACEHOLDER)
-    expect(record?.description).toContain(REDACTED_TOKEN_PLACEHOLDER)
-    expect(errArgs.flat().map(String).filter((l) => l.includes('ErrJsonlMissing diagnosis get failed for '))).toEqual([])
-    expect(spawnCalls).toHaveLength(1) // the colliding optimistic spawn only
-    expect(deleteCalls).toEqual([])
-    expect(notices).toEqual([])
-    expect(readLog()).toBe('')
-    assertNoLeak({ errArgs, startupErrorsLog: readLog(), notices, latchLines, record })
-  })
-
-  // AC 20 with b.jg5 SRJ-114: `ErrSpawnNotFound` at the diagnosis get reads
-  // the row as absent. The inconclusive report names the absence by the error
-  // name alone, never the thrown value's message (which carries a fake token
-  // here), in the log line, startup-errors.log and the persona notice.
-  test('AC 20, b.jg5 SRJ-114: row fetch answers a typed ErrSpawnNotFound whose message holds a fake token → the row is read as absent: the line, startup-errors.log and notice name ErrSpawnNotFound, never its message; nothing leaks', async () => {
-    const readLog = captureStartupErrors()
-    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
-    installDiagnosisGetFailure(cfg, () => new ErrSpawnNotFound('get', 'ErrSpawnNotFound', leakyMessage('gone', 'sub')), { spawnCalls: [], deleteCalls: [] })
-    let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
-    const errArgs = await withErrArgs(async () => {
-      result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
-    })
-
-    expect(result?.action).toBe('fresh-after-inconclusive-amnesia')
-    const reports = [
-      ...errArgs.map((args) => args.map(String).join(' ')).filter((l) => l.startsWith('[slack] ErrJsonlMissing diagnostic: ')),
-      onlyStartupEntry(readLog(), JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS),
-      ...notices.map((n) => n.text),
-    ]
-    expect(reports).toHaveLength(3)
-    for (const report of reports) {
-      expect(report).toContain(ErrSpawnNotFound.name)
-      expect(report).not.toContain(redactedLeakyMessage('gone'))
-    }
-    assertNoLeak({ errArgs, startupErrorsLog: readLog(), notices })
-  })
-
-  // AC 20 with b.jg5 SRJ-105: every other row-fetch failure is a read error,
-  // and a CONFIG answer has its own refusal row (SRJ-316), so the diagnostic
-  // get is refused. The refusal line names each shape by
-  // describeAdFailureForLog (redacted, on one line: a two-line errName
-  // cannot inject a line; an `ErrUnknownErrorName` by the name and the
-  // description agent-director reported, never the client's placeholder,
-  // b.jg5 SRJ-104), and nothing is posted: no inconclusive notice, no
-  // jsonl-diagnosis-inconclusive or spawn-failed entry, no delete, no spawn.
-  // Only the CONFIG answer raises an outage: its onset, which quotes the
-  // description redacted, is leak-checked with the rest.
-  test.each<[string, () => unknown, string]>([
-    [
-      'a CONFIG answer whose envelope description holds a URL and a fake token (b.jg5 SRJ-316)',
-      leakyConfig,
-      `ErrConfigMalformed ${quoted(REDACTED_AD_DESCRIPTION)}`,
-    ],
-    [
-      'a base AgentDirectorError',
-      () => errGeneric('get', 'ErrSpawnGone', leakyMessage('gone', 'desc')),
-      `ErrSpawnGone ${quoted(redactedLeakyMessage('gone'))}`,
-    ],
-    [
-      // The error's message is `<errName>: <description>`; the token-shaped
-      // errName is redacted there like any token.
-      'an AgentDirectorError whose errName is token-shaped',
-      () => errGeneric('get', fakeToken(BOT_TOKEN_PREFIX, 'errname'), leakyMessage('gone', 'desc')),
-      `AgentDirectorError ${quoted(`${REDACTED_TOKEN_PLACEHOLDER} ${redactedLeakyMessage('gone')}`)}`,
-    ],
-    [
-      'an AgentDirectorError whose errName spans two lines',
-      () => errGeneric('get', `ErrSpawnGone\n${fakeToken(BOT_TOKEN_PREFIX, 'line2')}`),
-      `AgentDirectorError ${quoted(`ErrSpawnGone ${REDACTED_TOKEN_PLACEHOLDER} oops`)}`,
-    ],
-    [
-      'a plain Error with a safe code',
-      () => Object.assign(new Error(leakyMessage('socket', 'msg')), { code: 'ECONNRESET', note: LEAK_SENTINEL }),
-      `Error code=ECONNRESET ${quoted(redactedLeakyMessage('socket'))}`,
-    ],
-    ['a rejected string', () => leakyMessage('down', 'str'), `string ${quoted(redactedLeakyMessage('down'))}`],
-  ])('AC 20 (b.jg5 SRJ-105): row fetch refused with %s → the refusal line names it redacted on one line; no notice, no startup entry, no delete, no spawn', async (_label, makeErr, shown) => {
-    const readLog = captureStartupErrors()
-    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
-    const persona = personaOf(cfg, CH)
-    const spawnCalls: import('agent-director').SpawnParams[] = []
-    const deleteCalls: StubDeleteParams[] = []
-    installDiagnosisGetFailure(cfg, makeErr, { spawnCalls, deleteCalls })
-    let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
-    const errArgs = await withErrArgs(async () => {
-      result = await spawnForPersona(persona, cfg, true)
-    })
-
-    expect(result).toStrictEqual({ key: persona.key, action: 'failed' })
-    const prefix = `[slack] spawnForPersona: ErrJsonlMissing diagnosis get refused for ${renderPersonaRef(persona.name, persona.key)}: `
-    const suffix = ' — no spawn-failure notice; nothing more is called (b.jg5 SRJ-105)'
-    const lines = errArgs.map((args) => args.map(String).join(' ')).filter((l) => l.startsWith(prefix))
-    expect(lines).toHaveLength(1)
-    const line = lines[0]!
-    expect(line).not.toContain('\n')
-    expect(line.endsWith(suffix)).toBe(true)
-    expect(line.slice(prefix.length, -suffix.length).split(' at ')[0]).toBe(shown)
-    expect(notices).toEqual([])
-    const log = readLog()
-    expect(countStartupEntries(log, JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toBe(0)
-    expect(countStartupEntries(log, STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
-    expect(errArgs.flat().map(String).filter((l) => l.includes('ErrJsonlMissing diagnosis get failed for '))).toEqual([])
-    expect(deleteCalls).toEqual([])
-    expect(spawnCalls).toHaveLength(1) // the colliding optimistic spawn only
-    expect(outageEmissions.map((e) => e.key)).toEqual(makeErr === leakyConfig ? [CH] : [])
-    assertNoLeak({ errArgs, startupErrorsLog: log, notices, outageEmissions })
-  })
-
-  // AC 20 (E13 Director decision 16): when the row fetch finds no row (the
-  // inconclusive path's one answer, ErrSpawnNotFound) and ErrJsonlMissing
-  // gave no enumerated paths, its description is echoed as "AD reported: …"
-  // only after redactSlackLogText, in the log line, the
-  // jsonl-diagnosis-inconclusive record and the persona notice (there also
-  // escaped for Slack, so the placeholders read `&lt;redacted-url&gt;`); the
-  // record's cause is describeAgentDirectorFailure: the error's name and the
-  // same redacted description as `message="…"`.
-  test('AC 20: the row fetch finds no row and ErrJsonlMissing\'s description holds a URL and a fake token → "AD reported:" carries it redacted in the line, the record and the notice (escaped for Slack there); nothing leaks', async () => {
-    const readLog = captureStartupErrors()
-    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
-    installDiagnosisGetFailure(cfg, () => errSpawnNotFound(), { spawnCalls: [], deleteCalls: [] }, adDescription())
-    let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
+    installAmnesia({ cfg, jsonlDescription: description, getResult: { session_id: 'current-session', jsonl_path: '/ad/opaque.jsonl' } })
     const errLog = await withCapturedErr(async () => {
-      result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
+      expect(await spawnForPersona(personaOf(cfg, CH), cfg, true)).toEqual({ key: CH, action: 'fresh-after-inconclusive-amnesia' })
     })
-
-    expect(result?.action).toBe('fresh-after-inconclusive-amnesia')
-    const reported = `the agent-director row is absent (ErrSpawnNotFound); AD reported: ${REDACTED_AD_DESCRIPTION}`
-    expect(errLog.split('\n').filter((l) => l.includes(reported))).toHaveLength(1)
-    const entry = onlyStartupEntry(readLog(), JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)
-    expect(entry).toContain(reported)
-    expect(entry.endsWith(` — ErrJsonlMissing message=${JSON.stringify(REDACTED_AD_DESCRIPTION)}`)).toBe(true)
-    // The notice quotes it escaped once for Slack (b.jg5 SRJ-1018).
-    expect(notices.map((n) => n.text).filter((t) => t.includes(escapeSlackControlCharacters(reported)))).toHaveLength(1)
-    expect(notices.map((n) => n.text).filter((t) => t.includes(REDACTED_URL_PLACEHOLDER))).toEqual([])
-    assertNoLeak({ errLog, startupErrorsLog: readLog(), notices })
-  })
-
-  // AC 20 (E13 Director decision 16, Task 0 decision B1): the lost record's
-  // cause is describeAgentDirectorFailure(err): the error's name and its
-  // description redacted as `message="…"`; never the error itself. The
-  // diagnosis runs, then the one reuse spawn (b.jg5 SRJ-712).
-  test('AC 20: lost, with an ErrJsonlMissing whose description holds a URL and a fake token → the diagnosis runs, then the one reuse spawn; the jsonl-transcript-lost-on-resume record names ErrJsonlMissing and the redacted description; nothing leaks', async () => {
-    const readLog = captureStartupErrors()
-    const startedAt = '2026-09-20T05:00:00Z'
-    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir, {
-      message_archive_db: makeArchiveWithMessagesSince(startedAt, 2),
-    })
-    const spawnCalls: import('agent-director').SpawnParams[] = []
-    installAmnesia({
-      cfg,
-      spawnCalls,
-      jsonlDescription: adDescription(),
-      getResult: { jsonl_path: '/data/proj/sess-5.jsonl', session_id: 'sess-5', cwd: CWD, started_at: startedAt },
-    })
-    let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
-    const errLog = await withCapturedErr(async () => {
-      result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
-    })
-
-    expect(result?.action).toBe('fresh-after-amnesia')
-    expect(spawnCalls.map((call) => call.reuse_finished)).toEqual([undefined, true])
-    const entry = onlyStartupEntry(readLog(), JSONL_TRANSCRIPT_LOST_ENTRY_CLASS)
-    expect(entry).toContain('2 message(s) since spawn')
-    const cause = entry.slice(entry.lastIndexOf(' — ') + ' — '.length)
-    expect(cause).toBe(`ErrJsonlMissing message=${JSON.stringify(REDACTED_AD_DESCRIPTION)}`)
-    expect(notices.map((notice) => notice.key)).toEqual([CH])
-    assertNoLeak({ errLog, startupErrorsLog: readLog(), notices })
-  })
-
-  // b.jg5 SRJ-1018: the lost notice's "Paths tried" names the transcript
-  // candidates, one of them the row's jsonl_path as agent-director reported
-  // it; posted to Slack, it is escaped once, so a `<!here>` or an `&` in a
-  // path is text, never markup. The server log and the record keep the path
-  // as read.
-  test('b.jg5 SRJ-1018: lost, with a row jsonl_path holding Slack control characters → the notice\'s "Paths tried" quotes the candidates escaped once for Slack; the log line and the record keep the path as read', async () => {
-    const readLog = captureStartupErrors()
-    const startedAt = '2026-09-20T05:00:00Z'
-    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir, {
-      message_archive_db: makeArchiveWithMessagesSince(startedAt, 2),
-    })
-    const jsonlPath = '/data/<!here>&proj/sess-6.jsonl'
-    installAmnesia({
-      cfg,
-      spawnCalls: [],
-      getResult: { jsonl_path: jsonlPath, session_id: 'sess-6', cwd: CWD, started_at: startedAt },
-    })
-    let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
-    const errLog = await withCapturedErr(async () => {
-      result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
-    })
-
-    expect(result?.action).toBe('fresh-after-amnesia')
+    expect(readLog()).toContain('reported by agent-director')
+    expect(readLog()).toContain(description)
+    expect(errLog).not.toMatch(/locally-computed|config-dir fallback/)
     expect(notices).toHaveLength(1)
-    const text = notices[0]!.text
-    const tried = text.slice(text.indexOf('Paths tried: ') + 'Paths tried: '.length)
-    expect(tried).toContain(escapeSlackControlCharacters(jsonlPath))
-    expect(tried).not.toMatch(/[<>]/)
-    expect(text).not.toContain(jsonlPath)
-    expect(onlyStartupEntry(readLog(), JSONL_TRANSCRIPT_LOST_ENTRY_CLASS)).toContain(jsonlPath)
-    expect(errLog).toContain(jsonlPath)
-    assertNoLeak({ errLog, startupErrorsLog: readLog(), notices })
   })
 
-  // b.jg5 SRJ-712, SRJ-1001 (E34 final review): every field of a transcript
-  // candidate (source, path, note) and the row's started_at can carry
-  // agent-director's text. Each is rendered on its own (`renderLogMessageText`:
-  // redacted, on one line, capped) before the candidates are joined
-  // (`jsonlCandidatesText`), for the log line and the startup-errors entry
-  // alike; the lost and inconclusive notices quote that text capped as one
-  // (`renderLogMessageText`) and escape it once for Slack.
-  const JSONL_MARKUP = '<!channel>&'
-  /** A field holding a fake token and Slack markup. */
-  const leakyJsonlField = (label: string): string => `${label} ${fakeToken(BOT_TOKEN_PREFIX, `jsonl-${label}`)} ${JSONL_MARKUP}`
-
-  test('b.jg5 SRJ-712, SRJ-1001: jsonlCandidatesText renders each field redacted, on one line and capped, unescaped (log text); none gives the no-candidates text; both notice builders cap the rendered text as one quote and escape it exactly once', () => {
-    const longNote = `${leakyJsonlField('note')}\n${'x'.repeat(MAX_LOGGED_MESSAGE_LENGTH)}`
-    const candidates: JsonlCandidate[] = [
-      { source: leakyJsonlField('source'), path: leakyJsonlField('path'), note: longNote },
-      { source: 'persisted', path: '/data/proj/sess.jsonl', note: 'ENOENT' },
-    ]
-
-    const text = jsonlCandidatesText(candidates)
-
-    expect(jsonlCandidatesText([])).toBe(JSONL_NO_CANDIDATES_TEXT)
-    for (const field of [candidates[0]!.source, candidates[0]!.path, longNote]) {
-      const rendered = renderLogMessageText(field)
-      expect(rendered).toContain(REDACTED_TOKEN_PLACEHOLDER)
-      expect(text).toContain(rendered)
-      expect(text).not.toContain(field)
-    }
-    expect(renderLogMessageText(longNote)).toHaveLength(MAX_LOGGED_MESSAGE_LENGTH)
-    expect(text).toContain('/data/proj/sess.jsonl')
-    expect(text).toContain(JSONL_MARKUP)
-    expect(text).not.toContain('\n')
-    const quoted = renderLogMessageText(text)
-    expect(quoted).toHaveLength(MAX_LOGGED_MESSAGE_LENGTH)
-    const notices = [
-      jsonlTranscriptLostNoticeText(2, text),
-      jsonlCandidatesInconclusiveNoticeText('the archive could not be consulted', 'paths+sources reported by agent-director', text),
-    ]
-    for (const notice of notices) {
-      expect(notice.split(escapeSlackControlCharacters(quoted))).toHaveLength(2)
-      expect(notice).not.toContain('<!channel>')
-      expect(notice).not.toContain(escapeSlackControlCharacters(escapeSlackControlCharacters(quoted)))
-    }
-    assertNoLeak({ text, notices })
-  })
-
-  test('b.jg5 SRJ-712, SRJ-1001: lost, with agent-director\'s enumerated candidate holding a fake token and Slack markup in its path and note → the log line and the record quote the rendered candidates, the notice quotes them escaped once; nothing leaks', async () => {
-    const readLog = captureStartupErrors()
-    const startedAt = '2026-09-20T05:00:00Z'
-    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir, {
-      message_archive_db: makeArchiveWithMessagesSince(startedAt, 2),
-    })
-    const candidate: JsonlCandidate = {
-      source: 'persisted',
-      path: `/data/${fakeToken(BOT_TOKEN_PREFIX, 'jsonl-path')}/a${JSONL_MARKUP}.jsonl`,
-      note: `stat ${fakeToken(BOT_TOKEN_PREFIX, 'jsonl-note')} ${JSONL_MARKUP} failed`,
-    }
-    installAmnesia({
-      cfg,
-      spawnCalls: [],
-      jsonlDescription: `no transcript found: ${candidate.source} ${candidate.path} (${candidate.note})`,
-      getResult: { jsonl_path: '/data/proj/sess-7.jsonl', session_id: 'sess-7', cwd: CWD, started_at: startedAt },
-    })
-    let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
-    const errLog = await withCapturedErr(async () => {
-      result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
-    })
-
-    expect(result?.action).toBe('fresh-after-amnesia')
-    const rendered = jsonlCandidatesText([candidate])
-    expect(errLog.split('\n').filter((line) => line.startsWith('[slack] ErrJsonlMissing diagnostic: ') && line.includes(rendered))).toHaveLength(1)
-    expect(onlyStartupEntry(readLog(), JSONL_TRANSCRIPT_LOST_ENTRY_CLASS)).toContain(rendered)
-    expect(notices.map((n) => n.text)).toEqual([jsonlTranscriptLostNoticeText(2, rendered)])
-    expect(notices[0]!.text).not.toContain('<!channel>')
-    assertNoLeak({ errLog, startupErrorsLog: readLog(), notices })
-  })
-
-  test('b.jg5 SRJ-712, SRJ-1001: inconclusive, with a row started_at holding a fake token and Slack markup → the log line and the record quote it rendered, the notice escaped once; nothing leaks', async () => {
-    const readLog = captureStartupErrors()
-    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir, {
-      message_archive_db: makeArchiveWithMessagesSince('2026-09-20T05:00:00Z', 2),
-    })
-    const startedAt = leakyJsonlField('started')
-    installAmnesia({
-      cfg,
-      spawnCalls: [],
-      getResult: { jsonl_path: '/data/proj/sess-8.jsonl', session_id: 'sess-8', cwd: CWD, started_at: startedAt },
-    })
-    let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
-    const errLog = await withCapturedErr(async () => {
-      result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
-    })
-
-    expect(result?.action).toBe('fresh-after-inconclusive-amnesia')
-    const quoted = `started_at=${renderLogMessageText(startedAt)}`
-    expect(quoted).toContain(REDACTED_TOKEN_PLACEHOLDER)
-    expect(errLog.split('\n').filter((line) => line.startsWith('[slack] ErrJsonlMissing diagnostic: ') && line.includes(quoted))).toHaveLength(1)
-    expect(onlyStartupEntry(readLog(), JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toContain(quoted)
-    expect(notices).toHaveLength(1)
-    expect(notices[0]!.text.split(escapeSlackControlCharacters(quoted))).toHaveLength(2)
-    expect(notices[0]!.text).not.toContain('<!channel>')
-    assertNoLeak({ errLog, startupErrorsLog: readLog(), notices })
-  })
-
-  // b.jg5 SRJ-1001: a transcript-loss diagnosis notice quotes agent-director's
-  // text: its description ("AD reported:") or the paths taken from it or from
-  // the row ("Transcript candidates tried", "Paths tried"). In the Slack
-  // notice that quoted part is redacted, on one line and cut to
-  // MAX_LOGGED_MESSAGE_LENGTH (`renderLogMessageText`), then escaped for
-  // Slack (`escapeSlackControlCharacters`, final-review fix #1); the log line
-  // and the startup-errors entry carry it unescaped, rendered field by field
-  // as the E34 final review renders it (`jsonlCandidatesText` for the
-  // candidates, `renderLogMessageText` for a description quoted whole), so a
-  // URL in it is redacted there too. A plain short quote reads in the notice,
-  // the log line and the entry exactly as given.
-
-  /** A URL-like transcript path, which redaction replaces. */
-  const URL_PATH = 'https://transcripts.example.test/v1/sess-u.jsonl'
-  /** A non-enumerated description of two lines, over the cap, naming `url`. */
-  const longAdReport = (url: string): string =>
-    `agent-director looked for the transcript at ${url} and found nothing.\n` +
-    `It checked ${Array.from({ length: 6 }, (_, i) => `/home/u/.claude/projects/-a-long-working-directory-name-${i}/sess-1.jsonl`).join(', ')}.`
-  /** Enumerated attempts, over the cap: a URL-like path first, then a stat note of two lines. */
-  const LONG_ATTEMPTS = [
-    adAttempt('persisted', URL_PATH),
-    'fallback /home/u/.claude/projects/-old/sess-0.jsonl (stat failed:\nno such file or directory)',
-    ...Array.from({ length: 5 }, (_, i) => adAttempt('fallback', `/home/u/.claude/projects/-a-long-working-directory-name-${i}/sess-1.jsonl`)),
-  ].join('; ')
-  /** `LONG_ATTEMPTS` as the log line and the entry carry it: each field redacted and on one line, none over the cap. */
-  const LONG_ATTEMPTS_LOGGED = LONG_ATTEMPTS.replace(URL_PATH, REDACTED_URL_PLACEHOLDER).replace('\n', ' ')
-  const PLAIN_ATTEMPT = adAttempt('persisted', '/data/proj/sess-1.jsonl')
-  const CANDIDATES_LEAD = 'Transcript candidates tried (paths+sources reported by agent-director): '
-  const INCONCLUSIVE_TAIL = '). An operator should investigate.'
-
-  interface QuotedDiagnosisCase {
-    /** What precedes the quoted part in the notice. */
-    noticeLead: string
-    /** What follows it in the notice. */
-    noticeTail: string
-    /** What precedes it in the log line and the entry. */
-    logLead: string
-    entryClass: string
-    /** Drive CH's ErrJsonlMissing launch at start, whose resume's description is `description`. */
-    run: (description: string) => Promise<void>
-    /** The long input, what CSCB quotes of it and what the log line and the entry carry; the plain short input and its quote. */
-    long: { description: string; quoted: string; logged: string }
-    plain: { description: string; quoted: string }
-  }
-
-  const QUOTED_DIAGNOSIS_CASES: Array<[string, QuotedDiagnosisCase]> = [
-    ['inconclusive, the row absent: "AD reported:" quotes the description', {
-      noticeLead: 'the agent-director row is absent (ErrSpawnNotFound); AD reported: ',
-      noticeTail: INCONCLUSIVE_TAIL,
-      logLead: 'the agent-director row is absent (ErrSpawnNotFound); AD reported: ',
-      entryClass: JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS,
-      run: async (description) => {
-        const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
-        installDiagnosisGetFailure(cfg, () => errSpawnNotFound(), { spawnCalls: [], deleteCalls: [] }, description)
-        expect((await spawnForPersona(personaOf(cfg, CH), cfg, true)).action).toBe('fresh-after-inconclusive-amnesia')
-      },
-      // The description is redacted before it is quoted anywhere; only the notice one-lines and cuts it.
-      long: { description: longAdReport(URL_PATH), quoted: longAdReport(REDACTED_URL_PLACEHOLDER), logged: renderLogMessageText(longAdReport(URL_PATH)) },
-      plain: { description: 'jsonl missing', quoted: 'jsonl missing' },
-    }],
-    ['inconclusive, no archive configured: "Transcript candidates tried" quotes the paths', {
-      noticeLead: CANDIDATES_LEAD,
-      noticeTail: INCONCLUSIVE_TAIL,
-      logLead: CANDIDATES_LEAD,
-      entryClass: JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS,
-      run: async (description) => {
-        const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
-        installAmnesia({ cfg, jsonlDescription: description, getResult: { jsonl_path: '/data/proj/sess-1.jsonl', session_id: 'sess-1', cwd: CWD } })
-        expect((await spawnForPersona(personaOf(cfg, CH), cfg, true)).action).toBe('fresh-after-inconclusive-amnesia')
-      },
-      long: { description: `no transcript found: ${LONG_ATTEMPTS}`, quoted: LONG_ATTEMPTS, logged: LONG_ATTEMPTS_LOGGED },
-      plain: { description: `no transcript found: ${PLAIN_ATTEMPT}`, quoted: PLAIN_ATTEMPT },
-    }],
-    ['lost: "Paths tried" quotes the paths', {
-      noticeLead: 'Paths tried: ',
-      noticeTail: '',
-      logLead: CANDIDATES_LEAD,
-      entryClass: JSONL_TRANSCRIPT_LOST_ENTRY_CLASS,
-      run: async (description) => {
-        const startedAt = '2026-09-20T05:00:00Z'
-        const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir, {
-          message_archive_db: makeArchiveWithMessagesSince(startedAt, 2),
-        })
-        installAmnesia({ cfg, jsonlDescription: description, getResult: { jsonl_path: '/data/proj/sess-1.jsonl', session_id: 'sess-1', cwd: CWD, started_at: startedAt } })
-        expect((await spawnForPersona(personaOf(cfg, CH), cfg, true)).action).toBe('fresh-after-amnesia')
-      },
-      long: { description: `no transcript found: ${LONG_ATTEMPTS}`, quoted: LONG_ATTEMPTS, logged: LONG_ATTEMPTS_LOGGED },
-      plain: { description: `no transcript found: ${PLAIN_ATTEMPT}`, quoted: PLAIN_ATTEMPT },
-    }],
-  ]
-
-  /**
-   * Run `c` on `description` and answer the one notice's quoted part (between
-   * its lead and tail), the one diagnostic log line and the one entry.
-   */
-  async function quotedDiagnosisRun(c: QuotedDiagnosisCase, description: string): Promise<{ notice: string; quotedPart: string; logLine: string; entry: string }> {
-    const readLog = captureStartupErrors()
-    const errArgs = await withErrArgs(() => c.run(description))
-    expect(notices.map((n) => n.key)).toEqual([CH])
-    const notice = notices[0]!.text
-    expect(notice.split(c.noticeLead)).toHaveLength(2)
-    expect(notice.endsWith(c.noticeTail)).toBe(true)
-    const quotedPart = notice.slice(notice.indexOf(c.noticeLead) + c.noticeLead.length, notice.length - c.noticeTail.length)
-    const logLines = errArgs.map((args) => args.map(String).join(' ')).filter((l) => l.startsWith('[slack] ErrJsonlMissing diagnostic: '))
-    expect(logLines).toHaveLength(1)
-    return { notice, quotedPart, logLine: logLines[0]!, entry: onlyStartupEntry(readLog(), c.entryClass) }
-  }
-
-  test.each(QUOTED_DIAGNOSIS_CASES)('SRJ-1001, %s: over the cap, on two lines and with a URL, the notice carries it redacted, on one line, cut to MAX_LOGGED_MESSAGE_LENGTH and then escaped for Slack; the log line and the entry carry it rendered field by field, unescaped', async (_label, c) => {
-    // The premise: the quote is over the cap and spans two lines.
-    expect(c.long.quoted.length).toBeGreaterThan(MAX_LOGGED_MESSAGE_LENGTH)
-    expect(c.long.quoted).toContain('\n')
-
-    const { notice, quotedPart, logLine, entry } = await quotedDiagnosisRun(c, c.long.description)
-
-    // Cut before it is escaped: the rendered quote is the cap's length, and the escape lengthens only the placeholder.
-    expect(renderLogMessageText(c.long.quoted)).toHaveLength(MAX_LOGGED_MESSAGE_LENGTH)
-    expect(quotedPart).toBe(escapeSlackControlCharacters(renderLogMessageText(c.long.quoted)))
-    expect(quotedPart).toContain(escapeSlackControlCharacters(REDACTED_URL_PLACEHOLDER))
-    expect(notice).not.toContain(REDACTED_URL_PLACEHOLDER)
-    expect(notice).not.toContain('\n')
-    expect(notice).not.toContain(URL_PATH)
-    // The log line and the entry: the quote rendered field by field (redacted,
-    // on one line), never escaped, the URL nowhere.
-    expect(logLine).toContain(`${c.logLead}${c.long.logged}`)
-    expect(entry).toContain(`${c.logLead}${c.long.logged}`)
-    expect(logLine).not.toContain(URL_PATH)
-    expect(entry).not.toContain(URL_PATH)
-  })
-
-  test.each(QUOTED_DIAGNOSIS_CASES)('SRJ-1001, %s: a plain short quote reads in the notice, the log line and the entry exactly as given', async (_label, c) => {
-    const { notice, quotedPart, logLine, entry } = await quotedDiagnosisRun(c, c.plain.description)
-
-    expect(quotedPart).toBe(c.plain.quoted)
-    expect(notice).toContain(`${c.noticeLead}${c.plain.quoted}${c.noticeTail}`)
-    expect(logLine).toContain(`${c.logLead}${c.plain.quoted}`)
-    expect(entry).toContain(`${c.logLead}${c.plain.quoted}`)
-  })
-
-  // AC 20 with b.jg5 SRJ-712, SRJ-113: `resume`'s answers are classified by
-  // class, so the client's ErrJsonlMissing whose errName is token-shaped is
-  // still a no-transcript answer: the diagnosis runs, then the one reuse
-  // spawn. Its errName and description never leak into a line, an entry or a
-  // notice; the lost record's cause names the class and carries both redacted.
-  test('AC 20: the client\'s ErrJsonlMissing whose errName is token-shaped and whose description holds a URL and a fake token is a no-transcript answer (by class): the diagnosis get, then one reuse spawn and no delete; the lost record carries both redacted; nothing leaks', async () => {
-    const readLog = captureStartupErrors()
-    const startedAt = '2026-09-20T05:00:00Z'
-    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir, {
-      message_archive_db: makeArchiveWithMessagesSince(startedAt, 2),
-    })
-    const spawnCalls: import('agent-director').SpawnParams[] = []
-    const deleteCalls: StubDeleteParams[] = []
-    const getCalls: import('agent-director').GetParams[] = []
-    installStub({
-      spawnCalls,
-      deleteCalls,
-      getCalls,
-      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
-      resumeError: new ErrJsonlMissing('resume', tokenErrName(), adDescription()),
-      getResult: personaRow(cfg, CH, { state: 'ended', jsonl_path: '/data/proj/sess-5.jsonl', session_id: 'sess-5', cwd: CWD, started_at: startedAt }),
-    })
-    let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
-    const errLog = await withCapturedErr(async () => {
-      result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
-    })
-
-    expect(result?.action).toBe('fresh-after-amnesia')
-    // The collision get, then the diagnosis get; the colliding plain spawn, then the one reuse.
-    expect([getCalls.length, deleteCalls]).toEqual([2, []])
-    expect(spawnCalls.map((call) => call.reuse_finished)).toEqual([undefined, true])
-    const log = readLog()
-    expect(countStartupEntries(log, JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toBe(0)
-    const entry = onlyStartupEntry(log, JSONL_TRANSCRIPT_LOST_ENTRY_CLASS)
-    expect(entry).toContain(`ErrJsonlMissing message=${JSON.stringify(`${REDACTED_TOKEN_PLACEHOLDER} ${REDACTED_AD_DESCRIPTION}`)}`)
-    assertNoLeak({ errLog, startupErrorsLog: log, notices })
-  })
-
-  // (b) unparseable/absent started_at — the archive is even configured (a real
-  // db), proving the short-circuit is on started_at, not on archive absence.
-  test('inconclusive (b) via startup: unparseable started_at → counter + jsonl-diagnosis-inconclusive record', async () => {
-    const readLog = captureStartupErrors()
-    const dbPath = makeArchiveWithMessagesSince('2026-09-20T05:00:00Z', 3)
-    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir, { message_archive_db: dbPath })
-    installAmnesia({
-      cfg,
-      getResult: {
-        jsonl_path: '/data/proj/sess-b.jsonl',
-        session_id: 'sess-b',
-        cwd: CWD,
-        started_at: 'not-a-timestamp',
-      },
-    })
-    const result = await startupSessionManager(cfg, { concurrency: 1 })
-
-    expect(result.freshAfterInconclusiveAmnesia).toBe(1)
-    expect(result.freshAfterAmnesia).toBe(0)
-    const log = readLog()
-    expect(log).toContain(JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)
-    // Detail names WHICH condition: started_at could not be parsed. Because it
-    // is unparseable, the archive must NOT have been consulted (no lost record).
-    expect(log).toContain("started_at is absent or unparseable")
-    expect(log).not.toContain(JSONL_TRANSCRIPT_LOST_ENTRY_CLASS)
-  })
-
-  // (b) with the row's started_at quoted (final-review fix #2): it is
-  // agent-director's text, so the reason renders it through
-  // renderLogMessageText (redacted, on one line, capped; blank reads
-  // `(none)`) in the log line, the entry and the notice alike, and the notice
-  // alone escapes it for Slack.
-  test.each([
-    ['holding "<", "&" and a URL', 'not<a&time https://clock.example.test/t1'],
-    ['empty', ''],
-    ['whitespace only', '   '],
-  ])('inconclusive (b): a started_at %s is quoted rendered in the line, the entry and the notice, and escaped in the notice only', async (_label, startedAt) => {
+  test('AD current-session candidates are reported in order; prior-session history is a separate reference', async () => {
     const readLog = captureStartupErrors()
     const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
-    installAmnesia({ cfg, getResult: { jsonl_path: '/data/proj/sess-b2.jsonl', session_id: 'sess-b2', cwd: CWD, started_at: startedAt } })
-    const errLog = await withCapturedErr(async () => {
-      expect((await spawnForPersona(personaOf(cfg, CH), cfg, true)).action).toBe('fresh-after-inconclusive-amnesia')
-    })
-
-    const rendered = renderLogMessageText(startedAt) || '(none)'
-    const quoted = `(started_at=${rendered})`
-    if (startedAt.includes('https://')) {
-      // The premise: rendering redacted the URL and kept "<" and "&", which the notice must escape.
-      expect(rendered).toContain(REDACTED_URL_PLACEHOLDER)
-      expect(/[<&]/.test(rendered.split(REDACTED_URL_PLACEHOLDER).join(''))).toBe(true)
-    } else {
-      expect(rendered).toBe('(none)')
-    }
-    const lines = errLog.split('\n').filter((l) => l.startsWith('[slack] ErrJsonlMissing diagnostic: '))
-    expect(lines).toHaveLength(1)
-    expect(lines[0]).toContain(quoted)
-    expect(onlyStartupEntry(readLog(), JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toContain(quoted)
-    expect(notices.map((n) => n.key)).toEqual([CH])
-    const notice = notices[0]!.text
-    expect(notice).toContain(escapeSlackControlCharacters(quoted))
-    expect(/[<>]/.test(notice)).toBe(false)
-    expect(notice).not.toContain('https://')
-    assertNoLeak({ errLog, startupErrorsLog: readLog(), notices })
+    const current = ['persisted /ad/current.jsonl (no such file or directory)', 'fallback /ad/alternate.jsonl (permission denied)']
+    installAmnesia({ cfg, jsonlDescription: [...current, 'history /ad/old.jsonl (missing)'].join('; ') })
+    await spawnForPersona(personaOf(cfg, CH), cfg, true)
+    expect(readLog()).toContain(current.join('; '))
+    expect(notices[0]!.text).not.toContain('history /ad/old.jsonl')
+    expect(readLog()).not.toContain('locally-computed')
   })
 
-  // (c-config) archive unavailable because none is configured. Distinguished
-  // from (c-other) by the actionable "no message archive is configured" hint.
-  test('inconclusive (c-config) via startup: no message_archive_db → counter + jsonl-diagnosis-inconclusive record', async () => {
-    const readLog = captureStartupErrors()
-    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir) // no message_archive_db
-    installAmnesia({
-      cfg,
-      getResult: { jsonl_path: '/data/proj/sess-c1.jsonl', session_id: 'sess-c1', cwd: CWD },
-    })
-    const result = await startupSessionManager(cfg, { concurrency: 1 })
-
-    expect(result.freshAfterInconclusiveAmnesia).toBe(1)
-    expect(result.freshAfterAmnesia).toBe(0)
-    const log = readLog()
-    expect(log).toContain(JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)
-    expect(log).toContain('no message archive is configured')
-  })
-
-  // (c-other) archive IS configured but the file is missing / unreadable.
-  // Distinguished from (c-config) by naming the configured path in the detail.
-  test('inconclusive (c-other) via startup: configured archive file missing → counter + jsonl-diagnosis-inconclusive record', async () => {
-    const readLog = captureStartupErrors()
-    const missingDb = join(tmpdir(), `cscb-wrb-missing-${Date.now()}.db`)
-    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir, { message_archive_db: missingDb })
-    installAmnesia({
-      cfg,
-      getResult: {
-        jsonl_path: '/data/proj/sess-c2.jsonl',
-        session_id: 'sess-c2',
-        cwd: CWD,
-        started_at: '2026-09-20T05:00:00Z',
-      },
-    })
-    const result = await startupSessionManager(cfg, { concurrency: 1 })
-
-    expect(result.freshAfterInconclusiveAmnesia).toBe(1)
-    expect(result.freshAfterAmnesia).toBe(0)
-    const log = readLog()
-    expect(log).toContain(JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)
-    // c-other wording names the configured (but unusable) archive path, and is
-    // distinct from the c-config "no message archive is configured" hint.
-    expect(log).toContain(`the message archive (${missingDb})`)
-    expect(log).not.toContain('no message archive is configured')
-  })
-
-  // --- Conclusive amnesia through startup: freshAfterAmnesia counter ---------
-  // b.fwu review gap: no test drove freshAfterAmnesia > 0 through
-  // startupSessionManager — the diagnosed 'fresh-after-amnesia' switch case and
-  // its loud follow-up line ("transcript could not be resumed") were asserted
-  // only in the negative. These two cover the two conclusive flavors.
-
-  // (lost) archive has post-spawn messages → real context destroyed. Diagnosis
-  // is CONCLUSIVE, so it lands in freshAfterAmnesia (not the inconclusive
-  // bucket), and the loud diagnosed follow-up line fires.
-  test('conclusive lost via startup: post-spawn archived messages → freshAfterAmnesia counter + diagnosed follow-up line', async () => {
-    captureStartupErrors()
-    const dbPath = makeArchiveWithMessagesSince('2026-09-20T05:00:00Z', 4)
-    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir, { message_archive_db: dbPath })
-    installAmnesia({
-      cfg,
-      getResult: {
-        jsonl_path: '/data/proj/sess-lost.jsonl',
-        session_id: 'sess-lost',
-        cwd: CWD,
-        started_at: '2026-09-20T05:00:00Z',
-      },
-    })
-    let result!: Awaited<ReturnType<typeof startupSessionManager>>
-    const errLog = await withCapturedErr(async () => {
-      result = await startupSessionManager(cfg, { concurrency: 1 })
-    })
-
-    expect(result.freshAfterAmnesia).toBe(1)
-    expect(result.freshAfterInconclusiveAmnesia).toBe(0)
-    expect(result.succeeded).toBe(1)
-    // Summary line reports the conclusive bucket, not the inconclusive one.
-    expect(errLog).toContain(
-      'startupSessionManager: complete — 1 persona(s): 0 resumed, 0 fresh-spawned, ' +
-        '1 fresh-after-amnesia, 0 fresh-after-inconclusive-amnesia, ' +
-        '0 reconnected, 0 no-op, 0 failed, 0 not brought up',
-    )
-    // The diagnosed follow-up line fires; the inconclusive one does not.
-    expect(errLog).toContain(
-      '1 persona(s) were fresh-spawned after ErrJsonlMissing (transcript could not be resumed)',
-    )
-    expect(errLog).not.toContain(
-      'fresh-spawned after ErrJsonlMissing WITHOUT a conclusive diagnosis',
-    )
-  })
-
-  // (never-created) 0 post-spawn messages → lossless but still CONCLUSIVE, so it
-  // is bucketed as freshAfterAmnesia (quiet: the diagnosed follow-up line still
-  // fires because freshAfterAmnesia > 0, but no per-channel 'lost' record).
-  test('conclusive never-created via startup: 0 post-spawn messages → freshAfterAmnesia counter, not inconclusive', async () => {
-    captureStartupErrors()
-    const dbPath = makeArchiveWithMessagesSince('2026-09-20T05:00:00Z', 0)
-    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir, { message_archive_db: dbPath })
-    installAmnesia({
-      cfg,
-      getResult: {
-        jsonl_path: '/data/proj/sess-nc.jsonl',
-        session_id: 'sess-nc',
-        cwd: CWD,
-        started_at: '2026-09-20T05:00:00Z',
-      },
-    })
-    const result = await startupSessionManager(cfg, { concurrency: 1 })
-
-    expect(result.freshAfterAmnesia).toBe(1)
-    expect(result.freshAfterInconclusiveAmnesia).toBe(0)
-    expect(result.succeeded).toBe(1)
-  })
-
-  // Notice wording for an inconclusive case must be UNCERTAINTY-shaped,
-  // never the 'lost' "destroyed"/"memory has been lost" wording — a false
-  // "your history was destroyed" is its own harm.
-  test('inconclusive persona notice is worded as uncertainty, not the lost "destroyed" wording', async () => {
-    const readLog = captureStartupErrors()
-    const cfg = makeNoticeConfig() // no message_archive_db: c-config → inconclusive
-    installAmnesia({
-      cfg,
-      key: NOTICE_KEY,
-      // The row's cwd is the notice persona's own working directory (personaRow).
-      getResult: { jsonl_path: '/data/proj/sess-u.jsonl', session_id: 'sess-u' },
-    })
-    const h = installNoticeNotifier(cfg)
-    const result = await spawnForPersona(personaOf(cfg, NOTICE_KEY), cfg, true)
-    await settleNotices()
-
-    expect(result.action).toBe('fresh-after-inconclusive-amnesia')
-    expect(readLog()).toContain(JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)
-    const text = expectOneNoticeToDestination(h)
-    // Uncertainty wording present, after the reuse wording (b.jg5 SRJ-712).
-    expect(text).toContain(`on restart I was ${JSONL_DIAGNOSIS_REUSE_WORDING};`)
-    expect(text).toContain('could not determine whether my prior')
-    // 'lost'-branch wording absent.
-    expect(text).not.toContain('has been lost')
-    expect(text).not.toContain('message archive shows')
-  })
-
-  // --- b.av2 SR-7.4: archive evidence follows the persona's channels -------
-  // Only the persona's `delivery: all` channels are counted, and a zero count
-  // proves idleness only when the archive sees all of the persona's traffic:
-  // with a `mentions` channel or DMs on, zero is inconclusive. Each case drives
-  // the real resume → ErrJsonlMissing → diagnosis path over a real temp
-  // archive; the row is the persona's own (`personaRow`), so the ladder
-  // resumes it instead of meeting the cwd / config_dir guard.
-
-  const SR74_STARTED_AT = '2026-09-20T05:00:00Z'
-  const SR74_NAME = 'Archive Bot'
-  const SR74_KEY = personaKey(SR74_NAME)
-  const ALL_1 = 'C0ALL0001'
-  const ALL_2 = 'C0ALL0002'
-  const MENTIONS = 'C0MENT003'
-  /** A channel of no persona: never counted. */
-  const ELSEWHERE = 'C0ELSE004'
-
-  interface Sr74Case {
-    channels: Persona['channels']
-    dmEnabled: boolean
-    /** Post-spawn archived messages by channel ID (the persona key included, to prove it is not counted). */
-    rows: Record<string, number>
-    outcome: 'never-created' | 'inconclusive' | 'lost'
-    /** For 'lost': the count the record and notice name. */
-    lostCount?: number
-  }
-
-  const SR74_CASES: Array<[string, Sr74Case]> = [
-    ['only `all` channels, no rows in them since spawn → never-created', {
-      channels: [{ id: ALL_1, delivery: 'all' }, { id: ALL_2, delivery: 'all' }],
-      dmEnabled: false,
-      rows: { [ELSEWHERE]: 3, [SR74_KEY]: 3 },
-      outcome: 'never-created',
-    }],
-    ['an `all` and a `mentions` channel, rows only in the `mentions` channel → inconclusive', {
-      channels: [{ id: ALL_1, delivery: 'all' }, { id: MENTIONS, delivery: 'mentions' }],
-      dmEnabled: false,
-      rows: { [MENTIONS]: 5 },
-      outcome: 'inconclusive',
-    }],
-    ['DMs on, an `all` channel with no rows since spawn → inconclusive', {
-      channels: [{ id: ALL_1, delivery: 'all' }],
-      dmEnabled: true,
-      rows: { [ELSEWHERE]: 2 },
-      outcome: 'inconclusive',
-    }],
-    ['DMs on and no channels → inconclusive', {
-      channels: [],
-      dmEnabled: true,
-      rows: { [ELSEWHERE]: 2, [SR74_KEY]: 2 },
-      outcome: 'inconclusive',
-    }],
-    ['an `all` and a `mentions` channel, rows in the `all` channel → lost (only the `all` rows counted)', {
-      channels: [{ id: ALL_1, delivery: 'all' }, { id: MENTIONS, delivery: 'mentions' }],
-      dmEnabled: false,
-      rows: { [ALL_1]: 3, [MENTIONS]: 2, [ELSEWHERE]: 7 },
-      outcome: 'lost',
-      lostCount: 3,
-    }],
-    ['rows only in the persona’s second `all` channel → lost', {
-      channels: [{ id: ALL_1, delivery: 'all' }, { id: ALL_2, delivery: 'all' }],
-      dmEnabled: false,
-      rows: { [ALL_2]: 2 },
-      outcome: 'lost',
-      lostCount: 2,
-    }],
-    ['DMs on, rows in the `all` channel → lost', {
-      channels: [{ id: ALL_1, delivery: 'all' }],
-      dmEnabled: true,
-      rows: { [ALL_1]: 4 },
-      outcome: 'lost',
-      lostCount: 4,
-    }],
-  ]
-
-  test.each(SR74_CASES)('SR-7.4: %s', async (_label, c) => {
-    const readLog = captureStartupErrors()
-    const boundary = Date.parse(SR74_STARTED_AT) / 1000
-    // Each channel's rows land strictly after started_at; one row per channel
-    // before it proves the "since spawn" bound still applies.
-    const rows = Object.entries(c.rows).flatMap(([channel, n]) => [
-      { ts: boundary - 10, channel },
-      ...Array.from({ length: n }, (_, i) => ({ ts: boundary + 1 + i, channel })),
-    ])
-    rows.push({ ts: boundary - 10, channel: ALL_1 })
-    const archive = buildTempArchiveDb(rows, ELSEWHERE)
-    archiveCleanups.push(archive.cleanup)
-    const cfg = makeMultiPersonaConfig(
-      [{
-        name: SR74_NAME,
-        channels: c.channels,
-        dm: c.dmEnabled ? { enabled: true, contact: 'U0CONTACT1' } : { enabled: false },
-        permission_prompts: c.channels.find((ch) => ch.delivery === 'all')?.id ?? 'dm',
-      }],
-      fixtureDir,
-      { message_archive_db: archive.dbPath },
-    )
-    installAmnesia({
-      cfg,
-      key: SR74_KEY,
-      getResult: { jsonl_path: '/data/proj/sess-sr74.jsonl', session_id: 'sess-sr74', started_at: SR74_STARTED_AT },
-    })
-
-    let result!: Awaited<ReturnType<typeof spawnForPersona>>
-    const errLog = await withCapturedErr(async () => {
-      result = await spawnForPersona(personaOf(cfg, SR74_KEY), cfg, true)
-    })
-    const log = readLog()
-
-    if (c.outcome === 'never-created') {
-      // Conclusive and quiet: no record, no notice.
-      expect(result).toEqual({ key: SR74_KEY, action: 'fresh-after-amnesia' })
-      expect(log).not.toContain(JSONL_TRANSCRIPT_LOST_ENTRY_CLASS)
-      expect(log).not.toContain(JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)
-      expect(notices).toHaveLength(0)
-      expect(errLog).toContain('transcript never created (archive consulted: 0 archived messages since spawn)')
-      return
-    }
-
-    expect(notices).toHaveLength(1)
-    expect(notices[0]!.key).toBe(SR74_KEY)
-    const text = notices[0]!.text
-
-    if (c.outcome === 'lost') {
-      expect(result).toEqual({ key: SR74_KEY, action: 'fresh-after-amnesia' })
-      expect(countStartupEntries(log, JSONL_TRANSCRIPT_LOST_ENTRY_CLASS)).toBe(1)
-      expect(log).not.toContain(JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)
-      expect(log).toContain(`the message archive holds ${c.lostCount} message(s) since spawn`)
-      expect(text).toContain(`message archive shows ${c.lostCount} message(s) since I started`)
-      expect(text).toContain('my conversation memory has been lost')
-      expect(text).not.toContain('could not determine whether my prior')
-      return
-    }
-
-    // Inconclusive, for the new cause: an unattributable zero.
-    expect(result).toEqual({ key: SR74_KEY, action: 'fresh-after-inconclusive-amnesia' })
-    expect(countStartupEntries(log, JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toBe(1)
-    expect(log).not.toContain(JSONL_TRANSCRIPT_LOST_ENTRY_CLASS)
-    expect(errLog).not.toContain('transcript never created')
-    expect(text).toContain('could not determine whether my prior')
-    expect(text).not.toContain('has been lost')
-    expect(text).not.toContain('message archive shows')
-    // The recorded cause is the new one, distinct from the existing reasons.
-    expect(log).toContain(UNATTRIBUTABLE_ZERO_REASON)
-    expect(log).not.toContain('no message archive is configured')
-    expect(log).not.toContain('could not be consulted')
-    expect(log).not.toContain('started_at is absent or unparseable')
-  })
-
-  // b.av2 SR-7.4, b.deo SRI-704: in fungible mode the diagnosis counts no
-  // channel and a zero is never attributable. The persona's spec-set
-  // `channels` (which the loader leaves empty in fungible mode) list a
-  // `delivery: all` channel holding archived messages since spawn, and its
-  // DMs are off: in declarative mode that is lost (the table's `all`-row
-  // cases); here it is inconclusive with the fungible-mode reason, never lost.
-  test('b.deo SRI-704: fungible mode, a `delivery: all` channel with archived messages since spawn and DMs off → inconclusive with the fungible-mode reason, never lost', async () => {
-    const readLog = captureStartupErrors()
-    const boundary = Date.parse(SR74_STARTED_AT) / 1000
-    const rows = [
-      { ts: boundary - 10, channel: ALL_1 },
-      ...Array.from({ length: 3 }, (_, i) => ({ ts: boundary + 1 + i, channel: ALL_1 })),
-    ]
-    const archive = buildTempArchiveDb(rows, ELSEWHERE)
-    archiveCleanups.push(archive.cleanup)
-    const cfg = makeMultiPersonaConfig(
-      [{
-        name: SR74_NAME,
-        channels: [{ id: ALL_1, delivery: 'all' }],
-        dm: { enabled: false },
-        invited: { permission_prompts: ALL_1 },
-      }],
-      fixtureDir,
-      { message_archive_db: archive.dbPath, allow_invited_channels: true },
-    )
-    const persona = personaOf(cfg, SR74_KEY)
-    expect(persona.channels).toEqual([{ id: ALL_1, delivery: 'all' }])
-    expect(persona.fungible_destination).toBe(ALL_1)
-    installAmnesia({
-      cfg,
-      key: SR74_KEY,
-      getResult: { jsonl_path: '/data/proj/sess-sri704.jsonl', session_id: 'sess-sri704', started_at: SR74_STARTED_AT },
-    })
-
-    let result!: Awaited<ReturnType<typeof spawnForPersona>>
-    const errLog = await withCapturedErr(async () => {
-      result = await spawnForPersona(persona, cfg, true)
-    })
-    const log = readLog()
-
-    expect(result).toEqual({ key: SR74_KEY, action: 'fresh-after-inconclusive-amnesia' })
-    expect(onlyStartupEntry(log, JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toContain(FUNGIBLE_MODE_ZERO_REASON)
-    expect(countStartupEntries(log, JSONL_TRANSCRIPT_LOST_ENTRY_CLASS)).toBe(0)
-    expect(errLog).toContain(FUNGIBLE_MODE_ZERO_REASON)
-    expect(errLog).not.toContain('transcript never created')
-    expect(errLog).not.toContain('Conversation history was LOST')
-    expect(`${log}${errLog}`).not.toContain(UNATTRIBUTABLE_ZERO_REASON)
-    expect(notices).toHaveLength(1)
-    expect(notices[0]!.key).toBe(SR74_KEY)
-    const text = notices[0]!.text
-    expect(text).toContain('could not determine whether my prior')
-    expect(text).toContain(escapeSlackControlCharacters(FUNGIBLE_MODE_ZERO_REASON))
-    expect(text).not.toContain('has been lost')
-    expect(text).not.toContain('message archive shows')
-    assertNoLeak({ log, errLog, notices })
-  })
-
-  // Carried from E3 Task 1 review: the locally computed fallback transcript
-  // path is built from the persona's effective claude_config_dir. A persona
-  // that overrides the top-level directory is looked up under its own.
-  test('a persona overriding the top-level claude_config_dir: the fallback transcript candidate is under the persona’s directory', async () => {
-    captureStartupErrors()
-    const topLevel = fixtureSubdir('top-level-config')
-    const own = fixtureSubdir('persona-config')
-    const cfg = makeStandInPersonaConfig(
-      { [CH]: { working_directory: CWD, claude_config_dir: own } },
-      fixtureDir,
-      { claude_config_dir: topLevel },
-    )
-    expect(personaOf(cfg, CH).claude_config_dir).toBe(own)
-    const spawnCalls: import('agent-director').SpawnParams[] = []
-    installAmnesia({
-      cfg,
-      spawnCalls,
-      // No enumerated AD detail, so the diagnosis computes the candidates itself.
-      jsonlDescription: 'jsonl missing',
-      getResult: { jsonl_path: '/data/proj/sess-own.jsonl', session_id: 'sess-own', cwd: CWD },
-    })
-
-    let result!: Awaited<ReturnType<typeof spawnForPersona>>
-    const log = await withCapturedErr(async () => {
-      result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
-    })
-
-    // The resume path was reached (the row's label matched the persona's own directory).
-    expect(result.action).toBe('fresh-after-inconclusive-amnesia')
-    const expected = resolveJsonlPath(CWD, 'sess-own', own)
-    expect(expected.startsWith(`${own}/projects/`)).toBe(true)
-    expect(log).toContain(`locally-computed(config-dir fallback) ${expected}`)
-    expect(log).not.toContain(resolveJsonlPath(CWD, 'sess-own', topLevel))
-    expect(log).not.toContain(`${topLevel}/projects`)
-    // The reuse spawn after the diagnosis runs under the persona's directory too.
-    expect(spawnCalls[1]?.reuse_finished).toBe(true)
-    expect(spawnCalls[1]!.extra_env?.['CLAUDE_CONFIG_DIR']).toBe(own)
-  })
-
-  // --- ErrNoSessionId sibling still 'spawned' (not amnesia) ---------------
-  // Guard: only ErrJsonlMissing routes to fresh-after-amnesia. The ErrNoSessionId
-  // sibling in the same branch keeps the plain 'spawned' action.
-  test('ErrNoSessionId sibling keeps action=spawned (only ErrJsonlMissing is amnesia)', async () => {
-    captureStartupErrors()
+  test('candidate descriptions are redacted and the persona notice escapes Slack markup once', async () => {
+    const readLog = captureStartupErrors(), token = fakeToken(BOT_TOKEN_PREFIX, 'transcript-detail')
     const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
-    installStub({
-      spawnQueue: [
-        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedOk<StubSpawnResult>({ instance_id: `cscb_${CH}` }),
-      ],
-      getResult: personaRow(cfg, CH, { state: 'ended' }),
-      resumeError: errNoSessionId(),
-    })
-    const result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
-    expect(result.action).toBe('spawned')
+    installAmnesia({ cfg, jsonlDescription: `persisted /ad/<@U00000001>&${token}.jsonl (missing)` })
+    const errLog = await withCapturedErr(async () => { await spawnForPersona(personaOf(cfg, CH), cfg, true) })
+    assertNoLeak({ log: readLog(), errLog, notices })
+    expect(readLog()).toContain('<@U00000001>')
+    expect(notices).toHaveLength(1)
+    expect(notices[0]!.text).toContain('&lt;@U00000001&gt;&amp;')
+    expect(notices[0]!.text).not.toContain('&amp;lt;')
   })
 
-  // --- b.jg5 SRJ-712 (AC 60): the diagnosis before the reuse, its texts ----
-
-  /** When P's row was started, for the archive's "since spawn" count. */
-  const SRJ712_STARTED_AT = '2026-09-20T05:00:00Z'
-
-  /**
-   * Wrap `stub`'s `get`, `spawn`, `resume` and `delete` so each call from now
-   * on is recorded in order, a spawn carrying the reuse flag as `reuse spawn`.
-   */
-  function recordAmnesiaCalls(stub: StubClient): string[] {
-    const order: string[] = []
-    const client = stub as unknown as Record<string, (params: object) => Promise<unknown>>
-    for (const verb of ['get', 'spawn', 'resume', 'delete'] as const) {
-      const original = client[verb]!
-      client[verb] = (params) => {
-        order.push(verb === 'spawn' && (params as SpawnParams).reuse_finished === true ? 'reuse spawn' : verb)
-        return original.call(stub, params)
-      }
-    }
-    return order
-  }
-
-  /** The configuration of CH: a message archive holding `archived` messages since `SRJ712_STARTED_AT`, or none. */
-  function srj712Config(archived: number | undefined): PersonaConfig {
-    const archive = archived === undefined ? {} : { message_archive_db: makeArchiveWithMessagesSince(SRJ712_STARTED_AT, archived) }
-    return makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir, archive)
-  }
-
-  /** CH's row as the diagnosis reads it: a transcript path and session id, started at `SRJ712_STARTED_AT`. */
-  const SRJ712_ROW: PersonaGetResultOverrides = {
-    jsonl_path: '/data/proj/sess-712.jsonl',
-    session_id: 'sess-712',
-    cwd: CWD,
-    started_at: SRJ712_STARTED_AT,
-  }
-
-  /** One verdict of the diagnosis: the archive behind it, the launch's amnesia action, its entry class and its notices. */
-  interface Srj712Verdict {
-    readonly archived: number | undefined
-    readonly action: 'fresh-after-amnesia' | 'fresh-after-inconclusive-amnesia'
-    readonly entryClass: string | undefined
-    readonly notices: number
-  }
-
-  const SRJ712_VERDICTS: ReadonlyArray<readonly [string, Srj712Verdict]> = [
-    ['lost (2 archived messages since spawn)', { archived: 2, action: 'fresh-after-amnesia', entryClass: JSONL_TRANSCRIPT_LOST_ENTRY_CLASS, notices: 1 }],
-    ['never-created (0 archived messages since spawn)', { archived: 0, action: 'fresh-after-amnesia', entryClass: undefined, notices: 0 }],
-    ['inconclusive (no message archive configured)', { archived: undefined, action: 'fresh-after-inconclusive-amnesia', entryClass: JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS, notices: 1 }],
-  ]
-
-  test.each(SRJ712_VERDICTS)('b.jg5 SRJ-712 (AC 60), %s, through the start pass: the diagnosis get comes before the one reuse spawn and nothing is deleted; the start summary counts the amnesia action; its entry and notice are kept; each of its lines, entries and notices says the persona is brought up fresh by a reuse spawn and its row is kept, and none says delete', async (_label, verdict) => {
+  test('an absent diagnosis row records uncertainty before reuse and deletes nothing', async () => {
     const readLog = captureStartupErrors()
-    const cfg = srj712Config(verdict.archived)
-    const deleteCalls: StubDeleteParams[] = []
-    const order = recordAmnesiaCalls(installAmnesia({ cfg, deleteCalls, getResult: SRJ712_ROW }))
-
-    let result!: Awaited<ReturnType<typeof startupSessionManager>>
-    const errLog = await withCapturedErr(async () => {
-      result = await startupSessionManager(cfg, { concurrency: 1 })
-    })
-
-    expect(result.perPersona).toEqual([{ key: CH, action: verdict.action }])
-    expect([result.freshAfterAmnesia, result.freshAfterInconclusiveAmnesia, result.freshSpawned, result.failed]).toEqual(
-      verdict.action === 'fresh-after-amnesia' ? [1, 0, 0, 0] : [0, 1, 0, 0],
-    )
-    // The collision get, the resume, then the diagnosis get before the one reuse spawn.
-    expect(order).toEqual(['spawn', 'get', 'resume', 'get', 'reuse spawn'])
-    expect(deleteCalls).toEqual([])
-    const log = readLog()
-    const entries = [JSONL_TRANSCRIPT_LOST_ENTRY_CLASS, JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS].flatMap((entryClass) =>
-      log.split('\n').filter((line) => line.includes(`] [${entryClass}] `)),
-    )
-    expect(entries.map((entry) => entry.includes(`] [${verdict.entryClass}] `))).toEqual(verdict.entryClass === undefined ? [] : [true])
-    expect(notices.map((notice) => notice.key)).toEqual(Array.from({ length: verdict.notices }, () => CH))
-    const lines = errLog.split('\n').filter((line) => line.startsWith('[slack] ErrJsonlMissing diagnostic: '))
-    expect(lines).toHaveLength(1)
-    const texts = [...lines, ...entries, ...notices.map((notice) => notice.text)]
-    for (const text of texts) {
-      expect(text).toContain(JSONL_DIAGNOSIS_REUSE_WORDING)
-      expect(text).not.toMatch(/delet/i)
-    }
-    expect(errLog).not.toMatch(/will be delet/i)
-    assertNoLeak({ errLog, startupErrorsLog: log, notices })
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir), calls = newLadderCalls()
+    installStub({ ...calls, spawnQueue: [cannedErr(errInstanceIdCollision()), cannedOk({ instance_id: personaInstanceId(CH) })],
+      getQueue: [cannedOk(personaRow(cfg, CH, { state: 'ended' })), cannedErr(errSpawnNotFound())], resumeError: errJsonlMissing() })
+    expect(await spawnForPersona(personaOf(cfg, CH), cfg, true)).toEqual({ key: CH, action: 'fresh-after-inconclusive-amnesia' })
+    expect(countStartupEntries(readLog(), JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toBe(1)
+    expect(calls.deleteCalls).toEqual([])
+    expect(calls.spawnCalls.map(p => p.reuse_finished)).toEqual([undefined, true])
+    expect(notices).toHaveLength(1)
   })
 
-  // b.jg5 SRJ-712, the E13 hatch note: the diagnosis's notice says the
-  // persona was brought up fresh, so it is posted only once the reuse spawn
-  // did; a reuse that fails posts its own spawn-failure notice alone. The
-  // entry, written with the diagnosis, is kept. A reuse that latches is the
-  // CONFLICT and UNUSABLE NAME describes' (their ErrJsonlMissing rows).
-  test('b.jg5 SRJ-712: lost, then a reuse spawn that fails (ErrTmuxSessionCreate): the lost entry is kept, the lost notice is not posted, and only the spawn-failure notice is; nothing is deleted', async () => {
+  test('a failed reuse retains the diagnosis record and posts only the launch-failure notice', async () => {
     const readLog = captureStartupErrors()
-    const cfg = srj712Config(2)
-    const deleteCalls: StubDeleteParams[] = []
-    const stub = installStub({
-      deleteCalls,
-      spawnQueue: [
-        cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()),
-        cannedErr<import('agent-director').SpawnResult>(errTmuxSessionCreate('spawn')),
-      ],
-      resumeError: errJsonlMissing(),
-      getResult: personaRow(cfg, CH, { state: 'ended', ...SRJ712_ROW }),
-    })
-    const order = recordAmnesiaCalls(stub)
-
-    let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
-    const errLog = await withCapturedErr(async () => {
-      result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
-    })
-
-    expect(result).toMatchObject({ key: CH, action: 'failed', countedClass: true })
-    expect(order).toEqual(['spawn', 'get', 'resume', 'get', 'reuse spawn'])
-    expect(deleteCalls).toEqual([])
-    expect(countStartupEntries(readLog(), JSONL_TRANSCRIPT_LOST_ENTRY_CLASS)).toBe(1)
-    expect(notices.map((notice) => notice.key)).toEqual([CH])
-    expect(notices[0]!.text).toContain(`\`${errTmuxSessionCreate().errName}\``)
+    const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir), calls = newLadderCalls()
+    installStub({ ...calls, spawnQueue: [cannedErr(errInstanceIdCollision()), cannedErr(errTmuxSessionCreate())],
+      getResult: personaRow(cfg, CH, { state: 'ended' }), resumeError: errJsonlMissing() })
+    expect(await spawnForPersona(personaOf(cfg, CH), cfg, true)).toEqual({ key: CH, action: 'failed', countedClass: true })
+    expect(countStartupEntries(readLog(), JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toBe(1)
+    expect(calls.deleteCalls).toEqual([])
+    expect(notices).toHaveLength(1)
     expect(notices[0]!.text).not.toContain(JSONL_DIAGNOSIS_REUSE_WORDING)
-    assertNoLeak({ errLog, startupErrorsLog: readLog(), notices })
   })
 })
 
-// ---------------------------------------------------------------------------
-// b.jgf — ErrJsonlNeverWritten: a lossless reuse spawn of the same id
-//
-// AD 0.10.0 split the old "resume can't find a transcript" condition into
-// ErrJsonlMissing (a transcript path was recorded but is gone now — ambiguous,
-// keeps the b.wrb diagnosis ceremony) and ErrJsonlNeverWritten (the session
-// never wrote one — provably nothing to lose). Pre-fix the new name matched no
-// branch in the resume ladder, so it hit the generic tail: action 'failed', a
-// spawn-failure notice, and restart.ts retrying the same impossible resume with
-// a doubling backoff forever. It goes on to one reuse spawn of the same id,
-// deleting nothing (b.jg5 SRJ-707).
 // ---------------------------------------------------------------------------
 
 describe('b.jgf: ErrJsonlNeverWritten → a lossless reuse spawn of the same id', () => {
@@ -13765,6 +12181,57 @@ async function readOwnRow(h: RecoveryHarness, key: string, read: 'status' | 'get
 /** The two shared own-row reads `readOwnRow` makes. */
 const READS = ['status', 'get'] as const
 
+describe('b.d6n: shared own-row readers forward absent rows to delivery lifecycle', () => {
+  let life: DeliveryLifecycle
+  afterEach(async () => { await life?.stop(); setDeliveryLifecycle(undefined); srj105AfterEach() })
+
+  function fixture() {
+    const f = srj105Build()
+    life = createDeliveryLifecycle({ clock: createFakeClock() })
+    setDeliveryLifecycle(life)
+    const row = harnessRow(f.h, harnessPersona(f.h, f.p), { state: 'waiting', session_id: 'same-ad-session' })
+    life.observeRow(f.p, row)
+    const relaunched: unknown[] = [], waiting: unknown[] = []
+    life.setRelaunchObserver((key, observation) => relaunched.push({ key, ...observation }))
+    life.setFirstWaitingObserver((key, observation) => waiting.push({ key, ...observation }))
+    return { ...f, row, relaunched, waiting }
+  }
+
+  test.each([...READS])('%s absence clears readiness and same-session waiting reports in again', async read => {
+    const f = fixture()
+    expect(life.hasWaited(f.p)).toBe(true)
+    await readOwnRow(f.h, f.p, read, errSpawnNotFound())
+    expect(life.hasWaited(f.p)).toBe(false)
+    expect(f.relaunched).toEqual([{ key: f.p, state: 'missing' }])
+    f.h.script({ getError: undefined, getResult: f.row })
+    expect((await readPersonaOwnRow(f.p, STATUS_READ_SITE)).kind).toBe(OWN_ROW_READ_ROW)
+    expect(life.hasWaited(f.p)).toBe(true)
+    expect(f.waiting).toHaveLength(1)
+    expect(f.waiting[0]).toMatchObject({ key: f.p, state: 'waiting', session_id: 'same-ad-session' })
+    expect(f.relaunched).toHaveLength(1)
+    assertNoLeak({ logs: f.h.errors, notices: f.h.notices })
+  })
+
+  test.each(READS.flatMap(read => ['stop', 'forget'].map(action => [read, action] as const)))('%s absence after lifecycle %s cannot signal a relaunch', async (read, action) => {
+    const f = fixture()
+    if (action === 'stop') await life.stop()
+    else life.forget(f.p)
+    await readOwnRow(f.h, f.p, read, errSpawnNotFound())
+    expect(f.relaunched).toEqual([])
+    expect(life.hasWaited(f.p)).toBe(true)
+    assertNoLeak({ logs: f.h.errors, notices: f.h.notices })
+  })
+
+  test('get absence whose caller stopped preserves lifecycle readiness', async () => {
+    const f = fixture()
+    f.h.script({ getError: errSpawnNotFound() })
+    expect(await readPersonaOwnRow(f.p, { ...STATUS_READ_SITE, actGoes: () => false })).toEqual({ kind: OWN_ROW_READ_ABSENT })
+    expect(f.relaunched).toEqual([])
+    expect(life.hasWaited(f.p)).toBe(true)
+    assertNoLeak({ logs: f.h.errors, notices: f.h.notices })
+  })
+})
+
 describe('b.jg5 SRJ-704, SRJ-1016: the shared own-row status and get reads end P\'s kill-failure episode, at a replacement site too', () => {
   afterEach(srj105AfterEach)
 
@@ -14727,18 +13194,11 @@ describe('b.jg5 SRJ-105, SRJ-501, SRJ-502: a CONFLICT at any spawn or resume of 
     h.script({ spawnError: row.build(), ...statusAnswering(row.rowState) })
     expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
     h.script({ spawnError: undefined, statusError: undefined })
-
-    const patched: string[] = []
-    setPreLaunchTrustPatcher((persona) => {
-      patched.push(persona.key)
-    })
     const callsBefore = h.stub.callCount()
     expect(await spawnForPersona(harnessPersona(h, p), h.config, false)).toStrictEqual({ key: p, action: 'latched' })
-    expect(patched).toEqual([])
     expect(h.stub.callCount()).toBe(callsBefore)
 
     expect(await h.launch(b)).toEqual({ key: b, action: 'spawned' })
-    expect(patched).toEqual([b])
   })
 
   test('b.jg5 SRJ-502, SRJ-1015: a persona latched during the start pass records no spawn-failed entry and is counted neither failed nor succeeded; B is counted; a second start pass makes no call for P', async () => {
@@ -14918,10 +13378,6 @@ describe('b.jg5 SRJ-501, SRJ-502: the session manager\'s latch install', () => {
     setConflictLatch(latch)
     const calls = makeStubCallLog()
     installStub(calls)
-    const patched: string[] = []
-    setPreLaunchTrustPatcher((persona) => {
-      patched.push(persona.key)
-    })
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
 
     let started: SpawnPersonaResult | undefined
@@ -14937,7 +13393,6 @@ describe('b.jg5 SRJ-501, SRJ-502: the session manager\'s latch install', () => {
     expect(restarted).toStrictEqual({ key: 'C', action: 'latched' })
     expect(session).toBe('skipped')
     expect(stubCallCount(calls)).toBe(0)
-    expect(patched).toEqual([])
     const gateLines = errLog.split('\n').filter((line) => line.startsWith(`[slack] spawnForPersona: not launching ${renderPersonaRef('C', 'C')} — `))
     expect(gateLines).toHaveLength(3)
     expect(gateLines.every((line) => line.includes(logged) && line.includes('case=unknown'))).toBe(true)
@@ -15429,14 +13884,14 @@ describe('b.jg5 SRJ-114, SRJ-122 (hatch A2): the gets SRJ-114 leaves alone latch
     assertNoLeak({ posts: posts(slack), trail: trail.events })
   })
 
-  test('the JSONL persistence safeguard\'s get of P\'s own row carrying the note: its lost-transcript notice is made as without the note; nothing latched, no CONFLICT notice', async () => {
+  test('the JSONL persistence safeguard\'s get of P\'s own row carrying the note: its AD transcript-reference notice is made as without the note; nothing latched, no CONFLICT notice', async () => {
     const { h, p } = srj105Build()
     const persona = harnessPersona(h, p)
     const pId = personaInstanceId(p)
     h.script({
       getFn: (params) =>
         params.instance_id === pId
-          ? harnessRow(h, persona, { state: 'ended', liveness_note: provenanceNote, session_id: TRANSCRIPT_SESSION_ID, jsonl_path: join(h.home, 'gone.jsonl') })
+          ? harnessRow(h, persona, { state: 'ended', liveness_note: provenanceNote, transcript_status: 'rotated', session_id: TRANSCRIPT_SESSION_ID, jsonl_path: join(h.home, 'gone.jsonl') })
           : errSpawnNotFound(),
     })
     const posted: Array<{ key: string; text: string }> = []
@@ -15445,8 +13900,7 @@ describe('b.jg5 SRJ-114, SRJ-122 (hatch A2): the gets SRJ-114 leaves alone latch
       posted.push({ key, text })
     }, {
       readMountinfo: () => '',
-      statFn: () => false,
-      archiveCountSince: () => 2,
+
       recordStartupError: () => {},
       home: h.home,
     })
@@ -17869,14 +16323,14 @@ describe('b.jg5 SRJ-122, SRJ-513 (hatch A2): the gets SRJ-122 leaves alone latch
     assertNoLeak({ posts: posts(slack), trail: trail.events })
   })
 
-  test.each(byName(launchStartCurrentLifeOf('get')))('the JSONL persistence safeguard\'s get of P\'s own row reading %s: its lost-transcript notice is made as for any row; nothing latched, nothing posted to the latch', async (_name, row) => {
+  test.each(byName(launchStartCurrentLifeOf('get')))('the JSONL persistence safeguard\'s get of P\'s own row reading %s: its AD transcript-reference notice is made as for any row; nothing latched, nothing posted to the latch', async (_name, row) => {
     const { h, p } = srj105Build()
     const persona = harnessPersona(h, p)
     const pId = personaInstanceId(p)
     h.script({
       getFn: (params) =>
         params.instance_id === pId
-          ? { ...row.build(persona, h.home), session_id: TRANSCRIPT_SESSION_ID, jsonl_path: join(h.home, 'gone.jsonl') }
+          ? { ...row.build(persona, h.home), transcript_status: 'rotated', session_id: TRANSCRIPT_SESSION_ID, jsonl_path: join(h.home, 'gone.jsonl') }
           : errSpawnNotFound(),
     })
     const posted: Array<{ key: string; text: string }> = []
@@ -17885,8 +16339,7 @@ describe('b.jg5 SRJ-122, SRJ-513 (hatch A2): the gets SRJ-122 leaves alone latch
       posted.push({ key, text })
     }, {
       readMountinfo: () => '',
-      statFn: () => false,
-      archiveCountSince: () => 2,
+
       recordStartupError: () => {},
       home: h.home,
     })
@@ -19285,16 +17738,14 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
       expect([h.stub.callCount(), getFailureCount(p), h.notices]).toEqual([0, 0, []])
     })
 
-    // SRJ-708, b.av2 SR-6.2: the trust patch once per launch attempt, the
-    // reply guard immediately before each launch call (a `resume` that went
-    // on to the reuse has run the patch).
+    // The reply guard runs immediately before each AD launch call.
     test.each([
-      ['the reuse kind', LIVE_ROW_LAUNCH_REUSE, ['patch', 'guard', 'spawn']],
-      ['a resume that answered ErrNoSessionId', LIVE_ROW_LAUNCH_RESUME, ['patch', 'guard', 'resume', 'guard', 'spawn']],
-    ] as const)('%s: the trust patch runs once in the attempt and the reply guard immediately before the reuse spawn', async (_label, kind, events) => {
+      ['the reuse kind', LIVE_ROW_LAUNCH_REUSE, ['guard', 'spawn']],
+      ['a resume that answered ErrNoSessionId', LIVE_ROW_LAUNCH_RESUME, ['guard', 'resume', 'guard', 'spawn']],
+    ] as const)('%s: the reply guard runs immediately before each AD launch call', async (_label, kind, events) => {
       const { h, p } = srj105Build()
       const order: string[] = []
-      setPreLaunchTrustPatcher(() => void order.push('patch'))
+
       setPreLaunchReplyGuard(() => {
         order.push('guard')
         return () => void order.push('undo')
@@ -19981,7 +18432,7 @@ describe('b.jg5 SRJ-707, SRJ-712: resume\'s no-transcript answers go on to one r
       ...ENDED_WITH_SESSION,
       jsonl_path: undefined,
       transcript_status: 'rotated',
-      prior_sessions: [{ session_id: 'previous-session', jsonl_path: '/archived/previous.jsonl', recorded_at: '2026-01-01T00:00:00Z' }],
+      prior_sessions: [{ session_id: 'previous-session', jsonl_path: '/archived/previous.jsonl' }],
     }
     h.script({
       ...collided(h, harnessPersona(h, p), rotatedRow),
@@ -23000,7 +21451,7 @@ const START_RESULT_ROWS: ReadonlyArray<readonly [string, StartResultRow]> = [
       launched: 'refused',
     },
   ],
-  ['a live row in another directory (the live-row sequence, E21, E22)', { arrange: (h, p) => scriptLiveRowElsewhere(h, p), action: 'sequence-waiting', counts: { sequenceWaiting: 1 } }],
+  ['a live row in another directory (the live-row sequence, E21, E22)', { arrange: (h, p) => scriptLiveRowElsewhere(h, p), action: 'sequence-waiting', counts: { sequenceWaiting: 1 }, armed: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }],
   ['P held on ErrInvalidFlags (E23)', { arrange: (h, p) => holdThroughReuse(h, p), action: 'held', counts: { held: 1 }, launched: 'skipped' }],
   ['P\'s key recorded as retired, with no row (E24)', { arrange: (h, p) => h.retireKey(p), action: SPAWN_ACTION_FRESH_RETIRED, counts: { succeeded: 1, freshRetired: 1 }, armed: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW, launched: true }],
 ]
@@ -23441,9 +21892,6 @@ describe('b.jg5 SRJ-810, SRJ-1502, SRJ-1015 (E27 T3): the old-life gate at the l
     h.script({ getResult: cannedGetResult({ instance_id: PRE_PERSONA_ID, cwd: harnessPersona(h, p).working_directory }) })
     const hold = holdFindMissing(h.stub.client)
     const steps: string[] = []
-    setPreLaunchTrustPatcher((persona) => {
-      steps.push(`patch ${persona.key}`)
-    })
     setPreLaunchReplyGuard((persona) => {
       steps.push(`guard ${persona.key}`)
     })
@@ -25728,7 +24176,7 @@ describe('automatic reconnect and startup typing entry points', () => {
   let clock: FakeClock
   beforeEach(() => {
     clock = createFakeClock()
-    life = createDeliveryLifecycle({ startId: 'entry', clock })
+    life = createDeliveryLifecycle({ clock })
     setDeliveryLifecycle(life)
   })
   afterEach(async () => { await life.stop(); setDeliveryLifecycle(undefined) })
@@ -25828,7 +24276,7 @@ describe('E4 guard: reconnect final awaited get', () => {
   function fixture(entry: 'direct' | 'restart' | 'permit' = 'direct') {
     const { h, p } = srj105Build()
     clock = createFakeClock()
-    life = createDeliveryLifecycle({ startId: 'final-get', clock })
+    life = createDeliveryLifecycle({ clock })
     setDeliveryLifecycle(life)
     const row = harnessRow(h, harnessPersona(h, p), { state: 'waiting' })
     h.script({ statusResult: cannedStatusResult({ state: 'waiting' }), getResult: row })
@@ -25880,7 +24328,7 @@ describe('E4 guard: reconnect final awaited get', () => {
     if (interruption === 'stop') await life.stop()
     if (interruption === 'ownership') {
       life.forget(f.p)
-      life.beforeLaunch(f.p)
+      life.activate(f.p)
       replacementLease = life.acquire(f.p, 'delivery')
       expect(replacementLease).toBeDefined()
     }
@@ -26010,7 +24458,7 @@ describe('reconnect continuation preserves partial command input', () => {
     '%s: retry submits one complete reconnect command without appending or duplicating text', async fault => {
       const { h, p } = srj105Build()
       const clock = createFakeClock()
-      life = createDeliveryLifecycle({ startId: fault, clock })
+      life = createDeliveryLifecycle({ clock })
       setDeliveryLifecycle(life)
       const row = harnessRow(h, harnessPersona(h, p), { state: 'waiting' })
       let reads = 0, input = '', textCalls = 0, enters = 0
@@ -26060,26 +24508,27 @@ describe('b.acu: delivery GONE handoff preserves recovery guards', () => {
     '%s refuses the affected persona without probing, while an eligible sibling enters checked recovery', async guard => {
       const h = makeRecoveryHarness({ harnessNow: true })
       const [p, q] = h.keys as [string, string]
-      const life = createDeliveryLifecycle({ startId: 'gone-guards', clock: h.clock })
+      const life = createDeliveryLifecycle({ clock: h.clock })
       setDeliveryLifecycle(life)
       setDeliveryPersonaLookup(key => h.config.personas.find(persona => persona.key === key))
       const starts = recordSequenceStarts()
       let release: (() => void) | undefined
       try {
         const row = personaRow(h.config, p, { state: 'waiting' })
-        const launch = life.observeRow(p, row)
+        life.observeRow(p, row)
         if (guard === 'not-up') h.setUp(p, false)
         if (guard === 'unapplied') h.remove(p)
         if (guard === 'wrong-instance') row.instance_id = personaInstanceId(q)
-        if (guard === 'stale-launch') life.beforeLaunch(p)
+        if (guard === 'stale-launch') life.observeRow(p, { state: 'pending' })
         if (guard === 'typing-owned') release = life.acquire(p, 'reconnect')
         if (guard === 'forgotten') life.forget(p)
 
-        expect(recoverDeliveryGone(p, row, launch)).toBe(false)
+        expect(recoverDeliveryGone(p, row)).toBe(false)
         expect(starts).toEqual([])
         expect(stubCallCount(h.stub.calls)).toBe(0)
         const sibling = personaRow(h.config, q, { state: 'waiting' })
-        expect(recoverDeliveryGone(q, sibling, life.observeRow(q, sibling))).toBe(true)
+        life.observeRow(q, sibling)
+        expect(recoverDeliveryGone(q, sibling)).toBe(true)
         expect(starts).toHaveLength(1)
         expect(starts[0]).toMatchObject({
           key: q, instanceId: personaInstanceId(q), lastReadState: 'waiting', keepsConversation: true, launches: true,

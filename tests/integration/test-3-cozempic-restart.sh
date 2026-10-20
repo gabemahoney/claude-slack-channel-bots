@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Test 3 (b.set): probe cozempic, stop + restart daemon, verify clean restart.
+# Test 3 (b.set, b.d6n): stop + restart daemon, verify clean restart.
 # Depends on Tests 1 and 2 having passed (daemon must be running going in).
 # ci-requires: test-2
 #
@@ -24,12 +24,6 @@ fail() {
     echo "FAIL: ${TEST_NAME}: $1" >&2
     exit 1
 }
-
-command -v cozempic >/dev/null 2>&1 \
-    || fail "cozempic not on PATH (required by test)"
-
-cozempic --version >/dev/null 2>&1 \
-    || fail "cozempic --version failed"
 
 cd /test-repo
 
@@ -76,8 +70,9 @@ if grep -qE 'Error:|Traceback|Uncaught' "${LOG}"; then
     fail "server.log contains error stack trace after restart"
 fi
 
-grep -qE "cozempic (available|not found on PATH)" "${LOG}" \
-    || fail "server.log missing cozempic probe entry ('cozempic available' or 'cozempic not found on PATH')"
+if grep -qE "cozempic (available|not found on PATH)" "${LOG}"; then
+    fail "server.log contains a retired CSCB transcript-cleaner probe"
+fi
 
 # The restart skipped the spawn of each persona again.
 [ "$(count_log "${SKIP_ALPHA}")" -gt "${ALPHA_BEFORE}" ] \

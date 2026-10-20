@@ -25,5 +25,5 @@ export async function makeQueue(stateDir: string, options: Omit<DeliveryQueueOpt
   await queue.start()
   return queue
 }
-export const sentRecord = (seq = 1, attempt = 1, send_kind: 'text' | 'enter' | 'retype' = 'text'): QueueRecord => ({ v: 1, kind: 'sent', seq, attempt, part: 1, send_kind, at: 1000, launch_id: 'launch', session_id: 'session', transcript_path: '/scratch/transcript.jsonl', transcript_size: 0 })
+export const sentRecord = (seq = 1, attempt = 1, send_kind: 'text' | 'enter' | 'retype' = 'text'): Extract<QueueRecord, { kind: 'sent' }> => ({ v: 1, kind: 'sent', seq, attempt, part: 1, send_kind, at: 1000, session_id: 'session', transcript_path: '/scratch/transcript.jsonl', transcript_size: 0 })
 export const deliveredRecord = (seq = 1, at = 1000): DeliveredRecord => ({ v: 1, kind: 'delivered', seq, part: 1, at, receipt: { path: '/scratch/transcript.jsonl', uuid: 'receipt' } })

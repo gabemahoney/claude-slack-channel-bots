@@ -1300,8 +1300,7 @@ describe('unavailable retry: what arms the timer (SRJ-301)', () => {
       await runJsonlPersistenceSafeguard(h.config, undefined, {
         home: h.home,
         readMountinfo: () => '',
-        statFn: () => false,
-        archiveCountSince: () => null,
+
         recordStartupError: () => {},
       })
       return h.stub.calls.getCalls.length
@@ -5184,8 +5183,7 @@ describe('unavailable retry: ENVIRONMENT arms from any verb, is never counted, i
     await runJsonlPersistenceSafeguard(h.config, undefined, {
       home: h.home,
       readMountinfo: () => '',
-      statFn: () => false,
-      archiveCountSince: () => null,
+
       recordStartupError: () => {},
     })
 

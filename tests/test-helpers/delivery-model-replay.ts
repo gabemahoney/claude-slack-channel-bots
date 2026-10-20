@@ -4,13 +4,13 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
-import { decideEngine, decideGate, selectDeliveryTarget, LAUNCH_SETTLE_MS, ENTER_DELAY_MS, RECEIPT_WAIT_MS, RETYPE_BACKOFF_MS, NOT_NOW_RETRY_MS, type DeliveryPolicyKnowledge, type DeliveryReading, type DeliveryPair } from '../../src/delivery-engine.ts'
+import { decideEngine, decideGate, selectDeliveryTarget, ENTER_DELAY_MS, RECEIPT_WAIT_MS, RETYPE_BACKOFF_MS, NOT_NOW_RETRY_MS, type DeliveryPolicyKnowledge, type DeliveryReading, type DeliveryPair } from '../../src/delivery-engine.ts'
 import { parseDeliveryTranscriptRecord, receiptTextMatches } from '../../src/delivery-receipt.ts'
 import { TAG_MAX_BYTES } from '../../src/tag-wrapper.ts'
 import { createFakeClock } from './fake-clock.ts'
 import { promptEntry, queuedCommandEntry, queueOperationEntry, pastedText } from './working-row-panes.ts'
 
-export const traceTimerConstants = { LAUNCH_SETTLE_MS, ENTER_DELAY_MS, RECEIPT_WAIT_MS, RETYPE_BACKOFF_MS: [...RETYPE_BACKOFF_MS], NOT_NOW_RETRY_MS: [...NOT_NOW_RETRY_MS], TAG_MAX_BYTES }
+export const traceTimerConstants = { ENTER_DELAY_MS, RECEIPT_WAIT_MS, RETYPE_BACKOFF_MS: [...RETYPE_BACKOFF_MS], NOT_NOW_RETRY_MS: [...NOT_NOW_RETRY_MS], TAG_MAX_BYTES }
 export function decodeDeliveryFixture(path: string, hash: string): any {
   const bytes = readFileSync(path)
   assert.equal(createHash('sha256').update(bytes).digest('hex'), hash, `changed frozen fixture ${path}`)
@@ -60,7 +60,7 @@ function reading(raw: any, constants: any): DeliveryReading {
 function duration(name: string, constants: any, engine: any): number {
   const item = engine.target[0]
   const n = item ? engine.retypes[item - 1] ?? 0 : 0
-  return ({ settle: LAUNCH_SETTLE_MS, receipt: RECEIPT_WAIT_MS,
+  return ({ receipt: RECEIPT_WAIT_MS,
     backoff: RETYPE_BACKOFF_MS[Math.min(n, RETYPE_BACKOFF_MS.length - 1)],
     enterDelay: ENTER_DELAY_MS,
     notNow: NOT_NOW_RETRY_MS[0], reconnect: NOT_NOW_RETRY_MS[0] } as Record<string, number>)[name]!
