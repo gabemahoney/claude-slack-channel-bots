@@ -356,7 +356,7 @@ describe('recovery through the confirmed credentials change', () => {
     expect(run.stub('bravo').callLog).toHaveLength(bravoCalls)
     await expectBravoServes(run, bravo, 'after alpha’s recovery')
     expect(h.pendingExists()).toBe(false)
-    expect(h.readRecord()).toEqual(h.readConfig()!)
+    expect(JSON.parse(h.readRecord()!.toString()).source).toEqual(JSON.parse(h.readConfig()!.toString()))
     expectNoLeak(run, { reply, newStub: newStub.callLog })
   })
 })

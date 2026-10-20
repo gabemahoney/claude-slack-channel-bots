@@ -5674,3 +5674,19 @@ queue_accepted() {
     jq -cS 'select(.v == 1 and .kind == "accepted" and .compact == null) | del(.attempt_high_watermark)' "${file}" \
         || fail "queue_accepted: could not read accepted queue records"
 }
+
+# Compare submitted configuration with the source retained by the production authority.
+# Successful application retains the exact reviewed bytes, including formatting.
+configuration_record_matches() {
+    python3 - "$1" "$2" <<'PY_RECORD'
+import base64, json, sys
+with open(sys.argv[1], "rb") as f:
+    expected = f.read()
+with open(sys.argv[2]) as f:
+    authority = json.load(f)
+assert authority['format'] == 'cscb-shared-channels-v1'
+assert isinstance(authority['revision'], int) and authority['revision'] >= 1
+assert base64.b64decode(authority['sourceBytesBase64'], validate=True) == expected
+assert authority['source'] == json.loads(expected)
+PY_RECORD
+}

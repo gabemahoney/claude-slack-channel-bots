@@ -4,7 +4,7 @@ The top-level `config.json` settings that apply to the whole server, the environ
 
 ## Server-wide settings
 
-These top-level fields apply to the whole server. Confirmed changes take effect at the next server start, with exceptions: `allow_invited_channels` applies in place at once; `claude_config_dir` applies at each inheriting persona's next launch; `stop_hook_bootstrap` applies immediately to each inheriting persona; and the CLI reads `stop_timeout`, `exit_timeout` and `agent_director_call_timeout_ms` from the confirmed record at once. See [Reload](reload.md#reload).
+These top-level fields apply to the whole server. Confirmed changes take effect at the next server start, with exceptions: `channel_mode` applies in place at once; `claude_config_dir` applies at each inheriting persona's next launch; `stop_hook_bootstrap` applies immediately to each inheriting persona; and the CLI reads `stop_timeout`, `exit_timeout` and `agent_director_call_timeout_ms` from the confirmed record at once. See [Reload](reload.md#reload).
 
 | Field | Type | Default | Description |
 |---|---|---|---|
@@ -32,7 +32,7 @@ These top-level fields apply to the whole server. Confirmed changes take effect 
 | `ack_reaction` | string | `"spinthinking"` | Emoji name, without colons, replacing the queued reaction after transcript receipts confirm the whole message and delivery is durably recorded. Must be non-empty when set. `spinthinking` is a custom emoji; see the prerequisite below. |
 | `reply_chunk_limit` | number | `4000` | Maximum Unicode code points per posted message: the `reply` tool splits longer text into several messages without splitting a surrogate pair. Must be a positive integer. |
 | `reply_chunk_mode` | `"length"` \| `"newline"` | `"newline"` | How the `reply` tool splits text longer than `reply_chunk_limit`. `length`: hard split at the limit. `newline`: prefer the last newline within the limit, keeping that newline in the preceding message; hard split a line that exceeds the limit. Both modes preserve all whitespace: concatenating the posted texts in order reproduces the supplied text exactly. |
-| `allow_invited_channels` | boolean | `false` | Picks the channel mode for every persona. Absent or `false` is **declarative mode**: each persona's `channels` and top-level `permission_prompts` are in force, and its `invited` section is not read. `true` is **fungible mode**: each persona's `channels` and top-level `permission_prompts` are not read, and its `invited` section is in force. A confirmed change applies in place at once and keeps every session. Non-boolean values are rejected at load. See [Channel modes](channel-modes.md#channel-modes), and read [Who can reach a persona in fungible mode](channel-modes.md#who-can-reach-a-persona-in-fungible-mode) before turning it on. |
+| `channel_mode` | `"strict"` or `"open"` | `"strict"` | Selects the channel mode; a confirmed change applies in place, at once. Shared channel choices and the destination are retained. See [Channel modes](channel-modes.md). |
 
 ---
 

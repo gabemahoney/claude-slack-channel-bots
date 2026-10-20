@@ -691,17 +691,15 @@ wait_until "${RECORD_WAIT_S}" "the stub never loaded the control file's labels" 
 # (bravo has no `invited`, so its default "dm" applies);
 # - switch-off: fungible without the switch.
 write_persona_config() {
-    local switch='' invited=''
+    local switch='' extra_alpha='' extra_bravo=''
     case "$1" in
         declarative) ;;
-        fungible)
-            [[ "${SWITCH_KEY:-}" =~ ^[a-z_]+$ ]] \
-                || fail "write_persona_config: the switch's key '${SWITCH_KEY:-}' is not printed yet, or not a plain key"
-            switch=$'\n  "'"${SWITCH_KEY}"$'": true,'
-            invited=$',\n      "invited": { "permission_prompts": "'"${A1}"'" }'
-            ;;
-        switch-off)
-            invited=$',\n      "invited": { "permission_prompts": "'"${A1}"'" }'
+        fungible|switch-off)
+            local mode='open'
+            [[ "$1" == 'switch-off' ]] && mode='strict'
+            switch=$'\n  "'"${SWITCH_KEY}"'": "'"${mode}"'",'
+            extra_alpha=', { "id": "'"${F1}"'", "delivery": "mentions" }, { "id": "'"${S1}"'", "delivery": "all" }'
+            extra_bravo=', { "id": "'"${F1}"'", "delivery": "mentions" }, { "id": "'"${F2}"'", "delivery": "mentions" }, { "id": "'"${A1}"'", "delivery": "mentions" }, { "id": "'"${S1}"'", "delivery": "all" }'
             ;;
         *) fail "write_persona_config: unknown shape '$1'" ;;
     esac
@@ -714,16 +712,16 @@ write_persona_config() {
       "working_directory": "${ALPHA_DIR}",
       "channels": [
         { "id": "${A1}", "delivery": "all" },
-        { "id": "${A2}", "delivery": "mentions" }
+        { "id": "${A2}", "delivery": "mentions" }${extra_alpha}
       ],
       "dm": { "enabled": false },
-      "permission_prompts": "${A1}"${invited}
+      "permission_prompts": "${A1}"
     },
     {
       "name": "${BRAVO}",
       "credentials_file": "${BRAVO_CREDS}",
       "working_directory": "${BRAVO_DIR}",
-      "channels": [{ "id": "${B1}", "delivery": "mentions" }],
+      "channels": [{ "id": "${B1}", "delivery": "mentions" }${extra_bravo}],
       "dm": { "enabled": true, "contact": "${CONTACT}" },
       "permission_prompts": "dm"
     }
@@ -748,12 +746,9 @@ start_server --live
 UNCLAIMED_CHANNEL="$(printed UNCLAIMED_CHANNEL)"
 PERSONA_INVITED_CHANNEL="$(printed PERSONA_INVITED_CHANNEL)"
 PERSONA_CHANNEL_DELIVERY_SET="$(printed PERSONA_CHANNEL_DELIVERY_SET)"
-STORE_CLASSES_TEXT="$(printed CHANNEL_DELIVERY_DIAGNOSTIC_CLASSES)"
-mapfile -t STORE_CLASSES <<< "${STORE_CLASSES_TEXT}"
-STORE_LOG_PREFIX="$(printed CHANNEL_DELIVERY_LOG_PREFIX)"
 SWITCH_KEY="$(printed MODE_SWITCH_SETTING)"
-FUNGIBLE="$(printed channelModeOf true)"
-DECLARATIVE="$(printed channelModeOf false)"
+FUNGIBLE="$(printed channelModeOf open)"
+DECLARATIVE="$(printed channelModeOf strict)"
 STORE_FILE="${SLACK_STATE_DIR}/$(printed CHANNEL_DELIVERY_FILE_NAME)"
 SET_TOOL="$(printed SET_CHANNEL_DELIVERY_TOOL)"
 APPLIED_CLASS="[slack] $(printed RELOAD_APPLIED):"
@@ -775,9 +770,9 @@ F1_HEARD_CAUSE="$(printed invitedChannelCause "${F1}" public mentions)"
 F1_HEARD_ALL_CAUSE="$(printed invitedChannelCause "${F1}" public all)"
 A1_HEARD_CAUSE="$(printed invitedChannelCause "${A1}" public mentions)"
 F2_HEARD_CAUSE="$(printed invitedChannelCause "${F2}" private mentions)"
-F1_SET_CAUSE="$(printed channelDeliverySetCause "${F1}" "${NO_CHOICE}" all all)"
+F1_SET_CAUSE="$(printed channelDeliverySetCause "${F1}" mentions all all)"
 F1_SET_AGAIN_CAUSE="$(printed channelDeliverySetCause "${F1}" all all all)"
-A1_SET_HELD_CAUSE="$(printed channelDeliverySetCause "${A1}" "${NO_CHOICE}" all mentions)"
+A1_SET_HELD_CAUSE="$(printed channelDeliverySetCause "${A1}" mentions all mentions)"
 U1_UNCLAIMED="$(persona_line "${UNCLAIMED_CHANNEL}" alpha "${U1_CAUSE}")"
 F1_UNCLAIMED="$(persona_line "${UNCLAIMED_CHANNEL}" alpha "${F1_CAUSE}")"
 X1_UNCLAIMED="$(persona_line "${UNCLAIMED_CHANNEL}" alpha "${X1_CAUSE}")"
@@ -785,7 +780,7 @@ X2_UNCLAIMED="$(persona_line "${UNCLAIMED_CHANNEL}" alpha "${X2_CAUSE}")"
 X3_UNCLAIMED="$(persona_line "${UNCLAIMED_CHANNEL}" alpha "${X3_CAUSE}")"
 ALPHA_HEARS_F1="$(persona_line "${PERSONA_INVITED_CHANNEL}" alpha "${F1_HEARD_CAUSE}")"
 ALPHA_HEARS_F1_ALL="$(persona_line "${PERSONA_INVITED_CHANNEL}" alpha "${F1_HEARD_ALL_CAUSE}")"
-ALPHA_HEARS_A1="$(persona_line "${PERSONA_INVITED_CHANNEL}" alpha "${A1_HEARD_CAUSE}")"
+ALPHA_HEARS_A1="$(persona_line "${PERSONA_INVITED_CHANNEL}" alpha "$(printed invitedChannelCause "${A1}" public all)")"
 BRAVO_HEARS_F2="$(persona_line "${PERSONA_INVITED_CHANNEL}" bravo "${F2_HEARD_CAUSE}")"
 BRAVO_HEARS_A1="$(persona_line "${PERSONA_INVITED_CHANNEL}" bravo "${A1_HEARD_CAUSE}")"
 ALPHA_SET_F1="$(persona_line "${PERSONA_CHANNEL_DELIVERY_SET}" alpha "${F1_SET_CAUSE}")"
@@ -856,7 +851,7 @@ wait_until "${RECORD_WAIT_S}" "start: the stub's record holds no push-refused li
 check_upgrade_log() {
     local term
     for term in "${SWITCH_KEY}" "${FUNGIBLE}" "${PERSONA_INVITED_CHANNEL}" "${PERSONA_CHANNEL_DELIVERY_SET}" \
-        "${STORE_CLASSES[@]}" "${STORE_LOG_PREFIX}"; do
+        ; do
         [[ -n "${term}" ]] || fail "$1: an empty term from the printer"
         [[ "$(count_server_log "${term}")" == 0 ]] || fail "$1: server.log names '${term}' in declarative mode"
     done
@@ -864,8 +859,8 @@ check_upgrade_log() {
 
 cmp -s -- "${CONFIG}" "${CONFIG_A_COPY}" || fail "phase A: config.json is not its copy, byte for byte"
 [[ -f "${LAST}" ]] || fail "phase A: config.json.last-applied was not written"
-cmp -s -- "${CONFIG}" "${LAST}" || fail "phase A: config.json.last-applied does not hold config.json's bytes"
-[[ ! -e "${STORE_FILE}" ]] || fail "phase A: ${STORE_FILE} exists in declarative mode"
+configuration_record_matches "${CONFIG}" "${LAST}" || fail "phase A: config.json.last-applied does not hold config.json's bytes"
+[[ ! -e "${SLACK_STATE_DIR}/channel-delivery.json" ]] || fail "phase A: a legacy store was created"
 check_upgrade_log "phase A after the start"
 
 # alpha A1 plain: delivered `receive_all`, found in the accepted queue record (the
@@ -907,7 +902,7 @@ wait_queued "phase A: bravo B1 mention" "${BRAVO_DIR}" "${B1}" "${PUSH_TS}" "${V
 # control); nothing written.
 expect_tool "phase A: alpha's set_channel_delivery A1 all" "${ALPHA_DIR}" \
     "$(jq -c -n --arg c "${A1}" '{channel: $c, delivery: "all"}')" true "${ALPHA_DECLARATIVE_REFUSAL}"
-[[ ! -e "${STORE_FILE}" ]] || fail "phase A: the refused call created ${STORE_FILE}"
+[[ ! -e "${SLACK_STATE_DIR}/channel-delivery.json" ]] || fail "phase A: the refused call created a legacy store"
 cmp -s -- "${CONFIG}" "${CONFIG_A_COPY}" || fail "phase A: config.json changed after the refused call"
 check_upgrade_log "phase A after its last control"
 
@@ -922,13 +917,16 @@ confirm_switch() {
     ALPHA_LAUNCHES="$(launch_counts "${ALPHA_REF}" "${ALPHA_START}" "${ALPHA_RELAUNCH}")"
     BRAVO_LAUNCHES="$(launch_counts "${BRAVO_REF}" "${BRAVO_START}" "${BRAVO_RELAUNCH}")"
     applied_before="$(count_log "${APPLIED_CLASS}")"
+    local authority_before="${SCENARIO_ROOT}/authority-before-${shape}.json"
+    cp -- "${LAST}" "${authority_before}"
     write_persona_config "${shape}"
     wait_for_file "${PENDING}" "${TICK_WAIT_S}" "${step}: config.json.pending never appeared"
     wait_until 10 "${step}: the pending file never carried the switch's line" pending_has_line "${line}"
     check_pending_layout "${step}"
+    cmp -s -- "${authority_before}" "${LAST}" || fail "${step}: authority envelope changed before confirmation"
     mv -f -- "${PENDING}" "${APPLY}"
     wait_for_count "${APPLIED_CLASS}" $(( applied_before + 1 )) "${APPLY_WAIT_S}" "${step}: the confirmation was never applied"
-    cmp -s -- "${CONFIG}" "${LAST}" || fail "${step}: config.json.last-applied does not hold config.json's bytes"
+    configuration_record_matches "${CONFIG}" "${LAST}" || fail "${step}: config.json.last-applied does not hold config.json's bytes"
 }
 
 # expect_sessions_kept <step> <alpha-channel> <alpha-ts> <bravo-channel> <bravo-ts>:
@@ -1033,9 +1031,7 @@ expect_since "${B6_MARK}" "[slack] ${UNCLAIMED_CHANNEL}:" 0 "step 6: unclaimed-c
 B7_MARK="$(log_mark)"
 push_message "${ALPHA_LABEL}" "${A1}" channel "$(plain_text)"
 B7_TS="${PUSH_TS}"
-wait_since "${B7_MARK}" "$(plain_drop "${ALPHA_REF}" "${A1}" "${DROP_NOT_MENTIONED}")" "${EVENT_WAIT_S}" \
-    "step 7: no not-mentioned line for alpha A1"
-expect_queued "step 7: alpha A1 plain" 0 "${ALPHA_DIR}" "${A1}" "${B7_TS}"
+wait_queued "step 7: alpha A1 retains its applied all preference" "${ALPHA_DIR}" "${A1}" "${B7_TS}" "${VIA_RECEIVE_ALL}"
 expect_since "${B7_MARK}" "${ALPHA_HEARS_A1}" 1 "step 7: alpha's persona-invited-channel lines for A1"
 
 # 8. alpha stores `all` for F1: accepted, naming F1, the stored `all` and the
@@ -1186,14 +1182,13 @@ confirm_switch switch-off "${SWITCH_OFF_LINE}" "switch off"
 OFF_MARK="$(log_mark)"
 push_message "${ALPHA_LABEL}" "${F1}" channel "$(plain_text)"
 OFF_F1_TS="${PUSH_TS}"
-wait_since "${OFF_MARK}" "${F1_UNCLAIMED}" "${EVENT_WAIT_S}" "switch off: no 0.11.1 unclaimed-channel line for alpha F1"
-expect_since "${OFF_MARK}" "${F1_UNCLAIMED}" 1 "switch off: alpha F1's unclaimed-channel lines"
-expect_queued "switch off: alpha F1 plain" 0 "${ALPHA_DIR}" "${F1}" "${OFF_F1_TS}"
+wait_queued "switch off: alpha F1 keeps its shared applied choice" "${ALPHA_DIR}" "${F1}" "${OFF_F1_TS}" "${VIA_RECEIVE_ALL_SHARED}"
+expect_since "${OFF_MARK}" "${F1_UNCLAIMED}" 0 "switch off: an applied channel is still configured"
 
-# alpha, A1, plain: delivered `receive_all`, by its listed entry.
+# alpha and bravo both hold A1 at all; strict mode has no open destination guard.
 push_message "${ALPHA_LABEL}" "${A1}" channel "$(plain_text)"
 OFF_A1_TS="${PUSH_TS}"
-wait_queued "switch off: alpha A1 plain" "${ALPHA_DIR}" "${A1}" "${OFF_A1_TS}" "${VIA_RECEIVE_ALL}"
+wait_queued "switch off: alpha A1 plain" "${ALPHA_DIR}" "${A1}" "${OFF_A1_TS}" "${VIA_RECEIVE_ALL_SHARED}"
 
 # bravo, B1, a mention: delivered `mention`, by its listed entry.
 push_message "${BRAVO_LABEL}" "${B1}" channel "$(mention_text "${BRAVO_BOT_USER}")"
@@ -1204,7 +1199,8 @@ expect_sessions_kept "switch off" "${A1}" "${OFF_A1_TS}" "${B1}" "${OFF_B1_TS}"
 
 # alpha's call for F1: refused with the declarative text; the file unchanged.
 expect_tool "switch off: alpha's set_channel_delivery F1 all" "${ALPHA_DIR}" "${F1_ALL_ARGS}" true "${ALPHA_DECLARATIVE_REFUSAL}"
-cmp -s -- "${STORE_FILE}" "${STORE_BEFORE_OFF}" || fail "switch off: ${STORE_FILE} changed"
+jq -ne --slurpfile before "${STORE_BEFORE_OFF}" --slurpfile after "${STORE_FILE}" '$before[0].personas == $after[0].personas' > /dev/null \
+    || fail "switch off: applied persona choices changed"
 
 # demo: retain one real stub DM's log and transcript
 # metadata before the successful scenario's EXIT trap deletes both. The

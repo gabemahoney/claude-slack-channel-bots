@@ -1623,7 +1623,7 @@ describe('persona teardown: every step for the removed key only, in order', () =
 
   test('over the real routing in fungible mode, tearing B down empties B\'s heard set and leaves A\'s, holding the same channel, unchanged', async () => {
     const clock = createFakeClock()
-    const h = makeRoutingHarness([{ name: NAME_A }, { name: NAME_B }], dir, { mode: 'fungible', dedupeClock: () => clock.now() })
+    const h = makeRoutingHarness([{ name: NAME_A }, { name: NAME_B }], dir, { mode: 'open', dedupeClock: () => clock.now() })
     cleanups.push(resetRoutingState)
     const f = makeFixture({ overrides: { routing: { forget: (key) => h.forget(key) } } })
     const [a, b] = [f.a.key, f.b.key]

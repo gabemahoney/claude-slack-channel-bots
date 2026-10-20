@@ -193,8 +193,11 @@ cp -- "${CONFIG}" "${V0_COPY}"
 # shellcheck disable=SC2119 # dry-run start: no --live
 start_server
 wait_for_file "${LAST}" "${TICK_WAIT_S}" "start never wrote config.json.last-applied"
-same_bytes "${CONFIG}" "${LAST}" || fail "start: config.json.last-applied does not hold config.json's bytes"
+configuration_record_matches "${CONFIG}" "${LAST}" || fail "start: config.json.last-applied does not hold config.json's bytes"
 [[ ! -e "${PENDING}" ]] || fail "start: config.json.pending exists with no edit made"
+
+AUTHORITY_V0="${SCENARIO_ROOT}/authority.v0.json"
+cp -- "${LAST}" "${AUTHORITY_V0}"
 
 # --- 1. Apply: preview, hold, confirm ------------------------------------
 emit_config "${V1_ALPHA}" all | write_config
@@ -205,17 +208,18 @@ wait_until 10 "edit 1: config.json.pending never named persona ${ALPHA}'s channe
 check_pending_layout "edit 1" in_place=1
 wait_for_log "${HEADER_1}" 10 "edit 1: reload-preview header not logged"
 expect_preview_logged "edit 1" edit1
-same_bytes "${V0_COPY}" "${LAST}" || fail "edit 1: config.json.last-applied changed before a confirmation"
+cmp -s -- "${AUTHORITY_V0}" "${LAST}" || fail "edit 1: config.json.last-applied changed before a confirmation"
 
 # An unconfirmed edit never applies: watch a full tick interval (the record
 # keeps its bytes, no reload-applied line, alpha is not updated in place).
 hold_not_applied "${HOLD_S}" "edit 1 unconfirmed" no_alpha_channels_update
+cmp -s -- "${AUTHORITY_V0}" "${LAST}" || fail "edit 1 unconfirmed: authority envelope changed"
 
 mv -f -- "${PENDING}" "${APPLY}"
 
 wait_for_log "${APPLIED_1}" "${TICK_WAIT_S}" "confirm 1: reload-applied not logged"
 [[ ! -e "${APPLY}" ]] || fail "confirm 1: config.json.apply still present after the apply"
-same_bytes "${CONFIG}" "${LAST}" || fail "confirm 1: config.json.last-applied does not hold the confirmed config.json"
+configuration_record_matches "${CONFIG}" "${LAST}" || fail "confirm 1: config.json.last-applied does not hold the confirmed config.json"
 wait_for_log "${ALPHA_UPDATED_CHANNELS}" 10 "confirm 1: persona ${ALPHA} not updated in place"
 # The same pass removes the pending file (nothing is pending any more) and,
 # having applied, logs no reload-nothing-pending line.
@@ -224,6 +228,8 @@ expect_count "${NOTHING_PENDING}" 0 "confirm 1: reload-nothing-pending logged af
 expect_count "${APPLIED_CLASS}" 1 "confirm 1: reload-applied lines"
 V1_COPY="${SCENARIO_ROOT}/config.v1.json"
 cp -- "${CONFIG}" "${V1_COPY}"
+AUTHORITY_V1="${SCENARIO_ROOT}/authority.v1.json"
+cp -- "${LAST}" "${AUTHORITY_V1}"
 
 # --- 2. Stale confirmation -----------------------------------------------
 emit_config "${V2_ALPHA}" all | write_config
@@ -252,13 +258,13 @@ check_pending_layout "edit 3" in_place=2
 pending_has_line "${ALPHA_DELIVERY_BODY}" || fail "edit 3: config.json.pending lost persona ${ALPHA}'s delivery change"
 wait_for_log "${HEADER_2}" 10 "edit 3: reload-preview header not logged"
 expect_preview_logged "edit 3" edit3
-same_bytes "${V1_COPY}" "${LAST}" || fail "edit 3: config.json.last-applied changed before a confirmation"
+cmp -s -- "${AUTHORITY_V1}" "${LAST}" || fail "edit 3: config.json.last-applied changed before a confirmation"
 
 mv -f -- "${STALE_COPY}" "${APPLY}"
 
 wait_for_log "${STALE_MATCH}" "${TICK_WAIT_S}" "stale confirmation: reload-stale-confirmation not logged"
 [[ ! -e "${APPLY}" ]] || fail "stale confirmation: config.json.apply still present"
-same_bytes "${V1_COPY}" "${LAST}" || fail "stale confirmation: config.json.last-applied changed"
+cmp -s -- "${AUTHORITY_V1}" "${LAST}" || fail "stale confirmation: config.json.last-applied changed"
 expect_count "${APPLIED_CLASS}" 1 "stale confirmation: a change was applied (reload-applied lines)"
 expect_count "${ALPHA_UPDATED_DELIVERY}" 0 "stale confirmation: persona ${ALPHA} updated in place"
 expect_count "${BRAVO_UPDATED_DELIVERY}" 0 "stale confirmation: persona ${BRAVO} updated in place"
@@ -271,7 +277,7 @@ mv -f -- "${PENDING}" "${APPLY}"
 
 wait_for_log "${APPLIED_2}" "${TICK_WAIT_S}" "confirm 3: reload-applied not logged"
 [[ ! -e "${APPLY}" ]] || fail "confirm 3: config.json.apply still present after the apply"
-same_bytes "${CONFIG}" "${LAST}" || fail "confirm 3: config.json.last-applied does not hold the confirmed config.json"
+configuration_record_matches "${CONFIG}" "${LAST}" || fail "confirm 3: config.json.last-applied does not hold the confirmed config.json"
 wait_for_log "${ALPHA_UPDATED_DELIVERY}" 10 "confirm 3: persona ${ALPHA} not updated in place"
 wait_for_log "${BRAVO_UPDATED_DELIVERY}" 10 "confirm 3: persona ${BRAVO} not updated in place"
 wait_until 10 "confirm 3: config.json.pending not removed after the apply" test ! -e "${PENDING}"

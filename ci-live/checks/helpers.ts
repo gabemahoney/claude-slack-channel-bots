@@ -359,8 +359,13 @@ export async function waitFile(ctx: CheckContext, path: string, timeoutMs: numbe
   return (await waitFor(async () => fileExists(ctx, path), { timeoutMs, intervalMs: POLL_MS, clock: ctx.clock })) === true
 }
 
-export async function recorded(ctx: CheckContext): Promise<boolean> {
-  return (await run(ctx, 'cmp -s "$S/config.json" "$S/config.json.last-applied"')).code === 0
+/** Compare exact source evidence rather than the envelope's unrelated applied facts. */
+export function recordedCommand(sourceFile = '"$S/config.json"'): string {
+  return `jq -e --rawfile source ${sourceFile} '.sourceBytesBase64 == ($source | @base64)' "$S/config.json.last-applied" >/dev/null`
+}
+
+export async function recorded(ctx: CheckContext, sourceFile?: string): Promise<boolean> {
+  return (await run(ctx, recordedCommand(sourceFile))).code === 0
 }
 
 export async function serverPid(ctx: CheckContext): Promise<string> {
@@ -722,7 +727,7 @@ export async function checkStartLines(
   const all = await since(ctx, m)
   const has = (s: string) => all.filter((l) => l.includes(s))
   if (fromRecord) {
-    f.expect(has(`[slack] Starting from the last-applied record "${S}/config.json.last-applied"`).length === 1, 'no single "Starting from the last-applied record" line')
+    f.expect(has(`[slack] Starting from the shared channel authority "${S}/config.json.last-applied" at revision `).length === 1, 'no single shared channel authority start line')
     f.expect(has('[slack] No last-applied record').length === 0, 'a "No last-applied record" line appeared')
   }
   letters.forEach((l, i) => {

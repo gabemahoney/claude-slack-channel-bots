@@ -1,6 +1,6 @@
 ---
 name: setup-slack-channel-bots
-description: Interactive setup wizard for claude-slack-channel-bots — states or changes the channel mode (declarative or fungible), adds personas one at a time (a Slack app from the manifest, its name and avatar, its credentials file written by a terminal command so tokens never enter the chat, its channels or the channels its app is invited to, its DMs and destination, its entry in config.json), then checks the system prompt, agent-director and legacy hooks and explains how the change takes effect.
+description: Interactive setup wizard for claude-slack-channel-bots — states or changes the channel mode (strict or open), adds personas one at a time (a Slack app from the manifest, its name and avatar, its credentials file written by a terminal command so tokens never enter the chat, its channels or the channels its app is invited to, its DMs and destination, its entry in config.json), then checks the system prompt, agent-director and legacy hooks and explains how the change takes effect.
 version: 1.0.0
 license: MIT
 user-invocable: true
@@ -12,9 +12,9 @@ allowed-tools: [Read, Write, Edit, Bash, Glob]
 
 Interactive setup wizard for `claude-slack-channel-bots`. Each bot is a
 **persona**: its own Slack app, its own credentials file, one Claude instance
-with its own working directory, and the channels it serves: in declarative
-mode, the default, the channels it is configured into; in fungible mode, the
-channels its app is invited to. The wizard states the channel mode, or sets
+with its own working directory, and the channels it serves: in strict
+mode, the default, the channels it is configured into; in open mode, the
+channels with applied non-off choices where its app is invited. The wizard states the channel mode, or sets
 it, adds personas one at a time, then checks the rest of the setup. It skips
 anything already done.
 
@@ -99,8 +99,7 @@ ls -l "$STATE_DIR/config.json" 2>/dev/null || echo "NOT_FOUND"
   Quick Start). An empty `{"personas": []}` is also a valid start.
 - **Present:** read it and list the personas already declared, by `name`, with
   their `working_directory`, `credentials_file` and `dm`, and each section
-  they carry: the declarative section's channel IDs and `permission_prompts`,
-  and the fungible section's `invited.permission_prompts`. Step 4 tells which
+  they carry: the shared channel IDs, delivery choices and `permission_prompts`. Step 4 tells which
   section is in force; Step 5 uses the names and paths to reject clashes.
 
 ---
@@ -128,87 +127,19 @@ confirmation applies everything `config.json` holds at that moment.
 
 ### Step 4 — Channel mode
 
-The top-level switch `allow_invited_channels` picks the channel mode for every
-persona. In declarative mode, the default, the operator lists each persona's
-channels and sets each one's `delivery`; in fungible mode, inviting a
-persona's app to a channel decides who can reach the persona there, and the
-persona's agent then sets each channel's delivery with `set_channel_delivery`.
-Suggest declarative mode: the operator keeps choosing each persona's audience.
-See `docs/channel-modes.md`.
+The top-level `channel_mode` selects `strict` (the default) or `open` for every persona. Both modes share `channels`, all four `delivery` choices and one required `permission_prompts` destination. See `docs/channel-modes.md`.
 
-Find the switch in the last-applied record and in `config.json`:
+Read the mode from the applied envelope and edited input separately:
 
 ```bash
 STATE_DIR="${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-slack-channel-bots}"
-for f in config.json.last-applied config.json; do
-  [ -f "$STATE_DIR/$f" ] && echo "$f: allow_invited_channels=$(jq '.allow_invited_channels' "$STATE_DIR/$f")"
-done
+[ ! -f "$STATE_DIR/config.json.last-applied" ] || jq '.applied.channel_mode // "strict"' "$STATE_DIR/config.json.last-applied"
+jq '.channel_mode // "strict"' "$STATE_DIR/config.json"
 ```
 
-`true` is fungible mode; `null` (absent) or `false` is declarative mode. The
-mode in force is the record's when the record exists (Step 3), otherwise
-`config.json`'s.
+On a fresh install, explain both modes, suggest `strict`, and ask which one. On an existing install, state the applied mode and ask whether to change it. An absent selector and `"strict"` mean the same mode. A differing input mode is pending until confirmed.
 
-- **A fresh install** (no last-applied record and no persona in
-  `config.json`): explain both modes, suggest declarative mode, and ask which
-  one. For fungible mode, have the operator read `docs/channel-modes.md`'s
-  `## Who can reach a persona in fungible mode` first, then add
-  `"allow_invited_channels": true` to `config.json`, keeping every other
-  field. For declarative mode, write nothing.
-- **An existing install:** state the mode in force and ask only whether to
-  change it. Compare the two files' modes, not their printed values: `null`
-  and `false` are the same mode. Only when `config.json`'s mode differs from
-  the record's is a switch change already pending: say so, and ask whether to
-  keep it.
-
-Step 5 adds each persona in the mode `config.json` holds after this step.
-
-**Changing the mode.** Make the switch and everything it needs one edit of
-`config.json`. In that same edit, collect for every declared persona the
-section the mode turned on needs:
-
-- **Turning fungible mode on** (`"allow_invited_channels": true`): for each
-  persona whose `dm.enabled` isn't `true` or that has no `dm.contact`, ask for
-  its fungible destination, `invited.permission_prompts`: a channel ID
-  (pattern `^[CG][A-Z0-9]+$`) that the persona's app is or will be invited to,
-  written `"invited": { "permission_prompts": "<channel ID>" }`, or `"dm"`
-  once its DMs are on and it has a contact. A persona with DMs on and a
-  contact may keep the default destination, `"dm"`, with no `invited`. Leave
-  each persona's `channels` and `permission_prompts` in place: fungible mode
-  doesn't read them, and declarative mode uses them again if the switch is
-  turned off. See `docs/channel-modes.md`'s `## Permission prompts in fungible mode`.
-- **Turning fungible mode off** (remove `allow_invited_channels`, or set it to
-  `false`): every persona needs a top-level `permission_prompts`, and
-  `channels` unless its `dm.enabled` is `true`, valid by the declarative-mode
-  rules. A persona whose
-  declarative section already passes them keeps it; for each other persona,
-  collect them as in 5.5 to 5.7. Its `invited` may stay: declarative mode
-  doesn't read it.
-
-Then check every persona against the load-time rules of the mode in force
-after the edit, in the debug skill's `### The load-time rules`: the rules for both
-modes, plus the declarative-mode rules when the switch is off, or the
-fungible-mode rules when it is on. A pending change is judged by the rules of
-the mode its own switch picks, so a persona that passes only the other mode's
-rules makes it `INVALID`. Write the edit only once every persona passes, so
-the pending change is never `INVALID`.
-
-**Before turning fungible mode on for an existing install,** tell the operator
-to review, for each persona's app:
-
-- its channel memberships in Slack, private channels included: each one
-  becomes a channel the persona serves;
-- its past `unclaimed-channel` lines in `server.log` and its rotated files
-  (`server.log.1` and later), which show channels whose messages reached the
-  app with no persona serving them:
-
-  ```bash
-  grep -h -F unclaimed-channel "$STATE_DIR"/server.log.* "$STATE_DIR"/server.log 2>/dev/null
-  ```
-
-and to read `docs/channel-modes.md`'s `## Who can reach a persona in fungible mode`, since
-an invite then changes who can reach a persona's worker. Step 10 says how the
-switch takes effect.
+To change modes, edit only `channel_mode`, preserving channel choices and the shared destination. Before selecting `open`, review each app’s channel memberships, private channels included, and past `unclaimed-channel` lines in `server.log`. A channel invitation alone does not create a listening choice. Have the operator read `docs/channel-modes.md`’s `## Who can reach a persona in fungible mode` before selecting it. Check every persona against the debug skill’s `### The load-time rules`; Step 10 describes confirmation.
 
 ---
 
@@ -309,23 +240,12 @@ share one, and the configuration is rejected.
 
 #### 5.5 Channels
 
-**In declarative mode,** for each channel the persona is in, collect:
+In both modes, collect each channel’s fields below. A persona with no channels must have DMs enabled:
 
-- **`id`**: the channel ID (`C` or `G` followed by capital letters and digits,
-  pattern `^[CG][A-Z0-9]+$`), not its name. In Slack, click the channel name;
-  the ID is at the bottom of the **About** tab.
-- **`delivery`**: `all` (every message in the channel) or `mentions` (only
-  messages that @mention the persona directly, and `@here` / `@channel`
-  broadcasts).
+- **`id`**: a Slack channel ID, pattern `^[CG][A-Z0-9]+$`. In Slack, click the channel name; the ID is at the bottom of **About**.
+- **`delivery`**: explicitly choose `off`, `mentions`, `all` or `thread_hybrid`. `off` disables channel listening; `mentions` delivers direct mentions and broadcasts; `all` delivers every message. Unassigned channels default to `off`.
 
-In declarative mode, a persona may have no channels only when its DMs are on
-(5.6). See `docs/configuration.md`'s `### Channel entries` and `### Channel delivery`.
-
-**In fungible mode,** skip the channels questions: the persona has no
-`channels` and no `delivery` to collect. It serves every public or private
-channel its app is invited to that is not externally shared, each at
-`mentions` unless its agent stores `all` for it with `set_channel_delivery`.
-Group DMs are never served. See `docs/channel-modes.md`'s `## What each mode serves`.
+See `docs/configuration.md`’s `### Channel entries` and `### Channel delivery`.
 
 In either mode, tell the operator to invite the persona's app to each channel
 the persona should serve, in that channel:
@@ -334,7 +254,7 @@ the persona should serve, in that channel:
 /invite @<the persona's bot display name>
 ```
 
-In fungible mode, the invite is what makes the persona serve the channel.
+In open mode, listening also requires a non-off applied choice.
 Invite the app to its destination channel from 5.7 too, when that is a
 channel. If the persona stays silent in a channel its app was invited to,
 point to the debugging skill's entry "A persona is silent in a channel its app
@@ -347,31 +267,11 @@ or if its prompts will go by DM (5.7), ask for `dm.contact`: the Slack user ID
 of the person who receives its prompts and notices, pattern `^[UW][A-Z0-9]+$`.
 In Slack, open that person's profile, then **⋮** → **Copy member ID**.
 
-In declarative mode, a persona with no channels must have DMs on. In fungible
-mode, no rule asks for DMs, but a persona with DMs off or no contact needs a
-channel destination (5.7). See `docs/configuration.md`'s "Direct messages" subsection.
+A persona whose destination is a channel needs no DMs. A `dm` destination needs both DMs on and a contact. See `docs/configuration.md`’s "Direct messages" subsection.
 
 #### 5.7 Permission prompts
 
-**In declarative mode,** ask where the persona's permission prompts and server
-notices go (`permission_prompts`, required):
-
-- one of the persona's own channel IDs from 5.5, or
-- `dm`, which needs `dm.enabled: true` and a `dm.contact`.
-
-See `docs/configuration.md`'s `### Permission prompts`.
-
-**In fungible mode,** ask instead for the fungible destination,
-`invited.permission_prompts`, where the persona's prompts and notices go; the
-top-level `permission_prompts` is not read:
-
-- a channel ID the persona's app will be invited to, written
-  `"invited": { "permission_prompts": "<channel ID>" }`. It needs no listing
-  and no DMs, but without the invite Slack refuses the posts; or
-- `"dm"`, the default when `invited` is left out, which needs
-  `dm.enabled: true` and a `dm.contact` (5.6).
-
-Everyone in a destination channel sees the prompts and notices. See `docs/channel-modes.md`'s `## Permission prompts in fungible mode`.
+Ask for `permission_prompts`, required in both modes: a listed channel ID, including a channel set to `off`, or `dm` with `dm.enabled: true` and a `dm.contact`. Invite the app to a channel destination so Slack accepts posts; everyone there sees its prompts and notices. See `docs/channel-modes.md`’s `## Permission prompts in both modes`.
 
 #### 5.8 Optional next-launch settings
 
@@ -395,7 +295,7 @@ Offer these only if the operator wants to override the top-level defaults
 
 #### 5.9 Declare the persona
 
-Show the operator the entry. In declarative mode, for example:
+Show the operator the entry. In strict mode, for example:
 
 ```json
 {
@@ -409,44 +309,9 @@ Show the operator the entry. In declarative mode, for example:
 }
 ```
 
-In fungible mode the entry has no declarative section, no `channels` and no
-top-level `permission_prompts`, for example:
+The same entry shape applies in both modes. Add `"dm": { "enabled": true, "contact": "<user ID>" }` and the 5.8 settings only when chosen. A DM-only persona explicitly sets `"permission_prompts": "dm"`.
 
-```json
-{
-  "name": "<name>",
-  "credentials_file": "<credentials file path>",
-  "working_directory": "<working directory>",
-  "invited": { "permission_prompts": "<channel ID>" }
-}
-```
-
-Add `"dm": { "enabled": true, "contact": "<user ID>" }` and the 5.8 settings
-only when chosen. In declarative mode, leave `channels` out of a DM-only
-persona; in fungible mode, leave `invited` out when the destination is the
-default `"dm"`. Check the entry against the debug skill's `### The load-time rules`
-for the mode in force after Step 4, together with the personas already in the
-file. In both modes:
-
-- the name and key, `working_directory` and `credentials_file` are each
-  unique across personas;
-- no persona's key starts with another persona's key (5.1);
-- `dm.contact` matches its pattern;
-- every path is absolute, `~` or `~/…`;
-- no key outside `docs/configuration.md`'s `### Persona fields` table.
-
-The declarative-mode rules:
-
-- channel IDs match their pattern, and no channel is listed twice;
-- `permission_prompts` is one of the persona's channels, or `dm` with DMs on
-  and a contact;
-- a persona with no channels has DMs on.
-
-The fungible-mode rules:
-
-- `invited` is an object holding only `permission_prompts`;
-- `invited.permission_prompts` is `"dm"` or a channel ID matching its pattern;
-- a `"dm"` destination, written or by default, has DMs on and a contact.
+Check the entry against the debug skill’s `### The load-time rules`, together with the personas already declared: unique names/keys, working directories and credentials paths; no key prefixes; valid paths and IDs; no duplicate channel IDs; explicit four-value delivery; required shared destination. Use only fields from `docs/configuration.md`’s `### Persona fields` table.
 
 On the operator's approval, append the entry to `personas` in `config.json`,
 keeping every other field and persona unchanged.
@@ -485,7 +350,7 @@ unavailable, have the operator add it in Slack or choose an available name.
 Both settings require a server start after confirmation; see
 [Acknowledgement reactions](../../docs/server-settings.md#acknowledgement-reactions).
 
-The channel-mode switch, `allow_invited_channels`, is a server-wide setting
+The channel-mode switch, `channel_mode`, is a server-wide setting
 too, but it is set only in Step 4, which collects every persona's section and
 checks the rules with it. Never set or change it here.
 
@@ -590,10 +455,10 @@ Explain the case that matches Step 3. Link to `docs/reload.md`.
 A change to the channel-mode switch from Step 4 is the one server-wide setting
 that applies in place: once confirmed, it takes effect at once, from the next
 event, tool call, prompt and notice, with no restart, and every session is
-kept. Its preview line reads `server-wide setting allow_invited_channels
+kept. Its preview line reads `server-wide setting channel_mode
 changed: turns <mode> mode on, applied in place at once, from the next event,
 tool call, prompt and notice, for …`, naming the mode it turns on and every
-persona it affects. See `docs/channel-modes.md`'s `## Turning fungible mode on or off`.
+persona it affects. See `docs/channel-modes.md`'s `## Turning open mode on or off`.
 
 A change to another server-wide setting, such as `port`, is recorded when
 confirmed and takes effect at the next server start (`docs/reload.md` `## When next-launch and server-wide
@@ -617,8 +482,8 @@ new persona came up: `server.log` has its `persona-start` line
 (`[slack] persona-start: personas[<i>] "<name>" (key=<key>): bring-up starting`)
 and no later line naming `(key=<key>)` with a failure class such as
 `persona-credentials-…` or `persona-directory-…`. Or @mention it in one of its
-channels and wait for its answer: in declarative mode, a channel listed in its
-`channels`; in fungible mode, a channel its app was invited to. In either
+channels and wait for its answer: in strict mode, a channel listed in its
+`channels`; in open mode, a channel its app was invited to. In either
 mode, a persona with DMs on can be DMed instead.
 
 ```bash
@@ -626,7 +491,7 @@ grep -F 'persona-start:' "$STATE_DIR/server.log" | tail -n 20
 grep -F '(key=<key>)' "$STATE_DIR/server.log" | tail -n 20
 ```
 
-In fungible mode, the first event a persona hears from a channel logs its
+In open mode, the first event a persona hears from a channel logs its
 `persona-invited-channel` line, naming the channel. If a persona stays silent
 in a channel its app was invited to, point to the debugging skill's entry
 "A persona is silent in a channel its app was invited to".
@@ -637,17 +502,12 @@ in a channel its app was invited to, point to the debugging skill's entry
 
 Report:
 
-- The channel mode `config.json` holds (declarative or fungible), and whether
+- The channel mode `config.json` holds (strict or open), and whether
   Step 4 changed it. A changed switch applies in place, at once, once
   confirmed (Step 10).
-- Each persona added: name, key if known, credentials file present with mode
-  0600 or not, and DMs on or off with the contact. In declarative mode, its
-  channels with their `delivery`, and the `permission_prompts` destination. In
-  fungible mode, its fungible destination (`invited.permission_prompts`, or
-  `"dm"` by default) and the channels the operator is to invite its app to.
-- When Step 4 changed the mode: each existing persona's fungible destination
-  (turning fungible mode on) or its `channels` and `permission_prompts`
-  (turning it off).
+- Each persona added: name, key if known, credentials file present with mode 0600 or not, DMs and contact, shared channels with `delivery`, and required `permission_prompts` destination.
+- When Step 4 changed the mode: the new mode, with channel choices and destination preserved.
+
 - `append_system_prompt_file` configured, `system_prompt_mode: "none"`, or
   skipped.
 - agent-director: installed (version) or missing.

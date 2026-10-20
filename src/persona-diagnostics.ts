@@ -319,7 +319,7 @@ export function formatCredentialsChangeFailed(failure: CredentialsChangeFailure)
  * The `persona-invited-channel` cause, formatted through
  * `formatPersonaDiagnostic` with no path:
  *
- *   `hears <public|private> channel <channel> in fungible mode, at channel delivery <mentions|all>`
+ *   `hears <public|private> channel <channel> in open mode, at channel delivery <mentions|all>`
  *
  * `delivery` is the persona's channel delivery after the loop guard. Pure.
  */
@@ -328,7 +328,7 @@ export function invitedChannelCause(
   channelType: FungibleChannelType,
   delivery: DeliveryMode,
 ): string {
-  return `hears ${channelType} channel ${channel} in fungible mode, at channel delivery ${delivery}`
+  return `hears ${channelType} channel ${channel} in open mode, at channel delivery ${delivery}`
 }
 
 /** How a `persona-channel-delivery-set` line names the absence of a stored choice before the call. */
@@ -395,14 +395,14 @@ export const FUNGIBLE_REFUSAL_TEXTS: Readonly<Record<FungibleRefusal, string>> =
  * The fungible-mode `unclaimed-channel` cause, formatted
  * through `formatPersonaDiagnostic` with no path:
  *
- *   `message in channel <channel> not delivered in fungible mode: <reason>; to serve this channel, use declarative mode with the channel listed`
+ *   `message in channel <channel> not delivered in open mode: <reason>; to serve this channel, use strict mode with the channel listed`
  *
  * `<reason>` is the refusal's text from `FUNGIBLE_REFUSAL_TEXTS`. Pure.
  */
 export function fungibleUnclaimedChannelCause(channel: string, refusal: FungibleRefusal): string {
   return (
-    `message in channel ${channel} not delivered in fungible mode: ${FUNGIBLE_REFUSAL_TEXTS[refusal]}; ` +
-    'to serve this channel, use declarative mode with the channel listed'
+    `message in channel ${channel} not delivered in open mode: ${FUNGIBLE_REFUSAL_TEXTS[refusal]}; ` +
+    'to serve this channel, use strict mode with the channel listed'
   )
 }
 

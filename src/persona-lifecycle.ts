@@ -638,7 +638,7 @@ export interface PersonaLifecycle {
  */
 export const DM_DESTINATION_SETTINGS: ReadonlySet<InPlaceSetting> = new Set<InPlaceSetting>([
   'permission_prompts',
-  'invited.permission_prompts',
+
   'dm.enabled',
   'dm.contact',
 ])

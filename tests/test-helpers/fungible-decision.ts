@@ -214,7 +214,7 @@ function receivingPersonaOf(row: FungibleDecisionRow): DeliveryPersona {
 
 /** Every applied persona's fungible destination the configuration sets, from its `fungible_destination`. */
 function destinationsOf(config: PersonaConfig): FungibleDecisionInputs['fungibleDestinations'] {
-  return config.personas.flatMap((p) => (p.fungible_destination === undefined ? [] : [{ key: p.key, destination: p.fungible_destination }]))
+  return config.personas.flatMap((p) => (p.permission_prompts === undefined ? [] : [{ key: p.key, destination: p.permission_prompts }]))
 }
 
 /** The row's stored choices as the decision reads them: a read-only lookup with the row's readability, no store and no file. */
@@ -259,9 +259,9 @@ export function channelDeliveryArgsOf(row: FungibleDecisionRow): Parameters<type
 
 /** The switch form of `config`: absent when the key is unset, else its value. */
 export function switchFormOf(config: PersonaConfig): SwitchForm {
-  const value: unknown = config.allow_invited_channels
+  const value: unknown = config.channel_mode
   if (value === undefined) return 'absent'
-  return value === true ? 'true' : 'false'
+  return value === 'open' ? 'true' : 'false'
 }
 
 /** The flag form of a flag as received: `null`, a string or any other non-boolean is `non-boolean`, never `absent`. */
@@ -288,7 +288,7 @@ export function channelTypeFormOf(event: SlackEvent): ChannelTypeForm | undefine
  * unset, as a file without the key gives it; `false` and `true` set it.
  */
 function cast(switchForm: SwitchForm, p: PersonaSpec = {}, q: PersonaSpec = {}, r: PersonaSpec = {}): PersonaConfig {
-  const overrides = switchForm === 'absent' ? { allow_invited_channels: undefined } : { allow_invited_channels: switchForm === 'true' }
+  const overrides = { channel_mode: switchForm === 'absent' ? undefined : switchForm === 'true' ? 'open' as const : 'strict' as const }
   return makeMultiPersonaConfig(
     [
       { name: P_KEY, ...p },
@@ -313,13 +313,11 @@ function declarativeCast(switchForm: 'absent' | 'false'): PersonaConfig {
     {
       channels: [{ id: LISTED_ALL, delivery: 'all' }, { id: LISTED_MENTIONS, delivery: 'mentions' }],
       dm: { enabled: true },
-      invited: { permission_prompts: P_DESTINATION },
-      fungible_destination: P_DESTINATION,
+      permission_prompts: P_DESTINATION,
     },
     {
       channels: [{ id: PRIVATE_CHANNEL, delivery: 'all' }],
-      invited: { permission_prompts: LISTED_ALL },
-      fungible_destination: LISTED_ALL,
+      permission_prompts: LISTED_ALL,
     },
   )
 }
@@ -335,8 +333,8 @@ const LISTED_CAST = cast('false', {
 function fungibleCast(pDm = true, p: PersonaSpec = {}, q: PersonaSpec = {}, r: PersonaSpec = {}): PersonaConfig {
   return cast(
     'true',
-    { invited: { permission_prompts: P_DESTINATION }, dm: { enabled: pDm }, ...p },
-    { invited: { permission_prompts: Q_DESTINATION }, ...q },
+    { permission_prompts: P_DESTINATION, dm: { enabled: pDm }, ...p },
+    { permission_prompts: Q_DESTINATION, ...q },
     r,
   )
 }
@@ -345,7 +343,7 @@ const FUNGIBLE_CAST = fungibleCast()
 const FUNGIBLE_CAST_DM_OFF = fungibleCast(false)
 
 /** Fungible mode with every other persona's destination `dm`. */
-const DM_DESTINATIONS_CAST = fungibleCast(true, {}, { invited: undefined })
+const DM_DESTINATIONS_CAST = fungibleCast(true, {}, { permission_prompts: 'dm' })
 
 // ---------------------------------------------------------------------------
 // Outcomes
@@ -360,7 +358,7 @@ function deliver(via: Via, fungible?: FungiblePath): DeliveryDecision {
   return fungible === undefined ? { action: 'deliver', via } : { action: 'deliver', via, fungible }
 }
 
-function drop(reason: 'non-message' | 'no-author' | 'own' | 'dm-disabled' | 'group-dm' | 'not-mentioned', fungible?: FungiblePath): DeliveryDecision {
+function drop(reason: 'non-message' | 'no-author' | 'own' | 'dm-disabled' | 'group-dm' | 'not-mentioned' | 'channel-off' | 'state-unavailable', fungible?: FungiblePath): DeliveryDecision {
   return fungible === undefined ? { action: 'drop', reason } : { action: 'drop', reason, fungible }
 }
 
@@ -501,18 +499,18 @@ declarativeRows.push(
 // ---------------------------------------------------------------------------
 
 const noStoredChoiceRows: FungibleDecisionRow[] = CHANNEL_KINDS.flatMap((kind): FungibleDecisionRow[] => {
-  const path = onPath(kind, 'mentions')
+  const path = onPath(kind, 'off')
   const at = `${kind} channel, no stored choice`
   const row = (label: string, event: SlackEvent, expected: DeliveryDecision): FungibleDecisionRow => ({
     label: `${at}: ${label}`, event, config: FUNGIBLE_CAST, flag: FLAG.false, stored: {}, expected,
   })
   return [
-    row('P\'s direct mention', messageIn(kind, P_MENTION), deliver('mention', path)),
-    row('<!here>', messageIn(kind, `${broadcastText('here')} standup`), deliver('broadcast', path)),
-    row('<!channel>', messageIn(kind, `${broadcastText('channel')} standup`), deliver('broadcast', path)),
-    row('plain message', messageIn(kind), drop('not-mentioned', path)),
-    row('<!everyone>', messageIn(kind, `${broadcastText('everyone')} standup`), drop('not-mentioned', path)),
-    row('user-group mention', messageIn(kind, `${userGroupMentionText()} standup`), drop('not-mentioned', path)),
+    row('P\'s direct mention', messageIn(kind, P_MENTION), drop('channel-off', path)),
+    row('<!here>', messageIn(kind, `${broadcastText('here')} standup`), drop('channel-off', path)),
+    row('<!channel>', messageIn(kind, `${broadcastText('channel')} standup`), drop('channel-off', path)),
+    row('plain message', messageIn(kind), drop('channel-off', path)),
+    row('<!everyone>', messageIn(kind, `${broadcastText('everyone')} standup`), drop('channel-off', path)),
+    row('user-group mention', messageIn(kind, `${userGroupMentionText()} standup`), drop('channel-off', path)),
     row(
       'Q\'s bot post mentioning P',
       makeBotMessage({
@@ -522,7 +520,7 @@ const noStoredChoiceRows: FungibleDecisionRow[] = CHANNEL_KINDS.flatMap((kind): 
         bot_id: Q_BOT,
         text: P_MENTION,
       }),
-      deliver('mention', path),
+      drop('channel-off', path),
     ),
   ]
 })
@@ -596,8 +594,8 @@ const ignoresChannelsRows: ChannelDeliveryRow[] = [
     event: publicMessage(PUBLIC_CHANNEL),
     config: fungibleCast(true, { channels: [{ id: PUBLIC_CHANNEL, delivery: 'all' }] }),
     flag: FLAG.false, stored: {},
-    expected: drop('not-mentioned', onPath('public', 'mentions')),
-    channelDelivery: delivery('mentions'),
+    expected: drop('channel-off', onPath('public', 'off')),
+    channelDelivery: delivery('off'),
   },
   {
     label: 'P lists the private channel mentions, P\'s stored all: plain message',
@@ -631,8 +629,8 @@ const ignoresChannelsRows: ChannelDeliveryRow[] = [
     event: publicMessage(PUBLIC_CHANNEL),
     config: FUNGIBLE_CAST, flag: FLAG.false, stored: {},
     viewChannels: { [P_KEY]: PUBLIC_CHANNEL, [Q_KEY]: { id: PUBLIC_CHANNEL, delivery: 'all' } },
-    expected: drop('not-mentioned', onPath('public', 'mentions')),
-    channelDelivery: delivery('mentions'),
+    expected: drop('channel-off', onPath('public', 'off')),
+    channelDelivery: delivery('off'),
   },
   {
     label: 'P\'s and R\'s sections undefined, P\'s stored all: plain message',
@@ -657,8 +655,8 @@ const ignoresChannelsRows: ChannelDeliveryRow[] = [
     event: privateMessage(PRIVATE_CHANNEL, P_MENTION),
     config: FUNGIBLE_CAST, flag: FLAG.false, stored: {},
     viewChannels: { [P_KEY]: FAIL_IF_READ, [Q_KEY]: FAIL_IF_READ, [R_KEY]: FAIL_IF_READ },
-    expected: deliver('mention', onPath('private', 'mentions')),
-    channelDelivery: delivery('mentions'),
+    expected: drop('channel-off', onPath('private', 'off')),
+    channelDelivery: delivery('off'),
   },
 ]
 
@@ -780,7 +778,7 @@ const loopGuardRows: ChannelDeliveryRow[] = [
   {
     label: 'R\'s fungible destination, a private channel, P\'s stored all: P\'s direct mention',
     event: privateMessage(PRIVATE_CHANNEL, P_MENTION),
-    config: fungibleCast(true, {}, {}, { invited: { permission_prompts: PRIVATE_CHANNEL } }),
+    config: fungibleCast(true, {}, {}, { permission_prompts: PRIVATE_CHANNEL }),
     flag: FLAG.false,
     stored: { [P_KEY]: { [PRIVATE_CHANNEL]: 'all' } },
     expected: deliver('mention', onPath('private', 'mentions')),
@@ -840,16 +838,16 @@ const unreadableStoreRows: ChannelDeliveryRow[] = [
     event: publicMessage(PUBLIC_CHANNEL),
     config: FUNGIBLE_CAST, flag: FLAG.false,
     stored: { [P_KEY]: { [PUBLIC_CHANNEL]: 'all' } }, readable: false,
-    expected: drop('not-mentioned', onPath('public', 'mentions')),
-    channelDelivery: delivery('mentions'),
+    expected: drop('state-unavailable'),
+    channelDelivery: delivery('off'),
   },
   {
     label: 'store unreadable, its lookup holding P\'s and Q\'s all: P\'s direct mention in a private channel',
     event: privateMessage(PRIVATE_CHANNEL, P_MENTION),
     config: FUNGIBLE_CAST, flag: FLAG.false,
     stored: { [P_KEY]: { [PRIVATE_CHANNEL]: 'all' }, [Q_KEY]: { [PRIVATE_CHANNEL]: 'all' } }, readable: false,
-    expected: deliver('mention', onPath('private', 'mentions')),
-    channelDelivery: delivery('mentions'),
+    expected: drop('state-unavailable'),
+    channelDelivery: delivery('off'),
   },
 ]
 

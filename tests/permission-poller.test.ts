@@ -48,7 +48,7 @@
  * - Fungible mode (beside), in its own
  *     describe with the switch on and a resolver reading it at each attempt,
  *     as `src/server.ts` wires it: a prompt for a persona whose fungible
- *     destination (`invited.permission_prompts`) is a channel posts once to
+ *     destination (`permission_prompts`) is a channel posts once to
  *     that channel, and one whose fungible destination is `dm`, explicit or
  *     by default, opens the DM with `dm.contact` and posts there, each on the
  *     persona's own client, no other client asked for or called; the live
@@ -1256,9 +1256,9 @@ describe('poller tick — `dm` destination', () => {
 
 describe('poller tick — fungible mode: prompts at the fungible destination (beside)', () => {
   /** The configuration in effect in declarative mode, as the one destination rule reads it. */
-  const DECLARATIVE_MODE: DestinationConfig = { allow_invited_channels: false }
+  const DECLARATIVE_MODE: DestinationConfig = { channel_mode: 'strict' }
   /** The configuration in effect in fungible mode, as the one destination rule reads it. */
-  const FUNGIBLE_MODE: DestinationConfig = { allow_invited_channels: true }
+  const FUNGIBLE_MODE: DestinationConfig = { channel_mode: 'open' }
 
   // F's fungible destination is a channel; X names `dm` explicitly; Y has no
   // `invited` section, so its fungible destination is `dm` by default.
@@ -1278,12 +1278,12 @@ describe('poller tick — fungible mode: prompts at the fungible destination (be
   beforeEach(() => {
     config = makeMultiPersonaConfig(
       [
-        { name: NAME_F, invited: { permission_prompts: F_DEST } },
-        { name: NAME_X, dm: { enabled: true, contact: X_CONTACT }, invited: { permission_prompts: DM_DESTINATION } },
-        { name: NAME_Y, dm: { enabled: true, contact: Y_CONTACT } },
+        { name: NAME_F, permission_prompts: F_DEST },
+        { name: NAME_X, dm: { enabled: true, contact: X_CONTACT }, permission_prompts: DM_DESTINATION },
+        { name: NAME_Y, permission_prompts: DM_DESTINATION, dm: { enabled: true, contact: Y_CONTACT } },
       ],
       personaDir,
-      { allow_invited_channels: true },
+      { channel_mode: 'open' },
     )
     ;[F, X, Y] = config.personas as [Persona, Persona, Persona]
     fungibleStubs = new Map(config.personas.map((p) => [p.key, makeStubSlack({ leakMarker: LEAK_SENTINEL })]))
@@ -1320,16 +1320,15 @@ describe('poller tick — fungible mode: prompts at the fungible destination (be
       () => X, () => DM_DESTINATION, ['conversations.open', 'chat.postMessage'], () => X_CONTACT,
     ],
     [
-      'a defaulted "dm" fungible destination (Y, no invited section): conversations.open for its dm.contact, then chat.postMessage to the returned D…',
+      'an explicit "dm" destination (Y, shared permission_prompts): conversations.open for its dm.contact, then chat.postMessage to the returned D…',
       () => Y, () => DM_DESTINATION, ['conversations.open', 'chat.postMessage'], () => Y_CONTACT,
     ],
   ])('%s — posted once on the persona\'s own client, no other client asked for or called; the live entry records that conversation and the persona key', async (_label, pick, fungibleDestination, expectedMethods, contact) => {
     const persona = pick()
     // Preconditions: the switch is on, the destination is the loader's
     // fungible destination, and the declarative section is not in force.
-    expect(config.allow_invited_channels).toBe(true)
-    expect(persona.fungible_destination).toBe(fungibleDestination())
-    expect(persona.permission_prompts).toBeUndefined()
+    expect(config.channel_mode).toBe('open')
+    expect(persona.permission_prompts).toBe(fungibleDestination())
     const stub = fungibleStubs.get(persona.key)!
     const dmContact = contact()
     const expectedChannel = dmContact === undefined ? F_DEST : stubOpenedDmId(dmContact)
@@ -1397,7 +1396,7 @@ describe('poller tick — fungible mode: prompts at the fungible destination (be
     // The declarative line names its setting once, so the swap below is exact.
     expect(declarativeLine.split(declarativeSetting)).toHaveLength(2)
     expect(fungibleLine).toBe(declarativeLine.replace(declarativeSetting, fungibleSetting))
-    expect(fungibleLine).not.toBe(declarativeLine)
+    expect(fungibleLine).toBe(declarativeLine)
     assertNoLeak({ fungible: fungible.logCalls, declarative: declarative.logCalls }, 'fungible destination refused')
   })
 })

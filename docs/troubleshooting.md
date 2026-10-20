@@ -9,7 +9,7 @@ Check Bun, the global package trust, the supported host, and the worker's Claude
 With no last-applied record, `start` exits with `missing prerequisite: config.json not found at <path>, and no config.json.last-applied at <path>`. Run `bun src/postinstall.ts` from the installed package directory to create the skeleton, or create the file, and check that `SLACK_STATE_DIR` names the directory you populated. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-configjson-not-found).
 
 **The server won't start: last-applied record error**
-`server.log` shows `[slack] Fatal: last-applied record error —`: the record can't be read or is invalid. Check `config.json`, then delete the record; the next start applies `config.json` as it stands. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-the-server-wont-start-last-applied-record-error).
+`server.log` shows `[slack] Fatal: last-applied record error —`: the record can't be read or is invalid. Preserve the shared authority, prepared input and pending evidence, and restore a trustworthy authority before starting again. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-the-server-wont-start-last-applied-record-error).
 
 **The server won't start: `reload-record-write-failed`**
 A start with no record could not write it, so nothing was applied. Make the directory holding `config.json` writable and not full, then start again. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-the-server-wont-start-reload-record-write-failed).
@@ -33,19 +33,19 @@ agent-director pre-trusts the working directory during launch. If any startup pr
 Normal for a short time after every launch: the server waits it out and never launches a second instance over it. If it hasn't started in time, the persona posts a *Launch stuck* or *Session not starting* notice. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-personas-instance-is-still-starting).
 
 **A persona doesn't receive messages in a channel or DM**
-Check that its Slack app is invited to the channel, that the channel is listed in `channels` with the `delivery` you want (declarative mode) or that its channel delivery there is the one you want (fungible mode), that the edit is confirmed, and for DMs that `dm.enabled` is `true`. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-doesnt-receive-messages-in-a-channel-or-dm).
+Check that its Slack app is invited to the channel, that the channel is listed in `channels` with the `delivery` you want (strict mode) or that its channel delivery there is the one you want (open mode), that the edit is confirmed, and for DMs that `dm.enabled` is `true`. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-doesnt-receive-messages-in-a-channel-or-dm).
 
 **A persona is silent in a channel it was invited to**
-An invite alone serves a channel only in fungible mode, and never a Slack Connect channel or a group DM. An edit that adds a mention, or a message posted before the invite, delivers nothing; the `unclaimed-channel` and `persona-invited-channel` lines in `server.log` show which case applies. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-is-silent-in-a-channel-it-was-invited-to).
+An invite alone creates no listening choice in either mode, and never a Slack Connect channel or a group DM. An edit that adds a mention, or a message posted before the invite, delivers nothing; the `unclaimed-channel` and `persona-invited-channel` lines in `server.log` show which case applies. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-is-silent-in-a-channel-it-was-invited-to).
 
 **A persona receives every message in a channel**
-In fungible mode its agent stored `all` there (a `persona-channel-delivery-set` line): ask it to switch back to `mentions`, remove its app from the channel, or turn fungible mode off. In declarative mode, change the channel's `delivery` to `mentions` and confirm the change. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-receives-every-message-in-a-channel).
+In open mode its agent stored `all` there (a `persona-channel-delivery-set` line): ask it to switch back to `mentions`, remove its app from the channel. A mode switch preserves the shared choice. In strict mode, change the channel's `delivery` to `mentions` and confirm the change. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-receives-every-message-in-a-channel).
 
 **File attachment fails after a long wait**
 Each Slack request attempt, an upload included, is limited to 30 s, so an upload that needs longer fails only after about 30 minutes of retries. Send smaller files, or split a large attachment. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-file-attachment-fails-after-a-long-wait).
 
 **Messages in a channel no persona is configured into are not delivered**
-Each such message logs an `unclaimed-channel` line naming the channel, and in fungible mode the reason. List the channel in a persona's `channels` and confirm the change, or turn fungible mode on for a public or private channel that is not externally shared. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-messages-in-a-channel-no-persona-is-configured-into-are-not-delivered).
+Each such message logs an `unclaimed-channel` line naming the channel, and in open mode the reason. Assign a non-off shared channel choice and confirm it; open mode also requires a public or private channel that is not externally shared. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-messages-in-a-channel-no-persona-is-configured-into-are-not-delivered).
 
 **Permission relay not working**
 Turn on the persona's app's interactivity, check the bot is in `check_permission` with `agent-director list --state check_permission --label service=cscb`, and if `permission-poller:` lines warn of skipped ticks, raise `agent_director_poll_interval_ms` (it takes effect at the next server start). [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-permission-relay-not-working).

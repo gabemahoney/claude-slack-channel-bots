@@ -42,7 +42,6 @@ import {
   parsePersonaConfigBytes,
   PERSONA_DM_KEYS,
   PERSONA_ENTRY_KEYS,
-  PERSONA_INVITED_KEYS,
   PERSONA_TOP_LEVEL_KEYS,
   type PersonaConfig,
   type PersonaConfigInput,
@@ -82,7 +81,6 @@ function input(top: Record<string, unknown> = {}, overrides: Partial<PersonaInpu
       name: 'alpha',
       channels: [{ id: 'C0A0001', delivery: 'all' }],
       permission_prompts: 'C0A0001',
-      invited: { permission_prompts: 'C0A0001' },
       ...overrides,
     },
     root,
@@ -129,7 +127,6 @@ const UNCOMPARED_PERSONA_FIELDS: readonly string[] = []
 function personaLeafSettings(): string[] {
   return PERSONA_ENTRY_KEYS.flatMap((key): string[] => {
     if (key === 'dm') return PERSONA_DM_KEYS.map((k) => `dm.${k}`)
-    if (key === 'invited') return PERSONA_INVITED_KEYS.map((k) => `invited.${k}`)
     if (key === 'channels') return CHANNEL_ENTRY_KEYS.map((k) => CHANNEL_FIELD_SETTING[k] ?? `channels[].${k}`)
     return [key]
   })
@@ -211,7 +208,7 @@ describe('every top-level key the loader accepts is compared', () => {
     ack_reaction: 'eyes',
     reply_chunk_limit: 2000,
     reply_chunk_mode: 'length',
-    allow_invited_channels: true,
+    channel_mode: 'open',
   })
 
   test('every server-wide key has a changed value to try', () => {
@@ -301,7 +298,7 @@ function classes(c: Partial<Classes>): Classes {
 
 /** The top-level settings of each channel mode: the switch absent, and the switch on. */
 const DECLARATIVE_TOP: Record<string, unknown> = {}
-const FUNGIBLE_TOP: Record<string, unknown> = { [MODE_SWITCH_SETTING]: true }
+const FUNGIBLE_TOP: Record<string, unknown> = { [MODE_SWITCH_SETTING]: 'open' }
 
 /** The plan class a row lands in, with the `src/` list that class's settings come from. */
 const PLAN_CLASSES = {
@@ -318,24 +315,9 @@ describe('a persona change is classified by the section in force when both confi
   // rows of the 0.11.1 classes are in tests/reload-preview.test.ts; here only
   // the rows each mode adds or changes.
   test.each<[string, Record<string, unknown>, Partial<PersonaInput>, Partial<PersonaInput>, PlanClass, string]>([
-    ['declarative: an invited change', DECLARATIVE_TOP, {}, { invited: { permission_prompts: 'C0A0002' } }, 'recorded', 'invited'],
-    [
-      'fungible: an invited.permission_prompts change',
-      FUNGIBLE_TOP,
-      {},
-      { invited: { permission_prompts: 'C0A0002' } },
-      'inPlace',
-      'invited.permission_prompts',
-    ],
-    [
-      'fungible: a channels change',
-      FUNGIBLE_TOP,
-      {},
-      { channels: [{ id: 'C0A0001', delivery: 'all' }, { id: 'C0A0002', delivery: 'all' }] },
-      'recorded',
-      'channels',
-    ],
-    ['fungible: a top-level permission_prompts change', FUNGIBLE_TOP, {}, { permission_prompts: 'C0A0002' }, 'recorded', 'permission_prompts'],
+    ['open: a channel change', FUNGIBLE_TOP, {}, { channels: [{ id: 'C0A0001', delivery: 'all' }, { id: 'C0A0002', delivery: 'all' }] }, 'inPlace', 'channels'],
+    ['open: a delivery change', FUNGIBLE_TOP, {}, { channels: [{ id: 'C0A0001', delivery: 'off' }] }, 'inPlace', 'delivery'],
+    ['open: a destination change', FUNGIBLE_TOP, { channels: [{ id: 'C0A0001', delivery: 'all' }, { id: 'C0A0002', delivery: 'all' }] }, { channels: [{ id: 'C0A0001', delivery: 'all' }, { id: 'C0A0002', delivery: 'all' }], permission_prompts: 'C0A0002' }, 'inPlace', 'permission_prompts'],
     [
       'fungible: a dm.enabled change',
       FUNGIBLE_TOP,
@@ -374,10 +356,10 @@ describe('a persona change is classified by the section in force when both confi
 
 describe('a change of the switch alone modifies no persona, in each direction', () => {
   test.each<[string, Record<string, unknown>, Record<string, unknown>]>([
-    ['absent to true', {}, { [MODE_SWITCH_SETTING]: true }],
-    ['false to true', { [MODE_SWITCH_SETTING]: false }, { [MODE_SWITCH_SETTING]: true }],
-    ['true to absent', { [MODE_SWITCH_SETTING]: true }, {}],
-    ['true to false', { [MODE_SWITCH_SETTING]: true }, { [MODE_SWITCH_SETTING]: false }],
+    ['absent to true', {}, { [MODE_SWITCH_SETTING]: 'open' }],
+    ['false to true', { [MODE_SWITCH_SETTING]: 'strict' }, { [MODE_SWITCH_SETTING]: 'open' }],
+    ['true to absent', { [MODE_SWITCH_SETTING]: 'open' }, {}],
+    ['true to false', { [MODE_SWITCH_SETTING]: 'open' }, { [MODE_SWITCH_SETTING]: 'strict' }],
   ])('the switch from %s is one effective changed setting, the switch with its personas', (_label, from, to) => {
     const mode = channelModeOf(parse(input(to)))
     expect(mode).not.toBe(channelModeOf(parse(input(from))))
@@ -396,8 +378,8 @@ describe('a change of the switch alone modifies no persona, in each direction', 
 
 describe('writing a key\'s default where it was absent (or removing it) is no effective change', () => {
   test.each<[string, Record<string, unknown>, Record<string, unknown>]>([
-    ['the switch, absent to false', {}, { [MODE_SWITCH_SETTING]: false }],
-    ['the switch, false to absent', { [MODE_SWITCH_SETTING]: false }, {}],
+    ['the switch, absent to false', {}, { [MODE_SWITCH_SETTING]: 'strict' }],
+    ['the switch, false to absent', { [MODE_SWITCH_SETTING]: 'strict' }, {}],
     ['fresh_system_prompt, absent to true', {}, { fresh_system_prompt: true }],
     ['fresh_system_prompt, true to absent', { fresh_system_prompt: true }, {}],
   ])('%s changes no setting and no persona', (_label, from, to) => {

@@ -879,7 +879,7 @@ describe('server-wide settings keep their start-time values after a confirmed ap
         ack_reaction: 'eyes',
         reply_chunk_limit: 1000,
         reply_chunk_mode: 'length',
-        [MODE_SWITCH_SETTING]: true,
+        [MODE_SWITCH_SETTING]: 'open',
       },
       '/applied-base',
     )

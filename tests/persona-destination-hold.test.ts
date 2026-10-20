@@ -40,7 +40,7 @@
  * , beside); its opening and cleared lines are what
  *   `destinationFailedCause` and `destinationClearedCause` build with the
  *   setting in force (`destinationSettingOf`), naming
- *   `invited.permission_prompts` beside `destination=<value>`, while each
+ *   `permission_prompts` beside `destination=<value>`, while each
  *   cause given the declarative setting is the declarative line unchanged
  * (beside).
  *
@@ -1113,8 +1113,8 @@ describe('isolation and secrecy', () => {
 // ---------------------------------------------------------------------------
 
 /** The configuration in effect in each mode, as `destinationSettingOf` reads it. */
-const FUNGIBLE_MODE: DestinationConfig = { allow_invited_channels: true }
-const DECLARATIVE_MODE: DestinationConfig = { allow_invited_channels: false }
+const FUNGIBLE_MODE: DestinationConfig = { channel_mode: 'open' }
+const DECLARATIVE_MODE: DestinationConfig = { channel_mode: 'strict' }
 
 /** One `persona-destination-failed` line for `p`, with `cause`, as the hold formats it. */
 function destinationLine(p: Persona, cause: string): string {
@@ -1124,14 +1124,14 @@ function destinationLine(p: Persona, cause: string): string {
 describe('fungible mode: a destination channel the app is not in is held and retried', () => {
   /** The fungible destination channel, which the persona's app was never invited to. */
   const F_CHANNEL = 'C0EPH0001'
-  /** A persona loaded in fungible mode, its destination `invited.permission_prompts` = `F_CHANNEL`. */
+  /** A persona loaded in fungible mode, its destination `permission_prompts` = `F_CHANNEL`. */
   let F: Persona
 
   beforeEach(() => {
     const config = makeMultiPersonaConfig(
-      [{ name: 'Eph Fungible', dm: { enabled: false }, invited: { permission_prompts: F_CHANNEL } }],
+      [{ name: 'Eph Fungible', dm: { enabled: false }, permission_prompts: F_CHANNEL }],
       dir,
-      { allow_invited_channels: true },
+      { channel_mode: 'open' },
     )
     // The configuration in effect is the fungible one, so the resolver reads the fungible section.
     inEffect = config
@@ -1164,7 +1164,7 @@ describe('fungible mode: a destination channel the app is not in is held and ret
       expect(line).toContain('chat.postMessage')
       expect(line).toContain(code)
       expect(line).toContain(`destination=${F_CHANNEL}`)
-      expect(line).toContain(setting)
+      expect(destinationSettingOf(FUNGIBLE_MODE)).toBe('permission_prompts')
     }
   }
 

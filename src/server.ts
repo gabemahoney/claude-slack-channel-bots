@@ -380,8 +380,7 @@ import {
 } from './state-dir-migration.ts'
 import { configInEffect, createReloadController, reloadFilePaths, type ReloadController } from './reload.ts'
 import {
-  channelDeliveryDeclarationOf,
-  loadChannelDeliveryAtStart,
+  createChannelDeliveryStore,
   type ChannelDeliveryStore,
 } from './channel-delivery.ts'
 import { createReloadTickDriver } from './reload-timer.ts'
@@ -1236,7 +1235,7 @@ const personaRouting = createPersonaRouting({
  * edited config file. A confirmed apply's step 1 reassigns it (
  * the reload controller's `onApplied`, through
  * `configInEffect`) to the confirmed persona set and the confirmed
- * `allow_invited_channels` switch, with every other server-wide value kept
+ * `channel_mode` switch, with every other server-wide value kept
  * from start time until the next start. The switch is the one server-wide
  * setting applied in place: every consumer of the channel mode reads it from
  * here at call time (`channelModeOf`). Null only before main() resolves the
@@ -2607,7 +2606,7 @@ export async function main(): Promise<void> {
   // (state-dir-migration.ts says what happens to each entry, and why it is
   // not done by the CLI or postinstall). First of all: before the directory
   // is made, and so before anything reads or writes it (the PID check, the
-  // retired keys, the last-applied record, config.json, channel-delivery.json,
+  // retired keys, the last-applied record, config.json,
   // the logs, the permission trail). With SLACK_STATE_DIR set it does nothing.
   // It never throws; a start it cannot make safe (an old server still running
   // on the old directory, a step that failed) stops here with the reason in
@@ -2763,7 +2762,7 @@ export async function main(): Promise<void> {
   // record): the server-wide values that hold until the next start, e.g. the
   // restart delay. Set below, right after the start resolves; never replaced
   // after that. A confirmed apply replaces `personaConfig`'s persona set and
-  // its allow_invited_channels switch, and keeps every other server-wide value
+  // its channel_mode switch, and keeps every other server-wide value
   // from here (`configInEffect`); the start
   // bring-up launches over the same rule. The reload controller keeps its own
   // applied configuration, the record's as resolved, without that override.
@@ -2840,7 +2839,7 @@ export async function main(): Promise<void> {
     checkConfigDir: checkLaunchConfigDir,
     slackClientFactory: PRODUCTION_SLACK_CLIENT_FACTORY,
     // step 1, once the record holds a confirmed
-    // change, the server runs its persona set and its allow_invited_channels
+    // change, the server runs its persona set and its channel_mode
     // switch, the one server-wide setting applied in place. Every other
     // server-wide setting keeps its start-time value (the next start applies
     // it). Everything that reads the applied set or the channel mode reads
@@ -2889,30 +2888,10 @@ export async function main(): Promise<void> {
   // The start-time applied config (declared before the reload controller).
   appliedConfig = personaConfig
 
-  // beside the stored-choice file
-  // (channel-delivery.json in the state directory) is read once here, right
-  // after the start resolved the configuration it runs and before the first
-  // await that follows, so no early shutdown return skips it and it comes
-  // before the connection manager, Bun.serve, the PID file, the start sweep
-  // and the start bring-up; behind no branch, so in both modes and in dry run
-  // too. The start rules run right after the read, over the applied personas
-  // and the retired-key store loaded above. Its production writer, delete and
-  // clock are the store's defaults (durableWriteFileSync, durableUnlinkSync,
-  // Date.now). An unreadable file is the store's own state and line, never a
-  // stop. This is the server's only stored-choice store: the reload
-  // controller reaches it through `channelDeliveryStore`, and nothing else
-  // builds one.
-  channelDeliveryStore = loadChannelDeliveryAtStart(
-    STATE_DIR,
-    {
-      applied: appliedConfig.personas.map((persona) => ({
-        key: persona.key,
-        declaration: channelDeliveryDeclarationOf(persona),
-      })),
-      retiredKeys,
-    },
-    { log: (line) => console.error(line) },
-  )
+  // Every consumer shares the authority already recovered by the reload controller.
+  // This adapter creates no store and performs no I/O.
+
+  channelDeliveryStore = createChannelDeliveryStore(reload.sharedChannels()!)
 
   // agent-director's timing settings. Read once here, after
   // the startup gate has passed and the start has resolved its configuration,

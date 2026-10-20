@@ -111,7 +111,7 @@ export const check1: CheckDef<CheckContext> = {
     f.expect(up, 'the start summary or a Session connected line did not appear within 6 minutes')
     const log = await since(ctx, logM)
     const has = (s: string) => log.filter((l) => l.includes(s))
-    f.expect(has(`[slack] No last-applied record: recorded the configuration file "${S}/config.json" as "${S}/config.json.last-applied"`).length === 1, 'no "No last-applied record: recorded …" line')
+    f.expect(has(`[slack] Starting from the shared channel authority "${S}/config.json.last-applied" at revision `).length === 1, 'no shared channel authority start line')
     f.expect(has('[slack] Loaded persona config: 3 persona(s)').length >= 1, 'no "Loaded persona config: 3 persona(s)" line')
     f.expect(has('[slack] startupSessionManager: 3 persona(s), concurrency=3').length >= 1, 'no "startupSessionManager: 3 persona(s), concurrency=3" line')
     ctx.shared.broughtUp = []
@@ -654,7 +654,7 @@ export const check13: CheckDef<CheckContext> = {
     await confirmedEdit(ctx, f, m3, setDelivery('mentions'), previewLines)
     const step9 = await sinceGrepE(ctx, m3, 'reload-(applied|noop|stale-confirmation|invalid):|updated in place|persona-start:|persona teardown|spawnForPersona')
     f.expect(step9.length === 2 && step9.some((l) => l.includes('updated in place (delivery)')) && step9.some((l) => l.includes('reload-applied:')), 'step 9: not exactly the updated-in-place and reload-applied lines')
-    const rec = (await lines(ctx, `jq -c '.personas[] | select(.name == "persona_a") | .channels' "$S/config.json.last-applied"`))[0] ?? ''
+    const rec = (await lines(ctx, `jq -c '.applied.personas[] | select(.name == "persona_a") | .channels' "$S/config.json.last-applied"`))[0] ?? ''
     f.expect(rec.includes(`{"id":"${ids.coordination}","delivery":"mentions"}`), 'the record does not show coordination back at mentions')
     f.expect((await serverPid(ctx)) === pidBefore, 'the server PID changed')
     f.expect(((await lines(ctx, "tmux list-panes -t slack_bot_persona_a -F '#{pane_pid}'"))[0] ?? '') === paneBefore, "A's pane process changed")

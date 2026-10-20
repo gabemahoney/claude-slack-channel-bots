@@ -5070,26 +5070,18 @@ describe('server.ts\'s file guard refuses every persona credentials file (sectio
     expect(props.get('clientFor')).toBe('clientFor')
   })
 
-  // The 64 KiB cap exempts three reads: the file guard's read of the config
-  // file, so an oversized config still protects the credentials files it
-  // names (behaviour in tests/config.test.ts); the start's read of the
-  // retired-key record, which only the server writes, so a record grown past
-  // the cap never stops a start (behaviour in tests/retired-keys.test.ts);
-  // and the start's read of the stored-choice file, which
-  // only the server writes, so a file of any size loads (behaviour in
-  // tests/channel-delivery.test.ts). Every other reader
-  // (the start's config, the last-applied record, the pending and apply
-  // files, the reload tick) must stay capped; this audit fails if any other
-  // call site passes the option, or names it.
-  test('readPersonaConfigBytes is called uncapped only by credentialsFilesToProtect, loadRetiredKeyStore and loadChannelDeliveryStore, and nothing else names the option', () => {
+  // Configuration and authority reads are complete by default. The unrelated
+  // agent-director settings file explicitly retains its bounded policy; only
+  // these named readers may pass a size-policy option.
+  test('only the named readers pass a size policy, and agent-director settings explicitly remain bounded', () => {
     const files = srcFiles().map(([path, source]) => [path, stripComments(source)] as const)
-    const UNCAPPED_SITES: ReadonlyArray<[string, RegExp]> = [
-      ['src/config.ts', /\bexport\s+function\s+credentialsFilesToProtect\s*\(/],
-      ['src/retired-keys.ts', /\bexport\s+function\s+loadRetiredKeyStore\s*\(/],
-      ['src/channel-delivery.ts', /\bexport\s+function\s+loadChannelDeliveryStore\s*\(/],
+    const POLICY_SITES: ReadonlyArray<[string, RegExp, string]> = [
+      ['src/config.ts', /\bexport\s+function\s+credentialsFilesToProtect\s*\(/, '{ uncapped: true }'],
+      ['src/retired-keys.ts', /\bexport\s+function\s+loadRetiredKeyStore\s*\(/, '{ uncapped: true }'],
+      ['src/ad-settings.ts', /\bfunction\s+readAdSettingsFile\s*\(/, '{ uncapped: false }'],
     ]
-    const sitePaths = UNCAPPED_SITES.map(([path]) => path)
-    // src/config.ts declares the option; any other file may name it only at its one allowed call.
+    const sitePaths = POLICY_SITES.map(([path]) => path)
+    // config.ts declares the option; elsewhere it appears only at its permitted call.
     const namesOutsideCalls = files
       .filter(([path]) => path !== 'src/config.ts')
       .map(([path, code]) => [path, indicesOf(/\buncapped\b/g, code).length] as const)
@@ -5101,8 +5093,8 @@ describe('server.ts\'s file guard refuses every persona credentials file (sectio
         .map((at) => ({ path, code, at, args: splitTopLevel(callArguments(code, at)) }))
         .filter((call) => call.args.length > 2),
     )
-    expect(withOptions.map((c) => [c.path, c.args[2]]).sort()).toEqual(sitePaths.map((path) => [path, '{ uncapped: true }']).sort())
-    for (const [path, fnRe] of UNCAPPED_SITES) {
+    expect(withOptions.map((c) => [c.path, c.args[2]]).sort()).toEqual(POLICY_SITES.map(([path, , policy]) => [path, policy]).sort())
+    for (const [path, fnRe] of POLICY_SITES) {
       const { code, at } = withOptions.find((c) => c.path === path)!
       const fn = code.search(fnRe)
       expect([path, fn]).not.toEqual([path, -1])
@@ -5164,8 +5156,8 @@ describe('the session tools read the channel mode of the configuration in effect
 // ---------------------------------------------------------------------------
 
 /** The store's start load and its factory; typed against the module, so a rename fails the typecheck. */
-const CHANNEL_DELIVERY_START_LOAD: keyof typeof ChannelDeliveryModule = 'loadChannelDeliveryAtStart'
-const CHANNEL_DELIVERY_FACTORY: keyof typeof ChannelDeliveryModule = 'loadChannelDeliveryStore'
+const CHANNEL_DELIVERY_START_LOAD: keyof typeof ChannelDeliveryModule = 'createChannelDeliveryStore'
+const CHANNEL_DELIVERY_FACTORY: keyof typeof ChannelDeliveryModule = 'createChannelDeliveryStore'
 /** The declaration a stored choice is kept under; typed against the module. */
 const CHANNEL_DELIVERY_DECLARATION_OF: keyof typeof ChannelDeliveryModule = 'channelDeliveryDeclarationOf'
 /** server.ts's one stored-choice holder: private to server.ts, so named by string. */
@@ -5201,123 +5193,21 @@ function startTimeConfig(): { name: string; at: number } {
   return { name, at }
 }
 
-describe('main() loads the stored-choice store once, behind no branch, after the start resolves and before the first await after it and the start bring-up pass, into the one holder the reload controller reads (beside)', () => {
-  test('imports the start load from the store module, declares it nowhere in server.ts, and its import and one call are its only mentions', () => {
-    expect(importSource(SERVER_CODE, CHANNEL_DELIVERY_START_LOAD)).toBe('./channel-delivery.ts')
-    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${CHANNEL_DELIVERY_START_LOAD}\\b`, 'g'), SERVER_CODE)).toEqual([])
-    expect(indicesOf(new RegExp(`\\b${CHANNEL_DELIVERY_START_LOAD}\\b`, 'g'), SERVER_CODE)).toHaveLength(2)
-    channelDeliveryStartLoad()
+describe('main() adapts the recovered shared authority once before bring-up', () => {
+  test('the adapter receives the controller authority after successful start resolution', () => {
+    const at = onlyCallOf('createChannelDeliveryStore')
+    expect(importSource(SERVER_CODE, 'createChannelDeliveryStore')).toBe('./channel-delivery.ts')
+    expect(atMainTopLevel(SERVER_CODE, at)).toBe(true)
+    expect(at).toBeGreaterThan(startResolution(SERVER_CODE).assignAt)
+    expect(at).toBeLessThan(onlyCallOf('runStartBringUp'))
+    expect(onlyCallArguments(SERVER_CODE, 'createChannelDeliveryStore').trim()).toBe('reload.sharedChannels()!')
+    expect(SERVER_CODE).not.toMatch(/\b(?:loadChannelDeliveryStore|loadChannelDeliveryAtStart|serializeChannelDelivery|parseChannelDelivery)\b/)
   })
-
-  test('the call is the whole right-hand side of an assignment to the holder that is a statement in main()\'s own statement list (behind no branch, so in both modes and in dry run too)', () => {
-    const at = channelDeliveryStartLoad()
-    const assign = SERVER_CODE.slice(0, at).search(new RegExp(`(?<![\\w.$])${CHANNEL_DELIVERY_HOLDER}\\s*=\\s*$`))
-    expect(assign).toBeGreaterThanOrEqual(0)
-    expect(atMainTopLevel(SERVER_CODE, assign)).toBe(true)
-    // Nothing follows the call on its statement (no operand, no member read).
-    const [, argsEnd] = balancedAfter(SERVER_CODE, at, '(', ')')
-    expect(SERVER_CODE.slice(argsEnd + 1)).toMatch(/^\s*;?\s*\n/)
-  })
-
-  test.each<[string, () => number]>([
-    ['the start resolution (<controller>.resolveStart)', () => startResolution(SERVER_CODE).resolveAt],
-    ['the applied config\'s start assignment (<loaded> = <outcome>.config)', () => startResolution(SERVER_CODE).assignAt],
-    ['the start-time applied config\'s assignment (<start-time config> = <loaded>)', () => startTimeConfig().at],
-  ])('loads AFTER %s', (_label, anchor) => {
-    expect(channelDeliveryStartLoad()).toBeGreaterThan(anchor())
-  })
-
-  // The first await after the start resolution and the start-time
-  // assignment: a shutdown begun during it returns from main() early, so a
-  // load after it could be skipped. Text inside literals never counts.
-  const firstAwaitAfterStart = (): number[] => {
-    const after = Math.max(startResolution(SERVER_CODE).assignAt, startTimeConfig().at)
-    return indicesOf(/\bawait\b/g, maskLiterals(SERVER_CODE)).filter((at) => at > after).slice(0, 1)
-  }
-
-  test.each<[string, () => number[]]>([
-    ['the first await after the start resolution and the start-time applied config\'s assignment', firstAwaitAfterStart],
-    ['the start sweep (reconcileOrphans)', () => callsOf('reconcileOrphans')],
-    ['the start bring-up (<controller>.runStartBringUp)', () => [startResolution(SERVER_CODE).bringUpAt]],
-    ['the PID file (writePidFile)', () => callsOf('writePidFile')],
-    ['the connection manager (createPersonaConnectionManager)', () => callsOf('createPersonaConnectionManager')],
-    ['Bun.serve', () => callsOf('Bun\\.serve')],
-  ])('loads BEFORE %s', (_label, anchors) => {
-    const later = anchors()
-    expect(later.length).toBeGreaterThan(0)
-    for (const at of later) expect(channelDeliveryStartLoad()).toBeLessThan(at)
-  })
-
-  test('loads over the server state directory (STATE_DIR), the start\'s applied personas with their declarations, and the one retired-key store, with only a log to console.error, so the store\'s production writer, delete and clock are used', () => {
-    const args = splitTopLevel(callArguments(SERVER_CODE, channelDeliveryStartLoad()))
-    expect(args).toHaveLength(3)
-    expect(args[0]).toBe('STATE_DIR')
-
-    const start = objectProperties(args[1]!)
-    expect([...start.keys()]).toEqual(['applied', 'retiredKeys'])
-    // Each applied persona of the start-time config, by its key and its
-    // declaration (the store module's own builder, imported, not declared).
-    expect(start.get('applied')).toMatch(
-      new RegExp(
-        `^${startTimeConfig().name}\\.personas\\.map\\(\\(?(\\w+)\\)? => \\(\\{ key: \\1\\.key, declaration: ${CHANNEL_DELIVERY_DECLARATION_OF}\\(\\1\\),? \\}\\)\\)$`,
-      ),
-    )
-    expect(importSource(SERVER_CODE, CHANNEL_DELIVERY_DECLARATION_OF)).toBe('./channel-delivery.ts')
-    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${CHANNEL_DELIVERY_DECLARATION_OF}\\b`, 'g'), SERVER_CODE)).toEqual([])
-    // The retired-key store main() bound from the record's start read: the
-    // one store, also the reload controller's `retiredKeys`.
-    const retiredRead = constOf('readRetiredKeysAtStart')
-    const stores = [...SERVER_CODE.matchAll(new RegExp(`\\bconst\\s+(\\w+)(?:\\s*:\\s*\\w+)?\\s*=\\s*${retiredRead}\\s*\\.\\s*store\\b`, 'g'))]
-    expect(stores).toHaveLength(1)
-    expect(start.get('retiredKeys')).toBe(stores[0]![1])
-
-    const deps = objectProperties(args[2]!)
-    expect([...deps.keys()]).toEqual(['log'])
-    expect(deps.get('log')).toMatch(/^\(\s*(\w+)\s*\)\s*=>\s*console\.error\(\s*\1\s*\)$/)
-  })
-
-  test('the holder is declared once, at module scope, with no initializer, and assigned only once, from the start load; every other mention is a call-time read by the reload controller\'s accessor, the routing or the session tools', () => {
+  test('the one adapter holder is assigned only from that recovered authority', () => {
     declaredOnce(CHANNEL_DELIVERY_HOLDER)
-    const decls = indicesOf(new RegExp(`^let\\s+${CHANNEL_DELIVERY_HOLDER}\\s*:\\s*ChannelDeliveryStore\\s*\\|\\s*undefined\\s*$`, 'gm'), SERVER_CODE)
-    expect(decls).toHaveLength(1)
-    expect(insideMain(decls[0]!)).toBe(false)
-
-    const assigned = assignmentsTo(CHANNEL_DELIVERY_HOLDER)
-    expect(assigned.map(({ value }) => value)).toEqual([`${CHANNEL_DELIVERY_START_LOAD}(`])
-    expect(SERVER_CODE.indexOf(CHANNEL_DELIVERY_START_LOAD, assigned[0]!.at)).toBe(channelDeliveryStartLoad())
-    // No compound assignment, update or other write form either.
-    expect(indicesOf(new RegExp(`\\b${CHANNEL_DELIVERY_HOLDER}\\s*(?:\\?\\?|\\|\\||&&|[-+*/%])=|(?:\\+\\+|--)\\s*${CHANNEL_DELIVERY_HOLDER}\\b|\\b${CHANNEL_DELIVERY_HOLDER}\\s*(?:\\+\\+|--)`, 'g'), SERVER_CODE)).toEqual([])
-
-    // Its mentions: the declaration, the assignment, the controller accessor's
-    // check and return, the routing's member and the session tools' member.
-    const named = indicesOf(new RegExp(`\\b${CHANNEL_DELIVERY_HOLDER}\\b`, 'g'), SERVER_CODE)
-    expect(named).toHaveLength(6)
-    expect(withinCall(named, onlyCallOf('createReloadController'))).toBe(2)
-    expect(withinCall(named, onlyCallOf('createPersonaRouting'))).toBe(1)
-    const tools = SERVER_CODE.search(/\bconst\s+sessionToolDeps\s*:\s*SessionToolDeps\s*=\s*\{/)
-    const [toolsStart, toolsEnd] = balancedAfter(SERVER_CODE, tools, '{', '}')
-    expect(named.filter((at) => at > toolsStart && at < toolsEnd)).toHaveLength(1)
-  })
-
-  // The controller's accessor is required and answers a store, so it reads
-  // the holder at each call and throws, before anything is written, if an
-  // apply ever ran before the load.
-  test('the reload controller\'s channelDelivery is an accessor over the holder, read at each call: it throws while the holder is unset and otherwise answers the holder itself', () => {
+    expect(assignmentsTo(CHANNEL_DELIVERY_HOLDER).map(({ value }) => value)).toEqual(['createChannelDeliveryStore(reload.sharedChannels()!)'])
     const accessor = onlyCallProps('createReloadController').get(CONTROLLER_CHANNEL_DELIVERY)
-    const H = CHANNEL_DELIVERY_HOLDER
-    expect(accessor).toMatch(
-      new RegExp(`^\\(\\) => \\{ if \\(${H} === undefined\\) throw new Error\\((['"])[^'"]+\\1\\);? return ${H};? \\}$`),
-    )
-  })
-
-  test('one store: no src file other than server.ts calls the start load, and none other than the store module calls the store factory', () => {
-    const callers = (name: string): string[] =>
-      srcFiles()
-        .filter(([, source]) => new RegExp(`(?<![\\w.$]|function\\s+)${name}\\s*\\(`).test(stripComments(source)))
-        .map(([path]) => path)
-        .sort()
-    expect(callers(CHANNEL_DELIVERY_START_LOAD).filter((path) => path !== 'src/channel-delivery.ts')).toEqual(['src/server.ts'])
-    expect(callers(CHANNEL_DELIVERY_FACTORY)).toEqual(['src/channel-delivery.ts'])
+    expect(accessor).toContain('return channelDeliveryStore')
   })
 })
 

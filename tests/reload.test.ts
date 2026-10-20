@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { queueRetentionClause } from '../src/reload-preview-clauses.ts'
 /**
  * reload.test.ts — The reload controller's start rules, the
@@ -166,6 +167,12 @@ afterEach(async () => {
 })
 
 /** `{ personas }` in file form. */
+/** Identity replacements declare a destination independently of the previous source. */
+function withIndependentDestination(persona: PersonaInput): PersonaInput {
+  const id = 'C0REVIEW' + createHash('sha256').update(JSON.stringify([persona.name, persona.credentials_file, persona.working_directory])).digest('hex').slice(0, 8).toUpperCase()
+  return { ...persona, channels: [{ id, delivery: 'all' }], permission_prompts: id }
+}
+
 function configOf(...personas: PersonaInput[]): { personas: PersonaInput[] } {
   return { personas }
 }
@@ -219,11 +226,11 @@ function malformedWithSentinel(): string {
   return `{\n  "personas": [\n    ${LEAK_SENTINEL}\n  ]\n}\n`
 }
 
-/** The deletion hint every record refusal carries. */
-function deletionHint(): string {
+/** The recovery hint preserves authority and prepared input for repair. */
+function recoveryHint(): string {
   return (
-    `Deleting the last-applied record "${h.paths.lastApplied}" makes the next start ` +
-    `apply the configuration file "${h.paths.config}" as it stands.`
+    `Preserve the shared channel authority "${h.paths.lastApplied}" and prepared configuration ` +
+    `"${h.paths.config}"; restore trustworthy authority evidence before starting again.`
   )
 }
 
@@ -458,6 +465,11 @@ function credentialsChangeLines(): string[] {
   return (h.pendingLines() ?? []).filter((line) => line.includes('credentials file "'))
 }
 
+/** Recover the exact reviewed bytes, including whitespace, for an operator revert. */
+function sourceBytesOf(recordBytes: Uint8Array): Buffer {
+  return Buffer.from(JSON.parse(Buffer.from(recordBytes).toString()).sourceBytesBase64, 'base64')
+}
+
 /** `bytes` with one newline appended: different bytes, the same content. */
 function withNewline(bytes: Uint8Array): Buffer {
   return Buffer.concat([bytes, Buffer.from('\n')])
@@ -504,7 +516,7 @@ describe('a start without a record applies the configuration file or refuses', (
 
     expect(run.outcome.kind).toBe('applied')
     expect(run.outcome.kind === 'applied' && run.outcome.source).toBe('config')
-    expect(h.readRecord()).toEqual(configBytes)
+    expect(JSON.parse(h.readRecord()!.toString()).source).toEqual(JSON.parse(configBytes.toString()))
     expect(h.readConfig()).toEqual(configBytes)
     expect(run.writes).toEqual([h.lastAppliedWrite()])
     // No temporary sibling (or any other file) is left beside the config.
@@ -514,7 +526,7 @@ describe('a start without a record applies the configuration file or refuses', (
     expect(broughtUp(run)).toEqual(keysOf('alpha', 'bravo'))
     expect(run.lifecycle.keys('launch').sort()).toEqual(keysOf('alpha', 'bravo'))
     expect(run.logs).toContain(
-      `[slack] No last-applied record: recorded the configuration file "${h.paths.config}" as "${h.paths.lastApplied}"`,
+      `[slack] Starting from the shared channel authority "${h.paths.lastApplied}" at revision 1`,
     )
     assertNoLeak(run.captured())
   })
@@ -562,11 +574,6 @@ describe('a start without a record applies the configuration file or refuses', (
   test.each([
     { label: 'missing', setUp: () => h.remove(h.paths.config), expected: 'does not exist' },
     { label: 'a directory', setUp: () => h.replaceWithDirectory(h.paths.config), expected: 'cannot be read (EISDIR)' },
-    {
-      label: 'larger than the 64 KiB read cap',
-      setUp: () => void h.writeOversized(h.paths.config, { prefix: JSON.stringify(configOf(h.persona('alpha'))) }),
-      expected: 'is larger than the 64 KiB limit',
-    },
   ])('a configuration file that is $label refuses the start and names the file', async ({ setUp, expected }) => {
     setUp()
 
@@ -601,8 +608,7 @@ describe('a start without a record applies the configuration file or refuses', (
     expect(h.readConfig()).toEqual(configBytes)
     expect(h.configDirEntries()).toEqual(['config.json'])
     expect(run.logs).toEqual([
-      `[slack] ${RELOAD_RECORD_WRITE_FAILED}: cannot write the last-applied record "${h.paths.lastApplied}" (${code}); ` +
-        'the server does not start and nothing is applied',
+      `[slack] ${RELOAD_RECORD_WRITE_FAILED}: cannot durably establish the shared channel authority "${h.paths.lastApplied}" (${code}); preserve the prepared configuration and authority evidence; the server does not start`,
     ])
     assertNoLeak(run.captured())
   })
@@ -620,11 +626,9 @@ describe('a start without a record applies the configuration file or refuses', (
     expect(run.outcome.kind === 'refused' && run.outcome.class).toBe(RELOAD_RECORD_WRITE_FAILED)
     expect(run.writes).toEqual([h.lastAppliedWrite(false)])
     expect(run.logs).toEqual([
-      `[slack] ${RELOAD_RECORD_WRITE_FAILED}: the last-applied record "${h.paths.lastApplied}" was written but its ` +
-        'directory could not be synced (EIO), so it may not survive a crash, and the next start will run it; ' +
-        'the server does not start',
+      `[slack] ${RELOAD_RECORD_WRITE_FAILED}: cannot durably establish the shared channel authority "${h.paths.lastApplied}" (EIO); the authority was renamed but its directory could not be synced, so the durable outcome is unresolved; preserve the prepared configuration and authority evidence; the server does not start`,
     ])
-    expect(h.readRecord()).toEqual(configBytes)
+    expect(JSON.parse(h.readRecord()!.toString()).source).toEqual(JSON.parse(configBytes.toString()))
     expect(h.configDirEntries()).toEqual(['config.json', 'config.json.last-applied'])
     assertNoLeak(run.captured({ record: writtenFile(h.paths.lastApplied) }))
 
@@ -636,7 +640,7 @@ describe('a start without a record applies the configuration file or refuses', (
     expectOutcomeConfigIsStartPass(next, 'alpha')
     expect(next.lifecycle.outcome(h.key('alpha'))).toBe('up')
     expect(next.writes).toEqual([])
-    expect(h.readRecord()).toEqual(configBytes)
+    expect(JSON.parse(h.readRecord()!.toString()).source).toEqual(JSON.parse(configBytes.toString()))
     assertNoLeak(next.captured())
   })
 })
@@ -648,123 +652,6 @@ describe('a start without a record applies the configuration file or refuses', (
 /** A public channel no persona lists, and one no persona names as a destination. */
 const UNLISTED_CHANNEL = 'C0RLDUNLIST1'
 /** A fungible destination bravo moves to in a held edit, listed and named by no persona. */
-const MOVED_DESTINATION = 'C0RLDMOVED1'
-
-/** The persona's fungible destination (`invited.permission_prompts`): a channel of its own that no persona lists. */
-function invitedDestination(name: string): string {
-  return `C0INV${h.key(name).toUpperCase().replace(/[^A-Z0-9]/g, '')}`
-}
-
-/** The channel `h.persona(name)` lists for the persona (its own `all` channel and its declarative destination). */
-function ownChannel(name: string): string {
-  return h.persona(name).channels![0]!.id
-}
-
-/** A persona with both sections valid: `h.persona(name)` with its own fungible destination, then `overrides`. */
-function bothSections(name: string, overrides: Partial<PersonaInput> = {}): PersonaInput {
-  return h.persona(name, { invited: { permission_prompts: invitedDestination(name) }, ...overrides })
-}
-
-/** The switch as a start writes it for `mode`: absent in declarative mode, `true` in fungible mode. */
-function startSwitch(mode: ChannelMode): Record<string, unknown> {
-  return mode === 'fungible' ? { [MODE_SWITCH_SETTING]: true } : {}
-}
-
-/** The switch as a candidate writes it to turn `mode` on: `true`, or an explicit `false`. */
-function turnOn(mode: ChannelMode): Record<string, unknown> {
-  return { [MODE_SWITCH_SETTING]: mode === 'fungible' }
-}
-
-const OTHER_MODE: Readonly<Record<ChannelMode, ChannelMode>> = { declarative: 'fungible', fungible: 'declarative' }
-
-/** `personas` under the top-level settings `top`, in file form. */
-function configWith(top: Record<string, unknown>, personas: PersonaInput[]): Record<string, unknown> {
-  return { ...top, personas }
-}
-
-/**
- * The loader's own error for `file` as the configuration file: `parsePersonaConfigBytes` over its bytes, as the start and the
- * tick parse it. Throws when `file` is valid.
- */
-function loaderErrorFor(file: unknown): string {
-  try {
-    parsePersonaConfigBytes(JSON.stringify(file), h.paths.config, h.dir, { home: h.home })
-  } catch (err) {
-    return (err as Error).message
-  }
-  throw new Error('loaderErrorFor: the configuration is valid')
-}
-
-/** Assert `error` names bravo (`personas[1]` and its `renderPersonaRef`) and `setting`, as every rejection does. */
-function expectNamesBravoAnd(error: string, setting: string): void {
-  expect(error).toContain(`personas[1] ${renderPersonaRef('bravo', h.key('bravo'))}: `)
-  expect(error).toContain(setting)
-}
-
-/**
- * A running server in `mode`: `personas` materialized and written, under the
- * switch for `mode`, as both the record and the configuration file
- * (byte-equal), detection started and the first check run (nothing pending).
- */
-async function runningIn(
-  mode: ChannelMode,
-  personas: PersonaInput[],
-  opts?: ReloadRunOptions,
-): Promise<{ run: ReloadRun; recordBytes: Buffer }> {
-  h.materialize(...personas)
-  const recordBytes = h.writeRecord(configWith(startSwitch(mode), personas))
-  h.writeConfig(configWith(startSwitch(mode), personas))
-  const run = await h.startDetecting(opts)
-  await run.ticks.tick()
-  expect(h.pendingExists()).toBe(false)
-  expect(channelModeOf(run.serverConfig())).toBe(mode)
-  return { run, recordBytes }
-}
-
-describe('a start without a record judges the configuration file by the mode its own switch picks', () => {
-  test("a configuration file whose switch is on and whose bravo breaks (no invited, so a dm destination by default, with DMs off) refuses the start, naming bravo and invited.permission_prompts", async () => {
-    // bravo's declarative section is valid: only the fungible rules reject it.
-    const personas = [bothSections('alpha'), h.persona('bravo')]
-    h.materialize(...personas)
-    const file = configWith({ [MODE_SWITCH_SETTING]: true }, personas)
-    const configBytes = h.writeConfig(file)
-    const error = loaderErrorFor(file)
-    expectNamesBravoAnd(error, FUNGIBLE_DESTINATION_SETTING)
-
-    const run = await h.start()
-
-    expectNothingApplied(run)
-    expect(run.outcome.kind === 'refused' && run.outcome.source).toBe('config')
-    expect(run.logs).toEqual([`${CONFIG_REFUSAL}${error}`])
-    expect(run.writes).toEqual([])
-    expect(h.readRecord()).toBeUndefined()
-    expect(h.readConfig()).toEqual(configBytes)
-    assertNoLeak(run.captured())
-  })
-
-  test.each<{ label: string; mode: ChannelMode; bravo: () => PersonaInput }>([
-    { label: 'the switch absent, with the same bravo (its invited never read)', mode: 'declarative', bravo: () => h.persona('bravo') },
-    {
-      label: 'the switch on, with bravo’s channels malformed (never read in fungible mode) and a valid invited',
-      mode: 'fungible',
-      bravo: () => bothSections('bravo', { channels: 'not an array' as unknown as PersonaInput['channels'] }),
-    },
-  ])('a configuration file with $label starts in the mode its switch picks', async ({ mode, bravo }) => {
-    const personas = [bothSections('alpha'), bravo()]
-    h.materialize(...personas)
-    const configBytes = h.writeConfig(configWith(startSwitch(mode), personas))
-
-    const run = await h.start()
-
-    expect(run.outcome.kind === 'applied' && run.outcome.source).toBe('config')
-    expect(h.readRecord()).toEqual(configBytes)
-    expect(channelModeOf(run.serverConfig())).toBe(mode)
-    expect(broughtUp(run)).toEqual(keysOf('alpha', 'bravo'))
-    expect(run.logs.filter((l) => l.startsWith(CONFIG_REFUSAL))).toEqual([])
-    assertNoLeak(run.captured())
-  })
-})
-
 // ---------------------------------------------------------------------------
 // Record present
 // ---------------------------------------------------------------------------
@@ -791,7 +678,7 @@ describe('a start with a record runs the record', () => {
     const run = await h.start()
 
     expect(run.outcome.kind === 'applied' && run.outcome.source).toBe('record')
-    expect(run.controller.applied()?.bytes).toEqual(new Uint8Array(recordBytes))
+    expect(JSON.parse(Buffer.from(run.controller.applied()!.bytes).toString())).toEqual(JSON.parse(recordBytes.toString()).source)
     expect(appliedShape(run)).toEqual([
       [h.key('alpha'), [{ id: alpha!.channels![0]!.id, delivery: 'all' }]],
       [h.key('bravo'), [{ id: bravo!.channels![0]!.id, delivery: 'all' }]],
@@ -802,7 +689,7 @@ describe('a start with a record runs the record', () => {
     expect(run.writes).toEqual([])
     expect(h.readRecord()).toEqual(recordBytes)
     expect(h.readConfig()).toEqual(configBytes)
-    expect(run.logs).toContain(`[slack] Starting from the last-applied record "${h.paths.lastApplied}"`)
+    expect(run.logs).toContain(`[slack] Starting from the shared channel authority "${h.paths.lastApplied}" at revision 1`)
     assertNoLeak(run.captured())
   })
 
@@ -864,11 +751,6 @@ describe('a start with a record runs the record', () => {
       expected: () => `The last-applied record "${h.paths.lastApplied}" cannot be read (EISDIR).`,
     },
     {
-      label: 'is larger than the 64 KiB read cap',
-      setUp: () => void h.writeOversized(h.paths.lastApplied, { prefix: JSON.stringify(configOf(h.persona('alpha'))) }),
-      expected: () => `The last-applied record "${h.paths.lastApplied}" is larger than the 64 KiB limit.`,
-    },
-    {
       label: 'has a JSON syntax error (line and column, no content)',
       setUp: () => void h.writeRecordBytes(malformedWithSentinel()),
       expected: () => `malformed JSON in "${h.paths.lastApplied}" at line 3, column 5.`,
@@ -888,9 +770,10 @@ describe('a start with a record runs the record', () => {
       setUp: () => void h.writeRecord({ routes: {}, default_route: 'C0OLD' }),
       expected: () => prePersonaConversionMessage('routes'),
     },
-  ])('a record that $label stops the start with the deletion hint and is left in place', async ({ setUp, expected }) => {
+  ])('a record that $label stops the start with the preservation and recovery hint and is left in place', async ({ setUp, expected }) => {
     const personas = materialized('alpha')
     const configBytes = h.writeConfig(configOf(...personas))
+    const trustworthyRecord = h.writeRecord(configOf(...personas))
     setUp()
     const recordBefore = existsSync(h.paths.lastApplied) && statSync(h.paths.lastApplied).isFile() ? h.readRecord() : undefined
 
@@ -903,18 +786,19 @@ describe('a start with a record runs the record', () => {
     expect(run.logs).toHaveLength(1)
     expect(run.logs[0]!.startsWith(RECORD_REFUSAL)).toBe(true)
     expect(run.logs[0]).toContain(expected())
-    expect(run.logs[0]!.endsWith(deletionHint())).toBe(true)
+    expect(run.logs[0]!.endsWith(recoveryHint())).toBe(true)
     expect(existsSync(h.paths.lastApplied)).toBe(true)
     if (recordBefore !== undefined) expect(h.readRecord()).toEqual(recordBefore)
     expect(h.readConfig()).toEqual(configBytes)
     assertNoLeak(run.captured())
 
-    // The hint holds: with the record deleted, the next start applies the config file.
+    // Restore known trustworthy evidence; the unconfirmed configuration remains independent.
     h.remove(h.paths.lastApplied)
+    h.writeRecordBytes(trustworthyRecord)
     const next = await h.start()
-    expect(next.outcome.kind === 'applied' && next.outcome.source).toBe('config')
+    expect(next.outcome.kind === 'applied' && next.outcome.source).toBe('record')
     expect(broughtUp(next)).toEqual(keysOf('alpha'))
-    expect(h.readRecord()).toEqual(configBytes)
+    expect(JSON.parse(h.readRecord()!.toString()).source).toEqual(JSON.parse(configBytes.toString()))
     assertNoLeak(next.captured())
   })
 
@@ -983,7 +867,7 @@ describe('a start with a record runs the record', () => {
 
   test('with the production tick driver on the fake clock, the first check runs 5 s after startDetection and never before it', async () => {
     const recordBytes = h.writeRecord(configOf())
-    h.writeConfigBytes(Buffer.concat([recordBytes, Buffer.from('\n')]))
+    h.writeConfigBytes(Buffer.concat([sourceBytesOf(recordBytes), Buffer.from('\n')]))
     const run = await h.start({ tickDriver: ({ clock, log }) => createReloadTickDriver({ clock, log }) })
 
     await run.clock.advance(60_000)
@@ -1015,7 +899,7 @@ describe('a start with zero personas runs', () => {
     const run = await h.start()
 
     expect(run.outcome.kind === 'applied' && run.outcome.source).toBe('config')
-    expect(h.readRecord()).toEqual(configBytes)
+    expect(JSON.parse(h.readRecord()!.toString()).source).toEqual(JSON.parse(configBytes.toString()))
     expect(run.lifecycle.startPasses.map((c) => c.personas)).toEqual([[]])
     expect(run.lifecycle.records).toEqual([])
     assertNoLeak(run.captured())
@@ -1195,7 +1079,7 @@ describe('a dry-run start follows the same start rules', () => {
     const run = await h.start({ dryRun: true })
 
     expect(run.outcome.kind === 'applied' && run.outcome.source).toBe(withRecord ? 'record' : 'config')
-    expect(h.readRecord()).toEqual(recordBytes ?? configBytes)
+    expect(JSON.parse(h.readRecord()!.toString()).source).toEqual(JSON.parse((recordBytes ? sourceBytesOf(recordBytes) : configBytes).toString()))
     expect(h.readConfig()).toEqual(configBytes)
     expect(run.writes).toEqual(withRecord ? [] : [h.lastAppliedWrite()])
     const names = withRecord ? ['alpha'] : ['alpha', 'bravo']
@@ -1255,7 +1139,7 @@ describe('a record or config file that is not a regular file refuses the start u
       target: () => h.paths.lastApplied,
       withRecord: true,
       source: 'record',
-      line: () => `${RECORD_REFUSAL}The last-applied record "${h.paths.lastApplied}" cannot be read (not a regular file). ${deletionHint()}`,
+      line: () => `${RECORD_REFUSAL}The last-applied record "${h.paths.lastApplied}" cannot be read (not a regular file). ${recoveryHint()}`,
     },
   ] as const)('$label (injected fstat)', async ({ target, withRecord, source, line }) => {
     const personas = materialized('alpha')
@@ -1304,7 +1188,7 @@ describe('a record or config file that is not a regular file refuses the start u
       const expectedLine =
         which === 'record'
           ? `${RECORD_REFUSAL}The last-applied record "${lastApplied}" cannot be read (not a regular file). ` +
-            `Deleting the last-applied record "${lastApplied}" makes the next start apply the configuration file "${config}" as it stands.`
+            `Preserve the shared channel authority "${lastApplied}" and prepared configuration "${config}"; restore trustworthy authority evidence before starting again.`
           : `${CONFIG_REFUSAL}The configuration file "${fifo}" cannot be read (not a regular file). ` +
             'The server requires the configuration file to start.'
       expect(result.outcome).toEqual({ kind: 'refused', source: which, line: expectedLine })
@@ -1350,7 +1234,7 @@ describe('detection keeps the pending file in step with the config file and appl
     const { run, recordBytes } = await running(['alpha'])
     const cp = run.checkpoint()
 
-    h.writeConfigBytes(withNewline(recordBytes))
+    h.writeConfigBytes(withNewline(sourceBytesOf(recordBytes)))
     await run.ticks.ticks(20)
 
     expect(run.since(cp)).toEqual(pendingWritten(loggedPreview([NO_EFFECTIVE_CHANGE_PREVIEW])))
@@ -1391,7 +1275,7 @@ describe('detection keeps the pending file in step with the config file and appl
     expect(h.pendingExists()).toBe(true)
     const cp = run.checkpoint()
 
-    h.writeConfigBytes(recordBytes)
+    h.writeConfigBytes(sourceBytesOf(recordBytes))
     await run.ticks.ticks(20)
 
     expect(run.since(cp)).toEqual(pendingRemoved())
@@ -1404,7 +1288,7 @@ describe('detection keeps the pending file in step with the config file and appl
     { label: 'a persona removed', edit: (a: PersonaInput) => configOf(a) },
     {
       label: "a persona's working_directory changed",
-      edit: (a: PersonaInput, b: PersonaInput) => configOf({ ...a, working_directory: join(dirname(a.working_directory), 'moved') }, b),
+      edit: (a: PersonaInput, b: PersonaInput) => configOf(withIndependentDestination({ ...a, working_directory: join(dirname(a.working_directory), 'moved') }), b),
     },
   ])('an unconfirmed destructive edit ($label) survives a restart: the applied set comes back and the first check leaves the edit pending', async ({ edit }) => {
     const [alpha, bravo] = materialized('alpha', 'bravo')
@@ -1465,7 +1349,7 @@ describe('detection keeps the pending file in step with the config file and appl
 
   test('while a change stays pending, a missing or stale pending file is rewritten at the next check with no log line, and unchanged checks write nothing', async () => {
     const { run, recordBytes } = await running(['alpha'])
-    h.writeConfigBytes(withNewline(recordBytes))
+    h.writeConfigBytes(withNewline(sourceBytesOf(recordBytes)))
     await run.ticks.tick()
     const current = h.readPending()!
     const rewritten = { ...NO_RUN_ACTIVITY, writes: [{ path: h.paths.pending, ok: true }] }
@@ -1541,7 +1425,7 @@ describe('detection keeps the pending file in step with the config file and appl
       edit: (alpha) => void h.writeConfig(configOf({ ...alpha, channels: [{ id: alpha.channels![0]!.id, delivery: 'sometimes' as 'all' }] })),
       error: () =>
         `loadPersonaConfig: invalid persona config in "${h.paths.config}": Persona config validation error: ` +
-        `personas[0] "alpha" (key=${h.key('alpha')}): channels[0].delivery is invalid. Allowed values are: all, mentions.`,
+        `personas[0] "alpha" (key=${h.key('alpha')}): channels[0].delivery is invalid. Allowed values are: off, mentions, all, thread_hybrid.`,
     },
     {
       label: 'has the pre-persona shape (the conversion text)',
@@ -1602,7 +1486,7 @@ describe('detection keeps the pending file in step with the config file and appl
     expect(run.previewEmissionCount()).toBe(1)
     expect(run.invalidLines()).toHaveLength(1)
 
-    h.writeConfigBytes(recordBytes)
+    h.writeConfigBytes(sourceBytesOf(recordBytes))
     const back = run.checkpoint()
     await run.ticks.ticks(5)
     expect(run.since(back)).toEqual(pendingRemoved())
@@ -1633,7 +1517,7 @@ describe('detection keeps the pending file in step with the config file and appl
     expect(run.since(cp)).toEqual(pendingWritten([invalidLogged(error)]))
     expect(run.logsOf(RELOAD_PREVIEW)).toEqual([])
 
-    h.writeConfigBytes(recordBytes)
+    h.writeConfigBytes(sourceBytesOf(recordBytes))
     const back = run.checkpoint()
     await run.ticks.ticks(3)
     expect(run.since(back)).toEqual(pendingRemoved())
@@ -1644,7 +1528,7 @@ describe('detection keeps the pending file in step with the config file and appl
     const [charlie] = materialized('charlie')
     const { run, personas, recordBytes } = await running(['alpha', 'bravo'])
     const [alpha, bravo] = personas
-    h.writeConfigBytes(withNewline(recordBytes))
+    h.writeConfigBytes(withNewline(sourceBytesOf(recordBytes)))
     await run.ticks.tick()
     const fingerprints = [h.pendingFingerprint()]
     const cp = run.checkpoint()
@@ -1656,7 +1540,7 @@ describe('detection keeps the pending file in step with the config file and appl
     expect(h.pendingFingerprint()).toBe(fingerprints[0])
 
     const edits = [
-      () => void h.writeConfigBytes(withNewline(withNewline(recordBytes))),
+      () => void h.writeConfigBytes(withNewline(withNewline(sourceBytesOf(recordBytes)))),
       () => void h.writeCredentials(alpha!),
       () => void h.writeCredentialsContent(bravo!, ''),
       () => h.deleteCredentials(bravo!),
@@ -1740,271 +1624,6 @@ interface ModeTurnRow {
   top?: Record<string, unknown>
   setting: string
 }
-
-describe('the reload tick judges a candidate by the mode its own switch turns on', () => {
-  test.each<ModeTurnRow>([
-    {
-      label: 'turns fungible mode on, the switch the only edit, while bravo has no invited (a dm destination by default) and DMs off',
-      from: 'declarative',
-      start: () => [bothSections('alpha'), h.persona('bravo')],
-      bravo: (bravo) => bravo,
-      setting: FUNGIBLE_DESTINATION_SETTING,
-    },
-    {
-      label: 'turns fungible mode on and sets bravo’s invited.permission_prompts to "dm" with DMs off',
-      from: 'declarative',
-      start: () => [bothSections('alpha'), bothSections('bravo')],
-      bravo: (bravo) => ({ ...bravo, invited: { permission_prompts: 'dm' } }),
-      setting: FUNGIBLE_DESTINATION_SETTING,
-    },
-    {
-      label: 'turns fungible mode off by removing the switch, the only edit, while bravo’s permission_prompts names a channel it does not list',
-      from: 'fungible',
-      start: () => [bothSections('alpha'), bothSections('bravo', { permission_prompts: UNLISTED_CHANNEL })],
-      bravo: (bravo) => bravo,
-      top: {},
-      setting: 'permission_prompts',
-    },
-    {
-      label: 'turns fungible mode off with false and gives bravo’s channel an unknown delivery mode',
-      from: 'fungible',
-      start: () => [bothSections('alpha'), bothSections('bravo')],
-      bravo: (bravo) => ({ ...bravo, channels: [{ id: ownChannel('bravo'), delivery: 'sometimes' as 'all' }] }),
-      setting: 'channels[0].delivery',
-    },
-  ])('a candidate that $label previews INVALID naming bravo and the setting, and its confirmation applies nothing', async ({ from, start, bravo, top, setting }) => {
-    const personas = start()
-    const { run, recordBytes } = await runningIn(from, personas)
-    const candidate = configWith(top ?? turnOn(OTHER_MODE[from]), [personas[0]!, bravo(personas[1]!)])
-    const error = loaderErrorFor(candidate)
-    expectNamesBravoAnd(error, setting)
-
-    await expectHeldInvalidAppliesNothing(run, recordBytes, candidate, error, from)
-  })
-
-  test.each<{ label: string; from: ChannelMode; bravo: (bravo: PersonaInput) => PersonaInput }>([
-    {
-      label: 'turning fungible mode on with bravo’s channels malformed',
-      from: 'declarative',
-      bravo: (bravo) => ({ ...bravo, channels: 'not an array' as unknown as PersonaInput['channels'] }),
-    },
-    {
-      label: 'turning fungible mode off with bravo’s invited malformed',
-      from: 'fungible',
-      bravo: (bravo) => ({ ...bravo, invited: 'not an object' as unknown as PersonaInput['invited'] }),
-    },
-  ])('control: $label (the section the candidate does not put in force) is a valid candidate, and its confirmation turns the mode on', async ({ from, bravo }) => {
-    const personas = [bothSections('alpha'), bothSections('bravo')]
-    const { run } = await runningIn(from, personas)
-    const to = OTHER_MODE[from]
-    const cp = run.checkpoint()
-
-    h.writeConfig(configWith(turnOn(to), [personas[0]!, bravo(personas[1]!)]))
-    await run.ticks.ticks(10)
-
-    expect(run.invalidLines()).toEqual([])
-    expect(h.pendingHeader()).toBe(previewHeader({ settings: 1 }))
-    expect(run.since(cp)).toEqual(pendingWritten())
-    expectNoPostNoLeak(run)
-
-    h.confirm()
-    await run.ticks.tick()
-
-    expect(run.logsOf(RELOAD_APPLIED)).toEqual([appliedLogged({ settings: 1 })])
-    expect(run.invalidLines()).toEqual([])
-    expect(channelModeOf(run.serverConfig())).toBe(to)
-    expect(h.readRecord()).toEqual(h.readConfig())
-    expectNoPostNoLeak(run)
-  })
-})
-
-/** What the routing delivered to bravo for one event, as `{chat_id, via}` (`[]`: not delivered). */
-type Delivered = Array<{ chat_id: string; via: string | undefined }>
-
-/**
- * What bravo's consumers do now, probed in this order: the
- * mode in effect; a mention in the unlisted channel (in fungible mode this
- * also puts the channel in bravo's heard set); `set_channel_delivery` of
- * `all` for that channel; a plain message there; a plain message in bravo's
- * listed channel; the reply tool's posting scope for the unlisted channel
- * (its refusal, or undefined when it posted); and where a notice posts.
- */
-interface ConsumersNow {
-  mode: ChannelMode
-  mentionUnlisted: Delivered
-  setChannelDelivery: ReloadToolResult
-  plainUnlisted: Delivered
-  plainOwn: Delivered
-  replyRefusal: string | undefined
-  notice: string[]
-}
-
-/** Probe bravo's consumers (see `ConsumersNow`). Needs bravo's registered session. */
-async function consumersNow(run: ReloadRun): Promise<ConsumersNow> {
-  const deliver = async (event: ReturnType<typeof makeChannelMessage>): Promise<Delivered> => {
-    const from = run.deliveries('bravo').length
-    await run.deliver('bravo', event)
-    return run.deliveries('bravo').slice(from).map(({ chat_id, via }) => ({ chat_id, via }))
-  }
-  const mention = `${mentionText(run.stub('bravo').identity.botUserId)} a probe`
-  const mentionUnlisted = await deliver(makeChannelMessage({ channel: UNLISTED_CHANNEL, text: mention }))
-  const setChannelDelivery = await run.callTool('bravo', SET_CHANNEL_DELIVERY_TOOL, { channel: UNLISTED_CHANNEL, delivery: 'all' })
-  const plainUnlisted = await deliver(makeChannelMessage({ channel: UNLISTED_CHANNEL, text: 'a probe' }))
-  const plainOwn = await deliver(makeChannelMessage({ channel: ownChannel('bravo'), text: 'a probe' }))
-  const reply = await run.callTool('bravo', 'reply', { chat_id: UNLISTED_CHANNEL, text: 'a probe reply' })
-  const from = run.stub('bravo').callLog.length
-  await run.notice('bravo', 'a probe notice')
-  const notice = run.stub('bravo').callLog.slice(from).map((c) => `${c.method} ${(c.args as { channel?: string }).channel ?? ''}`)
-  return {
-    mode: channelModeOf(run.serverConfig()),
-    mentionUnlisted,
-    setChannelDelivery,
-    plainUnlisted,
-    plainOwn,
-    replyRefusal: reply.isError ? reply.text : undefined,
-    notice,
-  }
-}
-
-/** bravo's consumers in declarative mode: its listed channel only, the declarative refusal, the posting-scope refusal and its own channel as destination. */
-function declarativeConsumers(): ConsumersNow {
-  const own = ownChannel('bravo')
-  return {
-    mode: 'declarative',
-    mentionUnlisted: [],
-    setChannelDelivery: { isError: true, text: channelDeliveryDeclarativeRefusal('bravo', h.key('bravo')) },
-    plainUnlisted: [],
-    plainOwn: [{ chat_id: own, via: 'receive_all' }],
-    replyRefusal: expect.stringContaining(JSON.stringify(UNLISTED_CHANNEL)),
-    notice: [`chat.postMessage ${own}`],
-  }
-}
-
-/**
- * bravo's consumers in fungible mode: the unlisted channel served (at the
- * stored `all` unless the loop guard holds it at `mentions`), its listed
- * channel at `mentions`, any channel ID postable, and `destination` (its own
- * fungible destination by default) for notices.
- */
-function fungibleConsumers({ destination = invitedDestination('bravo'), heldByLoopGuard = false } = {}): ConsumersNow {
-  const delivery = heldByLoopGuard ? 'mentions' : 'all'
-  return {
-    mode: 'fungible',
-    mentionUnlisted: [{ chat_id: UNLISTED_CHANNEL, via: 'mention' }],
-    setChannelDelivery: { isError: false, text: channelDeliverySetResultText(UNLISTED_CHANNEL, 'all', { delivery, heldByLoopGuard }) },
-    plainUnlisted: heldByLoopGuard ? [] : [{ chat_id: UNLISTED_CHANNEL, via: 'receive_all' }],
-    plainOwn: [],
-    replyRefusal: undefined,
-    notice: [`chat.postMessage ${destination}`],
-  }
-}
-
-describe('an edit of the switch or of invited is held until confirmation', () => {
-  /**
-   * Each row's `changed`: the one consumer field its edit changes once
-   * confirmed (the mode, the notice destination, or the loop guard's result
-   * for `set_channel_delivery`). The whole consumer state after a switch
-   * change or an in-place `invited` change is pinned in
-   * `tests/reload-apply.test.ts`.
-   */
-  test.each<{ label: string; from: ChannelMode; candidate: (alpha: PersonaInput, bravo: PersonaInput) => Record<string, unknown>; changed: () => Partial<ConsumersNow> }>([
-    {
-      label: 'the switch turned on',
-      from: 'declarative',
-      candidate: (alpha, bravo) => configWith(turnOn('fungible'), [alpha, bravo]),
-      changed: () => ({ mode: 'fungible' }),
-    },
-    {
-      label: 'the switch turned off',
-      from: 'fungible',
-      candidate: (alpha, bravo) => configWith(turnOn('declarative'), [alpha, bravo]),
-      changed: () => ({ mode: 'declarative' }),
-    },
-    {
-      label: 'bravo’s invited.permission_prompts moved in fungible mode',
-      from: 'fungible',
-      candidate: (alpha, bravo) => configWith(startSwitch('fungible'), [alpha, { ...bravo, invited: { permission_prompts: MOVED_DESTINATION } }]),
-      changed: () => ({ notice: fungibleConsumers({ destination: MOVED_DESTINATION }).notice }),
-    },
-    {
-      label: 'alpha’s invited.permission_prompts moved onto the unlisted channel bravo serves at all, in fungible mode',
-      from: 'fungible',
-      candidate: (alpha, bravo) => configWith(startSwitch('fungible'), [{ ...alpha, invited: { permission_prompts: UNLISTED_CHANNEL } }, bravo]),
-      changed: () => ({ setChannelDelivery: fungibleConsumers({ heldByLoopGuard: true }).setChannelDelivery }),
-    },
-  ])('$label: over many checks the pending file and preview are written, and delivery, posting scope, set_channel_delivery and the notice destination stay as they were until the confirmation', async ({ from, candidate, changed }) => {
-    const personas = [bothSections('alpha'), bothSections('bravo')]
-    const { run, recordBytes } = await runningIn(from, personas, { realLifecycle: true })
-    run.registerSession('alpha')
-    run.registerSession('bravo')
-    const before = await consumersNow(run)
-    expect(before).toEqual(from === 'fungible' ? fungibleConsumers() : declarativeConsumers())
-    const cp = run.checkpoint()
-
-    h.writeConfig(candidate(personas[0]!, personas[1]!))
-    await run.ticks.ticks(25)
-
-    // One pending-file write and one preview emission; no lifecycle operation, no Slack client and no Slack call.
-    expect(run.since(cp)).toEqual(pendingWritten())
-    expect(h.pendingExists()).toBe(true)
-    expect(run.invalidLines()).toEqual([])
-    const held = [await consumersNow(run)]
-    const later = run.checkpoint()
-    await run.ticks.ticks(25)
-    expect(run.since(later)).toEqual(NO_RUN_ACTIVITY)
-    held.push(await consumersNow(run))
-
-    expect(held).toEqual([before, before])
-    expect(h.readRecord()).toEqual(recordBytes)
-    expect(run.appliedConfigs).toEqual([])
-    expect(run.previewEmissionCount()).toBe(1)
-    assertNoLeak(run.captured({ before, held }))
-
-    // The confirmation applies it: the same probes now follow the edit.
-    h.confirm()
-    await run.ticks.tick()
-
-    expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(1)
-    expect(h.readRecord()).toEqual(h.readConfig())
-    const after = await consumersNow(run)
-    expect(after).not.toEqual(before)
-    expect(before).not.toMatchObject(changed())
-    expect(after).toMatchObject(changed())
-    assertNoLeak(run.captured({ after }))
-  })
-})
-
-describe('a pasted value in the switch or in invited.permission_prompts reaches no preview, pending file or log line', () => {
-  test.each<{ label: string; from: ChannelMode; candidate: (alpha: PersonaInput, bravo: PersonaInput) => Record<string, unknown>; setting: string; bravoNamed: boolean }>([
-    {
-      label: 'the switch as a string',
-      from: 'declarative',
-      candidate: (alpha, bravo) => configWith({ [MODE_SWITCH_SETTING]: LEAK_SENTINEL }, [alpha, bravo]),
-      setting: MODE_SWITCH_SETTING,
-      bravoNamed: false,
-    },
-    {
-      label: 'bravo’s invited.permission_prompts in fungible mode',
-      from: 'fungible',
-      candidate: (alpha, bravo) => configWith(startSwitch('fungible'), [alpha, { ...bravo, invited: { permission_prompts: LEAK_SENTINEL } }]),
-      setting: FUNGIBLE_DESTINATION_SETTING,
-      bravoNamed: true,
-    },
-  ])('$label holding the sentinel is an INVALID candidate naming the setting only, and its confirmation applies nothing', async ({ from, candidate, setting, bravoNamed }) => {
-    const personas = [bothSections('alpha'), bothSections('bravo')]
-    const { run, recordBytes } = await runningIn(from, personas)
-    const file = candidate(personas[0]!, personas[1]!)
-    const error = loaderErrorFor(file)
-    expect(error).toContain(setting)
-    if (bravoNamed) expectNamesBravoAnd(error, setting)
-
-    await expectHeldInvalidAppliesNothing(run, recordBytes, file, error, from)
-  })
-})
-
-// ---------------------------------------------------------------------------
-// Detection: credentials files (detection half)
-// ---------------------------------------------------------------------------
 
 describe('detection compares each referenced credentials file with what its persona holds', () => {
   test("a token rotated inside an up persona's credentials file (config.json byte-equal to the record) is previewed as a credentials line naming the persona and path, with no token anywhere and no reconnect before confirmation", async () => {
@@ -2236,7 +1855,7 @@ describe('detection compares each referenced credentials file with what its pers
   // declaration is unchanged, so only its held digest lets a re-save of its file show as pending.
   test("the current rule reversed: with the collision fixed in the config file (bravo given its own file), a re-save of alpha's file adds alpha's credentials change to what is pending; reverting its bytes takes it out again", async () => {
     const { run, alpha, bravo, charlie } = await sharedCredentialsRunning()
-    const bravoOwn = h.persona('bravo')
+    const bravoOwn = withIndependentDestination(h.persona('bravo'))
     h.writeCredentials(bravoOwn)
     expect(bravoOwn.credentials_file).not.toBe(bravo.credentials_file)
     const cp = run.checkpoint()
@@ -2272,7 +1891,7 @@ describe('detection compares each referenced credentials file with what its pers
   test("a persona whose credentials_file path changed is pending by the config bytes; its new file is not compared with the old one's held content", async () => {
     const { run, personas } = await running(['alpha'])
     const [alpha] = personas
-    const moved = { ...alpha!, credentials_file: join(dirname(alpha!.credentials_file), 'moved-credentials.json') }
+    const moved = withIndependentDestination({ ...alpha!, credentials_file: join(dirname(alpha!.credentials_file), 'moved-credentials.json') })
     h.writeCredentials(moved)
     const cp = run.checkpoint()
 
@@ -2393,7 +2012,7 @@ describe('the pending-change preview in the pending file and the server log', ()
     h.makeWorkingDirectory({ working_directory: moved })
     const cp = run.checkpoint()
 
-    h.writeConfig(configOf(alpha!, { ...charlie!, working_directory: moved }))
+    h.writeConfig(configOf(alpha!, withIndependentDestination({ ...charlie!, working_directory: moved })))
     await run.ticks.ticks(50)
 
     assertNoLeak(run.captured())
@@ -2416,7 +2035,7 @@ describe('the pending-change preview in the pending file and the server log', ()
     const configBytes = h.writeConfig(configOf(alpha!, bravo!))
     const first = await h.start()
     expect(first.outcome).toMatchObject({ kind: 'applied', source: 'config' })
-    expect(h.readRecord()).toEqual(configBytes)
+    expect(JSON.parse(h.readRecord()!.toString()).source).toEqual(JSON.parse(configBytes.toString()))
     await first.stop()
 
     // While the server is down, bravo is dropped from config.json. The reboot has fresh in-memory state and no pending file.
@@ -2434,7 +2053,7 @@ describe('the pending-change preview in the pending file and the server log', ()
 
     expect(h.pendingLines()).toEqual([previewHeader({ removed: 1 }), removedLine('bravo')])
     expect(run.since(cp)).toEqual(pendingWritten())
-    expect(h.readRecord()).toEqual(configBytes)
+    expect(JSON.parse(h.readRecord()!.toString()).source).toEqual(JSON.parse(configBytes.toString()))
     expectNoPostNoLeak(first, run)
   })
 
@@ -2854,14 +2473,14 @@ describe('in dry run, detection ignores credentials files', () => {
     expectNoPostNoLeak(run)
   })
 
-  test('with a config edit pending, the fingerprint covers the config file alone and a credentials change rewrites nothing', async () => {
+  test('with a config edit pending, the fingerprint covers config bytes and authority revision and a credentials change rewrites nothing', async () => {
     const [alpha] = materialized('alpha')
     const recordBytes = h.writeRecord(configOf(alpha!))
-    h.writeConfigBytes(withNewline(recordBytes))
+    h.writeConfigBytes(withNewline(sourceBytesOf(recordBytes)))
     const run = await h.startDetecting({ dryRun: true })
     await run.ticks.tick()
     const fingerprint = h.pendingFingerprint()
-    expect(fingerprint).toBe(reloadFingerprint(h.readConfig()!, []))
+    expect(fingerprint).toBe(reloadFingerprint(h.readConfig()!, [], run.controller.sharedChannels()!.revision))
     const cp = run.checkpoint()
 
     // Rotated, then unusable (malformed, deleted, a directory): no credentials line and no cause, ever.
@@ -2895,7 +2514,7 @@ describe('a pending-file write or delete that fails is logged once per episode a
     h.failWrites({ step, code })
     const cp = run.checkpoint()
 
-    h.writeConfigBytes(withNewline(recordBytes))
+    h.writeConfigBytes(withNewline(sourceBytesOf(recordBytes)))
     await run.ticks.ticks(10)
 
     const failedWrites = (n: number) => Array.from({ length: n }, () => ({ path: h.paths.pending, ok: false }))
@@ -2927,7 +2546,7 @@ describe('a pending-file write or delete that fails is logged once per episode a
     h.failWrites({ step: 'fsyncSync', call: 2 })
     const cp = run.checkpoint()
 
-    h.writeConfigBytes(withNewline(recordBytes))
+    h.writeConfigBytes(withNewline(sourceBytesOf(recordBytes)))
     await run.ticks.ticks(5)
 
     // An unsynced write still put the preview in place, so the logged preview points at it.
@@ -2944,12 +2563,12 @@ describe('a pending-file write or delete that fails is logged once per episode a
 
   test('a delete that fails after a revert is logged once over many checks; reload-nothing-pending follows the delete that succeeds', async () => {
     const { run, recordBytes } = await running(['alpha'])
-    h.writeConfigBytes(withNewline(recordBytes))
+    h.writeConfigBytes(withNewline(sourceBytesOf(recordBytes)))
     await run.ticks.tick()
     h.failRemoves()
     const cp = run.checkpoint()
 
-    h.writeConfigBytes(recordBytes)
+    h.writeConfigBytes(sourceBytesOf(recordBytes))
     await run.ticks.ticks(10)
 
     const failedRemoves = (n: number) =>
@@ -2973,12 +2592,12 @@ describe('a pending-file write or delete that fails is logged once per episode a
 
   test('a delete whose directory sync fails counts as removed: logged once, then reload-nothing-pending, and never retried', async () => {
     const { run, recordBytes } = await running(['alpha'])
-    h.writeConfigBytes(withNewline(recordBytes))
+    h.writeConfigBytes(withNewline(sourceBytesOf(recordBytes)))
     await run.ticks.tick()
     h.failRemoves({ step: 'fsyncSync' })
     const cp = run.checkpoint()
 
-    h.writeConfigBytes(recordBytes)
+    h.writeConfigBytes(sourceBytesOf(recordBytes))
     await run.ticks.ticks(5)
 
     expect(run.since(cp)).toEqual({
@@ -2996,16 +2615,16 @@ describe('a pending-file write or delete that fails is logged once per episode a
     const cannotWrite = fileFailureLine('EIO')
     const cp = run.checkpoint()
 
-    h.writeConfigBytes(withNewline(recordBytes))
+    h.writeConfigBytes(withNewline(sourceBytesOf(recordBytes)))
     await run.ticks.ticks(3)
     expect(run.logsOf('reload')).toEqual([cannotWrite])
 
     // Nothing was ever written, so the revert has nothing to remove.
-    h.writeConfigBytes(recordBytes)
+    h.writeConfigBytes(sourceBytesOf(recordBytes))
     await run.ticks.ticks(3)
     expect(run.logsOf(RELOAD_NOTHING_PENDING)).toEqual([NOTHING_PENDING])
 
-    h.writeConfigBytes(withNewline(recordBytes))
+    h.writeConfigBytes(withNewline(sourceBytesOf(recordBytes)))
     await run.ticks.ticks(3)
     expect(run.logsOf('reload')).toEqual([cannotWrite, cannotWrite])
     expect(run.previewEmissionCount()).toBe(2)
@@ -3025,7 +2644,7 @@ describe('a pending-file write or delete that fails is logged once per episode a
     lookupFails = true
     const cp = run.checkpoint()
 
-    h.writeConfigBytes(withNewline(recordBytes))
+    h.writeConfigBytes(withNewline(sourceBytesOf(recordBytes)))
     await run.ticks.ticks(10)
 
     expect(run.since(cp)).toEqual({ ...NO_RUN_ACTIVITY, logs: [expect.stringMatching(/^\[slack\] reload: detection check failed/)] })
@@ -3183,7 +2802,7 @@ function recordingSlots(run: () => ReloadRun, candidate: () => Buffer | undefine
     calls.push({
       step,
       keys: actedOn(inputs, step),
-      recordIsCandidate: record !== undefined && record.equals(candidate() ?? Buffer.alloc(0)),
+      recordIsCandidate: record !== undefined && candidate() !== undefined && JSON.stringify(JSON.parse(record.toString()).source) === JSON.stringify(JSON.parse(candidate()!.toString())),
       applied: run().appliedKeys(),
     })
     // A later step must not start before this one settles.
@@ -3271,10 +2890,10 @@ describe('confirmation and apply', () => {
     h.confirm()
     await run.ticks.tick()
 
-    expect(h.readRecord()).toEqual(configBytes)
+    expect(JSON.parse(h.readRecord()!.toString()).source).toEqual(JSON.parse(configBytes.toString()))
     expect(run.appliedKeys()).toEqual(keysOf('alpha'))
     expect(run.appliedConfigs.map((c) => c.personas.map((p) => p.key))).toEqual([keysOf('alpha')])
-    expect(run.controller.applied()?.bytes).toEqual(new Uint8Array(configBytes))
+    expect(JSON.parse(Buffer.from(run.controller.applied()!.bytes).toString())).toEqual(JSON.parse(configBytes.toString()))
     expect(h.configDirEntries()).toEqual(['config.json', 'config.json.last-applied'])
     // No reload-nothing-pending line: the apply's own line says what happened. Step 1 writes the retired-key record first.
     expect(outsideLifecycle(run.since(cp))).toEqual({
@@ -3300,7 +2919,7 @@ describe('confirmation and apply', () => {
     h.confirm()
     await run.ticks.tick()
 
-    expect(h.readRecord()).toEqual(configBytes)
+    expect(JSON.parse(h.readRecord()!.toString()).source).toEqual(JSON.parse(configBytes.toString()))
     expect(run.appliedKeys()).toEqual(keysOf('alpha', 'charlie'))
     expect(run.logsOf(RELOAD_APPLIED)).toEqual([appliedLogged({ added: 1 })])
     expect(h.applyExists()).toBe(false)
@@ -3308,12 +2927,12 @@ describe('confirmation and apply', () => {
   })
 
   test('after an apply, detection compares with the new applied set: the old config back is previewed as an addition', async () => {
-    const { run, recordBytes } = await pendingRemoval(['alpha', 'bravo'])
+    const { run, personas } = await pendingRemoval(['alpha', 'bravo'])
     h.confirm()
     await run.ticks.tick()
     const cp = run.checkpoint()
 
-    h.writeConfigBytes(recordBytes)
+    h.writeConfig(configOf(personas[0]!, withIndependentDestination(personas[1]!)))
     await run.ticks.ticks(3)
 
     expect(h.pendingHeader()).toBe(previewHeader({ added: 1 }))
@@ -3333,7 +2952,7 @@ describe('confirmation and apply', () => {
     expect(h.readRecord()).toEqual(recordBytes)
     await next.ticks.tick()
 
-    expect(h.readRecord()).toEqual(configBytes)
+    expect(JSON.parse(h.readRecord()!.toString()).source).toEqual(JSON.parse(configBytes.toString()))
     expect(next.appliedKeys()).toEqual(keysOf('alpha'))
     expect(next.logsOf(RELOAD_APPLIED)).toEqual([appliedLogged({ removed: 1 })])
     expect(h.applyExists()).toBe(false)
@@ -3341,7 +2960,7 @@ describe('confirmation and apply', () => {
     expectNoPostNoLeak(run, next)
   })
 
-  test('the confirmation is deleted before anything is applied: it is gone when the record is written and when the server is told the new set', async () => {
+  test('confirmation evidence survives through authority activation and is consumed after a successful application', async () => {
     const seen: Array<[string, boolean]> = []
     const { run } = await pendingRemoval(['alpha', 'bravo'], {
       beforeWrite: (path) => void (path === h.paths.lastApplied && seen.push(['record write', h.applyExists()])),
@@ -3352,8 +2971,8 @@ describe('confirmation and apply', () => {
     await run.ticks.tick()
 
     expect(seen).toEqual([
-      ['record write', false],
-      ['onApplied', false],
+      ['record write', true],
+      ['onApplied', true],
     ])
     expectNoPostNoLeak(run)
   })
@@ -3370,7 +2989,7 @@ describe('confirmation and apply', () => {
       edit: (alpha) => void h.writeConfig(configOf({ ...alpha, channels: [{ id: alpha.channels![0]!.id, delivery: 'sometimes' as 'all' }] })),
       error: () =>
         `loadPersonaConfig: invalid persona config in "${h.paths.config}": Persona config validation error: ` +
-        `personas[0] "alpha" (key=${h.key('alpha')}): channels[0].delivery is invalid. Allowed values are: all, mentions.`,
+        `personas[0] "alpha" (key=${h.key('alpha')}): channels[0].delivery is invalid. Allowed values are: off, mentions, all, thread_hybrid.`,
     },
     {
       label: 'the pre-persona shape',
@@ -3475,7 +3094,7 @@ describe('confirmation and apply', () => {
 
     h.confirm()
     await run.ticks.tick()
-    expect(h.readRecord()).toEqual(configBytes)
+    expect(JSON.parse(h.readRecord()!.toString()).source).toEqual(JSON.parse(configBytes.toString()))
     expect(run.appliedKeys()).toEqual(keysOf('alpha'))
     expect(run.logsOf(RELOAD_APPLIED)).toEqual([appliedLogged({ removed: 1 })])
     expect(run.logsOf(RELOAD_STALE_CONFIRMATION)).toHaveLength(1)
@@ -3493,7 +3112,7 @@ describe('confirmation and apply', () => {
     await run.ticks.tick()
 
     if (dryRun) {
-      expect(h.readRecord()).toEqual(configBytes)
+      expect(JSON.parse(h.readRecord()!.toString()).source).toEqual(JSON.parse(configBytes.toString()))
       expect(run.logsOf(RELOAD_APPLIED)).toEqual([appliedLogged({ removed: 1 })])
       expect(run.logsOf(RELOAD_STALE_CONFIRMATION)).toEqual([])
     } else {
@@ -3535,11 +3154,6 @@ describe('confirmation and apply', () => {
           },
         },
       }),
-    },
-    {
-      label: 'a matching copy larger than the 64 KiB read cap',
-      place: () => void h.writeOversized(h.paths.apply, { prefix: h.readPending()! }),
-      what: STALE_TOO_LARGE,
     },
   ])('a malformed or unreadable confirmation ($label) applies nothing and logs one reload-stale-confirmation line', async ({ place, what, opts }) => {
     const { run, recordBytes } = await pendingRemoval(['alpha', 'bravo'], opts?.())
@@ -3625,11 +3239,11 @@ describe('confirmation and apply', () => {
 
     expect(outsideLifecycle(run.since(cp))).toEqual({
       ...NO_RUN_ACTIVITY,
-      logs: [undeletableLogged('EIO'), retiredKeysLogged('recorded'), oldLifeHoldBeganLogged(), appliedLogged({ removed: 1 })],
+      logs: [retiredKeysLogged('recorded'), oldLifeHoldBeganLogged(), appliedLogged({ removed: 1 }), undeletableLogged('EIO')],
       writes: [h.retiredKeysWrite(), h.lastAppliedWrite()],
       removes: [applyNotRemoved()],
     })
-    expect(h.readRecord()).toEqual(configBytes)
+    expect(JSON.parse(h.readRecord()!.toString()).source).toEqual(JSON.parse(configBytes.toString()))
     expect(h.applyExists()).toBe(true)
 
     const ignored = run.checkpoint()
@@ -3678,14 +3292,14 @@ describe('confirmation and apply', () => {
     // Its content changes (the preview edited, the fingerprint kept): processed again, and it matches.
     h.writeApplyBytes(Buffer.concat([h.readApply()!, Buffer.from('an edit to the preview\n')]))
     await run.ticks.tick()
-    expect(h.readRecord()).toEqual(configBytes)
+    expect(JSON.parse(h.readRecord()!.toString()).source).toEqual(JSON.parse(configBytes.toString()))
     expect(run.logsOf(RELOAD_APPLIED)).toEqual([appliedLogged({ removed: 1 })])
     // The delete seam fails the pending file's removal too, after the apply.
     expect(run.logsOf('reload')).toEqual([undeletableLogged('EIO'), undeletableLogged('EIO'), fileFailureLine('EIO')])
     expectNoPostNoLeak(run)
   })
 
-  test('an undeletable confirmation that is then removed by hand is forgotten: the same bytes placed again are acted on again', async () => {
+  test('a consumed undeletable confirmation removed by hand is processed again but stale against the advanced authority revision', async () => {
     const { run, configBytes } = await pendingRemoval(['alpha', 'bravo'])
     h.confirm()
     const confirmation = h.readApply()!
@@ -3700,18 +3314,17 @@ describe('confirmation and apply', () => {
     await run.ticks.tick()
     expect(run.since(gone)).toEqual(NO_RUN_ACTIVITY)
 
-    // The same bytes again: not the ignored confirmation any more, so processed (it matches, and is a no-op now).
+    // The same bytes are a new file gesture, but their reviewed revision has already been consumed.
     h.writeApplyBytes(confirmation)
     const again = run.checkpoint()
     await run.ticks.tick()
     expect(outsideLifecycle(run.since(again))).toEqual({
       ...NO_RUN_ACTIVITY,
-      logs: [undeletableLogged('EIO'), noopLogged()],
-      writes: [h.lastAppliedWrite()],
+      logs: [undeletableLogged('EIO'), staleLogged(STALE_MISMATCH)],
       removes: [applyNotRemoved()],
     })
-    expect(h.readRecord()).toEqual(configBytes)
-    expect(run.appliedConfigs).toHaveLength(2)
+    expect(JSON.parse(h.readRecord()!.toString()).source).toEqual(JSON.parse(configBytes.toString()))
+    expect(run.appliedConfigs).toHaveLength(1)
     expectNoPostNoLeak(run)
   })
 
@@ -3725,11 +3338,11 @@ describe('confirmation and apply', () => {
 
     expect(outsideLifecycle(run.since(cp))).toEqual({
       ...NO_RUN_ACTIVITY,
-      logs: [removedUnsyncedLogged('EIO'), retiredKeysLogged('recorded'), oldLifeHoldBeganLogged(), appliedLogged({ removed: 1 })],
+      logs: [retiredKeysLogged('recorded'), oldLifeHoldBeganLogged(), appliedLogged({ removed: 1 }), removedUnsyncedLogged('EIO')],
       writes: [h.retiredKeysWrite(), h.lastAppliedWrite()],
       removes: [{ path: h.paths.apply, ok: true, removed: true, unsynced: true }],
     })
-    expect(h.readRecord()).toEqual(configBytes)
+    expect(JSON.parse(h.readRecord()!.toString()).source).toEqual(JSON.parse(configBytes.toString()))
     expect(run.appliedKeys()).toEqual(keysOf('alpha'))
     expect(h.applyExists()).toBe(false)
 
@@ -3766,17 +3379,11 @@ describe('confirmation and apply', () => {
     {
       label: 'before the rename (openSync)',
       failure: { step: 'openSync', call: 3 },
-      line: () => failureLine(`[slack] ${RELOAD_RECORD_WRITE_FAILED}: cannot write `, h.paths.lastApplied, 'EIO'),
+      line: () => failureLine(`[slack] ${RELOAD_RECORD_WRITE_FAILED}: cannot write the shared channel authority `, h.paths.lastApplied, 'EIO'),
       recordWrites: [false],
     },
-    {
-      label: 'at the directory fsync after the rename, the previous record written back',
-      failure: { step: 'fsyncSync', call: 4 },
-      // The restore is shown by the second record write and the record's bytes below.
-      line: () => failureLine(`[slack] ${RELOAD_RECORD_WRITE_FAILED}: wrote `, h.paths.lastApplied, 'EIO'),
-      recordWrites: [false, true],
-    },
-  ] as const)('a record write failing $label applies nothing, logs one reload-record-write-failed line and rewrites the pending file on the same check', async ({ failure, line, recordWrites }) => {
+
+  ] as const)(': a record write failing $label applies nothing, logs one reload-record-write-failed line and retains failed confirmation evidence without retry', async ({ failure, line, recordWrites }) => {
     let run!: ReloadRun
     const slots = recordingSlots(() => run, () => h.readConfig())
     const started = await pendingRemoval(['alpha', 'bravo'], { applySteps: slots.slots })
@@ -3798,7 +3405,7 @@ describe('confirmation and apply', () => {
         ...recordWrites.map((ok) => h.lastAppliedWrite(ok)),
         { path: h.paths.pending, ok: true },
       ],
-      removes: [applyRemoved(), retiredKeysRemoved()],
+      removes: [retiredKeysRemoved()],
     })
     expect(h.readRecord()).toEqual(started.recordBytes)
     expect(run.controller.applied()).toBe(applied)
@@ -3808,14 +3415,15 @@ describe('confirmation and apply', () => {
     expect(run.previewEmissionCount()).toBe(1)
     assertNoLeak(run.captured({ record: writtenFile(h.paths.lastApplied) }))
 
-    // Used once; a fresh rename, with the writer working, applies.
+    // Failure evidence is retained with no silent retry; a fresh confirming rename permits another attempt.
+    expect(h.applyExists()).toBe(true)
     h.clearWriteFailure()
     const later = run.checkpoint()
     await run.ticks.ticks(3)
     expect(run.since(later)).toEqual(NO_RUN_ACTIVITY)
     h.confirm()
     await run.ticks.tick()
-    expect(h.readRecord()).toEqual(started.configBytes)
+    expect(JSON.parse(h.readRecord()!.toString()).source).toEqual(JSON.parse(started.configBytes.toString()))
     expect(run.logsOf(RELOAD_APPLIED)).toEqual([appliedLogged({ removed: 1 })])
     expectNoPostNoLeak(run)
   })
@@ -3835,7 +3443,7 @@ describe('confirmation and apply', () => {
     const slots = recordingSlots(() => run, () => h.readConfig())
     const started = await running(['alpha'], { applySteps: slots.slots })
     run = started.run
-    const configBytes = h.writeConfigBytes(edit(started.recordBytes))
+    const configBytes = h.writeConfigBytes(edit(sourceBytesOf(started.recordBytes)))
     await run.ticks.tick()
     expect(h.pendingLines()).toEqual([NO_EFFECTIVE_CHANGE_PREVIEW])
     const cp = run.checkpoint()
@@ -3849,7 +3457,7 @@ describe('confirmation and apply', () => {
       writes: [h.lastAppliedWrite()],
       removes: [applyRemoved()],
     })
-    expect(h.readRecord()).toEqual(configBytes)
+    expect(JSON.parse(h.readRecord()!.toString()).source).toEqual(JSON.parse(configBytes.toString()))
     expect(run.appliedConfigs).toHaveLength(1)
     expect(slots.calls).toEqual([])
     expect(h.pendingExists()).toBe(false)
@@ -3874,7 +3482,7 @@ describe('confirmation and apply', () => {
       writes: [h.lastAppliedWrite()],
       removes: [applyRemoved()],
     })
-    expect(h.readRecord()).toEqual(configBytes)
+    expect(JSON.parse(h.readRecord()!.toString()).source).toEqual(JSON.parse(configBytes.toString()))
     expect(h.pendingExists()).toBe(false)
     expectNoPostNoLeak(run)
   })
@@ -3929,7 +3537,9 @@ describe('confirmation and apply', () => {
     expect(slots.events).toEqual(APPLY_STEPS.flatMap((step) => [`start ${step}`, `end ${step}`]))
     expect(run.logsOf('reload')).toEqual([expect.stringMatching(/^\[slack\] reload: apply step 3 \(in-place-updates\) failed: /)])
     expect(run.logsOf(RELOAD_APPLIED)).toEqual([appliedLogged({ added: 1, removed: 1, inPlace: 1, credentials: 1 })])
-    expect(run.logs.at(-1)).toBe(appliedLogged({ added: 1, removed: 1, inPlace: 1, credentials: 1 }))
+    expect(h.pendingExists()).toBe(true)
+    expect(h.pendingLines()?.some((line) => line.includes(alpha!.credentials_file))).toBe(true)
+    expect(run.previewEmissionCount()).toBe(2)
     expectNoPostNoLeak(run)
   })
 
@@ -3951,7 +3561,7 @@ describe('confirmation and apply', () => {
     const [alpha, bravo] = started.personas
     expect(run.lifecycle.outcome(h.key('bravo'))).toBe('broken')
     // alpha moves to a new working directory (destructive); bravo's file is rotated.
-    const moved = { ...alpha!, working_directory: join(h.root, 'alpha-moved') }
+    const moved = withIndependentDestination({ ...alpha!, working_directory: join(h.root, 'alpha-moved') })
     h.makeWorkingDirectory(moved)
     h.writeCredentials(bravo!)
     h.writeConfig(configOf(moved, bravo!))
@@ -4014,7 +3624,7 @@ describe('confirmation and apply', () => {
       recordIsCandidate: true,
       applied: keysOf('alpha'),
     })
-    expect(h.readRecord()).toEqual(started.configBytes)
+    expect(JSON.parse(h.readRecord()!.toString()).source).toEqual(JSON.parse(started.configBytes.toString()))
     expect(run.appliedKeys()).toEqual(keysOf('alpha'))
     expect(run.appliedConfigs).toHaveLength(1)
     expect(h.pendingExists()).toBe(false)
@@ -4079,7 +3689,7 @@ describe('confirmation and apply', () => {
     expect(slots.calls).toEqual([{ step: 'template-refresh', keys: true, recordIsCandidate: true, applied: keysOf('alpha') }])
     expect(run.logsOf(RELOAD_NOOP)).toEqual([noopLogged()])
     expect(run.logsOf(RELOAD_APPLIED)).toEqual([])
-    expect(h.readRecord()).toEqual(candidate)
+    expect(JSON.parse(h.readRecord()!.toString()).source).toEqual(JSON.parse(candidate.toString()))
     expectNoPostNoLeak(run)
   })
 })
@@ -4309,6 +3919,7 @@ describe('confirmed credentials changes: recovery of a credentials-broken person
     const preview = [previewHeader({ credentials: 1 }), credentialsChangedLine(alpha, effect, cause)]
     expect(h.pendingLines()).toEqual(preview)
     const fingerprint = h.pendingFingerprint()
+    const authorityRevision = JSON.parse(h.readRecord()!.toString()).revision
     assertNoLeak(run.captured())
     const cp = run.checkpoint()
 
@@ -4322,9 +3933,10 @@ describe('confirmed credentials changes: recovery of a credentials-broken person
     expect(run.logsOf(PERSONA_CREDENTIALS_CHANGE_FAILED)).toEqual([
       cause === undefined ? changeFailedLine(alpha) : changeFailedExact(alpha, cause, 'connection'),
     ])
-    // Still pending, in the same state: the pending file is written again with the credentials line.
+    // The credentials stay pending under the new authority revision; the consumed confirmation cannot replay.
     expect(h.pendingLines()).toEqual(preview)
-    expect(h.pendingFingerprint()).toBe(fingerprint)
+    expect(h.pendingFingerprint()).not.toBe(fingerprint)
+    expect(JSON.parse(h.readRecord()!.toString()).revision).toBe(authorityRevision + 1)
     expect(run.bringUps.credentialsDigest(key)).toBe(held)
     // The old connection keeps serving: no socket opened or closed, the same identity, still up.
     expect(run.socketActivity('alpha')).toEqual(sockets)
@@ -4503,22 +4115,7 @@ describe('confirmed credentials changes: recovery of a credentials-broken person
 // The 64 KiB read cap on the tick and confirmation paths
 // ---------------------------------------------------------------------------
 
-describe('a file larger than the 64 KiB read cap is unreadable to the tick', () => {
-  test('an oversized config.json on a running server logs one reload-invalid line and previews INVALID naming the limit', async () => {
-    const { run, recordBytes } = await running(['alpha'])
-    const cp = run.checkpoint()
-
-    h.writeOversized(h.paths.config, { prefix: '{"personas": [], "padding": "' })
-    await run.ticks.ticks(5)
-
-    const error = `the configuration file "${h.paths.config}" is larger than the 64 KiB limit.`
-    assertNoLeak(run.captured())
-    expect(h.pendingLines()).toEqual(invalidPreview(error))
-    expect(run.since(cp)).toEqual(pendingWritten([invalidLogged(error)]))
-    expect(h.readRecord()).toEqual(recordBytes)
-    expectNoPostNoLeak(run)
-  })
-
+describe('the independent credential-file safety limit', () => {
   test("an oversized referenced credentials file is previewed as an unusable credentials change and never leaks", async () => {
     const { run, personas } = await running(['alpha'])
     const cp = run.checkpoint()
@@ -4562,11 +4159,11 @@ function loaderError(source: string, detail: string): string {
   return `loadPersonaConfig: invalid persona config in "${source}": Persona config validation error: ${detail}`
 }
 
-/** The one line a refused start logs: the config file's error, or the record's with the deletion hint. */
+/** The one line a refused start logs: the config file's error, or the record's with the preservation and recovery hint. */
 function startRefusal(source: 'config' | 'record', detail: string): string {
   return source === 'config'
     ? `${CONFIG_REFUSAL}${loaderError(h.paths.config, detail)}`
-    : `${RECORD_REFUSAL}${loaderError(h.paths.lastApplied, detail)} ${deletionHint()}`
+    : `${RECORD_REFUSAL}${loaderError(h.paths.lastApplied, detail)} ${recoveryHint()}`
 }
 
 /**
@@ -4718,7 +4315,7 @@ describe('a token-shaped persona name is an ordinary name: previewed, applied an
     {
       // The key follows the name, so a rename is alpha's removal plus the new name's addition over alpha's files.
       label: 'an existing persona renamed to one',
-      edit: (alpha, name) => [{ ...alpha, name }],
+      edit: (alpha, name) => [withIndependentDestination({ ...alpha, name })],
       counts: { added: 1, removed: 1 },
       removed: ['alpha'],
       remaining: [],
@@ -4752,7 +4349,7 @@ describe('a token-shaped persona name is an ordinary name: previewed, applied an
     h.confirm()
     await run.ticks.tick()
 
-    expect(h.readRecord()).toEqual(configBytes)
+    expect(JSON.parse(h.readRecord()!.toString()).source).toEqual(JSON.parse(configBytes.toString()))
     expect(run.appliedKeys()!.sort()).toEqual([...keysOf(...remaining), h.key(name)].sort())
     expect(run.controller.applied()!.config.personas.find((p) => p.key === h.key(name))?.name).toBe(name)
     expect(run.logsOf(RELOAD_APPLIED)).toEqual([appliedLogged(counts)])
@@ -4773,7 +4370,7 @@ describe('a token-shaped persona name is an ordinary name: previewed, applied an
     const run = await h.start()
 
     expect(run.outcome.kind === 'applied' && run.outcome.source).toBe(source)
-    expect(h.readRecord()).toEqual(bytes)
+    expect(sourceBytesOf(h.readRecord()!)).toEqual(source === 'config' ? bytes : sourceBytesOf(bytes))
     expect(run.controller.applied()!.config.personas.map((p) => [p.name, p.key])).toEqual([
       ['alpha', h.key('alpha')],
       [name, h.key(name)],

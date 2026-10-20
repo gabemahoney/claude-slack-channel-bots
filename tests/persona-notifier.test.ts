@@ -5,7 +5,7 @@
  * channel, through that persona's own Web client, as one top-level message
  * whose text carries the persona reference built from the persona's stored
  * key: its `permission_prompts` in declarative mode, its fungible destination
- * (`invited.permission_prompts`, `dm` when absent) in fungible mode (
+ * (`permission_prompts`, `dm` when absent) in fungible mode (
  * beside and), proven for a channel, an explicit
  * and a defaulted `dm` fungible destination with the resolver reading the
  * switch at each attempt, as `src/server.ts` wires it. A `dm` destination gets
@@ -333,12 +333,12 @@ describe('fungible mode: notices go to the fungible destination (beside)', () =>
   beforeEach(() => {
     const config = makeMultiPersonaConfig(
       [
-        { name: 'Foxtrot Notifier', invited: { permission_prompts: F_DEST } },
-        { name: 'Xray Notifier', dm: { enabled: true, contact: X_CONTACT }, invited: { permission_prompts: DM_DESTINATION } },
-        { name: 'Yankee Notifier', dm: { enabled: true, contact: Y_CONTACT } },
+        { name: 'Foxtrot Notifier', permission_prompts: F_DEST },
+        { name: 'Xray Notifier', dm: { enabled: true, contact: X_CONTACT }, permission_prompts: DM_DESTINATION },
+        { name: 'Yankee Notifier', permission_prompts: DM_DESTINATION, dm: { enabled: true, contact: Y_CONTACT } },
       ],
       dir,
-      { allow_invited_channels: true },
+      { channel_mode: 'open' },
     )
     ;[F, X, Y] = config.personas as [Persona, Persona, Persona]
     // The resolver reads the configuration in effect at each attempt, as `src/server.ts` wires it.
@@ -360,15 +360,14 @@ describe('fungible mode: notices go to the fungible destination (beside)', () =>
     ['a channel fungible destination (F): one top-level post to that channel', () => F, () => F_DEST, () => undefined],
     ['an explicit "dm" fungible destination (X): the DM with its dm.contact, opened at post time', () => X, () => DM_DESTINATION, () => X_CONTACT],
     [
-      'a defaulted "dm" fungible destination (Y, no invited section): the DM with its dm.contact, opened at post time',
+      'an explicit "dm" destination (Y, shared permission_prompts): the DM with its dm.contact, opened at post time',
       () => Y, () => DM_DESTINATION, () => Y_CONTACT,
     ],
   ])('%s, carrying the persona reference, through the persona\'s own client; no other persona\'s stub is called', async (_label, pick, fungibleDestination, contact) => {
     const self = pick()
     // Preconditions: the destination is the loader's fungible destination,
     // and the declarative section is not in force.
-    expect(self.fungible_destination).toBe(fungibleDestination())
-    expect(self.permission_prompts).toBeUndefined()
+    expect(self.permission_prompts).toBe(fungibleDestination())
     const dmContact = contact()
     // Nothing is opened before a notice is raised.
     expect(fh.stub(self.key).callLog).toEqual([])

@@ -11,7 +11,7 @@
  *   edit; the record is a byte copy of the file at each step;
  * - runs in declarative mode, with no fungible destination and no `invited`
  *   section on any persona;
- * - never gets a stored-choice file (`CHANNEL_DELIVERY_FILE_NAME`);
+ * - never gets a stored-choice file (`'channel-delivery.json'`);
  * - logs, previews and posts nothing that names the switch, fungible mode or
  *   a class this work adds (the term list below), so no line suggests
  * fungible mode and, with the switch absent, no recorded line
@@ -56,9 +56,6 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
 
 import {
-  CHANNEL_DELIVERY_DIAGNOSTIC_CLASSES,
-  CHANNEL_DELIVERY_FILE_NAME,
-  CHANNEL_DELIVERY_LOG_PREFIX,
   SET_CHANNEL_DELIVERY_TOOL,
 } from '../src/channel-delivery.ts'
 import {
@@ -203,10 +200,6 @@ function modeSwitchLineHead(mode: (typeof CHANNEL_MODES)[number]): string {
 const TERM_LIST: readonly Term[] = [
   { label: 'PERSONA_INVITED_CHANNEL', text: PERSONA_INVITED_CHANNEL },
   { label: 'PERSONA_CHANNEL_DELIVERY_SET', text: PERSONA_CHANNEL_DELIVERY_SET },
-  ...CHANNEL_DELIVERY_DIAGNOSTIC_CLASSES.map((text) => ({ label: `CHANNEL_DELIVERY_DIAGNOSTIC_CLASSES ${text}`, text })),
-  { label: 'CHANNEL_DELIVERY_LOG_PREFIX', text: CHANNEL_DELIVERY_LOG_PREFIX },
-  { label: 'CHANNEL_DELIVERY_FILE_NAME', text: CHANNEL_DELIVERY_FILE_NAME },
-  { label: 'FUNGIBLE_DESTINATION_SETTING', text: FUNGIBLE_DESTINATION_SETTING },
   // The switch's key. Its membership in the top-level keys is pinned below,
   // so a rename fails the suite instead of leaving this entry checking nothing.
   { label: 'MODE_SWITCH_SETTING', text: MODE_SWITCH_SETTING },
@@ -339,7 +332,7 @@ describe('upgrade fixtures and the term list', () => {
   })
 
   test.each([
-    ['fungible', 'a FunGible mode', 'FunGible'],
+    ['open', 'a FunGible mode', 'FunGible'],
     ['invited', 'an InViTed channel', 'InViTed'],
   ])('the checker reports the word "%s" in mixed case', (_word, text, hit) => {
     expect(termsIn(text)).toEqual([`word "${hit}"`])
@@ -376,10 +369,8 @@ describe('a 0.11.1 configuration loaded directly stays declarative', () => {
       }
 
       expect(readFileSync(configPath).equals(fixture.bytes)).toBe(true)
-      expect(channelModeOf(config)).toBe('declarative')
-      expect(config.personas.map((p) => ({ fungible: p.fungible_destination, invited: p.sections.invited }))).toEqual(
-        fixture.input.personas.map(() => ({ fungible: undefined, invited: undefined })),
-      )
+      expect(channelModeOf(config)).toBe('strict')
+      expect(config.personas.every(p => !('fungible_destination' in p) && !('invited' in p.sections))).toBe(true)
       expect(
         config.personas.map((p) => ({ name: p.name, channels: p.channels, dm: p.dm, permission_prompts: p.permission_prompts })),
       ).toEqual(
@@ -390,7 +381,7 @@ describe('a 0.11.1 configuration loaded directly stays declarative', () => {
           permission_prompts: entry.permission_prompts,
         })),
       )
-      expect(filesNamed(rig!.root, CHANNEL_DELIVERY_FILE_NAME)).toEqual([])
+      expect(filesNamed(rig!.root, 'channel-delivery.json')).toEqual([])
       // The loader prints nothing for a valid configuration, so the check is
       // that nothing was printed at all, which also rules out every term.
       expect(messages).toEqual([])
@@ -449,16 +440,16 @@ async function startFixture(h: ReloadHarness, fixture: UpgradeFixture): Promise<
 function expectDeclarativeAndUnchanged(h: ReloadHarness, run: ReloadRun, bytes: Buffer): void {
   expect({
     config: h.readConfig()?.equals(bytes),
-    record: h.readRecord()?.equals(bytes),
+    record: h.readRecord() !== undefined && JSON.stringify(JSON.parse(h.readRecord()!.toString()).source) === JSON.stringify(JSON.parse(bytes.toString())),
     mode: channelModeOf(run.serverConfig()),
-    fungibleDestinations: run.serverConfig()?.personas.filter((p) => p.fungible_destination !== undefined).map((p) => p.name),
-    storedChoiceFile: existsSync(h.channelDeliveryFile),
-    namedAnywhere: filesNamed(h.root, CHANNEL_DELIVERY_FILE_NAME),
+    removedFields: run.serverConfig()?.personas.filter(p => 'fungible_destination' in p || 'invited' in p.sections).map(p => p.name),
+    storedChoiceFile: existsSync(join(h.stateDir, 'channel-delivery.json')),
+    namedAnywhere: filesNamed(h.root, 'channel-delivery.json'),
   }).toEqual({
     config: true,
     record: true,
-    mode: 'declarative',
-    fungibleDestinations: [],
+    mode: 'strict',
+    removedFields: [],
     storedChoiceFile: false,
     namedAnywhere: [],
   })

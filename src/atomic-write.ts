@@ -100,7 +100,11 @@ function durableTempPath(path: string): string {
 function writeAll(fs: DurableWriteFs, fd: number, bytes: Uint8Array): void {
   let offset = 0
   while (offset < bytes.length) {
-    offset += fs.writeSync(fd, bytes, offset, bytes.length - offset)
+    const written = fs.writeSync(fd, bytes, offset, bytes.length - offset)
+    if (!Number.isInteger(written) || written <= 0 || written > bytes.length - offset) {
+      throw Object.assign(new Error('durableWriteFileSync: write made no valid progress'), { code: 'EIO' })
+    }
+    offset += written
   }
 }
 

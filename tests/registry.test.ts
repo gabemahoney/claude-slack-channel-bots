@@ -103,7 +103,7 @@ import {
 } from '../src/registry.ts'
 import { trackAck, consumeAck, _resetAckTracker, addDeliveryAck } from '../src/ack-tracker.ts'
 import {
-  makeFungiblePersona,
+  makePersona,
   makeMultiPersonaConfig,
   makeStandInPersonaConfig,
   writeConfigFile,
@@ -315,7 +315,7 @@ function makeHarness(): Harness {
   }
   const harness: Harness = {
     dir, stateDir, inboxDir, credentialsFile, alpha, beta, personas, clients, alphaToken, deps,
-    mode: 'declarative',
+    mode: 'strict',
     modeDeps: { ...deps, getChannelMode: () => harness.mode },
     lines: [],
     results: [],
@@ -400,9 +400,9 @@ function applyPersona(p: Persona, on: boolean, overrides: Partial<Persona> = {})
  */
 function applyFungibleAlpha(on: boolean, spec: PersonaSpec = {}): Persona {
   const config = makeMultiPersonaConfig(
-    [{ name: h.alpha.name, invited: { permission_prompts: A_ALL }, ...spec, dm: { enabled: on } }],
+    [{ name: h.alpha.name, permission_prompts: A_ALL, ...spec, dm: { enabled: on } }],
     h.dir,
-    { allow_invited_channels: true },
+    { channel_mode: 'open' },
   )
   const persona = config.personas[0]!
   expect(persona.key).toBe(h.alpha.key)
@@ -1774,7 +1774,7 @@ function scopeCheck(persona: Persona, target: string, expected: ScopeExpected): 
 // row's outcome shows the persona's list is not what decides there. Every
 // refusal is checked by its full message.
 describe('checkPersonaTarget per channel mode', () => {
-  test.each([...scopeCases('declarative', DECLARATIVE_SCOPE_ROWS), ...scopeCases('fungible', FUNGIBLE_SCOPE_ROWS)])(
+  test.each([...scopeCases('strict', DECLARATIVE_SCOPE_ROWS), ...scopeCases('open', FUNGIBLE_SCOPE_ROWS)])(
     '$mode: $label, DMs $dmsLabel, $action',
     ({ mode, target, dms, action, expected, dmTarget }) => {
       const persona = applyPersona(h.alpha, dms)
@@ -1782,7 +1782,7 @@ describe('checkPersonaTarget per channel mode', () => {
       const check = checkPersonaTarget(persona, target, action, mode)
 
       expect(check).toEqual(scopeCheck(persona, target, expected(dms, action)))
-      if (dmTarget && mode === 'fungible') expect(check).toEqual(checkPersonaTarget(persona, target, action, 'declarative'))
+      if (dmTarget && mode === 'open') expect(check).toEqual(checkPersonaTarget(persona, target, action, 'strict'))
     },
   )
 
@@ -1801,7 +1801,7 @@ describe('tool posting scope in fungible mode (through the MCP server)', () => {
   const ACT_TOOLS = TOOLS.filter((t) => t !== 'reply')
 
   beforeEach(() => {
-    h.mode = 'fungible'
+    h.mode = 'open'
   })
 
   test.each(TOOLS.flatMap((tool) => [UNCONFIGURED, GROUP_DM].map((target) => [tool, target] as const)))(
@@ -1862,7 +1862,7 @@ describe('the channel mode at each call', () => {
   test('flipping the mode between calls to the same unlisted channel flips the outcome', async () => {
     const session = await openModeSession(h.alpha)
     const outcomes: Array<[boolean | undefined, string]> = []
-    for (const mode of ['declarative', 'fungible', 'declarative'] as const) {
+    for (const mode of ['strict', 'open', 'strict'] as const) {
       h.mode = mode
       const result = await session.call('reply', TOOL_ARGS.reply(UNCONFIGURED))
       outcomes.push([result.isError, result.isError ? result.content[0]!.text : ''])
@@ -1878,7 +1878,7 @@ describe('the channel mode at each call', () => {
 
   test('a deps object with no mode reader decides as declarative mode, even for a persona in fungible shape', async () => {
     const persona = applyFungibleAlpha(true)
-    h.mode = 'fungible'
+    h.mode = 'open'
     expect(h.deps.getChannelMode).toBeUndefined()
     const session = await openPersonaSession(h.alpha)
 
@@ -1899,7 +1899,7 @@ describe('the channel mode at each call', () => {
 describe('dry run in fungible mode (SLACK_DRY_RUN=1)', () => {
   beforeEach(() => {
     process.env['SLACK_DRY_RUN'] = '1'
-    h.mode = 'fungible'
+    h.mode = 'open'
   })
 
   test.each(TOOLS)('%s to an unlisted channel returns the dry-run result with no Slack call', async (tool) => {
@@ -1928,94 +1928,41 @@ describe('dry run in fungible mode (SLACK_DRY_RUN=1)', () => {
   )
 })
 
-// in fungible mode the outbound
-// outcome never depends on the declarative section (`channels`, the top-level
-// `permission_prompts`), even one holding a D… conversation or a malformed
-// value, which declarative mode would allow as listed channels.
-describe('fungible mode never reads the declarative section on the outbound path', () => {
-  /** A declarative section beside the fungible one: a listed channel, a D… conversation and a malformed value. */
-  const DECLARATIVE_SECTION: ChannelEntry[] = [
-    { id: A_ALL, delivery: 'all' },
-    { id: DM_CONV, delivery: 'all' },
-    { id: MALFORMED_ID, delivery: 'mentions' },
-  ]
-
-  /** Every fungible-row target × DMs off and on × `post` and `act`, as fungible mode decides it for `persona`. */
-  function fungibleOutcomes(persona: Persona): Record<string, PersonaTargetCheck> {
-    return Object.fromEntries(
-      scopeCases('fungible', FUNGIBLE_SCOPE_ROWS).map(({ label, target, dms, dmsLabel, action }) => [
-        `${label}, DMs ${dmsLabel}, ${action}`,
-        checkPersonaTarget({ ...persona, dm: { ...persona.dm, enabled: dms } }, target, action, 'fungible'),
-      ]),
-    )
-  }
-
-  /** `persona` applied as Alpha Bot; replies to an unlisted channel, the section's D… entry and its malformed entry. */
-  async function replyOutcomes(persona: Persona): Promise<Array<[boolean | undefined, string]>> {
-    h.personas.set(persona.key, persona)
-    const session = await openModeSession(h.alpha)
-    const results: Array<[boolean | undefined, string]> = []
-    for (const target of [UNCONFIGURED, DM_CONV, MALFORMED_ID]) {
-      const result = await session.call('reply', TOOL_ARGS.reply(target))
-      results.push([result.isError, result.isError ? result.content[0]!.text : ''])
+describe('shared configuration on the outbound path', () => {
+  test.each(['strict', 'open'] as const)('%s loads the same valid list and rejects malformed shared values', mode => {
+    const home = join(h.dir, 'home')
+    mkdirSync(home, { recursive: true })
+    const clean = makePersona({ name: h.alpha.name }, h.dir)
+    const load = (label: string, persona: unknown) => {
+      const dir = join(h.dir, mode + label)
+      mkdirSync(dir)
+      return loadPersonaConfig(writeConfigFile(dir, { channel_mode: mode, personas: [persona] }), home)
     }
-    return results
-  }
-
-  test('a resolved persona whose channels hold a listed channel, a D… conversation and a malformed value is decided as one with no channels', async () => {
-    const withSection = applyFungibleAlpha(false, { channels: DECLARATIVE_SECTION, permission_prompts: MALFORMED_ID })
-    const without = applyFungibleAlpha(false)
-    expect(withSection.channels).toEqual(DECLARATIVE_SECTION)
-    expect(without.channels).toEqual([])
-
-    expect(fungibleOutcomes(withSection)).toEqual(fungibleOutcomes(without))
-
-    h.mode = 'fungible'
-    const expected: Array<[boolean | undefined, string]> = [
-      [undefined, ''],
-      [true, refusal(without, DM_CONV, WHY.dmsOff)],
-      [true, refusal(without, MALFORMED_ID, FUNGIBLE_TARGET_REFUSAL)],
-    ]
-    expect(await replyOutcomes(withSection)).toEqual(expected)
-    expect(await replyOutcomes(without)).toEqual(expected)
-    // In declarative mode the same persona's section is read: its D… and
-    // malformed entries are listed channels there.
-    h.mode = 'declarative'
-    expect((await replyOutcomes(withSection)).map(([isError]) => isError)).toEqual([true, undefined, undefined])
+    const resolved = load('valid', clean).personas[0]!
+    expect(resolved.channels).toEqual(clean.channels!)
+    expect(resolved.permission_prompts).toBe(clean.permission_prompts!)
+    for (const [label, change] of [
+      ['channels', { channels: [{ id: A_ALL, delivery: 'sometimes' }] }],
+      ['destination', { permission_prompts: 42 }],
+      ['removed', { invited: { permission_prompts: 'dm' } }],
+    ] as const) expect(() => load(label, { ...clean, ...change })).toThrow()
   })
 
-  test('a configuration whose channels and top-level permission_prompts are malformed loads in fungible mode through the real loader, and its outbound outcomes are those of a persona with no declarative section', async () => {
-    const home = join(h.dir, 'home')
-    mkdirSync(home)
-    const load = (name: string, persona: unknown) => {
-      const dir = join(h.dir, name)
-      mkdirSync(dir)
-      return loadPersonaConfig(writeConfigFile(dir, { allow_invited_channels: true, personas: [persona] }), home)
+  test('open mode permits an unlisted valid channel without permitting malformed or disabled DM targets', async () => {
+    const persona = applyFungibleAlpha(false)
+    h.mode = 'open'
+    const session = await openModeSession(persona)
+    const allowed = await session.call('reply', TOOL_ARGS.reply(UNCONFIGURED))
+    expect(allowed.isError).toBeUndefined()
+    for (const target of [DM_CONV, MALFORMED_ID]) {
+      const before = stubOf(persona).calls.postMessage.length
+      expect((await session.call('reply', TOOL_ARGS.reply(target))).isError).toBe(true)
+      expect(stubOf(persona).calls.postMessage).toHaveLength(before)
     }
-    const clean = makeFungiblePersona({ name: h.alpha.name }, h.dir)
-    const malformedChannels = [{ id: DM_CONV, delivery: 'sometimes' }, 'not-an-entry', { id: 42 }]
-    const malformed = load('malformed', { ...clean, channels: malformedChannels, permission_prompts: 42 })
-    const plain = load('plain', clean)
-    expect(channelModeOf(malformed)).toBe('fungible')
-    const withSection = malformed.personas[0]!
-    const without = plain.personas[0]!
-    expect(withSection.key).toBe(h.alpha.key)
-    // The malformed section reached the loader, as written, and resolved to none.
-    expect(withSection.sections.channels).toEqual(malformedChannels)
-    expect(withSection.sections.permission_prompts).toBe(42)
-    expect(withSection.channels).toEqual([])
-    expect(withSection.permission_prompts).toBeUndefined()
-
-    expect(fungibleOutcomes(withSection)).toEqual(fungibleOutcomes(without))
-
-    h.mode = 'fungible'
-    const expected: Array<[boolean | undefined, string]> = [
-      [undefined, ''],
-      [true, refusal(without, DM_CONV, WHY.dmsOff)],
-      [true, refusal(without, MALFORMED_ID, FUNGIBLE_TARGET_REFUSAL)],
-    ]
-    expect(await replyOutcomes(withSection)).toEqual(expected)
-    expect(await replyOutcomes(without)).toEqual(expected)
+    h.mode = 'strict'
+    const strict = await session.call('reply', TOOL_ARGS.reply(UNCONFIGURED))
+    expect(strict.isError).toBe(true)
+    expect(strict.content[0]!.text).toContain(UNCONFIGURED)
   })
 })
 
@@ -2147,7 +2094,7 @@ describe("Slack's refusals as tool errors in fungible mode", () => {
   }
 
   beforeEach(() => {
-    h.mode = 'fungible'
+    h.mode = 'open'
   })
 
   test.each(TOOLS.flatMap((tool) => CODES.map((code) => [tool, code] as const)))(
@@ -2245,7 +2192,7 @@ describe("Slack's refusals as tool errors in fungible mode", () => {
   test.each(TOOLS)(
     "declarative mode with the reader bound: %s on a listed channel Slack refuses keeps the text a session with no mode reader gets",
     async (tool) => {
-      h.mode = 'declarative'
+      h.mode = 'strict'
       const run = async (deps: SessionToolDeps) => {
         stubOf(h.alpha).script[TOOL_QUEUE[tool]].push({ kind: 'platform', error: 'not_in_channel' })
         const session = await openSession(registerSession(h.alpha.working_directory, h.alpha.key, makeTransport(), makeServer()), deps)
@@ -2860,14 +2807,14 @@ describe('tool list and instructions', () => {
   })
 
   // negotiated tools only; the system prompt owns full tag semantics.
-  test('the compact contract retains all nine points in order and every tool/via value under its cap', async () => {
+  test('the compact contract retains all contract points in order and every tool/via value under its cap', async () => {
     const { client } = await openPersonaSession(h.alpha)
     expect(client.getServerCapabilities()).toEqual({ tools: {} })
     expect(MCP_INSTRUCTIONS_MAX_CHARS).toBe(2048)
     expect(MCP_INSTRUCTIONS.length).toBeLessThanOrEqual(MCP_INSTRUCTIONS_MAX_CHARS)
     const points = [
       'The sender reads Slack', 'Messages arrive as the <channel> tag described in the system prompt',
-      'via:', '<@ID>', 'attachment_count', 'You may act', 'With DMs on', 'Pass message_id', 'reply accepts files',
+      'via:', '<@ID>', 'attachment_count', 'In strict mode', SET_CHANNEL_DELIVERY_TOOL, 'With DMs on', 'Pass message_id', 'reply accepts files',
     ]
     let last = -1
     for (const point of points) {
@@ -2899,28 +2846,26 @@ describe('session instructions in both channel modes', () => {
   /** The instructions a session for Alpha Bot receives when opened with the mode seam at `mode`. */
   async function instructionsIn(mode: ChannelMode): Promise<string | undefined> {
     h.mode = mode
-    if (mode === 'fungible') applyFungibleAlpha(false)
+    if (mode === 'open') applyFungibleAlpha(false)
     else h.personas.set(h.alpha.key, h.alpha)
     const { client } = await openModeSession(h.alpha)
     return client.getInstructions()
   }
 
   test('a session opened in fungible mode and one opened in declarative mode each receive exactly MCP_INSTRUCTIONS', async () => {
-    const fungible = await instructionsIn('fungible')
-    const declarative = await instructionsIn('declarative')
+    const fungible = await instructionsIn('open')
+    const declarative = await instructionsIn('strict')
 
     expect(fungible).toBe(MCP_INSTRUCTIONS)
     expect(declarative).toBe(MCP_INSTRUCTIONS)
     expect(fungible).toBe(declarative!)
   })
 
-  test('the text says where the persona may act, with invited channels off and on, and that the channel-delivery tool sets how closely the persona listens in a channel, called when someone there asks', () => {
-    expect(MCP_INSTRUCTIONS).toMatch(/You may act in every channel you receive/)
-    expect(MCP_INSTRUCTIONS).toMatch(/invited channels off[^\n]*these are your configured channels/)
-    expect(MCP_INSTRUCTIONS).toMatch(/with it on[^\n]*channels your Slack app belongs to[^\n]*Slack refuses others/)
-    expect(MCP_INSTRUCTIONS).toMatch(
-      new RegExp(`${literal(SET_CHANNEL_DELIVERY_TOOL)} sets listening to mentions[^\\n]*when someone in that channel asks`),
-    )
+  test('the text describes both channel modes and all listening choices when someone asks', () => {
+    expect(MCP_INSTRUCTIONS).toContain('In strict mode you may act in your configured non-off channels.')
+    expect(MCP_INSTRUCTIONS).toContain('In open mode Slack enforces channel access.')
+    expect(MCP_INSTRUCTIONS).toMatch(new RegExp(`${literal(SET_CHANNEL_DELIVERY_TOOL)} sets listening to off, mentions[^\n]*all[^\n]*thread_hybrid`))
+    expect(MCP_INSTRUCTIONS).toContain('Use it when someone in that channel asks; new assignments require open mode.')
   })
 })
 

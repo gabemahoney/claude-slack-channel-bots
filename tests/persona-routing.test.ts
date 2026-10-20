@@ -80,7 +80,7 @@ describe('persona routing and durable dedupe', () => {
     const h = harness(); const event = makeChannelMessage({ channel: CA }); await h.receive(event, ['alpha']); h.forget('alpha'); await h.receive(event, ['alpha'])
     await h.receive({ ...event, edited: { ts: '1700000001.000001' } }, ['alpha'])
     expect(h.queued('alpha').map(i => i.accepted.key)).toEqual([{ chat_id: CA, ts: event.ts as string }, { chat_id: CA, ts: event.ts as string, edited_ts: '1700000001.000001' }]); expect(facts(h, 'beta')).toEqual([])
-    h.setMode('fungible'); await h.receive(event, ['alpha']); expect(h.queued('alpha')).toHaveLength(2); expect(h.queued('alpha').map(i => i.accepted.via)).toEqual(['receive_all', 'receive_all'])
+    h.setMode('open'); await h.receive(event, ['alpha']); expect(h.queued('alpha')).toHaveLength(2); expect(h.queued('alpha').map(i => i.accepted.via)).toEqual(['receive_all', 'receive_all'])
   })
   test.each([undefined, null, {}, { type: 'reaction_added' }, { type: 'message', subtype: 'message_deleted' }])('nonmessage %p acks and stores nothing', async event => {
     const h = harness(); await h.receive(event); expect(h.order.filter(s => s === 'ack')).toEqual(['ack']); expect(facts(h, 'alpha')).toEqual([]); expect(facts(h, 'beta')).toEqual([])
@@ -119,11 +119,13 @@ describe('persona routing and durable dedupe', () => {
 })
 describe('fungible mode', () => {
   test.each([false, true])('paired app mention is ignored in either order and message enters queue once (%p)', async mentionFirst => {
-    const h = harness({ mode: 'fungible' }); const message = makeChannelMessage({ channel: CX, text: mentionText(h.p('alpha').stub.identity.botUserId) + ' hello' }); const app = { ...message, type: 'app_mention' }
+    const h = harness({ mode: 'open', channelDelivery: undefined });
+    const alpha = h.p('alpha').persona; h.channelDelivery!.set(alpha.key, CX, 'mentions', alpha); const message = makeChannelMessage({ channel: CX, text: mentionText(h.p('alpha').stub.identity.botUserId) + ' hello' }); const app = { ...message, type: 'app_mention' }
     await h.receive(mentionFirst ? app : message, ['alpha']); await h.receive(mentionFirst ? message : app, ['alpha']); expect(facts(h, 'alpha')).toEqual([{ channel: CX, ts: message.ts as string, via: 'mention', text: message.text as string }]); expect(facts(h, 'beta')).toEqual([]); expect(h.heardChannels('alpha')).toEqual(new Set([CX])); expect(h.logs.filter(s => s.includes('persona-invited-channel'))).toHaveLength(1)
   })
   test.each(Object.entries(ENVELOPE_FLAG_FORMS))('envelope flag %s retains decision behavior', async (form, envelope) => {
-    const h = harness({ mode: 'fungible' }); const event = makeChannelMessage({ channel: CX, text: mentionText(h.p('alpha').stub.identity.botUserId) + ' hello' }); await h.receive(event, ['alpha'], undefined, envelope)
+    const h = harness({ mode: 'open', channelDelivery: undefined });
+    const alpha = h.p('alpha').persona; h.channelDelivery!.set(alpha.key, CX, 'mentions', alpha); const event = makeChannelMessage({ channel: CX, text: mentionText(h.p('alpha').stub.identity.botUserId) + ' hello' }); await h.receive(event, ['alpha'], undefined, envelope)
     expect(h.queued('alpha')).toHaveLength(form === 'false' ? 1 : 0); expect(facts(h, 'beta')).toEqual([])
   })
 })

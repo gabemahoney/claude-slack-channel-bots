@@ -292,7 +292,7 @@ import {
 } from '../src/ad-settings.ts'
 import { AD_VERSION_RECHECK_INTERVAL_MS, DEBUG_SKILL_PATH, DEBUG_SKILL_RUNTIME_STOP_SECTION_TITLE, PHASE1_FLOOR_VERSION, PHASE1_RUNBOOK_DOC, PHASE1_RUNBOOK_SECTION_TITLE, PUBLISHING_HOST_BLOCK_HEADING } from '../src/ad-version-gate.ts'
 import { DEFAULT_STORE_PATH } from '../src/agent-director-client.ts'
-import { CHANNEL_DELIVERY_FILE_NAME, CHANNEL_DELIVERY_UNREADABLE, SET_CHANNEL_DELIVERY_TOOL } from '../src/channel-delivery.ts'
+import { CHANNEL_DELIVERY_FILE_NAME, SET_CHANNEL_DELIVERY_TOOL } from '../src/channel-delivery.ts'
 import {
   CLEAR_LATCH_COMMAND,
   CLEAR_LATCH_DIAL_HOST,
@@ -315,7 +315,6 @@ import {
   MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
   PERSONA_DM_KEYS,
   PERSONA_ENTRY_KEYS,
-  PERSONA_INVITED_KEYS,
   PERSONA_TOP_LEVEL_KEYS,
   prefixRelatedKeysReason,
   resolvePersonaConfig,
@@ -708,16 +707,16 @@ function codeSpans(cell: string): string[] {
 const PERSONAS_HEADING = '## Personas (config.json)'
 const EXAMPLE_HEADING = '### Example'
 /** The heading of the second complete example, in fungible mode, a section of `CHANNEL_MODES_DOC`. */
-const FUNGIBLE_EXAMPLE_HEADING = '## Example in fungible mode'
+const FUNGIBLE_EXAMPLE_HEADING = '## Example in open mode'
 
 /**
  * The persona-entry key holding the fungible section: read
  * only in fungible mode, so the declarative example need not carry it.
  */
-const FUNGIBLE_SECTION_KEY = 'invited' satisfies (typeof PERSONA_ENTRY_KEYS)[number]
+const REMOVED_SECTION_KEY = 'invited'
 
 /** The fungible section's key naming the persona's destination, `invited.permission_prompts`. */
-const INVITED_DESTINATION_KEY = 'permission_prompts' satisfies (typeof PERSONA_INVITED_KEYS)[number]
+const INVITED_DESTINATION_KEY = 'permission_prompts' satisfies (typeof PERSONA_ENTRY_KEYS)[number]
 
 /** Where a section nested in the persona reference comes from, for `requiredSection` failures. */
 const IN_PERSONAS = `${CONFIGURATION_DOC}, under "${PERSONAS_HEADING}",`
@@ -763,7 +762,6 @@ const MOVED_SERVER_SETTINGS = ['ack_reaction', 'reply_chunk_limit', 'reply_chunk
 const KEY_TABLES: [heading: string, keys: readonly string[]][] = [
   ['Persona fields', PERSONA_ENTRY_KEYS.flatMap((key) => {
     if (key === 'dm') return PERSONA_DM_KEYS.map((sub) => `dm.${sub}`)
-    if (key === FUNGIBLE_SECTION_KEY) return PERSONA_INVITED_KEYS.map((sub) => `${FUNGIBLE_SECTION_KEY}.${sub}`)
     return [key]
   })],
   ['Channel entries', CHANNEL_ENTRY_KEYS],
@@ -853,14 +851,6 @@ describe('README.md', () => {
     /** The switch's row, found by the switch named in its Change cell. */
     const SWITCH_ROW: Expected = { label: `the switch ${MODE_SWITCH_SETTING}`, find: naming(MODE_SWITCH_SETTING), session: 'Kept', destructive: false }
 
-    /** The recorded row, found by the section keys its Change cell names. */
-    const RECORDED_ROW: Expected = {
-      label: `a recorded change to the section not in force (${RECORDED_SECTION_KEYS.join(', ')})`,
-      find: naming(...RECORDED_SECTION_KEYS),
-      session: 'Kept',
-      destructive: false,
-    }
-
     /**
      * One entry per change kind the plan classifies (`ValidChangePlan`'s lists),
      * the settings expanded from the plan's exported classes. A new kind in the
@@ -911,7 +901,7 @@ describe('README.md', () => {
         destructive: true,
       })),
       settings: [SERVER_WIDE_ROW, SWITCH_ROW],
-      recorded: [RECORDED_ROW],
+      recorded: [],
       added: [
         {
           label: 'a persona is added',
@@ -959,17 +949,6 @@ describe('README.md', () => {
       expect(serverWideExceptionProblems(rows)).toEqual([])
     })
 
-    /** The recorded row's problems in `all`: its Once confirmed cell names no `reload-noop`. */
-    function recordedNoopProblems(all: readonly Row[]): string[] {
-      const row = all.find(RECORDED_ROW.find)
-      if (row === undefined) return ['no recorded row']
-      return codeSpans(row.confirmed).includes(RELOAD_NOOP) ? [] : [`Once confirmed names no \`${RELOAD_NOOP}\``]
-    }
-
-    test(`the recorded row's Once confirmed cell names \`${RELOAD_NOOP}\` for a confirmation of recorded changes only`, () => {
-      expect(recordedNoopProblems(rows)).toEqual([])
-    })
-
     /**
      * Self-checks on edited copies of the README: each of the
      * two rows this work adds, the switch's and the recorded one, fails its
@@ -980,7 +959,7 @@ describe('README.md', () => {
      * `reload-noop` case fails when the label is cut from that row.
      */
     describe('self-checks, on edited copies', () => {
-      const NEW_ROWS: readonly Expected[] = [SWITCH_ROW, RECORDED_ROW]
+      const NEW_ROWS: readonly Expected[] = [SWITCH_ROW]
 
       /** `text` with `edit` applied to the raw line of the one table row `expected` finds; an edit to '' removes the line. */
       function withRowEdited(text: string, expected: Expected, edit: (line: string) => string): string {
@@ -1024,11 +1003,7 @@ describe('README.md', () => {
         expect(serverWideExceptionProblems(rowsOf(edited))).toEqual([problem])
       })
 
-      test(`the recorded row with \`${RELOAD_NOOP}\` cut fails the ${RELOAD_NOOP} case`, () => {
-        const edited = withRowEdited(reloadDoc, RECORDED_ROW, (line) => line.replaceAll(`\`${RELOAD_NOOP}\``, 'a no-op line'))
-        expect(edited).not.toBe(reloadDoc)
-        expect(recordedNoopProblems(rowsOf(edited))).toEqual([`Once confirmed names no \`${RELOAD_NOOP}\``])
-      })
+
     })
   })
 
@@ -1133,10 +1108,10 @@ describe('README.md', () => {
        */
       const COMPLETENESS: [label: string, check: (example: Example) => void][] = [
         ['the switch absent or false (declarative mode)', ({ raw }) => {
-          expect([undefined, false] as unknown[]).toContainEqual(raw[MODE_SWITCH_SETTING])
+          expect([undefined, 'strict'] as unknown[]).toContainEqual(raw[MODE_SWITCH_SETTING])
         }],
         ['every persona-entry key declarative mode reads', ({ raw }) => {
-          const read = PERSONA_ENTRY_KEYS.filter((key) => key !== FUNGIBLE_SECTION_KEY)
+          const read = PERSONA_ENTRY_KEYS
           expect(read.filter((key) => !raw.personas.some((p) => key in p))).toEqual([])
         }],
         ['every dm key', ({ raw }) => {
@@ -1181,26 +1156,21 @@ describe('README.md', () => {
        */
       const FUNGIBLE_COMPLETENESS: [label: string, check: (example: Example) => void][] = [
         ['the switch true (fungible mode)', ({ raw }) => {
-          expect(raw[MODE_SWITCH_SETTING]).toBe(true)
+          expect(raw[MODE_SWITCH_SETTING]).toBe('open')
         }],
         ['a persona with DMs off and a channel fungible destination', ({ config }) => {
           const shapes = config.personas.map((p) => ({
             dm: p.dm.enabled,
-            channelDestination: p.fungible_destination !== undefined && p.fungible_destination !== DM_DESTINATION,
+            channelDestination: p.permission_prompts !== undefined && p.permission_prompts !== DM_DESTINATION,
           }))
           expect(shapes).toContainEqual({ dm: false, channelDestination: true })
         }],
-        [`a persona whose destination is "${DM_DESTINATION}" by default, none written`, ({ raw, config }) => {
-          const byDefault = config.personas.filter((p, i) => {
-            const invited = raw.personas[i].invited
-            const written = invited !== undefined && INVITED_DESTINATION_KEY in invited
-            return p.fungible_destination === DM_DESTINATION && !written
-          })
-          expect(byDefault.map((p) => p.name)).not.toEqual([])
+        ['a persona with an explicitly written DM destination', ({ raw, config }) => {
+          expect(config.personas.some((p, i) => p.permission_prompts === DM_DESTINATION && raw.personas[i]!.permission_prompts === DM_DESTINATION)).toBe(true)
         }],
-        ['every key of the fungible section', ({ raw }) => {
-          const written = (key: string) => raw.personas.some((p) => p.invited !== undefined && key in p.invited)
-          expect(PERSONA_INVITED_KEYS.filter((key) => !written(key))).toEqual([])
+        ['shared fields are present and removed keys never occur', ({ raw }) => {
+          expect(raw.personas.every(p => 'permission_prompts' in p && !(REMOVED_SECTION_KEY in p))).toBe(true)
+          expect(raw).not.toHaveProperty('allow_invited_channels')
         }],
       ]
 
@@ -7520,9 +7490,9 @@ const SERVER_SETTINGS_HEADING = '# Server settings'
 const WHAT_EACH_MODE_SERVES_HEADING = '## What each mode serves'
 /** The security subsection, read before turning fungible mode on, so right after what each mode serves. */
 const WHO_CAN_REACH_HEADING = '## Who can reach a persona in fungible mode'
-const TURNING_FUNGIBLE_HEADING = '## Turning fungible mode on or off'
-const FUNGIBLE_DELIVERY_HEADING = '## Channel delivery in fungible mode'
-const FUNGIBLE_PROMPTS_HEADING = '## Permission prompts in fungible mode'
+const TURNING_FUNGIBLE_HEADING = '## Turning open mode on or off'
+const FUNGIBLE_DELIVERY_HEADING = '## Channel delivery in open mode'
+const FUNGIBLE_PROMPTS_HEADING = '## Permission prompts in both modes'
 /** The page's sections, in order: the four of the contract, the security section and the fungible-mode example. */
 const CHANNEL_MODES_SUBSECTIONS = [WHAT_EACH_MODE_SERVES_HEADING, WHO_CAN_REACH_HEADING, TURNING_FUNGIBLE_HEADING, FUNGIBLE_DELIVERY_HEADING, FUNGIBLE_PROMPTS_HEADING, FUNGIBLE_EXAMPLE_HEADING] as const
 
@@ -7550,7 +7520,7 @@ const DM_KEY = 'dm' satisfies (typeof PERSONA_ENTRY_KEYS)[number]
 const DELIVERY_KEY = 'delivery' satisfies (typeof CHANNEL_ENTRY_KEYS)[number]
 const DM_CONTACT = `${DM_KEY}.${'contact' satisfies (typeof PERSONA_DM_KEYS)[number]}`
 const DM_ENABLED = `${DM_KEY}.${'enabled' satisfies (typeof PERSONA_DM_KEYS)[number]}`
-const INVITED_DESTINATION = `${FUNGIBLE_SECTION_KEY}.${INVITED_DESTINATION_KEY}`
+const INVITED_DESTINATION = `${REMOVED_SECTION_KEY}.${INVITED_DESTINATION_KEY}`
 const MENTIONS = 'mentions' satisfies (typeof DELIVERY_MODES)[number]
 const ALL = 'all' satisfies (typeof DELIVERY_MODES)[number]
 const RECEIVE_ALL_SHARED = 'receive_all_shared' satisfies Via
@@ -7638,22 +7608,8 @@ function switchLineQuote(mode: ChannelMode): string {
 
 /** The ending of the switch's line when no persona is in both configurations (`modeSwitchLine` with none), from its last `;`. */
 function switchLineNoPersonaEnding(): string {
-  const line = modeSwitchLine('fungible', [])
+  const line = modeSwitchLine('open', [])
   return line.slice(line.lastIndexOf(';'))
-}
-
-/**
- * A recorded line as README "Reading the preview" quotes it:
- * `recordedLine` for a change to the section of `mode`'s, from ` changed in
- * the`, after `…`. The declarative section's for `channels`, the fungible
- * section's for `invited`.
- */
-function recordedLineQuote(section: ChannelMode): string {
-  const fields: RecordedSectionKey[] = section === 'fungible' ? [FUNGIBLE_SECTION_KEY] : [CHANNELS_KEY]
-  const line = recordedLine({ ...previewSample(), fields })
-  const at = line.indexOf(' changed in the ')
-  if (at < 0) throw new Error(`recordedLine renders no " changed in the ": ${line}`)
-  return `…${line.slice(at)}`
 }
 
 /**
@@ -7665,329 +7621,204 @@ function recordedLineQuote(section: ChannelMode): string {
  * thunks built when the row runs; labels from their exports.
  */
 const README_DEO_ROWS: readonly DocRow[] = [
-  // the two modes: "## Channel modes" ( S2).
-  ['Channel modes: what each mode serves, the switch, who sets delivery and the destination, per mode', readmeSection(WHAT_EACH_MODE_SERVES_HEADING), [
-    ci(`| The switch | ${SWITCH} absent or ${code('false')}, the default | ${code(`${MODE_SWITCH_SETTING}: true`)} |`),
-    ci(`The channels listed in its ${code(CHANNELS_KEY)} | Every public or private channel its Slack app is a member of that Slack marks as not externally shared`),
-    ci(`The operator, with each channel entry's ${code(DELIVERY_KEY)} | The persona's agent, with ${TOOL}; ${code(MENTIONS)} otherwise`),
-    ci(`| Destination of prompts and notices | ${code(PROMPTS_KEY)} | ${code(INVITED_DESTINATION)}, ${DM_VALUE} when it is absent`),
-  ]],
-  ['Channel modes: two separate sections, neither reading nor overriding the other', readmeSection(WHAT_EACH_MODE_SERVES_HEADING), [
-    ci('**Each mode reads only its own section.** Neither reads nor overrides the other'),
-    ci(`in declarative mode ${code(FUNGIBLE_SECTION_KEY)} is not read, and in fungible mode ${code(CHANNELS_KEY)} and the top-level ${code(PROMPTS_KEY)} are not read, whatever they hold`),
-    ci('A persona may carry both sections, so switching back and forth needs no rewrite'),
-  ]],
-  ['Channel modes: turning fungible mode on serves, from the next message, every public or private channel each app is already in that is not externally shared, at mentions unless a stored choice applies, listed delivery not carried over', readmeSection(TURNING_FUNGIBLE_HEADING), [
-    ci("**Turning it on.** From each channel's next message, fungible mode serves every public or private channel each persona's app is already in that is not externally shared"),
-    ci(`Each channel is served at ${code(MENTIONS)} unless a stored choice applies`),
-    ci(`Listed ${code(DELIVERY_KEY)} values are not carried over`),
-  ]],
-  [`Channel modes: before turning it on, the operator reviews each app's channels and past ${UNCLAIMED_CHANNEL} lines`, readmeSection(TURNING_FUNGIBLE_HEADING), [
+["Channel modes: strict and open share configured choices", readmeSection(WHAT_EACH_MODE_SERVES_HEADING), [ci("`channel_mode`"), ci("`strict`"), ci("`open`"), ci("default")]],
+["Channel modes: one shared list and destination", readmeSection(WHAT_EACH_MODE_SERVES_HEADING), [ci("shared"), ci("`channels`"), ci("`permission_prompts`"), ci("both modes")]],
+["Channel modes: changing mode preserves applied channel choices", readmeSection(TURNING_FUNGIBLE_HEADING), [ci("preserve"), ci("`delivery`"), ci("confirmed")]],
+[`Channel modes: before turning it on, the operator reviews each app's channels and past ${UNCLAIMED_CHANNEL} lines`, readmeSection(TURNING_FUNGIBLE_HEADING), [
     ci("Before you turn it on, review each persona's app's channel memberships in Slack, private channels included"),
     ci(`Past ${code(UNCLAIMED_CHANNEL)} lines in ${code('server.log')} show channels`),
     `grep ${UNCLAIMED_CHANNEL} ~/.config/claude-slack-channel-bots/server.log*`,
   ]],
-  ['Channel modes: upgrades stay declarative, with no migration', readmeSection(WHAT_EACH_MODE_SERVES_HEADING), [
-    ci(`**Upgrades stay declarative.** A configuration without ${SWITCH} runs in declarative mode`),
-    ci(`Upgrading needs no migration, and nothing rewrites ${code(CONFIG_FILE_NAME)}`),
-  ]],
-  ['Channel modes: switching and switching back go through pending and confirm, with no restart', readmeSection(TURNING_FUNGIBLE_HEADING), [
-    ci('The switch changes through a confirmed edit, like every other setting'),
-    ci('Read the pending preview. The switch has its own line'),
-    ci('It applies in place, at once, from the next event, tool call, prompt and notice, with no restart, and every session is kept'),
-    ci(`To turn it off, remove the setting or set it to ${code('false')}`),
-    ci('**Turning it off.** The change is checked by the declarative rules'),
-  ]],
-  [`Channel modes: channel delivery, ${MENTIONS} by default, ${SET_CHANNEL_DELIVERY_TOOL}, and the loop guard`, readmeSection(FUNGIBLE_DELIVERY_HEADING), [
-    ci(`**${code(MENTIONS)} is the default.** A channel is at ${code(ALL)} only when the persona's agent stored ${code(ALL)} for it with ${TOOL}`),
-    ci(`**The loop guard.** A channel that is another persona's fungible destination (its ${code(INVITED_DESTINATION)} channel) is held at ${code(MENTIONS)} for every other persona, whatever they stored`),
-    ci(`a ${DM_VALUE} destination holds nothing`),
-    ci(`**Stored choices persist.** Each choice is kept in ${code(CHANNEL_DELIVERY_FILE_NAME)}`),
-  ]],
-  [`Channel modes: the ${RECEIVE_ALL_SHARED} approximation, a stored choice saying nothing of whether the other app remains in the channel`, readmeSection(FUNGIBLE_DELIVERY_HEADING), [
+["Channel modes: old keys require a manual edit", readmeSection(WHAT_EACH_MODE_SERVES_HEADING), [ci("manual"), ci("`allow_invited_channels`"), ci("`invited`"), ci("rejected")]],
+["Channel modes: switching through pending confirmation", readmeSection(TURNING_FUNGIBLE_HEADING), [ci("confirmed"), ci("preview"), ci("no restart"), ci("`strict`"), ci("`open`")]],
+["Channel modes: four persistent listening choices and default off", readmeSection(FUNGIBLE_DELIVERY_HEADING), [ci("`off`"), ci("`mentions`"), ci("`all`"), ci("`thread_hybrid`"), ci("default"), ci("config.json.last-applied")]],
+[`Channel modes: the ${RECEIVE_ALL_SHARED} approximation, a stored choice saying nothing of whether the other app remains in the channel`, readmeSection(FUNGIBLE_DELIVERY_HEADING), [
     ci(`**${code(RECEIVE_ALL_SHARED)} is an approximation.**`),
     ci("A stored choice says nothing about whether the other persona's app remains in the channel"),
   ]],
-  [`Channel modes: the warning against two personas at ${ALL} in one channel`, readmeSection(FUNGIBLE_DELIVERY_HEADING), [
+[`Channel modes: the warning against two personas at ${ALL} in one channel`, readmeSection(FUNGIBLE_DELIVERY_HEADING), [
     ci(`**Don't keep two personas at ${code(ALL)} in one channel.**`),
     ci('the two can keep answering each other with no human involved'),
     ci(`If one should listen to everything, keep the other at ${code(MENTIONS)}`),
   ]],
-  [`Channel modes: the fungible destination ${INVITED_DESTINATION}, "${DM_DESTINATION}" by default`, readmeSection(FUNGIBLE_PROMPTS_HEADING), [
-    ci(`In fungible mode, a persona's destination is its ${code(INVITED_DESTINATION)}, ${DM_VALUE} when it is absent`),
-    ci('**A channel ID:** any channel; it needs no listing and no DMs'),
-    ci(`**${DM_VALUE}, written or by default:** a DM from the persona's app to its ${code(DM_CONTACT)}`),
-  ]],
-
+["Channel modes: required shared destination", readmeSection(FUNGIBLE_PROMPTS_HEADING), [ci("`permission_prompts`"), ci("required"), ci("both modes"), ci("`dm`"), ci("listed")]],
   // the configuration sections cases do not read ( S3).
   [`Server-wide settings: the opening paragraph names ${MODE_SWITCH_SETTING} and the reminder default as applying immediately`, unitOf(USER_DOCS_NAME, '## Server-wide settings', 'These top-level fields apply'), [
     ci('Confirmed changes take effect at the next server start, with exceptions'),
     ci(`${SWITCH} applies in place at once`),
     ci('`stop_hook_bootstrap` applies immediately to each inheriting persona'),
   ]],
-  [`Persona fields: ${CHANNELS_KEY} is a declarative-mode field`, tableRowOf('### Persona fields', `${code(CHANNELS_KEY)} |`), [
-    ci('in declarative mode, yes unless'),
-    ci('Declarative mode only:'),
-    ci('Not read in fungible mode'),
-  ]],
-  [`Persona fields: ${PROMPTS_KEY} is a declarative-mode field`, tableRowOf('### Persona fields', `${code(PROMPTS_KEY)} |`), [
-    ci('in declarative mode, yes'),
-    ci('Declarative mode only:'),
-    ci('Not read in fungible mode'),
-  ]],
-  [`Persona fields: the note on ${DM_KEY} names ${FUNGIBLE_SECTION_KEY}`, unitOf(USER_DOCS_NAME, '### Persona fields', `${code(DM_KEY)} is an object`), [
-    ci(`${code(FUNGIBLE_SECTION_KEY)} is an object holding ${code(INVITED_DESTINATION_KEY)}`),
-  ]],
-  // Each section's pointer into "## Channel modes" is read by `pointerProblems` (DECLARATIVE_POINTERS), not here.
-  ['Channel entries: applies in declarative mode', readmeSection('### Channel entries'), [
-    ci('Channel entries apply in declarative mode'),
-  ]],
-  ['Channel delivery: applies in declarative mode', readmeSection('### Channel delivery'), [
-    ci('This section applies in declarative mode'),
-  ]],
-  ['Permission prompts: applies in declarative mode', readmeSection('### Permission prompts'), [
-    ci(`This section applies in declarative mode, where ${code(PROMPTS_KEY)} is required`),
-  ]],
-  ['Load-time rules: the switch is checked before any persona, and a non-boolean value is rejected naming it', sectionOf(REFERENCE_NAME, SKILL_LOAD_TIME_RULES_HEADING), [
-    ci(`It checks the server-wide settings first, ${SWITCH} among them, before any persona, in either mode`),
-    ci(`a non-boolean ${SWITCH} is rejected naming the setting`),
-  ]],
-  [`Load-time rules: in declarative mode ${FUNGIBLE_SECTION_KEY} is neither checked nor read`, sectionOf(REFERENCE_NAME, SKILL_LOAD_TIME_RULES_HEADING), [
-    ci(`${code(FUNGIBLE_SECTION_KEY)} is neither checked nor read in declarative mode`),
-  ]],
-  [`Load-time rules: in fungible mode ${CHANNELS_KEY} and the top-level ${PROMPTS_KEY} are neither checked nor read`, sectionOf(REFERENCE_NAME, SKILL_LOAD_TIME_RULES_HEADING), [
-    ci(`${code(CHANNELS_KEY)} and the top-level ${code(PROMPTS_KEY)} are neither checked nor read in fungible mode`),
-  ]],
-  [`Load-time rules: in fungible mode ${FUNGIBLE_SECTION_KEY} is an object holding only ${INVITED_DESTINATION_KEY}, "${DM_DESTINATION}" or a channel ID`, sectionOf(REFERENCE_NAME, SKILL_LOAD_TIME_RULES_HEADING), [
-    ci(`${code(FUNGIBLE_SECTION_KEY)} isn't an object, or holds a key other than ${code(INVITED_DESTINATION_KEY)}`),
-    ci(`${code(INVITED_DESTINATION)} is neither ${DM_VALUE} nor a well-formed channel ID`),
-  ]],
-  [`Load-time rules: in fungible mode a "${DM_DESTINATION}" destination, written or by default, needs ${DM_ENABLED} true and a ${DM_CONTACT}`, sectionOf(REFERENCE_NAME, SKILL_LOAD_TIME_RULES_HEADING), [
-    ci(`The persona's destination is ${DM_VALUE}, written or by default, without ${code(`${DM_ENABLED}: true`)} or without a ${code(DM_CONTACT)}`),
-  ]],
-  ['Load-time rules: in fungible mode a channel destination needs no listing and no DMs', sectionOf(REFERENCE_NAME, SKILL_LOAD_TIME_RULES_HEADING), [
-    ci('A channel destination needs no listing and no DMs'),
-  ]],
-  ['Load-time rules: the cross-persona rules apply in both modes', sectionOf(REFERENCE_NAME, SKILL_LOAD_TIME_RULES_HEADING), [
+["Persona fields: shared channel choices", tableRowOf('### Persona fields', `${code(CHANNELS_KEY)} |`), [ci("both modes")]],
+["Persona fields: required shared destination", tableRowOf('### Persona fields', `${code(PROMPTS_KEY)} |`), [ci("both modes"), ci("required")]],
+["Channel entries: shared in both modes", readmeSection('### Channel entries'), [ci("both modes")]],
+["Channel delivery: four shared values", readmeSection('### Channel delivery'), [ci("both modes"), ci("`off`"), ci("`mentions`"), ci("`all`"), ci("`thread_hybrid`")]],
+["Permission prompts: required in both modes", readmeSection('### Permission prompts'), [ci("both modes"), ci("required")]],
+["Load-time rules: channel_mode accepts only strict and open", sectionOf(REFERENCE_NAME, SKILL_LOAD_TIME_RULES_HEADING), [ci("`channel_mode`"), ci("`strict`"), ci("`open`"), ci("rejected")]],
+["Load-time rules: explicit DM destination requires enabled and contact", sectionOf(REFERENCE_NAME, SKILL_LOAD_TIME_RULES_HEADING), [ci("`permission_prompts`"), ci("`dm`"), ci("`dm.enabled`"), ci("`dm.contact`")]],
+["Load-time rules: a listed channel destination is allowed including off", sectionOf(REFERENCE_NAME, SKILL_LOAD_TIME_RULES_HEADING), [ci("listed"), ci("including `off`"), ci("both modes")]],
+['Load-time rules: the cross-persona rules apply in both modes', sectionOf(REFERENCE_NAME, SKILL_LOAD_TIME_RULES_HEADING), [
     ci("In both modes: - A persona's name or key equals another persona's name or key. - A persona's key starts with another persona's key"),
     ci(`Two personas share a ${code('working_directory' satisfies (typeof PERSONA_ENTRY_KEYS)[number])} or a ${code('credentials_file' satisfies (typeof PERSONA_ENTRY_KEYS)[number])}, compared by real path`),
   ]],
-  ['Load-time rules: a change is judged by the mode it turns on, INVALID in each direction', sectionOf(REFERENCE_NAME, SKILL_LOAD_TIME_RULES_HEADING), [
-    ci('A pending change is judged by the rules of the mode its own switch picks, not by the mode in effect'),
-    ci(`A change that turns fungible mode on is ${INVALID} when a persona's ${code(FUNGIBLE_SECTION_KEY)} section breaks the fungible-mode rules`),
-    ci(`a change that turns it off is ${INVALID} when a persona's ${code(CHANNELS_KEY)} or ${code(PROMPTS_KEY)} breaks the declarative-mode rules`),
-  ]],
-
-  // receiving, security ( S4).
-  ...(['mention', 'broadcast'] as const).map((via): DocRow => [`receiving: the ${via} row, scoped per mode`, kindRowOf(via), [
-    ci(`In declarative mode: in a channel listed in ${via === 'mention' ? 'its' : "the persona's"} ${code(CHANNELS_KEY)}`),
-    ci('In fungible mode: in a public or private channel its app is in that is not externally shared, at either channel delivery'),
+["Load-time rules: shared fields are validated regardless of mode", sectionOf(REFERENCE_NAME, SKILL_LOAD_TIME_RULES_HEADING), [ci("both modes"), ci("`channels`"), ci("`permission_prompts`"), ci("invalid")]],
+...(['mention', 'broadcast'] as const).map((via): DocRow => [`receiving: the ${via} row, scoped per mode`, kindRowOf(via), [
+    ci(`In strict mode: in a channel listed in ${via === 'mention' ? 'its' : "the persona's"} ${code(CHANNELS_KEY)}`),
+    ci('In open mode: in a public or private channel its app is in that is not externally shared, with a non-off applied channel choice'),
   ]]),
-  [`receiving: the ${RECEIVE_ALL_SHARED} row, scoped per mode`, kindRowOf(RECEIVE_ALL_SHARED), [
-    ci(`In declarative mode: in a channel listed in its ${code(CHANNELS_KEY)} with ${code(`${DELIVERY_KEY}: ${ALL}`)}, when at least one other persona`),
-    ci(`In fungible mode: in a public or private channel its app is in that is not externally shared, where its channel delivery is ${code(ALL)}`),
+[`receiving: the ${RECEIVE_ALL_SHARED} row, scoped per mode`, kindRowOf(RECEIVE_ALL_SHARED), [
+    ci(`In strict mode: in a channel listed in its ${code(CHANNELS_KEY)} with ${code(`${DELIVERY_KEY}: ${ALL}`)}, when at least one other persona`),
+    ci(`In open mode: in a public or private channel its app is in that is not externally shared, where its channel delivery is ${code(ALL)}`),
     ci(`has a channel delivery of ${code(ALL)} for that channel by the same rule, whether or not that persona's app remains in the channel`),
   ]],
-  ['receiving: the receive_all row, scoped per mode', kindRowOf('receive_all'), [
-    ci(`In declarative mode: in a channel listed in its ${code(CHANNELS_KEY)} with ${code(`${DELIVERY_KEY}: ${ALL}`)}, when no other persona`),
-    ci(`In fungible mode: in a public or private channel its app is in that is not externally shared, where its channel delivery is ${code(ALL)}, when no other persona in the applied configuration has a channel delivery of ${code(ALL)} for that channel`),
+['receiving: the receive_all row, scoped per mode', kindRowOf('receive_all'), [
+    ci(`In strict mode: in a channel listed in its ${code(CHANNELS_KEY)} with ${code(`${DELIVERY_KEY}: ${ALL}`)}, when no other persona`),
+    ci(`In open mode: in a public or private channel its app is in that is not externally shared, where its channel delivery is ${code(ALL)}, when no other persona in the applied configuration has a channel delivery of ${code(ALL)} for that channel`),
   ]],
-  ['receiving: in fungible mode an @mention is delivered from its message event', unitOf(USER_DOCS_NAME, RECEIVING_HEADING, '- **In fungible mode, an @mention is delivered from its'), [
-    ci(`**In fungible mode, an @mention is delivered from its ${code('message')} event.**`),
+['receiving: in open mode an @mention is delivered from its message event', unitOf(USER_DOCS_NAME, RECEIVING_HEADING, '- **In open mode, an @mention is delivered from its'), [
+    ci(`**In open mode, an @mention is delivered from its ${code('message')} event.**`),
     ci(`the ${code('app_mention')} event decides nothing and the ${code('message')} event carrying the same mention decides`),
   ]],
-  ['receiving: "Anyone in the workspace can reach a persona", in both modes', unitOf(USER_DOCS_NAME, RECEIVING_HEADING, '- **Anyone in the workspace can reach a persona,**'), [
+['receiving: "Anyone in the workspace can reach a persona", in both modes', unitOf(USER_DOCS_NAME, RECEIVING_HEADING, '- **Anyone in the workspace can reach a persona,**'), [
     ci('**Anyone in the workspace can reach a persona,** in both modes'),
-    ci(`in declarative mode in its listed channels, by each channel's ${code(DELIVERY_KEY)}`),
-    ci('in fungible mode in every channel its app is invited to that it serves, by its channel delivery there'),
+    ci(`in strict mode in its listed channels, by each channel's ${code(DELIVERY_KEY)}`),
+    ci('in open mode in every channel its app is invited to that it serves, by its channel delivery there'),
     ci(`in both modes by DM when its ${code(DM_ENABLED)} is ${code('true')}`),
   ]],
-  ["security: an invite changes a persona's audience", readmeSection(WHO_CAN_REACH_HEADING), [
+["security: an invite changes a persona's audience", readmeSection(WHO_CAN_REACH_HEADING), [
     ci("Each persona's Claude worker runs with tool access on the host"),
-    ci("**An invite changes a persona's audience.**"),
+    ci("**Assignments change a persona's audience.**"),
   ]],
-  ['security: any member can point a worker at any channel they are in, private channels included, which the operator may not see', readmeSection(WHO_CAN_REACH_HEADING), [
-    ci("Any workspace member can point a persona's worker at any channel they are in by inviting the persona's app there"),
+['security: any member can point a worker at any channel they are in, private channels included, which the operator may not see', readmeSection(WHO_CAN_REACH_HEADING), [
+    ci("A channel invitation and an applied listening choice can expose a persona's worker to new people"),
     ci('This includes private channels, which the operator may not be able to see'),
   ]],
-  [`security: anyone who can reach the persona can switch any channel it serves to ${ALL}, one they are not in included`, readmeSection(WHO_CAN_REACH_HEADING), [
+[`security: anyone who can reach the persona can switch any channel it serves to ${ALL}, one they are not in included`, readmeSection(WHO_CAN_REACH_HEADING), [
     ci(`**Anyone who can reach the persona can switch a channel to ${code(ALL)}.** In any channel it serves, or by DM, anyone can ask the persona to switch any channel it serves to ${code(ALL)}, including a channel they are not in`),
     ci('From then on, every message in that channel reaches the worker'),
   ]],
-  ['security: fetch_messages reads every channel the app is in, so content can be carried between channels', readmeSection(WHO_CAN_REACH_HEADING), [
+['security: fetch_messages reads every channel the app is in, so content can be carried between channels', readmeSection(WHO_CAN_REACH_HEADING), [
     ci(`**${code('fetch_messages' satisfies (typeof TARGETING_TOOLS)[number])} reads every channel the app is in.**`),
     ci('so content can be carried from one channel to another'),
   ]],
-  ['security: Slack Connect channels are never served in fungible mode', readmeSection(WHO_CAN_REACH_HEADING), [
-    ci('**Slack Connect channels are never served.** An externally shared channel is never served in fungible mode'),
+['security: Slack Connect channels are never served in open mode', readmeSection(WHO_CAN_REACH_HEADING), [
+    ci('**Slack Connect channels are never served.** An externally shared channel is never served in open mode'),
   ]],
-  ["security: an Enterprise Grid channel is served when Slack marks it not externally shared, so every sharing workspace's members can reach the persona", readmeSection(WHO_CAN_REACH_HEADING), [
+["security: an Enterprise Grid channel is served when Slack marks it not externally shared, so every sharing workspace's members can reach the persona", readmeSection(WHO_CAN_REACH_HEADING), [
     ci("**Enterprise Grid: Slack's flag decides.**"),
-    ci('is served when Slack marks it as not externally shared, and then members of every workspace sharing it can reach the persona'),
+    ci('can be served when Slack marks it as not externally shared, and then members of every workspace sharing it can reach the persona'),
   ]],
-  [`security: the audit lines ${PERSONA_INVITED_CHANNEL} and ${PERSONA_CHANNEL_DELIVERY_SET}`, readmeSection(WHO_CAN_REACH_HEADING), [
-    ci(`The audit lines in ${code('server.log')} are ${code(PERSONA_INVITED_CHANNEL)}, logged the first time a persona hears a channel in fungible mode`),
+[`security: the audit lines ${PERSONA_INVITED_CHANNEL} and ${PERSONA_CHANNEL_DELIVERY_SET}`, readmeSection(WHO_CAN_REACH_HEADING), [
+    ci(`The audit lines in ${code('server.log')} are ${code(PERSONA_INVITED_CHANNEL)}, logged the first time a persona hears a channel in open mode`),
     ci(`and ${code(PERSONA_CHANNEL_DELIVERY_SET)}, logged for each stored ${TOOL} choice`),
   ]],
-  ["security: log rotation can discard a channel's only audit line, and a restart logs every heard channel again", readmeSection(WHO_CAN_REACH_HEADING), [
+["security: log rotation can discard a channel's only audit line, and a restart logs every heard channel again", readmeSection(WHO_CAN_REACH_HEADING), [
     ci("log rotation can discard a channel's only audit line"),
-    ci('After a restart, the first event from each channel a persona hears in fungible mode logs its line again'),
+    ci('After a restart, the first event from each channel a persona hears in open mode logs its line again'),
   ]],
-
-  // the introduction, "Personas (config.json)" and "Tools" ( S5).
-  ['introduction: the channels a persona serves, per mode', unitOf(USER_DOCS_NAME, README_TITLE_HEADING, 'A single HTTP MCP server'), [
-    ci('in declarative mode, the default, the channels it is configured into; in fungible mode, every public or private channel its Slack app is invited to that is not externally shared'),
+['introduction: the channels a persona serves, per mode', unitOf(USER_DOCS_NAME, README_TITLE_HEADING, 'A single HTTP MCP server'), [
+    ci('in both modes, its non-off applied channel choices determine listening'),
   ]],
-  ["introduction: what a persona's tool calls may target, per mode", unitOf(USER_DOCS_NAME, README_TITLE_HEADING, 'A single HTTP MCP server'), [
-    ci("Each persona's tool calls act as that persona: in declarative mode only in the channels it is configured into, in fungible mode in any channel ID it names, where the call goes to Slack, which decides"),
+["introduction: what a persona's tool calls may target, per mode", unitOf(USER_DOCS_NAME, README_TITLE_HEADING, 'A single HTTP MCP server'), [
+    ci("Each persona's tool calls act as that persona: in strict mode only in its configured non-off channels, in open mode in any channel ID it names, where the call goes to Slack, which decides"),
   ]],
-  ['Personas (config.json): the channels a persona serves and its tools may target, per mode', unitOf(USER_DOCS_NAME, PERSONAS_HEADING, 'Each bot is a **persona**'), [
-    ci('In declarative mode, the default, those are the channels it is configured into, and its tools may target only them'),
-    ci('in fungible mode, they are the public and private channels its app is invited to that are not externally shared, and its tools may target any channel ID: the call goes to Slack, which decides'),
+['Personas (config.json): the channels a persona serves and its tools may target, per mode', unitOf(USER_DOCS_NAME, PERSONAS_HEADING, 'Each bot is a **persona**'), [
+    ci('In both modes, listening follows the shared applied channel choices'),
+    ci('in open mode, its tools may target any channel ID: the call goes to Slack, which decides'),
   ]],
-  ['Tools: in declarative mode a refused target sends nothing to Slack', unitOf(USER_DOCS_NAME, TOOLS_HEADING, '- **In declarative mode,**'), [
+['Tools: in strict mode a refused target sends nothing to Slack', unitOf(USER_DOCS_NAME, TOOLS_HEADING, '- **In strict mode,**'), [
     ci("a tool call with any other target, a channel the persona isn't configured into included, is refused with a tool error naming the persona and the target, and nothing is sent to Slack"),
   ]],
-  ["Tools: in fungible mode a target that is no channel ID or allowed DM target is refused before any Slack call (FUNGIBLE_TARGET_REFUSAL), and Slack's refusal of any other reaches the persona", unitOf(USER_DOCS_NAME, TOOLS_HEADING, '- **In fungible mode,**'), [
+["Tools: in open mode a target that is no channel ID or allowed DM target is refused before any Slack call (FUNGIBLE_TARGET_REFUSAL), and Slack's refusal of any other reaches the persona", unitOf(USER_DOCS_NAME, TOOLS_HEADING, '- **In open mode,**'), [
     ci(`a target that ${FUNGIBLE_TARGET_REFUSAL.replace(/^it /, '').replace(/\.$/, '')} is refused before any Slack call, with a tool error naming the persona and the target`),
     ci('Any other channel target goes to Slack, which decides'),
     ci(`for example ${code('not_in_channel')} for a channel the persona's app is not in, reaches the persona as a tool error naming the persona, the channel and Slack's error code`),
   ]],
-  ...TARGETING_TOOLS.map((tool): DocRow => [`Tools: the ${tool} row states its targets in each mode`, toolRowOf(tool), [
-    ci(tool === 'reply' ? "in declarative mode one of the persona's configured channels; in fungible mode any channel ID" : 'a configured channel in declarative mode; any channel ID in fungible mode'),
+...TARGETING_TOOLS.map((tool): DocRow => [`Tools: the ${tool} row states its targets in each mode`, toolRowOf(tool), [
+    ci(tool === 'reply' ? "in strict mode one of the persona's configured non-off channels; in open mode any channel ID" : 'a configured non-off channel in strict mode; any channel ID in open mode'),
   ]]),
-  [`Tools: the ${SET_CHANNEL_DELIVERY_TOOL} row, exactly one`, toolRowOf(SET_CHANNEL_DELIVERY_TOOL), [
-    docLink(BOTS_DOC, CHANNEL_MODES_DOC, anchorLink(FUNGIBLE_DELIVERY_HEADING).slice(2, -1)),
-    ci(`Two inputs: ${code('channel')}, a channel ID, and ${code(DELIVERY_KEY)}, ${code(MENTIONS)} or ${code(ALL)}`),
-    ci('It works only in fungible mode: every call is refused in declarative mode'),
-    ci(`and while ${code(CHANNEL_DELIVERY_FILE_NAME)} is unreadable`),
-    ci('It accepts only a channel the persona has heard a message from in fungible mode since it came up, or one it holds a stored choice for'),
-    ci('It makes no Slack call'),
-    ci(`The choice persists in ${code(CHANNEL_DELIVERY_FILE_NAME)} and applies from the next message in that channel`),
-    ci(`says so when the loop guard holds the channel at ${code(MENTIONS)}`),
-    ci(`Each accepted call logs one ${code(PERSONA_CHANNEL_DELIVERY_SET)} line`),
-    ci('It changes no configuration and applies no reload'),
-  ]],
-  ['Tools: the known residual in an externally shared channel the app is in', readmeSection(TOOLS_HEADING), [
+["Tools: set_channel_delivery updates one shared authority", toolRowOf(SET_CHANNEL_DELIVERY_TOOL), [ci("`off`"), ci("`mentions`"), ci("`all`"), ci("`thread_hybrid`"), ci("open mode"), ci("strict mode"), ci("config.json.last-applied"), ci("no Slack call")]],
+['Tools: the known residual in an externally shared channel the app is in ', readmeSection(TOOLS_HEADING), [
     ci("CSCB makes no Slack call to learn whether a channel holds the persona's app, is externally shared or is a group DM"),
-    ci('So in fungible mode it refuses no post, read, reaction or edit in an externally shared channel that the app belongs to'),
+    ci('So in open mode it refuses no post, read, reaction or edit in an externally shared channel that the app belongs to'),
   ]],
-  ['Tools: the known residual in a group DM the app is in, where Slack refuses reads', readmeSection(TOOLS_HEADING), [
+['Tools: the known residual in a group DM the app is in, where Slack refuses reads ', readmeSection(TOOLS_HEADING), [
     ci('The same holds in a group DM the app belongs to, except that Slack refuses reads there'),
     ci(`the app has no ${code('mpim:history')} scope`),
   ]],
-  [`Tools: the permission-prompt note for ${SET_CHANNEL_DELIVERY_TOOL}`, readmeSection(TOOLS_HEADING), [
+[`Tools: the permission-prompt note for ${SET_CHANNEL_DELIVERY_TOOL}`, readmeSection(TOOLS_HEADING), [
     ci("On a host whose Claude Code permission settings don't allow the server's tools as a group"),
     ci(`the first ${TOOL} call raises a permission prompt, in either mode`),
   ]],
-
-
-  // Reload outside "What a confirmation applies" ( S6).
-  [`Files beside the config file: ${CHANNEL_DELIVERY_FILE_NAME}, what it holds, only the server writes it, never edit it by hand`, tableRowOf('## Files beside the config file', `${code(CHANNEL_DELIVERY_FILE_NAME)} |`), [
-    ci("The stored-choice file: each persona's stored channel-delivery choices"),
-    ci('It holds no token and no message text'),
-    ci('Only the server reads and writes it, never the CLI'),
-    ci(`It is absent until the first accepted ${TOOL} call, so it is never created in declarative mode`),
-    ci('Never edit it by hand'),
-    ci('The server reads it once at each start'),
-  ]],
-  [`Files beside the config file: ${CHANNEL_DELIVERY_FILE_NAME}, the unreadable state, linked to the debugging skill`, tableRowOf('## Files beside the config file', `${code(CHANNEL_DELIVERY_FILE_NAME)} |`), [
-    `[${code(CHANNEL_DELIVERY_UNREADABLE)}]${docLink(RELOAD_DOC, DEBUG_SKILL_FILE, anchorLink(code(CHANNEL_DELIVERY_UNREADABLE)).slice(2, -1))}`,
-    ci('starts and runs every persona, but for that run no stored choice applies'),
-    ci(`in fungible mode every channel is at ${code(MENTIONS)}, ${TOOL} is refused, and nothing is written to the file or dropped from it`),
-  ]],
-  [`Files beside the config file: ${CHANNEL_DELIVERY_FILE_NAME}, its fix is moving it aside`, tableRowOf('## Files beside the config file', `${code(CHANNEL_DELIVERY_FILE_NAME)} |`), [
-    ci('To fix it, move the file aside, then restart the server; this discards every stored choice'),
-  ]],
-  [`Files beside the config file: ${CHANNEL_DELIVERY_FILE_NAME}, the residual of restoring an unreadable file`, tableRowOf('## Files beside the config file', `${code(CHANNEL_DELIVERY_FILE_NAME)} |`), [
-    ci('If you restore that same file in place instead of moving it aside, a persona removed and added back with the same'),
-    ci('while it was unreadable gets its earlier choices again'),
-  ]],
-  [`Size limit: ${CHANNEL_DELIVERY_FILE_NAME} has no size cap`, readmeSection('## Size limit'), [
-    ci(`and the stored-choice file (${code(CHANNEL_DELIVERY_FILE_NAME)}) have no size cap`),
-  ]],
-  [`Reading the preview: the header counts the switch among the server-wide settings, and a persona with only recorded changes is not counted`, readmeSection('## Reading the preview'), [
-    ci(`and the server-wide settings changed, the switch ${SWITCH} among them`),
-    ci('A persona whose only changes are recorded ones (changes to the section not in force, see the table below) is not counted as modified'),
-  ]],
-  ["Reading the preview: the switch's line, as modeSwitchLine renders it in each direction, and its row", readmeSection('## Reading the preview'), [
-    () => `| ${code(switchLineQuote('fungible'))} |`,
-    () => `| ${code(switchLineQuote('declarative'))} |`,
+["Files beside the config file: sole shared authority envelope", tableRowOf('## Files beside the config file', `${code(CHANNEL_DELIVERY_FILE_NAME)} |`), [ci("shared authority"), ci("revision"), ci("applied configuration"), ci("source"), ci("Never edit it by hand")]],
+["Shared authority: preserve uncertain outcome evidence", tableRowOf('## Files beside the config file', `${code(CHANNEL_DELIVERY_FILE_NAME)} |`), [ci("preserve"), ci("trustworthy"), ci("unresolved")]],
+["Shared authority: replacement never inherits choices", tableRowOf('## Files beside the config file', `${code(CHANNEL_DELIVERY_FILE_NAME)} |`), [ci("identity"), ci("incarnation"), ci("never inherits")]],
+["Size limit: configuration and shared state remain uncapped", readmeSection('## Size limit'), [ci("config.json.last-applied"), ci("no size cap"), ci("credentials"), ci("64 KiB")]],
+["Reading the preview: mode and effective channel changes", readmeSection('## Reading the preview'), [ci("`channel_mode`"), ci("server-wide settings"), ci("no effective change")]],
+["Reading the preview: the switch's line, as modeSwitchLine renders it in each direction, and its row", readmeSection('## Reading the preview'), [
+    () => `| ${code(switchLineQuote('open'))} |`,
+    () => `| ${code(switchLineQuote('strict'))} |`,
     () => ci(`ends ${code(switchLineNoPersonaEnding())} when there is none`),
     ci('It applies at once, with no restart, and every session is kept'),
     ci('The inherited `stop_hook_bootstrap` default also applies immediately to reminder checks'),
   ]],
-  ['Reading the preview: the recorded lines, as recordedLine renders them for each section, and their row', readmeSection('## Reading the preview'), [
-    () => code(recordedLineQuote('declarative')),
-    () => code(recordedLineQuote('fungible')),
-    ci(`(${code(CHANNELS_KEY)} or ${code(PROMPTS_KEY)} in fungible mode, ${code(FUNGIBLE_SECTION_KEY)} in declarative mode)`),
-    ci('These lines come after every persona line and before the server-wide setting lines'),
-    ci(`A change made only of recorded changes previews as ${code(NO_EFFECTIVE_CHANGE)}, followed by its recorded lines`),
-  ]],
   [`Confirming a change: the switch is the exception to "recorded and take effect later"`, readmeSection('## Confirming a change'), [
     ci(`Next-launch and most server-wide settings are recorded and take effect later; the switch ${SWITCH} and reminder setting ` + code('stop_hook_bootstrap') + ` (own or inherited) apply in place at once`),
   ]],
-  [`Confirming a change: ${RELOAD_NOOP} covers a confirmation of recorded changes only`, tableRowOf('## Confirming a change', `\`[slack] ${RELOAD_NOOP}:`), [
-    ci('as for a confirmation whose only changes are recorded ones (changes to the section not in force)'),
-  ]],
-  [`Confirming a change: ${RELOAD_RECORD_WRITE_FAILED} names the stored-choice file`, tableRowOf('## Confirming a change', `\`[slack] ${RELOAD_RECORD_WRITE_FAILED}:`), [
-    ci(`The line can also name the stored-choice file (${code(CHANNEL_DELIVERY_FILE_NAME)})`),
-    ci('a confirmation that brings up a persona whose stored choices were dropped earlier, by a write that failed, first writes that file'),
-    ci("when it can't, nothing is applied, the retired-key record is not written, and the change stays pending"),
-  ]],
+["Confirming a change: shared-authority failures retain evidence", tableRowOf('## Confirming a change', `\`[slack] ${RELOAD_RECORD_WRITE_FAILED}:`), [ci("shared"), ci("preserve"), ci("pending")]],
   ['When next-launch and server-wide changes take effect: the switch takes effect once confirmed, with no restart', readmeSection('## When next-launch and server-wide changes take effect'), [
     ci(`Server-wide settings take effect at the next server start, except ${SWITCH} and the inherited ` + code('stop_hook_bootstrap') + ` reminder setting: both take effect when the change is confirmed, and need no ${code(CLI_COMMAND_CLEAN_RESTART)}`),
   ]],
-
-  // troubleshooting and downgrade ( S8).
-  [`"${SILENT_INVITED_TITLE}": declarative mode, listing the channel or turning fungible mode on`, viaSymptom(`**${SILENT_INVITED_TITLE}**`, SILENT_INVITED_SKILL_HEADING), [
-    ci(`No match, or ${code('false')}, is declarative mode`),
+[`"${SILENT_INVITED_TITLE}": strict mode, explicit shared choice`, viaSymptom(`**${SILENT_INVITED_TITLE}**`, SILENT_INVITED_SKILL_HEADING), [
+    ci(`The command prints ${code('true')} for open mode and ${code('false')} for strict mode`),
     ci('not delivered: no applied persona lists this channel'),
-    ci(`List the channel in this persona's ${code(CHANNELS_KEY)} and confirm the change, or turn fungible mode on`),
+    ci(`List the channel in this persona’s ${code(CHANNELS_KEY)} with a non-off ${code('delivery')} and confirm the change`),
   ]],
-  [`"${SILENT_INVITED_TITLE}": an externally shared channel`, viaSymptom(`**${SILENT_INVITED_TITLE}**`, SILENT_INVITED_SKILL_HEADING), [
-    ci('**An externally shared channel** (fungible mode)'),
+[`"${SILENT_INVITED_TITLE}": an externally shared channel`, viaSymptom(`**${SILENT_INVITED_TITLE}**`, SILENT_INVITED_SKILL_HEADING), [
+    ci('**An externally shared channel** (open mode)'),
     ci(`with the reason ${code(UNCLAIMED_REASON_EXTERNALLY_SHARED)}`),
-    ci('Fungible mode never serves it. Serve it in declarative mode, with the channel listed'),
+    ci('Open mode never serves it. Serve it in strict mode, with the channel listed'),
   ]],
-  [`"${SILENT_INVITED_TITLE}": a group DM`, viaSymptom(`**${SILENT_INVITED_TITLE}**`, SILENT_INVITED_SKILL_HEADING), [
+[`"${SILENT_INVITED_TITLE}": a group DM`, viaSymptom(`**${SILENT_INVITED_TITLE}**`, SILENT_INVITED_SKILL_HEADING), [
     ci('a group DM is never served, in either mode'),
   ]],
-  [`"${SILENT_INVITED_TITLE}": an edit that adds a mention`, viaSymptom(`**${SILENT_INVITED_TITLE}**`, SILENT_INVITED_SKILL_HEADING), [
-    ci(`In fungible mode an @mention is delivered from its ${code('message')} event`),
+[`"${SILENT_INVITED_TITLE}": an edit that adds a mention`, viaSymptom(`**${SILENT_INVITED_TITLE}**`, SILENT_INVITED_SKILL_HEADING), [
+    ci(`In open mode an @mention is delivered from its ${code('message')} event`),
     ci('Post another message that @mentions the persona'),
   ]],
-  [`"${SILENT_INVITED_TITLE}": a message posted before the invite`, viaSymptom(`**${SILENT_INVITED_TITLE}**`, SILENT_INVITED_SKILL_HEADING), [
+[`"${SILENT_INVITED_TITLE}": a message posted before the invite`, viaSymptom(`**${SILENT_INVITED_TITLE}**`, SILENT_INVITED_SKILL_HEADING), [
     ci('Slack sends the app no event for a message posted before it joined the channel'),
   ]],
-  [`"${RECEIVES_EVERYTHING_TITLE}": an agent chose ${ALL}`, viaSymptom(`**${RECEIVES_EVERYTHING_TITLE}**`, RECEIVES_EVERYTHING_SKILL_HEADING), [
+[`"${RECEIVES_EVERYTHING_TITLE}": an agent chose ${ALL}`, viaSymptom(`**${RECEIVES_EVERYTHING_TITLE}**`, RECEIVES_EVERYTHING_SKILL_HEADING), [
     ci(`The persona's agent chose ${code(ALL)} for that channel with ${TOOL}`),
     ci(`Its sign is a [${code(PERSONA_CHANNEL_DELIVERY_SET)}](#${PERSONA_CHANNEL_DELIVERY_SET}) line`),
   ]],
-  [`"${RECEIVES_EVERYTHING_TITLE}": ask the persona to switch back`, viaSymptom(`**${RECEIVES_EVERYTHING_TITLE}**`, RECEIVES_EVERYTHING_SKILL_HEADING), [
+[`"${RECEIVES_EVERYTHING_TITLE}": ask the persona to switch back`, viaSymptom(`**${RECEIVES_EVERYTHING_TITLE}**`, RECEIVES_EVERYTHING_SKILL_HEADING), [
     ci(`ask the persona, in that channel or by DM, to switch the channel back to ${code(MENTIONS)}`),
   ]],
-  [`"${RECEIVES_EVERYTHING_TITLE}": remove the app from the channel`, viaSymptom(`**${RECEIVES_EVERYTHING_TITLE}**`, RECEIVES_EVERYTHING_SKILL_HEADING), [
+[`"${RECEIVES_EVERYTHING_TITLE}": remove the app from the channel`, viaSymptom(`**${RECEIVES_EVERYTHING_TITLE}**`, RECEIVES_EVERYTHING_SKILL_HEADING), [
     ci("remove the persona's app from the channel"),
   ]],
-  [`"${RECEIVES_EVERYTHING_TITLE}": turn the switch off`, viaSymptom(`**${RECEIVES_EVERYTHING_TITLE}**`, RECEIVES_EVERYTHING_SKILL_HEADING), [
-    ci('turn fungible mode off with a confirmed change'),
+[`"${RECEIVES_EVERYTHING_TITLE}": confirm an explicit shared choice`, viaSymptom(`**${RECEIVES_EVERYTHING_TITLE}**`, RECEIVES_EVERYTHING_SKILL_HEADING), [
+    ci('have the operator set the shared channel choice to `mentions` or `off` and confirm the change'),
+    ci('A mode switch preserves the choice'),
   ]],
-  [`"${UNCLAIMED_ENTRY_TITLE}": the ${UNCLAIMED_CHANNEL} fix in declarative mode, fungible mode the other fix, never for a group DM`, viaSymptom(`**${UNCLAIMED_ENTRY_TITLE}**`, UNCLAIMED_SKILL_HEADING), [
-    ci(`In declarative mode, the persona's Slack app is a member of a channel that no persona lists in ${code(CHANNELS_KEY)}`),
+[`"${UNCLAIMED_ENTRY_TITLE}": the ${UNCLAIMED_CHANNEL} fix in strict mode, explicit shared choice in open mode too, never for a group DM`, viaSymptom(`**${UNCLAIMED_ENTRY_TITLE}**`, UNCLAIMED_SKILL_HEADING), [
+    ci(`In strict mode, the persona's Slack app is a member of a channel that no persona lists in ${code(CHANNELS_KEY)}`),
     ci(`Add the channel to the right persona's ${code(CHANNELS_KEY)} in ${code(CONFIG_FILE_NAME)}`),
-    ci('For a public or private channel that is not externally shared: turn fungible mode on'),
+    ci('In open mode too, explicitly assign a non-off shared channel choice in `config.json` and confirm it'),
+    ci('Selecting open mode alone does not create a choice'),
+    ci('Only public or private channels that are not externally shared can be served in open mode'),
     ci('a group DM is never served in either mode'),
   ]],
-  [`"${UNCLAIMED_ENTRY_TITLE}": the ${UNCLAIMED_CHANNEL} fix in fungible mode, each reason (FUNGIBLE_REFUSAL_TEXTS); for every reason but a malformed channel ID, served only in declarative mode with the channel listed; a malformed channel ID served in neither mode`, viaSymptom(`**${UNCLAIMED_ENTRY_TITLE}**`, UNCLAIMED_SKILL_HEADING), [
-    ci("In fungible mode, a `message` event the persona's app received was refused by the fungible path"),
+[`"${UNCLAIMED_ENTRY_TITLE}": the ${UNCLAIMED_CHANNEL} fix in open mode, each reason (FUNGIBLE_REFUSAL_TEXTS); for every reason but a malformed channel ID, served only in strict mode with the channel listed; a malformed channel ID served in neither mode`, viaSymptom(`**${UNCLAIMED_ENTRY_TITLE}**`, UNCLAIMED_SKILL_HEADING), [
+    ci("In open mode, a `message` event the persona's app received was refused by the open path"),
     // Each reason as a row of the reasons table, its first cell.
     ...Object.values(FUNGIBLE_REFUSAL_TEXTS).map((reason) => ci(`| ${code(reason)} |`)),
-    ci(`For every reason but ${code(UNCLAIMED_REASON_CHANNEL_ID_MALFORMED)}, the line's own advice is the one way to serve such a channel: declarative mode, with the channel listed`),
+    ci(`For every reason but ${code(UNCLAIMED_REASON_CHANNEL_ID_MALFORMED)}, the line's own advice is the one way to serve such a channel: strict mode, with the channel listed`),
     ci('Neither mode serves a malformed channel ID'),
     ci(`${code(CONFIG_FILE_NAME)} can't list such an ID either, so neither mode serves it`),
   ]],
-  ...R55_DOWNGRADE_ROWS,
+...R55_DOWNGRADE_ROWS
 ]
 
 /** The setup wizard's step on how a change takes effect, found by its title, whatever its number. */
@@ -8003,7 +7834,7 @@ const WIZARD_TAKES_EFFECT_HEADING = /^### Step \d+ — How the change takes effe
 const WIZARD_SWITCH_LINE_ROW: DocRow = [
   `${WIZARD_FILE}: the switch's line, as modeSwitchLine renders it in each direction`,
   sectionOf(WIZARD_FILE, WIZARD_TAKES_EFFECT_HEADING),
-  [() => code(switchLineQuote('fungible')), () => code(switchLineQuote('declarative'))],
+  [() => code(switchLineQuote('open')), () => code(switchLineQuote('strict'))],
 ]
 
 /** Where a README heading must stand: exactly once, inside `parent`, right after `previous` (the nearest heading at its level or above), and after a line matching `after`. */
@@ -8254,14 +8085,13 @@ describe('the README describes both channel modes', () => {
         const example = JSON.parse(completeExample(readme())) as { personas: Record<string, unknown>[] } & Record<string, unknown>
         const applied = load('applied.json', example)
         const candidate = structuredClone(example)
-        candidate[MODE_SWITCH_SETTING] = true
+        candidate[MODE_SWITCH_SETTING] = 'open'
         const byName = (name: string) => {
           const persona = candidate.personas.find((p) => p.name === name)
           if (persona === undefined) throw new Error(`the declarative Example has no persona "${name}"`)
           return persona
         }
         const planner = byName('planner')
-        planner[FUNGIBLE_SECTION_KEY] = { [INVITED_DESTINATION_KEY]: planner[PROMPTS_KEY] }
         const reviewer = byName('reviewer')
         reviewer[CHANNELS_KEY] = [...(reviewer[CHANNELS_KEY] as unknown[]), { id: planner[PROMPTS_KEY], [DELIVERY_KEY]: MENTIONS }]
         const plan = buildChangePlan(applied, { kind: 'valid', config: load('candidate.json', candidate) }, { realPath: (path) => path, home })

@@ -84,7 +84,9 @@ function expectOutcome(row: FungibleDecisionRow): void {
 function expectOutcomeAndChannelDelivery(row: ChannelDeliveryRow): void {
   expectOutcome(row)
   const result = channelDeliveryFor(...channelDeliveryArgsOf(row))
-  expect<unknown[]>([result, result.delivery]).toStrictEqual([row.channelDelivery, pathOf(row.expected)?.channelDelivery])
+  expect(result).toStrictEqual(row.channelDelivery)
+  const path = pathOf(row.expected)
+  if (path) expect(result.delivery).toBe(path.channelDelivery)
 }
 
 /** Every row of every group. */

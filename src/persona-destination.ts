@@ -94,7 +94,7 @@ export const NO_CONVERSATION_ID_CODE = 'no_conversation_id'
 export const DECLARATIVE_DESTINATION_SETTING = 'permission_prompts'
 
 /** The setting that names a persona's destination in fungible mode. */
-export const FUNGIBLE_DESTINATION_SETTING = 'invited.permission_prompts'
+export const FUNGIBLE_DESTINATION_SETTING = 'permission_prompts'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -166,11 +166,11 @@ export interface DestinationMessage {
 
 /**
  * The part of a configuration the one destination rule reads: its
- * `allow_invited_channels` switch (`channelModeOf`). Null or undefined when
+ * `channel_mode` switch (`channelModeOf`). Null or undefined when
  * there is no configuration (before the server's start resolves): declarative
  * mode.
  */
-export type DestinationConfig = Pick<ServerSettings, 'allow_invited_channels'> | null | undefined
+export type DestinationConfig = Pick<ServerSettings, 'channel_mode'> | null | undefined
 
 /** Dependencies injected into `createPersonaDestinations`. */
 export interface PersonaDestinationsDeps {
@@ -239,44 +239,16 @@ interface DmCacheEntry {
 // ---------------------------------------------------------------------------
 
 /** The resolved fields the one destination rule reads. */
-export type PersonaDestinationFields = Pick<Persona, 'permission_prompts' | 'fungible_destination'>
+export type PersonaDestinationFields = Pick<Persona, 'permission_prompts'>
 
-/**
- * The one destination rule: a persona's
- * destination, `dm` or a channel ID, by the channel mode of `config`, the
- * configuration in effect when the caller acts (
- * `channelModeOf`). Fungible mode: its fungible destination
- * (`invited.permission_prompts`, `dm` when that is absent). Declarative mode:
- * its `permission_prompts` (`dm` when that is absent, which no loaded
- * declarative configuration resolves).
- *
- * Every caller passes the configuration in effect and the persona it read
- * from it at that attempt, never a copy taken at start or held in a closure
- * or a queued item, so a confirmed change of the switch or of either
- * destination setting applies from the next attempt. A `dm` destination is
- * refused by `dmDestinationRefusal` unless DMs are on with a contact.
- *
- * The one place a destination consumer reads `permission_prompts` or
- * `fungible_destination`: the resolver below, its DM
- * refusal, the destination hold, the permission poller and the notifier all
- * go through it. Pure.
- */
+/** The required common permission destination in strict and open modes. */
 export function personaDestinationOf(config: DestinationConfig, persona: PersonaDestinationFields): string {
-  if (channelModeOf(config) === 'fungible') return persona.fungible_destination ?? DM_DESTINATION
-  return persona.permission_prompts ?? DM_DESTINATION
+  return persona.permission_prompts
 }
 
-/**
- * The setting that names a persona's destination under `config`, the
- * configuration in effect when the caller acts:
- * `permission_prompts` in declarative mode, `invited.permission_prompts` in
- * fungible mode. It reads the same switch the one destination rule reads
- * (`channelModeOf`), so a line naming it names the setting that
- * `personaDestinationOf` over the same `config` took the destination from.
- * Pure.
- */
+/** The single permission-destination setting in both modes. */
 export function destinationSettingOf(config: DestinationConfig): DestinationSetting {
-  return channelModeOf(config) === 'fungible' ? FUNGIBLE_DESTINATION_SETTING : DECLARATIVE_DESTINATION_SETTING
+  return DECLARATIVE_DESTINATION_SETTING
 }
 
 /**

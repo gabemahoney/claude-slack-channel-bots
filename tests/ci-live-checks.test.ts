@@ -165,13 +165,14 @@ import { join } from 'node:path'
 import { buildMessagesWaitingNotice, deliveryAge } from '../src/delivery-notices.ts'
 import { queueEvidence, queueEvidenceScript, type QueueEvidence } from '../ci-live/checks/delivery-evidence.ts'
 import { PHASE1_FLOOR_VERSION } from '../src/ad-version-gate.ts'
-import { channelModeOf, DM_DESTINATION, MCP_SERVER_NAME, parsePersonaConfigBytes, PERSONA_ENTRY_KEYS, PERSONA_INVITED_KEYS, PERSONA_TOP_LEVEL_KEYS } from '../src/config.ts'
+import { channelModeOf, DM_DESTINATION, MCP_SERVER_NAME, parsePersonaConfigBytes, PERSONA_ENTRY_KEYS, PERSONA_TOP_LEVEL_KEYS } from '../src/config.ts'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
 import { SET_CHANNEL_DELIVERY_TOOL } from '../src/channel-delivery.ts'
 import { checkPersonaTarget, createSessionServer, slackRefusalToolErrorText, type SessionEntry, type SessionToolDeps } from '../src/registry.ts'
 import { personaDestinationOf } from '../src/persona-destination.ts'
 import { RELOAD_APPLIED, RELOAD_NOOP, renderAppliedLogLine, renderNoopLogLine } from '../src/reload-apply.ts'
+import { createSharedChannelAuthority, initialSharedChannelState, parseSharedChannelState, serializeSharedChannelState } from '../src/shared-channels.ts'
 import { RELOAD_NOTHING_PENDING } from '../src/reload.ts'
 import { PENDING_FILE_HEADER } from '../src/reload-fingerprint.ts'
 import {
@@ -605,7 +606,7 @@ function startSummary(ending: string): string {
 function startLog(cAt: number | null, ending = START_SUMMARY_END): [number, string][] {
   const connected = (l: PersonaLetter) => `[slack] Session connected: persona "persona_${l}" (key=persona_${l}) cwd="/home/cscb/cscb-live/${l}"`
   return [
-    [20, `[slack] Starting from the last-applied record "${S}/config.json.last-applied"`],
+    [20, `[slack] Starting from the shared channel authority "${S}/config.json.last-applied" at revision 1`],
     [20, '[slack] Loaded persona config: 3 persona(s)'],
     ...(['a', 'b', 'c'] as const).map((l, i): [number, string] => [25, `[slack] persona-start: personas[${i}] "persona_${l}" (key=persona_${l}): bring-up starting`]),
     [80, connected('a')],
@@ -1291,18 +1292,17 @@ describe('Check 29a', () => {
     })
   })
 
-  test('the stored-choice file goes to both scans with the other state files; absent, it is accepted, and a credential in it fails the check', async () => {
+  test('the sole authority goes to both scans with the other active state files; absent, it is accepted, and a credential in it fails the check', async () => {
     expect(CHECK29A_STATE_FILES).toEqual([
       '"$S/config.json"',
       '"$S/config.json.last-applied"',
       '"$S/config.json.pending"',
-      '"$S/channel-delivery.json"',
       '"$S"/server.log*',
       '"$S/startup-errors.log"',
       '"$S/permission-trail.jsonl"',
       '~/cscb-live/boot-start.log',
     ])
-    const leakF = (stored: string) => ['tokens checked: 6', `${S}/config.json: 0`, `${S}/config.json.pending: absent`, `${S}/channel-delivery.json: ${stored}`, `${S}/server.log: 0`]
+    const leakF = (stored: string) => ['tokens checked: 6', `${S}/config.json: 0`, `${S}/config.json.pending: absent`, `${S}/config.json.last-applied: ${stored}`, `${S}/server.log: 0`]
     const { container, scripts } = fakeContainer([['leakcount', lines({}, { f: leakF('absent') })]])
     const r = await check29a.run(makeCtx({ container }))
     expect([r.status, r.reason]).toEqual(['PASS', undefined])
@@ -1471,9 +1471,9 @@ describe('Check 24: typed-delivery waiting and original-item recovery', () => {
       if (script === 'rows') return 'cscb_persona_a persona_a ended'
       if (script === 'showpending') return preview
       if (script.startsWith('[ -e ')) return { code: 1 }
-      if (script.includes('jq -c .session_restart_delay')) return '0'
+      if (script.includes('jq -c .applied.session_restart_delay')) return '0'
       if (script.includes("jq -c '.session_restart_delay'")) return opts.origDelay ?? 'null'
-      if (script.includes("jq -r '.ack_reaction'")) return 'eyes'
+      if (script.includes("jq -r '.applied.ack_reaction'")) return 'eyes'
       if (script.includes('jq -sc --arg channel')) return JSON.stringify({ ...(recovery ? completed : outstanding), ...opts.queue })
       if (script.startsWith('tags a ')) return opts.transcript ?? (recovery ? tag : '')
       return sinceOver(script, log) ?? ''
@@ -2748,7 +2748,7 @@ function retriedStartLog(opts: { up?: boolean; connected?: boolean; notBroughtUp
   const path = 'path="/home/testuser/.config/cscb-credentials/persona_a-credentials.json"'
   const session = (l: PersonaLetter) => `[slack] Session connected: persona "persona_${l}" (key=persona_${l}) cwd="/home/cscb/cscb-live/${l}"`
   const lines: [number, string][] = [
-    [20, `[slack] Starting from the last-applied record "${S}/config.json.last-applied"`],
+    [20, `[slack] Starting from the shared channel authority "${S}/config.json.last-applied" at revision 1`],
     [20, '[slack] Loaded persona config: 3 persona(s)'],
     ...(['a', 'b', 'c'] as const).map((l, i): [number, string] => [25, `[slack] persona-start: personas[${i}] "persona_${l}" (key=persona_${l}): bring-up starting`]),
     [35, `[2026-09-26T19:51:41.070Z] [slack] persona-slack-unreachable: personas[0] ${ref} ${path}: Slack unreachable checking app_token via the Socket Mode open: WebSocket phase timed out after 10 s`],
@@ -3182,20 +3182,20 @@ describe("Check 30's switch-on edit (switchOnFilter), from each starting state",
     const edited = jqEdit(home, input, switchOnFilter(DRY_RUN_IDS))
     const before = loadLive(renderConfig(input))
     const after = loadLive(edited)
-    expect([channelModeOf(before), channelModeOf(after)]).toEqual(['declarative', 'fungible'])
+    expect([channelModeOf(before), channelModeOf(after)]).toEqual(['strict', 'open'])
     const json = JSON.parse(edited) as Record<string, unknown> & { personas: Record<string, unknown>[] }
-    expect(json.personas.map((p) => typeof (p[INVITED_KEY] as Record<string, unknown> | undefined)?.[INVITED_PERMISSION_PROMPTS_KEY])).toEqual(input.personas.map(() => 'string'))
-    // one destination rule, from the configuration in effect before and after.
+    expect(json.personas.map((p) => p.permission_prompts)).toEqual(input.personas.map(p => p.permission_prompts))
+    // T1's one destination rule, from the configuration in effect before and after.
     expect(after.personas.map((p) => [p.key, personaDestinationOf(after, p)])).toEqual(before.personas.map((p) => [p.key, personaDestinationOf(before, p)]))
-    // The only differences: the switch and the invited sections.
+    // The mode-only edit preserves every shared choice and destination.
     const { [SWITCH_KEY]: switchValue, ...rest } = json
-    expect(switchValue).toBe(true)
-    expect({ ...rest, personas: json.personas.map(({ [INVITED_KEY]: _invited, ...p }) => p) }).toEqual(JSON.parse(renderConfig(input)))
+    expect(switchValue).toBe('open')
+    expect(rest).toEqual(JSON.parse(renderConfig(input)))
   })
 
   test("the positive control: in Part 9's state, A with \"dm\" (DMs on, no dm.contact) is refused by the same load", () => {
-    const filter = `${switchOnFilter(DRY_RUN_IDS)} | (.personas[] | select(.name == ${JSON.stringify(personaName('a'))})).${INVITED_KEY}.${INVITED_PERMISSION_PROMPTS_KEY} = ${JSON.stringify(DM_DESTINATION)}`
-    const refused = new RegExp(`${INVITED_KEY}\\.${INVITED_PERMISSION_PROMPTS_KEY}`)
+    const filter = `${switchOnFilter(DRY_RUN_IDS)} | (.personas[] | select(.name == ${JSON.stringify(personaName('a'))})).${INVITED_PERMISSION_PROMPTS_KEY} = ${JSON.stringify(DM_DESTINATION)}`
+    const refused = new RegExp(INVITED_PERMISSION_PROMPTS_KEY)
     const edited = jqEdit(home, part9State(false), filter)
     expect(() => loadLive(edited)).toThrow(refused)
     // The same edit from the setup state (A's DMs off) is refused too: "dm" is valid for neither.
@@ -3205,17 +3205,18 @@ describe("Check 30's switch-on edit (switchOnFilter), from each starting state",
   test('the switch-only edits of Checks 32 and 33 change the switch alone', () => {
     const on = jqEdit(home, part9State(false), switchOnFilter(DRY_RUN_IDS))
     const off = jqEdit(home, JSON.parse(on), switchFilter(false))
-    expect(JSON.parse(off)).toEqual({ ...JSON.parse(on), [SWITCH_KEY]: false })
-    expect(channelModeOf(loadLive(off))).toBe('declarative')
+    expect(JSON.parse(off)).toEqual({ ...JSON.parse(on), [SWITCH_KEY]: 'strict' })
+    expect(channelModeOf(loadLive(off))).toBe('strict')
     expect(JSON.parse(jqEdit(home, JSON.parse(off), switchFilter(true)))).toEqual(JSON.parse(on))
   })
 })
 
 describe('the switch is absent before Check 30', () => {
-  test('the configuration setup writes, and D\'s entry, carry no switch and no invited section', () => {
+  test('the configuration setup writes, and D\'s entry, carry the required shared destination and no explicit mode', () => {
     const config = buildLiveConfig(DRY_RUN_IDS) as unknown as Record<string, unknown>
     expect(Object.keys(config)).not.toContain(SWITCH_KEY)
-    for (const p of [...buildLiveConfig(DRY_RUN_IDS).personas, personaEntryFor('d', DRY_RUN_IDS)]) expect(Object.keys(p)).not.toContain(INVITED_KEY)
+    for (const p of [...buildLiveConfig(DRY_RUN_IDS).personas, personaEntryFor('d', DRY_RUN_IDS)]) expect(p.permission_prompts).toBeDefined()
+    expect(Object.keys(buildLiveConfig(DRY_RUN_IDS).personas[0]!)).not.toContain('invited')
   })
 
   test("source audit: the switch's key is spelled only in live-config.ts's constant, and only invited-checks.ts uses the switch's names", () => {
@@ -3316,6 +3317,25 @@ function srcPlan(record: string, config: string) {
   return plan
 }
 
+/** Produce the actual authority envelope, with exact source bytes retained. */
+function liveAuthority(source: string): string {
+  return Buffer.from(serializeSharedChannelState(initialSharedChannelState(Buffer.from(source), loadLive(source)))).toString()
+}
+
+/** Reopen production authority; all scripted durable mutations update the same envelope. */
+function worldAuthority(world: ReloadWorld) {
+  const path = `${S}/config.json.last-applied`
+  const state = parseSharedChannelState(Buffer.from(world.record), path, { home: '/home/testuser' })!
+  return createSharedChannelAuthority(path, state, { home: '/home/testuser', write: (_path, bytes) => { world.record = Buffer.from(bytes).toString() } })
+}
+
+function worldPlan(world: ReloadWorld) {
+  const authority = worldAuthority(world)
+  const plan = buildChangePlan(authority.config(), { kind: 'valid', config: authority.previewReviewed(Buffer.from(world.config)) }, { realPath: p => p, home: '/home/testuser', dryRun: true })
+  if (!plan.valid) throw new Error('the scripted shared configuration is invalid')
+  return plan
+}
+
 /**
  * The container's reload files, kept by a scripted server that writes
  * config.json.pending with the package's own preview whenever config.json
@@ -3350,7 +3370,7 @@ function reloadContainer(home: string, world: ReloadWorld, answers: ReadonlyArra
   }
   const same = (a: string | null, b: string | null) => a !== null && a === b
   const settle = () => {
-    if (world.config !== world.record) {
+    if (world.config !== worldAuthority(world).sourceBytes().toString()) {
       world.pending = true
       return
     }
@@ -3385,7 +3405,7 @@ function reloadContainer(home: string, world: ReloadWorld, answers: ReadonlyArra
         }
         if (script === 'showpending') {
           if (!world.pending) return { code: 1, stdout: 'config.json.pending does not exist' }
-          return [PENDING_FILE_HEADER, `fingerprint: sha256:${'0'.repeat(64)}`, '', ...renderPreviewLines(srcPlan(world.record, world.config)), ''].join('\n')
+          return [PENDING_FILE_HEADER, `fingerprint: sha256:${'0'.repeat(64)}`, '', ...renderPreviewLines(worldPlan(world)), ''].join('\n')
         }
         const cmp = /^cmp -s (\S+|"[^"]*") (\S+|"[^"]*")$/.exec(script)
         if (cmp) return { code: same(files[cmp[1]!]?.() ?? null, files[cmp[2]!]?.() ?? null) ? 0 : 1 }
@@ -3398,10 +3418,11 @@ function reloadContainer(home: string, world: ReloadWorld, answers: ReadonlyArra
         }
         if (script === 'guard || exit 90\nmv "$S/config.json.pending" "$S/config.json.apply"') {
           if (!world.pending) return { code: 1 }
-          const plan = srcPlan(world.record, world.config)
+          const plan = worldPlan(world)
           const recordPath = `${S}/config.json.last-applied`
           world.log.push(plan.noEffectiveChange ? renderNoopLogLine(recordPath) : renderAppliedLogLine(plan, recordPath))
-          world.record = world.config
+          const authority = worldAuthority(world)
+          if (authority.applyReviewed(Buffer.from(world.config), authority.revision).kind !== 'applied') throw new Error('scripted application failed')
           world.pending = false
           return ''
         }
@@ -3479,7 +3500,7 @@ describe('Check 34: restores the config and the channel, and leaves C in no chan
 
   /** The config half's end state: config.json and the record are the copy, nothing pending, the copy removed. */
   function expectRestored(run: Awaited<ReturnType<typeof check34Run>>, copy: string) {
-    expect([run.world.config, run.world.record, run.world.pending, run.world.copy]).toEqual([copy, copy, false, null])
+    expect([run.world.config, worldAuthority(run.world).sourceBytes().toString(), run.world.pending, run.world.copy]).toEqual([copy, copy, false, null])
     expect(run.shared.invitedConfigCopy).toBeUndefined()
   }
 
@@ -3491,15 +3512,15 @@ describe('Check 34: restores the config and the channel, and leaves C in no chan
     ['after Check 32 (Check 33 did not switch it on): the switch off, invited kept', 'off', RELOAD_NOOP],
   ] as const)('the config change only, %s: the copy is restored with the preview and apply outcome that state calls for, nothing pending; no channel gesture', async (_what, at, outcome) => {
     const s = states()
-    const run = await check34Run({ world: { config: s[at], record: s[at], copy: s.copy, pending: false, log: [] } })
+    const run = await check34Run({ world: { config: s[at], record: liveAuthority(s[at]), copy: s.copy, pending: false, log: [] } })
     expect([run.r.status, run.r.reason]).toEqual(['PASS', undefined])
     expectRestored(run, s.copy)
     const outcomeLines = run.world.log.filter((l) => l.includes(`] ${outcome}: `))
     expect(outcomeLines.length).toBe(1)
     // The runner's expected preview is the package's, for this state.
     const expected = restorePreview(
-      { on: false, personas: JSON.parse(s.copy).personas.map((p: { name: string }) => ({ name: p.name, invited: 'null' })) },
-      { on: at === 'on', personas: JSON.parse(s[at]).personas.map((p: { name: string; invited: unknown }) => ({ name: p.name, invited: JSON.stringify(p.invited) })) },
+      { on: false, personas: JSON.parse(s.copy).personas.map((p: { name: string }) => ({ name: p.name })) },
+      { on: at === 'on', personas: JSON.parse(s[at]).personas.map((p: { name: string }) => ({ name: p.name })) },
     )
     expect(expected.preview).toEqual(renderPreviewLines(srcPlan(s[at], s.copy)))
     expect(outcomeLines[0]).toBe(expected.outcome)
@@ -3511,7 +3532,7 @@ describe('Check 34: restores the config and the channel, and leaves C in no chan
     ['with nothing written (config.json still the copy)', false],
   ] as const)('the edit never confirmed, %s: the restore leaves nothing pending, with one reload-nothing-pending line only when a change was pending', async (_what, edited) => {
     const s = states()
-    const run = await check34Run({ world: { config: edited ? s.on : s.copy, record: s.copy, copy: s.copy, pending: edited, log: [] } })
+    const run = await check34Run({ world: { config: edited ? s.on : s.copy, record: liveAuthority(s.copy), copy: s.copy, pending: edited, log: [] } })
     expect([run.r.status, run.r.reason]).toEqual(['PASS', undefined])
     expectRestored(run, s.copy)
     expect(run.world.log.filter((l) => l.includes(`] ${NOTHING_PENDING_CLASS}: `)).length).toBe(edited ? 1 : 0)
@@ -3533,7 +3554,7 @@ describe('Check 34: restores the config and the channel, and leaves C in no chan
 
   test('both: the config restored and the channel kicked before it is archived', async () => {
     const s = states()
-    const run = await check34Run({ world: { config: s.on, record: s.on, copy: s.copy, pending: false, log: [] }, channel: { cMember: true } })
+    const run = await check34Run({ world: { config: s.on, record: liveAuthority(s.on), copy: s.copy, pending: false, log: [] }, channel: { cMember: true } })
     expect([run.r.status, run.r.reason]).toEqual(['PASS', undefined])
     expectRestored(run, s.copy)
     const kick = run.slack.calls.indexOf(KICK)
@@ -3546,7 +3567,7 @@ describe('Check 34: restores the config and the channel, and leaves C in no chan
   test("a container command of the config half throws: the channel is still kicked and archived, and the reason names the config half's throw", async () => {
     const s = states()
     const run = await check34Run({
-      world: { config: s.on, record: s.on, copy: s.copy, pending: false, log: [] },
+      world: { config: s.on, record: liveAuthority(s.on), copy: s.copy, pending: false, log: [] },
       channel: { cMember: true },
       answers: [
         [
@@ -3579,13 +3600,13 @@ describe('Check 34: restores the config and the channel, and leaves C in no chan
    */
   function staleWorld(staleReads: number | null) {
     const s = states()
-    const world: ReloadWorld = { config: s.off, record: s.on, copy: s.copy, pending: true, log: [] }
+    const world: ReloadWorld = { config: s.off, record: liveAuthority(s.on), copy: s.copy, pending: true, log: [] }
     let reads = 0
     const showpending = (): Partial<ProcResult> | string => {
       if (!world.pending) return { code: 1, stdout: 'config.json.pending does not exist' }
       const restored = world.config === s.copy
-      if (!restored || staleReads === null || reads++ < staleReads) return pendingText('a', srcPlan(world.record, s.off))
-      return pendingText('b', srcPlan(world.record, world.config))
+      if (!restored || staleReads === null || reads++ < staleReads) return pendingText('a', srcPlan(JSON.stringify(worldAuthority(world).snapshot().applied), s.off))
+      return pendingText('b', worldPlan(world))
     }
     return { s, world, answers: [['showpending', showpending]] as const }
   }
@@ -3608,7 +3629,7 @@ describe('Check 34: restores the config and the channel, and leaves C in no chan
 
   test('a pending file already there while config.json already holds the copy: that file is the restore\'s, read and confirmed with no wait for another', async () => {
     const s = states()
-    const run = await check34Run({ world: { config: s.copy, record: s.on, copy: s.copy, pending: true, log: [] } })
+    const run = await check34Run({ world: { config: s.copy, record: liveAuthority(s.on), copy: s.copy, pending: true, log: [] } })
     expect([run.r.status, run.r.reason]).toEqual(['PASS', undefined])
     expectRestored(run, s.copy)
     expect(run.scripts.filter((x) => x === 'showpending').length).toBe(1)
@@ -3622,7 +3643,7 @@ describe('Check 34: restores the config and the channel, and leaves C in no chan
 
   test('FAIL: C still in the run channel (archived before the kick, so Slack refuses the kick); the config half still runs', async () => {
     const s = states()
-    const run = await check34Run({ world: { config: s.on, record: s.on, copy: s.copy, pending: false, log: [] }, channel: { cMember: true, archived: true } })
+    const run = await check34Run({ world: { config: s.on, record: liveAuthority(s.on), copy: s.copy, pending: false, log: [] }, channel: { cMember: true, archived: true } })
     expect([run.r.status, run.r.reason]).toEqual([
       'FAIL',
       `channel: threw HumanCallError: conversations.kick failed: is_archived; C is still in 1 channel(s), archived ones included: ${RUN_CHANNEL.id}`,
@@ -3665,8 +3686,8 @@ describe('Checks 30 to 32 against a scripted workspace and server', () => {
     askedDelivery?: 'mentions' | 'all'
     /** C does not answer the message that does not mention it. */
     ignorePlain?: boolean
-    /** With the switch off, C logs no unclaimed-channel line ('silent') or answers the mention ('answers'). */
-    switchedOff?: 'silent' | 'answers'
+    /** With the switch off, C fails to answer, or incorrectly calls the listed channel unclaimed. */
+    switchedOff?: 'silent' | 'unclaimed'
     /** The read of the switch in the record prints false (the switch already off before Check 32). */
     switchReadsOff?: boolean
   }
@@ -3679,15 +3700,15 @@ describe('Checks 30 to 32 against a scripted workspace and server', () => {
    * first event logging the package's persona-invited-channel line), calls
    * set_channel_delivery when asked (the package's line, then done) and, at
    * `all`, answers a message that does not mention it; with the switch off,
-   * a mention logs the package's unclaimed-channel line and gets no answer.
+   * the listed shared choice is retained and C still answers a mention.
    * `opts` (`InvitedOpts`) departs from that. `slackCalls` is every Slack
    * method the human calls, in order.
    */
   function invitedRun(opts: InvitedOpts = {}) {
     const clock = virtualClock()
     const config = renderConfig(SETUP_STATE())
-    const world: ReloadWorld = { config, record: config, copy: null, pending: false, log: [] }
-    const switchOn = () => (JSON.parse(world.record) as Record<string, unknown>)[SWITCH_KEY] === true
+    const world: ReloadWorld = { config, record: liveAuthority(config), copy: null, pending: false, log: [] }
+    const switchOn = () => channelModeOf(worldAuthority(world).config()) === 'open'
     const messages: ScriptedMessage[] = []
     let seq = 0
     const nextTs = () => `1700000100.${String(++seq).padStart(6, '0')}`
@@ -3709,8 +3730,8 @@ describe('Checks 30 to 32 against a scripted workspace and server', () => {
         const mentioned = text.includes(`<@${C.userId}>`)
         if (!members.has(C.userId) || (!mentioned && delivery === 'mentions')) return
         if (!switchOn()) {
-          if (opts.switchedOff !== 'silent') world.log.push(cLog(UNCLAIMED_CHANNEL, srcUnclaimedChannelCause(channel)))
-          if (opts.switchedOff === 'answers') answer(channel, 'off-check')
+          if (opts.switchedOff === 'unclaimed') world.log.push(cLog(UNCLAIMED_CHANNEL, srcUnclaimedChannelCause(channel)))
+          if (opts.switchedOff !== 'silent') answer(channel, 'off-check')
           return
         }
         if (!heard.has(channel)) logTimes(opts.invitedLines ?? 1, cLog(PERSONA_INVITED_CHANNEL, srcInvitedChannelCause(channel, 'public', delivery)))
@@ -3722,7 +3743,9 @@ describe('Checks 30 to 32 against a scripted workspace and server', () => {
             const error = refused ? slackRefusalToolErrorText(SET_CHANNEL_DELIVERY_TOOL, C_PERSONA, channel, undefined) : null
             calls.push(JSON.stringify({ channel, ts: null, threadTs: false, delivery: asked, outcome: refused ? 'error' : 'ok', error }))
             if (!refused) {
-              logTimes(opts.setLines ?? 1, cLog(PERSONA_CHANNEL_DELIVERY_SET, srcChannelDeliverySetCause(channel, undefined, asked, asked)))
+              logTimes(opts.setLines ?? 1, cLog(PERSONA_CHANNEL_DELIVERY_SET, srcChannelDeliverySetCause(channel, delivery, asked, asked)))
+              const authority = worldAuthority(world)
+              if (authority.assign(C_PERSONA.key, authority.incarnation(C_PERSONA.key)!, channel, asked, authority.revision).kind !== 'applied') throw new Error('scripted shared assignment failed')
               delivery = asked
             }
           }
@@ -3735,13 +3758,17 @@ describe('Checks 30 to 32 against a scripted workspace and server', () => {
       call: async (method, params = {}) => {
         slackCalls.push(method)
         if (method === 'conversations.create') return opts.createRefused ? { ok: false, error: 'name_taken' } : { ok: true, channel: { id: RUN_CHANNEL.id } }
-        if (method === 'conversations.invite') members.add(String(params.users))
+        if (method === 'conversations.invite') {
+          members.add(String(params.users))
+          const authority = worldAuthority(world)
+          if (authority.observeMembership(C_PERSONA.key, authority.incarnation(C_PERSONA.key)!, { event: 'scripted-invite', identity: 'authenticated-app', channel: RUN_CHANNEL.id, member: true, boundary: 0 }, authority.revision).kind !== 'applied') throw new Error('scripted invite failed')
+        }
         return inner.call(method, params)
       },
     }
     const { container, scripts } = reloadContainer(home, world, [
       ...(opts.editFails ? [['config.json.tmp', { code: 1 }] as const] : []),
-      ...(opts.switchReadsOff ? [[`jq -c ${q(SWITCH_VALUE_JQ)} "$S/config.json.last-applied"`, 'false'] as const] : []),
+      ...(opts.switchReadsOff ? [[`jq -c ${q(`.applied | ${SWITCH_VALUE_JQ}`)} "$S/config.json.last-applied"`, 'false'] as const] : []),
       ['echo READY', opts.ready === false ? '' : 'READY'],
       [
         `cp "$S/config.json" ${CONFIG_COPY} && echo COPIED`,
@@ -3777,7 +3804,7 @@ describe('Checks 30 to 32 against a scripted workspace and server', () => {
     expect(run.ctx.shared.invitedChannel).toEqual(RUN_CHANNEL)
     expect(run.ctx.shared.invitedCAnswerTs).toBe(run.messages.find((m) => m.user === C.userId)!.ts)
     expect(run.world.copy).toBe(renderConfig(SETUP_STATE()))
-    expect(channelModeOf(loadLive(run.world.record))).toBe('fungible')
+    expect(channelModeOf(worldAuthority(run.world).config())).toBe('open')
     expect(r.notes).toEqual(['Check 30: the mention before the invite was not delivered to C'])
     const gestures = ['conversations.create', 'chat.postMessage', 'conversations.invite']
     expect(run.slackCalls.filter((m) => gestures.includes(m))).toEqual(['conversations.create', 'chat.postMessage', 'conversations.invite', 'chat.postMessage'])
@@ -3824,21 +3851,22 @@ describe('Checks 30 to 32 against a scripted workspace and server', () => {
     expect([quiet.ctx.shared.invitedConfigCopy, quiet.ctx.shared.invitedChannel, quiet.ctx.shared.invitedCAnswerTs]).toEqual([CONFIG_COPY, RUN_CHANNEL, undefined])
   })
 
-  test('Checks 30, 31 and 32 in order: C stores all and answers a message that does not mention it; then, with the switch off, a mention gets no answer and one unclaimed-channel line', async () => {
+  test('Checks 30, 31 and 32 in order: C stores all and answers a message that does not mention it; then strict mode retains all and answers the mention without an unclaimed-channel line', async () => {
     const run = await throughCheck31()
     const r = await check32.run(run.ctx)
     assertNoLeak(r)
     expect([r.status, r.reason]).toEqual(['PASS', undefined])
-    expect(channelModeOf(loadLive(run.world.record))).toBe('declarative')
-    expect(run.world.log.filter((l) => l.includes(`] ${UNCLAIMED_CHANNEL}: `)).length).toBe(1)
+    expect(channelModeOf(worldAuthority(run.world).config())).toBe('strict')
+    expect(run.world.log.filter((l) => l.includes(`] ${UNCLAIMED_CHANNEL}: `))).toEqual([])
+    expect(worldAuthority(run.world).choice(C_PERSONA.key, RUN_CHANNEL.id)).toBe('all')
     expect(unguardedChanges(run.scripts)).toEqual([])
     expectNoPromptDeclared(run.guard)
   })
 
-  // Silence alone never passes Check 32: it needs the unclaimed-channel line, and the switch to have been on.
+  // Check 32 requires both a reply and the retained shared choice, with no unclaimed diagnostic.
   test.each<[string, InvitedOpts, string]>([
-    ['C silent and no unclaimed-channel line', { switchedOff: 'silent' }, `expected one ${UNCLAIMED_CHANNEL} line with the declarative cause naming C and the run channel, found 0`],
-    ['C answering with the switch off', { switchedOff: 'answers' }, 'C answered in the run channel with the switch off'],
+    ['C silent despite its active choice', { switchedOff: 'silent' }, 'C did not answer the mention with its retained shared choice in strict mode'],
+    ['a listed channel incorrectly reported unclaimed', { switchedOff: 'unclaimed' }, 'a listed shared channel was reported unclaimed in strict mode (1 lines)'],
     ['the switch already off in the record', { switchReadsOff: true }, 'the switch is not on in the last-applied record, so there is nothing to switch off'],
   ])('Check 32 FAILs after Checks 30 and 31 pass: %s', async (_what, opts, reason) => {
     const run = await throughCheck31(opts)
@@ -3852,8 +3880,8 @@ describe('Checks 30 to 32 against a scripted workspace and server', () => {
   test.each<[string, InvitedOpts, string]>([
     ['a refused set_channel_delivery call', { callOutcome: 'error' }, `C's ${SET_CHANNEL_DELIVERY_TOOL} call was refused`],
     ['a call asking for a delivery other than all', { askedDelivery: 'mentions' }, `C's call asked for delivery mentions, not all`],
-    ['no persona-channel-delivery-set line', { setLines: 0 }, `expected one ${PERSONA_CHANNEL_DELIVERY_SET} line naming C and the run channel (none to all, at all), found 0`],
-    ['two persona-channel-delivery-set lines', { setLines: 2 }, `expected one ${PERSONA_CHANNEL_DELIVERY_SET} line naming C and the run channel (none to all, at all), found 2`],
+    ['no persona-channel-delivery-set line', { setLines: 0 }, `expected one ${PERSONA_CHANNEL_DELIVERY_SET} line naming C and the run channel (mentions to all, at all), found 0`],
+    ['two persona-channel-delivery-set lines', { setLines: 2 }, `expected one ${PERSONA_CHANNEL_DELIVERY_SET} line naming C and the run channel (mentions to all, at all), found 2`],
     ['C not answering the message that does not mention it', { ignorePlain: true }, 'C did not answer the message that does not mention it'],
   ])('Check 31 FAILs on %s', async (_what, opts, failure) => {
     const run = invitedRun(opts)
@@ -4009,7 +4037,7 @@ describe("Check 33: after the kick, reply and fetch_messages are refused with Sl
       return { on, off: jqEdit(home, JSON.parse(on), switchFilter(false)) }
     })()
     const config = opts.switchOn ? s.on : s.off
-    const world: ReloadWorld = { config, record: config, copy: null, pending: false, log: [] }
+    const world: ReloadWorld = { config, record: liveAuthority(config), copy: null, pending: false, log: [] }
     const calls: (ToolCall & { tool: string })[] = []
     const messages: ScriptedMessage[] = []
     let seq = 0
@@ -4072,7 +4100,7 @@ describe("Check 33: after the kick, reply and fetch_messages are refused with Sl
   test("the switch goes on again (an edit of the switch alone, confirmed), C's app is kicked from the run channel before C is asked; the refusals' codes are evidence and notes", async () => {
     const run = await check33Run([{ done: true, calls: REFUSED }, { done: true, calls: ALL_OK }])
     expect([run.r.status, run.r.reason]).toEqual(['PASS', undefined])
-    expect(run.world.record).toBe(jqEdit(home, JSON.parse(run.world.record), switchFilter(true)))
+    expect(channelModeOf(worldAuthority(run.world).config())).toBe('open')
     expect(run.world.log.filter((l) => l.includes(`] ${RELOAD_APPLIED}: `)).map((l) => l.includes(appliedLine({ settings: 1 })))).toEqual([true])
     const kick = run.slackCalls.indexOf('human conversations.kick')
     expect(kick).toBeGreaterThan(-1)
@@ -4445,12 +4473,12 @@ describe('expected texts match the package', () => {
   const namesOf = (letters: readonly PersonaLetter[]) => letters.map(personaName)
 
   test.each([
-    ['fungible', ['a', 'b', 'c']],
-    ['fungible', ['a', 'b', 'c', 'd']],
-    ['declarative', ['a', 'b', 'c']],
-    ['declarative', ['a', 'b', 'c', 'd']],
-    ['fungible', []],
-    ['declarative', []],
+    ['open', ['a', 'b', 'c']],
+    ['open', ['a', 'b', 'c', 'd']],
+    ['strict', ['a', 'b', 'c']],
+    ['strict', ['a', 'b', 'c', 'd']],
+    ['open', []],
+    ['strict', []],
   ] as const)("the switch's preview line, turning %s mode on for %j (Checks 30, 32, 33 and 34)", (mode, letters) => {
     const names = namesOf(letters)
     expect(modeSwitchPreviewLine(mode, names)).toBe(modeSwitchLine(mode, names.map((n, index) => ({ name: n, key: n, index }))))
@@ -4463,13 +4491,14 @@ describe('expected texts match the package', () => {
     })
     afterEach(() => rmSync(home, { recursive: true, force: true }))
 
-    test.each(STARTING_STATES)("Check 30 from %s: the header, each persona's in-place line and the switch's line", (_what, state) => {
+    test.each(STARTING_STATES)("Check 30 from %s: only the server mode changes", (_what, state) => {
       const before = renderConfig(state())
       const after = jqEdit(home, state(), switchOnFilter(DRY_RUN_IDS))
       const names = (state().personas as { name: string }[]).map((p) => p.name)
       const rendered = renderPreviewLines(srcPlan(before, after))
       expect(switchOnPreview(names).preview).toEqual(rendered)
-      for (const n of names) expect(rendered).toContain(invitedInPlaceLine(n))
+      expect(rendered).toHaveLength(2)
+      expect(switchOnPreview(names).counts).toEqual({ in_place: 0, settings: 1 })
     })
 
     test.each([false, true])('the switch-only edit to %p (Check 32 off, Check 33 on)', (on) => {
@@ -4480,8 +4509,9 @@ describe('expected texts match the package', () => {
     })
   })
 
-  test("Check 34's recorded line for a removed invited section, and its no-effective-change preview and reload-noop line", () => {
-    expect(invitedRecordedLine(C_NAME)).toBe(recordedLine({ name: C_NAME, key: C_NAME, fields: ['invited'] }))
+  test("a shared destination change is in place in both modes; unchanged restore has a no-effective-change preview and reload-noop line", () => {
+    expect(invitedRecordedLine(C_NAME)).toBe(invitedInPlaceLine(C_NAME))
+    expect(invitedRecordedLine(C_NAME)).toContain('permission_prompts changed: applied in place immediately')
     const plan: ValidChangePlan = {
       valid: true, added: [], removed: [], destructive: [], inPlace: [], credentials: [], nextLaunch: [], unchanged: [], recorded: [], settings: [],
       noEffectiveChange: true, configDirsChanged: false,
@@ -4537,8 +4567,8 @@ describe('expected texts match the package', () => {
   test("the setting names live-config.ts writes: the switch's key, invited and its permission_prompts, and \"dm\"", () => {
     expect(SWITCH_KEY).toBe(MODE_SWITCH_SETTING)
     expect(PERSONA_TOP_LEVEL_KEYS).toContain(SWITCH_KEY)
-    expect(PERSONA_ENTRY_KEYS).toContain(INVITED_KEY as never)
-    expect([...PERSONA_INVITED_KEYS]).toEqual([INVITED_PERMISSION_PROMPTS_KEY])
+    expect(PERSONA_ENTRY_KEYS).toContain(INVITED_KEY)
+    expect(PERSONA_ENTRY_KEYS).toContain(INVITED_PERMISSION_PROMPTS_KEY)
     expect(RUNNER_DM_DESTINATION).toBe(DM_DESTINATION)
   })
 
@@ -4638,8 +4668,8 @@ describe('expected texts match the package', () => {
       const part11 = block(/^## Part 11:/)
       const check = (id: string) => block(new RegExp(`^### Check ${id}:`))
       /** Check 34's views: the copy (declarative, no invited section) and the record with the switch on or off. */
-      const COPY = { on: false, personas: ABC.map((name) => ({ name, invited: 'null' })) }
-      const record = (on: boolean) => ({ on, personas: ABC.map((name) => ({ name, invited: JSON.stringify({ permission_prompts: 'dm' }) })) })
+      const COPY = { on: false, personas: ABC.map((name) => ({ name })) }
+      const record = (on: boolean) => ({ on, personas: ABC.map((name) => ({ name })) })
       /** One case per line of `texts`, quoted by Check `id`. */
       const lines = (id: string, label: string, texts: readonly string[]) => texts.map((t, i): [string, string, string] => [id, `${label}, line ${i + 1}`, t])
 
@@ -4650,13 +4680,12 @@ describe('expected texts match the package', () => {
 
       test.each<[string, string, string]>([
         ...lines('30', 'the switch-on preview with A, B and C', switchOnPreview(ABC).preview),
-        ['30', "D's in-place line", invitedInPlaceLine(d)],
+        ...lines('30', 'the mode-only preview with D still declared', switchOnPreview([a, b, c, d]).preview),
         ['30', 'the reload-applied line', planPath(appliedLine(switchOnPreview(ABC).counts))],
         ['30', 'the persona-invited-channel line', personaLine(INVITED_CHANNEL_CLASS, 2, c, runnerInvitedChannelCause(RUN, 'public', 'mentions'))],
-        ['31', 'the persona-channel-delivery-set line', personaLine(CHANNEL_DELIVERY_SET_CLASS, 2, c, runnerChannelDeliverySetCause(RUN, undefined, 'all', 'all'))],
+        ['31', 'the persona-channel-delivery-set line', personaLine(CHANNEL_DELIVERY_SET_CLASS, 2, c, runnerChannelDeliverySetCause(RUN, 'mentions', 'all', 'all'))],
         ...lines('32', 'the switch-off preview', switchOnlyPreview(false, ABC)),
         ['32', 'the reload-applied line', planPath(appliedLine({ settings: 1 }))],
-        ['32', 'the unclaimed-channel line', personaLine(UNCLAIMED_CHANNEL_CLASS, 2, c, runnerUnclaimedChannelCause(RUN))],
         ['33', "the reply call's refusal", slackRefusalText(REPLY_TOOL, c, RUN, CODE)],
         ['33', "the fetch_messages call's refusal", slackRefusalText(FETCH_MESSAGES_TOOL, c, RUN, CODE)],
         ...lines('34', 'the restore preview, the switch on in the record', restorePreview(COPY, record(true)).preview),
@@ -4668,20 +4697,22 @@ describe('expected texts match the package', () => {
         expect(check(id)).toContain(quoted(text))
       })
 
-      test("Check 30's variant with D still declared: the header's in-place count and the switch line's added ending", () => {
+      test("Check 30's variant with D still declared still changes only the mode", () => {
         const [abcHeader, ...abcRest] = switchOnPreview(ABC).preview
         const [abcdHeader, ...abcdRest] = switchOnPreview([a, b, c, d]).preview
-        const abcSwitch = abcRest.at(-1)!
-        const abcdSwitch = abcdRest.at(-1)!
-        expect(abcdHeader).toBe(abcHeader!.replace('3 modified in place', '4 modified in place'))
-        expect(appliedLine(switchOnPreview([a, b, c, d]).counts)).toContain('4 modified in place')
-        expect(abcdSwitch.startsWith(abcSwitch.slice(0, -1))).toBe(true)
-        expect(check('30')).toContain(quoted('4 modified in place'))
-        expect(check('30')).toContain(quoted(abcdSwitch.slice(abcSwitch.length - 1)))
+        expect(abcdHeader).toBe(abcHeader!)
+        expect(switchOnPreview([a, b, c, d]).counts).toEqual({ in_place: 0, settings: 1 })
+        expect(abcdRest[0]!.startsWith(abcRest[0]!.slice(0, -1))).toBe(true)
+        expect(check('30')).toContain(quoted(abcdRest[0]!))
+      })
+
+      test('Check 32 describes retained shared delivery and never treats the listed channel as unclaimed', () => {
+        expect(check('32')).toContain('shared choice')
+        expect(check('32')).not.toContain(quoted(personaLine(UNCLAIMED_CHANNEL_CLASS, 2, c, runnerUnclaimedChannelCause(RUN))))
       })
 
       test("Check 33's switch-on preview is Check 32's with the mode words swapped, and its edit is the switch alone", () => {
-        const [off, on] = ['declarative', 'fungible'].map((mode) => `turns ${mode} mode on`) as [string, string]
+        const [off, on] = ['strict', 'open'].map((mode) => `turns ${mode} mode on`) as [string, string]
         expect(switchOnlyPreview(true, ABC)).toEqual(switchOnlyPreview(false, ABC).map((l) => l.replace(off, on)))
         expect(check('33')).toContain(`${quoted(on)} in place of ${quoted(off)}`)
         expect(check('33')).toContain(quoted(switchFilter(true)))
@@ -4700,7 +4731,7 @@ describe('expected texts match the package', () => {
         expect(check('30')).toContain(`cp "$S/config.json" ${CONFIG_COPY}`)
         expect(check('30')).toContain(`jq '${switchOnFilter(PLAN_IDS)}'`)
         expect(check('32')).toContain(`jq '${switchFilter(false)}'`)
-        for (const id of ['32', '34']) expect(check(id)).toContain(`jq -c '${SWITCH_VALUE_JQ}' "$S/config.json.last-applied"`)
+        for (const id of ['32', '34']) expect(check(id)).toContain(`jq -c '.applied | ${SWITCH_VALUE_JQ}' "$S/config.json.last-applied"`)
         expect(check('34')).toContain(`if guard; then cp ${CONFIG_COPY} "$S/config.json"; fi`)
         expect(part11).toContain(quoted(runChannelName('')))
       })

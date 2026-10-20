@@ -321,7 +321,7 @@ const STARTUP_ENTRY_RE = /^\[[^\]]*\] \[([^\]]*)\] (.*)$/
 
 /** Build the real persona notifier over one stub Slack per persona of `config`. */
 export function makeNotifierHarness(
-  config: Pick<PersonaConfig, 'personas'> & Partial<Pick<PersonaConfig, 'allow_invited_channels'>>,
+  config: Pick<PersonaConfig, 'personas'> & Partial<Pick<PersonaConfig, 'channel_mode'>>,
   opts: NotifierHarnessOptions = {},
 ): NotifierHarness {
   const personas = [...config.personas]
@@ -366,7 +366,7 @@ export function makeNotifierHarness(
     isDryRun: () => dryRun,
     log,
     ...(recorder !== undefined ? { recordStartupError: recorder } : {}),
-    getPersonaConfig: opts.getPersonaConfig ?? (() => ({ allow_invited_channels: config.allow_invited_channels === true })),
+    getPersonaConfig: opts.getPersonaConfig ?? (() => ({ channel_mode: config.channel_mode ?? 'strict' })),
   })
 
   function stub(key: string): StubSlack {

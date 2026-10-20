@@ -738,9 +738,9 @@ type PersonaTargetKind = 'channel' | 'dm' | 'user' | 'other'
  * Pure: no Slack call, logging or state.
  */
 function classifyPersonaTarget(persona: Persona, target: string, mode: ChannelMode): PersonaTargetKind {
-  if (mode === 'fungible') {
+  if (mode === 'open') {
     if (CHANNEL_ID_RE.test(target)) return 'channel'
-  } else if (target !== '' && persona.channels.some((c) => c.id === target)) {
+  } else if (target !== '' && persona.channels.some((c) => c.id === target && c.delivery !== 'off')) {
     return 'channel'
   }
   if (DM_CONVERSATION_ID_RE.test(target)) return 'dm'
@@ -796,7 +796,7 @@ export function checkPersonaTarget(
   persona: Persona,
   target: string,
   action: PersonaTargetAction,
-  mode: ChannelMode = 'declarative',
+  mode: ChannelMode = 'strict',
 ): PersonaTargetCheck {
   const kind = classifyPersonaTarget(persona, target, mode)
   const refuse = (why: string): PersonaTargetCheck => ({
@@ -805,7 +805,7 @@ export function checkPersonaTarget(
   })
   if (kind === 'channel') return { allowed: true, kind }
   if (kind === 'other') {
-    return refuse(mode === 'fungible' ? FUNGIBLE_TARGET_REFUSAL : `it is not one of the persona's configured channels.`)
+    return refuse(mode === 'open' ? FUNGIBLE_TARGET_REFUSAL : `it is not one of the persona's configured channels.`)
   }
   if (!persona.dm.enabled) return refuse(`DMs are off for this persona (dm.enabled is false).`)
   if (kind === 'user' && action !== 'post') {
@@ -898,9 +898,9 @@ export function personaNotAppliedRefusal(tool: string, key: string): string {
  * turned invited channels on.
  */
 export const SET_CHANNEL_DELIVERY_DESCRIPTION =
-  "Set how closely your persona listens in one channel its Slack app was invited to: mentions (only @mentions of you and @here or @channel broadcasts) or all (every message). " +
+  'Set listening in a channel to off, mentions (@mentions and @here or @channel broadcasts), all (every message), or thread_hybrid (mentions and replies in followed threads). ' +
   'Call it when someone in that channel asks for it. ' +
-  'It works only when the operator has turned invited channels on; otherwise every call is refused. ' +
+  'New assignments require open mode; otherwise they are refused. ' +
   'The choice applies from the next message in that channel and is kept across server restarts.'
 
 /** The description of the tool's `channel` input. */
@@ -909,10 +909,10 @@ export const SET_CHANNEL_DELIVERY_CHANNEL_DESCRIPTION =
 
 /** The description of the tool's `delivery` input. */
 export const SET_CHANNEL_DELIVERY_DELIVERY_DESCRIPTION =
-  '"mentions" (only @mentions of you and @here or @channel broadcasts) or "all" (every message in the channel)'
+  '"off", "mentions" (@mentions and broadcasts), "all" (every message), or "thread_hybrid" (mentions and replies in followed threads)'
 
 /** The values the tool's `delivery` input takes, in the order its schema lists them. */
-const SET_CHANNEL_DELIVERY_VALUES: readonly DeliveryMode[] = ['mentions', 'all']
+const SET_CHANNEL_DELIVERY_VALUES: readonly DeliveryMode[] = ['off', 'mentions', 'all', 'thread_hybrid']
 
 /** Whether `value` is a value the tool's `delivery` input takes: `"mentions"` or `"all"`. */
 function isChannelDeliveryValue(value: unknown): value is DeliveryMode {
@@ -956,13 +956,13 @@ function channelDeliveryRefusalLead(name: string, key: string): string {
 /**
  * Rule 1's tool error: declarative mode.
  *
- *   Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): invited channels are off, and in declarative mode channel delivery is set by the operator in config.json.
+ *   Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): strict mode is active, so channel delivery is set by the operator in config.json.
  *
  * Pure.
  */
 export function channelDeliveryDeclarativeRefusal(name: string, key: string): string {
   return (
-    `${channelDeliveryRefusalLead(name, key)}: invited channels are off, and in declarative mode ` +
+    `${channelDeliveryRefusalLead(name, key)}: strict mode is active, so ` +
     'channel delivery is set by the operator in config.json.'
   )
 }
@@ -972,14 +972,14 @@ export function channelDeliveryDeclarativeRefusal(name: string, key: string): st
  * or no store is bound. `path` is the store's path, or
  * `CHANNEL_DELIVERY_FILE_NAME` when no store is bound.
  *
- *   Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): the stored-choice file "<path>" is not readable, so no channel delivery can be stored. To fix: the operator moves the file aside, then restarts the server.
+ *   Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): the stored-choice file "<path>" is not readable, so the outcome is unresolved and no channel delivery can be stored. The operator must preserve the evidence and restore trustworthy shared state before retrying.
  *
  * Pure.
  */
 export function channelDeliveryUnreadableRefusal(name: string, key: string, path: string): string {
   return (
-    `${channelDeliveryRefusalLead(name, key)}: the stored-choice file ${JSON.stringify(path)} is not readable, ` +
-    'so no channel delivery can be stored. To fix: the operator moves the file aside, then restarts the server.'
+    `${channelDeliveryRefusalLead(name, key)}: the shared channel authority ${JSON.stringify(path)} is not trustworthy, ` +
+    'so the outcome is unresolved and no channel delivery can be stored. The operator must preserve the evidence and restore trustworthy shared state before retrying.'
   )
 }
 
@@ -1008,8 +1008,8 @@ export function channelDeliveryValueRefusal(name: string, key: string, value: un
  * named, JSON-encoded, only when it matches `ECHOABLE_CHANNEL_RE`; otherwise
  * the error says it is not shown.
  *
- *   Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): channel "<channel>" is not known: it is not a channel this persona has heard a message from in fungible mode, or holds a choice for. Only a public or private channel that is not externally shared can be set.
- *   Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): the channel is not known (the value given is not shown): it is not a channel this persona has heard a message from in fungible mode, or holds a choice for. Only a public or private channel that is not externally shared can be set.
+ *   Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): channel "<channel>" is not known: it is not a channel this persona has heard a message from in open mode, or holds a choice for. Only a public or private channel that is not externally shared can be set.
+ *   Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): the channel is not known (the value given is not shown): it is not a channel this persona has heard a message from in open mode, or holds a choice for. Only a public or private channel that is not externally shared can be set.
  *
  * Pure.
  */
@@ -1019,7 +1019,7 @@ export function channelDeliveryChannelRefusal(name: string, key: string, channel
     : 'the channel is not known (the value given is not shown)'
   return (
     `${channelDeliveryRefusalLead(name, key)}: ${what}: it is not a channel this persona has heard a message from ` +
-    'in fungible mode, or holds a choice for. Only a public or private channel that is not externally shared can be set.'
+    'in open mode, or holds a choice for. Only a public or private channel that is not externally shared can be set.'
   )
 }
 
@@ -1028,10 +1028,10 @@ export function channelDeliveryChannelRefusal(name: string, key: string, channel
  * choice, and the persona's channel delivery there from the next event,
  * `result` (`channelDeliveryFor` with the choice just stored). When the loop
  * guard holds the channel at `mentions`, it says so and that the channel is
- * another persona's fungible destination.
+ * another persona's permission destination.
  *
  *   Stored <stored> as your channel delivery for channel <channel>. From the next message in that channel, your channel delivery there is <delivery>.
- *   Stored <stored> as your channel delivery for channel <channel>. From the next message in that channel, your channel delivery there is mentions: the channel is another persona's fungible destination, where its permission prompts and notices go, so the loop guard holds it at mentions whatever is stored.
+ *   Stored <stored> as your channel delivery for channel <channel>. From the next message in that channel, your channel delivery there is mentions: the channel is another persona's permission destination, where its permission prompts and notices go, so the loop guard holds it at mentions whatever is stored.
  *
  * Pure.
  */
@@ -1039,7 +1039,7 @@ export function channelDeliverySetResultText(channel: string, stored: DeliveryMo
   const lead = `Stored ${stored} as your channel delivery for channel ${channel}. ` +
     `From the next message in that channel, your channel delivery there is ${result.delivery}`
   return result.heldByLoopGuard
-    ? `${lead}: the channel is another persona's fungible destination, where its permission prompts and notices go, ` +
+    ? `${lead}: the channel is another persona's permission destination, where its permission prompts and notices go, ` +
       `so the loop guard holds it at ${result.delivery} whatever is stored.`
     : `${lead}.`
 }
@@ -1055,7 +1055,7 @@ export function channelDeliverySetResultText(channel: string, stored: DeliveryMo
  */
 export function channelDeliveryWriteFailedText(name: string, key: string, path: string): string {
   return (
-    `Tool "${SET_CHANNEL_DELIVERY_TOOL}" failed for persona ${renderPersonaRef(name, key)}: the stored-choice file ` +
+    `Tool "${SET_CHANNEL_DELIVERY_TOOL}" failed for persona ${renderPersonaRef(name, key)}: the shared channel authority ` +
     `${JSON.stringify(path)} could not be written, so the choice was not stored and channel delivery is unchanged.`
   )
 }
@@ -1169,8 +1169,8 @@ export const MCP_INSTRUCTIONS = [
   'via: dm = a direct message; mention = you were @mentioned; broadcast = @here or @channel; receive_all_shared = a channel where you and another persona receive every message; receive_all = a channel where only you receive every message.',
   '<@ID> mentions a Slack user or persona. Use <@ID> to address another persona.',
   'If attachment_count is present, use download_attachment(chat_id, message_id) to fetch attachments.',
-  'You may act in every channel you receive. With invited channels off, these are your configured channels; with it on, channels your Slack app belongs to (Slack refuses others).',
-  `${SET_CHANNEL_DELIVERY_TOOL} sets listening to mentions (@mentions and @here/@channel broadcasts) or all (every message). Use it when someone in that channel asks; it requires invited channels on.`,
+  'In strict mode you may act in your configured non-off channels. In open mode Slack enforces channel access.',
+  `${SET_CHANNEL_DELIVERY_TOOL} sets listening to off, mentions (@mentions and broadcasts), all (every message), or thread_hybrid (mentions and followed-thread replies). Use it when someone in that channel asks; new assignments require open mode.`,
   'With DMs on, you may reply, react, edit_message, fetch_messages and download_attachment in a DM you belong to (D... chat_id). To start a DM, reply takes a user ID (U... or W...) as chat_id and returns the D... ID for later edits, reactions, reads and thread replies. Other tools take no user ID. With DMs off you have no DM target. Any other target is refused.',
   'Pass message_id (the triggering message ts) to reply to remove the ack reaction.',
   'reply accepts files: ["/abs/path.png"] for attachments. react adds emoji reactions; edit_message updates a sent message; fetch_messages reads real Slack history from conversations.history.',
@@ -1701,8 +1701,8 @@ export function createSessionServer(
     if (getSessionByPersona(key) !== entry) return toolError(personaNotAppliedRefusal(name, key))
 
     // rules, in order; the first broken gives the error.
-    const mode: ChannelMode = deps.getChannelMode?.() ?? 'declarative'
-    if (mode !== 'fungible') return toolError(channelDeliveryDeclarativeRefusal(persona.name, key))
+    const mode: ChannelMode = deps.getChannelMode?.() ?? 'strict'
+    if (mode !== 'open') return toolError(channelDeliveryDeclarativeRefusal(persona.name, key))
     if (store === undefined || !store.readable) {
       return toolError(channelDeliveryUnreadableRefusal(persona.name, key, store?.path ?? CHANNEL_DELIVERY_FILE_NAME))
     }
@@ -1734,7 +1734,7 @@ export function createSessionServer(
     // switch.
     const applied = deps.getAppliedPersonas?.() ?? [persona]
     const result = channelDeliveryFor(key, channel, {
-      fungibleDestinations: fungibleDestinationsOf({ allow_invited_channels: true }, applied),
+      fungibleDestinations: fungibleDestinationsOf({ channel_mode: 'open' }, applied),
       storedChoices: store,
     })
     // one line per accepted call, after the
@@ -1768,7 +1768,7 @@ export function createSessionServer(
     if (!persona) return toolError(personaNotAppliedRefusal(name, key))
     if (name === 'reply') await deps.onReplyCall?.(key)
     // The channel mode, read now with the persona.
-    const mode: ChannelMode = deps.getChannelMode?.() ?? 'declarative'
+    const mode: ChannelMode = deps.getChannelMode?.() ?? 'strict'
 
     // Posting scope, before the dry-run branch.
     const rawTarget = args[toolTarget.arg]
@@ -1789,7 +1789,7 @@ export function createSessionServer(
       // Fungible mode, channel target: Slack enforces
       // membership, so its refusal names the persona, the channel and
       // Slack's error code. The log line stays token-safe.
-      if (mode === 'fungible' && scope.kind === 'channel') {
+      if (mode === 'open' && scope.kind === 'channel') {
         console.error(
           `[slack] Tool "${name}" failed for persona ${ref} on channel ${JSON.stringify(target)}: ${describeThrownValue(err)}`,
         )

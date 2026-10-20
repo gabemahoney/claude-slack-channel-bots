@@ -317,8 +317,7 @@ function bravoDestructive(
  */
 function switched(value: boolean | undefined, mutate: (c: EditableInput) => void = () => {}): PersonaConfig {
   return edited((c) => {
-    for (const p of c.personas) p.invited = { permission_prompts: p.permission_prompts }
-    if (value !== undefined) c[MODE_SWITCH_SETTING] = value
+    if (value !== undefined) c[MODE_SWITCH_SETTING] = value ? 'open' : 'strict'
     mutate(c)
   })
 }
@@ -1370,12 +1369,11 @@ describe('server-wide settings', () => {
   // candidate is valid with the switch on and the switch is the only change.
   test('turning on only allow_invited_channels is one changed setting, with the line modeSwitchLine builds; it changes no persona', () => {
     const fungibleReady = (c: EditableInput) => {
-      for (const p of c.personas) p.invited = { permission_prompts: p.permission_prompts }
-    }
+      }
     const before = edited(fungibleReady)
     const after = edited((c) => {
       fungibleReady(c)
-      c[MODE_SWITCH_SETTING] = true
+      c[MODE_SWITCH_SETTING] = 'open'
     })
     expect(channelModeOf(after)).not.toBe(channelModeOf(before))
     const plan = buildChangePlan(before, valid(after), facts())
@@ -1465,7 +1463,7 @@ describe('server-wide settings', () => {
     })
 
     test.each(SWITCH_DIRECTIONS)('%s: a candidate with no persona present in both says no persona is affected', (_label, from, to) => {
-      const delta = persona('delta', 'C0D0001', { invited: { permission_prompts: 'C0D0001' } })
+      const delta = persona('delta', 'C0D0001')
       const after = switched(to, (c) => (c.personas = [delta]))
       const { plan, lines } = previewBetween(switched(from), after)
 
@@ -1509,87 +1507,25 @@ describe('server-wide settings', () => {
 // Sections across a switch change, and recorded changes
 // ---------------------------------------------------------------------------
 
-describe('classification across a switch change, the resolved and section comparisons, and the recorded lines', () => {
-  /** bravo's DMs on with a contact, so `dm` is a valid fungible destination for it. */
-  const dmOn = (b: PersonaInput): void => {
-    b.dm = { enabled: true, contact: 'U0B0001' }
-  }
-  const noop = (): void => {}
-
-  type CrossModeExpected = { inPlace: InPlaceSetting } | { recorded: RecordedSectionKey }
-
-  /**
-   * bravo's change across a switch change, in `expected`'s class: an in-place
-   * change gives bravo's in-place line, a recorded one the recorded line and
-   * leaves bravo unchanged; either comes with the switch's line.
-   */
-  function expectCrossMode(
-    from: boolean | undefined,
-    to: boolean | undefined,
-    before: (b: PersonaInput) => void,
-    after: (b: PersonaInput) => void,
-    expected: CrossModeExpected,
-  ): void {
-    const candidate = switched(to, (c) => after(entry(c, 'bravo')))
-    const { plan, lines } = previewBetween(
-      switched(from, (c) => before(entry(c, 'bravo'))),
-      candidate,
-    )
-
-    const switchSetting = { name: MODE_SWITCH_SETTING, mode: channelModeOf(candidate), personas: baseRefs() }
-    const switchLine = modeSwitchLine(channelModeOf(candidate), baseRefs())
-    if ('inPlace' in expected) {
-      const change = { ...ref('bravo', 1), settings: [expected.inPlace] }
-      expect(plan).toEqual(
-        planWith({ inPlace: [change], unchanged: [ref('alpha', 0), ref('charlie', 2)], settings: [switchSetting] }),
-      )
-      expect(lines).toEqual([header({ inPlace: 1, settings: 1 }), inPlaceLineOf(change), switchLine])
-    } else {
-      const change = { ...ref('bravo', 1), fields: [expected.recorded] }
-      expect(plan).toEqual(planWith({ recorded: [change], unchanged: baseRefs(), settings: [switchSetting] }))
-      expect(lines).toEqual([header({ settings: 1 }), recordedLine(change), switchLine])
-    }
-  }
-
-  const changeInvited = (b: PersonaInput): void => {
-    b.invited = { permission_prompts: 'C0B0002' }
-  }
-  const addChannel = (b: PersonaInput): void => {
-    b.channels!.push({ id: 'C0B0003', delivery: 'all' })
-  }
-
-  test.each<[string, boolean | undefined, boolean | undefined, (b: PersonaInput) => void, CrossModeExpected]>([
-    ['turned on with invited changed: in place, as invited.permission_prompts', undefined, true, changeInvited, { inPlace: 'invited.permission_prompts' }],
-    ['turned on with channels changed: channels recorded, bravo not modified', undefined, true, addChannel, { recorded: 'channels' }],
-    ['turned off with channels changed: in place', true, undefined, addChannel, { inPlace: 'channels' }],
-    ['turned off with invited changed: invited recorded, bravo not modified', true, undefined, changeInvited, { recorded: 'invited' }],
-  ])('the switch %s', (_label, from, to, mutate, expected) => {
-    expectCrossMode(from, to, noop, mutate, expected)
-  })
-
-  test.each<[string, (b: PersonaInput) => void]>([
-    ['an invited with no permission_prompts', (b) => (b.invited = {})],
-    ['no invited at all', (b) => delete b.invited],
-  ])('fungible mode in both: %s against an explicit "dm" is no change, compared by resolved value', (_label, absent) => {
-    const before = switched(true, (c) => {
-      dmOn(entry(c, 'bravo'))
-      absent(entry(c, 'bravo'))
+describe('shared fields are applied in place across mode changes', () => {
+  test.each([
+    [undefined, undefined], [true, true], [undefined, true], [true, undefined],
+  ] as const)('from %p to %p, delivery, list and destination changes stay active', (from, to) => {
+    const before = switched(from)
+    const after = switched(to, c => {
+      const p = c.personas[1]!
+      p.channels = [...p.channels!, { id: 'C0SHAREDNEW', delivery: 'off' }]
+      p.permission_prompts = 'C0SHAREDNEW'
     })
-    const after = switched(true, (c) => {
-      dmOn(entry(c, 'bravo'))
-      entry(c, 'bravo').invited = { permission_prompts: DM_DESTINATION }
-    })
-    // As written the section differs; resolved, the destination is the same.
-    expect(JSON.stringify(after.personas[1]!.sections.invited)).not.toBe(JSON.stringify(before.personas[1]!.sections.invited))
-    expect(after.personas[1]!.fungible_destination).toBe(before.personas[1]!.fungible_destination)
-
     const { plan, lines } = previewBetween(before, after)
-
-    expect(plan).toEqual(planWith({ unchanged: baseRefs(), noEffectiveChange: true }))
-    expect(lines).toEqual([NO_EFFECT_LINE])
+    expect(plan.inPlace).toEqual([{ ...ref('bravo', 1), settings: ['channels', 'permission_prompts'] }])
+    expect(plan.recorded).toEqual([])
+    expect(lines.some(line => line.includes('bravo') && line.includes('permission_prompts'))).toBe(true)
+    assertNoLeak({ plan, lines })
   })
+})
 
-  // the test-only timer override block is read once at start; a reload never applies a change of it live, and its preview says so.
+describe('no effective change', () => {
   test.each<[string, Record<string, number> | undefined, Record<string, number> | undefined]>([
     ['the block added', undefined, { dialog_ready_timeout_ms: 120_000 }],
     ['the block removed', { dialog_ready_timeout_ms: 120_000 }, undefined],
@@ -1602,6 +1538,7 @@ describe('classification across a switch change, the resolved and section compar
     const { plan, lines } = previewBetween(withBlock(from), withBlock(to))
 
     expect(plan).toEqual(planWith({ unchanged: baseRefs(), noEffectiveChange: true }))
+    expect(changePlanCounts(plan)).toEqual(counts({}))
     expect(lines).toEqual([NO_EFFECT_LINE])
   })
 
@@ -1616,135 +1553,7 @@ describe('classification across a switch change, the resolved and section compar
     expect(lines).toEqual(preview(edited((c) => { c.port = 3200 })).lines)
   })
 
-  test.each<[string, boolean | undefined, boolean | undefined, (b: PersonaInput) => void, (b: PersonaInput) => void, InPlaceSetting]>([
-    [
-      'invited going from absent to {} as the switch turns on',
-      undefined,
-      true,
-      (b) => {
-        dmOn(b)
-        delete b.invited
-      },
-      (b) => {
-        dmOn(b)
-        b.invited = {}
-      },
-      'invited.permission_prompts',
-    ],
-    // The same reorder within declarative mode reads no effective change (the channel set is unchanged).
-    ['channels reordered as the switch turns off', true, undefined, noop, (b) => b.channels!.reverse(), 'channels'],
-  ])('a section in force in the candidate only is compared as written, by JSON value: %s is an in-place change', (_label, from, to, before, after, setting) => {
-    expectCrossMode(from, to, before, after, { inPlace: setting })
-  })
 
-  test('the recorded line names the persona and its changed fields, says the change is recorded and has no effect until the switch selects that section', () => {
-    const declarative = channelModeOf(switched(undefined))
-    const fungible = channelModeOf(switched(true))
-    // Rows: the switch in both configurations, bravo's edit, the fields it records, and the section they belong to.
-    const rows: Array<[boolean | undefined, (b: PersonaInput) => void, RecordedSectionKey[], string]> = [
-      [
-        true,
-        (b) => {
-          addChannel(b)
-          b.permission_prompts = 'C0B0002'
-        },
-        ['channels', 'permission_prompts'],
-        declarative,
-      ],
-      [undefined, changeInvited, ['invited'], fungible],
-    ]
-
-    for (const [value, mutate, fields, section] of rows) {
-      const candidate = switched(value, (c) => mutate(entry(c, 'bravo')))
-      const { plan, lines } = previewBetween(switched(value), candidate)
-      const change = { ...ref('bravo', 1), fields }
-
-      expect(plan).toEqual(planWith({ recorded: [change], unchanged: baseRefs(), noEffectiveChange: true }))
-      expect(changePlanCounts(plan)).toEqual(counts({}))
-      expect(lines).toEqual([NO_EFFECT_LINE, recordedLine(change)])
-
-      const line = lines[1]!
-      expect(line).toContain(renderPersonaRef('bravo', 'bravo'))
-      // The changed fields, and no other recorded key, before the switch is named.
-      const head = line.slice(0, line.indexOf(MODE_SWITCH_SETTING))
-      for (const key of RECORDED_SECTION_KEYS) {
-        const named = new RegExp(`\\b${key}\\b`).test(head)
-        expect([key, named]).toEqual([key, fields.includes(key)])
-      }
-      expect(head).toContain('recorded')
-      // No effect until the switch selects that section; the candidate's own mode is not named.
-      const tail = line.slice(line.indexOf('no effect until'))
-      expect(tail).toContain(MODE_SWITCH_SETTING)
-      expect(tail).toContain(section)
-      expect(line).not.toContain(channelModeOf(candidate))
-    }
-  })
-
-  test('a candidate whose only changes are recorded: the no-effective-change preview, then the recorded lines in candidate order', () => {
-    const candidate = switched(true, (c) => {
-      entry(c, 'alpha').channels!.push({ id: 'C0A0002', delivery: 'all' })
-      entry(c, 'charlie').permission_prompts = 'C0C0002'
-      c.personas.reverse()
-    })
-    const { plan, lines } = previewBetween(switched(true), candidate)
-
-    const recorded = [
-      { ...ref('charlie', 0), fields: ['permission_prompts' as const] },
-      { ...ref('alpha', 2), fields: ['channels' as const] },
-    ]
-    expect(plan).toEqual(
-      planWith({ recorded, unchanged: [ref('charlie', 0), ref('bravo', 1), ref('alpha', 2)], noEffectiveChange: true }),
-    )
-    expect(changePlanCounts(plan)).toEqual(counts({}))
-    expect(lines).toEqual([NO_EFFECT_LINE, ...recorded.map(recordedLine)])
-  })
-
-  test('the recorded line sits after every persona line and before every server-wide line, the switch\'s included', () => {
-    const candidate = switched(true, (c) => {
-      c.bind = '0.0.0.0'
-      // alpha comes first in candidate order, yet its recorded line follows bravo's persona line.
-      entry(c, 'alpha').channels!.push({ id: 'C0A0002', delivery: 'all' })
-      changeInvited(entry(c, 'bravo'))
-      c.personas.push(persona('delta', 'C0D0001', { invited: { permission_prompts: 'C0D0001' } }))
-    })
-    const { plan, lines } = previewBetween(switched(undefined), candidate)
-
-    const recorded = { ...ref('alpha', 0), fields: ['channels' as const] }
-    expect(plan.recorded).toEqual([recorded])
-    expect(lines[0]).toBe(header({ added: 1, inPlace: 1, settings: 2 }))
-    // The server-wide lines end the preview; the recorded line comes just before them.
-    const settingsAt = lines.length - plan.settings.length
-    expect(plan.settings.map((s) => s.name)).toContain(MODE_SWITCH_SETTING)
-    expect(lines.slice(settingsAt)).toContain(modeSwitchLine(channelModeOf(candidate), baseRefs()))
-    expect(lines[settingsAt - 1]).toBe(recordedLine(recorded))
-    // Every persona line (the addition and bravo's in-place line) is above it.
-    const personaLines = lines.slice(1, settingsAt - 1)
-    expect(personaLines.map((l) => /\(key=(\w+)\)/.exec(l)?.[1])).toEqual(['delta', 'bravo'])
-    expect(personaLines[1]).toBe(inPlaceLineOf({ ...ref('bravo', 1), settings: ['invited.permission_prompts'] }))
-  })
-
-  test.each<[string, boolean | undefined, (b: PersonaInput) => void, RecordedSectionKey[]]>([
-    ['a channels entry, in fungible mode', true, (b) => (b.channels = [{ id: LEAK_SENTINEL, delivery: 'all' }]), ['channels']],
-    ['an invited value, in declarative mode', undefined, (b) => (b.invited = { permission_prompts: LEAK_SENTINEL }), ['invited']],
-  ])('LEAK_SENTINEL in %s: the recorded line names the field, never the value', (_label, value, mutate, fields) => {
-    const candidate = switched(value, (c) => mutate(entry(c, 'bravo')))
-    // The candidate really carries the sentinel, in the section not in force.
-    expect(() => assertNoLeak(candidate.personas[1]!.sections)).toThrow()
-
-    // `render` ran assertNoLeak over the plan and every rendered form.
-    const { plan, lines } = previewBetween(switched(value), candidate)
-
-    const change = { ...ref('bravo', 1), fields }
-    expect(plan.recorded).toEqual([change])
-    expect(lines).toEqual([NO_EFFECT_LINE, recordedLine(change)])
-  })
-})
-
-// ---------------------------------------------------------------------------
-// No effective change, and paths by real path
-// ---------------------------------------------------------------------------
-
-describe('no effective change', () => {
   test.each<[string, () => PersonaConfig]>([
     ['a whitespace-only edit', () => parse(baseInput(), JSON.stringify(baseInput()))],
     [

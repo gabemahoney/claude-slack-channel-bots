@@ -147,6 +147,7 @@ const FIXED_READERS: readonly string[] = [
   'registry.ts',
   'persona-destination.ts',
   'jsonl-persistence-check.ts',
+  'shared-channels.ts',
 ]
 
 /** The one destination rule, declared in `src/persona-destination.ts`. */
@@ -222,18 +223,7 @@ interface AdmittedRead {
 const STORED_CHOICES_ENTRY = "a persona key's entry of the stored-choice file: its own `channels` map of stored choices, never a persona's"
 
 const ADMITTED_READS: readonly AdmittedRead[] = [
-  { file: 'channel-delivery.ts', within: 'serializeChannelDelivery', read: 'entry.channels', count: 3, reason: STORED_CHOICES_ENTRY },
-  {
-    file: 'channel-delivery.ts',
-    within: 'personaEntryOf',
-    read: "value['channels']",
-    count: 1,
-    reason: "a persona key's entry of the stored-choice file as parsed from JSON, checked before it is a record",
-  },
-  { file: 'channel-delivery.ts', within: 'createChannelDeliveryStore > set', read: 'existing?.channels', count: 2, reason: STORED_CHOICES_ENTRY },
-  { file: 'channel-delivery.ts', within: 'createChannelDeliveryStore > drop', read: 'entry.channels', count: 1, reason: STORED_CHOICES_ENTRY },
-  { file: 'channel-delivery.ts', within: 'createChannelDeliveryStore > storedChoice', read: 'entries.get(key)?.channels', count: 1, reason: STORED_CHOICES_ENTRY },
-  { file: 'channel-delivery.ts', within: 'createChannelDeliveryStore > storedChannels', read: 'entries.get(key)?.channels', count: 1, reason: STORED_CHOICES_ENTRY },
+  { file: 'channel-delivery.ts', within: 'createChannelDeliveryStore > storedChannels', read: 'authority.channels', count: 1, reason: 'the shared authority method, not a persona field or independent store' },
 ]
 
 /** How a field is read. */
@@ -636,13 +626,8 @@ describe('the readers of sections and fungible_destination', () => {
     expect(allFieldReads(modules).filter((r) => r.field === 'sections').length).toBeGreaterThan(0)
   })
 
-  test('fungible_destination is read only by the one destination rule, the delivery decision, the routing and the reload plan', () => {
-    expect(readersFindings(modules, 'fungible_destination', FUNGIBLE_DESTINATION_READERS)).toEqual([])
-    expect(allFieldReads(modules).filter((r) => r.field === 'fungible_destination' && r.file === 'reload-plan.ts').length).toBeGreaterThan(0)
-  })
-
-  test('src/config.ts reads fungible_destination only where it builds a persona', () => {
-    expect(placementFindings(modules, { file: 'config.ts', regions: [{ fn: PERSONA_BUILDER }], fields: ['fungible_destination'] })).toEqual([])
+  test.each(['invited', 'fungible_destination'] as const)('removed field %s has no reader under src/', field => {
+    expect(readersFindings(modules, field, [])).toEqual([])
   })
 })
 
@@ -650,11 +635,11 @@ describe('one destination rule', () => {
   const modules = srcSources()
   const { sources } = auditProgram(modules)
 
-  test('the rule is declared once, in src/persona-destination.ts, and reads both destination fields', () => {
+  test('the rule is declared once, in src/persona-destination.ts, and reads the single permission destination', () => {
     const declared = [...sources].flatMap(([file, sf]) => functionsNamed(sf, ONE_DESTINATION_RULE).map(() => file))
     expect(declared).toEqual(['persona-destination.ts'])
     const ruleReads = fieldReads(modules, 'persona-destination.ts').filter((r) => inRegion(r.node, { fn: ONE_DESTINATION_RULE }))
-    expect([...new Set(ruleReads.map((r) => r.field))].sort()).toEqual(['fungible_destination', 'permission_prompts'])
+    expect([...new Set(ruleReads.map((r) => r.field))].sort()).toEqual(['permission_prompts'])
   })
 
   test.each(DESTINATION_CONSUMERS.map((file) => [`src/${file}`, file] as const))('%s reads none of the persona fields', (_label, file) => {

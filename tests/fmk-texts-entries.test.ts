@@ -496,7 +496,6 @@ describe("the printer's references (tests/integration/fixtures/fmk-texts.ts)", (
     'delivery-decision.ts:FUNGIBLE_REFUSALS:defined': () => nonEmptyStrings(deliveryDecision.FUNGIBLE_REFUSALS, false),
     'config.ts:CHANNEL_MODES:defined': () => nonEmptyStrings(config.CHANNEL_MODES, false),
     'config.ts:DELIVERY_MODES:defined': () => nonEmptyStrings(config.DELIVERY_MODES, false),
-    'channel-delivery.ts:CHANNEL_DELIVERY_DIAGNOSTIC_CLASSES:defined': () => nonEmptyStrings(channelDelivery.CHANNEL_DELIVERY_DIAGNOSTIC_CLASSES, true),
     'persona-diagnostics.ts:PERSONA_DIAGNOSTIC_CLASSES:defined': () => nonEmptyStrings(personaDiagnostics.PERSONA_DIAGNOSTIC_CLASSES, true),
   }
 
@@ -538,8 +537,6 @@ describe("the printer's references (tests/integration/fixtures/fmk-texts.ts)", (
     'reload-plan.ts:MODE_SWITCH_SETTING:constant',
     'reload-plan.ts:MODE_SWITCH_SETTING:string',
     'channel-delivery.ts:CHANNEL_DELIVERY_FILE_NAME:constant',
-    'channel-delivery.ts:CHANNEL_DELIVERY_LOG_PREFIX:constant',
-    'channel-delivery.ts:CHANNEL_DELIVERY_DIAGNOSTIC_CLASSES:defined',
     'persona-diagnostics.ts:formatPersonaDiagnostic:function',
     'persona-diagnostics.ts:PERSONA_DIAGNOSTIC_CLASSES:defined',
   ])("test-29's printer reads %s", (ref) => {

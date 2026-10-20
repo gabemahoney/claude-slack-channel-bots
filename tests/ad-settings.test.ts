@@ -441,7 +441,7 @@ describe('ad settings: read failures', () => {
   test.each<[string, Partial<PersonaConfigFs>, string]>([
     ['a directory', { fstatFile: () => ({ isFile: () => false, isDirectory: () => true }) }, 'EISDIR'],
     ['a non-regular file', { fstatFile: () => ({ isFile: () => false, isDirectory: () => false }) }, CONFIG_NOT_REGULAR_FILE_CODE],
-    ['a file over the size cap', { fstatFile: () => ({ isFile: () => true, isDirectory: () => false, size: MAX_RELOAD_FILE_BYTES + 1 }) }, MAX_RELOAD_FILE_SIZE_TEXT],
+    ['a file over the size cap', { fstatFile: () => ({ isFile: () => true, isDirectory: () => false, size: MAX_RELOAD_FILE_BYTES + 1 }), readFileFd: () => Buffer.from('#' + 'x'.repeat(MAX_RELOAD_FILE_BYTES)) }, MAX_RELOAD_FILE_SIZE_TEXT],
     ['a permission error', { openFile: () => { throw errnoError('EACCES') } }, 'EACCES'],
     ['a path component that is not a directory', { openFile: () => { throw errnoError('ENOTDIR') } }, 'ENOTDIR'],
     ['an I/O error on the read', { readFileFd: () => { throw errnoError('EIO') } }, 'EIO'],

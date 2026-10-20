@@ -118,6 +118,7 @@ const CREDENTIALS_HELPER = 'tests/test-helpers/credentials.ts'
 const SOURCE_SURFACES: [RegExp, string][] = [
   [/^src\/codex-config-keys\.ts$/, 'the names-only Codex config scanner and authorized top-level host model reader'],
   [/^src\/config\.ts$/, 'the persona config loader and record validation'],
+  [/^src\/shared-channels\.ts$/, 'the durable applied configuration, source input and persona identity authority'],
   [/^src\/test-mcp-drop\.ts$/, 'the test-only MCP disconnect route, which reads applied persona config and logs and returns the configured persona key'],
   [/^src\/persona-credentials\.ts$/, 'the credentials reader and classifier'],
   [/^src\/persona-bringup\.ts$/, 'the local bring-up checks, which read the credentials file'],
@@ -176,6 +177,7 @@ const HELPER_SURFACES: Record<string, Record<string, string>> = {
     sentinelInMessage: 'plants the leak sentinel in an error message (in a fake token and a ticket URL)',
     sentinelTicketUrl: 'plants the leak sentinel in a ticket URL',
   },
+  'tests/test-helpers/shared-channels.ts': { configBytes: 'serializes config input', initialSharedState: 'builds a shared config-state envelope', writeSharedState: 'writes the shared config-state envelope', makeSharedAuthority: 'builds and writes the shared authority' },
   'tests/test-helpers/persona-config.ts': { writeConfigFile: 'writes a config file' },
   'tests/test-helpers/ad-settings.ts': { writeAgentDirectorConfig: "writes agent-director's config.toml" },
   'tests/test-helpers/channel-delivery.ts': { writeChannelDeliveryRecord: 'writes a stored-choice file holding persona declarations' },
@@ -628,7 +630,7 @@ describe('every suite that touches config, credentials or reload calls assertNoL
     ])
     expect(touchReasonsOf(suite, "import { declarationOf, readChannelDeliveryRecord, SAMPLE_SET_AT } from './test-helpers/channel-delivery.ts'")).toEqual([])
     const importing = SUITES.filter((file) => touchReasons(file).some((r) => r.includes('tests/test-helpers/channel-delivery.ts')))
-    expect(importing).toContain(suite)
+    expect(importing).toContain('tests/cli.test.ts')
     expect(importing.map((file) => [file, callsAssertNoLeak(file), file in EXEMPT])).toEqual(importing.map((file) => [file, true, false]))
   })
 
@@ -985,7 +987,7 @@ describe("a caught error's text reaches a log line under src/ only redacted (sec
     expect(SOURCE_FILES).toEqual(
       expect.arrayContaining(['src/session-manager.ts', 'src/restart.ts', 'src/persona-connections.ts', 'src/cli.ts', 'src/server.ts', 'src/channel-delivery.ts']),
     )
-    const counts = ['src/session-manager.ts', 'src/restart.ts', 'src/permission-poller.ts', 'src/persona-lifecycle.ts', 'src/persona-episodes.ts', 'src/channel-delivery.ts'].map(
+    const counts = ['src/session-manager.ts', 'src/restart.ts', 'src/permission-poller.ts', 'src/persona-lifecycle.ts', 'src/persona-episodes.ts', 'src/reload.ts'].map(
       (file) => logCalls(codeOf(file)).length,
     )
     expect(counts.every((n) => n > 0)).toBe(true)

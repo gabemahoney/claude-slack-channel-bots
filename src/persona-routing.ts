@@ -53,7 +53,7 @@ const NO_AUTHOR_PLACEHOLDER = '(none)'
 const APP_MENTION_EVENT_TYPE = 'app_mention'
 
 /** The channel mode in which a persona serves the channels its app is in. */
-const FUNGIBLE_MODE: ChannelMode = 'fungible'
+const FUNGIBLE_MODE: ChannelMode = 'open'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -64,10 +64,10 @@ export type SlackAck = () => Promise<void> | void
 
 /**
  * The persona config fields this module reads: the personas, the restart
- * delay, and the `allow_invited_channels` switch, read through
+ * delay, and the `channel_mode` switch, read through
  * `channelModeOf` at each event.
  */
-export type PersonaRoutingConfig = Pick<PersonaConfig, 'personas' | 'session_restart_delay' | 'allow_invited_channels'> & Partial<Pick<PersonaConfig, 'queued_ack_reaction'>>
+export type PersonaRoutingConfig = Pick<PersonaConfig, 'personas' | 'session_restart_delay' | 'channel_mode'> & Partial<Pick<PersonaConfig, 'queued_ack_reaction'>>
 
 /** Dependencies injected into `createPersonaRouting`. */
 export interface PersonaRoutingDeps {
@@ -296,6 +296,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
             return
           }
           if (!config || !persona) return
+          if (deps.getChannelDelivery?.()?.readable === false) { storeFailed = true; return }
           const identity = deps.getBotIdentity(key)
           const decision = decideDelivery(ev, { key, botUserId: identity?.botUserId, botId: identity?.botId, channels: persona.channels, dmEnabled: persona.dm.enabled }, config.personas, fungibleInputs(config, mode, isExtSharedChannel))
           const path = fungiblePathOf(decision)

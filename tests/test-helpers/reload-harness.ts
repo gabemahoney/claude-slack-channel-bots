@@ -31,13 +31,12 @@ import {
 } from '../../src/atomic-write.ts'
 import {
   channelDeliveryDeclarationOf,
-  channelDeliveryPath,
-  loadChannelDeliveryAtStart,
-  type ChannelDeliveryRecord,
+  createChannelDeliveryStore,
   type ChannelDeliveryStore,
 } from '../../src/channel-delivery.ts'
 import {
   channelModeOf,
+  parsePersonaConfigBytes,
   DM_DESTINATION,
   MAX_RELOAD_FILE_BYTES,
   replySettingsOf,
@@ -175,7 +174,9 @@ import {
   type StubCallLog,
   type StubClientOptions,
 } from './agent-director-stub.ts'
-import { readChannelDeliveryRecord } from './channel-delivery.ts'
+import { readChannelDeliveryRecord, type ChannelDeliveryRecord } from './channel-delivery.ts'
+import { sharedChannelPath } from './shared-channels.ts'
+import { initialSharedChannelState, serializeSharedChannelState } from '../../src/shared-channels.ts'
 import {
   APP_TOKEN_PREFIX,
   BOT_TOKEN_PREFIX,
@@ -1436,7 +1437,7 @@ export interface ReloadHarness {
   retiredKeysWrite(ok?: boolean): ReloadRunActivity['writes'][number]
   /** A writer call on the last-applied record (`paths.lastApplied`), as `run.writes` holds it. */
   lastAppliedWrite(ok?: boolean): ReloadRunActivity['writes'][number]
-  /** The stored-choice file's path, `channelDeliveryPath(stateDir)`. */
+  /** The stored-choice file's path, `paths.lastApplied`. */
   readonly channelDeliveryFile: string
   /**
    * A writer call on the stored-choice file, as `run.writes` holds it: a
@@ -2678,17 +2679,9 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
      * path over its own failure seam and its deletes the run's delete.
      */
     function loadChannelDeliveryForStart(start: PersonaConfig): void {
-      channelDeliveryStore = loadChannelDeliveryAtStart(
-        stateDir,
-        {
-          applied: start.personas.map((persona) => ({
-            key: persona.key,
-            declaration: channelDeliveryDeclarationOf(persona),
-          })),
-          retiredKeys,
-        },
-        { log, write: writeChannelDelivery, remove, now: () => connections.clock.now() },
-      )
+      const authority = controller.sharedChannels()
+      if (!authority) throw new Error('reload-harness: resolved start has no shared authority')
+      channelDeliveryStore = createChannelDeliveryStore(authority)
     }
     controller = createReloadController({
       stopDelivery: async () => {},
@@ -3281,10 +3274,10 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     retiredKeysFile: retiredKeysPath(stateDir),
     retiredKeysWrite: (ok = true) => ({ path: retiredKeysPath(stateDir), ok }),
     lastAppliedWrite: (ok = true) => ({ path: paths.lastApplied, ok }),
-    channelDeliveryFile: channelDeliveryPath(stateDir),
-    channelDeliveryWrite: (ok = true) => ({ path: channelDeliveryPath(stateDir), ok }),
-    readChannelDelivery: () => readChannelDeliveryRecord(stateDir),
-    writeChannelDeliveryBytes: (bytes) => writeBytes(channelDeliveryPath(stateDir), bytes),
+    channelDeliveryFile: paths.lastApplied,
+    channelDeliveryWrite: (ok = true) => ({ path: paths.lastApplied, ok }),
+    readChannelDelivery: () => readChannelDeliveryRecord(dir),
+    writeChannelDeliveryBytes: (bytes) => writeBytes(paths.lastApplied, bytes),
     key: (name) => personaKey(name),
     persona(name, overrides = {}) {
       let channel = channels.get(name)
@@ -3303,7 +3296,17 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     },
     writeConfig: (input) => writeBytes(paths.config, serialize(input)),
     writeConfigBytes: (bytes) => writeBytes(paths.config, bytes),
-    writeRecord: (input) => writeBytes(paths.lastApplied, serialize(input)),
+    writeRecord: input => {
+      const bytes = serialize(input)
+      // Normal fixtures use the production envelope. Deliberately invalid
+      // baseline fixtures remain raw so startup itself must refuse them.
+      let envelope: Uint8Array
+      try {
+        const config = parsePersonaConfigBytes(bytes, paths.lastApplied, dir, { home, record: true })
+        envelope = serializeSharedChannelState(initialSharedChannelState(bytes, config))
+      } catch { return writeBytes(paths.lastApplied, bytes) }
+      return writeBytes(paths.lastApplied, envelope)
+    },
     writeRecordBytes: (bytes) => writeBytes(paths.lastApplied, bytes),
     readConfig: () => readIfPresent(paths.config),
     readRecord: () => readIfPresent(paths.lastApplied),
@@ -3479,8 +3482,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     clearWriteFailure: () => writeSeam.clear(),
     failRemoves: (failure) => removeSeam.fail(failure),
     clearRemoveFailure: () => removeSeam.clear(),
-    failChannelDeliveryWrites: (failure) => channelDeliveryWriteSeam.fail(failure),
-    clearChannelDeliveryWriteFailure: () => channelDeliveryWriteSeam.clear(),
+    failChannelDeliveryWrites: (failure) => writeSeam.fail(failure),
+    clearChannelDeliveryWriteFailure: () => writeSeam.clear(),
     poisonTokenEnvironment() {
       if (tokenWatch !== undefined) throw new Error('reload-harness: the token environment is already poisoned')
       const original = process.env

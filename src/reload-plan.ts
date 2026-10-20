@@ -219,7 +219,6 @@ export const IN_PLACE_SETTINGS = [
   'channels',
   'delivery',
   'permission_prompts',
-  'invited.permission_prompts',
   'dm.enabled',
   'dm.contact',
   'stop_hook_bootstrap',
@@ -233,13 +232,13 @@ export type InPlaceSetting = (typeof IN_PLACE_SETTINGS)[number]
  * belong to the section the candidate's switch does not select: the declarative section's `channels` and `permission_prompts`,
  * and the fungible section, `invited`. In the order they are reported.
  */
-export const RECORDED_SECTION_KEYS = ['channels', 'permission_prompts', 'invited'] as const satisfies readonly (keyof PersonaSections)[]
+export const RECORDED_SECTION_KEYS = ['channels', 'permission_prompts'] as const satisfies readonly (keyof PersonaSections)[]
 
 /** A persona key whose change can be recorded. */
 export type RecordedSectionKey = (typeof RECORDED_SECTION_KEYS)[number]
 
 /** The server-wide setting that picks the channel mode; it has a preview line of its own. */
-export const MODE_SWITCH_SETTING = 'allow_invited_channels'
+export const MODE_SWITCH_SETTING = 'channel_mode'
 
 /** The settings that take effect at the persona's next launch, in the order they are reported. */
 export const NEXT_LAUNCH_SETTINGS = ['claude_config_dir'] as const
@@ -365,7 +364,7 @@ export interface ServerSettingChange {
    */
   inheritedBy?: InheritingPersonaRef[]
   /**
-   * For the switch (`allow_invited_channels`) only: the
+   * For the switch (`channel_mode`, ) only: the
    * channel mode the change turns on. Absent for any other setting.
    */
   mode?: ChannelMode
@@ -510,35 +509,18 @@ function personaSectionChanges(
   mode: ChannelMode,
   sameMode: boolean,
 ): { inPlace: InPlaceSetting[]; recorded: RecordedSectionKey[] } {
+  const was = new Map(before.channels.map((c) => [c.id, c.delivery]))
+  const now = new Map(after.channels.map((c) => [c.id, c.delivery]))
   const changed: Record<InPlaceSetting, boolean> = {
-    channels: false,
-    delivery: false,
-    permission_prompts: false,
-    'invited.permission_prompts': false,
+    channels: was.size !== now.size || [...now.keys()].some((id) => !was.has(id)),
+    delivery: [...now].some(([id, delivery]) => was.has(id) && was.get(id) !== delivery),
+    permission_prompts: before.permission_prompts !== after.permission_prompts,
     'dm.enabled': before.dm.enabled !== after.dm.enabled,
     'dm.contact': before.dm.contact !== after.dm.contact,
     stop_hook_bootstrap: before.stop_hook_bootstrap !== after.stop_hook_bootstrap,
   }
-  let recorded: RecordedSectionKey[]
-  if (mode === 'declarative') {
-    if (sameMode) {
-      const was = new Map(before.channels.map((c) => [c.id, c.delivery]))
-      const now = new Map(after.channels.map((c) => [c.id, c.delivery]))
-      changed.channels = was.size !== now.size || [...now.keys()].some((id) => !was.has(id))
-      changed.delivery = [...now].some(([id, delivery]) => was.has(id) && was.get(id) !== delivery)
-      changed.permission_prompts = before.permission_prompts !== after.permission_prompts
-    } else {
-      changed.channels = sectionKeyChanged(before, after, 'channels')
-      changed.permission_prompts = sectionKeyChanged(before, after, 'permission_prompts')
-    }
-    recorded = sectionKeyChanged(before, after, 'invited') ? ['invited'] : []
-  } else {
-    changed['invited.permission_prompts'] = sameMode
-      ? before.fungible_destination !== after.fungible_destination
-      : sectionKeyChanged(before, after, 'invited')
-    recorded = (['channels', 'permission_prompts'] as const).filter((key) => sectionKeyChanged(before, after, key))
-  }
-  return { inPlace: IN_PLACE_SETTINGS.filter((setting) => changed[setting]), recorded }
+  return { inPlace: IN_PLACE_SETTINGS.filter((setting) => changed[setting]), recorded: [] }
+
 }
 
 /** Two values of one server-wide setting are equal (paths by real path, anything else by JSON value). */
@@ -652,8 +634,8 @@ function configDirsDiffer(applied: PersonaConfig, candidate: PersonaConfig, home
  *
  * Server-wide settings are compared by resolved value, paths by real path. A
  * changed `claude_config_dir` lists the personas
- * that inherit the change. A changed `allow_invited_channels` (absent and
- * `false` are the same value) carries the mode it turns on and every persona
+ * that inherit the change. A changed `channel_mode` (absent and
+ * `strict` are the same value) carries the mode it turns on and every persona
  * present in both configurations. `noEffectiveChange` holds
  * when nothing but unchanged personas remains: a whitespace or key-order
  * edit, a key added with its default value, or recorded changes only.
@@ -999,10 +981,10 @@ const CLI_RECORD_AND_SERVER_START_SETTINGS: ReadonlySet<string> = new Set<string
 
 /**
  * The switch's preview line: a change of
- * `allow_invited_channels` turns `mode` on for every persona, in place at
+ * `channel_mode` turns `mode` on for every persona, in place at
  * once:
  *
- *   server-wide setting allow_invited_channels changed: turns fungible mode
+ *   server-wide setting channel_mode changed: turns fungible mode
  *   on, applied in place at once, from the next event, tool call, prompt and
  *   notice, for "alpha" (key=alpha), "bravo" (key=bravo).
  *
@@ -1033,13 +1015,13 @@ export function modeSwitchLine(
  *
  *   persona "alpha" (key=alpha): channels, permission_prompts changed in the
  *   declarative section: recorded, with no effect until
- *   allow_invited_channels selects declarative mode.
+ *   channel_mode selects declarative mode.
  *
  * The section is the fungible one when the change names `invited`, else the
  * declarative one. Pure; unescaped (`renderPreviewLines` escapes).
  */
 export function recordedLine(p: Pick<RecordedPersonaChange, 'name' | 'key' | 'fields'>): string {
-  const section: ChannelMode = p.fields.includes('invited') ? 'fungible' : 'declarative'
+  const section: ChannelMode = 'strict'
   return (
     `${personaRef(p)}: ${p.fields.join(', ')} changed in the ${section} section: recorded, with no effect until ` +
     `${MODE_SWITCH_SETTING} selects ${section} mode.`

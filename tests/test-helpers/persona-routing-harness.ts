@@ -1,4 +1,4 @@
-
+import { mkdtempSync } from 'node:fs'
 
 import { createDeliveryQueue, type QueueItem } from '../../src/delivery-queue.ts'
 import { createDeliveryPreparation, type DeliveryPreparationDeps } from '../../src/delivery-intake.ts'
@@ -21,7 +21,9 @@ import {
   type ReplySettings,
 } from '../../src/config.ts'
 import { durableWriteFileSync } from '../../src/atomic-write.ts'
-import { loadChannelDeliveryStore, type ChannelDeliveryStore } from '../../src/channel-delivery.ts'
+import { createChannelDeliveryStore, type ChannelDeliveryStore } from '../../src/channel-delivery.ts'
+import { createSharedChannelAuthority } from '../../src/shared-channels.ts'
+import { configBytes, initialSharedState, readSharedState, sharedChannelPath } from './shared-channels.ts'
 import { createPersonaRouting, type PersonaRoutingDeps } from '../../src/persona-routing.ts'
 import { formatPersonaNotice, type PersonaNotifier } from '../../src/persona-notifier.ts'
 import type { PersonaDestinationHold } from '../../src/persona-destination-hold.ts'
@@ -745,13 +747,13 @@ export function makeRoutingHarness(
   }
   const configSpecs: PersonaSpec[] = specs.map((spec, i) => {
     const destination = opts.fungibleDestinations?.[builtNames[i]!]
-    return destination === undefined ? spec : { ...spec, invited: { ...spec.invited, permission_prompts: destination } }
+    return destination === undefined ? spec : { ...spec, permission_prompts: destination }
   })
   /** The configuration under `mode`'s switch, or the switch `overrides` sets when no mode is given. */
   const configIn = (mode: ChannelMode | undefined): PersonaConfig =>
     makeMultiPersonaConfig(configSpecs, baseDir, {
       ...opts.overrides,
-      ...(mode === undefined ? {} : { allow_invited_channels: mode === 'fungible' }),
+      ...(mode === undefined ? {} : { channel_mode: mode }),
     })
   const config = configIn(opts.mode)
   const handles = config.personas.map((persona): PersonaHandle => ({
@@ -998,16 +1000,16 @@ export function makeRoutingHarness(
     }
   // The stored-choice store, loaded once as main loads it,
   // its lines in `h.logs` and each write recorded before it is made.
-  if (opts.channelDelivery !== undefined) {
-    h.channelDelivery = loadChannelDeliveryStore(opts.channelDelivery.stateDir, {
-      log,
-      ...(opts.channelDelivery.unreadable === true ? { readFs: UNREADABLE_STORE_FS } : {}),
-      write: (path, bytes) => {
-        h.channelDeliveryWrites.push(path)
-        durableWriteFileSync(path, bytes)
-      },
-    })
+  {
+    const stateDir = opts.channelDelivery?.stateDir ?? mkdtempSync(join(baseDir, 'routing-authority-'))
+    const raw = { ...config, personas: config.personas.map(({ index, key, sections, ...persona }) => persona) }
+    const state = readSharedState(stateDir) ?? initialSharedState(stateDir, raw)
+    h.channelDelivery = createChannelDeliveryStore(createSharedChannelAuthority(sharedChannelPath(stateDir), state, {
+      write(path, bytes) { h.channelDeliveryWrites.push(path); durableWriteFileSync(path, bytes) },
+    }))
+    h.channelDelivery.authority.subscribe(next => { h.config = next })
   }
+
   const preparation = createDeliveryPreparation({ queue, clock: opts.preparationClock, clientFor: webClientFor, resolveUserName: opts.resolveUserName ?? resolveUserName })
   const routing = createPersonaRouting({
     queue,

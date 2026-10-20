@@ -6,6 +6,8 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 ## Unreleased
 
+The shared channel foundation uses `channel_mode` (`strict` by default, or `open`), four delivery values and one required `permission_prompts` destination. `config.json.last-applied` is the sole shared authority; reviewed source bytes and pending edits remain distinct from applied choices. Configuration and previews have no size cap; credentials retain their independent limit.
+
 ---
 
 ## 0.18.1 (2026-10-22)

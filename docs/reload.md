@@ -8,11 +8,10 @@ These files sit in the same directory as `config.json` (`~/.config/claude-slack-
 
 | File | What it is |
 |---|---|
-| `config.json.last-applied` | The record: a byte copy of the last configuration the server applied. The server writes it. |
+| `config.json.last-applied` | The sole shared authority: an envelope holding the revision, applied configuration, reviewed source and exact reviewed bytes (`sourceBytesBase64`). It also records persona identity, incarnation and ordered channel choices. A replacement never inherits old choices. Never edit it by hand. For an unresolved write, preserve the authority, prepared input and pending evidence; restore trustworthy evidence before retrying. |
 | `config.json.pending` | A preview of what applying the edit would do, written by the server. It exists only while a change is pending. |
-| `config.json.apply` | Your confirmation: the pending file, renamed. The server deletes it at its next check (see [Confirming a change](#confirming-a-change)). |
+| `config.json.apply` | Your confirmation: the pending file, renamed. Successful application consumes it; a failed authority write preserves it (see [Confirming a change](#confirming-a-change)). |
 | `retired-keys.json` | The retired-key record: the persona keys the server holds as retired. A confirmed change records the key of each removed persona (a renamed persona's old key included) and of each persona whose `name`, `credentials_file` or `working_directory` changed, before `config.json.last-applied` is rewritten. A server start also records, before its clean-up of old instances ends any of them, the key of every agent-director instance labelled with a persona that is not in the applied configuration (for example, a persona that `config.json` no longer names, at a start after `config.json.last-applied` was deleted; see [Start rules](#start-rules)), so a persona added back later with that key starts fresh. If that write fails, the start logs it in `server.log`, holds those keys as retired until the server stops, and records them again at the next start. Only the server writes it, never the CLI. It is kept across restarts and is absent until a key is first recorded. A key's entry is removed on its own once the persona's new session is running. If it can't be read, the server doesn't start; moving it aside is the fix (see `retired-keys-unreadable` under [Startup errors](troubleshooting.md#startup-errors)). |
-| `channel-delivery.json` | The stored-choice file: each persona's stored channel-delivery choices (see [Channel delivery in fungible mode](channel-modes.md#channel-delivery-in-fungible-mode)), by persona key and channel, with each persona's `name`, `credentials_file` and `working_directory`. It holds no token and no message text. Only the server reads and writes it, never the CLI. It is absent until the first accepted `set_channel_delivery` call, so it is never created in declarative mode. Never edit it by hand. The server reads it once at each start. A persona's choices are dropped when a confirmed change retires its key (the persona is removed, or its `name`, `credentials_file` or `working_directory` changes), and at a start when its key is not an applied persona, its `name`, `credentials_file` or `working_directory` differs from the one stored, or `retired-keys.json` holds its key as retired and the persona's new session has not yet begun; each drop logs a `[slack] channel-delivery:` line. If the file can't be read, parsed or validated at a start, the server leaves it in place, logs one [`channel-delivery-unreadable`](../skills/debug-slack-channel-bots/SKILL.md#channel-delivery-unreadable) line, and starts and runs every persona, but for that run no stored choice applies: in fungible mode every channel is at `mentions`, `set_channel_delivery` is refused, and nothing is written to the file or dropped from it. To fix it, move the file aside, then restart the server; this discards every stored choice. If you restore that same file in place instead of moving it aside, a persona removed and added back with the same `name`, `credentials_file` and `working_directory` while it was unreadable gets its earlier choices again. |
 
 | `queue/<key>.jsonl` | The persona’s durable queue, holding message text until delivery. Removing a persona retains its queue file; delivery resumes only when the same key returns. |
 
@@ -21,8 +20,8 @@ These files sit in the same directory as `config.json` (`~/.config/claude-slack-
 | At start | What happens |
 |---|---|
 | A record exists | The server runs the record, not `config.json`. This includes the start after a host reboot. |
-| No record (a fresh install, or the first start after upgrading to this release) | The server checks `config.json`, records it and applies it. If the file is missing or invalid, the server doesn't start and `server.log` says why. |
-| The record can't be read or is invalid | The server doesn't start. The log line names the record and says that deleting it makes the next start apply `config.json` as it stands. |
+| No record on a fresh install | The server checks `config.json`, records it and applies it. If the file is missing or invalid, the server doesn't start and `server.log` says why. |
+| The record can’t be read or is invalid | The server does not start. Preserve the authority and prepared input; restore trustworthy evidence. |
 | The record can't be written | The server doesn't start and logs `reload-record-write-failed`. |
 
 A configuration with zero personas is valid and starts.
@@ -33,7 +32,7 @@ Credentials files are read as they stand at every start. So a credentials change
 
 `stop`, `stop --stop-bots` and `clean_restart` take their timeouts and persona set from the record when there is one, and from `config.json` otherwise.
 
-Deleting the record discards it: the next start applies `config.json` as it stands, whatever it contains.
+Keep the record intact during recovery. Restore a trustworthy authority rather than promoting an unconfirmed `config.json` edit.
 
 If the first start fails on a setting such as `port` or `bind`, see "A fix to config.json is ignored after a failed first start" in [Troubleshooting](troubleshooting.md#troubleshooting).
 
@@ -55,7 +54,7 @@ grep -E 'reload-(preview|invalid|nothing-pending)' ~/.config/claude-slack-channe
 
 ## Reading the preview
 
-The first line counts the personas added, removed, destructively modified, modified in place and with changed credentials, and the server-wide settings changed, the switch `allow_invited_channels` among them. A persona whose only changes are recorded ones (changes to the section not in force, see the table below) is not counted as modified. Then there is one line per affected persona, one per persona with a recorded change, and one per changed setting. For example:
+The first line counts the personas added, removed, destructively modified, modified in place and with changed credentials, and the server-wide settings changed, the switch `channel_mode` among them. Then there is one line per affected persona and one per changed setting. For example:
 
 ```
 claude-slack-channel-bots: pending configuration change (written by the server)
@@ -70,13 +69,12 @@ server-wide setting port changed: once applied, it is recorded and takes effect 
 server-wide setting claude_config_dir changed: inherited by "planner" (key=planner), "reviewer" (key=reviewer); takes effect at each one's next launch, which starts fresh (the conversation is not resumed), instance kept until then.
 ```
 
-Made to the configuration in the declarative [Example](configuration.md#example), a change that turns fungible mode on, gives `planner` an `invited.permission_prompts` and edits `reviewer`'s `channels`, which fungible mode doesn't read, previews like this:
+Made to the configuration in the strict [Example](configuration.md#example), a change that turns open mode on and adds `planner`’s destination channel to `reviewer`’s shared `channels` at `mentions` previews like this:
 
 ```
 A configuration change is pending; nothing has been applied. personas: 0 added, 0 removed, 0 destructively modified, 1 modified in place, 0 with changed credentials; server-wide settings: 1 changed.
-persona "planner" (key=planner): invited.permission_prompts changed: applied in place immediately, instance kept.
-persona "reviewer" (key=reviewer): channels changed in the declarative section: recorded, with no effect until allow_invited_channels selects declarative mode.
-server-wide setting allow_invited_channels changed: turns fungible mode on, applied in place at once, from the next event, tool call, prompt and notice, for "planner" (key=planner), "reviewer" (key=reviewer), "helpdesk" (key=helpdesk).
+persona "reviewer" (key=reviewer): channels changed: applied in place immediately, instance kept.
+server-wide setting channel_mode changed: turns open mode on, applied in place at once, from the next event, tool call, prompt and notice, for "planner" (key=planner), "reviewer" (key=reviewer), "helpdesk" (key=helpdesk).
 ```
 
 The preview describes the full effect of the change. What each kind of change does once confirmed is in [What a confirmation applies](#what-a-confirmation-applies).
@@ -92,14 +90,13 @@ Paths in the preview are absolute: a `~` in `config.json` is shown expanded. In 
 | `claude_config_dir changed: …, which starts fresh (the conversation is not resumed)` | The persona's next launch uses the new config directory and starts a new conversation. The running instance is kept until then. |
 | `…; but at that launch it cannot come up: claude_config_dir cannot be resolved to a real path (<errno>)` | A warning after a changed `claude_config_dir`: the new directory can't be resolved, for example a symlink on its path points to nothing. On a changed top-level `claude_config_dir`, the warning names the inheriting personas it stops; on a `DESTRUCTIVE:` line that also changes the directory, it reads `but it cannot come up`. Confirming still applies the change: at the persona's next launch (at once, for a destructive change) it is held, its Slack connection closed, and it comes up once the directory resolves (`persona-config-dir-unresolvable` in `server.log`). Fix the directory, or the setting, before confirming. A directory that doesn't exist yet but whose parent does is fine. |
 | `… could not be checked.` | The server couldn't check whether an added persona can come up, whether a changed `claude_config_dir` can be resolved, or whether a persona is down because of its credentials. `server.log` has a `reload: cannot check …` line; report it as a bug. |
-| `… changed in the declarative section: recorded, with no effect until allow_invited_channels selects declarative mode.` or `… changed in the fungible section: recorded, with no effect until allow_invited_channels selects fungible mode.` | A recorded change: the persona's section not in force changed (`channels` or `permission_prompts` in fungible mode, `invited` in declarative mode). The line names the persona and the changed fields. The change is recorded and has no effect until the switch selects that section. These lines come after every persona line and before the server-wide setting lines. A change made only of recorded changes previews as `no effective change`, followed by its recorded lines. |
-| `server-wide setting allow_invited_channels changed: turns <mode> mode on, applied in place at once, from the next event, tool call, prompt and notice, for …` | The switch. The line names the mode it turns on (`fungible` or `declarative`) and every persona present in both configurations, or ends `; no persona is affected.` when there is none. It applies at once, with no restart, and every session is kept (see [Channel modes](channel-modes.md#channel-modes)). The inherited `stop_hook_bootstrap` default also applies immediately to reminder checks. |
+| `server-wide setting channel_mode changed: turns <mode> mode on, applied in place at once, from the next event, tool call, prompt and notice, for …` | The switch. The line names the mode it turns on (`open` or `strict`) and every persona present in both configurations, or ends `; no persona is affected.` when there is none. It applies at once, with no restart, and every session is kept (see [Channel modes](channel-modes.md#channel-modes)). The inherited `stop_hook_bootstrap` default also applies immediately to reminder checks. |
 | `server-wide setting … inherited by …` | A changed top-level default. The line lists the personas that inherit it. If none does, a `claude_config_dir` change says `no persona inherits it, so no instance is affected`; a `stop_hook_bootstrap` change says `no persona inherits the change, so no reply reminder is affected`. |
 | `server-wide setting … changed: once applied, it is recorded and takes effect at the next server start after that.` | A setting such as `port`, `bind`, `queued_ack_reaction` or `ack_reaction`. It doesn't take effect until the server starts after the change is applied. Outstanding work keeps its original queued emoji; see [Acknowledgement reactions](server-settings.md#acknowledgement-reactions). |
 | `server-wide setting … changed: once applied, it is recorded, and the CLI takes it from the record from then on (the running server does not use it).` | `stop_timeout` or `exit_timeout`. Only the CLI uses them: once the change is applied, the next `stop` or `clean_restart` uses the new value, with no restart needed. |
 | `server-wide setting … changed: once applied, it is recorded, the CLI takes it from the record from then on, and the running server uses it from its next start.` | `agent_director_call_timeout_ms`. Once the change is applied, the next `stop --stop-bots` or `clean_restart` uses the new value; the running server keeps its current value until it next starts. |
 | `INVALID: <error> Nothing will be applied.` | The edited `config.json` is invalid or missing. Fix the file; nothing is applied until it is valid. `server.log` shows a `reload-invalid` line. |
-| `… no effective change: …` | The edit changes nothing that runs (for example, whitespace, a default written out, or only recorded changes, whose lines follow). |
+| `… no effective change: …` | The edit changes nothing that runs (for example, whitespace, a default written out, or a source-only edit). |
 
 ## Confirming a change
 
@@ -109,7 +106,7 @@ To apply a pending change, rename `config.json.pending` to `config.json.apply` i
 cd "${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-slack-channel-bots}" && mv config.json.pending config.json.apply
 ```
 
-Read the preview first. The server picks the confirmation up at its next check, within about 5 seconds; a check still running an earlier apply delays it, so `reload-applied` can come minutes later. It deletes the confirmation and applies it without a restart. Next-launch and most server-wide settings are recorded and take effect later; the switch `allow_invited_channels` and reminder setting `stop_hook_bootstrap` (own or inherited) apply in place at once (see [What a confirmation applies](#what-a-confirmation-applies)).
+Read the preview first. The server picks the confirmation up at its next check, within about 5 seconds; a check still running an earlier apply delays it, so `reload-applied` can come minutes later. It deletes the confirmation and applies it without a restart. Next-launch and most server-wide settings are recorded and take effect later; the switch `channel_mode` and reminder setting `stop_hook_bootstrap` (own or inherited) apply in place at once (see [What a confirmation applies](#what-a-confirmation-applies)).
 
 You can direct an agent to do the rename for you. Nothing has to be computed, copied or typed. A confirmation made while the server is stopped is processed at the first check after the next start.
 
@@ -121,11 +118,11 @@ grep -E 'reload-(applied|noop|invalid|stale-confirmation|record-write-failed)' "
 
 | Line | Meaning |
 |---|---|
-| `[slack] reload-applied: applied the confirmed configuration change without a restart (personas: …); the last-applied record "<path>" now holds it` | The change is applied, and `config.json.last-applied` holds it. |
-| `[slack] reload-noop: the confirmed configuration has no effective change, …` | Nothing that runs changed, as for a confirmation whose only changes are recorded ones (changes to the section not in force). The record was rewritten, and nothing is left pending. |
+| `[slack] reload-applied: applied the confirmed configuration change without a restart (personas: …); the last-applied record "<path>" now holds it` | The change is applied, and the authority’s applied configuration holds it. |
+| `[slack] reload-noop: the confirmed configuration has no effective change, …` | Nothing that runs changed, as for whitespace or an explicit default. The application revision and exact reviewed source bytes are recorded without changing channel assignment values or order, and nothing is left pending. |
 | `[slack] reload-invalid: the confirmed configuration is invalid, so nothing is applied: <error>` | `config.json` was invalid or missing when you confirmed. The line carries the full error. Fix the file, then confirm the new preview. |
 | `[slack] reload-stale-confirmation: the confirmation "<path>" …; nothing is applied` | See [Stale confirmations](#stale-confirmations). |
-| `[slack] reload-record-write-failed: … the confirmed change is not applied and stays pending…` | `config.json.last-applied` or the retired-key record (`retired-keys.json`) couldn't be written, so nothing is applied; the line also says whether the keys the confirmation recorded as retired were removed again. The line can also name the stored-choice file (`channel-delivery.json`): a confirmation that brings up a persona whose stored choices were dropped earlier, by a write that failed, first writes that file; when it can't, nothing is applied, the retired-key record is not written, and the change stays pending. Fix the state directory (permissions, free space), then confirm again. |
+| `[slack] reload-record-write-failed: … the confirmed change is not applied and stays pending…` | The shared authority or retired-key record could not be written. Preserve authority, prepared input, confirmation and pending evidence. For an unresolved write, restore trustworthy evidence before retrying. After a definite failure, fix the reported filesystem cause, then make a fresh confirming rename: the running server does not retry the failed gesture automatically. After restart, a retained, unconsumed confirmation is revalidated against recovered state and may apply if still valid. |
 
 ## What a confirmation applies
 
@@ -133,16 +130,15 @@ Each row is one kind of change: what happens once you confirm it, and what happe
 
 | Change | Once confirmed | Live session |
 |---|---|---|
-| `channels`, `delivery` or `permission_prompts` changes (in declarative mode), `invited.permission_prompts` changes (in fungible mode), or `dm.enabled` or `dm.contact` changes | Applied in place, immediately: from the next event or post. A changed DM contact is used for the next prompt. | Kept |
+| `channels`, `delivery`, `permission_prompts`, `dm.enabled` or `dm.contact` changes | Applied in place, immediately: from the next event or post. A changed DM contact is used for the next prompt. | Kept |
 | A credentials file's content changes (same path), such as a rotated token | Only that persona reconnects: the new connection opens, then the old one closes. If the new file can't be used or Slack refuses it, the old connection keeps running, `server.log` shows `persona-credentials-change-failed`, and the change stays pending. If Slack can't be reached, the old connection stays in use while the new one retries. A persona that is retrying (Slack unreachable, its working directory unusable, or held for its `claude_config_dir` by `persona-config-dir-unresolvable`) has no connection and retries with the new content. A persona down because of its credentials comes up on the confirmed change, with no restart; if its new file can't be used, it stays down with its usual line, such as `persona-credentials-invalid`, and nothing stays pending. | Kept |
 | `claude_config_dir` changes (the persona's own or inherited) | Recorded. The persona's next launch uses it and starts a new conversation on the same instance when the directory changed: the conversation is not resumed, nothing is deleted, and the old transcript stays in the old directory. | Kept until the next launch |
 | `stop_hook_bootstrap` changes (the persona's own or inherited) | Applied in place, immediately: subsequent reminder checks use the confirmed value. | Kept |
 | A persona is removed | Torn down: its session is ended, with the result checked and retried, and its agent-director row is kept as the old life until agent-director's `expire` removes it, never resumed. Its posted permission prompts stay in Slack, and clicking one has no effect. Until its old instance has ended, no persona is brought up in its working directory (see "A persona waits on an old instance in its working directory" in [Troubleshooting](troubleshooting.md#troubleshooting)). Previewed `DESTRUCTIVE:`. | Retired: never resumed |
 | A persona's `credentials_file` path or `working_directory` changes | Torn down as a removal is (its row kept, never resumed), then brought up fresh from its new entry on the same instance, with no restart: a new conversation, and the new credentials file is read. The new conversation starts only once the old instance has ended, and any other persona in the old working directory waits until then too (see "A persona waits on an old instance in its working directory" in [Troubleshooting](troubleshooting.md#troubleshooting)). Previewed `DESTRUCTIVE:`. See [Destructive changes](#destructive-changes). | Retired: never resumed |
 | A persona's `name` changes | A removal plus an addition: the name sets the key. The old persona is torn down as a removal is (its row kept until agent-director's `expire` removes it, never resumed), and the new one is brought up fresh once the old one's instance has ended (see "A persona waits on an old instance in its working directory" in [Troubleshooting](troubleshooting.md#troubleshooting)). The removal half is previewed `DESTRUCTIVE:` (`DESTRUCTIVE: persona "<old name>" … is removed`), followed by an `… is added` line for the new name. | Retired: never resumed |
-| The switch `allow_invited_channels` changes, turning fungible mode on or off | Applied in place, at once: from the next event, tool call, prompt and notice, with no restart. Each persona serves the channels of the mode turned on (see [Channel modes](channel-modes.md#channel-modes)). While fungible mode is on, stored channel-delivery choices apply; listed `delivery` values are not carried over, so each channel is at `mentions` unless a stored choice applies. | Kept |
-| `channels` or `permission_prompts` changes in fungible mode, or `invited` changes in declarative mode: the section not in force | Recorded, with no effect until the switch selects that section. A confirmation whose only changes are recorded ones logs `reload-noop`. | Kept |
-| A server-wide setting changes, such as `port` | Recorded. The running server keeps its current value, and the next server start uses the recorded one. `allow_invited_channels` and inherited `stop_hook_bootstrap` apply in place at once (see their rows above). `stop_timeout` and `exit_timeout` differ too: only the CLI uses them, and it takes them from the record at once, so the next `stop` or `clean_restart` uses them. `agent_director_call_timeout_ms` differs as well: the CLI takes it from the record at once, and the running server uses it from its next start. | Not affected |
+| The switch `channel_mode` changes, selecting `strict` or `open` | Applied in place, at once: from the next event, tool call, prompt and notice, with no restart. Shared channel choices and the destination are preserved. | Kept |
+| A server-wide setting changes, such as `port` | Recorded. The running server keeps its current value, and the next server start uses the recorded one. `channel_mode` and inherited `stop_hook_bootstrap` apply in place at once (see the switch's row above). `stop_timeout` and `exit_timeout` differ too: only the CLI uses them, and it takes them from the record at once, so the next `stop` or `clean_restart` uses them. `agent_director_call_timeout_ms` differs as well: the CLI takes it from the record at once, and the running server uses it from its next start. | Not affected |
 | A persona is added | Brought up exactly as at start, including the storage check (`jsonl-non-persistent`, see [Startup errors](troubleshooting.md#startup-errors)). If its credentials file or working directory is bad, it logs the same lines as at start and never affects running personas. See "A persona doesn't come up or doesn't answer" in [Troubleshooting](troubleshooting.md#troubleshooting). | New session |
 
 - **Inherited defaults.** A changed top-level `claude_config_dir` takes effect at each inheriting persona's next launch. A changed top-level `stop_hook_bootstrap` applies immediately to each inheriting persona. The preview lists those personas; a persona that sets its own value isn't affected.
@@ -152,7 +148,7 @@ Each row is one kind of change: what happens once you confirm it, and what happe
 
 ## When next-launch and server-wide changes take effect
 
-A persona's next launch happens when the bot dies (a crash or a failed health check), at a `clean_restart`, at `stop --stop-bots` then `start`, or after a host reboot. A plain `stop` and `start` reconnects to the running instance, which is not a launch. Server-wide settings take effect at the next server start, except `allow_invited_channels` and the inherited `stop_hook_bootstrap` reminder setting: both take effect when the change is confirmed, and need no `clean_restart`. The CLI takes `stop_timeout`, `exit_timeout` and `agent_director_call_timeout_ms` from the record at once; see the table.
+A persona's next launch happens when the bot dies (a crash or a failed health check), at a `clean_restart`, at `stop --stop-bots` then `start`, or after a host reboot. A plain `stop` and `start` reconnects to the running instance, which is not a launch. Server-wide settings take effect at the next server start, except `channel_mode` and the inherited `stop_hook_bootstrap` reminder setting: both take effect when the change is confirmed, and need no `clean_restart`. The CLI takes `stop_timeout`, `exit_timeout` and `agent_director_call_timeout_ms` from the record at once; see the table.
 
 To make them take effect sooner, wait for the `reload-applied` line, then run `claude-slack-channel-bots clean_restart`. It reads the bot list from the record before it stops the server, so if you run it earlier it can work from the old record. The server comes back on the record, and every bot is relaunched. Conversations resume, except that a changed `claude_config_dir` starts that persona fresh.
 
@@ -166,13 +162,13 @@ Nothing about the teardown is posted to Slack. Every notice raised for the perso
 
 ## Stale confirmations
 
-A confirmation is pinned to the exact content of `config.json` and of every credentials file it names. If any of them changed after the preview was written, nothing is applied. The confirmation is deleted, and one `reload-stale-confirmation` line is logged. The same happens for a confirmation that can't be read or isn't a pending file the server wrote.
+A confirmation is pinned to the exact content of `config.json`, the shared authority revision and every credentials file it names. If any of them changed after the preview was written, nothing is applied. The confirmation is deleted, and one `reload-stale-confirmation` line is logged. The same happens for a confirmation that can't be read or isn't a pending file the server wrote.
 
 To fix it, wait for the server to write `config.json.pending` again (within about 5 seconds), read it and rename it again. A confirmation is used once. If the same content comes back later, for example after a revert and a redo, confirm it again.
 
 ## Size limit
 
-`config.json`, the files beside it and each credentials file are read only up to 64 KiB; a larger file is treated as unreadable. The retired-key record (`retired-keys.json`) and the stored-choice file (`channel-delivery.json`) have no size cap: only the server writes them. The queue is also read in full with no size cap (`queue/<key>.jsonl`). If a very large change makes `config.json.pending` itself larger, its rename is refused as stale, so split the change into smaller edits.
+`config.json`, `config.json.last-applied`, prepared configuration and pending previews have no size cap. Each credentials file retains its independent 64 KiB limit, as do agent-director settings. The retired-key record and queue files are also read in full. A large valid configuration or preview does not need splitting.
 
 ## No reload command
 
@@ -180,4 +176,4 @@ By design, no CLI subcommand, MCP tool or HTTP endpoint applies a change: the re
 
 ## When the server can't start
 
-A confirmation needs a running server. When the record keeps the server from starting (it can't be read or is invalid, or the first start recorded a bad `port` or `bind`), fix `config.json`, delete `config.json.last-applied`, then run `claude-slack-channel-bots start`. With no record, the start applies `config.json` as it stands and shows no preview.
+A confirmation needs a running server. If the shared authority is unreadable, invalid or unresolved, preserve it, prepared input and pending evidence. Restore a trustworthy authority before starting again; do not discard it to apply an unconfirmed file.

@@ -12,8 +12,8 @@
  *   it again: C answers, and one `persona-invited-channel` line names it;
  * - Check 31: asked in the channel, C stores `all` there with
  *   `set_channel_delivery`, then answers a message that does not mention it;
- * - Check 32: the switch goes off; a mention gets no reply, and one
- *   `unclaimed-channel` line (the declarative cause) names the channel;
+ * - Check 32: strict mode preserves the shared choice and C still answers
+ *   a mention in the listed channel;
  * - Check 33: the switch goes on again, the human kicks C's app; asked by
  *   DM, C's `reply` and `fetch_messages` on the channel are refused with
  *   Slack's code, and the outcomes of `react`, `edit_message` and
@@ -41,7 +41,7 @@
  */
 
 import { describeError } from '../lib/errors.ts'
-import { INVITED_KEY, SWITCH_KEY, SWITCH_VALUE_JQ, switchFilter, switchOnFilter } from '../lib/live-config.ts'
+import { SWITCH_KEY, SWITCH_VALUE_JQ, switchFilter, switchOnFilter } from '../lib/live-config.ts'
 import { personaName, PERSONA_LETTERS } from '../lib/personas.ts'
 import { REPLY_TIMEOUT_MS, RELOAD_TIMEOUT_MS, SECOND } from '../lib/wait.ts'
 import type { CheckContext } from './context.ts'
@@ -67,6 +67,7 @@ import {
   previewHeader,
   q,
   recorded,
+  recordedCommand,
   run,
   S,
   sinceGrep,
@@ -116,15 +117,15 @@ export function personaLine(cls: string, index: number, name: string, cause: str
 
 /** src/persona-diagnostics.ts `invitedChannelCause`. */
 export function invitedChannelCause(channel: string, channelType: 'public' | 'private', delivery: 'mentions' | 'all'): string {
-  return `hears ${channelType} channel ${channel} in fungible mode, at channel delivery ${delivery}`
+  return `hears ${channelType} channel ${channel} in open mode, at channel delivery ${delivery}`
 }
 
 /** src/persona-diagnostics.ts `channelDeliverySetCause` (no stored choice before the call reads `none`, `NO_STORED_CHOICE`). */
 export function channelDeliverySetCause(
   channel: string,
-  before: 'mentions' | 'all' | undefined,
-  after: 'mentions' | 'all',
-  delivery: 'mentions' | 'all',
+  before: 'off' | 'mentions' | 'all' | 'thread_hybrid' | undefined,
+  after: 'off' | 'mentions' | 'all' | 'thread_hybrid',
+  delivery: 'off' | 'mentions' | 'all' | 'thread_hybrid',
 ): string {
   return `stored choice for channel ${channel} set from ${before ?? 'none'} to ${after}, at channel delivery ${delivery} after the loop guard`
 }
@@ -163,19 +164,19 @@ export function slackRefusalCode(tool: string, name: string, channel: string, te
 }
 
 /** src/reload-plan.ts `modeSwitchLine`: the switch's preview line, for the personas present in both configurations. */
-export function modeSwitchPreviewLine(mode: 'fungible' | 'declarative', names: readonly string[]): string {
+export function modeSwitchPreviewLine(mode: 'open' | 'strict', names: readonly string[]): string {
   const head = `server-wide setting ${SWITCH_KEY} changed: turns ${mode} mode on, applied in place at once, from the next event, tool call, prompt and notice`
   return names.length === 0 ? `${head}; no persona is affected.` : `${head}, for ${names.map(ref).join(', ')}.`
 }
 
-/** A persona's preview line when its `invited.permission_prompts` changed in place (src/reload-plan.ts's rendering of an in-place change). */
+/** A changed shared destination is an in-place update in either mode. */
 export function invitedInPlaceLine(name: string): string {
-  return `persona ${ref(name)}: invited.permission_prompts changed: applied in place immediately, instance kept.`
+  return `persona ${ref(name)}: permission_prompts changed: applied in place immediately, instance kept.`
 }
 
-/** src/reload-plan.ts `recordedLine` for a changed `invited` section while the candidate is in declarative mode. */
+/** Shared destinations have no dormant mode-specific record. */
 export function invitedRecordedLine(name: string): string {
-  return `persona ${ref(name)}: ${INVITED_KEY} changed in the fungible section: recorded, with no effect until ${SWITCH_KEY} selects fungible mode.`
+  return invitedInPlaceLine(name)
 }
 
 /** src/reload-plan.ts's preview of a change with no effect (`PENDING_PREVIEW_TITLE`, `NO_EFFECTIVE_CHANGE`). */
@@ -202,39 +203,28 @@ export function invitedPersonas(names: readonly string[]): string[] {
 
 /** Check 30's preview and applied counts for config.json naming `names`. Pure. */
 export function switchOnPreview(names: readonly string[]): { preview: string[]; counts: { in_place: number; settings: number } } {
-  const touched = invitedPersonas(names)
-  const counts = { in_place: touched.length, settings: 1 }
-  return { preview: [previewHeader(counts), ...touched.map(invitedInPlaceLine), modeSwitchPreviewLine('fungible', names)], counts }
+  const counts = { in_place: 0, settings: 1 }
+  return { preview: [previewHeader(counts), modeSwitchPreviewLine('open', names)], counts }
 }
 
 /** The preview of an edit of the switch alone (Checks 32 and 33), for config.json naming `names`. Pure. */
 export function switchOnlyPreview(on: boolean, names: readonly string[]): string[] {
-  return [previewHeader({ settings: 1 }), modeSwitchPreviewLine(on ? 'fungible' : 'declarative', names)]
+  return [previewHeader({ settings: 1 }), modeSwitchPreviewLine(on ? 'open' : 'strict', names)]
 }
 
-/** A configuration file as Check 34 compares two: the switch, and each persona's name and `invited` section (as JSON). */
+/** Mode and continuing persona identities for Check 34's mode-only restore. */
 export interface ConfigView {
   on: boolean
-  personas: { name: string; invited: string }[]
+  personas: { name: string }[]
 }
 
-/**
- * Check 34's restore of `copy` over the applied `record`: the preview the server writes and the line its confirmation
- * logs, worked out from the state Checks 30–33 left. The personas present in
- * both whose `invited` section differs are recorded (the copy, in
- * declarative mode, has none). With the switch changed, the header counts
- * one server-wide setting, then the recorded lines and the switch's line,
- * and the apply logs `reload-applied`; with the switch already as the copy
- * has it, the no-effective-change preview with the recorded lines, confirmed
- * as `reload-noop`. Pure.
- */
+/** Restore never interprets copied shared choices as new assignments. */
 export function restorePreview(copy: ConfigView, record: ConfigView): { preview: string[]; outcome: string } {
-  const applied = new Map(record.personas.map((p) => [p.name, p.invited]))
-  const both = copy.personas.filter((p) => applied.has(p.name))
-  const recordedLines = both.filter((p) => applied.get(p.name) !== p.invited).map((p) => invitedRecordedLine(p.name))
-  if (copy.on === record.on) return { preview: [NO_EFFECTIVE_CHANGE_PREVIEW, ...recordedLines], outcome: noopLine() }
+  if (copy.on === record.on) return { preview: [NO_EFFECTIVE_CHANGE_PREVIEW], outcome: noopLine() }
+  const applied = new Set(record.personas.map(p => p.name))
+  const both = copy.personas.filter(p => applied.has(p.name))
   return {
-    preview: [previewHeader({ settings: 1 }), ...recordedLines, modeSwitchPreviewLine(copy.on ? 'fungible' : 'declarative', both.map((p) => p.name))],
+    preview: [previewHeader({ settings: 1 }), modeSwitchPreviewLine(copy.on ? 'open' : 'strict', both.map(p => p.name))],
     outcome: appliedLine({ settings: 1 }),
   }
 }
@@ -257,15 +247,23 @@ async function configNames(ctx: CheckContext): Promise<string[]> {
 }
 
 /** `file`'s switch and personas (`ConfigView`), or null when it cannot be read. */
-async function configView(ctx: CheckContext, file: string): Promise<ConfigView | null> {
-  const out = await lines(ctx, `jq -c ${q(`{on: ${SWITCH_VALUE_JQ}, personas: [.personas[] | {name, invited: (.${INVITED_KEY} | tojson)}]}`)} ${file}`)
+async function configView(ctx: CheckContext, file: string, authority = false): Promise<ConfigView | null> {
+  const projection = `${authority ? '.applied | ' : ''}{on: ${SWITCH_VALUE_JQ}, personas: [.personas[] | {name}]}`
+  const out = await lines(ctx, `jq -c ${q(projection)} ${file}`)
   const v = jsonLines<ConfigView>(out)[0]
   return v && typeof v.on === 'boolean' && Array.isArray(v.personas) ? v : null
 }
 
-/** Whether the switch is on in the last-applied record. */
+/** Read applied mode from the sole authority, never an unconfirmed source edit. */
 async function switchOnInRecord(ctx: CheckContext): Promise<boolean> {
-  return (await lines(ctx, `jq -c ${q(SWITCH_VALUE_JQ)} "$S/config.json.last-applied"`))[0] === 'true'
+  return (await lines(ctx, `jq -c ${q(`.applied | ${SWITCH_VALUE_JQ}`)} "$S/config.json.last-applied"`))[0] === 'true'
+}
+
+/** C's durable shared choice, including choices absent from the submitted source. */
+async function sharedChoice(ctx: CheckContext, channel: string): Promise<'off' | 'mentions' | 'all' | 'thread_hybrid' | undefined> {
+  const filter = `.applied.personas[] | select(.name == ${JSON.stringify(personaName('c'))}) | .channels[]? | select(.id == ${JSON.stringify(channel)}) | .delivery`
+  const value = (await lines(ctx, `jq -r ${q(filter)} "$S/config.json.last-applied"`))[0]
+  return value === 'off' || value === 'mentions' || value === 'all' || value === 'thread_hybrid' ? value : undefined
 }
 
 /** C's line of `cls` with `cause`, at C's index in config.json (`names`). */
@@ -357,7 +355,7 @@ export const check30: CheckDef<CheckContext> = {
     const f = new Findings()
     const ids = ctx.ids
     const human = needHuman(ctx)
-    const ready = await run(ctx, 'guard && cmp -s "$S/config.json" "$S/config.json.last-applied" && [ ! -e "$S/config.json.pending" ] && kill -0 "$(cat "$S/server.pid")" && echo READY')
+    const ready = await run(ctx, `guard && ${recordedCommand()} && [ ! -e "$S/config.json.pending" ] && kill -0 "$(cat "$S/server.pid")" && echo READY`)
     if (!f.expect(ready.out.includes('READY'), 'not in the applied, nothing-pending, running state; nothing was changed')) return f.result()
     const copied = await guarded(ctx, `cp "$S/config.json" ${CONFIG_COPY} && echo COPIED`)
     if (!f.expect(copied.ok && copied.out.includes('COPIED'), 'config.json could not be copied; nothing was changed')) return f.result()
@@ -408,6 +406,7 @@ export const check31: CheckDef<CheckContext> = {
     const f = new Findings()
     const names = await configNames(ctx)
     const m = await mark(ctx)
+    const previousChoice = await sharedChoice(ctx, ch.id)
     const before = await callCount(ctx, SET_CHANNEL_DELIVERY_TOOL, ch.id)
     const o = await askC(
       ctx,
@@ -428,8 +427,8 @@ export const check31: CheckDef<CheckContext> = {
       f.add(`refusal: ${call.error.slice(0, 300)}`)
     }
     const set = await cLinesOf(ctx, m, CHANNEL_DELIVERY_SET_CLASS, ch.id)
-    const want = cLine(names, CHANNEL_DELIVERY_SET_CLASS, channelDeliverySetCause(ch.id, undefined, 'all', 'all'))
-    f.expect(set.length === 1 && set[0]!.includes(want), `expected one ${CHANNEL_DELIVERY_SET_CLASS} line naming C and the run channel (none to all, at all), found ${set.length}`)
+    const want = cLine(names, CHANNEL_DELIVERY_SET_CLASS, channelDeliverySetCause(ch.id, previousChoice, 'all', 'all'))
+    f.expect(set.length === 1 && set[0]!.includes(want), `expected one ${CHANNEL_DELIVERY_SET_CLASS} line naming C and the run channel (${previousChoice ?? 'none'} to all, at all), found ${set.length}`)
     const plain = await askAndWait(ctx, ch.id, 'Whoever is listening in this channel: reply here with the word heard-all.', 'c', 'heard-all')
     f.add(`TS_PLAIN ${plain.ts}`)
     f.expect(plain.reply !== null, 'C did not answer the message that does not mention it')
@@ -443,7 +442,7 @@ export const check31: CheckDef<CheckContext> = {
 
 export const check32: CheckDef<CheckContext> = {
   id: '32',
-  title: "Check 32: with the switch off and C's app still in the channel, a mention is not delivered, and one unclaimed-channel line says so",
+  title: "Check 32: switching to strict mode preserves C's shared choice and delivery in the channel",
   needs: LIVE,
   row: '32',
   async run(ctx) {
@@ -453,6 +452,8 @@ export const check32: CheckDef<CheckContext> = {
     const human = needHuman(ctx)
     if (!f.expect(await switchOnInRecord(ctx), 'the switch is not on in the last-applied record, so there is nothing to switch off')) return f.result()
     const names = await configNames(ctx)
+    const previousChoice = await sharedChoice(ctx, ch.id)
+    if (!f.expect(previousChoice !== undefined && previousChoice !== 'off', 'C has no active shared choice in the run channel')) return f.result()
     const m = await mark(ctx)
     const out = await confirmedEdit(ctx, f, m, switchFilter(false), switchOnlyPreview(false, names))
     expectApplied(f, out.appliedLines, { settings: 1 })
@@ -460,12 +461,12 @@ export const check32: CheckDef<CheckContext> = {
     const ts = await human.post(ch.id, `${mention(ctx, 'c')} the switch is off: reply here with the word off-check.`)
     f.add(`TS ${ts}`)
     const reply = await human.waitForBotMessage(ch.id, bot(ctx, 'c'), ts, () => true, REPLY_TIMEOUT_MS)
-    f.expect(reply === null, 'C answered in the run channel with the switch off')
+    f.expect(reply !== null, 'C did not answer the mention with its retained shared choice in strict mode')
+    f.expect(await sharedChoice(ctx, ch.id) === previousChoice, 'the mode change altered C\'s shared choice')
     const unclaimed = await cLinesOf(ctx, m2, UNCLAIMED_CHANNEL_CLASS, ch.id)
-    const want = cLine(names, UNCLAIMED_CHANNEL_CLASS, unclaimedChannelCause(ch.id))
     f.expect(
-      unclaimed.length === 1 && unclaimed[0]!.includes(want),
-      `expected one ${UNCLAIMED_CHANNEL_CLASS} line with the declarative cause naming C and the run channel, found ${unclaimed.length}`,
+      unclaimed.length === 0,
+      `a listed shared channel was reported unclaimed in strict mode (${unclaimed.length} lines)`,
     )
     return f.result()
   },
@@ -614,9 +615,9 @@ async function restoreConfig(ctx: CheckContext, f: Findings, copy: string): Prom
   const g = await guarded(ctx, 'true')
   if (!f.expect(g.ok, 'config: the guard refused')) return
   const copyView = await configView(ctx, copy)
-  const recordView = await configView(ctx, '"$S/config.json.last-applied"')
+  const recordView = await configView(ctx, '"$S/config.json.last-applied"', true)
   if (!f.expect(copyView !== null && recordView !== null, 'config: the copy or the last-applied record could not be read')) return
-  const neverConfirmed = (await run(ctx, `cmp -s ${copy} "$S/config.json.last-applied"`)).code === 0
+  const neverConfirmed = await recorded(ctx, copy)
   const pendingBefore = await fileExists(ctx, '"$S/config.json.pending"')
   // A pending file already there is an earlier edit's: its fingerprint is noted so the
   // restore's own file (a new fingerprint) is the one read and confirmed. With config.json

@@ -112,7 +112,7 @@ const PUBLIC_CHANNEL_TYPE = 'channel'
 const PRIVATE_CHANNEL_TYPE = 'group'
 
 /** The channel mode in which the fungible path applies. */
-const FUNGIBLE_MODE: ChannelMode = 'fungible'
+const FUNGIBLE_MODE: ChannelMode = 'open'
 
 /** The channel delivery that hears every message. */
 const DELIVERY_ALL: DeliveryMode = 'all'
@@ -182,6 +182,8 @@ export type DeliveryDropReason =
   | 'group-dm'
   | 'channel-not-configured'
   | 'not-mentioned'
+  | 'channel-off'
+  | 'state-unavailable'
 
 /**
  * The drop reason of a fungible-mode event that did not take the fungible
@@ -368,6 +370,7 @@ export function decideDelivery(
     return { action: 'drop', reason: 'channel-not-configured', unclaimed: !claimed }
   }
 
+  if (entry.delivery === 'off') return { action: 'drop', reason: 'channel-off' }
   const text = ev['text']
   if (mentionsPersona(text, persona.botUserId)) return { action: 'deliver', via: 'mention' }
   if (hasBroadcast(text)) return { action: 'deliver', via: 'broadcast' }
@@ -392,10 +395,12 @@ function decideFungibleChannel(
   const refusal = fungibleRefusalOf(channelType, channel, inputs)
   if (refusal !== undefined) return { action: 'drop', reason: 'fungible-refused', refusal }
 
+  if (inputs.storedChoices?.readable === false) return { action: 'drop', reason: 'state-unavailable' }
   const path: FungiblePath = {
     channelType: channelType === PUBLIC_CHANNEL_TYPE ? 'public' : 'private',
     channelDelivery: channelDeliveryFor(persona.key, channel, inputs).delivery,
   }
+  if (path.channelDelivery === 'off') return { action: 'drop', reason: 'channel-off', fungible: path }
   const text = ev['text']
   if (mentionsPersona(text, persona.botUserId)) return { action: 'deliver', via: 'mention', fungible: path }
   if (hasBroadcast(text)) return { action: 'deliver', via: 'broadcast', fungible: path }
@@ -447,10 +452,11 @@ export function channelDeliveryFor(
 ): ChannelDeliveryResult {
   const held = inputs.fungibleDestinations.some((other) =>
     other.key !== key && other.destination !== DM_DESTINATION_VALUE && other.destination === channel)
-  if (held) return { delivery: DELIVERY_MENTIONS, heldByLoopGuard: true }
   const store = inputs.storedChoices
   const stored = store !== undefined && store.readable ? store.storedChoice(key, channel) : undefined
-  return { delivery: stored === DELIVERY_ALL ? DELIVERY_ALL : DELIVERY_MENTIONS, heldByLoopGuard: false }
+  if (stored === 'off') return { delivery: 'off', heldByLoopGuard: false }
+  if (held) return { delivery: DELIVERY_MENTIONS, heldByLoopGuard: true }
+  return { delivery: stored ?? 'off', heldByLoopGuard: false }
 }
 
 /** step 2: the author is P's bot user, or the event carries P's bot ID. */

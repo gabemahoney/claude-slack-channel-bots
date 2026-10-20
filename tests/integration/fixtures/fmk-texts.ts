@@ -3819,34 +3819,20 @@ async function checkDeliveryArgument(context: EntryContext, entry: string, name:
   if (!modes.includes(value)) usageFail(`${entry}: <${name}> must be one of ${modes.join(', ')} (got '${value}')`)
 }
 
-/** `CHANNEL_DELIVERY_DIAGNOSTIC_CLASSES` (channel-delivery.ts): the store's own class labels, one per line, in its order. No argument. */
-const channelDeliveryDiagnosticClasses: Entry = {
-  synopsis: '',
-  async print(args, context) {
-    const entry = 'CHANNEL_DELIVERY_DIAGNOSTIC_CLASSES'
-    expectArguments(entry, args, [])
-    const classes = await packageExport(context, 'channel-delivery.ts', entry)
-    if (!Array.isArray(classes) || classes.length === 0 || !classes.every((c) => typeof c === 'string' && c !== '' && !c.includes('\n'))) {
-      fail(PRINTER_FAIL_EXIT, `the installed package's src/channel-delivery.ts export ${entry} is not a non-empty list of one-line strings`)
-    }
-    return (classes as readonly string[]).join('\n')
-  },
-}
-
 /**
  * `channelModeOf({ <MODE_SWITCH_SETTING>: <true|false> })` (config.ts): the
  * name of the mode the switch's value picks, the switch keyed by the
  * package's MODE_SWITCH_SETTING (reload-plan.ts).
  */
 const channelModeOfSwitch: Entry = {
-  synopsis: '<true|false>',
+  synopsis: '<strict|open>',
   async print(args, context) {
     const entry = 'channelModeOf'
-    expectArguments(entry, args, ['true|false'])
+    expectArguments(entry, args, ['strict|open'])
     const [value] = args
-    if (value !== 'true' && value !== 'false') usageFail(`${entry}: the switch's value must be true or false (got '${value}')`)
-    const modeOf = await packageFunction<(config: Record<string, boolean>) => unknown>(context, 'config.ts', entry)
-    return builtString(entry, modeOf({ [await packageString(context, 'reload-plan.ts', 'MODE_SWITCH_SETTING')]: value === 'true' }))
+    if (value !== 'strict' && value !== 'open') usageFail(`${entry}: the mode must be strict or open`)
+    const modeOf = await packageFunction<(config: Record<string, string>) => unknown>(context, 'config.ts', entry)
+    return builtString(entry, modeOf({ [await packageString(context, 'reload-plan.ts', 'MODE_SWITCH_SETTING')]: value! }))
   },
 }
 
@@ -4116,8 +4102,6 @@ const ENTRIES: Readonly<Record<string, Entry>> = joinEntryTables({
   channelModeOf: channelModeOfSwitch,
   MODE_SWITCH_SETTING: constantEntry('reload-plan.ts', 'MODE_SWITCH_SETTING'),
   CHANNEL_DELIVERY_FILE_NAME: constantEntry('channel-delivery.ts', 'CHANNEL_DELIVERY_FILE_NAME'),
-  CHANNEL_DELIVERY_LOG_PREFIX: constantEntry('channel-delivery.ts', 'CHANNEL_DELIVERY_LOG_PREFIX'),
-  CHANNEL_DELIVERY_DIAGNOSTIC_CLASSES: channelDeliveryDiagnosticClasses,
   formatPersonaDiagnostic: personaDiagnosticLine,
 }, argsEntries(ARGS_ENTRIES), fnEntries(FN_ENTRIES))
 

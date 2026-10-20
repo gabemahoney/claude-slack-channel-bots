@@ -96,6 +96,7 @@
  */
 
 import { createHash } from 'node:crypto'
+import { createSharedChannelAuthority, initialSharedChannelState, parseSharedChannelState, sharedAppliedConfig, serializeSharedChannelState, type SharedChannelAuthority, type SharedChannelState } from './shared-channels.ts'
 import { dirname, resolve } from 'node:path'
 import {
   durableUnlinkSync,
@@ -104,15 +105,13 @@ import {
   DurableWriteUnsyncedError,
 } from './atomic-write.ts'
 import {
-  CHANNEL_DELIVERY_DROP_RETIRED,
-  CHANNEL_DELIVERY_WRITE_FAILED,
-  type ChannelDeliveryDrop,
   type ChannelDeliveryStore,
 } from './channel-delivery.ts'
 import {
   configFileReadFailureMessage,
   configReadFailurePredicate,
   credentialsFilesToProtect,
+  DEFAULT_PERSONA_CONFIG_FS,
   isMissingConfigCode,
   parsePersonaConfigBytes,
   PersonaConfigReadError,
@@ -492,24 +491,7 @@ export interface ReloadControllerDeps {
    * too, and a test builds it over the writer (and delete) it gives here.
    */
   retiredKeys: RetiredKeyStore
-  /**
-   * The server's stored-choice store (`src/channel-delivery.ts`
-   *): production passes an accessor over the one store `main()`
-   * loaded after the start resolution, which is why it is an accessor and
-   * not a value. The controller calls it once per confirmed apply, on the
-   * valid-plan path, before step 1's first write, and uses that store for
-   * the whole apply; nothing else calls it (not building the controller,
-   * `resolveStart`, `runStartBringUp`, a detection pass or the preview).
-   * Through it step 1 writes the unwritten drops of a key it brings up before
-   * any other write, and fails closed when that write fails (
-   * beside); drops the stored choices of every key it retires
-   * once the last-applied rewrite has succeeded; and marks
-   * each destructive modify's key as retiring, clearing it once step 2 has
-   * settled, all beside
-   * In production its writes reach the disk through
-   * `durableWriteFileSync`; a test builds it over the writer seam the
-   * reload harness gives.
-   */
+  /** The read/write adapter over this controller's recovered authority. It owns only the in-memory retiring-session guard; configuration and identity application use one atomic authority write. */
   channelDelivery: () => ChannelDeliveryStore
   /**
    * Stop delivery running for a key apply step 1 recorded as
@@ -585,7 +567,7 @@ export interface ReloadControllerDeps {
    * right after the record was rewritten and in the same synchronous step as
    * the controller's own swap. Production
    * reassigns the server's `personaConfig` to `configInEffect`: the new
-   * persona set and its `allow_invited_channels` switch, with every other
+   * persona set and its `channel_mode` switch, with every other
    * server-wide value kept from start time; the bring-up controller's applied
    * set, the reply reminder and every consumer of the channel mode read it
    * from there. A throw is logged; the apply goes on.
@@ -620,7 +602,7 @@ export interface ReloadControllerDeps {
 /**
  * The configuration the server runs once a confirmed apply's step 1 made
  * `applied` current (the server-wide row):
- * `applied`'s persona set and its `allow_invited_channels` switch over every
+ * `applied`'s persona set and its `channel_mode` switch over every
  * other server-wide setting of `startTime`, the configuration the server
  * started with. A changed server-wide setting (the listener's `bind` and
  * `port`, the restart delay, `resume_enabled`, the cron paths, …) is
@@ -639,7 +621,7 @@ export interface ReloadControllerDeps {
  * is mutated.
  */
 export function configInEffect(startTime: PersonaConfig, applied: PersonaConfig): PersonaConfig {
-  return { ...startTime, allow_invited_channels: applied.allow_invited_channels, personas: applied.personas }
+  return { ...startTime, channel_mode: applied.channel_mode, personas: applied.personas }
 }
 
 // ---------------------------------------------------------------------------
@@ -714,6 +696,7 @@ export interface AppliedConfiguration {
   /** The bytes that were read and validated; the record holds exactly these. */
   bytes: Uint8Array
   source: AppliedConfigSource
+  sharedState?: SharedChannelState
 }
 
 /** The outcome of `resolveStart`. */
@@ -741,13 +724,13 @@ type Selection =
   | { ok: false; source: AppliedConfigSource; message: string }
 
 /**
- * `cause` followed by the deletion hint: names the record and says that
- * deleting it makes the next start apply the configuration file.
+ * `cause` followed by the recovery hint: retain both authority and prepared
+ * input so an operator can restore trustworthy evidence without guessing.
  */
 function recordFailureMessage(paths: ReloadFilePaths, cause: string): string {
   return (
-    `${cause} Deleting the last-applied record "${paths.lastApplied}" makes the next start ` +
-    `apply the configuration file "${paths.config}" as it stands.`
+    `${cause} Preserve the shared channel authority "${paths.lastApplied}" and prepared configuration ` +
+    `"${paths.config}"; restore trustworthy authority evidence before starting again.`
   )
 }
 
@@ -783,6 +766,12 @@ function selectConfiguration(
   }
   if (recordBytes !== undefined) {
     try {
+      const sharedState = parseSharedChannelState(recordBytes, paths.lastApplied, { home })
+      if (sharedState !== undefined) {
+        const config = sharedAppliedConfig(sharedState, paths.lastApplied, { home })
+        const bytes = Buffer.from(sharedState.sourceBytesBase64, 'base64')
+        return { ok: true, applied: { config, bytes, source: 'record', sharedState } }
+      }
       const config = parsePersonaConfigBytes(recordBytes, paths.lastApplied, configDir, { home, record: true })
       return { ok: true, applied: { config, bytes: recordBytes, source: 'record' } }
     } catch (err) {
@@ -833,6 +822,7 @@ interface PendingState {
   plan: ChangePlan
   /** The fingerprint of the bytes this pass read. */
   fingerprint: string
+  authorityRevision?: number
   /** A change is pending: the configuration changed or any credentials changed. */
   pending: boolean
 }
@@ -871,6 +861,7 @@ interface PendingDetection {
 
 /** What the detection tick asks of the controller that owns the applied state. */
 interface PendingDetectionHost {
+  sharedChannels?(): SharedChannelAuthority | undefined
   /** The applied configuration now; read at the start of every derivation, so a swap is seen at once. */
   applied(): AppliedConfiguration
   /**
@@ -885,7 +876,7 @@ interface PendingDetectionHost {
 /** The confirmation as the tick found it. */
 type ConfirmationRead =
   | { kind: 'absent' }
-  | { kind: 'bytes'; bytes: Buffer }
+  | { kind: 'bytes'; bytes: Buffer; fileIdentity: string }
   | { kind: 'unreadable'; code: string | undefined }
 
 /**
@@ -984,6 +975,12 @@ function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetecti
   let applied = host.applied()
   /** The identity of a confirmation acted on once that could not be deleted. */
   let ignoredConfirmation: string | undefined
+  /**
+   * Suppress a failed activation's retained confirmation in this controller
+   * until a fresh gesture. After restart, an unconsumed confirmation may still
+   * authorize an apply after revalidation against the recovered state.
+   */
+  let failedConfirmation: string | undefined
 
   let factFailureLatched = false
   /** A fact the preview needs could not be gathered in this pass. */
@@ -1004,7 +1001,8 @@ function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetecti
     if (!read.ok) return { kind: 'unreadable', path: paths.config, missing: read.missing, code: read.code }
     if (!configChanged) return { kind: 'valid', config: applied.config }
     try {
-      return { kind: 'valid', config: parsePersonaConfigBytes(read.bytes, paths.config, configDir, { home: deps.home }) }
+      const authority = host.sharedChannels?.()
+      return { kind: 'valid', config: authority ? authority.previewReviewed(read.bytes) : parsePersonaConfigBytes(read.bytes, paths.config, configDir, { home: deps.home }) }
     } catch (err) {
       return { kind: 'invalid', error: errorMessage(err) }
     }
@@ -1085,7 +1083,7 @@ function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetecti
   function derive(): PendingState {
     applied = host.applied()
     const read = readConfigFile(paths.config, deps.configFs)
-    const configChanged = !read.ok || !read.bytes.equals(applied.bytes)
+    const configChanged = !read.ok || !read.bytes.equals(Buffer.from(applied.bytes))
     const candidate = candidateOf(read, configChanged)
 
     const credentialsReads = new Map<string, CredentialsFileRead>()
@@ -1149,7 +1147,7 @@ function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetecti
     const plan = buildChangePlan(applied.config, candidate, facts)
     if (!factFailed) factFailureLatched = false
 
-    const fingerprint = reloadFingerprint(fingerprintContentOf(read), entries)
+    const fingerprint = reloadFingerprint(fingerprintContentOf(read), entries, host.sharedChannels?.()?.revision)
     const credentialsChanged = plan.valid && plan.credentials.length > 0
     return {
       bytes: read.ok ? read.bytes : undefined,
@@ -1157,6 +1155,7 @@ function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetecti
       configChanged,
       plan,
       fingerprint,
+      authorityRevision: host.sharedChannels?.()?.revision,
       pending: configChanged || credentialsChanged,
     }
   }
@@ -1263,7 +1262,17 @@ function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetecti
   /** The confirmation, read once and stat-first, or why there is none. Never throws. */
   function readConfirmation(): ConfirmationRead {
     try {
-      return { kind: 'bytes', bytes: readPersonaConfigBytes(paths.apply, deps.configFs) }
+      let fileIdentity = ''
+      const fstat = deps.configFs?.fstatFile ?? DEFAULT_PERSONA_CONFIG_FS.fstatFile
+      const bytes = readPersonaConfigBytes(paths.apply, {
+        ...deps.configFs,
+        fstatFile(fd) {
+          const stat = fstat(fd)
+          fileIdentity = JSON.stringify([stat.dev, stat.ino, stat.ctimeMs, stat.mtimeMs])
+          return stat
+        },
+      })
+      return { kind: 'bytes', bytes, fileIdentity }
     } catch (err) {
       const code = err instanceof PersonaConfigReadError ? err.code : undefined
       return isMissingConfigCode(code) ? { kind: 'absent' } : { kind: 'unreadable', code }
@@ -1301,27 +1310,30 @@ function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetecti
 
   /**
    * Process `config.json.apply` against this pass's `state`:
-   * read it, delete it, then apply on a fingerprint match or log one
-   * `reload-stale-confirmation` line. Resolves whether the applied state
-   * changed.
+   * keep its evidence through activation, then consume it on success or an
+   * invalid/stale review. A failed activation retains the file and waits for
+   * a fresh file or content before another attempt. Resolves whether the
+   * applied state changed.
    */
   async function processConfirmation(state: PendingState): Promise<boolean> {
     const confirmation = readConfirmation()
     if (confirmation.kind === 'absent') {
       ignoredConfirmation = undefined
+      failedConfirmation = undefined
       return false
     }
     const identity =
       confirmation.kind === 'bytes'
         ? createHash('sha256').update(confirmation.bytes).digest('hex')
         : UNREADABLE_CONFIRMATION_IDENTITY
+    const attemptIdentity = confirmation.kind === 'bytes' ? identity + confirmation.fileIdentity : identity
+    if (attemptIdentity === failedConfirmation) return false
+    failedConfirmation = undefined
     if (identity === ignoredConfirmation) {
       // Acted on once already: only retry the delete, silently.
       if (removeConfirmation(true)) ignoredConfirmation = undefined
       return false
     }
-    ignoredConfirmation = removeConfirmation(false) ? undefined : identity
-
     let stale: StaleConfirmationReason | undefined
     if (confirmation.kind === 'unreadable') {
       stale = { kind: 'unreadable', code: confirmation.code }
@@ -1331,10 +1343,14 @@ function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetecti
       else if (fingerprint !== state.fingerprint) stale = { kind: 'mismatch' }
     }
     if (stale !== undefined) {
+      ignoredConfirmation = removeConfirmation(false) ? undefined : identity
       deps.log(renderStaleConfirmationLogLine(paths.apply, stale))
       return false
     }
     const changed = await host.applyConfirmed(state)
+    if (stopped) return changed
+    if (changed || !state.plan.valid) ignoredConfirmation = removeConfirmation(false) ? undefined : identity
+    else failedConfirmation = attemptIdentity
     // A confirmed invalid candidate has had its one `reload-invalid` line:
     // count it as logged, so this pass's pending refresh does not log the
     // pending-time line for the same candidate (the first pass after a start
@@ -1401,6 +1417,7 @@ export interface ReloadController {
    * the configuration; a second call throws.
    */
   resolveStart(): ReloadStartOutcome
+  sharedChannels(): SharedChannelAuthority | undefined
   /**
    * The start bring-up pass over the applied set, through the injected
    * `lifecycle.startBringUp`. Call once, after `resolveStart` returned
@@ -1468,6 +1485,7 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
     )
   let phase: StartPhase = 'unresolved'
   let appliedState: AppliedConfiguration | undefined
+  let sharedChannels: SharedChannelAuthority | undefined
 
   /**
    * Whether a persona is broken by its credentials now, for apply steps 4 and
@@ -1484,6 +1502,7 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
   }
   let detection: PendingDetection | undefined
   let detectionStopped = false
+  let applyingReviewed = false
 
   function refuse(source: AppliedConfigSource, cls: ReloadDiagnosticClass | undefined, line: string): ReloadStartOutcome {
     phase = 'refused'
@@ -1499,32 +1518,24 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
       return refuse(selection.source, undefined, prefix + selection.message)
     }
     const { applied } = selection
-    if (applied.source === 'config') {
-      try {
-        write(paths.lastApplied, applied.bytes)
-      } catch (err) {
-        if (err instanceof DurableWriteUnsyncedError) {
-          // The rename happened: the record is on disk and the next start runs
-          // it. Say so, rather than "cannot write".
-          return refuse(
-            'config',
-            RELOAD_RECORD_WRITE_FAILED,
-            `[slack] ${RELOAD_RECORD_WRITE_FAILED}: the last-applied record "${paths.lastApplied}" was written but its ` +
-              `directory could not be synced${errnoSuffix(err)}, so it may not survive a crash, and the next start ` +
-              `will run it; the server does not start`,
-          )
-        }
-        return refuse(
-          'config',
-          RELOAD_RECORD_WRITE_FAILED,
-          `[slack] ${RELOAD_RECORD_WRITE_FAILED}: cannot write the last-applied record "${paths.lastApplied}"` +
-            `${errnoSuffix(err)}; the server does not start and nothing is applied`,
-        )
+    const sharedState = applied.sharedState ?? initialSharedChannelState(applied.bytes, applied.config)
+    if (applied.sharedState === undefined) {
+      try { write(paths.lastApplied, serializeSharedChannelState(sharedState)) }
+      catch (err) {
+        const outcome = err instanceof DurableWriteUnsyncedError
+          ? '; the authority was renamed but its directory could not be synced, so the durable outcome is unresolved' : ''
+        return refuse(applied.source, RELOAD_RECORD_WRITE_FAILED,
+          `[slack] ${RELOAD_RECORD_WRITE_FAILED}: cannot durably establish the shared channel authority ${JSON.stringify(paths.lastApplied)}${errnoSuffix(err)}${outcome}; preserve the prepared configuration and authority evidence; the server does not start`)
       }
-      deps.log(`[slack] No last-applied record: recorded the configuration file "${paths.config}" as "${paths.lastApplied}"`)
-    } else {
-      deps.log(`[slack] Starting from the last-applied record "${paths.lastApplied}"`)
     }
+    sharedChannels = createSharedChannelAuthority(paths.lastApplied, sharedState, { write, home: deps.home, sourcePath: paths.config })
+    sharedChannels.subscribe(config => {
+      // Reviewed activation establishes old-life guards before notifying consumers.
+      if (applyingReviewed) return
+      if (appliedState !== undefined) appliedState = { config, bytes: sharedChannels!.sourceBytes(), source: 'record' }
+      notifyApplied(config)
+    })
+    deps.log(`[slack] Starting from the shared channel authority "${paths.lastApplied}" at revision ${sharedChannels.revision}`)
     phase = 'applied'
     appliedState = applied
     return { kind: 'applied', ...applied }
@@ -1539,42 +1550,6 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
       await lifecycle.startBringUp(appliedState.config)
     } finally {
       phase = 'brought-up'
-    }
-  }
-
-  /**
-   * Step 1's rewrite of the last-applied record: the candidate bytes, byte for byte, through the durable
-   * writer. Answers undefined when it succeeded. On a failure before the
-   * rename the old record is intact; on a directory-sync failure after it the
-   * previous bytes are written back (best effort). Either way it answers the
-   * `reload-record-write-failed` line, unlogged, for the caller to complete
-   * with the retired-key record's restore and log once; the caller leaves the
-   * applied state as it was, so the change stays pending.
-   */
-  function writeRecord(bytes: Uint8Array, previous: Uint8Array): string | undefined {
-    const record = JSON.stringify(paths.lastApplied)
-    const notApplied = 'the confirmed change is not applied and stays pending'
-    try {
-      write(paths.lastApplied, bytes)
-      return undefined
-    } catch (err) {
-      if (!(err instanceof DurableWriteUnsyncedError)) {
-        return `[slack] ${RELOAD_RECORD_WRITE_FAILED}: cannot write the last-applied record ${record}${errnoSuffix(err)}; ${notApplied}`
-      }
-      let restored: string
-      try {
-        write(paths.lastApplied, previous)
-        restored = 'the previous record was written back'
-      } catch (restoreErr) {
-        restored =
-          restoreErr instanceof DurableWriteUnsyncedError
-            ? 'the previous record was written back, though its directory could not be synced either'
-            : `writing the previous record back failed too${errnoSuffix(restoreErr)}, so the next start may run the unapplied change`
-      }
-      return (
-        `[slack] ${RELOAD_RECORD_WRITE_FAILED}: wrote the last-applied record ${record} but could not sync its ` +
-        `directory${errnoSuffix(err)}; ${restored}; ${notApplied}`
-      )
     }
   }
 
@@ -1638,45 +1613,6 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
       } catch (err) {
         deps.log(`[slack] reload: beginning the old-life hold of ${begin.instanceId} failed: ${describeThrownValue(err)}`)
       }
-    }
-  }
-
-  /**
-   * Step 1's first write (beside): when a key the
-   * plan brings up (`plan.added`, a key-changing rename's new key included,
-   * and `plan.destructive`'s new halves) has an unwritten drop in
-   * `channelDelivery`, write the record the store holds in memory, once.
-   * Answers false only when that write failed (an unsynced rename included);
-   * the store has then logged its own line with the error code. Writes
-   * nothing when no such key has an unwritten drop, or when the store is
-   * unreadable. A successful write carries only drops already in force, so
-   * nothing later in step 1 undoes it.
-   */
-  function writeDropsBeforeBringUp(channelDelivery: ChannelDeliveryStore, plan: ValidChangePlan): boolean {
-    if (!channelDelivery.readable) return true
-    const broughtUp = [...plan.added, ...plan.destructive].map(({ key }) => key)
-    if (!broughtUp.some((key) => channelDelivery.hasUnwrittenDrop(key))) return true
-    return channelDelivery.writeUnwrittenDrops() !== CHANNEL_DELIVERY_WRITE_FAILED
-  }
-
-  /**
-   * Drop the stored choices of every key the apply retires,
-   * once the last-applied rewrite has succeeded: each removed persona's key
-   * (a key-changing rename's old key included) and each destructive modify's
-   * key, the keys `retiredKeysToRecord` records as `removed` and
-   * `destructive-modify`, in one batch with the retired reason. A failed
-   * write is the store's own line and leaves an unwritten drop; a throw is
-   * logged, never raised: the apply goes on.
-   */
-  function dropRetiredChoices(channelDelivery: ChannelDeliveryStore, plan: ValidChangePlan): void {
-    const batch = [...plan.removed, ...plan.destructive].map(
-      ({ key }): ChannelDeliveryDrop => ({ key, reason: CHANNEL_DELIVERY_DROP_RETIRED }),
-    )
-    if (batch.length === 0) return
-    try {
-      channelDelivery.drop(batch)
-    } catch (err) {
-      deps.log(`[slack] reload: dropping the stored choices of the retired keys failed: ${describeThrownValue(err)}`)
     }
   }
 
@@ -1783,21 +1719,15 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
     }
     // A valid plan always comes from bytes that were read and parsed.
     if (candidate.kind !== 'valid' || bytes === undefined) return false
-    const inputs = applyStepInputs(plan, current.config, candidate.config)
     const steps = applyStepsFor(plan)
     // the one stored-choice store, asked
     // once per apply, before step 1's first write, and used for the whole
     // apply.
     const channelDelivery = deps.channelDelivery()
 
-    // Step 1: write, record, rewrite and restore in
-    // one synchronous stretch, so no mark, clear or other write of either
-    // store comes between. beside a key brought up
-    // with an unwritten drop has it written first, or nothing is applied.
-    if (!writeDropsBeforeBringUp(channelDelivery, plan)) {
-      deps.log(reloadChannelDeliveryWriteFailedLine(channelDelivery.path, paths.lastApplied))
-      return false
-    }
+    // Retirement and the one authority application run without an await.
+    // A definite failure restores retirement; an uncertain durable outcome
+    // keeps its retirement evidence for recovery.
     const store = deps.retiredKeys
     const batch = retiredKeysToRecord(plan, store)
     const recorded = batch.length === 0 ? undefined : store.record(batch)
@@ -1809,15 +1739,20 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
     // rewrite and the teardown's kill; nothing awaited, so step 1 stays one
     // synchronous stretch.
     for (const { key } of batch) stopDeliveryOf(key)
-    const rewriteFailed = writeRecord(bytes, current.bytes)
-    if (rewriteFailed !== undefined) {
-      const restored =
-        recorded !== undefined && recorded.outcome === RETIRED_KEYS_WRITTEN
-          ? retiredKeysRestoredClause(store, store.restore(recorded.snapshot))
-          : ''
-      deps.log(rewriteFailed + restored)
+    const reviewedRevision = state.authorityRevision
+    let result
+    applyingReviewed = true
+    try { result = sharedChannels?.applyReviewed(bytes, reviewedRevision!) }
+    finally { applyingReviewed = false }
+    if (result?.kind !== 'applied') {
+      const restored = result?.kind !== 'unresolved' && recorded !== undefined && recorded.outcome === RETIRED_KEYS_WRITTEN
+        ? retiredKeysRestoredClause(store, store.restore(recorded.snapshot)) : ''
+      const failure = sharedChannels?.failure ?? ''
+      deps.log(`[slack] ${RELOAD_RECORD_WRITE_FAILED}: cannot write the shared channel authority ${JSON.stringify(paths.lastApplied)}${failure}; application ${result?.kind ?? 'failed'}; preserve the prepared input and authority evidence; the change remains pending` + restored)
       return false
     }
+    const merged = sharedChannels!.config()
+    const mergedInputs = applyStepInputs(plan, current.config, merged)
     // the rewrite succeeded, so each key this step recorded
     // holds its old life's working directory from now, before any teardown's
     // kill; a failed write or rewrite above began none.
@@ -1825,9 +1760,6 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
     for (const persona of plan.removed) {
       try { deps.onQueueRetained?.(persona.key, deps.queueOpenCount?.(persona.key) ?? 0) } catch { /* observer cannot interrupt apply */ }
     }
-    // the retired keys' stored choices stop applying now, in
-    // the same synchronous stretch; a failed write never fails the apply.
-    dropRetiredChoices(channelDelivery, plan)
     // each destructive modify's key is retiring from here
     // until step 2 has settled, so no call stores a choice for it meanwhile.
     const retiring = plan.destructive.map(({ key }) => key)
@@ -1835,16 +1767,16 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
     const onStepFailure = (step: ApplyStepName, err: unknown): void =>
       deps.log(`[slack] reload: apply step ${applyStepNumber(step)} (${step}) failed: ${describeThrownValue(err)}`)
     try {
-      appliedState = { config: candidate.config, bytes, source: 'config' }
-      notifyApplied(candidate.config)
+      appliedState = { config: merged, bytes: sharedChannels!.sourceBytes(), source: 'config' }
+      notifyApplied(merged)
       // Step 2 on its own, so the retiring window closes once it has
       // settled, before step 3 starts; `runApplySteps` keeps its order and
       // failure isolation across the two calls.
-      await runApplySteps(applySlots, inputs, steps.filter((step) => step === TEARDOWNS_STEP), onStepFailure)
+      await runApplySteps(applySlots, mergedInputs, steps.filter((step) => step === TEARDOWNS_STEP), onStepFailure)
     } finally {
       setRetiring(channelDelivery, retiring, false)
     }
-    await runApplySteps(applySlots, inputs, steps.filter((step) => step !== TEARDOWNS_STEP), onStepFailure)
+    if (!detectionStopped) await runApplySteps(applySlots, mergedInputs, steps.filter((step) => step !== TEARDOWNS_STEP), onStepFailure)
     deps.log(plan.noEffectiveChange ? renderNoopLogLine(paths.lastApplied) : renderAppliedLogLine(plan, paths.lastApplied))
     return true
   }
@@ -1855,6 +1787,7 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
     const initial = appliedState
     detection = createPendingDetection(deps, {
       applied: () => appliedState ?? initial,
+      sharedChannels: () => sharedChannels,
       applyConfirmed,
     })
     deps.tickDriver.start(detection.tick)
@@ -1873,6 +1806,7 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
     startDetection,
     stopDetection,
     applied: () => appliedState,
+    sharedChannels: () => sharedChannels,
     protectedCredentialsFiles: () =>
       credentialsFilesToProtect(appliedState?.config.personas ?? [], paths.config, deps.home, deps.configFs),
   }

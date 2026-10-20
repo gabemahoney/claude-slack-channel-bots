@@ -42,6 +42,7 @@ import {
   promptState,
   q,
   recorded,
+  recordedCommand,
   removalRowProblems,
   removedPreviewLine,
   type Row,
@@ -105,7 +106,7 @@ export const check24Setup: CheckDef<CheckContext> = {
     const m = await mark(ctx)
     ctx.shared.origDelay = (await lines(ctx, `jq -c '.session_restart_delay' "$S/config.json"`))[0] ?? 'null'
     f.add(`ORIG_DELAY=${ctx.shared.origDelay}`)
-    const ack = (await lines(ctx, `jq -r '.ack_reaction' "$S/config.json.last-applied"`))[0]
+    const ack = (await lines(ctx, `jq -r '.applied.ack_reaction' "$S/config.json.last-applied"`))[0]
     f.expect(ack === 'eyes', 'ack_reaction in the record is not eyes')
     const out = await confirmedEdit(ctx, f, m, '.session_restart_delay = 0', SETTINGS_PREVIEW)
     f.expect((out.appliedLines[0] ?? '').includes('server-wide settings: 1 changed)'), 'the reload-applied line does not end with "server-wide settings: 1 changed)"')
@@ -123,7 +124,7 @@ export const check24: CheckDef<CheckContext> = {
     const f = new Findings()
     const ids = ctx.ids
     const human = needHuman(ctx)
-    const delay = (await lines(ctx, 'jq -c .session_restart_delay "$S/config.json.last-applied"'))[0]
+    const delay = (await lines(ctx, 'jq -c .applied.session_restart_delay "$S/config.json.last-applied"'))[0]
     if (!f.expect(delay === '0', 'automatic restarts are not disabled in the applied record')) return f.result()
     f.expect((await rows(ctx)).some((r) => r.id === 'cscb_persona_a'), 'no cscb_persona_a row')
     const m = await mark(ctx)
@@ -231,7 +232,7 @@ export const check25: CheckDef<CheckContext> = {
     const f = new Findings()
     const ids = ctx.ids
     f.note('Check 25: D was added by a config.json edit and a credentials file moved into place by the runner, not by the wizard')
-    const setup = await run(ctx, 'guard && mkdir -p ~/cscb-live/d && cmp -s "$S/config.json" "$S/config.json.last-applied" && [ ! -e "$S/config.json.pending" ] && kill -0 "$(cat "$S/server.pid")" && echo READY')
+    const setup = await run(ctx, `guard && mkdir -p ~/cscb-live/d && ${recordedCommand()} && [ ! -e "$S/config.json.pending" ] && kill -0 "$(cat "$S/server.pid")" && echo READY`)
     if (!f.expect(setup.out.includes('READY'), 'not in the applied, nothing-pending, running state')) return f.result()
     const m = await mark(ctx)
     const pid = await serverPid(ctx)
@@ -498,7 +499,7 @@ export const check28: CheckDef<CheckContext> = {
     f.expect((await lines(ctx, 'grep -c persona_b "$S/config.json.pending"'))[0] === '0', 'step 6: the pending file names persona_b')
     f.expect((await sinceGrep(ctx, bmark, '[slack] reload-preview: DESTRUCTIVE:')).length === 1, 'step 6: the DESTRUCTIVE preview was not logged exactly once since the reboot')
     f.expect(!(await recorded(ctx)), 'step 6: config.json matches the record')
-    const recNames = await lines(ctx, `jq -r '.personas[].name' "$S/config.json.last-applied"`)
+    const recNames = await lines(ctx, `jq -r '.applied.personas[].name' "$S/config.json.last-applied"`)
     f.expect(JSON.stringify(recNames) === JSON.stringify(['persona_a', 'persona_b', 'persona_c']), 'step 6: the record does not name A, B and C')
 
     // Step 7: each persona answers; B runs on the new token.
@@ -592,19 +593,11 @@ export function personaCountsProblem(letter: string, value: string | undefined):
   return `persona ${letter}: malformed transcript count (${what} is not "<transcripts> <delivered>")`
 }
 
-/**
- * The state files Check 29a's token-shape count and leak count read, as shell
- * words for its `F=(…)` array: the config, the record, the pending file and
- * the stored-choice file the server writes in fungible mode, the server logs, the startup-errors log, the
- * permission trail and the boot-start log. An absent file (the pending file
- * after a clean run, the stored-choice file in a dry run or a run with no
- * fungible mode) is no finding.
- */
+/** State files written by the server, for Check 29a's token and leak audits. */
 export const CHECK29A_STATE_FILES: readonly string[] = [
   '"$S/config.json"',
   '"$S/config.json.last-applied"',
   '"$S/config.json.pending"',
-  '"$S/channel-delivery.json"',
   '"$S"/server.log*',
   '"$S/startup-errors.log"',
   '"$S/permission-trail.jsonl"',

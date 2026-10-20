@@ -100,6 +100,7 @@ function updateContent(hash: ReturnType<typeof createHash>, content: Fingerprint
 export function reloadFingerprint(
   config: FingerprintContent,
   credentials: readonly FingerprintCredentialsEntry[],
+  authorityRevision?: number,
 ): string {
   const hash = createHash('sha256')
   hash.update(FINGERPRINT_DOMAIN, 'utf-8')
@@ -110,6 +111,10 @@ export function reloadFingerprint(
     hash.update(lengthPrefix(path.length))
     hash.update(path)
     updateContent(hash, entry.content)
+  }
+  if (authorityRevision !== undefined) {
+    hash.update('shared-authority-revision:')
+    hash.update(String(authorityRevision))
   }
   return hash.digest('hex')
 }
