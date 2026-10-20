@@ -507,9 +507,13 @@ Scenarios that kill a bot use `real_kill_and_reconcile`: retain and validate
 the AD kill result, stop CSCB, respect pending grace, then run the documented
 bounded `find-missing`/status sequence (including the second kill if needed).
 Errors or a still-live row fail the fixture for operator diagnosis.
-After restarting CSCB, `real_wait_relaunch` requires a changed AD
-`launch_started_at` and an MCP connection logged after the stop. A resume may
-keep its native session ID; an old connection line cannot satisfy the check.
+The fixture retains the killed row's AD instance and native `session_id`,
+and verifies that this same conversation reaches `ended` or `missing`.
+After restarting CSCB, `real_wait_relaunch` requires that row to become live
+with either a replacement `session_id` or a new AD `last_seen_at` for the
+resumed session, plus an MCP connection logged after the stop.
+AD exposes `launch_started_at` only while pending; an old connection line
+cannot satisfy the check.
 
 Every real-agent failure retains metadata for all main and subagent transcript
 records from its isolated HOME, plus structured AD row and exact-receipt

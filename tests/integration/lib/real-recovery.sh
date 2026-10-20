@@ -7,12 +7,13 @@ require_scenario_home real-recovery
 # bounded live-row sequence before restarting CSCB. A failed operation stops
 # the fixture for operator diagnosis; it never authorizes a replacement.
 real_kill_and_reconcile() {
-    local instance row state remaining attempt
+    local instance session row state remaining attempt
     instance="$(real_instance "$1")"
     REAL_KILLED_ROW="${SCENARIO_ROOT}/killed-${1}.json"
     real_ad get --instance-id "${instance}" > "${REAL_KILLED_ROW}"
-    jq -e '.launch_started_at | type == "string" and length > 0' "${REAL_KILLED_ROW}" >/dev/null \
-        || fail 'kill fixture requires an AD launch identity'
+    jq -e '.session_id | type == "string" and length > 0' "${REAL_KILLED_ROW}" >/dev/null \
+        || fail 'kill fixture requires an AD native session identity'
+    session="$(jq -r .session_id "${REAL_KILLED_ROW}")"
     _real_checked_kill "${instance}" 1
     stop_server
     # Capture after stop, so even a connection racing shutdown is historical.
@@ -45,7 +46,18 @@ console.log(Math.max(0, Math.ceil((start + grace - Date.now()) / 1000)))
             || fail 'find-missing failed; operator inspection required'
         real_ad status --instance-id "${instance}" > "${row}" || fail 'post-kill status failed; operator inspection required'
         state="$(jq -r .state "${row}")"
-        if [[ "${state}" == ended || "${state}" == missing ]]; then return 0; fi
+        if [[ "${state}" == ended || "${state}" == missing ]]; then
+            # launch_started_at is pending-only in AD. Keep the finished
+            # row's last hook timestamp instead, before restarting CSCB.
+            real_ad get --instance-id "${instance}" > "${REAL_KILLED_ROW}" \
+                || fail 'finished row could not be retained'
+            jq -e --arg instance "${instance}" --arg session "${session}" \
+                '(.state == "ended" or .state == "missing")
+                and .instance_id == $instance and .session_id == $session
+                and (.last_seen_at | type == "string" and length > 0)' "${REAL_KILLED_ROW}" >/dev/null \
+                || fail 'AD row did not remain finished before restart'
+            return 0
+        fi
         if [[ "${attempt}" -lt 3 ]]; then sleep 5; fi
     done
     fail 'killed AD row remains live after the documented sequence; operator inspection required'
@@ -67,9 +79,11 @@ _real_relaunched() {
     real_ad get --instance-id "$(real_instance "$1")" > "${row}" 2>/dev/null || return 1
     jq -e --slurpfile old "${REAL_KILLED_ROW}" \
         '(.state == "waiting" or .state == "working") and .labels.tag_prompt == "1"
+         and .instance_id == $old[0].instance_id
          and (.session_id | type == "string" and length > 0)
-         and (.launch_started_at | type == "string" and length > 0)
-         and .launch_started_at != $old[0].launch_started_at' "${row}" >/dev/null || return 1
+         and (.last_seen_at | type == "string" and length > 0)
+         and (.session_id != $old[0].session_id
+              or .last_seen_at != $old[0].last_seen_at)' "${row}" >/dev/null || return 1
     tail -n "+$((REAL_CONNECTION_LINE_BASE+1))" "${SLACK_STATE_DIR}/server.log" \
         | grep -F 'Session connected: persona ' | grep -qF "(key=$1)"
 }
