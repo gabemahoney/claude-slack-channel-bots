@@ -226,6 +226,30 @@ describe('receipt reader', () => {
     expect(priorOnly.receipt?.path).toBe(old)
   })
 
+  test.each(['claude', 'codex'] as const)('%s excludes pre-send receipts in a previously observed prior session', async agent => {
+    const h = await fixture(agent), prior = join(h.root, 'prior.jsonl')
+    const entry = agent === 'claude' ? promptEntry : codexPromptEntry
+    writeTranscript(prior, [entry(h.text)])
+    const row = { ...h.row, prior_sessions: [{ jsonl_path: prior }] }
+    const read = () => h.reader.read(agent, row, h.item(), 1, h.queue.items('alpha'))
+    expect(read().receipt).toBeUndefined()
+    const beforeSend = fs.statSync(prior).size
+    await h.send()
+    expect(read().receipt).toBeUndefined()
+    appendTranscript(prior, [entry(h.text)])
+    expect(read().receipt).toMatchObject({ path: prior, offset: beforeSend, text: h.text, kind: 'take-in' })
+  })
+
+  test.each(['claude', 'codex'] as const)('%s accepts offset-zero receipts in a prior file first discovered after the send', async agent => {
+    const h = await fixture(agent), prior = join(h.root, 'newly-discovered.jsonl')
+    const entry = agent === 'claude' ? promptEntry : codexPromptEntry
+    h.read()
+    await h.send()
+    writeTranscript(prior, [{ ...entry(h.text), timestamp: '1970-01-01T00:00:00.000Z' }])
+    const observed = h.reader.read(agent, { ...h.row, prior_sessions: [{ jsonl_path: prior }] }, h.item(), 1)
+    expect(observed.receipt).toMatchObject({ path: prior, offset: 0, at: 0, text: h.text, kind: 'take-in' })
+  })
+
   test.each(['never_written', 'no_session', 'rotated', 'present'])('missing current path with transcript_status=%s', async transcript_status => {
     const h = await fixture()
     fs.unlinkSync(h.path)
@@ -266,6 +290,28 @@ describe('receipt reader', () => {
     expect(read().receipt).toBeDefined()
     fs.truncateSync(h.path, 0)
     expect(read()).toMatchObject({ availability: 'not-yet-written', records: [], receipt: undefined })
+  })
+
+  test.each(['claude', 'codex'] as const)('%s rechecks cached receipts after EACCES and never credits an unreadable file', async agent => {
+    const h = await fixture(agent)
+    await h.send()
+    h.append((agent === 'claude' ? promptEntry : codexPromptEntry)(h.text))
+    let refused = false
+    const reader = createDeliveryReceiptReader({ fs: { ...fs,
+      openSync: ((...args: any[]) => {
+        if (refused) throw Object.assign(new Error('refused'), { code: 'EACCES' })
+        return (fs.openSync as any)(...args)
+      }) as typeof fs.openSync,
+    } })
+    const read = () => reader.read(agent, h.row, h.item(), 1)
+    const readable = read()
+    expect(readable.availability).toBe('readable')
+    expect(readable.receipt).toMatchObject({ path: h.path, offset: 0, text: h.text })
+    expect(readable.records).toEqual([readable.receipt!])
+    refused = true
+    expect(read()).toMatchObject({ availability: 'unreadable', receipt: undefined, records: readable.records })
+    refused = false
+    expect(read()).toEqual(readable)
   })
 
   test('Claude discovery uses configured scratch home; Codex does not synthesize a path', async () => {

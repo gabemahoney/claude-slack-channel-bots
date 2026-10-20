@@ -695,6 +695,124 @@ describe('AD authority regressions', () => {
 
 
 describe('disconnected delivery draft is recovered before reconnect control text', () => {
+  async function retainedDraft(failRecoveryAppend = false) {
+    const h = await harness()
+    await h.accept('retained delivery'); await h.accept('successor')
+    const p = h.p()
+    p.connected = false; p.autoReceipt = false; p.box = 'retained delivery'
+    await h.queue.append('alpha', {
+      v: 1, kind: 'sent', seq: 1, part: 1, attempt: 1, send_kind: 'text', at: 0,
+      launch_id: 'old-start:1', session_id: p.row.session_id, transcript_path: p.path, transcript_size: 0,
+    })
+    if (failRecoveryAppend) h.failAppend('sent')
+    expect(await h.engine.recoverBeforeReconnect('alpha')).toBe(false)
+    await h.advance(LAUNCH_SETTLE_MS)
+    return h
+  }
+
+  test('an AD read timeout releases the lease without ending the recovery receipt wait', async () => {
+    const h = await retainedDraft(), p = h.p()
+    expect(h.keyCalls()).toEqual([{ key: 'alpha', verb: 'send-keys', at: LAUNCH_SETTLE_MS, params: { instance_id: 'cscb_alpha', key: 'Enter' } }])
+    const timeout = errCallTimeout('get')
+    p.getError = timeout
+    await h.advance(DELIVERY_ROW_POLL_MS)
+    expect(h.errors).toEqual([timeout])
+    expect(h.lifecycle.owner('alpha')).toBe('free')
+    p.getError = undefined
+    await h.clock.advance(1)
+    expect(await h.engine.recoverBeforeReconnect('alpha')).toBe(false)
+    expect(h.clock.now()).toBe(LAUNCH_SETTLE_MS + DELIVERY_ROW_POLL_MS + 1)
+    expect(h.engine.snapshot('alpha')?.e.timers.receipt).toBe(RECEIPT_WAIT_MS - DELIVERY_ROW_POLL_MS - 1)
+    await h.advance(RECEIPT_WAIT_MS - DELIVERY_ROW_POLL_MS - 2)
+    expect(await h.engine.recoverBeforeReconnect('alpha')).toBe(false)
+    expect(h.engine.snapshot('alpha')?.e.timers.receipt).toBe(1)
+    await h.advance(1)
+    expect(await h.engine.recoverBeforeReconnect('alpha')).toBe(true)
+    expect(h.keyCalls().map(c => c.params)).toEqual([{ instance_id: 'cscb_alpha', key: 'Enter' }])
+    expect(h.records().filter(r => r.kind === 'sent').map(r => [r.seq, 'send_kind' in r && r.send_kind, r.at])).toEqual([[1, 'text', 0], [1, 'enter', LAUNCH_SETTLE_MS]])
+    expect(h.records().filter(r => r.kind === 'delivered')).toEqual([])
+    expect(h.queue.openCount('alpha')).toBe(2)
+    expect(h.calls.filter(c => c.verb === 'read-pane' || c.verb === 'reconnect')).toEqual([])
+  })
+
+  test('an exact recovery receipt permits reconnect early only after its delivered append is durable', async () => {
+    const h = await retainedDraft(), p = h.p()
+    await h.advance(DELIVERY_ROW_POLL_MS)
+    const offset = statSync(p.path).size
+    const receipt = { ...promptEntry('retained delivery'), uuid: 'recovery-receipt' }
+    appendTranscript(p.path, [receipt])
+    const append = h.queue.append.bind(h.queue)
+    let markWriting!: () => void, releaseAppend!: () => void
+    const writing = new Promise<void>(resolve => { markWriting = resolve })
+    const held = new Promise<void>(resolve => { releaseAppend = resolve })
+    h.queue.append = async (key, record) => {
+      if (record.kind === 'delivered') { markWriting(); await held }
+      await append(key, record)
+    }
+    const recovering = h.engine.recoverBeforeReconnect('alpha')
+    await writing
+    try {
+      expect(await h.engine.recoverBeforeReconnect('alpha')).toBe(false)
+      expect(h.records().filter(r => r.kind === 'delivered')).toEqual([])
+      expect(h.queue.openCount('alpha')).toBe(2)
+      expect(h.events.filter(e => e.type === 'delivered')).toEqual([])
+    } finally { releaseAppend() }
+    expect(await recovering).toBe(true)
+    expect(h.clock.now()).toBeLessThan(LAUNCH_SETTLE_MS + RECEIPT_WAIT_MS)
+    expect(h.records().filter(r => r.kind === 'delivered')).toEqual([
+      { v: 1, kind: 'delivered', seq: 1, part: 1, at: LAUNCH_SETTLE_MS + DELIVERY_ROW_POLL_MS, receipt: { path: p.path, uuid: receipt.uuid, offset } },
+    ])
+    expect(h.events.filter(e => e.type === 'delivered')).toEqual([{ type: 'delivered', key: 'alpha', seq: 1, part: 1 }])
+    expect(h.queue.openCount('alpha')).toBe(1)
+    expect(h.keyCalls().map(c => c.params)).toEqual([{ instance_id: 'cscb_alpha', key: 'Enter' }])
+  })
+
+  test('a failed recovery-intent append keeps reconnect blocked through the append backoff', async () => {
+    const h = await retainedDraft(true)
+    expect(h.errors).toHaveLength(1)
+    expect(h.lifecycle.owner('alpha')).toBe('free')
+    expect(h.records().filter(r => r.kind === 'sent')).toHaveLength(1)
+    expect(h.keyCalls()).toEqual([])
+    expect(await h.engine.recoverBeforeReconnect('alpha')).toBe(false)
+    await h.advance(RETYPE_BACKOFF_MS[0] - 1)
+    expect(await h.engine.recoverBeforeReconnect('alpha')).toBe(false)
+    expect(h.keyCalls()).toEqual([])
+    await h.advance(1)
+    expect(h.keyCalls().map(c => c.params)).toEqual([{ instance_id: 'cscb_alpha', key: 'Enter' }])
+    expect(h.records().filter(r => r.kind === 'sent').at(-1)).toMatchObject({ seq: 1, part: 1, attempt: 2, send_kind: 'enter' })
+    expect(await h.engine.recoverBeforeReconnect('alpha')).toBe(false)
+    expect(h.queue.openCount('alpha')).toBe(2)
+    expect(h.records().filter(r => r.kind === 'delivered')).toEqual([])
+  })
+
+  test('AD working extends recovery through a fresh receipt wait after waiting, even when a timeout freed the lease', async () => {
+    const h = await retainedDraft(), p = h.p()
+    p.row.state = 'working'
+    await h.advance(DELIVERY_ROW_POLL_MS)
+    expect(h.engine.status('alpha')?.receiptWorking).toBe(true)
+    p.getError = errCallTimeout('get')
+    await h.advance(DELIVERY_ROW_POLL_MS)
+    expect(h.lifecycle.owner('alpha')).toBe('free')
+    p.getError = undefined
+    await h.advance(RECEIPT_WAIT_MS)
+    expect(await h.engine.recoverBeforeReconnect('alpha')).toBe(false)
+    expect(h.engine.status('alpha')?.receiptWorking).toBe(true)
+    p.row.state = 'waiting'
+    await h.advance(DELIVERY_ROW_POLL_MS)
+    const waitingAt = h.clock.now()
+    expect(h.engine.status('alpha')?.receiptWorking).toBe(false)
+    expect(await h.engine.recoverBeforeReconnect('alpha')).toBe(false)
+    expect(h.engine.snapshot('alpha')?.e.timers.receipt).toBe(RECEIPT_WAIT_MS)
+    await h.advance(RECEIPT_WAIT_MS - 1)
+    expect(await h.engine.recoverBeforeReconnect('alpha')).toBe(false)
+    await h.advance(1)
+    expect(h.clock.now()).toBe(waitingAt + RECEIPT_WAIT_MS)
+    expect(await h.engine.recoverBeforeReconnect('alpha')).toBe(true)
+    expect(h.keyCalls().map(c => c.params)).toEqual([{ instance_id: 'cscb_alpha', key: 'Enter' }])
+    expect(h.queue.openCount('alpha')).toBe(2)
+    expect(h.records().filter(r => r.kind === 'delivered')).toEqual([])
+  })
+
   test.each(['none', 'refused-enter', 'unknown-enter'] as const)(
     '%s: recovery retries Enter without repeating retained delivery text and keeps the FIFO head until its exact receipt', async fault => {
       const h = await harness()

@@ -482,8 +482,11 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
         const k = build(key, s), pair = selectDeliveryTarget(k)
         if (pair[0] === 0) return true
         const attempt = latestDeliveryAttempt(k, pair)
+        // A failed read can release the lease before the receipt wait ends.
+        // Let the engine finish that wait, including a working-row extension.
         return !s.pending && life.owner(key) !== 'delivery' && (attempt === undefined ||
-          (s.e.launchSeen === life.launchId(key) && s.e.sessionSeen === s.row?.session_id && s.e.recoveryAttempt === attempt))
+          (s.e.phase === 'ready' && !s.receiptWorking && s.e.launchSeen === life.launchId(key) &&
+            s.e.sessionSeen === s.row?.session_id && s.e.recoveryAttempt === attempt))
       }
       // A reconnect rerun from this engine cannot wait on its own tick.
       if (s.busy) return reconciled()
