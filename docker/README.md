@@ -428,6 +428,10 @@ Add `--ai-only` to `--claude-versions` to run just AC11, AC12, AC15,
 AC20, AC23, AC91 and AC106, three trials each (21 per version).
 This selection records `claude-ai-only` and uses
 `REAL-AGENT-CLAUDE-AI-VERDICT`; it certifies only those AI trials.
+For a narrower rerun, add `--ai-criteria 15` (or a comma-separated set of known
+criterion numbers). This requires both `--ai-only` and explicit Claude versions,
+keeps three trials per selected criterion, and records `claude-ai-selected`
+with `REAL-AGENT-CLAUDE-AI-SELECTED-VERDICT`. It cannot certify omitted criteria.
 
 Use the established `CI_ANTHROPIC_*` prefix on the `/ci` runner and **every** `ci-verdict.ts` wait/stop/report/recovery call, as the current CI skill describes. The heavy coordinator reads those CI names directly. Never put credential values in arguments or diagnostic output.
 

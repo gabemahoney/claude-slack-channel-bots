@@ -1,0 +1,129 @@
+{
+  "run": "real-1792519134421-3860158",
+  "version": "2.1.304",
+  "nativeBinarySha256": "ea0f135784631619a7a409d07322ecec964f9cc4fd377508ed1ba3f141f27912",
+  "provenance": "Captured offsets, roles, block kinds and repeated tool IDs. Bodies, hashes and nested ToolSearch definition content in replay are synthetic; native writer semantics independently verified in checksum-matched binary.",
+  "captures": [
+    {
+      "trial": 1,
+      "offset": 108199,
+      "sessionId": "d6cedd8f-4cc6-4e82-a9a2-3059daaf5fba",
+      "shape": "user-context"
+    },
+    {
+      "trial": 1,
+      "offset": 112484,
+      "sessionId": "d6cedd8f-4cc6-4e82-a9a2-3059daaf5fba",
+      "shape": "system-context"
+    },
+    {
+      "trial": 1,
+      "offset": 125126,
+      "sessionId": "d6cedd8f-4cc6-4e82-a9a2-3059daaf5fba",
+      "shape": "tool-result-context",
+      "toolUseId": "call_X6LnzVZ0PbomYDlHeHXa45OC",
+      "originalTool": "ToolSearch",
+      "originalToolOffset": 37213,
+      "originalResultOffset": 39883
+    },
+    {
+      "trial": 2,
+      "offset": 108090,
+      "sessionId": "1a04be87-9566-414f-b7ea-f8f11cb7622a",
+      "shape": "user-context"
+    },
+    {
+      "trial": 2,
+      "offset": 112375,
+      "sessionId": "1a04be87-9566-414f-b7ea-f8f11cb7622a",
+      "shape": "system-context"
+    },
+    {
+      "trial": 2,
+      "offset": 125017,
+      "sessionId": "1a04be87-9566-414f-b7ea-f8f11cb7622a",
+      "shape": "tool-result-context",
+      "toolUseId": "call_j1iAS209m9KZK7dCsikKSB2r",
+      "originalTool": "ToolSearch",
+      "originalToolOffset": 37104,
+      "originalResultOffset": 39774
+    },
+    {
+      "trial": 3,
+      "offset": 108090,
+      "sessionId": "e765b2e0-b9c6-4b6a-a2b9-ffc346e54fe8",
+      "shape": "user-context"
+    },
+    {
+      "trial": 3,
+      "offset": 112375,
+      "sessionId": "e765b2e0-b9c6-4b6a-a2b9-ffc346e54fe8",
+      "shape": "system-context"
+    },
+    {
+      "trial": 3,
+      "offset": 125017,
+      "sessionId": "e765b2e0-b9c6-4b6a-a2b9-ffc346e54fe8",
+      "shape": "tool-result-context",
+      "toolUseId": "call_E7QsFKGzaORYhOosUpmkHzBm",
+      "originalTool": "ToolSearch",
+      "originalToolOffset": 37104,
+      "originalResultOffset": 39774
+    }
+  ],
+  "shapes": [
+    {
+      "name": "user-context",
+      "message": {
+        "role": "user",
+        "content": [
+          {
+            "type": "text",
+            "text": "synthetic request context 0"
+          },
+          {
+            "type": "text",
+            "text": "synthetic request context 1"
+          },
+          {
+            "type": "text",
+            "text": "synthetic request context 2"
+          },
+          {
+            "type": "text",
+            "text": "synthetic request context 3"
+          }
+        ]
+      }
+    },
+    {
+      "name": "system-context",
+      "message": {
+        "role": "system",
+        "content": "synthetic system context"
+      }
+    },
+    {
+      "name": "tool-result-context",
+      "message": {
+        "role": "user",
+        "content": [
+          {
+            "type": "tool_result",
+            "tool_use_id": "synthetic-search",
+            "content": [
+              {
+                "type": "tool_reference",
+                "tool_name": "mcp__slack-channel-router__reply"
+              }
+            ]
+          },
+          {
+            "type": "text",
+            "text": "synthetic context after discovery"
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -49,10 +49,32 @@ also accept a larger setup lead without introducing a fixed tolerance.
 `claude-304-api-request-blob.json` records the observed field shape from that
 run's AC11 trial 1, offset 117952: an untimed blob containing an assistant
 `ToolSearch` tool-use block. Hash, session, ID and arguments are synthetic.
-The kind can carry actions, so it remains outside the informational allowlist.
-Controls reject this shape, a `Write` action variant and a text variant in
-both the AC11 spoof and AC15 exchange guards. They do not count the blob as
-an executed tool call; they reject its unverifiable untimed evidence.
+The kind can carry actions, so it remains outside the blanket informational
+allowlist. AC11 still rejects it. AC15 now validates request echoes separately,
+as described below, and rejects every embedded forbidden action.
+
+`claude-304-ac15-request-echoes.json` inventories all nine retained blobs from
+run `real-1792519134421-3860158`. Each trial contains four user text blocks,
+a system string, and a user tool-result/text pair. The last repeats the exact
+ID of the earlier native `ToolSearch` result; none of these nine contains a
+`tool_use`. Bodies and nested result content used in tests are synthetic.
+
+The checksum-matched native 2.1.304 binary (SHA-256 recorded in the fixture)
+confirms the interpretation: `Kvt` builds `blobCandidates` from outgoing
+`params.messages` (or its privacy-cut subset), hashes canonical messages, and
+removes `cache_control` from the saved copies. `appendRequestReplayRecords`
+writes candidates missing from the transcript hash index, followed by an
+`api-request` whose tail references their hashes. These are request-replay
+context records, not separate executions. The builder and writer are at byte
+offsets 245545319 and 245713043 in that exact binary.
+
+AC15 requires the four-field native blob envelope, an untimed non-transcript
+record, a hex digest, a recognized message role and understood content shapes.
+It recursively checks all embedded `tool_use`/`server_tool_use` objects before
+exempting the echo from time ordering. Only reply and native `ToolSearch`
+tool uses pass. Tool references inside results are definitions, not calls.
+Malformed/unknown content, extra envelope fields and forbidden actions still
+fail; an echo supplies neither receipt nor readback/completion evidence.
 
 ## Timestamp sweep
 

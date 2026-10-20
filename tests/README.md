@@ -777,8 +777,13 @@ floor), the only untimed informational exclusions are exact three-field records 
 `permission-mode`/`permissionMode`, `atis-latch`/`atis`,
 `last-prompt`/`leafUuid` and `ai-title`/`aiTitle`. They carry no timestamp,
 UUID, parent UUID or text; added fields and other untimed records remain checked.
-`api-request-blob` remains rejected because its native `message.content` can
-contain tool-use/action blocks; its kind is not an informational exemption.
+`api-request-blob` is not a blanket informational exemption. AC15 separately
+recognizes the native request-replay envelope and understood content shapes,
+then recursively checks embedded tool uses against the same reply/ToolSearch
+rule before skipping its clock. Unknown/malformed shapes and forbidden actions
+still fail. Echoes cannot supply receipt or completion evidence. AC11 retains
+its existing rejection. See the captured request-echo inventory in the fixture
+README above.
 
 Ordinary answers must belong to the delivered item's own native turn;
 foreign, stale, sidechain, synthetic, API-error or unfinished responses

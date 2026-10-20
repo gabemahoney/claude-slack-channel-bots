@@ -137,25 +137,77 @@ for (const criterion of ['ordinary', 'AC11', 'AC15'] as const) {
   })
 }
 
-for (const criterion of ['AC11', 'AC15'] as const) {
-  test.each(['ToolSearch', 'Write', 'text'])(`${criterion} rejects native api-request-blob even with %s content`, kind => {
-    const e = ordinaryEvidence()
-    if (criterion === 'AC15') {
-      e.expected.case = 'AC15'
-      e.reply.value.message.content[0].text = JSON.stringify(e.expected)
-    }
-    const check = () => criterion === 'AC11' ? spoofTurn(e) : completedAIReadback(e)
-    expect(check).not.toThrow()
-    const fixture = JSON.parse(readFileSync(new URL('./fixtures/native-attachment-membership/claude-304-api-request-blob.json', import.meta.url), 'utf8'))
-    const value = fixture.record
-    if (kind === 'Write') value.message.content[0] = { type: 'tool_use', name: 'Write', id: 'extra', input: { file_path: 'spoof.txt', content: 'KIWI' } }
-    if (kind === 'text') value.message.content = 'plain native request text'
-    const blob = { path: e.take.path, offset: 26, at: NaN, value, ...parseDeliveryTranscriptRecord('claude', value) }
-    expect(nativeInformation(blob, e.adapters)).toBe(false)
-    e.own.push(blob)
-    expect(check).toThrow(criterion === 'AC11' ? 'spoof response has stale/invalid time' : 'AC15 exchange has invalid/stale time')
-  })
+test.each(['ToolSearch', 'Write', 'text'])('AC11 still rejects native api-request-blob with %s content', kind => {
+  const e = ordinaryEvidence()
+  expect(() => spoofTurn(e)).not.toThrow()
+  const fixture = JSON.parse(readFileSync(new URL('./fixtures/native-attachment-membership/claude-304-api-request-blob.json', import.meta.url), 'utf8'))
+  const value = fixture.record
+  if (kind === 'Write') value.message.content[0] = { type: 'tool_use', name: 'Write', id: 'extra', input: { file_path: 'spoof.txt', content: 'KIWI' } }
+  if (kind === 'text') value.message.content = 'plain native request text'
+  const blob = { path: e.take.path, offset: 26, at: NaN, value, ...parseDeliveryTranscriptRecord('claude', value) }
+  expect(nativeInformation(blob, e.adapters)).toBe(false)
+  e.own.push(blob)
+  expect(() => spoofTurn(e)).toThrow('spoof response has stale/invalid time')
+})
+
+function ac15Echo(e: ReturnType<typeof ordinaryEvidence>, message: any, offset = 26): TranscriptEntry {
+  const value = { type: 'api-request-blob', sessionId: 'session', hash: 'a'.repeat(64), message }
+  return { path: e.take.path, offset, at: NaN, value, ...parseDeliveryTranscriptRecord('claude', value) }
 }
+const echoFixtures = JSON.parse(readFileSync(new URL('./fixtures/native-attachment-membership/claude-304-ac15-request-echoes.json', import.meta.url), 'utf8')).shapes
+
+test.each(echoFixtures.map((shape: any) => [shape.name, shape.message]))('AC15 accepts captured %s request echo in earlier and final part windows', (_name, message) => {
+  const e = multipartAC15()
+  e.own.push(ac15Echo(e, structuredClone(message)), ac15Echo(e, structuredClone(message), 66))
+  expect(completedAIReadback(e).receipt_uuid).toBe('part-3')
+})
+
+test('AC15 request echoes with exact JSON cannot replace native readback/completion', () => {
+  const e = multipartAC15()
+  e.own.push(ac15Echo(e, { role: 'assistant', content: [{ type: 'text', text: JSON.stringify(e.expected) }] }, 66))
+  expect(completedAIReadback(e).receipt_uuid).toBe('part-3')
+  e.own.splice(5, 1)
+  expect(() => completedAIReadback(e)).toThrow('no completed current-turn')
+})
+
+test.each(['ToolSearch', 'mcp__slack-channel-router__reply'])('AC15 checks and accepts echoed %s without counting it as an extra action', name => {
+  const e = multipartAC15()
+  e.own.push(ac15Echo(e, { role: 'assistant', content: [{ type: 'tool_use', name, id: 'echoed-call', input: {} }] }))
+  expect(completedAIReadback(e).receipt_uuid).toBe('part-3')
+})
+
+test.each(['direct', 'tool-result', 'input', 'extra-field', 'server-tool', 'real-action-after-echo'])(
+  'AC15 rejects a forbidden tool in %s beside otherwise valid readback', where => {
+    const e = multipartAC15(), action = { type: where === 'server-tool' ? 'server_tool_use' : 'tool_use', name: 'Write', id: 'forbidden', input: {} }
+    const blob = ac15Echo(e, { role: 'assistant', content: [{ type: 'text', text: 'context' }] })
+    e.own.push(blob)
+    expect(completedAIReadback(e).receipt_uuid).toBe('part-3')
+    if (where === 'tool-result') blob.value.message.content = [{ type: 'tool_result', tool_use_id: 'prior', content: [action] }]
+    else if (where === 'input') blob.value.message.content = [{ type: 'tool_use', name: 'ToolSearch', id: 'allowed', input: { nested: action } }]
+    else if (where === 'extra-field') blob.value.hidden = { nested: action }
+    else if (where === 'real-action-after-echo') e.own.push(forbiddenAC15Action(e, 27, 'part-1', 'Write'))
+    else blob.value.message.content = [action]
+    expect(() => completedAIReadback(e)).toThrow('AC15 non-reply tool action observed')
+  })
+
+test.each([
+  ['timestamp', (r: TranscriptEntry) => { r.at = 26; r.value.timestamp = new Date(26).toISOString() }],
+  ['UUID', (r: TranscriptEntry) => { r.value.uuid = 'impostor' }],
+  ['malformed hash', (r: TranscriptEntry) => { r.value.hash = 'not-a-native-hash' }],
+  ['unknown role', (r: TranscriptEntry) => { r.value.message.role = 'tool' }],
+  ['missing content', (r: TranscriptEntry) => { delete r.value.message.content }],
+  ['extra message field', (r: TranscriptEntry) => { r.value.message.stop_reason = 'end_turn' }],
+  ['unknown block', (r: TranscriptEntry) => { r.value.message.content = [{ type: 'unknown_action' }] }],
+  ['malformed tool', (r: TranscriptEntry) => { r.value.message.content = [{ type: 'tool_use', name: 'ToolSearch', input: {} }] }],
+  ['malformed result', (r: TranscriptEntry) => { r.value.message.content = [{ type: 'tool_result', tool_use_id: 'prior', content: {} }] }],
+  ['malformed text', (r: TranscriptEntry) => { r.value.message.content = [{ type: 'text', text: {} }] }],
+] as const)('AC15 rejects request-echo %s instead of blanket allowlisting its kind', (_name, change) => {
+  const e = multipartAC15(), blob = ac15Echo(e, { role: 'user', content: 'context' })
+  e.own.push(blob)
+  expect(completedAIReadback(e).receipt_uuid).toBe('part-3')
+  change(blob)
+  expect(() => completedAIReadback(e)).toThrow('AC15 malformed native request echo')
+})
 
 // AC23's resume boundary: the native shutdown bookkeeping has no timestamp.
 // Only clocks/offsets/UUIDs are captured; bodies and receipts below are synthetic.

@@ -21,8 +21,8 @@ function nativeTakeIn(entry: TranscriptEntry, adapters: ReceiptAdapters): boolea
 
 // Native session metadata has no temporal or ancestry identity. Only the five
 // observed three-field shapes are informational; added evidence stays checked.
-// api-request-blob is deliberately excluded: its message can contain tool_use
-// and tool_result blocks, so its kind alone cannot exempt it from action guards.
+// api-request-blob is not a blanket informational exclusion. AC15 separately
+// validates its request-echo structure and all embedded actions below.
 export function nativeInformation(entry: TranscriptEntry, adapters: ReceiptAdapters): boolean {
   const value = entry.value, field = new Map([
     ['mode', 'mode'], ['permission-mode', 'permissionMode'], ['atis-latch', 'atis'],
@@ -92,6 +92,60 @@ export function nativeTime(session: TranscriptEntry[], entry: TranscriptEntry, r
   return entry.at >= receipt.at && (!parent || Number.isFinite(parent.at) && entry.at >= parent.at)
 }
 
+function assertAC15Action(block: any) {
+  if (block.type === 'tool_use' || block.type === 'server_tool_use') check(block.type === 'tool_use'
+    && ['mcp__slack-channel-router__reply', 'ToolSearch'].includes(block.name), 'AC15 non-reply tool action observed')
+}
+
+function assertAC15EmbeddedActions(value: any): void {
+  if (!value || typeof value !== 'object') return
+  assertAC15Action(value)
+  for (const child of Object.values(value)) assertAC15EmbeddedActions(child)
+}
+
+const object = (value: any): boolean => value !== null && typeof value === 'object' && !Array.isArray(value)
+const onlyKeys = (value: any, keys: string[]): boolean => object(value) && Object.keys(value).every(k => keys.includes(k))
+
+// Native 2.1.304 appendRequestReplayRecords writes hash-keyed copies of outgoing
+// request messages, not new assistant actions. Accept only understood shapes;
+// definitions inside ToolSearch results are references, not tool executions.
+function requestEchoContent(content: any, toolResult = false): boolean {
+  if (typeof content === 'string') return true
+  return Array.isArray(content) && content.every(block => {
+    if (!object(block)) return false
+    switch (block.type) {
+      case 'text': return onlyKeys(block, ['type', 'text']) && typeof block.text === 'string'
+      case 'tool_use': return onlyKeys(block, ['type', 'id', 'name', 'input'])
+        && typeof block.id === 'string' && block.id.length > 0 && typeof block.name === 'string' && object(block.input)
+      case 'tool_result': return onlyKeys(block, ['type', 'tool_use_id', 'content', 'is_error'])
+        && typeof block.tool_use_id === 'string' && block.tool_use_id.length > 0
+        && (block.is_error === undefined || typeof block.is_error === 'boolean')
+        && (block.content === undefined || requestEchoContent(block.content, true))
+      case 'tool_reference': return toolResult && onlyKeys(block, ['type', 'tool_name'])
+        && typeof block.tool_name === 'string' && block.tool_name.length > 0
+      default: return false
+    }
+  })
+}
+
+function ac15RequestEcho(entry: TranscriptEntry, adapters: ReceiptAdapters): boolean {
+  const value = entry.value
+  if (value.type !== 'api-request-blob') return false
+  // Check actions even in malformed or nested data before considering the
+  // time exemption. No hash, role or surrounding text can conceal a tool_use.
+  assertAC15EmbeddedActions(value)
+  check(onlyKeys(value, ['type', 'sessionId', 'hash', 'message']) && Object.keys(value).length === 4
+    && typeof value.sessionId === 'string' && value.sessionId.length > 0
+    && typeof value.hash === 'string' && /^[a-f0-9]{64}$/.test(value.hash)
+    && onlyKeys(value.message, ['role', 'content']) && Object.keys(value.message).length === 2
+    && ['user', 'assistant', 'system'].includes(value.message.role) && requestEchoContent(value.message.content)
+    && Number.isNaN(entry.at) && entry.kind === 'other' && entry.uuid === undefined && entry.text === undefined,
+  'AC15 malformed native request echo')
+  const parsed = adapters.parseDeliveryTranscriptRecord('claude', value)
+  check(parsed.kind === 'other' && parsed.uuid === undefined && parsed.text === undefined, 'AC15 request echo carries transcript evidence')
+  return true
+}
+
 // AC15 may acknowledge a part, but retrieval or any other action cannot
 // supply missing context. Inspect every copy's turn and its late descendants;
 // completion/JSON provenance remains the ordinary final-part oracle below.
@@ -124,6 +178,7 @@ function assertAC15Exchange(parts: string[], acceptedAt: number, seq: number, jo
       for (const e of session.filter(e => e.offset > copy.offset && ((!next || e.offset < next.offset) || linked(e)
         || e.value?.type === 'system' && e.value.refusedUserMessageUuid === copy.uuid))) {
         if (nativeInformation(e, adapters)) continue
+        if (ac15RequestEcho(e, adapters)) continue
         check(!(e.value.type === 'system' && /(?:refusal|fallback|api_error|api_retry)/.test(e.value.subtype ?? '')),
           'AC15 exchange has refusal/API failure')
         check(nativeTime(session, e, copy, adapters), 'AC15 exchange has invalid/stale time')
@@ -133,8 +188,7 @@ function assertAC15Exchange(parts: string[], acceptedAt: number, seq: number, jo
           check(block && typeof block === 'object' && typeof block.type === 'string', 'AC15 has malformed native response block')
           // Claude's native ToolSearch discovers deferred tool definitions; it
           // does not execute them. Check every subsequent action independently.
-          if (block.type === 'tool_use' || block.type === 'server_tool_use') check(block.type === 'tool_use'
-            && ['mcp__slack-channel-router__reply', 'ToolSearch'].includes(block.name), 'AC15 non-reply tool action observed')
+          assertAC15Action(block)
         }
       }
     }
