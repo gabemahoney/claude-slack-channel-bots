@@ -4,6 +4,7 @@ set -euo pipefail
 TEST_NAME="test-101-fmk-real-busy"
 source "$(dirname "$0")/../integration/lib/scenario.sh"
 source "$(dirname "$0")/../integration/lib/real-scenario.sh"
+source "$(dirname "$0")/../integration/lib/real-recovery.sh"
 CASE_ASSERT="${SCENARIO_FIXTURES}/real-case-assertions.ts"
 BUSY_SETTLED="$(dirname "$0")/test-101-denial-settled.ts"
 case_assert() { bun "${CASE_ASSERT}" "$1" "${SLACK_STATE_DIR}" "${REAL_KEY}" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" "${@:2}"; }
@@ -59,10 +60,9 @@ wait_until 180 'denied subagent did not settle after successful relay response' 
 real_wait_idle "${REAL_KEY}"
 real_dm "${REAL_LABEL}" 'message after denied subagent request'
 wait_until 180 'dialog-hold Delivery stuck was not posted' case_assert dialog-notice "${SCENARIO_SLACK_RECORD}" "${REAL_LABEL}"
-real_ad kill --instance-id "$(real_instance "${REAL_KEY}")" >/dev/null
-stop_server
+real_kill_and_reconcile "${REAL_KEY}"
 start_server --live
-real_wait_launch "${REAL_KEY}"
+real_wait_relaunch "${REAL_KEY}"
 real_wait_delivery "${REAL_KEY}" 6
 
 case_assert launches

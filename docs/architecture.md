@@ -1091,6 +1091,15 @@ In `main()` the steps run in this order: 0, 1, 2, 2a, 2a-bis, 2b, 2c, 3, then th
 
 ### Auto-Restart
 
+When a disconnected session's reconnect is refused with `ErrDialogMaybeOpen`,
+`reconnectAnswerTo` runs the shared, memoized `findMissing` sweep and re-reads
+the persona's own AD row. This applies both to startup collision recovery and
+later reconnects: AD can refuse input before checking a killed process.
+A finished row returns `row-read-finished` to the existing resume path; a
+live, unverified or unreadable row stays held. The refusal supplies no death
+evidence and authorizes no kill, forced spawn, pane read, hash bypass or Enter.
+The sweep retains existing error-class handling, pending grace and latches.
+
 Restart guards, backoff, the cap latch and every restart dependency are keyed by persona key (b.av2 SR-6.3), and restart log lines name it as `persona=<key>`, e.g. `[slack] Scheduling restart for persona=<key> in <n>s (backoff)`.
 
 Auto-restart only acts on a persona that is up. It is separate from bring-up retries (Server-Managed Startup step 5), which have their own per-persona timers on the SR-3.2 backoff with no cap and never touch this module's counter, backoff or cap. In particular, a directory that is missing at bring-up is a bring-up retry. A persona that is running and whose directory later disappears stays on this path: the health check raises `cwd-unreachable` for it (b.av2 SR-11), and its relaunches follow the backoff and cap below.

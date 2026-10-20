@@ -18368,6 +18368,103 @@ function reconnectUnusableNameLatch(p: string, row: UnusableNameCaseRow): Expect
   return { ...unusableNameLatch(p, row), lines: (h) => lines(h), says: RECONNECT_LATCHED_SAYS }
 }
 
+describe('disconnected reconnect reconciles AD liveness despite a dialog hold', () => {
+  beforeEach(() => _resetFindMissingMemo())
+  afterEach(() => srj105AfterEach())
+
+  test.each(['direct', 'startup'] as const)('%s keeps an unverified dialog-held row held across retries', async entry => {
+    const { h, p } = srj105Build()
+    h.script({
+      ...collided(h, harnessPersona(h, p), { state: 'waiting' }),
+      findMissingResult: unverifiedRowsOf(p),
+      sendKeysError: errDialogMaybeOpen(),
+    })
+    const order = recordCallOrder(h)
+    const run = () => entry === 'startup' ? h.launch(p) : reconnectMcpWithCause(p, WAITING_READ)
+    const first = await run()
+    expect(first).toEqual(entry === 'startup' ? { key: p, action: 'retrying' } : { outcome: 'transient' })
+    if (entry === 'direct') await run()
+    expect(order.indexOf('findMissing')).toBeGreaterThan(order.indexOf('sendKeys'))
+    expect(h.stub.calls.findMissingCalls).toHaveLength(1)
+    expect(h.stub.calls.sendKeysCalls.length).toBe(entry === 'direct' ? 2 : 1)
+    for (const call of h.stub.calls.sendKeysCalls) {
+      expect(call).toEqual({ instance_id: personaInstanceId(p), text: RECONNECT_TEXT, no_enter: true })
+    }
+    expect(h.stub.calls.killCalls).toEqual([])
+    expect(h.stub.calls.resumeCalls).toEqual([])
+    expect(h.stub.calls.readPaneCalls).toEqual([])
+    expect(h.stub.calls.spawnCalls).toHaveLength(entry === 'startup' ? 1 : 0)
+    expect(getFailureCount(p)).toBe(0)
+  })
+
+  test.each(['startup', 'restart adapter'] as const)('%s routes the reconciled missing row toward resume without death evidence', async entry => {
+    const { h, p } = srj105Build()
+    const persona = harnessPersona(h, p)
+    let reconciled = false
+    h.script({
+      ...collided(h, persona, { state: 'waiting' }),
+      getFn: () => harnessRow(h, persona, { state: reconciled ? 'missing' : 'waiting' }),
+      findMissingFn: () => {
+        reconciled = true
+        return cannedFindMissing({ rows: { [personaInstanceId(p)]: 'ids' } })
+      },
+      sendKeysError: errDialogMaybeOpen(),
+    })
+    const order = recordCallOrder(h)
+    if (entry === 'startup') {
+      expect(await h.launch(p)).toEqual({ key: p, action: 'resumed' })
+      expect(order.indexOf('findMissing')).toBeLessThan(order.indexOf('resume'))
+    } else {
+      expect(await _buildReconnectSessionAdapter(() => persona)(p)).toEqual({
+        outcome: 'escalate-dead', deadEvidence: carriedDeadEvidenceOf(DEAD_SESSION_CAUSE_ROW_READ_FINISHED),
+      })
+      expect(isDeadEvidence(DEAD_SESSION_CAUSE_ROW_READ_FINISHED)).toBe(false)
+    }
+    expect(h.stub.calls.findMissingCalls).toHaveLength(1)
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf(entry === 'startup' ? { spawn: 1, sendKeys: 1, resume: 1 } : { sendKeys: 1 }))
+    expect(h.stub.calls.readPaneCalls).toEqual([])
+  })
+
+  test.each(['missing', 'ended', 'pending', 'check_permission'] as const)('the fresh post-sweep %s row alone decides recovery', async state => {
+    const { h, p } = srj105Build()
+    let reconciled = false
+    const launchStartedAt = new Date().toISOString()
+    h.script({
+      getFn: () => harnessRow(h, harnessPersona(h, p), { state: reconciled ? state : 'waiting', launch_started_at: launchStartedAt }),
+      findMissingFn: () => {
+        reconciled = true
+        return unverifiedRowsOf(p)
+      },
+      sendKeysError: errDialogMaybeOpen(),
+    })
+    const finished = state === 'missing' || state === 'ended'
+    expect(await reconnectMcpWithCause(p, WAITING_READ)).toEqual(finished
+      ? { outcome: 'dead-session', deadCause: DEAD_SESSION_CAUSE_ROW_READ_FINISHED, finishedState: state }
+      : { outcome: 'transient' })
+    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ sendKeys: 1 }))
+    expect(h.stub.calls.readPaneCalls).toEqual([])
+  })
+
+  test.each([
+    ['UNAVAILABLE', () => SRJ105_UNAVAILABLE[0]![1]('find-missing'), true],
+    ['ENVIRONMENT', () => errTmuxNotAvailable('find-missing'), true],
+    ['CONFIG', () => errConfigMalformed('find-missing'), true],
+    ['UNCLASSIFIED', () => errGeneric('find-missing', 'ErrSweepUnknown'), true],
+    ['UNUSABLE NAME', () => errUnusableName(), false],
+  ] as const)('%s sweep error follows the shared class handling', async (_name, make, refused) => {
+    const { h, p } = srj105Build()
+    h.script({ findMissingError: make(), sendKeysError: errDialogMaybeOpen() })
+    const order = recordCallOrder(h)
+    expect(await runInAttempt(p, 'recovery', () => reconnectMcpWithCause(p, WAITING_READ))).toEqual({ outcome: 'transient' })
+    expect(order).toEqual(['get', 'get', 'sendKeys', 'findMissing', ...(refused ? [] : ['get'])])
+    expect(h.stub.calls.killCalls).toEqual([])
+    expect(h.stub.calls.resumeCalls).toEqual([])
+    expect(h.stub.calls.spawnCalls).toEqual([])
+    expect(h.stub.calls.readPaneCalls).toEqual([])
+    expect(getFailureCount(p)).toBe(0)
+  })
+})
+
 describe('b.jg5 SRJ-118, SRJ-609: reconnectMcpWithCause makes one send-keys and decides its answer by class; no tmux server start, no retry, no failure counted or posted', () => {
   /** Every `resolveSystemBinary` call the installed re-check made (the `ErrInvalidFlags` cells). */
   let resolveCalls: Array<object | undefined>
