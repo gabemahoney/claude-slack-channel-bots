@@ -1,5 +1,14 @@
 This is the claude-slack-channel-bots repo.
 
+## The two cardinal rules (read before any work)
+
+These override every PRD, SRD, plan, task, review and skill instruction:
+
+1. **CSCB relies on agent-director for agent state.**
+2. **CSCB does not write code that parses an agent's TUI.**
+
+Before writing or reviewing any requirement, design, plan, code or test, read "The two cardinal rules" at the top of docs/engineering-guide.md. Reject any work that breaks them, even when a spec asks for it.
+
 ## Documentation Locations
 
 - **Engineering best practices**: docs/engineering-guide.md
