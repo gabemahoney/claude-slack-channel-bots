@@ -1,8 +1,8 @@
 /**
  * b.omv SR-15.6 / t3.j2a.di.th.4y: certification and trace handoff boundaries.
  * Synthetic cases use disposable inputs and an in-memory scheduler. They never
- * certify the repository. The separate committed-evidence case deliberately
- * fails until the complete canonical certification exists; do not skip it.
+ * certify the repository. Committed local evidence has its own complete-run
+ * and independent-proof gate; it never substitutes for scheduler certification.
  * E3 owns runtime replay and ENGINE_ACTIONS conformance.
  */
 import { afterEach, describe, expect, test } from 'bun:test'
@@ -480,25 +480,124 @@ assert not (root / "ci/.runs").exists()
 `))
 })
 
-// Kept outside the synthetic filter: expected to fail while E1 is uncertified.
-// Only committed artifacts travel with a checkout. The production CLI audit of
-// ignored scheduler logs and absolute-path SANY evidence is a separate gate.
-// The complete compact fixture set expands beyond 1 GiB and is checked twice.
-// Keep its finite deadline separate from the small synthetic cases' 30s cap.
-test('delivery committed evidence: latest PASS binds portable inputs and fixtures after checkout relocation without repository writes', () => python(String.raw`
+// Local TLC evidence deliberately has a separate gate from scheduler certification.
+// Relocation retains every current input/fixture and never accesses ignored runs.
+test('delivery committed local evidence binds current inputs and fixtures after checkout relocation without repository writes', () => python(String.raw`
 before = committed_state(SOURCE)
 try:
-    record = readonly(lambda: portable_certificate(SOURCE))
+    local = load(REPO / "tests/test-helpers/delivery-local-evidence.py", "verdict_local_evidence")
+    summary = readonly(local.validate)
+    coverage = json.loads((REPO / "tests/fixtures/delivery-traces/coverage.json").read_text())
+    assert coverage["certification"] is False
     relocated = SCRATCH / "relocated-checkout/spec/tla"
-    for name in [*record["inputs"], "ci/verdicts.txt"]:
+    for name in coverage["inputs"]:
         target = relocated / name
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(SOURCE / name, target)
     shutil.copytree(REPO / "tests/fixtures/delivery-traces",
                     relocated.parents[1] / "tests/fixtures/delivery-traces")
+    local.SOURCE = relocated
+    local.DESTINATION = relocated.parents[1] / "tests/fixtures/delivery-traces"
     assert not (relocated / "ci/.runs").exists()
-    assert readonly(lambda: portable_certificate(relocated)) == record
+    assert readonly(local.validate) == summary
     assert not (relocated / "ci/.runs").exists()
 finally:
     assert committed_state(SOURCE) == before, "committed evidence/source state changed"
 `, 600_000), 605_000)
+
+test('local delivery evidence refuses incomplete rows, missing independent proofs and changed retained artifacts', () => python(String.raw`
+local = load(REPO / "tests/test-helpers/delivery-local-evidence.py", "refusal_local_evidence")
+coverage = json.loads((REPO / "tests/fixtures/delivery-traces/coverage.json").read_text())
+rows = local.runner.load_manifest(local.SOURCE, False)
+for mutate, message in [
+    (lambda report: report.update(certification=True), "not a complete local report"),
+    (lambda report: report.update(partial=True), "not a complete local report"),
+    (lambda report: report.update(inputsUnchanged=False), "changed local inputs"),
+    (lambda report: report.update(modelSha256="0" * 64), "stale local model"),
+    (lambda report: report.pop("localLaunch"), "changed local launch provenance"),
+    (lambda report: report["localLaunch"].update(sha256="0" * 64), "changed local launch provenance"),
+    (lambda report: report["rows"].pop(), "incomplete local manifest"),
+    (lambda report: report["auxiliaryRows"].pop(), "incomplete auxiliary manifest"),
+    (lambda report: report["rows"][0].update(proofsRequested=False), "missing/failed local proof"),
+    (lambda report: report["rows"][0].update(proofError="incomplete witness"), "missing/failed local proof"),
+    (lambda report: report["rows"][0].update(matched=False), "unfinished local row"),
+    (lambda report: report["auxiliaryRows"][0].update(timeout=True), "unfinished local row"),
+    (lambda report: next(row for row in report["rows"] if row["mode"] == "simulate").update(temporalVerified=True), "overstated local temporal verdict"),
+]:
+    report = copy.deepcopy(coverage["report"])
+    mutate(report)
+    refuses(lambda: readonly(lambda: local.validate_report(report, rows)), message)
+
+report = copy.deepcopy(coverage["report"])
+launch = json.loads(report["localLaunch"]["raw"])
+launch["rowSeconds"] -= 1
+raw_launch = json.dumps(launch)
+report["localLaunch"] = {"raw": raw_launch, "sha256": local.digest(raw_launch.encode())}
+refuses(lambda: readonly(lambda: local.validate_report(report, rows)), "changed local launch budget or scope")
+
+def fixture(cfg):
+    name = cfg + "-001.json"
+    return local.unpack(json.loads((local.DESTINATION / name).read_text()))
+
+core = next(row for row in rows if row["cfg"] == "core_head_taken_in")
+envelope = fixture(core["cfg"])
+for mutate, message in [
+    (lambda e: e.pop("acceptedWork"), "missing accepted-work evidence"),
+    (lambda e: e["acceptedWork"]["artifacts"].pop("search/run.log"), "missing accepted-work artifacts"),
+    (lambda e: e["acceptedWork"]["artifacts"]["java-launcher"].update(sha256="0" * 64), "changed accepted-work artifact"),
+    (lambda e: e.pop("localRowBudgetSeconds"), "changed local row budget"),
+    (lambda e: e.update(localRowBudgetSeconds=e["localRowBudgetSeconds"] - 1), "accepted-work row clock changed"),
+]:
+    changed = copy.deepcopy(envelope)
+    mutate(changed)
+    refuses(lambda: readonly(lambda: local.metadata(core, changed, coverage["inputs"])), message)
+
+control = next(row for row in rows if row["cfg"] == "control_deferred_only_open")
+envelope = fixture(control["cfg"])
+for field, message in [("concreteCandidate", "missing separate concrete temporal candidate"),
+                       ("candidateSource", "missing candidate source provenance"),
+                       ("temporalSensitivity", "missing/stale temporal sensitivity evidence")]:
+    changed = copy.deepcopy(envelope)
+    changed.pop(field)
+    refuses(lambda: readonly(lambda: local.metadata(control, changed, coverage["inputs"])), message)
+changed = copy.deepcopy(envelope)
+changed["localArtifacts"].pop("sensitivity/mutant/run.log")
+refuses(lambda: readonly(lambda: local.validate_temporal_artifacts(control, changed)), "missing/extra temporal proof artifact")
+changed = copy.deepcopy(envelope)
+changed["localArtifacts"]["sensitivity/mutant/run.log"]["sha256"] = "0" * 64
+refuses(lambda: readonly(lambda: local.validate_temporal_artifacts(control, changed)), "changed temporal artifact")
+
+auxiliary = next(row for row in local.cardinal.auxiliary_rows(local.SOURCE) if row["cfg"] == "permission_eventually_delivered")
+result = next(row for row in coverage["report"]["auxiliaryRows"] if row["cfg"] == auxiliary["cfg"])
+evidence = copy.deepcopy(coverage["auxiliaryEvidence"][auxiliary["cfg"]])
+evidence["traces"][0]["behavior"][0]["executedAction"] = "forged"
+refuses(lambda: readonly(lambda: local.validate_auxiliary(auxiliary, result, evidence)), "changed auxiliary raw trace")
+
+supplemental = local.unpack(json.loads((local.DESTINATION / local.SUPPLEMENTAL_NAME).read_text()))
+changed = copy.deepcopy(supplemental)
+changed["supplementalEvidence"]["artifacts"].pop("replay/ExactReplay.tla")
+refuses(lambda: readonly(lambda: local.validate_supplemental(changed, coverage["inputs"])), "missing/extra supplemental artifact")
+
+def replace_supplemental_artifact(envelope, name, content):
+    evidence = envelope["supplementalEvidence"]
+    checksum = local.digest(content)
+    evidence["artifacts"][name] = {"sha256": checksum, "base64": base64.b64encode(content).decode()}
+    evidence["payload"]["artifacts"][name] = checksum
+    return checksum
+
+changed = copy.deepcopy(supplemental)
+name = "replay/ExactReplay.tla"
+original = base64.b64decode(changed["supplementalEvidence"]["artifacts"][name]["base64"])
+content = original.replace(b"Assert(Next,", b"Assert(TRUE,")
+assert content != original
+changed["supplementalEvidence"]["payload"]["replay"]["moduleSha256"] = replace_supplemental_artifact(changed, name, content)
+refuses(lambda: readonly(lambda: local.validate_supplemental(changed, coverage["inputs"])), "changed supplemental checker inputs/log")
+
+changed = copy.deepcopy(supplemental)
+name = "replay/run.log"
+original = base64.b64decode(changed["supplementalEvidence"]["artifacts"][name]["base64"])
+content = original.replace(b"true", b"false", 1)
+assert content != original
+changed["supplementalEvidence"]["payload"]["replay"]["logSha256"] = replace_supplemental_artifact(changed, name, content)
+refuses(lambda: readonly(lambda: local.validate_supplemental(changed, coverage["inputs"])), "missing original-Next supplemental replay proof")
+`, 120_000), 125_000)

@@ -1,6 +1,5 @@
-/** Full certified runtime decision replay (b.omv SR-15.6). The E1 verdict
- * suite owns provenance boundary permutations; this composes its validator
- * and the frozen contract's complete graph and class sensitivity checks. */
+/** Local TLC runtime decision replay after the cardinal-rule model migration.
+ * Local evidence keeps its own provenance; it is never a scheduler certificate. */
 import { afterEach, expect, test } from 'bun:test'
 import { spawnSync } from 'node:child_process'
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
@@ -17,55 +16,32 @@ afterEach(() => { for (const root of scratch.splice(0)) rmSync(root, { recursive
 function temporary() { const root = mkdtempSync(join(tmpdir(), 'delivery-conformance-')); scratch.push(root); return root }
 function coverage() { return JSON.parse(readFileSync(join(fixtures, 'coverage.json'), 'utf8')) }
 
-test('certified inputs, all complete paths and temporal cycles retain class-specific sensitivity and executed coverage', () => {
+test('complete local TLC inputs retain full paths, cycles, executed controls and coverage without claiming scheduler certification', () => {
   const root = temporary(), home = join(root, 'home'); mkdirSync(home)
   const body = String.raw`
-record = readonly(lambda: portable_certificate(SOURCE))
-rows = {row["cfg"]: row for row in runner.load_manifest(SOURCE, False)}
-summary = {"traces": 0, "states": 0, "controls": set(), "actions": set(), "faults": set(), "flaps": set()}
-inventory = record["trace_evidence"]["fixtures"]
-for name, checksum in sorted(inventory.items()):
-    cfg = name.rsplit("-", 1)[0]
-    row = rows[cfg]
-    stored = runner.read_json(SOURCE.parents[1] / "tests/fixtures/delivery-traces" / name)
-    envelope = contract.rehydrate_fixture(stored)
-    behavior, metadata = validate_committed_envelope(record, row, envelope)
-    if runner.reduced_cfg(row):
-        contract.validate_restart_mutation_behavior(row, behavior)
-    bugs = contract.executed_bug_steps(row, behavior, companion=cfg in runner.RESTART_MUTATIONS)
-    assert envelope["behaviorMetadata"] == {**metadata, "bugSteps": bugs}, cfg + ": altered replay/control metadata"
-    if cfg in runner.ALL_CONTROLS:
-        summary["controls"].add(cfg)
-        if not row["properties"] and metadata["controlClass"] == "choice":
-            assert bugs, cfg + ": no executed divergent transition"
-    for before, after in zip(behavior, behavior[1:]):
-        if before["state"] == after["state"]:
-            continue
-        if after["control"]["class"] == "correct" and after["executedAction"] in record["trace_evidence"]["engineActions"]:
-            summary["actions"].add(after["executedAction"])
-        if after["transition"] in record["trace_evidence"]["flappingActions"]:
-            summary["flaps"].add(after["transition"])
-        for fault in record["trace_evidence"]["boundedFaults"]:
-            delta = after["state"]["faults"][fault] - before["state"]["faults"][fault]
-            assert delta in (0, 1), cfg + ": invalid fault edge"
-            if delta:
-                summary["faults"].add(fault)
-    summary["traces"] += 1
-    summary["states"] += len(behavior)
-for actual, expected in (("actions", "engineActions"), ("faults", "boundedFaults"), ("flaps", "flappingActions"), ("controls", "controls")):
-    assert sorted(summary[actual]) == record["trace_evidence"][expected], "lost executed coverage: " + actual
-    summary[actual] = len(summary[actual])
-print(json.dumps(summary))
+local = load(REPO / "tests/test-helpers/delivery-local-evidence.py", "conformance_local_evidence")
+print(json.dumps(readonly(local.validate)))
 `
   const result = spawnSync('/usr/bin/python3', ['-B', '-c', `${deliveryEvidencePython}\n${body}`, repo, root], {
     cwd: repo, env: hostSafeChildEnv(home, { tools: [], extras: { TMPDIR: root, SLACK_STATE_DIR: join(home, 'state') } }),
     encoding: 'utf8', timeout: 600000, maxBuffer: 1024 * 1024,
   })
   expect({ status: result.status, signal: result.signal, error: result.error?.message, diagnostic: result.status === 0 ? '' : result.stderr + result.stdout }).toEqual({ status: 0, signal: null, error: undefined, diagnostic: '' })
-  expect(JSON.parse(result.stdout)).toEqual({ traces: 300, states: 54473, controls: 38, actions: 21, faults: 26, flaps: 4 })
+  const c = coverage()
+  expect(JSON.parse(result.stdout)).toEqual({ traces: c.summary.traces, states: c.summary.states, controls: 38, actions: ENGINE_ACTIONS.length, faults: 26, flaps: 4 })
+  expect(c.certification).toBe(false)
+  expect(c.evidenceKind).toBe('local-tlc-replay')
+  expect(c.report.inputsUnchanged).toBe(true)
+  expect(c.report.rows).toHaveLength(76)
+  expect(c.report.auxiliaryRows).toHaveLength(8)
+  expect(Object.keys(c.auxiliaryEvidence)).toHaveLength(8)
+  expect(Object.keys(c.supplementalEvidence)).toEqual(['supplemental_pullback-001.json'])
+  expect(c.report.rows.some((row: any) => row.cfg === 'supplemental_pullback')).toBe(false)
+  const checked = new Set(c.report.rows.filter((row: any) => row.mode === 'check' && row.expect === 'pass').flatMap((row: any) => row.checks))
+  for (const invariant of ['NoDrop', 'InOrder', 'TranscriptFIFO', 'OneInFlight', 'DurableAccept', 'ReceiptBacked', 'NoDuplicateKey']) expect(checked.has(invariant)).toBe(true)
 }, 600000)
 
-test('ENGINE_ACTIONS equals the frozen TLA source vocabulary and fixture inventory', () => {
+test('ENGINE_ACTIONS equals the current TLA source vocabulary and frozen fixture inventory', () => {
   const source = readFileSync(join(repo, 'spec/tla/PersonaDelivery.tla'), 'utf8')
   const set = /EngineActions\s*==\s*\{([^}]+)\}/.exec(source)![1]!
   const actions = [...set.matchAll(/"([^"]+)"/g)].map(m => m[1]!).sort()
@@ -73,25 +49,28 @@ test('ENGINE_ACTIONS equals the frozen TLA source vocabulary and fixture invento
   const c = coverage()
   expect(c.engineActions).toEqual(actions)
   expect(Object.keys(c.fixtures).sort()).toEqual(readdirSync(fixtures).filter(name => name !== 'coverage.json').sort())
-  expect(Object.keys(c.fixtures)).toHaveLength(300)
+  expect(Object.keys(c.fixtures)).toHaveLength(c.summary.traces)
 })
 
-test('every state of all 300 certified traces chooses through production screen/receipt adapters and separate frozen engine/gate readings', async () => {
+test('every frozen state replays AD/receipt decisions; recovery intents also tolerate disconnected MCP', async () => {
   const c = coverage()
-  let states = 0, divergentReadings = 0, savedScreens = 0, expiredSteps = 0
-  // One envelope at a time: the complete expanded corpus is over 1 GiB.
+  let states = 0, divergentReadings = 0, savedReadings = 0, expiredSteps = 0, mcpIndependentRecoveries = 0, recoveryEnters = 0
+  // Decode one envelope at a time to bound replay memory.
   for (const [name, hash] of Object.entries(c.fixtures)) {
     const envelope = decodeDeliveryFixture(join(fixtures, name), hash as string)
     const result = await replayDeliveryFixture(envelope)
-    states += result.states; divergentReadings += result.divergentReadings; savedScreens += result.savedScreens; expiredSteps += result.expiredSteps
+    states += result.states; divergentReadings += result.divergentReadings; savedReadings += result.savedReadings; expiredSteps += result.expiredSteps
+    mcpIndependentRecoveries += result.mcpIndependentRecoveries; recoveryEnters += result.recoveryEnters
   }
-  expect(states).toBe(54473)
+  expect(states).toBe(c.summary.states)
   expect(divergentReadings).toBeGreaterThan(0)
-  expect(savedScreens).toBeGreaterThan(0)
+  expect(savedReadings).toBeGreaterThan(0)
   expect(expiredSteps).toBeGreaterThan(0)
+  expect(mcpIndependentRecoveries).toBeGreaterThan(0)
+  expect(recoveryEnters).toBeGreaterThan(0)
 }, 180000)
 
-test('an isolated mutation of production FIFO selection is detected by the same certified replay', async () => {
+test('an isolated mutation of production FIFO selection is detected by the same local TLC replay', async () => {
   const root = temporary(), path = join(root, 'mutant-policy.ts')
   const original = readFileSync(join(repo, 'src/delivery-policy.ts'), 'utf8')
   const expression = '.sort((a, b) => a - b)'

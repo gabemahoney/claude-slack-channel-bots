@@ -4,17 +4,16 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
-import { decideEngine, decideGate, selectDeliveryTarget, LAUNCH_SETTLE_MS, ENTER_DELAY_MS, ENTER_ONLY_RETRY_MS, RECEIPT_WAIT_MS, RETYPE_BACKOFF_MS, NOT_NOW_RETRY_MS, IDLE_EVIDENCE_MAX_WAIT_MS, type DeliveryPolicyKnowledge, type DeliveryReading, type DeliveryPair } from '../../src/delivery-engine.ts'
-import { FULL_PANE_READ_LINES, readDeliveryScreen } from '../../src/delivery-screen.ts'
+import { decideEngine, decideGate, selectDeliveryTarget, LAUNCH_SETTLE_MS, ENTER_DELAY_MS, RECEIPT_WAIT_MS, RETYPE_BACKOFF_MS, NOT_NOW_RETRY_MS, type DeliveryPolicyKnowledge, type DeliveryReading, type DeliveryPair } from '../../src/delivery-engine.ts'
 import { parseDeliveryTranscriptRecord, receiptTextMatches } from '../../src/delivery-receipt.ts'
 import { TAG_MAX_BYTES } from '../../src/tag-wrapper.ts'
 import { createFakeClock } from './fake-clock.ts'
-import { deliveryPane, promptEntry, queuedCommandEntry, queueOperationEntry, pastedText } from './working-row-panes.ts'
+import { promptEntry, queuedCommandEntry, queueOperationEntry, pastedText } from './working-row-panes.ts'
 
-export const traceTimerConstants = { LAUNCH_SETTLE_MS, ENTER_DELAY_MS, ENTER_ONLY_RETRY_MS, RECEIPT_WAIT_MS, RETYPE_BACKOFF_MS: [...RETYPE_BACKOFF_MS], NOT_NOW_RETRY_MS: [...NOT_NOW_RETRY_MS], IDLE_EVIDENCE_MAX_WAIT_MS, FULL_PANE_READ_LINES, TAG_MAX_BYTES }
+export const traceTimerConstants = { LAUNCH_SETTLE_MS, ENTER_DELAY_MS, RECEIPT_WAIT_MS, RETYPE_BACKOFF_MS: [...RETYPE_BACKOFF_MS], NOT_NOW_RETRY_MS: [...NOT_NOW_RETRY_MS], TAG_MAX_BYTES }
 export function decodeDeliveryFixture(path: string, hash: string): any {
   const bytes = readFileSync(path)
-  assert.equal(createHash('sha256').update(bytes).digest('hex'), hash, `changed certified fixture ${path}`)
+  assert.equal(createHash('sha256').update(bytes).digest('hex'), hash, `changed frozen fixture ${path}`)
   const stored = JSON.parse(bytes.toString('utf8'))
   if (!stored.fixtureContainer) return stored
   const container = stored.fixtureContainer
@@ -35,13 +34,9 @@ function textFor(constants: any, pair: DeliveryPair): string {
   return `<channel source="slack-channel-router" user="sender" ts="${actual[0]}.000000" part="${actual[1]}">body\n${actual.join(':')}</channel>`
 }
 function reading(raw: any, constants: any): DeliveryReading {
-  const own = Array.isArray(raw.box) ? textFor(constants, raw.box) : String(raw.box ?? '')
-  const text = raw.screen === 'item' ? own : raw.screen === 'other' ? 'a human draft' : ''
-  const pane = raw.screen === 'overlay' ? 'Do you want to proceed?\n❯ 1. Yes\nEnter to confirm · Esc to cancel'
-    : deliveryPane(text, { history: `❯ earlier unrelated prompt\n${raw.screen === 'running' ? '✻ Thinking… (2s · ↓ 100 tokens)\n' : ''}` })
-  const parsed = readDeliveryScreen('claude', pane, own)
-  const screen = parsed.kind === 'own' ? 'item' : parsed.kind === 'empty' ? parsed.running ? 'running' : 'empty' : parsed.kind === 'input' ? 'other' : 'overlay'
-  assert.equal(screen, raw.screen, 'concrete screen rendering changed the observation')
+  // AD observations are the readiness contract. Never render or parse a pane,
+  // and never derive idle/busy from transcript contents.
+  assert(!('screen' in raw) && !('box' in raw), 'native UI leaked into AD observations')
   const records = raw.records.map((record: any, n: number) => {
     const text = textFor(constants, record.text)
     let entry
@@ -53,21 +48,21 @@ function reading(raw: any, constants: any): DeliveryReading {
     }
     // Parse serialized concrete JSONL records, as the receipt reader does.
     const parsed = parseDeliveryTranscriptRecord('claude', JSON.parse(JSON.stringify(entry)))
-    assert.equal(parsed.kind, record.kind)
-    assert(receiptTextMatches(parsed.text ?? '', text), 'concrete transcript failed exact text matching')
+    assert.equal(parsed.kind, record.kind === 'take-in' ? 'take-in' : 'other')
+    if (parsed.kind === 'take-in') assert(receiptTextMatches(parsed.text ?? '', text), 'concrete transcript failed exact text matching')
     return { kind: parsed.kind, text }
   })
   // A queue-is-receipt control deliberately advertises an enqueue here. Keep
   // that frozen observation: the production policy must reject its kind.
   for (const n of raw.receipts) assert(Number.isInteger(n) && records[n - 1], 'receipt index outside the concrete transcript')
-  return { ...structuredClone(raw), screen, box: parsed.kind === 'own' ? own : parsed.text, records }
+  return { ...structuredClone(raw), records }
 }
 function duration(name: string, constants: any, engine: any): number {
   const item = engine.target[0]
   const n = item ? engine.retypes[item - 1] ?? 0 : 0
   return ({ settle: LAUNCH_SETTLE_MS, receipt: RECEIPT_WAIT_MS,
-    backoff: RETYPE_BACKOFF_MS[Math.min(n, RETYPE_BACKOFF_MS.length - 1)], idleEvidence: IDLE_EVIDENCE_MAX_WAIT_MS,
-    enterDelay: engine.phase === 'retry' ? ENTER_ONLY_RETRY_MS : ENTER_DELAY_MS,
+    backoff: RETYPE_BACKOFF_MS[Math.min(n, RETYPE_BACKOFF_MS.length - 1)],
+    enterDelay: ENTER_DELAY_MS,
     notNow: NOT_NOW_RETRY_MS[0], reconnect: NOT_NOW_RETRY_MS[0] } as Record<string, number>)[name]!
 }
 export function renderDeliveryKnowledge(raw: any, constants: any): DeliveryPolicyKnowledge {
@@ -82,7 +77,7 @@ export function renderDeliveryKnowledge(raw: any, constants: any): DeliveryPolic
 export async function replayDeliveryFixture(envelope: any, choices = { decideEngine, decideGate, selectDeliveryTarget }) {
   const metadata = envelope.behaviorMetadata, rows = envelope[metadata.replayField].behavior
   const clock = createFakeClock({ flushTurns: 0 })
-  let divergentReadings = 0, savedScreens = 0, expiredSteps = 0
+  let divergentReadings = 0, savedReadings = 0, expiredSteps = 0, mcpIndependentRecoveries = 0, recoveryEnters = 0
   const outputs: unknown[][] = []
   for (const [index, record] of rows.entries()) {
     const where = `${envelope.cfg}:${index + 1}`
@@ -102,10 +97,19 @@ export async function replayDeliveryFixture(envelope: any, choices = { decideEng
     const expected = control ? [record.correctEngineChoice, record.correctGateChoice, record.correctSelectedTarget]
       : [record.EngineChoice, record.GateChoice, record.selectedTarget]
     assert.deepEqual(actual, expected, `${where}: production choice/target mismatch`)
+    if (actual[0] === 'recordRecoveryEnter') {
+      // Separate from the unchanged frozen-state replay above: contrast one
+      // input to prove a durable recovery intent does not depend on MCP.
+      const disconnected = structuredClone(record.knowledge)
+      disconnected.r.mcp = false
+      assert.equal(choices.decideEngine(renderDeliveryKnowledge(disconnected, record.constants)), 'recordRecoveryEnter', `${where}: recovery Enter depends on MCP`)
+      mcpIndependentRecoveries++
+    }
+    if (actual[0] === 'pressEnter' && k.e.phase === 'recovery-enter') recoveryEnters++
     assert.equal(JSON.stringify([k, gate]), before, `${where}: production mutated frozen knowledge`)
     outputs.push(actual)
     if (JSON.stringify(record.knowledge.r) !== JSON.stringify(record.gateKnowledge.r)) divergentReadings++
-    if (JSON.stringify(record.knowledge.e.keyReading) !== JSON.stringify(record.knowledge.r)) savedScreens++
+    if (JSON.stringify(record.knowledge.e.keyReading) !== JSON.stringify(record.knowledge.r)) savedReadings++
   }
   // Finite choice controls must expose the actually executed divergent edge;
   // temporal omissions/fairness/scheduling use their separately validated
@@ -114,5 +118,5 @@ export async function replayDeliveryFixture(envelope: any, choices = { decideEng
     const before = rows[position - 1], actual = outputs[position - 1]
     assert.notDeepEqual(actual, [before.EngineChoice, before.GateChoice, before.selectedTarget], `${envelope.cfg}:${position}: ineffective choice control`)
   }
-  return { states: rows.length, divergentReadings, savedScreens, expiredSteps, elapsed: clock.now() }
+  return { states: rows.length, divergentReadings, savedReadings, expiredSteps, mcpIndependentRecoveries, recoveryEnters, elapsed: clock.now() }
 }
