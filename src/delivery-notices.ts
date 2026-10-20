@@ -137,6 +137,10 @@ export function createDeliveryReporting(deps: DeliveryReportingDeps) {
       deps.log(`[slack] delivery-${event.type}: ${JSON.stringify({ key, session_id: event.sessionId, at: event.at })}`)
       return
     }
+    if (event.type === 'transcript-reference') {
+      deps.log(`[slack] delivery-transcript-reference: ${JSON.stringify({ key: safe(key), instance_id: safe(event.instanceId), session_id: safe(event.sessionId), jsonl_path: safe(event.path), at: event.at })}`)
+      return
+    }
     if (event.type === 'marker-missing' || event.type === 'delivered') return
     const item = deps.queue.items(key).find(i => i.accepted.seq === event.seq)
     if (!item) return

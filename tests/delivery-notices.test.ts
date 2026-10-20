@@ -34,6 +34,21 @@ test('launch timing diagnostics preserve structured engine evidence without post
   expect(r.queue.items(r.beta)).toEqual([])
 })
 
+test('late AD transcript references retain their identity in redacted diagnostics without a Slack notice', async () => {
+  const r = await run(), prefix = '[slack] delivery-transcript-reference: '
+  r.reporting.engineEvent({ type: 'transcript-reference', key: r.alpha, instanceId: `cscb_${r.alpha}`, sessionId: 'native-session', path: '/native/native-session.jsonl', at: 1500 })
+  const secret = sentinelInMessage('late-reference')
+  r.reporting.engineEvent({ type: 'transcript-reference', key: r.alpha, instanceId: secret, sessionId: secret, path: secret, at: 2500 })
+  await r.flush()
+  expect(r.logs).toHaveLength(2)
+  expect(JSON.parse(r.logs[0]!.slice(prefix.length))).toEqual({
+    key: r.alpha, instance_id: `cscb_${r.alpha}`, session_id: 'native-session', jsonl_path: '/native/native-session.jsonl', at: 1500,
+  })
+  expect(r.logs[1]).not.toContain(secret)
+  assertNoLeak(r.logs)
+  expect(r.h.totalPosts()).toBe(0)
+})
+
 // The sole literal wording pin for this notice module; behavior uses its builders.
 test('SR-8 delivery notices and all nine fixed remedies keep their required wording', () => {
   expect(reasons.map(([reason]) => deliveryStuckRemedy(reason, 'alpha', 3))).toEqual([

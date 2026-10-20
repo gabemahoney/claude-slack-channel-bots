@@ -59,7 +59,7 @@ import { prepareBotSystemPrompt, botSystemPromptPath } from './bot-system-prompt
 import type { Client } from 'agent-director'
 import { createDeliveryEngines, createDeliveryLifecycle, type DeliveryEngines, type DeliveryLifecycle, type DeliveryEngineEvent } from './delivery-engine.ts'
 import { createDeliveryAdScope } from './delivery-ad-scope.ts'
-import { setDeliveryLifecycle, setDeliveryPersonaLookup, inspectPersonaUpgrade, isTagUpgradePending, hasNotConnectedEpisode, applyDeliveryOwnRowRead, handleDeliveryKeyError, handleDeliveryReadError, recoverDeliveryGone } from './session-manager.ts'
+import { setDeliveryLifecycle, setDeliveryPersonaLookup, inspectPersonaUpgrade, isTagUpgradePending, hasNotConnectedEpisode, applyDeliveryOwnRowRead, handleDeliveryKeyError, handleDeliveryReadError, recoverDeliveryGone, refreshDeliveryTranscript } from './session-manager.ts'
 import type { WebClient } from '@slack/web-api'
 import { join, resolve } from 'path'
 import { fileURLToPath } from 'url'
@@ -3538,6 +3538,7 @@ export async function main(): Promise<void> {
     prepare: (key, item) => deliveryPreparation!.owns(key, item.accepted.seq) ? deliveryPreparation!.prepare(key, item) : Promise.resolve(),
     onRow: applyDeliveryOwnRowRead,
     inspectUpgrade: (key, _row, client, beforeCall) => deliveryScope.run(key, client as Client, beforeCall, async () => { await inspectPersonaUpgrade(key, getAppliedPersona(key)) }),
+    refreshTranscript: (key, client, beforeCall) => deliveryScope.run(key, client as Client, beforeCall, () => refreshDeliveryTranscript(key)),
     onKeyError: handleDeliveryKeyError,
     onReadError: handleDeliveryReadError,
     isRestartPendingOrActive, scheduleRestart,

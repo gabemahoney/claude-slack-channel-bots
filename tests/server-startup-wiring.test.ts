@@ -5527,6 +5527,8 @@ describe('typed delivery reporting production wiring', () => {
     expect(engine.get('onEvent')).toBe('event => deliveryEngineEvents.emit(event)')
     expect(engine.get('inspectUpgrade')).toContain('deliveryScope.run(key, client as Client, beforeCall,')
     expect(engine.get('inspectUpgrade')).toContain('inspectPersonaUpgrade(key, getAppliedPersona(key))')
+    expect(engine.get('refreshTranscript')).toContain('deliveryScope.run(key, client as Client, beforeCall, () => refreshDeliveryTranscript(key))')
+    expect(importSource(SERVER_CODE, 'refreshDeliveryTranscript')).toBe('./session-manager.ts')
     const life = onlyCallProps('createDeliveryLifecycle')
     expect(life.has('onReconnectScreen')).toBe(false)
     expect(onlyCallProps('createDeliveryReporting').has('reconnectBlocked')).toBe(false)

@@ -1,4 +1,7 @@
 import { MCP_SERVER_NAME } from '../src/config.ts'
+import type { Client } from 'agent-director'
+import { createDeliveryAdScope } from '../src/delivery-ad-scope.ts'
+import { refreshDeliveryTranscript } from '../src/session-manager.ts'
 /** b.omv SR-5/6: production executor over a durable queue and real adapters.
  * Receipt permutations and gate lifecycle live in their
  * own suite. Every timestamp and retry is driven by the injected fake clock. */
@@ -894,6 +897,91 @@ describe('durable FIFO and send sequence', () => {
     await delivered(h)
     expect(h.textCalls().map(c => c.params.text)).toEqual(['stuck', 'later'])
   })
+  test.each(['fresh', 'resumed'] as const)('%s delivery discovers a transcript reference published after Enter', async launch => {
+    const h = await harness(), p = h.p()
+    const oldPath = join(h.root, 'prior-transcript.jsonl')
+    writeTranscript(oldPath, [])
+    p.row = { ...p.row, jsonl_path: launch === 'fresh' ? '' : oldPath }
+    await h.accept('late transcript reference')
+    await start(h)
+    await h.advance(ENTER_DELAY_MS)
+    expect(h.keyCalls().map(c => c.params.key ?? 'text')).toEqual(['text', 'Enter'])
+    expect(h.queue.openCount('alpha')).toBe(1)
+    const gets = h.calls.filter(c => c.verb === 'get').length
+    // AD publishes the reference later, without changing session or state.
+    p.row = { ...p.row, jsonl_path: p.path }
+    await h.advance(DELIVERY_ROW_POLL_MS)
+    expect(h.calls.filter(c => c.verb === 'get').length).toBeGreaterThan(gets)
+    expect(h.queue.openCount('alpha')).toBe(0)
+    expect(h.textCalls()).toHaveLength(1)
+    expect(h.records().find(r => r.kind === 'delivered')).toMatchObject({ receipt: { path: p.path } })
+    const references = h.events.filter(event => event.type === 'transcript-reference')
+    expect(references).toEqual([{
+      type: 'transcript-reference', key: 'alpha', instanceId: p.row.instance_id, sessionId: p.row.session_id, path: p.path, at: h.clock.now(),
+    }])
+  })
+
+  test.each(['healed', 'late-file', 'refused', 'teardown'] as const)('provisional Claude transcript: %s uses the shared AD sweep and fresh row', async outcome => {
+    const scope = createDeliveryAdScope()
+    const recovery = makeRecoveryHarness({ personas: [{ name: 'alpha' }], harnessNow: true, deliveryScope: scope })
+    const h = await harness({
+      refreshTranscript: (key, client, beforeCall) => scope.run(key, client as Client, beforeCall, () => refreshDeliveryTranscript(key)),
+    })
+    setDeliveryLifecycle(h.lifecycle)
+    const p = h.p()
+    p.row = { ...p.row, jsonl_path: '' }
+    const sweeps: number[] = []
+    const readsAfterSweep: string[] = []
+    p.getHook = () => { if (sweeps.length) readsAfterSweep.push(p.row.jsonl_path) }
+    h.client('alpha').findMissing = async () => {
+      sweeps.push(h.clock.now())
+      if (outcome === 'refused') throw errCallTimeout('find-missing')
+      if (outcome === 'teardown') void h.engine.forget('alpha')
+      if (outcome !== 'late-file' || sweeps.length > 1) p.row = { ...p.row, jsonl_path: p.path }
+      return { count: 0, ids: [], unverified: 0, unverified_ids: [] }
+    }
+    try {
+      await h.accept('provisional reference')
+      await start(h)
+      expect(sweeps).toEqual([])
+      await h.advance(ENTER_DELAY_MS)
+      // Native take-in exists, but get still reports no reference.
+      expect(readFileSync(p.path, 'utf8')).toContain('provisional reference')
+      expect(sweeps).toHaveLength(1)
+      expect(readsAfterSweep).toEqual(outcome === 'refused' || outcome === 'teardown' ? [] : [p.row.jsonl_path])
+      if (outcome === 'late-file') {
+        await h.advance(DELIVERY_ROW_POLL_MS)
+        expect(sweeps).toHaveLength(1) // shared successful sweep is memoized
+        await recovery.clock.advanceTo(10000)
+        await h.advance(DELIVERY_ROW_POLL_MS)
+        expect(sweeps).toHaveLength(2)
+      }
+      const completes = outcome === 'healed' || outcome === 'late-file'
+      expect(h.queue.openCount('alpha')).toBe(completes ? 0 : 1)
+      expect(h.events.filter(event => event.type === 'transcript-reference')).toEqual(completes ? [{
+        type: 'transcript-reference', key: 'alpha', instanceId: p.row.instance_id, sessionId: p.row.session_id, path: p.path, at: sweeps.at(-1)!,
+      }] : [])
+      expect(h.keyCalls().map(c => c.params.key ?? 'text')).toEqual(['text', 'Enter'])
+      expect(recovery.stub.calls.findMissingCalls).toEqual([]) // isolated delivery client owns the sweep
+      assertNoLeak({ calls: h.calls, events: h.events, errors: h.errors, recovery: recovery.captured() })
+    } finally { await h.engine.stop(); recovery.cleanup() }
+  })
+
+  test('an exact receipt at the recorded send path needs no provisional-reference sweep', async () => {
+    let sweeps = 0
+    const h = await harness({ refreshTranscript: async () => { sweeps++; return false } }), p = h.p()
+    p.keyHook = params => {
+      if (params.key === 'Enter') p.row = { ...p.row, jsonl_path: '' }
+      return undefined
+    }
+    await h.accept('recorded path survives')
+    await start(h)
+    await delivered(h)
+    expect(sweeps).toBe(0)
+    expect(h.textCalls()).toHaveLength(1)
+    expect(h.records().find(r => r.kind === 'delivered')).toMatchObject({ receipt: { path: p.path } })
+  })
+
   test('accepted sends never confirm without a transcript record', async () => {
     const h = await harness()
     await h.accept('first'); await h.accept('second')

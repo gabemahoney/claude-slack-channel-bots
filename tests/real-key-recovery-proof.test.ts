@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { assertResetKeyRecovery, assertSwallowedEnterRecovery, assertUnknownKeyRecovery } from './integration/fixtures/real-case-assertions.ts'
+import { assertFirstLaunchWaiting, assertResetKeyRecovery, assertSwallowedEnterRecovery, assertUnknownKeyRecovery } from './integration/fixtures/real-case-assertions.ts'
 import { makeEngineHarness } from './test-helpers/delivery-engine.ts'
 import { ENTER_DELAY_MS } from '../src/delivery-engine.ts'
 
@@ -12,6 +12,19 @@ const text = { kind: 'sent', seq: 1, part: 1, send_kind: 'text', session_id: 'na
 const enter = { ...text, send_kind: 'enter', at: 12000 }
 
 describe('real key recovery proof', () => {
+  test.each([
+    ['own waiting', 'control', 'native-session', 1000, true],
+    ['foreign persona waiting', 'other', 'native-session', 1000, false],
+    ['foreign session waiting', 'control', 'other-session', 1000, false],
+    ['late waiting', 'control', 'native-session', 1001, false],
+    ['stale waiting', 'control', 'native-session', 999, false],
+    ['missing session', 'control', '', 1000, false],
+  ] as const)('first launch binds %s to the own persona and durable session', (_, key, session_id, at, allowed) => {
+    const proof = () => assertFirstLaunchWaiting([{ key, session_id, at }], [text], 'control', 1000, 1000)
+    if (allowed) expect(proof().session_id).toBe(text.session_id)
+    else expect(proof).toThrow()
+  })
+
   function resetFixture() {
     const sent = (at: number, send_kind: string) => ({
       kind: 'sent', seq: 4, part: 1, session_id: 'native-session', send_kind, at,

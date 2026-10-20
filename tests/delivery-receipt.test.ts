@@ -73,6 +73,23 @@ describe('real delivery timeout evidence (synthetic, no native launch)', () => {
     assertNoLeak(evidence)
     expect(JSON.stringify(evidence)).not.toContain(secret)
   })
+  test.each(['own', 'absent', 'foreign-persona', 'foreign-instance', 'foreign-session', 'foreign-directory'] as const)(
+    'pathless send accepts only independently observed AD transcript ownership: %s', async binding => {
+      const h = await fixture()
+      await h.send(0, '')
+      h.append({ ...promptEntry(h.text), sessionId: 'current', timestamp: new Date(h.item().accepted.received_at + 1).toISOString() })
+      // A delivered record alone must never establish ownership of its path.
+      await h.queue.append('alpha', { v: 1, kind: 'delivered', seq: 1, part: 1, at: h.item().accepted.received_at + 2, receipt: { path: h.path, uuid: 'receipt' } })
+      const reference = { key: 'alpha', instance_id: 'cscb_alpha', session_id: 'current', jsonl_path: h.path, at: 1500 }
+      if (binding === 'foreign-persona') reference.key = 'beta'
+      if (binding === 'foreign-instance') reference.instance_id = 'cscb_beta'
+      if (binding === 'foreign-session') reference.session_id = 'other'
+      if (binding === 'foreign-directory') reference.jsonl_path = join(h.root, 'foreign', 'current.jsonl')
+      fs.writeFileSync(join(h.root, 'server.log'), binding === 'absent' ? '' : '[slack] delivery-transcript-reference: ' + JSON.stringify(reference) + '\n')
+      fs.writeFileSync(join(h.root, 'shim.log'), '')
+      const evidence = deliveryFailureEvidence({ stateDir: h.root, key: 'alpha', shimLog: join(h.root, 'shim.log'), transcripts: [h.path] }, readTranscripts([h.path], adapters), adapters)
+      expect(evidence.sessionEntries).toBe(binding === 'own' ? 1 : 0)
+    })
   test.each(['waiting', 'working', 'pending', 'ended', 'unknown'])('real readiness follows AD state %s without reading a pane', state => {
     const root = fs.mkdtempSync(join(tmpdir(), 'ad-waiting-control-'))
     try {

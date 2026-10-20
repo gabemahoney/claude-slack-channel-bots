@@ -34,6 +34,15 @@ export function assertSwallowedEnterRecovery(journal: any[], calls: KeyCall[], f
 
 type LaunchObservation = { key: string; session_id: string; at: number }
 
+/** Bind first-waiting evidence to this persona and its durable AD session. */
+export function assertFirstLaunchWaiting(waiting: LaunchObservation[], sent: { session_id?: string }[], key: string, start: number, textAt: number): LaunchObservation {
+  const observed = waiting.find(r => r.key === key && r.at >= start && r.at <= textAt)
+  check(observed, 'actual first-waiting launch observation missing')
+  check(sent.length > 0 && !!observed.session_id && sent.every(r => r.session_id === observed.session_id),
+    'fresh launch sends do not match AD waiting session')
+  return observed
+}
+
 /** Restart resets the first receipt/retry wait to 10s. The next retype has
  * two 30s waits, separated by its durable guarded Enter recovery. Checking
  * those stages distinguishes a reset from retaining the old 60s/120s slot. */
@@ -275,9 +284,7 @@ try {
     const j=cumulativeJournal(), item=j.find(r=>r.kind==='accepted'&&!r.compact&&r.received_at>=start), fixed=j.find(r=>r.kind==='fixed'&&r.seq===item?.seq)
     check(fixed?.parts?.length===1&&text.every(t=>t.words[t.words.indexOf('--text')+1]===fixed.parts[0]),'fresh launch text does not match its first message')
     check(!j.some(r=>r.kind==='sent'&&r.seq===item.seq&&r.send_kind==='enter'),'fresh launch needed an Enter-only recovery')
-    const waiting=firstWaiting().find(r=>r.at>=start&&r.at<=text[0]!.at)
-    check(waiting,'actual first-waiting launch observation missing')
-    check(j.filter(r=>r.kind==='sent'&&r.seq===item.seq).every(r=>r.session_id===waiting.session_id),'fresh launch sends do not match AD waiting session')
+    const waiting=assertFirstLaunchWaiting(firstWaiting(),j.filter(r=>r.kind==='sent'&&r.seq===item.seq),key!,start,text[0]!.at)
     let pending:typeof text[number]|undefined
     const pauses:number[]=[]
     for(const send of s) {

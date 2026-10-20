@@ -799,8 +799,7 @@
  *                                    persona brought up fresh by a reuse spawn
  *                                    of the same instance, its row kept
  *   JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS
- *   JSONL_TRANSCRIPT_LOST_ENTRY_CLASS
- *                                    the diagnosis's startup-errors classes
+ *                                    the diagnosis's startup-errors class
  *                                    (src/session-manager.ts)
  * Scenario 12, a missing row with no session id and an ended row with a
  * stale `config_dir` label beside a running session (test-19; b.jg5
@@ -3082,7 +3081,6 @@ const ARGS_ENTRIES: Readonly<Record<string, ArgsEntry>> = {
   },
   JSONL_DIAGNOSIS_REUSE_WORDING: { args: [], print: () => text('session-manager.ts', 'JSONL_DIAGNOSIS_REUSE_WORDING') },
   JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS: { args: [], print: () => text('session-manager.ts', 'JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS') },
-  JSONL_TRANSCRIPT_LOST_ENTRY_CLASS: { args: [], print: () => text('session-manager.ts', 'JSONL_TRANSCRIPT_LOST_ENTRY_CLASS') },
   // Scenario 12 (test-19; b.jg5 SRJ-1414).
   RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY: { args: [], print: () => text('retired-keys.ts', 'RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY') },
   reloadAppliedLogLine: {

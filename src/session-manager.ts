@@ -4509,6 +4509,17 @@ async function reconcileMissingSweep(
   )
 }
 
+/** AD owns provisional transcript discovery. Share the existing sweep and
+ * its refusal/latch handling; the delivery engine reads its own row next. */
+export async function refreshDeliveryTranscript(key: string): Promise<boolean> {
+  const canRead = () => (!deliveryLifecycle || deliveryLifecycle.active(key)) && !personaLatchedNow(key)
+  if (!canRead()) return false
+  const answer = await reconcileMissingSweep(key, 'delivery-transcript', keyRef(key), {
+    nextStepGetKey: key, postRunGetsGo: canRead,
+  })
+  return typeof answer === 'object' && answer !== null && canRead()
+}
+
 /**
  * How a persona's own findMissing call is made (`bypassingFindMissingSweep`):
  * its wrapper's options (an old-life wait's calls arm nothing for the old

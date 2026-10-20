@@ -25,7 +25,6 @@ t19_value() {
 t19_value JSONL_MISSING adErrorName ErrJsonlMissing
 t19_value REUSE_WORDING JSONL_DIAGNOSIS_REUSE_WORDING
 t19_value INCONCLUSIVE_CLASS JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS
-t19_value LOST_CLASS JSONL_TRANSCRIPT_LOST_ENTRY_CLASS
 t19_value LAST_APPLIED_SUFFIX LAST_APPLIED_FILE_SUFFIX
 
 # The lost-transcript diagnosis's log line head (src/session-manager.ts
@@ -649,7 +648,7 @@ t19_leg() {
         awk -v a="${diag_t}" -v b="${reuse_t}" 'BEGIN { exit !(a + 0 <= b + 0) }' \
             || fail "${step}: the lost-transcript diagnosis for ${id} (${diag_t}) is logged after the reuse spawn's call (${reuse_t})"
         echo "${TEST_NAME}: ${step}: the lost-transcript diagnosis for ${id} at ${diag_t}, before the reuse spawn"
-        echo "${TEST_NAME}: NOTE: ${step}: the diagnosis's startup-errors entries after the mark: ${INCONCLUSIVE_CLASS}=$(t19_count_after "${SLACK_STATE_DIR}/startup-errors.log" "${MARK_ERRORS}" "] [${INCONCLUSIVE_CLASS}] ") ${LOST_CLASS}=$(t19_count_after "${SLACK_STATE_DIR}/startup-errors.log" "${MARK_ERRORS}" "] [${LOST_CLASS}] ")"
+        echo "${TEST_NAME}: NOTE: ${step}: the diagnosis's startup-errors entries after the mark: ${INCONCLUSIVE_CLASS}=$(t19_count_after "${SLACK_STATE_DIR}/startup-errors.log" "${MARK_ERRORS}" "] [${INCONCLUSIVE_CLASS}] ")"
     fi
 
     # Same-agent reuse starts a new conversation and archives the previous one.

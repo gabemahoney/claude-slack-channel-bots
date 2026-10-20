@@ -26,6 +26,7 @@ export interface DeliveryStatus {
 export type DeliveryEngineEvent =
   | { type: 'launch-observed'; key: string; sessionId: string; at: number }
   | { type: 'launch-first-waiting'; key: string; sessionId: string; at: number }
+  | { type: 'transcript-reference'; key: string; instanceId: string; sessionId: string; path: string; at: number }
   | { type: 'delivered'; key: string; seq: number; part: number }
   | { type: 'item-delivered'; key: string; seq: number; at: number; waitMs: number }
   | { type: 'first-typed'; key: string; seq: number; part: number }
@@ -45,6 +46,8 @@ export interface DeliveryEngineDeps {
   onRow?(key: string, row: GetResult): boolean
   /** E4's shared replacement when a fresh own-row marker is unproved, under the engine's client and call budget. */
   inspectUpgrade?(key: string, row: GetResult, client: DeliveryClient, beforeCall: () => void): Promise<void>
+  /** Ask AD's shared sweep to publish a provisional Claude transcript reference. */
+  refreshTranscript?(key: string, client: DeliveryClient, beforeCall: () => void): Promise<boolean>
   onReadError?(key: string, error: unknown, verb: 'get'): Promise<void>
   onError?(key: string, error: unknown): void
   onEvent?(event: DeliveryEngineEvent): void
@@ -93,7 +96,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
   interface State {
     e: DeliveryPolicyEngine; reading: DeliveryReading; row?: GetResult; receipt?: ReceiptObservation
     reader: DeliveryReceiptReader; receiptTarget?: DeliveryPair; receiptAttempt?: number; deadlines: Partial<Record<DeliveryTimer, number>>; budget: () => void
-    rowAt: number; notNowStep: number; retryStep: number; appendRetryStep: number; lastSeq?: number; lastPart?: number
+    rowAt: number; notNowStep: number; retryStep: number; appendRetryStep: number; lastSeq?: number; lastPart?: number; transcriptReference?: string
     pending?: { record: QueueRecord; complete(): void }; lease?: () => void; timer?: unknown; busy?: Promise<void>; stopped: boolean
     relaunch: boolean; restarted?: boolean; gone?: { row: GetResult; handedOff?: boolean }; receiptWorking: boolean; pollAfter: number; snapshot?: DeliveryPolicyKnowledge; lastRetypeEvent?: number; dialogHold: boolean; dialogMaybeOpen: boolean; recoveringReconnect?: boolean
   }
@@ -246,8 +249,32 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
   }
   async function observe(key: string, s: State, head: QueueItem, part: number, force = false): Promise<boolean> {
     if (!await readRow(key, s, force) || !s.row) return false
-    const row = s.row, persona = deps.persona(key), agent: DeliveryAgent = row.agent === 'codex' ? 'codex' : persona?.agent ?? 'claude'
-    const receipt = s.reader.read(agent, row, head, part, deps.queue.items(key))
+    const persona = deps.persona(key)
+    const agentOf = (row: GetResult): DeliveryAgent => row.agent === 'codex' ? 'codex' : persona?.agent ?? 'claude'
+    let row = s.row
+    let receipt = s.reader.read(agentOf(row), row, head, part, deps.queue.items(key))
+    // Claude's SessionStart can precede its first transcript write. AD keeps
+    // that reference empty until find-missing heals it; get alone cannot.
+    // Keep receipts from recorded/prior paths usable without a sweep. Only
+    // reconcile after a durable attempt, never before the first input.
+    if (!receipt.receipt && deps.refreshTranscript && row.agent === 'claude' && !row.jsonl_path && row.session_id &&
+      row.instance_id === deps.instanceId(key) && !['pending', 'ended', 'missing'].includes(row.state) &&
+      (head.unknownSend || effectiveSends(head, part).length > 0)) {
+      const client = await deps.clientFor(key)
+      if (stopped || s.stopped || !life.active(key) || !deps.isUp(key) || deps.isLatched(key) || deps.isHeld(key)) return false
+      if (!await deps.refreshTranscript(key, client, s.budget)) return false
+      if (stopped || s.stopped || !life.active(key) || !deps.isUp(key) || deps.isLatched(key) || deps.isHeld(key)) return false
+      if (!await readRow(key, s, true) || !s.row) return false
+      row = s.row
+      receipt = s.reader.read(agentOf(row), row, head, part, deps.queue.items(key))
+    }
+    // Preserve an AD binding absent from an earlier durable attempt.
+    // This is reference evidence, independent of whether a receipt matched.
+    if (row.instance_id === deps.instanceId(key) && row.jsonl_path && row.session_id &&
+      s.transcriptReference !== row.jsonl_path && effectiveSends(head, part).some(send => send.transcript_path !== row.jsonl_path)) {
+      s.transcriptReference = row.jsonl_path
+      emit({ type: 'transcript-reference', key, instanceId: row.instance_id, sessionId: row.session_id, path: row.jsonl_path, at: clock.now() })
+    }
     s.receipt = receipt
     s.receiptTarget = [head.accepted.seq, part]; s.receiptAttempt = effectiveSends(head, part).at(-1)?.attempt ?? 0
     const text = head.fixed?.parts[part - 1]
