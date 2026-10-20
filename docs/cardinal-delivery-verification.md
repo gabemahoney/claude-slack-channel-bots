@@ -12,7 +12,7 @@ Receipt-window fix `7e80d089` keeps reconciliation blocked after an AD read fail
 
 Reconnect records input intent before text. Partial or uncertain input resumes with Enter alone; definite text refusal clears intent. Pending control input blocks delivery keys and retains lifecycle retry ownership even after MCP connects. Launch/session change, terminal/absent rows, teardown and shutdown cancel intent and delayed keys.
 
-Documentation follow-up removes working/waiting pane checks, stale screen-duration notices, native final-pane/composer diagnostics, startup approver/trust Enter instructions and the obsolete `working-tmux-gone`/`waiting-row-pane-gone` evidence rows. Outcome-only prompt-row, latch and teardown probes remain. The prior local model, trace, conformance and unit results are recorded below. External CI failed at `712013d9` and again at repair baseline `3a6f2300`; both repair rounds and their verification limits are recorded separately below.
+Documentation follow-up removes working/waiting pane checks, stale screen-duration notices, native final-pane/composer diagnostics, startup approver/trust Enter instructions and the obsolete `working-tmux-gone`/`waiting-row-pane-gone` evidence rows. Outcome-only prompt-row, latch and teardown probes remain. The prior local model, trace, conformance and unit results are recorded below. External CI failed at `712013d9`, `3a6f2300` and `0e166f7c`; the repair rounds and their verification limits are recorded separately below.
 
 ## Audit disposition
 
@@ -412,6 +412,71 @@ The earlier scoped documentation audit passed **2,456 tests, zero failures and 3
 After completing the evidence update, the final scoped `bun test tests/shipped-docs.test.ts` run passed **2,456 tests, zero failures and 3,549 assertions in 9.57 s** (`/tmp/acu-ci2-docs-final-shipped.log`), with the same scratch launch HOME/state, environment stripping and host-safety preload. Final documentation whitespace and structural checks passed; local validation is complete.
 
 All 57 audit dispositions, frozen model inputs, traces and retained TLC evidence remain unchanged. The passing conformance replay is no fresh TLC run or adapter-level proof. Per the owner's explicit instruction, CI is not run locally; the separate runner's rerun is still pending, and the recorded external gate remains FAIL at `3a6f2300`. No CI pass, merge or push is claimed.
+
+### External CI at `0e166f7c`: FAIL
+
+The owner's `/tmp/acu_ci_fix3.md` records **38 of 41 scripts passing, three failing** at `0e166f7cb270a5b839cc478406682e9e552bcf14`. All scripts were attempted across these runs; the selective pass does not turn the full gate green.
+
+| Run ID | Scope and result |
+|---|---|
+| `20261020t113254z-u6n8tkhg` | Full run: FAIL, 28 pass, tests 17/18/26 fail, ten not run. |
+| `20261020t121344z-djaadw36` | Selective keep-going: PASS, all ten previously skipped scripts plus startup pass; combined coverage becomes 38 pass, three fail. |
+| `20261020t123435z-ji9x2id8` | Isolated once-only confirmation: FAIL, test 17 repeats the harness/recovery ordering failure. |
+
+Run artifacts were reported under `/run/openclaw/horde/cscb-ci-<run id>`. No local rerun is authorized for this repair round.
+
+### Third CI repair: completed local evidence
+
+All production source is unchanged from `0e166f7c` in this round. The changes correct observation and audit assertions in tests 17, 18 and 26, with local executable controls and production-path regressions; they establish no new native CI verdict.
+
+| Failed script | Root cause and corrected assertion |
+|---|---|
+| `test-17-fmk-launch-pending.sh` | The harness's independent AD poll saw `waiting` before CSCB's scheduled 30-second retry; the test incorrectly required the condition to end before that harness observation. Anchor on CSCB's first own `waiting` observation, its matching persona retry and the first owned `status`/`get` invocation in that retry; retain the existing five-second read/condition-end allowance, irrespective of harness polling order. |
+| `test-18-fmk-wedged.sh` | AD's `caller_pid` identifies the AD CLI child, while the selector required the CSCB server PID. Correlate outcomes to exact shim-recorded CLI child PIDs, with server parent, instance, operation, timestamp, order and outcome checks. |
+| `test-26-fmk-timing-settings.sh` | The genuine slow-create error raises G to 61 s and B to 121 s; the old 120-second report-in wait expired before the first eligible retry after B. Audit actual retry starts, re-arms and owned AD calls to require recovery in the first eligible retry, then allow separate bounded checked-kill confirmation, relaunch and applied-hook phases. Anchor B and no-early-kill checks to AD's `launch_started_at`. |
+
+#### Test 17: retry cadence and independent observers
+
+The full CI clock shape is harness `waiting` at `1792496132.408312`, persona retry at `1792496139.143`, own `status` invocation at `1792496139.145602` and condition end at `1792496139.151`. The isolated confirmation has the corresponding times `1792499794.527237`, `1792499801.255`, `1792499801.259309` and `1792499801.265`. The approximately 6.74-second gap precedes CSCB's own read; invocation-to-end is under 6 ms in both cases. It follows the existing 30-second retry cadence against the fixture's 23-second report delay and independent harness poll, rather than a delay after CSCB receives `waiting`.
+
+`tests/fmk-launch-pending-dialog-wait.test.ts` executes the actual shell oracle with both CI clock shapes. Controls also cover CSCB observing `waiting` before the harness, an earlier pending-only retry, `get` recovery, and missing/wrong/late observations, ownership, retry, verb or condition end. The first own `waiting` observation selects its matching retry; that retry's first owned row read anchors the five-second allowance. A later read cannot hide a delayed condition end. The P2 observer-ordering finding was fixed, and the closing review returned no findings.
+
+#### Test 18: correlate the child invocation
+
+The shared scenario helper's opt-in `with-pid` projection adds the recorded CLI invocation PID; default consumers retain six columns. Reconnect polling and final verification select the originating uncertain text, every refused Enter and the first successful Enter through the same exact child-invocation correlation. Server-parent ownership is still required; a child merely sharing that parent cannot satisfy the audit.
+
+Executable controls use the real shim-log and AD event-record shapes through the actual query, polling and selector helpers. Wrong parent/instance/child/operation, reordered or missing events, wrong outcomes and the old server-PID filter fail; unrelated child noise is ignored. Millisecond event precision is handled against microsecond shim timestamps, and an overlapping unrelated `get` does not truncate a send-keys outcome window. The original native CI raw trail was not retained locally: this proof uses the actual caller-PID code contract and record-shape controls, rather than claiming a replay of that trail.
+
+#### Test 26: preserve the timeout and require the first eligible retry
+
+The raised `create_timeout_ms=40000` gives G=61 s and B=121 s with the scenario's configured floor. In the high leg, the recorded create error returns at +40.059 s; retries fall at approximately +45/+55/+75/+115/+175 s, because their delays are measured from launch completion. The old report-in wait ended around +160–162 s, before the first retry eligible to recover at +175.059 s. The low leg's actual CI recovery at +165.864 s is consistent with its +30 s client error and fifth retry at +165 s.
+
+Two new `tests/session-manager.test.ts` cases execute production retry, pending-row, live-row sequence and checked-kill paths with modeled AD outcomes: +30,000 ms `ErrCallTimeout` and +40,059 ms launch-timeout `ErrTmuxUnresponsive`. Both retain the first four retries without kill/relaunch, then require the fifth retry to checked-kill, read an AD terminal row and start a fresh launch; no pane read, startup key or delete is permitted. These are local modeled-AD cases, not new CI runs or native-hook proof.
+
+Review rejected the first draft's broad observation deadline because it could accept a missed eligible retry. Review also found that its no-early-kill check measured B from the shim's `T_CALL` instead of AD's launch start. Neither draft assertion is accepted evidence.
+
+The final shell oracle polls each actual retry's start and re-arm and correlates CSCB's own instance-specific `get` and `kill` calls within that retry. Each retry's timer phase is bounded from the preceding re-arm; an eligible retry that ends without a checked kill fails immediately, even if a later retry could finish within the diagnostic deadline. A retry starting before B can become eligible while an AD call crosses B; deferral across that boundary requires the production rule's own before-B answer. Both eligibility and no-early-kill use AD's `launch_started_at` plus B, independently of the shim invocation time.
+
+Only after that first eligible retry begins recovery does the scenario allow separate bounded waits for successful checked-kill confirmation, a fresh launch and report-in. The low leg also bounds the following retry that stops its timer. The configured schedule still supplies a diagnostic phase estimate; it does not replace the actual-retry checks. Controls cover a one-retry delay, missing or late kills, launch-start offsets, bounded phase overruns and valid or unresolved AD calls crossing B.
+
+The scenario retains both genuine timeout errors, the exact pending recovery-get barrier, no kill before B, one successful checked kill before each fresh launch, fresh AD terminal-row evidence and a CSCB row read before relaunch, and an applied `SessionStart` matching the recovered session. Local record-shape controls and the production fake-clock cases do not establish native hook behavior; that remains the Docker scenario's proof.
+
+#### Third-round validation and commits
+
+The source-contract review, including test 18's caller-PID contract, and the test-18 correlation review returned no findings. Test 17's observer-ordering correction and test 26's first-eligible-retry and AD-launch-timestamp corrections passed their closing reviews with no findings. The final fixture-only correction also received a fresh scoped review with no findings. These conclusions cover the changed code/test contracts; the documentation review covers the repair diff and relevant context, not every unchanged guide.
+
+The test-17 correction passed **1,448 focused tests** (`/tmp/acu-ci3-retry-order-focused.log`). After the rejected test-26 draft was replaced, the final oracle passed **1,466 focused tests** and **two production fake-clock cases**. These are scoped results, not full-suite counts; the earlier 4,687-test and 26-case runs preceded the final oracle rework.
+
+The first full unit attempt passed **31,165 tests**, skipped 21 and failed three: the shell stand-in in `tests/fmk-launch-pending-dialog-wait.test.ts` lacked the new recovery helper. Its owner corrected only that stand-in and its helper argument/order validation, ran the focused checks, and reran the complete suite. The final isolated full run passed **31,168 tests, 21 skipped and zero failures across 181 files in 184.52 s**, including all **29 model conformance/verdict tests**. Logs: `/tmp/acu-ci3-full-units.log` and `/tmp/acu-ci3-full-units.xml`; typecheck passed (`/tmp/acu-ci3-typecheck.log`). The **31,092-pass** result above belongs to the previous repair baseline `0e166f7c`.
+
+| Bug | Commit | Change |
+|---|---|---|
+| b.aqj | `88d155a5` | Correlate reconnect outcomes with exact AD child invocations. |
+| b.acu | `9f8275cb` | Audit recovery at CSCB's authoritative row reads and first eligible retries; retain the exact recovery-get barrier and validate its shell stand-in arguments/order. |
+
+The final scoped documentation audit passed **2,456 tests, zero failures and 3,549 assertions in 9.39 s** (`/tmp/acu-ci3-docs-final-shipped.log`), using a scratch launch HOME/state, stripped token/persona/Claude-config environment and the host-safety preload. Documentation whitespace checks passed. The repair diff and relevant customer-facing/architecture context require no further documentation changes; this is not a review of every unchanged guide.
+
+All 57 audit dispositions and previous model/trace/proof sections remain intact. Production source, model inputs, frozen traces and `.claude/**` are unchanged from `0e166f7c`. The passing conformance replay and modeled AD cases establish no new TLC proof or native-hook CI result. No CI run, merge or push was performed. The recorded external gate remains **FAIL at `0e166f7c` (38/41 scripts passing)**; only the separate runner's external CI rerun remains.
 
 ## Documentation boundary
 
