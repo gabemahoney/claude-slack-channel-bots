@@ -285,7 +285,6 @@ import {
   LIVENESS_LIVE,
   LIVENESS_READING_DEAD,
   LIVENESS_READING_DEAD_NO_ROW,
-  LIVENESS_READING_DEAD_INSTALL_GONE,
   LIVENESS_READING_UNKNOWN,
   LIVENESS_UNKNOWN,
   livenessReadingForStatus,
@@ -1638,10 +1637,9 @@ export async function _runCallTimeoutStartStep(
  *   - `ErrSpawnNotFound` → `dead`, carrying no row as what it read
  *     (`LIVENESS_READING_DEAD_NO_ROW`); clears `ad-unreachable` and
  *     `ad-config-malformed`, as a state answer does;
- *   - `ErrSystemInstallDisappeared` → `dead`, marked as read from no row
- *     (`LIVENESS_READING_DEAD_INSTALL_GONE`: the slow-recovery count resets
- *     on it without ending its episode, b.jg5 SRJ-610); raises
- *     `ad-unreachable` with its binary path;
+ *   - `ErrSystemInstallDisappeared` → `unknown`: no agent state was read;
+ *     raises `ad-unreachable` with its binary path, and recovery waits for
+ *     an authoritative agent-director observation (b.jpf);
  *   - `ErrTmuxNotAvailable` (ENVIRONMENT) → `unknown`; raises
  *     `tmux-unavailable` through `raiseTmuxUnavailable` with the error, which
  *     posts SRJ-1021's onset for the re-bound-socket form;
@@ -1683,8 +1681,9 @@ export async function _runCallTimeoutStartStep(
  * (b.jg5 SRJ-311, SRJ-316). Inside a restart run an UNCLASSIFIED answer (an
  * `ErrInternal`, a store-open name, a name CSCB gives no handling) is also
  * reported to the persona's unclassified-error episode (b.jg5 SRJ-313), but
- * `ErrSystemInstallDisappeared` is not: it keeps its `dead` reading (SRJ-105,
- * SRJ-314). From the health tick nothing is reported.
+ * `ErrSystemInstallDisappeared` is not: its `ad-unreachable` outage reports
+ * the failure, and its reading is `unknown`. From the health tick nothing
+ * is reported.
  *
  * The same instance is the persona routing's lost-message row read (b.jg5
  * SRJ-115, SRJ-1011), made from the Slack event path, outside any launch or
@@ -1695,7 +1694,7 @@ export async function _runCallTimeoutStartStep(
  * `status` not being tmux-touching, no answer starts a `tmux-unresponsive`
  * condition; an ENVIRONMENT or CONFIG answer raises its outage and arms the
  * retry timer, and `ErrSystemInstallDisappeared` raises `ad-unreachable` and
- * reads `dead` (SRJ-105, SRJ-1501).
+ * reads `unknown` (b.jpf).
  *
  * @internal
  */
@@ -1729,7 +1728,7 @@ export function _buildIsSessionAliveAdapter(
       // error arms the persona's retry timer, whatever the reading below.
       // b.jg5 SRJ-313: an UNCLASSIFIED status there is reported to the
       // persona's unclassified-error episode, except ErrSystemInstallDisappeared,
-      // which keeps its `dead` reading (SRJ-105, SRJ-314).
+      // whose ad-unreachable outage already reports the failure (b.jpf).
       reportAgentDirectorError(key, err, 'status', {
         reportUnclassified: !isAdErrorInstance(err, ErrSystemInstallDisappeared),
       })
@@ -1760,8 +1759,8 @@ function livenessLatchedReading(): LivenessReading {
 /**
  * The liveness adapter's reading for a `status` error (b.jg5 SRJ-314), with
  * its outage flags; see `_buildIsSessionAliveAdapter`. Decided by class
- * through `src/ad-error-class.ts`. Only `ErrSpawnNotFound` and
- * `ErrSystemInstallDisappeared` read `dead`.
+ * through `src/ad-error-class.ts`. Only `ErrSpawnNotFound` reads `dead`:
+ * an installation failure supplies no observation of the agent (b.jpf).
  */
 function statusErrorReading(key: string, err: unknown): LivenessReading {
   if (isAdErrorInstance(err, ErrSpawnNotFound)) {
@@ -1773,9 +1772,9 @@ function statusErrorReading(key: string, err: unknown): LivenessReading {
   }
   if (isAdErrorInstance(err, ErrSystemInstallDisappeared)) {
     setOutageFlag(key, 'ad-unreachable', binaryPathOf(err))
-    // b.jg5 SRJ-610: `dead` all the same, marked as read from no row, so the
-    // slow-recovery count resets without ending its episode (hatch A2).
-    return LIVENESS_READING_DEAD_INSTALL_GONE
+    // The executable disappearing says nothing about its agents. Keep the
+    // outage and wait for an authoritative status answer before recovery.
+    return LIVENESS_READING_UNKNOWN
   }
   if (classifyAdError(err).errorClass === AD_ERROR_CLASS_ENVIRONMENT) {
     // b.jg5 SRJ-1021: the raising error picks the onset.
