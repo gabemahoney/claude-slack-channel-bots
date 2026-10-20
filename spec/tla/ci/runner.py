@@ -37,7 +37,7 @@ MAX_BUDGET = 14100
 LIMIT_MARGIN_S = 300
 MIN_MEMORY = 24 * 1024**3
 SAFETY = {"DurableAccept", "NoDrop", "ReceiptBacked", "InOrder", "TranscriptFIFO",
-          "OneInFlight", "NoTypeIntoText", "NoRetypeWhileWorking", "GateExclusive", "NoDuplicateKey"}
+          "OneInFlight", "TypingGuards", "NoRetypeWhileWorking", "GateExclusive", "NoDuplicateKey"}
 LIVENESS = {"EventuallyDelivered", "HeadTakenIn", "ReconnectNotBlocked", "GateFreeInfinitelyOften"}
 CORE = {"NoDrop", "InOrder", "OneInFlight", "DurableAccept", "ReceiptBacked", "HeadTakenIn"}
 ORIGINAL_POSITIVES = {prefix + suffix for prefix in ("safety_", "live_") for suffix in
@@ -53,12 +53,12 @@ CONTROLS = {
     "control_send_is_delivery": "ReceiptBacked", "control_queue_is_receipt": "TranscriptFIFO",
     "control_start_drop": "NoDrop", "control_compact_open": "NoDrop",
     "control_early_ack": "DurableAccept", "control_skip_refused": "InOrder",
-    "control_start_unsent_head": "InOrder", "control_retype_into_text": "NoTypeIntoText",
+    "control_start_unsent_head": "InOrder", "control_retype_into_text": "TypingGuards",
     "control_retype_working": "NoRetypeWhileWorking", "control_reconnect_keys": "GateExclusive",
     "control_keep_gate": "GateFreeInfinitelyOften",
     "control_hold_gate_mcp_reconnect": "ReconnectNotBlocked",
     "control_hold_gate_mcp_delivery": "EventuallyDelivered",
-    "control_no_deferred": "ReconnectNotBlocked", "control_reconnect_running": "NoTypeIntoText",
+    "control_no_deferred": "ReconnectNotBlocked", "control_reconnect_running": "TypingGuards",
     "control_deferred_only_open": "ReconnectNotBlocked", "control_park_retype": "EventuallyDelivered",
     "control_unreadable_park": "HeadTakenIn", "control_weak_observe": "EventuallyDelivered",
     "control_replace_observation": "EventuallyDelivered", "control_duplicate_key": "NoDuplicateKey",
@@ -79,7 +79,7 @@ RESTART_CASES = {
 # controls remain raw: a safety projection is not a liveness quotient.
 RESTART_MUTATIONS = {
     "restart_control_" + cfg.removeprefix("control_"): {
-        "original": cfg, "bug": cfg.removeprefix("control_"), "target": target,
+        "original": cfg, "bug": ("retype_without_guards" if cfg == "control_retype_into_text" else cfg.removeprefix("control_")), "target": target,
         "faults": faults, "retypes": retypes,
     }
     for cfg, target, faults, retypes in (
@@ -92,10 +92,10 @@ RESTART_MUTATIONS = {
         ("control_early_ack", "DurableAccept", (), 1),
         ("control_skip_refused", "InOrder", ("textRefused",), 1),
         ("control_start_unsent_head", "InOrder", ("serverCrash",), 2),
-        ("control_retype_into_text", "NoTypeIntoText", ("enterRefused", "enterUnknown", "lostEnter", "busyWaiting", "pullBack"), 2),
+        ("control_retype_into_text", "TypingGuards", ("textUnknown", "relayOff"), 2),
         ("control_retype_working", "NoRetypeWhileWorking", ("busyWaiting",), 1),
         ("control_reconnect_keys", "GateExclusive", ("mcpDrop",), 1),
-        ("control_reconnect_running", "NoTypeIntoText", ("busyWaiting", "mcpDrop"), 1),
+        ("control_reconnect_running", "TypingGuards", ("busyWaiting", "mcpDrop"), 1),
         ("control_duplicate_key", "NoDuplicateKey", ("serverCrash",), 2),
     )
 }
@@ -103,12 +103,13 @@ ALL_CONTROLS = {**CONTROLS, **{cfg: item["target"] for cfg, item in RESTART_MUTA
 RESTART_SIMULATION = "restart_order_simulation"
 RESTART_SIMULATION_PARAMETERS = {"num": 8, "depth": 256, "seed": 111792}
 RESTART_REDUCTION = {"view": "RestartSafetyView", "constraint": "RestartStateConstraint",
-                     "maxSentRecordsPerPair": 2, "binaryTimers": True,
+                     "maxSentRecordsPerPair": 4, "binaryTimers": True,
                      "inactiveFaultCounters": 0}
 CORE_REDUCTION = {**RESTART_REDUCTION, "view": None,
                   "bounds": {"MaxItems": 1, "MaxParts": 1, "MaxAgentQueue": 2}}
-# The original four-Enter-retry mutation needs six durable sends. Its authorized
-# projection preserves that path without adopting the companions' state bound.
+# Retain the historical VIEW-only control contract while replacing composer
+# ownership with the non-screen local-guard mutation. Companion checks keep
+# their independent four-send recovery bound.
 VIEW_ONLY_CONTROL = "control_retype_into_text"
 VIEW_ONLY_REDUCTION = {"view": "RestartSafetyView", "constraint": None}
 CFG_KEYWORDS = set("CONSTANT CONSTANTS CONSTRAINT CONSTRAINTS ACTION_CONSTRAINT ACTION_CONSTRAINTS "
@@ -165,16 +166,16 @@ CONSTANTS
   MaxParts = 2
   MaxLaunches = 3
   MaxServerStarts = 3
-  MaxRetypes = 1
+  MaxRetypes = 2
   EnterRetries = 4
-  MaxAgentQueue = 4
-  Faults = {"enterRefused", "enterUnknown", "lostEnter"}
+  MaxAgentQueue = 6
+  Faults = {"textUnknown", "relayOff"}
   PromptFlapping = FALSE
   Flapping = FALSE
-  Bug = "retype_into_text"
+  Bug = "retype_without_guards"
   Scenario = "control"
   IdenticalTexts = FALSE
-INVARIANT NoTypeIntoText
+INVARIANT TypingGuards
 VIEW RestartSafetyView
 ALIAS TraceView
 POSTCONDITION EmitTrace'''

@@ -52,14 +52,15 @@ CONSTANTS = {"MaxItems": 2, "MaxParts": 2, "MaxLaunches": 1,
 CORE_CONSTANTS = dict(CONSTANTS, MaxItems=1, MaxParts=1, MaxAgentQueue=2, Flapping=False)
 SCOPE = "existential-accepted-work-within-RestartStateConstraint"
 
-# Source of the previously diagnosed working-first-send guide. This executable
-# text, not an ignored historical trace or summary, is part of the pinned helper.
+# The guide exercises waiting-only delivery through original Next. Its result
+# is independently replayed with every original fairness and progress check.
 GUIDE = r'''Guide ==
  CASE st.w.kind # "none" -> EngineStep
+ [] st.h.everDelivered = Pairs /\ st.g.owner = "free" /\
+    st.a.actual = "idle" /\ Flapping -> AgentOwnTurnStart
+ [] st.h.everDelivered = Pairs /\ st.g.owner = "free" /\ ~Flapping -> Done
  [] st.h.accepted # Items /\ st.observation = "none" /\ st.g.owner = "free" -> Accept
  [] st.a.submitted /\ st.a.actual = "idle" -> AgentTakeIn
- [] st.h.everSent = {} /\ st.e.request = "delivery" /\ st.g.owner = "free" /\
-    st.a.actual = "idle" /\ Flapping -> AgentOwnTurnStart
  [] st.h.everSent = {} /\ st.e.request = "delivery" /\ st.g.owner = "free" -> GateStep
  [] st.a.actual # "idle" /\ (st.e.phase = "text" \/ st.w.kind = "sent" \/
     st.e.request = "granted") -> EngineStep
@@ -132,7 +133,7 @@ def witness_constants(cfg_text):
     require(values == CONSTANTS or core,
             "unsupported witness constants or accepted-work floor")
     invariants = ["TypeOK", "DurableAccept", "NoDrop", "ReceiptBacked", "InOrder",
-                  "TranscriptFIFO", "OneInFlight", "NoTypeIntoText",
+                  "TranscriptFIFO", "OneInFlight", "TypingGuards",
                   "NoRetypeWhileWorking", "GateExclusive", "NoDuplicateKey"]
     expected = ["SPECIFICATION Spec", "CONSTANTS"]
     expected += (["INVARIANT " + name for name in invariants] + ["PROPERTY HeadTakenIn"]
@@ -240,8 +241,8 @@ def raw_coverage(raw, constants, deadline):
                 "trace constants/control mismatch")
         state = record["state"]
         counts = Counter((r["item"], r["part"]) for r in state["p"]["sent"])
-        require(set(counts) <= pairs and all(n <= 2 for n in counts.values()),
-                "raw state leaves two-persisted-send restriction")
+        require(set(counts) <= pairs and all(n <= 4 for n in counts.values()),
+                "raw state leaves four-persisted-send recovery restriction")
         require(all(type(n) is int and n in {0, 1} for n in state["e"]["timers"].values())
                 and all(type(n) is int and n == 0 for n in state["faults"].values()),
                 "raw state leaves binary-timer/inactive-fault restriction")

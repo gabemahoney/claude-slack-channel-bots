@@ -218,7 +218,7 @@ def replay_inputs(cfg_text, raw, *, correct_cycle=False, positive=False):
     matches = "TRUE" if correct_cycle else "TraceRecord(st) = ReplayRecords[position]"
     goal = target + " /\\ " + nonvacuity(target) if positive else "~" + target
     # Supporting positive contrasts are RAW existential behaviors. They do not
-    # claim positive nonvacuity inside the canonical two-send restriction.
+    # claim positive nonvacuity inside the canonical four-send recovery restriction.
     restriction = "" if positive or correct_cycle else " /\\ []RestartStateConstraint"
     library, (state_name, record_name) = tla_values([states, behavior])
     module = """---------------- MODULE TemporalReplay ----------------
@@ -557,7 +557,6 @@ def validate_evidence(root, row, raw, evidence, *, require_contrast=False):
         if bug == "deferred_only_open":
             initial = behavior[0]["state"]
             require(behavior[0]["constants"]["Scenario"] == "empty-reconnect"
-                    and initial["a"]["screen"] in {"other", "overlay"}
                     and not initial["a"]["mcp"] and initial["g"]["deferred"]
                     and not initial["p"]["accepted"]
                     and all(not r["state"]["p"]["accepted"] for r in behavior[loop-1:]),
