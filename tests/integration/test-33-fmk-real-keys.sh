@@ -31,7 +31,8 @@ real_dm "${REAL_LABEL}" 'three swallowed texts'
 REAL_DELIVERY_WAIT_S=300 real_wait_delivery "${REAL_KEY}" 3
 case_assert key-proof 3 spacing
 # Restart an UNCONFIRMED head during its growing retry episode; the new
-# launch starts its spacing over, rather than inheriting the old backoff.
+# launch restarts at 10s, then uses two guarded 30s recovery stages. Prove
+# each durable Enter/text stage and its launch identity, not a text-gap bound.
 real_wait_idle "${REAL_KEY}"
 real_fault send-keys no_enter swallow 3
 real_dm "${REAL_LABEL}" 'restart resets an in-flight retry episode'

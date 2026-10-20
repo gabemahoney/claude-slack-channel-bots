@@ -1243,6 +1243,80 @@ describe('operational delivery events', () => {
 })
 
 describe('AD authority regressions', () => {
+  test.each([false, true])('working receipts do not delay the next FIFO part, multipart=%s', async multipart => {
+    const h = await harness()
+    const bodies = Array.from({ length: 20 }, (_, n) => `item ${n + 1}`)
+    if (multipart) await h.accept('multipart', 'alpha', bodies)
+    else for (const body of bodies) await h.accept(body)
+    const p = h.p(); p.autoReceipt = false
+    p.keyHook = params => {
+      if (params.key === 'Enter') {
+        p.row.state = 'working'
+        const body = p.box
+        h.clock.setTimeout(() => appendTranscript(p.path, [promptEntry(body)]), 1500)
+        h.clock.setTimeout(() => { p.row.state = 'waiting' }, 2500)
+      }
+      return undefined
+    }
+    await start(h)
+    await h.advance(60000)
+    expect(h.queue.openCount('alpha')).toBe(0)
+    expect(h.textCalls().map(call => call.params.text)).toEqual(bodies)
+    const times = h.textCalls().map(call => call.at)
+    expect(times.slice(1).map((at, n) => at - times[n]!)).toEqual(Array(19).fill(ENTER_DELAY_MS + 2500))
+    expect(h.records().filter(record => record.kind === 'delivered').map(record => [record.seq, record.part]))
+      .toEqual(bodies.map((_, n) => multipart ? [1, n + 1] : [n + 1, 1]))
+    expect(h.errors).toEqual([])
+  })
+
+  test('a working receipt is cleared only after its failed delivered append becomes durable', async () => {
+    const h = await harness()
+    await h.accept('first'); await h.accept('second')
+    const p = h.p(); p.autoReceipt = false
+    p.keyHook = params => { if (params.key === 'Enter') p.row.state = 'working'; return undefined }
+    await start(h); await h.advance(ENTER_DELAY_MS + DELIVERY_ROW_POLL_MS)
+    expect(h.engine.status('alpha')?.receiptWorking).toBe(true)
+    h.failAppend('delivered')
+    appendTranscript(p.path, [promptEntry('first')])
+    await h.until(() => h.errors.length === 1)
+    expect(h.engine.status('alpha')?.receiptWorking).toBe(true)
+    expect(h.records().filter(record => record.kind === 'delivered')).toEqual([])
+    expect(h.textCalls().map(call => call.params.text)).toEqual(['first'])
+    expect(h.queue.openCount('alpha')).toBe(2)
+    expect(h.lifecycle.owner('alpha')).toBe('free')
+    await h.advance(RETYPE_BACKOFF_MS[0] - 1)
+    expect(h.engine.status('alpha')?.receiptWorking).toBe(true)
+    expect(h.records().filter(record => record.kind === 'delivered')).toEqual([])
+    await h.advance(1)
+    expect(h.records().filter(record => record.kind === 'delivered').map(record => [record.seq, record.part])).toEqual([[1, 1]])
+    expect(h.engine.status('alpha')?.receiptWorking).toBe(false)
+    expect(h.engine.snapshot('alpha')?.e.timers.receipt).toBe(0)
+    expect(h.textCalls().map(call => call.params.text)).toEqual(['first'])
+    p.row.state = 'waiting'
+    await h.advance(DELIVERY_ROW_POLL_MS)
+    expect(h.textCalls().map(call => call.params.text)).toEqual(['first', 'second'])
+  })
+
+  test('observing a new launch discards the previous working receipt extension', async () => {
+    const h = await harness(); await h.accept()
+    const p = h.p(); p.autoReceipt = false
+    p.keyHook = params => { if (params.key === 'Enter') p.row.state = 'working'; return undefined }
+    await start(h); await h.advance(ENTER_DELAY_MS + DELIVERY_ROW_POLL_MS)
+    expect(h.engine.status('alpha')?.receiptWorking).toBe(true)
+    const launch = h.lifecycle.launchId('alpha')
+    h.lifecycle.beforeLaunch('alpha')
+    await h.tick()
+    expect(h.lifecycle.launchId('alpha')).not.toBe(launch)
+    expect(h.engine.status('alpha')?.receiptWorking).toBe(false)
+    expect(h.records().filter(record => record.kind === 'delivered')).toEqual([])
+    p.row.state = 'waiting'; p.keyHook = undefined
+    await h.advance(DELIVERY_ROW_POLL_MS)
+    const waitingAt = h.clock.now()
+    await h.advance(LAUNCH_SETTLE_MS)
+    expect(h.keyCalls().at(-1)).toMatchObject({ at: waitingAt + LAUNCH_SETTLE_MS, params: { key: 'Enter' } })
+    expect(h.textCalls()).toHaveLength(1)
+  })
+
   test.each(['claude', 'codex'] as const)('%s waiting permits delivery without reading arbitrary pane contents', async agent => {
     const h = await harness(), p = h.p()
     p.row.agent = agent

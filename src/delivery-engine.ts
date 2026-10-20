@@ -367,6 +367,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
         }
         if (action === 'observeLaunch') {
           release(s); s.e.phase = 'ready'; s.e.launchSeen = k.r.launch; s.e.sessionSeen = k.r.session
+          s.receiptWorking = false
           s.e.recoveryAttempt = undefined
           s.e.retypes = {}; s.dialogHold = false; s.dialogMaybeOpen = false; s.retryStep = 0; s.notNowStep = 0
           s.deadlines.backoff = 0; s.deadlines.notNow = 0; s.deadlines.enterDelay = 0
@@ -385,6 +386,10 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
           const receipt = s.receipt?.receipt
           if (!receipt) break
           queueWrite(s, { v: 1, kind: 'delivered', seq: pair[0], part, at: clock.now(), receipt: { path: receipt.path, uuid: receipt.uuid, offset: receipt.offset } }, () => {
+            // The working extension belongs to this confirmed part. Carrying
+            // it into the next head makes its first waiting row start a new
+            // receipt timeout before that head has sent any keys.
+            s.receiptWorking = false; s.deadlines.receipt = 0
             s.e.phase = 'ready'; s.e.target = NO_DELIVERY_PAIR; release(s)
             emit({ type: 'delivered', key, seq: pair[0], part })
             const item = deps.queue.items(key).find(i => i.accepted.seq === pair[0])

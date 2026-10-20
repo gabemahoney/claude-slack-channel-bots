@@ -4,7 +4,7 @@ import { join, resolve } from 'node:path'
 import { auditReceipts, captureReceiptJournal, jsonLines, packedReceiptAdapters, personaTranscripts, readTranscripts, receiptJournal, shimWords, transcriptFiles } from './transcript-receipts.ts'
 import { assertBusyProof, emitBusyProofFailure, pollBusyProof, type BusyProofSnapshot } from './busy-proof.ts'
 function check(value: unknown, reason: string): asserts value { if (!value) throw new Error(reason) }
-type KeyCall = { at: number; words: string[] }
+type KeyCall = { at: number; words: string[]; pid?: string }
 function recoveryKey(call: KeyCall, instance: string) {
   return call.words.includes('send-keys') && call.words.includes(instance)
     && (call.words.includes('--no-enter') || (call.words.includes('--key') && call.words.includes('Enter')))
@@ -32,11 +32,55 @@ export function assertSwallowedEnterRecovery(journal: any[], calls: KeyCall[], f
     'swallowed Enter has no observed durable Enter-only recovery under the existing backoff')
 }
 
+type LaunchObservation = { key: string; launch_id: string; session_id: string; at: number }
+
+/** Restart resets the first receipt/retry wait to 10s. The next retype has
+ * two 30s waits, separated by its durable guarded Enter recovery. Checking
+ * those stages distinguishes a reset from retaining the old 60s/120s slot. */
+export function assertResetKeyRecovery(journal: any[], calls: KeyCall[], faults: KeyCall[], waiting: LaunchObservation[], seq: number, instance: string) {
+  const sent = journal.filter(record => record.kind === 'sent' && record.seq === seq)
+  const launch = sent.at(-1)?.launch_id
+  const newer = sent.filter(record => record.launch_id === launch)
+  check(newer.length === 4 && newer.map(record => record.send_kind).join(',') === 'enter,retype,enter,retype',
+    'reset requires the durable Enter/text/Enter/text recovery sequence')
+  const [initial, first, recovery, second] = newer
+  const old = sent.filter(record => record.launch_id !== launch && record.send_kind !== 'enter')
+  check(old.length >= 3 && old.every(record => record.at < initial.at && record.part === initial.part),
+    'reset did not interrupt a growing retry episode for this part')
+  check(newer.every(record => record.part === initial.part && record.session_id === initial.session_id
+    && record.launch_id && record.session_id), 'reset stages have inconsistent part/session/launch identity')
+  const observed = waiting.find(row => 'cscb_' + row.key === instance && row.launch_id === launch && row.session_id === initial.session_id)
+  check(observed && initial.at >= observed.at + 1000, 'reset lacks the new launch first-waiting/settle evidence')
+  const keys = calls.filter(call => recoveryKey(call, instance)
+    && call.words[call.words.indexOf('--instance-id') + 1] === instance && call.at >= initial.at)
+  const enterCall = (record: any, end: number) => keys.find(call => call.at >= record.at && call.at < end
+    && call.words.includes('--key') && call.words.includes('Enter'))
+  const textCall = (record: any, end: number) => keys.find(call => call.at >= record.at && call.at < end && call.words.includes('--no-enter'))
+  const initialKey = enterCall(initial, first.at), firstKey = textCall(first, recovery.at)
+  const recoveryKeyCall = enterCall(recovery, second.at), secondKey = textCall(second, Infinity)
+  check(initialKey && firstKey && recoveryKeyCall && secondKey, 'reset stages lack actual persona key calls')
+  const normalEnter = keys.find(call => call.at > firstKey.at && call.at < recovery.at
+    && call.words.includes('--key') && call.words.includes('Enter'))
+  check(normalEnter && normalEnter.at - firstKey.at >= 500, 'reset text lacks its guarded delayed Enter')
+  check(faults.some(fault => fault.at >= firstKey.at && fault.at < normalEnter.at
+    && !!fault.pid && fault.pid === firstKey.pid
+    && fault.words[0] === 'send-keys' && fault.words[1] === 'no_enter' && fault.words[2] === 'swallow'),
+    'reset first retype was not swallowed by the injected text fault')
+  const stages = [first.at - initialKey.at, recovery.at - normalEnter.at, second.at - recoveryKeyCall.at]
+  for (const [n, elapsed] of stages.entries()) {
+    const [minimum, nextSlot] = n === 0 ? [10000, 30000] : [30000, 60000]
+    check(elapsed >= minimum! && elapsed < nextSlot!, 'reset retained or skipped a backoff stage: ' + n)
+  }
+  check(!calls.some(call => call.at >= initial.at && call.at <= secondKey.at && call.words.includes('read-pane')),
+    'reset recovery read native pane text')
+  return { launch, stages, sends: newer.map(record => ({ kind: record.send_kind, at: record.at })) }
+}
+
 async function main() {
 const [command, state, key, shim, root, arg = '', arg2 = '', arg3 = ''] = process.argv.slice(2)
 function journal() { return jsonLines(join(state!, 'queue', `${key}.jsonl`)) }
 function cumulativeJournal() { return receiptJournal(state!, key!) }
-function calls() { return readFileSync(shim!, 'utf8').split('\n').filter(l => l.startsWith('call\t')).map(l => { const f=l.split('\t'); return { at:Number(f[1])*1000, words:shimWords(f[5]!) } }) }
+function calls() { return readFileSync(shim!, 'utf8').split('\n').filter(l => l.startsWith('call\t')).map(l => { const f=l.split('\t'); return { at:Number(f[1])*1000, pid:f[2], words:shimWords(f[5]!) } }) }
 function blocks(e:any):any[] { return e.value?.type==='assistant'&&Array.isArray(e.value?.message?.content)?e.value.message.content:[] }
 async function entries() { return readTranscripts(transcriptFiles(root!), await packedReceiptAdapters()) }
 async function confirmReceipts() {
@@ -99,11 +143,14 @@ try {
     await confirmReceipts()
     console.log('recorded: unknown outcome confirmed by exact receipt after guarded recovery '+arg)
   } else if(command==='reset-spacing') {
-    const s=cumulativeJournal().filter(r=>r.kind==='sent'&&r.seq===Number(arg)&&r.send_kind!=='enter')
-    const launches=[...new Set(s.map(r=>r.launch_id))];check(launches.length>=2,'head was not retried across a real launch')
-    const newer=s.filter(r=>r.launch_id===launches.at(-1));check(newer.length>=2,'restarted head did not exercise a new retry')
-    check(newer[1].at-newer[0].at<60000,'restart retained later backoff instead of resetting')
-    console.log('recorded: restart reset spacing '+JSON.stringify(newer.map(r=>r.at)))
+    const faults=readFileSync(shim!,'utf8').split('\n').filter(l=>l.startsWith('fault\t')).map(l=>{const f=l.split('\t');return {at:Number(f[1])*1000,pid:f[2],words:shimWords(f[5]!)}})
+    const waiting=readFileSync(join(state!,'server.log'),'utf8').split('\n').flatMap(line=>{
+      const marker='delivery-launch-first-waiting: ', index=line.indexOf(marker)
+      return index < 0 ? [] : [JSON.parse(line.slice(index+marker.length))]
+    })
+    const proof=assertResetKeyRecovery(cumulativeJournal(),calls(),faults,waiting,Number(arg),'cscb_'+key)
+    await confirmReceipts()
+    console.log('recorded: restart reset guarded recovery '+JSON.stringify(proof))
   } else if(command==='key-proof') {
     const j=cumulativeJournal(), s=j.filter(r=>r.kind==='sent'&&r.seq===Number(arg))
     const text=s.filter(r=>r.send_kind!=='enter')
