@@ -6,6 +6,10 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 ## Unreleased
 
+---
+
+## 0.17.1 (2026-10-20)
+
 ### Agent-director owns delivery readiness
 
 - Delivery, retries and reconnect text/Enter now wait for agent-director's `waiting` state and retain the existing connection, relay, marker and persona safeguards. Refused input stays queued under the existing backoff. CSCB no longer interprets native terminal screens or transcript idle/compaction markers to decide when to type.
