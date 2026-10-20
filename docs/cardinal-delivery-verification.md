@@ -12,7 +12,7 @@ Receipt-window fix `7e80d089` keeps reconciliation blocked after an AD read fail
 
 Reconnect records input intent before text. Partial or uncertain input resumes with Enter alone; definite text refusal clears intent. Pending control input blocks delivery keys and retains lifecycle retry ownership even after MCP connects. Launch/session change, terminal/absent rows, teardown and shutdown cancel intent and delayed keys.
 
-Documentation follow-up removes working/waiting pane checks, stale screen-duration notices, native final-pane/composer diagnostics, startup approver/trust Enter instructions and the obsolete `working-tmux-gone`/`waiting-row-pane-gone` evidence rows. Outcome-only prompt-row, latch and teardown probes remain. The prior local model, trace, conformance and unit results are recorded below. External CI failed at `712013d9`; the repair and its pending external rerun are recorded separately below.
+Documentation follow-up removes working/waiting pane checks, stale screen-duration notices, native final-pane/composer diagnostics, startup approver/trust Enter instructions and the obsolete `working-tmux-gone`/`waiting-row-pane-gone` evidence rows. Outcome-only prompt-row, latch and teardown probes remain. The prior local model, trace, conformance and unit results are recorded below. External CI failed at `712013d9` and again at repair baseline `3a6f2300`; both repair rounds and their verification limits are recorded separately below.
 
 ## Audit disposition
 
@@ -293,7 +293,7 @@ The external runner tested `712013d984cfa601517f5cb4491e53374b508bb7`. Across th
 
 The runner classified tests 32/33 as source recovery stalls: after a worker kill, recovery Enter returned AD `GONE`, but restart delay zero or a stale `waiting` row prevented recovery and left durable work blocked for 180 seconds. The other nine failures were test/fixture mismatches. Its initial test-26 diagnosis was provisional, and test 41's sanitized refusal was class `other`; the exact native refusal reason remains unknown.
 
-### Current CI repair
+### First CI repair, completed at `3a6f2300`
 
 The delivery engine now preserves a key's actual AD `GONE` evidence for its launch, bars further keys, releases the lifecycle lease and hands recovery to `recoverDeliveryGone` in `session-manager.ts`. That adapter starts the existing checked AD live-row recovery sequence detached from the engine tick; it does not await a sequence that can join launch/reconnect or teardown. Recovery therefore continues with restart delay zero and a stale `waiting` row, while existing applied/up, latch, hold, outage, cap and launch-identity guards remain.
 
@@ -363,11 +363,55 @@ The pre-repair targeted documentation run, `bun test tests/shipped-docs.test.ts`
 
 The earlier stale-reference audit across README, CONTRIBUTING, `docs/*.md`, `tests/README.md` and tracked skills found no removed readiness/approver symbols or screen-based contract; explicit removal rationale in this report and excluded CI-live collection contracts remain. Outcome-only prompt-row/latch/teardown probes and human diagnostic commands are retained. Review of the customer-facing pages found no additional operator changes needed after the existing AD-owned guidance and release notes.
 
-### Current repair documentation verification
+### First repair documentation verification
 
 The documentation-only diff passes `git diff --check`. A structural comparison against `712013d9` confirms all 57 audit rows and the prior model/helper/config/trace inventory and canonical evidence sections are unchanged, with all three failed CI run IDs and nine repair rationales present. Architecture and testing guidance now describe the GONE/absent-row handoffs, retry ownership and authoritative fixture boundaries; customer-facing guidance needs no additional operator action for this repair.
 
-After final evidence completion, the scoped `bun test tests/shipped-docs.test.ts` run passed **2,456 tests, zero failures and 3,549 assertions in 9.71 s**, using a scratch launch HOME/state, stripped token/persona/Claude config environment and the host-safety preload (`/tmp/acu-docs-ci-final-shipped.log`). No pending local validation placeholders remain; the external CI rerun is still pending.
+After final evidence completion, the scoped `bun test tests/shipped-docs.test.ts` run passed **2,456 tests, zero failures and 3,549 assertions in 9.71 s**, using a scratch launch HOME/state, stripped token/persona/Claude config environment and the host-safety preload (`/tmp/acu-docs-ci-final-shipped.log`). At that first repair handoff, local validation was complete and the external rerun was pending; its result is recorded below.
+
+### External CI at `3a6f2300`: FAIL
+
+The second external round tested `3a6f2300d11f095844e8a15536e5cf84344529a8`. Cumulative coverage was **41 scripts attempted, 36 passed and five failed**: tests 17, 18, 26, 32 and 33. The full gate remains **FAIL**; selective diagnostics complete coverage without establishing a gate pass. The owner's `/tmp/acu_ci_fix2.md` records the results, with artifacts under `/run/openclaw/horde/cscb-ci-<run id>`.
+
+| Run ID | Scope | Result |
+|---|---|---|
+| `20261020t094021z-x3gvvuzk` | Full CI | FAIL: 28 passed, tests 17/18/26 failed, ten not run. |
+| `20261020t102148z-qz52lbba` | Isolated test-17 confirmation | FAIL: the same pending-row reporting timeout recurred; original/confirmation elapsed times were 222.339/221.791 s. |
+| `20261020t102642z-68mhcxa6` | Selective keep-going | FAIL: eight passed, tests 32/33 failed, zero selected scripts not run; cumulative coverage reached 36 pass/five fail. |
+
+The runner initially classified 17/32/33 provisionally. Test 32 delivered 13 of 20 fault-burst items by 174 s, leaving seven open at the unchanged 180-second bound; item spacing was 12–14 s. Test 33 confirmed all four deliveries but rejected a 60,616 ms text gap against its less-than-60-second assertion. The local investigations below establish the causes without claiming a new integration run.
+
+### Second CI repair: causes and local evidence
+
+The repair is committed separately as `e0af28a4` (b.aqj: receipt-wait cleanup and retry-stage assertions) and `d866076a` (b.acu: launch-response faults, fixture helper and AD audit evidence). The source/test HEAD is `d866076a6142df71bc933fc296ac88f6bc7c093a`; this documentation update records no later commit.
+
+| Failed test | One-line root cause and repair |
+|---|---|
+| 32 — real FIFO order | `receiptWorking` survived a durable `delivered` append, so the next FIFO head inherited an extra 10-second receipt wait; clear the flag/deadline only after append success and clear the old flag on launch change. |
+| 33 — real keys | The text-gap oracle omitted two guarded retry stages: 30 s + 500 ms text/Enter delay + 30 s is 60,500 ms deterministically; assert each durable recovery stage and its AD/launch/fault identity instead. |
+| 17 — launch pending | The slow-create timeout left AD without pane identity, so SessionStart/re-fire hooks were ignored and G=60 expired before find-missing adoption; replace that fixture with successful-launch response loss after AD saves identity. |
+| 18 — wedged | The scenario called undefined local helper `tmux_session_value`; use supported scenario tmux metadata helpers and validate session/pane/process identity with executable controls. |
+| 26 — timing settings | The audit read only `ad.spawn.state_transition`, omitting missing-state evidence from `ad.find_missing.tick`; merge both by exact instance/time and retain latest-terminal-state and read-before-launch guards. |
+
+The five added source lines change only adapter receipt bookkeeping in `src/delivery-engine.ts`. Four production regressions cover 20 FIFO items, 20 multipart parts, failed delivered-append durability and launch replacement; all four fail against baseline `3a6f2300` (`/tmp/acu-ci2-baseline-tests.log`). A deterministic 20-item reproduction gives 13-second baseline spacing and six open at 180 s, versus 3-second fixed spacing with all 20 delivered by 60.5 s. Test 32's bound is unchanged. The reproduction and native CI have different receipt/AD timing, hence different remaining-item counts.
+
+Test 33 now requires the durable Enter/retype/Enter/retype sequence for the same part/session/launch, AD first-waiting evidence, actual persona key calls and the swallowed text fault's matching process ID. Stage assertions require the reset 10-second wait and both 30-second waits, plus the guarded Enter delay; this verifies reset behavior rather than merely widening a wall-clock bound. No production backoff value changes.
+
+An isolated actual agent-director 0.12 experiment reproduced test 17's missing-identity/hook-ignore/adoption sequence, establishing a fixture contract failure without a CSCB source defect. The replacement shim targets one persona and launch verb, calls real AD first, consumes its rule only after success and returns the authentic launch-timeout `ErrTmuxUnresponsive` envelope; collisions and launch errors pass through without consuming the rule. The 23-second report delay, G=60, retry schedule and combined polling deadline are unchanged.
+
+The final test-17 review caught a send-keys uncertainty envelope that classified as UNAVAILABLE but did not close the production launch-timeout window. The dedicated launch envelope fixes that finding. Executable shim controls now decode the reply through the real client and production classifier, require timeout-window ownership for plain spawn, reuse spawn and resume, and reject the old envelope as a negative control; `unknown-typed` is unchanged. The closing review returned no findings.
+
+The focused pacing run passed **767 tests** (`/tmp/acu-ci2-pacing-focused.log`); known fixture/assertion repairs passed **796 tests** (`/tmp/acu-known-tests.log`). Pending-fixture focused checks passed **1,399 tests** (`/tmp/acu-ci2-pending-fixture-focused.log`), followed by **18 scoped controls** (`/tmp/acu-ci2-pending-fixture-final.log`). After the launch-envelope correction, the final focused run passed **2,342 tests, zero failures and 5,699 assertions in 11.40 s** (`/tmp/acu-ci2-launch-envelope-focused.log`). Typecheck and shell syntax checks passed. These local checks establish no native CI verdict.
+
+All closing source and test reviews returned no findings, including the final test-17 follow-up. The three-file documentation diff and relevant context review also returned no findings; it did not reread the large unchanged portions of the architecture and testing guides.
+
+The final full isolated unit run passed **31,092 tests, 21 skipped, zero failures and 196,306 assertions across 181 files in 182.25 s**, including all **29 model conformance/verdict tests**. Evidence is in `/tmp/acu-ci2-full-units.log` and `/tmp/acu-ci2-full-units.xml`; typecheck passed (`/tmp/acu-ci2-typecheck.log`) and whitespace checks passed. The **31,014-pass** result above belongs to the first repair at `3a6f2300`.
+
+The earlier scoped documentation audit passed **2,456 tests, zero failures and 3,549 assertions in 9.83 s** (`/tmp/acu-ci2-docs-shipped.log`), with a scratch launch HOME/state, stripped token/persona/Claude config environment and the host-safety preload. Structural checks preserve all 57 audit rows and retained model evidence; all three second-round run IDs and five root causes are present, and model/trace/config files have no diff. Customer-facing delivery and agent-director guidance requires no additional operator action.
+
+After completing the evidence update, the final scoped `bun test tests/shipped-docs.test.ts` run passed **2,456 tests, zero failures and 3,549 assertions in 9.57 s** (`/tmp/acu-ci2-docs-final-shipped.log`), with the same scratch launch HOME/state, environment stripping and host-safety preload. Final documentation whitespace and structural checks passed; local validation is complete.
+
+All 57 audit dispositions, frozen model inputs, traces and retained TLC evidence remain unchanged. The passing conformance replay is no fresh TLC run or adapter-level proof. Per the owner's explicit instruction, CI is not run locally; the separate runner's rerun is still pending, and the recorded external gate remains FAIL at `3a6f2300`. No CI pass, merge or push is claimed.
 
 ## Documentation boundary
 
