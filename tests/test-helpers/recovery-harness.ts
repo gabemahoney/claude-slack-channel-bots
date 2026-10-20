@@ -2,1069 +2,6 @@ import { createDeliveryQueue } from '../../src/delivery-queue.ts'
 import { createDeliveryPreparation } from '../../src/delivery-intake.ts'
 import { cannedReadPaneResult } from './ad-results.ts'
 import { IDLE_PANE } from './working-row-panes.ts'
-/**
- * test-helpers/recovery-harness.ts — `makeRecoveryHarness`, the recovery
- * harness (b.jg5 SRJ-1304): the UNAVAILABLE retry timer and the recovery
- * paths around it, wired over one fake clock and one stub client.
- *
- * API
- * ---
- * `makeRecoveryHarness(options?)` builds, over one `createFakeClock`:
- *
- * - `controller`: the server's UNAVAILABLE retry controller
- *   (`createUnavailableRetryController`) on the harness clock. Its log lines
- *   go to `lines`. Its retry action is a delegate: every retry is recorded in
- *   `attempts` (persona key, retry number, cause kinds, mode and the clock
- *   time), then answered by the current action. The default action is
- *   `fullModeAction`, the server's retry action for both modes
- *   (`createFullModeRetryAction`) over the real restart module's retry entry
- *   (`runRestartRetry`), wired as `main()` wires it: the session manager's
- *   row read (`readPersonaRowState`, a pending-only retry's one `status`
- *   call), the applied-persona lookup over the live applied set, the
- *   relaunch gate below, the restart cap (`isAtCap` at
- *   `RESTART_FAILURE_CAP`), the harness's shutting-down flag, the latch's
- *   latched query (`latch` below), the hold's held query (`invalidFlagsHold`
- *   below) and "blocks a retry" (as `main()`'s
- *   `isPersonaRetryBlocked`, b.jg5 SRJ-303: the session manager's
- *   `personaRetryBlockCause` names a cause, `isLaunchInFlight`, its
- *   `isLiveRowSequenceRunning`, SRJ-706, or an old-life wait step for a hold
- *   the persona waits on, SRJ-811; a running dialog approver alone never
- *   skips a retry, SRJ-401), with that cause query as `retryBlockCause` (the
- *   skip's again-reason and the restart retry's skip line), and the condition's
- *   retry hooks: the
- *   connection and stream probes (`isSessionConnected`
- *   over `setConnected`) and `endTmuxUnresponsive`,
- *   the condition's end with reason `TMUX_UNRESPONSIVE_END_RETRY` and the
- *   retry's reading followed by the clear of the persona's
- *   `tmux-unavailable` outage with that reading (b.jg5 SRJ-311, SRJ-312),
- *   and the read-and-step dependency (`stepPendingRow`, b.jg5 SRJ-409,
- *   SRJ-411): the session manager's `retryPendingRowStep` over the
- *   applied-persona lookup, so a pending-only retry whose `status` shows
- *   `pending` makes one `get` and keeps a covered or undecided row armed
- *   pending-only, or starts the live-row sequence for an uncovered one; a
- *   covered row then gets the pending-row rule's one run of that retry (the
- *   pending-row rule, below), its answer mapped for the action
- *   (`pendingStepOfRuleAnswer`: a gone row hands the persona to the restart
- *   path's decision in the same retry).
- *   `scriptedAction` is
- *   the scripted action: it answers each persona's queued outcomes
- *   (`answer(key, ...outcomes)`) in order and, once they run out, a bare
- *   refusal (`{ kind: 'again' }`). `options.action` replaces the default
- *   (`'scripted'` picks the scripted action); `setAction(action)` swaps the
- *   current action, and `setAction(undefined)` goes back to the full-mode
- *   one. As in `main()`, the controller's per-fire observer (`onRetryFire`)
- *   is the condition's retry onset check (`tmuxUnresponsive.onsetAtRetry`),
- *   called at every fire, one whose retry is skipped included, before the
- *   action; its stop observer (`onStopped`) is composed as in `main()`: the
- *   condition's `cancelAlert(key, reason)`, so every real stop of a
- *   persona's timer cancels its pending alert check, then the
- *   unclassified-error episodes' `retryStopped(key, reason)`, each isolated.
- *   Every call to it is recorded first in `stops` (`{ key, reason }`).
- * - The restart module is initialised over the configuration
- *   (`initRestart`) with the production adapters: the liveness read
- *   (`_buildIsSessionAliveAdapter` over the applied configuration, one
- *   instance, as `main()`'s `isSessionAliveAdapter`, which the lost-message
- *   driver's row read is too), the
- *   reconnect and kill adapters (`_buildReconnectSessionAdapter`,
- *   `_buildKillSessionAdapter`, over the applied-persona lookup; the
- *   reconnect adapter, as `main()` builds it, with the latch's latched query;
- *   the kill adapter with the kill-retry clock below) and
- *   `launchSession` over the applied configuration with the relaunch gate as
- *   `canLaunch` and, as `main()` binds it, the escalate-dead verdict the
- *   restart work hands a relaunch passed on unchanged as `deadEvidence`
- *   (b.jg5 SRJ-611), so a relaunch after an escalation carries its verdict
- *   into the ladder. `getRestartDelay` answers the configuration's
- *   `session_restart_delay` (0 by default). `onCapReached` records the key in
- *   `capReached` and then, as `main()` binds it, calls
- *   `notifyRestartCapReached`, whose notice lands in `notices`, and ends the
- *   persona's unclassified-error episode
- *   (`end(key, UNCLASSIFIED_ERROR_END_CAPPED)`), and stops its retry timer
- *   in either mode (`controller.stop(key, UNAVAILABLE_RETRY_STOP_CAPPED)`,
- *   b.jg5 SRJ-305, so a real stop shows in `stops`), each isolated. `serialize` is `serializer.run`, one real per-persona
- *   serializer (`createPersonaSerializer`), which a test may hold a turn on.
- *   `armRetryTimer`, the arm hook, is bound as `main()` binds it (b.jg5
- *   SRJ-314, SRJ-301): every `unknown` liveness reading at the restart work,
- *   the re-probe's included, arms the persona's timer on the controller with
- *   `UNAVAILABLE_RETRY_CAUSE_READ_ERROR`, straight to the controller (it is
- *   not recorded in `triggers`); an arm while the timer is armed or running
- *   keeps its due time. `deferPendingRow`, the `pending` deferral (b.jg5
- *   SRJ-314, SRJ-409, SRJ-411), is bound as `main()` binds it: every
- *   `pending` liveness reading at the restart work, the re-probe's included,
- *   is handed, awaited, to the server's `deferPendingRow` with the reading's
- *   launch start and the harness's applied-persona lookup (its lines go to
- *   `errors`). For an applied persona it runs the session manager's
- *   `readAndStepPendingRow`: one `get`, then a covered or undecided row armed
- *   pending-only (through the trigger sink: in `triggers` with
- *   `UNAVAILABLE_RETRY_CAUSE_PENDING_ROW`), an uncovered one sent through the
- *   live-row sequence (conversation not kept, context `recovery`), a latching
- *   row latched; its per-answer lines (row no longer pending, gone, refused)
- *   are written, and a step that throws is logged and still answers
- *   `pending`. At a retry of the persona's timer (b.jg5 SRJ-410) a covered
- *   row gets the pending-row rule's one run, and a row the rule or the
- *   step's own `get` reads `ended`, `missing` or gone answers gone; the
- *   binding returns the deferral's answer, as `main()`'s does, so a gone
- *   answer takes the restart work on to its dead branch in the same run (no
- *   kill for a row read finished). The reconnect adapter is given the same
- *   lookup, so its own `pending` answer takes the same deferral, with no
- *   rule run (`mayRunRule: false`).
- *   `isLatched` is the latch's latched query (`latch`
- *   below). `isHeld` is the hold's held query (`invalidFlagsHold` below;
- *   b.jg5 SRJ-207), so the restart work answers `held` with no call for a
- *   held persona and arms no restart timer for it.
- *   `isLiveRowSequenceRunning` is the session manager's gate
- *   (`liveRowSequenceGate(key, 'runRestartWork')`, b.jg5 SRJ-706, SRJ-303,
- *   SRJ-811), as `main()` binds it, so the restart work answers
- *   `sequence-waiting` with no call while the persona's sequence runs, and
- *   while an old-life wait runs on its own `cscb_<key>` the gate also arms
- *   its timer (`held-for-old-life`, through the wait bindings' arm).
- *   `isHeldForOldLife`, the old-life hook (b.jg5 SRJ-810, SRJ-812), is the
- *   session manager's hold step over the applied persona
- *   (`oldLifeHoldStep(persona, 'runRestartWork')`), as `main()` binds it:
- *   while a hold other than one on the persona's own row is on its working
- *   directory, the step records the persona as waiting, starts the hold's
- *   wait unless one runs and arms its timer (`held-for-old-life`, through the
- *   wait bindings' arm, so in `triggers`), and the restart work answers
- *   `sequence-waiting` with no call; a key outside the applied set is never
- *   held there.
- *   `slowRecovery`, the slow-recovery observer, is the harness's
- *   slow-recovery tracker (below), as `main()` binds it (b.jg5 SRJ-610).
- *   `options.restartDeps` replaces any of these. Every ask of the
- *   latched query in effect, a replacement's included, is recorded by key
- *   first (for `loseMessage`'s `restartRequested`); a throw still reaches
- *   the restart module.
- * - The relaunch gate is the real `createPersonaRelaunchGate` over a serving
- *   connection, with the bring-up outcome `setUp(key, up)` controls (every
- *   configured persona up at first) and the live applied set (its lines go
- *   to `lines`). `setConnected(key, connected)` controls whether the
- *   persona's session is registered as connected with its message stream
- *   (`isSessionConnected`; none at first).
- * - Drivers, each as the server does it: `shutdown()` raises the
- *   shutting-down flag, closes the live-row sequence registry
- *   (`close()`, not awaited: every sequence's stop signal is set, so none
- *   makes a call after the one in progress, and no start is taken after
- *   it; b.jg5 SRJ-706), closes the controller
- *   (`close(UNAVAILABLE_RETRY_STOP_SHUTDOWN)`), stops every latch re-check
- *   timer (`latchRecheck`'s `stopAll`, as `main()`'s shutdown does right
- *   after the controller: none is armed again; b.jg5 SRJ-505), then the episodes
- *   (`episodes.close()`: every alert check cancelled, a later condition
- *   start answers `closed`), then stops every dialog approver
- *   (`stopAllDialogApprovers`, not awaited: none makes a call after the one
- *   in progress, and none starts after it); `teardown(key)` is the
- *   teardown's submit: it first stops the persona's dialog approver
- *   (`stopDialogApprover(key, APPROVER_STOP_TEARDOWN)`, not awaited; also the
- *   one a launch in flight would start), then its live-row sequence
- *   (`stopLiveRowSequence(key, LIVE_ROW_STOP_TEARDOWN)`, not awaited: its
- *   signal is set now; b.jg5 SRJ-706, SRJ-715), then
- *   stops the persona's timer (`stop(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN)`)
- *   and cancels its alert check (`tmuxUnresponsive.cancelAlert(key,
- *   UNAVAILABLE_RETRY_STOP_TORN_DOWN)`, which logs nothing more when the
- *   stop observer has already cancelled it), the condition kept; then it
- *   forgets the persona's old-life waits (the session manager's
- *   `forgetOldLifeWaits(key)`, not awaited: the key is forgotten as waiting
- *   on every hold, and a wait no persona left in the applied configuration
- *   waits on is stopped with the teardown reason; b.jg5 SRJ-811), the step
- *   production's turn takes right after the timer's stop; then it
- *   forgets the persona's latch silently (`latch.forget(key)`: no post, no
- *   set observer call, no line; its forget observer stops the persona's
- *   latch re-check timer, b.jg5 SRJ-505), the turn's step that production's
- *   `forgetConflictLatch` binds (b.jg5 SRJ-504), and then its
- *   `ErrInvalidFlags` hold (`forget(key)`: no post, no retry), the step
- *   production's `forgetInvalidFlagsHold` binds (b.jg5 SRJ-207, SRJ-715). The teardown's turn then
- *   forgets the persona's episodes, every kind (its unclassified-error,
- *   CONFLICT and slow-recovery episodes included), and its counts (the
- *   slow-recovery count), as production's `forgetNoticeEpisodes`
- *   does; a case does that step with `episodes.forget(key)` after
- *   `teardown(key)`, which keeps production's order (the latch, then the
- *   episodes). The harness does not wait for a launch in flight as the turn
- *   does, so a case settles any launch before `teardown(key)`. `remove(key)`
- *   drops the persona from the applied configuration without a teardown;
- *   `reAdd(key)` puts one of the harness's personas back.
- * - `teardownDeps()` (b.jg5 SRJ-715): the persona teardown's dependencies
- *   that act on what the harness owns, each bound as `main()` binds it in
- *   `createPersonaLifecycle`, so a case hands them to the real lifecycle
- *   (with recorders or real modules for the rest) and the whole teardown,
- *   submit and turn, runs over the harness: `stopApprover`
- *   (`stopDialogApprover(key, APPROVER_STOP_TEARDOWN)`),
- *   `stopLiveRowSequence` (`stopLiveRowSequence(key,
- *   LIVE_ROW_STOP_TEARDOWN)`), `whenLaunchSettled`, `cancelLaunchWait`
- *   (`cancelWorkingRowWait`), `stopRetryTimer` (the controller's
- *   `stop(key, UNAVAILABLE_RETRY_STOP_TORN_DOWN)`, then the condition's
- *   `cancelAlert` with the same reason), `forgetOldLifeWaits` (the session
- *   manager's teardown member, b.jg5 SRJ-811), `forgetConflictLatch` (`latch`'s
- *   `forget`, whose forget observer stops the persona's latch re-check
- *   timer), `forgetInvalidFlagsHold` (`invalidFlagsHold`'s `forget`),
- *   `forgetNoticeEpisodes` (`episodes.forget`), `resetOutageState`
- *   (`resetAllToHealthy`), `killInstance` (`killPersonaInstanceForTeardown`
- *   with `killRetryClock`, so `drive` moves the clock to its waits) and
- *   `raiseKillFailureAlert` (the harness's kill-failure alerts' `raise`,
- *   not latched, with the context `KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN`).
- *   Each call builds a fresh object over the same instances.
- * - `stub`: one stub client (`makeStubClient`) with its call log
- *   (`stub.calls`), installed through `installStubSpawnPath` with the spawn
- *   home under the harness's temporary HOME, and handed to the outage state
- *   (`initOutageState`) as its client. No launch path kills a tmux session
- *   or runs tmux: every launch reaches only the stub.
- *   `script(knobs)` sets the stub's answers (`StubClientOptions` knobs such
- *   as `spawnError`, `getQueue` or the per-call `spawnFn`, `resumeFn`,
- *   `findMissingFn`, `readPaneFn`, `sendKeysFn` and `killFn`), read at each
- *   call.
- * - `harnessNow`: with `options.harnessNow`, the session manager's clock
- *   (`_setNow`) is the harness clock, set where the approver's clock is:
- *   each launch call's window (b.jg5 SRJ-407, `launchCallWindowOf`) is
- *   recorded on harness-clock times, and the working-row wait, its deferral
- *   runs and the findMissing memo's window read it too; `cleanup()` restores
- *   the real one (`_resetNow`). Without it the harness leaves that clock
- *   alone (real unless the case sets its own), since a case that bounds the
- *   working-row wait in real ms needs a clock that moves on its own.
- * - `triggers`: the outage state's trigger sink (b.jg5 SRJ-301) is the
- *   controller, behind a recorder: every trigger an agent-director error
- *   inside a launch or recovery attempt sends (`{ key, kind }`, the cause
- *   kind) is recorded here, then armed on the controller; an ENVIRONMENT
- *   answer (`ErrTmuxNotAvailable`) or a CONFIG answer (`ErrConfigMalformed`)
- *   from any call for a persona, in or out of an attempt, is sent too (b.jg5
- *   SRJ-311, SRJ-316). The sink's pending-only arm (`armPendingOnly`, as the
- *   production sink, the controller, has it), which a launch's
- *   `ErrTmuxSessionCreate` reaches through the outage state's launch-failure
- *   arm (`armPendingOnlyAfterLaunchFailure`; b.jg5 SRJ-112, SRJ-113,
- *   SRJ-409), is recorded the same way, with the kind
- *   `UNAVAILABLE_RETRY_CAUSE_PENDING_ROW`, then armed on the controller's
- *   `armPendingOnly`. With
- *   `options.triggerSink: false` no sink is installed: nothing is recorded or
- *   armed.
- * - `outageClears` (b.jg5 SRJ-305, SRJ-306, SRJ-311): the outage state's
- *   cleared-flag observer (`onFlagCleared`), installed in the same
- *   `initOutageState` call as `main()` binds it: each real clear of a
- *   persona's `tmux-unavailable` outage (never a silent reset, never another
- *   class) calls the controller's condition-end entry once
- *   (`conditionEnded(key, UNAVAILABLE_RETRY_CONDITION_TMUX_UNAVAILABLE,
- *   reading)`, the reading the clear brought), recorded here
- *   (`{ key, reading, result }`) with what the controller answered. The
- *   health tick's healthy branch clears it with `LIVENESS_LIVE`; the harness
- *   has no tick, so a case clears it as that branch does
- *   (`clearOutageFlag(key, 'tmux-unavailable', LIVENESS_LIVE)`).
- * - `episodes` and `tmuxUnresponsive` (b.jg5 SRJ-307, SRJ-310, SRJ-1016):
- *   one notice-episodes instance (`createPersonaEpisodes`) on the harness
- *   clock, whose posts land in `episodeNotices` and whose lines go to
- *   `lines`, and the `tmux-unresponsive` condition over it
- *   (`createTmuxUnresponsiveCondition`, its started and ended lines to
- *   `lines`), wired as `main()` wires them: the condition is the outage
- *   state's condition sink in the same `initOutageState` call as the trigger
- *   sink, so a tmux-touching call's UNAVAILABLE inside an attempt starts it
- *   on the harness clock and a tmux-touching success or GONE ends it; each
- *   end of a holding condition calls the controller's condition-end entry
- *   (`conditionEnded(key, UNAVAILABLE_RETRY_CONDITION_TMUX_UNRESPONSIVE,
- *   reading)`), recorded in `conditionEnds` (`{ key, reading, result }`)
- *   with what the controller answered. The condition's mode accessor
- *   (`healthCheckOn`) reads `health_check_interval` in the configuration in
- *   effect at each check (0, the default, is off: the onset comes at a retry
- *   at or past `TMUX_UNRESPONSIVE_ONSET_FLOOR_MS`; `setHealthCheckInterval`
- *   changes it). Its alert threshold accessor is E6's
- *   `adAlertThresholdMsInEffect` over the settings in effect below, so a
- *   start arms an alert check on the harness clock;
- *   `options.alertThresholdMs` replaces the accessor, and `false` arms none.
- *   A case reads the condition with
- *   `tmuxUnresponsive.holds(key)` and `tmuxUnresponsive.firstRefusalAt(key)`.
- *   With `options.conditionSink: false` the condition is not installed in
- *   the outage state (the retry hooks and `tickEnd` still reach it).
- * - The unclassified-error episodes (b.jg5 SRJ-313, SRJ-1009;
- *   `createUnclassifiedErrorEpisodes`) over the same episodes instance,
- *   wired as `main()` wires them: the outage state's unclassified sink in
- *   the same `initOutageState` call, so each UNCLASSIFIED outcome inside a
- *   launch or recovery attempt (a row read's included) begins or continues
- *   the persona's episode; the alert threshold is E6's
- *   `adAlertThresholdMsInEffect` (never `options.alertThresholdMs`, which is
- *   the condition's); the configured-key lookup reads the live applied set,
- *   so after `remove(key)` the alert takes the log-only route, one
- *   `recordStartupError(PERSONA_UNCLASSIFIED_ERROR_LABEL, 'persona=<key>:
- *   <text>')` into the harness's `startup-errors.log` (`startupErrors()`);
- *   otherwise the alert lands in `episodeNotices`; their lines go to
- *   `lines`. `unclassifiedErrorOpen(key)` reads whether the persona's
- *   episode is open; nothing sets it by hand.
- * - `slowRecovery` (b.jg5 SRJ-610, SRJ-1010, SRJ-1016): one slow-recovery
- *   tracker (`createSlowRecoveryTracker`) over the same episodes instance,
- *   built after the unclassified-error episodes as `main()` builds it, its
- *   lines to `lines`; its post (SRJ-1010, `slowRecoveryText`) lands in
- *   `episodeNotices`. It is the restart deps' slow-recovery observer, so the
- *   restart work's runs feed its count, and its latch end (`endForLatch`) is
- *   the latch's fourth hold. `slowRecovery` is read-only: `count(key)` and
- *   `isOpen(key)` (the same state as `episodes.count(key,
- *   PERSONA_EPISODE_KIND_SLOW_DEAD_SESSION_RECOVERY)` and `episodes.isOpen`);
- *   a case moves it only through restart runs, a latch, a forget or
- *   `shutdown()`.
- * - The kill-failure alerts (b.jg5 SRJ-704, SRJ-1007, SRJ-1016;
- *   `createKillFailureAlerts`) over the same episodes instance, built and
- *   installed in the session manager (`setKillFailureAlerts`, removed by
- *   `cleanup()`) as `main()` builds and installs them, before any launch:
- *   the restart path's kill adapter and the live-row sequence's kills raise
- *   the bounded retry's decision through them (context `recovery`; the
- *   collision ladder makes no kill), the stuck-launch abort's kill too
- *   (context 'stuck-launch abort', given to the pending-row rule's builder),
- *   and every own-row read of the session manager that reads
- *   the row `ended` or `missing`, or finds it gone (`ErrSpawnNotFound`), ends
- *   the persona's episode silently. The destination route posts through the
- *   episodes' sink, so the alert lands in `episodeNotices`; the
- *   configured-key lookup reads the live applied set, so after `remove(key)`
- *   (also mid-run, from inside a stub call, e.g. through
- *   `recordCallOrder`'s `during`) the alert takes the log-only route, one
- *   `recordStartupError(<class>, <entry>)` into the harness's
- *   `startup-errors.log` (`startupErrors()`); their lines go to `lines`.
- *   `killFailureOpen(key)` reads whether the persona's episode is open
- *   (the lost-message driver's kill-failed input); nothing sets it by hand.
- *   The applied set is the harness's own, so a removal ends with it.
- * - The stuck-launch episode (b.jg5 SRJ-1016, SRJ-1017): `episodes` is
- *   installed in the session manager (`setStuckLaunchEpisodes`, removed by
- *   `cleanup()`) as `main()` installs its notice episodes, before any
- *   launch, so every own-row read of the session manager that reads the row
- *   `waiting`, `working`, `ask_user` or `check_permission` ends the persona's
- *   stuck-launch episode silently (the session manager logs its line through
- *   `console.error`, so it goes to `errors`); the latch's fifth hold ends it
- *   too (below; that line goes to `lines`). The harness posts no stuck-launch text: a
- *   case posts through `postStuckLaunchHeld` / `postStuckLaunchRelaunching`
- *   (`src/pending-row.ts`) over `episodes`, and the post lands in
- *   `episodeNotices`.
- * - The pending-row rule (b.jg5 SRJ-410, SRJ-404, SRJ-303), composed as
- *   `main()` composes it and installed right after the live-row sequence
- *   registry (`setPendingRowRule`, removed by `cleanup()` with
- *   `_resetPendingRowRule`): `createPendingRowRule` over the session
- *   manager's one builder (`buildPendingRowRuleDeps`), given the
- *   applied-persona lookup, `episodes` (so its held post, SRJ-1017's held
- *   text, lands in `episodeNotices`) and `console.error` as its log (its
- *   `[slack] pending-row:` lines go to `errors`), with the harness's
- *   serializer (`serializer.run`, as `main()`'s `personaLifecycle.run`) as
- *   the turn its one run at a dialog approver's stop takes, and the retry
- *   action's gate (`retryRunGate`: applied, latched, held on
- *   `ErrInvalidFlags`, up, the cap, shutdown) as the gate that run is
- *   dropped by when it starts (`PendingRowRuleInstall.gate`). So the
- *   production rule runs at each retry of a persona's timer that reaches a
- *   covered `pending` row (a pending-only retry's step, a full-mode retry's
- *   `pending` deferral, the collision ladder's `pending` step) and once at
- *   an approver's stop with the row last read `pending`; every other origin
- *   only arms. Its lap and its calls go through the stub; its latched query,
- *   "blocks a retry", old-life hold gate, outage flags and episodes are the
- *   harness's own. Its clock is the session manager's (`_setNow`): with
- *   `options.harnessNow` that is the harness clock already; without it the
- *   rule's `now` alone is the harness clock, so a row is aged by moving the
- *   harness clock either way (`pastSampleGrace` moves it to G past the
- *   stub's sample launch start; the clock starts at 0, so a row with that
- *   launch start is younger than G until the case moves it). Each
- *   approver-stop run is tracked and `settle()` awaits it. With
- *   `options.pendingRowRule: false` none is installed, and each retry or
- *   stop that would run it logs its "no pending-row rule is installed" line.
- *   Step 3's own-launch slot (`PendingRowRuleDeps.ownLaunch`) is the one
- *   the builder sets (b.jg5 SRJ-412): the stuck-launch abort
- *   (`createStuckLaunchAbort`) over the own-launch query
- *   (`isCscbOwnLaunch`), so CSCB's own stuck launch at B gets the
- *   relaunching post, the abort's checked kill and the live-row sequence
- *   from step 2, and every other row at B the held post. The builder is
- *   given the kill-retry clock (`killRetryWait: killRetryClock`, so the
- *   abort kill's waits between tries are on the harness clock and `drive`
- *   moves it to them) and the harness's kill-failure alerts
- *   (`killFailureAlerts`, so its alert, context 'stuck-launch abort', lands
- *   in `episodeNotices`). `stuckLaunchAbortUsed(key)` reads the abort's
- *   per-episode state (`isAbortUsed`). A launch the harness makes is CSCB's
- *   own only with `options.harnessNow` (the launch window and the stub's
- *   launch start then share the clock); without it the window is on the
- *   real clock and no harness launch is own.
- *   A case scripts the row with `makePendingRowModel`
- *   (`tests/test-helpers/pending-row-model.ts`), which takes a harness as
- *   its host.
- * - `timedCalls` and `callTimes(verb, key?)` (b.jg5 SRJ-410, AC 33): every
- *   agent-director verb of the stub client (`RECOVERY_STUB_VERBS`, by method
- *   name) is wrapped at build, in place, so each call is stamped with the
- *   harness clock when it is made (`{ verb, at, instanceId }`, the instance
- *   id the call named, undefined for `findMissing` and `list`), before the
- *   stub records and answers it; `callTimes` reads one verb's times, of one
- *   persona's instance with `key`. A verb a case replaces afterwards
- *   (`holdFindMissing`, `holdSpawns`' held calls) is stamped only if its
- *   replacement calls the wrapped verb.
- * - `setApproverCap(ms)`: the approver's test cap mid-case
- *   (`_setDialogReadyTimeoutMs(ms)`, or `_resetDialogReadyTimeoutMs()` for
- *   `undefined`, so the approver stops at B), read by approvers started from
- *   then on; `options.approverCapMs` sets it at build, and `cleanup()`
- *   unsets it.
- * - `restartServer(key)`: a server restart as persona `key` sees it (b.jg5
- *   SRJ-410's "a server restart mid-launch"). It forgets what a new process
- *   starts without for the persona: its retry timer stopped with
- *   `UNAVAILABLE_RETRY_STOP_SHUTDOWN` (a real stop, in `stops`), its dialog
- *   approver stopped with `APPROVER_STOP_SHUTDOWN` (no pending-row run
- *   follows) and awaited, its launch records forgotten (`forgetLaunchCalls`:
- *   the launch-call window and "this launch's row" record, SRJ-407, the
- *   not-interactive record and the record of CSCB's own launch, SRJ-412),
- *   and its episodes and counts forgotten, every kind (`episodes.forget(key)`,
- *   the stuck-launch episode included, whose close disposes the abort's
- *   per-episode state, SRJ-412). It throws if the own-launch record or a
- *   used abort outlives that. Its latch is dropped silently and its latch
- *   re-check timer stopped (`latch.forget(key)`, then `latchRecheck`'s
- *   `stop(key)`; b.jg5 SRJ-504: a server restart drops every latch and its
- *   timer, and the persona latches again at its next attempt).
- *   The stub's row is untouched; the outage flags, the holds, the
- *   retired-key store, the restart module's counts and the findMissing memo
- *   are kept (a case that needs them gone builds a new harness). It throws
- *   while the persona has a launch in flight or a live-row sequence running
- *   (settle them first). The case then runs the start pass itself
- *   (`launch(key)`).
- * - `latch` and `latchEvents` (b.jg5 SRJ-501, SRJ-502, SRJ-508): one latch
- *   per harness (`createConflictLatch`, its lines to `lines`), composed as
- *   `main()` composes it: installed in the session manager
- *   (`setConflictLatch`), so a CONFLICT at a collision-ladder spawn or
- *   `resume` latches the persona (a `launch` answers `latched`) and a latched
- *   persona's launch makes no agent-director call; its latched query bound
- *   into the full-mode retry action (`isLatched`: a retry of a latched
- *   persona stops with `UNAVAILABLE_RETRY_STOP_LATCHED`, no call) and into
- *   the restart deps (`RestartDeps.isLatched`: the restart work answers
- *   `latched`, no call); and its set observers in `main()`'s order: the
- *   holds (`bindConflictLatchHolds`) and then the CONFLICT notice
- *   (`bindConflictNotice`) over `episodes`, whose post lands in
- *   `episodeNotices`. On every set the holds run in order, each isolated:
- *   the timer's stop (`controller.stop(key,
- *   UNAVAILABLE_RETRY_STOP_LATCHED)`, so a real stop shows in `stops`), the
- *   condition's silent end (`tmuxUnresponsive.end(key,
- *   TMUX_UNRESPONSIVE_END_LATCHED, undefined, { silent: true })`: no recovery
- *   post; a holding condition's end shows in `conditionEnds`), the
- *   unclassified-error episode's end (`end(key,
- *   UNCLASSIFIED_ERROR_END_LATCHED)`), the slow-recovery tracker's latch
- *   end (`slowRecovery.endForLatch(key)`: the count reset and the episode
- *   ended silently) and the stuck-launch episode's end
- *   (`endStuckLaunchEpisodeForLatch(episodes, key, log)`, `src/pending-row.ts`:
- *   the episode ended silently, with one line when one was open). `latch` is
- *   read-only: `isLatched(key)`, `record(key)` and the latch's own
- *   `addSetObserver(observer)` (answering its remover). `latchEvents` holds, in order, each set as the
- *   observers see it (`{ step: 'set', key, outcome, record }`, recorded by an
- *   observer added before the holds), each of the first three holds as it is
- *   called (`{ step: 'hold', key, hold }`; the slow-recovery and stuck-launch
- *   ends are not recorded, and a case reads them through `slowRecovery` and
- *   `episodes.isOpen(key, PERSONA_EPISODE_KIND_STUCK_LAUNCH)`) and each CONFLICT
- *   notice posted (`{ step: 'notice', key, text }`), so a case can read that
- *   every hold ran before the notice.
- *   The harness has no health tick, so `HealthCheckDeps.isLatched` is not
- *   bound here; a tick case binds `latch.isLatched` itself. `teardown(key)`
- *   forgets the persona's latch silently (b.jg5 SRJ-504), as production's
- *   teardown does. `latchSet` is the latch's own set entries (`set`,
- *   `setFromConflict`, `setFromUnusableName`, `setLaunchStartNotRecorded`,
- *   `setProbeDropped`), so a case latches P as a latching site does, every
- *   observer above and the re-check's arm running (a conflict-cases row's
- *   `latchOn(h.latchSet, key)`).
- * - `latchRecheck` (E30; b.jg5 SRJ-505, SRJ-506): the latch re-check,
- *   composed through the session manager's one builder exactly as `main()`
- *   composes it (`buildLatchRecheck` over the latch, the harness clock, the
- *   harness's serializer `serializer.run` as `main()`'s
- *   `personaLifecycle.run`, the live applied configuration, `console.error`
- *   as its log, so its lines and its round's lines go to `errors`, the
- *   latch notice's episodes, the harness's relaunch gate as its
- *   `canRelaunch`, so a persona `setUp(key, false)` set down gets no launch
- *   in a round, b.av2 SR-6.4, and the restart cap (`isAtCap` at
- *   `RESTART_FAILURE_CAP`, over the real failure counter) as its `isAtCap`,
- *   so a persona at the cap gets its reads in a round but no launch and no
- *   run of the restart path's decision, b.av2 SR-6.3, bug b.xkd, and the
- *   reset of that counter (`forgetFailures`) as its `resetRestartFailures`,
- *   so a clear by hand that clears a latch resets the persona's count before
- *   its retry at once while the re-check's own clears leave it, b.jg5
- *   SRJ-509, bug b.ebi; every operation it submits through the
- *   serializer is tracked until it settles); its clear goes through the one clear entry:
- *   one recovery post, the episode ended, the timer stopped, then, after a
- *   clear that launched nothing, the after-clear sequence's run in the same
- *   serializer turn, b.jg5 SRJ-506). With `options.latchRecheck` (false when unset, so the
- *   suites that assert no call and no timer for a latched persona on the
- *   other automated paths keep their meaning) its observer is bound after
- *   the holds and the notice (`bindLatchRecheck`), so a set runs the holds,
- *   the notice, then the timer's arm: a persona that latches gets one
- *   timer, its first round
- *   `LATCH_RECHECK_INTERVAL_MS` later on the harness clock whatever
- *   `health_check_interval` is, each next one that long after the previous
- *   round settled. Its timers are tracked: `latchRecheck.nextDueAt()` (the
- *   earliest pending re-check's due time, or undefined) and
- *   `pendingTimers()`, beside the controller's `isArmed(key)`,
- *   `armedKeys()` and `whenRoundSettled(key)` (a round's settling includes
- *   the after-clear sequence's run it owes), and the builder's `clear` and
- *   `clearAndRecover`, and the clear by hand over them (`clearByHand`:
- *   `clearByHandOf(latchRecheck)`, as `main()` binds the `/clear-latch`
- *   route's clear, b.jg5 SRJ-510). `advanceToRecheck()` moves
- *   the clock to the earliest pending re-check, settles its round
- *   (`settle()`) and answers the time it fired at; it throws when none is
- *   pending. `advance` awaits the rounds a firing starts (flush-bounded) and
- *   `settle()` awaits them in real time. Its stops: a clear (the clear
- *   entry's `stop`), every forget of the persona's latch (the binding's
- *   forget observer: `teardown(key)`, `teardownDeps().forgetConflictLatch`,
- *   `restartServer(key)`), `shutdown()`'s `stopAll` and `cleanup()`'s.
- *   Decision (E30 T1's PM finding, recorded in E30 T3): the binding is
- *   opt-in, and stays so, although `main()` always binds it. Binding it by
- *   default broke 84 tests in 8 files, each asserting that a latched persona
- *   gets no call and no timer on some other automated path (AC 46's half and
- *   its kin), which a bound re-check's 120 s rounds and its armed timer would
- *   contradict. So a case about the re-check, or about a latched persona's
- *   life with it, passes `latchRecheck: true` (as `tests/conflict-latch.test.ts`'s
- *   `makeRecheckHarness` does); every other case leaves it unbound, and the
- *   default changes only together with those suites.
- * - `invalidFlagsHold` (b.jg5 SRJ-207, SRJ-1008, SRJ-1016, SRJ-305): one
- *   `ErrInvalidFlags` hold per harness (`createInvalidFlagsHold`, its lines
- *   to `lines`), composed as `main()` composes it: installed in the session
- *   manager (`setInvalidFlagsHold`, removed by `cleanup()`), so a reuse
- *   spawn's `ErrInvalidFlags` whose re-check did not stop the server holds
- *   the persona (its launch answers `held`) and a held persona's launch makes
- *   no agent-director call; its held query bound into the full-mode retry
- *   action (`isHeld`: a retry of a held persona stops with
- *   `UNAVAILABLE_RETRY_STOP_HELD`, no call), the restart deps
- *   (`RestartDeps.isHeld`) and the lost-message driver's cannot-launch
- *   input; and its set reaction (`bindInvalidFlagsHoldSetReaction`), which
- *   stops the persona's timer through the controller's stop entry with
- *   `UNAVAILABLE_RETRY_STOP_HELD` (a real stop shows in `stops`) and then
- *   posts SRJ-1008's alert once in its episode over `episodes` (in
- *   `episodeNotices`). `invalidFlagsHold` is read-only: `isHeld(key)`,
- *   `beganUnder(key)` and `heldKeys()`; a tick case binds
- *   `invalidFlagsHold.isHeld` as `HealthCheckDeps.isHeld` itself.
- *   `teardown(key)` forgets the persona's hold silently.
- * - The version-changed listener (b.jg5 SRJ-204, SRJ-207), registered as
- *   `main()` registers it (`onAdVersionChanged`): the hold's version-change
- *   reaction (`endInvalidFlagsHoldsOnVersionChange`) over the hold, the
- *   episodes and the live applied set, its retry at once the restart
- *   module's retry entry (`runRestartRetry`, no delay gate) with "blocks a
- *   retry", for each persona still applied. Each retry at once is recorded
- *   in `retriesAtOnce` (`{ key, at, outcome }`: the clock time it was asked
- *   for at and, once settled, the retry entry's outcome), and `settle()`
- *   awaits it. A re-check reset drops every listener, so `recheckAnswers`
- *   registers it again; `cleanup()` removes it.
- * - `versionRecheck(initial?)`: installs agent-director's version re-check
- *   on the harness clock as `main()` installs it (`installAdVersionRecheck`,
- *   its lines to `lines`), with the baseline `PHASE1_RC_VERSION`; its binary
- *   resolve (`makeStubResolveSystemBinary`) answers `initial` (that version
- *   by default) until the case sets another with `answer(outcome)` (a
- *   version, a below-floor version, a failure); its `recordStartupError`
- *   writes into the harness's `startup-errors.log` (`startupErrors()`) and
- *   its stop's exit codes are recorded (`stops`, the server is not stopped).
- *   It answers its `resolves`, `stops`, `nextDueAt()` (its next timed
- *   re-check's due time, none once a stop ended it) and `pendingTimers()`
- *   (its timers among the clock's pending ones: its interval, and a call's
- *   time limit while one runs). Its 120 s timer is pending for as long as it
- *   is installed, so a case counting pending timers subtracts it; `cleanup()`
- *   disposes it before it counts. It throws when a re-check is already
- *   installed.
- * - The configured-persona query (b.jg5 SRJ-114): installed in the session
- *   manager beside the latch (`setConfiguredPersonaQuery`), as `main()`
- *   installs it, over the live applied set: a key counts as configured while
- *   it is applied, so a `provenance_conflict` note on a configured persona's
- *   own row latches it through `latch`, and a key outside the harness's
- *   personas, or one `remove(key)` dropped, counts as not configured.
- * - `retiredKeys` (b.jg5 SRJ-807): the one retired-key store, read at build
- *   over `stateDir` as `main()`'s start read reads it
- *   (`readRetiredKeysAtStart`, its lines to `console.error`, so to `errors`)
- *   and installed in the session manager right after the configured-persona
- *   query (`setRetiredKeyStore`), as `main()` installs it; so any key's own
- *   row read live other than `pending` while its mark is set clears its
- *   entry. The store reads the record once, so a case seeds it through
- *   `options.retiredKeys` (the entries by key, given the persona keys),
- *   which the harness writes with `writeRetiredKeysRecord` into `stateDir`
- *   before the load; with none there is no file. Its writes go through the
- *   production durable writer, each recorded in `retiredKeyWrites` (path,
- *   and whether it went through); `failRetiredKeyWrites(count?)` refuses the
- *   next `count` (1 by default) with `RECOVERY_RETIRED_KEY_WRITE_FAILURE_CODE`
- *   before they touch the file. A record the store refuses to read fails the
- *   build, with everything it installed put back.
- *   `retireKey(key, options?)` (b.jg5 SRJ-805, SRJ-806) records a key after
- *   the build through the installed store's own primitives, never by writing
- *   the file behind it: one `record` batch with the key and its cause
- *   (`removed` by default), then, with `options.mark`, one `mark`; it throws
- *   unless each went through (written, or unchanged for a key already so), so
- *   a case that wants a failing write calls `failRetiredKeyWrites` after it.
- *   Its writes show in `retiredKeyWrites` like any other.
- *   `retiredEntry(key)` reads the key's entry back through the store's
- *   queries: `{ recorded, marked, entry }` (`isRecorded`, `isMarked`, a mark
- *   held in memory after a failed write included, and `entry`).
- * - `oldLifeHolds` (b.jg5 SRJ-809): the one old-life hold set, built right
- *   after the retired-key store as `main()` builds it
- *   (`createOldLifeHoldSet`, its lines to `console.error`, so to `errors`,
- *   directories compared by the production real-path resolver) and
- *   installed in the session manager right after the store
- *   (`setOldLifeHolds`), as `main()` installs it before the start sweep; so
- *   every row read the session manager makes ends or re-points a hold, the
- *   start sweep begins its holds there, and a teardown or sweep kill whose
- *   tries decided the ordinary kill-failure alert marks one. A restart is a
- *   new harness: holds live in memory, so it starts with none. The view is
- *   read-only: `snapshot()` (every hold, in begin order: instance id, old
- *   key, directory and its real path, cause, kill-failed mark, waiting
- *   personas), `holdOf(id)`, `holdsOnDirectory(dir)`,
- *   `holdsWaitedOnBy(persona)` and `waitsOnKillFailed(persona)`.
- *   `beginOldLifeHold(begin)` is apply step 1's begin, the one member of the
- *   set `main()` hands the reload controller (`ReloadControllerDeps.oldLifeHolds`);
- *   a case that needs a hold no sweep began (an apply step 1 hold on
- *   `cscb_<key>` at the old declaration's directory) begins it there. The
- *   start sweep is `startSweep(isShuttingDown?)`: `reconcileOrphans` over the
- *   applied configuration (the live applied set) on `killRetryClock`, driven
- *   with `drive`, its shutdown query the harness's shutting-down flag
- *   (`shutdown()`) as `main()` binds it unless the case passes another; its
- *   rows are the stub's `list` answer (`script({ listResult })`).
- * - The old-life wait (b.jg5 SRJ-811, SRJ-812, SRJ-1512), composed as
- *   `main()` composes it: the registry below takes `runOutsideAttempt`
- *   (`runOutsideAttempts`), so a wait runs outside every attempt, and the
- *   wait's bindings (`setOldLifeWaitBindings`) are installed right after the
- *   kill-failure alerts: each waiting persona's arm through the trigger sink
- *   (in `triggers`, kind `held-for-old-life`, then armed on the controller),
- *   the sequence clock (its waits and its kill's waits between tries are
- *   sequence timers, so `driveSequence` moves the clock to them), `lines` as
- *   its sequence log, the live applied set, the harness's kill-failure
- *   alerts, the startup-errors recorder over `stateDir`, and the wait's own
- *   unclassified-error episodes (`createOldLifeWaitUnclassifiedErrors`, on
- *   the harness clock at E6's alert threshold in effect, keyed by the held
- *   instance id; their lines to `errors`, their alert the log-only
- *   `persona-unclassified-error` entry in `startupErrors()`; read with
- *   `oldLifeWaitUnclassifiedOpen(id)`; closed by `shutdown()` and
- *   `cleanup()`). The wait's own end lines and kill-try lines go to
- *   `console.error` (`errors`).
- *   `startOldLifeWait(id)` starts the wait on a held id through the session
- *   manager's ensure entry (`ensureOldLifeWait`), throwing unless it
- *   answered `started`, and answers the outcome promise (its end handler has
- *   run once it resolves); `runOldLifeWait(id)` starts one and drives it to
- *   its end; `oldLifeWaitRunning(id)` is the registry's no-launch query and
- *   `oldLifeWaitSettled(id)` its settle query by instance id
- *   (`_whenSettledOn`), both read-only. A case holds the wait at a run with
- *   the stub's `holdFindMissing`, as for a sequence. The waiting personas are
- *   computed from the applied configuration (a persona whose working
- *   directory is the held directory, and the persona whose own `cscb_<key>`
- *   is held). `shutdown()`'s close stops every wait.
- * - What a hold refuses (b.jg5 SRJ-810, SRJ-1502, SRJ-1505), composed as
- *   `main()` composes it. Every launch (`launch(key)`, the restart path's
- *   `launchSession`, a live-row sequence's step-6 launch) meets the session
- *   manager's old-life gate in the real `spawnForPersona`: a persona whose
- *   working directory a hold other than one on its own row holds is
- *   recorded as waiting on it, the hold's wait is started unless one runs,
- *   its timer is armed (`held-for-old-life`, in `triggers`) and the launch
- *   answers `sequence-waiting` with no call; the restart work's old-life
- *   hook (above) is the same step. The reconnect guard and the reconnect
- *   adapter's held-own-row branch are the production code's own. The hold
- *   set's end observer that retries the waiting personas
- *   (`createOldLifeHoldEndRetry`) is registered after the session manager's
- *   own, as `main()` registers it: its run-now is the controller's
- *   `runNow(key, { kind: UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD },
- *   UNAVAILABLE_RETRY_RUN_NOW_HOLD_ENDED)` and its applied query the live
- *   applied set, so once a hold ends each persona recorded as waiting on it,
- *   still applied and not latched, is retried at once, at the clock time of
- *   the end, with no clock advance (the retry's run is awaited by
- *   `settle()`). Each run-now is recorded in `holdEndRetries` (`{ key, at,
- *   result }`). `admitSession(rootsPath)` is the admission driver: one
- *   `decideSessionAdmission` call as `handleInitialized` makes it, over the
- *   applied personas, the real up predicate (`createPersonaUpPredicate` over
- *   the same serving connection, bring-up outcome and live applied set as the
- *   relaunch gate), the not-up description `handleInitialized` passes
- *   (`describePersonaNotUp` of the persona's bring-up state, a persona
- *   `setUp(key, false)` set down being `retrying`), its line to
- *   `console.error` (`errors`) and the session
- *   manager's held-directory query (`oldLifeHeldDirectory`) over the one hold
- *   set; it answers the admission (`held`, `admitted`, `not-up`,
- *   `unmatched`) and registers nothing.
- * - `tickEnd(key)`: what a health tick's healthy branch does to the
- *   condition, as `main()` binds `HealthCheckDeps.endTmuxUnresponsive`: the
- *   condition's end with reason `TMUX_UNRESPONSIVE_END_TICK` and the `live`
- *   reading (`LIVENESS_LIVE`). `tickOnset(tickStartedAt?)`: what a health
- *   tick body's end does, as `main()` binds `HealthCheckDeps.onTickEnd`: the
- *   condition's onset check (`onsetAtTick`) for a tick started at
- *   `tickStartedAt`, the harness clock's now by default (a condition whose
- *   first refusal is at that same time gets no onset). The harness has no
- *   health tick of its own.
- * - `launch(key)`: a start-pass launch of the configured persona `key`
- *   through the real `spawnForPersona` (`isStartup` true) over the stub,
- *   resolving with its `SpawnPersonaResult` (`latched` for a CONFLICT at a
- *   ladder spawn or `resume`, and for a persona already latched). Each persona's working directory
- *   exists, so a row the stub answers in it is the persona's own. A launch
- *   that returns success arms the persona's retry timer in pending-only mode
- *   (b.jg5 SRJ-301, SRJ-409: through the trigger sink, so one `triggers`
- *   entry with `UNAVAILABLE_RETRY_CAUSE_PENDING_ROW`, unless the persona is
- *   latched or `options.triggerSink` is false) and starts its dialog
- *   approver on its own (b.jg5 SRJ-401): `launch(key)` resolves before the
- *   approver's first lap, which comes once the launch has settled. Every
- *   other successful launch (the restart path's, a sequence's step-6 reuse,
- *   a retry's hand-off run) arms the same way.
- * - The dialog approver runs on the harness clock (`_setApproverClock`): its
- *   sleeps between laps (`DIALOG_POLL_INTERVAL_MS`) and its cap timer are
- *   harness-clock timers, so it makes no lap until the clock moves. Its cap
- *   is `installStubSpawnPath`'s 200 ms, below the pace, so it makes one lap
- *   and stops at the cap once the clock reaches it; `options.approverCapMs`
- *   sets another (a case that needs a second lap passes one above
- *   `DIALOG_POLL_INTERVAL_MS`), and `setApproverCap` sets or unsets it
- *   mid-case. `approverRunning(key)` is the session
- *   manager's `isDialogApproverRunning(key)`, read-only. So a case launches
- *   P, calls `settle()` (the first lap's calls are then made, and P's
- *   approver sleeps until its next lap), and holds P there until it moves the
- *   clock: `advance(ms)` fires the approver's timers due by then, each lap
- *   running before the next firing. `runApproverToStop(key, maxSteps?)` drives
- *   P's approver to its stop: it settles, then advances the clock to the
- *   approver's next timer, until the approver no longer runs (throwing after
- *   `maxSteps` timers, 1000 by default, or when it runs with no timer, held
- *   in a call), and resolves with its outcome (`ApproverOutcome`, through
- *   `_whenDialogApproverStopped`); other timers due on the way fire too, as in
- *   `advance`. A case that counts calls after a launch settles first, or
- *   drives the approver to its stop.
- * - The bounded retry of a kill (b.jg5 SRJ-702, `src/kill-retry.ts`) runs
- *   on the harness clock, bound as `main()` binds it: the restart path's kill
- *   adapter gets the kill-retry clock (its kill is one try, seeded with the
- *   run's `dead` reading), the live-row sequence's kills take the sequence
- *   clock through the session manager's dependency builder (the collision
- *   ladder makes no kill; a live row's kills are the sequence's), the
- *   stuck-launch abort's kill (3 tries on its `pending` row) takes the
- *   kill-retry clock through the pending-row rule's builder, and the
- *   kill retry's
- *   keep-going query (`setPersonaKillKeepGoingQuery`, removed by
- *   `cleanup()`) is the up predicate over the same serving connection,
- *   bring-up outcome (`setUp`) and live applied set as the relaunch gate,
- *   with the harness's shutting-down flag. Each try's read between tries is
- *   the session manager's shared own-row `status` read, the one `main()`
- *   uses, so it shows as a stub `status` of the persona's instance. The
- *   kill-retry clock (`killRetryClock`, which a case also hands the start
- *   sweep as `reconcileOrphans(config, h.killRetryClock)`, as `main()` hands
- *   it the production clock) is the harness clock with each 2 s wait
- *   between tries tracked, so `advance(ms)` fires a wait like every other
- *   timer, and
- *   `drive(work)` awaits `work` (a `launch(key)`, a direct restart call)
- *   while moving the clock to each pending wait's end as it is set (every
- *   other timer due by then fires too, as in `advance`), in 1 ms real-time
- *   steps for the spawn path's own file I/O, bounded by `options.settleMs`;
- *   it throws when `work` is still unsettled at the bound with no wait
- *   pending. A wait still pending at `cleanup()` fails it, as any timer does.
- * - The live-row sequence (b.jg5 SRJ-705, SRJ-706, SRJ-717;
- *   `src/live-row-sequence.ts`): its dependencies (`sequenceDeps`) come
- *   from the session manager's one builder (`buildLiveRowSequenceDeps`),
- *   given what `main()` gives it: the harness's kill-failure alerts (over
- *   `episodes`), the trigger sink above as the retry arm (so each end's arm
- *   is recorded in `triggers` and armed on the controller), the live applied
- *   set, `lines` as its log, and the sequence clock: the harness clock with
- *   each sequence timer tracked (the step-2 wait, the run spacing, the
- *   step-4 pause and each wait between a kill's tries). Step 6 runs as
- *   production runs it, through the stub: the `resume` leg and the session
- *   manager's reuse spawn (`reuseSpawnForPersona`, b.jg5 SRJ-112, SRJ-708),
- *   a stub `spawn` of the persona's id carrying the reuse flag, whose
- *   success runs the after-launch step (the `pre_trust` line and the dialog
- *   approver on the harness clock). `reuseSpawns()` is a read-only view of
- *   the reuse spawns: the stub's recorded `spawn` calls that carry the reuse
- *   field (`reuse_finished`), in order (a spawn held by `holdSpawns` is not
- *   in the stub's log, so not in the view). The registry (b.jg5 SRJ-706)
- *   is built and installed as `main()` builds and installs it:
- *   `createLiveRowSequenceRegistry` over those dependencies with
- *   production's attempt runner (`runDetachedRecoveryAttempt`: each sequence
- *   in its own recovery attempt for its persona, detached from its
- *   starter's), installed in the session manager
- *   (`setLiveRowSequenceRegistry`) after the latch (below) and before any
- *   launch, so a latch of a persona stops its sequence through the set
- *   observer the installer registers. `sequenceSettled(key)` is the
- *   registry's test-only settle query (`_whenSettled`): the running
- *   sequence's outcome once it settles, else the last one's.
- *   `sequenceRequest(key, request)` is the start request for persona `key`,
- *   a configured one or one `remove(key)` dropped, with the request's seed
- *   (the state last read), entry step (step 1 by default),
- *   keep-conversation flag and retired-key flag (both false by default),
- *   launch flag (true by default; false is the no-launch form), alert
- *   context (`recovery` by default) and, when given, the retired-key reading
- *   at the attempt's start (`retiredAtStart`, b.jg5 SRJ-806; absent by
- *   default, so the start entry fills it); a case that wants the start entry's own
- *   answer hands it to `startLiveRowSequence`. `startSequence(key, request)`
- *   starts one sequence (steps 1 to 6) through the session manager's start
- *   entry and resolves at once, before the sequence's first call, throwing
- *   unless the entry answered `started`; it answers the outcome promise (the
- *   registry's `_whenSettled`) and a stop through the session manager's stop
- *   entry (`stopLiveRowSequence`: the signal set before it returns,
- *   resolving once the sequence has settled). `sequenceRunning(key)` is the
- *   session manager's running query, read-only: true from the start's answer
- *   until the sequence settles, its step-6 launch included. While it is true
- *   the sequence is in "blocks a retry" and so in "in flight for P" (below),
- *   the restart deps' running query answers true, and every launch path for
- *   the persona (`launch(key)`, the restart path's `launchSession`) answers
- *   `sequence-waiting` with no call.
- *   `runSequence(key, request)` starts one and drives it to its end;
- *   `driveSequence(work)` awaits `work` while moving the clock to each
- *   pending sequence timer as it is set (every other timer due by then fires
- *   too, as in `advance`), in 1 ms real-time steps for the launch's own file
- *   I/O, bounded by `options.settleMs` steps that find no sequence timer
- *   pending; it throws when `work` is still unsettled then. The exported
- *   `runSequenceStoppedAtKill(h, key, step, answer, reason)` runs one whose
- *   step-1 or step-4 kill gets its last try's answer (one of
- *   `LATE_KILL_ANSWERS`) after its stop was set. The exported
- *   `scriptLiveRowElsewhere(h, key, script)` scripts a launch of the persona
- *   to meet its own row read live in another directory, a collision ladder
- *   replacement site (b.jg5 SRJ-707) whose launch starts the persona's
- *   sequence and answers `sequence-waiting`, every later `get` reading the
- *   row `ended`; `launchThroughSequence(h, key)` makes that launch and drives
- *   the sequence it started to its end.
- * - `recheckAnswers(version)`: installs agent-director's version re-check
- *   (b.jg5 SRJ-204; `installAdVersionRecheck`, on its own fake clock, its
- *   lines to `lines`) with its `resolveSystemBinary` answering `version`
- *   (`makeStubResolveSystemBinary`), so an `ErrInvalidFlags` answer's one
- *   immediate re-check reads it: an older version decides that the server
- *   stops. It answers the binary resolves the re-check made and the exit
- *   codes its stop was asked for; `cleanup()` removes the install. It
- *   resets the re-check module first, which drops every version-changed
- *   listener, so it registers the harness's again.
- * - `settle()`: awaits every configured persona's launch in flight
- *   (`whenLaunchSettled`), every retry run in flight (`whenRunSettled`),
- *   with its re-arm or stop, every retry at once in flight
- *   (`retriesAtOnce`) and every pending-row rule run queued at an
- *   approver's stop (so a case holding a turn of `serializer` for the
- *   persona while one is queued gets the bound's error), and then until every running dialog approver
- *   waits for its next lap on the harness clock or has stopped (each holds
- *   its cap timer and, while it sleeps, its sleep timer, so all sleep when
- *   their pending timers number twice the running approvers). The spawn path
- *   does its own file I/O in real event-loop turns, so this is the one
- *   real-time wait: 1 ms steps, bounded by `options.settleMs`, and it throws
- *   when a launch or a run is still in flight at the bound, or an approver
- *   neither sleeps nor has stopped (one held in a call). A retry whose
- *   launch goes on past a spawn needs it before the clock moves on.
- * - `loseMessage(key)` retains its legacy name as the disconnected Slack
- *   intake driver (b.omv SR-4.2). It hands one distinct event in the persona's
- *   first channel to the real routing and real durable queue, with no MCP
- *   session registered. Storage and ack precede the existing recovery
- *   decision. The up predicate, latch, retry controller, in-flight gates,
- *   liveness adapter, holds and restart module are the same ones used by the
- *   harness's recovery paths. It makes the decision's permitted one `status`
- *   read of the persona's own instance, and requests a human restart only
- *   for `starting-now`. It returns `LostMessageOutcome`: the accepted-row
- *   delta, acknowledgment, restart request/pending facts and exact stub call
- *   deltas. It asserts that intake emits no lost-message notice. Other
- *   recovery episode notices still use the harness notifier as before.
- *   `restartAsks` records the restart module's latched query, including
- *   direct `scheduleRestart` calls; `restartRequested` counts only asks made
- *   while this input was handled. A registered MCP session is refused by
- *   this driver so the case cannot silently exercise another branch.
- * - `outageNotices`: the outage state's notices, `{ key, text }`, in order.
- * - `episodeNotices`: the notice episodes' posts, `{ key, text }`, in order
- *   (production posts them through the persona notifier).
- * - `notices`: the session manager's notices (`setSessionNotifier`),
- *   `{ key, text }`, in order.
- * - `stateDir` and `startupErrors()`: `SLACK_STATE_DIR` points at a
- *   temporary directory while the harness is live; `startupErrors()` answers
- *   the entries written to its `startup-errors.log`, one per line.
- * - Overlapping harnesses (a case that builds a second harness before it
- *   cleans the first up): `SLACK_STATE_DIR` and `console.error` are the
- *   newest live harness's, and each `cleanup()` gives them up last in, first
- *   out by effect, whatever order the case cleans up in: cleaning up the
- *   newest live harness puts back what was in effect at its build, while
- *   cleaning up an older one changes nothing now and passes what it saved to
- *   the next newer one, so the values from before the first build are back
- *   once all are cleaned up, never an earlier harness's removed directory or
- *   capture. Only these two process-wide values are restored this way: the
- *   session manager's installs (the stub client, the latch, the hold, the
- *   rule and the rest) are module singletons that the newest build installs
- *   and every `cleanup()` resets, so a case drives only its newest harness
- *   while two are live.
- * - `home` and `settings()`: agent-director's settings in effect, through
- *   the settings install (`installAdSettings`) over the temporary HOME.
- *   `options.adSettings`, when given, is written there first
- *   (`writeAgentDirectorConfig`); otherwise no file exists and the defaults
- *   are in effect. The reader's lines go to `lines`.
- *   `rewriteAdSettings(input)` writes the file again and lets the installed
- *   reader read it, as its next 120 s tick's read would.
- * - `config` and `keys`: a resolved configuration of `options.personas`
- *   (two personas by default) with `session_restart_delay` and
- *   `health_check_interval` from the options, both 0 by default (SRJ-304),
- *   and `resume_enabled` from `options.resumeEnabled` when given (the
- *   configuration's default otherwise). Every persona is applied at first.
- * - `advance(ms)`: moves the clock `ms` forward one due time at a time.
- *   Before and after each firing it awaits every in-flight retry run
- *   (`whenRunSettled`) and then every running dialog approver's next sleep,
- *   each bounded by `options.settleFlushes` clock flushes, so a re-arm
- *   measured from a run's end lands exactly, an approver's lap runs at the
- *   time its sleep ended, and a run or approver the test holds open does
- *   not stall the step. Resolves with the number of timers fired.
- * - `errors`: every `console.error` call while the harness is live (the
- *   session manager's and the restart module's lines), its arguments joined
- *   with spaces, in order, while the harness is the newest live one.
- *   `console.error` is replaced at build and given up by `cleanup()` (see
- *   overlapping harnesses, above).
- * - `captured()`: everything captured, for `assertNoLeak`: the lines, the
- *   `console.error` lines, the four notice lists, the startup-errors
- *   entries, the attempts, the triggers, the condition ends, the outage
- *   clears, the stops, the latch events, the stub's recorded spawn calls,
- *   the retries at once, the hold-end retries, the driver's Slack calls and
- *   the state directory as
- *   a written file.
- * - `cleanup()`: first stops and forgets every dialog approver
- *   (`_resetDialogApprovers`, silently: none makes a call after the one in
- *   progress) and clears the timers they left on the harness clock, then
- *   stops every retry timer (`stopAll`) and every latch re-check timer
- *   (`latchRecheck`'s `stopAll`; a round already running is not cancelled,
- *   so a case settles before it ends), forgets every
- *   episode and clears every count (`episodes.forgetAll()`, which cancels
- *   every alert check; so no slow-recovery count or episode is left behind,
- *   and two harnesses built one after the other, each with its own episodes
- *   and tracker, share none) and
- *   cancels every notice the driver's destination hold holds, then
- *   drops the driver's routing and undoes every
- *   install and reset the harness made (`console.error`, the restart module's state and the
- *   failure counter, backoff and cap latch, the outage state and its trigger sink, the session notifier,
- *   the session manager's latch install and the latch's set observers, the
- *   hold's install and its set reaction, the version-changed listener,
- *   the kill-failure alerts' install,
- *   the stuck-launch episodes' install,
- *   the pending-row rule's install (`_resetPendingRowRule`; a run already
- *   queued at an approver's stop is not cancelled, so a case that stops an
- *   approver with its row past G settles before it ends),
- *   the kill retry's keep-going query,
- *   the configured-persona query (`_resetConfiguredPersonaQuery`), so two
- *   harnesses built one after the other share no query,
- *   the retired-key store's install (`_resetRetiredKeyStore`), so none is
- *   left installed after it, the hold set's end-retry observer (removed
- *   first, so no hold a later step ends retries anyone) and the old-life
- *   hold set's install (`_resetOldLifeHolds`), so no hold outlives the
- *   harness,
- *   the stub spawn path and client with every launch still in flight
- *   (`_resetInFlightLaunches`, which also forgets every launch-call window
- *   and every record of CSCB's own launch, b.jg5 SRJ-412) and the
- *   approver's clock and cap, the session manager's clock when
- *   `options.harnessNow` set it (`_resetNow`), the
- *   findMissing memo, the tmux seams, the settings install, the version
- *   re-check's install when `recheckAnswers` or `versionRecheck` made one
- *   (disposed first, before the pending timers are counted), the sequence
- *   registry's install (`_resetLiveRowSequenceRegistry`), the old-life wait
- *   bindings (`_resetOldLifeWaitBindings`), `SLACK_STATE_DIR` and
- *   `console.error`, given up as overlapping harnesses need, above) and
- *   removes the temporary directory. The registry is closed (every live-row
- *   sequence and old-life wait still running stopped with the shutdown
- *   reason) after the pending timers, the running sequences and the running
- *   waits are counted. It
- *   throws, after undoing everything, when a timer is still pending on the
- *   clock (a sequence or wait timer included, which the message counts
- *   apart), a live-row sequence or an old-life wait still runs (a case
- *   settles every sequence and wait it starts, releasing any call it
- *   holds), a latch re-check round or an after-clear job (a clear by
- *   hand's included) the re-check submitted has not settled (a case awaits
- *   the round, or `serializer.whenIdle(key)`, before it ends), or a
- *   persona is still armed: the episodes run on the harness clock, so a timer
- *   they armed and left pending fails it too. Retry timers are the one
- *   exception, by design: `stopAll` runs before the count, so a persona's
- *   armed retry timer (in either mode) is stopped, not counted. That covers
- *   the pending-only timer every successful launch leaves armed (b.jg5
- *   SRJ-301, SRJ-409), which a case need not stop; a case asserts it with
- *   `expectPendingOnlyWatch(h, key)` (or reads `controller.view(key)`, whose
- *   `mode` and `causes` are the timer's mode and recorded cause kinds), and
- *   one that wants it gone mid-case stops it with `controller.stop(key,
- *   reason)` (shown in `stops`). Every other pending timer (an approver's
- *   timer left by a case, a kill's wait, a sequence or old-life wait timer,
- *   an episode's alert check) still fails it.
- *
- * Shared case helpers, each over a harness: `personaOf` (a configured
- * persona), `personaRow` (a persona's own row as a `get` reads it, with
- * overrides), the restart cap's (b.av2 SR-6.3; bug b.xkd):
- * `putAtRestartCap` (a persona at the cap over the real backoff count, the
- * one copy in tests/test-helpers/persona-routing-harness.ts, exported here
- * too) and `recheckAtCapLinesOf` (the latch re-check's at-the-cap lines for
- * a persona, whatever call they name), the retired-key store's clear lines (b.jg5 SRJ-807; src
- * exports no builder for them): `retiredEntryClearedLine` and
- * `retiredEntryClearFailedLine` (a write `failRetiredKeyWrites` refused), each
- * for the record's path, the key, the state read and the read's site, and
- * `retiredKeyLinesIn` (the store's lines among some lines), `pastSampleGrace` (the clock moved to G past the stub's sample
- * launch start, so a `pending` row is waited on no longer), `unavailableAt`
- * (an UNAVAILABLE answer of a verb), `expectUntouched` (a persona left
- * alone: no trigger, timer, notice, outage flag or call),
- * `expectPendingOnlyWatch` (a persona's retry timer armed and waiting in
- * pending-only mode with the pending-row cause, and its pending-row trigger
- * recorded), the retry timer's lines (`src/unavailable-retry.ts` exports no
- * builder for them): `retryLinesOf` (a persona's among `lines`),
- * `reArmedLine` (a retry answered `again`, its next wait from `retryWaitMs`),
- * `stoppedLine` and `pendingOnlyStoppedLine` (a stopped timer),
- * `dispatcherBugWordingIn` (every captured line, `console.error`
- * line, notice and startup-errors entry carrying `DISPATCHER_BUG_WORDING`,
- * which no post or line may give a collision, b.jg5 SRJ-713),
- * `expectLostMessageReports` (accept one disconnected message through the
- * driver and assert durable storage, acknowledgment and its stub calls, by default none in states 1 to 5 and
- * one `status` of the persona's instance after them, and no restart asked
- * for or pending unless `restartRequested`; resolves with the outcome), `collided` (the stub answers of a launch whose optimistic spawn
- * collides), `callCounts` (the stub's calls by verb), `personaCallCounts`
- * (the stub's calls for one persona's instance, those whose
- * `instance_id` is `personaInstanceId(key)`, by verb, leaving out
- * verbs with none; a case wanting the persona's total over every verb sums
- * its values), `callCountsSince` (what one by-verb count holds beyond an
- * earlier one, by verb, leaving out verbs with no increase), `recordCallOrder`
- * (wraps every verb of the stub client, in place, so each call from then on
- * also appends the verb's name to the returned list, in call order: every
- * function the client has, `readPane`, `sendKeys`, `pause`, `decide` and
- * `close` included, so a case can assert exactly the calls a launch makes),
- * `retryNow` (fire a
- * persona's next retry and settle it), `reuseSpawnOf` (persona `key`'s reuse
- * spawn as the stub records it, for a comparison: `cscb_<key>` with the reuse
- * flag and the persona's `extra_env`), `startSequenceHeldAtRun` (start a
- * persona's live-row sequence and resolve once its next `find-missing` run
- * is held by the stub's `holdFindMissing`), `ownRowsLiveThenMissing` (each
- * persona's own row live at its first `get`, `missing` after), `holdSequenceReuse` (hold a
- * persona's reuse spawn open at the stub, so a sequence's step-6 launch
- * stays in flight),
- * `rowReadsUntilSpawn` (each row reads a
- * state until its spawn resolves, then `waiting`; a `pending` row shows the
- * stub's default launch start unless the case asks for none; it returns the
- * `statusFn` it scripts), `scriptTimedLaunch` (b.jg5 SRJ-407, on a harness
- * built with `harnessNow`: persona
- * `key`'s next `spawn` or `resume` takes a given time on the harness clock
- * and ends in either launch-timeout form, `LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT`
- * or `LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE`, or `TIMED_LAUNCH_SUCCESS`;
- * from its end on, the persona's `get` reads its row with the launch start
- * placed against the call's window, `TimedLaunchStart`: on either bound,
- * inside, before, after or none; its handle gives the error, the window, the
- * launch start, the row, and a `status` answer with the same launch start
- * for the case's own `statusFn`), the own-launch drivers over a
- * `makePendingRowModel` row (b.jg5 SRJ-412, SRJ-407; AC 9, AC 31, AC 48; a
- * harness built with `harnessNow`): `launchOwnPending` (launch the persona
- * and settle, so the approver's first lap records the model's new `pending`
- * launch as CSCB's own; throws unless `isCscbOwnLaunch` then answers yes;
- * resolves with its launch start), `scriptModelLaunch` (the model's next
- * launch call takes `takesMs`, ends in success or either launch-timeout
- * form, and its launch start lies inside the call's window, before it or
- * after its end: `scriptTimedLaunch` for a row the model answers),
- * `launchByAnotherProcess` (the model's row reads `pending` with a launch
- * start the server never recorded; answers it) and `driveToB` (move the
- * clock to B past the row's launch start, firing the approver's stop at B
- * and its one rule run, then settle while moving the clock to each wait
- * between the abort kill's tries), and the condition's log
- * lines: `conditionLinePrefix`, `conditionLines`, `conditionStartedLines`,
- * `conditionEndedLines` and the line builders `conditionOnsetLine`,
- * `conditionAlertLine`, `conditionEndedLine`, `conditionRecoveryLine` and
- * `conditionSilentEndLine`; the unclassified-error episodes' log lines:
- * `unclassifiedLinePrefix`, `unclassifiedLines`, `unclassifiedStartedLines`
- * and the line builders `unclassifiedStartedLine`, `unclassifiedEndedLine`
- * (for any end reason), `unclassifiedPostedLine` and
- * `unclassifiedLoggedLine`; `adConfigMalformedRaiseLines`, the outage
- * state's `ad-config-malformed` raise lines; and the kill-failure alert's
- * texts (b.jg5 SRJ-704, SRJ-1007), each built with
- * `src/kill-failure-alert.ts`'s builders for the persona's own session and
- * instance id from the thrown values' raw descriptions:
- * `ordinaryAlertContent`, `survivorAlertContent`, `killFailureNotice` (the
- * destination post as `episodeNotices` holds it), `killFailureRecoveryEntry`
- * (the not-configured route's entry, context `recovery` unless given), with
- * `startupEntriesOf` (one class's entries without their timestamp),
- * `startupEntries` (every entry as its class and text, in order),
- * `killFailureLines` (the alerts' own lines) and the alerts' line builders
- * (context `recovery`; `killFailurePostedLine` takes another):
- * `killFailureEndedLine`, `killFailurePostedLine`,
- * `killFailureHeldLine`, `killFailureLoggedLine`, `killFailureNotRaisedLine`
- * (a stopped retry's one line, b.jg5 SRJ-702, naming the stop's cause it is
- * given: `liveRowStopCauseText` for the live-row sequence's own stop,
- * `PERSONA_KILL_STOP_CAUSE_SHUTDOWN` or `PERSONA_KILL_STOP_CAUSE_NOT_UP` for
- * what the keep-going query told, `PERSONA_KILL_STOP_CAUSE_GENERIC` when it
- * could not tell, or `PERSONA_KILL_STOP_CAUSE_RECHECK`, all from
- * `src/session-manager.ts`; built by `killFailureStoppedRetryText`), `killFailureStoppedEntry` (its
- * `persona-kill-failed` entry, no alert text) and
- * `killFailureStoppedEntryLine`.
- *
- * Pending-only mode is armed by production paths on the harness (b.jg5
- * SRJ-301, SRJ-409, SRJ-411): a successful launch, a launch's
- * `ErrTmuxSessionCreate`, the collision ladder's `pending` branch, the
- * restart path's `pending` deferral and a pending-only retry's read-and-step,
- * each through the trigger sink except the retry's own re-arm; a case may
- * still arm it directly (`controller.armPendingOnly`).
- *
- * Launch starts (b.jg5 SRJ-513): every `pending` row the harness scripts
- * (`rowReadsUntilSpawn`, and a case's own `cannedStatusResult`,
- * `cannedGetResult` or `cannedListRow` row, `collided`'s included) carries
- * the stub's sample launch start (`SAMPLE_LAUNCH_START_DEFAULT`) unless the
- * case asks for none (`launch_started_at: SAMPLE_LAUNCH_START_NONE` or
- * `null`, or `rowReadsUntilSpawn`'s `launchStartedAt` option), since a
- * configured persona's own `pending` row with no launch start latches it.
- * Rows in any other state carry none.
- *
- * Isolation: no top-level `mock.module()`, no real HOME, `~/.config/agent-director`,
- * tmux, child process or Slack client (the driver's clients are stubs). The
- * retry timer, the dialog approver, the waits between a kill's tries and the
- * live-row sequence's waits run on the fake clock only; the one real-time
- * wait is the bounded poll for the spawn path's own file I/O (`settle()`'s,
- * and `drive`'s and `driveSequence`'s between their timers). A retry
- * never arms the restart module's own (real) timer: its entry bypasses it. Every file
- * sits under one `mkdtempSync` directory.
- *
- * SPDX-License-Identifier: MIT
- */
 
 import { expect } from 'bun:test'
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
@@ -1212,12 +149,9 @@ import {
   type TmuxUnavailableRetryDeps,
 } from '../../src/server.ts'
 import {
-  APPROVER_STOP_SHUTDOWN,
-  APPROVER_STOP_TEARDOWN,
-  DIALOG_POLL_INTERVAL_MS,
+
   _resetConfiguredPersonaQuery,
-  _resetDialogApprovers,
-  _resetDialogReadyTimeoutMs,
+
   _resetPendingRowRule,
   buildPendingRowRuleDeps,
   forgetLaunchCalls,
@@ -1230,10 +164,9 @@ import {
   _resetInvalidFlagsHold,
   _resetLiveRowSequenceRegistry,
   _resetNow,
-  _setApproverClock,
+
   _setNow,
-  _setDialogReadyTimeoutMs,
-  _whenDialogApproverStopped,
+
   buildLatchRecheck,
   clearByHandOf,
   type LatchRecheck,
@@ -1243,7 +176,7 @@ import {
   ensureOldLifeWait,
   forgetOldLifeWaits,
   isCscbOwnLaunch,
-  isDialogApproverRunning,
+
   isLaunchInFlight,
   isLiveRowSequenceRunning,
   isSequenceOrOldLifeWaitRunning,
@@ -1257,6 +190,7 @@ import {
   ownLaunchRecordOf,
   personaRetryBlockCause,
   readPersonaRowState,
+  readPersonaOwnRow,
   reconcileOrphans,
   retryPendingRowStep,
   setConfiguredPersonaQuery,
@@ -1272,13 +206,11 @@ import {
   setStuckLaunchEpisodes,
   spawnForPersona,
   startLiveRowSequence,
-  stopAllDialogApprovers,
-  stopDialogApprover,
+
   stopLiveRowSequence,
   waitsOnKillFailedHold,
   whenLaunchSettled,
-  type ApproverClock,
-  type ApproverOutcome,
+
   type OrphanReconcileResult,
   type SpawnPersonaResult,
 } from '../../src/session-manager.ts'
@@ -1396,9 +328,6 @@ const DEFAULT_SETTLE_FLUSHES = 20
 /** How long `settle` waits at most for the launches in flight, in real ms (1 ms steps). */
 const DEFAULT_SETTLE_MS = 2000
 
-/** How many approver timers `runApproverToStop` fires at most when the case gives no bound. */
-const DEFAULT_APPROVER_STEPS = 1000
-
 /** What the scripted action answers once a persona's queued outcomes run out: a bare refusal. */
 const SCRIPTED_REFUSAL: UnavailableRetryOutcome = Object.freeze({ kind: 'again' })
 
@@ -1494,14 +423,7 @@ export interface RecoveryHarnessOptions {
   conditionSink?: boolean
   /** Real ms `settle` waits at most for the launches in flight; `DEFAULT_SETTLE_MS` when unset. */
   settleMs?: number
-  /**
-   * The dialog approver's cap in ms (`_setDialogReadyTimeoutMs`), on the
-   * harness clock from the approver's start: `installStubSpawnPath`'s 200 ms
-   * when unset, below the approver's pace (`DIALOG_POLL_INTERVAL_MS`), so it
-   * makes one lap and stops at the cap when the clock reaches it. A case
-   * that needs later laps passes a larger cap.
-   */
-  approverCapMs?: number
+
   /**
    * The retired-key record the store reads at build (b.jg5 SRJ-807): the
    * entries by key, given the harness's persona keys, written into `stateDir`
@@ -1519,12 +441,7 @@ export interface RecoveryHarnessOptions {
    * `_setWaitForWaitingTimeoutMs`) needs the real one.
    */
   harnessNow?: boolean
-  /**
-   * Install the pending-row rule (b.jg5 SRJ-410) in the session manager as
-   * `main()` installs it; true when unset. False installs none, so a retry
-   * or an approver stop that would run it logs its "no pending-row rule is
-   * installed" line and keeps the pending-only arm only.
-   */
+
   pendingRowRule?: boolean
   /**
    * Bind the latch re-check (b.jg5 SRJ-505) to the latch as `main()` binds
@@ -1805,7 +722,6 @@ export interface RecoveryVersionRecheck {
 export type RecoveryTeardownDeps = Required<
   Pick<
     PersonaLifecycleDeps,
-    | 'stopApprover'
     | 'stopLiveRowSequence'
     | 'whenLaunchSettled'
     | 'cancelLaunchWait'
@@ -2046,19 +962,7 @@ export interface RecoveryHarness {
   readonly timedCalls: readonly RecoveryTimedCall[]
   /** The harness-clock times of `verb`'s calls, in order; with `key`, only those naming persona `key`'s instance. */
   callTimes(verb: RecoveryStubVerb, key?: string): number[]
-  /**
-   * Set the dialog approver's test cap (`_setDialogReadyTimeoutMs`) to `ms`
-   * for approvers started from now on, or unset it with `undefined`
-   * (`_resetDialogReadyTimeoutMs`: the approver stops at B). `cleanup()`
-   * unsets it.
-   */
-  setApproverCap(ms: number | undefined): void
-  /**
-   * A server restart as persona `key` sees it (b.jg5 SRJ-410's "a server
-   * restart mid-launch"): forget what a new process starts without; the
-   * stub's row is untouched. Resolves once the persona's approver has
-   * stopped. See the module comment.
-   */
+
   restartServer(key: string): Promise<void>
   /**
    * Whether persona `key`'s open stuck-launch episode has used its one abort
@@ -2069,33 +973,16 @@ export interface RecoveryHarness {
    * rule is installed (`options.pendingRowRule: false`).
    */
   stuckLaunchAbortUsed(key: string): boolean
-  /** Whether persona `key`'s dialog approver is running (read-only; the session manager's `isDialogApproverRunning`). */
-  approverRunning(key: string): boolean
-  /**
-   * Drive persona `key`'s dialog approver on the harness clock until it has
-   * stopped, and resolve with how it ended (the session manager's
-   * `_whenDialogApproverStopped`); see the module comment.
-   */
-  runApproverToStop(key: string, maxSteps?: number): Promise<ApproverOutcome | undefined>
+
   answer(key: string, ...outcomes: UnavailableRetryOutcome[]): void
   setAction(action: UnavailableRetryAction | undefined): void
   /** Whether persona `key`'s bring-up outcome is up (the relaunch gate); true at first. */
   setUp(key: string, up: boolean): void
   /** Whether persona `key`'s session is registered as connected with its message stream; false at first. */
   setConnected(key: string, connected: boolean): void
-  /**
-   * The server's shutdown: raise the shutting-down flag, close the live-row
-   * sequence registry (every sequence stopped, none started after it), close
-   * the controller, close the episodes, then stop every dialog approver (none
-   * starts after it).
-   */
+
   shutdown(): void
-  /**
-   * The persona teardown's submit (stop its dialog approver, then its
-   * live-row sequence, stop the retry timer, cancel the condition's alert
-   * check), then its turn's latch forget (silent); its episodes forget is the
-   * case's `episodes.forget(key)` after it.
-   */
+
   teardown(key: string): void
   /**
    * The persona teardown's dependencies over the harness's own instances,
@@ -2202,19 +1089,18 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   // (`isLaunchInFlight`), a running live-row sequence
   // (`isLiveRowSequenceRunning`, SRJ-706) or an old-life wait step for a
   // hold P waits on (`isOldLifeWaitRunningFor`, SRJ-811), never a running
-  // dialog approver (SRJ-401); the full-mode retry action receives it, with
+
   // the cause query. "In flight for P" (`isPersonaWorkInFlight`, SRJ-315,
-  // SRJ-1011), built from it: that, or a running dialog approver
-  // (`isDialogApproverRunning`); the driver's read gate and its
+
   // `tmux-unavailable` retry check receive it.
   const isPersonaRetryBlocked = (key: string): boolean => personaRetryBlockCause(key) !== undefined
-  const isPersonaWorkInFlight = (key: string): boolean => isPersonaRetryBlocked(key) || isDialogApproverRunning(key)
+  const isPersonaWorkInFlight = (key: string): boolean => isPersonaRetryBlocked(key)
 
   const queued = new Map<string, UnavailableRetryOutcome[]>()
   const scripted: UnavailableRetryAction = (key) => queued.get(key)?.shift() ?? SCRIPTED_REFUSAL
   // As main()'s `retryRunGate` (b.jg5 SRJ-303, SRJ-305, SRJ-404): the retry
   // action's gate before any call, one object for the retry action and the
-  // pending-row rule's run at a dialog approver's stop (`setPendingRowRule`
+
   // below), so that run is gated as a retry's is.
   const retryRunGate: RetryRunGateDeps = {
     appliedPersona,
@@ -2233,7 +1119,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     retry: runRestartRetry,
     ...retryRunGate,
     // As main() binds it (b.jg5 SRJ-303): only work that blocks a retry
-    // skips it; a running dialog approver alone never does (SRJ-401). The
+
     // skip's again-reason and the restart retry's skip line name the cause.
     isInFlight: isPersonaRetryBlocked,
     retryBlockCause: personaRetryBlockCause,
@@ -2247,7 +1133,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     // row read shows `pending` reads the applied persona's row once more and
     // takes the one pending-row step: a covered or undecided row is armed
     // pending-only and kept; one that is not covered starts the live-row
-    // sequence, with no launch or approver of the retry's own.
+
     stepPendingRow: (key) => retryPendingRowStep(key, appliedPersona(key)),
   })
   let current: UnavailableRetryAction = options.action === 'scripted' ? scripted : (options.action ?? fullMode)
@@ -2531,28 +1417,9 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       }
     }
   }
-  // The dialog approver runs on the harness clock (b.jg5 SRJ-401): its sleeps
+
   // between laps and its cap timer are harness-clock timers, tracked here so
-  // `settle()` can tell an approver waiting for its next lap and `cleanup()`
-  // can clear what a stopped approver left. Undone by `resetStubSpawnPath`.
-  const approverTimers = new Set<unknown>()
-  const approverClock: ApproverClock = {
-    now: () => clock.now(),
-    setTimeout: (callback, delayMs) => {
-      const handle = clock.setTimeout(() => {
-        approverTimers.delete(handle)
-        callback()
-      }, delayMs)
-      approverTimers.add(handle)
-      return handle
-    },
-    clearTimeout: (handle) => {
-      approverTimers.delete(handle)
-      clock.clearTimeout(handle)
-    },
-  }
-  _setApproverClock(approverClock)
-  if (options.approverCapMs !== undefined) _setDialogReadyTimeoutMs(options.approverCapMs)
+
   // With `options.harnessNow`, the session manager's own clock (`_setNow`) is
   // the harness clock too: each launch call's window (b.jg5 SRJ-407) is read
   // on it, as are the working-row wait, its deferral runs and the findMissing
@@ -2681,7 +1548,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
   // factory over the session manager's one dependency builder, given the
   // applied-persona lookup, the one episodes instance (so its held post
   // lands in `episodeNotices`) and `console.error` as its log (so its lines
-  // go to `errors`); its approver-stop run takes the persona's turn in the
+
   // harness's serializer, as main()'s in `personaLifecycle.run`. Each such
   // run is tracked so `settle()` awaits it. Its clock is the session
   // manager's (`_setNow`), which is the harness clock with
@@ -2976,33 +1843,6 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     void all
   }
 
-  /** The configured personas whose dialog approver is running. */
-  function runningApproverKeys(): string[] {
-    return keys.filter((key) => isDialogApproverRunning(key))
-  }
-
-  /**
-   * Whether every running dialog approver waits for its next lap on the
-   * harness clock: each holds at most two harness-clock timers (its cap and,
-   * while it sleeps between laps, its sleep), so all sleep exactly when the
-   * approvers' pending timers number twice the running approvers. True when
-   * none runs and none left a timer.
-   */
-  function approversQuiet(): boolean {
-    return approverTimers.size === 2 * runningApproverKeys().length
-  }
-
-  /** Let the running approvers reach their next sleep, for at most `settleFlushes` clock flushes. */
-  async function settleApprovers(): Promise<void> {
-    for (let flushes = 0; flushes < settleFlushes && !approversQuiet(); flushes++) await clock.flush()
-  }
-
-  /**
-   * Await every configured persona's launch in flight, every retry run and
-   * every latch re-check round in flight, and then every running dialog
-   * approver's next sleep on the harness clock (or its stop), in 1 ms
-   * real-time steps, for at most `settleMs`.
-   */
   async function settleLaunches(): Promise<void> {
     let settled = false
     const all = Promise.all([
@@ -3015,36 +1855,28 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       settled = true
     })
     const realTurn = (): Promise<unknown> => new Promise((resolve) => setTimeout(resolve, 1))
-    for (let waited = 0; waited < settleMs && !(settled && approversQuiet()); waited++) {
+    for (let waited = 0; waited < settleMs && !settled; waited++) {
       if (!settled) {
         await Promise.race([all, realTurn()])
         continue
       }
       await clock.flush()
-      if (!approversQuiet()) await realTurn()
+
     }
     if (!settled) throw new Error(`recovery harness: a launch or a retry run was still in flight after ${settleMs} ms`)
-    if (!approversQuiet()) {
-      throw new Error(
-        `recovery harness: a dialog approver was neither stopped nor waiting for its next lap after ${settleMs} ms (running for ${JSON.stringify(runningApproverKeys())})`,
-      )
-    }
+
   }
 
-  /**
-   * Move the clock `ms` forward one due time at a time; before and after each
-   * firing, await the retry runs and the approvers (flush-bounded).
-   */
   async function advance(ms: number): Promise<number> {
     if (!Number.isFinite(ms) || ms < 0) throw new RangeError(`recovery harness: advance needs a finite, non-negative ms, got ${ms}`)
     const target = clock.now() + ms
     let fired = 0
     await settleRuns()
-    await settleApprovers()
+
     for (let next = clock.pending()[0]; next !== undefined && next.dueAt <= target; next = clock.pending()[0]) {
       fired += await clock.advanceTo(next.dueAt)
       await settleRuns()
-      await settleApprovers()
+
     }
     await clock.advanceTo(target)
     return fired
@@ -3094,11 +1926,6 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     }
     if (!settled) throw new Error(`recovery harness: the driven work was still unsettled after ${settleMs} ms with no kill-retry wait pending`)
     return work
-  }
-
-  /** The earliest due time of a pending approver timer, or undefined. */
-  function nextApproverDue(): number | undefined {
-    return nextDueOf(approverTimers)
   }
 
   /**
@@ -3196,7 +2023,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
 
   // As main()'s `tmuxUnavailableRetryDeps` (b.jg5 SRJ-311): the outage
   // state's flag, the controller's armed read, the latch's latched query,
-  // "in flight for P" (a running dialog approver included) and the
+
   // ENVIRONMENT arm, straight to the
   // controller (not through the trigger sink, so not in `triggers`), with
   // its line to `console.error` (`errors`).
@@ -3237,10 +2064,10 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       // exactly true.
       isRetryArmed: (key) => controller.isArmed(key) === true,
       // As main() binds it (b.jg5 SRJ-1011, SRJ-401): state 6's member is a
-      // launch call or the dialog approver that runs after it returned.
-      isLaunchOrApproverRunning: (key) => isLaunchInFlight(key) || isDialogApproverRunning(key),
+
+      isLaunchRunning: (key) => isLaunchInFlight(key),
       // As main() binds them (b.jg5 SRJ-1011, SRJ-115): the read gate's
-      // "in flight for P" (a running dialog approver included), and the one row
+
       // read is the harness's liveness adapter, so it shows as a stub `status`.
       isWorkInFlight: isPersonaWorkInFlight,
       readRowLiveness: isSessionAliveAdapter,
@@ -3526,11 +2353,6 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       return timedCalls.filter((call) => call.verb === verb && (id === undefined || call.instanceId === id)).map((call) => call.at)
     },
 
-    setApproverCap(ms) {
-      if (ms === undefined) _resetDialogReadyTimeoutMs()
-      else _setDialogReadyTimeoutMs(ms)
-    },
-
     async restartServer(key) {
       if (!keys.includes(key)) throw new Error(`recovery harness: no configured persona ${JSON.stringify(key)}`)
       // A new process has no launch call or live-row sequence in flight: the
@@ -3540,9 +2362,9 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       if (sequences.isRunning(key)) throw new Error(`recovery harness: persona ${key}'s live-row sequence runs; settle it before restartServer`)
       // Its retry timer, as a shutdown stops it (a real stop, in `stops`).
       controller.stop(key, UNAVAILABLE_RETRY_STOP_SHUTDOWN)
-      // Its dialog approver, with the shutdown reason (b.jg5 SRJ-404: no
+
       // pending-row run follows), awaited.
-      await stopDialogApprover(key, APPROVER_STOP_SHUTDOWN)
+
       // Its launch records: the launch-call window and "this launch's row"
       // record (b.jg5 SRJ-407), the not-interactive record and the record of
       // CSCB's own launch (SRJ-412).
@@ -3565,19 +2387,6 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     stuckLaunchAbortUsed(key) {
       if (stuckLaunchAbort === undefined) throw new Error('recovery harness: no pending-row rule with a stuck-launch abort is installed')
       return stuckLaunchAbort.isAbortUsed(key)
-    },
-
-    approverRunning: (key) => isDialogApproverRunning(key),
-
-    async runApproverToStop(key, maxSteps = DEFAULT_APPROVER_STEPS) {
-      for (let steps = 0; ; steps++) {
-        await settleLaunches()
-        if (!isDialogApproverRunning(key)) return _whenDialogApproverStopped(key)
-        if (steps >= maxSteps) throw new Error(`recovery harness: persona ${key}'s dialog approver still ran after ${maxSteps} steps`)
-        const due = nextApproverDue()
-        if (due === undefined) throw new Error(`recovery harness: persona ${key}'s dialog approver runs with no timer on the harness clock`)
-        await advance(due - clock.now())
-      }
     },
 
     answer(key, ...outcomes) {
@@ -3610,16 +2419,16 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
       latchRecheck.stopAll()
       episodes.close()
       waitUnclassifiedErrors.close()
-      // As main()'s shutdown (b.jg5 SRJ-404): every approver is marked and
+
       // woken now, not awaited; none starts after it.
-      void stopAllDialogApprovers()
+
     },
 
     teardown(key) {
       // As production's teardown submit (b.jg5 SRJ-404, SRJ-715): its dialog
-      // approver first, and the one a launch in flight would start; not
+
       // awaited here (the teardown's turn awaits it).
-      void stopDialogApprover(key, APPROVER_STOP_TEARDOWN)
+
       // As production's teardown submit (b.jg5 SRJ-706, SRJ-715): its
       // live-row sequence right after, its stop signal set now; not awaited
       // here (the teardown's turn awaits it).
@@ -3641,8 +2450,7 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
 
     teardownDeps: () => ({
       // As main() binds them in createPersonaLifecycle (b.jg5 SRJ-404,
-      // SRJ-706, SRJ-715): the approver first, then the live-row sequence.
-      stopApprover: (key) => stopDialogApprover(key, APPROVER_STOP_TEARDOWN),
+
       stopLiveRowSequence: (key) => stopLiveRowSequence(key, LIVE_ROW_STOP_TEARDOWN),
       whenLaunchSettled: (key) => whenLaunchSettled(key),
       cancelLaunchWait: (key) => cancelWorkingRowWait(key),
@@ -3714,11 +2522,9 @@ export function makeRecoveryHarness(options: RecoveryHarnessOptions = {}): Recov
     }),
 
     cleanup() {
-      // Every dialog approver first, so none makes a call (or arms a timer
+
       // through the trigger sink) after this; their timers go with them.
-      _resetDialogApprovers()
-      for (const handle of approverTimers) clock.clearTimeout(handle)
-      approverTimers.clear()
+
       controller.stopAll('the recovery harness is cleaned up')
       // Every latch re-check timer, before the pending timers are counted.
       latchRecheck.stopAll()
@@ -4388,12 +3194,7 @@ export interface TimedLaunch {
   row(): CannedGetResult
   /** Replace the row overrides `get` reads from now on; the placed launch start stays unless `overrides` give `launch_started_at`. */
   setRow(overrides: PersonaGetResultOverrides): void
-  /**
-   * A `status` answer for the row (`cannedStatusResult`): `pending` with the
-   * placed launch start, with `overrides`. The driver scripts no `status`;
-   * a case hands this to its own `statusFn` or `statusQueue` (an approver's
-   * lap reads `status`). Throws before the call ends.
-   */
+
   statusRow(overrides?: Partial<StatusResult>): StatusResult
 }
 
@@ -4570,23 +3371,10 @@ export function scriptModelLaunch(h: RecoveryHarness, row: PendingRowModel, opti
   })
 }
 
-/**
- * CSCB's own launch of persona `row.key`, held `pending` (b.jg5 SRJ-412,
- * SRJ-407): launch the persona (`h.launch`) over its pending-row model `row`
- * and settle, so the model answers the launch call (a `resume` of a finished
- * row with a session id, a plain spawn of no row) with a new `pending`
- * launch whose launch start lies inside the call's window, and the dialog
- * approver's first lap reads it (`keepApproverLaunchStart`), recording it as
- * CSCB's own. Throws unless the row then reads `pending` and the own-launch
- * query answers yes for its launch start (`isCscbOwnLaunch`), so a harness
- * built without `harnessNow` (the window then on the real clock) fails here.
- * Use a model whose `dialogOnLaunch` the approver cannot clear
- * (`PENDING_ROW_DIALOG_UNRECOGNISED` or `PENDING_ROW_DIALOG_NONE`) for a
- * launch that stays `pending`. Resolves with the row's raw launch start.
- */
 export async function launchOwnPending(h: RecoveryHarness, row: PendingRowModel): Promise<string> {
   await h.launch(row.key)
   await h.settle()
+  await readPersonaOwnRow(row.key, { site: 'launchOwnPending', what: 'observe returned launch row' })
   const launchStart = row.launchStartedAt()
   if (row.state() !== AGENT_DIRECTOR_PENDING_STATE || typeof launchStart !== 'string' || !isCscbOwnLaunch(row.key, launchStart)) {
     throw new Error(
@@ -4615,27 +3403,13 @@ export function launchByAnotherProcess(h: RecoveryHarness, row: PendingRowModel,
   return launchStart
 }
 
-/**
- * Age persona `row.key`'s `pending` row to B past its launch start (b.jg5
- * SRJ-410, SRJ-412): move the harness clock to the row's launch start plus B
- * in effect (`adLaunchBoundMsInEffect`), firing every timer due by then as
- * `advance` does (the approver's laps and its stop at B, which runs the
- * pending-row rule once; P's retries), then settle while moving the clock to
- * each wait between the abort kill's tries as it is set (`drive(settle())`),
- * so an abort whose kill answers UNAVAILABLE runs its tries on the harness
- * clock. It stops at B: a relaunch the abort's live-row sequence made is
- * left at its approver's first lap (`runApproverToStop` would drive that
- * approver to its own B as well). Throws when the row has no launch start,
- * or the clock is already past B. A case running the approver under a test
- * cap unsets it first (`setApproverCap(undefined)`), so the approver stops
- * at B and not at the cap.
- */
 export async function driveToB(h: RecoveryHarness, row: PendingRowModel): Promise<void> {
   const launchStartMs = row.launchStartMs()
   if (launchStartMs === undefined) throw new Error(`driveToB: persona ${row.key}'s row has no launch start`)
   const waitMs = launchStartMs + adLaunchBoundMsInEffect() - h.clock.now()
   if (waitMs < 0) throw new Error(`driveToB: the clock is already ${-waitMs} ms past B for persona ${row.key}`)
   await h.advance(waitMs)
+  if (h.controller.isArmed(row.key)) await h.drive(retryNow(h, row.key, { settle: false }))
   await h.drive(h.settle())
 }
 

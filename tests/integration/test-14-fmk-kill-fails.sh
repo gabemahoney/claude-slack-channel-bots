@@ -1,252 +1,7 @@
 #!/usr/bin/env bash
-# Test 14 (HO §7 scenarios 16, 2 and 15; b.jg5 SRJ-1403, SRJ-1417; AC 1,
-# AC 24, AC 64): a kill that really fails. With the tmux shim in `fail-kill`,
-# a live row's agent-director `kill` finds its worker still running after the
-# kill exit wait and answers ErrTmuxKillFailed: at an upgrade's first start
-# sweep over pre-persona rows (scenario 16), at the start sweep, at a
-# `config_dir` mismatch and at a `cwd` mismatch (scenario 2), and at a
-# persona removal's teardown (scenario 15). At each site no CSCB delete or
-# launch follows, the row is kept, and one kill-failure alert quoting
-# agent-director's description is routed per SRJ-704 (b.jg5 SRJ-704,
-# SRJ-705, SRJ-707, SRJ-411, SRJ-513, SRJ-714, SRJ-715, SRJ-801, SRJ-802,
-# SRJ-803, SRJ-1002, SRJ-1003, SRJ-1007, SRJ-1013, SRJ-1014, SRJ-1020,
-# SRJ-1401, SRJ-1418).
-#
-# fmk setup (lib/scenario.sh fmk mode; b.jg5 SRJ-1306, SRJ-1401):
-# - its own HOME, agent-director store and tmux server, all under
-#   SCENARIO_ROOT, with the agent-director shim in front of the binary and the
-#   tmux shim first on the PATH of every CSCB process (the bot server, `start`
-#   and `stop` runs), which agent-director inherits;
-# - the 0.10.0 start (SCENARIO_AD_START=0.10.0: 0.10.0's binary behind the
-#   shim, no store); scenario 16's rows seeded on it from the scenario's own
-#   shell (`seed_prepersona_fleet`, `seed_010_row`: 0.10.0's own `spawn`,
-#   which makes the store); end and reconcile every worker, then install
-#   (`install_ad_release`, which migrates the store, re-shims both paths and
-#   checks the shims), verify terminal rows survive unchanged, then rebuild
-#   live fixtures with the release; every leg runs on the release;
-# - agent-director at its default settings (no config.toml): kill_exit_wait_ms
-#   at its default, 5000 ms, measured (slowest exit 603 ms) (RN-6; HO rev 31);
-#   the bounded retry makes 3 tries 2 s apart (KILL_RETRY_TRIES,
-#   KILL_RETRY_SPACING_MS, src/kill-retry.ts), so one kill's tries take about
-#   20 s;
-# - every start is live (`start_server --live`), against the loopback Slack
-#   stub (fixtures/slack-stub-server.ts, one for the script, every persona's
-#   token pair answered ok), with `health_check_interval` 0, so no health tick
-#   reconnects or relaunches a persona; posts are read from the stub's record;
-# - the tmux shim's mode per leg: `log` while a leg launches its persona,
-#   `fail-kill` for the kills the leg checks, `log` again at the leg's end;
-#   legs 0 and 4 limit `fail-kill` to one row's session name, session id and
-#   pane id (`tmux_shim_mode fail-kill --targets`, a harness addition), so every other kill runs the real tmux;
-# - the stub worker's mode per working directory (`stub_mode`): the start
-#   sweep's persona reports in (`startup-trust`, the approver's Enter), the
-#   `config_dir` and `cwd` personas never do (`silent`), so their rows stay
-#   `pending` with a launch start; the removed persona reports in
-#   (`startup-trust`); of the 0.10.0 rows, P's never reports in (`silent`) and
-#   the others report in at once (`at-once`, `seed_010_row`'s default);
-# - each leg has its own persona (key, credentials, channel, directories) and
-#   reads only its own ids, and only lines written after its start mark (a
-#   later start re-sweeps rows an earlier leg kept): server.log and
-#   startup-errors.log from the mark's line, the Slack stub's record from the
-#   mark's line, and CSCB's agent-director calls (`cscb_ad_calls`: only the
-#   agent-director shim's lines whose parent is a CSCB process) from the
-#   mark's time;
-# - between legs the harness plays the operator: a plain `stop` (no
-#   teardown), an edit of config.json and the last-applied record moved aside,
-#   so the next start applies config.json as it stands (docs/reload.md);
-# - re-pointing a symlinked `working_directory` or `claude_config_dir`
-#   (`repoint_symlink`, a harness addition) is
-#   the working default that makes a real `cwd` or `config_dir` mismatch with
-#   no config edit: agent-director's spawn records the real `cwd`, CSCB writes
-#   the `config_dir` label by real path, and `compareRowToPersona` resolves the
-#   persona's directories by real path at every comparison. Setup checks its
-#   refusals (a link or target outside SCENARIO_ROOT, a link that is not a
-#   symlink, a missing target), each leaving the link as it was.
-#
-# Legs, in run order (each a function `leg_<name>`):
-#   0. upgrade_sweep (scenario 16; SRJ-1417, SRJ-714) seeded on 0.10.0
-#                   before the install: two pre-persona rows (A and B: a
-#                   `channel` label, no `persona` label, named as the
-#                   pre-persona package names them, workers reporting in at
-#                   once); P's own row (`cscb_<P key>`, its `persona` label,
-#                   in a directory other than P's configured one, its worker
-#                   `silent`); all workers end before migration, then released
-#                   launches reuse their rows. P is injected as `pending` with
-#                   no launch start (SRJ-513, SRJ-1020); and absent persona
-#                   Q's live row. config.json names P (a Slack destination)
-#                   and not Q; `fail-kill` is limited to A's session and pane
-#                   (the rebuilt release launch is owned, so fail-kill refuses
-#                   its actual tmux kill); the number of targeted calls is
-#                   logged; a start; once the start sweep's summary line is
-#                   logged, `log`. Then the summary's counts (4 listed, 1
-#                   recorded as retired, 1 left for a latch, and every live
-#                   stray not killed kept with its kill failed); the pass's
-#                   retry budget (SRJ-702, AC 56), with A, B and Q in the
-#                   order CSCB first killed them (agent-director's `list`
-#                   order is not assumed): the first whose kill failed made
-#                   exactly KILL_RETRY_TRIES CSCB kills, each later one
-#                   exactly 1, and one whose kill succeeded before it is
-#                   logged; A's kill: each of its tries answered
-#                   ErrTmuxKillFailed, its session still there, exactly one
-#                   `orphan-cleanup` entry naming A (the pre-persona row's
-#                   head, then the alert's ordinary version in its start-sweep
-#                   form) and one server-log line of it; B's and Q's kills
-#                   each either succeeded (the sweep's per-row line, no entry,
-#                   the session gone) or did not (exactly one entry, the
-#                   session still there), which is logged; P latched from its
-#                   own listed row, no CSCB
-#                   kill of P's row, and exactly one launch-start-not-recorded
-#                   post at P's destination; Q's key in the retired-key record
-#                   with cause `absent-at-start`; no CSCB delete; every seeded
-#                   row present (harness `get`); every running stub worker in
-#                   a session a row of the harness's `list` records, and at
-#                   least A's and P's workers found running; nothing
-#                   about A in the Slack stub's record. A plain stop; then the
-#                   harness plays the human acting on the alerts ("Operator
-#                   actions"): it ends each old worker's session by its
-#                   session id and runs `find-missing` until A's, B's, Q's
-#                   and P's rows read finished, so no later start sweeps them
-#                   live and spends a later pass's retry budget (leg 1's X
-#                   keeps its KILL_RETRY_TRIES tries).
-#   1. start_sweep  persona X reports in (`log`); a plain stop; X removed from
-#                   config.json; `fail-kill`; a start. The start sweep
-#                   (`reconcileOrphans`) sweeps X's live row (absent persona)
-#                   and kills it with the bounded retry: each try answers
-#                   ErrTmuxKillFailed, its description carrying
-#                   RETRY_KILL_LATER_PHRASE and NEVER_DELETE_ROW_PHRASE. Then
-#                   exactly KILL_RETRY_TRIES CSCB kills of X's id, no CSCB
-#                   delete, spawn or resume of it; X's row present and still
-#                   `waiting`; exactly one `orphan-cleanup` startup-errors
-#                   entry for X, naming its row, state, session and the
-#                   outcome, carrying the alert's ordinary version in its
-#                   start-sweep form for the last try's description, and one
-#                   server-log line of it; nothing about X reaches the Slack
-#                   stub, no `tmux-unresponsive` post is made and no
-#                   `tmux-unresponsive` condition starts, for X or any
-#                   persona (no started line in server.log: a start-sweep
-#                   kill and ErrTmuxKillFailed never start one, SRJ-307, and
-#                   no persona is configured).
-#   2. config_dir   persona C (Slack destination) has a symlinked
-#                   claude_config_dir and the `silent` stub: its row stays
-#                   `pending` with a launch start. A plain stop; the symlink
-#                   re-pointed; `fail-kill`; a start. The start sweep never
-#                   compares `config_dir` and keeps the row; the start pass's
-#                   collision `get` finds it `pending` and not covered (its
-#                   `config_dir` label differs, SRJ-411; the not-covered
-#                   line), so the ladder's `pending` branch starts the
-#                   live-row sequence, whose first kill's tries each answer
-#                   ErrTmuxKillFailed. Then exactly
-#                   one ordinary alert at C's destination (the persona
-#                   notifier's prefix, then the alert for the last try's
-#                   description with the "keeps retrying" closing sentence);
-#                   C is observed through one further retry of its retry
-#                   timer, whose sequence's kill fails the same way and posts
-#                   no second alert (no post of any text at C's destination
-#                   during the hold after it, NO_SECOND_ALERT_HOLD_S below,
-#                   and the same count of posts there just before the leg's
-#                   stop); after the first failed try no CSCB
-#                   delete, spawn or resume of C's id; C's row present; no
-#                   `tmux-unresponsive` post and no `tmux-unresponsive`
-#                   started line for C's key.
-#   3. cwd          persona W (Slack destination) has a symlinked
-#                   working_directory and the `silent` stub; a start (`log`)
-#                   launches it, its row reads `pending` and its retry timer
-#                   runs in pending-only mode (first retry 30 s after the
-#                   launch, SRJ-302). With `fail-kill` set, the symlink is
-#                   re-pointed before that retry (within REPOINT_BEFORE_S of
-#                   the launch start; no not-covered line before it); the
-#                   retry's `status` read and its `get` find the row's `cwd`
-#                   differing by real path (the not-covered line after the
-#                   re-point, with no start in between), and the live-row
-#                   sequence's kill fails. Then the same checks as leg 2,
-#                   for W, through one further retry.
-#   4. persona_removal (scenario 15; SRJ-1417, SRJ-715, SRJ-1003, SRJ-803)
-#                   persona R (Slack destination, `startup-trust`) is up, its
-#                   row `waiting`. `fail-kill` limited to R's session and
-#                   pane; the operator removes R from config.json and
-#                   confirms the apply by renaming the pending file to the
-#                   apply file (docs/reload.md). R's teardown kill: each of
-#                   its KILL_RETRY_TRIES tries answered ErrTmuxKillFailed, its
-#                   tries ended exhausted; exactly one `persona-teardown-notice`
-#                   entry naming R, "raised during its teardown", carrying the
-#                   alert's ordinary version with the log-only closing
-#                   sentence, and one server-log line of it; no CSCB delete;
-#                   R's row present; R's key in the retired-key record with
-#                   cause `removed`; nothing about R in the Slack stub's
-#                   record after the edit, and no `tmux-unresponsive` post
-#                   and no `tmux-unresponsive` started line for R's key.
-#                   `log`; a plain stop.
-#   Rows a leg keeps are swept again by a later start (leg 1's first start,
-#   in `log`, sweeps P's row, P being absent then), so every check reads
-#   only its own ids and window.
-#   The `resume_enabled=false` site is not driven here: SRJ-1403 leaves it,
-#   with `ErrSpawnNotResumable` with dead evidence, to SRJ-110's unit test
-#   (dead evidence means the session is gone, so agent-director's kill sends
-#   no kill for the shim to fail; dead-evidence rule).
-#
-# Waits: each leg's kills are waited for by their lines, bounded at
-# KILL_WAIT_S (3 tries of up to the 5000 ms kill exit wait, 2 s apart, with
-# their reads); a further retry by its line, bounded at RETRY_WAIT_S (the
-# retry timer's next wait, 30 or 60 s, plus a kill's tries). No fixed sleep
-# but the hold that checks no second alert follows: at least
-# NO_SECOND_ALERT_HOLD_S, and at least twice the first alert's measured
-# latency (from its kill tries' end line to its post, by their own times)
-# plus NO_SECOND_ALERT_MARGIN_S.
-#
-# Matched values (every one printed by fixtures/fmk-texts.ts from the
-# installed package, never typed here):
-#   - the per-try line's fixed part before the JSON-quoted description
-#     (`killRetryTryLine`, src/kill-retry.ts; `describeKillOutcome`,
-#     src/checked-kill.ts), from which each try's description is read;
-#   - the end line's parts (`killRetryEndLine`, src/kill-retry.ts), which
-#     count each sequence's kill tries;
-#   - RETRY_KILL_LATER_PHRASE, NEVER_DELETE_ROW_PHRASE
-#     (src/ad-description-phrases.ts);
-#   - ORPHAN_CLEANUP_LABEL (src/kill-failure-alert.ts), the entry's class,
-#     matched as `[<class>] ` (the entry line's layout, src/startup-errors.ts
-#     recordStartupError, which has no exported builder);
-#   - the entry's head (`startSweepKillFailedEntry`, src/session-manager.ts)
-#     and the alert's start-sweep entry form (`killFailureAlertEntryText` over
-#     `killFailureAlertText`, src/kill-failure-alert.ts);
-#   - the destination post (`formatPersonaNotice`, src/persona-notifier.ts,
-#     then `killFailureAlertText` for Slack, src/kill-failure-alert.ts);
-#   - the line for a `pending` row that is not covered
-#     (`uncoveredPendingRowLine`, src/session-manager.ts, with
-#     PENDING_ROW_REASON_CONFIG_DIR_MISMATCH or
-#     PENDING_ROW_REASON_CWD_MISMATCH, src/pending-row.ts), which names the
-#     site that sent the row to the live-row sequence;
-#   - the `tmux-unresponsive` onset (`tmuxUnresponsiveOnsetText`,
-#     src/persona-episodes.ts) and the condition's started line up to its
-#     refusing verb (`tmuxUnresponsiveStartedLine`), for absence checks;
-#   - instance ids (`personaInstanceId`, src/persona-identity.ts; each alert's
-#     session is the one the row records, read with a harness `get`) and the
-#     last-applied record's suffix (LAST_APPLIED_FILE_SUFFIX, src/reload.ts);
-#   - legs 0 and 4: the `service` label and the `persona` label's key
-#     (SERVICE_LABEL, PERSONA_LABEL_KEY) and a persona's session name
-#     (`personaTmuxSessionName`), src/persona-identity.ts, for the 0.10.0 rows;
-#     the start sweep's summary line and its fixed head
-#     (`startSweepSummaryLine`), its per-row line for a kill whose success
-#     stands (`startSweepKillSucceededLine`), its pre-persona `orphan-cleanup`
-#     entry head (`startSweepKillFailedEntry`) and its line for a persona
-#     latched from its own listed row (`startSweepLatchedFromOwnRowLine`, case
-#     LATCH_CASE_LAUNCH_START_NOT_RECORDED), src/session-manager.ts; the
-#     launch-start-not-recorded post's body (`launchStartNotRecordedNoticeText`,
-#     src/conflict-latch.ts) after the notifier's prefix; the persona
-#     teardown's class (PERSONA_TEARDOWN_NOTICE_LABEL) and its entry for the
-#     alert (`personaTeardownNoticeEntryText`, src/persona-notifier.ts); the
-#     retired-key record's path (`retiredKeysPath`) and the causes
-#     RETIRED_KEY_CAUSE_REMOVED and RETIRED_KEY_CAUSE_ABSENT_AT_START,
-#     src/retired-keys.ts (the record's `keys` and `cause` fields are its
-#     format's, SRJ-802, which exports no field name); the pending and apply
-#     files' suffixes (PENDING_FILE_SUFFIX, APPLY_FILE_SUFFIX, src/reload.ts).
-#
-# Outcomes the SRD leaves open are logged as `NOTE:` lines, not asserted: the
-# CSCB calls of a leg's id before its first kill, counted by verb, and the
-# posts a leg's destination got.
-#
-# The script ends with the closing assertions, `assert_no_server_tmux`,
-# `assert_no_cscb_include_finished` and `assert_no_cscb_delete` (b.jg5
-# SRJ-1418), in its own shell; their counts read only the shims' lines whose
-# parent is a CSCB process.
+# Preserve kill-failure, sweep, lifecycle and retry contracts through real AD.
+# Positive workers report SessionStart without startup keys.
+
 set -euo pipefail
 
 TEST_NAME="test-14-fmk-kill-fails"
@@ -309,7 +64,7 @@ P_KEY="$(persona_key "${P_NAME}")"
 t14_value P_ID personaInstanceId "${P_KEY}"
 t14_value P_SESSION personaTmuxSessionName "${P_KEY}"
 P_WORK="$(make_workdir "${SCENARIO_TAG}latched_work")"
-stub_mode "${P_WORK}" "${STUB_MODE_STARTUP_TRUST}"
+stub_mode "${P_WORK}" "${STUB_MODE_AT_ONCE}"
 P_ROW_WORK="$(make_workdir "${SCENARIO_TAG}latched_row")"
 stub_mode "${P_ROW_WORK}" "${STUB_MODE_AT_ONCE}"
 seed_010_row "${P_ID}" "${P_SESSION}" "${P_ROW_WORK}" "${SVC_LABEL}" "${PERSONA_LABEL}=${P_KEY}" > /dev/null
@@ -456,7 +211,7 @@ X_NAME="${SCENARIO_TAG}sweep"
 X_LABEL="${SCENARIO_TAG}sweep1"
 X_CHANNEL="C0T14SWP1"
 X_WORK="$(make_workdir "${SCENARIO_TAG}sweep_work")"
-stub_mode "${X_WORK}" "${STUB_MODE_STARTUP_TRUST}"
+stub_mode "${X_WORK}" "${STUB_MODE_AT_ONCE}"
 X_CFG="${CFG_ROOT}/${SCENARIO_TAG}sweep_cfg"
 X_KEY="$(persona_key "${X_NAME}")"
 t14_value X_ID personaInstanceId "${X_KEY}"
@@ -466,7 +221,7 @@ C_NAME="${SCENARIO_TAG}cfgdir"
 C_LABEL="${SCENARIO_TAG}cfgdir1"
 C_CHANNEL="C0T14CFG1"
 C_WORK="$(make_workdir "${SCENARIO_TAG}cfgdir_work")"
-stub_mode "${C_WORK}" "${STUB_MODE_STARTUP_TRUST}"
+stub_mode "${C_WORK}" "${STUB_MODE_AT_ONCE}"
 C_CFG_ONE="${CFG_ROOT}/${SCENARIO_TAG}cfgdir_one"
 C_CFG_TWO="${CFG_ROOT}/${SCENARIO_TAG}cfgdir_two"
 C_CFG_LINK="${CFG_ROOT}/${SCENARIO_TAG}cfgdir_link"
@@ -478,9 +233,9 @@ W_NAME="${SCENARIO_TAG}cwd"
 W_LABEL="${SCENARIO_TAG}cwd1"
 W_CHANNEL="C0T14CWD1"
 W_ONE="$(make_workdir "${SCENARIO_TAG}cwd_one")"
-stub_mode "${W_ONE}" "${STUB_MODE_STARTUP_TRUST}"
+stub_mode "${W_ONE}" "${STUB_MODE_AT_ONCE}"
 W_TWO="$(make_workdir "${SCENARIO_TAG}cwd_two")"
-stub_mode "${W_TWO}" "${STUB_MODE_STARTUP_TRUST}"
+stub_mode "${W_TWO}" "${STUB_MODE_AT_ONCE}"
 W_LINK="${SCENARIO_ROOT}/work/${SCENARIO_TAG}cwd_link"
 W_CFG="${CFG_ROOT}/${SCENARIO_TAG}cwd_cfg"
 W_KEY="$(persona_key "${W_NAME}")"
@@ -497,7 +252,7 @@ R_NAME="${SCENARIO_TAG}removed"
 R_LABEL="${SCENARIO_TAG}removed1"
 R_CHANNEL="C0T14REM1"
 R_WORK="$(make_workdir "${SCENARIO_TAG}removed_work")"
-stub_mode "${R_WORK}" "${STUB_MODE_STARTUP_TRUST}"
+stub_mode "${R_WORK}" "${STUB_MODE_AT_ONCE}"
 R_CFG="${CFG_ROOT}/${SCENARIO_TAG}removed_cfg"
 R_KEY="$(persona_key "${R_NAME}")"
 t14_value R_ID personaInstanceId "${R_KEY}"
@@ -1363,7 +1118,7 @@ leg_upgrade_sweep() {
 
 leg_start_sweep() {
     local step="start sweep" session entry_head alert m n kills
-    stub_mode "${X_WORK}" "${STUB_MODE_STARTUP_TRUST}"
+    stub_mode "${X_WORK}" "${STUB_MODE_AT_ONCE}"
     tmux_shim_mode log
     t14_config_for_next_start "$(t14_persona_json "${X_NAME}" "${X_LABEL}" "${X_WORK}" "${X_CFG}" "${X_CHANNEL}")"
     t14_start_and_wait 1
@@ -1582,7 +1337,7 @@ leg_cwd() {
 
 leg_persona_removal() {
     local step="persona removal" session ids sid pane pending apply end kills entry ref n state
-    stub_mode "${R_WORK}" "${STUB_MODE_STARTUP_TRUST}"
+    stub_mode "${R_WORK}" "${STUB_MODE_AT_ONCE}"
     tmux_shim_mode log
     t14_config_for_next_start "$(t14_persona_json "${R_NAME}" "${R_LABEL}" "${R_WORK}" "${R_CFG}" "${R_CHANNEL}")"
     t14_start_and_wait 1

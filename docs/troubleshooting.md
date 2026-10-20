@@ -21,7 +21,7 @@ The first start recorded the bad setting, such as `port` or `bind`, before it fa
 The persona is silent. Accepted messages remain queued while its instance is unavailable. Find its key on its `persona-start` line in `server.log` and read its lines: each names a class (such as `persona-credentials-invalid` or `persona-directory-missing`) and the file or directory to fix. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-doesnt-come-up-or-doesnt-answer).
 
 **A persona's instance waits at a startup prompt**
-After each launch the server presses Enter on Claude Code's folder-trust prompt, for at most the later of 5 minutes and `pending_grace_seconds` plus 60 s, and types nothing else. For any other prompt, attach with `tmux attach -t =slack_bot_<key>` and answer it. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-personas-instance-waits-at-a-startup-prompt).
+agent-director pre-trusts the working directory during launch. If any startup prompt still needs an answer, attach with `tmux attach -t =slack_bot_<key>` and answer it yourself; CSCB sends no automatic startup answers. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-personas-instance-waits-at-a-startup-prompt).
 
 **A persona's instance is still starting**
 Normal for a short time after every launch: the server waits it out and never launches a second instance over it. If it hasn't started in time, the persona posts a *Launch stuck* or *Session not starting* notice. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-personas-instance-is-still-starting).

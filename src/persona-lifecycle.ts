@@ -424,14 +424,14 @@ export interface PersonaLifecycleDeps {
    * the kill. Optional, so hand-built fixtures stay valid; production always
    * passes it.
    */
-  stopApprover?: (key: string) => unknown
+  stopDelivery?: (key: string) => unknown
   /**
    * Stop the key's running live-row sequence (b.jg5 SRJ-706, SRJ-715:
    * production `stopLiveRowSequence` with the teardown reason): it makes no
    * further call, and the returned promise settles once the sequence has
    * settled, its call in flight returned (a step-6 launch it had already
    * started included), so the retry-timer stop that follows clears an arm
-   * that call made. Called right after `stopApprover`: when the teardown is
+   * that call made. Called right after `stopDelivery`: when the teardown is
    * submitted, and awaited as its second step, before the wait for the
    * launch in flight; and awaited again once that launch has settled, since
    * the launch can have started a sequence at a collision ladder replacement
@@ -861,7 +861,7 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
     const { key } = persona
     const prefix = `[slack] persona teardown of ${renderPersonaRef(persona.name, key)}`
     const cancels: [string, () => unknown][] = [
-      ['stopping its dialog approver', () => deps.stopApprover?.(key)],
+      ['stopping its delivery', () => deps.stopDelivery?.(key)],
       [LIVE_ROW_SEQUENCE_STOP_STEP, () => deps.stopLiveRowSequence?.(key)],
       ["cancelling its launch's wait for a working row", () => deps.cancelLaunchWait?.(key)],
     ]
@@ -964,7 +964,7 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
     // b.jg5 SRJ-715, first group, before the wait for its launch in flight.
     // b.jg5 SRJ-404: its dialog approver first, so no Enter reaches the old
     // life (the approver that launch would start does not start).
-    await step('stopping its dialog approver', () => deps.stopApprover?.(key))
+    await step('stopping its delivery', () => deps.stopDelivery?.(key))
     // b.jg5 SRJ-706: its live-row sequence second: it makes no further call,
     // and this step waits for its call in flight, so the retry-timer stop
     // right after clears an arm that call made.

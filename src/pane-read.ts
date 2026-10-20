@@ -1,102 +1,8 @@
 /**
- * pane-read.ts — The outcome of one `read-pane` of a persona's own row, its
- * class under b.jg5 SRJ-117's table, and the line counts (the full read and
- * the one-line probe).
- *
- * Every site that reads persona P's pane reads P's own row `cscb_<key>`.
- * agent-director answers by the row's current launch: the worker's pane, or,
- * when no session of the current launch is there and exactly one leftover of
- * the persona is, that leftover's pane, the one agent-director's own per-pane
- * label marks with the leftover's token. CSCB never reads or sets that label.
- * With neither there the answer is GONE (`ErrTmuxCaptureFailed`); when the
- * worker's pane is not found, the one leftover has no pane carrying its
- * token, or several leftovers run, it is CONFLICT.
- *
- * A pane may be a single leftover's: it never proves on its own that the
- * worker's own session is there (b.jg5 SRJ-117, SRJ-613), and no site acts
- * on a pane alone. A pane leads at most to a deferral (b.jdc's reconnect
- * verdict), no action (b.jdc's ladder action), a positive-idle fold that
- * also needs the transcript (the working-row verdict and the launch wait's
- * evidence read), the reconnect (the waiting-row check) or Enter (the dialog
- * approver and the pending-row rule's lap). The backstop is the `send-keys`
- * that follows, which
- * agent-director answers by the row's current launch and which types nothing
- * when it refuses:
- *   - the reconnect's `/mcp reconnect` (`reconnectMcpWithCause`) on a live
- *     row that is not `pending` answers CONFLICT "not this launch's
- *     session": nothing is typed, CSCB latches P (b.jg5 SRJ-501) and posts
- *     its CONFLICT notice once (SRJ-508), and the refused `send-keys` is
- *     never retried (SRJ-118, SRJ-505);
- *   - the approver's Enter on a `pending` row answers
- *     `ErrSpawnNotInteractive`: the approver stops with nothing typed, no
- *     kill and one log line (b.jg5 SRJ-404);
- *   - the pending-row rule's lap Enter (`sendPendingRowLapEnter`) on a
- *     `pending` row answers `ErrSpawnNotInteractive` the same way: nothing
- *     is typed, the lap ends, no further lap is made on that launch, and the
- *     rule's run goes on (b.jg5 SRJ-410).
- * A pane that leads to a deferral or to no action is followed by no
- * keystroke at all; once a later tick reads the row `waiting`, or shows a
- * `working` row stale, the reconnect's `send-keys` is the backstop again.
- * Each site's own comment names its backstop.
- *
- * The users of {@link PaneReadOutcome} are the shared reader
- * `readPersonaOwnPane` in `src/session-manager.ts` and, through it, the
- * b.d61 working-row verdict (`workingReconnectVerdict` in `src/server.ts`,
- * whose pane `checkWorkingRowPane` folds), the b.f2b waiting-row check
- * (`checkWaitingRowPane`), the launch wait's evidence read
- * (`staleWorkingRowIsIdle`), and b.jdc's two prompt-row paths: the reconnect
- * verdict (`promptRowReconnectVerdict` in `src/server.ts`) and the ladder
- * action (`launchOnPromptRow`), which read with the one-line probe count
- * ({@link PROBE_PANE_READ_LINES}); both of b.jdc's columns of SRJ-117's
- * table are built; and the pending-row rule's lap (`readPendingRowLapPane`,
- * 40 lines, the only read made with `allow_pending`), whose pane leads at
- * most to Enter. b.jg5 SRJ-117 holds the full table of sites
- * that read a persona's pane and how each handles each outcome. The dialog
- * approver (`approvePreSessionDialogs`) keeps its own classification and
- * does not use this module.
- *
- * {@link paneReadFailureOf} maps a value thrown by `read-pane` to exactly one
- * failure outcome, by the classifier's class and by error class through
- * `src/ad-error-class.ts` (b.jg5 SRJ-104; `classifyAdError`,
- * `isAdErrorInstance`), never by an error's name. What
- * each outcome means at a site is the caller's to decide:
- *
- *   GONE          `ErrTmuxCaptureFailed` (any GONE class)
- *   ABSENT        `ErrSpawnNotFound`: the row is absent
- *   CONFLICT      `ErrTmuxSessionConflict`, the thrown value kept so the
- *                 caller can latch (b.jg5 SRJ-501)
- *   UNUSABLE NAME an `ErrInternal` naming the recorded tmux session name, the
- *                 thrown value kept so the caller can latch (b.jg5 SRJ-512)
- *   CONFIG        `ErrConfigMalformed` (the outage is raised by the caller's
- *                 agent-director wrapper, not here)
- *   ENVIRONMENT   `ErrTmuxNotAvailable`
- *   UNAVAILABLE   timeouts included: `ErrTmuxUnresponsive`, `ErrCallTimeout`,
- *                 an `ErrUnknownErrorName` of a later name, CSCB's own
- *                 `UnknownError` wrapper and any value that is not an
- *                 agent-director error
- *   UNCLASSIFIED  every other value: an `ErrInternal` without that phrase,
- *                 the store-open names, `ErrSystemInstallDisappeared`, any
- *                 STATE name but `ErrSpawnNotFound`, LAUNCH FAILURE,
- *                 DIRECTORY and every name CSCB gives no handling
- *
- * A pane is {@link PANE_READ_PANE}; the shared reader in
- * `src/session-manager.ts` (`readPersonaOwnPane`) answers
- * {@link PANE_READ_LATCHED} for a persona it did not read because it is
- * latched, or that its CONFLICT or UNUSABLE NAME answer latched.
- *
- * Each failure outcome carries the classifier's class and the redacted
- * one-line description `describeAdFailureForLog` renders (b.jg5 SRJ-104:
- * the reported name, so an `ErrUnknownErrorName` shows the name and the
- * description agent-director sent, never the client's placeholder; else the
- * safe `errName`; then the description through `redactSlackLogText`, on one
- * line, capped); {@link paneReadClassNote} renders the class for the end of a
- * site's log line. An UNCLASSIFIED outcome the shared reader answers for an
- * `ErrInvalidFlags` whose version re-check decided that the server stops
- * carries the stop mark `stopping: true` ({@link PaneReadUnclassified}).
- * The module is pure: no agent-director call, no latch, no module state, no
- * log line. Never throws.
- *
- * SPDX-License-Identifier: MIT
+ * Outcome-only probes of a persona's own row. The caller uses AD's success
+ * or error class; pane content never leaves the probe and never grants keys.
+ * A successful probe may refer to a leftover session, so readiness still
+ * comes from a fresh AD row and AD's send-keys refusals.
  */
 
 import {
@@ -112,13 +18,6 @@ import {
   type AdErrorClass,
 } from './ad-error-class.ts'
 import { ErrSpawnNotFound } from './agent-director-errors.ts'
-
-/**
- * Trailing pane lines a full read asks for (b.jg5 SRJ-117's `n_lines` at the
- * working-row verdict, the waiting-row check and the launch wait's evidence
- * read).
- */
-export const FULL_PANE_READ_LINES = 40
 
 /**
  * Trailing pane lines a one-line probe asks for (b.jg5 SRJ-117's `n_lines`
@@ -177,14 +76,13 @@ export type PaneReadFailureKind = (typeof PANE_READ_FAILURE_KINDS)[number]
 // ---------------------------------------------------------------------------
 
 /**
- * The read answered a pane (its text). It may be a single leftover's, so it
+ * The read succeeded. It may be a single leftover's, so it
  * is never proof on its own that the worker's own session is there (b.jg5
  * SRJ-613); the `send-keys` that follows it is the backstop (see the module
  * comment).
  */
 export interface PaneReadPane {
   readonly kind: typeof PANE_READ_PANE
-  readonly pane: string
 }
 
 /** What every failure outcome carries. */

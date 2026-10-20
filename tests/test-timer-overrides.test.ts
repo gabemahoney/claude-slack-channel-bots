@@ -15,8 +15,15 @@
  * SPDX-License-Identifier: MIT
  */
 
+import { spawnSync } from 'node:child_process'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
+import { describeKillOutcome, KILL_OUTCOME_KILLED } from '../src/checked-kill.ts'
+import { stuckLaunchAbortKillLine, STUCK_LAUNCH_ABORT_KILL_SUCCEEDED } from '../src/pending-row.ts'
+import { doublingBackoffDelay } from '../src/backoff.ts'
 import { afterEach, describe, expect, test } from 'bun:test'
-import { adLaunchBoundMsInEffect, DIALOG_READY_TIMEOUT_MS, resetAdSettingsForTests } from '../src/ad-settings.ts'
+import { adLaunchBoundMs, DEFAULT_AD_SETTINGS_IN_EFFECT, pendingGraceMinimumSeconds, adLaunchBoundMsInEffect, DIALOG_READY_TIMEOUT_MS, resetAdSettingsForTests } from '../src/ad-settings.ts'
 import {
   AD_VERSION_RECHECK_INTERVAL_MS,
   installAdVersionRecheck,
@@ -32,7 +39,7 @@ import {
   installTestTimerOverrides,
   TEST_TIMER_OVERRIDES_LOG_PREFIX,
 } from '../src/test-timer-overrides.ts'
-import { UNAVAILABLE_RETRY_BASE_S, UNAVAILABLE_RETRY_CEILING_S } from '../src/unavailable-retry.ts'
+import { unavailableRetryRetryLine, unavailableRetryReArmedLine, UNAVAILABLE_RETRY_BASE_S, UNAVAILABLE_RETRY_CEILING_S } from '../src/unavailable-retry.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { makeStubResolveSystemBinary } from './test-helpers/agent-director-stub.ts'
 import { PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
@@ -231,4 +238,225 @@ describe('installTestTimerOverrides', () => {
     expect(() => installTestTimerOverrides(REFUSED_LEG, () => {})).not.toThrow()
     expect(adLaunchBoundMsInEffect()).toBe(120_000)
   })
+})
+
+// Exercise the actual shell oracle without sourcing or running a scenario.
+// Rows/hooks/checked-kill outcomes here are modeled AD records, not CI proof.
+describe('b.acu CI round 3: test-26 recovery observation deadline', () => {
+  const source = readFileSync(join(import.meta.dir, 'integration/test-26-fmk-timing-settings.sh'), 'utf8')
+  const declaration = (name: string) => source.match(new RegExp(`^${name}\\(\\) \\{[\\s\\S]*?^\\}`, 'm'))![0]
+  const input = (name: string) => Number(source.match(new RegExp(`^${name}=(\\d+)`, 'm'))![1])
+  const createMs = input('CREATE_RAISED_MS')
+  const settings = {
+    ...DEFAULT_AD_SETTINGS_IN_EFFECT,
+    tmux: {
+      ...DEFAULT_AD_SETTINGS_IN_EFFECT.tmux,
+      create_timeout_ms: BigInt(createMs),
+      pending_grace_seconds: pendingGraceMinimumSeconds(BigInt(createMs), DEFAULT_AD_SETTINGS_IN_EFFECT.tmux.pipe_close_wait_ms),
+    },
+  }
+  const boundMs = adLaunchBoundMs(settings, input('OVR_DIALOG_READY_MS'))
+  const quote = (text: string) => `'${text.replaceAll("'", "'\\''")}'`
+  function probe(completed: number, command: string, options: { boundMs?: number; base?: number; ceiling?: number; launchAt?: number } = {}) {
+    const root = mkdtempSync('/tmp/timing-bound-control-')
+    const base = options.base ?? input('OVR_RETRY_BASE_S'), ceiling = options.ceiling ?? input('OVR_RETRY_CEILING_S')
+    let due = 0
+    const retryCases = Array.from({ length: 100 }, (_, attempt) => {
+      due += doublingBackoffDelay(base, attempt, ceiling)
+      return `${attempt + 1}) echo ${due};;`
+    }).join('\n')
+    writeFileSync(join(root, 'calls.tsv'), '')
+    writeFileSync(join(root, 'outcomes.tsv'), '')
+    writeFileSync(join(root, 'row.json'), JSON.stringify({ state: 'waiting', session_id: 'fresh-session' }))
+    const script = [
+      'set -euo pipefail', `fixture=${quote(root)}`,
+      `B_CT_MS=${options.boundMs ?? boundMs}`, `OVR_RETRY_BASE_S=${base}`, `OVR_RETRY_CEILING_S=${ceiling}`,
+      ...['LOG_WAIT_S', 'LAUNCH_WAIT_S', 'REPORT_WAIT_S'].map(name => `${name}=${input(name)}`),
+      'fail() { echo "$*" >&2; exit 1; }',
+      // Match the printer contract, calculating every returned due time with
+      // production backoff arithmetic in the parent, over the supplied set.
+      `printed() { [[ "$1 $3 $4" == "unavailableRetryDueS unavailable_retry_base_s=${base} unavailable_retry_ceiling_s=${ceiling}" ]] || exit 9; case "$2" in ${retryCases} *) exit 9;; esac; }`,
+      ...['time_before', 'time_plus', 'seconds_between', 'call_timeout_observation_deadline', 'call_timeout_recovery_started', 'hooks_brought_up', 'expect_checked_kill_before_launch'].map(declaration),
+      'NOW=0; now_s() { echo "$NOW"; }',
+      `CT_LAUNCH_AT=${options.launchAt ?? 0}; call_timeout_observation_deadline "$CT_LAUNCH_AT" ${completed}`,
+      'declare -A ID=([t2]=cscb_fixture) KEY=([t2]=fixture)', 'SCENARIO_TAG=fixture', 'AD_OUT="$fixture/row.json"',
+      'ad_capture() { [[ "$*" == "get --instance-id cscb_fixture" ]] || exit 9; AD_RC=0; }',
+      `ad_trail_events() { [[ "$*" == 'ad.hook.fired cscb_fixture' ]] || exit 9; echo '{"event_name":"SessionStart","session_id":"fresh-session","upsert_outcome":"updated"}'; }`,
+      'cscb_calls_between() { echo 0; }',
+      'wait_until() { [[ "$3 $4 $5" == "row_state_is cscb_fixture waiting" ]] || exit 9; time_before "$READY" "$(time_plus "$NOW" "$1")" || fail "never reported in"; NOW="$READY"; }',
+      command,
+    ].join('\n')
+    try {
+      const result = spawnSync('bash', ['-c', script], {
+        env: hostSafeChildEnv(root, { tools: ['bash', 'awk', 'jq', 'wc', 'grep', 'cat'] }), encoding: 'utf8', timeout: 10_000,
+      })
+      expect(result.error).toBeUndefined()
+      expect(result.signal).toBeNull()
+      assertNoLeak({ stdout: result.stdout, stderr: result.stderr })
+      return result
+    } finally { rmSync(root, { recursive: true, force: true }) }
+  }
+
+  test('the written 40-second create timeout raises G to 61 seconds and B to 121 seconds', () => {
+    expect([createMs, Number(settings.tmux.pending_grace_seconds), boundMs]).toEqual([40_000, 61, 121_000])
+    expect(source).toContain('B_CT_MS="$(printed adLaunchBoundMs "${TABLE_CT[@]}" "dialog_ready_timeout_ms=${OVR_DIALOG_READY_MS}")"')
+    expect(declaration('leg_call_timeout_high')).toContain('call_timeout_observation_deadline "${CT_LAUNCH_AT}" "${T_END}"')
+    expect(declaration('leg_call_timeout_low')).toContain('call_timeout_observation_deadline "${CT_LAUNCH_AT}" "${T_END}" "${RETRY_CEILING_S}"')
+  })
+
+  test.each([
+    [30, 5, 165], [40.059, 5, 175.059],
+    [45.999, 5, 180.999], [46, 4, 121], [46.001, 4, 121.001],
+  ])('error completed at +%s: retry %s at +%s is the first at/after B', (completed, retry, eligible) => {
+    const result = probe(completed, 'echo "$CT_ELIGIBLE_RETRY $CT_ELIGIBLE_AT $CT_DEADLINE"')
+    expect(result.status).toBe(0)
+    expect(result.stdout.trim().split(' ').map(Number)).toEqual([
+      retry, eligible, Number((eligible + input('LOG_WAIT_S') + input('LAUNCH_WAIT_S') + input('REPORT_WAIT_S')).toFixed(3)),
+    ])
+  })
+
+  test.each([
+    { base: 10, ceiling: 20, boundMs: 121_000, retry: 5, eligible: 130.059 },
+    { base: 5, ceiling: 60, boundMs: 200_000, retry: 6, eligible: 235.059 },
+  ])('the actual oracle responds to changed retry settings and B: %p', options => {
+    const result = probe(40.059, 'echo "$CT_ELIGIBLE_RETRY $CT_ELIGIBLE_AT"', options)
+    expect(result.status).toBe(0)
+    expect(result.stdout.trim().split(' ').map(Number)).toEqual([options.retry, options.eligible])
+  })
+
+  test.each([30, 40.059])('error +%s: SessionStart has its own bounded phase after the actual recovery launch', completed => {
+    const ready = completed + 136
+    expect(ready).toBeGreaterThan(completed + input('REPORT_WAIT_S'))
+    const result = probe(completed, `NOW=${completed + 135}; READY=${ready}; hooks_brought_up control t2 0; echo recovered`)
+    expect(result.status).toBe(0)
+    expect(result.stdout).toContain('recovered')
+  })
+
+  test('a SessionStart beyond its own report phase still fails', () => {
+    const result = probe(40.059, 'NOW=175.059; READY=296; hooks_brought_up control t2 0')
+    expect(result.status).toBe(1)
+    expect(result.stderr).toContain('never reported in')
+  })
+
+  type RetryRecord = { start: number; end?: number; get: number; kill?: number; beforeB?: boolean }
+  function recoveryProbe(completed: number, records: RetryRecord[], options: { launchAt?: number; now?: number } = {}) {
+    const logs: Array<[string, number]> = []
+    const calls = { get: [] as string[], kill: [] as string[] }
+    let due = 0
+    const dueCases = Array.from({ length: 10 }, (_, i) => {
+      due += doublingBackoffDelay(input('OVR_RETRY_BASE_S'), i, input('OVR_RETRY_CEILING_S'))
+      return `${i + 1}) echo ${due};;`
+    }).join('\n')
+    records.forEach((r, i) => {
+      logs.push([unavailableRetryRetryLine('fixture', i + 1, false), r.start])
+      if (r.end !== undefined) logs.push([unavailableRetryReArmedLine('fixture', i + 1, false, 'fixture-marker', undefined, 0), r.end])
+      calls.get.push(`shim\t${r.get}\tcscb_fixture`)
+      if (r.kill !== undefined) calls.kill.push(`shim\t${r.kill}\tcscb_fixture`)
+    })
+    const commands = [
+      'REFUSED_MARKER=fixture-marker; declare -A REF=([t2]=fixture)',
+      `NOW=${options.now ?? records.at(-1)!.kill ?? records.at(-1)!.end ?? records.at(-1)!.start}`,
+      // These are the production retry builders. The printer itself is a
+      // Docker-only entry point; execute the extracted audit, not the scenario.
+      `printed() { case "$1" in unavailableRetryDueS) case "$2" in ${dueCases} esac;; unavailableRetryRetryLine) case "$3" in ${Array.from({length: 11}, (_, i) => `${i + 1}) echo ${quote(unavailableRetryRetryLine('fixture', i + 1, false))};;`).join('\n')} esac;; unavailableRetryReArmedLine) case "$3" in ${Array.from({length: 10}, (_, i) => `${i + 1}) echo ${quote(unavailableRetryReArmedLine('fixture', i + 1, false, 'fixture-marker', undefined, 0))};;`).join('\n')} esac;; pendingRowRuleRoundLineHead) echo fixture-round;; *) exit 9;; esac; }`,
+      // log_lines uses substring matching, as the scenario's log reader does.
+      `log_lines() { while IFS=$'\t' read -r at line; do [[ "$line" == *"$1"* ]] && printf '%s\t%s\n' "$at" "$line"; done < "$fixture/retries.tsv"; return 0; }`,
+      `log_time() { echo "\${1%%$'\t'*}"; }`,
+      `cscb_ad_calls() { [[ "$2 $3" == '--instance-id cscb_fixture' ]] || exit 9; case "$1" in get) cat "$fixture/gets.tsv";; kill) cat "$fixture/kills.tsv";; *) exit 9;; esac; }`,
+      `first_cscb_call_at_or_after() { local a="$1"; shift; cscb_ad_calls "$@" | awk -F'\t' -v a="$a" '$2 >= a { print; exit }'; }`,
+      `call_fields() { CALL_T="$(awk -F'\t' '{print $2}' <<< "$2")"; }`,
+      `log_lines_from() { local a="$1" b="$2"; log_lines "$3" | awk -F'\t' -v a="$a" -v b="$b" '$1 >= a && $1 < b'; }`,
+      `printf '%s\n' ${quote(logs.map(([line, at]) => `${at}\t${line}`).join('\n'))} > "$fixture/retries.tsv"`,
+      `printf '%s\n' ${quote(calls.get.join('\n'))} > "$fixture/gets.tsv"`,
+      `printf '%s\n' ${quote(calls.kill.join('\n'))} > "$fixture/kills.tsv"`,
+      ...records.filter(r => r.beforeB).map(r => `printf '%s\n' ${quote(`${r.end! - 0.001}\tfixture-round before B: nothing more this round`)} >> "$fixture/retries.tsv"`),
+      'for ((i=0; i<10; i++)); do if call_timeout_recovery_started control t2; then echo "recovered $CT_RECOVERY_RETRY $CT_RECOVERY_AT"; exit 0; fi; done; fail "no recovery"',
+    ].join('\n')
+    return probe(completed, commands, options)
+  }
+
+  function retries(completed: number, recovery: number): RetryRecord[] {
+    let due = completed
+    return Array.from({ length: recovery }, (_, i) => {
+      due += doublingBackoffDelay(input('OVR_RETRY_BASE_S'), i, input('OVR_RETRY_CEILING_S'))
+      return { start: due, get: due + 0.01, ...(i + 1 === recovery ? { kill: due + 0.02 } : { end: due + 0.03 }) }
+    })
+  }
+
+  test.each([30, 40.059])('actual retry audit accepts retry five at error +%s, rejects a one-retry delay still inside the global deadline', completed => {
+    const positive = recoveryProbe(completed, retries(completed, 5))
+    expect(positive.status).toBe(0)
+    expect(positive.stdout).toContain('recovered 5')
+    const delayed = retries(completed, 6)
+    expect(delayed.at(-1)!.kill!).toBeLessThan(completed + 135 + input('LOG_WAIT_S') + input('LAUNCH_WAIT_S') + input('REPORT_WAIT_S'))
+    const negative = recoveryProbe(completed, delayed)
+    expect(negative.status).toBe(1)
+    expect(negative.stderr).toContain('first eligible retry 5 ended without a CSCB checked kill')
+  })
+
+  test('AD launch start +1 moves B from +121 to +122 and eligibility from retry four to five', () => {
+    const noOffset = probe(46, 'echo "$CT_ELIGIBLE_RETRY $CT_BOUND_AT"')
+    const offset = probe(46, 'echo "$CT_ELIGIBLE_RETRY $CT_BOUND_AT"', { launchAt: 1 })
+    expect(noOffset.stdout.trim()).toBe('4 121.000000')
+    expect(offset.stdout.trim()).toBe('5 122.000000')
+    expect(recoveryProbe(46, retries(46, 5), { launchAt: 1 }).status).toBe(0)
+    const early = recoveryProbe(46, retries(46, 4), { launchAt: 1 })
+    expect(early.status).toBe(1)
+    expect(early.stderr).toContain('CSCB kill before B')
+  })
+
+  test.each(['read-crossing', 'return-crossing', 'before-B-answer'])('a retry beginning before B uses actual AD observations across B: %s', mode => {
+    const records = retries(45.99, mode === 'before-B-answer' ? 5 : 4)
+    records[3] = mode === 'before-B-answer'
+      ? { start: 120.99, get: 120.995, end: 121.01, beforeB: true }
+      : { start: 120.99, get: mode === 'read-crossing' ? 121.005 : 120.995, kill: 121.01 }
+    const result = recoveryProbe(45.99, records)
+    expect(result.status).toBe(0)
+    expect(result.stdout).toContain(`recovered ${mode === 'before-B-answer' ? 5 : 4}`)
+  })
+
+  test('a retry crossing B cannot silently defer recovery without a production before-B answer', () => {
+    const records = retries(45.99, 5)
+    records[3] = { start: 120.99, get: 120.995, end: 121.01 }
+    const result = recoveryProbe(45.99, records)
+    expect(result.status).toBe(1)
+    expect(result.stderr).toContain('crossed B without recovery or a production before-B answer')
+  })
+
+  test.each(['pending', 'late-kill'])('an eligible retry has its own row-check phase bound: %s', mode => {
+    const records = retries(40.059, 5)
+    records[4] = { start: 175.059, get: 175.069, ...(mode === 'late-kill' ? { kill: 205.06 } : {}) }
+    const result = recoveryProbe(40.059, records, { now: 205.06 })
+    expect(result.status).toBe(1)
+    expect(result.stderr).toContain(mode === 'pending' ? 'retry 5 exceeded its bounded recovery phase' : 'retry 5 kill exceeded its bounded recovery phase')
+  })
+
+  test('the low leg additionally bounds the following retry that stops its timer', () => {
+    const result = probe(30, 'first="$CT_DEADLINE"; call_timeout_observation_deadline 0 30 "$OVR_RETRY_CEILING_S"; seconds_between "$first" "$CT_DEADLINE"')
+    expect(result.status).toBe(0)
+    expect(Number(result.stdout)).toBe(input('OVR_RETRY_CEILING_S'))
+  })
+
+  test.each(['complete', 'early-kill', 'no-kill', 'wrong-instance', 'duplicate-kill', 'no-outcome', 'refused-outcome', 'outcome-after-launch', 'outcome-before-previous'])('a fresh launch requires an actual CSCB kill and successful checked outcome: %s', mode => {
+    const marker = 'fixture-follows'
+    const head = stuckLaunchAbortKillLine('fixture', {
+      kind: STUCK_LAUNCH_ABORT_KILL_SUCCEEDED, killSent: true,
+      description: describeKillOutcome({ kind: KILL_OUTCOME_KILLED, killSent: true }),
+    }, marker).split(marker)[0]!
+    const commands = [
+      'T_CALL=-107; CT_LAUNCH_AT=-106',
+      `printf '%s\\n' ${quote(mode === 'no-kill' ? '' : `${mode === 'early-kill' ? 14.999 : 15}\tcscb_${mode === 'wrong-instance' ? 'other' : 'fixture'}${mode === 'duplicate-kill' ? '\n16\tcscb_fixture' : ''}`)} > "$fixture/calls.tsv"`,
+      `printf '%s\\n' ${quote(mode === 'no-outcome' ? '' : `${mode === 'outcome-after-launch' ? 21 : mode === 'outcome-before-previous' ? 9 : 16}\t${mode === 'refused-outcome' ? 'refused checked kill' : head}sequence follows`)} > "$fixture/outcomes.tsv"`,
+      // The real helper must ask for this persona's successful outcome.
+      `printed() { [[ "$*" == 'stuckLaunchAbortKillSucceededHead fixture' ]] || exit 9; echo ${quote(head)}; }`,
+      `cscb_calls_between() { [[ "$3 $4" == "kill --instance-id" ]] || exit 9; awk -F "\\t" -v a="$1" -v b="$2" -v id="$5" '$1 >= a && $1 < b && $2 == id { n++ } END { print n+0 }' "$fixture/calls.tsv"; }`,
+      `count_log_from() { awk -F "\\t" -v a="$1" -v b="$2" -v head="$3" '$1 >= a && $1 < b && index($2, head) { n++ } END { print n+0 }' "$fixture/outcomes.tsv"; }`,
+      'expect_checked_kill_before_launch control t2 10 20',
+    ].join('\n')
+    const result = probe(40.059, commands)
+    expect(result.status).toBe(mode === 'complete' ? 0 : 1)
+    if (mode === 'early-kill') expect(result.stderr).toContain('CSCB kill before B')
+    else if (mode !== 'complete') expect(result.stderr).toContain(mode.includes('kill') || mode === 'wrong-instance' ? 'CSCB checked kill' : 'successful checked-kill outcome')
+  })
+
 })

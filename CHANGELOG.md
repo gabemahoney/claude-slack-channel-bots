@@ -6,6 +6,12 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 ## Unreleased
 
+### Agent-director owns delivery readiness
+
+- Delivery, retries and reconnect text/Enter now wait for agent-director's `waiting` state and retain the existing connection, relay, marker and persona safeguards. Refused input stays queued under the existing backoff. CSCB no longer interprets native terminal screens or transcript idle/compaction markers to decide when to type.
+- Unconfirmed sends receive a durable Enter-only recovery attempt, followed by a receipt wait before the complete message is offered again. Only an exact own-message transcript receipt confirms delivery; strict FIFO, durable queues and at-least-once behavior remain.
+- Startup dialogs require agent-director pre-trust or a human answer. CSCB no longer presses Enter on folder-trust prompts. See [startup prompt troubleshooting](docs/troubleshooting.md).
+
 ---
 
 ## 0.17.0 (2026-10-19)

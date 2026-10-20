@@ -55,19 +55,17 @@
  */
 
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js'
-
 import { randomBytes } from 'node:crypto'
 import { prepareBotSystemPrompt, botSystemPromptPath } from './bot-system-prompt.ts'
 import type { Client } from 'agent-director'
 import { createDeliveryEngines, createDeliveryLifecycle, type DeliveryEngines, type DeliveryLifecycle, type DeliveryEngineEvent } from './delivery-engine.ts'
 import { createDeliveryAdScope } from './delivery-ad-scope.ts'
 import { parseLaunchStart } from './pending-row.ts'
-import { setDeliveryLifecycle, setDeliveryPersonaLookup, inspectPersonaUpgrade, isTagUpgradePending, hasNotConnectedEpisode, applyDeliveryOwnRowRead, handleDeliveryKeyError, handleDeliveryReadError, classifyWorkingPane } from './session-manager.ts'
+import { setDeliveryLifecycle, setDeliveryPersonaLookup, inspectPersonaUpgrade, isTagUpgradePending, hasNotConnectedEpisode, applyDeliveryOwnRowRead, handleDeliveryKeyError, handleDeliveryReadError, recoverDeliveryGone } from './session-manager.ts'
 import type { WebClient } from '@slack/web-api'
 import { join, resolve } from 'path'
 import { fileURLToPath } from 'url'
 import { mkdirSync, promises as fsPromises } from 'fs'
-
 import { assertSendable as libAssertSendable } from './lib.ts'
 import {
   expandTilde,
@@ -86,16 +84,12 @@ import {
 } from './config.ts'
 import { personaInstanceId, renderPersonaRef, resolvePersonaTarget, resolveClaudeConfigDir } from './persona-identity.ts'
 import {
-  APPROVER_STOP_RETIRED_KEY,
-  APPROVER_STOP_TEARDOWN,
   applyOwnRowStatusStep,
   buildLatchRecheck,
   buildLiveRowSequenceDeps,
   cancelWorkingRowWait,
   checkLaunchConfigDir,
   checkPromptRowDeferral,
-  checkWaitingRowPane,
-  checkWorkingRowPane,
   clearByHandOf,
   carriedDeadEvidenceOf,
   DEAD_SESSION_CAUSE_ROW_READ_FINISHED,
@@ -103,16 +97,12 @@ import {
   escalateDeadVerdictOfCause,
   ESCALATE_DEAD_REPROBE_DECIDES,
   ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ,
-  ESCALATE_DEAD_WAITING_ROW_PANE_GONE,
   type EscalateDeadVerdict,
   endPromptRowDeferral,
-  endWorkingRowDeferral,
   forgetNotConnectedEpisode,
-  forgetWorkingRowEvidence,
-  hasPendingWorkingRowEvidence,
   holdLaunchIfConfigDirUnresolvable,
-  isDialogApproverRunning,
   isLaunchInFlight,
+  isLiveRowSequenceRunning,
   createOldLifeHoldEndRetry,
   forgetOldLifeWaits,
   isOwnRowOldLifeHeld,
@@ -129,7 +119,6 @@ import {
   setPersonaKillKeepGoingQuery,
   setStuckLaunchEpisodes,
   launchSession,
-  noteWorkingRowDeferral,
   notifyDisconnectedWithAutoRestartDisabled,
   notifyPersonaNotConnected,
   notifyRestartCapReached,
@@ -166,16 +155,11 @@ import {
   spawnForPersona,
   startLiveRowSequence,
   startupSessionManager,
-  stopAllDialogApprovers,
-  stopDialogApprover,
   stopLiveRowSequence,
   sweepDeadTmuxChannelWithCause,
-  WAITING_ROW_PANE_ABSENT,
-  WAITING_ROW_PANE_GONE,
   whenLaunchSettled,
 } from './session-manager.ts'
 import {
-  FULL_PANE_READ_LINES,
   PANE_READ_ABSENT,
   PANE_READ_CONFIG,
   PANE_READ_ENVIRONMENT,
@@ -263,7 +247,6 @@ import { createPersonaSerializer } from './persona-serializer.ts'
 import { createPersonaLifecycle, type PersonaLifecycle } from './persona-lifecycle.ts'
 import { describeKillOutcome, killOutcomeStopsServer } from './checked-kill.ts'
 import { KILL_RETRY_SEED_NOT_LIVE_VALUE, KILL_RETRY_SYSTEM_CLOCK, killRetryStopped, type KillRetryWait } from './kill-retry.ts'
-import { cleanSession, getCozempicAvailable } from './cozempic.ts'
 import { resolveSystemBinary } from 'agent-director'
 import {
   ErrSpawnNotFound,
@@ -328,6 +311,8 @@ import {
   UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD,
   UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
   UNAVAILABLE_RETRY_RUN_NOW_HOLD_ENDED,
+  UNAVAILABLE_RETRY_RUN_NOW_RAN,
+  UNAVAILABLE_RETRY_RUN_NOW_ARMED,
   UNAVAILABLE_RETRY_CONDITION_TMUX_UNAVAILABLE,
   UNAVAILABLE_RETRY_CONDITION_TMUX_UNRESPONSIVE,
   UNAVAILABLE_RETRY_STOP_CAPPED,
@@ -568,37 +553,14 @@ let personaInvalidFlagsHold: Pick<InvalidFlagsHold, 'isHeld' | 'forgetAll'> | un
  */
 let liveRowSequences: LiveRowSequenceRegistry | undefined
 
-/**
- * b.jg5 SRJ-303: true while work in flight for the persona blocks a retry of
- * its retry timer: a launch call (`isLaunchInFlight`), a running live-row
- * sequence (`isLiveRowSequenceRunning`, b.jg5 SRJ-706), or an old-life wait
- * step for a hold the persona waits on (`isOldLifeWaitRunningFor`, b.jg5
- * SRJ-811), each false before main() installs the registry, the hold set and
- * the wait's bindings: exactly when the session manager's
- * `personaRetryBlockCause` names one, which the retry controller also gets
- * (`retryBlockCause`) to name it in the again-reason and the restart retry's
- * skip line. A running dialog approver is not here: it runs after its
- * launch call has returned and never blocks a retry (SRJ-401). Given to the
- * retry controller (`isInFlight`). Every member here is also in flight for
- * the persona (`isPersonaWorkInFlight` is built from this), so the tick
- * never attempts over work that holds back the retry timer.
- */
+
 function isPersonaRetryBlocked(key: string): boolean {
   return personaRetryBlockCause(key) !== undefined
 }
 
-/**
- * b.jg5 SRJ-315, SRJ-1011 (Terms, "In flight for P"): true while work is in
- * flight for the persona: anything that blocks a retry
- * (`isPersonaRetryBlocked`), or a running dialog approver
- * (`isDialogApproverRunning`, SRJ-401). Given to the health tick's in-flight
- * member (`isLaunchInFlight`), the lost-message routing's read gate
- * (`isWorkInFlight`) and the `tmux-unavailable` retry check
- * (`armMissingTmuxUnavailableRetry`, for the session disconnect handler and
- * the lost-message routing), which mirrors the tick's own check.
- */
+
 function isPersonaWorkInFlight(key: string): boolean {
-  return isPersonaRetryBlocked(key) || isDialogApproverRunning(key)
+  return isPersonaRetryBlocked(key)
 }
 
 /**
@@ -852,14 +814,7 @@ export function armMissingTmuxUnavailableRetry(
   return 'armed'
 }
 
-/**
- * The production dependencies of {@link armMissingTmuxUnavailableRetry}: the
- * outage state's flag, the retry controller and the latch through the
- * holders main() sets (read at call time: before main() builds them there is
- * no controller and no persona is latched), "in flight for P" as the health
- * tick takes it (`isPersonaWorkInFlight`, a running dialog approver included)
- * and the one ENVIRONMENT arm path.
- */
+
 const tmuxUnavailableRetryDeps: TmuxUnavailableRetryDeps = {
   isTmuxUnavailable: (key) => getOutageFlags(key).has('tmux-unavailable'),
   isRetryArmed: (key) => unavailableRetry?.isArmed(key),
@@ -1157,8 +1112,6 @@ async function handleInitialized(
   // Promote pending → registered (removes from pendingSessionMap internally;
   // the pending stub becomes the registered entry).
   registerSession(realCwd, persona.key, pendingId)
-  // b.f2b: connected again, so its not-connected episode (if any) is over:
-  // its notice latch and the restart path's idle evidence are forgotten.
   forgetNotConnectedEpisode(persona.key)
 
   // Register MCP session ID for future HTTP request routing
@@ -1218,19 +1171,9 @@ const personaRouting = createPersonaRouting({
   getChannelDelivery: () => channelDeliveryStore,
   // A lost message for a persona that is not up restarts nothing (b.av2 SR-6.4).
   isPersonaUp,
-  // b.jg5 SRJ-1011: the lost-message state inputs, each read at call time.
-  // The latch and the tmux-unresponsive conditions are built in main(), so
-  // before then no persona is latched and no condition holds. State 6's
-  // launch-or-approver member: a launch call, or the dialog approver that
-  // runs after it returned, in its own registry (SRJ-401). This is not the
-  // "in flight for P" predicate below: a live-row sequence or an old-life
-  // wait step reports `restarting` instead (the sequence/wait member below).
   isLatched: (key) => personaLatch?.isLatched(key) ?? false,
   isTmuxUnresponsive: (key) => personaTmuxUnresponsive?.holds(key) ?? false,
-  isLaunchOrApproverRunning: (key) => isLaunchInFlight(key) || isDialogApproverRunning(key),
-  // b.jg5 SRJ-1011: the lost-message read gate's "in flight for P" is the
-  // health tick's (isPersonaWorkInFlight: a running approver and a running
-  // live-row sequence included), so in-flight work reaches the gate through it.
+  isLaunchRunning: (key) => isLaunchInFlight(key),
   isWorkInFlight: isPersonaWorkInFlight,
   // b.jg5 SRJ-706, SRJ-811, SRJ-812, SRJ-1011: while P's live-row sequence,
   // or an old-life wait step for a hold P waits on, runs, a lost message
@@ -1421,26 +1364,7 @@ let shuttingDown = false
 let httpServer: ReturnType<typeof Bun.serve> | null = null
 let cronScheduler: CronScheduler | null = null
 
-/**
- * The shutdown sequence, reached from SIGTERM / SIGINT (exit code 0) and from
- * the runtime version re-check's stop (`AD_VERSION_RECHECK_STOP_EXIT_CODE`,
- * b.jg5 SRJ-205). `reason` is named in the shutdown line. It stops every
- * timer the server runs (the permission poller, the health check, the
- * runtime version re-check, the reload detection tick, the cron scheduler,
- * restart, UNAVAILABLE retry, bring-up and destination-hold timers,
- * keep-alives), stops every live-row sequence (b.jg5 SRJ-706; none makes a
- * further call, and none starts after it) and every dialog approver (b.jg5
- * SRJ-404; likewise), forgets every persona's notice
- * episodes and `ErrInvalidFlags` hold (b.jg5 SRJ-207), closes HTTP,
- * the MCP transports and the persona Slack connections, releases the
- * agent-director client handle, removes the PID file and exits with
- * `exitCode`. It makes no agent-director call: every worker and row is left
- * as it is, and an apply already under way is not awaited. A second call
- * while one runs is a no-op. Its awaits have no deadline of their own; a
- * re-check stop is bounded by the deadline `main()` arms before calling it
- * (`shutdown-deadline.ts`), and exits with its code even when the process
- * runs out of work first, because that stop sets `process.exitCode`.
- */
+
 async function shutdown(reason: string, exitCode = 0): Promise<void> {
   if (shuttingDown) return
   shuttingDown = true
@@ -1456,11 +1380,6 @@ async function shutdown(reason: string, exitCode = 0): Promise<void> {
     cronScheduler.stop()
     cronScheduler = null
   }
-  // b.jg5 SRJ-706: every running live-row sequence stops (its stop signal set
-  // now, so none makes a call after the one in progress returns, and none
-  // holds a timer), and no sequence starts after this; a call in progress is
-  // not waited for, as for the dialog approvers below. Before the retry
-  // controller closes and before the client is released.
   void liveRowSequences?.close().catch((err: unknown) => {
     console.error(`[slack] stopping the live-row sequences on shutdown failed: ${describeThrownValue(err)}`)
   })
@@ -1492,12 +1411,7 @@ async function shutdown(reason: string, exitCode = 0): Promise<void> {
   // persona whose held notices are dropped unposted.
   personaDestinationHold.cancelAll()
   stopAllKeepAliveTimers()
-  // b.jg5 SRJ-404: every running dialog approver is stopped (marked and woken
-  // now, so none makes a call after the one in progress returns) and none
-  // starts after this; a call in progress is not waited for.
-  void stopAllDialogApprovers().catch((err: unknown) => {
-    console.error(`[slack] stopping the dialog approvers on shutdown failed: ${describeThrownValue(err)}`)
-  })
+
 
   console.error(`[slack] Shutting down: ${reason}`)
 
@@ -1938,12 +1852,6 @@ export function _buildKillSessionAdapter(
 ): (key: string, lastRead: DeadLivenessReading) => Promise<KillSessionResult> {
   // `key` is the persona key; `lastRead` the restart run's `dead` reading.
   return async (key: string, lastRead: DeadLivenessReading) => {
-    // The launch call only, not a running dialog approver (b.jg5 SRJ-401):
-    // this kill can run while an approver still runs for the persona (an
-    // approver reads the row again only at its next lap, or once its call in
-    // progress returns). That approver then meets GONE, or is superseded by
-    // a newer launch's, and stops. So the kill checks `isLaunchInFlight` only, as do the
-    // reconnect verdicts (`promptRowReconnectVerdict`, `workingReconnectVerdict`).
     if (isLaunchInFlight(key)) {
       console.error(`[slack] killSession (restart adapter): launch already in flight for persona=${key} — not killing`)
       return KILL_SESSION_NOT_KILLED_GUARD
@@ -1986,321 +1894,7 @@ export function _buildKillSessionAdapter(
 // _buildReconnectSessionAdapter
 // ---------------------------------------------------------------------------
 
-/**
- * _buildReconnectSessionAdapter — test-only factory for the restart module's
- * reconnectSession dependency. Production code wires this via main()'s
- * initRestart call; tests call it directly to exercise the b.9a7 working→
- * 'transient' state gate without importing the private closure inside main().
- *
- * b.9a7 HAZARD 2 (turn corruption, b.rmy invariant) — state gate:
- * reconnectMcp types `/mcp reconnect` into the tmux pane. Before b.9a7 only
- * rare event paths reached this; now the health-check tick can drive it
- * periodically for any live state. A session mid-long-turn (`working`) is
- * exactly the case most likely to look disconnected while healthy, and typing
- * into its pane mid-turn risks corrupting the turn. So DEFER `working`: probe
- * AD state and, if working, return 'transient' — a no-op that restart.ts does
- * NOT count and does NOT re-enter scheduleRestart on, leaving a later tick free
- * to retry once the turn settles to `waiting`. This does not regress the b.rmy
- * invariant: we never declare a `working` row with a live tmux session dead,
- * only decline to poke it.
- *
- * b.f2b — never type blind. When the status call throws, nothing is known
- * about the session (it may be mid-turn), so nothing is typed: the failure is
- * logged and the adapter returns 'transient'; the next tick retries. In the
- * liveness probe (b.jg5 SRJ-314) only `ErrSpawnNotFound` and
- * `ErrSystemInstallDisappeared` read dead; every other `status` error reads
- * `unknown`, so nothing kills or relaunches the persona on it. Before b.f2b a
- * failed status call fell through to the reconnect.
- *
- * b.f2b — never type into a prompt or dialog. `/mcp reconnect` + Enter typed
- * into an `ask_user` or `check_permission` session could confirm the dialog's
- * default, so those states are deferred too ('transient'): the deferral is
- * logged, and the persona's `blocked-on-prompt` not-connected notice is raised
- * (once per episode). b.jdc, b.jg5 SRJ-606: only while its session may
- * still be waiting on the prompt. The row keeps its state after the session
- * dies, so the row is read first with one one-line `read-pane` through the
- * shared reader (`promptRowReconnectVerdict`: `PROBE_PANE_READ_LINES`, no
- * tmux call), answered by b.jg5 SRJ-117's b.jdc reconnect-verdict column:
- *   - a pane → the deferral: once the deferrals have run for
- *     `PROMPT_ROW_SWEEP_AFTER_MS` each one first sweeps and reads the row
- *     again (`checkPromptRowDeferral`), and otherwise `deferPromptRow`
- *     defers with the notice. A pane leads at most to the deferral: it may
- *     be a single leftover's (b.jg5 SRJ-117, SRJ-613), nothing is typed on
- *     it, and the reconnect's `send-keys` a later tick makes is the backstop
- *     (its CONFLICT "not this launch's session" latches the persona);
- *   - GONE → the dead-tmux sweep (verdict `prompt-row-tmux-gone`) and an
- *     escalate-dead answer carrying that verdict (`escalateDeadWith`), with
- *     no notice; the row absent (`ErrSpawnNotFound`) → the same, carrying
- *     the verdict `row-absent-at-pane-read`;
- *   - UNAVAILABLE (timeouts included), CONFIG (the wrapper raised the
- *     `ad-config-malformed` outage) or UNCLASSIFIED → taken as alive: the
- *     deferral;
- *   - ENVIRONMENT (the wrapper raised the `tmux-unavailable` outage) →
- *     'transient', with no deferral noted and no notice;
- *   - CONFLICT or UNUSABLE NAME (the reader latched the persona with the row
- *     state the adapter read), or a persona already latched → 'transient',
- *     with no deferral noted, no notice and nothing typed.
- * Once the prompt is answered, a later tick reconnects it
- * when it can tell the session is idle again (its row reads `waiting`, or the
- * positive-idle rule shows a `working` row stale).
- *
- * b.f2b, b.jg5 SRJ-604 — a `waiting` row's pane is read once first, with one
- * `read-pane` of the row (`checkWaitingRowPane`), answered by b.jg5
- * SRJ-117's waiting-row column:
- *   - a pane: a running turn or a prompt or dialog on it defers
- *     ('transient') the same way (a prompt raises the same notice);
- *     otherwise the reconnect below goes ahead. The pane may be a single
- *     leftover's (b.jg5 SRJ-117, SRJ-613), so it is no proof that the
- *     worker's own session is there: the reconnect's own `send-keys` is the
- *     backstop, and its CONFLICT "not this launch's session" latches the
- *     persona with nothing typed (b.jg5 SRJ-118, SRJ-501);
- *   - GONE → nothing is typed: the dead-tmux sweep
- *     (`sweepDeadTmuxChannelWithCause`, verdict `waiting-row-pane-gone`) and
- *     an escalate-dead answer carrying that verdict (`escalateDeadWith`;
- *     'transient' when the sweep was refused), as the `working` row's GONE
- *     below; the row absent (`ErrSpawnNotFound`) → the same, carrying the
- *     verdict `row-absent-at-pane-read` (b.jg5 SRJ-117);
- *   - CONFLICT or UNUSABLE NAME (the reader latched the persona with the row
- *     state `waiting`), a persona already latched, or ENVIRONMENT (the
- *     wrapper raised the `tmux-unavailable` outage) → 'transient', nothing
- *     typed;
- *   - UNAVAILABLE (timeouts included), CONFIG (the wrapper raised the
- *     `ad-config-malformed` outage) or UNCLASSIFIED → the reconnect goes
- *     ahead on the `waiting` row alone, agent-director's own idle signal.
- *
- * b.d61, b.jg5 SRJ-603 — the `working` deferral is bounded by agent-director's
- * `read-pane`. A `working` row is no proof of a live turn: when the persona's
- * session is killed mid-turn, SessionEnd fires but AD only soft-refreshes the
- * row (`working → working`), and it stays frozen until a findMissing sweep
- * reconciles it to `missing`. Deferring on the row alone would repeat on every
- * tick and the persona would never relaunch. So the `working` branch
- * (`workingReconnectVerdict`) makes one `read-pane` of the persona's own row
- * through the shared reader (`readPersonaOwnPane`: `FULL_PANE_READ_LINES`,
- * the row state `working`), with no tmux probe, and answers by b.jg5
- * SRJ-117's working-row column:
- *   - a launch for the persona is in flight → defer ('transient'), first and
- *     with no agent-director call: the launch owns the session's lifecycle;
- *   - a pane → the positive-idle rule decides (b.f2b, `checkWorkingRowPane`
- *     on that pane, which reads no pane of its own). A `working` row can be
- *     stale: agent-director may leave it `working` after the turn ended, and
- *     deferring on it forever would strand the persona. The pane may be a
- *     single leftover's (b.jg5 SRJ-613), so it is never proof on its own:
- *     each attempt reads the session's transcript too when the pane shows an
- *     idle screen (located with the persona's claude_config_dir from
- *     `getPersona`), and the evidence is kept across attempts (they are a
- *     tick or more apart): once the pane has shown the same idle screen (no
- *     busy indicator, no prompt) AND the transcript has ended with a
- *     completed turn, both unchanged, at every read across reads spanning
- *     `STALE_WORKING_WINDOW_MS`, the row is stale and the adapter goes on to
- *     the reconnect below, whose own `send-keys` is the backstop: its
- *     CONFLICT "not this launch's session" latches the persona with nothing
- *     typed (b.jg5 SRJ-118, SRJ-501). A busy, changing or blank pane, an
- *     idle one whose transcript doesn't end with a completed turn or can't
- *     be located or read, or evidence not yet held for the window, defers
- *     ('transient'), as above;
- *     so does a prompt, which is never typed into, and which raises the
- *     `blocked-on-prompt` notice (once per episode) once shown across reads
- *     spanning the window. The evidence is forgotten when an attempt reads
- *     the row in another state or reads no pane, when a launch for the
- *     persona starts, and when it reconnects, becomes deliverable again or
- *     is torn down. Each deferral here, and an UNAVAILABLE or CONFIG read's
- *     below, is one more in the persona's run of deferrals on the row
- *     (`noteWorkingRowDeferral`): once the run has lasted
- *     `UNPROVEN_IDLE_NOTICE_AFTER_MS` (10 min), the `unproven-idle`
- *     not-connected notice is raised (once per episode), so a row whose
- *     idleness can never be proven is not held back from silently. The run
- *     ends when an attempt reads another state (a failed status call leaves
- *     it), when a reconnect is typed, when a launch starts and with the
- *     episode;
- *   - GONE (`ErrTmuxCaptureFailed`: agent-director found no pane of the
- *     row's launch) → there is no pane to type into: forget the evidence,
- *     fire the dead-tmux sweep (`sweepDeadTmuxChannelWithCause`, b.sv7,
- *     verdict `working-tmux-gone`) once and answer escalate-dead carrying
- *     that verdict (`escalateDeadWith`; 'transient' when the sweep was
- *     refused, b.jg5 SRJ-105: nothing is re-probed, killed or relaunched);
- *   - the row absent (`ErrSpawnNotFound`) → the same, carrying the verdict
- *     `row-absent-at-pane-read`: a row read that takes the GONE column
- *     without being a GONE (b.jg5 SRJ-117);
- *   - UNAVAILABLE (timeouts included), or CONFIG (the wrapper raised the
- *     `ad-config-malformed` outage, b.jg5 SRJ-316) → defer ('transient'),
- *     with one deferral noted on the row: a read that could not run is never
- *     proof the session is dead (b.rmy);
- *   - ENVIRONMENT (the wrapper raised the `tmux-unavailable` outage, b.jg5
- *     SRJ-311) or UNCLASSIFIED (b.jg5 SRJ-105: the wrapper reported the
- *     persona's unclassified-error episode, or the reader did after an
- *     `ErrInvalidFlags` re-check) → defer ('transient'), with no deferral
- *     noted;
- *   - CONFLICT or UNUSABLE NAME (the reader latched the persona with the row
- *     state `working`, b.jg5 SRJ-501, SRJ-512), or a persona already latched,
- *     which the reader does not read → 'transient', with no deferral noted,
- *     no notice and nothing typed (b.jg5 SRJ-502).
- *   After an escalate-dead answer restart.ts probes liveness again in the
- *   same restart run and, when the reconciled row reads dead, relaunches at
- *   once, with its checked kill first only for a verdict that is dead
- *   evidence and a re-probe of `ErrSystemInstallDisappeared`, which reads
- *   no row; a re-probe that read the row voids the verdict, so the relaunch
- *   has no kill and carries none (b.jg5 SRJ-611). The sweep may leave the row live (in
- *   `unverified_ids`, or, when `pending`, not judged, b.jg5 SRJ-120), and it
- *   may then stay live for further ticks: nothing promises that the re-probe
- *   or a later tick reads it dead. Each escalate-dead tick sweeps again, with
- *   no step beyond the sweep, and restart.ts's slow-recovery observer posts
- *   the slow-recovery notice once after 3 such ticks whose re-probe still
- *   reads the row live (b.jg5 SRJ-610, SRJ-1010). After a
- *   run the sweep makes, each configured persona's own row left in
- *   `unverified_ids` is read with one `get`, and only a `provenance_conflict`
- *   note there latches (b.jg5 SRJ-114); restart.ts asks the latch right after
- *   this verdict, before its re-probe, so a persona latched that way gets no
- *   further agent-director call (b.jg5 SRJ-502), and again before its kill.
- * The deferral therefore lasts only while agent-director reads the persona's
- * pane, or cannot answer, and gives no positive evidence that the row is
- * stale (b.f2b), and is reported once it has lasted
- * `UNPROVEN_IDLE_NOTICE_AFTER_MS`.
- *
- * b.dup — a row agent-director will not type into. agent-director refuses
- * send-keys to a row that is not interactive (`ErrSpawnNotInteractive`):
- *   - `pending` (its session has not started; SessionStart has not fired) →
- *     defer ('pending'), typing nothing (`deferPendingRow`, awaited, passed
- *     the row's raw launch start when the result showed one, b.jg5 SRJ-115):
- *     the keystrokes would be refused, and the session connects its MCP
- *     servers on its own once it starts. The deferral decides whether the
- *     row is covered (b.jg5 SRJ-409, SRJ-411): a covered row arms the
- *     persona's retry timer in pending-only mode; a retired key's old life
- *     before its new life, or a `cwd` or `config_dir` mismatch, goes through
- *     the live-row sequence, with no `/mcp reconnect` typed. The restart work hands a row its liveness
- *     probe reads `pending` to `deferPendingRow` itself, before it would
- *     call this adapter (b.jg5 SRJ-314); this branch covers a row the probe
- *     read `live` that reads `pending` by this second read. Its deferral
- *     makes no pending-row rule run and never answers gone
- *     (`mayRunRule: false`): the next retry's first probe reads the row
- *     and runs the rule there (b.jg5 SRJ-410). restart.ts
- *     treats it as it treats 'transient', and answers
- *     `RESTART_OUTCOME_PENDING_DEFERRED`, so the UNAVAILABLE retry timer
- *     knows the row read `pending`.
- *   - `ended` or `missing` — read here, or reached between this status read
- *     and the keystrokes (a findMissing sweep, such as the one another
- *     persona's launch wait starts with, marked the row missing) → the
- *     refused keystrokes make the reconnect answer 'dead-session' with cause
- *     `row-not-interactive`, which is swept with that verdict (b.jdc) and
- *     answered escalate-dead carrying it: a verdict that is never dead
- *     evidence and only routes the persona into restart.ts's decision, since
- *     a finished row (or a `pending` row whose session may be another
- *     launch's, b.jg5 SRJ-613) does not prove the worker gone (b.jg5 SRJ-609,
- *     SRJ-611). When restart.ts's re-probe reads the row dead it relaunches
- *     the persona in the same run with no kill, carrying the verdict into
- *     the ladder (b.d61); a row that still reads live is swept again at each
- *     later escalate-dead tick (b.jg5 SRJ-610). No spawn-failure notice is
- *     raised.
- *
- * b.jg5 SRJ-118, SRJ-609 — the reconnect itself (`reconnectMcpWithCause`,
- * with the row state this adapter's `status` read gave as its last read) is
- * one `send-keys`, never retried, with no tmux server start. It is the
- * backstop for every pane read above: a pane may be a single leftover's
- * (b.jg5 SRJ-117, SRJ-613), and this `send-keys` is answered by the row's
- * current launch, so on a live row that is not `pending` it answers CONFLICT
- * "not this launch's session" when a leftover holds the persona's session,
- * with nothing typed; the persona latches (b.jg5 SRJ-501). Its answer maps:
- *   - `ok` → 'success';
- *   - `dead-session` → one dead-tmux sweep (`sweepDeadTmuxChannelWithCause`)
- *     with the verdict its cause gives (`escalateDeadVerdictOfCause`):
- *     `tmux-gone` (GONE) → `dead-session`, `row-not-interactive` →
- *     `row-not-interactive`, `row-absent` (`ErrSpawnNotFound`, a row read) →
- *     `row-absent-at-pane-read`, never `tmux-gone`'s; then escalate-dead
- *     carrying that verdict ('transient' when the sweep was refused, b.jg5
- *     SRJ-105);
- *   - `transient` (the reconnect latched the persona on a CONFLICT or
- *     UNUSABLE NAME, found it latched, or met UNAVAILABLE, ENVIRONMENT,
- *     CONFIG or UNCLASSIFIED) → 'transient' with no sweep: nothing typed,
- *     nothing counted, no spawn-failure notice.
- *
- * b.jg5 SRJ-611 — every escalate-dead answer carries what proved it
- * (`ReconnectEscalateDead`, `escalateDeadWith`): the verdict it swept with,
- * the one its escalate-dead line names, or, for a prompt row whose 10-minute
- * sweep found it finished, the cause `row-read-finished` that the deferral
- * check's line names. Only the GONE-based verdicts are dead evidence:
- * `dead-session` (`tmux-gone`), `working-tmux-gone`, `waiting-row-pane-gone`
- * and `prompt-row-tmux-gone`. `row-not-interactive` (b.jg5 SRJ-609),
- * `row-absent-at-pane-read` and `row-read-finished` are a refusal and row
- * reads: they only route the persona into restart.ts's decision, which
- * relaunches after a `dead` re-probe with no kill.
- *
- * b.jg5 SRJ-115, SRJ-512, SRJ-513 — the state read applies the session manager's
- * own-row `status` step (`applyOwnRowStatusStep`) after its own call, on the
- * result whole: an UNUSABLE NAME answer, or a latch decision of the row-read
- * rule over the result (a configured persona's own row reading `pending`
- * with no launch start, b.jg5 SRJ-513), latches the persona, and the
- * adapter answers 'transient' with nothing typed and no `deferPendingRow`
- * hand-off (`reconnectLatchedByRead`). The same step ends an old-life hold
- * on `cscb_<key>` when the row reads `ended` or `missing`, or the answer is
- * `ErrSpawnNotFound`, and keeps it on any live reading, `pending` included
- * (b.jg5 SRJ-809). The `working` and `waiting`
- * rows' pane reads (`workingReconnectVerdict`, `checkWaitingRowPane`, both
- * through the shared reader) latch on an UNUSABLE NAME answer too and
- * defer, so nothing is typed after them.
- * (The lost-message row read is the liveness adapter's,
- * `_buildIsSessionAliveAdapter`, which applies the same step; not this one.)
- *
- * b.jg5 SRJ-805 — never type into a retired key's old life. Right after the
- * state read and the latched gate below, a row that reads live other than
- * `pending` (`waiting`, `working`, a prompt state, or a state CSCB does not
- * know) of a key the installed retired-key store has recorded with no "new
- * life has begun" mark (`retiredKeyReadingOf`, the session manager's one
- * reader of that store; a mark held in memory after a failed write counts as
- * set) is the old life (`ownRowOldLifeOf`): no pane is read and nothing is
- * typed; the live-row sequence is started through the session manager's
- * start entry with the retired-key flag, the conversation not kept and alert
- * context `recovery`, seeded with the state read, and the adapter answers
- * 'transient', never counted (`replaceOwnRowOldLife`). The health tick, the
- * lost-message trigger and the retry timer's full-mode rerun all reach it
- * through the restart path. With the mark set the live row is the new life
- * and is reconnected as below; a `pending` row goes to the `pending`
- * deferral, which sends an unmarked key's old life through the live-row
- * sequence under the uncovered-row rule (b.jg5 SRJ-411).
- *
- * b.jg5 SRJ-810 — never type into a held old life. The same path serves a
- * key that is not recorded whose own row `cscb_<key>` is held for an old
- * life (`isOwnRowOldLifeHeld`: a row the start sweep swept for its `cwd`
- * whose kill did not succeed), read live other than `pending`: the live-row
- * sequence is started with no retired-key flag and the adapter answers
- * 'transient'. While the old-life wait runs on that row the start answers
- * `already-running` and the persona's retry timer is armed (b.jg5 SRJ-811).
- * Any other key is unchanged. The `working` and `waiting` branches read
- * the pane, which is awaited, so the store and the hold set are asked again
- * right before `/mcp reconnect` is typed, after the latch, and a key
- * recorded or held meanwhile takes the same replacement with nothing typed.
- * The state read itself
- * clears a marked key's entry when the row reads `waiting`, `working`,
- * `ask_user` or `check_permission` (b.jg5 SRJ-807).
- *
- * b.jg5 SRJ-502 — never type into a latched persona, nor read its pane. The
- * reads above are awaited, and a launch outside the restart serializer can
- * latch the persona while they run, after the restart work's own latched
- * check. So the latch (`isLatched`, `reconnectLatchedAt`) is asked again after
- * each awaited step that a further call follows: right after the state read,
- * before any branch on the state (so no pane read, sweep or notice follows
- * it); in the `working`-row verdict, right after its `read-pane`, before the
- * fold, the sweep or a deferral; in the prompt-row verdict, right after its
- * `read-pane`, before the sweep or the deferral, and again right before
- * `deferPromptRow`'s `blocked-on-prompt` notice; in the `waiting` branch,
- * right after its `read-pane`'s GONE or absent answer, before the sweep;
- * right before each not-connected notice the `working` and `waiting` checks
- * raise (the `unproven-idle` notice a noted deferral can raise, and the
- * `blocked-on-prompt` notice), passed to them as `latchedNow`; and right
- * before `/mcp reconnect` is typed. A latched persona, or a query that throws (fail
- * safe), gets nothing more done and one line naming it, and the adapter
- * answers 'transient', which restart.ts neither counts nor escalates to a
- * kill (`RESTART_OUTCOME_RECONNECT_DEFERRED`).
- *
- * @param getPersona  The applied persona with a key (production:
- *   `getAppliedPersona`), for locating a `working` row's transcript under its
- *   claude_config_dir; without it only the row's persisted transcript path is
- *   read.
- * @param isLatched  The latched query (production: the server's latch's
- *   `isLatched`); absent, no persona is latched here.
- * @param appliedPersona  The applied-persona lookup `deferPendingRow` reads
- *   for a `pending` row (default `getAppliedPersona`, the server's applied
- *   config; a caller outside `main()` passes its own).
- * @internal
- */
+
 export function _buildReconnectSessionAdapter(
   getPersona?: (key: string) => Persona | undefined,
   isLatched?: (key: string) => boolean,
@@ -2310,10 +1904,10 @@ export function _buildReconnectSessionAdapter(
   // `key` is the persona key.
   const run: (key: string) => Promise<'success' | ReconnectEscalateDead | 'transient' | 'pending'> = async (key: string) => {
     const upgrade = await inspectPersonaUpgrade(key, getPersona?.(key) ?? appliedPersona(key))
-    if (upgrade !== 'current') { deliveryLifecycle?.defer(key); return 'transient' }
-    if (getSessionByPersona(key)?.connected === true) { deliveryLifecycle?.clearDeferred(key); return 'success' }
+    if (upgrade !== 'current') { if (!isLiveRowSequenceRunning(key)) deliveryLifecycle?.defer(key); return 'transient' }
+    if (getSessionByPersona(key)?.connected === true && !deliveryLifecycle?.reconnectInput(key)) { deliveryLifecycle?.clearDeferred(key); return 'success' }
     if (deliveryLifecycle?.owner(key) !== undefined && deliveryLifecycle.owner(key) !== 'free') { deliveryLifecycle.defer(key); return 'transient' }
-    if (deliveryLifecycle && !await deliveryLifecycle.recoverBeforeReconnect(key)) { deliveryLifecycle.defer(key); return 'transient' }
+    if (deliveryLifecycle && !await deliveryLifecycle.recoverBeforeReconnect(key)) { if (!isLiveRowSequenceRunning(key)) deliveryLifecycle.defer(key); return 'transient' }
     let state: string
     // b.jg5 SRJ-115: a `pending` row's raw launch start, for `deferPendingRow`.
     let launchStartedAt: string | undefined
@@ -2326,7 +1920,7 @@ export function _buildReconnectSessionAdapter(
       // latched the persona types nothing. b.jg5 SRJ-809: the same step ends
       // an old-life hold on cscb_<key> when the row reads `ended` or
       // `missing`; a live reading, `pending` included, keeps it.
-      if (applyOwnRowStatusStep(key, { result: st }, RECONNECT_STATUS_SITE)) return reconnectLatchedByRead(key)
+      if (applyOwnRowStatusStep(key, { result: st }, RECONNECT_STATUS_SITE)) return reconnectLatchedByRead()
       state = st.state
       launchStartedAt = pendingLaunchStartOf(st)
     } catch (err) {
@@ -2334,9 +1928,8 @@ export function _buildReconnectSessionAdapter(
       // (the own-row `status` step); nothing is typed. b.jg5 SRJ-809: the
       // same step ends an old-life hold on cscb_<key> on `ErrSpawnNotFound`
       // (no row); any other error keeps it.
-      if (applyOwnRowStatusStep(key, { thrown: err }, RECONNECT_STATUS_SITE)) return reconnectLatchedByRead(key)
+      if (applyOwnRowStatusStep(key, { thrown: err }, RECONNECT_STATUS_SITE)) return reconnectLatchedByRead()
       // b.f2b: nothing is known about the session, so nothing is typed.
-      forgetWorkingRowEvidence(key)
       console.error(reconnectStatusCheckFailedLine(key, describeAdFailureForLog(err)))
       return 'transient'
     }
@@ -2350,20 +1943,9 @@ export function _buildReconnectSessionAdapter(
     // reports 'transient'.
     const oldLife = ownRowOldLifeOf(key, state)
     if (oldLife !== undefined) return replaceOwnRowOldLife(key, state, oldLife)
-    // b.f2b: the evidence for a `working` row spans consecutive attempts that
-    // read the row `working`; any other reading ends it, and the run of
-    // deferrals on the row with it.
-    if (state !== 'working') {
-      forgetWorkingRowEvidence(key)
-      endWorkingRowDeferral(key)
-    }
-    // b.jdc: likewise the run of deferrals on a row waiting on a prompt.
     if (!PROMPT_ROW_STATES.has(state)) endPromptRowDeferral(key)
-    const workingLaunch = state === 'working' ? { launchId: deliveryLifecycle?.launchId(key) } : undefined
-    if (state === 'working') {
-      const verdict = await workingReconnectVerdict(key, getPersona, latchedNow, options.noNotice)
-      if (verdict !== 'reconnect') return verdict
-    } else if (PROMPT_ROW_STATES.has(state)) {
+    if (state === 'working' && isLaunchInFlight(key)) return 'transient'
+    if (PROMPT_ROW_STATES.has(state)) {
       return promptRowReconnectVerdict(key, state, latchedNow, options.noNotice)
     } else if (state === 'pending') {
       // A deliberate deviation from b.jg5 SRJ-410 ("at each retry"): no
@@ -2373,16 +1955,6 @@ export function _buildReconnectSessionAdapter(
       // rule running at the next retry, whose first probe reads the row.
       await deferPendingRow(key, launchStartedAt, appliedPersona, { mayRunRule: false })
       return 'pending'
-    } else if (state === 'waiting') {
-      const check = await checkWaitingRowPane(key, latchedNow, options)
-      // b.f2b: its pane shows a running turn or a prompt, or the read latched
-      // the persona, met ENVIRONMENT, or carried the stop mark of a version
-      // re-check that decided the server stops (b.jg5 SRJ-205); logged
-      // there. Nothing is typed.
-      if (check === 'defer') return 'transient'
-      // b.jg5 SRJ-604, SRJ-117: GONE, or the row absent: nothing is typed.
-      if (check === WAITING_ROW_PANE_GONE) return escalateRowWithNoPane(key, ESCALATE_DEAD_WAITING_ROW_PANE_GONE, latchedNow)
-      if (check === WAITING_ROW_PANE_ABSENT) return escalateRowWithNoPane(key, ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ, latchedNow)
     }
     // Widened return type (SR-25.1 single counting site): surface the
     // ReconnectOutcome to restart.ts so it can call recordSuccess on the
@@ -2434,8 +2006,8 @@ export function _buildReconnectSessionAdapter(
     const oldLifeNow = ownRowOldLifeOf(key, state)
     if (oldLifeNow !== undefined) return replaceOwnRowOldLife(key, state, oldLifeNow)
     // b.jg5 SRJ-118, SRJ-501: the reconnect's last read is this adapter's
-    // `status` read (`waiting`, or a stale `working` row).
-    const result = await reconnectMcpWithCause(key, latchRowStateRead(state), undefined, { workingChecked: workingLaunch })
+    // `status` read; the fresh waiting row still decides before keys.
+    const result = await reconnectMcpWithCause(key, latchRowStateRead(state))
     if (result.outcome === 'ok') return 'success'
     if (result.outcome === 'dead-session') {
       // b.sv7: trigger the internal memoized findMissing sweep (b.m4r) before
@@ -2469,12 +2041,10 @@ export function _buildReconnectSessionAdapter(
     return 'transient'
   }
   return async key => {
-    // Pause prior screen-only time; only this run's real screen finding
-    // resumes it. Failed reads and other guards never count as screen time.
     if (deliveryLifecycle?.deferred(key)) deliveryLifecycle.defer(key)
     const result = await run(key)
     if (result === 'transient' || result === 'pending') {
-      if (!deliveryLifecycle?.deferred(key)) deliveryLifecycle?.defer(key)
+      if (!isLiveRowSequenceRunning(key) && !deliveryLifecycle?.deferred(key)) deliveryLifecycle?.defer(key)
     } else deliveryLifecycle?.clearDeferred(key)
     return result
   }
@@ -2538,8 +2108,6 @@ function ownRowOldLifeOf(key: string, state: string): OwnRowOldLife | undefined 
  * persona (SRJ-706). Never throws.
  */
 function replaceOwnRowOldLife(key: string, state: string, why: OwnRowOldLife): 'transient' {
-  forgetWorkingRowEvidence(key)
-  endWorkingRowDeferral(key)
   endPromptRowDeferral(key)
   const startAnswer = startLiveRowSequence({
     key,
@@ -2599,13 +2167,12 @@ export function reconnectHeldOwnRowLine(key: string, state: string, startAnswer:
 
 /**
  * The reconnect adapter's answer for a state read that latched the persona
- * (b.jg5 SRJ-115, SRJ-502, SRJ-512): its `working`-row evidence is
- * forgotten, nothing is typed (the step logged the one line), and the
+ * (b.jg5 SRJ-115, SRJ-502, SRJ-512): nothing is typed (the step logged
+ * the one line), and the
  * adapter answers 'transient', which restart.ts neither counts nor escalates
  * to a kill.
  */
-function reconnectLatchedByRead(key: string): 'transient' {
-  forgetWorkingRowEvidence(key)
+function reconnectLatchedByRead(): 'transient' {
   return 'transient'
 }
 
@@ -2772,7 +2339,7 @@ async function promptRowReconnectVerdict(
   if (latchedNow()) return 'transient'
   switch (read.kind) {
     case PANE_READ_PANE:
-      return promptRowDeferral(key, state, latchedNow, noNotice, true)
+      return promptRowDeferral(key, state, latchedNow, noNotice)
     case PANE_READ_GONE:
       endPromptRowDeferral(key)
       console.error(promptRowPaneGoneLine(key, state, read))
@@ -2811,7 +2378,6 @@ async function promptRowDeferral(
   state: string,
   latchedNow: () => boolean,
   noNotice = false,
-  paneRead = false,
 ): Promise<ReconnectEscalateDead | 'transient'> {
   const deferral = await checkPromptRowDeferral(key, state)
   if (deferral === 'escalate') return escalateDeadWith(DEAD_SESSION_CAUSE_ROW_READ_FINISHED)
@@ -2822,8 +2388,7 @@ async function promptRowDeferral(
   // awaited (the gate logs its line): no notice.
   if (latchedNow()) return 'transient'
   // b.omv SR-5.5: a failed read preserves prompt-row liveness retries,
-  // but only a prompt row with a readable pane starts screen-block time.
-  deliveryLifecycle?.defer(key, paneRead ? 'menu' : undefined)
+  deliveryLifecycle?.defer(key)
   return deferPromptRow(key, state, noNotice)
 }
 
@@ -2898,19 +2463,7 @@ export function promptRowLatchedLine(key: string, state: string): string {
   return `[slack] reconnectSession: persona=${key} is ${state} and is latched — deferring; no deferral noted, no notice, nothing typed (b.jg5 SRJ-502)`
 }
 
-/**
- * b.f2b: the reconnect adapter's verdict for a persona whose row reads
- * `ask_user` or `check_permission` and whose session is not known to be gone
- * (see `promptRowReconnectVerdict`):
- * `/mcp reconnect` + Enter could confirm the dialog's default, so nothing is
- * typed. Logs the deferral, raises the `blocked-on-prompt` not-connected
- * notice (once per episode) and returns 'transient'. The notice says that,
- * once the prompt is answered, CSCB reconnects the persona when it can tell
- * the session is idle again: the restart path runs only with auto-restart on
- * (`scheduleRestart` arms nothing while `session_restart_delay` is 0), and
- * its later attempts reconnect a `waiting` row, or a `working` row the
- * positive-idle rule shows stale.
- */
+
 function deferPromptRow(key: string, state: string, noNotice = false): 'transient' {
   console.error(
     `[slack] reconnectSession: persona=${key} is ${state} — its session waits on a prompt or dialog; not typing /mcp reconnect into it, deferring to a later tick (b.f2b/b.rmy)`,
@@ -2951,71 +2504,7 @@ export function deferringPendingRowLine(key: string, launchStartedAt?: string): 
   return `[slack] Deferring persona=${key}: its row reads pending${launch} — its session has not started (SessionStart has not fired) and agent-director refuses send-keys until it does; no reconnect typed, nothing counted; the restart path defers the pending row to the pending-row step, whose own lines say what follows (b.dup; b.jg5 SRJ-409)`
 }
 
-/**
- * The `pending` deferral for persona `key` (b.dup; b.jg5 SRJ-314, SRJ-409,
- * SRJ-411): its row reads `pending`, so its session has not started.
- * agent-director would refuse keystrokes to it (`ErrSpawnNotInteractive`,
- * which the reconnect answers as `dead-session` with cause
- * `row-not-interactive`, a route into the restart path's decision only,
- * b.jg5 SRJ-609), and the session connects its MCP servers on its own once
- * it starts. Two callers reach it, both inside the restart work's recovery
- * attempt and awaiting it: the restart work, through
- * `RestartDeps.deferPendingRow` (bound in `main()`), when its liveness probe
- * or b.d61's re-probe reads `pending`, whatever the session's connection
- * shows; and the reconnect adapter, when its own `status` read finds the
- * row `pending` (see `_buildReconnectSessionAdapter`). `launchStartedAt` is
- * the row's launch start as that `status` result showed it (raw, never
- * parsed or aged here; b.jg5 SRJ-115, SRJ-406), absent when it showed none.
- *
- * It logs the deferral (`deferringPendingRowLine`), naming the launch start
- * when one was read and it passes `LAUNCH_START_LOG_RE` (anything else is
- * left out of the line; the value itself stays as carried), then, for the
- * applied persona with this
- * key, runs the session manager's read-and-step entry
- * (`readAndStepPendingRow`): one `get` of its own row through the shared
- * own-row read, whose row supersedes the `status` read's, and the one
- * pending-row step:
- *   - covered, or undecided (a directory that cannot be resolved now): the
- *     persona's retry timer is armed in pending-only mode (the controller's
- *     armed line, cause `pending-row`); nothing typed, killed or launched;
- *   - not covered (an unmarked retired key's old life, before its new life
- *     has begun, b.jg5 SRJ-805; or a `cwd` or `config_dir` mismatch): one
- *     start of the live-row sequence, with the conversation
- *     not kept and alert context `recovery`; nothing typed and no approver;
- *   - latched by the read (a provenance note, or the persona's own row with
- *     no launch start, b.jg5 SRJ-513): nothing more; the latch's gates stop
- *     later work;
- *   - another state, no row, or a refused read: one line saying so; the
- *     next run decides again.
- * At a retry of the persona's retry timer only (`isInsideTimerRetry`; b.jg5
- * SRJ-410, rulings: the rule runs there and nowhere else, and a read-and-step
- * `get` reading `ended` counts as gone in a full-mode retry), and unless
- * `options.mayRunRule` is false:
- *   - covered: the pending-row rule's one run of that retry on the row the
- *     `get` read (`runPendingRowRuleAtRetry`); a row it reads `ended`,
- *     `missing` or gone answers gone, anything else 'pending', the abort of
- *     CSCB's own stuck launch included (b.jg5 SRJ-412: its live-row
- *     sequence started, or the abort kept the row), which the restart work
- *     answers as its `pending` deferral;
- *   - `ended`, `missing` or no row from the step's own `get`: gone.
- * A gone answer (the `DeadRowRead`) lets the restart work go
- * on to its dead branch in the same run, with no kill for a row read
- * finished and never a launch over `pending`. Reached from any other origin
- * (the start pass, a restart timer, a human-triggered restart, the
- * lost-message trigger), the deferral only arms, as before.
- * A persona that is not applied reads nothing more; `appliedPersona` is the
- * applied-persona lookup that decides it (default `getAppliedPersona`, the
- * server's applied config; a caller outside `main()` passes its own).
- * Otherwise answers 'pending' whatever the step did, a deferral like
- * 'transient': nothing is counted and no notice is raised (a launch whose
- * session never leaves `pending` gets the pending-row rule's stuck-launch
- * post at B, its only post about the launch, b.jg5 SRJ-405). A step that
- * throws is logged and changes nothing about the answer.
- *
- * Exported for tests.
- *
- * @internal
- */
+
 export async function deferPendingRow(
   key: string,
   launchStartedAt?: string,
@@ -3147,146 +2636,7 @@ function deferralGone(key: string, gone: DeadRowRead): DeferPendingRowAnswer {
   return gone
 }
 
-/**
- * `workingReconnectVerdict`'s line when the `working` row's `read-pane`
- * answered GONE (b.d61, b.jg5 SRJ-603); `read` is that failure. Exported for
- * tests.
- *
- * @internal
- */
-export function workingRowPaneGoneLine(key: string, read: PaneReadFailure): string {
-  return `[slack] reconnectSession: persona=${key} is working but agent-director's read-pane found no pane of its launch: ${read.description} — not deferring; ${ESCALATE_DEAD_REPROBE_DECIDES} (${paneReadClassNote(read)}; b.d61, b.jg5 SRJ-603)`
-}
 
-/**
- * `workingReconnectVerdict`'s line when the `working` row was absent
- * (`ErrSpawnNotFound`) at its `read-pane` (b.jg5 SRJ-117); `read` is that
- * failure. Exported for tests.
- *
- * @internal
- */
-export function workingRowAbsentAtPaneReadLine(key: string, read: PaneReadFailure): string {
-  return `[slack] reconnectSession: persona=${key} is working but its agent-director row was absent at the pane read: ${read.description} — not deferring; ${ESCALATE_DEAD_REPROBE_DECIDES} (${paneReadClassNote(read)}; b.jg5 SRJ-117)`
-}
-
-/** The site label of the `working`-row verdict's read, the head of the shared reader's latch line. */
-const WORKING_ROW_PANE_READ_SITE = 'reconnectSession'
-
-/**
- * b.d61, b.jg5 SRJ-603: the reconnect adapter's verdict for a persona whose
- * AD row reads `working` (see `_buildReconnectSessionAdapter`). A launch for
- * it in flight defers first ('transient'), with no agent-director call. Then
- * one `read-pane` of its own row through the shared reader
- * (`readPersonaOwnPane`: `FULL_PANE_READ_LINES`, the row state `working`),
- * with no tmux probe, answered by b.jg5 SRJ-117's working-row column:
- *   - a pane → the positive-idle rule decides on it (b.f2b,
- *     `checkWorkingRowPane`, the transcript located with the persona
- *     `getPersona` returns): 'reconnect' once the row is shown stale, and the
- *     adapter goes on to type `/mcp reconnect`; otherwise 'transient'. The
- *     pane may be a single leftover's (b.jg5 SRJ-117, SRJ-613), so it is no
- *     proof that the worker's own session is there. The backstop is the
- *     reconnect's `send-keys` (`reconnectMcpWithCause`, with the row state
- *     `working`): on a live row that is not `pending` it answers CONFLICT
- *     "not this launch's session" when a leftover holds the persona's
- *     session, and then nothing is typed, P latches (b.jg5 SRJ-501) with its
- *     CONFLICT notice posted once, the refused `send-keys` is never retried
- *     (SRJ-118) and the adapter answers 'transient';
- *   - GONE → the sweep with the verdict `working-tmux-gone`
- *     (`escalateRowWithNoPane`) and an escalate-dead answer carrying that
- *     verdict (`escalateDeadWith`);
- *   - the row absent (`ErrSpawnNotFound`) → the same, carrying the verdict
- *     `row-absent-at-pane-read`;
- *   - UNAVAILABLE (timeouts included) or CONFIG → 'transient', with one
- *     deferral noted on the row (`noteWorkingRowDeferral`);
- *   - ENVIRONMENT or UNCLASSIFIED → 'transient', with no deferral noted (the
- *     wrapper raised the outage or reported the episode, b.jg5 SRJ-105); an
- *     UNCLASSIFIED carrying the stop mark (`stopping`: the reader's
- *     `ErrInvalidFlags` re-check decided that the server stops, b.jg5
- *     SRJ-205) logs its own line, and nothing more is called for it;
- *   - CONFLICT or UNUSABLE NAME (the reader latched the persona and logged
- *     its line), or a persona already latched → 'transient', with no
- *     deferral noted and no notice.
- * Every answer but a pane forgets the persona's working-row evidence. A
- * refused sweep (b.jg5 SRJ-105) answers 'transient' instead of
- * escalate-dead. A persona latched by the time the read answers
- * (`latchedNow`, the adapter's `reconnectLatchedAt` for the persona; b.jg5
- * SRJ-502) gets no fold, sweep, deferral or notice: 'transient'; the check
- * on a pane asks `latchedNow` again right before each notice it can raise.
- * Never throws: the reader, `sweepDeadTmuxChannelWithCause` and
- * `checkWorkingRowPane` swallow their own failures.
- */
-async function workingReconnectVerdict(
-  key: string,
-  getPersona: ((key: string) => Persona | undefined) | undefined,
-  latchedNow: () => boolean,
-  noNotice = false,
-): Promise<ReconnectEscalateDead | 'transient' | 'reconnect'> {
-  if (isLaunchInFlight(key)) {
-    console.error(`[slack] reconnectSession: persona=${key} is working and a launch for it is in flight — deferring /mcp reconnect to a later tick (b.d61)`)
-    return 'transient'
-  }
-  const read = await readPersonaOwnPane(key, {
-    nLines: FULL_PANE_READ_LINES,
-    // The adapter has just read the row `working`.
-    lastRead: latchRowStateRead('working'),
-    site: WORKING_ROW_PANE_READ_SITE,
-  })
-  if (read.kind === PANE_READ_LATCHED) {
-    forgetWorkingRowEvidence(key)
-    console.error(
-      `[slack] reconnectSession: persona=${key} is working and is latched — deferring; no deferral noted, nothing typed (b.jg5 SRJ-502)`,
-    )
-    return 'transient'
-  }
-  // b.jg5 SRJ-205: the reader's version re-check decided that the server
-  // stops → nothing more is called for the persona.
-  if (read.kind === PANE_READ_UNCLASSIFIED && read.stopping === true) {
-    forgetWorkingRowEvidence(key)
-    console.error(
-      `[slack] reconnectSession: persona=${key} is working and reading its pane failed: ${read.description} — the agent-director version re-check decided that the server stops; not typing /mcp reconnect, nothing more is called for it (${paneReadClassNote(read)}; b.jg5 SRJ-204, SRJ-205)`,
-    )
-    return 'transient'
-  }
-  // b.jg5 SRJ-502: latched elsewhere while the read was awaited → no fold,
-  // sweep, deferral or notice.
-  if (latchedNow()) {
-    forgetWorkingRowEvidence(key)
-    return 'transient'
-  }
-  switch (read.kind) {
-    case PANE_READ_PANE:
-      if (classifyWorkingPane(read.pane) === 'prompt') deliveryLifecycle?.defer(key, 'menu')
-      // b.f2b: the fold on this pane (and the transcript, for an idle one),
-      // kept across attempts; `checkWorkingRowPane` logs what it found (a
-      // running turn logs the b.9a7 deferral line).
-      return (await checkWorkingRowPane(key, read.pane, { persona: getPersona?.(key), latchedNow, noNotice })) === 'reconnect'
-        ? 'reconnect'
-        : 'transient'
-    case PANE_READ_GONE:
-      console.error(workingRowPaneGoneLine(key, read))
-      return escalateRowWithNoPane(key, 'working-tmux-gone', latchedNow)
-    case PANE_READ_ABSENT:
-      console.error(workingRowAbsentAtPaneReadLine(key, read))
-      return escalateRowWithNoPane(key, ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ, latchedNow)
-    case PANE_READ_UNAVAILABLE:
-    case PANE_READ_CONFIG:
-      forgetWorkingRowEvidence(key)
-      console.error(
-        `[slack] reconnectSession: persona=${key} is working and reading its pane failed: ${read.description} — no idle evidence, and no proof the session is gone; deferring /mcp reconnect to a later tick (${paneReadClassNote(read)}; b.jg5 SRJ-603, b.rmy)`,
-      )
-      // b.f2b: held back from the row once more; a long run is reported. The
-      // restart path runs only with auto-restart on.
-      if (!noNotice) noteWorkingRowDeferral(key, false)
-      return 'transient'
-    case PANE_READ_ENVIRONMENT:
-    case PANE_READ_UNCLASSIFIED:
-      forgetWorkingRowEvidence(key)
-      console.error(
-        `[slack] reconnectSession: persona=${key} is working and reading its pane failed: ${read.description} — deferring /mcp reconnect to a later tick; no deferral noted (${paneReadClassNote(read)}; b.jg5 SRJ-105, SRJ-117)`,
-      )
-      return 'transient'
-  }
-}
 
 /**
  * The reconnect adapter's answer for a `working`, `waiting`, `ask_user` or
@@ -3309,7 +2659,6 @@ async function escalateRowWithNoPane(
   verdict: EscalateDeadVerdict,
   latchedNow: () => boolean,
 ): Promise<ReconnectEscalateDead | 'transient'> {
-  forgetWorkingRowEvidence(key)
   if (latchedNow()) return 'transient'
   const sweep = await sweepDeadTmuxChannelWithCause(key, verdict)
   return sweep.refused ? 'transient' : escalateDeadWith(verdict)
@@ -3526,10 +2875,7 @@ export async function main(): Promise<void> {
     // b.jg5 SRJ-809: apply step 1 begins its old-life holds in the one hold
     // set, once the last-applied rewrite has succeeded.
     oldLifeHolds,
-    // b.jg5 SRJ-808, SRJ-404: apply step 1 stops the dialog approver of each
-    // key it records, right after the record and before the last-applied
-    // rewrite and the teardown's kill; no pending-row rule run follows.
-    stopApprover: async (key) => { const stopping = deliveryEngines?.forget(key); deliveryLifecycle?.forget(key); await stopDialogApprover(key, APPROVER_STOP_RETIRED_KEY); await stopping },
+    stopDelivery: async (key) => { const stopping = deliveryEngines?.forget(key); deliveryLifecycle?.forget(key); await stopping },
     // b.av2 SR-8.6 as amended by b.jg5 SRJ-1511, beside b.deo SRI-406,
     // SRI-408 and SRI-502: a confirmed apply's step 1 writes the unwritten
     // drops of a key it brings up, drops the retired keys' stored choices and
@@ -3984,42 +3330,6 @@ export async function main(): Promise<void> {
     log: (line) => console.error(line),
   })
 
-  // b.jg5 SRJ-301, SRJ-303, SRJ-305: one UNAVAILABLE retry controller, on the
-  // system clock, installed below as the outage state's trigger sink before
-  // the start pass (whose launches are the first attempts that can arm it).
-  // A full-mode retry reruns the restart path's decision through the restart
-  // module's retry entry, and so through the one per-persona serializer
-  // initRestart gets; a pending-only retry reads the persona's row with the
-  // session manager's row read. Either stops on shutdown, a persona no longer
-  // applied, latched, held on ErrInvalidFlags, not up (the relaunch gate) or
-  // at the restart cap. The gate is built further down and
-  // initRestart runs later still: no statement in between awaits, and no
-  // retry falls due before 30 s. Dry run arms nothing, since it makes no
-  // agent-director call. b.jg5 SRJ-310: a retry that finds the persona's row
-  // live out of `pending` with its session connected with its stream ends
-  // its tmux-unresponsive condition (built just below; no retry runs before
-  // it exists). b.jg5 SRJ-308: every retry, one skipped for work in flight
-  // included, is the condition's onset check with the health check off.
-  // b.jg5 SRJ-309: every stop of a persona's timer, whatever its reason (a
-  // teardown and shutdown included), cancels the condition's alert check
-  // not yet posted while it holds, since the alert says CSCB keeps retrying;
-  // b.jg5 SRJ-305, SRJ-308: the same call holds the condition's onset back
-  // until a later refusal (never again after a terminal stop).
-  // b.jg5 SRJ-311, SRJ-312: the same healthy-row observation (a live row out
-  // of `pending`, connected with its stream) also clears the persona's
-  // `tmux-unavailable` outage, with that reading, which the cleared-flag
-  // observer below passes on to the timer's condition-end entry.
-  // b.jg5 SRJ-313: the same stop observer then tells the unclassified-error
-  // episodes, which end the persona's episode only when the stop's reason is
-  // that a retry found nothing left to recover, that a pending-only retry
-  // read the row live out of `pending` or ended or gone, or that the
-  // `tmux-unavailable` condition cleared or the `tmux-unresponsive`
-  // condition ended. Each consumer is isolated, so one that throws does not
-  // skip the other.
-  // b.jg5 SRJ-303, SRJ-305, SRJ-404: the retry action's gate before any call
-  // (applied, latched, held on ErrInvalidFlags, up, the cap, shutdown), one
-  // object for the retry action and the pending-row rule's run at a dialog
-  // approver's stop, so that run is gated as a retry's is.
   const retryRunGate: RetryRunGateDeps = {
     appliedPersona: getAppliedPersona,
     canRelaunch: (key) => canRelaunch(key),
@@ -4051,9 +3361,6 @@ export async function main(): Promise<void> {
     action: createFullModeRetryAction({
       retry: runRestartRetry,
       ...retryRunGate,
-      // b.jg5 SRJ-303: only work that blocks a retry skips it; a running
-      // dialog approver alone never does (SRJ-401). The skip's again-reason
-      // and the restart retry's skip line name what blocks it.
       isInFlight: isPersonaRetryBlocked,
       retryBlockCause: personaRetryBlockCause,
       readRow: readPersonaRowState,
@@ -4062,28 +3369,11 @@ export async function main(): Promise<void> {
         tmuxUnresponsive.end(key, TMUX_UNRESPONSIVE_END_RETRY, reading)
         clearOutageFlag(key, 'tmux-unavailable', reading)
       },
-      // b.jg5 SRJ-409, SRJ-411: a pending-only retry whose row read shows
-      // `pending` reads the applied persona's row once more with `get` and
-      // decides whether it is covered: a covered or undecided row is armed
-      // pending-only and kept; one that is not covered goes through the
-      // live-row sequence, with no launch or approver of the retry's own.
       stepPendingRow: (key) => retryPendingRowStep(key, getAppliedPersona(key)),
     }),
   })
   unavailableRetry = retryTimers
 
-  // b.jg5 SRJ-705, SRJ-706: the one live-row sequence registry, on the system
-  // clock, its sequences composed by the session manager's one builder over
-  // the kill-failure alerts installed above (the builder's default), the
-  // retry controller's arm and the applied configuration read at each call;
-  // each sequence runs in its own recovery
-  // attempt for its persona, detached from its starter's. Installed in the
-  // session manager before the start pass and before any path that can start
-  // a sequence; the latch installed above gets its set observer here, so a
-  // latch of a persona stops its sequence. Its running query is in "blocks a
-  // retry" (and so in "in flight for P"), the lost-message routing's
-  // sequence/wait member and the restart work's gate; a teardown stops a
-  // persona's sequence right after its approver, and shutdown() closes it.
   const sequences = createLiveRowSequenceRegistry({
     deps: buildLiveRowSequenceDeps({
       retryArm: retryTimers,
@@ -4098,14 +3388,6 @@ export async function main(): Promise<void> {
   liveRowSequences = sequences
   setLiveRowSequenceRegistry(sequences)
 
-  // b.jg5 SRJ-410, SRJ-404: the one pending-row rule, built through its
-  // factory over the session manager's one dependency builder (the notice
-  // episodes above for its held post) and installed beside the sequence
-  // registry, before the start pass. It runs only at a retry of a persona's
-  // timer (the pending-only step, the restart path's deferral, the ladder's
-  // `pending` step) and once at a dialog approver's stop, which takes the
-  // persona's turn in the lifecycle serializer and is dropped when the retry
-  // action's gate would stop a retry then; every other origin only arms.
   setPendingRowRule({
     rule: createPendingRowRule(
       buildPendingRowRuleDeps({
@@ -4238,14 +3520,12 @@ export async function main(): Promise<void> {
     stuckAfterMs: testTimers.deliveryStuckAfterMs,
     log: line => console.error(line),
     notify: (key, text) => personaNotifier.notify(key, text),
-    reconnectBlocked: (key, rule) => { notifyPersonaNotConnected(key, { reason: 'reconnect-blocked', rule }) },
     delivered: createDeliveryAckCallback({ getReaction: () => getReplySettings().ack_reaction, clientFor }),
   })
   for (const event of bufferedQueueEvents.splice(0)) deliveryReporting.queueEvent(event)
   deliveryReporting.startupFindings(deliveryQueue!.startupFindings())
   deliveryLifecycle = createDeliveryLifecycle({
     startId: randomBytes(16).toString('hex'), parseLaunchStart,
-    onReconnectScreen: (key, reason, blockedMs) => deliveryEngineEvents.emit({ type: 'reconnect-screen', key, reason, blockedMs }),
     onError: error => console.error(`[slack] deferred reconnect failed: ${describeThrownValue(error)}`),
   })
   setDeliveryLifecycle(deliveryLifecycle)
@@ -4260,7 +3540,7 @@ export async function main(): Promise<void> {
     persona: key => { const p = getAppliedPersona(key); return p ? { cwd: p.working_directory, configDir: resolveClaudeConfigDir(p.claude_config_dir) } : undefined },
     isUp: key => !shuttingDown && isPersonaUp(key),
     isLatched: key => conflictLatch.isLatched(key),
-    isHeld: key => invalidFlagsHold.isHeld(key) || personaKillFailureAlerts?.isOpen(key) === true || waitsOnKillFailedHold(key) || isOwnRowOldLifeHeld(key),
+    isHeld: key => invalidFlagsHold.isHeld(key) || personaKillFailureAlerts?.isOpen(key) === true || waitsOnKillFailedHold(key) || isOwnRowOldLifeHeld(key) || isLiveRowSequenceRunning(key),
     isConnected: key => getSessionByPersona(key)?.connected === true,
     // The engine can notice a newly accepted head while its Slack handler
     // is still acknowledging it. Only post-ack intake/recovery may start
@@ -4271,6 +3551,14 @@ export async function main(): Promise<void> {
     onKeyError: handleDeliveryKeyError,
     onReadError: handleDeliveryReadError,
     isRestartPendingOrActive, scheduleRestart,
+    recoverGone: recoverDeliveryGone,
+    recoverAbsent: (key, launch) => {
+      if (deliveryLifecycle?.launchId(key) !== launch) return false
+      const result = retryTimers.runNow(key, { kind: 'delivery-row-absent' }, 'delivery-row-absent')
+      // An already running retry may stop on a row read from before the
+      // absence. Keep the engine's GONE evidence unless a new pass started.
+      return result === UNAVAILABLE_RETRY_RUN_NOW_RAN || result === UNAVAILABLE_RETRY_RUN_NOW_ARMED
+    },
     onEvent: event => deliveryEngineEvents.emit(event),
     onError: (key, error) => console.error(`[slack] delivery persona=${key}: ${describeThrownValue(error)}`),
     reconnect: (key, client, beforeCall) => deliveryScope.run(key, client as Client, beforeCall, async () => {
@@ -4355,18 +3643,6 @@ export async function main(): Promise<void> {
   // launches it.
   setConfigDirUnresolvableHook(personaBringUps.holdForConfigDir)
 
-  // b.av2 SR-6.5 / SR-6.1 / SR-8.6 / SR-6.6 / SR-6.4: the apply's persona
-  // teardown, in-place update, credentials change and bring-up (recovery
-  // included), each through the per-persona serializer, and its template
-  // refresh. The teardown (b.jg5 SRJ-715, SRJ-1507) stops the key's
-  // approver, live-row sequence and retry timer first, kills its row with
-  // the bounded retry and keeps the row: nothing here deletes one. b.jg5
-  // SRJ-1003: the one notifier also carries the teardown's window: its submit
-  // mutes the key's notice episodes, and from the start of its turn until it
-  // completes every notice for the key, a CONFLICT or UNUSABLE NAME its kill
-  // meets included, is written to the server log and startup-errors.log,
-  // never posted. This supplies only the production dependencies; the
-  // operations live in persona-lifecycle.ts.
   personaLifecycleOps = createPersonaLifecycle({
     serialize: personaLifecycle.run,
     bringUps: personaBringUps,
@@ -4380,12 +3656,7 @@ export async function main(): Promise<void> {
     isShuttingDown: () => shuttingDown,
     log: (line) => console.error(line),
     whenLaunchSettled,
-    // b.jg5 SRJ-404, SRJ-715: a teardown stops the key's dialog approver
-    // first, and the one its launch in flight would start.
-    stopApprover: async (key) => { const stopping = deliveryEngines?.forget(key); deliveryLifecycle?.forget(key); await stopDialogApprover(key, APPROVER_STOP_TEARDOWN); await stopping },
-    // b.jg5 SRJ-706, SRJ-715: right after the approver, the key's live-row
-    // sequence, before the wait for its launch in flight; the teardown waits
-    // for the sequence's call in flight to return.
+    stopDelivery: async (key) => { const stopping = deliveryEngines?.forget(key); deliveryLifecycle?.forget(key); await stopping },
     stopLiveRowSequence: (key) => stopLiveRowSequence(key, LIVE_ROW_STOP_TEARDOWN),
     // b.f2b: a teardown cancels a launch's wait for a `working` row rather
     // than wait it out (up to 10 min).
@@ -4678,7 +3949,6 @@ export async function main(): Promise<void> {
       return session?.connected === true
     },
     // b.f2b: the persona locates a `working` row's transcript (its
-    // claude_config_dir) for the positive-idle rule.
     reconnectSession: _buildReconnectSessionAdapter(getAppliedPersona, (key) => conflictLatch.isLatched(key)),
     killSession: _buildKillSessionAdapter(getAppliedPersona, KILL_RETRY_SYSTEM_CLOCK),
     launchSession: async (key, _cwd, _sessionId, deadEvidence) => {
@@ -4872,10 +4142,6 @@ export async function main(): Promise<void> {
       return session?.connected === true
     },
     isRestartPendingOrActive,
-    // b.f2b, b.jg5 SRJ-315: "in flight for P", a running dialog approver
-    // included (SRJ-401). Work in flight owns the session (a start launch
-    // may still be waiting in the background for a `working` row), so the
-    // tick still reads the persona but makes no attempt for it.
     isLaunchInFlight: isPersonaWorkInFlight,
     // b.jg5 SRJ-315, SRJ-502: a latched persona is still read, but the tick
     // makes no attempt for it.
@@ -4914,10 +4180,6 @@ export async function main(): Promise<void> {
     // (the one the first refusal's time comes from).
     now: () => noticeEpisodes.clock.now(),
     onTickEnd: (tickStartedAt) => tmuxUnresponsive.onsetAtTick(tickStartedAt),
-    // b.f2b: while the reconnect adapter holds an idle run for a persona's
-    // `working` row, the next attempt (which can find the row stale and
-    // reconnect it) is scheduled on the first undeliverable tick.
-    hasPendingWorkingRowEvidence,
     isAtCap: (key) => backoffIsAtCap(key, RESTART_FAILURE_CAP),
     statRoute: _buildStatRouteImpl(),
     scheduleRestart,

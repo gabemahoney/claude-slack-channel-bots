@@ -1,6 +1,6 @@
 import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
-import { IDLE_PANE } from './test-helpers/working-row-panes.ts'
 import { useImmediateTypingLifecycle } from './test-helpers/legacy-typing.ts'
+import { IDLE_PANE } from './test-helpers/working-row-panes.ts'
 useImmediateTypingLifecycle()
 /**
  * persona-connections.test.ts — persona credentials file and bring-up
@@ -132,18 +132,20 @@ useImmediateTypingLifecycle()
  * SPDX-License-Identifier: MIT
  */
 
+import { LogLevel, type Logger } from '@slack/socket-mode'
+import type { WebClientOptions } from '@slack/web-api'
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import {
   chmodSync,
-  constants as fsConstants,
   existsSync,
+  constants as fsConstants,
   lstatSync,
   mkdirSync,
   mkdtempSync,
-  readdirSync,
   readFileSync,
+  readdirSync,
   readlinkSync,
   realpathSync,
   rmSync,
@@ -153,19 +155,42 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
-import { LogLevel, type Logger } from '@slack/socket-mode'
-import type { WebClientOptions } from '@slack/web-api'
+import { getClient } from '../src/agent-director-client.ts'
+import { AgentDirectorError, ErrSpawnCapReached, ErrSpawnNotFound } from '../src/agent-director-errors.ts'
+import { _resetBackoffState, getFailureCount } from '../src/backoff.ts'
+import { resolveRealPath, type Persona } from '../src/config.ts'
+import { _resetOutageState, getOutageFlags, initOutageState } from '../src/outage-state.ts'
 import {
-  CREDENTIALS_MISSING_MARKER,
-  CREDENTIALS_UNREADABLE_MARKER,
-  DEFAULT_CREDENTIALS_FS,
-  PersonaSlackTokens,
-  checkPersonaCredentials,
-  checkPersonaCredentialsAndDigest,
-  credentialsDigest,
-  readCredentialsFile,
-  type CredentialsFs,
-} from '../src/persona-credentials.ts'
+  createNotUpSessionDropper,
+  createPersonaBringUpController,
+  describePersonaNotUp,
+  type CredentialsSwap,
+  type PersonaBringUpController,
+  type PersonaBringUpControllerDeps,
+  type PersonaBringUpResultSummary,
+  type PersonaBringUpState,
+  type PersonaCredentialsChangeResult,
+} from '../src/persona-bringup-controller.ts'
+import {
+  DEFAULT_WORKING_DIRECTORY_FS,
+  checkPersonaConfigDir,
+  checkPersonaLocalBringUp,
+  checkPersonaWorkingDirectory,
+  type BringUpPersona,
+  type OtherBringUpPersona,
+  type PersonaBringUpFs,
+  type WorkingDirectoryFs,
+} from '../src/persona-bringup.ts'
+import {
+  MAX_LOGGED_MESSAGE_LENGTH,
+  createUnhandledRejectionHandler,
+  describeLogMessage,
+  describeSlackCallFailure,
+  describeThrownValue,
+  describeThrownValueWithoutStack,
+  isSafeIdentifier,
+  slackPlatformReason,
+} from '../src/persona-connection-errors.ts'
 import {
   createPersonaConnectionManager,
   dryRunPersonaIdentity,
@@ -178,27 +203,16 @@ import {
   type PersonaSocketEventPayload,
 } from '../src/persona-connections.ts'
 import {
-  MAX_LOGGED_MESSAGE_LENGTH,
-  createUnhandledRejectionHandler,
-  describeLogMessage,
-  describeSlackCallFailure,
-  describeThrownValue,
-  describeThrownValueWithoutStack,
-  isSafeIdentifier,
-  slackPlatformReason,
-} from '../src/persona-connection-errors.ts'
-import { REDACTED_TOKEN_PLACEHOLDER, REDACTED_URL_PLACEHOLDER } from '../src/slack-log-redaction.ts'
-import { AgentDirectorError, ErrSpawnCapReached, ErrSpawnNotFound } from '../src/agent-director-errors.ts'
-import {
-  DEFAULT_WORKING_DIRECTORY_FS,
-  checkPersonaConfigDir,
-  checkPersonaLocalBringUp,
-  checkPersonaWorkingDirectory,
-  type BringUpPersona,
-  type OtherBringUpPersona,
-  type PersonaBringUpFs,
-  type WorkingDirectoryFs,
-} from '../src/persona-bringup.ts'
+  CREDENTIALS_MISSING_MARKER,
+  CREDENTIALS_UNREADABLE_MARKER,
+  DEFAULT_CREDENTIALS_FS,
+  PersonaSlackTokens,
+  checkPersonaCredentials,
+  checkPersonaCredentialsAndDigest,
+  credentialsDigest,
+  readCredentialsFile,
+  type CredentialsFs,
+} from '../src/persona-credentials.ts'
 import {
   PERSONA_CONNECTION_LOST,
   PERSONA_CONNECTION_RESTORED,
@@ -208,10 +222,10 @@ import {
   PERSONA_CREDENTIALS_REFUSED,
   PERSONA_CREDENTIALS_UNREADABLE,
   PERSONA_DIAGNOSTIC_CLASSES,
-  PERSONA_SLACK_UNREACHABLE,
-  PERSONA_START,
   PERSONA_DIRECTORY_MISSING,
   PERSONA_DIRECTORY_UNUSABLE,
+  PERSONA_SLACK_UNREACHABLE,
+  PERSONA_START,
   formatCredentialsChangeFailed,
   formatPersonaDiagnostic,
   personaCheckFailure,
@@ -220,6 +234,20 @@ import {
   type PersonaDiagnosticClass,
 } from '../src/persona-diagnostics.ts'
 import { personaKey, renderPersonaRef } from '../src/persona-identity.ts'
+import { createPersonaNotifier, type PersonaNotifier } from '../src/persona-notifier.ts'
+import { MAX_TIMER_DELAY_MS, createPersonaRetrySchedule } from '../src/persona-retry-schedule.ts'
+import { createPersonaSerializer, type PersonaSerialize, type PersonaSerializer } from '../src/persona-serializer.ts'
+import {
+  longLivedWebClientOptions,
+  redactSlackLogText,
+  redactingSlackLogger,
+  resolveSlackApiUrlOverride,
+  socketModeClientOptions,
+  socketModeSlackLogger,
+  validationWebClientOptions,
+  type SlackLogPersona,
+} from '../src/persona-slack-clients.ts'
+import { createSlackEpisodeTracker, type SlackEpisodeTracker } from '../src/persona-slack-episodes.ts'
 import {
   SlackAuthTestTimeoutError,
   SlackStartTimeoutError,
@@ -232,18 +260,48 @@ import {
   type SlackValidationOutcome,
 } from '../src/persona-slack-validation.ts'
 import {
-  longLivedWebClientOptions,
-  redactSlackLogText,
-  redactingSlackLogger,
-  resolveSlackApiUrlOverride,
-  socketModeClientOptions,
-  socketModeSlackLogger,
-  validationWebClientOptions,
-  type SlackLogPersona,
-} from '../src/persona-slack-clients.ts'
-import { MAX_TIMER_DELAY_MS, createPersonaRetrySchedule } from '../src/persona-retry-schedule.ts'
+  composePersonaStatusListeners,
+  createPersonaRelaunchGate,
+  createPersonaUpFlushListener,
+  createPersonaUpPredicate,
+} from '../src/persona-start.ts'
 import { WEB_API_CALL_REFUSED_LOCALLY, WebApiCallRefusedLocallyError } from '../src/persona-web-api-watch.ts'
-import { createSlackEpisodeTracker, type SlackEpisodeTracker } from '../src/persona-slack-episodes.ts'
+import {
+  _resetRegistry,
+  closePendingSession,
+  createPendingSession,
+  decideSessionAdmission,
+  dropPersonaSession,
+  getSessionByPersona,
+  registerMcpSessionId,
+  registerSession,
+  removePendingSession,
+  resolveTransportForRequest,
+  unregisterByMcpSessionId,
+  type SessionAdmission,
+  type SessionEntry,
+} from '../src/registry.ts'
+import { RESTART_FAILURE_CAP } from '../src/restart.ts'
+import {
+  reconcileOrphans,
+  setSessionNotifier,
+  spawnForPersona,
+  startupSessionManager,
+  type StartupSessionManagerResult,
+} from '../src/session-manager.ts'
+import { REDACTED_TOKEN_PLACEHOLDER, REDACTED_URL_PLACEHOLDER } from '../src/slack-log-redaction.ts'
+import {
+  cannedGetResult,
+  cannedListRow,
+  errInstanceIdCollision,
+  errSpawnNotFound,
+  installStubSpawnPath,
+  makeStubCallLog,
+  makeStubClient,
+  resetStubSpawnPath,
+  stubCallCount,
+  type StubSpawnPath,
+} from './test-helpers/agent-director-stub.ts'
 import {
   APP_TOKEN_PREFIX,
   BOT_TOKEN_PREFIX,
@@ -257,6 +315,12 @@ import {
   writeCredentialsFile,
   type CredentialsOverrides,
 } from './test-helpers/credentials.ts'
+import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
+import { makeFifo, mkfifoAvailable } from './test-helpers/fifo.ts'
+import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
+import type { PersonaSpec } from './test-helpers/persona-config.ts'
+import { makeConnectionHarness, type ConnectionHarness } from './test-helpers/persona-connection-harness.ts'
+import { PONG_TIMEOUT_TEXT, outputDuring, socketLogLine, ticketUrl } from './test-helpers/slack-logger-probes.ts'
 import {
   INITIAL_CREDENTIALS,
   makeAppMention,
@@ -276,70 +340,6 @@ import {
   type StubSlackScript,
   type WebApiOutcome,
 } from './test-helpers/slack-stub.ts'
-import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
-import { makeFifo, mkfifoAvailable } from './test-helpers/fifo.ts'
-import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
-import { PONG_TIMEOUT_TEXT, outputDuring, socketLogLine, ticketUrl } from './test-helpers/slack-logger-probes.ts'
-import {
-  cannedGetResult,
-  cannedListRow,
-  errInstanceIdCollision,
-  errSpawnNotFound,
-  installStubSpawnPath,
-  makeStubCallLog,
-  makeStubClient,
-  resetStubSpawnPath,
-  stubCallCount,
-  type StubSpawnPath,
-} from './test-helpers/agent-director-stub.ts'
-import { makeConnectionHarness, type ConnectionHarness } from './test-helpers/persona-connection-harness.ts'
-import type { PersonaSpec } from './test-helpers/persona-config.ts'
-import { resolveRealPath, type Persona } from '../src/config.ts'
-import { createPersonaSerializer, type PersonaSerialize, type PersonaSerializer } from '../src/persona-serializer.ts'
-import {
-  createNotUpSessionDropper,
-  createPersonaBringUpController,
-  describePersonaNotUp,
-  type CredentialsSwap,
-  type PersonaBringUpController,
-  type PersonaBringUpControllerDeps,
-  type PersonaBringUpResultSummary,
-  type PersonaBringUpState,
-  type PersonaCredentialsChangeResult,
-} from '../src/persona-bringup-controller.ts'
-import {
-  composePersonaStatusListeners,
-  createPersonaUpFlushListener,
-  createPersonaRelaunchGate,
-  createPersonaUpPredicate,
-} from '../src/persona-start.ts'
-import { createPersonaNotifier, type PersonaNotifier } from '../src/persona-notifier.ts'
-import {
-  reconcileOrphans,
-  setSessionNotifier,
-  spawnForPersona,
-  startupSessionManager,
-  type StartupSessionManagerResult,
-} from '../src/session-manager.ts'
-import {
-  _resetRegistry,
-  closePendingSession,
-  createPendingSession,
-  decideSessionAdmission,
-  dropPersonaSession,
-  getSessionByPersona,
-  registerMcpSessionId,
-  registerSession,
-  removePendingSession,
-  resolveTransportForRequest,
-  unregisterByMcpSessionId,
-  type SessionAdmission,
-  type SessionEntry,
-} from '../src/registry.ts'
-import { _resetOutageState, getOutageFlags, initOutageState } from '../src/outage-state.ts'
-import { getClient } from '../src/agent-director-client.ts'
-import { _resetBackoffState, getFailureCount } from '../src/backoff.ts'
-import { RESTART_FAILURE_CAP } from '../src/restart.ts'
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -6937,10 +6937,9 @@ describe('bring-up outcomes (E5)', () => {
     // Rows: the row's state, how the row spells A's directory, what the ladder does with it and
     // the calls it makes for A's instance (the spawn is the one that collides with the row).
     test.each<[string, 'waiting' | 'ended', 'configured' | 'old symlink target', 'reconnected' | 'resumed', Record<string, number>]>([
-      ['a waiting row is reconnected', 'waiting', 'configured', 'reconnected', { spawn: 1, get: 4, readPane: 2, sendKeys: 2 }],
-      // The status read is the resumed instance's dialog check.
-      ['an ended row is resumed', 'ended', 'configured', 'resumed', { spawn: 1, get: 1, resume: 1, status: 1 }],
-      ['a waiting row recorded under the target of a working_directory symlink that now dangles is reconnected', 'waiting', 'old symlink target', 'reconnected', { spawn: 1, get: 4, readPane: 2, sendKeys: 2 }],
+      ['a waiting row is reconnected', 'waiting', 'configured', 'reconnected', { spawn: 1, get: 4, sendKeys: 2 }],
+      ['an ended row is resumed', 'ended', 'configured', 'resumed', { spawn: 1, get: 1, resume: 1 }],
+      ['a waiting row recorded under the target of a working_directory symlink that now dangles is reconnected', 'waiting', 'old symlink target', 'reconnected', { spawn: 1, get: 4, sendKeys: 2 }],
     ])('AC 23, AC 24: a directory-broken persona’s surviving row is kept, and once its directory exists it comes up with no confirmation and its launch reuses the row — %s, with no kill, delete or fresh spawn; its instance, refused while it retried, is then admitted', async (_label, state, spelling, action, reuseCalls) => {
       let launched: Awaited<ReturnType<typeof spawnForPersona>> | undefined
       const f: BringUpFixture = makeBringUpFixture({

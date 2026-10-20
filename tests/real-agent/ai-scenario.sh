@@ -206,7 +206,6 @@ AC15_BODY
         real_wait_delivery "${REAL_KEY}" 1
         real_wait_idle "${REAL_KEY}"
         real_ad send-keys --instance-id "$(real_instance "${REAL_KEY}")" --text '/compact' >/dev/null
-        wait_until 120 'AC23 compact not observed' case_assert compacted
         real_wait_idle "${REAL_KEY}"
         for stage in compact resume; do
             if [[ "${stage}" == resume ]]; then

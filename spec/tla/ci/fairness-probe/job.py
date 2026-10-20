@@ -18,14 +18,14 @@ def fair_enabled(s: dict) -> dict[str, bool]:
     work = not s["delivered"] or s["gate"] != "free"
     env = s["actual"] == "idle" and s["row"] == "waiting" and not s["permission"]
     release = (s["phase"] in {"cooldown", "done"}
-               or (s["phase"] in {"ready", "boxed"} and not s["request"]))
+               or (s["phase"] in {"ready"} and not s["request"]))
     return {
         "EngineObserve": work and s["observation"] == "none" and env,
         "EngineStep": work and s["observation"] == "ready",
         "GateStep": ((s["gate"] == "free" and s["request"])
                      or (s["gate"] == "delivery" and release)),
         "ReconnectStep": (not s["mcp"] and s["gate"] == "free" and not s["reconnectPending"]
-                          and s["actual"] == "idle" and not s["permission"] and s["box"] == "empty"),
+                          and s["row"] == "waiting" and not s["permission"]),
         "AgentTakeIn": (s["box"] == "item" and s["submitted"]
                         and s["actual"] == "idle" and not s["permission"]),
         "AgentTurnEnd": s["actual"] == "busy" and not s["permission"],
@@ -50,16 +50,18 @@ def lasso_evidence(trace: dict, cfg: str) -> dict:
     # too: this diagnostic must never hide a previously accepted text/Enter.
     if any(node["st"]["made"] or node["st"]["taken"] or node["st"]["delivered"]
            or node["st"]["submitted"] or node["st"]["box"] != "empty"
-           or not node["st"]["mcp"] or node["st"]["retypes"] != 0
-           or node["st"]["enterRetries"] != 0 for node in trace["behavior"]):
+           or not node["st"]["mcp"] or node["st"]["retypes"] != 0 for node in trace["behavior"]):
         raise ValueError("requested first-text-refusal trace accepted text or consumed retry budget")
     # All modeled actions set transition. Stuttering retains that old label;
     # it is not evidence that the named action ran on the closing edge.
     executed = [edge for edge in cycle_edges if edge[0][1]["st"] != edge[2][1]["st"]]
     transitions = {edge[2][1]["st"]["transition"] for edge in executed}
-    if not {"EngineStep", "GateStep", "AgentTurnEnd", "AgentOwnTurnStart",
-            "PermissionOpen", "PermissionAnswer"} <= transitions:
+    if not {"EngineStep", "GateStep", "AgentTurnEnd", "AgentOwnTurnStart"} <= transitions:
         raise ValueError("missing live-guard/flapping/fair-action evidence")
+    # Waiting-only calls can be refused after a waiting-to-working race,
+    # without a permission dialog. Both outcomes are authoritative AD guards.
+    if "PermissionOpen" in transitions and "PermissionAnswer" not in transitions:
+        raise ValueError("permission-open cycle lacks its corresponding answer")
     outcomes = {edge[2][1]["st"]["outcome"] for edge in executed}
     if "permission-refused-text" not in outcomes or "permission-refused-enter" in outcomes:
         raise ValueError("loop must witness first-text refusals, with no refused Enter loop")
@@ -86,7 +88,7 @@ def lasso_evidence(trace: dict, cfg: str) -> dict:
             "EnvTypable_recurs": True, "TranscriptReadable_always": True,
             "MCP_connected_always": True, "ReconnectsDue": True,
             "AgentTakeIn_disabled_on_loop": True, "text_accepted_ever": False,
-            "enter_retries_used": 0, "EnterRetries": 4, "bounded_faults": 0, "retypes": 0}
+            "bounded_faults": 0, "retypes": 0}
 
 
 def permission_lasso(work: Path, row: dict) -> dict:

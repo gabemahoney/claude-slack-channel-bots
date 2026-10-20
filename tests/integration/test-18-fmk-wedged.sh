@@ -1,145 +1,5 @@
 #!/usr/bin/env bash
-# Test 18 (HO §7 scenario 6; b.jg5 SRJ-1408; AC 1, AC 56): a wedged tmux.
-# With the tmux shim in `wedge`, every tmux call agent-director makes for CSCB
-# hangs and runs no tmux, so every verb that touches tmux is UNAVAILABLE or
-# times out. CSCB takes no destructive action, makes at most one onset post
-# per persona and none once its alert has posted, one alert per persona once
-# the alert threshold has passed, caps no persona, keeps retrying, and makes
-# one recovery post per persona when tmux answers again; the start sweep's
-# delay stays within one row's retries and one try per later row (b.jg5
-# SRJ-302, SRJ-305, SRJ-307 to
-# SRJ-310, SRJ-702, SRJ-1006, SRJ-1016, SRJ-1401, SRJ-1418).
-#
-# fmk setup (lib/scenario.sh fmk mode; b.jg5 SRJ-1306, SRJ-1401):
-# - its own HOME, agent-director store and tmux server, all under
-#   SCENARIO_ROOT, with the agent-director shim in front of the binary and the
-#   tmux shim first on the PATH of every CSCB process (the bot server, `start`
-#   and `stop` runs), which agent-director inherits; the scenario's own shell
-#   keeps the real tmux, so the harness's reads are never wedged;
-# - the release start (SCENARIO_AD_START unset: the 0.11.0 release, installed
-#   by its install.sh at sourcing);
-# - agent-director at its default settings (no config.toml): the alert
-#   threshold is the longer of stopping_window_seconds (90) and
-#   starting_session_seconds (300), plus 60 s: 360 s, printed from
-#   `adAlertThresholdMs` of the defaults (src/ad-settings.ts);
-# - CSCB's agent-director call timeout at its default
-#   (DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS, src/config.ts), and
-#   `health_check_interval` 0 in config.json, so no health tick runs: the
-#   onset is checked at the retries of each persona's retry timer;
-# - every start is live (`start_server --live`), against the loopback Slack
-#   stub (fixtures/slack-stub-server.ts, one for the script, every persona's
-#   token pair answered ok); posts are read from the stub's record;
-# - every persona has its own key, credentials, channel (its Slack
-#   destination) and directories, and every stub worker runs `startup-trust`
-#   (the approver's Enter makes it report in);
-# - the tmux shim: `log` while the personas are launched, `wedge` (its
-#   default delay, 60 s, longer than every tmux call timeout at
-#   agent-director's defaults) from just before the wedged start until more
-#   than the alert threshold has passed since A's and B's first refusals,
-#   then `log`;
-# - counts read only the agent-director shim's lines whose parent is a CSCB
-#   process (`cscb_ad_calls`), from the wedged start's mark on; server.log
-#   and the Slack stub's record from the mark's line on.
-#
-# Setup. Personas A and B (kept) and X1, X2 and X3 (absent-to-be) are
-# launched in `log` until each row reads `waiting`. The harness plays the
-# operator from the scenario's own shell: a plain `stop` (no teardown, every
-# worker keeps running and every row stays live), X1 to X3 removed from
-# config.json and the last-applied record moved aside (so the next start
-# applies config.json as it stands, docs/reload.md), `wedge`, and a start.
-#
-# Section 1, the start sweep under `wedge` (AC 56; b.jg5 SRJ-702, SRJ-714):
-# the release's `list` is a store read with no tmux call, so the sweep lists
-# all five rows and reaches the kills of X1 to X3's live rows (absent
-# personas). Checked:
-#   - the summary line: 5 listed, none killed, 5 kept with 3 kills failed,
-#     3 keys recorded as retired, none left for a latch;
-#   - the first swept row (the X row CSCB killed first) gets exactly
-#     KILL_RETRY_TRIES CSCB `kill` calls, its per-try lines saying "try again"
-#     and then "no tries left", and each later swept row exactly 1, its one
-#     per-try line saying the pass's retries are spent;
-#   - the sweep's duration, from its CSCB `list` call (the agent-director
-#     shim's log; the sweep logs no start line, so the `list` carrying the
-#     `service` label is its start) to its summary line (server.log), is at
-#     most one row's KILL_RETRY_TRIES tries and KILL_RETRY_TRIES - 1 waits of
-#     KILL_RETRY_SPACING_MS, plus one try per later row, each try bounded by
-#     CSCB's call timeout: (3 + 2) x 60 s + 2 x 2 s = 304 s at the defaults
-#     (the measured duration is logged);
-#   - no CSCB `delete`, and every X row is present (a harness `get`).
-#
-# Section 2, the condition, the alert and the recovery (b.jg5 SRJ-1408,
-# SRJ-307 to SRJ-310, SRJ-305): A's and B's own live rows match them, so the
-# sweep keeps them, and the start pass's plain spawns collide and route to
-# `get` (expected; neither a reuse nor a resume). The `get` reads `waiting`,
-# and the plain stop ended the stub's MCP session, so the start pass and each
-# retry run the reconnect's waiting-row proof and fresh screen check
-# (b.omv SR-5.3/5.5), whose tmux verbs are refused: the first refusal starts the
-# persona's `tmux-unresponsive` condition (its started line) and arms its
-# retry timer. After the unwedge the next retry's pane read succeeds, which
-# ends the condition (a tmux-touching call succeeded, SRJ-310).
-# Both the UNAVAILABLE retry schedule (SRJ-302) and E3's per-persona
-# deferred-reconnect timer drive checks with `health_check_interval` 0.
-# The onset falls due on a check at least TMUX_UNRESPONSIVE_ONSET_FLOOR_MS
-# after the first refusal (SRJ-308), and the alert once more than the threshold (360 s) has
-# passed (SRJ-309). `wedge` is kept until both alerts have posted (each
-# waited for up to ALERT_SLACK_S past its persona's threshold), then `log`,
-# and each recovery is waited for up to one retry interval (at most
-# UNAVAILABLE_RETRY_CEILING_S, SRJ-302) and RECOVERY_SLACK_S. Recovery must
-# finish the guarded no_enter text and delayed Enter. Checked, for each of A and B:
-#   - at most one onset, none after its alert (SRJ-308: SRD over Epic, *at
-#     most* one; whether it posted is logged);
-#   - exactly one alert, posted more than the threshold after the first
-#     refusal, and exactly one recovery, posted after the unwedge, each at the
-#     persona's destination as the persona notifier's prefix
-#     (`formatPersonaNotice`) and then the printer's body;
-#   - no restart-cap notice, no cap-reached line, no retry entry's cap-skip
-#     line and no retry timer stopped at the cap (SRJ-305);
-#   - CSCB-parented calls naming its id continue after its alert;
-#   - no CSCB `kill`, `delete`, reuse spawn (`spawn --reuse-finished`) or
-#     `resume` naming its id, and no relaunch: the start pass's one plain
-#     spawn is the only `spawn` naming it; its row is present (a harness
-#     `get`);
-#   - exactly one `tmux-unresponsive` started line (one episode).
-# Logged as `NOTE:` lines, not asserted (outcomes the SRD leaves open): each
-# persona's CSCB calls after the mark, by verb; whether its onset posted;
-# every post at its destination (what the recovered persona's reconnect does
-# after the condition ends is left open, and is logged so); the status reads
-# between the first swept row's tries.
-#
-# Matched values (every one printed by fixtures/fmk-texts.ts from the
-# installed package, never typed here):
-#   - the `tmux-unresponsive` onset, alert (at the default threshold) and
-#     recovery bodies (`tmuxUnresponsiveOnsetText`, `tmuxUnresponsiveAlertText`,
-#     `tmuxUnresponsiveRecoveryText`, src/persona-episodes.ts, b.jg5 SRJ-1006)
-#     after the persona notifier's prefix (`formatPersonaNotice`,
-#     src/persona-notifier.ts); the started line's head
-#     (`tmuxUnresponsiveStartedLine`, src/persona-episodes.ts);
-#   - the alert threshold at the defaults (`adAlertThresholdMs`,
-#     DEFAULT_AD_SETTINGS_IN_EFFECT, src/ad-settings.ts), the retry
-#     schedule's base and ceiling (UNAVAILABLE_RETRY_BASE_S,
-#     UNAVAILABLE_RETRY_CEILING_S, src/unavailable-retry.ts) and the onset's
-#     floor (TMUX_UNRESPONSIVE_ONSET_FLOOR_MS, src/persona-episodes.ts);
-#   - the restart-cap notice's body (`restartCapReachedNoticeText`,
-#     src/session-manager.ts), the retry entry's cap-skip line
-#     (`restartRetryCapSkippedLine`, src/restart.ts) and the retry timer's
-#     cap stop reason (UNAVAILABLE_RETRY_STOP_CAPPED,
-#     src/unavailable-retry.ts); the cap-reached line has no exported builder,
-#     so its fixed fragment is quoted below with its source;
-#   - the start sweep's summary line and its head (`startSweepSummaryLine`,
-#     src/session-manager.ts), the `service` label its `list` carries
-#     (SERVICE_LABEL, src/persona-identity.ts), the bounded retry's tries,
-#     spacing and per-try line parts (KILL_RETRY_TRIES,
-#     KILL_RETRY_SPACING_MS, `killRetryTryLine` with KILL_RETRY_NEXT_AGAIN,
-#     KILL_RETRY_NEXT_EXHAUSTED and KILL_RETRY_NEXT_BUDGET_SPENT,
-#     src/kill-retry.ts) and CSCB's call timeout
-#     (DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS, src/config.ts);
-#   - instance ids (`personaInstanceId`, src/persona-identity.ts) and the
-#     last-applied record's suffix (LAST_APPLIED_FILE_SUFFIX, src/reload.ts).
-#
-# The script ends with the closing assertions, `assert_no_server_tmux`,
-# `assert_no_cscb_include_finished` and `assert_no_cscb_delete` (b.jg5
-# SRJ-1418), in its own shell; their counts read only the shims' lines whose
-# parent is a CSCB process.
+# AD outcome and lifecycle regression checks; no startup TUI interpretation.
 set -euo pipefail
 
 TEST_NAME="test-18-fmk-wedged"
@@ -174,7 +34,6 @@ t18_whole THRESHOLD_MS adAlertThresholdMs.default
 t18_whole RETRY_BASE_S UNAVAILABLE_RETRY_BASE_S
 t18_whole RETRY_CEILING_S UNAVAILABLE_RETRY_CEILING_S
 t18_whole ENTER_DELAY_MS ENTER_DELAY_MS
-t18_whole FULL_LINES FULL_PANE_READ_LINES
 t18_whole ONSET_FLOOR_MS TMUX_UNRESPONSIVE_ONSET_FLOOR_MS
 t18_value SVC_LABEL SERVICE_LABEL
 t18_value SUMMARY_HEAD startSweepSummaryLine.head
@@ -228,7 +87,7 @@ t18_persona() {
     printf -v "${p}_LABEL" '%s' "${SCENARIO_TAG}${short}1"
     printf -v "${p}_CHANNEL" '%s' "${channel}"
     work="$(make_workdir "${SCENARIO_TAG}${short}_work")"
-    stub_mode "${work}" "${STUB_MODE_STARTUP_TRUST}"
+    stub_mode "${work}" "${STUB_MODE_AT_ONCE}"
     printf -v "${p}_WORK" '%s' "${work}"
     printf -v "${p}_CFG" '%s' "${CFG_ROOT}/${SCENARIO_TAG}${short}_cfg"
     key="$(persona_key "${SCENARIO_TAG}${short}")"
@@ -250,7 +109,7 @@ for t18_p in "${KEPT[@]}" "${ABSENT[@]}"; do
     t18_cfg_var="${t18_p}_CFG"
     t18_work_var="${t18_p}_WORK"
     mkdir -p "${!t18_cfg_var}"
-    stub_mode "${!t18_work_var}" "${STUB_MODE_STARTUP_TRUST}"
+    stub_mode "${!t18_work_var}" "${STUB_MODE_AT_ONCE}"
     t18_bot="$(fake_token bot "${!t18_label_var}")"
     t18_app="$(fake_token app "${!t18_label_var}")"
     printf '{"bot_token": "%s", "app_token": "%s"}\n' "${t18_bot}" "${t18_app}" \
@@ -501,8 +360,23 @@ t18_note_posts() {
 # Setup: every persona launched in `log` and reported in
 # ---------------------------------------------------------------------------
 
+t18_reconnect_identity() {
+    local session pane
+    t18_row_get "$1" "$2"
+    session="$(jq -er '.tmux_session_name | select(type == "string" and length > 0)' "${AD_OUT}")" \
+        || fail "$2: the reported fixture has no tmux session name"
+    _scenario_tmux_check "$2: fixture identity"
+    pane="$(_scenario_tmux display-message -p -t "$(_scenario_session_target "${session}"):" '#{session_id} #{pane_id} #{pane_pid}')" \
+        || fail "$2: cannot read the fixture's pane identity"
+    [[ "${pane}" =~ ^\$[0-9]+\ %[0-9]+\ [1-9][0-9]*$ ]] \
+        || fail "$2: the fixture has incomplete pane identity"
+    jq -ce --arg pane "${pane}" '[.session_id, .tmux_session_name, .tmux_socket, .jsonl_path, $pane] |
+        select(all(.[]; type == "string" and length > 0))' "${AD_OUT}" \
+        || fail "$2: the reported fixture has incomplete identity"
+}
+
 t18_setup() {
-    local step="setup" m before p id_var
+    local step="setup" m before p id_var identity
     tmux_shim_mode log
     t18_write_config "${KEPT[@]}" "${ABSENT[@]}"
     m="$(completion_match 5)" || exit 1
@@ -512,6 +386,8 @@ t18_setup() {
     for p in "${KEPT[@]}" "${ABSENT[@]}"; do
         id_var="${p}_ID"
         wait_until "${ROW_WAIT_S}" "${step}: ${!id_var} never reported in (waiting)" t18_row_is "${!id_var}" waiting
+        identity="$(t18_reconnect_identity "${!id_var}" "${step}")" || exit 1
+        printf -v "${p}_IDENTITY" '%s' "${identity}"
     done
 
     # The operator: a plain stop (every worker keeps running and every row
@@ -657,14 +533,39 @@ t18_texts() {
 }
 
 t18_reconnect_submitted() {
-    local n
-    n="$(cscb_ad_count_between "$2" - send-keys "--instance-id $1" "--key Enter")" || return 1
-    (( n >= 1 ))
+    local events calls selected
+    events="$(ad_trail_events ad.send_keys.called "$1")" || return 1
+    calls="$(ad_cscb_calls "$1" - - with-pid)" || return 1
+    selected="$(_scenario_reconnect_outcomes "${SERVER_PID}" "${calls}" "${events}")" || return 1
+    jq -e --argjson since "$2" '
+        length >= 2 and (.[-1] | .outcome == "ok" and
+            ((.ts | (.[0:19] + "Z" | fromdateiso8601) + (("0." + .[20:23]) | tonumber)) + 0.001 >= $since))
+    ' <<< "${selected}" > /dev/null
+}
+
+# Select both audit streams through the same successful Enter. The mark is
+# taken before clearing the fault, so post-mark Enters can still be refused.
+t18_reconnect_window() {
+    local step="$1" server="$2" mark="$3" calls="$4" outcomes="$5" selected count
+    selected="$(_scenario_reconnect_outcomes "${server}" "${calls}" "${outcomes}")" \
+        || fail "${step}: cannot correlate AD reconnect outcomes to server invocations"
+    count="$(jq 'length' <<< "${selected}")"
+    (( count >= 2 )) || fail "${step}: reconnect has no successful Enter after its originating text"
+    T18_RECONNECT_CALLS="$(awk -F '\t' -v count="${count}" '
+        $4 == "send-keys" { started = 1; sends++ }
+        started { print }
+        sends == count { exit }
+    ' <<< "${calls}")"
+    awk -F '\t' -v mark="${mark}" '
+        $4 == "send-keys" { pos = $1; args = $6 }
+        END { exit !(pos > mark && args ~ /--key Enter/) }
+    ' <<< "${T18_RECONNECT_CALLS}" || fail "${step}: successful reconnect Enter is not after the unwedge mark"
+    T18_RECONNECT_OUTCOMES="$(jq -c '.[]' <<< "${selected}")"
 }
 
 t18_condition_section() {
     local step="wedged condition" p head n deadline_s wait_s alert_t unwedge_t times t onset_n
-    local id_var key_var ch_var at_var alert_var onset_var rec_var verb calls unwedge_mark
+    local id_var key_var ch_var at_var alert_var onset_var rec_var verb calls unwedge_mark outcomes identity_var
 
     # Each persona's first refusal: its condition's started line.
     for p in "${KEPT[@]}"; do
@@ -720,26 +621,18 @@ t18_condition_section() {
         # An outage all-clear precedes the reconnect's Enter. Wait for both
         # key calls before inspecting their order, provenance and delay.
         wait_until "${RECOVERY_SLACK_S}" "${step}: ${p}'s reconnect never submitted" \
-            t18_reconnect_submitted "${!id_var}" "${unwedge_mark}"
-        # The unwedge may land between an in-flight attempt's pane reads
-        # and its successful text/Enter. Include that complete attempt:
-        # from the preceding send through the first post-unwedge Enter,
-        # excluding the preceding send itself. Earlier refused attempts
-        # must not count as another text/Enter pair in this audit.
-        calls="$(ad_cscb_calls "${!id_var}" - -)" || exit 1
-        calls="$(awk -F '\t' -v mark="${unwedge_mark}" '
-            { rows[NR] = $0 }
-            $4 == "send-keys" {
-                sends[++n] = NR
-                if ($1 > mark && $6 ~ /--key Enter/) {
-                    first = n > 2 ? sends[n - 2] + 1 : 1
-                    for (i = first; i <= NR; i++) print rows[i]
-                    exit
-                }
-            }
-        ' <<< "${calls}")"
-        _scenario_assert_reconnect_rows "${step}: ${p}" "${SERVER_PID}" "${ENTER_DELAY_MS}" "${FULL_LINES}" \
-            "${calls}"
+            t18_reconnect_submitted "${!id_var}" "${unwedge_t}"
+        # Retain the originating uncertain text, every refused Enter, and
+        # the successful post-unwedge Enter. A suffix of two Enters loses
+        # the intent which makes those retries safe.
+        calls="$(ad_cscb_calls "${!id_var}" - - with-pid)" || exit 1
+        outcomes="$(ad_trail_events ad.send_keys.called "${!id_var}")" || exit 1
+        t18_reconnect_window "${step}: ${p}" "${SERVER_PID}" "${unwedge_mark}" "${calls}" "${outcomes}"
+        _scenario_assert_reconnect_rows "${step}: ${p}" "${SERVER_PID}" "${ENTER_DELAY_MS}" \
+            "${T18_RECONNECT_CALLS}" "${T18_RECONNECT_OUTCOMES}"
+        identity_var="${p}_IDENTITY"
+        [[ "$(t18_reconnect_identity "${!id_var}" "${step}")" == "${!identity_var}" ]] \
+            || fail "${step}: ${p}'s reconnect changed its launch/session/pane identity"
 
         # Exactly one alert and one recovery, the recovery after the unwedge.
         n="$(t18_count_posts "" "${!alert_var}")"

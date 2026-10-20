@@ -1,40 +1,107 @@
-/**
- * fmk-launch-pending-dialog-wait.test.ts — test-17 waits for the trust
- * dialog through the stub's record of the dialogs it printed, never through
- * the pane alone (b.fyq).
- *
- * The stub clears an answered dialog from its pane and scrollback
- * (tests/integration/fixtures/stub-claude.sh `clear_answered_dialog`) and
- * appends every dialog it prints to a record that `stub_shown_dialogs` reads
- * (tests/README.md, the stub's entry). A wait that polls only the pane can
- * miss a dialog shown and answered between two reads: test-17's scenario 5
- * did under parallel /ci load, failing with "P's pane never showed the
- * trust dialog" though the approver had answered it.
- *
- * Reads the script and runs nothing (it runs only in /ci). The rule: every
- * loop of the script that breaks on the trust needle (`${TRUST_NEEDLE}`)
- * reads the pane (`pane_capture`) and then writes `stub_shown_dialogs`'s
- * output to a file, and each of its breaks stops on a condition that ORs in a
- * plain (not negated) grep of that file for the needle; and the script has at
- * least one such loop (scenario 5's step 6), so the check never passes for
- * want of a loop to read. The pane comes first because the record can lag
- * the pane (the stub's `show_dialog` tees the dialog to both) but is written
- * before the stub reads the Enter that clears it: a record read and then a
- * pane read can both miss a dialog printed before them, and the loop's last
- * clear read (`last_clear`) would then not be a time before the dialog. The
- * self-checks run the audit over planted loops.
- *
- * SPDX-License-Identifier: MIT
- */
-
+/** The timeout recovery scenario awaits its exact AD get result before checking hooks. */
 import { describe, expect, test } from 'bun:test'
+import { spawnSync } from 'node:child_process'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
-import { spawnSync } from 'node:child_process'
-import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
+import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
+import { thisLaunchRowLiveLine } from '../src/session-manager.ts'
+import { TMUX_UNRESPONSIVE_END_TEXT, tmuxUnresponsiveEndedLine, TMUX_UNRESPONSIVE_END_LAUNCH_ROW_LIVE } from '../src/persona-episodes.ts'
+import { unavailableRetryRetryLine } from '../src/unavailable-retry.ts'
 
 const REPO_ROOT = resolve(import.meta.dir, '..')
+
+describe('test-17 ends launch-timeout recovery on its own first retry read', () => {
+  const source = readFileSync(resolve(REPO_ROOT, 'tests/integration/test-17-fmk-launch-pending.sh'), 'utf8')
+  const declaration = (name: string) => source.match(new RegExp(`^${name}\\(\\) \\{[\\s\\S]*?^\\}`, 'm'))![0]
+  const key = 't17_spawn', id = `cscb_${key}`, server = '42001'
+  const shellQuote = (s: string) => `'${s.replaceAll("'", "'\\''")}'`
+  // Actual full and isolated CI clock shapes: the harness observes waiting
+  // before the 30-second retry, which then ends the condition synchronously.
+  const runs = [
+    { label: 'full', harness: 1792496132.408312, retry: 1792496139.143, read: 1792496139.145602, end: 1792496139.151, get: 1792496139.153146 },
+    { label: 'confirmation', harness: 1792499794.527237, retry: 1792499801.255, read: 1792499801.259309, end: 1792499801.265, get: 1792499801.267546 },
+  ]
+  function probe(kind = 'complete', run = runs[1]!) {
+    const root = mkdtempSync('/tmp/pending-retry-control-')
+    const stamp = (at: number, text: string) => `[${new Date(at * 1000).toISOString()}] ${text}`
+    let readServer = server, readId = id, endKey = key, waitingKey = key
+    let end = run.end, waiting = run.end, retry = run.retry
+    if (kind === 'wrong-server') readServer = '42002'
+    if (kind === 'wrong-persona-read') readId += '_other'
+    if (kind === 'wrong-persona-end') endKey += '_other'
+    if (kind === 'wrong-persona-waiting') waitingKey += '_other'
+    if (kind === 'late-end' || kind === 'late-both') end = run.read + 6.738
+    if (kind === 'late-waiting' || kind === 'late-both') waiting = run.read + 6.738
+    if (kind === 'already-ended') end = run.retry - 1
+    if (kind === 'wrong-retry') retry = run.retry - 10
+    if (kind === 'late-read') retry = run.read - 6.738
+    const verb = kind === 'get-recovery' ? 'get' : 'status'
+    // The five columns are call_table's real CI projection: timestamp,
+    // CSCB PPID, AD verb, instance ID and decoded argument list.
+    const row = (at: number, ppid: string, instance: string, v: string) => `${at}\t${ppid}\t${v}\t${instance}\t--instance-id ${instance}`
+    const calls = [
+      row(run.retry - 30, server, id, 'get'), // A pending get in an earlier retry is not the waiting observation.
+      row(run.harness, '42099', id, 'get'), // A harness read never satisfies the CSCB oracle.
+      ...(kind === 'harness-only' ? [] : [row(run.read, readServer, readId, verb), row(run.get, readServer, readId, 'get')]),
+      ...(kind === 'late-both' ? [row(run.read + 6.7, server, id, verb)] : []),
+    ]
+    const logs = [
+      ...(kind === 'earlier-pending-retry' ? [stamp(run.retry - 30.01, unavailableRetryRetryLine(key, 1, true))] : []),
+      ...(kind === 'missing-retry' ? [] : [stamp(retry, unavailableRetryRetryLine(kind === 'wrong-persona-retry' ? `${key}_other` : key, 1, false))]),
+      // A re-arm starts the same way but is not the start of another retry.
+      stamp(run.read, `${unavailableRetryRetryLine(key, 1, false)}: re-armed`),
+      ...(kind === 'next-retry' ? [stamp(run.end - 0.001, unavailableRetryRetryLine(key, 2, false))] : []),
+      ...(kind === 'missing-end' ? [] : [stamp(end, tmuxUnresponsiveEndedLine(endKey, TMUX_UNRESPONSIVE_END_LAUNCH_ROW_LIVE))]),
+      ...(kind === 'missing-waiting' ? [] : [stamp(waiting, thisLaunchRowLiveLine({ site: 'isSessionAlive', what: kind === 'wrong-read-verb' ? 'get' : verb }, `persona=${waitingKey}`, 'waiting', true))]),
+    ]
+    writeFileSync(join(root, 'calls.tsv'), calls.sort((a, b) => Number(a.split('\t')[0]) - Number(b.split('\t')[0])).join('\n') + '\n')
+    writeFileSync(join(root, 'server.log'), logs.sort().join('\n') + '\n')
+    writeFileSync(join(root, 'ended.txt'), Object.keys(TMUX_UNRESPONSIVE_END_TEXT).map(reason => tmuxUnresponsiveEndedLine(key, reason)).join('\n') + '\n')
+    const full = unavailableRetryRetryLine(key, 1, false).match(/^(.*retry )1(.*)$/)!
+    const pending = unavailableRetryRetryLine(key, 1, true).match(/^(.*retry )1(.*)$/)!
+    const bound = source.match(/^LT_RETRY_READ_S=(\d+)/m)![1]!
+    const script = [
+      'set -euo pipefail', 'fixture_root="$1"', 'SLACK_STATE_DIR="$fixture_root"', `LT_RETRY_READ_S=${bound}`,
+      `declare -A RT_RETRY_HEAD=([${key}]=${shellQuote(full[1]!)} )`,
+      `declare -A RT_RETRY_FULL=([${key}]=${shellQuote(full[2]!)} )`,
+      `declare -A RT_RETRY_PENDING=([${key}]=${shellQuote(pending[2]!)} )`,
+      'fail() { printf "%s\\n" "$*" >&2; exit 1; }',
+      'fmk_text() { cat "$fixture_root/ended.txt"; }',
+      ...['calls', 'retry_hits', 'log_hits', 'lt_expect_recovery_ended'].map(declaration),
+      `lt_expect_recovery_ended "$fixture_root/calls.tsv" ${server} ${id} ${key} 0 control`,
+    ].join('\n')
+    try {
+      const result = spawnSync('bash', ['-c', script, 'pending-retry-control', root], {
+        env: hostSafeChildEnv(root, { tools: ['bash', 'awk', 'python3', 'grep', 'head', 'cut', 'cat'] }), encoding: 'utf8', timeout: 10000,
+      })
+      expect(result.error).toBeUndefined(); expect(result.signal).toBeNull()
+      assertNoLeak({ stdout: result.stdout, stderr: result.stderr })
+      return result
+    } finally { rmSync(root, { recursive: true, force: true }) }
+  }
+  test.each(runs)('$label CI recovery passes despite the harness observing waiting earlier', run => {
+    expect(run.end - run.harness).toBeGreaterThan(6.7)
+    expect(probe('complete', run).status).toBe(0)
+  })
+  test.each([
+    { label: 'with a later owned get', harness: runs[1]!.end + 0.001 },
+    { label: 'with no later owned read', harness: runs[1]!.end + 0.1 },
+  ])('CSCB observes waiting before the harness, $label', ({ harness }) => {
+    const run = { ...runs[1]!, harness }
+    expect(run.end).toBeLessThan(run.harness)
+    expect(probe('complete', run).status).toBe(0)
+  })
+  test('an earlier retry that still read pending does not become the recovery anchor', () => {
+    expect(probe('earlier-pending-retry').status).toBe(0)
+  })
+  test('get recovery uses the same ownership and deadline checks', () => {
+    expect(probe('get-recovery').status).toBe(0)
+  })
+  test.each(['missing-end', 'missing-waiting', 'missing-retry', 'late-end', 'late-waiting', 'late-both', 'late-read', 'harness-only', 'wrong-server', 'wrong-persona-read', 'wrong-persona-end', 'wrong-persona-waiting', 'wrong-persona-retry', 'wrong-read-verb', 'already-ended', 'wrong-retry', 'next-retry'])('%s cannot satisfy the first recovery-read oracle', kind => {
+    expect(probe(kind).status).toBe(1)
+  })
+})
 
 describe('test-26 waits for its exact asynchronous recovery-get result', () => {
   const source = readFileSync(resolve(REPO_ROOT, 'tests/integration/test-26-fmk-timing-settings.sh'), 'utf8')
@@ -60,15 +127,21 @@ describe('test-26 waits for its exact asynchronous recovery-get result', () => {
       'fail() { printf "%s\\n" "$*" >&2; exit 1; }',
       '_scenario_now_ms() { cat "$clock"; }',
       'sleep() { local t; read -r t < "$clock"; printf "%s\\n" "$((t + 1000))" > "$clock"; }',
-      'printed() { printf "%s\\n" "exact recovery-get pending 123 APPROVER"; }',
+      'printed() { printf "%s\\n" "exact recovery-get pending 123 COVERED_NO_STARTUP_KEYS"; }',
       // Only the exact existing expected line can satisfy this dependency.
-      'count_log() { local t; read -r t < "$clock"; if [[ "$1" == "exact recovery-get pending 123 APPROVER" && "$kind" != missing-call && "$kind" != wrong-outcome ]] && { [[ "$kind" == complete || "$kind" == duplicate ]] || (( t >= 2000 )); }; then [[ "$kind" == duplicate ]] && echo 2 || echo 1; else echo 0; fi; }',
+      'count_log() { local t; read -r t < "$clock"; if [[ "$1" == "exact recovery-get pending 123 COVERED_NO_STARTUP_KEYS" && "$kind" != missing-call && "$kind" != wrong-outcome ]] && { [[ "$kind" == complete || "$kind" == duplicate ]] || (( t >= 2000 )); }; then [[ "$kind" == duplicate ]] && echo 2 || echo 1; else echo 0; fi; }',
       'log_lines() { :; }',
       'first_cscb_call_at_or_after() { local t; read -r t < "$clock"; if [[ "$kind" != missing-call ]] && { [[ "$kind" != delayed-call ]] || (( t >= 1000 )); }; then echo matching-get; fi; }',
       'call_fields() { [[ "$2" == matching-get ]] || fail wrong-call; CALL_T=2; }',
-      'approver_brought_up() { echo approver-verified; }',
+      'recovery_awaited=0',
+      'await_call_timeout_recovery() { [[ "$1 $2" == "synthetic t2" ]] || fail wrong-recovery; recovery_awaited=1; }',
+      'hooks_brought_up() { [[ "$recovery_awaited" == 1 ]] || fail recovery-not-awaited; echo hooks-verified; }',
+      'declare -A WORK=([t2]=synthetic_work)',
+      'tmux_shim_mode() { [[ "$1" == log ]] || fail wrong-mode; echo fixture-released; }',
+      'stub_report_delay() { [[ "$1 $2" == "synthetic_work 0" ]] || fail wrong-delay; }',
       declaration(scenario, '_scenario_poll_until'), declaration(scenario, '_scenario_check_timeout'),
-      declaration(scenario, 'wait_until'), declaration(scenario, '_scenario_log_has'), actualHelper, actualBlock,
+      declaration(scenario, 'wait_until'), declaration(scenario, '_scenario_log_has'), actualHelper,
+      declaration(source, 'release_timed_out_launch_fixture'), actualBlock,
       'printf "elapsed-ms=%s\\n" "$(cat "$clock")"',
     ].join('\n')
     try {
@@ -83,7 +156,8 @@ describe('test-26 waits for its exact asynchronous recovery-get result', () => {
   test.each(['delayed-call', 'delayed-result'])('%s fails the old immediate assertion and passes the exact-result barrier', kind => {
     const old = probe(kind, true), current = probe(kind)
     expect(old.status).toBe(1); expect(current.status).toBe(0)
-    expect(current.stdout).toContain('approver-verified'); expect(current.clock).toBe(2000)
+    expect(current.stdout).toContain('hooks-verified'); expect(current.clock).toBe(2000)
+    expect(current.stdout).toContain('fixture-released')
   })
   test('already completed recovery passes without waiting', () => {
     for (const old of [true, false]) {
@@ -96,220 +170,7 @@ describe('test-26 waits for its exact asynchronous recovery-get result', () => {
     const current = probe(kind)
     expect(current.status).toBe(1)
     expect(current.clock).toBe(kind === 'duplicate' ? 0 : 30000)
-    expect(current.stdout).not.toContain('approver-verified')
-  })
-})
-
-const SCRIPT_FILE = 'tests/integration/test-17-fmk-launch-pending.sh'
-
-/** The trust needle as the script names it (fixtures/fmk-texts.ts prints its value at run time). */
-const NEEDLE = '${TRUST_NEEDLE}'
-
-/** A line that ends a loop's head: `while …; do`, `for …; do` or a lone `do`. */
-const LOOP_OPEN = /(?:^|[\s;])do\s*$/
-
-/** A line that closes a loop: `done`, `done < <(…)`. */
-const LOOP_CLOSE = /^\s*done\b/
-
-/** A `stub_shown_dialogs` call whose output goes to a file; group 2 is the file's word (`${shown}`). */
-const RECORD_READ = /\bstub_shown_dialogs\b[^>|;&]*>\s*("?)([^\s"]+)\1/
-
-/** The script's read of P's pane. */
-const PANE_READ_CALL = /\bpane_capture\b/
-
-/** `<condition> && break`, the whole line; group 1 is the condition. */
-const AND_BREAK = /^\s*(.+?)\s*&&\s*break\s*$/
-
-/** A `break` alone on its line, which stops the loop from inside an `if`. */
-const LONE_BREAK = /^\s*break\s*$/
-
-/** An `if <condition>; then` (or `elif`) line; group 1 is the condition. */
-const IF_HEAD = /^\s*(?:el)?if\s+(.+?)\s*;\s*then\s*$/
-
-/** An `else` or `fi` line: a lone `break` below one is not in the branch an `if` head above it opens. */
-const BLOCK_EDGE = /^\s*(?:else|fi)\b/
-
-/** One loop of the script: the 1-based line of its head and its body's lines (head and `done` excluded). */
-interface Loop {
-  line: number
-  body: string[]
-}
-
-/** The script's loops, paired by nesting, comment lines skipped; `unpaired` names a `done` or a head the pairing left over. */
-function scriptLoops(script: string): { loops: Loop[]; unpaired: number[] } {
-  const lines = script.split('\n').map((text) => (text.trimStart().startsWith('#') ? '' : text))
-  const open: number[] = []
-  const loops: Loop[] = []
-  const unpaired: number[] = []
-  lines.forEach((text, i) => {
-    if (LOOP_CLOSE.test(text)) {
-      const head = open.pop()
-      if (head === undefined) unpaired.push(i + 1)
-      else loops.push({ line: head + 1, body: lines.slice(head + 1, i) })
-    }
-    if (LOOP_OPEN.test(text)) open.push(i)
-  })
-  return { loops, unpaired: [...unpaired, ...open.map((i) => i + 1)] }
-}
-
-/**
- * The condition that stops the loop at each `break` of `body`: the text
- * before `&& break`, or, for a lone `break`, the condition of the nearest
- * `if …; then` above it with no `else` or `fi` between; undefined where the
- * audit cannot read one. Pure.
- */
-function stopConditions(body: string[]): (string | undefined)[] {
-  return body.flatMap((text, i) => {
-    if (!/\bbreak\b/.test(text)) return []
-    const andBreak = AND_BREAK.exec(text)
-    if (andBreak !== null) return [andBreak[1]]
-    if (!LONE_BREAK.test(text)) return [undefined]
-    const edge = body.slice(0, i).reverse().find((above) => IF_HEAD.test(above) || BLOCK_EDGE.test(above))
-    return [edge === undefined ? undefined : IF_HEAD.exec(edge)?.[1]]
-  })
-}
-
-/** Whether `condition` holds whenever a plain grep of one of `records` finds the needle: one of its `||` alternatives is that grep, and it has no `&&`. Pure. */
-function stopsOnRecord(condition: string, records: string[]): boolean {
-  return !condition.includes('&&') && condition.split('||').some((alt) => /^\s*grep\b/.test(alt) && alt.includes(NEEDLE) && records.some((file) => alt.includes(file)))
-}
-
-/**
- * What keeps `script`'s waits for the trust dialog (its loops whose
- * body names the needle and breaks) from reading the stub's record: empty
- * when each wait reads the pane, then writes `stub_shown_dialogs`'s output
- * to a file, and stops only on a condition that ORs in a plain grep of that
- * file for the needle, and there is at least one wait. Pure.
- */
-function dialogWaitFindings(script: string): string[] {
-  const { loops, unpaired } = scriptLoops(script)
-  if (unpaired.length > 0) return [`unpaired loop line(s) ${unpaired.join(', ')}: the audit cannot pair each loop head with its done`]
-  const waits = loops.filter(({ body }) => body.some((text) => text.includes(NEEDLE)) && body.some((text) => /\bbreak\b/.test(text)))
-  if (waits.length === 0) return ['no loop breaks on the trust needle: the audit found no wait for the dialog to read']
-  return waits.flatMap(({ line, body }) => {
-    const records = body.flatMap((text) => {
-      const read = RECORD_READ.exec(text)
-      return read === null ? [] : [read[2]!]
-    })
-    if (records.length === 0) {
-      return [`line ${line}: the wait for the trust dialog reads no stub record (stub_shown_dialogs), so it misses a dialog shown and answered between two pane reads`]
-    }
-    const findings: string[] = []
-    const paneAt = body.findIndex((text) => PANE_READ_CALL.test(text))
-    if (paneAt === -1 || paneAt > body.findIndex((text) => RECORD_READ.test(text))) {
-      findings.push(`line ${line}: the wait for the trust dialog does not read the pane (pane_capture) before the stub's record, so a read clear in both is no proof the dialog had not shown at its time (last_clear)`)
-    }
-    for (const condition of stopConditions(body)) {
-      if (condition === undefined) {
-        findings.push(`line ${line}: the audit cannot read the condition of a break in the wait for the trust dialog (write \`if <condition>; then … break\` or \`<condition> && break\`)`)
-      } else if (!stopsOnRecord(condition, records)) {
-        findings.push(`line ${line}: the wait for the trust dialog stops on \`${condition}\`, which does not OR in a plain grep of the stub's record (${records.join(', ')}) for the needle`)
-      }
-    }
-    return findings
-  })
-}
-
-const lines = (...text: string[]): string => text.join('\n')
-
-const PANE_READ = '    pane_capture "${step}" "${session}" "${pane}"'
-const RECORD_LINE = '    stub_shown_dialogs "${session}" > "${shown}" || fail "${step}: could not read the record"'
-
-describe("test-17 waits for the trust dialog through the stub's record, not the pane alone (b.fyq)", () => {
-  test(`${SCRIPT_FILE}: every loop that breaks on the trust needle reads the pane, then stub_shown_dialogs, and stops on a grep of the record for the needle`, () => {
-    expect(dialogWaitFindings(readFileSync(resolve(REPO_ROOT, SCRIPT_FILE), 'utf-8'))).toEqual([])
-  })
-
-  const planted: [label: string, script: string, expected: RegExp][] = [
-    [
-      'a wait that reads only the pane (step 6 before b.fyq)',
-      lines(
-        'while :; do',
-        '    line="$(now_s)"',
-        PANE_READ,
-        '    if grep -qF -- "${TRUST_NEEDLE}" "${pane}"; then',
-        '        dialog_at="${line}"',
-        '        break',
-        '    fi',
-        '    expect_no_needle "${step}: before the dialog" "${pane}"',
-        '    last_clear="${line}"',
-        '    sleep "${SCENARIO_POLL_S}"',
-        'done',
-      ),
-      /^line 1: the wait for the trust dialog reads no stub record \(stub_shown_dialogs\)/,
-    ],
-    [
-      'a wait that reads the record but tests only the pane',
-      lines('while :; do', PANE_READ, RECORD_LINE, '    if grep -qF -- "${TRUST_NEEDLE}" "${pane}"; then', '        break', '    fi', 'done'),
-      /^line 1: .* stops on `grep -qF -- "\$\{TRUST_NEEDLE\}" "\$\{pane\}"`, which does not OR in a plain grep of the stub's record \(\$\{shown\}\)/,
-    ],
-    [
-      'a stop that needs the needle in both the pane and the record',
-      lines('while :; do', PANE_READ, RECORD_LINE, '    grep -qF -- "${TRUST_NEEDLE}" "${pane}" && grep -qF -- "${TRUST_NEEDLE}" "${shown}" && break', 'done'),
-      /^line 1: .* stops on `grep [^`]*"\$\{pane\}" && grep [^`]*"\$\{shown\}"`, which does not OR in/,
-    ],
-    [
-      'a negated record check beside a stop that tests only the pane',
-      lines(
-        'while :; do',
-        PANE_READ,
-        RECORD_LINE,
-        '    ! grep -qF -- "${TRUST_NEEDLE}" "${shown}" || fail "${step}: the record holds a dialog the pane missed"',
-        '    if grep -qF -- "${TRUST_NEEDLE}" "${pane}"; then',
-        '        break',
-        '    fi',
-        'done',
-      ),
-      /^line 1: .* stops on `grep -qF -- "\$\{TRUST_NEEDLE\}" "\$\{pane\}"`, which does not OR in/,
-    ],
-    [
-      'a break in the else branch of the record test (it stops on a clear read)',
-      lines(
-        'while :; do',
-        PANE_READ,
-        RECORD_LINE,
-        '    if grep -qF -- "${TRUST_NEEDLE}" "${pane}" "${shown}"; then',
-        '        sleep "${SCENARIO_POLL_S}"',
-        '    else',
-        '        break',
-        '    fi',
-        'done',
-      ),
-      /^line 1: the audit cannot read the condition of a break in the wait for the trust dialog/,
-    ],
-    [
-      'a wait that reads the record before the pane',
-      lines(
-        'while :; do',
-        '    line="$(now_s)"',
-        RECORD_LINE,
-        PANE_READ,
-        '    if grep -qF -- "${TRUST_NEEDLE}" "${pane}" "${shown}"; then',
-        '        break',
-        '    fi',
-        '    last_clear="${line}"',
-        'done',
-      ),
-      /^line 1: the wait for the trust dialog does not read the pane \(pane_capture\) before the stub's record/,
-    ],
-    [
-      'a record read only before the wait',
-      lines(RECORD_LINE.trimStart(), 'while :; do', PANE_READ, '    if grep -qF -- "${TRUST_NEEDLE}" "${pane}" "${shown}"; then', '        break', '    fi', 'done'),
-      /^line 2: the wait for the trust dialog reads no stub record/,
-    ],
-    [
-      'a script whose only wait is a pane predicate under wait_until',
-      lines('wait_until 40 "the dialog never showed" pane_shows_dev_dialog', 'for needle in "${TRUST_NEEDLE}" "${TRUST_NEEDLE}"; do', '    grep -qF -- "${needle}" "${pane}"', 'done'),
-      /^no loop breaks on the trust needle/,
-    ],
-    [
-      'a loop left open',
-      lines('while :; do', PANE_READ, RECORD_LINE, '    grep -qF -- "${TRUST_NEEDLE}" "${pane}" "${shown}" && break'),
-      /^unpaired loop line\(s\) 1: the audit cannot pair each loop head with its done$/,
-    ],
-  ]
-
-  test.each(planted)('self-check: %s is a finding', (_label, script, expected) => {
-    expect(dialogWaitFindings(script)).toEqual([expect.stringMatching(expected)])
+    expect(current.stdout).not.toContain('hooks-verified')
+    expect(current.stdout).not.toContain('fixture-released')
   })
 })

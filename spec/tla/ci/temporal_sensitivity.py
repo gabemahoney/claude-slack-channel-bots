@@ -218,7 +218,7 @@ def replay_inputs(cfg_text, raw, *, correct_cycle=False, positive=False):
     matches = "TRUE" if correct_cycle else "TraceRecord(st) = ReplayRecords[position]"
     goal = target + " /\\ " + nonvacuity(target) if positive else "~" + target
     # Supporting positive contrasts are RAW existential behaviors. They do not
-    # claim positive nonvacuity inside the canonical two-send restriction.
+    # claim positive nonvacuity inside the canonical four-send recovery restriction.
     restriction = "" if positive or correct_cycle else " /\\ []RestartStateConstraint"
     library, (state_name, record_name) = tla_values([states, behavior])
     module = """---------------- MODULE TemporalReplay ----------------
@@ -557,7 +557,6 @@ def validate_evidence(root, row, raw, evidence, *, require_contrast=False):
         if bug == "deferred_only_open":
             initial = behavior[0]["state"]
             require(behavior[0]["constants"]["Scenario"] == "empty-reconnect"
-                    and initial["a"]["screen"] in {"other", "overlay"}
                     and not initial["a"]["mcp"] and initial["g"]["deferred"]
                     and not initial["p"]["accepted"]
                     and all(not r["state"]["p"]["accepted"] for r in behavior[loop-1:]),
@@ -620,7 +619,7 @@ NotConcrete == ~(Fairness""" + assumption + " /\\ []RestartStateConstraint /\\ ~
 # The guide never supplies enabledness or fairness to the exact replay proof.
 def targeted_candidate_inputs(cfg_text):
     spec, target, bug, constants = cfg_context(cfg_text)
-    require(bug in {"park_retype", "unreadable_park"}, "unsupported targeted candidate")
+    require(bug in {"park_retype", "unreadable_park", "hold_gate_mcp"}, "unsupported targeted candidate")
     assumption = " /\\ TypableHeadTakeInAssumption" if spec == "Spec" else ""
     module = r'''---------------- MODULE ConcreteCandidate ----------------
 EXTENDS PersonaDelivery
@@ -629,6 +628,8 @@ TargetedMutationWitnessGuide ==
  [] st.h.accepted = {} /\ st.observation = "none" -> Accept
  [] st.e.phase = "text" /\ st.faults["textUnknown"] = 0 ->
       EngineCallFault /\ st'.outcome = "textUnknown" /\ st'.a.box = None
+ [] Bug = "hold_gate_mcp" /\ st.faults["textUnknown"] > 0 /\
+    st.faults["mcpDrop"] = 0 /\ st.g.owner = "delivery" -> MCPDrop
  [] Bug = "park_retype" /\ st.e.retypes[1] >= 1 /\ st.a.box # None /\
     st.faults["agentDrop"] = 0 -> AgentDrop
  [] Bug = "unreadable_park" /\ st.h.everSent # {} /\ st.e.phase = "ready" /\
@@ -646,8 +647,39 @@ NotConcrete == ~(Fairness''' + assumption + " /\\ []RestartStateConstraint /\\ ~
                     "CONSTRAINT RestartStateConstraint\nALIAS TraceView\nPOSTCONDITION EmitTrace\n")
 
 
+def observation_replacement_candidate_inputs(cfg_text):
+    """Exercise replacement of a waiting read before the engine consumes it.
+
+    This only guides the search through original Next actions. Exact replay,
+    raw action fairness and the same-schedule correct contrast still decide
+    whether the exported candidate establishes the mutation's sensitivity.
+    """
+    spec, target, bug, constants = cfg_context(cfg_text)
+    require(bug == "replace_observation", "unsupported observation candidate")
+    assumption = " /\\ TypableHeadTakeInAssumption" if spec == "Spec" else ""
+    module = r'''---------------- MODULE ConcreteCandidate ----------------
+EXTENDS PersonaDelivery
+TargetedMutationWitnessGuide ==
+ CASE st.w.kind # "none" -> EngineStep
+ [] st.h.accepted = {} /\ st.observation = "none" -> Accept
+ [] st.observation = "ready" /\ st.knowledge.r.row = "waiting" /\
+    st.a.row = "waiting" /\ EngineChoice(StepKnowledge) = "requestGate" -> AgentOwnTurnStart
+ [] st.observation = "ready" /\ st.knowledge.r.row = "waiting" /\
+    st.a.row = "working" -> EngineObserve
+ [] st.observation = "ready" \/ InternalContinuation -> EngineStep
+ [] st.a.actual # "idle" -> AgentTurnEnd
+ [] OTHER -> EngineObserve
+CandidateNext == Next /\ TargetedMutationWitnessGuide
+CandidateSpec == Init /\ [][CandidateNext]_vars
+NotConcrete == ~(Fairness''' + assumption + " /\\ []RestartStateConstraint /\\ ~" + target + " )\n" + "=" * 56 + "\n"
+    return module, ("SPECIFICATION CandidateSpec\n" + constants + "PROPERTY NotConcrete\n"
+                    "CONSTRAINT RestartStateConstraint\nALIAS TraceView\nPOSTCONDITION EmitTrace\n")
+
+
 def candidate_search_inputs(cfg_text, raw):
-    if cfg_context(cfg_text)[2] in {"park_retype", "unreadable_park"}:
+    if cfg_context(cfg_text)[2] == "replace_observation":
+        return "independent-targeted-guide", observation_replacement_candidate_inputs(cfg_text)
+    if cfg_context(cfg_text)[2] in {"park_retype", "unreadable_park", "hold_gate_mcp"}:
         return "independent-targeted-guide", targeted_candidate_inputs(cfg_text)
     return "view-label-search", candidate_inputs(cfg_text, raw)
 

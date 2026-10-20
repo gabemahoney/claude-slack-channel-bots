@@ -3,12 +3,12 @@ import type { QueueEvent, QueueItem, DeliveryQueue, AcceptedRecord } from './del
 import type { DeliveryEngineEvent, DeliveryReason, DeliveryStatus } from './delivery-engine.ts'
 import type { PersonaEpisodes } from './persona-episodes.ts'
 import { CONFLICT_NOTICE_HUMAN_ONLY_LINE } from './conflict-latch.ts'
-import { DELIVERY_STUCK_AFTER_MS, RECONNECT_BLOCKED_NOTICE_MS } from './delivery-constants.ts'
+import { DELIVERY_STUCK_AFTER_MS } from './delivery-constants.ts'
 import { escapeSlackControlCharacters } from './slack-text-escape.ts'
 import { redactSlackLogText } from './slack-log-redaction.ts'
 import { renderPersonaRef } from './persona-identity.ts'
-
 import { MESSAGE_NOT_SAVED, MESSAGE_RECEIVED, MESSAGE_DELIVERED, MESSAGE_RETYPED, MESSAGE_NOT_TAKEN_IN, DELIVERY_STUCK, QUEUE_RECORD_UNREADABLE, QUEUE_UNWRITABLE, QUEUE_KEPT, deliveryIdentity, buildDeliveryDiagnostic, queueErrorCode, type DeliveryDiagnosticClass } from './persona-diagnostics.ts'
+
 export { DELIVERY_DIAGNOSTIC_CLASSES, MESSAGE_NOT_SAVED, MESSAGE_RECEIVED, MESSAGE_DELIVERED, MESSAGE_RETYPED, MESSAGE_NOT_TAKEN_IN, DELIVERY_STUCK, MESSAGES_WAITING, QUEUE_RECORD_UNREADABLE, QUEUE_UNWRITABLE, QUEUE_KEPT, SYSTEM_PROMPT_UNWRITABLE, deliveryIdentity, buildDeliveryDiagnostic, queueErrorCode } from './persona-diagnostics.ts'
 const safe = (text: string): string => redactSlackLogText(text).replace(/[\r\n]/g, ' ')
 const slack = (text: string): string => escapeSlackControlCharacters(safe(text))
@@ -23,12 +23,10 @@ export function buildDeliveryDispatchLine(persona: string, accepted: AcceptedRec
 export function buildMessageNotSavedNotice(persona: string, sender: string): string {
   return `:warning: *Message not saved* — a message from ${slack(sender)} for ${slack(persona)} could not be saved. Slack will send it again a few times; it is delivered if one copy is saved, otherwise it is lost and should be sent again. Further messages to this persona may fail the same way until storing works; server.log counts them. Check the server's disk.`
 }
-export type DeliveryStuckReason = 'menu' | 'input' | 'relay-off' | 'mcp' | 'refused' | 'transcript' | 'queue-unwritable' | 'not-taken-in' | 'dialog-hold'
+export type DeliveryStuckReason = 'relay-off' | 'mcp' | 'refused' | 'transcript' | 'queue-unwritable' | 'not-taken-in' | 'dialog-hold'
 export function deliveryStuckRemedy(reason: DeliveryStuckReason, key: string, count: number): string {
   const attach = `\`tmux attach -t =slack_bot_${key}\``
   switch (reason) {
-    case 'menu': return `A menu, overlay or dialog is open in its terminal. Attach with ${attach} and close it.`
-    case 'input': return `Text is left in its input box. Attach with ${attach} and submit or clear it.`
     case 'relay-off': return `Its permission relay is off. Restart the persona's bot.`
     case 'mcp': return `It is not connected to this server over MCP. Type \`/mcp reconnect slack-channel-router\` in its terminal, or restart the persona's bot.`
     case 'refused': return `agent-director keeps refusing to type into it. Check its state with \`agent-director get --instance-id cscb_${key}\`.`
@@ -69,8 +67,8 @@ export function buildQueueRecordUnreadableNotice(persona: string, count: number,
 function stuckReason(reason: DeliveryReason, status: DeliveryStatus): DeliveryStuckReason | undefined {
   if (reason === 'transcript-unreadable') return 'transcript'
   if (reason === 'not-now') return 'refused'
-  if ((reason === 'receipt' || reason === 'idle-evidence') && status.retypeCount > 0) return 'not-taken-in'
-  return ['menu', 'input', 'relay-off', 'mcp', 'queue-unwritable', 'dialog-hold'].includes(reason) ? reason as DeliveryStuckReason : undefined
+  if ((reason === 'receipt' || reason === 'backoff') && status.retypeCount > 0) return 'not-taken-in'
+  return ['relay-off', 'mcp', 'queue-unwritable', 'dialog-hold'].includes(reason) ? reason as DeliveryStuckReason : undefined
 }
 export interface DeliveryReportingDeps {
   queue: DeliveryQueue; episodes: PersonaEpisodes
@@ -78,7 +76,6 @@ export interface DeliveryReportingDeps {
   state(key: string): DeliveryReportState
   log(line: string): void
   notify(key: string, text: string): void | Promise<unknown>
-  reconnectBlocked(key: string, rule: 'menu' | 'input'): void
   delivered?(key: string, item: QueueItem): void | Promise<void>
   stuckAfterMs?: number
   now?: () => number
@@ -140,7 +137,6 @@ export function createDeliveryReporting(deps: DeliveryReportingDeps) {
       deps.log(`[slack] delivery-${event.type}: ${JSON.stringify({ key, launch_id: event.launchId, session_id: event.sessionId, at: event.at })}`)
       return
     }
-    if (event.type === 'reconnect-screen') { if (event.blockedMs >= RECONNECT_BLOCKED_NOTICE_MS && deps.state(key).up) deps.reconnectBlocked(key, event.reason); return }
     if (event.type === 'marker-missing' || event.type === 'delivered') return
     const item = deps.queue.items(key).find(i => i.accepted.seq === event.seq)
     if (!item) return
@@ -168,7 +164,7 @@ export function createDeliveryReporting(deps: DeliveryReportingDeps) {
     if (!state.up) return
     const waiting = messagesWaitingState(status, state)
     if (waiting) { deps.episodes.begin(key, 'messages-waiting'); deps.episodes.post(key, 'messages-waiting', buildMessagesWaitingNotice(ref(key), status.count, status.ageMs, waiting)); return }
-    if (state.outage || state.prompt || state.launch || status.reconnectScreen || status.row === 'pending' || status.row === 'check_permission' || status.row === 'working' && (status.receiptWorking || status.dialogMaybeOpen || event.reason === 'receipt')) return
+    if (state.outage || state.prompt || state.launch || status.row === 'pending' || status.row === 'check_permission' || status.row === 'working' && (status.receiptWorking || status.dialogMaybeOpen || event.reason === 'receipt')) return
     const reason = stuckReason(event.reason, status)
     if (!reason || status.ageMs <= (deps.stuckAfterMs ?? DELIVERY_STUCK_AFTER_MS)) return
     const begun = deps.episodes.begin(key, 'delivery-stuck')

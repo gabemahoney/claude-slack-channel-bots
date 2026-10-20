@@ -10,7 +10,7 @@ import type { AcceptedInput, DeliveryQueue, QueueRecord } from '../../src/delive
 import { createFakeClock } from './fake-clock.ts'
 import { makeQueue, injectedInput, readQueue } from './delivery-queue.ts'
 import { cannedGetResult, makeStubClient, type CannedGetResult } from './agent-director-stub.ts'
-import { appendTranscript, codexPromptEntry, deliveryPane, endedTurn, promptEntry, replyEntry, writeTranscript } from './working-row-panes.ts'
+import { appendTranscript, codexPromptEntry, endedTurn, promptEntry, replyEntry, writeTranscript } from './working-row-panes.ts'
 
 export async function makeEngineHarness(options: { keys?: string[]; constants?: DeliveryEngineDeps['constants']; stateDir?: string; configuredAgent?: 'claude' | 'codex'; clientFor?: DeliveryEngineDeps['clientFor']; onRow?: DeliveryEngineDeps['onRow']; inspectUpgrade?: DeliveryEngineDeps['inspectUpgrade']; onEvent?: DeliveryEngineDeps['onEvent'] } = {}) {
   const root = options.stateDir ?? mkdtempSync(join(tmpdir(), 'delivery-engine-'))
@@ -31,15 +31,15 @@ export async function makeEngineHarness(options: { keys?: string[]; constants?: 
     const state = {
       key, path, row: cannedGetResult({ instance_id: `cscb_${key}`, cwd: root, jsonl_path: path, session_id: `${key}-session`, labels: { tag_prompt: '1' } }) as CannedGetResult,
       box: '', up: true, latched: false, held: false, connected: true, applied: true, restartPending: false,
-      running: false, pane: undefined as string | undefined, getError: undefined as Error | undefined, paneError: undefined as Error | undefined,
+      running: false, pane: undefined as string | undefined, getError: undefined as Error | undefined, getHook: undefined as (() => void) | undefined, paneError: undefined as Error | undefined,
       autoReceipt: true, lostEnters: 0, retainBox: false,
       keyHook: undefined as ((params: SendKeysParams) => Error | undefined | Promise<Error | undefined>) | undefined,
       reads: 0, readHook: undefined as (() => void) | undefined,
     }
     state.row.transcript_status = 'present'
     const stub = makeStubClient({
-      getFn(params) { calls.push({ key, verb: 'get', at: clock.now(), params }); return state.getError ?? state.row },
-      readPaneFn(params) { calls.push({ key, verb: 'read-pane', at: clock.now(), params }); state.reads++; state.readHook?.(); return state.paneError ?? { pane: state.pane ?? deliveryPane(state.box, { agent: state.row.agent === 'codex' ? 'codex' : 'claude', running: state.running }), pane_sha256: '' } },
+      getFn(params) { state.getHook?.(); calls.push({ key, verb: 'get', at: clock.now(), params }); return state.getError ?? state.row },
+      readPaneFn(params) { calls.push({ key, verb: 'read-pane', at: clock.now(), params }); state.reads++; state.readHook?.(); return state.paneError ?? { pane: state.pane ?? 'arbitrary terminal contents', pane_sha256: '' } },
       async sendKeysFn(params) {
         calls.push({ key, verb: 'send-keys', at: clock.now(), params: { ...params } }); order.push(`keys:${key}`)
         const error = await state.keyHook?.(params)

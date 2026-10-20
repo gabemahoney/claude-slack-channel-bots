@@ -771,7 +771,7 @@ AD_BIN_PATH="$(realpath -e -- "${SCENARIO_AD_BIN}")" || fail "setup: cannot reso
 
 start_slack_stub
 P_WORK="$(make_workdir p)"
-stub_mode "${P_WORK}" "${STUB_MODE_STARTUP_TRUST}"
+stub_mode "${P_WORK}" "${STUB_MODE_AT_ONCE}"
 stub_mode "${P_WORK}" "${STUB_MODE_AT_ONCE}"
 P_CONFIG_DIR="${SCENARIO_ROOT}/claude-config-p"
 mkdir -p "${P_CONFIG_DIR}"

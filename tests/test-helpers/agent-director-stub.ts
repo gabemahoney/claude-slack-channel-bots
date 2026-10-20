@@ -1,136 +1,4 @@
 import { cannedReadPaneResult } from './ad-results.ts'
-/**
- * agent-director-stub.ts — Test helper that mints fake `agent-director`
- * `Client` instances for unit tests (SR-8.3).
- *
- * Epic 1 scope: only the verbs the foundation needs are wired up — the
- * typed Err* classes the SR-5.1 startup gate branches on (`ErrBunVersionTooOld`
- * for the Bun-version gate, plus the AD 0.7.0 system-install discovery trio
- * `ErrSystemInstallNotFound` / `ErrSystemInstallTooOld` /
- * `ErrSystemInstallUnreachable` thrown by `Client.create` and
- * `resolveSystemBinary`), `version()` for the version-gate sub-case matrix,
- * and `makeTemplate()` for the SR-3.2 template install path. Epic 2 extends
- * this helper to cover the full spawn / list / get / decide surface CSCB uses
- * at runtime.
- *
- * Beyond `Client` instances, this module also exports `makeStubCreateClient`
- * and `makeStubResolveSystemBinary` — stub factories shaped like
- * `Client.create()` and `resolveSystemBinary()` respectively, used to drive
- * the SR-5.1 startup gate's catch ladder for the three system-install errors
- * and the runtime version re-check. `makeStubResolveSystemBinary` resolves
- * with `PHASE1_RC_VERSION` at `STUB_RESOLVE_DEFAULT_PATH` by default, takes
- * an ordered `outcomes` list (each entry a version, an error to reject with,
- * or a call that never settles; the last entry repeats) and records every
- * call in `calls`. `makeCloseCountingStubClient` gives a stub client whose
- * `close()` counts its calls, and `makePassingGateDeps` the startup-gate
- * seams of a run that passes every step.
- *
- * The stub does NOT extend `Client` — instantiating the real class would call
- * Bun FFI. Instead it satisfies the structural-typed verb surface CSCB calls,
- * including the AD 0.7.0 readonly getters `binaryPath` / `binaryVersion`.
- * Production code under test injects the stub via the `getClient` factory
- * passed to the startup gate (see src/agent-director-startup.ts).
- *
- * `makeStubCallLog` / `stubCallCount` give a capture list for every verb and
- * their total, and `installStubSpawnPath` / `resetStubSpawnPath` route the
- * real persona launch path (`spawnForPersona`) to a fresh stub client with
- * the approver's cap shortened and a temp spawn home; the approver reads and
- * types; the prompt-row checks (b.jdc's one-line `read-pane`) only read; both
- * go through the stub client only. A launch
- * through that path returns before its approver's first lap (the approver
- * runs on its own after the launch call, b.jg5 SRJ-401), and
- * `resetStubSpawnPath` leaves no approver running.
- *
- * A recorded `spawn` may be a reuse spawn (b.jg5 SRJ-112, SRJ-708): the
- * stub records its parameters as the client's own `SpawnParams`, reuse flag
- * (`reuse_finished`) included, so a test reads the flag from `spawnCalls`
- * with no cast, and answers it like any spawn, from the same queue and knobs.
- *
- * Per-call answers: `statusFn`, `getFn`, `spawnFn`, `resumeFn`,
- * `findMissingFn`, `readPaneFn`, `sendKeysFn` and `killFn` compute a verb's
- * answer from each call's parameters and win over its queue, error and
- * result; each call is still recorded in the verb's capture list first.
- * Every one but `statusFn` and `getFn` may be async, so a case runs code
- * while a call is in progress, such as moving a fake clock and then
- * rejecting with `errCallTimeout` or `errTmuxUnresponsiveLaunchTimeout`
- * (b.jg5 SRJ-407's launch-call window). Each answers `undefined` to leave a
- * call to the verb's other knobs. The last four let a row's answers follow
- * what CSCB did to it (b.jg5 SRJ-410, SRJ-412): an Enter that clears a
- * startup dialog, a `find-missing` run that judges the row only from G, a
- * `kill` that ends it (`tests/test-helpers/pending-row-model.ts` scripts one
- * persona's row through them).
- *
- * Held calls: `holdSpawns` keeps a stub's `spawn` calls open, and
- * `holdFindMissing` its `find-missing` calls (b.jg5 SRJ-706: a live-row
- * sequence's run held while the start pass, an apply, a stop or a lost
- * message is driven), until the test settles each, oldest first: its handle
- * gives the calls received, the number still held, a promise for a call
- * entered, release with a result (a placement from `cannedFindMissing`),
- * failure with an error, and release of every held call for cleanup.
- *
- * Phase 1 errors and results (b.jg5 SRJ-1303):
- *   - Every error builder uses the client's own class, except:
- *       - `errGeneric`, which builds the base `AgentDirectorError` for any
- *         `errName` (a base error named like a class is not that class:
- *         the classifier answers UNCLASSIFIED for it);
- *       - `errAmbiguousRequest` and `errPermissionRequestNotFound`, which
- *         build the base `AgentDirectorError` with the error's `errName`
- *         although the client exports a class for each, because the code
- *         under test recognises both by `errName`.
- *     The three families for the errors only the Phase 1 client declares
- *     (`errTmuxUnresponsive*`, `errTmuxKillFailed`, `errTmuxSessionConflict`)
- *     build with `new` on `ErrTmuxUnresponsive`, `ErrTmuxKillFailed` and
- *     `ErrTmuxSessionConflict`, the client's own classes as
- *     `src/agent-director-errors.ts` re-exports them. Each value carries its
- *     verb, its name as `errName` and its description.
- *   - `ErrInternal`, `ErrConfigMalformed` and the three store-open names
- *     (`ErrSchemaMismatch`, `ErrSchemaMigrationRequired`, `ErrStoreOpen`)
- *     have no class in any client and arrive as `ErrUnknownErrorName`;
- *     `errInternal`, `errUnusableName`, `errConfigMalformed`,
- *     `errSchemaMismatch` and `errUnknownErrorName` build that class the way
- *     the client does, with the name in `unknownName` and the binary's
- *     `{ err_name, err_description }` envelope in `envelope`
- *     (`ErrSchemaMigrationRequired` and `ErrStoreOpen` through
- *     `errUnknownErrorName`).
- *   - A plain spawn's re-lookup after "duplicate session" that could not
- *     answer (HO rev 26; b.jg5 SRJ-111): `errTmuxUnresponsiveNewRowEnded`
- *     (UNAVAILABLE) and `errTmuxNotAvailableNewRowEnded` (ENVIRONMENT), each
- *     carrying "the new row was ended" and the retry with `reuse_finished`
- *     (`NEW_ROW_ENDED_RETRY`), never the launch-timeout words.
- *   - `UNAVAILABLE_FORMS` is the one table of UNAVAILABLE forms (label,
- *     builder by verb, cause kind); `unavailableForms` picks a subset.
- *   - The description words CSCB matches come from
- *     `src/ad-description-phrases.ts`; the Phase 1 result fields
- *     (`kill_sent`, `launch_started_at`, `liveness_note`, `pre_trust`) are
- *     typed by the client's own result types. A binary older than Phase 1
- *     omits `kill_sent` and `pre_trust`, which the client declares required,
- *     so the stub's `kill`, spawn and `resume` answers are typed
- *     `StubKillResult`, `StubSpawnResult` and `StubResumeResult`: the
- *     client's type with that one field optional ({@link MayLackPhase1Fields}).
- *   - Liveness notes (b.jg5 SRJ-114): `provenanceNote` is the only note that
- *     latches; `nonLatchingNotes` is every other note agent-director names,
- *     the list a `test.each` iterates for "no other note latches", typed as
- *     the client's free text; `unknownNote` is a note CSCB does not
- *     know. Tests take note values from here and never type them.
- *   - Launch starts (b.jg5 SRJ-513): the canned row builders
- *     (`cannedStatusResult`, `cannedGetResult`, `cannedListRow`) and the stub
- *     client's default answers give a `pending` row the sample launch start
- *     `SAMPLE_LAUNCH_START_DEFAULT` unless the case gives `launch_started_at`,
- *     since a configured persona's own `pending` row with no launch start
- *     latches the persona. "No launch start" is an explicit request:
- *     `launch_started_at: SAMPLE_LAUNCH_START_NONE` (the key left out) or
- *     `launch_started_at: null`. Rows in any other state carry no launch
- *     start unless given one. Tests take launch starts from the
- *     `SAMPLE_LAUNCH_START*` constants and never type a timestamp.
- *   - Pre-trust (b.jg5 SRJ-413): `cannedSpawnResult` and `cannedResumeResult`
- *     take a `pre_trust`, and `PRE_TRUST_VALUES` lists the three values
- *     (`ok`, `skipped`, `failed`), checked at compile time against every
- *     member of `PreTrust`; a result with no `pre_trust` (from a binary older
- *     than Phase 1) is the builder's value left out. Tests take `pre_trust`
- *     values from the list and never type them.
- *
- * SPDX-License-Identifier: MIT
- */
 
 import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
@@ -214,15 +82,7 @@ import {
   personaInstanceId,
   personaTmuxSessionName,
 } from '../../src/persona-identity.ts'
-import {
-  _resetApproverClock,
-  _resetDialogReadyTimeoutMs,
-  _resetInFlightLaunches,
-  _resetSpawnHomeDir,
-  _setDialogReadyTimeoutMs,
-  _setSpawnHomeDir,
-  personaConfigDirLabelValue,
-} from '../../src/session-manager.ts'
+import { _resetInFlightLaunches, _resetSpawnHomeDir, _setSpawnHomeDir, personaConfigDirLabelValue } from '../../src/session-manager.ts'
 import { resetClientForTests, setClientForTests } from '../../src/agent-director-client.ts'
 import {
   ERR_SCHEMA_MISMATCH_NAME,
@@ -2337,31 +2197,10 @@ export interface StubSpawnPath {
   spawnedIds(): string[]
 }
 
-/**
- * Route the real persona launch path (`spawnForPersona`) to a fresh stub
- * client with an empty call log: the client is installed as the process's
- * agent-director client, and the spawn home is `homeDir` (its `.claude`
- * directory is created). A prompt row (`ask_user`, `check_permission`) the
- * launch meets is read through the stub's `read-pane` (b.jg5 SRJ-607),
- * whose default answer is a pane: no action.
- * `homeDir` must be under the test's `mkdtempSync` directory. Undo
- * everything with `resetStubSpawnPath` in `afterEach`.
- *
- * A launch through this path that returns success starts the persona's
- * startup-dialog approver on its own (b.jg5 SRJ-401): `spawnForPersona`
- * returns before the approver's first lap, which then reads and types
- * through the same client (`status`, `readPane`, `sendKeys`). Its cap is
- * 200 ms (`_setDialogReadyTimeoutMs`, which caps the approver only); its
- * laps are `DIALOG_POLL_INTERVAL_MS` apart, and its sleeps and cap run on
- * the approver's clock (the real one unless the case sets
- * `_setApproverClock`). A case that counts calls after the launch awaits the
- * approver's stop first (`_whenDialogApproverStopped(key)`).
- */
 export function installStubSpawnPath(homeDir: string): StubSpawnPath {
   const calls = makeStubCallLog()
   const client = makeStubClient(calls)
   setClientForTests(client as unknown as Parameters<typeof setClientForTests>[0])
-  _setDialogReadyTimeoutMs(200)
   mkdirSync(join(homeDir, '.claude'), { recursive: true })
   _setSpawnHomeDir(homeDir)
   return {
@@ -2372,18 +2211,9 @@ export function installStubSpawnPath(homeDir: string): StubSpawnPath {
   }
 }
 
-/**
- * Undo `installStubSpawnPath`: stop and forget every dialog approver and
- * every launch still marked in flight (`_resetInFlightLaunches`, which runs
- * the session manager's approver reset), so no approver is left running;
- * then restore the approver's real clock (a case may have set
- * `_setApproverClock`) and its cap, the client and the spawn home.
- */
 export function resetStubSpawnPath(): void {
   _resetInFlightLaunches()
   resetClientForTests()
-  _resetDialogReadyTimeoutMs()
-  _resetApproverClock()
   _resetSpawnHomeDir()
 }
 

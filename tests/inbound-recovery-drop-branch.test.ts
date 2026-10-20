@@ -1,205 +1,74 @@
-import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
-import { TRUST_DIALOG_PANE } from './test-helpers/working-row-panes.ts'
-/**
- * inbound-recovery-drop-branch.test.ts — lost messages (b.av2 SR-4.6, SR-7.3,
- * SR-7.2 part; b.kvq and b.9cj recovery, keyed per persona). The AC 26
- * verifier: run `bun test tests/inbound-recovery-drop-branch.test.ts -t
- * "AC 26"` for its cases; the AC 68 verifier (no human-triggered restart in
- * states 2 to 6, b.jg5 SRJ-1501): `bun test
- * tests/inbound-recovery-drop-branch.test.ts -t "AC 68"`. Name this file:
- * a bare `-t` also matches other files' "AC 26" and "AC 68" cases.
- *
- * A Slack message that qualifies for persona P but finds no live,
- * stream-bearing session (no session, a disconnected one, or one that has lost
- * its GET stream) is lost. The branch in src/persona-routing.ts decides the
- * recovery state (b.jg5 SRJ-1011, SRJ-1509), the first that applies, in the
- * order src/lost-message.ts exports (`LOST_MESSAGE_STATES`): P not up (b.av2
- * SR-6.4, bug b.g57: its own bring-up recovery launches it); P latched
- * (held for a human); P held on `ErrInvalidFlags` (cannot launch); P's kill
- * failed; P not answering (its `tmux-unresponsive` condition holds, or its
- * `tmux-unavailable` or `ad-config-malformed` outage is raised; never an
- * unclassified-error episode alone; only while P's retry timer is armed and
- * P is below the restart cap, b.jg5 SRJ-1011 as amended, so a P at the cap
- * reports restart limit reached whatever is raised); P's row reading `pending` (session
- * starting: a launch or dialog approver for P running, or the one row read
- * the routing makes when none of states 1 to 5 applies and nothing is in
- * flight for P answering `pending`; a live-row sequence or old-life wait
- * step running for P answers restarting first, with no read; a failed read,
- * `unknown` or rejected, is never `pending`; states 1 to 5 are decided again
- * after the read); then P's restart guards (a
- * restart already pending or running, auto-restart disabled, P at the
- * restart-failure cap). It schedules a human-triggered restart of P only
- * when none applies ("starting now"; b.jg5 SRJ-1501, AC 68), and raises one
- * lost-message notice at P's permission-prompt destination (a channel, or
- * the DM with `dm.contact`), through P's own client and under P's identity.
- * The notice names P, the sender and the recovery state, and never carries
- * the message text. Nothing is posted in the conversation the message came
- * from. In src/restart.ts, `scheduleRestart(…, { humanTrigger: true })`
- * clamps the backoff delay DOWN to HUMAN_TRIGGER_DELAY_CEILING (never up).
- *
- * Every case drives the real module (`createPersonaRouting(deps).receive`)
- * through the shared harness (tests/test-helpers/persona-routing-harness.ts):
- * the real registry, restart.ts and backoff.ts state, one `makeStubSlack`
- * client per persona, and the real persona notifier and destination hold (on
- * a fake clock) as the routing's `notify`. So every notice assertion is on a
- * captured Slack call. No pipeline logic or reply text is copied here. The
- * receiving persona (alpha) is the SECOND persona of the config, its
- * destination is never the conversation a message comes from, and every case
- * also checks the first persona (beta): a recovery, notice or post keyed to
- * the wrong persona fails. Notice text is checked by property (persona,
- * "lost", sender, one recovery state, no mention, no message text); the state
- * is told by the harness's `stateOf`, which matches the wordings
- * src/lost-message.ts exports, so no wording is copied here.
- *
- * The state inputs are the harness's real instances, set through their own
- * entries: E13's latch (`set`, `setFromConflict`, and `forget`, its silent
- * drop), E10's `tmux-unresponsive` condition (`start`, `end`), the real
- * outage state (`raiseTmuxUnavailable`, `raiseAdConfigMalformed`,
- * `clearOutageFlag`, recorded apart from the Slack stubs), and the harness's
- * own restart launch held open (a launch running, as production binds
- * `isLaunchInFlight`). The inputs later Epics bind (held on `ErrInvalidFlags`,
- * kill failed, a live-row sequence or old-life wait step) and a running
- * dialog approver are per-key sets. "No restart" is checked as no relaunch-gate
- * ask (`h.restartAsks`) and no restart pending or launch the message started,
- * with the restart module able to launch (fast delay) and not given the
- * latch, so only the routing's own rule keeps it from restarting. The row
- * read is the harness's scripted `readRowLiveness` (`rowRead`, answers from
- * src/liveness-reading.ts or a rejection; its `during` latches P or raises
- * an outage while the read runs), bound only where a case asks for it. The
- * streamless branch's own cases are in tests/dispatch-get-stream.test.ts;
- * general delivery, and where the read is gated in the pipeline, in
- * tests/persona-routing.test.ts.
- *
- * The read's agent-director side runs on the recovery harness
- * (tests/test-helpers/recovery-harness.ts, its lost-message driver bound as
- * main() binds it): the read is the one liveness adapter's `status` of P's
- * own instance, outside any launch or recovery attempt, so its answers'
- * effects (outage raises, retry timer arms, episodes, the condition) are
- * read from the real modules over the stub client and a fake clock; none is
- * made while a spawn is held open, nor while the persona's dialog approver
- * runs after its launch returned (b.jg5 SRJ-401; driven on the harness
- * clock), and one is made once the approver has stopped; and the restart
- * path's own read still keeps a launch off a `pending` row after a failed
- * routing read. State 4 (b.jg5 SRJ-1011, SRJ-704) runs there too, the
- * driver's kill-failed input bound to the harness's kill-failure alerts'
- * episode: an item accepted after the ordinary alert (the restart path's one
- * try, or a live-row sequence's tries ending in `ErrTmuxUnresponsive` after a
- * survivor-naming failure) reports `kill-failed`; after the survivor version,
- * or once the episode ended, it never does; a CONFLICT latch gives
- * `held-for-human` first. A message lost while P's live-row sequence runs
- * (b.jg5 SRJ-706, the driver's sequence/wait input and read gate bound to
- * the session manager's running query) reports `restarting` there with no
- * read and no restart, P's row `pending` and the sequence's own step-6
- * launch included; a latch beats it, and once the sequence has ended the
- * one read is made again. State 3 (b.jg5 SRJ-1011, SRJ-207) runs there too,
- * the driver's held-on-invalid-flags input bound to the harness's one
- * `ErrInvalidFlags` hold: an item accepted while P is held through a real
- * reuse reports `cannot-launch` with no restart and no call; above an open
- * kill-failure episode it still does; under a latch `held-for-human` comes
- * first; once the binary's version changes and the hold ends it never does.
- * The read clears a retired key's entry there too (b.jg5 SRJ-807, through the
- * liveness adapter's own-row step, the harness's one retired-key store
- * installed as main() installs it): P recorded with its mark set and its row
- * read `waiting` reports as before with P's entry cleared, and a `pending`
- * row reports session starting with nothing cleared.
- * A message lost for P whose key is recorded as retired with no mark (b.jg5
- * SRJ-805) asks for P's restart as for any persona, and that restart never
- * resumes P or types into its old life: an `ended` row is launched by one
- * reuse of P's id, and a live row goes through the live-row sequence, during
- * which a further lost message reports restarting with no read.
- * A message lost while Q waits on an old-life hold (b.jg5 SRJ-812, SRJ-1011
- * state 4; E27 T2), the driver's kill-failed input also bound to the hold's
- * mark and its sequence/wait input and read gate to a wait step running for
- * a hold Q waits on, as main() binds them: before any kill of the old key
- * failed (a hold begun at apply step 1, or from the start sweep's list) it
- * reports today's state with Q's one read, and `restarting` with no read
- * while a wait step runs (Q's own row `pending` included); once the old
- * key's kill failed (the wait's, a teardown's or the sweep's) it reports
- * `kill-failed` until the hold ends; after a survivor version, a CONFLICT or
- * a `kill_sent: false` success it never does.
- *
- * main() in src/server.ts cannot run in a test (startup gate, real port, real
- * Slack connections), so describe (7) audits its source for the wiring only:
- * server.ts hands inbound events to the routing module through the persona
- * event router and holds no copy of the branch.
- *
- * SPDX-License-Identifier: MIT
- */
+import { livenessReadingForStatus } from '../src/liveness-reading.ts'
+import type { Persona } from '../src/config.ts'
+import type { LostMessageState } from '../src/lost-message.ts'
+import { LIVENESS_READING_LIVE, LIVENESS_READING_PENDING, LIVENESS_READING_UNKNOWN } from '../src/liveness-reading.ts'
+import { isAtCap } from '../src/backoff.ts'
+import { LIVENESS_READING_DEAD } from '../src/liveness-reading.ts'
+import { RESTART_FAILURE_CAP } from '../src/restart.ts'
+import { HOLD_LATCH_CASES, LATCH_CASE_LEFTOVER, LATCH_ROW_STATE_UNREADABLE, REFUSED_OPERATION_NONE, REFUSED_OPERATION_PLAIN_SPAWN, LATCH_ROW_STATE_NO_ROW } from '../src/conflict-latch.ts'
+import { PERSONA_EPISODE_KIND_UNCLASSIFIED_ERROR, TMUX_UNRESPONSIVE_END_TICK } from '../src/persona-episodes.ts'
+import { OUTAGE_CLASS_ORDER, clearOutageFlag, raiseAdConfigMalformed, raiseTmuxUnavailable, setOutageFlag } from '../src/outage-state.ts'
+import { createPersonaRelaunchGate } from '../src/persona-start.ts'
+import type { PersonaConnectionStatus } from '../src/persona-connections.ts'
+import { makeAppMention, makeDm, mentionText, stubOpenedDmId, type StubSlackOptions } from './test-helpers/slack-stub.ts'
+import { CONFLICT_CASE_ROWS, conflictForPersona } from './test-helpers/conflict-cases.ts'
+import { putAtRestartCap, LOST_MESSAGE_STATES, LOST_STATE_SETUPS, NEVER_FIRE_RESTART_DELAY_S, ROW_READ_REJECTS, ROW_READ_REJECTION_REDACTED, type RoutingHarnessOptions, type RowReadAnswer } from './test-helpers/persona-routing-harness.ts'
 
-import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test'
+
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { PHASE1_FLOOR_VERSION } from '../src/ad-version-gate.ts'
+import { recordFailure } from '../src/backoff.ts'
 import {
-  initRestart,
-  scheduleRestart,
-  isRestartPendingOrActive,
-  runRestartRetry,
-  HUMAN_TRIGGER_DELAY_CEILING,
-  RESTART_FAILURE_CAP,
-} from '../src/restart.ts'
-import { recordFailure, isAtCap } from '../src/backoff.ts'
-import type { Persona } from '../src/config.ts'
-import type { LostMessageState } from '../src/lost-message.ts'
+  latchRowStateRead
+} from '../src/conflict-latch.ts'
+import { LIVE_ROW_LAUNCH_REASON_RETIRED_KEY, LIVE_ROW_LAUNCH_REUSE, LIVE_ROW_OUTCOME_LAUNCHED, liveRowSequenceStartLine } from '../src/live-row-sequence.ts'
 import {
   AGENT_DIRECTOR_PENDING_STATE,
   LIVENESS_DEAD_ROW_ENDED,
-  LIVENESS_DEAD_ROW_MISSING,
-  LIVENESS_READING_DEAD,
-  LIVENESS_READING_LIVE,
-  LIVENESS_READING_PENDING,
-  LIVENESS_READING_UNKNOWN,
+  LIVENESS_DEAD_ROW_MISSING
 } from '../src/liveness-reading.ts'
-import { personaInstanceId } from '../src/persona-identity.ts'
+import {
+  getOutageFlags,
+  type OutageClass
+} from '../src/outage-state.ts'
+import { PENDING_ROW_REASON_CWD_MISMATCH, PENDING_ROW_REASON_RETIRED_OLD_LIFE, type PendingRowNotCoveredReason } from '../src/pending-row.ts'
+import { personaInstanceId, renderPersonaRef } from '../src/persona-identity.ts'
+import {
+  HUMAN_TRIGGER_DELAY_CEILING,
+  initRestart,
+  isRestartPendingOrActive,
+  restartOldLifeHeldLine,
+  runRestartRetry,
+  scheduleRestart
+} from '../src/restart.ts'
+import { OLD_LIFE_HOLD_CAUSE_APPLY_STEP_1, RETIRED_KEY_CAUSE_REMOVED } from '../src/retired-keys.ts'
+import { LIVENESS_STATUS_SITE } from '../src/server.ts'
+import {
+  OLD_LIFE_ROW_READ_STATE, SPAWN_ACTION_FRESH_RETIRED, isLaunchInFlight, killPersonaInstanceForTeardown,
+  launchForLiveRowSequence,
+  noteOldLifeRowRead,
+  readPersonaOwnRow, readPersonaRowState, uncoveredPendingRowLine
+} from '../src/session-manager.ts'
 import {
   UNAVAILABLE_RETRY_CAUSE_CONFIG,
   UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT,
   UNAVAILABLE_RETRY_CAUSE_PENDING_ROW,
+  UNAVAILABLE_RETRY_ROW_ABSENT, UNAVAILABLE_RETRY_RUN_NOW_RAN,
 } from '../src/unavailable-retry.ts'
 import {
-  HOLD_LATCH_CASES,
-  LATCH_CASE_LEFTOVER,
-  LATCH_ROW_STATE_UNREADABLE,
-  REFUSED_OPERATION_NONE,
-  REFUSED_OPERATION_PLAIN_SPAWN,
-  LATCH_ROW_STATE_NO_ROW,
-} from '../src/conflict-latch.ts'
-import { PERSONA_EPISODE_KIND_UNCLASSIFIED_ERROR, TMUX_UNRESPONSIVE_END_TICK } from '../src/persona-episodes.ts'
-import {
-  OUTAGE_CLASS_ORDER,
-  clearOutageFlag,
-  getOutageFlags,
-  raiseAdConfigMalformed,
-  raiseTmuxUnavailable,
-  setOutageFlag,
-  type OutageClass,
-} from '../src/outage-state.ts'
-import { renderPersonaRef } from '../src/persona-identity.ts'
-import { createPersonaRelaunchGate } from '../src/persona-start.ts'
-import type { PersonaConnectionStatus } from '../src/persona-connections.ts'
-import {
-  makeAppMention,
-  makeChannelMessage,
-  makeDm,
-  makeWebhookPost,
-  mentionText,
-  stubOpenedDmId,
-  type SlackEvent,
-  type StubSlackOptions,
-  type WebApiOutcome,
-} from './test-helpers/slack-stub.ts'
-import { assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
-import { indicesOf, stripComments } from './test-helpers/source-audit.ts'
-import { CONFLICT_CASE_ROWS, LAUNCH_START_ABSENT_PERSONA_KEY, conflictForPersona } from './test-helpers/conflict-cases.ts'
-import { absentRow } from './test-helpers/old-life.ts'
-import {
+  SAMPLE_LAUNCH_START_NONE,
   cannedErr,
   cannedFindMissing,
   cannedGetResult,
+  cannedKillResult,
   cannedOk,
   cannedStatusResult,
   errConfigMalformed,
   errInternal,
+  errInvalidFlags,
   errSchemaMismatch,
   errSystemInstallDisappeared,
   errTmuxKillFailed,
@@ -207,175 +76,68 @@ import {
   errTmuxSessionConflict,
   errTmuxUnresponsive,
   holdFindMissing,
-  holdSpawns,
-  SAMPLE_LAUNCH_START_NONE,
+  provenanceNote,
   unavailableForms,
-  type FindMissingHold,
+  type CannedGetResult,
+  type FindMissingHold
 } from './test-helpers/agent-director-stub.ts'
+import { LAUNCH_START_ABSENT_PERSONA_KEY } from './test-helpers/conflict-cases.ts'
+import { assertNoLeak } from './test-helpers/credentials.ts'
+import { absentRow } from './test-helpers/old-life.ts'
 import {
   makeRestartDeps,
   makeRoutingHarness,
-  putAtRestartCap,
   resetRoutingState,
   waitFor,
-  LOST_MESSAGE_STATES,
-  LOST_STATE_SETUPS,
-  NEVER_FIRE_RESTART_DELAY_S,
-  ROW_READ_REJECTS,
-  ROW_READ_REJECTION_REDACTED,
-  type RoutingHarness,
-  type RoutingHarnessOptions,
-  type RowReadAnswer,
+  type RoutingHarness
 } from './test-helpers/persona-routing-harness.ts'
-import {
-  APPROVER_STOP_CAP,
-  APPROVER_STOP_LIVE,
-  APPROVER_STOP_TEARDOWN,
-  DIALOG_POLL_INTERVAL_MS,
-  isLaunchInFlight,
-  readPersonaRowState,
-  stopDialogApprover,
-  type ApproverStopReason,
-} from '../src/session-manager.ts'
 import {
   expectLostMessageReports,
   expectPendingOnlyWatch,
   holdSequenceReuse,
+  holdThroughReuse,
+  installGoneRestartProbe,
   launchThroughSequence,
   makeRecoveryHarness,
   ownRowsLiveThenMissing,
   pastSampleGrace,
+  personaCallCounts,
   personaOf,
-  installGoneRestartProbe,
+  personaRow,
+  retiredEntryClearedLine, retiredKeyLinesIn,
   retryNow,
-  scriptLiveRowElsewhere,
+  reuseSpawnOf,
   rowReadsUntilSpawn,
+  scriptLiveRowElsewhere,
   startSequenceHeldAtRun,
+  unavailableAt,
   type RecoveryHarness,
-  type RecoveryHarnessOptions,
-  type RecoveryRowState,
+  type RecoveryHarnessOptions
 } from './test-helpers/recovery-harness.ts'
-import { holdThroughReuse, personaCallCounts, personaRow, reuseSpawnOf, unavailableAt } from './test-helpers/recovery-harness.ts'
-import { retiredEntryClearedLine, retiredKeyLinesIn } from './test-helpers/recovery-harness.ts'
 import { readRetiredKeysRecord, retiredKeysRecordOf, type RetiredKeySeed } from './test-helpers/retired-keys.ts'
-import { OLD_LIFE_HOLD_CAUSE_APPLY_STEP_1, RETIRED_KEY_CAUSE_REMOVED } from '../src/retired-keys.ts'
-import { cannedKillResult, errInvalidFlags, provenanceNote, type CannedGetResult } from './test-helpers/agent-director-stub.ts'
 import {
-  OLD_LIFE_ROW_READ_STATE,
-  killPersonaInstanceForTeardown,
-  launchForLiveRowSequence,
-  noteOldLifeRowRead,
-  readPersonaOwnRow,
-  SPAWN_ACTION_FRESH_RETIRED,
-  uncoveredPendingRowLine,
-} from '../src/session-manager.ts'
-import { LIVE_ROW_LAUNCH_REASON_RETIRED_KEY, LIVE_ROW_LAUNCH_REUSE, LIVE_ROW_OUTCOME_LAUNCHED, liveRowSequenceStartLine } from '../src/live-row-sequence.ts'
-import { PENDING_ROW_REASON_CWD_MISMATCH, PENDING_ROW_REASON_RETIRED_OLD_LIFE, type PendingRowNotCoveredReason } from '../src/pending-row.ts'
-import { latchRowStateRead } from '../src/conflict-latch.ts'
-import { PHASE1_FLOOR_VERSION } from '../src/ad-version-gate.ts'
-import { LIVENESS_STATUS_SITE } from '../src/server.ts'
-import { restartOldLifeHeldLine } from '../src/restart.ts'
-import { UNAVAILABLE_RETRY_ROW_ABSENT, UNAVAILABLE_RETRY_RUN_NOW_RAN } from '../src/unavailable-retry.ts'
+  makeChannelMessage,
+  type SlackEvent
+} from './test-helpers/slack-stub.ts'
+import { indicesOf, stripComments } from './test-helpers/source-audit.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-const FAST_DELAY_S = 0.01 // 10 ms timer — fast enough for tests
-const SLOW_DELAY_S = NEVER_FIRE_RESTART_DELAY_S // never fires during a test
+const FAST_DELAY_S = 0.01 // the restart launch runs within the bounded poll
 const WAIT_MS = 50
-
-/**
- * Alpha's channels (all `all`): its home (its channel destination), a second
- * channel, and a coordination channel it shares with beta (`mentions` there).
- * Beta's own `mentions` channel (its destination), and a channel nobody lists.
- */
+const SLOW_DELAY_S = NEVER_FIRE_RESTART_DELAY_S
 const ALPHA_HOME = 'C0ALPHA01'
 const ALPHA_SECOND = 'C0ALPHA02'
-const SHARED = 'C0SHARED1'
 const BETA_MENTIONS = 'C0BETA001'
 const UNCLAIMED = 'C0NOBODY1'
-
-/** Alpha's `dm.contact`, and a DM with alpha from another user (a source conversation). */
 const CONTACT = 'U0CONTACT1'
-const SOURCE_DM = 'D0SRCDM001'
-const DM_SENDER = 'U0DMSENDR1'
-
-/** The event factories' default human author. */
-const HUMAN = 'U0STUBUSR1'
-/** The name the stub's `users.info` gives every user. */
 const STUB_USER_NAME = 'stub-user'
+const SHARED = 'C0SHARED1'
 
 /** In every lost message's text; must never reach a Slack call. */
 const MESSAGE_MARKER = 'lost-body-marker-7Kq2'
-
-
-// ---------------------------------------------------------------------------
-// Harness: the shared routing harness over beta (first) and alpha (second,
-// the receiving persona), with no session registered unless asked
-// ---------------------------------------------------------------------------
-
-/** Alpha's permission-prompt destination: its home channel, or `dm` with its contact. */
-type Destination = 'channel' | 'dm'
-
-/** The drop branch: no session at all, or a connected session without its GET stream. */
-type Branch = 'no session' | 'streamless'
-
-type Harness = RoutingHarness & {
-  /** The receiving persona in every lost-message case: personas[1]. */
-  alpha: Persona
-  /** The other persona: personas[0]. */
-  beta: Persona
-  /** Deliver `event` to the receiving persona key(s), as the socket handler does. */
-  deliver(event: unknown, keys: string | readonly string[]): Promise<void>
-  /** Keys whose dialog approver is running (with `approver`): read with the harness's launches in flight as state 6's input. */
-  approverRunning: Set<string>
-}
-
-interface HarnessOptions {
-  destination?: Destination
-  branch?: Branch
-  sessionRestartDelay?: number
-  restartDelayS?: number
-  launchSession?: RoutingHarnessOptions['launchSession']
-  /** Hold every restart launch open until teardown (the harness's `holdLaunches`), keeping the persona in flight. */
-  holdLaunches?: boolean
-  alphaStub?: StubSlackOptions
-  resolveUserName?: RoutingHarnessOptions['resolveUserName']
-  notify?: RoutingHarnessOptions['notify']
-  /**
-   * Give the routing the harness's up check (the real up predicate, not up
-   * for the keys in `h.notUp`, asks recorded in `h.upAsks`). Without it (and
-   * without `notUp`) the routing has no up check.
-   */
-  upCheck?: boolean
-  /**
-   * Names whose bring-up outcome is not `up` although their connection still
-   * delivers a message (a persona that stopped being up while the message
-   * was in flight, or the old half of a destructive modify); implies `upCheck`.
-   */
-  notUp?: readonly string[]
-  /** Install the real outage state with a recording sink (the harness's `outageState`). */
-  outageState?: boolean
-  /**
-   * State 6's input is a launch of the harness in flight OR a key in
-   * `h.approverRunning` (a dialog approver running). Without it the harness's
-   * default (its launches in flight) is bound.
-   */
-  approver?: boolean
-  /**
-   * Bind the routing's one lost-message row read, scripted per persona name
-   * (the harness's `rowRead`). Without it no read is bound and none is made.
-   */
-  rowRead?: RoutingHarnessOptions['rowRead']
-  /** Bind the routing's missing-retry-timer arm (the harness's `armRetryTimer`: each ask recorded, P's timer armed). */
-  armRetryTimer?: boolean
-  /** Names whose retry timer is armed first (the harness's `retryArmed`); default every persona. */
-  retryArmed?: readonly string[]
-}
-
-/** A connection that serves, so only the bring-up outcome decides whether a persona is up. */
-const SERVING: PersonaConnectionStatus = { state: 'up', identity: { botUserId: 'U0SERVING', botId: 'B0SERVING' } }
 
 let dir: string
 /** Every harness a case built (cleaned up and leak-checked in teardown). */
@@ -393,106 +155,10 @@ function makeRecovery(options: RecoveryHarnessOptions = {}): RecoveryHarness {
   return h
 }
 
-function makeHarness(opts: HarnessOptions = {}): Harness {
-  const streamless = opts.branch === 'streamless'
-  const approverRunning = new Set<string>()
-  const h = makeRoutingHarness(
-    [
-      { name: 'beta', channels: [{ id: BETA_MENTIONS, delivery: 'mentions' }, { id: SHARED, delivery: 'mentions' }] },
-      {
-        name: 'alpha',
-        channels: [
-          { id: ALPHA_HOME, delivery: 'all' },
-          { id: ALPHA_SECOND, delivery: 'all' },
-          { id: SHARED, delivery: 'all' },
-        ],
-        // DMs on (so a DM to alpha qualifies) whatever the destination is.
-        dm: { enabled: true, contact: CONTACT },
-        permission_prompts: (opts.destination ?? 'channel') === 'dm' ? 'dm' : ALPHA_HOME,
-      },
-    ],
-    dir,
-    {
-      sessions: streamless ? ['alpha'] : [],
-      streamless: streamless ? ['alpha'] : undefined,
-      overrides: { session_restart_delay: opts.sessionRestartDelay ?? 60 },
-      restartDelayS: opts.restartDelayS ?? FAST_DELAY_S,
-      launchSession: opts.launchSession,
-      holdLaunches: opts.holdLaunches,
-      stubOptions: opts.alphaStub ? { alpha: opts.alphaStub } : undefined,
-      resolveUserName: opts.resolveUserName,
-      notify: opts.notify,
-      upCheck: opts.upCheck,
-      notUp: opts.notUp,
-      outageState: opts.outageState,
-      isLaunchOrApproverRunning: opts.approver === true
-        ? (key) => h.isLaunchInFlight(key) || approverRunning.has(key)
-        : undefined,
-      rowRead: opts.rowRead,
-      armRetryTimer: opts.armRetryTimer,
-      retryArmed: opts.retryArmed,
-    },
-  )
-  const [beta, alpha] = h.config!.personas as [Persona, Persona]
-  const harness = Object.assign(h, {
-    alpha,
-    beta,
-    deliver: (event: unknown, keys: string | readonly string[]) =>
-      h.receiveKeys(event, typeof keys === 'string' ? [keys] : keys),
-    approverRunning,
-  })
-  harnesses.push(harness)
-  return harness
-}
-
-/** The conversation alpha's notices go to for `destination`. */
-function destinationId(destination: Destination): string {
-  return destination === 'dm' ? stubOpenedDmId(CONTACT) : ALPHA_HOME
-}
-
-/** Where alpha's session (if any) runs: the restart of a streamless session uses its cwd. */
-function expectedLaunchCwd(h: Harness, branch: Branch): string {
-  return branch === 'streamless' ? h.p('alpha').sessionCwd! : h.alpha.working_directory
-}
-
 /** A human's message in `channel`, carrying the message marker. */
 function messageIn(channel: string, text = `hello, anyone there? ${MESSAGE_MARKER}`): SlackEvent {
   return makeChannelMessage({ channel, text })
 }
-
-/** A DM to alpha in `channel` from `user`, carrying the message marker. */
-function dmFrom(user: string, channel: string): SlackEvent {
-  return makeDm({ channel, user, text: `a direct question ${MESSAGE_MARKER}` })
-}
-
-/** Every captured post as (persona whose stub posted, conversation, recovery state). */
-/** The first persona (beta) got no restart and made no Slack call of any kind. */
-function expectBetaUntouched(h: Harness): void {
-  expect(isRestartPendingOrActive(h.beta.key)).toBe(false)
-  expect(h.p('beta').stub.callLog).toEqual([])
-}
-
-/**
- * The properties every lost-message notice has: it names alpha (b.av2
- * SR-7.2), says a message was lost, names `sender` with no mention, identifies
- * `state` and no other, and no Slack call anywhere carries the message text.
- */
-/**
- * AC 26: the lost message made exactly one Slack post, alpha's notice, at its
- * destination (for `dm`, the conversation `conversations.open` returned for
- * the contact), through alpha's own client with no username or icon override,
- * and nothing in `source`. Beta made no Slack call.
- */
-function expectStoredWithoutNotice(h: Harness, want: { destination: Destination; source: string; sender: string; state: LostMessageState }): void {
- expect(h.allPosts()).toEqual([])
- expect(h.notices).toEqual([])
- expect(h.queue.openCount(h.alpha.key)).toBeGreaterThan(0)
- expect(h.queued('beta')).toEqual([])
-}
-
-/** `persona-destination-failed` start lines, and its `cleared:` lines. */
-const failedLines = (h: Harness) => h.logs.filter((l) => l.includes('persona-destination-failed:') && !l.includes('cleared:'))
-const clearedLines = (h: Harness) => h.logs.filter((l) => l.includes('persona-destination-failed:') && l.includes('cleared:'))
 
 // ---------------------------------------------------------------------------
 // Setup
@@ -536,661 +202,6 @@ afterEach(async () => {
 })
 
 // ===========================================================================
-// The state inputs (b.jg5 SRJ-1011), each set for one persona key through its
-// real entry and cleared through its real end, clear or forget. Every input
-// is keyed: setting it for beta never changes alpha's state.
-// ===========================================================================
-
-interface StateInput {
-  /** Harness options the input needs. */
-  opts?: HarnessOptions
-  /** Put persona `key` under the input. */
-  set(h: Harness, key: string): void
-  /** Take persona `key` out of it again (absent where no case needs it). */
-  clear?(h: Harness, key: string): void
-}
-
-/** Persona `key`'s working directory. */
-function cwdOf(h: Harness, key: string): string {
-  return h.config!.personas.find((p) => p.key === key)!.working_directory
-}
-
-const INPUTS = {
-  'not up': {
-    opts: { upCheck: true },
-    set: (h, key) => { h.notUp.add(key) },
-    clear: (h, key) => { h.notUp.delete(key) },
-  },
-  // E13's set entry with a real CONFLICT error; `forget` is its silent drop.
-  'latched on a CONFLICT': {
-    set: (h, key) => {
-      expect(h.latch.setFromConflict(key, conflictForPersona(key), { refusedOperation: REFUSED_OPERATION_PLAIN_SPAWN, rowState: LATCH_ROW_STATE_NO_ROW })).toBeDefined()
-      expect(h.latch.isLatched(key)).toBe(true)
-    },
-    clear: (h, key) => { expect(h.latch.forget(key)).toBe(true) },
-  },
-  // The hold's set, as a reuse spawn's ErrInvalidFlags sets it (SRJ-207); `forget` is its silent end.
-  'held on ErrInvalidFlags': {
-    set: (h, key) => {
-      expect(h.invalidFlagsHold.set(key)).toBe(true)
-      expect(h.invalidFlagsHold.isHeld(key)).toBe(true)
-    },
-    clear: (h, key) => { expect(h.invalidFlagsHold.forget(key)).toBe(true) },
-  },
-  'kill failed': {
-    set: (h, key) => { h.killFailed.add(key) },
-    clear: (h, key) => { h.killFailed.delete(key) },
-  },
-  // E10's entry: a refusal from a tmux-touching verb starts the condition; a
-  // health tick that reads the row live ends it.
-  'tmux-unresponsive holds': {
-    set: (h, key) => {
-      expect(h.tmuxUnresponsive.start(key, 'resume', errTmuxUnresponsive('resume'))).toBe('started')
-    },
-    clear: (h, key) => { expect(h.tmuxUnresponsive.end(key, TMUX_UNRESPONSIVE_END_TICK)).not.toBe('not-holding') },
-  },
-  // E11's one raise entry and the real clear.
-  'tmux-unavailable raised': {
-    opts: { outageState: true },
-    set: (_h, key) => {
-      raiseTmuxUnavailable(key, errTmuxNotAvailable())
-      expect(getOutageFlags(key).has('tmux-unavailable')).toBe(true)
-    },
-    clear: (_h, key) => {
-      clearOutageFlag(key, 'tmux-unavailable')
-      expect(getOutageFlags(key).size).toBe(0)
-    },
-  },
-  // E12's one raise entry and the real clear.
-  'ad-config-malformed raised': {
-    opts: { outageState: true },
-    set: (_h, key) => {
-      raiseAdConfigMalformed(key, errConfigMalformed())
-      expect(getOutageFlags(key).has('ad-config-malformed')).toBe(true)
-    },
-    clear: (_h, key) => {
-      clearOutageFlag(key, 'ad-config-malformed')
-      expect(getOutageFlags(key).size).toBe(0)
-    },
-  },
-  'a dialog approver running': {
-    opts: { approver: true },
-    set: (h, key) => { h.approverRunning.add(key) },
-    clear: (h, key) => { h.approverRunning.delete(key) },
-  },
-  'a live-row sequence running': {
-    set: (h, key) => { h.sequenceOrWaitRunning.add(key) },
-    clear: (h, key) => { h.sequenceOrWaitRunning.delete(key) },
-  },
-  // A restart whose timer has not fired: armed at a delay that never fires,
-  // then the restart module is able to launch again (fast delay).
-  'a pending restart': {
-    set: (h, key) => {
-      const delay = h.restartDelayS
-      h.restartDelayS = SLOW_DELAY_S
-      scheduleRestart(key, cwdOf(h, key), undefined, { humanTrigger: true })
-      h.restartDelayS = delay
-      expect(isRestartPendingOrActive(key)).toBe(true)
-    },
-  },
-  'auto-restart disabled': {
-    opts: { sessionRestartDelay: 0 },
-    set: () => {},
-  },
-} satisfies Record<string, StateInput>
-
-type InputName = keyof typeof INPUTS
-
-/** State 5's three sources (b.jg5 SRJ-1011). */
-const STATE_5_SOURCES = ['tmux-unresponsive holds', 'tmux-unavailable raised', 'ad-config-malformed raised'] as const satisfies readonly InputName[]
-
-/** The harness options of every named input together. */
-function inputOpts(...names: InputName[]): HarnessOptions {
-  return Object.assign({}, ...names.map((n) => (INPUTS[n] as StateInput).opts ?? {}))
-}
-
-// ===========================================================================
-// AC 26 x SR-7.3 x b.jg5 SRJ-1011 — the recovery state. Every state
-// (`LOST_MESSAGE_STATES`) × a channel or `dm` destination, on the no-session
-// branch. Each notice identifies its state and no other (so the ten texts are
-// pairwise distinct); only "starting now" asks for, schedules or launches a
-// restart (b.jg5 SRJ-1501, AC 68), while restart.ts itself could launch (fast
-// delay). The rows from `held-for-human` to `restart-limit-reached` run with
-// no up check, so a routing without `isPersonaUp` counts every persona as up.
-// ===========================================================================
-
-/**
- * Arrange alpha in `state` for the next lost message on the no-session
- * branch, as the shared table (`LOST_STATE_SETUPS`) arranges it, its launches
- * in its working directory.
- */
-function arrangeState(h: Harness, state: LostMessageState): Promise<void> | void {
-  return LOST_STATE_SETUPS[state].arrange(h, h.alpha.key, h.alpha.working_directory)
-}
-
-describe('AC 26: recovery selects the recovery state', () => {
-  const table: [LostMessageState, Destination][] = LOST_MESSAGE_STATES.flatMap((s) => (['channel', 'dm'] as const).map((d): [LostMessageState, Destination] => [s, d]))
-
-  test.each(table)(
-    'AC 26, AC 68: state %s, a %s destination: one notice at the destination naming the sender and that state\'s wording only, nothing in the source; a restart is asked for only when starting now',
-    async (state, destination) => {
-      const setup = LOST_STATE_SETUPS[state]
-      const h = makeHarness({ destination, ...setup.opts })
-      await arrangeState(h, state)
-      const asksBefore = h.restartAsks.length
-
-      await h.deliver(messageIn(SHARED), h.alpha.key)
-
-      expectStoredWithoutNotice(h, { destination, source: SHARED, sender: STUB_USER_NAME, state })
-      // Only "starting now" asks the relaunch gate (it schedules the restart).
-      expect(h.restartAsks.slice(asksBefore)).toEqual(state === 'starting-now' ? [h.alpha.key] : [])
-      expect(isRestartPendingOrActive(h.alpha.key)).toBe(setup.pending)
-      await Bun.sleep(WAIT_MS) // a launch the message scheduled would have fired by now
-      expect(h.launches).toHaveLength(setup.launches)
-      for (const launch of h.launches) expect(launch).toEqual({ key: h.alpha.key, cwd: h.alpha.working_directory })
-    },
-  )
-})
-
-// ===========================================================================
-// b.jg5 SRJ-1011 state 5 (hatch notes E11, E12) — an item accepted while P is
-// not answering, from each of its three sources: its `tmux-unresponsive`
-// condition holding (E10), its `tmux-unavailable` outage raised (SRJ-311) or
-// its `ad-config-malformed` outage raised (SRJ-316). No restart is asked for,
-// scheduled or launched, and the source's own notice (the outage onset) goes
-// to the outage state's sink, not to Slack. After the source's real end or
-// clear, the next lost message starts a restart. An open unclassified-error
-// episode, or another outage class, is not a source.
-// ===========================================================================
-
-describe('b.jg5 SRJ-1011 state 5: an item accepted while the persona is not answering starts no restart', () => {
-  const SOURCES: [typeof STATE_5_SOURCES[number]][] = STATE_5_SOURCES.map((source) => [source])
-
-  test.each(SOURCES)(
-    'AC 68: %s: the notice says not answering and no restart is asked for or launched; after its real end the next lost message starts now with one launch',
-    async (source) => {
-      const h = makeHarness(inputOpts(source))
-      INPUTS[source].set(h, h.alpha.key)
-      const asksBefore = h.restartAsks.length
-
-      await h.deliver(messageIn(SHARED), h.alpha.key)
-
-      expectStoredWithoutNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state: 'not-answering' })
-      expect(h.restartAsks.slice(asksBefore)).toEqual([])
-      expect(isRestartPendingOrActive(h.alpha.key)).toBe(false)
-      await Bun.sleep(WAIT_MS)
-      expect(h.launches).toEqual([])
-
-      INPUTS[source].clear(h, h.alpha.key)
-      await h.deliver(messageIn(SHARED), h.alpha.key)
-
-
-      expect(h.postsTo(SHARED)).toEqual([])
-      await waitFor(() => h.launches.length > 0)
-      await Bun.sleep(WAIT_MS)
-      expect(h.launches).toEqual([{ key: h.alpha.key, cwd: h.alpha.working_directory }])
-      expectBetaUntouched(h)
-    },
-  )
-
-  test.each<[string, LostMessageState, InputName | undefined, number]>([
-    ['alone', 'starting-now', undefined, 1],
-    ['with a dialog approver running', 'session-starting', 'a dialog approver running', 0],
-    ['with auto-restart disabled', 'auto-restart-disabled', 'auto-restart disabled', 0],
-  ])(
-    'hatch A2: an open unclassified-error episode %s never reports not answering; the message reports %s',
-    async (_label, state, other, launches) => {
-      const h = makeHarness(other === undefined ? {} : inputOpts(other))
-      expect(h.episodes.begin(h.alpha.key, PERSONA_EPISODE_KIND_UNCLASSIFIED_ERROR)).toBe('begun')
-      if (other !== undefined) INPUTS[other].set(h, h.alpha.key)
-
-      await h.deliver(messageIn(SHARED), h.alpha.key)
-
-      expect(h.episodes.isOpen(h.alpha.key, PERSONA_EPISODE_KIND_UNCLASSIFIED_ERROR)).toBe(true)
-      expectStoredWithoutNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state })
-      await Bun.sleep(WAIT_MS)
-      expect(h.launches).toHaveLength(launches)
-    },
-  )
-
-  test.each(OUTAGE_CLASS_ORDER.filter((cls) => cls !== 'tmux-unavailable' && cls !== 'ad-config-malformed'))(
-    'the %s outage raised for the persona is not a not-answering source: the message starts now',
-    async (cls) => {
-      const h = makeHarness({ outageState: true })
-      setOutageFlag(h.alpha.key, cls, 'detail')
-      expect(getOutageFlags(h.alpha.key).has(cls)).toBe(true)
-
-      await h.deliver(messageIn(SHARED), h.alpha.key)
-
-      expectStoredWithoutNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state: 'starting-now' })
-      // The outage's onset went to the outage state's sink, never to Slack.
-      expect(h.outageNotices.map((n) => n.key)).toEqual([h.alpha.key])
-    },
-  )
-})
-
-// ===========================================================================
-// b.jg5 SRJ-1011 as amended (orchestrator ruling): "A persona whose retry
-// timer is stopped at the restart cap reports restart-limit-reached, never
-// state 5's 'CSCB is retrying', whatever condition or flag is raised. In
-// SRJ-1011's order, state 5 applies only while P's retry timer is armed."
-// Through the real routing, with the restart delay above 0 (so auto-restart
-// disabled does not come first) and the row read bound (answering live, a
-// restart's input): alpha at the restart cap (SRJ-305, the real backoff
-// state) with each state-5 source, its retry timer still armed (the window
-// the cap closes: that timer stops at its next retry) or none, reports
-// restart limit reached; no restart is asked for, scheduled or launched,
-// and the missing-retry-timer arm is never asked. Below the cap, state 5
-// needs the timer: armed, not answering; `tmux-unavailable` raised with
-// none armed, the arm is asked before the decision and its timer makes the
-// message not answering, with no read; the condition or `ad-config-malformed`
-// alone with none armed is not state 5, so the message falls through to the
-// next state that applies (here starting now, with its read and restart).
-// ===========================================================================
-
-describe('b.jg5 SRJ-1011 as amended: state 5 applies only while the retry timer is armed, and never at the restart cap', () => {
-  /** Alpha under `source`, its retry timer armed first or not, the arm member bound and the row read answering live. */
-  function gateHarness(source: typeof STATE_5_SOURCES[number], armed: boolean): Harness {
-    const h = makeHarness({
-      ...inputOpts(source),
-      armRetryTimer: true,
-      retryArmed: armed ? ['alpha'] : [],
-      rowRead: { alpha: LIVENESS_READING_LIVE },
-    })
-    INPUTS[source].set(h, h.alpha.key)
-    return h
-  }
-
-  const CAPPED = STATE_5_SOURCES.flatMap((source) => ([true, false] as const).map(
-    (armed): [typeof STATE_5_SOURCES[number], string, boolean] => [source, armed ? 'still armed' : 'none armed', armed],
-  ))
-
-  test.each(CAPPED)(
-    'AC 68: alpha at the restart cap with %s, its retry timer %s: the notice says restart limit reached, never not answering; no restart is asked for, scheduled or launched, and no retry timer is asked for or armed',
-    async (source, _timer, armed) => {
-      const h = gateHarness(source, armed)
-      putAtRestartCap(h.alpha.key)
-
-      await h.deliver(messageIn(SHARED), h.alpha.key)
-
-      expectStoredWithoutNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state: 'restart-limit-reached' })
-      // States 1 to 5 did not apply, so the one read was made.
-      expect(h.rowReads).toEqual([h.alpha.key])
-      expect(h.retryTimerArms).toEqual([])
-      expect(h.retryArmed.has(h.alpha.key)).toBe(armed)
-      expect(h.restartAsks).toEqual([])
-      expect(isRestartPendingOrActive(h.alpha.key)).toBe(false)
-      await Bun.sleep(WAIT_MS) // a restart the message scheduled would have launched by now
-      expect(h.launches).toEqual([])
-      expectNoFakeTimerLeft(h)
-    },
-  )
-
-  test.each<[typeof STATE_5_SOURCES[number], string, LostMessageState, boolean, readonly string[]]>([
-    ['tmux-unresponsive holds', 'armed', 'not-answering', true, []],
-    ['tmux-unavailable raised', 'armed', 'not-answering', true, ['alpha']],
-    ['ad-config-malformed raised', 'armed', 'not-answering', true, []],
-    ['tmux-unavailable raised', 'none armed (the arm, asked before the decision, arms it)', 'not-answering', false, ['alpha']],
-    ['tmux-unresponsive holds', 'none armed', 'starting-now', false, []],
-    ['ad-config-malformed raised', 'none armed', 'starting-now', false, []],
-  ])(
-    'below the cap, %s, the retry timer %s: the notice says %s; only starting now asks for a restart',
-    async (source, _timer, state, armed, armAsks) => {
-      const h = gateHarness(source, armed)
-
-      await h.deliver(messageIn(SHARED), h.alpha.key)
-
-      expectStoredWithoutNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state })
-      expect(h.retryTimerArms).toEqual(h.keys(armAsks))
-      expect(h.retryArmed.has(h.alpha.key)).toBe(state === 'not-answering')
-      // Not answering is decided at the read gate's check, with no read; a
-      // fall-through makes the one read (live) and then starts now.
-      expect(h.rowReads).toEqual(state === 'not-answering' ? [] : [h.alpha.key])
-      expect(h.restartAsks).toEqual(state === 'starting-now' ? [h.alpha.key] : [])
-      expect(isRestartPendingOrActive(h.alpha.key)).toBe(state === 'starting-now')
-      await Bun.sleep(WAIT_MS)
-      expect(h.launches).toEqual(state === 'starting-now' ? [{ key: h.alpha.key, cwd: h.alpha.working_directory }] : [])
-    },
-  )
-})
-
-// ===========================================================================
-// b.jg5 SRJ-1011 state 2 (hatch note E13; SRJ-502) — an item accepted while P
-// is latched reads E13's latch instance: a CONFLICT and E13's two declared
-// hold cases each give `held-for-human`, and no restart. After the latch's
-// silent forget, the next lost message starts a restart.
-// ===========================================================================
-
-describe('b.jg5 SRJ-1011 state 2: an item accepted while the persona is latched starts no restart', () => {
-  const conflictRow = CONFLICT_CASE_ROWS.find((row) => row.latchCase === LATCH_CASE_LEFTOVER)!
-  const LATCHES: [string, (h: Harness) => void][] = [
-    [
-      `a CONFLICT (${conflictRow.name})`,
-      (h) => { h.latch.setFromConflict(h.alpha.key, conflictRow.build(), { refusedOperation: conflictRow.refusedOperation, rowState: conflictRow.rowState }) },
-    ],
-    ...HOLD_LATCH_CASES.map((latchCase): [string, (h: Harness) => void] => [
-      `the hold case ${latchCase}`,
-      (h) => { h.latch.set(h.alpha.key, { latchCase, refusedOperation: REFUSED_OPERATION_NONE, rowState: LATCH_ROW_STATE_UNREADABLE }) },
-    ]),
-  ]
-
-  test.each(LATCHES)(
-    'AC 68, SRJ-502: latched on %s: the notice says held for a human, no restart is asked for or launched and the latch posts nothing; after the latch is forgotten the next lost message starts now',
-    async (_label, latch) => {
-      const h = makeHarness()
-      latch(h)
-      expect(h.latch.isLatched(h.alpha.key)).toBe(true)
-
-      await h.deliver(messageIn(SHARED), h.alpha.key)
-
-      expectStoredWithoutNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state: 'held-for-human' })
-      expect(h.restartAsks).toEqual([])
-      expect(isRestartPendingOrActive(h.alpha.key)).toBe(false)
-      await Bun.sleep(WAIT_MS)
-      expect(h.launches).toEqual([])
-
-      expect(h.latch.forget(h.alpha.key)).toBe(true)
-      await h.deliver(messageIn(SHARED), h.alpha.key)
-
-
-      await waitFor(() => h.launches.length > 0)
-      expect(h.launches).toEqual([{ key: h.alpha.key, cwd: h.alpha.working_directory }])
-      expectBetaUntouched(h)
-    },
-  )
-
-  test('one message lost on both connections, alpha latched and beta not: beta reports starting now and is restarted, alpha reports held for a human and is not, each at its own destination', async () => {
-    const h = makeHarness()
-    INPUTS['latched on a CONFLICT'].set(h, h.alpha.key)
-    // Beta is `mentions` in the shared channel, so it gets the message by mention.
-    const event = messageIn(SHARED, `${mentionText(h.p('beta').stub.identity.botUserId)} ${MESSAGE_MARKER}`)
-
-    await h.deliver(event, [h.beta.key, h.alpha.key])
-
-
-    expect(h.postsTo(SHARED)).toEqual([])
-    expect(h.restartAsks).toEqual([h.beta.key])
-    expect(isRestartPendingOrActive(h.beta.key)).toBe(true)
-    expect(isRestartPendingOrActive(h.alpha.key)).toBe(false)
-    await waitFor(() => h.launches.length > 0)
-    await Bun.sleep(WAIT_MS)
-    expect(h.launches).toEqual([{ key: h.beta.key, cwd: h.beta.working_directory }])
-  })
-})
-
-// ===========================================================================
-// b.jg5 SRJ-1011 order, through the real routing, as adjacent pairs: with
-// both inputs set, the earlier state is reported; with the earlier input
-// cleared, the later one. The live-row sequence or old-life wait input
-// answers `restarting` before a launch running (Task ruling; SRJ-706). No
-// message asks for, schedules or launches a restart.
-// ===========================================================================
-
-describe('b.jg5 SRJ-1011: the first state that applies is reported', () => {
-  test.each<[InputName, InputName, LostMessageState, LostMessageState]>([
-    ['not up', 'latched on a CONFLICT', 'not-up', 'held-for-human'],
-    ['latched on a CONFLICT', 'held on ErrInvalidFlags', 'held-for-human', 'cannot-launch'],
-    ['held on ErrInvalidFlags', 'kill failed', 'cannot-launch', 'kill-failed'],
-    ['kill failed', 'tmux-unresponsive holds', 'kill-failed', 'not-answering'],
-    ['tmux-unresponsive holds', 'a dialog approver running', 'not-answering', 'session-starting'],
-    ['a live-row sequence running', 'a dialog approver running', 'restarting', 'session-starting'],
-    ['a dialog approver running', 'a pending restart', 'session-starting', 'restarting'],
-    ['tmux-unresponsive holds', 'auto-restart disabled', 'not-answering', 'auto-restart-disabled'],
-  ])('%s over %s: %s, then, once the first is cleared, %s', async (first, second, firstState, secondState) => {
-    const h = makeHarness(inputOpts(first, second))
-    INPUTS[second].set(h, h.alpha.key)
-    INPUTS[first].set(h, h.alpha.key)
-    const asksBefore = h.restartAsks.length
-    const pendingBefore = isRestartPendingOrActive(h.alpha.key)
-
-    await h.deliver(messageIn(SHARED), h.alpha.key)
-    ;(INPUTS[first] as StateInput).clear!(h, h.alpha.key)
-    await h.deliver(messageIn(SHARED), h.alpha.key)
-
-
-    expect(h.restartAsks.slice(asksBefore)).toEqual([])
-    expect(isRestartPendingOrActive(h.alpha.key)).toBe(pendingBefore)
-    await Bun.sleep(WAIT_MS)
-    expect(h.launches).toEqual([])
-    expectBetaUntouched(h)
-  })
-
-  // Every keyed input (auto-restart disabled is server-wide).
-  const KEYED = (Object.keys(INPUTS) as InputName[]).filter((n) => n !== 'auto-restart disabled')
-
-  test.each(KEYED.map((n): [InputName] => [n]))(
-    'another persona\'s input is not the persona\'s: with beta under "%s", alpha\'s lost message starts now and alpha is restarted',
-    async (input) => {
-      const h = makeHarness(inputOpts(input))
-      INPUTS[input].set(h, h.beta.key)
-
-      await h.deliver(messageIn(SHARED), h.alpha.key)
-
-
-      expect(isRestartPendingOrActive(h.alpha.key)).toBe(true)
-      await waitFor(() => h.launches.some((l) => l.key === h.alpha.key))
-      expect(h.launches.filter((l) => l.key === h.alpha.key)).toEqual([{ key: h.alpha.key, cwd: h.alpha.working_directory }])
-    },
-  )
-})
-
-// ===========================================================================
-// b.jg5 SRJ-1011 state 6 by the read (E15 T2) — with states 1 to 5 clear and
-// nothing in flight for P, the routing makes one row read of P (the
-// harness's scripted `readRowLiveness`). A `pending` answer is state 6, which
-// comes before every restart guard: no restart is asked for, scheduled or
-// launched (SRJ-1501; AC 68, state 6 from the read). A `live` reading or no
-// row (`dead`) is not `pending`: the state is the next that applies, here
-// starting now, AC 68's control. A launch running is state 6 with no read
-// (the AC 68 describe); a dialog approver running, likewise (the order pairs
-// above, and the read gate in tests/persona-routing.test.ts).
-// ===========================================================================
-
-/** No fake-clock timer is left: the destination hold's and the episodes'. */
-function expectNoFakeTimerLeft(h: Harness): void {
-  expect(h.holdClock.pendingCount()).toBe(0)
-  expect(h.episodesClock.pendingCount()).toBe(0)
-}
-
-/** States 2 to 6 of b.jg5 SRJ-1011, where no human-triggered restart fires (SRJ-1501). */
-const NO_RESTART_STATES = LOST_MESSAGE_STATES.slice(
-  LOST_MESSAGE_STATES.indexOf('held-for-human'),
-  LOST_MESSAGE_STATES.indexOf('session-starting') + 1,
-)
-
-describe('b.jg5 SRJ-1011 state 6 by the read: a row reading `pending` reports session starting and starts no restart', () => {
-  test.each<[string, InputName | undefined, boolean]>([
-    ['nothing else applies', undefined, false],
-    ['a restart timer is pending (state 6 comes before restarting)', 'a pending restart', true],
-    ['auto-restart is disabled (state 6 comes before auto-restart disabled)', 'auto-restart disabled', false],
-  ])('AC 68: %s: one read of alpha, then the session-starting notice; no restart is asked for, scheduled or launched', async (_label, input, pending) => {
-    const h = makeHarness({ ...(input === undefined ? {} : inputOpts(input)), rowRead: { alpha: LIVENESS_READING_PENDING } })
-    if (input !== undefined) INPUTS[input].set(h, h.alpha.key)
-    const asksBefore = h.restartAsks.length
-
-    await h.deliver(messageIn(SHARED), h.alpha.key)
-
-    expectStoredWithoutNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state: 'session-starting' })
-    expect(h.readOrder).toEqual([`read:${h.alpha.key}`])
-    expect(h.restartAsks.slice(asksBefore)).toEqual([])
-    expect(isRestartPendingOrActive(h.alpha.key)).toBe(pending)
-    await Bun.sleep(WAIT_MS) // a restart the message scheduled would have launched by now
-    expect(h.launches).toEqual([])
-    expectNoFakeTimerLeft(h)
-  })
-
-  test.each<[string, RowReadAnswer]>([
-    ['a live reading', LIVENESS_READING_LIVE],
-    ['no row (the dead reading)', LIVENESS_READING_DEAD],
-  ])('AC 68 control: %s is not `pending`: one read, then starting now, which asks the relaunch gate once and launches once', async (_label, answer) => {
-    const h = makeHarness({ rowRead: { alpha: answer } })
-
-    await h.deliver(messageIn(SHARED), h.alpha.key)
-
-    expectStoredWithoutNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state: 'starting-now' })
-    expect(h.readOrder).toEqual([`read:${h.alpha.key}`])
-    expect(h.restartAsks).toEqual([h.alpha.key])
-    await waitFor(() => h.launches.length > 0)
-    await Bun.sleep(WAIT_MS)
-    expect(h.launches).toEqual([{ key: h.alpha.key, cwd: h.alpha.working_directory }])
-  })
-})
-
-// ===========================================================================
-// b.jg5 SRJ-1011 — a failed read (an `unknown` reading, or a read that
-// rejects) is never taken for `pending`: state 6 is left out and the state
-// is the next that applies. A rejection is caught and logged once, naming the
-// persona, its message redacted (the teardown leak check covers the rest).
-// ===========================================================================
-
-describe('b.jg5 SRJ-1011: a failed row read leaves state 6 out', () => {
-  const FAILED: [string, RowReadAnswer][] = [
-    ['an unknown reading', LIVENESS_READING_UNKNOWN],
-    ['a read that rejects', ROW_READ_REJECTS],
-  ]
-  const NEXT: [string, InputName | undefined, LostMessageState][] = [
-    ['nothing else', undefined, 'starting-now'],
-    ['a restart timer pending', 'a pending restart', 'restarting'],
-    ['auto-restart disabled (delay 0)', 'auto-restart disabled', 'auto-restart-disabled'],
-  ]
-  const table = FAILED.flatMap(([label, answer]) =>
-    NEXT.map(([nextLabel, input, state]): [string, string, LostMessageState, RowReadAnswer, InputName | undefined] => [label, nextLabel, state, answer, input]),
-  )
-
-  test.each(table)('%s, with %s: recovery selects %s; only starting now asks for a restart, which launches once', async (_label, _nextLabel, state, answer, input) => {
-    const h = makeHarness({ ...(input === undefined ? {} : inputOpts(input)), rowRead: { alpha: answer } })
-    if (input !== undefined) INPUTS[input].set(h, h.alpha.key)
-    const asksBefore = h.restartAsks.length
-
-    await h.deliver(messageIn(SHARED), h.alpha.key)
-
-    expectStoredWithoutNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state })
-    expect(h.rowReads).toEqual([h.alpha.key])
-    expect(h.restartAsks.slice(asksBefore)).toEqual(state === 'starting-now' ? [h.alpha.key] : [])
-    expect(isRestartPendingOrActive(h.alpha.key)).toBe(state !== 'auto-restart-disabled')
-    const failedLines = h.logs.filter((l) => l.includes(ROW_READ_REJECTION_REDACTED))
-    if (answer === ROW_READ_REJECTS) {
-      expect(failedLines).toHaveLength(1)
-      expect(failedLines[0]).toContain(renderPersonaRef(h.alpha.name, h.alpha.key))
-      // The thrown value's type, then its redacted message.
-      expect(failedLines[0]).toContain(`Error message="${ROW_READ_REJECTION_REDACTED}"`)
-    } else {
-      expect(failedLines).toEqual([])
-    }
-    expect(h.logs.filter((l) => l.includes('error handling event'))).toEqual([])
-    await Bun.sleep(WAIT_MS)
-    expect(h.launches).toEqual(state === 'starting-now' ? [{ key: h.alpha.key, cwd: h.alpha.working_directory }] : [])
-    expectNoFakeTimerLeft(h)
-  })
-})
-
-// ===========================================================================
-// b.jg5 SRJ-1011 (Task ruling: decide again after the read) — states 1 to 5
-// are decided again over fresh answers once the read settles, so a latch or
-// an outage that begins while the read runs gives state 2 or 5, whatever
-// the read answers. (A live-row sequence or old-life wait step running for
-// P answers `restarting` with no read, SRJ-706: the read gate in
-// tests/persona-routing.test.ts.) Two messages lost together,
-// both reads in flight at once, schedule one restart: nothing is awaited
-// between the final decision and `scheduleRestart`.
-// ===========================================================================
-
-describe('b.jg5 SRJ-1011: the state is decided again after the read', () => {
-  const DURING: [string, InputName, LostMessageState][] = [
-    ['alpha is latched', 'latched on a CONFLICT', 'held-for-human'],
-    ['alpha\'s tmux-unavailable outage is raised', 'tmux-unavailable raised', 'not-answering'],
-    ['alpha\'s ad-config-malformed outage is raised', 'ad-config-malformed raised', 'not-answering'],
-  ]
-  const table = DURING.flatMap(([label, input, state]) =>
-    ([['live', LIVENESS_READING_LIVE], ['pending', LIVENESS_READING_PENDING]] as const).map(
-      ([name, answer]): [string, string, InputName, LostMessageState, RowReadAnswer] => [label, name, input, state, answer],
-    ),
-  )
-
-  test.each(table)('AC 68: %s while the read runs, which then answers %s: recovery selects the earlier state, and no restart is asked for, scheduled or launched', async (_label, _answerName, input, state, answer) => {
-    const h = makeHarness({
-      ...inputOpts(input),
-      rowRead: { alpha: { answer, during: (hh, key) => INPUTS[input].set(hh as Harness, key) } },
-    })
-
-    await h.deliver(messageIn(SHARED), h.alpha.key)
-
-    expectStoredWithoutNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state })
-    expect(h.readOrder).toEqual([`read:${h.alpha.key}`])
-    expect(h.restartAsks).toEqual([])
-    expect(isRestartPendingOrActive(h.alpha.key)).toBe(false)
-    await Bun.sleep(WAIT_MS)
-    expect(h.launches).toEqual([])
-    expectNoFakeTimerLeft(h)
-  })
-
-  test('two messages lost together for alpha, both reads in flight at once and answering live: exactly one restart is scheduled; one notice says starting now, the other restarting', async () => {
-    // Each read waits until both have started, so both decisions follow both reads.
-    let started = 0
-    let bothStarted!: () => void
-    const both = new Promise<void>((resolve) => { bothStarted = resolve })
-    const during = async (): Promise<void> => {
-      started += 1
-      if (started === 2) bothStarted()
-      await both
-    }
-    const h = makeHarness({ restartDelayS: SLOW_DELAY_S, rowRead: { alpha: { answer: LIVENESS_READING_LIVE, during } } })
-
-    await Promise.all([
-      h.deliver(messageIn(SHARED, `first ${MESSAGE_MARKER}`), h.alpha.key),
-      h.deliver(messageIn(ALPHA_SECOND, `second ${MESSAGE_MARKER}`), h.alpha.key),
-    ])
-
-    expect(h.readOrder.slice(0, 2)).toEqual([`read:${h.alpha.key}`, `read:${h.alpha.key}`])
-    expect(h.rowReads).toEqual([h.alpha.key, h.alpha.key])
-    // One scheduleRestart reached the relaunch gate (a second would have asked it again).
-    expect(h.restartAsks).toEqual([h.alpha.key])
-    expect(isRestartPendingOrActive(h.alpha.key)).toBe(true)
-
-
-    expectBetaUntouched(h)
-  })
-})
-
-// ===========================================================================
-// AC 68 (b.jg5 SRJ-1501, the b.av2 SR-4.6 amendment) — the verifier: run
-// `bun test tests/inbound-recovery-drop-branch.test.ts -t "AC 68"` (a bare
-// `-t "AC 68"` also matches b.av2's AC 68 cases in reload-apply.test.ts).
-// In each of states 2 to 6 (state 6 from a launch
-// running here; from the read, and the `starting-now` control, which
-// launches once, in the state-6-by-read describe above), arranged as the
-// shared state table (`LOST_STATE_SETUPS`) arranges it, with the restart
-// module able to launch (fast delay) and its relaunch gate recording every
-// ask, a queued Slack item asks for, schedules and launches nothing. The row read
-// is bound in every row and would answer live (a restart's input): only the
-// early state keeps it from being made.
-// ===========================================================================
-
-describe('AC 68: no human-triggered restart fires in states 2 to 6 (b.jg5 SRJ-1501)', () => {
-  const rows = NO_RESTART_STATES.map((state): [string, LostMessageState] => [
-    state === 'session-starting' ? 'session-starting (a launch running)' : state,
-    state,
-  ])
-
-  test.each(rows)('AC 68: %s: no read, and the message asks the relaunch gate nothing, schedules nothing and launches nothing', async (_label, state) => {
-    const h = makeHarness({ ...LOST_STATE_SETUPS[state].opts, rowRead: { alpha: LIVENESS_READING_LIVE } })
-    await arrangeState(h, state)
-    const asksBefore = h.restartAsks.length
-    const launchesBefore = h.launches.length
-    const pendingBefore = isRestartPendingOrActive(h.alpha.key)
-
-    await h.deliver(messageIn(SHARED), h.alpha.key)
-
-    expectStoredWithoutNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state })
-    expect(h.rowReads).toEqual([])
-    expect(h.restartAsks.slice(asksBefore)).toEqual([])
-    expect(isRestartPendingOrActive(h.alpha.key)).toBe(pendingBefore)
-    await Bun.sleep(WAIT_MS) // a restart the message scheduled would have launched by now
-    expect(h.launches).toHaveLength(launchesBefore)
-  })
-})
-
-// ===========================================================================
 // b.jg5 SRJ-1011, SRJ-115 through the recovery harness (its lost-message
 // driver, bound as main() binds it): the routing's row read is the one
 // liveness adapter's `status` of P's own instance, made outside any launch or
@@ -1215,14 +226,6 @@ function expectNothingRaisedOrArmed(h: RecoveryHarness, key: string): void {
   expect(h.clock.pendingCount()).toBe(0)
 }
 
-/**
- * Nothing raised for `key`, and the one thing armed is the pending-only watch
- * a successful launch leaves on its new row (b.jg5 SRJ-301, SRJ-409): no
- * outage flag, no condition, no episode; the timer waiting in pending-only
- * mode with only the pending-row cause, on the fake clock's one timer; and
- * `pendingRowArms` pending-row triggers (the launch's, plus one for each
- * approver stop that arms), no other.
- */
 function expectOnlyThePendingOnlyWatch(h: RecoveryHarness, key: string, pendingRowArms: number): void {
   expect([...getOutageFlags(key)]).toEqual([])
   expect(h.triggers).toEqual(Array.from({ length: pendingRowArms }, () => ({ key, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW })))
@@ -1235,69 +238,10 @@ function expectOnlyThePendingOnlyWatch(h: RecoveryHarness, key: string, pendingR
 }
 
 describe('b.jg5 SRJ-1011 through the recovery harness: the read is the liveness adapter\'s one `status`, outside any attempt', () => {
-  test('AC 68: a spawn held open, and then P’s dialog approver running after the launch returned (the row `pending`, a dialog shown), each report session starting with no `status` call from the routing and no restart; Q beside it makes its read', async () => {
-    const h = makeRecovery()
-    const [key, other] = h.keys as [string, string]
-    const id = personaInstanceId(key)
-    const hold = holdSpawns(h.stub.client)
-    const launch = h.launch(key)
-    await hold.entered(id)
-    // b.omv SR-7.6: fresh startup Enter proofs see the same pending row.
-    h.script({ statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE }), getResult: personaRow(h, key, { state: AGENT_DIRECTOR_PENDING_STATE }), readPaneResults: [cannedReadPaneResult(TRUST_DIALOG_PANE)] })
-
-    // A launch running is state 6 with no read.
-    await expectLostMessageReports(h, key, 'session-starting', { calls: {} })
-
-    // The spawn returns and the launch with it; P's approver makes its first
-    // lap (it reads the row `pending` and answers the dialog) and then waits
-    // for its next one on the harness clock.
-    hold.release(id)
-    expect(await launch).toMatchObject({ key, action: 'spawned' })
-    await h.settle()
-    expect(h.approverRunning(key)).toBe(true)
-    expect(h.stub.calls.sendKeysCalls).toHaveLength(1)
-    const spawnsBefore = h.stub.calls.spawnCalls.length
-
-    // The approver running is state 6 with no read, never starting now.
-    await expectLostMessageReports(h, key, 'session-starting', { calls: {} })
-    expect(isRestartPendingOrActive(key)).toBe(false)
-    expect(h.stub.calls.spawnCalls).toHaveLength(spawnsBefore)
-    // Q has no approver: its message makes its one read, which finds its row `pending`.
-    await expectLostMessageReports(h, other, 'session-starting')
-
-    // The launch's pending-only watch, and the cap stop's arm over the row
-    // still `pending` (b.jg5 SRJ-404, SRJ-409); nothing else.
-    expect(await h.runApproverToStop(key)).toMatchObject({ reason: APPROVER_STOP_CAP })
-    expectOnlyThePendingOnlyWatch(h, key, 2)
-  })
 
   // The launch leaves its pending-only watch (b.jg5 SRJ-301, SRJ-409); the
   // cap stop over a row still `pending` arms it once more, the teardown stop
   // and a stop on a live row never do (b.jg5 SRJ-404).
-  test.each<[string, string, RecoveryRowState, ApproverStopReason, LostMessageState, number]>([
-    ['its stop entry', 'the row still `pending`', AGENT_DIRECTOR_PENDING_STATE, APPROVER_STOP_TEARDOWN, 'session-starting', 1],
-    ['its ready cap', 'the row still `pending`', AGENT_DIRECTOR_PENDING_STATE, APPROVER_STOP_CAP, 'session-starting', 2],
-    ['a lap that reads the row live', 'the row live', 'waiting', APPROVER_STOP_LIVE, 'auto-restart-disabled', 1],
-  ])('AC 68: after P’s dialog approver stopped at %s, %s, the next lost message makes exactly one `status` call and reports %s, with no restart and no spawn; only the launch’s pending-only watch is armed', async (_how, _row, state, reason, lostState, pendingRowArms) => {
-    // A cap past the pace, so a second lap reads the row before it.
-    const h = makeRecovery({ approverCapMs: 2 * DIALOG_POLL_INTERVAL_MS })
-    const [key] = h.keys as [string]
-    h.script({ statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE }) })
-    await h.launch(key)
-    await h.settle()
-    expect(h.approverRunning(key)).toBe(true)
-
-    h.script({ statusResult: cannedStatusResult({ state }) })
-    if (reason === APPROVER_STOP_TEARDOWN) expect(await stopDialogApprover(key, APPROVER_STOP_TEARDOWN)).toBe(true)
-    expect(await h.runApproverToStop(key)).toMatchObject({ reason })
-    expect(h.approverRunning(key)).toBe(false)
-    const spawnsBefore = h.stub.calls.spawnCalls.length
-
-    await expectLostMessageReports(h, key, lostState)
-    expect(isRestartPendingOrActive(key)).toBe(false)
-    expect(h.stub.calls.spawnCalls).toHaveLength(spawnsBefore)
-    expectOnlyThePendingOnlyWatch(h, key, pendingRowArms)
-  })
 
   test('with `session_restart_delay` above 0, a routing read that fails reports starting now; the restart path\'s own read then finds the row `pending` and spawns nothing', async () => {
     const h = makeRecovery({ sessionRestartDelay: FAST_DELAY_S })
@@ -1458,7 +402,7 @@ describe('b.jg5 SRJ-805: an item accepted for a retired key asks for a restart t
     expect(h.stub.calls.spawnCalls).toEqual([reuseSpawnOf(h, key)])
     expect([h.stub.calls.resumeCalls, h.stub.calls.sendKeysCalls]).toEqual([[], []])
     expect(h.retiredEntry(key)).toMatchObject({ recorded: true, marked: true })
-    await h.runApproverToStop(key)
+
   })
 
   test('P\'s row live (waiting): the asked-for restart types nothing into the old life and launches nothing itself, and starts the sequence; a second message while it runs reports restarting with no read and asks for no restart; the sequence ends in the reuse for the retired key', async () => {
@@ -1484,7 +428,7 @@ describe('b.jg5 SRJ-805: an item accepted for a retired key asks for a restart t
       result: { key, action: SPAWN_ACTION_FRESH_RETIRED },
     })
     expect([h.stub.calls.spawnCalls, h.stub.calls.resumeCalls, h.stub.calls.sendKeysCalls]).toEqual([[reuseSpawnOf(h, key)], [], []])
-    await h.runApproverToStop(key)
+
   })
 })
 
@@ -1553,7 +497,7 @@ describe('b.jg5 SRJ-409, SRJ-411: an item accepted for P whose restart reads P\'
     hold.release(cannedFindMissing({ rows: { [personaInstanceId(key)]: 'ids' } }))
     expect(await h.driveSequence(h.sequenceSettled(key))).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_REUSE, result: { key } })
     expect([h.stub.calls.spawnCalls, h.stub.calls.resumeCalls, h.stub.calls.sendKeysCalls]).toEqual([[reuseSpawnOf(h, key)], [], []])
-    await h.runApproverToStop(key)
+
   })
 })
 
@@ -1618,7 +562,6 @@ describe('b.jg5 SRJ-1011 state 4: an item accepted after the kill-failure alert 
     h.script({ statusQueue: [cannedOk(cannedStatusResult({ state: 'ended' }))] })
 
     await sequenceKill(h, key, errTmuxKillFailed(undefined, 'pane-process-survived'))
-    await h.runApproverToStop(key)
 
     expect(h.episodeNotices).toHaveLength(1)
     expect(h.killFailureOpen(key)).toBe(false)
@@ -1645,7 +588,6 @@ describe('b.jg5 SRJ-1011 state 4: an item accepted after the kill-failure alert 
     // which ends the episode, and no kill is sent for it (b.jg5 SRJ-110, SRJ-314).
     readRow()
     await retryNow(h, key)
-    await h.runApproverToStop(key)
 
     expect(h.killFailureOpen(key)).toBe(false)
     expect(h.stub.calls.killCalls).toHaveLength(1)
@@ -1837,7 +779,7 @@ describe('b.jg5 SRJ-706, SRJ-1011: an item accepted while P\'s live-row sequence
 
 describe('not up: a queued Slack item for a persona that is not up starts no restart', () => {
   test.each(['no session'] as const)(
-    'b.g57 REGRESSION: %s, alpha not up while its connection still delivers: three messages each get exactly the not-up notice at the destination, no restart is asked for, scheduled or launched and nothing is delivered; once alpha is up, the next lost message starts now',
+    'b.g57 REGRESSION: %s, alpha not up while its connection still delivers: three messages stay queued with no notice, no restart is asked for, scheduled or launched and nothing is delivered; once alpha is up, the next lost message starts now',
     async (branch) => {
       const h = makeHarness({ branch, notUp: ['alpha'] })
       // The relaunch gate over the same bring-up state: before the fix every
@@ -1851,7 +793,7 @@ describe('not up: a queued Slack item for a persona that is not up starts no res
 
 
       expect(h.postsTo(SHARED)).toEqual([])
-      expect(h.upAsks).toEqual([h.alpha.key, h.alpha.key, h.alpha.key])
+      expect(h.upAsks).toEqual(Array(6).fill(h.alpha.key))
       expect(isRestartPendingOrActive(h.alpha.key)).toBe(false)
       expect(gateLines).toEqual([])
       expect(h.p('alpha').notifications).toEqual([])
@@ -1870,7 +812,7 @@ describe('not up: a queued Slack item for a persona that is not up starts no res
     },
   )
 
-  test('one message lost on both connections, beta up and alpha not up: beta reports starting now and is restarted, alpha reports not up and is not, each at its own destination', async () => {
+  test('one accepted message on both connections, beta up and alpha not up: only beta restarts and each persona retains exactly one queued item', async () => {
     const h = makeHarness({ notUp: ['alpha'] })
     // Beta is `mentions` in the shared channel, so it gets the message by mention.
     const event = messageIn(SHARED, `${mentionText(h.p('beta').stub.identity.botUserId)} ${MESSAGE_MARKER}`)
@@ -1879,7 +821,12 @@ describe('not up: a queued Slack item for a persona that is not up starts no res
 
 
     expect(h.postsTo(SHARED)).toEqual([])
-    expect(h.upAsks).toEqual([h.beta.key, h.alpha.key])
+    expect([...h.upAsks].sort()).toEqual([h.alpha.key, h.alpha.key, h.beta.key, h.beta.key].sort())
+    expect(h.queued('alpha')).toHaveLength(1)
+    expect(h.queued('beta')).toHaveLength(1)
+    expect(h.p('alpha').notifications).toEqual([])
+    expect(h.p('beta').notifications).toEqual([])
+    expect(h.allPosts()).toEqual([])
     expect(isRestartPendingOrActive(h.beta.key)).toBe(true)
     expect(isRestartPendingOrActive(h.alpha.key)).toBe(false)
     await waitFor(() => h.launches.length > 0)
@@ -1912,14 +859,14 @@ describe('not up: a queued Slack item for a persona that is not up starts no res
   // two-persona case above; the AC 26 state table (no up check at all) fails
   // if an absent check counted as not up. This one row shows an up persona
   // still falls through to a later restart-guard state.
-  test('alpha up through the up check and at the restart-failure cap: the notice says restart limit reached and nothing launches', async () => {
+  test('alpha up through the real up check and at the restart-failure cap: the item stays queued and nothing launches', async () => {
     const h = makeHarness({ ...LOST_STATE_SETUPS['restart-limit-reached'].opts, upCheck: true })
     await arrangeState(h, 'restart-limit-reached')
 
     await h.deliver(messageIn(SHARED), h.alpha.key)
 
     expectStoredWithoutNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state: 'restart-limit-reached' })
-    expect(h.upAsks).toEqual([h.alpha.key])
+    expect(h.upAsks).toEqual([h.alpha.key, h.alpha.key])
     await Bun.sleep(WAIT_MS)
     expect(h.launches).toEqual([])
   })
@@ -2470,10 +1417,750 @@ describe('b.jg5 SRJ-812, SRJ-810 (AC 54): a restart a queued Slack item triggers
     expect(h.oldLifeHolds.holdOf(id)).toBeUndefined()
     expect(h.holdEndRetries).toEqual([{ key: q, at: endedAt, result: UNAVAILABLE_RETRY_RUN_NOW_RAN }])
     expect(h.stub.calls.spawnCalls.map((params) => params.instance_id)).toEqual([personaInstanceId(q)])
-    await h.runApproverToStop(q)
+
     h.controller.stopAll('the case is over')
     expectOnlyQQueued(h, q, 1)
     expect(h.slack(q).callLog.filter((call) => call.method === 'chat.postMessage')).toHaveLength(0)
     expect(h.slack(b).callLog).toEqual([])
+  })
+})
+
+/** Alpha's permission-prompt destination: its home channel, or `dm` with its contact. */
+type Destination = 'channel' | 'dm'
+
+/** The drop branch: no session at all, or a connected session without its GET stream. */
+type Branch = 'no session' | 'streamless'
+
+type Harness = RoutingHarness & {
+  /** The receiving persona in every lost-message case: personas[1]. */
+  alpha: Persona
+  /** The other persona: personas[0]. */
+  beta: Persona
+  /** Deliver `event` to the receiving persona key(s), as the socket handler does. */
+  deliver(event: unknown, keys: string | readonly string[]): Promise<void>
+}
+
+interface HarnessOptions {
+  destination?: Destination
+  branch?: Branch
+  sessionRestartDelay?: number
+  restartDelayS?: number
+  launchSession?: RoutingHarnessOptions['launchSession']
+  /** Hold every restart launch open until teardown (the harness's `holdLaunches`), keeping the persona in flight. */
+  holdLaunches?: boolean
+  alphaStub?: StubSlackOptions
+  resolveUserName?: RoutingHarnessOptions['resolveUserName']
+  notify?: RoutingHarnessOptions['notify']
+  /**
+   * Give the routing the harness's up check (the real up predicate, not up
+   * for the keys in `h.notUp`, asks recorded in `h.upAsks`). Without it (and
+   * without `notUp`) the routing has no up check.
+   */
+  upCheck?: boolean
+  /**
+   * Names whose bring-up outcome is not `up` although their connection still
+   * delivers a message (a persona that stopped being up while the message
+   * was in flight, or the old half of a destructive modify); implies `upCheck`.
+   */
+  notUp?: readonly string[]
+  /** Install the real outage state with a recording sink (the harness's `outageState`). */
+  outageState?: boolean
+  /**
+   * Bind the routing's one lost-message row read, scripted per persona name
+   * (the harness's `rowRead`). Without it no read is bound and none is made.
+   */
+  rowRead?: RoutingHarnessOptions['rowRead']
+  /** Bind the routing's missing-retry-timer arm (the harness's `armRetryTimer`: each ask recorded, P's timer armed). */
+  armRetryTimer?: boolean
+  /** Names whose retry timer is armed first (the harness's `retryArmed`); default every persona. */
+  retryArmed?: readonly string[]
+}
+
+/** A connection that serves, so only the bring-up outcome decides whether a persona is up. */
+const SERVING: PersonaConnectionStatus = { state: 'up', identity: { botUserId: 'U0SERVING', botId: 'B0SERVING' } }
+
+function makeHarness(opts: HarnessOptions = {}): Harness {
+  const streamless = opts.branch === 'streamless'
+  const h = makeRoutingHarness(
+    [
+      { name: 'beta', channels: [{ id: BETA_MENTIONS, delivery: 'mentions' }, { id: SHARED, delivery: 'mentions' }] },
+      {
+        name: 'alpha',
+        channels: [
+          { id: ALPHA_HOME, delivery: 'all' },
+          { id: ALPHA_SECOND, delivery: 'all' },
+          { id: SHARED, delivery: 'all' },
+        ],
+        // DMs on (so a DM to alpha qualifies) whatever the destination is.
+        dm: { enabled: true, contact: CONTACT },
+        permission_prompts: (opts.destination ?? 'channel') === 'dm' ? 'dm' : ALPHA_HOME,
+      },
+    ],
+    dir,
+    {
+      sessions: streamless ? ['alpha'] : [],
+      streamless: streamless ? ['alpha'] : undefined,
+      overrides: { session_restart_delay: opts.sessionRestartDelay ?? 60 },
+      restartDelayS: opts.restartDelayS ?? FAST_DELAY_S,
+      launchSession: opts.launchSession,
+      holdLaunches: opts.holdLaunches,
+      stubOptions: opts.alphaStub ? { alpha: opts.alphaStub } : undefined,
+      resolveUserName: opts.resolveUserName,
+      notify: opts.notify,
+      upCheck: opts.upCheck,
+      notUp: opts.notUp,
+      outageState: opts.outageState,
+      rowRead: opts.rowRead ?? { alpha: livenessReadingForStatus(cannedStatusResult({ state: 'waiting' })), beta: livenessReadingForStatus(cannedStatusResult({ state: 'waiting' })) },
+      armRetryTimer: opts.armRetryTimer,
+      retryArmed: opts.retryArmed,
+    },
+  )
+  const [beta, alpha] = h.config!.personas as [Persona, Persona]
+  const harness = Object.assign(h, {
+    alpha,
+    beta,
+    deliver: (event: unknown, keys: string | readonly string[]) =>
+      h.receiveKeys(event, typeof keys === 'string' ? [keys] : keys),
+  })
+  harnesses.push(harness)
+  return harness
+}
+
+/** The conversation alpha's notices go to for `destination`. */
+function destinationId(destination: Destination): string {
+  return destination === 'dm' ? stubOpenedDmId(CONTACT) : ALPHA_HOME
+}
+
+/** Where alpha's session (if any) runs: the restart of a streamless session uses its cwd. */
+function expectedLaunchCwd(h: Harness, branch: Branch): string {
+  return branch === 'streamless' ? h.p('alpha').sessionCwd! : h.alpha.working_directory
+}
+
+
+/** A DM to alpha in `channel` from `user`, carrying the message marker. */
+function dmFrom(user: string, channel: string): SlackEvent {
+  return makeDm({ channel, user, text: `a direct question ${MESSAGE_MARKER}` })
+}
+
+/** Every captured post as (persona whose stub posted, conversation, recovery state). */
+/** The first persona (beta) got no restart and made no Slack call of any kind. */
+function expectBetaUntouched(h: Harness): void {
+  expect(isRestartPendingOrActive(h.beta.key)).toBe(false)
+  expect(h.p('beta').stub.callLog).toEqual([])
+}
+
+/**
+ * The properties every lost-message notice has: it names alpha (b.av2
+ * SR-7.2), says a message was lost, names `sender` with no mention, identifies
+ * `state` and no other, and no Slack call anywhere carries the message text.
+ */
+/**
+ * AC 26: the lost message made exactly one Slack post, alpha's notice, at its
+ * destination (for `dm`, the conversation `conversations.open` returned for
+ * the contact), through alpha's own client with no username or icon override,
+ * and nothing in `source`. Beta made no Slack call.
+ */
+function expectStoredWithoutNotice(h: Harness, want: { destination: Destination; source: string; sender: string; state: LostMessageState }): void {
+ expect(h.allPosts()).toEqual([])
+ expect(h.notices).toEqual([])
+ expect(h.queue.openCount(h.alpha.key)).toBeGreaterThan(0)
+ expect(h.queued('beta')).toEqual([])
+}
+
+/** `persona-destination-failed` start lines, and its `cleared:` lines. */
+const failedLines = (h: Harness) => h.logs.filter((l) => l.includes('persona-destination-failed:') && !l.includes('cleared:'))
+const clearedLines = (h: Harness) => h.logs.filter((l) => l.includes('persona-destination-failed:') && l.includes('cleared:'))
+
+
+interface StateInput {
+  /** Harness options the input needs. */
+  opts?: HarnessOptions
+  /** Put persona `key` under the input. */
+  set(h: Harness, key: string): void
+  /** Take persona `key` out of it again (absent where no case needs it). */
+  clear?(h: Harness, key: string): void
+}
+
+/** Persona `key`'s working directory. */
+function cwdOf(h: Harness, key: string): string {
+  return h.config!.personas.find((p) => p.key === key)!.working_directory
+}
+
+const INPUTS = {
+  'not up': {
+    opts: { upCheck: true },
+    set: (h, key) => { h.notUp.add(key) },
+    clear: (h, key) => { h.notUp.delete(key) },
+  },
+  // E13's set entry with a real CONFLICT error; `forget` is its silent drop.
+  'latched on a CONFLICT': {
+    set: (h, key) => {
+      expect(h.latch.setFromConflict(key, conflictForPersona(key), { refusedOperation: REFUSED_OPERATION_PLAIN_SPAWN, rowState: LATCH_ROW_STATE_NO_ROW })).toBeDefined()
+      expect(h.latch.isLatched(key)).toBe(true)
+    },
+    clear: (h, key) => { expect(h.latch.forget(key)).toBe(true) },
+  },
+  // The hold's set, as a reuse spawn's ErrInvalidFlags sets it (SRJ-207); `forget` is its silent end.
+  'held on ErrInvalidFlags': {
+    set: (h, key) => {
+      expect(h.invalidFlagsHold.set(key)).toBe(true)
+      expect(h.invalidFlagsHold.isHeld(key)).toBe(true)
+    },
+    clear: (h, key) => { expect(h.invalidFlagsHold.forget(key)).toBe(true) },
+  },
+  'kill failed': {
+    set: (h, key) => { h.killFailed.add(key) },
+    clear: (h, key) => { h.killFailed.delete(key) },
+  },
+  // E10's entry: a refusal from a tmux-touching verb starts the condition; a
+  // health tick that reads the row live ends it.
+  'tmux-unresponsive holds': {
+    set: (h, key) => {
+      expect(h.tmuxUnresponsive.start(key, 'resume', errTmuxUnresponsive('resume'))).toBe('started')
+    },
+    clear: (h, key) => { expect(h.tmuxUnresponsive.end(key, TMUX_UNRESPONSIVE_END_TICK)).not.toBe('not-holding') },
+  },
+  // E11's one raise entry and the real clear.
+  'tmux-unavailable raised': {
+    opts: { outageState: true },
+    set: (_h, key) => {
+      raiseTmuxUnavailable(key, errTmuxNotAvailable())
+      expect(getOutageFlags(key).has('tmux-unavailable')).toBe(true)
+    },
+    clear: (_h, key) => {
+      clearOutageFlag(key, 'tmux-unavailable')
+      expect(getOutageFlags(key).size).toBe(0)
+    },
+  },
+  // E12's one raise entry and the real clear.
+  'ad-config-malformed raised': {
+    opts: { outageState: true },
+    set: (_h, key) => {
+      raiseAdConfigMalformed(key, errConfigMalformed())
+      expect(getOutageFlags(key).has('ad-config-malformed')).toBe(true)
+    },
+    clear: (_h, key) => {
+      clearOutageFlag(key, 'ad-config-malformed')
+      expect(getOutageFlags(key).size).toBe(0)
+    },
+  },
+  'a live-row sequence running': {
+    set: (h, key) => { h.sequenceOrWaitRunning.add(key) },
+    clear: (h, key) => { h.sequenceOrWaitRunning.delete(key) },
+  },
+  // A restart whose timer has not fired: armed at a delay that never fires,
+  // then the restart module is able to launch again (fast delay).
+  'a pending restart': {
+    set: (h, key) => {
+      const delay = h.restartDelayS
+      h.restartDelayS = SLOW_DELAY_S
+      scheduleRestart(key, cwdOf(h, key), undefined, { humanTrigger: true })
+      h.restartDelayS = delay
+      expect(isRestartPendingOrActive(key)).toBe(true)
+    },
+  },
+  'auto-restart disabled': {
+    opts: { sessionRestartDelay: 0 },
+    set: () => {},
+  },
+} satisfies Record<string, StateInput>
+
+type InputName = keyof typeof INPUTS
+
+/** State 5's three sources (b.jg5 SRJ-1011). */
+const STATE_5_SOURCES = ['tmux-unresponsive holds', 'tmux-unavailable raised', 'ad-config-malformed raised'] as const satisfies readonly InputName[]
+
+/** The harness options of every named input together. */
+function inputOpts(...names: InputName[]): HarnessOptions {
+  return Object.assign({}, ...names.map((n) => (INPUTS[n] as StateInput).opts ?? {}))
+}
+
+
+/**
+ * Arrange alpha in `state` for the next lost message on the no-session
+ * branch, as the shared table (`LOST_STATE_SETUPS`) arranges it, its launches
+ * in its working directory.
+ */
+function arrangeState(h: Harness, state: LostMessageState): Promise<void> | void {
+  return LOST_STATE_SETUPS[state].arrange(h, h.alpha.key, h.alpha.working_directory)
+}
+
+describe('AC 26: recovery selects the recovery state', () => {
+  const table: [LostMessageState, Destination][] = LOST_MESSAGE_STATES.flatMap((s) => (['channel', 'dm'] as const).map((d): [LostMessageState, Destination] => [s, d]))
+
+  test.each(table)(
+    'AC 26, AC 68: state %s, a %s destination: stores one item without a source or destination notice; a restart is asked for only when starting now',
+    async (state, destination) => {
+      const setup = LOST_STATE_SETUPS[state]
+      const h = makeHarness({ destination, ...setup.opts })
+      await arrangeState(h, state)
+      const asksBefore = h.restartAsks.length
+
+      await h.deliver(messageIn(SHARED), h.alpha.key)
+
+      expectStoredWithoutNotice(h, { destination, source: SHARED, sender: STUB_USER_NAME, state })
+      // Only "starting now" asks the relaunch gate (it schedules the restart).
+      expect(h.restartAsks.slice(asksBefore)).toEqual(state === 'starting-now' ? [h.alpha.key] : [])
+      expect(isRestartPendingOrActive(h.alpha.key)).toBe(setup.pending)
+      await Bun.sleep(WAIT_MS) // a launch the message scheduled would have fired by now
+      expect(h.launches).toHaveLength(setup.launches)
+      for (const launch of h.launches) expect(launch).toEqual({ key: h.alpha.key, cwd: h.alpha.working_directory })
+    },
+  )
+})
+
+// ===========================================================================
+// b.jg5 SRJ-1011 state 5 (hatch notes E11, E12) — an item accepted while P is
+// not answering, from each of its three sources: its `tmux-unresponsive`
+// condition holding (E10), its `tmux-unavailable` outage raised (SRJ-311) or
+// its `ad-config-malformed` outage raised (SRJ-316). No restart is asked for,
+// scheduled or launched, and the source's own notice (the outage onset) goes
+// to the outage state's sink, not to Slack. After the source's real end or
+// clear, the next lost message starts a restart. An open unclassified-error
+// episode, or another outage class, is not a source.
+// ===========================================================================
+
+describe('b.jg5 SRJ-1011 state 5: an item accepted while the persona is not answering starts no restart', () => {
+  const SOURCES: [typeof STATE_5_SOURCES[number]][] = STATE_5_SOURCES.map((source) => [source])
+
+  test.each(SOURCES)(
+    'AC 68: %s: the notice says not answering and no restart is asked for or launched; after its real end the next lost message starts now with one launch',
+    async (source) => {
+      const h = makeHarness(inputOpts(source))
+      INPUTS[source].set(h, h.alpha.key)
+      const asksBefore = h.restartAsks.length
+
+      await h.deliver(messageIn(SHARED), h.alpha.key)
+
+      expectStoredWithoutNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state: 'not-answering' })
+      expect(h.restartAsks.slice(asksBefore)).toEqual([])
+      expect(isRestartPendingOrActive(h.alpha.key)).toBe(false)
+      await Bun.sleep(WAIT_MS)
+      expect(h.launches).toEqual([])
+
+      INPUTS[source].clear(h, h.alpha.key)
+      await h.deliver(messageIn(SHARED), h.alpha.key)
+
+
+      expect(h.postsTo(SHARED)).toEqual([])
+      await waitFor(() => h.launches.length > 0)
+      await Bun.sleep(WAIT_MS)
+      expect(h.launches).toEqual([{ key: h.alpha.key, cwd: h.alpha.working_directory }])
+      expectBetaUntouched(h)
+    },
+  )
+
+  test.each<[string, LostMessageState, InputName | undefined, number]>([
+    ['alone', 'starting-now', undefined, 1],
+    ['with auto-restart disabled', 'auto-restart-disabled', 'auto-restart disabled', 0],
+  ])(
+    'hatch A2: an open unclassified-error episode %s never reports not answering; the message reports %s',
+    async (_label, state, other, launches) => {
+      const h = makeHarness(other === undefined ? {} : inputOpts(other))
+      expect(h.episodes.begin(h.alpha.key, PERSONA_EPISODE_KIND_UNCLASSIFIED_ERROR)).toBe('begun')
+      if (other !== undefined) INPUTS[other].set(h, h.alpha.key)
+
+      await h.deliver(messageIn(SHARED), h.alpha.key)
+
+      expect(h.episodes.isOpen(h.alpha.key, PERSONA_EPISODE_KIND_UNCLASSIFIED_ERROR)).toBe(true)
+      expectStoredWithoutNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state })
+      await Bun.sleep(WAIT_MS)
+      expect(h.launches).toHaveLength(launches)
+    },
+  )
+
+  test.each(OUTAGE_CLASS_ORDER.filter((cls) => cls !== 'tmux-unavailable' && cls !== 'ad-config-malformed'))(
+    'the %s outage raised for the persona is not a not-answering source: the message starts now',
+    async (cls) => {
+      const h = makeHarness({ outageState: true })
+      setOutageFlag(h.alpha.key, cls, 'detail')
+      expect(getOutageFlags(h.alpha.key).has(cls)).toBe(true)
+
+      await h.deliver(messageIn(SHARED), h.alpha.key)
+
+      expectStoredWithoutNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state: 'starting-now' })
+      // The outage's onset went to the outage state's sink, never to Slack.
+      expect(h.outageNotices.map((n) => n.key)).toEqual([h.alpha.key])
+    },
+  )
+})
+
+// ===========================================================================
+// b.jg5 SRJ-1011 as amended (orchestrator ruling): "A persona whose retry
+// timer is stopped at the restart cap reports restart-limit-reached, never
+// state 5's 'CSCB is retrying', whatever condition or flag is raised. In
+// SRJ-1011's order, state 5 applies only while P's retry timer is armed."
+// Through the real routing, with the restart delay above 0 (so auto-restart
+// disabled does not come first) and the row read bound (answering live, a
+// restart's input): alpha at the restart cap (SRJ-305, the real backoff
+// state) with each state-5 source, its retry timer still armed (the window
+// the cap closes: that timer stops at its next retry) or none, reports
+// restart limit reached; no restart is asked for, scheduled or launched,
+// and the missing-retry-timer arm is never asked. Below the cap, state 5
+// needs the timer: armed, not answering; `tmux-unavailable` raised with
+// none armed, the arm is asked before the decision and its timer makes the
+// message not answering, with no read; the condition or `ad-config-malformed`
+// alone with none armed is not state 5, so the message falls through to the
+// next state that applies (here starting now, with its read and restart).
+// ===========================================================================
+
+describe('b.jg5 SRJ-1011 as amended: state 5 applies only while the retry timer is armed, and never at the restart cap', () => {
+  /** Alpha under `source`, its retry timer armed first or not, the arm member bound and the row read answering live. */
+  function gateHarness(source: typeof STATE_5_SOURCES[number], armed: boolean): Harness {
+    const h = makeHarness({
+      ...inputOpts(source),
+      armRetryTimer: true,
+      retryArmed: armed ? ['alpha'] : [],
+      rowRead: { alpha: LIVENESS_READING_LIVE },
+    })
+    INPUTS[source].set(h, h.alpha.key)
+    return h
+  }
+
+  const CAPPED = STATE_5_SOURCES.flatMap((source) => ([true, false] as const).map(
+    (armed): [typeof STATE_5_SOURCES[number], string, boolean] => [source, armed ? 'still armed' : 'none armed', armed],
+  ))
+
+  test.each(CAPPED)(
+    'AC 68: alpha at the restart cap with %s, its retry timer %s: the notice says restart limit reached, never not answering; no restart is asked for, scheduled or launched, and no retry timer is asked for or armed',
+    async (source, _timer, armed) => {
+      const h = gateHarness(source, armed)
+      putAtRestartCap(h.alpha.key)
+
+      await h.deliver(messageIn(SHARED), h.alpha.key)
+
+      expectStoredWithoutNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state: 'restart-limit-reached' })
+      // States 1 to 5 did not apply, so the one read was made.
+      expect(h.rowReads).toEqual([h.alpha.key])
+      expect(h.retryTimerArms).toEqual([])
+      expect(h.retryArmed.has(h.alpha.key)).toBe(armed)
+      expect(h.restartAsks).toEqual([])
+      expect(isRestartPendingOrActive(h.alpha.key)).toBe(false)
+      await Bun.sleep(WAIT_MS) // a restart the message scheduled would have launched by now
+      expect(h.launches).toEqual([])
+      expectNoFakeTimerLeft(h)
+    },
+  )
+
+  test.each<[typeof STATE_5_SOURCES[number], string, LostMessageState, boolean, readonly string[]]>([
+    ['tmux-unresponsive holds', 'armed', 'not-answering', true, []],
+    ['tmux-unavailable raised', 'armed', 'not-answering', true, ['alpha']],
+    ['ad-config-malformed raised', 'armed', 'not-answering', true, []],
+    ['tmux-unavailable raised', 'none armed (the arm, asked before the decision, arms it)', 'not-answering', false, ['alpha']],
+    ['tmux-unresponsive holds', 'none armed', 'starting-now', false, []],
+    ['ad-config-malformed raised', 'none armed', 'starting-now', false, []],
+  ])(
+    'below the cap, %s, the retry timer %s: the notice says %s; only starting now asks for a restart',
+    async (source, _timer, state, armed, armAsks) => {
+      const h = gateHarness(source, armed)
+
+      await h.deliver(messageIn(SHARED), h.alpha.key)
+
+      expectStoredWithoutNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state })
+      expect(h.retryTimerArms).toEqual(h.keys(armAsks))
+      expect(h.retryArmed.has(h.alpha.key)).toBe(state === 'not-answering')
+      // Not answering is decided at the read gate's check, with no read; a
+      // fall-through makes the one read (live) and then starts now.
+      expect(h.rowReads).toEqual(state === 'not-answering' ? [] : [h.alpha.key])
+      expect(h.restartAsks).toEqual(state === 'starting-now' ? [h.alpha.key] : [])
+      expect(isRestartPendingOrActive(h.alpha.key)).toBe(state === 'starting-now')
+      await Bun.sleep(WAIT_MS)
+      expect(h.launches).toEqual(state === 'starting-now' ? [{ key: h.alpha.key, cwd: h.alpha.working_directory }] : [])
+    },
+  )
+})
+
+// ===========================================================================
+// b.jg5 SRJ-1011 state 2 (hatch note E13; SRJ-502) — an item accepted while P
+// is latched reads E13's latch instance: a CONFLICT and E13's two declared
+// hold cases each give `held-for-human`, and no restart. After the latch's
+// silent forget, the next lost message starts a restart.
+// ===========================================================================
+
+describe('b.jg5 SRJ-1011 state 2: an item accepted while the persona is latched starts no restart', () => {
+  const conflictRow = CONFLICT_CASE_ROWS.find((row) => row.latchCase === LATCH_CASE_LEFTOVER)!
+  const LATCHES: [string, (h: Harness) => void][] = [
+    [
+      `a CONFLICT (${conflictRow.name})`,
+      (h) => { h.latch.setFromConflict(h.alpha.key, conflictRow.build(), { refusedOperation: conflictRow.refusedOperation, rowState: conflictRow.rowState }) },
+    ],
+    ...HOLD_LATCH_CASES.map((latchCase): [string, (h: Harness) => void] => [
+      `the hold case ${latchCase}`,
+      (h) => { h.latch.set(h.alpha.key, { latchCase, refusedOperation: REFUSED_OPERATION_NONE, rowState: LATCH_ROW_STATE_UNREADABLE }) },
+    ]),
+  ]
+
+  test.each(LATCHES)(
+    'AC 68, SRJ-502: latched on %s: the notice says held for a human, no restart is asked for or launched and the latch posts nothing; after the latch is forgotten the next lost message starts now',
+    async (_label, latch) => {
+      const h = makeHarness()
+      latch(h)
+      expect(h.latch.isLatched(h.alpha.key)).toBe(true)
+
+      await h.deliver(messageIn(SHARED), h.alpha.key)
+
+      expectStoredWithoutNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state: 'held-for-human' })
+      expect(h.restartAsks).toEqual([])
+      expect(isRestartPendingOrActive(h.alpha.key)).toBe(false)
+      await Bun.sleep(WAIT_MS)
+      expect(h.launches).toEqual([])
+
+      expect(h.latch.forget(h.alpha.key)).toBe(true)
+      await h.deliver(messageIn(SHARED), h.alpha.key)
+
+
+      await waitFor(() => h.launches.length > 0)
+      expect(h.launches).toEqual([{ key: h.alpha.key, cwd: h.alpha.working_directory }])
+      expectBetaUntouched(h)
+    },
+  )
+
+  test('one message lost on both connections, alpha latched and beta not: beta reports starting now and is restarted, alpha reports held for a human and is not, each at its own destination', async () => {
+    const h = makeHarness()
+    INPUTS['latched on a CONFLICT'].set(h, h.alpha.key)
+    // Beta is `mentions` in the shared channel, so it gets the message by mention.
+    const event = messageIn(SHARED, `${mentionText(h.p('beta').stub.identity.botUserId)} ${MESSAGE_MARKER}`)
+
+    await h.deliver(event, [h.beta.key, h.alpha.key])
+
+
+    expect(h.postsTo(SHARED)).toEqual([])
+    expect(h.restartAsks).toEqual([h.beta.key])
+    expect(isRestartPendingOrActive(h.beta.key)).toBe(true)
+    expect(isRestartPendingOrActive(h.alpha.key)).toBe(false)
+    await waitFor(() => h.launches.length > 0)
+    await Bun.sleep(WAIT_MS)
+    expect(h.launches).toEqual([{ key: h.beta.key, cwd: h.beta.working_directory }])
+  })
+})
+
+// ===========================================================================
+// b.jg5 SRJ-1011 order, through the real routing, as adjacent pairs: with
+// both inputs set, the earlier state is reported; with the earlier input
+// cleared, the later one. The live-row sequence or old-life wait input
+// answers `restarting` before a launch running (Task ruling; SRJ-706). No
+// message asks for, schedules or launches a restart.
+// ===========================================================================
+
+describe('b.jg5 SRJ-1011: the first state that applies is reported', () => {
+  test.each<[InputName, InputName, LostMessageState, LostMessageState]>([
+    ['not up', 'latched on a CONFLICT', 'not-up', 'held-for-human'],
+    ['latched on a CONFLICT', 'held on ErrInvalidFlags', 'held-for-human', 'cannot-launch'],
+    ['held on ErrInvalidFlags', 'kill failed', 'cannot-launch', 'kill-failed'],
+    ['kill failed', 'tmux-unresponsive holds', 'kill-failed', 'not-answering'],
+    ['tmux-unresponsive holds', 'auto-restart disabled', 'not-answering', 'auto-restart-disabled'],
+  ])('%s over %s: %s, then, once the first is cleared, %s', async (first, second, firstState, secondState) => {
+    const h = makeHarness(inputOpts(first, second))
+    INPUTS[second].set(h, h.alpha.key)
+    INPUTS[first].set(h, h.alpha.key)
+    const asksBefore = h.restartAsks.length
+    const pendingBefore = isRestartPendingOrActive(h.alpha.key)
+
+    await h.deliver(messageIn(SHARED), h.alpha.key)
+    ;(INPUTS[first] as StateInput).clear!(h, h.alpha.key)
+    await h.deliver(messageIn(SHARED), h.alpha.key)
+
+
+    expect(h.restartAsks.slice(asksBefore)).toEqual([])
+    expect(isRestartPendingOrActive(h.alpha.key)).toBe(pendingBefore)
+    await Bun.sleep(WAIT_MS)
+    expect(h.launches).toEqual([])
+    expectBetaUntouched(h)
+  })
+
+  // Every keyed input (auto-restart disabled is server-wide).
+  const KEYED = (Object.keys(INPUTS) as InputName[]).filter((n) => n !== 'auto-restart disabled')
+
+  test.each(KEYED.map((n): [InputName] => [n]))(
+    'another persona\'s input is not the persona\'s: with beta under "%s", alpha\'s lost message starts now and alpha is restarted',
+    async (input) => {
+      const h = makeHarness(inputOpts(input))
+      INPUTS[input].set(h, h.beta.key)
+
+      await h.deliver(messageIn(SHARED), h.alpha.key)
+
+
+      expect(isRestartPendingOrActive(h.alpha.key)).toBe(true)
+      await waitFor(() => h.launches.some((l) => l.key === h.alpha.key))
+      expect(h.launches.filter((l) => l.key === h.alpha.key)).toEqual([{ key: h.alpha.key, cwd: h.alpha.working_directory }])
+    },
+  )
+})
+
+// ===========================================================================
+// b.jg5 SRJ-1011 state 6 by the read (E15 T2) — with states 1 to 5 clear and
+// nothing in flight for P, the routing makes one row read of P (the
+// harness's scripted `readRowLiveness`). A `pending` answer is state 6, which
+// comes before every restart guard: no restart is asked for, scheduled or
+// launched (SRJ-1501; AC 68, state 6 from the read). A `live` reading or no
+// row (`dead`) is not `pending`: the state is the next that applies, here
+// starting now, AC 68's control. A launch running is state 6 with no read
+// (the AC 68 describe); a dialog approver running, likewise (the order pairs
+// above, and the read gate in tests/persona-routing.test.ts).
+// ===========================================================================
+
+/** No fake-clock timer is left: the destination hold's and the episodes'. */
+function expectNoFakeTimerLeft(h: Harness): void {
+  expect(h.holdClock.pendingCount()).toBe(0)
+  expect(h.episodesClock.pendingCount()).toBe(0)
+}
+
+/** States 2 to 6 of b.jg5 SRJ-1011, where no human-triggered restart fires (SRJ-1501). */
+const NO_RESTART_STATES = LOST_MESSAGE_STATES.slice(
+  LOST_MESSAGE_STATES.indexOf('held-for-human'),
+  LOST_MESSAGE_STATES.indexOf('session-starting') + 1,
+)
+
+describe('b.jg5 SRJ-1011 state 6 by the read: a row reading `pending` reports session starting and starts no restart', () => {
+  test.each<[string, InputName | undefined, boolean]>([
+    ['nothing else applies', undefined, false],
+    ['a restart timer is pending (state 6 comes before restarting)', 'a pending restart', true],
+    ['auto-restart is disabled (state 6 comes before auto-restart disabled)', 'auto-restart disabled', false],
+  ])('AC 68: %s: one read of alpha, then the session-starting notice; no restart is asked for, scheduled or launched', async (_label, input, pending) => {
+    const h = makeHarness({ ...(input === undefined ? {} : inputOpts(input)), rowRead: { alpha: LIVENESS_READING_PENDING } })
+    if (input !== undefined) INPUTS[input].set(h, h.alpha.key)
+    const asksBefore = h.restartAsks.length
+
+    await h.deliver(messageIn(SHARED), h.alpha.key)
+
+    expectStoredWithoutNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state: 'session-starting' })
+    expect(h.readOrder).toEqual([`read:${h.alpha.key}`])
+    expect(h.restartAsks.slice(asksBefore)).toEqual([])
+    expect(isRestartPendingOrActive(h.alpha.key)).toBe(pending)
+    await Bun.sleep(WAIT_MS) // a restart the message scheduled would have launched by now
+    expect(h.launches).toEqual([])
+    expectNoFakeTimerLeft(h)
+  })
+
+  test.each<[string, RowReadAnswer]>([
+    ['a live reading', LIVENESS_READING_LIVE],
+    ['no row (the dead reading)', LIVENESS_READING_DEAD],
+  ])('AC 68 control: %s is not `pending`: one read, then starting now, which asks the relaunch gate once and launches once', async (_label, answer) => {
+    const h = makeHarness({ rowRead: { alpha: answer } })
+
+    await h.deliver(messageIn(SHARED), h.alpha.key)
+
+    expectStoredWithoutNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state: 'starting-now' })
+    expect(h.readOrder).toEqual([`read:${h.alpha.key}`])
+    expect(h.restartAsks).toEqual([h.alpha.key])
+    await waitFor(() => h.launches.length > 0)
+    await Bun.sleep(WAIT_MS)
+    expect(h.launches).toEqual([{ key: h.alpha.key, cwd: h.alpha.working_directory }])
+  })
+})
+
+// ===========================================================================
+// b.jg5 SRJ-1011 — a failed read (an `unknown` reading, or a read that
+// rejects) is never taken for `pending`: state 6 is left out and the state
+// is the next that applies. A rejection is caught and logged once, naming the
+// persona, its message redacted (the teardown leak check covers the rest).
+// ===========================================================================
+
+describe('b.jg5 SRJ-1011: a failed row read leaves state 6 out', () => {
+  const FAILED: [string, RowReadAnswer][] = [
+    ['an unknown reading', LIVENESS_READING_UNKNOWN],
+    ['a read that rejects', ROW_READ_REJECTS],
+  ]
+  const NEXT: [string, InputName | undefined, LostMessageState][] = [
+    ['nothing else', undefined, 'starting-now'],
+    ['a restart timer pending', 'a pending restart', 'restarting'],
+    ['auto-restart disabled (delay 0)', 'auto-restart disabled', 'auto-restart-disabled'],
+  ]
+  const table = FAILED.flatMap(([label, answer]) =>
+    NEXT.map(([nextLabel, input, state]): [string, string, LostMessageState, RowReadAnswer, InputName | undefined] => [label, nextLabel, state, answer, input]),
+  )
+
+  test.each(table)('%s, with %s: recovery selects %s; only starting now asks for a restart, which launches once', async (_label, _nextLabel, state, answer, input) => {
+    const h = makeHarness({ ...(input === undefined ? {} : inputOpts(input)), rowRead: { alpha: answer } })
+    if (input !== undefined) INPUTS[input].set(h, h.alpha.key)
+    const asksBefore = h.restartAsks.length
+
+    await h.deliver(messageIn(SHARED), h.alpha.key)
+
+    expectStoredWithoutNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state })
+    expect(h.rowReads).toEqual([h.alpha.key])
+    expect(h.restartAsks.slice(asksBefore)).toEqual(state === 'starting-now' ? [h.alpha.key] : [])
+    expect(isRestartPendingOrActive(h.alpha.key)).toBe(state !== 'auto-restart-disabled')
+    const failedLines = h.logs.filter((l) => l.includes(ROW_READ_REJECTION_REDACTED))
+    if (answer === ROW_READ_REJECTS) {
+      expect(failedLines).toHaveLength(1)
+      expect(failedLines[0]).toContain(renderPersonaRef(h.alpha.name, h.alpha.key))
+      // The thrown value's type, then its redacted message.
+      expect(failedLines[0]).toContain(`Error message="${ROW_READ_REJECTION_REDACTED}"`)
+    } else {
+      expect(failedLines).toEqual([])
+    }
+    expect(h.logs.filter((l) => l.includes('error handling event'))).toEqual([])
+    await Bun.sleep(WAIT_MS)
+    expect(h.launches).toEqual(state === 'starting-now' ? [{ key: h.alpha.key, cwd: h.alpha.working_directory }] : [])
+    expectNoFakeTimerLeft(h)
+  })
+})
+
+// ===========================================================================
+// b.jg5 SRJ-1011 (Task ruling: decide again after the read) — states 1 to 5
+// are decided again over fresh answers once the read settles, so a latch or
+// an outage that begins while the read runs gives state 2 or 5, whatever
+// the read answers. (A live-row sequence or old-life wait step running for
+// P answers `restarting` with no read, SRJ-706: the read gate in
+// tests/persona-routing.test.ts.) Two messages lost together,
+// both reads in flight at once, schedule one restart: nothing is awaited
+// between the final decision and `scheduleRestart`.
+// ===========================================================================
+
+describe('b.jg5 SRJ-1011: the state is decided again after the read', () => {
+  const DURING: [string, InputName, LostMessageState][] = [
+    ['alpha is latched', 'latched on a CONFLICT', 'held-for-human'],
+    ['alpha\'s tmux-unavailable outage is raised', 'tmux-unavailable raised', 'not-answering'],
+    ['alpha\'s ad-config-malformed outage is raised', 'ad-config-malformed raised', 'not-answering'],
+  ]
+  const table = DURING.flatMap(([label, input, state]) =>
+    ([['live', LIVENESS_READING_LIVE], ['pending', LIVENESS_READING_PENDING]] as const).map(
+      ([name, answer]): [string, string, InputName, LostMessageState, RowReadAnswer] => [label, name, input, state, answer],
+    ),
+  )
+
+  test.each(table)('AC 68: %s while the read runs, which then answers %s: recovery selects the earlier state, and no restart is asked for, scheduled or launched', async (_label, _answerName, input, state, answer) => {
+    const h = makeHarness({
+      ...inputOpts(input),
+      rowRead: { alpha: { answer, during: (hh, key) => INPUTS[input].set(hh as Harness, key) } },
+    })
+
+    await h.deliver(messageIn(SHARED), h.alpha.key)
+
+    expectStoredWithoutNotice(h, { destination: 'channel', source: SHARED, sender: STUB_USER_NAME, state })
+    expect(h.readOrder).toEqual([`read:${h.alpha.key}`])
+    expect(h.restartAsks).toEqual([])
+    expect(isRestartPendingOrActive(h.alpha.key)).toBe(false)
+    await Bun.sleep(WAIT_MS)
+    expect(h.launches).toEqual([])
+    expectNoFakeTimerLeft(h)
+  })
+
+  test('two messages lost together for alpha, both reads in flight at once and answering live: exactly one restart is scheduled; both items stay queued and only the first schedules recovery', async () => {
+    // Each read waits until both have started, so both decisions follow both reads.
+    let started = 0
+    let bothStarted!: () => void
+    const both = new Promise<void>((resolve) => { bothStarted = resolve })
+    const during = async (): Promise<void> => {
+      started += 1
+      if (started === 2) bothStarted()
+      await both
+    }
+    const h = makeHarness({ restartDelayS: SLOW_DELAY_S, rowRead: { alpha: { answer: LIVENESS_READING_LIVE, during } } })
+
+    await Promise.all([
+      h.deliver(messageIn(SHARED, `first ${MESSAGE_MARKER}`), h.alpha.key),
+      h.deliver(messageIn(ALPHA_SECOND, `second ${MESSAGE_MARKER}`), h.alpha.key),
+    ])
+
+    expect(h.readOrder.slice(0, 2)).toEqual([`read:${h.alpha.key}`, `read:${h.alpha.key}`])
+    expect(h.rowReads).toEqual([h.alpha.key, h.alpha.key])
+    // One scheduleRestart reached the relaunch gate (a second would have asked it again).
+    expect(h.restartAsks).toEqual([h.alpha.key])
+    expect(isRestartPendingOrActive(h.alpha.key)).toBe(true)
+
+
+    expectBetaUntouched(h)
   })
 })

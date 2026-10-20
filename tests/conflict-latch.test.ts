@@ -1,479 +1,41 @@
-import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
-import { TRUST_DIALOG_PANE } from './test-helpers/working-row-panes.ts'
+import type { RecoveryStubVerb } from './test-helpers/recovery-harness.ts'
+import { CLEAR_LATCH_ROUTE, handleClearLatch } from '../src/clear-latch.ts'
+import { latchClearRestartResetFailedLine, sweepDeadTmuxChannel, type LatchClearSequenceAnswer } from '../src/session-manager.ts'
 import { MCP_SERVER_NAME } from '../src/config.ts'
 import { useImmediateTypingLifecycle } from './test-helpers/legacy-typing.ts'
 useImmediateTypingLifecycle()
-/**
- * conflict-latch.test.ts — CONFLICT case recognition (b.jg5 SRJ-507), the
- * `tests/conflict-latch.test.ts` half of SRJ-1303, and the latch record
- * (SRJ-501, with SRJ-506's same-case rule) over `createConflictLatch`.
- *
- * Recognition: every row of the case table (`tests/test-helpers/conflict-cases.ts`)
- * resolves to its case; a description carrying several case phrases takes the
- * first in `CONFLICT_CASE_ORDER`, and so does a description built from any two
- * phrase constants, in either textual order; the plain spawn's label wordings
- * and the other words beside a case phrase are no case; one pin case (the
- * file's only literal block) checks the exported order against SRJ-507's,
- * with "no pane 0.0" absent. The `different-id` and `another-store`
- * descriptions carry no "Operator actions" section title, which is read from
- * the stub's own descriptions, never typed.
- *
- * Record: latching a persona on each row's error records the quoted session,
- * the case, the refused operation and the row state; a description with no
- * quoted name records `slack_bot_<key>`; an empty or multi-line quoted span
- * is skipped whole (quotes pair left to right), so a later name is taken, and
- * a description with only such spans records `slack_bot_<key>`; a `waiting` state and an unreadable
- * state count as live, `pending`, `ended`, `missing` and no row do not; the
- * description is kept redacted, on one line and capped. A different case
- * relatches (the record replaced), the same case keeps the record unchanged
- * (SRJ-506, hatch A3), and `set` answers which. One latch per persona, a new
- * instance holds none, and `forget` is silent and per key. Set observers see
- * every set; a throwing or rejecting observer, and a throwing log, are
- * swallowed.
- *
- * The CONFLICT notice (SRJ-1004), its episode (SRJ-508, SRJ-1016) and the
- * recovery texts (SRJ-1005). One pin case (the file's only literal block for
- * these texts) checks every case's notice, every fixed line and both recovery
- * templates with each reason against SRJ-1004's and SRJ-1005's words. Every
- * other case compares with the helper's `expectedConflictNotice`, assembled
- * from the exported constants: per row, the post a real latch bound to real
- * notice episodes makes is the row's expected notice, its lines in SRJ-1004's
- * order ("a different instance id": its must-not-be-ended line in place of
- * the pointer and no "Operator actions"; "another agent-director store": its
- * must-not-be-ended line, then the pointer, then the `list` line); CSCB's own
- * lines (`cscbOwnLines`) match none of `SESSION_ENDING_COMMAND_FORMS` and none
- * of the helper's `CSCB_OWN_LINE_FORBIDDEN` (kill-pane, set-option,
- * agent-director delete, clear-latch, has-session, a label option name), while
- * the quoted "no kill was sent" is let through; the description is redacted,
- * capped and escaped once for Slack (the log line stays unescaped), and a
- * record with none has no description line. Episode: a latch posts once, a
- * same-case set posts nothing, a new case posts once more, another persona
- * posts only for itself, a hold case, a closed instance and an unbound
- * observer post nothing, and a b.f2b `unproven-idle` or `blocked-on-prompt`
- * notice already raised for the persona suppresses nothing (AC 41). A hold
- * case opens no CONFLICT episode and posts no CONFLICT notice: each hold
- * opens its own episode kind, and the unusable-name hold posts SRJ-1019.
- *
- * The unusable recorded name (SRJ-512, SRJ-1019, SRJ-508, SRJ-1016; AC 77,
- * AC 85), over the helper's `UNUSABLE_NAME_CASE_ROWS`. One pin case (the
- * file's only literal block for this text) checks SRJ-1019 word for word
- * against the builder; every other case compares with the rows' `notice`.
- * Per fault: the latch posts the row's notice once, with the instance id,
- * the description rendered (redacted, capped) and quoted, the "Operator
- * actions" title (read from the stub) and the human-only sentence; CSCB's
- * own text (`cscbOwnText`) names no session-ending command and nothing of
- * `CSCB_OWN_LINE_FORBIDDEN`. A sentinel-bearing description is redacted and
- * an overlong one capped; through `makeNotifierHarness` the persona's own
- * stub gets `formatPersonaNotice(persona, notice)` at its destination. Per
- * row: the record (the case, "none", the row's state, `slack_bot_<key>`, the
- * description) and the matching set input; a quoted session is recorded by
- * SRJ-501's rule; an `ErrInternal` without the phrase, and other values,
- * latch nothing. Episode: the first latch posts once under the unusable-name
- * kind, a second UNUSABLE NAME posts nothing, a relatch from a CONFLICT posts
- * once and a relatch back posts SRJ-1004 once (each ending the other kind's
- * episode silently), and a not-connected notice suppresses nothing.
- *
- * SRJ-512's automated half (SRJ-502, on `makeRecoveryHarness`, both settings
- * 0): P latches from `resume`'s UNUSABLE NAME, and in a second harness from
- * the working-row evidence `read-pane`; then a new launch, the retry entry,
- * a scheduled and a human-triggered restart and the retry timer make no
- * tmux-touching call (`tmuxTouchingCallsIn`) or delete for P's instance,
- * count nothing, and leave exactly one post, SRJ-1019; Q's paths reach the
- * stub as before. A message lost for P so latched reports `held-for-human`
- * with no call and no restart; Q's reports its own state. The UNCLASSIFIED
- * control: an `ErrInternal` without the phrase at the same `resume` latches nothing,
- * posts no hold notice and takes E12's handling (the unclassified episode,
- * the UNCLASSIFIED cause armed, nothing counted).
- *
- * The reconnect as a latch site (SRJ-118, SRJ-505, on `makeRecoveryHarness`,
- * both settings 0): P launches onto a colliding `waiting` row whose
- * reconnect's one `send-keys` answers CONFLICT (a case-table reconnect row)
- * or UNUSABLE NAME; P latches once with one post, and the same paths plus a
- * health tick make no further `send-keys`, other tmux-touching call or
- * delete for P and count nothing, the retry timer stopping latched;
- * Q launches and reconnects as before.
- * The kill as a latch site (SRJ-110, SRJ-505, AC 9; E20): P's restart run's
- * kill after a liveness read of ErrSystemInstallDisappeared (a row read
- * `ended` launches with no kill, SRJ-314), or the step-1 kill of the
- * live-row sequence P's
- * launch starts at a collision ladder replacement site over a row read
- * `waiting` in another directory (the ladder makes
- * no kill of its own, b.jg5 SRJ-707), answers CONFLICT "not this launch's
- * session" (the case table's restart-kill and sequence-kill rows), or
- * the restart run's kill answers UNUSABLE NAME; P latches once with one
- * post, its armed retry timer stops latched, and the same paths plus a health
- * tick make no further `kill`, delete, spawn, resume or other tmux-touching
- * call for P: exactly one `kill` of P; Q's paths go on.
- * The live-row sequence's own latches (SRJ-110, SRJ-501, SRJ-512, SRJ-513,
- * SRJ-114, SRJ-613; E21, on `makeRecoveryHarness`'s sequence driver): over
- * the case table's sequence-kill rows (`SEQUENCE_KILL_CONFLICT_CASE_ROWS`,
- * `SEQUENCE_KILL_UNUSABLE_NAME_CASE_ROWS`: the step-1 and step-4 kills, on a
- * row last read `pending` or `waiting`, SRJ-613's kill backstop among them),
- * P latches once with the row's record and one post, the kill is sent once
- * and is P's sequence's last call, and P's armed retry timer stops latched;
- * a `provenance_conflict` note at the step-2 `get` or a confirming `get`
- * latches "conflicting labels" with the note latch's refused operation, one
- * post; P's own `pending` row with no launch start at the step-2 `get`
- * latches "launch start not recorded" with one post and no wait armed (each
- * such read ends the sequence stopped for the latch, with no further call
- * and nothing armed), and the same row under an old key latches no one; Q's
- * sequence, run beside P's, is not latched and launches. A running sequence
- * whose first run is held stops when P latches from another path's own-row
- * read: no further call for P, one post, no alert or timer left, while Q's
- * sequence beside it runs on to its launch.
- * The reuse spawn's latches (SRJ-112, SRJ-501, SRJ-507, SRJ-512; HO rev 15,
- * rev 20; AC 77, AC 85; E22, on `makeRecoveryHarness`'s sequence driver
- * ending in a reuse): over the case table's reuse rows
- * (`REUSE_SPAWN_CONFLICT_CASE_ROWS`, every CONFLICT case a spawn can answer,
- * "another agent-director store" in both forms and "conflicting labels"
- * after "duplicate session" among them, and
- * `REUSE_SPAWN_UNUSABLE_NAME_CASE_ROWS`), on a finished row and, for the
- * pre-spawn scan's rows, on an id with no row (step 3's `get` reading none),
- * P latches once with the reuse spawn's refused operation (none for UNUSABLE
- * NAME) and the state the sequence last read ("no row" for the scan's), one
- * post, the reuse is P's last call, nothing is counted and P's armed retry
- * timer stops latched; SRJ-512's reuse case: the post points to "Operator
- * actions" and CSCB's own words name no session-ending command, and a message
- * lost then reports `held-for-human` with no call and no restart; Q's
- * sequence, run beside P's, is not latched and launches its own reuse.
- * The not-resumable step's re-read (SRJ-710, SRJ-114, SRJ-513, on
- * `makeRecoveryHarness`): after `resume`'s ErrSpawnNotResumable on a path
- * holding dead evidence, a re-read carrying a `provenance_conflict` note or
- * reading P's own `pending` row with no launch start latches P once with its
- * record and one post, and nothing follows (no sequence, kill, delete or
- * launch; nothing counted); Q untouched. `resume`'s CONFLICT rows at both
- * `resume` sites are tests/session-manager.test.ts's.
- * Recovery: each reason ("row reads" over every live and dead state) under
- * both latch kinds, with no line matching either list.
- *
- * AC 46's automated half (SRJ-502, on `makeRecoveryHarness` with both
- * settings 0): P latches through the launch driver at a plain-spawn row and
- * at a `resume` row; then a new launch, the retry entry, a scheduled restart,
- * a human-triggered restart request, the retry timer (armed after the latch,
- * over several waits) and a health tick with the latched query bound make no
- * kill, spawn, resume or delete for P (the tick reads its liveness only), and
- * the latch posts exactly one CONFLICT notice and no spawn-failure notice;
- * Q's run of each path is asserted call for call. The restart module's delay
- * accessor answers a non-zero delay (the setting 0 arms no restart timer), and
- * the restart timer and the health interval, which take no clock, are fired
- * by hand from a captured callback, so no real timer runs. A failing
- * latch-time `status` read (UNAVAILABLE, and UNCLASSIFIED) proves the order:
- * the read before any set, then the set, the three holds in order and the
- * notice, by which P's timer, `tmux-unresponsive` condition and
- * unclassified episode are all closed, and nothing fires for P afterwards.
- *
- * The holds' set observer (SRJ-502, SRJ-610, SRJ-1016), pure: on a set the
- * four holds (the timer's stop, the condition's end, the unclassified end and
- * the slow-recovery end) run for the persona in that order, before a notice
- * observer bound after them; a hold that throws is logged and the next still
- * runs; holds with no slow-recovery end run the other three. With the
- * stuck-launch end bound it runs fifth, after the slow-recovery end, on a
- * latch, a relatch and a same-case set alike, and still runs when an
- * earlier hold throws; one that throws is logged under its name. The latch's
- * slow-recovery end on `makeRecoveryHarness` (SRJ-610, SRJ-1016, SRJ-502):
- * P's and Q's rows read `working` with their panes gone, so three restart
- * runs each escalate dead with a live re-probe and open both slow-recovery
- * episodes (one `slowRecoveryText` post each); P's next run meets the
- * working-row verdict's `read-pane` CONFLICT and latches; by the CONFLICT
- * notice P's count is 0 and its episode ended, with the latched reason's
- * lines and no slow-recovery post, exactly one CONFLICT post follows, later
- * runs for P are latched and post nothing, and Q keeps its count and open
- * episode; the harness's cleanup leaves no count or episode behind.
- *
- * The latch's stuck-launch end on `makeRecoveryHarness` (SRJ-1016, SRJ-502):
- * P's and Q's stuck-launch posts (`postStuckLaunchHeld`,
- * `postStuckLaunchRelaunching` over the harness's episodes) open both
- * episodes; P's latch (a plain-spawn `scan-leftover` CONFLICT, whose
- * latch-time read finds no row), and separately P's relatch with a new case
- * (a `provenance_conflict` note on its own `ended` row, after a first latch),
- * end P's episode by the CONFLICT notice, with one line carrying the latched
- * reason and no post from the end; Q's episode stays open; a later post of
- * the same text for P posts again.
- *
- * A lost message while latched (SRJ-502, SRJ-1011, AC 68, on
- * `makeRecoveryHarness` with both settings 0): P latches through the launch
- * driver at a plain-spawn `scan-leftover` row; a message lost for P through
- * the harness's lost-message driver (the real routing's no-session branch,
- * its latched query the harness's latch, as `main()` binds it) reports
- * `held-for-human` with the exported wording, posted at P's destination, asks
- * the restart module for no restart and makes no call, and nothing fires for
- * P afterwards; Q's lost message reports its own state.
- *
- * SRJ-504's restart legs (AC 45, on `makeRecoveryHarness`): a server restart
- * is two harness lifetimes, the first cleaned up before the second is built,
- * each over a stub answering the same condition. In each lifetime P's
- * bring-up latches it with the one fresh latch reaction (set latched, the
- * three holds, one CONFLICT post), no spawn-failure notice and only the leg's
- * calls; before the second lifetime's first attempt P is unlatched, with no
- * record, event, post or call. The scan leg: the plain first spawn meets
- * `scan-leftover`, recorded "plain spawn" with no row (the latch-time `status`
- * read answers `ErrSpawnNotFound`). The "no valid label" leg, in its reuse
- * form (b.jg5 SRJ-707): collision, `get` reading `ended` with no session id,
- * `resume` answering `ErrNoSessionId`, then the reuse spawn of the same id
- * answering `no-valid-id`, recorded "reuse spawn" with the collision `get`'s
- * `ended`; no delete in either lifetime. At that same reuse site the stub's
- * another-store description, in both forms, latches P with "another
- * agent-director store" and "reuse spawn" (SRJ-507), its one post carrying
- * the another-store line.
- *
- * The note rules (SRJ-114; SRJ-501's note trigger and its Test half;
- * SRJ-1004's note notice, hatch A2). The pure decision
- * (`decideOwnRowRead`): a configured persona's own row carrying the stub's
- * `provenanceNote`, in every state, decides a latch with "conflicting
- * labels", P's bring-up and the state read (a `waiting` state counts as
- * live); every other note agent-director names (`nonLatchingNotes`), the
- * stub's `unknownNote` (a prefix of it is the latching note), the latching
- * note case-folded or inside other text, and no note decide nothing; so does
- * the latching note on an unconfigured key's row, another caller's row,
- * another persona's row read for P and an id that only starts with P's.
- * Through the shared own-row read (`readPersonaOwnRow`) on
- * `makeRecoveryHarness`, its real latch and notice episodes: a note latch
- * once (the record is `slack_bot_<key>`, "conflicting labels", P's bring-up
- * and the live `waiting` state, with no description; one CONFLICT post; a
- * second read posts nothing; Q is neither latched nor called); the notice,
- * line by line from the exported constants and the case-sentence table, with
- * no "agent-director said" line; P latched first with another case relatches
- * on the note with one new post; a configured Q's own row latches Q alone;
- * and `tmux_server_changed`, `process_not_seen_session_present` (standing
- * for every other listed note), the unknown note, no note, and the latching
- * note on another caller's row, on a key outside the configuration and on a
- * removed persona's row latch no one and post nothing.
- *
- * A `pending` row with no launch start (SRJ-513, SRJ-1020, SRJ-508,
- * SRJ-1016; AC 8, AC 68, AC 86), over the helper's launch-start rows. The
- * decision: every latching row (a `status`, a `get` and a `list` read; P's
- * current life, another `cwd` and another `config_dir` label, covered or
- * not by construction; the launch start absent, `null` or unparseable)
- * decides "launch start not recorded", "none" and `pending`, and latched
- * from it P records that with `slack_bot_<key>` and posts the row's notice
- * once; every non-latching row (a launch start recorded, another state, an
- * absent persona's, another caller's or a pre-persona row) decides nothing;
- * a row with both the note and no launch start decides the launch-start case
- * only. One pin case (the file's only literal block for this text) checks
- * SRJ-1020 word for word against the builder; the notice quotes the session,
- * points to "Operator actions", and names no session-ending command and
- * nothing of `CSCB_OWN_LINE_FORBIDDEN`; through `makeNotifierHarness` it is
- * posted as `formatPersonaNotice(persona, notice)`. Episode: three more
- * reads post nothing; P latched first on a CONFLICT, on "unusable recorded
- * name" or on a note relatches with one new post, the record replaced; a
- * not-connected notice suppresses nothing. On `makeRecoveryHarness` (both
- * settings 0), with P's row read `pending` with no launch start
- * (`readPendingNoLaunchStart`): P latches once from the collision `get` (in
- * P's `cwd` and in another), a scheduled restart's liveness read, the retry
- * timer's pending-only row read and the lost-message read; then every
- * automated path (`driveEveryPath`) makes no call for P's instance, no
- * find-missing, counts nothing and leaves no timer armed, with one SRJ-1020
- * post; such a row under a key outside the configuration latches no one.
- * The start sweep's `list` of P's own such row (in P's `cwd`, carrying the
- * note too, or in another `cwd`) latches P with the launch-start case and
- * one post, and neither the sweep nor the start pass after it makes any
- * call of P's row; a lost message then reports `held-for-human` (SRJ-116,
- * SRJ-714). A
- * CONFLICT or an UNUSABLE NAME whose latch-time `status` read finds such a
- * row leaves P latched with the launch-start case alone, one post (hatch
- * A2). A relatch through a real read (the shared own-row `status` read,
- * `readPersonaOwnRowStatus`): P latched first on a CONFLICT (at its launch)
- * or on "unusable recorded name" (at a `status` read) relatches on a read
- * of its own `pending` row with no launch start, the record replaced
- * (`launchStartRecord`), the first episode ended, one SRJ-1020 post and the
- * step's "the persona relatched" line; and P latched on the launch-start
- * case relatches on a read answering UNUSABLE NAME with one SRJ-1019 post.
- * Expected hold records come from the helper (an unusable-name row's
- * `record(key)`, `launchStartRecord(key)`), never typed here. A lost
- * message: its read of such a row latches P and reports
- * `held-for-human` with no restart; its read answering UNUSABLE NAME does
- * the same with SRJ-1019; with a launch start it reports `session-starting`;
- * with P already latched on either hold it reports `held-for-human` with no
- * read; Q reports its own state.
- *
- * The dialog approver's latches (SRJ-404, SRJ-501, SRJ-502, SRJ-512, SRJ-513;
- * SRJ-117 and SRJ-118's approver rows), on `makeRecoveryHarness` with both
- * settings 0, P's and Q's rows read `pending` with a launch start and every
- * pane showing the folder-trust dialog. Its own answer, per approver row of
- * the helper's tables (`APPROVER_CONFLICT_CASE_ROWS`: each CONFLICT its
- * `read-pane` and `send-keys` can meet, recording P's next check or recovery
- * and `pending`; `APPROVER_UNUSABLE_NAME_CASE_ROWS`: UNUSABLE NAME at its
- * `status`, `read-pane` and `send-keys`, refused operation none): the
- * approver stops `latched` with its lap's calls up to the refused one and
- * none after, P latches once through the latch's set entry (the set, the
- * three holds, one post), nothing is armed, counted or noticed, and Q's
- * approver presses Enter on its own dialog and runs on to its cap; then every
- * automated path (`driveEveryPath`) makes no call for P, tmux-touching or
- * not, with still one post, while Q's paths reach the stub as before. A latch
- * from another path (an own-row `get` of a `provenance_conflict` note, an
- * own-row `status` of a `pending` row with no launch start, a CONFLICT at a
- * new launch's plain spawn), set while P's approver sleeps between laps or
- * while its `read-pane` showing the dialog is awaited: the approver stops
- * `latched` before the clock moves (its cap is past the laps driven), no
- * Enter reaches P after the latch and no call follows over three more laps,
- * with one post; Q, unlatched, presses Enter at each of its laps.
- *
- * The latch re-check (SRJ-505; E30 T1; AC 2, 5, 7, 8, 44, 46, 71). Pure:
- * for every row of the case table (`RECHECK_TABLE`: every site kind's
- * CONFLICT rows, the live-row sequence's step-6 `resume` rows and the plain
- * spawn's rows recorded unreadable or live included, the resume and reuse
- * "this row's own id" rows once their probe is dropped, the UNUSABLE NAME,
- * launch-start and note rows),
- * `decideLatchRecheck` gives each step-1 reading's whole decision as the
- * row's `recheck` columns say, and a retired key's call; each finished-row
- * retry entry's launch is `decideFinishedRowLaunch`'s; the table holds every
- * row once and no description names "no pane 0.0". SRJ-1304's audit (E30
- * T3): every site kind has its rows and every row every re-check column;
- * every `resume` and reuse row has its `pending` (no probe, no retry, no
- * post; "conflicting labels": the one-line `read-pane`, no launch), `ended`
- * (its probe or retry) and absent (a `resume` cleared, a reuse retried)
- * entries; the plain spawn's rows, from the scan and from "duplicate
- * session", give no row the plain spawn, a finished row the reuse,
- * `pending` no retry, and another live state no retry when recorded
- * unreadable or live. On `makeRecoveryHarness`
- * with the re-check bound (`latchRecheck`), `health_check_interval` 0 and P's
- * row on the row model, one case per row: P latched by the row's `latchOn`,
- * then one round per still-latched reading and answer, each one interval
- * after the previous, makes step 1's read and exactly the row's call (the
- * probe and the lap read-pane with `n_lines` 1, the lap's with
- * `allow_pending`; the reuse with `reuse_finished`, the plain spawn without),
- * keeps the record with no post and makes no call between rounds; a last
- * round (the row's run of the restart path's decision, else its first step-1
- * clear) ends the latch and stops the timer. Named cases: the timer
- * (nothing before 120 s, one round per 120 s with the health check off, and
- * on, its ticks every 30 s between the rounds reading P only and scheduling
- * nothing; a relatch adding no timer, a fire waiting for P's serializer
- * turn, the stop at a teardown, the teardown dependencies' forget and
- * shutdown); HO rev 28
- * (a resume or reuse latch's row left `pending` by a stays-pending refusal
- * gets status only, round after round, and its probe or retry once it reads
- * `ended`; for every resume and reuse row, a gone row clears a resume latch,
- * P's next launch being the plain spawn, and retries a reuse as a fresh
- * spawn; a finished-row get reading
- * `pending` launches nothing); a round's read of a marked key's live row
- * drops its entry (E24; a retired key's retry being the reuse is
- * tests/session-manager.test.ts's); "not
- * this launch's session" from a kill, a reconnect send-keys and a read-pane
- * (status only while live, never the refused call; on `missing` the
- * finished-row resume, a no-information answer keeping the latch and the
- * leftover relatching with one post; with no row the plain first spawn,
- * whose scan refusal relatches as a plain-spawn latch); "conflicting labels"
- * (the note on a connected live row: get only; a pending row: the one-line
- * read-pane, typing nothing); a different case relatching with one post and
- * the next round following it; a latch matching no table row ("left over
- * from an earlier life" at P's next check or recovery): step 1 only, pure
- * and in one round, with one line naming the pair; a round's launch behind
- * the gates every launch path asks (b.av2 SR-6.4, SRJ-207, SRJ-810): not
- * up, held after its reuse retry met ErrInvalidFlags, or held back for an
- * old life (sequence-waiting, no timer armed), each with its line, no launch,
- * P latched and no post; AC 71 at every call kind and each finished-row
- * retry launch (each no-information
- * answer: latched, nothing started, raised, armed, fed or posted; CONFIG: one
- * `ad-config-malformed` onset; UNUSABLE NAME: a relatch with SRJ-1019's
- * post), and a step-1 read of a `pending` row with no launch start
- * relatching with SRJ-1020's post; AC 46 with the re-check bound (P's only
- * calls are its rounds' status reads, 120 s apart).
- *
- * The clear (SRJ-506, SRJ-1005, SRJ-1016, SRJ-120; E30 T2; AC 8, 42, 43, 77,
- * 85, 86). Pure: the one clear entry (`createLatchClear`) over a real latch
- * and real notice episodes, for a CONFLICT, an unusable-name and a
- * launch-start latch and every reason: one recovery post from the builders
- * (`latchRecoveryText` for the record's kind, reason and session), every
- * latch-kind episode ended (a later latch posts again), the timer stopped
- * once and one line (`latchClearedLine`, pinned once); an unlatched persona
- * and a second clear do nothing; after the episodes close nothing is posted
- * and the line says so; a throwing step is logged and the rest still runs.
- * `decideClearedProbeRetry` over every refused operation and reading, and
- * the clears that launched nothing. On `makeRecoveryHarness` with the
- * re-check bound: every step-1 clear and every launch-start finished-row
- * clear of the case table posts once with the column's reason, then (step 1
- * only) one bypassing find-missing before the next read, then the retry at
- * once, P held active meanwhile; AC 42 (a latch set live stays latched with
- * one post over every live reading) and AC 43 (the approver's "conflicting
- * labels" latch clears once the row reports in); every cadence retry that is
- * not refused, and every finished-row retry, posts nothing before it, clears
- * with one post with its reason, makes no find-missing and no second launch;
- * every cleared probe of the table is followed by one find-missing and
- * exactly one retry with P still latched, which clears with one post, but
- * for a run of the restart path's decision over a row step 1 read `pending`,
- * which leaves P latched; the find-missing refused (UNAVAILABLE, UNCLASSIFIED, CONFIG,
- * ENVIRONMENT) holds the retry back with no post, the latched answer and
- * another failure go on, a collision gives no information, a "this row's own
- * id" retry refused again drops the probe (AC 8), and a pending own-id or
- * pane-not-found resume or reuse gets nothing until its row reads ended; after
- * a step-1 clear a note the find-missing removes does not relatch, one still
- * there relatches with one post, and a refused find-missing launches nothing
- * and arms P's retry timer; a "conflicting labels" pending read-pane's GONE
- * or pane clears and arms the pending-only watch; the holds' clears (AC 77,
- * 85, 86); E18's slow-recovery episode posting again after a clear; the
- * after-clear job's ordering in P's serializer turn (a queued operation runs
- * after it, a health tick at its find-missing reads nothing of P, and P
- * latched again between the round's clear and the run it owes gets no call
- * and keeps its new latch); and
- * `runLatchClearSequence` and the builder's `clear` and `clearAndRecover`
- * (not latched, the clear before it returns, its outcomes and lines).
- *
- * The recovery harness's own overlap rule (SRJ-1304; E30 T3): two or three
- * harnesses built before any is cleaned up, cleaned up in creation order,
- * newest first or in a mixed order, leave `SLACK_STATE_DIR` and
- * `console.error` the newest live harness's after each cleanup, and what
- * was in effect before the first build once all are cleaned up.
- *
- * The lines (b.jg5 SRJ-1014), each from its exported builder: the latch-set
- * and relatch lines (`conflictLatchSetLine`, its words pinned once in the
- * relatch case); the latched gate's line at a new launch of a latched P
- * (`latchedLaunchSkipLine`); the re-check round's line naming step 1's
- * outcome and the call (`latchRecheckRoundLine`: a spawn latch's retry after
- * step 1 found no row, `step=spawn-retry`; a "not this launch's session"
- * latch's finished-row retry, `step=finished-row-retry`, HO rev 15; a read
- * with no information; a read that relatched, `step=not-decided`; a table
- * decision); the `latch-recheck:` lines (not up, a launch in flight, an
- * unresolvable claude_config_dir, a probe dropped, a collision that gives no
- * information); the `latch-clear:` lines and the cleared line, "cleared by
- * hand" among its reasons. SRJ-1002: a CONFLICT or an UNUSABLE NAME met at
- * the restart path's kill or the shared read-pane for a persona removed from
- * the applied configuration sets no latch, posts nothing, writes no
- * startup-errors entry and logs one line with `notConfiguredLatchOutcome`,
- * while a configured persona beside it latches; with no configured-persona
- * query installed, or one that throws, the removed persona latches as before.
- *
- * Pure module under test, except the recovery-harness cases: one
- * `createConflictLatch` per test over a line capture and a recording
- * observer; `afterEach` runs `assertNoLeak` over every line, event and record
- * captured, over every notice post and over each harness's `captured()`,
- * then cleans the harness up (which throws on a pending timer, or on a
- * re-check round or after-clear job still in flight) and resets the
- * health check. The notice cases build `createPersonaEpisodes` over
- * `createFakeClock` with a recording sink; `afterEach` checks no timer is
- * pending and clears the session-manager notifier and its not-connected
- * latch. No `mock.module()`.
- *
- * SPDX-License-Identifier: MIT
- */
 
 import { afterEach, describe, expect, test } from 'bun:test'
 import { mkdtempSync, realpathSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import type { GetResult, ListRow } from 'agent-director'
 import {
-  UNUSABLE_RECORDED_NAME_PHRASE,
   CONFLICT_ANOTHER_STORE_PHRASE,
   CONFLICT_CONFLICTING_LABELS_PHRASE,
   CONFLICT_DIFFERENT_ID_PHRASE,
   CONFLICT_LEFTOVER_PHRASE,
   CONFLICT_NEVER_REPORTED_IN_PHRASE,
-  CONFLICT_NO_VALID_ID_PHRASE,
   CONFLICT_NOT_THIS_LAUNCH_PHRASE,
+  CONFLICT_NO_VALID_ID_PHRASE,
   CONFLICT_OWN_ID_PHRASE,
   CONFLICT_PANE_NOT_FOUND_PHRASE,
   NEVER_DELETE_ROW_PHRASE,
   NEW_ROW_ENDED_PHRASE,
-  NO_KILL_SENT_PHRASE,
   NOTHING_WRITTEN_PHRASE,
+  NO_KILL_SENT_PHRASE,
   PANE_NOT_ADOPTED_PHRASE,
   PLAIN_SPAWN_LABEL_NAMES_THIS_ID_PHRASE,
   PLAIN_SPAWN_LABEL_NOT_THIS_ID_PHRASE,
   RETRY_KILL_LATER_PHRASE,
+  UNUSABLE_RECORDED_NAME_PHRASE,
 } from '../src/ad-description-phrases.ts'
+import { classifyAdError } from '../src/ad-error-class.ts'
 import { adAlertThresholdMsInEffect, adLaunchBoundMsInEffect } from '../src/ad-settings.ts'
-import type { GetResult, ListRow } from 'agent-director'
 import { ERR_TMUX_SESSION_CONFLICT_NAME, ErrTmuxSessionConflict } from '../src/agent-director-errors.ts'
+import { getFailureCount, isAtCap } from '../src/backoff.ts'
+import { killOutcomeOf } from '../src/checked-kill.ts'
 import {
   CONFLICT_CASE_ORDER,
   CONFLICT_CASE_SENTENCES,
@@ -504,36 +66,31 @@ import {
   LATCH_CASE_LAUNCH_START_NOT_RECORDED,
   LATCH_CASE_LEFTOVER,
   LATCH_CASE_NEVER_REPORTED_IN,
-  LATCH_CASE_NO_VALID_ID,
   LATCH_CASE_NOT_THIS_LAUNCH,
+  LATCH_CASE_NO_VALID_ID,
   LATCH_CASE_OWN_ID,
   LATCH_CASE_PANE_NOT_FOUND,
   LATCH_CASE_UNRECOGNISED,
   LATCH_CASE_UNUSABLE_RECORDED_NAME,
   LATCH_KIND_CONFLICT,
   LATCH_KIND_HOLD,
+  LATCH_NOTICE_EPISODE_KINDS,
+  LATCH_RECHECK_INTERVAL_MS,
   LATCH_RECOVERY_REASON_CLEARED_BY_HAND,
   LATCH_RECOVERY_REASON_KIND_CLEARED_BY_HAND,
   LATCH_RECOVERY_REASON_KIND_ROW_READS,
-  LATCH_NOTICE_EPISODE_KINDS,
   LATCH_RECOVERY_REASON_RELAUNCH_NOT_REFUSED,
   LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED,
   LATCH_RECOVERY_REASON_ROW_GONE,
   LATCH_RECOVERY_REASON_ROW_READS_HEAD,
   LATCH_RECOVERY_REASON_TEXTS,
   LATCH_RECOVERY_TAIL,
-  LATCH_ROW_STATE_KIND_READ,
-  LAUNCH_START_NOTICE_POINTER,
   LATCH_ROW_STATE_KIND_NO_ROW,
+  LATCH_ROW_STATE_KIND_READ,
   LATCH_ROW_STATE_NO_ROW,
   LATCH_ROW_STATE_UNREADABLE,
-  REFUSED_OPERATION_BRING_UP,
-  REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY,
-  REFUSED_OPERATION_NONE,
-  REFUSED_OPERATION_PLAIN_SPAWN,
-  REFUSED_OPERATION_RESUME,
-  REFUSED_OPERATION_REUSE_SPAWN,
-  LATCH_RECHECK_INTERVAL_MS,
+  LAUNCH_START_NOTICE_POINTER,
+  RECHECK_ACTION_NONE,
   RECHECK_CALL_FINISHED_ROW,
   RECHECK_CALL_NONE,
   RECHECK_CALL_PENDING_READ_PANE,
@@ -549,51 +106,52 @@ import {
   RECHECK_CLEARED_BY_RETRY,
   RECHECK_CLEARED_BY_STEP_1,
   RECHECK_CLEARS_THAT_LAUNCHED_NOTHING,
-  RECHECK_ACTION_NONE,
+  RECHECK_LINE_STEP_NOT_DECIDED,
   RECHECK_READING_FAILED_VALUE,
   RECHECK_READING_NO_ROW_VALUE,
   RECHECK_READING_STATE,
-  RECHECK_LINE_STEP_NOT_DECIDED,
   RECHECK_STEP_CLEAR_GONE,
   RECHECK_STEP_FINISHED_ROW_RETRY,
   RECHECK_STEP_NO_INFORMATION,
   RECHECK_STEP_SPAWN_RETRY,
   RECHECK_STEP_TABLE,
-  conflictLatchSetLine,
-  createLatchClear,
-  latchRecheckRoundLine,
-  notConfiguredLatchOutcome,
-  type LatchRecheckLineStep,
-  decideClearedProbeRetry,
-  latchClearedLine,
-  type LatchClear,
-  type LatchRecheckReading,
-  decideFinishedRowLaunch,
-  decideLatchRecheck,
-  type LatchRecheckCall,
+  REFUSED_OPERATION_BRING_UP,
+  REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY,
+  REFUSED_OPERATION_NONE,
+  REFUSED_OPERATION_PLAIN_SPAWN,
+  REFUSED_OPERATION_RESUME,
+  REFUSED_OPERATION_REUSE_SPAWN,
   UNUSABLE_NAME_NOTICE_HEAD,
   UNUSABLE_NAME_NOTICE_REASON,
   bindConflictLatchHolds,
   bindConflictNotice,
   conflictCaseSentence,
+  conflictLatchSetLine,
   conflictNoticeText,
   conflictRecoveryText,
   conflictSessionName,
   createConflictLatch,
+  createLatchClear,
+  decideClearedProbeRetry,
+  decideFinishedRowLaunch,
+  decideLatchRecheck,
   holdRecoveryText,
   isHoldLatchCase,
+  isUnusableNameError,
+  latchClearedLine,
   latchKindOf,
+  latchRecheckRoundLine,
   latchRecoveryReasonRowReads,
   latchRecoveryReasonText,
   latchRecoveryText,
   latchRowStateRead,
   launchStartNotRecordedNoticeText,
   launchStartNotRecordedSetInput,
+  notConfiguredLatchOutcome,
   recogniseConflictCase,
   rowStateCountsAsLive,
   shellQuoteSessionName,
   takesUnrecognisedHandling,
-  isUnusableNameError,
   unusableNameNoticeText,
   unusableNameSetInput,
   type ConflictLatch,
@@ -604,18 +162,23 @@ import {
   type ConflictLatchSetEvent,
   type ConflictLatchSetInput,
   type LatchCase,
+  type LatchClear,
   type LatchKind,
+  type LatchRecheckCall,
+  type LatchRecheckLineStep,
+  type LatchRecheckReading,
   type LatchRecoveryReason,
   type LatchRowState,
 } from '../src/conflict-latch.ts'
+import { _resetHealthCheckState, initHealthCheck, startHealthCheck, stopHealthCheck } from '../src/health-check.ts'
 import { invalidFlagsHeldNoLaunchLine } from '../src/invalid-flags-hold.ts'
 import {
   LIVE_ROW_OUTCOME_ABORTED,
   LIVE_ROW_OUTCOME_LAUNCHED,
   LIVE_ROW_OUTCOME_STOPPED,
   LIVE_ROW_SEQUENCE_ENTRY_GET,
-  LIVE_ROW_START_STARTED,
   LIVE_ROW_SEQUENCE_LOG_PREFIX,
+  LIVE_ROW_START_STARTED,
   LIVE_ROW_STOP_LATCHED,
   liveRowSequenceStopAskedLine,
 } from '../src/live-row-sequence.ts'
@@ -627,11 +190,8 @@ import {
   LIVENESS_DEAD_ROW_MISSING,
   LIVENESS_READING_DEAD_ENDED,
 } from '../src/liveness-reading.ts'
-import { killOutcomeOf } from '../src/checked-kill.ts'
-import { describeThrownValue, MAX_LOGGED_MESSAGE_LENGTH, renderLogMessageText } from '../src/persona-connection-errors.ts'
 import { adConfigMalformedOnset, getOutageFlags, type OutageClass } from '../src/outage-state.ts'
-import { classifyAdError } from '../src/ad-error-class.ts'
-import { CLEAR_LATCH_ROUTE, handleClearLatch } from '../src/clear-latch.ts'
+import { PROBE_PANE_READ_LINES } from '../src/pane-read.ts'
 import {
   STUCK_LAUNCH_ALREADY_POSTED,
   STUCK_LAUNCH_END_LATCHED,
@@ -644,9 +204,8 @@ import {
   stuckLaunchRelaunchingText,
   type StuckLaunchPosterDeps,
 } from '../src/pending-row.ts'
-import { formatPersonaNotice } from '../src/persona-notifier.ts'
+import { MAX_LOGGED_MESSAGE_LENGTH, describeThrownValue, renderLogMessageText } from '../src/persona-connection-errors.ts'
 import {
-  createPersonaEpisodes,
   PERSONA_EPISODE_KIND_CONFLICT,
   PERSONA_EPISODE_KIND_LAUNCH_START_NOT_RECORDED,
   PERSONA_EPISODE_KIND_SLOW_DEAD_SESSION_RECOVERY,
@@ -654,26 +213,31 @@ import {
   PERSONA_EPISODE_KIND_UNUSABLE_RECORDED_NAME,
   TMUX_UNRESPONSIVE_END_LATCHED,
   UNCLASSIFIED_ERROR_END_LATCHED,
+  createPersonaEpisodes,
   type PersonaEpisodeKind,
   type PersonaEpisodes,
 } from '../src/persona-episodes.ts'
 import { personaInstanceId, personaTmuxSessionName, renderPersonaRef } from '../src/persona-identity.ts'
+import { formatPersonaNotice } from '../src/persona-notifier.ts'
 import type { PersonaSerialize, PersonaSerializer } from '../src/persona-serializer.ts'
-import { forgetFailures, getFailureCount, isAtCap } from '../src/backoff.ts'
-import { _resetHealthCheckState, initHealthCheck, startHealthCheck, stopHealthCheck } from '../src/health-check.ts'
 import {
-  holdRestartActive,
-  isRestartPendingOrActive,
   RESTART_FAILURE_CAP,
   RESTART_OUTCOME_CAPPED,
   RESTART_OUTCOME_LATCHED,
   RESTART_OUTCOME_LAUNCHED,
   RESTART_OUTCOME_PENDING_DEFERRED,
   RESTART_OUTCOME_RECONNECT_DEFERRED,
+  holdRestartActive,
+  isRestartPendingOrActive,
   restartRetryCapSkippedLine,
   runRestartRetry,
   scheduleRestart,
 } from '../src/restart.ts'
+import { ROW_READ_LAUNCH_START_NOT_RECORDED, ROW_READ_NO_DECISION, decideOwnRowRead, type RowReadRow } from '../src/row-read-rules.ts'
+import { _buildIsSessionAliveAdapter } from '../src/server.ts'
+import { COLLISION_GET_SITE, LATCH_CLEAR_SEQUENCE_FIND_MISSING_REFUSED, LATCH_CLEAR_SEQUENCE_NOT_APPLIED, LATCH_CLEAR_SEQUENCE_NOT_LATCHED, LATCH_CLEAR_SEQUENCE_RETRIED, LATCH_CLEAR_SEQUENCE_RETRY_FAILED, LATCH_RECHECK_AT_CAP, OWN_ROW_READ_ROW, OWN_ROW_STATUS_LATCHED, OWN_ROW_STATUS_STATE, SPAWN_ACTION_RETRYING, _resetConfiguredPersonaQuery, _resetNotConnectedEpisodes, isLaunchInFlight, latchClearClearFailedLine, latchClearFindMissingRefusedLine, latchClearNotAppliedLine, latchClearNotRunInTurnLine, latchClearRelatchedAfterFindMissingLine, latchClearRelatchedBeforeRunLine, latchClearRetryAnsweredLine, latchClearRetryAtOnceLineHead, latchClearRetryFailedLine, latchClearRunFailedLine, latchEntryQueryFailedLine, latchOnRestartKillOutcome, latchRecheckAtCapLine, latchRecheckCollisionNoInformationLine, latchRecheckUnmatchedLine, latchedLaunchSkipLine, latchedNoArmPendingRowLine, oldLifeHoldLaunchLine, readPersonaOwnPane, readPersonaOwnRow, readPersonaOwnRowStatus, reconcileOrphans, runLatchClearSequence, setConfiguredPersonaQuery, setSessionNotifier, setStuckLaunchEpisodes, type LatchClearSequenceDeps, type OwnRowReadSite } from '../src/session-manager.ts'
+import { REDACTED_TOKEN_PLACEHOLDER } from '../src/slack-log-redaction.ts'
+import { escapeSlackControlCharacters } from '../src/slack-text-escape.ts'
 import {
   SLOW_RECOVERY_POST_THRESHOLD,
   SLOW_RECOVERY_RESET_LATCHED,
@@ -681,184 +245,110 @@ import {
   slowRecoveryEpisodeEndedLine,
   slowRecoveryText,
 } from '../src/slow-recovery.ts'
-import { _buildIsSessionAliveAdapter } from '../src/server.ts'
-import { decideOwnRowRead, ROW_READ_LAUNCH_START_NOT_RECORDED, ROW_READ_NO_DECISION, type RowReadRow } from '../src/row-read-rules.ts'
-import {
-  APPROVER_STOP_CAP,
-  APPROVER_STOP_LATCHED,
-  DIALOG_POLL_INTERVAL_MS,
-  _resetNotConnectedEpisodes,
-  isLaunchInFlight,
-  notifyPersonaNotConnected,
-  OWN_ROW_READ_ROW,
-  OWN_ROW_STATUS_LATCHED,
-  OWN_ROW_STATUS_STATE,
-  latchedNoArmPendingRowLine,
-  readPersonaOwnRow,
-  readPersonaOwnRowStatus,
-  reconcileOrphans,
-  setSessionNotifier,
-  SPAWN_ACTION_RETRYING,
-  LATCH_CLEAR_SEQUENCE_FIND_MISSING_REFUSED,
-  LATCH_CLEAR_SEQUENCE_NOT_APPLIED,
-  LATCH_CLEAR_SEQUENCE_NOT_LATCHED,
-  LATCH_CLEAR_SEQUENCE_RETRIED,
-  LATCH_CLEAR_SEQUENCE_RETRY_FAILED,
-  latchClearClearFailedLine,
-  latchClearFindMissingRefusedLine,
-  latchClearNotAppliedLine,
-  latchClearNotRunInTurnLine,
-  latchClearRelatchedAfterFindMissingLine,
-  latchClearRelatchedBeforeRunLine,
-  latchClearRestartResetFailedLine,
-  latchClearRetryAnsweredLine,
-  latchClearRetryAtOnceLineHead,
-  latchClearRetryFailedLine,
-  latchClearRunFailedLine,
-  LATCH_RECHECK_AT_CAP,
-  latchRecheckAtCapLine,
-  latchRecheckCollisionNoInformationLine,
-  latchRecheckConfigDirLine,
-  latchRecheckLaunchInFlightLine,
-  latchRecheckNotUpLine,
-  latchRecheckProbeDroppedLine,
-  latchRecheckUnmatchedLine,
-  latchedLaunchSkipLine,
-  latchOnRestartKillOutcome,
-  latchEntryQueryFailedLine,
-  readPersonaOwnPane,
-  setStuckLaunchEpisodes,
-  COLLISION_GET_SITE,
-  _resetConfigDirFs,
-  _resetConfiguredPersonaQuery,
-  _setConfigDirFs,
-  setConfiguredPersonaQuery,
-  oldLifeHoldLaunchLine,
-  runLatchClearSequence,
-  sweepDeadTmuxChannel,
-  ESCALATE_DEAD_WAITING_ROW_PANE_GONE,
-  type LatchClearSequenceAnswer,
-  type LatchClearSequenceDeps,
-  type ApproverVerb,
-  type NotConnectedNotice,
-  type OwnRowReadSite,
-} from '../src/session-manager.ts'
 import {
   UNAVAILABLE_RETRY_CAUSE_PENDING_ROW,
   UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
   UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
-  UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED,
   UNAVAILABLE_RETRY_CEILING_S,
   UNAVAILABLE_RETRY_MODE_PENDING_ONLY,
-  UNAVAILABLE_RETRY_STOP_LATCHED,
+  UNAVAILABLE_RETRY_STOP_LATCHED
 } from '../src/unavailable-retry.ts'
-import { REDACTED_TOKEN_PLACEHOLDER } from '../src/slack-log-redaction.ts'
-import { escapeSlackControlCharacters } from '../src/slack-text-escape.ts'
 import {
   CONFLICT_CASES,
+  SAMPLE_LAUNCH_START_DEFAULT,
+  SAMPLE_LAUNCH_START_NONE,
+  SAMPLE_LAUNCH_START_WHOLE,
+  STUB_TMUX_SESSION_NAME,
+  UNUSABLE_NAME_FAULTS,
   cannedFindMissing,
   cannedGetResult,
   cannedListRow,
   cannedOk,
   cannedStatusResult,
   errCallTimeout,
-  errInvalidFlags,
   errConfigMalformed,
   errInstanceIdCollision,
-  errTmuxNotAvailable,
   errInternal,
+  errInvalidFlags,
   errNoSessionId,
   errSpawnNotFound,
   errSpawnNotResumable,
   errSystemInstallDisappeared,
-  errTmuxCaptureFailed,
+  errTmuxNotAvailable,
   errTmuxSendKeys,
   errTmuxSessionConflict,
   errTmuxUnresponsive,
   errUnknownErrorName,
-  nonLatchingNotes,
-  provenanceNote,
-  SAMPLE_LAUNCH_START_DEFAULT,
-  SAMPLE_LAUNCH_START_NONE,
-  SAMPLE_LAUNCH_START_WHOLE,
-  STUB_TMUX_SESSION_NAME,
-  UNUSABLE_NAME_FAULTS,
   errUnusableName,
   holdFindMissing,
   holdSpawns,
+  nonLatchingNotes,
+  provenanceNote,
   unknownNote,
   type CannedRowPersona,
-  type UnusableNameFault,
+  type UnusableNameFault
 } from './test-helpers/agent-director-stub.ts'
 import {
-  APPROVER_CONFLICT_CASE_ROWS,
-  APPROVER_SITES,
-  APPROVER_UNUSABLE_NAME_CASE_ROWS,
-  APPROVER_VERB_CALLS,
   CONFLICT_CASE_ROWS,
   FINISHED_ROW_RETRY_ENTRIES,
-  NOTE_LATCH_CASE_ROWS,
-  PLAIN_SPAWN_CONFLICT_CASE_ROWS,
-  PLAIN_SPAWN_LATCH_TIME_ROW_STATES,
-  PLAIN_SPAWN_RECORDED_LIVE_CASE_ROWS,
-  SEQUENCE_RESUME_CONFLICT_CASE_ROWS,
-  SEQUENCE_RESUME_SITE,
-  LIVENESS_PANE_SITES,
-  PROMPT_ROW_PANE_SITES,
-  RECONNECT_SITE,
-  RESTART_KILL_SITE,
-  REUSE_SPAWN_SITE,
-  SEQUENCE_KILL_SITES,
-  STUCK_LAUNCH_ABORT_SITE,
-  UNUSABLE_NAME_SITES,
-  recheckEntryAt,
-  recheckNoInformationAnswers,
-  RECHECK_CONFIG_ANSWER,
-  RECHECK_GONE_ANSWER,
-  RECHECK_PANE_ANSWER,
-  RECHECK_UNUSABLE_NAME_ANSWER,
-  recheckPaneConflictAnswer,
-  type FinishedRowRetryEntry,
-  type RecheckReadingName,
-  type RecheckAnswer,
-  type RecheckColumns,
-  type RecheckEntry,
-  type RecheckLatchEntries,
   LAUNCH_START_ABSENT_PERSONA_KEY,
   LAUNCH_START_AND_NOTE_ROW,
   LAUNCH_START_ANOTHER_CALLERS_ID,
   LAUNCH_START_CASE_ROWS,
   LAUNCH_START_NON_LATCHING_ROWS,
-  SEQUENCE_STEP1_KILL_SITE,
+  NOTE_LATCH_CASE_ROWS,
+  PLAIN_SPAWN_CONFLICT_CASE_ROWS,
+  PLAIN_SPAWN_LATCH_TIME_ROW_STATES,
+  PLAIN_SPAWN_RECORDED_LIVE_CASE_ROWS,
+  PROMPT_ROW_PANE_SITES,
+  RECHECK_CONFIG_ANSWER,
+  RECHECK_GONE_ANSWER,
+  RECHECK_PANE_ANSWER,
+  RECHECK_UNUSABLE_NAME_ANSWER,
+  RECONNECT_SITE,
   RESTART_KILL_CONFLICT_CASE_ROWS,
+  RESTART_KILL_SITE,
   RESTART_KILL_UNUSABLE_NAME_CASE_ROWS,
   REUSE_SPAWN_CONFLICT_CASE_ROWS,
+  REUSE_SPAWN_SITE,
   REUSE_SPAWN_UNUSABLE_NAME_CASE_ROWS,
   SEQUENCE_KILL_CONFLICT_CASE_ROWS,
+  SEQUENCE_KILL_SITES,
   SEQUENCE_KILL_STEP,
   SEQUENCE_KILL_UNUSABLE_NAME_CASE_ROWS,
-  sequenceKillConflictRowsAt,
+  SEQUENCE_RESUME_CONFLICT_CASE_ROWS,
+  SEQUENCE_RESUME_SITE,
+  SEQUENCE_STEP1_KILL_SITE,
   SESSION_ENDING_COMMAND_FORMS,
+  STUCK_LAUNCH_ABORT_SITE,
   UNPARSEABLE_LAUNCH_START,
   UNUSABLE_NAME_CASE_ROWS,
+  UNUSABLE_NAME_SITES,
   cscbOwnLineForbiddenIn,
   cscbOwnLines,
   cscbOwnText,
   expectedConflictNotice,
   expectedLatchRecord,
-  isApproverSite,
   launchStartRecord,
-  livenessPaneConflictRowsAt,
+  recheckEntryAt,
+  recheckNoInformationAnswers,
   reconnectConflictRowsAt,
   reconnectUnusableNameRowsAt,
+  sequenceKillConflictRowsAt,
   sessionEndingCommandsIn,
   tmuxTouchingCallCounts,
   tmuxTouchingCallsIn,
   type ConflictCaseRow,
+  type FinishedRowRetryEntry,
   type LaunchStartCaseRow,
+  type RecheckAnswer,
+  type RecheckColumns,
+  type RecheckEntry,
+  type RecheckLatchEntries,
+  type RecheckReadingName,
   type SequenceKillSite,
   type UnusableNameCaseRow,
-  type UnusableNameSite,
+  type UnusableNameSite
 } from './test-helpers/conflict-cases.ts'
 import {
   BOT_TOKEN_PREFIX,
@@ -871,6 +361,19 @@ import {
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import { builtAround, lineParts } from './test-helpers/line-parts.ts'
 import { PRE_PERSONA_ID, PRE_PERSONA_LABELS, holdOldAt } from './test-helpers/old-life.ts'
+import {
+  PENDING_ROW_FIND_MISSING_REMOVES_NOTE,
+  PENDING_ROW_FIND_MISSING_REMOVES_NOTHING,
+  PENDING_ROW_MODEL_NO_ROW,
+  PENDING_ROW_RESTORE_STAYS_PENDING,
+  makePendingRowModel,
+  pendingRowOfRecheckReading,
+  restoreRefusal,
+  scanRefusal,
+  type PendingRowLaunchAnswer,
+  type PendingRowModel,
+  type PendingRowModelOptions
+} from './test-helpers/pending-row-model.ts'
 import { posts } from './test-helpers/permission-relay-harness.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { makeNotifierHarness } from './test-helpers/persona-notifier.ts'
@@ -892,8 +395,8 @@ import {
   putAtRestartCap,
   recheckAtCapLinesOf,
   recordCallOrder,
-  reuseSpawnOf,
   retryNow,
+  reuseSpawnOf,
   scriptSequenceKillFailure,
   startSequenceHeldAtRun,
   unclassifiedEndedLine,
@@ -902,25 +405,8 @@ import {
   type RecoveryHarness,
   type RecoveryHarnessOptions,
   type RecoveryStubScript,
-  type RecoveryStubVerb,
-  type RecoveryTimedCall,
+  type RecoveryTimedCall
 } from './test-helpers/recovery-harness.ts'
-import {
-  makePendingRowModel,
-  pendingRowOfRecheckReading,
-  restoreRefusal,
-  scanRefusal,
-  PENDING_ROW_DIALOG_NONE,
-  PENDING_ROW_DIALOG_TRUST,
-  PENDING_ROW_FIND_MISSING_REMOVES_NOTE,
-  PENDING_ROW_FIND_MISSING_REMOVES_NOTHING,
-  PENDING_ROW_MODEL_NO_ROW,
-  PENDING_ROW_RESTORE_STAYS_PENDING,
-  type PendingRowLaunchAnswer,
-  type PendingRowModel,
-  type PendingRowModelOptions,
-} from './test-helpers/pending-row-model.ts'
-import { PROBE_PANE_READ_LINES } from '../src/pane-read.ts'
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -2156,26 +1642,6 @@ describe('the CONFLICT notice\'s episode', () => {
     expect(run.episodes.view(KEY, PERSONA_EPISODE_KIND_CONFLICT)).toEqual(first)
   })
 
-  test.each([
-    ['unproven-idle', { reason: 'unproven-idle', autoRestartDisabled: false, heldMs: 600_000 }],
-    ['blocked-on-prompt', { reason: 'blocked-on-prompt', autoRestartDisabled: false }],
-  ] as const)('a persona already given the %s not-connected notice still gets the CONFLICT post once', (_reason, notConnected: NotConnectedNotice) => {
-    const notConnectedPosts: Array<readonly [string, string]> = []
-    setSessionNotifier((key, text) => {
-      notConnectedPosts.push([key, text])
-    })
-    expect(notifyPersonaNotConnected(KEY, notConnected)).toBe(true)
-    expect(notConnectedPosts.map(([key]) => key)).toEqual([KEY])
-
-    const run = makeNoticeRun()
-    latchOnRow(run.latch, KEY, ownId)
-    latchOnRow(run.latch, KEY, ownId)
-    expect(run.posts).toEqual([[KEY, ownId.notice.text]])
-    expect(notifyPersonaNotConnected(KEY, notConnected)).toBe(false)
-    expect(notConnectedPosts.length).toBe(1)
-    assertNoLeak(notConnectedPosts)
-  })
-
   test('a hold case opens no CONFLICT episode and posts no CONFLICT notice: each hold opens its own kind, and the unusable-name hold posts SRJ-1019', () => {
     const run = makeNoticeRun()
     const description = UNUSABLE_NAME_CASE_ROWS[0]!.description
@@ -2448,23 +1914,6 @@ describe('the unusable-recorded-name notice\'s episode (SRJ-508, SRJ-1016)', () 
     ])
   })
 
-  test.each([
-    ['unproven-idle', { reason: 'unproven-idle', autoRestartDisabled: false, heldMs: 600_000 }],
-    ['blocked-on-prompt', { reason: 'blocked-on-prompt', autoRestartDisabled: false }],
-  ] as const)('a persona already given the %s not-connected notice still gets the unusable-name post once', (_reason, notConnected: NotConnectedNotice) => {
-    const notConnectedPosts: Array<readonly [string, string]> = []
-    setSessionNotifier((key, text) => {
-      notConnectedPosts.push([key, text])
-    })
-    expect(notifyPersonaNotConnected(KEY, notConnected)).toBe(true)
-
-    const run = makeNoticeRun()
-    latchUnusable(run.latch, KEY, first)
-    latchUnusable(run.latch, KEY, second)
-    expect(run.posts).toEqual([[KEY, first.notice(KEY)]])
-    expect(notConnectedPosts.map(([key]) => key)).toEqual([KEY])
-    assertNoLeak(notConnectedPosts)
-  })
 })
 
 // ---------------------------------------------------------------------------
@@ -2609,14 +2058,6 @@ interface AutomatedPathsRun {
   readonly failStatusOnce: (key: string, err: Error) => void
 }
 
-/**
- * A recovery harness with both settings 0, every persona's row read `ended`
- * until a spawn of it resolves (`waiting` from then on), and the restart
- * module's serialized turns recorded. The restart module's delay accessor
- * answers `RESTART_DELAY_S`, so `scheduleRestart` arms its timer (with the
- * setting 0 it arms none); the configuration keeps `session_restart_delay` 0.
- * `options` go to the harness (the approver's cap, for instance).
- */
 function makeAutomatedPathsRun(options: Omit<RecoveryHarnessOptions, 'restartDeps'> = {}): AutomatedPathsRun {
   const outcomes: Array<readonly [string, unknown]> = []
   let serializer: PersonaSerializer | undefined
@@ -2718,7 +2159,7 @@ const CLEARED: RecoveryStubScript = { spawnError: undefined, spawnQueue: undefin
  * no automated path kills a row it has just read `ended` (b.jg5 SRJ-110,
  * SRJ-314, option A).
  */
-const RELAUNCH = { statusCalls: 2, spawnCalls: 1 }
+const RELAUNCH = { statusCalls: 1, spawnCalls: 1 }
 
 /** The latch's reaction to one set of P, as `latchSteps` reads it: the set, the three holds in order, then the notice. */
 const oneLatch = (key: string) => [
@@ -2836,7 +2277,7 @@ async function runHealthTick({ h, killRow }: AutomatedPathsRun): Promise<{ sched
 
 /** What Q's run of each `driveEveryPath` path calls: Q is unlatched, so each reaches the stub. */
 const Q_CALLS_ON_EVERY_PATH = [
-  ['a new launch', { spawnCalls: 1, statusCalls: 1 }],
+  ['a new launch', { spawnCalls: 1 }],
   ['the retry entry', RELAUNCH],
   ['a scheduled restart', RELAUNCH],
   ['a human-triggered restart', RELAUNCH],
@@ -3016,7 +2457,7 @@ const NOT_CONFIGURED_ENTRIES: ReadonlyArray<readonly [string, LatchEntryRun, () 
       h.script({ readPaneError: err })
       return readPersonaOwnPane(key, { nLines: PROBE_PANE_READ_LINES, lastRead: ENDED, site: NOT_CONFIGURED_PANE_SITE })
     },
-    () => livenessPaneConflictRowsAt('working-row verdict')[0]!,
+    () => reconnectConflictRowsAt('waiting')[0]!,
     () => UNUSABLE_NAME_CASE_ROWS.find((row) => row.site === 'read-pane')!,
   ],
 ]
@@ -3108,7 +2549,7 @@ describe('SRJ-1002: a CONFLICT or an UNUSABLE NAME met for a persona no longer i
 
 describe('SRJ-610, SRJ-1016, SRJ-502: P\'s latch ends its open slow-recovery episode silently and resets its count; Q\'s is untouched (recovery harness)', () => {
   /** The working-row verdict's `read-pane` CONFLICT row: P's next run latches P through the latch's set entry. */
-  const workingRowConflict = livenessPaneConflictRowsAt('working-row verdict')[0]!
+  const reconnectConflict = reconnectConflictRowsAt('working')[0]!
   const SLOW = PERSONA_EPISODE_KIND_SLOW_DEAD_SESSION_RECOVERY
   /** `key`'s slow-recovery lines among `lines`. */
   const slowLinesOf = (lines: readonly string[], key: string): string[] =>
@@ -3124,7 +2565,7 @@ describe('SRJ-610, SRJ-1016, SRJ-502: P\'s latch ends its open slow-recovery epi
     // Both rows read `working` and each pane read answers GONE: every run's
     // working-row verdict sweeps and escalates dead, and its re-probe still
     // reads the row live, so each run is one of the tracker's notes.
-    h.script({ statusResult: cannedStatusResult({ state: 'working' }), readPaneError: errTmuxCaptureFailed() })
+    h.script({ statusResult: cannedStatusResult({ state: 'working' }), sendKeysError: errTmuxSendKeys() })
     for (let tick = 0; tick < SLOW_RECOVERY_POST_THRESHOLD; tick++) {
       expect([await run(p), await run(q)]).toEqual([RESTART_OUTCOME_RECONNECT_DEFERRED, RESTART_OUTCOME_RECONNECT_DEFERRED])
     }
@@ -3147,14 +2588,14 @@ describe('SRJ-610, SRJ-1016, SRJ-502: P\'s latch ends its open slow-recovery epi
 
     // P's next run: its working-row read-pane answers a CONFLICT, which latches P.
     const linesBefore = h.lines.length
-    h.script({ readPaneError: workingRowConflict.build() })
+    h.script({ sendKeysError: reconnectConflict.build() })
     await run(p)
     await h.settle()
     expect(h.latch.record(p)).toMatchObject({
-      sessionName: workingRowConflict.sessionName,
-      latchCase: workingRowConflict.latchCase,
-      refusedOperation: workingRowConflict.refusedOperation,
-      rowState: workingRowConflict.rowState,
+      sessionName: reconnectConflict.sessionName,
+      latchCase: reconnectConflict.latchCase,
+      refusedOperation: reconnectConflict.refusedOperation,
+      rowState: reconnectConflict.rowState,
     })
     expect(latchSteps(h)).toEqual(oneLatch(p))
     // By the notice the latch's hold had reset P's count and ended its episode; Q's were as before.
@@ -3163,7 +2604,7 @@ describe('SRJ-610, SRJ-1016, SRJ-502: P\'s latch ends its open slow-recovery epi
     expect(h.episodeNotices).toEqual([
       { key: p, text: slowRecoveryText(p) },
       { key: q, text: slowRecoveryText(q) },
-      { key: p, text: workingRowConflict.notice.text },
+      { key: p, text: reconnectConflict.notice.text },
     ])
     const latchRunLines = h.lines.slice(linesBefore)
     expect(slowLinesOf(latchRunLines, p)).toEqual([
@@ -3364,108 +2805,6 @@ describe('SRJ-502, SRJ-1011: an accepted message while P is latched stays queued
 
 /** The instance id a stub call's params name, if any. */
 const instanceOf = (params: unknown): unknown => (params as { instance_id?: unknown } | undefined)?.instance_id
-
-/**
- * Each way an UNUSABLE NAME latches P through the launch driver: the row
- * whose answer it is, and the stub answers that bring P's launch there.
- * `resume`: the optimistic spawn collides, the collision `get` reads `ended`
- * and the `resume` answers it. The working-row evidence `read-pane`: the
- * optimistic spawn collides, the collision `get` reads a live `working` row,
- * so the launch waits for it; the wait's `status` reads `working` (the case
- * makes P's row read so) and its evidence read, the pane read, answers it.
- */
-const UNUSABLE_LATCH_WAYS: ReadonlyArray<readonly [string, UnusableNameCaseRow, (h: RecoveryHarness, key: string) => RecoveryStubScript]> = [
-  ['resume', unusableRow('resume', 'empty'), (h, key) => ({ ...collided(h, personaOf(h, key), { state: 'ended' }), resumeError: unusableRow('resume', 'empty').build() })],
-  [
-    'the working-row evidence read-pane',
-    unusableRow('read-pane', 'control-character'),
-    (h, key) => ({ ...collided(h, personaOf(h, key), { state: 'working' }), readPaneError: unusableRow('read-pane', 'control-character').build() }),
-  ],
-]
-
-describe('SRJ-512: an UNUSABLE NAME from resume and from the working-row read-pane holds P for a human on every automated path (recovery harness)', () => {
-  test.each(UNUSABLE_LATCH_WAYS)('P latched by %s: one SRJ-1019 post; then a new launch, the retry entry, a scheduled and a human-triggered restart and the retry timer make no tmux-touching call or delete for P and count nothing; Q\'s paths reach the stub as before', async (_label, row, latchScript) => {
-    const run = makeAutomatedPathsRun()
-    const { h, outcomes } = run
-    expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
-    const [p, q] = h.keys as [string, string]
-    run.readWorking(p)
-
-    h.script(latchScript(h, p))
-    expect(await h.launch(p)).toEqual({ key: p, action: 'latched' })
-    expect(h.latch.record(p)).toEqual(row.record(p))
-    h.script(CLEARED)
-    const touchingAtLatch = tmuxTouchingCallCounts(h.stub.calls)
-
-    const { launched, qCalls, notScheduledLines, attemptsBefore } = await driveEveryPath(run)
-
-    // Nothing tmux-touching or deleting reached P after the latch.
-    expect(tmuxTouchingCallsIn(h.stub.calls, touchingAtLatch).filter((call) => instanceOf(call.params) === personaInstanceId(p))).toEqual([])
-    expect(h.stub.calls.deleteCalls.filter((call) => instanceOf(call) === personaInstanceId(p))).toEqual([])
-    // Each path stopped for P: the launch and the retry entry answered latched, no restart timer, the retry timer stopped latched.
-    expect(launched).toEqual([{ key: p, action: 'latched' }, { key: q, action: 'spawned' }])
-    expect(outcomes).toEqual([
-      [p, RESTART_OUTCOME_LATCHED],
-      ...[1, 2, 3, 4].map(() => [q, RESTART_OUTCOME_LAUNCHED] as const),
-    ])
-    expect(notScheduledLines).toEqual([[notSchedulingLine(p)], [notSchedulingLine(p)]])
-    expect(h.attempts.slice(attemptsBefore).map((a) => [a.key, a.retry])).toEqual(retryTimerAttempts(p, q))
-    expect(h.stops.filter((stop) => stop.key === p)).toEqual([{ key: p, reason: UNAVAILABLE_RETRY_STOP_LATCHED }])
-    expect([h.controller.armedKeys(), isRestartPendingOrActive(p)]).toEqual([[], false])
-    // Nothing counted, no spawn-failure notice or spawn-failed entry, one latch and exactly one post: SRJ-1019.
-    expect([getFailureCount(p), getFailureCount(q)]).toEqual([0, 0])
-    expect(h.notices).toEqual([])
-    expect(h.startupErrors()).toEqual([])
-    expect(latchSteps(h)).toEqual(oneLatch(p))
-    expect(h.episodeNotices).toEqual([{ key: p, text: row.notice(p) }])
-    expect(h.latch.isLatched(q)).toBe(false)
-    // Q, beside it, still reaches the stub on every path.
-    expect(qCalls).toEqual([...Q_CALLS_ON_EVERY_PATH])
-  })
-
-  test.each(UNUSABLE_LATCH_WAYS)('P latched by %s: an accepted message stays queued without a notice, status read or restart; Q makes its own row read', async (_label, row, latchScript) => {
-    const h = makeRecoveryHarness()
-    harnesses.push(h)
-    expect(h.config.session_restart_delay).toBe(0)
-    const [p, q] = h.keys as [string, string]
-    // P's row reads working (the read-pane way's evidence read is then made); Q's reads no row.
-    h.script({
-      ...latchScript(h, p),
-      statusFn: (params) => (params.instance_id === personaInstanceId(p) ? cannedStatusResult({ state: 'working' }) : errSpawnNotFound()),
-    })
-    expect(await h.launch(p)).toEqual({ key: p, action: 'latched' })
-    expect(h.latch.record(p)).toEqual(row.record(p))
-    const pCallsAtLatch = personaCallCounts(h, p)
-
-    await expectLostMessageReports(h, p, 'held-for-human')
-    expect(posts(h.slack(p))).toEqual([])
-    expect(h.restartAsks.filter((key) => key === p)).toEqual([])
-    expect([isRestartPendingOrActive(p), personaCallCounts(h, p)]).toEqual([false, pCallsAtLatch])
-    expect(h.episodeNotices).toEqual([{ key: p, text: row.notice(p) }])
-
-    await expectLostMessageReports(h, q, 'auto-restart-disabled')
-    expect(h.latch.isLatched(q)).toBe(false)
-  })
-
-  test('UNCLASSIFIED control: an ErrInternal without the phrase from the same resume latches nothing, posts no hold notice and takes the unclassified handling', async () => {
-    const h = makeRecoveryHarness()
-    harnesses.push(h)
-    const [p] = h.keys as [string]
-    const err = errInternal()
-    h.script({ ...collided(h, personaOf(h, p), { state: 'ended' }), resumeError: err })
-
-    expect(await h.launch(p)).toEqual({ key: p, action: SPAWN_ACTION_RETRYING })
-
-    // No latch and no hold notice.
-    expect([h.latch.isLatched(p), h.latchEvents, h.episodeNotices]).toEqual([false, [], []])
-    // E12's handling: the unclassified episode opens, the timer is armed with the UNCLASSIFIED cause, nothing is counted or noticed, and nothing more is called.
-    expect(unclassifiedLines(h, p)).toEqual([unclassifiedStartedLine(p, err)])
-    expect(h.unclassifiedErrorOpen(p)).toBe(true)
-    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED }])
-    expect([getFailureCount(p), h.notices, h.startupErrors()]).toEqual([0, [], []])
-    expect(personaCallCounts(h, p)).toEqual({ spawnCalls: 1, getCalls: 1, resumeCalls: 1 })
-  })
-})
 
 // ---------------------------------------------------------------------------
 // SRJ-118, SRJ-505, SRJ-502, SRJ-512: the reconnect is a latch site. P
@@ -4268,23 +3607,6 @@ describe('the launch-start latch\'s record and episode (SRJ-513, SRJ-508, SRJ-10
     expect(run.latch.isLatched(OTHER)).toBe(false)
   })
 
-  test.each([
-    ['unproven-idle', { reason: 'unproven-idle', autoRestartDisabled: false, heldMs: 600_000 }],
-    ['blocked-on-prompt', { reason: 'blocked-on-prompt', autoRestartDisabled: false }],
-  ] as const)('a persona already given the %s not-connected notice still gets the launch-start post once', (_reason, notConnected: NotConnectedNotice) => {
-    const notConnectedPosts: Array<readonly [string, string]> = []
-    setSessionNotifier((key, text) => {
-      notConnectedPosts.push([key, text])
-    })
-    expect(notifyPersonaNotConnected(KEY, notConnected)).toBe(true)
-
-    const run = makeNoticeRun()
-    latchFromLaunchStartRead(run.latch, KEY, currentLifeRow('get'))
-    latchFromLaunchStartRead(run.latch, KEY, currentLifeRow('list'))
-    expect(run.posts).toEqual([[KEY, launchStartNotRecordedNoticeText(KEY)]])
-    expect(notConnectedPosts.map(([key]) => key)).toEqual([KEY])
-    assertNoLeak(notConnectedPosts)
-  })
 })
 
 /** Each latch set the harness's observers saw: the key and the outcome. */
@@ -4449,7 +3771,7 @@ describe('SRJ-513: a pending row with no launch start holds P for a human on eve
     expect(h.errors.filter((line) => line === latchedNoArmPendingRowLine(renderPersonaRef(personaOf(h, p).name, p)))).toHaveLength(1)
     expect(await h.launch(q)).toEqual({ key: q, action: 'spawned' })
     expect(h.triggers).toEqual([{ key: q, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }])
-    await h.runApproverToStop(q)
+
   })
 
   /** A key outside the harness's personas, or a persona removed from the applied configuration, whose row reads `pending` with no launch start. */
@@ -4690,99 +4012,6 @@ describe('SRJ-513, SRJ-1011: a message lost for P whose row reads pending with n
   })
 })
 
-// ---------------------------------------------------------------------------
-// The dialog approver's latches (b.jg5 SRJ-404, SRJ-501, SRJ-502, SRJ-512,
-// SRJ-513; SRJ-117 and SRJ-118's approver rows), on the recovery harness
-// ---------------------------------------------------------------------------
-
-/** The approver verb of one of its site kinds; throws for any other site, so a case never runs on a wrong row. */
-function approverVerbOf(site: string): ApproverVerb {
-  if (!isApproverSite(site)) throw new Error(`not an approver site: ${site}`)
-  return site.slice('approver '.length) as ApproverVerb
-}
-
-/** Calls through `verb`, including fresh marked-row and pane proofs before Enter (b.omv SR-7.6). */
-function lapCallsThrough(verb: ApproverVerb): Record<string, number> {
-  if (verb === 'send-keys') return { statusCalls: 1, getCalls: 2, readPaneCalls: 2, sendKeysCalls: 1 }
-  const verbs = APPROVER_SITES.map(approverVerbOf)
-  return Object.fromEntries(verbs.slice(0, verbs.indexOf(verb) + 1).map((v) => [APPROVER_VERB_CALLS[v], 1]))
-}
-
-/** One answer to the approver that latches P: the verb that meets it, the answer, and what the latch holds and posts for persona `key`. */
-interface ApproverLatchCase {
-  readonly verb: ApproverVerb
-  readonly build: () => Error
-  readonly record: (key: string) => ConflictLatchRecord
-  readonly notice: (key: string) => string
-}
-
-/**
- * Every approver row of the helper's tables: each CONFLICT its `read-pane`
- * and `send-keys` can meet on a `pending` row records P's next check or
- * recovery and `pending` (b.jg5 SRJ-501, typed here from the SRD, not read
- * from the row) beside the row's quoted session and description, as a whole
- * record; each UNUSABLE NAME at its `status`, `read-pane` and `send-keys`
- * holds the row's whole record (refused operation none).
- */
-const APPROVER_LATCH_CASES: ReadonlyArray<readonly [string, ApproverLatchCase]> = [
-  ...APPROVER_CONFLICT_CASE_ROWS.map((row): readonly [string, ApproverLatchCase] => [
-    `CONFLICT at ${row.name}`,
-    {
-      verb: approverVerbOf(row.site),
-      build: row.build,
-      record: (key) =>
-        expectedLatchRecord(key, {
-          sessionName: row.sessionName,
-          latchCase: row.latchCase,
-          refusedOperation: REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY,
-          rowState: latchRowStateRead(AGENT_DIRECTOR_PENDING_STATE),
-          description: row.build().errDescription,
-        }),
-      notice: () => row.notice.text,
-    },
-  ]),
-  ...APPROVER_UNUSABLE_NAME_CASE_ROWS.map((row): readonly [string, ApproverLatchCase] => [
-    `UNUSABLE NAME at ${row.name}`,
-    { verb: approverVerbOf(row.site), build: row.build, record: row.record, notice: row.notice },
-  ]),
-]
-
-/**
- * Every pane shows the folder-trust dialog, and persona `key`'s approver
- * call at `verb` answers `err`: its `status` through the run's row reads, a
- * pane verb by wrapping the stub client's verb, which records the call
- * before it answers.
- */
-function approverMeets(run: AutomatedPathsRun, key: string, verb: ApproverVerb, err: Error): void {
-  const { h } = run
-  h.script({ readPaneResults: [cannedReadPaneResult(TRUST_DIALOG_PANE)] })
-  const id = personaInstanceId(key)
-  const client = h.stub.client
-  if (verb === 'status') {
-    run.failStatus(key, err)
-  } else if (verb === 'read-pane') {
-    const readPane = client.readPane.bind(client)
-    client.readPane = async (params) => {
-      const result = await readPane(params)
-      if (params.instance_id === id) throw err
-      return result
-    }
-  } else {
-    const sendKeys = client.sendKeys.bind(client)
-    client.sendKeys = async (params) => {
-      const result = await sendKeys(params)
-      if (params.instance_id === id) throw err
-      return result
-    }
-  }
-}
-
-/** The calls of persona `key`'s instance in one stub call list. */
-const callsOf = (calls: readonly unknown[], key: string): unknown[] => calls.filter((params) => instanceOf(params) === personaInstanceId(key))
-
-/** The approver's cap in the cases where P latches from another path: past the laps the case drives, so only a stop ends P's approver. */
-const OTHER_PATH_CAP_MS = 10 * DIALOG_POLL_INTERVAL_MS
-
 /** The reading site the other paths' own-row reads name. */
 const OTHER_PATH_SITE: OwnRowReadSite = { site: 'conflict-latch.test', what: 'another path\'s own-row read' }
 
@@ -4791,7 +4020,6 @@ const ladderSpawnRow = lazyRow(
   (row) => row.refusedOperation === REFUSED_OPERATION_PLAIN_SPAWN && row.latchCase === LATCH_CASE_LEFTOVER && row.rowState !== LATCH_ROW_STATE_NO_ROW,
 )
 
-/** Each other path that latches P while its approver runs, and the case it records. */
 const OTHER_LATCH_PATHS: ReadonlyArray<readonly [string, (run: AutomatedPathsRun, p: string) => Promise<void>, LatchCase]> = [
   [
     'an own-row get read of a provenance_conflict note',
@@ -4819,126 +4047,6 @@ const OTHER_LATCH_PATHS: ReadonlyArray<readonly [string, (run: AutomatedPathsRun
     LATCH_CASE_LEFTOVER,
   ],
 ]
-
-/** When the other path latches P: while its approver sleeps between laps, or while its first `read-pane` (showing the dialog) is awaited. */
-const LATCH_TIMES = ['between its laps', 'while its read-pane is awaited'] as const
-
-describe('the dialog approver\'s latches: its own CONFLICT or UNUSABLE NAME latches P once, and a latch from any path stops it (recovery harness; SRJ-404, SRJ-501, SRJ-502, SRJ-512, SRJ-513)', () => {
-  test.each(APPROVER_LATCH_CASES)('%s: P latches once with its record and one post, its approver stops latched with nothing typed after it, and no automated path calls P while it is latched; Q\'s approver clears its own dialog', async (_name, c) => {
-    const run = makeAutomatedPathsRun()
-    const { h } = run
-    const [p, q] = h.keys as [string, string]
-    run.readPending(p)
-    run.readPending(q)
-    approverMeets(run, p, c.verb, c.build())
-
-    expect(await h.launch(p)).toEqual({ key: p, action: 'spawned' })
-    expect(await h.launch(q)).toEqual({ key: q, action: 'spawned' })
-    await h.settle()
-
-    // P: its lap's calls up to the refused one and none after; one latch through the latch's set entry, one post; nothing counted or noticed.
-    // Each launch armed its persona's timer pending-only (b.jg5 SRJ-301, SRJ-409); the latch's hold stopped P's, Q's stays armed.
-    expect((await h.runApproverToStop(p))?.reason).toBe(APPROVER_STOP_LATCHED)
-    expect(personaCallCounts(h, p)).toEqual({ spawnCalls: 1, ...lapCallsThrough(c.verb) })
-    expect(h.latch.record(p)).toEqual(c.record(p))
-    expect(latchSteps(h)).toEqual(oneLatch(p))
-    expect(h.episodeNotices).toEqual([{ key: p, text: c.notice(p) }])
-    expect([h.triggers, h.controller.armedKeys(), getFailureCount(p), h.notices]).toEqual([
-      [{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }, { key: q, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }],
-      [q],
-      0,
-      [],
-    ])
-    expect(h.stops.filter((stop) => stop.key === p)).toEqual([{ key: p, reason: UNAVAILABLE_RETRY_STOP_LATCHED }])
-    // The approver's latched stop arms nothing (b.jg5 SRJ-404).
-    expect(h.controller.isArmed(p)).toBe(false)
-
-    // Q, beside it: its approver pressed Enter on its dialog and ran on until its cap; Q is not latched.
-    expect(personaCallCounts(h, q)).toEqual({ spawnCalls: 1, ...lapCallsThrough('send-keys') })
-    expect(h.approverRunning(q)).toBe(true)
-    expect((await h.runApproverToStop(q))?.reason).toBe(APPROVER_STOP_CAP)
-    expect(h.latch.isLatched(q)).toBe(false)
-
-    // While P is latched no automated path calls it, tmux-touching or not; Q's paths reach the stub as before.
-    run.readPending(q, false)
-    const pAtLatch = personaCallCounts(h, p)
-    const touchingAtLatch = tmuxTouchingCallCounts(h.stub.calls)
-    const { launched, qCalls, attemptsBefore } = await driveEveryPath(run)
-    expect(callCountsSince(personaCallCounts(h, p), pAtLatch)).toEqual({})
-    expect(tmuxTouchingCallsIn(h.stub.calls, touchingAtLatch).filter((call) => instanceOf(call.params) === personaInstanceId(p))).toEqual([])
-    expect(launched).toEqual([{ key: p, action: 'latched' }, { key: q, action: 'spawned' }])
-    expect(h.attempts.slice(attemptsBefore).map((a) => [a.key, a.retry])).toEqual(retryTimerAttempts(p, q))
-    // The latch's hold stopped the pending-only timer P's launch armed; the retry timer path's arm then fired once and stopped latched.
-    expect(h.stops.filter((stop) => stop.key === p)).toEqual([
-      { key: p, reason: UNAVAILABLE_RETRY_STOP_LATCHED },
-      { key: p, reason: UNAVAILABLE_RETRY_STOP_LATCHED },
-    ])
-    expect(qCalls).toEqual([...Q_CALLS_ON_EVERY_PATH])
-    // Still the one latch and the one post.
-    expect(latchSteps(h)).toEqual(oneLatch(p))
-    expect(h.episodeNotices).toEqual([{ key: p, text: c.notice(p) }])
-    expect([getFailureCount(p), h.clock.pendingCount()]).toEqual([0, 0])
-  })
-
-  test.each(OTHER_LATCH_PATHS.flatMap(([name, latchP, latchCase]) => LATCH_TIMES.map((when) => [name, when, latchP, latchCase] as const)))('P latched by %s %s: its running approver stops latched and makes no further call, so no Enter reaches P after the latch; one post; Q\'s approver runs on and keeps clearing its dialog', async (_name, when, latchP, latchCase) => {
-    const run = makeAutomatedPathsRun({ approverCapMs: OTHER_PATH_CAP_MS })
-    const { h } = run
-    const [p, q] = h.keys as [string, string]
-    run.readPending(p)
-    run.readPending(q)
-    h.script({ readPaneResults: [cannedReadPaneResult(TRUST_DIALOG_PANE)] })
-    let pAtLatch: Record<string, number> | undefined
-    const latchNow = async (): Promise<void> => {
-      await latchP(run, p)
-      pAtLatch = personaCallCounts(h, p)
-    }
-    if (when === 'while its read-pane is awaited') {
-      // P's first pane read is made and shows the dialog; P latches before the approver gets its answer.
-      const client = h.stub.client
-      const readPane = client.readPane.bind(client)
-      client.readPane = async (params) => {
-        const result = await readPane(params)
-        if (params.instance_id === personaInstanceId(p) && pAtLatch === undefined) await latchNow()
-        return result
-      }
-    }
-
-    expect(await h.launch(p)).toEqual({ key: p, action: 'spawned' })
-    expect(await h.launch(q)).toEqual({ key: q, action: 'spawned' })
-    await h.settle()
-    if (when === 'between its laps') {
-      // P's first lap pressed Enter, and its approver sleeps until its next lap.
-      expect(h.approverRunning(p)).toBe(true)
-      await latchNow()
-    }
-    await h.settle()
-
-    // Stopped by the latch, not by its cap: no longer running before the clock moves.
-    expect(h.approverRunning(p)).toBe(false)
-    expect((await h.runApproverToStop(p))?.reason).toBe(APPROVER_STOP_LATCHED)
-    expect(callsOf(h.stub.calls.sendKeysCalls, p)).toHaveLength(when === 'between its laps' ? 1 : 0)
-    expect(h.latch.record(p)?.latchCase).toBe(latchCase)
-    expect(latchSteps(h)).toEqual(oneLatch(p))
-    expect(h.episodeNotices.map((notice) => notice.key)).toEqual([p])
-
-    // Three laps of Q later: no call for P, and Q, unlatched, pressed Enter at each.
-    expect(h.approverRunning(q)).toBe(true)
-    const qEnters = callsOf(h.stub.calls.sendKeysCalls, q).length
-    await h.advance(3 * DIALOG_POLL_INTERVAL_MS)
-    expect(callCountsSince(personaCallCounts(h, p), pAtLatch!)).toEqual({})
-    expect(callsOf(h.stub.calls.sendKeysCalls, q)).toHaveLength(qEnters + 3)
-    expect([h.latch.isLatched(q), h.approverRunning(q)]).toEqual([false, true])
-    expect(h.episodeNotices.map((notice) => notice.key)).toEqual([p])
-    expect((await h.runApproverToStop(q))?.reason).toBe(APPROVER_STOP_CAP)
-    // Q's launch left its timer armed pending-only (b.jg5 SRJ-301, SRJ-409); P's was stopped by the latch's hold.
-    // Once Q's is stopped, nothing else is pending.
-    expectPendingOnlyWatch(h, q)
-    expect(h.controller.armedKeys()).toEqual([q])
-    expect(h.stops.filter((stop) => stop.key === p)).toEqual([{ key: p, reason: UNAVAILABLE_RETRY_STOP_LATCHED }])
-    h.controller.stop(q, 'the case is over')
-    expect(h.clock.pendingCount()).toBe(0)
-  })
-})
 
 // ---------------------------------------------------------------------------
 // The live-row sequence's own latches (E21; b.jg5 SRJ-110, SRJ-501, SRJ-512,
@@ -5303,7 +4411,7 @@ describe('a running live-row sequence stops when P latches from another path: no
     expect([h.latch.isLatched(q), latchSteps(h)]).toEqual([false, oneLatch(p)])
     expect(h.episodeNotices.map((notice) => notice.key)).toEqual([p])
     expect(killFailureLines(h, p)).toEqual([])
-    await h.runApproverToStop(q)
+
     // Q's sequence's launch left Q's timer armed pending-only (b.jg5 SRJ-301, SRJ-409); P has none. Once it is stopped, nothing is pending.
     expectPendingOnlyWatch(h, q)
     expect(h.controller.armedKeys()).toEqual([q])
@@ -5361,7 +4469,7 @@ describe('the not-resumable step\'s re-read latches (recovery harness; SRJ-710, 
   }
 
   /** The ladder's calls up to the re-read: nothing after it. */
-  const LADDER_TO_REREAD = ['spawn', 'get', 'get', 'readPane', 'readPane', 'get', 'sendKeys', 'findMissing', 'resume', 'get']
+  const LADDER_TO_REREAD = ['spawn', 'get', 'get', 'get', 'sendKeys', 'findMissing', 'resume', 'get']
 
   test('the re-read carries a provenance_conflict note: P latches once with the shared own-row read\'s record ("conflicting labels", slack_bot_<key>, no description) and one post; no sequence starts, though the path holds dead evidence; no call after the re-read', async () => {
     const { h, p, q } = makeRun()
@@ -5516,22 +4624,21 @@ describe('the latch re-check\'s decision for every row of the case table (SRJ-50
   })
 
   test('every site kind has its rows, and every row carries every re-check column: its read, its table action, and one entry per state step 1 can read, each with its decision, its retired-key call and, for a call one verb answers, its answers (SRJ-1304)', () => {
-    // E13's ladder and E28's plain spawn, E22's reuse, E23's resume, E17's approver, E18's three read-pane sites,
+
     // E19's reconnect and prompt rows, E20's restart kill, E21's sequence kills and step-6 resume, E29's abort kill.
     const siteKinds = [
       'plain spawn',
       REUSE_SPAWN_SITE,
       'resume',
       SEQUENCE_RESUME_SITE,
-      ...APPROVER_SITES,
-      ...LIVENESS_PANE_SITES,
+
       RECONNECT_SITE,
       ...PROMPT_ROW_PANE_SITES,
       RESTART_KILL_SITE,
       ...SEQUENCE_KILL_SITES,
       STUCK_LAUNCH_ABORT_SITE,
     ]
-    // The approver's status answers no CONFLICT, so its rows are UNUSABLE NAME rows only.
+
     const sitesWithRows = new Set<string>([...EVERY_CONFLICT_ROW, ...UNUSABLE_NAME_CASE_ROWS].map((row) => row.site))
     expect(siteKinds.filter((site) => !sitesWithRows.has(site))).toEqual([])
     // E16's holds: an unusable-name row at every site kind that can answer UNUSABLE NAME, and the launch-start rows.
@@ -5992,18 +5099,6 @@ describe('HO rev 28: a latched resume or reuse is probed or retried only when st
   const launchRowsRefusing = (refusedOperation: string) =>
     EVERY_CONFLICT_ROW.filter((row) => row.refusedOperation === refusedOperation).map((row) => [row.name, row] as const)
 
-  test.each(launchRowsRefusing(REFUSED_OPERATION_RESUME))('%s, its row gone: step 1\'s ErrSpawnNotFound clears the latch, and the retry at once after its find-missing is the plain spawn, never a resume or a reuse (SRJ-506)', async (_name, row) => {
-    const { h, p } = latchForRecheck(row, { state: PENDING_ROW_MODEL_NO_ROW })
-    const spawnsBefore = h.stub.calls.spawnCalls.length
-    const round = await recheckRound(h, p)
-    expect(round.verbs.slice(0, 2)).toEqual([row.recheck.readVerb, 'findMissing'])
-    expect(round.verbs).not.toContain('resume')
-    expect([h.latch.isLatched(p), h.latchRecheck.isArmed(p)]).toEqual([false, false])
-    const spawns = h.stub.calls.spawnCalls.slice(spawnsBefore)
-    expect([spawns.length, spawns[0]?.reuse_finished, h.stub.calls.resumeCalls]).toEqual([1, undefined, []])
-    if (h.approverRunning(p)) await h.runApproverToStop(p)
-  })
-
   test.each(launchRowsRefusing(REFUSED_OPERATION_REUSE_SPAWN))('%s, its row gone: the reuse is retried as an ordinary fresh spawn, with no probe; not refused, it clears the latch', async (_name, row) => {
     const { h, p } = latchForRecheck(row, { state: PENDING_ROW_MODEL_NO_ROW })
     const round = await recheckRound(h, p)
@@ -6036,7 +5131,7 @@ describe('HO rev 28: a latched resume or reuse is probed or retried only when st
 
 describe('"not this launch\'s session": status only, the refused call never repeated, a live reading never clears; on a finished or gone row one finished-row retry with P still latched (recovery harness; SRJ-505, SRJ-506)', () => {
   /** The latch from a refused kill, a reconnect's send-keys and a read-pane (the waiting-row check's). */
-  const SITES = ['kill', 'reconnect send-keys', 'waiting-row check'].map(
+  const SITES = ['kill', 'reconnect send-keys'].map(
     (site) => [site, lazyRow((candidate) => candidate.latchCase === LATCH_CASE_NOT_THIS_LAUNCH && candidate.site === site)] as const,
   )
   /** The calls a "not this launch's session" latch never makes again: the refused kill, send-keys, read-pane or pause, and no delete. */
@@ -6084,50 +5179,6 @@ describe('"not this launch\'s session": status only, the refused call never repe
     round = await recheckRound(h, p)
     expect(round.verbs).toEqual(['status', 'spawn'])
     expect([h.latch.record(p)?.latchCase, h.episodeNotices.length]).toEqual([LATCH_CASE_LEFTOVER, 2])
-  })
-})
-
-describe('"conflicting labels": step 1 reads with get; the note keeps the latch with no call; a pending row gets the lap\'s one-line read-pane, typing nothing (recovery harness; SRJ-505, SRJ-410)', () => {
-  test('a provenance_conflict note on P\'s live, connected row keeps the latch with no other call and no post, round after round', async () => {
-    const noteRow = NOTE_LATCH_CASE_ROWS.find((row) => row.state === rowStateOfReading('waiting'))!
-    const run = latchForRecheck(noteRow, { state: noteRow.state, note: true })
-    const { h, p } = run
-    h.setConnected(p, true)
-    for (let n = 0; n < 3; n++) {
-      const round = await recheckRound(h, p)
-      expect(round.verbs).toEqual(['get'])
-      expectStillLatched(run, round.at)
-    }
-  })
-
-  test('a resume latched on "conflicting labels", its row pending with no note and a startup dialog on its pane: each round one read-pane with n_lines 1 and allow_pending and no resume; the same CONFLICT keeps the latch; nothing is typed, and no lap, run or kill is made while latched', async () => {
-    const row = conflictingLabelsResumeRow()
-    const sameCase = recheckEntryAt(row.recheck, 'pending').answers!.stillLatched[0]!
-    const run = latchForRecheck(row, { state: AGENT_DIRECTOR_PENDING_STATE, dialog: PENDING_ROW_DIALOG_TRUST, readPane: [1, 2, 3].map(() => sameCase.answer()) })
-    const { h, p, model } = run
-    for (let n = 0; n < 3; n++) {
-      const round = await recheckRound(h, p)
-      expect(round.verbs).toEqual(['get', 'readPane'])
-      expect(model.calls.at(-1)?.params).toEqual({ instance_id: personaInstanceId(p), n_lines: PROBE_PANE_READ_LINES, allow_pending: true })
-      expectStillLatched(run, round.at)
-    }
-    expect([model.state(), model.dialog()]).toEqual([AGENT_DIRECTOR_PENDING_STATE, PENDING_ROW_DIALOG_TRUST])
-  })
-})
-
-describe('a retry\'s answer: a different case relatches with one new post, and the next round follows the new case (recovery harness; SRJ-505, SRJ-506)', () => {
-  test('the lap read-pane of a "conflicting labels" latch\'s pending row answering "the agent\'s pane was not found" relatches with it (one new post), and the next round is that case\'s probe: status, then read-pane with n_lines 1 and no allow_pending', async () => {
-    const row = rowWhere((candidate) => candidate.latchCase === LATCH_CASE_CONFLICTING_LABELS && candidate.refusedOperation === REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY && candidate.rowState.kind === LATCH_ROW_STATE_KIND_READ && candidate.rowState.state === AGENT_DIRECTOR_PENDING_STATE)
-    const relatch = recheckEntryAt(row.recheck, 'pending').answers!.relatches.find((answer) => answer.latchCase === LATCH_CASE_PANE_NOT_FOUND)!
-    const { h, p, model } = latchForRecheck(row, { state: AGENT_DIRECTOR_PENDING_STATE, readPane: [relatch.answer(), recheckPaneConflictAnswer('pane-not-found').answer()] })
-    let round = await recheckRound(h, p)
-    expect(round.verbs).toEqual(['get', 'readPane'])
-    expect(h.latch.record(p)).toMatchObject({ latchCase: LATCH_CASE_PANE_NOT_FOUND, refusedOperation: REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY, rowState: latchRowStateRead(AGENT_DIRECTOR_PENDING_STATE) })
-    expect([h.episodeNotices.length, h.latchRecheck.pendingTimers()]).toEqual([2, 1])
-    round = await recheckRound(h, p)
-    expect(round.verbs).toEqual(['status', 'readPane'])
-    expect(model.calls.at(-1)?.params).toEqual({ instance_id: personaInstanceId(p), n_lines: PROBE_PANE_READ_LINES })
-    expect([h.latch.record(p)?.latchCase, h.episodeNotices.length]).toEqual([LATCH_CASE_PANE_NOT_FOUND, 2])
   })
 })
 
@@ -6309,22 +5360,6 @@ function roundLineHead(h: RecoveryHarness, key: string, latchCase: LatchCase, st
 }
 
 describe('the round line names step 1\'s outcome and the call: a spawn latch\'s retry after step 1 found no row and a "not this launch\'s session" latch\'s finished-row retry each say so (HO rev 15), and so do a read that gave no information and one that relatched (recovery harness; SRJ-505, SRJ-1014)', () => {
-  test.each([
-    ['a reuse spawn latch', anotherStoreReuseRow, RECHECK_CALL_REUSE_SPAWN, (_model: PendingRowModel) => {}],
-    // Refused again by the scan: still latched with no post.
-    ['a plain spawn latch', scanLeftoverRow, RECHECK_CALL_PLAIN_SPAWN, (model: PendingRowModel) => model.scriptPlainSpawns(scanRefusal(scanLeftoverRow().build()))],
-  ] as const)('%s whose step 1 finds no row: one round line, step=spawn-retry, the spawn its call', async (_label, rowOf, call, script) => {
-    const row = rowOf()
-    expect(recheckEntryAt(row.recheck, 'no row').decision).toMatchObject({ step: RECHECK_STEP_SPAWN_RETRY, call })
-    const { h, p, model, record } = latchForRecheck(row, { state: PENDING_ROW_MODEL_NO_ROW })
-    script(model)
-    const round = await recheckRound(h, p)
-    expect(round.verbs.slice(0, 2)).toEqual(['status', 'spawn'])
-    const lines = roundLinesOf(h, p)
-    expect(lines).toHaveLength(1)
-    expect(lines[0]).toStartWith(roundLineHead(h, p, record.latchCase, RECHECK_STEP_SPAWN_RETRY, call))
-    await stopApprover(h, p)
-  })
 
   test.each([
     ['missing', RECHECK_CALL_RESUME, ['status', 'get', 'get', 'resume']],
@@ -6384,66 +5419,6 @@ describe('the round line names step 1\'s outcome and the call: a spawn latch\'s 
 })
 
 describe('a round\'s launch asks the gates every launch path asks: a persona not up, held on ErrInvalidFlags or held back for an old life gets no launch and stays latched with no post (recovery harness; b.av2 SR-6.4; SRJ-505, SRJ-207, SRJ-810)', () => {
-  test('not up (its bring-up has not succeeded, the relaunch gate main() passes): its status read and the not-up line, no spawn, P still latched with no post; once up, the next round makes the reuse', async () => {
-    const run = latchForRecheck(anotherStoreReuseRow(), { state: LIVENESS_DEAD_ROW_ENDED })
-    const { h, p } = run
-    h.setUp(p, false)
-    let round = await recheckRound(h, p)
-    expect(round.verbs).toEqual(['status'])
-    expectStillLatched(run, round.at)
-    expect(h.errors.filter((line) => line === latchRecheckNotUpLine(personaRefOf(h, p), RECHECK_CALL_REUSE_SPAWN))).toHaveLength(1)
-    h.setUp(p, true)
-    round = await recheckRound(h, p)
-    expect(round.verbs.slice(0, 2)).toEqual(['status', 'spawn'])
-    expect(h.stub.calls.spawnCalls).toEqual([reuseSpawnOf(h, p)])
-    await stopApprover(h, p)
-  })
-
-  test('a launch already in flight for P (its spawn held open, P latched meanwhile): the round\'s status read and the in-flight line, no second spawn, P still latched with no post', async () => {
-    const h = makeRecheckHarness()
-    const [p] = h.keys as [string]
-    const model = makePendingRowModel(h, p, { sessionId: 'session-of-p', state: PENDING_ROW_MODEL_NO_ROW })
-    const id = personaInstanceId(p)
-    const hold = holdSpawns(h.stub.client, (spawned) => spawned === id)
-    const launching = h.launch(p)
-    await hold.entered(id)
-    anotherStoreReuseRow().latchOn(h.latchSet, p)
-    const record = h.latch.record(p)
-    model.setState(LIVENESS_DEAD_ROW_ENDED)
-
-    // The round, with the launch still held (so no settling of launches).
-    await h.advance(h.latchRecheck.nextDueAt()! - h.clock.now())
-    await h.latchRecheck.whenRoundSettled(p)
-
-    expect(h.errors.filter((line) => line === latchRecheckLaunchInFlightLine(personaRefOf(h, p), RECHECK_CALL_REUSE_SPAWN))).toHaveLength(1)
-    expect(hold.calls).toHaveLength(1)
-    expect([h.latch.record(p), h.episodeNotices.length]).toEqual([record, 1])
-    hold.release(id)
-    await launching
-    await h.settle()
-    await stopApprover(h, p)
-  })
-
-  test('its claude_config_dir unresolvable (bug b.g57): its status read and the config-dir line, no spawn, P still latched with no post; once it resolves, the next round makes the reuse', async () => {
-    const run = latchForRecheck(anotherStoreReuseRow(), { state: LIVENESS_DEAD_ROW_ENDED })
-    const { h, p } = run
-    const gone = (): never => {
-      throw Object.assign(new Error('no such directory'), { code: 'ENOENT' })
-    }
-    _setConfigDirFs({ realpath: gone, lstat: gone })
-    let round: RecheckRoundRun
-    try {
-      round = await recheckRound(h, p)
-    } finally {
-      _resetConfigDirFs()
-    }
-    expect(round.verbs).toEqual(['status'])
-    expectStillLatched(run, round.at)
-    expect(h.errors.filter((line) => line === latchRecheckConfigDirLine(personaRefOf(h, p), RECHECK_CALL_REUSE_SPAWN))).toHaveLength(1)
-    round = await recheckRound(h, p)
-    expect(round.verbs.slice(0, 2)).toEqual(['status', 'spawn'])
-    await stopApprover(h, p)
-  })
 
   test('held: a reuse retry answering ErrInvalidFlags holds P (SRJ-207), and the next round makes no spawn: its status read and the held line, P still latched with no further post', async () => {
     const { h, p, record } = latchForRecheck(anotherStoreReuseRow(), { state: LIVENESS_DEAD_ROW_ENDED, reuseSpawns: [errInvalidFlags('spawn')] })
@@ -6744,39 +5719,6 @@ describe('the single retry after a cleared probe, and the clears that launched n
   })
 })
 
-/** The stub calls a re-check or its after-clear job launches with. */
-const LAUNCH_VERBS: ReadonlySet<string> = new Set(['spawn', 'resume'])
-
-/** One P call the stub client saw, as `watchCalls` records it: the verb, the notice posts made by then and whether P was latched and active. */
-interface WatchedCall {
-  readonly verb: string
-  readonly posts: number
-  readonly latched: boolean
-  readonly active: boolean
-}
-
-/**
- * Record, at each call of `verbs` on the harness's stub client for persona
- * `key` (or naming no instance, as `findMissing`), the verb, the notice posts
- * made by then, and whether P was latched and held active then.
- */
-function watchCalls(h: RecoveryHarness, key: string, verbs: readonly RecoveryStubVerb[] = ['status', 'get', 'readPane', 'findMissing', 'spawn', 'resume']): WatchedCall[] {
-  const seen: WatchedCall[] = []
-  const id = personaInstanceId(key)
-  const client = h.stub.client as unknown as Record<string, (params?: { instance_id?: unknown }) => unknown>
-  for (const verb of verbs) {
-    const original = client[verb]!.bind(client)
-    client[verb] = (params) => {
-      const named = params?.instance_id
-      if (named === undefined || named === id) {
-        seen.push({ verb, posts: h.episodeNotices.length, latched: h.latch.isLatched(key), active: isRestartPendingOrActive(key) })
-      }
-      return original(params)
-    }
-  }
-  return seen
-}
-
 /** Persona `key` of `h` as the session manager's lines name it: its name and key. */
 function personaRefOf(h: RecoveryHarness, key: string): string {
   return renderPersonaRef(personaOf(h, key).name, key)
@@ -6788,16 +5730,13 @@ function retryAtOnceLinesOf(h: RecoveryHarness, key: string): string[] {
   return h.errors.filter((line) => line.startsWith(head))
 }
 
-/** Stop P's dialog approver when a launch started it, so the harness's cleanup finds no timer. */
-async function stopApprover(h: RecoveryHarness, key: string): Promise<void> {
-  if (h.approverRunning(key)) await h.runApproverToStop(key)
-}
-
 /** P unlatched with its re-check timer stopped and no latch episode open. */
 function expectClearedState(h: RecoveryHarness, key: string): void {
   expect([h.latch.isLatched(key), h.latchRecheck.isArmed(key), h.latchRecheck.pendingTimers()]).toEqual([false, false, 0])
   expect(LATCH_NOTICE_EPISODE_KINDS.map((kind) => [kind, h.episodes.isOpen(key, kind)])).toEqual(LATCH_NOTICE_EPISODE_KINDS.map((kind) => [kind, false]))
 }
+
+const LAUNCH_VERBS: ReadonlySet<string> = new Set(['spawn', 'resume'])
 
 /** Every step-1 clear of the case table (gone, reported in) and every "launch start not recorded" clear on `ended` or `missing`, by row and reading. */
 const RECHECK_CLEARS = RECHECK_TABLE.flatMap((row) =>
@@ -6811,7 +5750,6 @@ describe('a clear by step 1 or by a "launch start not recorded" row read finishe
     // Every launch-start row, LAUNCH_START_AND_NOTE_ROW included.
     expect(launchStartClears).toHaveLength(2 * (LAUNCH_START_CASE_ROWS.length + 1))
   })
-
   test.each(RECHECK_CLEARS)('%s', async (_name, row, entry) => {
     const { h, p, q, model } = latchForRecheck(row, row.noLaunchStart ? { launchStartedAt: SAMPLE_LAUNCH_START_NONE } : {})
     if (row.probeDropped) expect(h.latchSet.setProbeDropped(p)).toBe(true)
@@ -6842,9 +5780,9 @@ describe('a clear by step 1 or by a "launch start not recorded" row read finishe
     expect([watched[0]?.posts, watched[0]?.latched]).toEqual([1, true])
     expect([watched[1]?.verb, watched[1]?.posts, watched[1]?.latched, watched[1]?.active]).toEqual([stepOne ? 'findMissing' : 'status', 2, false, true])
     expect(isRestartPendingOrActive(p)).toBe(false)
-    await stopApprover(h, p)
     expect([h.latch.isLatched(q), personaCallCounts(h, q)]).toEqual([false, {}])
   })
+
 })
 
 describe('AC 42, AC 43: a latch set while the row read live is not cleared by a live reading and posts nothing more; one set on a pending row clears once the row reports in (recovery harness; SRJ-505, SRJ-506)', () => {
@@ -6881,24 +5819,6 @@ describe('AC 42, AC 43: a latch set while the row read live is not cleared by a 
     expect(clearedLinesIn(h.errors, p)).toEqual([])
   })
 
-  test('AC 43: the approver\'s read-pane meets "conflicting labels" on P\'s pending launch; once a human answers the dialog the row reads waiting, and the next round clears with one "its agent-director row reads waiting" post, then one find-missing and the retry at once', async () => {
-    const row = APPROVER_CONFLICT_CASE_ROWS.find((candidate) => candidate.latchCase === LATCH_CASE_CONFLICTING_LABELS && candidate.verb === 'read-pane')!
-    expect(row.rowState).toEqual(latchRowStateRead(AGENT_DIRECTOR_PENDING_STATE))
-    const { h, p, model, record } = latchForRecheck(row, { state: AGENT_DIRECTOR_PENDING_STATE, dialog: PENDING_ROW_DIALOG_TRUST, readPane: [row.build()] })
-    // While pending, the lap's read-pane meets the same case: still latched, no post.
-    let round = await recheckRound(h, p)
-    expect(round.verbs).toEqual(['get', 'readPane'])
-    expect(h.episodeNotices).toHaveLength(1)
-    // A human answers the dialog by hand: the row reads waiting.
-    model.setDialog(PENDING_ROW_DIALOG_NONE)
-    model.setState('waiting')
-    round = await recheckRound(h, p)
-    expect(round.verbs.slice(0, 2)).toEqual(['get', 'findMissing'])
-    expect(h.episodeNotices.slice(1)).toEqual([recoveryPost(p, record, latchRecoveryReasonRowReads('waiting'))])
-    expectClearedState(h, p)
-    expect(retryAtOnceLinesOf(h, p)).toHaveLength(1)
-    await stopApprover(h, p)
-  })
 })
 
 /** A retry the re-check makes at its cadence, by table row: the first entry whose call is a launch, with each answer that clears. */
@@ -6911,7 +5831,7 @@ const CADENCE_RETRY_CLEARS = RECHECK_TABLE.filter((row) => !row.probeDropped).fl
 
 describe('a retry at the cadence that is not refused: no post before it, no find-missing, one recovery post with "a retry of the refused operation was not refused", and no second launch (recovery harness; SRJ-506, SRJ-1005; hatch A3)', () => {
   test.each(CADENCE_RETRY_CLEARS)('%s', async (_name, row, entry, answer) => {
-    const { h, p, model, record } = latchForRecheck(row, row.noLaunchStart ? { launchStartedAt: SAMPLE_LAUNCH_START_NONE } : {})
+    const { h, p, q, model, record } = latchForRecheck(row, row.noLaunchStart ? { launchStartedAt: SAMPLE_LAUNCH_START_NONE } : {})
     scriptRecheckReading(model, row.recheck.readVerb, entry)
     scriptLaunchAnswer(model, entry.decision.call, answer.answer())
     const watched = watchCalls(h, p)
@@ -6923,6 +5843,10 @@ describe('a retry at the cadence that is not refused: no post before it, no find
     const expected = [row.recheck.readVerb, ...guardedLaunchCalls(LAUNCH_CALL_METHOD[entry.decision.call]!)]
     expect(verbs.slice(0, expected.length)).toEqual(expected)
     expect([verbs.filter((verb) => LAUNCH_VERBS.has(verb)).length, verbs.includes('findMissing')]).toEqual([1, false])
+    expect(h.stub.calls.spawnCalls.map(call => [call.instance_id, call.reuse_finished === true])).toEqual(
+      entry.decision.call === RECHECK_CALL_RESUME ? [] : [[personaInstanceId(p), entry.decision.call === RECHECK_CALL_REUSE_SPAWN]],
+    )
+    expect(h.stub.calls.resumeCalls.map(call => call.instance_id)).toEqual(entry.decision.call === RECHECK_CALL_RESUME ? [personaInstanceId(p)] : [])
     // P was still latched with only its latch post when the retry was made.
     expect(watched.filter((call) => LAUNCH_VERBS.has(call.verb)).map((call) => [call.posts, call.latched])).toEqual([[1, true]])
     expect(answer.reason).toEqual(LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED)
@@ -6931,7 +5855,7 @@ describe('a retry at the cadence that is not refused: no post before it, no find
     expectClearedState(h, p)
     // The retry's outcome stands: no retry at once after it.
     expect(retryAtOnceLinesOf(h, p)).toEqual([])
-    await stopApprover(h, p)
+    expect([h.latch.isLatched(q), personaCallCounts(h, q)]).toEqual([false, {}])
   })
 })
 
@@ -6944,7 +5868,7 @@ describe('"not this launch\'s session": no post before its finished-row retry or
   test.each(FINISHED_ROW_CLEARS)('%s', async (_name, entry, answer) => {
     const noRow = entry.reading.kind === RECHECK_READING_NO_ROW_VALUE.kind
     const state = noRow ? PENDING_ROW_MODEL_NO_ROW : (entry.reading as { state: string }).state
-    const { h, p, model, record } = latchForRecheck(statusOnlyRow(), { state, ...(entry.hasSessionId ? {} : { row: { session_id: '' } }) })
+    const { h, p, q, model, record } = latchForRecheck(statusOnlyRow(), { state, ...(entry.hasSessionId ? {} : { row: { session_id: '' } }) })
     scriptLaunchAnswer(model, entry.call, answer.answer())
     const watched = watchCalls(h, p)
     const from = h.timedCalls.length
@@ -6955,6 +5879,10 @@ describe('"not this launch\'s session": no post before its finished-row retry or
     const expected = ['status', 'get', ...guardedLaunchCalls(LAUNCH_CALL_METHOD[entry.call]!)]
     expect(verbs.slice(0, expected.length)).toEqual(expected)
     expect([verbs.filter((verb) => LAUNCH_VERBS.has(verb)).length, verbs.includes('findMissing')]).toEqual([1, false])
+    expect(h.stub.calls.spawnCalls.map(call => [call.instance_id, call.reuse_finished === true])).toEqual(
+      entry.call === RECHECK_CALL_RESUME ? [] : [[personaInstanceId(p), entry.call === RECHECK_CALL_REUSE_SPAWN]],
+    )
+    expect(h.stub.calls.resumeCalls.map(call => call.instance_id)).toEqual(entry.call === RECHECK_CALL_RESUME ? [personaInstanceId(p)] : [])
     expect(watched.filter((call) => call.verb === 'get' || LAUNCH_VERBS.has(call.verb)).map((call) => [call.verb, call.posts, call.latched])).toEqual([
       ['get', 1, true],
       ...(entry.call === RECHECK_CALL_RESUME ? [['get', 1, true]] : []),
@@ -6964,40 +5892,9 @@ describe('"not this launch\'s session": no post before its finished-row retry or
     expect(h.episodeNotices.slice(1)).toEqual([recoveryPost(p, record, answer.reason)])
     expectClearedState(h, p)
     expect(retryAtOnceLinesOf(h, p)).toEqual([])
-    await stopApprover(h, p)
+    expect([h.latch.isLatched(q), personaCallCounts(h, q)]).toEqual([false, {}])
   })
 
-  test('while the leftover runs, the finished-row resume relatches with "left over from an earlier life": one CONFLICT post and no recovery post; once it is gone, the next finished round\'s resume clears with one recovery post', async () => {
-    const missing = finishedRowEntryFor('missing')
-    const leftover = missing.answers!.relatches.find((relatch) => relatch.latchCase === LATCH_CASE_LEFTOVER)!
-    const { h, p, model, record } = latchForRecheck(statusOnlyRow(), { state: LIVENESS_DEAD_ROW_MISSING, resumes: [leftover.answer()] })
-    let round = await recheckRound(h, p)
-    expect(round.verbs).toEqual(['status', 'get', 'get', 'resume'])
-    const relatched = h.latch.record(p)!
-    expect(relatched.latchCase).toBe(LATCH_CASE_LEFTOVER)
-    expect(h.episodeNotices.map((notice) => notice.text).filter((text) => text.startsWith(CONFLICT_RECOVERY_HEAD) || text.startsWith(HOLD_RECOVERY_HEAD))).toEqual([])
-    expect(h.episodeNotices).toHaveLength(2)
-    // The resume latch on a row read missing: the next round retries the resume, which is not refused.
-    model.setState(LIVENESS_DEAD_ROW_MISSING)
-    round = await recheckRound(h, p)
-    expect(round.verbs.slice(0, 3)).toEqual(['status', 'get', 'resume'])
-    expect(h.episodeNotices.slice(2)).toEqual([recoveryPost(p, relatched, LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED)])
-    expect(record.latchCase).toBe(LATCH_CASE_NOT_THIS_LAUNCH)
-    await stopApprover(h, p)
-  })
-
-  test('a plain-spawn latch whose scan refusal wrote no row: a retry refused again posts nothing; one not refused clears with "a retry of the refused operation was not refused", with no find-missing before either', async () => {
-    const { h, p, record } = latchForRecheck(scanLeftoverRow(), { state: PENDING_ROW_MODEL_NO_ROW, plainSpawns: [scanRefusal(scanLeftoverRow().build())] })
-    let round = await recheckRound(h, p)
-    expect(round.verbs).toEqual(['status', 'spawn'])
-    expect([h.latch.record(p), h.episodeNotices.length]).toEqual([record, 1])
-    round = await recheckRound(h, p)
-    expect(round.verbs.slice(0, 2)).toEqual(['status', 'spawn'])
-    expect(h.episodeNotices.slice(1)).toEqual([recoveryPost(p, record, LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED)])
-    expect(personaCallsFrom(h, p, 0).map((call) => call.verb)).not.toContain('findMissing')
-    expectClearedState(h, p)
-    await stopApprover(h, p)
-  })
 })
 
 /** Every probe of the case table that finds the condition cleared: a row, a reading whose call is the probe, and the answer. */
@@ -7007,9 +5904,17 @@ const CLEARED_PROBES = RECHECK_TABLE.filter((row) => !row.probeDropped).flatMap(
     .flatMap((entry) => entry.answers!.probeFoundCleared.map((answer) => [`${row.name}, step 1 reading ${entry.name}, the probe answering ${answer.name}`, row, entry, answer] as const)),
 )
 
-describe('a probe that finds the condition cleared: one bypassing find-missing, then exactly one retry of the latched operation with P still latched; one recovery post only when that retry clears (recovery harness; SRJ-505, SRJ-506, SRJ-120; HO rev 28; hatch A3)', () => {
+/** A "this row's own id" reuse latch on a row recorded `ended`. */
+const ownIdReuseRow = launchRow(REFUSED_OPERATION_REUSE_SPAWN, LATCH_CASE_OWN_ID)
+
+/** Make every `find-missing` answer `err` from now on (the row model no longer answers it). */
+function failFindMissing(h: RecoveryHarness, err: Error): void {
+  h.script({ findMissingFn: () => err })
+}
+
+describe('the cleared probe\'s find-missing and single retry: a refused run holds the retry back, the latched answer goes on, a collision gives no information, and a "this row\'s own id" retry refused again drops the probe (recovery harness; SRJ-505, SRJ-506, SRJ-120; AC 8; E14 build)', () => {
   test.each(CLEARED_PROBES)('%s', async (_name, row, entry, answer) => {
-    const { h, p, model, record } = latchForRecheck(row)
+    const { h, p, q, model, record } = latchForRecheck(row)
     scriptRecheckReading(model, row.recheck.readVerb, entry)
     model.scriptReadPane(answer.answer())
     const watched = watchCalls(h, p)
@@ -7029,6 +5934,8 @@ describe('a probe that finds the condition cleared: one bypassing find-missing, 
     )
     if (retry !== RECHECK_CALL_RESTART_DECISION) {
       expect([verbs.filter((verb) => verb === 'findMissing').length, verbs.filter((verb) => LAUNCH_VERBS.has(verb)).length]).toEqual([1, 1])
+      expect(h.stub.calls.spawnCalls).toEqual(retry === RECHECK_CALL_REUSE_SPAWN ? [reuseSpawnOf(h, p)] : [])
+      expect(h.stub.calls.resumeCalls).toHaveLength(retry === RECHECK_CALL_RESUME ? 1 : 0)
     }
     // The retry's outcome by step 1's reading: a run of the restart path's
     // decision over a row read `pending` defers to the pending row, which
@@ -7044,19 +5951,9 @@ describe('a probe that finds the condition cleared: one bypassing find-missing, 
     }
     // A retry's clear keeps its outcome: no retry at once after it.
     expect(retryAtOnceLinesOf(h, p)).toEqual([])
-    await stopApprover(h, p)
+    expect([h.latch.isLatched(q), personaCallCounts(h, q)]).toEqual([false, {}])
   })
-})
 
-/** A "this row's own id" reuse latch on a row recorded `ended`. */
-const ownIdReuseRow = launchRow(REFUSED_OPERATION_REUSE_SPAWN, LATCH_CASE_OWN_ID)
-
-/** Make every `find-missing` answer `err` from now on (the row model no longer answers it). */
-function failFindMissing(h: RecoveryHarness, err: Error): void {
-  h.script({ findMissingFn: () => err })
-}
-
-describe('the cleared probe\'s find-missing and single retry: a refused run holds the retry back, the latched answer goes on, a collision gives no information, and a "this row\'s own id" retry refused again drops the probe (recovery harness; SRJ-505, SRJ-506, SRJ-120; AC 8; E14 build)', () => {
   const REFUSALS: ReadonlyArray<readonly [string, () => Error, readonly OutageClass[]]> = [
     ['UNAVAILABLE (ErrTmuxUnresponsive)', () => errTmuxUnresponsive('find-missing'), []],
     ['UNAVAILABLE (ErrCallTimeout)', () => errCallTimeout('find-missing'), []],
@@ -7079,25 +5976,6 @@ describe('the cleared probe\'s find-missing and single retry: a refused run hold
     expectStillLatched(run, round.at)
   })
 
-  test('the run answers latched for P, latched before it (FIND_MISSING_LATCHED): the single retry still follows and, not refused, clears with one post', async () => {
-    const { h, p, record } = latchForRecheck(ownIdResumeRow(), { state: LIVENESS_DEAD_ROW_ENDED, readPane: [RECHECK_GONE_ANSWER.answer()] })
-    const watched = watchCalls(h, p)
-    const round = await recheckRound(h, p)
-    expect(round.verbs.slice(0, 5)).toEqual(['status', 'readPane', 'findMissing', 'get', 'resume'])
-    expect(watched.find((call) => call.verb === 'findMissing')?.latched).toBe(true)
-    expect(h.episodeNotices.slice(1)).toEqual([recoveryPost(p, record, LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED)])
-    await stopApprover(h, p)
-  })
-
-  test('the run failing with an answer that is no refusal (ErrSpawnNotFound) lets the single retry go ahead', async () => {
-    const { h, p, record } = latchForRecheck(ownIdResumeRow(), { state: LIVENESS_DEAD_ROW_ENDED, readPane: [RECHECK_GONE_ANSWER.answer()] })
-    failFindMissing(h, errSpawnNotFound())
-    const round = await recheckRound(h, p)
-    expect(round.verbs.slice(0, 5)).toEqual(['status', 'readPane', 'findMissing', 'get', 'resume'])
-    expect(h.episodeNotices.slice(1)).toEqual([recoveryPost(p, record, LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED)])
-    await stopApprover(h, p)
-  })
-
   test('the single retry (a reuse) answering ErrInstanceIdCollision gives no information: P stays latched with no post and no further call (no get-then-act), the next round probing again', async () => {
     const run = latchForRecheck(ownIdReuseRow(), { state: LIVENESS_DEAD_ROW_ENDED, readPane: [RECHECK_GONE_ANSWER.answer()], reuseSpawns: [errInstanceIdCollision()] })
     const { h, p } = run
@@ -7112,36 +5990,6 @@ describe('the cleared probe\'s find-missing and single retry: a refused run hold
     expect(round.verbs).toEqual(['status', 'readPane'])
   })
 
-  test.each([
-    ['resume', ownIdResumeRow, 'resume', (model: PendingRowModel, err: Error) => model.scriptResumes(err)],
-    ['reuse', ownIdReuseRow, 'spawn', (model: PendingRowModel, err: Error) => model.scriptReuseSpawns(err)],
-  ] as const)('AC 8: a "this row\'s own id" %s whose single retry is refused again with that case drops the probe for the episode, with one line and no post; the next rounds retry it directly, only on a row read ended', async (_label, rowOf, verb, refuse) => {
-    const row = rowOf()
-    const run = latchForRecheck(row, { state: LIVENESS_DEAD_ROW_ENDED, readPane: [RECHECK_GONE_ANSWER.answer()] })
-    const { h, p, model, record } = run
-    refuse(model, row.build())
-    let round = await recheckRound(h, p)
-    expect(round.verbs).toEqual(['status', 'readPane', 'findMissing', ...guardedLaunchCalls(verb)])
-    expect(h.latch.record(p)).toEqual({ ...record, probeDropped: true })
-    expect(h.episodeNotices).toHaveLength(1)
-    expect(h.errors.filter((line) => line === latchRecheckProbeDroppedLine(personaRefOf(h, p)))).toHaveLength(1)
-    // The probe dropped: the latched operation itself, no read-pane and no find-missing; refused again, still no post.
-    refuse(model, row.build())
-    round = await recheckRound(h, p)
-    expect(round.verbs).toEqual(['status', ...guardedLaunchCalls(verb)])
-    expect(h.episodeNotices).toHaveLength(1)
-    model.setState(AGENT_DIRECTOR_PENDING_STATE)
-    round = await recheckRound(h, p)
-    expect(round.verbs).toEqual(['status'])
-    // Ended again: retried, not refused, it clears with one post.
-    model.setState(LIVENESS_DEAD_ROW_ENDED)
-    round = await recheckRound(h, p)
-    const expected = ['status', ...guardedLaunchCalls(verb)]
-    expect(round.verbs.slice(0, expected.length)).toEqual(expected)
-    expect(h.episodeNotices.slice(1)).toEqual([recoveryPost(p, record, LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED)])
-    await stopApprover(h, p)
-  })
-
   test('a "this row\'s own id" retry refused with another case relatches with one post and drops no probe', async () => {
     const { h, p, model } = latchForRecheck(ownIdResumeRow(), { state: LIVENESS_DEAD_ROW_ENDED, readPane: [RECHECK_GONE_ANSWER.answer()] })
     model.scriptResumes(anotherStoreResumeRow().build())
@@ -7151,46 +5999,6 @@ describe('the cleared probe\'s find-missing and single retry: a refused run hold
     expect(h.episodeNotices).toHaveLength(2)
   })
 
-  /**
-   * The case table has no `resume` or reuse row with "the agent's pane was
-   * not found" (agent-director gives that case at a pane verb, not a launch),
-   * so that latch is set directly through the latch's `set`: the own-id
-   * launch row's record (its operation, its `ended` row state and session)
-   * with the pane-not-found case and no description.
-   */
-  const paneNotFoundOf = (ownId: ConflictCaseRow): RecheckLatchRow & { readonly name: string } => ({
-    name: `${ownId.name}, as "the agent's pane was not found"`,
-    latchOn: (latch, key) => {
-      const { refusedOperation, rowState, sessionName } = ownId.record(key)
-      return latch.set(key, { latchCase: LATCH_CASE_PANE_NOT_FOUND, refusedOperation, rowState, sessionName })
-    },
-  })
-  const PENDING_GATED = (
-    [
-      ['resume', ownIdResumeRow, 'resume'],
-      ['reuse', ownIdReuseRow, 'spawn'],
-    ] as const
-  ).flatMap(([label, ownId, verb]) => [
-    [`a ${label} latched on "this row's own id"`, (): RecheckLatchRow => ownId(), verb] as const,
-    [`a ${label} latched on "the agent's pane was not found"`, (): RecheckLatchRow => paneNotFoundOf(ownId()), verb] as const,
-  ])
-
-  test.each(PENDING_GATED)('HO rev 28, %s: while its row reads pending, no probe, no find-missing and no retry, round after round; once it reads ended, the probe, one find-missing and one retry, which clears with one post', async (_name, rowOf, verb) => {
-    const run = latchForRecheck(rowOf(), { state: AGENT_DIRECTOR_PENDING_STATE, readPane: [RECHECK_GONE_ANSWER.answer()] })
-    const { h, p, model, record } = run
-    for (let n = 0; n < 3; n++) {
-      const round = await recheckRound(h, p)
-      expect(round.verbs).toEqual(['status'])
-      expectStillLatched(run, round.at)
-    }
-    model.setState(LIVENESS_DEAD_ROW_ENDED)
-    const round = await recheckRound(h, p)
-    const expected = ['status', 'readPane', 'findMissing', ...guardedLaunchCalls(verb)]
-    expect(round.verbs.slice(0, expected.length)).toEqual(expected)
-    expect(round.verbs.filter((v) => v === 'findMissing' || LAUNCH_VERBS.has(v))).toEqual(['findMissing', verb])
-    expect(h.episodeNotices.slice(1)).toEqual([recoveryPost(p, record, LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED)])
-    await stopApprover(h, p)
-  })
 })
 
 // Bug b.xkd (b.av2 SR-6.3; SRJ-505, SRJ-506): the restart cap wins over the
@@ -7229,24 +6037,6 @@ describe('bug b.xkd: at the restart cap a round still reads, so the latch can st
     expect(lines[0]).toEndWith(`; no retry (${LATCH_RECHECK_AT_CAP})`)
     expectStillLatched(run, round.at)
     expect([h.stub.calls.spawnCalls, h.stub.calls.resumeCalls, getFailureCount(p)]).toEqual([[], [], RESTART_FAILURE_CAP])
-  })
-
-  test('the cap resets: the next cleared probe gets its find-missing and its single retry, which clears with one post', async () => {
-    const run = latchForRecheck(ownIdResumeRow(), { state: LIVENESS_DEAD_ROW_ENDED, readPane: [RECHECK_GONE_ANSWER.answer(), RECHECK_GONE_ANSWER.answer()] })
-    const { h, p, record } = run
-    putAtRestartCap(p)
-    let round = await recheckRound(h, p)
-    expect(round.verbs).toEqual(['status', 'readPane'])
-    expectStillLatched(run, round.at)
-
-    forgetFailures(p)
-    round = await recheckRound(h, p)
-
-    expect(round.verbs.slice(0, 5)).toEqual(['status', 'readPane', 'findMissing', 'get', 'resume'])
-    expect(recheckAtCapLinesOf(h, p)).toHaveLength(1)
-    expect(h.episodeNotices.slice(1)).toEqual([recoveryPost(p, record, LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED)])
-    expectClearedState(h, p)
-    await stopApprover(h, p)
   })
 
   // Bug b.ebi: only a clear by hand resets the restart failure count; the
@@ -7302,16 +6092,6 @@ function latchWithNote(removes: typeof PENDING_ROW_FIND_MISSING_REMOVES_NOTE | t
 }
 
 describe('after a clear by step 1: the bypassing find-missing comes before the next read; a note it removes does not relatch P, one still there relatches with one new post; a refused run makes no launch and leaves P to its retry timer (recovery harness; SRJ-506, SRJ-114, SRJ-120; E14 build)', () => {
-  test('a note the run removes: the post-run get reads no note, P stays unlatched and is retried at once', async () => {
-    const { h, p, model, record } = latchWithNote(PENDING_ROW_FIND_MISSING_REMOVES_NOTE)
-    const round = await recheckRound(h, p)
-    expect(round.verbs.slice(0, 3)).toEqual(['status', 'findMissing', 'get'])
-    expect(model.note()).toBe(false)
-    expect(h.episodeNotices.slice(1)).toEqual([recoveryPost(p, record, latchRecoveryReasonRowReads('waiting'))])
-    expect(h.latch.isLatched(p)).toBe(false)
-    expect(retryAtOnceLinesOf(h, p)).toHaveLength(1)
-    await stopApprover(h, p)
-  })
 
   test('a note still there after the run: P latches again on "conflicting labels" with one new post and no retry; its re-check timer is armed anew', async () => {
     const { h, p, record } = latchWithNote(PENDING_ROW_FIND_MISSING_REMOVES_NOTHING)
@@ -7367,60 +6147,30 @@ describe('"conflicting labels" on a pending row: a read-pane answering GONE (or 
   })
 })
 
-describe('the holds\' clears: ErrSpawnNotFound clears an unusable-name latch with one "Hold cleared" post and P comes up fresh; a launch-start latch clears on ErrSpawnNotFound, on ended or missing with exactly one bring-up retry, and on a hand-edited waiting row (recovery harness; SRJ-506, SRJ-512, SRJ-513; AC 77, AC 85, AC 86)', () => {
-  test.each(UNUSABLE_NAME_CASE_ROWS.map((row) => [row.name, row] as const))('AC 77, AC 85, an unusable-name latch (%s), its row gone: one hold recovery post with "its agent-director row is gone", one find-missing, then the plain first spawn (no resume, no reuse)', async (_name, row) => {
-    const { h, p, model } = latchForRecheck(row, { state: 'waiting' })
-    model.setState(PENDING_ROW_MODEL_NO_ROW)
-    const round = await recheckRound(h, p)
-    expect(round.verbs.slice(0, 4)).toEqual(['status', 'findMissing', 'status', 'spawn'])
-    expect(h.episodeNotices.slice(1)).toEqual([{ key: p, text: holdRecoveryText(LATCH_RECOVERY_REASON_ROW_GONE) }])
-    expect([h.stub.calls.resumeCalls, h.stub.calls.spawnCalls.map((call) => call.reuse_finished)]).toEqual([[], [undefined]])
-    expectClearedState(h, p)
-    await stopApprover(h, p)
-  })
-
-  const LAUNCH_START_ROW = LAUNCH_START_CASE_ROWS[0]!
-  test.each([
-    ['ErrSpawnNotFound: the row gone', PENDING_ROW_MODEL_NO_ROW, LATCH_RECOVERY_REASON_ROW_GONE, ['status', 'findMissing', 'status', 'spawn']],
-    ['ended', LIVENESS_DEAD_ROW_ENDED, latchRecoveryReasonRowReads(LIVENESS_DEAD_ROW_ENDED), ['status', 'status', 'spawn']],
-    ['missing', LIVENESS_DEAD_ROW_MISSING, latchRecoveryReasonRowReads(LIVENESS_DEAD_ROW_MISSING), ['status', 'status', 'spawn']],
-    ['waiting (edited by hand)', 'waiting', latchRecoveryReasonRowReads('waiting'), ['status', 'findMissing', 'status']],
-  ] as const)('AC 86, a launch-start latch whose row reads %s: one hold recovery post with its reason, then its calls (no find-missing before the finished row\'s one bring-up retry)', async (_label, state, reason, verbs) => {
-    const { h, p, model } = latchForRecheck(LAUNCH_START_ROW, { launchStartedAt: SAMPLE_LAUNCH_START_NONE })
-    model.setState(state)
-    const round = await recheckRound(h, p)
-    expect(round.verbs.slice(0, verbs.length)).toEqual([...verbs])
-    expect(round.verbs.filter((verb) => LAUNCH_VERBS.has(verb)).length).toBe((verbs as readonly string[]).includes('spawn') ? 1 : 0)
-    expect(h.episodeNotices.slice(1)).toEqual([{ key: p, text: holdRecoveryText(reason) }])
-    expectClearedState(h, p)
-    await stopApprover(h, p)
-  })
-})
-
 describe('E18: after a clear, three escalate-dead runs begin a new slow-recovery episode and post once (recovery harness; SRJ-610, SRJ-1016, SRJ-506)', () => {
   test('P\'s slow-recovery episode ended at its latch; once the latch clears, three escalate-dead runs whose re-probe reads the row live post the slow-recovery notice once more', async () => {
     const h = makeRecoveryHarness()
     harnesses.push(h)
     const [p] = h.keys as [string]
     const run = () => runRestartRetry(p, personaOf(h, p).working_directory, isLaunchInFlight)
-    h.script({ statusResult: cannedStatusResult({ state: 'working' }), readPaneError: errTmuxCaptureFailed() })
+    h.script({ statusResult: cannedStatusResult({ state: 'working' }), sendKeysError: errTmuxSendKeys() })
     for (let tick = 0; tick < SLOW_RECOVERY_POST_THRESHOLD; tick++) expect(await run()).toBe(RESTART_OUTCOME_RECONNECT_DEFERRED)
-    const workingRowConflict = livenessPaneConflictRowsAt('working-row verdict')[0]!
-    h.script({ readPaneError: workingRowConflict.build() })
+    const reconnectConflict = reconnectConflictRowsAt('working')[0]!
+    h.script({ sendKeysError: reconnectConflict.build() })
     await run()
     await h.settle()
     const record = h.latch.record(p)!
     expect([h.slowRecovery.count(p), h.slowRecovery.isOpen(p)]).toEqual([0, false])
 
     expect(h.latchRecheck.clear(p, LATCH_RECOVERY_REASON_CLEARED_BY_HAND)).toBe(true)
-    h.script({ readPaneError: errTmuxCaptureFailed() })
+    h.script({ sendKeysError: errTmuxSendKeys() })
     for (let tick = 0; tick < SLOW_RECOVERY_POST_THRESHOLD; tick++) expect(await run()).toBe(RESTART_OUTCOME_RECONNECT_DEFERRED)
     await h.settle()
 
     expect([h.slowRecovery.count(p), h.slowRecovery.isOpen(p)]).toEqual([SLOW_RECOVERY_POST_THRESHOLD, true])
     expect(h.episodeNotices).toEqual([
       { key: p, text: slowRecoveryText(p) },
-      { key: p, text: workingRowConflict.notice.text },
+      { key: p, text: reconnectConflict.notice.text },
       recoveryPost(p, record, LATCH_RECOVERY_REASON_CLEARED_BY_HAND),
       { key: p, text: slowRecoveryText(p) },
     ])
@@ -7428,72 +6178,6 @@ describe('E18: after a clear, three escalate-dead runs begin a new slow-recovery
 })
 
 describe('the after-clear job runs in P\'s serializer turn right after the round: no other serialized work and no health-tick read of P between the clear and its find-missing, and P is held active until the job ends (recovery harness; SRJ-506)', () => {
-  test('P\'s step-1 status is held while another operation for P is queued and a health tick runs at the find-missing: the queued operation runs only after the retry at once, and the tick reads nothing of P', async () => {
-    const { h, p, model } = latchForRecheck(anotherStoreResumeRow(), { state: LIVENESS_DEAD_ROW_ENDED })
-    model.setState('waiting')
-    const order: string[] = []
-    const gate = Promise.withResolvers<void>()
-    const reached = Promise.withResolvers<void>()
-    const id = personaInstanceId(p)
-    const status = h.stub.client.status.bind(h.stub.client)
-    let held = true
-    h.stub.client.status = async (params) => {
-      if (params.instance_id === id) {
-        order.push('status')
-        if (held) {
-          held = false
-          reached.resolve()
-          await gate.promise
-        }
-      }
-      return status(params)
-    }
-    const scheduled: string[] = []
-    initHealthCheck({
-      isSessionAlive: _buildIsSessionAliveAdapter(() => h.config),
-      isSessionConnected: () => false,
-      isRestartPendingOrActive,
-      isLaunchInFlight,
-      isLatched: (key) => h.latch.isLatched(key),
-      isAtCap: (key) => isAtCap(key, RESTART_FAILURE_CAP),
-      statRoute: async () => true,
-      scheduleRestart: (key) => {
-        scheduled.push(key)
-      },
-      isShuttingDown: () => false,
-      getPersonas: () => ({ [p]: personaOf(h, p).working_directory }),
-      endTmuxUnresponsive: () => {},
-      onTickEnd: () => {},
-      now: h.clock.now,
-    })
-    const tick = captureTimer('setInterval', () => startHealthCheck(1))
-    const findMissing = h.stub.client.findMissing.bind(h.stub.client)
-    h.stub.client.findMissing = async (params) => {
-      order.push(`findMissing latched=${h.latch.isLatched(p)} active=${isRestartPendingOrActive(p)}`)
-      await tick()
-      order.push('tick done')
-      return findMissing(params)
-    }
-
-    const advancing = h.advance(LATCH_RECHECK_INTERVAL_MS)
-    await reached.promise
-    expect(order).toEqual(['status'])
-    const other = h.serializer.run(p, () => {
-      order.push(`other active=${isRestartPendingOrActive(p)}`)
-    })
-    gate.resolve()
-    await advancing
-    await other
-    await h.settle()
-    stopHealthCheck()
-
-    expect(order.slice(0, 3)).toEqual(['status', 'findMissing latched=false active=true', 'tick done'])
-    expect(order.at(-1)).toBe('other active=false')
-    expect(order.slice(3, -1).every((entry) => entry === 'status')).toBe(true)
-    expect(order.slice(3, -1).length).toBeGreaterThan(0)
-    expect([scheduled, retryAtOnceLinesOf(h, p).length, isRestartPendingOrActive(p)]).toEqual([[], 1, false])
-    await stopApprover(h, p)
-  })
 
   test('P latched again between the round\'s clear and the run it owes: the run calls nothing for P and logs one "latched again" line, and the new latch stays with its one post and its re-check timer', async () => {
     const { h, p, q, model, record } = latchForRecheck(anotherStoreResumeRow(), { state: LIVENESS_DEAD_ROW_ENDED })
@@ -7579,7 +6263,6 @@ describe('the exported after-clear sequence (runLatchClearSequence) and the buil
     expect(verbs.slice(0, 2)).toEqual(['findMissing', 'status'])
     expect([deps.submitted, h.episodeNotices.length, isRestartPendingOrActive(p)]).toEqual([[p], 2, false])
     expect(clearedLinesIn(h.errors, p)).toEqual([latchClearedLine(p, record, LATCH_RECOVERY_REASON_CLEARED_BY_HAND, true)])
-    await stopApprover(h, p)
   })
 
   test('the builder\'s clearAndRecover is the same sequence over its clear entry, with its find-missing first', async () => {
@@ -7591,7 +6274,6 @@ describe('the exported after-clear sequence (runLatchClearSequence) and the buil
     await h.settle()
     expect(personaCallsFrom(h, p, from).map((call) => call.verb).slice(0, 2)).toEqual(['findMissing', 'status'])
     expect(h.episodeNotices.slice(1)).toEqual([recoveryPost(p, record, LATCH_RECOVERY_REASON_CLEARED_BY_HAND)])
-    await stopApprover(h, p)
   })
 
   test('the builder\'s clear alone posts once, stops the timer and calls nothing; a second clear does nothing', () => {
@@ -7623,7 +6305,6 @@ describe('the exported after-clear sequence (runLatchClearSequence) and the buil
     expect(await answer.done).toEqual({ kind: LATCH_CLEAR_SEQUENCE_RETRIED, outcome: RESTART_OUTCOME_LAUNCHED })
     await h.settle()
     expect(resets).toHaveLength(1)
-    await stopApprover(h, p)
   })
 
   test('bug b.ebi: with no reset handed in, a clear of a P at the restart cap resets nothing: cleared true with its count kept, and the retry at once answers capped with nothing launched', async () => {
@@ -7645,7 +6326,6 @@ describe('the exported after-clear sequence (runLatchClearSequence) and the buil
     })
     await h.settle()
     expect(personaCallsFrom(h, p, from).map((call) => call.verb)).not.toContain('findMissing')
-    await stopApprover(h, p)
   })
 
   // The sequence's four failure lines, from their builders; `persona=<key>`
@@ -7738,7 +6418,6 @@ describe('the exported after-clear sequence (runLatchClearSequence) and the buil
     expectClearedState(h, p)
     expect(personaCallsFrom(h, p, from).map((call) => call.verb).slice(0, 3)).toEqual(['findMissing', 'status', 'spawn'])
     expect(isRestartPendingOrActive(p)).toBe(false)
-    await stopApprover(h, p)
   })
 
   test('a retry at once that throws answers retry-failed with one line, after the find-missing; P\'s hold is released', async () => {
@@ -7789,7 +6468,6 @@ describe('the exported after-clear sequence (runLatchClearSequence) and the buil
     expectClearedState(h, p)
     expect(personaCallsFrom(h, p, from).map((call) => call.verb).slice(0, 2)).toEqual(['findMissing', 'status'])
     expect(h.errors.filter((line) => line === latchClearRelatchedBeforeRunLine(personaRefOf(h, p)))).toEqual([])
-    await stopApprover(h, p)
   })
 
   test('its find-missing refused (UNAVAILABLE): find-missing-refused, no launch, P\'s retry timer armed', async () => {
@@ -7908,13 +6586,12 @@ describe('the clear by hand (clear-latch): in P\'s serializer turn, one "cleared
     expect(watched.map((call) => call.verb).slice(0, 2)).toEqual(['findMissing', 'status'])
     expect([watched.filter((call) => call.verb === 'findMissing').length, h.episodeNotices.length, retryAtOnceLinesOf(h, p).length]).toEqual([1, 2, 1])
     expect([h.latch.isLatched(q), personaCallCounts(h, q)]).toEqual([false, {}])
-    await stopApprover(h, p)
   })
 
   test('order: the recovery post, then one bypassing find-missing (a new call inside the memo window an ordinary run just filled), then P\'s next row read, then its retry at once, all at the clear\'s clock time', async () => {
     const { h, p, q } = latchForRecheck(anotherStoreResumeRow(), { state: LIVENESS_DEAD_ROW_ENDED })
-    await sweepDeadTmuxChannel(q, ESCALATE_DEAD_WAITING_ROW_PANE_GONE)
-    await sweepDeadTmuxChannel(q, ESCALATE_DEAD_WAITING_ROW_PANE_GONE)
+    await sweepDeadTmuxChannel(q, 'prompt-row-tmux-gone')
+    await sweepDeadTmuxChannel(q, 'prompt-row-tmux-gone')
     // The second ordinary run reused the memo: one call so far.
     expect(h.callTimes('findMissing')).toHaveLength(1)
     const watched = watchCalls(h, p)
@@ -7936,7 +6613,6 @@ describe('the clear by hand (clear-latch): in P\'s serializer turn, one "cleared
       ['spawn', 2, false],
     ])
     expect(retryAtOnceLinesOf(h, p)).toEqual([latchClearRetryAnsweredLine(personaRefOf(h, p), RESTART_OUTCOME_LAUNCHED)])
-    await stopApprover(h, p)
   })
 
   test('in P\'s turn: with P\'s turn held by another operation, the route has not answered, nothing is posted and P is still latched; once the turn is released the clear runs, and only then the route answers 200 with cleared true', async () => {
@@ -7955,7 +6631,6 @@ describe('the clear by hand (clear-latch): in P\'s serializer turn, one "cleared
     expect(h.episodeNotices.slice(1)).toEqual([recoveryPost(p, record, LATCH_RECOVERY_REASON_CLEARED_BY_HAND)])
     await settleClearJob(h, p)
     expect([h.callTimes('findMissing').length, retryAtOnceLinesOf(h, p).length]).toEqual([1, 1])
-    await stopApprover(h, p)
   })
 
   test.each([
@@ -8000,7 +6675,6 @@ describe('the clear by hand (clear-latch): in P\'s serializer turn, one "cleared
     expect(h.episodeNotices.slice(1)).toEqual([recoveryPost(p, record, reason)])
     expect(clearedLinesIn(h.errors, p)).toEqual([latchClearedLine(p, record, reason, true)])
     expect([h.callTimes('findMissing').length, retryAtOnceLinesOf(h, p).length, h.latch.isLatched(p)]).toEqual([1, 1, false])
-    await stopApprover(h, p)
   })
 
   test('the answer before the run: with the bypassing find-missing held open, the route has already answered 200 with cleared true; once it is released, P\'s row read and the retry at once follow in order', async () => {
@@ -8018,7 +6692,6 @@ describe('the clear by hand (clear-latch): in P\'s serializer turn, one "cleared
     await settleClearJob(h, p)
     expect(watched.map((call) => call.verb).slice(0, 3)).toEqual(['findMissing', 'status', 'spawn'])
     expect([retryAtOnceLinesOf(h, p).length, isRestartPendingOrActive(p)]).toEqual([1, false])
-    await stopApprover(h, p)
   })
 
   test.each([
@@ -8037,7 +6710,6 @@ describe('the clear by hand (clear-latch): in P\'s serializer turn, one "cleared
     expect(h.episodeNotices.slice(1)).toEqual([recoveryPost(p, record, LATCH_RECOVERY_REASON_CLEARED_BY_HAND)])
     expectClearedState(h, p)
     expect([h.callTimes('findMissing').length, retryAtOnceLinesOf(h, p).length]).toEqual([1, 1])
-    await stopApprover(h, p)
   })
 
   test('a provenance_conflict note the bypassing run removes does not relatch P: the post-run get reads no note, one recovery post, and P retried at once', async () => {
@@ -8049,7 +6721,6 @@ describe('the clear by hand (clear-latch): in P\'s serializer turn, one "cleared
     expect(model.note()).toBe(false)
     expect(h.episodeNotices.slice(1)).toEqual([recoveryPost(p, record, LATCH_RECOVERY_REASON_CLEARED_BY_HAND)])
     expect([h.latch.isLatched(p), retryAtOnceLinesOf(h, p).length]).toEqual([false, 1])
-    await stopApprover(h, p)
   })
 
   test('a provenance_conflict note still there after the bypassing run relatches P on "conflicting labels" with one new post and no second recovery post; no retry, its re-check timer armed', async () => {
@@ -8110,7 +6781,6 @@ describe('the clear by hand (clear-latch): in P\'s serializer turn, one "cleared
     await settleClearJob(h, p)
     expect(h.episodeNotices.slice(1)).toEqual([recoveryPost(p, record, LATCH_RECOVERY_REASON_CLEARED_BY_HAND)])
     expect([clearedLinesIn(h.errors, p).length, h.callTimes('findMissing').length, retryAtOnceLinesOf(h, p).length]).toEqual([1, 1, 1])
-    await stopApprover(h, p)
   })
 
   test.each([
@@ -8133,7 +6803,6 @@ describe('the clear by hand (clear-latch): in P\'s serializer turn, one "cleared
       clearedLinesIn(h.errors, q),
       getFailureCount(q),
     ]).toEqual([qRecord, latchQ ? 1 : 0, latchQ, {}, false, [], RESTART_FAILURE_CAP])
-    await stopApprover(h, p)
   })
 
   test.each([
@@ -8182,7 +6851,6 @@ describe('the clear by hand (clear-latch): in P\'s serializer turn, one "cleared
     expect(retryAtOnceLinesOf(h, p)).toEqual([latchClearRetryAnsweredLine(personaRefOf(h, p), RESTART_OUTCOME_LAUNCHED)])
     expect(h.errors.filter((line) => line === restartRetryCapSkippedLine(p))).toEqual([])
     expect([getFailureCount(p), h.capReached]).toEqual([0, []])
-    await stopApprover(h, p)
   })
 })
 
@@ -8239,3 +6907,32 @@ describe('the recovery harness: overlapping harnesses give SLACK_STATE_DIR and c
     }
   })
 })
+
+interface WatchedCall {
+  readonly verb: string
+  readonly posts: number
+  readonly latched: boolean
+  readonly active: boolean
+}
+
+/**
+ * Record, at each call of `verbs` on the harness's stub client for persona
+ * `key` (or naming no instance, as `findMissing`), the verb, the notice posts
+ * made by then, and whether P was latched and held active then.
+ */
+function watchCalls(h: RecoveryHarness, key: string, verbs: readonly RecoveryStubVerb[] = ['status', 'get', 'readPane', 'findMissing', 'spawn', 'resume']): WatchedCall[] {
+  const seen: WatchedCall[] = []
+  const id = personaInstanceId(key)
+  const client = h.stub.client as unknown as Record<string, (params?: { instance_id?: unknown }) => unknown>
+  for (const verb of verbs) {
+    const original = client[verb]!.bind(client)
+    client[verb] = (params) => {
+      const named = params?.instance_id
+      if (named === undefined || named === id) {
+        seen.push({ verb, posts: h.episodeNotices.length, latched: h.latch.isLatched(key), active: isRestartPendingOrActive(key) })
+      }
+      return original(params)
+    }
+  }
+  return seen
+}

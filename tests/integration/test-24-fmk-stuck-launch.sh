@@ -1,446 +1,8 @@
 #!/usr/bin/env bash
-# Test 24 (HO §7 scenario 21; b.jg5 SRJ-1423, SRJ-410, SRJ-412, SRJ-404,
-# SRJ-405, SRJ-406, SRJ-1017, SRJ-120, SRJ-705, SRJ-613, SRJ-501, SRJ-1004,
-# SRJ-505, SRJ-1306, SRJ-1401, SRJ-1418; AC 9): a
-# launch stuck at a startup prompt CSCB's approver does not recognise, in
-# legs run in this order:
-# - the own-launch leg (`leg_own_stuck_launch`): a resumed launch this server
-#   started, held at the stub's unrecognised dialog, stays `pending`; CSCB
-#   makes no `find-missing` run before G from its launch start; after G its
-#   pending-row rule's runs, at most one per retry-timer interval, leave the
-#   row unjudged (the worker's process is seen), and each is treated as not
-#   judged; at B the approver stops with a log line only, the rule's run at
-#   that stop makes one relaunching post, then one `kill` with `kill_sent`
-#   true, which ends the worker; a `find-missing` run after the kill marks the
-#   row `missing`, and a `resume` of the same session id follows, with no
-#   counted failure and no other post;
-# - the other-process leg (`leg_other_process`): a `pending` row the server
-#   did not launch (the harness's own `resume`, playing another process) gets
-#   one held post naming the session and a human's remedies, no second held
-#   post at a later retry, and no `kill`;
-# - the relabelled-session leg (`legs_relabelled_session_and_grouped_viewer`,
-#   persona R): CSCB's own resumed launch, held as in the own-launch leg,
-#   whose session the harness relabels to name an earlier launch of
-#   `cscb_<R>`, so the session is a leftover to agent-director while its
-#   worker still runs; at B one relaunching post, then one `kill`, answered
-#   CONFLICT ("not this launch's session"); R latches with one CONFLICT post,
-#   and the `kill` is not retried through a later latch re-check;
-# - the grouped-viewer leg (the same function and server run, persona V):
-#   CSCB's own resumed launch, held as above, with a grouped viewer session the
-#   harness attaches to its session; at B one relaunching post and one `kill`
-#   with `kill_sent` true, and V's worker process is gone.
-#
-# The fmk set-up (lib/scenario.sh, fmk mode: TEST_NAME carries `-fmk-`):
-# - its own HOME, agent-director store and tmux server under SCENARIO_ROOT;
-#   the release installed through its install.sh, behind the agent-director
-#   shim (agent-director-admin too); agent-director's default settings (no
-#   config.toml, so no `[tmux]` table);
-# - the tmux shim first on every CSCB process's PATH, in `log` mode
-#   throughout;
-# - the stub as `claude`: `startup-trust` (no selection) in a working
-#   directory until a leg selects `unrecognised-dialog` (a startup dialog no
-#   approver needle matches; it reports in on the first line that reaches its
-#   stdin) or `at-once` there (`stub_mode`; a stub reads its directory's
-#   selection when it starts, so a selection holds from the next launch);
-# - CSCB's config: `health_check_interval` 0 (ruling S3: no tick is needed;
-#   the retry timer drives every pending-row run), `session_restart_delay` 5,
-#   `exit_timeout` 5;
-# - the live server against the Slack stub (fixtures/slack-stub-server.ts
-#   with `--record`; posts are read from that record), one stub per server
-#   run, answering ok only for that run's personas' token pairs, and
-#   labelling each post with its persona's token suffix;
-# - the own-launch and other-process legs each in its own state dir
-#   (`new_state_dir`), with one persona, so the leg's persona's `pending` row
-#   is the only one the pending-row rule runs on (`find-missing` carries no
-#   instance id); the own-launch leg runs alone;
-# - the relabelled-session and grouped-viewer legs in one state dir and one
-#   server run, with R and V: a `find-missing` run judges both rows, so no
-#   check of these legs counts `find-missing` runs, and every check is
-#   attributed to one persona (its row id in the agent-director calls, its
-#   key or reference in the log lines, its token suffix in the posts).
-#
-# The own-launch leg (`leg_own_stuck_launch`), in run order, persona P
-# (working directory `own`). Steps marked [harness] are the harness playing a
-# human from the scenario's own shell; no CSCB process makes them.
-#   1. The live start brings P up: the stub holds at the startup-trust dialog,
-#      the approver clears it, the row reads `waiting` with a
-#      session_id, the server registers the stub's MCP session as P's,
-#      and the bring-up's approver has stopped (no bot-server pane read of P
-#      for APPROVER_QUIET_S).
-#   2. A plain `stop` (ruling S4), which leaves the worker running; [harness]
-#      the worker ends with the stub's sentinel, sent into P's pane with the
-#      real tmux, and a harness `get` reads the row `ended` (or `missing`)
-#      with its session_id.
-#   3. [harness] P's working directory is selected for `unrecognised-dialog`,
-#      then a live start: its start pass resumes P (the collision ladder's
-#      plain spawn collides, its `get` reads the finished row, then one
-#      `resume`), a launch this server makes.
-#   4. [harness] The row reads `pending` with the same session_id and a
-#      launch start L that parses; P's pane shows the stub's unrecognised
-#      dialog (UNRECOGNISED_DIALOG_LINE, waited for up to DIALOG_WAIT_S) and
-#      neither approver needle (`hold_at_unrecognised_dialog`); the worker's
-#      process (the pane's process) is noted.
-#   5. [harness] P's working directory is selected for `at-once`: the held
-#      stub keeps its dialog, and the relaunch, the next launch in the
-#      directory, reports in at once.
-#   6. [harness] The row is read every HOLD_POLL_S until the bot server's
-#      `kill` of P's row is in the shim's log, bounded at ABORT_WAIT_S from L.
-#   7. [harness] The row is read until it is live, bounded at RELAUNCH_WAIT_S
-#      from L: it reads `waiting` with the same session_id, and the
-#      server registers the relaunched stub's session as P's.
-#   8. Checks, over the bot server's agent-director calls (`call_table`) and
-#      its log lines from the start of step 3:
-#      - every harness read before the kill reads `pending` with launch
-#        start L, the last within HOLD_READ_GAP_S of the kill
-#        (`reads_before_kill_pending`);
-#      - no bot-server `find-missing` from L to G after it;
-#      - the bot server's `find-missing` runs from G to the kill: the run at
-#        the approver's stop is the first after the approver's line at B, and
-#        the last before the kill; every other run is a retry's, at least one,
-#        each with one pending-row rule round line of origin
-#        PENDING_ROW_RULE_ORIGIN_RETRY (`pendingRowRuleRoundLineHead`) whose
-#        run reads
-#        PENDING_ROW_RUN_NOT_JUDGED, and consecutive runs are at least
-#        2 × UNAVAILABLE_RETRY_BASE_S apart (see the waits), the gap that
-#        ends at the approver's stop's run excepted;
-#      - exactly one server.log line equal to the approver's line at B
-#        (`approverBoundLine`), measured from the launch start, at B or later
-#        (within 0.5 s, the log's clock) and before the kill
-#        (`expect_approver_line_at_b`);
-#      - the rule's run at that stop: one round line of origin
-#        PENDING_ROW_RULE_ORIGIN_APPROVER_STOP (`pendingRowRuleRoundLineHead`)
-#        whose run reads
-#        PENDING_ROW_RUN_NOT_JUDGED, and exactly one line equal to
-#        `pendingRowRuleApproverStopRelaunchLine` (the relaunching post, the
-#        abort, the live-row sequence started);
-#      - exactly one relaunching poster line (`stuckLaunchPostLine`, mark
-#        `relaunching`, answer `posted`), written at or after the approver's
-#        line at B and before the kill (`expect_relaunching_post_line`), and
-#        no held poster line with the answer `posted`, in either form of the
-#        held text (`stuckLaunchHeldPostedLines`, `expect_no_held_posted`);
-#      - exactly one post in the Slack stub's record from the start on: the
-#        relaunching post, equal to `stuckLaunchRelaunchingPost` (so no post
-#        from the approver, no spawn-failure post and no held post);
-#      - exactly one `kill` of P's row from any CSCB process in the leg, the
-#        bot server's, carrying no `--include-finished` (`one_abort_kill`);
-#        one abort kill line
-#        starting with `stuckLaunchAbortKillSucceededHead` (`kill_sent`
-#        true); P's worker process is gone after it;
-#      - a bot-server `find-missing` after the kill, then one live-row
-#        sequence run line marking the row `missing`
-#        (`liveRowSequenceStep3MarkedMissingLines`), then a bot-server `get`
-#        of the row, then the leg's second bot-server `resume` of the row,
-#        after its last `find-missing`;
-#      - exactly two bot-server `resume`s of P's row in the leg (the start
-#        pass's, before the kill, and the relaunch, after it); no reuse spawn
-#        of P's row, and no spawn of it after the start pass's `resume`;
-#      - no counted failure: no server.log line naming P with a counted
-#        launch failure or the restart cap (`expect_no_counted_failure`).
-#   The server is then stopped with a plain `stop`, and [harness] P's worker
-#   ends with the sentinel.
-# Recorded, not asserted (ruling S8): the start pass's summary, the bot
-# server's calls of P's row and its `find-missing` runs with their times from
-# L, P's pending-row rule, retry-timer, abort and live-row sequence lines,
-# the startup-errors.log lines naming P, the trail's kill records for P's row
-# (`ad.kill.called`), and the relaunched worker's process.
-#
-# The other-process leg (`leg_other_process`), in run order, persona Q
-# (working directory `other`); the leg's server launches nothing for Q's
-# held row, so its `pending` row is never CSCB's own (SRJ-412).
-#   1. The live start brings Q up as in the own-launch leg's step 1.
-#   2. A plain `stop`; [harness] the worker ends with the sentinel, and the
-#      row reads `ended` (or `missing`) with its session_id.
-#   3. [harness] Q's working directory is selected for `unrecognised-dialog`.
-#   4. [harness, playing another process] The harness resumes Q's row from
-#      the scenario's own shell (`resume --instance-id cscb_<Q>`
-#      through the harness call). The row reads `pending` with the same
-#      session_id and a launch start L; Q's pane shows the stub's
-#      unrecognised dialog and neither approver needle.
-#   5. [harness] At L + OTHER_START_AFTER_S, a live start: its start pass
-#      finds Q's row `pending` (its collision ladder's plain spawn collides,
-#      and its collision line reads `pending`), which arms Q's retry timer.
-#   6. [harness] The leg waits for the held poster line (`stuckLaunchPostLine`,
-#      mark `held`, answer `posted`), bounded at HELD_WAIT_S from L, then for
-#      a later retry's held poster line with the answer `already-posted`,
-#      bounded at AGAIN_WAIT_S from the first.
-#   7. Checks, over every process's agent-director calls of Q's row and the
-#      leg's log lines and posts:
-#      - the only `resume` of Q's row is the harness's: one `call` line, whose
-#        parent is the scenario's own shell;
-#      - no CSCB process makes a reuse spawn or a `resume` of Q's row; the
-#        bot server's one plain spawn of it is its start pass's ladder's
-#        first step, followed by its collision line reading `pending`;
-#      - no `kill` of Q's row from any CSCB process;
-#      - exactly one post in the Slack stub's record from the start of step
-#        5 on: the held post, equal to `stuckLaunchHeldPost` for Q's launch
-#        start L with the attach remedy (`false`); no relaunching poster line
-#        names Q.
-#   8. [harness, playing a human] Enter is sent into Q's pane
-#      (`stub_press_enter`): the stub reports in and the row reads `waiting`
-#      within REPORT_WAIT_S. The record still holds the one held post. The
-#      server is then stopped with a plain `stop`, and [harness] Q's worker
-#      ends with the sentinel.
-# Recorded, not asserted (ruling S8): the start pass's summary, the bot
-# server's calls of Q's row and its `find-missing` runs with their times from
-# L, Q's pending-row rule and retry-timer lines.
-#
-# The relabelled-session and grouped-viewer legs
-# (`legs_relabelled_session_and_grouped_viewer`), in run order, in one server
-# run: persona R (working directory `relabel`) and persona V (working
-# directory `viewer`). The relabel and the viewer are the harness's, from the
-# scenario's own shell, and the relabel follows lib/scenario.sh's seeding
-# rules (b.jg5 SRJ-1306, agent-director's handoff rev 15 and rev 17): the
-# relabelled `@ad_owner` label keeps R's instance id and ends with the
-# scenario store's own store id (`ad_store_id`), and R's worker pane carries
-# `@ad_pane` = `<the label's token> <the pane's id>`, so agent-director finds
-# the leftover's pane through it and the laps' `read-pane` returns that pane
-# (SRJ-613).
-#   1. The live start brings R and V up: the start pass completes with both,
-#      and each is brought up as in the own-launch leg's step 1.
-#   2. A plain `stop`; [harness] both workers end with the sentinel, and each
-#      row reads `ended` (or `missing`) with its session_id.
-#   3. [harness] Both working directories are selected for
-#      `unrecognised-dialog`, then a live start: its start pass resumes R and
-#      V, launches this server makes.
-#   4. [harness] Each row reads `pending` with its session_id and a
-#      launch start (L_R, L_V) that parses; each pane shows the stub's
-#      unrecognised dialog and neither approver needle; each worker's process
-#      is noted.
-#   5. [harness] V's working directory is selected for `at-once` (its
-#      relaunch reports in at once); [harness] a grouped viewer session is
-#      attached to V's session (`attach_viewer`: `new-session -t`, in the
-#      same session group).
-#   6. [harness] R's own session is relabelled with an earlier launch's
-#      token. Its labels are drawn and checked first, as `relabel_session`
-#      draws and checks them, with nothing written (`plan_relabel`: a fresh
-#      token other than the label's and the row's current launch token).
-#      They are written in one tmux invocation (`write_relabel`: both
-#      `set-option`s one command list, which the tmux server runs as one
-#      step, so no agent-director lookup or pane listing reads one label new
-#      and the other old). The write is anchored on the approver's lap: after
-#      its first lap of R's row (its first bot-server `status` of R's row
-#      after the harness's first `pending` read), on its next bot-server
-#      `read-pane` of R's row, once that call's process has exited (its
-#      answer), and only while the next lap is due (that `read-pane`'s time
-#      plus DIALOG_POLL_INTERVAL_MS) at least RELABEL_MARGIN_S +
-#      RELABEL_WRITE_S later; otherwise on the next lap's `read-pane`, for
-#      at most RELABEL_ATTEMPTS laps (else the leg fails). Checked there:
-#      the relabel is before B from L_R; no bot-server `status` or
-#      `read-pane` of R's row falls between the anchoring `read-pane` and
-#      the relabel's end, read once the next lap's `status` is logged (else
-#      the leg fails: the relabel raced the approver's lap); the session's
-#      `@ad_owner` reads `ad_owner_label <token> <session id> cscb_<R>
-#      <store id>`, ending with the scenario store's own id; the worker
-#      pane's `@ad_pane` reads `<token> <pane id>`; that pane runs R's
-#      worker.
-#   7. [harness] Both rows are read every HOLD_POLL_S until the bot server's
-#      `kill` of each is in the shim's log, bounded at ABORT_WAIT_S from the
-#      later launch start (each persona's reads stop at its own kill).
-#   8. [harness] V's worker process is gone within GONE_WAIT_S; V's row reads
-#      `waiting` with its session_id (its relaunch) and the server
-#      registers its session; R's latch-set line comes within LATCH_WAIT_S;
-#      then the leg waits for R's first latch re-check round line, bounded at
-#      the re-check interval plus RECHECK_SLACK_S.
-#   9. The relabelled-session leg's checks (`check_relabelled_session`), over
-#      the bot server's agent-director calls (`call_table`) and the log lines
-#      and posts from the start of step 3:
-#      - exactly one `kill` of R's row from any CSCB process in the leg, the
-#        bot server's, carrying no `--include-finished`, through R's latch
-#        re-check (so never retried);
-#      - every harness read of R's row before the kill reads `pending` with
-#        launch start L_R, the last within HOLD_READ_GAP_S of the kill (a
-#        `missing` read there is agent-director judging the row before the
-#        abort, a finding to report, never a check to weaken);
-#      - exactly one server.log line equal to R's approver line at B
-#        (`approverBoundLine`), at B or later and before the kill; exactly one
-#        relaunching poster line for R (`stuckLaunchPostLine`, mark
-#        `relaunching`, answer `posted`), at or after that line and before
-#        the kill, and no held poster line with the answer `posted`, in either
-#        form of the held text;
-#      - exactly one abort kill line for R starting with
-#        `stuckLaunchAbortKillConflictHead` (answer latched, outcome not
-#        killed, class CONFLICT, `ErrTmuxSessionConflict`) whose description
-#        carries CONFLICT_NOT_THIS_LAUNCH_PHRASE, logged after the kill, and
-#        none starting with `stuckLaunchAbortKillSucceededHead`;
-#      - exactly one latch-set line for R (`conflictLatchSetLineHead`,
-#        `latched`), after the kill, and no relatch line; agent-director's
-#        description in it carries CONFLICT_NOT_THIS_LAUNCH_PHRASE, and the
-#        line equals `conflictNotThisLaunchLatchedLine` for that description
-#        (case "not this launch's session", refused operation "P's next check
-#        or recovery", state `pending`);
-#      - exactly two posts for R in the Slack stub's record from the start on:
-#        the relaunching post (`stuckLaunchRelaunchingPost`), then the
-#        CONFLICT post (`conflictNotThisLaunchPost` for that description);
-#      - at least one latch re-check round line for R
-#        (`latchRecheckNotThisLaunchRoundHead`), after the latch;
-#      - exactly one bot-server `resume` of R's row in the leg (the start
-#        pass's, before the kill) and no spawn of it after that `resume`;
-#      - no counted failure: no server.log line naming R with a counted
-#        launch failure or the restart cap.
-#   10. The grouped-viewer leg's checks (`check_grouped_viewer`), over the
-#      same calls, lines and posts:
-#      - exactly one `kill` of V's row from any CSCB process in the leg, the
-#        bot server's, carrying no `--include-finished`;
-#      - every harness read of V's row before the kill reads `pending` with
-#        launch start L_V, the last within HOLD_READ_GAP_S of the kill;
-#      - exactly one abort kill line for V starting with
-#        `stuckLaunchAbortKillSucceededHead` (`kill_sent` true);
-#      - exactly one server.log line equal to V's approver line at B
-#        (`approverBoundLine`), at B from L_V or later and before the kill;
-#      - exactly one relaunching poster line for V, at or after that line and
-#        before the kill, and exactly one post for V in the record: the
-#        relaunching post;
-#      - V's worker process is gone.
-#   The server is then stopped with a plain `stop`, and [harness] V's worker
-#   ends with the sentinel, and R's held worker too.
-# Recorded, not asserted: the start pass's summary, the bot server's
-# `find-missing` runs with their times from L_R, the relabel's time from L_R
-# and the approver's first lap's, the relabel's margins (its start less the
-# anchoring `read-pane`, the next lap's due time and its logged `status`
-# less the relabel's end, and its length), R's abort kill and latch-set lines, the
-# bot server's `read-pane` calls of R's row from the relabel to the kill, R's
-# re-check round lines and the bot server's calls of R's row after the latch,
-# R's row after the re-check and after its worker ended, R's pending-row
-# rule, abort and latch lines, V's abort lines, and whether the viewer
-# session remains after V's kill.
-#
-# Waits and their derivation (seconds). G is agent-director's default pending
-# grace period (60 s), B CSCB's launch bound at agent-director's default
-# settings (300 s), UNAVAILABLE_RETRY_BASE_S (30 s) and
-# UNAVAILABLE_RETRY_CEILING_S (300 s) the retry timer's first and longest
-# waits, all printed from the installed package (below):
-# - the retry timer's waits double from UNAVAILABLE_RETRY_BASE_S after each
-#   retry that finds the row still `pending` (b.jg5 SRJ-302); its first retry
-#   comes UNAVAILABLE_RETRY_BASE_S after the launch returned, before G
-#   (checked: G > UNAVAILABLE_RETRY_BASE_S), so it finds the row `pending`,
-#   and every wait after it is at least 2 × UNAVAILABLE_RETRY_BASE_S: the
-#   bound the own-launch leg's runs from G to the abort are held to (SRJ-410:
-#   "at least 60 s apart once a retry has found the row pending");
-# - APPROVER_QUIET_S is three laps at the approver's pace before G
-#   (DIALOG_POLL_INTERVAL_MS), rounded up to whole seconds: a running
-#   approver reads the pane every lap while the row is pending, so that long
-#   with no pane read after the row read `waiting` means it has stopped;
-# - ABORT_WAIT_S = B + ABORT_SLACK_S from L: the approver stops at B from the
-#   launch start, and the rule's run at that stop makes its lap, its run, its
-#   `get`, the post and the kill;
-# - RELAUNCH_WAIT_S = B + UNAVAILABLE_RETRY_CEILING_S + RELAUNCH_SLACK_S from
-#   L: the abort comes at B, and no retry wait is longer than the ceiling;
-#   RELAUNCH_SLACK_S covers the sequence's `find-missing` runs (5 s apart),
-#   its `resume`, the stub's report-in and the harness's read;
-# - HOLD_POLL_S is the harness's read interval while the row is held, and
-#   HOLD_READ_GAP_S bounds the last read before the kill;
-# - OTHER_START_AFTER_S = B − 3 × UNAVAILABLE_RETRY_BASE_S +
-#   OTHER_START_MARGIN_S from L: the start arms Q's retry timer, whose second
-#   retry comes 3 × UNAVAILABLE_RETRY_BASE_S after it, so at B from L or
-#   later (step 3 of the rule, the held post); its first retry comes at
-#   B − 2 × UNAVAILABLE_RETRY_BASE_S + OTHER_START_MARGIN_S from L or later,
-#   at or after G (checked), so it makes the rule's lap and run; its third
-#   retry comes 4 × UNAVAILABLE_RETRY_BASE_S after the second;
-# - HELD_WAIT_S = B + UNAVAILABLE_RETRY_CEILING_S + HELD_SLACK_S from L, and
-#   AGAIN_WAIT_S = UNAVAILABLE_RETRY_CEILING_S + HELD_SLACK_S from the held
-#   post: no retry wait is longer than the ceiling;
-# - the relabelled-session and grouped-viewer legs: LAP_WAIT_S bounds the
-#   approver's first lap after R's first `pending` read, each next pane read
-#   and its answer, and the lap after the relabel (it laps every
-#   DIALOG_POLL_INTERVAL_MS before G), and the relabel must end before B
-#   from L_R; the harness looks for these every LAP_POLL_S and starts the
-#   relabel only while the next lap is due at least RELABEL_MARGIN_S +
-#   RELABEL_WRITE_S later, so a write within RELABEL_WRITE_S ends at least
-#   RELABEL_MARGIN_S before that lap, whatever this run's detection took;
-#   the part of a lap this leaves holds at least ten polls (checked at
-#   setup), and a lap seen too late moves the anchor to the next; ABORT_WAIT_S bounds
-#   each kill as in the own-launch leg, from the later launch start; V's
-#   relaunch is bounded at UNAVAILABLE_RETRY_CEILING_S + RELAUNCH_SLACK_S
-#   after the kills (the own-launch leg's RELAUNCH_WAIT_S less B); LATCH_WAIT_S
-#   bounds R's latch-set line after its kill (the abort latches right after
-#   its kill answers); the latch re-check comes LATCH_RECHECK_INTERVAL_MS
-#   (120 s) after the latch, so its round line is bounded at that interval
-#   plus RECHECK_SLACK_S.
-#
-# Matched values. CSCB's values are printed by fixtures/fmk-texts.ts from
-# the installed package, never retyped: APPROVER_LOG_PREFIX,
-# DEV_CHANNELS_DIALOG_NEEDLE, TRUST_DIALOG_NEEDLE and DIALOG_POLL_INTERVAL_MS
-# (src/session-manager.ts); G (src/ad-settings.ts
-# DEFAULT_AD_SETTINGS.tmux.pending_grace_seconds) and B (src/ad-settings.ts
-# adLaunchBoundMs over DEFAULT_AD_SETTINGS_IN_EFFECT);
-# UNAVAILABLE_RETRY_BASE_S and UNAVAILABLE_RETRY_CEILING_S
-# (src/unavailable-retry.ts); PENDING_ROW_RULE_LOG_HEAD,
-# PENDING_ROW_RUN_NOT_JUDGED, PENDING_ROW_RULE_ORIGIN_RETRY and
-# PENDING_ROW_RULE_ORIGIN_APPROVER_STOP (src/pending-row.ts); the approver's
-# line at B (`approverBoundLine`: src/session-manager.ts approverLogLine over
-# approverBoundMessage with APPROVER_BOUND_FROM_LAUNCH_START); the rule's
-# approver-stop line (`pendingRowRuleApproverStopRelaunchLine`:
-# src/session-manager.ts pendingRowRuleApproverStopLine); the relaunching
-# and held posts (`stuckLaunchRelaunchingPost`, `stuckLaunchHeldPost`:
-# src/persona-notifier.ts formatPersonaNotice over src/pending-row.ts
-# stuckLaunchRelaunchingText and stuckLaunchHeldText, whose launch start is
-# rendered by describeLaunchStartForLog, recorded through the entry of that
-# name); the poster's lines (`stuckLaunchPostLine`, src/pending-row.ts); the
-# abort kill's line up to what follows (`stuckLaunchAbortKillSucceededHead`:
-# src/pending-row.ts stuckLaunchAbortKillLine over src/checked-kill.ts
-# describeKillOutcome, the source of `kill_sent`); the live-row sequence's
-# marked-missing run lines (`liveRowSequenceStep3MarkedMissingLines`:
-# src/live-row-sequence.ts liveRowSequenceRunLine); every held poster line
-# with the answer `posted` (`stuckLaunchHeldPostedLines`: src/pending-row.ts
-# stuckLaunchPostLine for both forms of the held text, each unmuted and
-# muted); and the head of the rule's round lines from each origin
-# (`pendingRowRuleRoundLineHead`: src/pending-row.ts pendingRowRuleRoundLine,
-# up to the launch start). For the
-# relabelled-session leg: CONFLICT_NOT_THIS_LAUNCH_PHRASE
-# (src/ad-description-phrases.ts) and LATCH_RECHECK_INTERVAL_MS
-# (src/conflict-latch.ts); the abort kill's line for a CONFLICT that latched
-# the persona, up to agent-director's description
-# (`stuckLaunchAbortKillConflictHead`: src/pending-row.ts
-# stuckLaunchAbortKillLine over src/checked-kill.ts describeKillOutcome of a
-# thrown ErrTmuxSessionConflict); the latch-set lines' heads
-# (`conflictLatchSetLineHead`) and the whole line of the abort kill's latch
-# (`conflictNotThisLaunchLatchedLine`: src/conflict-latch.ts
-# conflictLatchSetLine); the CONFLICT post (`conflictNotThisLaunchPost`:
-# src/persona-notifier.ts formatPersonaNotice over src/conflict-latch.ts
-# conflictNoticeText); and the re-check round lines' head
-# (`latchRecheckNotThisLaunchRoundHead`: src/conflict-latch.ts
-# latchRecheckRoundLine). Agent-director's description is read from R's
-# latch-set line, its ` message="…"` JSON-decoded
-# (src/persona-connection-errors.ts describeLogMessage). Fragments with no
-# exported builder or value, each quoted from its source:
-# - `[slack] Session connected: persona <ref>` (src/server.ts, the MCP
-#   session's registration line);
-# - `[slack] spawnForPersona: collision resolved, state=pending for <ref>`
-#   (src/session-manager.ts runPersonaLadder's collision line; `pending` is
-#   agent-director's state name);
-# - `find-missing: ` before the run's placement in a round line's steps
-#   (src/pending-row.ts createPendingRowRule's step word);
-# - PENDING_ROW_RULE_LOG_HEAD then the persona reference, for P's, Q's and
-#   R's recorded rule lines;
-# - `[slack] unavailable-retry: persona=<key> ` (src/unavailable-retry.ts,
-#   the retry timer's lines), `[slack] live-row-sequence: <ref>`
-#   (src/live-row-sequence.ts LIVE_ROW_SEQUENCE_LOG_PREFIX) and
-#   `[slack] pending-row: persona=<key> stuck-launch` (src/pending-row.ts
-#   stuckLaunchLineHead) and `[slack] conflict-latch: `
-#   (src/conflict-latch.ts, the latch's lines), for the recorded lines;
-# - `[slack] Session relaunch failed for persona=<key>`, `[slack] Launch
-#   failed for persona=<key>` and `[slack] Cap reached for persona=<key>`
-#   (COUNTED_FAILURE_HEADS; src/restart.ts runRestartWork,
-#   recordLaunchResultOutsideRestartWork and countLaunchFailure: a counted
-#   launch failure and the restart cap), each checked at setup to appear in
-#   the installed package's src/restart.ts (CSCB_PKG_DIR, as fmk-texts.ts
-#   reads it), so a zero count means something;
-# - the stub's sentinel `__CSCB_TEST_EXIT__` and a line of its unrecognised
-#   dialog, UNRECOGNISED_DIALOG_LINE (fixtures/stub-claude.sh,
-#   print_unrecognised_dialog);
-# - `ad.kill.called` and `instance_id` (agent-director's trail record
-#   of a kill, ADSRD SR-6.4), for the recorded trail;
-# - the persona reference `"<name>" (key=<key>)` (lib/scenario.sh
-#   persona_ref, src/persona-identity.ts renderPersonaRef) and the instance id
-#   `cscb_<key>` (src/persona-identity.ts personaInstanceId).
-#
-# Closing: the script ends with `assert_no_server_tmux`,
-# `assert_no_cscb_include_finished` and `assert_no_cscb_delete` in its own
-# shell. Every count of CSCB's agent-director calls reads only shim lines
-# whose parent is a CSCB process (the bot server); the harness's calls (its
-# reads and its `resume`), the stub's own status reads and its stop lines
-# never count, apart from the other-process leg's check that the harness's
-# `resume` is the only one of Q's row, which reads every process's calls.
+# Stuck pending launches: own-launch abort, foreign-process hold, relabel conflict
+# and grouped viewer preservation. AD rows and existing retry backoff own timing;
+# abort must follow B and may wait until the next retry. No startup UI is read.
+
 set -euo pipefail
 
 TEST_NAME="test-24-fmk-stuck-launch"
@@ -484,10 +46,8 @@ STUB_WAIT_S=20        # the Slack stub writing its ready file
 START_WAIT_S=120      # a start pass: one bring-up or one launch
 REPORT_WAIT_S=60      # after a start pass or an Enter: the row reporting in
 CONNECT_WAIT_S=30     # after the row reported in: the server registering the stub's session
-APPROVER_STOP_WAIT_S=20  # after the session connected: the bring-up's approver stopping
 ENDED_WAIT_S=20       # after the sentinel: the row reading ended or missing
 SESSION_WAIT_S=10     # after the first pending read: the session present
-DIALOG_WAIT_S=10      # after the session is present: the stub's unrecognised dialog drawn in its pane
 ABORT_SLACK_S=30
 RELAUNCH_SLACK_S=60
 HOLD_POLL_S=1
@@ -495,11 +55,6 @@ HOLD_READ_GAP_S=5
 GONE_WAIT_S=10        # after the kill: the worker's process gone
 OTHER_START_MARGIN_S=15
 HELD_SLACK_S=40
-LAP_WAIT_S=30         # after R's first pending read: the approver's first lap; then each next pane read, its answer, and the lap after the relabel
-LAP_POLL_S=0.02       # the relabel's anchor: how often the harness looks for the approver's calls of R and the pane read's answer
-RELABEL_MARGIN_S=0.4  # the least time from the relabel's end to the approver's next lap due
-RELABEL_WRITE_S=0.1   # the time allowed for the relabel's one tmux invocation
-RELABEL_ATTEMPTS=5    # the approver's laps the relabel may anchor on, at most
 LATCH_WAIT_S=30       # after R's kill: the latch-set line
 RECHECK_SLACK_S=60
 
@@ -509,10 +64,6 @@ FMK_TEXTS="${SCENARIO_FIXTURES}/fmk-texts.ts"
 # The stub's sentinel (fixtures/stub-claude.sh).
 SENTINEL=__CSCB_TEST_EXIT__
 
-# A line of the stub's unrecognised dialog (fixtures/stub-claude.sh
-# print_unrecognised_dialog), quoted (ruling S7): a held pane shows it once
-# the stub has drawn its dialog.
-UNRECOGNISED_DIALOG_LINE='Choose the text style that looks best with your terminal'
 
 # The fragments of a counted launch failure and of the restart cap, each
 # followed by the persona's key in its line (src/restart.ts runRestartWork,
@@ -672,10 +223,6 @@ ms_to_s() {
 
 # pane_capture <step> <session> <file>: a pane on the scenario's tmux server,
 # read with the real tmux from the scenario's own shell, into <file>.
-pane_capture() {
-    "${SCENARIO_REAL_TMUX}" capture-pane -p -t "=$2:" > "$3" 2> "$3.err" \
-        || fail "$1: tmux could not read the pane of session $2: $(head -c 300 "$3.err")"
-}
 
 # has_session <session>: true when the scenario's tmux server holds it.
 has_session() {
@@ -692,30 +239,10 @@ pane_pid_of() {
     printf '%s\n' "${pids}"
 }
 
-# expect_no_needle <step> <file>: fail when <file> holds either approver needle.
-expect_no_needle() {
-    local needle
-    for needle in "${DEV_NEEDLE}" "${TRUST_NEEDLE}"; do
-        ! grep -qF -- "${needle}" "$2" || fail "$1: the pane holds the approver needle '${needle}'"
-    done
-}
 
-# pane_shows_dialog <step> <session> <file>: read the session's pane into
-# <file>; true when it holds UNRECOGNISED_DIALOG_LINE.
-pane_shows_dialog() {
-    pane_capture "$1" "$2" "$3"
-    grep -qF -- "${UNRECOGNISED_DIALOG_LINE}" "$3"
-}
 
-# hold_at_unrecognised_dialog <step> <session>: the session is present, its
-# pane shows the stub's unrecognised dialog (UNRECOGNISED_DIALOG_LINE), and
-# that pane shows neither approver needle.
-hold_at_unrecognised_dialog() {
-    local pane="${SCENARIO_ROOT}/pane-$2.txt"
+hold_pending_worker() {
     wait_until "${SESSION_WAIT_S}" "$1: no tmux session $2 for the held row" has_session "$2"
-    wait_until "${DIALOG_WAIT_S}" "$1: the pane of session $2 never showed the unrecognised dialog ('${UNRECOGNISED_DIALOG_LINE}')" \
-        pane_shows_dialog "$1" "$2" "${pane}"
-    expect_no_needle "$1" "${pane}"
 }
 
 # end_worker <id> <step>: a plain stop has left row <id>'s worker running;
@@ -802,14 +329,6 @@ server_calls_of() {
     printf '%s\n' "${lines[@]}" | awk -F'\t' -v p="${SERVER_PID}" '$4 == p'
 }
 
-# approver_quiet_of <id>: true once the bot server's last pane read of row
-# <id> (if any) is at least APPROVER_QUIET_S old.
-approver_quiet_of() {
-    local last
-    last="$(server_calls_of "$1" read-pane | tail -n 1 | cut -f2)"
-    [[ -z "${last}" ]] && return 0
-    awk -v t="${last}" -v n="$(now_s)" -v q="${APPROVER_QUIET_S}" 'BEGIN { exit !(n - t >= q) }'
-}
 
 # server_killed <id> <srv>: true once the shim's log holds a `call` line whose
 # parent is the bot server <srv> and whose words hold `kill` and row <id>.
@@ -822,45 +341,14 @@ server_killed() {
 # server_call_after <id> <srv> <verb> <time>: print the time of the first
 # shim `call` line after <time> whose parent is the bot server <srv> and
 # whose words hold <verb> and row <id>; false when there is none.
-server_call_after() {
-    awk -F'\t' -v id="$1" -v p="$2" -v v="$3" -v t="$4" '
-        $1 == "call" && $4 == p && $2 + 0 > t + 0 && index($6, id) {
-            n = split($6, w, " ")
-            for (i = 1; i <= n; i++) if (w[i] == v) { print $2; found = 1; exit }
-        }
-        END { exit !found }' "${SCENARIO_AD_SHIM_LOG}"
-}
 
 # server_called_after <id> <srv> <verb> <time>: true once `server_call_after`
 # finds such a line; prints nothing.
-server_called_after() {
-    server_call_after "$@" > /dev/null
-}
 
 # server_call_pid_after <id> <srv> <verb> <time>: as `server_call_after`, but
 # print `<time> <pid>`, the pid being the call's agent-director process (the
 # shim `exec`s it, so the logged pid is that process's).
-server_call_pid_after() {
-    awk -F'\t' -v id="$1" -v p="$2" -v v="$3" -v t="$4" '
-        $1 == "call" && $4 == p && $2 + 0 > t + 0 && index($6, id) {
-            n = split($6, w, " ")
-            for (i = 1; i <= n; i++) if (w[i] == v) { print $2 " " $3; found = 1; exit }
-        }
-        END { exit !found }' "${SCENARIO_AD_SHIM_LOG}"
-}
 
-# lap_wait_until <timeout-s> <message> <command> [<arg>...]: as `wait_until`
-# (lib/scenario.sh), polling every LAP_POLL_S, for the relabel's anchor on
-# the approver's lap.
-lap_wait_until() {
-    local timeout_s="$1" msg="$2" deadline
-    shift 2
-    deadline=$(( $(_scenario_now_ms) + timeout_s * 1000 ))
-    while ! "$@"; do
-        (( $(_scenario_now_ms) < deadline )) || fail "${msg} (not within ${timeout_s}s)"
-        sleep "${LAP_POLL_S}"
-    done
-}
 
 # log_hits <from-line> <fragment>...: print `<line number> TAB <time> TAB
 # <text>` for each line of $SLACK_STATE_DIR/server.log after line
@@ -964,20 +452,12 @@ pid_gone() {
     ! pid_alive "$1"
 }
 
-# bring_up <step> <id> <ref>: after a live start of one persona, the start
-# pass completes with it brought up, its row reads `waiting` with a
-# session_id (BROUGHT_UP_SID), the server registers its session, and
-# the bring-up's approver has stopped.
 bring_up() {
     wait_for_log "$(completion_match 1)" "${START_WAIT_S}" "$1: the start pass never completed"
     expect_completion 1 "$1" "0 not brought up"
     persona_brought_up "$@"
 }
 
-# persona_brought_up <step> <id> <ref>: once a live start pass has completed,
-# the persona's row reads `waiting` with a session_id
-# (BROUGHT_UP_SID), the server registers its session, and its bring-up's
-# approver has stopped.
 persona_brought_up() {
     wait_until "${REPORT_WAIT_S}" "$1: row $2 never reported in (waiting) after the start" \
         row_of_reads "$2" "$1: bring-up" waiting
@@ -986,8 +466,6 @@ persona_brought_up() {
     # src/server.ts: the MCP session's registration line.
     wait_for_log "$(matcher "[slack] Session connected: persona $3")" "${CONNECT_WAIT_S}" \
         "$1: the server never registered the stub's session"
-    wait_until "${APPROVER_STOP_WAIT_S}" "$1: the bot server still reads the pane of $2 ${APPROVER_STOP_WAIT_S}s after the bring-up" \
-        approver_quiet_of "$2"
 }
 
 # The checks the own-launch, relabelled-session and grouped-viewer legs share.
@@ -1023,31 +501,13 @@ one_abort_kill() {
     printf '%s\n' "${at}"
 }
 
-# expect_approver_line_at_b <step> <line> <b-at> <kill-at> <launch-s>:
-# exactly one server.log line equal to <line> (the approver's line at B),
-# at <b-at> or later (0.5 s tolerance for the log's millisecond clock) and
-# before <kill-at>; print its time.
-expect_approver_line_at_b() {
-    local step="$1" line="$2" b_at="$3" kill_at="$4" l_s="$5" hits=() at
-    mapfile -t hits < <(log_lines_equal "${log0}" "${line}")
-    (( ${#hits[@]} == 1 )) || fail "${step}: ${#hits[@]} server.log line(s) equal to the approver's line at B, not one: ${line}"
-    at="$(cut -f2 <<< "${hits[0]}")"
-    awk -v a="${at}" -v b="${b_at}" 'BEGIN { exit !(a + 0.5 >= b + 0) }' \
-        || fail "${step}: the approver's line at B came $(seconds_between "${l_s}" "${at}")s after the launch start, before B"
-    before "${at}" "${kill_at}" || fail "${step}: the approver's line at B came after the kill"
-    printf '%s\n' "${at}"
-}
 
-# expect_relaunching_post_line <step> <line> <bound-at> <kill-at>: exactly one
-# server.log line equal to <line> (the relaunching poster line), at or after
-# <bound-at> (the approver's line at B) and at or before <kill-at>; print its
-# time.
 expect_relaunching_post_line() {
     local step="$1" line="$2" bound_at="$3" kill_at="$4" hits=() at
     mapfile -t hits < <(log_lines_equal "${log0}" "${line}")
     (( ${#hits[@]} == 1 )) || fail "${step}: ${#hits[@]} relaunching poster line(s), not one: ${line}"
     at="$(cut -f2 <<< "${hits[0]}")"
-    awk -v p="${at}" -v b="${bound_at}" 'BEGIN { exit !(p + 0 >= b + 0) }' || fail "${step}: the relaunching post came before the approver's line at B"
+    awk -v p="${at}" -v b="${bound_at}" 'BEGIN { exit !(p + 0 >= b + 0) }' || fail "${step}: the relaunching post came before B"
     awk -v p="${at}" -v k="${kill_at}" 'BEGIN { exit !(p + 0 <= k + 0) }' || fail "${step}: the relaunching post came after the kill"
     printf '%s\n' "${at}"
 }
@@ -1075,10 +535,6 @@ expect_no_counted_failure() {
 # Values from the installed package
 # ---------------------------------------------------------------------------
 
-APPROVER_PREFIX="$(fmk_text APPROVER_LOG_PREFIX)" || fail "setup: fmk-texts.ts could not print APPROVER_LOG_PREFIX"
-DEV_NEEDLE="$(fmk_text DEV_CHANNELS_DIALOG_NEEDLE)" || fail "setup: fmk-texts.ts could not print DEV_CHANNELS_DIALOG_NEEDLE"
-TRUST_NEEDLE="$(fmk_text TRUST_DIALOG_NEEDLE)" || fail "setup: fmk-texts.ts could not print TRUST_DIALOG_NEEDLE"
-PACE_MS="$(fmk_text DIALOG_POLL_INTERVAL_MS)" || fail "setup: fmk-texts.ts could not print DIALOG_POLL_INTERVAL_MS"
 G_S="$(fmk_text DEFAULT_AD_SETTINGS.tmux.pending_grace_seconds)" \
     || fail "setup: fmk-texts.ts could not print DEFAULT_AD_SETTINGS.tmux.pending_grace_seconds"
 B_MS="$(fmk_text 'adLaunchBoundMs(DEFAULT_AD_SETTINGS_IN_EFFECT)')" \
@@ -1088,26 +544,17 @@ RETRY_CEILING_S="$(fmk_text UNAVAILABLE_RETRY_CEILING_S)" || fail "setup: fmk-te
 PENDING_ROW_HEAD="$(fmk_text PENDING_ROW_RULE_LOG_HEAD)" || fail "setup: fmk-texts.ts could not print PENDING_ROW_RULE_LOG_HEAD"
 NOT_JUDGED="$(fmk_text PENDING_ROW_RUN_NOT_JUDGED)" || fail "setup: fmk-texts.ts could not print PENDING_ROW_RUN_NOT_JUDGED"
 ORIGIN_RETRY="$(fmk_text PENDING_ROW_RULE_ORIGIN_RETRY)" || fail "setup: fmk-texts.ts could not print PENDING_ROW_RULE_ORIGIN_RETRY"
-ORIGIN_APPROVER_STOP="$(fmk_text PENDING_ROW_RULE_ORIGIN_APPROVER_STOP)" \
-    || fail "setup: fmk-texts.ts could not print PENDING_ROW_RULE_ORIGIN_APPROVER_STOP"
-[[ -n "${APPROVER_PREFIX}" && -n "${DEV_NEEDLE}" && -n "${TRUST_NEEDLE}" && -n "${PENDING_ROW_HEAD}" ]] \
-    || fail "setup: fmk-texts.ts printed an empty value"
-[[ -n "${NOT_JUDGED}" && -n "${ORIGIN_RETRY}" && -n "${ORIGIN_APPROVER_STOP}" ]] || fail "setup: fmk-texts.ts printed an empty value"
-[[ "${PACE_MS}" =~ ^[1-9][0-9]*$ ]] || fail "setup: the approver's pace '${PACE_MS}' is not a whole number of milliseconds"
+[[ -n "${NOT_JUDGED}" && -n "${ORIGIN_RETRY}" ]] || fail "setup: fmk-texts.ts printed an empty value"
 [[ "${G_S}" =~ ^[1-9][0-9]*$ ]] || fail "setup: G '${G_S}' is not a whole number of seconds"
 [[ "${B_MS}" =~ ^[1-9][0-9]*$ ]] || fail "setup: B '${B_MS}' is not a whole number of milliseconds"
 [[ "${RETRY_BASE_S}" =~ ^[1-9][0-9]*$ && "${RETRY_CEILING_S}" =~ ^[1-9][0-9]*$ ]] \
     || fail "setup: the retry base '${RETRY_BASE_S}' or ceiling '${RETRY_CEILING_S}' is not a whole number of seconds"
 B_S=$(( (B_MS + 999) / 1000 ))
-# Three approver laps' worth of time, in whole seconds (at least one).
-APPROVER_QUIET_S=$(( (3 * PACE_MS + 999) / 1000 ))
-# The first retry, UNAVAILABLE_RETRY_BASE_S after the launch, comes before G,
-# so every later retry wait is at least twice the base (see the header).
 (( G_S > RETRY_BASE_S )) || fail "setup: G ${G_S}s is not longer than the retry timer's first wait ${RETRY_BASE_S}s"
 (( B_S > G_S )) || fail "setup: B ${B_S}s is not longer than G ${G_S}s"
 RUN_GAP_MIN_S=$(( 2 * RETRY_BASE_S ))
-ABORT_WAIT_S=$(( B_S + ABORT_SLACK_S ))
-RELAUNCH_WAIT_S=$(( B_S + RETRY_CEILING_S + RELAUNCH_SLACK_S ))
+ABORT_WAIT_S=$(( B_S + RETRY_CEILING_S + ABORT_SLACK_S ))
+RELAUNCH_WAIT_S=$(( B_S + 2 * RETRY_CEILING_S + RELAUNCH_SLACK_S ))
 OTHER_START_AFTER_S=$(( B_S - 3 * RETRY_BASE_S + OTHER_START_MARGIN_S ))
 (( OTHER_START_AFTER_S > 0 && OTHER_START_AFTER_S + RETRY_BASE_S >= G_S )) \
     || fail "setup: the other-process leg's start ${OTHER_START_AFTER_S}s after the launch start leaves its first retry before G ${G_S}s"
@@ -1115,9 +562,6 @@ HELD_WAIT_S=$(( B_S + RETRY_CEILING_S + HELD_SLACK_S ))
 AGAIN_WAIT_S=$(( RETRY_CEILING_S + HELD_SLACK_S ))
 echo "${TEST_NAME}: G ${G_S}s, B ${B_S}s (${B_MS}ms), retry base ${RETRY_BASE_S}s, ceiling ${RETRY_CEILING_S}s; own-launch leg: abort bound ${ABORT_WAIT_S}s, relaunch bound ${RELAUNCH_WAIT_S}s, runs at least ${RUN_GAP_MIN_S}s apart; other-process leg: start ${OTHER_START_AFTER_S}s after the launch start, held-post bound ${HELD_WAIT_S}s, next-retry bound ${AGAIN_WAIT_S}s"
 
-APPROVER_BOUND_LINE="$(fmk_text approverBoundLine "${P_REF}" "${B_MS}")" || fail "setup: fmk-texts.ts could not print approverBoundLine"
-APPROVER_STOP_RELAUNCH_LINE="$(fmk_text pendingRowRuleApproverStopRelaunchLine "${P_REF}")" \
-    || fail "setup: fmk-texts.ts could not print pendingRowRuleApproverStopRelaunchLine"
 RELAUNCHING_POST="$(fmk_text stuckLaunchRelaunchingPost "${P_NAME}" "${P_KEY}" "${B_MS}")" \
     || fail "setup: fmk-texts.ts could not print stuckLaunchRelaunchingPost"
 P_RELAUNCHING_POSTED="$(fmk_text stuckLaunchPostLine "${P_KEY}" relaunching posted)" \
@@ -1125,8 +569,6 @@ P_RELAUNCHING_POSTED="$(fmk_text stuckLaunchPostLine "${P_KEY}" relaunching post
 P_HELD_POSTED_LINES="$(fmk_text stuckLaunchHeldPostedLines "${P_KEY}")" || fail "setup: fmk-texts.ts could not print stuckLaunchHeldPostedLines for P"
 P_RETRY_ROUND_HEAD="$(fmk_text pendingRowRuleRoundLineHead "${P_REF}" "${ORIGIN_RETRY}")" \
     || fail "setup: fmk-texts.ts could not print pendingRowRuleRoundLineHead for the retry origin"
-P_STOP_ROUND_HEAD="$(fmk_text pendingRowRuleRoundLineHead "${P_REF}" "${ORIGIN_APPROVER_STOP}")" \
-    || fail "setup: fmk-texts.ts could not print pendingRowRuleRoundLineHead for the approver-stop origin"
 ABORT_KILL_HEAD="$(fmk_text stuckLaunchAbortKillSucceededHead "${P_KEY}")" \
     || fail "setup: fmk-texts.ts could not print stuckLaunchAbortKillSucceededHead"
 MARKED_MISSING_LINES="$(fmk_text liveRowSequenceStep3MarkedMissingLines "${P_REF}")" \
@@ -1136,8 +578,8 @@ Q_HELD_AGAIN="$(fmk_text stuckLaunchPostLine "${Q_KEY}" held already-posted)" \
     || fail "setup: fmk-texts.ts could not print stuckLaunchPostLine for Q"
 Q_RELAUNCHING_POSTED="$(fmk_text stuckLaunchPostLine "${Q_KEY}" relaunching posted)" \
     || fail "setup: fmk-texts.ts could not print stuckLaunchPostLine for Q"
-for v in APPROVER_BOUND_LINE APPROVER_STOP_RELAUNCH_LINE RELAUNCHING_POST P_RELAUNCHING_POSTED P_HELD_POSTED_LINES P_RETRY_ROUND_HEAD \
-    P_STOP_ROUND_HEAD ABORT_KILL_HEAD MARKED_MISSING_LINES Q_HELD_POSTED Q_HELD_AGAIN Q_RELAUNCHING_POSTED; do
+for v in RELAUNCHING_POST P_RELAUNCHING_POSTED P_HELD_POSTED_LINES P_RETRY_ROUND_HEAD \
+    ABORT_KILL_HEAD MARKED_MISSING_LINES Q_HELD_POSTED Q_HELD_AGAIN Q_RELAUNCHING_POSTED; do
     [[ -n "${!v}" ]] || fail "setup: fmk-texts.ts printed an empty ${v}"
 done
 # Every held poster line is one non-empty line.
@@ -1151,19 +593,11 @@ for t in "${COUNTED_FAILURE_HEADS[@]}"; do
         || fail "setup: the installed package's src/restart.ts does not hold the counted-failure fragment '${t}'; the no-counted-failure checks would count nothing"
 done
 
-# The relabel starts only while the approver's next lap is due at least
-# RELABEL_MARGIN_S + RELABEL_WRITE_S away (DIALOG_POLL_INTERVAL_MS after the
-# anchoring pane read); what that leaves of a lap, for the harness to see
-# the pane read and its answer, holds at least ten of its LAP_POLL_S polls.
-awk -v m="${RELABEL_MARGIN_S}" -v w="${RELABEL_WRITE_S}" -v p="${LAP_POLL_S}" -v lap="${PACE_MS}" 'BEGIN { exit !(lap / 1000 - m - w >= 10 * p) }' \
-    || fail "setup: RELABEL_MARGIN_S ${RELABEL_MARGIN_S}s and RELABEL_WRITE_S ${RELABEL_WRITE_S}s leave less than ten LAP_POLL_S (${LAP_POLL_S}s) polls of the approver's lap (${PACE_MS}ms)"
-
 # The relabelled-session and grouped-viewer legs' values.
 NOT_THIS_LAUNCH_PHRASE="$(fmk_text CONFLICT_NOT_THIS_LAUNCH_PHRASE)" || fail "setup: fmk-texts.ts could not print CONFLICT_NOT_THIS_LAUNCH_PHRASE"
 RECHECK_MS="$(fmk_text LATCH_RECHECK_INTERVAL_MS)" || fail "setup: fmk-texts.ts could not print LATCH_RECHECK_INTERVAL_MS"
 [[ "${RECHECK_MS}" =~ ^[1-9][0-9]*$ ]] || fail "setup: the latch re-check interval '${RECHECK_MS}' is not a whole number of milliseconds"
 RECHECK_S=$(( (RECHECK_MS + 999) / 1000 ))
-R_APPROVER_BOUND_LINE="$(fmk_text approverBoundLine "${R_REF}" "${B_MS}")" || fail "setup: fmk-texts.ts could not print approverBoundLine for R"
 R_RELAUNCHING_POST="$(fmk_text stuckLaunchRelaunchingPost "${R_NAME}" "${R_KEY}" "${B_MS}")" \
     || fail "setup: fmk-texts.ts could not print stuckLaunchRelaunchingPost for R"
 R_RELAUNCHING_POSTED="$(fmk_text stuckLaunchPostLine "${R_KEY}" relaunching posted)" || fail "setup: fmk-texts.ts could not print stuckLaunchPostLine for R"
@@ -1181,10 +615,9 @@ V_RELAUNCHING_POST="$(fmk_text stuckLaunchRelaunchingPost "${V_NAME}" "${V_KEY}"
 V_RELAUNCHING_POSTED="$(fmk_text stuckLaunchPostLine "${V_KEY}" relaunching posted)" || fail "setup: fmk-texts.ts could not print stuckLaunchPostLine for V"
 V_ABORT_KILL_HEAD="$(fmk_text stuckLaunchAbortKillSucceededHead "${V_KEY}")" \
     || fail "setup: fmk-texts.ts could not print stuckLaunchAbortKillSucceededHead for V"
-V_APPROVER_BOUND_LINE="$(fmk_text approverBoundLine "${V_REF}" "${B_MS}")" || fail "setup: fmk-texts.ts could not print approverBoundLine for V"
-for v in NOT_THIS_LAUNCH_PHRASE R_APPROVER_BOUND_LINE R_RELAUNCHING_POST R_RELAUNCHING_POSTED R_HELD_POSTED_LINES R_ABORT_CONFLICT_HEAD \
+for v in NOT_THIS_LAUNCH_PHRASE R_RELAUNCHING_POST R_RELAUNCHING_POSTED R_HELD_POSTED_LINES R_ABORT_CONFLICT_HEAD \
     R_ABORT_SUCCEEDED_HEAD R_LATCHED_HEAD R_RELATCHED_HEAD R_RECHECK_HEAD V_RELAUNCHING_POST V_RELAUNCHING_POSTED V_ABORT_KILL_HEAD \
-    V_APPROVER_BOUND_LINE; do
+    ; do
     [[ -n "${!v}" ]] || fail "setup: fmk-texts.ts printed an empty ${v}"
 done
 ! grep -qx '' <<< "${R_HELD_POSTED_LINES}" || fail "setup: fmk-texts.ts printed an empty held poster line for R"
@@ -1204,7 +637,7 @@ leg_own_stuck_launch() {
     mkdir -m 700 "${creds}"
     start_slack_stub "${SCENARIO_ROOT}/slack-stub-own" "${P_SUFFIX}"
     work="$(make_workdir own)"
-    stub_mode "${work}" "${STUB_MODE_STARTUP_TRUST}"
+    stub_mode "${work}" "${STUB_MODE_AT_ONCE}"
     creds_file="$(write_credentials "${creds}" "${P_SUFFIX}")"
     write_personas_config "$(persona_json "${P_NAME}" "${creds_file}" "${work}" "${P_CHANNEL}")"
 
@@ -1219,8 +652,7 @@ leg_own_stuck_launch() {
     [[ "${ROW_SID}" == "${sid}" ]] || fail "${step}: the ${ROW_STATE} row's session_id is '${ROW_SID}', not the live row's ${sid}"
     echo "${TEST_NAME}: ${step}: after the sentinel the row reads ${ROW_STATE} with session_id ${ROW_SID}"
 
-    # Step 3 [harness]: the unrecognised dialog, then the start pass's resume.
-    stub_mode "${work}" "${STUB_MODE_UNRECOGNISED}"
+    stub_mode "${work}" "${STUB_MODE_MANUAL_START}"
     log0="$(line_count "${SLACK_STATE_DIR}/server.log")"
     posts0="$(( $(line_count "${SLACK_RECORD}") + 1 ))"
     leg_start="$(now_s)"
@@ -1238,7 +670,7 @@ leg_own_stuck_launch() {
     session="${ROW_SESSION}"
     [[ -n "${session}" ]] || fail "${step}: the pending row names no tmux session"
     echo "${TEST_NAME}: ${step}: the held row reads pending, session_id ${ROW_SID}, launch_started_at ${ROW_LAUNCH}"
-    hold_at_unrecognised_dialog "${step}: the held launch" "${session}"
+    hold_pending_worker "${step}: the held launch" "${session}"
     worker="$(pane_pid_of "${step}" "${session}")"
 
     # Step 5 [harness]: the next launch in P's directory reports in at once.
@@ -1294,19 +726,22 @@ leg_own_stuck_launch() {
     n="$(count_calls "${table}" "${srv}" - find-missing "${l_s}" "$(plus_s "${g_at}" -0.001)")"
     (( n == 0 )) || fail "${step}: the bot server ran find-missing ${n} time(s) between P's launch start and G after it"
 
-    # The approver's one line at B, measured from the launch start.
-    bound_at="$(expect_approver_line_at_b "${step}" "${APPROVER_BOUND_LINE}" "${b_at}" "${kill_at}" "${l_s}")" || exit 1
-    echo "${TEST_NAME}: ${step}: the approver stopped at +$(seconds_between "${l_s}" "${bound_at}")s from L. Its lines naming P (recorded): $(log_hits "${log0}" "${APPROVER_PREFIX}" | cut -f3 | grep -F -- "${P_REF}" | cut -c1-220 | tr '\n' '|')"
+    # The timer owns the abort after B; no automatic pane/key activity occurs.
+    bound_at="${b_at}"
+    before "${b_at}" "$(plus_s "${kill_at}" 0.001)" || fail "${step}: abort came before B"
+    for verb in read-pane send-keys; do
+        n="$(count_calls "${table}" "${srv}" "${P_ID}" "${verb}" "${l_s}" "${kill_at}")"
+        (( n == 0 )) || fail "${step}: ${n} automatic ${verb} call(s) during pending launch"
+    done
 
     # The find-missing runs from G to the kill.
     mapfile -t fms < <(calls "${table}" "${srv}" - find-missing "${g_at}" "${kill_at}" | cut -f1)
     stop_run_at="$(first_call_at "${table}" "${srv}" - find-missing "${bound_at}" "${kill_at}")"
-    [[ -n "${stop_run_at}" ]] || fail "${step}: no bot-server find-missing between the approver's stop at B and the kill"
+    [[ -n "${stop_run_at}" ]] || fail "${step}: no bot-server find-missing between B and the kill"
     [[ "${fms[-1]}" == "${stop_run_at}" ]] \
-        || fail "${step}: $(( ${#fms[@]} )) find-missing run(s) from G to the kill, and the one at the approver's stop is not the last before the kill"
-    (( ${#fms[@]} >= 2 )) || fail "${step}: no retry's find-missing run between G and the approver's stop at B"
+        || fail "${step}: $(( ${#fms[@]} )) find-missing run(s) from G to the kill, and the abort retry is not the last before the kill"
+    (( ${#fms[@]} >= 1 )) || fail "${step}: no retry find-missing run after G"
     for (( i = 1; i < ${#fms[@]}; i++ )); do
-        [[ "${fms[i]}" == "${stop_run_at}" ]] && continue
         gap="$(seconds_between "${fms[i - 1]}" "${fms[i]}")"
         awk -v g="${gap}" -v m="${RUN_GAP_MIN_S}" 'BEGIN { exit !(g + 0 >= m + 0) }' \
             || fail "${step}: two bot-server find-missing runs before the abort only ${gap}s apart, closer than ${RUN_GAP_MIN_S}s"
@@ -1321,17 +756,6 @@ leg_own_stuck_launch() {
     }
     n="$(grep -cvF -- "find-missing: ${NOT_JUDGED}" <<< "${retry_rounds}" || true)"
     (( n == 0 )) || fail "${step}: ${n} retry-origin rule round(s) before the abort did not read the run as not judged"
-    # The rule's run at the approver's stop: its run not judged, then the relaunching post and the abort.
-    stop_rounds="$(log_hits "${log0}" "${P_STOP_ROUND_HEAD}" "find-missing: ")"
-    n="$(grep -c . <<< "${stop_rounds}" || true)"
-    (( n == 1 )) || fail "${step}: ${n} approver-stop rule round line(s) for P with a run, not one"
-    [[ "${stop_rounds}" == *"find-missing: ${NOT_JUDGED}"* ]] \
-        || fail "${step}: the rule's run at the approver's stop did not read its find-missing as not judged: ${stop_rounds}"
-    mapfile -t hits < <(log_lines_equal "${log0}" "${APPROVER_STOP_RELAUNCH_LINE}")
-    (( ${#hits[@]} == 1 )) || fail "${step}: ${#hits[@]} line(s) equal to the rule's approver-stop relaunch line, not one: ${APPROVER_STOP_RELAUNCH_LINE}"
-    echo "${TEST_NAME}: ${step}: ${#fms[@]} bot-server find-missing run(s) from G to the kill, the approver's stop's at +$(seconds_between "${l_s}" "${stop_run_at}")s"
-
-    # The relaunching post, after the approver's line at B and before the kill, the leg's only post.
     post_at="$(expect_relaunching_post_line "${step}" "${P_RELAUNCHING_POSTED}" "${bound_at}" "${kill_at}")" || exit 1
     expect_no_held_posted "${step}" "${P_HELD_POSTED_LINES}"
     mapfile -t lines < <(record_posts "${posts0}")
@@ -1406,7 +830,7 @@ leg_other_process() {
     mkdir -m 700 "${creds}"
     start_slack_stub "${SCENARIO_ROOT}/slack-stub-other" "${Q_SUFFIX}"
     work="$(make_workdir other)"
-    stub_mode "${work}" "${STUB_MODE_STARTUP_TRUST}"
+    stub_mode "${work}" "${STUB_MODE_AT_ONCE}"
     creds_file="$(write_credentials "${creds}" "${Q_SUFFIX}")"
     write_personas_config "$(persona_json "${Q_NAME}" "${creds_file}" "${work}" "${Q_CHANNEL}")"
 
@@ -1420,8 +844,7 @@ leg_other_process() {
     end_worker "${Q_ID}" "${step}: the worker"
     [[ "${ROW_SID}" == "${sid}" ]] || fail "${step}: the ${ROW_STATE} row's session_id is '${ROW_SID}', not the live row's ${sid}"
 
-    # Step 3 [harness]: the unrecognised dialog in Q's directory.
-    stub_mode "${work}" "${STUB_MODE_UNRECOGNISED}"
+    stub_mode "${work}" "${STUB_MODE_MANUAL_START}"
 
     # Step 4 [harness, playing another process]: the harness's own resume of Q,
     # from the scenario's own shell.
@@ -1435,7 +858,7 @@ leg_other_process() {
     session="${ROW_SESSION}"
     [[ -n "${session}" ]] || fail "${step}: the pending row names no tmux session"
     echo "${TEST_NAME}: ${step}: the harness's resume left the row pending, launch_started_at ${ROW_LAUNCH} (rendered $(fmk_text describeLaunchStartForLog "${ROW_LAUNCH}"))"
-    hold_at_unrecognised_dialog "${step}: the held launch" "${session}"
+    hold_pending_worker "${step}: the held launch" "${session}"
     held_post="$(fmk_text stuckLaunchHeldPost "${Q_NAME}" "${Q_KEY}" "${ROW_LAUNCH}" false)" \
         || fail "${step}: fmk-texts.ts could not print stuckLaunchHeldPost"
 
@@ -1583,11 +1006,9 @@ check_relabelled_session() {
     # Until the kill the row read pending with launch start L: no find-missing run marked it before B.
     reads_before_kill_pending "${step}" "${r_reads}" "${kill_at}" "${r_l_ms}" "${r_l_s}" R
 
-    # At B: the approver's one line, then the relaunching post, before the kill.
-    bound_at="$(expect_approver_line_at_b "${step}" "${R_APPROVER_BOUND_LINE}" "${r_b_at}" "${kill_at}" "${r_l_s}")" || exit 1
+    bound_at="${r_b_at}"
     post_at="$(expect_relaunching_post_line "${step}" "${R_RELAUNCHING_POSTED}" "${bound_at}" "${kill_at}")" || exit 1
     expect_no_held_posted "${step}" "${R_HELD_POSTED_LINES}"
-    echo "${TEST_NAME}: ${step}: R's approver line at B at +$(seconds_between "${r_l_s}" "${bound_at}")s, its relaunching post at +$(seconds_between "${r_l_s}" "${post_at}")s from its launch start"
 
     # The kill answered CONFLICT, "not this launch's session": the abort kill's line for a latch.
     mapfile -t hits < <(log_lines_starting "${log0}" "${R_ABORT_CONFLICT_HEAD}")
@@ -1677,10 +1098,8 @@ check_grouped_viewer() {
         fail "${step}: ${#hits[@]} abort kill line(s) for V starting '${V_ABORT_KILL_HEAD}' (kill_sent true), not one"
     }
 
-    # At B: the approver's one line, then one relaunching post, before the kill: V's only post.
-    bound_at="$(expect_approver_line_at_b "${step}" "${V_APPROVER_BOUND_LINE}" "${v_b_at}" "${kill_at}" "${v_l_s}")" || exit 1
+    bound_at="${v_b_at}"
     post_at="$(expect_relaunching_post_line "${step}" "${V_RELAUNCHING_POSTED}" "${bound_at}" "${kill_at}")" || exit 1
-    echo "${TEST_NAME}: ${step}: V's approver line at B at +$(seconds_between "${v_l_s}" "${bound_at}")s, its relaunching post at +$(seconds_between "${v_l_s}" "${post_at}")s from its launch start"
     mapfile -t lines < <(record_posts_of "${posts0}" "${V_SUFFIX}")
     (( ${#lines[@]} == 1 )) || {
         printf '  | %s\n' "${lines[@]}" >&2
@@ -1710,9 +1129,9 @@ legs_relabelled_session_and_grouped_viewer() {
     mkdir -m 700 "${creds}"
     start_slack_stub "${SCENARIO_ROOT}/slack-stub-rv" "${R_SUFFIX}" "${V_SUFFIX}"
     r_work="$(make_workdir relabel)"
-    stub_mode "${r_work}" "${STUB_MODE_STARTUP_TRUST}"
+    stub_mode "${r_work}" "${STUB_MODE_AT_ONCE}"
     v_work="$(make_workdir viewer)"
-    stub_mode "${v_work}" "${STUB_MODE_STARTUP_TRUST}"
+    stub_mode "${v_work}" "${STUB_MODE_AT_ONCE}"
     r_creds="$(write_credentials "${creds}" "${R_SUFFIX}")"
     v_creds="$(write_credentials "${creds}" "${V_SUFFIX}")"
     write_personas_config "$(persona_json "${R_NAME}" "${r_creds}" "${r_work}" "${R_CHANNEL}")" \
@@ -1734,9 +1153,8 @@ legs_relabelled_session_and_grouped_viewer() {
     end_worker "${V_ID}" "${step}: V's worker"
     [[ "${ROW_SID}" == "${v_sid}" ]] || fail "${step}: V's ${ROW_STATE} row's session_id is '${ROW_SID}', not the live row's ${v_sid}"
 
-    # Step 3 [harness]: the unrecognised dialog in both directories, then the start pass's resumes.
-    stub_mode "${r_work}" "${STUB_MODE_UNRECOGNISED}"
-    stub_mode "${v_work}" "${STUB_MODE_UNRECOGNISED}"
+    stub_mode "${r_work}" "${STUB_MODE_MANUAL_START}"
+    stub_mode "${v_work}" "${STUB_MODE_MANUAL_START}"
     log0="$(line_count "${SLACK_STATE_DIR}/server.log")"
     posts0="$(( $(line_count "${SLACK_RECORD}") + 1 ))"
     leg_start="$(now_s)"
@@ -1753,7 +1171,7 @@ legs_relabelled_session_and_grouped_viewer() {
     r_b_at="$(ms_to_s "$(( r_l_ms + B_MS ))")"
     r_session="${ROW_SESSION}"
     [[ -n "${r_session}" ]] || fail "${step}: R's pending row names no tmux session"
-    hold_at_unrecognised_dialog "${step}: R's held launch" "${r_session}"
+    hold_pending_worker "${step}: R's held launch" "${r_session}"
     r_worker="$(pane_pid_of "${step}" "${r_session}")"
     echo "${TEST_NAME}: ${step}: R's held row reads pending, launch_started_at ${ROW_LAUNCH}, session ${r_session}"
     wait_until "${START_WAIT_S}" "${step}: row ${V_ID} never read pending after the start" \
@@ -1764,7 +1182,7 @@ legs_relabelled_session_and_grouped_viewer() {
     v_b_at="$(ms_to_s "$(( v_l_ms + B_MS ))")"
     v_session="${ROW_SESSION}"
     [[ -n "${v_session}" ]] || fail "${step}: V's pending row names no tmux session"
-    hold_at_unrecognised_dialog "${step}: V's held launch" "${v_session}"
+    hold_pending_worker "${step}: V's held launch" "${v_session}"
     v_worker="$(pane_pid_of "${step}" "${v_session}")"
     echo "${TEST_NAME}: ${step}: V's held row reads pending, launch_started_at ${ROW_LAUNCH}, session ${v_session}"
 
@@ -1775,31 +1193,10 @@ legs_relabelled_session_and_grouped_viewer() {
         || fail "${step}: tmux could not read the viewer ${viewer_sid}'s name"
     echo "${TEST_NAME}: ${step}: the grouped viewer ${viewer} (${viewer_sid}) is attached to V's session ${v_session}"
 
-    # Step 6 [harness]: R's own session is relabelled with an earlier launch's
-    # token, its labels drawn now and written in one tmux invocation after
-    # the approver's first lap of R's row (its first bot-server status of R
-    # after the pending read), on a later read-pane of R once that call is
-    # answered, while the next lap is due at least RELABEL_MARGIN_S +
-    # RELABEL_WRITE_S away; else on the next lap's read-pane.
+    # Relabel before G: no screen poller runs, and the first acting retry waits for G.
     plan_relabel "${step}" "${r_session}"
-    lap_wait_until "${LAP_WAIT_S}" "${step}: no bot-server status of ${R_ID} within ${LAP_WAIT_S}s of its pending read (the approver's first lap)" \
-        server_called_after "${R_ID}" "${srv}" status "${r_pending_at}"
-    lap_at="$(server_call_after "${R_ID}" "${srv}" status "${r_pending_at}")"
-    anchor_from="${lap_at}"
-    for (( attempt = 1; ; attempt++ )); do
-        lap_wait_until "${LAP_WAIT_S}" "${step}: no bot-server read-pane of ${R_ID} within ${LAP_WAIT_S}s of the approver's lap (anchor ${attempt})" \
-            server_called_after "${R_ID}" "${srv}" read-pane "${anchor_from}"
-        read -r pane_at pane_pid <<< "$(server_call_pid_after "${R_ID}" "${srv}" read-pane "${anchor_from}")"
-        next_due="$(plus_s "${pane_at}" "$(ms_to_s "${PACE_MS}")")"
-        lap_wait_until "${LAP_WAIT_S}" "${step}: the approver's read-pane of ${R_ID} (process ${pane_pid}) not answered" pid_gone "${pane_pid}"
-        relabel_at="${EPOCHREALTIME/,/.}"
-        before "${relabel_at}" "${r_b_at}" || fail "${step}: the relabel would come at or after B"
-        awk -v a="${relabel_at}" -v d="${next_due}" -v m="${RELABEL_MARGIN_S}" -v w="${RELABEL_WRITE_S}" 'BEGIN { exit !(d - a >= m + w) }' && break
-        slacks+="${slacks:+, }$(seconds_between "${relabel_at}" "${next_due}")s"
-        (( attempt < RELABEL_ATTEMPTS )) \
-            || fail "${step}: in ${RELABEL_ATTEMPTS} laps of ${R_ID}, none left ${RELABEL_MARGIN_S}s + ${RELABEL_WRITE_S}s before the next lap once its read-pane was answered (left: ${slacks})"
-        anchor_from="${pane_at}"
-    done
+    relabel_at="${EPOCHREALTIME/,/.}"
+    before "${relabel_at}" "$(plus_s "${r_l_s}" "${G_S}")" || fail "${step}: relabel started after G"
     write_relabel "${step}"
     relabel_end="${EPOCHREALTIME/,/.}"
     label_sid="${RELABEL_SID}"
@@ -1816,18 +1213,7 @@ legs_relabelled_session_and_grouped_viewer() {
     got="$("${SCENARIO_REAL_TMUX}" display-message -p -t "${label_pane}" '#{pane_pid}')" || fail "${step}: tmux could not read the process of ${label_pane}"
     [[ "${got}" == "${r_worker}" ]] || fail "${step}: the relabelled pane ${label_pane} runs ${got}, not R's worker ${r_worker}"
     before "$(now_s)" "${r_b_at}" || fail "${step}: the relabel ended at or after B"
-    # No approver lap of R from the anchoring read-pane to the relabel's end
-    # (its two label writes), read once the next lap's status is logged.
-    lap_wait_until "${LAP_WAIT_S}" "${step}: no bot-server status of ${R_ID} within ${LAP_WAIT_S}s of the relabel (the approver's next lap)" \
-        server_called_after "${R_ID}" "${srv}" status "${relabel_end}"
-    next_at="$(server_call_after "${R_ID}" "${srv}" status "${relabel_end}")"
-    for verb in status read-pane; do
-        raced="$(server_call_after "${R_ID}" "${srv}" "${verb}" "${pane_at}" || true)"
-        [[ -z "${raced}" ]] || ! before "${raced}" "${relabel_end}" \
-            || fail "${step}: the relabel raced the approver's lap: a bot-server ${verb} of ${R_ID} at +$(seconds_between "${pane_at}" "${raced}")s from the anchoring read-pane, before the relabel's end at +$(seconds_between "${pane_at}" "${relabel_end}")s (its start at +$(seconds_between "${pane_at}" "${relabel_at}")s)"
-    done
-    echo "${TEST_NAME}: ${step}: R's session ${label_sid} relabelled at +$(seconds_between "${r_l_s}" "${relabel_at}")s from its launch start (the approver's first lap at +$(seconds_between "${r_l_s}" "${lap_at}")s, the anchoring read-pane at +$(seconds_between "${r_l_s}" "${pane_at}")s, anchor ${attempt}${slacks:+; earlier anchors left ${slacks}}): @ad_owner '${want}', pane ${label_pane} @ad_pane '${token} ${label_pane}'"
-    echo "${TEST_NAME}: ${step}: the relabel's margins (recorded): relabel start - last lap's read-pane $(seconds_between "${pane_at}" "${relabel_at}")s; next lap due - relabel end $(seconds_between "${relabel_end}" "${next_due}")s (due at the read-pane + ${PACE_MS}ms); next lap's status - relabel end $(seconds_between "${relabel_end}" "${next_at}")s; relabel duration $(seconds_between "${relabel_at}" "${relabel_end}")s"
+    echo "${TEST_NAME}: ${step}: R's session ${label_sid} relabelled before G at +$(seconds_between "${r_l_s}" "${relabel_at}")s; @ad_owner '${want}'"
 
     # Step 7 [harness]: read both rows until the bot server's kill of each, bounded from the later launch start.
     : > "${r_reads}"

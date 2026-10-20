@@ -1,10 +1,8 @@
 /** Synthetic gate controls. These records are never written into a real queue
  * or a native session and never constitute native acceptance evidence. */
 import { describe, expect, test } from 'bun:test'
-import { auditCodexDelivery, assertCodexRecovery, assertCodexObservationInventory } from './real-agent/codex-gate.ts'
+import { auditCodexDelivery, assertCodexRecovery } from './real-agent/codex-gate.ts'
 import { projectCodexRollout } from './real-agent/codex-evidence.ts'
-import { readFileSync } from 'node:fs'
-import { join } from 'node:path'
 import { assertNoLeak } from './test-helpers/credentials.ts'
 
 const instance = 'cscb_synthetic', path = '/private/synthetic.jsonl', session = 'synthetic-session'
@@ -90,86 +88,7 @@ describe('Codex delivery gate receipt audit', () => {
   })
 })
 
-describe('Codex gate native observation inventory', () => {
-  const panes = () => ['idle-empty', 'slash-popup', 'at-popup', 'dollar-popup', 'shortcuts-overlay', 'idle-one-line-draft',
-    'idle-multiline-draft', 'busy-one-line-draft', 'busy-multiline-draft'].map(label => ({ label, agent: 'codex', version: '0.159.2',
-      state: label.startsWith('busy-') ? 'working' : 'waiting', screen: { kind: label === 'idle-empty' ? 'empty' : /popup|overlay/.test(label) ? 'menu' : 'input' } }))
-  test('all popup draft idle busy and no-turn observations pass independently of AI completion', () => {
-    expect(() => assertCodexObservationInventory(panes(), true)).not.toThrow()
-  })
-  test.each(['missing-popup', 'missing-draft', 'duplicate', 'wrong-agent', 'wrong-version', 'wrong-screen', 'wrong-state', 'no-no-turn'])('%s cannot pass the observation inventory', kind => {
-    const p = panes()
-    if (kind === 'missing-popup') p.splice(2, 1)
-    if (kind === 'missing-draft') p.pop()
-    if (kind === 'duplicate') p.push(p[0]!)
-    if (kind === 'wrong-agent') p[0]!.agent = 'claude'
-    if (kind === 'wrong-version') p[0]!.version = 'other-version'
-    if (kind === 'wrong-screen') p[2]!.screen.kind = 'input'
-    if (kind === 'wrong-state') p[7]!.state = 'waiting'
-    expect(() => assertCodexObservationInventory(p, kind !== 'no-no-turn')).toThrow()
-  })
-})
-
-describe('native pane rendering uses bounded observable polling', () => {
-  const source = readFileSync(join(import.meta.dir, 'real-agent/codex-delivery.ts'), 'utf8')
-  const extract = (name: string) => source.match(new RegExp(`^async function ${name}[\\s\\S]*?^\\}`, 'm'))![0]
-  function probe(label: string, frames: { state: string; screen: { kind: string; text?: string }; after?: number }[]) {
-    let at = 0, calls = 0
-    const captures: number[] = [], diagnostics: { label: string; value: unknown }[] = []
-    const wait = new Function('Date', 'Bun', 'pane', 'record', new Bun.Transpiler({ loader: 'ts' }).transformSync(
-      extract('poll') + '\n' + extract('observationPane') + '\nreturn observationPane',
-    ))({ now: () => at }, { sleep: async (ms: number) => { at += ms } }, async () => {
-      captures.push(at)
-      const frame = frames[Math.min(calls++, frames.length - 1)]!
-      at += frame.after ?? 0
-      return frame
-    }, (label: string, value: unknown) => { diagnostics.push({ label, value }); assertNoLeak({ label, value }) }) as (label: string, text: string) => Promise<unknown>
-    return { run: () => wait(label, 'first line\nsecond line'), captures, diagnostics, calls: () => calls, at: () => at }
-  }
-  test.each(['slash-popup', 'at-popup', 'dollar-popup', 'shortcuts-overlay', 'idle-multiline-draft', 'busy-multiline-draft'])('%s waits for delayed screen rendering and matching activity', async label => {
-    const expected = { state: label.startsWith('busy-') ? 'working' : 'waiting', screen: { kind: label.includes('draft') ? 'input' : 'menu', text: 'first line\nsecond line' } }
-    const p = probe(label, [{ state: 'waiting', screen: { kind: 'empty' } }, { ...expected, state: expected.state === 'working' ? 'waiting' : 'working' }, expected])
-    expect(await p.run()).toEqual(expected)
-    expect(p.captures).toEqual([0, 250, 500])
-    expect(p.diagnostics).toEqual([])
-  })
-  test('a partially rendered multiline draft cannot satisfy the expected draft', async () => {
-    const expected = { state: 'waiting', screen: { kind: 'input', text: 'first line\nsecond line' } }
-    const p = probe('idle-multiline-draft', [{ ...expected, screen: { kind: 'input', text: 'first line' } }, expected])
-    expect(await p.run()).toEqual(expected); expect(p.calls()).toBe(2)
-  })
-  test.each([
-    ['slash-popup', 'waiting', 'input'], ['idle-one-line-draft', 'waiting', 'empty'],
-    ['busy-one-line-draft', 'waiting', 'input'], ['idle-one-line-draft', 'working', 'input'],
-  ])('%s cannot capture kind=%s/%s through its 120s bound', async (label, state, kind) => {
-    const p = probe(label!, [{ state: state!, screen: { kind: kind!, text: 'first line\nsecond line' } }])
-    await expect(p.run()).rejects.toThrow('observation incomplete within bound')
-    expect(p.at()).toBe(120000); expect(p.calls()).toBe(480)
-    expect(p.diagnostics).toEqual([{ label: 'bound', value: { step: `native ${label} rendering`, milliseconds: 120000 } }])
-  })
-  test('a read that returns the expected screen after the deadline is refused', async () => {
-    const p = probe('at-popup', [{ state: 'waiting', screen: { kind: 'menu' }, after: 120001 }])
-    await expect(p.run()).rejects.toThrow('observation incomplete within bound')
-    expect(p.calls()).toBe(1)
-    expect(p.diagnostics).toEqual([{ label: 'bound', value: { step: 'native at-popup rendering', milliseconds: 120000 } }])
-  })
-  test('every popup and draft observation calls the polled capture without fixed render sleeps', () => {
-    const observe = extract('observe')
-    expect(observe.match(/await observationPane\(label!, text!\)/g)).toHaveLength(2)
-    expect(observe).not.toMatch(/Bun\.sleep\((100|300)\)/)
-  })
-})
-
 describe('Codex fault recovery evidence', () => {
-  test('Enter-only recovery requires actual Enter after a durable retry and exactly one text', () => {
-    const f = sample(), retry = { ...(f.journal[2] as any), send_kind: 'enter', at: 1050, attempt: 2 }
-    f.journal.splice(3, 0, retry)
-    f.shim += call(1051, undefined, 'Enter')
-    expect(() => assertCodexRecovery(f.journal, 1, 'enter', f.shim, instance)).not.toThrow()
-    expect(() => assertCodexRecovery(f.journal, 1, 'enter', f.shim + call(1060, texts[0]), instance)).toThrow()
-    expect(() => assertCodexRecovery(f.journal, 1, 'enter', call(1001, texts[0]), instance)).toThrow()
-    expect(() => assertCodexRecovery(f.journal, 1, 'enter', call(1001, texts[0]) + call(2001, undefined, 'Enter'), instance)).toThrow()
-  })
   test('lost text needs both durable retype and a second actual text call', () => {
     const f = sample(), retry = { ...(f.journal[2] as any), send_kind: 'retype', at: 1050, attempt: 2 }
     f.journal.splice(3, 0, retry)
@@ -178,7 +97,7 @@ describe('Codex fault recovery evidence', () => {
     expect(() => assertCodexRecovery(f.journal, 1, 'retype', f.shim, instance)).not.toThrow()
     expect(() => assertCodexRecovery(f.journal, 1, 'retype', call(1001, texts[0]) + call(1049, texts[0]), instance)).toThrow()
   })
-  test('trailing popup characters are confirmed without a retype', () => {
+  test('exact trailing characters are confirmed without a retype', () => {
     const f = sample()
     for (const seq of [1, 2]) expect(() => assertCodexRecovery(f.journal, seq, 'no-retype', f.shim, instance)).not.toThrow()
     f.shim += call(1051, texts[0])

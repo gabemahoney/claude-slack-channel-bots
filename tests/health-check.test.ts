@@ -4,51 +4,16 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { describe, test, expect, beforeEach, beforeAll, afterAll, afterEach } from 'bun:test'
+import type { Client } from 'agent-director'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test'
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs'
 import { stat as fsStat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import {
-  initHealthCheck,
-  startHealthCheck,
-  _resetHealthCheckState,
-  _runHealthCheckTickForTest,
-  buildPersonaWorkList,
-  forgetDisconnectedStreak,
-  healthCheckAtCapSkipLine,
-  type HealthCheckDeps,
-} from '../src/health-check.ts'
-import {
-  _resetOutageState,
-  initOutageState,
-  getOutageFlags,
-  setOutageFlag,
-  clearOutageFlag,
-  resetAllToHealthy,
-  ONSET_TEMPLATES,
-  ALL_CLEAR_TEMPLATE,
-  adConfigMalformedOnset,
-} from '../src/outage-state.ts'
-import type { Client } from 'agent-director'
-import { _buildIsSessionAliveAdapter, _buildStatRouteImpl } from '../src/server.ts'
+import { describeAdFailureForLog } from '../src/ad-error-class.ts'
 import { resetClientForTests, setClientForTests } from '../src/agent-director-client.ts'
-import { personaInstanceId } from '../src/persona-identity.ts'
 import { _resetBackoffState } from '../src/backoff.ts'
-import { makeMultiPersonaConfig, makePersonaConfig } from './test-helpers/persona-config.ts'
 import type { Persona } from '../src/config.ts'
-import type { PersonaConnectionManager } from '../src/persona-connections.ts'
-import { checkPersonaConfigDir } from '../src/persona-bringup.ts'
-import {
-  _resetNotConnectedEpisodes,
-  forgetNotConnectedEpisode,
-  notifyDisconnectedWithAutoRestartDisabled,
-  notifyPersonaNotConnected,
-  setConflictLatch,
-  setConfiguredPersonaQuery,
-  _resetConfiguredPersonaQuery,
-  setSessionNotifier,
-} from '../src/session-manager.ts'
 import {
   LATCH_CASE_LAUNCH_START_NOT_RECORDED,
   bindConflictNotice,
@@ -57,11 +22,16 @@ import {
   type ConflictLatch,
   type ConflictLatchRecord,
 } from '../src/conflict-latch.ts'
-import { describeAdFailureForLog } from '../src/ad-error-class.ts'
-import { createPersonaEpisodes } from '../src/persona-episodes.ts'
-import { createFakeClock } from './test-helpers/fake-clock.ts'
-import { NO_LAUNCH_START_FORMS, UNUSABLE_NAME_CASE_ROWS, launchStartRecord } from './test-helpers/conflict-cases.ts'
-import { createPersonaRelaunchGate } from '../src/persona-start.ts'
+import {
+  _resetHealthCheckState,
+  _runHealthCheckTickForTest,
+  buildPersonaWorkList,
+  forgetDisconnectedStreak,
+  healthCheckAtCapSkipLine,
+  initHealthCheck,
+  startHealthCheck,
+  type HealthCheckDeps,
+} from '../src/health-check.ts'
 import {
   AGENT_DIRECTOR_DEAD_STATES,
   AGENT_DIRECTOR_PENDING_STATE,
@@ -74,22 +44,35 @@ import {
   type LivenessReading,
 } from '../src/liveness-reading.ts'
 import {
+  ALL_CLEAR_TEMPLATE,
+  ONSET_TEMPLATES,
+  _resetOutageState,
+  adConfigMalformedOnset,
+  clearOutageFlag,
+  getOutageFlags,
+  initOutageState,
+  resetAllToHealthy,
+  setOutageFlag,
+} from '../src/outage-state.ts'
+import {
   createPersonaBringUpController,
   type PersonaBringUpController,
 } from '../src/persona-bringup-controller.ts'
+import { checkPersonaConfigDir } from '../src/persona-bringup.ts'
+import type { PersonaConnectionManager } from '../src/persona-connections.ts'
+import { createPersonaEpisodes } from '../src/persona-episodes.ts'
+import { personaInstanceId } from '../src/persona-identity.ts'
+import { createPersonaRelaunchGate } from '../src/persona-start.ts'
+import { _buildIsSessionAliveAdapter, _buildStatRouteImpl } from '../src/server.ts'
 import {
-  makeConnectionHarness,
-  type ConnectionHarness,
-  type ConnectionHarnessOptions,
-} from './test-helpers/persona-connection-harness.ts'
-import {
-  APP_TOKEN_PREFIX,
-  LEAK_SENTINEL,
-  REDACTED_SENTINEL_TAIL,
-  assertNoLeak,
-  fakeToken,
-  sentinelInMessage,
-} from './test-helpers/credentials.ts'
+  _resetConfiguredPersonaQuery,
+  _resetNotConnectedEpisodes,
+  forgetNotConnectedEpisode,
+  notifyDisconnectedWithAutoRestartDisabled,
+  setConfiguredPersonaQuery,
+  setConflictLatch,
+  setSessionNotifier
+} from '../src/session-manager.ts'
 import {
   SAMPLE_LAUNCH_START_FRACTIONAL,
   SAMPLE_LAUNCH_START_WHOLE,
@@ -100,6 +83,22 @@ import {
   errSystemInstallDisappeared,
   makeStubClient,
 } from './test-helpers/agent-director-stub.ts'
+import { NO_LAUNCH_START_FORMS, UNUSABLE_NAME_CASE_ROWS, launchStartRecord } from './test-helpers/conflict-cases.ts'
+import {
+  APP_TOKEN_PREFIX,
+  LEAK_SENTINEL,
+  REDACTED_SENTINEL_TAIL,
+  assertNoLeak,
+  fakeToken,
+  sentinelInMessage,
+} from './test-helpers/credentials.ts'
+import { createFakeClock } from './test-helpers/fake-clock.ts'
+import { makeMultiPersonaConfig, makePersonaConfig } from './test-helpers/persona-config.ts'
+import {
+  makeConnectionHarness,
+  type ConnectionHarness,
+  type ConnectionHarnessOptions,
+} from './test-helpers/persona-connection-harness.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -1234,7 +1233,7 @@ describe('b.f2b: launches in flight, the delay-0 not-connected notice, pending w
     const asked: Array<[number, string, string]> = []
     deps.notifyNotConnected = (key, why) => {
       asked.push([deps.isSessionConnectedCalls.length, key, why])
-      notifyDisconnectedWithAutoRestartDisabled(key, why)
+      notifyDisconnectedWithAutoRestartDisabled(key)
     }
 
     await runTicks(deps, 6)
@@ -1247,26 +1246,6 @@ describe('b.f2b: launches in flight, the delay-0 not-connected notice, pending w
       expect(raised[0]!.text).toStartWith(head!)
       expect(raised[0]!.text).toContain(detail!)
     }
-  })
-
-  test('one latch for every notice: an unproven-idle notice already raised in the episode (a launch wait that gave up on the working row at delay 0) is the episode\'s one; the tick\'s delay-0 notice raises nothing more', async () => {
-    const raised: Array<{ key: string; text: string }> = []
-    setSessionNotifier((key, text) => { raised.push({ key, text }) })
-    expect(notifyPersonaNotConnected(KEY, { reason: 'unproven-idle', autoRestartDisabled: true, heldMs: 10 * 60_000 })).toBe(true)
-    const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_LIVE, isSessionConnectedResult: false, maxTicks: 4 })
-    deps.isAutoRestartDisabled = () => true
-    let asked = 0
-    deps.notifyNotConnected = (key, why) => {
-      asked++
-      notifyDisconnectedWithAutoRestartDisabled(key, why)
-    }
-
-    await runTicks(deps, 4)
-
-    expect(deps.scheduleRestartAtConnectedCount).toEqual([2, 4])
-    expect(asked).toBe(2)
-    expect(raised.map((n) => n.key)).toEqual([KEY])
-    expect(raised[0]!.text).toContain('its session reads working but CSCB can\'t prove it\'s idle')
   })
 
   test('a healthy tick, and only a healthy one, ends the persona\'s not-connected episode (endNotConnectedEpisode): a later episode is reported again', async () => {
@@ -1291,26 +1270,6 @@ describe('b.f2b: launches in flight, the delay-0 not-connected notice, pending w
     expect(raised.map((n) => n.key)).toEqual([KEY, KEY])
   })
 
-  test.each<[string, boolean, number[]]>([
-    ['pending', true, [1, 2]],
-    ['none', false, [2]],
-  ])('working-row evidence %s: an alive persona not deliverable is scheduled from its first undeliverable tick when evidence is pending, else from its second', async (_label, pending, scheduledAt) => {
-    const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_LIVE, isSessionConnectedResult: false, maxTicks: 2 })
-    deps.hasPendingWorkingRowEvidence = () => pending
-
-    await runTicks(deps, 2)
-
-    expect(deps.scheduleRestartAtConnectedCount).toEqual(scheduledAt)
-  })
-
-  test('pending working-row evidence schedules nothing for a persona that is connected with its stream', async () => {
-    const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_LIVE, maxTicks: 2 })
-    deps.hasPendingWorkingRowEvidence = () => true
-
-    await runTicks(deps, 2)
-
-    expect(deps.scheduleRestartCalls).toEqual([])
-  })
 })
 
 // ---------------------------------------------------------------------------

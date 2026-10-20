@@ -1,9 +1,9 @@
 /** Shared typing ownership and the no-engine reconnect driver (b.omv SR-5.5/6.6). */
 import { afterEach, describe, expect, test } from 'bun:test'
-import { createDeliveryLifecycle, NOT_NOW_RETRY_MS, RECONNECT_BLOCKED_NOTICE_MS, type DeliveryLifecycle, type TypingOwner } from '../src/delivery-lifecycle.ts'
 import { createDeliveryAdScope } from '../src/delivery-ad-scope.ts'
-import { createFakeClock } from './test-helpers/fake-clock.ts'
+import { createDeliveryLifecycle, NOT_NOW_RETRY_MS, type DeliveryLifecycle, type TypingOwner } from '../src/delivery-lifecycle.ts'
 import { makeStubClient } from './test-helpers/agent-director-stub.ts'
+import { createFakeClock } from './test-helpers/fake-clock.ts'
 
 const lives: DeliveryLifecycle[] = []
 const unblocks: (() => void)[] = []
@@ -12,11 +12,11 @@ afterEach(async () => {
   for (const life of lives.splice(0)) await life.stop()
 })
 function harness() {
-  const clock = createFakeClock(), calls: { key: string; at: number }[] = [], screens: unknown[] = []
-  const life = createDeliveryLifecycle({ startId: 'server-run', clock, onReconnectScreen: (key, screen, blockedMs) => screens.push({ key, screen, blockedMs }) })
+  const clock = createFakeClock(), calls: { key: string; at: number }[] = []
+  const life = createDeliveryLifecycle({ startId: 'server-run', clock })
   lives.push(life)
   life.setReconnect(async key => { calls.push({ key, at: clock.now() }) })
-  return { clock, life, calls, screens }
+  return { clock, life, calls }
 }
 
 describe('launch identity and typing leases', () => {
@@ -39,11 +39,11 @@ describe('launch identity and typing leases', () => {
     const nextServer = createDeliveryLifecycle({ startId: 'another-run' }); lives.push(nextServer)
     expect(nextServer.launchId('alpha')).not.toBe(first)
   })
-  test.each(['delivery', 'reconnect', 'startup'] as const)('%s holds one persona gate; stale releases cannot free a replacement lease', owner => {
+  test.each(['delivery', 'reconnect'] as const)('%s holds one persona gate; stale releases cannot free a replacement lease', owner => {
     const { life } = harness()
     const release = life.acquire('alpha', owner)!
     expect(life.owner('alpha')).toBe(owner)
-    for (const contender of ['delivery', 'reconnect', 'startup'] as TypingOwner[]) expect(life.acquire('alpha', contender)).toBeUndefined()
+    for (const contender of ['delivery', 'reconnect'] as TypingOwner[]) expect(life.acquire('alpha', contender)).toBeUndefined()
     const sibling = life.acquire('beta', 'delivery')!
     expect(life.owner('beta')).toBe('delivery')
     life.forget('alpha')
@@ -94,7 +94,7 @@ describe('deferred reconnect ownership', () => {
   })
   test.each(['typed-or-connected', 'ended', 'missing', 'teardown', 'shutdown'] as const)('%s cancels the deferred timer while preserving a sibling', async reason => {
     const { life, clock, calls } = harness()
-    life.defer('alpha', 'menu'); life.defer('beta', 'input')
+    life.defer('alpha'); life.defer('beta')
     if (reason === 'typed-or-connected') life.clearDeferred('alpha')
     else if (reason === 'ended' || reason === 'missing') life.observeRow('alpha', { state: reason })
     else if (reason === 'teardown') life.forget('alpha')
@@ -104,22 +104,7 @@ describe('deferred reconnect ownership', () => {
     if (reason !== 'shutdown') expect(life.deferred('alpha')).toBeUndefined()
     if (reason === 'teardown' || reason === 'shutdown') expect(life.acquire('alpha', 'delivery')).toBeUndefined()
   })
-  test('screen-only blocked time and events pause across failed reads and reset after the episode clears', async () => {
-    const { life, clock, screens } = harness()
-    life.engineRunning('alpha', true)
-    life.defer('alpha', 'menu')
-    await clock.advance(RECONNECT_BLOCKED_NOTICE_MS)
-    life.defer('alpha', 'menu')
-    expect(screens.at(-1)).toEqual({ key: 'alpha', screen: 'menu', blockedMs: RECONNECT_BLOCKED_NOTICE_MS })
-    life.defer('alpha') // A failed read has no screen evidence.
-    await clock.advance(RECONNECT_BLOCKED_NOTICE_MS)
-    expect(life.deferred('alpha')?.blockedMs).toBe(RECONNECT_BLOCKED_NOTICE_MS)
-    expect(screens).toHaveLength(2)
-    life.defer('alpha', 'input')
-    expect(screens.at(-1)).toEqual({ key: 'alpha', screen: 'input', blockedMs: RECONNECT_BLOCKED_NOTICE_MS })
-    life.clearDeferred('alpha'); life.defer('alpha', 'input')
-    expect(screens.at(-1)).toEqual({ key: 'alpha', screen: 'input', blockedMs: 0 })
-  })
+
   test('shutdown resolves a delayed key pause and waits for an already running reconnect', async () => {
     const { life, clock } = harness()
     let finish!: () => void, stopped = false, paused = false
@@ -160,4 +145,38 @@ test('concurrent and nested reconnect scopes keep each persona client and budget
   await first
   expect(counts).toEqual([1, 2])
   expect(scope.current('alpha')).toBeUndefined(); expect(scope.current('beta')).toBeUndefined()
+})
+
+
+describe('retained reconnect input ownership', () => {
+  test.each(['new-launch', 'new-session', 'new-stamp', 'ended', 'missing', 'teardown'] as const)(
+    '%s cancels the old command continuation while preserving the sibling', event => {
+      const { life } = harness()
+      for (const key of ['alpha', 'beta']) {
+        life.observeRow(key, { state: 'waiting', session_id: 'old-session', launch_started_at: '2026-10-15T01:00:00Z' })
+        life.rememberReconnectInput(key, { launch: life.launchId(key), session: 'old-session' })
+      }
+      if (event === 'new-launch') life.beforeLaunch('alpha')
+      else if (event === 'teardown') life.forget('alpha')
+      else life.observeRow('alpha', { state: event === 'ended' || event === 'missing' ? event : 'waiting', session_id: event === 'new-session' ? 'new-session' : 'old-session', launch_started_at: event === 'new-stamp' ? '2026-10-15T02:00:00Z' : '2026-10-15T01:00:00Z' })
+      expect(life.reconnectInput('alpha')).toBeUndefined()
+      expect(life.reconnectInput('beta')).toBeDefined()
+      expect(life.acquire('beta', 'delivery')).toBeUndefined()
+    },
+  )
+  test('a pending command keeps its retry timer when a connected engine takes ownership', async () => {
+    const { life, clock, calls } = harness()
+    life.rememberReconnectInput('alpha', { launch: life.launchId('alpha'), session: 's1' })
+    life.setReconnect(async key => { calls.push({ key, at: clock.now() }); life.clearReconnectInput(key); life.clearDeferred(key) })
+    life.defer('alpha')
+    life.engineRunning('alpha', true)
+    expect(life.acquire('alpha', 'delivery')).toBeUndefined()
+    await clock.advance(NOT_NOW_RETRY_MS[0])
+    expect(calls).toEqual([{ key: 'alpha', at: NOT_NOW_RETRY_MS[0] }])
+    expect(life.reconnectInput('alpha')).toBeUndefined()
+    expect(clock.pendingCount()).toBe(0)
+    const release = life.acquire('alpha', 'delivery')
+    expect(release).toBeDefined()
+    release?.()
+  })
 })

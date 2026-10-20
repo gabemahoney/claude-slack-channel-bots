@@ -1,82 +1,47 @@
-/**
- * persona-lifecycle.test.ts — The persona teardown, the apply bring-up (and
- * the recovery bring-up of a credentials-broken persona), the credentials
- * change and the in-place update (`createPersonaLifecycle`,
- * src/persona-lifecycle.ts; b.av2 SR-6.1, SR-6.2, SR-6.4, SR-6.5, SR-6.6,
- * SR-8.6).
- *
- * Every lifecycle here runs through a real `createPersonaSerializer`. The
- * dependencies are recorders by default (each call appends `<dep>:<arg>` to
- * one shared trail, so order and the key are both asserted), replaced by the
- * real module where the case is about that module:
- * - the notice window (b.jg5 SRJ-1003, SRJ-1002): the recorders trail the
- *   notifier's submit, window open and close and submit end too, so the
- *   window is shown open before the turn's first step and closed after its
- *   last;
- * - the agent-director kill (b.jg5 SRJ-715, SRJ-110, SRJ-702) and AC 65: the
- *   real teardown kill entry (`killPersonaInstanceForTeardown`, the bounded
- *   retry on a fake clock whose waits the case drives) over `makeStubClient`,
- *   with the real outage state (`resetAllToHealthy`), the real notifier with
- *   its teardown window, destination resolver and destination hold
- *   (`makeNotifierHarness`, fake clock), and the real kill-failure alerts and
- *   unclassified-error episodes over real notice episodes whose sink is that
- *   notifier, bound as `main()` binds them (context 'persona teardown'). The
- *   notifier's startup-errors entries and the alerts' log-only entries are
- *   read back from the test's temp `logDir`; their class and text come from
- *   `src/`'s constant and builders. There is no delete: the row is kept
- *   whatever the kill answers;
- * - the teardown end to end (b.jg5 SRJ-715): the recovery harness's
- *   `teardownDeps()` (the real approver and live-row sequence stops, retry
- *   controller, latch, hold, notice episodes, outage state and bounded-retry
- *   kill, bound as `main()` binds them), what P holds set through the
- *   harness's real routes, each left-over read through its module's query;
- * - the ack-reaction entries: the real ack tracker's `forgetPersonaAcks`;
- * - the heard set (b.av2 SR-6.5 with b.deo SRI-307, b.deo AC 13): the real routing
- *   in fungible mode (`makeRoutingHarness`), its `forget` as
- *   `routing.forget`, each persona's heard set filled by events through the
- *   routing and read through its own `heardChannels`; the registry and
- *   restart state the harness installs are reset after the case
- *   (`resetRoutingState`);
- * - the notice episodes (b.jg5 SRJ-1016): a real `createPersonaEpisodes`
- *   instance on a fake clock, its `forget` as `forgetNoticeEpisodes`;
- * - the latch (b.jg5 SRJ-504): a real `createConflictLatch` with the CONFLICT
- *   notice bound to real notice episodes over a recording sink (handing each
- *   notice on to the real notifier where the case is about the window), its
- *   `forget` as `forgetConflictLatch`;
- * - the `ErrInvalidFlags` hold (b.jg5 SRJ-207, SRJ-715): a real
- *   `createInvalidFlagsHold` with its set reaction bound to real notice
- *   episodes over a recording sink (on to the real notifier as above), its
- *   `forget` as `forgetInvalidFlagsHold`;
- * - serialization behind a restart: the real restart module
- *   (`initRestart` with `serialize`, real `cancelRestartTimer`). Its timer is
- *   a real `setTimeout` (1 ms here; it takes no fake clock), waited for by a
- *   1 ms-step poll. Beside it, the real UNAVAILABLE retry controller on a
- *   fake clock (its `stop` with the torn-down reason as `stopRetryTimer`,
- *   recorded in the trail), with A's and B's timers armed and never fired;
- * - serialization behind a bring-up retry, the recovery bring-up of a
- *   persona broken by its credentials, and confirmed credentials changes
- *   (the controller's `changeCredentials` called directly, and through the
- *   lifecycle): the real bring-up controller over the real connection manager
- *   (`makeControllerStack` over `makeConnectionHarness`, fake clock), each
- *   rewritten credentials file registered as its own stub credential set.
- *
- * Isolation (b.av2 SR-13.2): persona paths under a per-test `mkdtempSync`
- * directory, fake tokens only, no real agent-director, no Slack post.
- *
- * SPDX-License-Identifier: MIT
- */
 
-import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
+
 import type { MakeTemplateParams } from 'agent-director'
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import { mkdirSync, mkdtempSync, rmSync, unlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
 
-import type { Persona, PersonaConfig } from '../src/config.ts'
-import { resetClientForTests, setClientForTests, getClient } from '../src/agent-director-client.ts'
-import { ErrSystemInstallDisappeared } from '../src/agent-director-errors.ts'
+import type { StatusResult } from 'agent-director'
 import { _resetAckTracker, consumeAck, forgetPersonaAcks, trackAck } from '../src/ack-tracker.ts'
+import {
+  AD_ERROR_CLASS_CONFIG,
+  AD_ERROR_CLASS_CONFLICT,
+  AD_ERROR_CLASS_ENVIRONMENT,
+  AD_ERROR_CLASS_UNAVAILABLE,
+  AD_ERROR_CLASS_UNCLASSIFIED,
+  AD_ERROR_CLASS_UNUSABLE_NAME,
+  classifyAdError,
+  killFailedDescriptionOf,
+} from '../src/ad-error-class.ts'
+import {
+  installAdVersionRecheck,
+  RECHECK_OUTCOME_PASS,
+  RECHECK_OUTCOME_STOP,
+  resetAdVersionRecheckForTests,
+} from '../src/ad-version-gate.ts'
+import { getClient, resetClientForTests, setClientForTests } from '../src/agent-director-client.ts'
+import { ErrSystemInstallDisappeared } from '../src/agent-director-errors.ts'
 import { _resetBackoffState } from '../src/backoff.ts'
+import {
+  describeKillOutcome,
+  KILL_OUTCOME_KILLED,
+  KILL_OUTCOME_NOT_KILLED,
+  KILL_OUTCOME_ROW_GONE,
+  KILL_OUTCOME_SESSION_GONE,
+  KILL_REFUSAL_AT_KILL,
+  KILL_REFUSAL_AT_READ,
+  killOutcomeOf,
+  teardownKillNotSucceededNoticeText,
+  teardownKillRefusalNoticeText,
+  type KillFailure,
+  type KillOutcome,
+} from '../src/checked-kill.ts'
+import type { Persona, PersonaConfig } from '../src/config.ts'
 import {
   bindConflictNotice,
   CONFLICT_LATCH_SET_LATCHED,
@@ -98,14 +63,42 @@ import {
   type ConflictLatchSetInput,
 } from '../src/conflict-latch.ts'
 import {
+  bindInvalidFlagsHoldSetReaction,
+  createInvalidFlagsHold,
+  INVALID_FLAGS_HOLD_ALERT_TEXT,
+  invalidFlagsHoldForgetLine,
+  type InvalidFlagsHold,
+} from '../src/invalid-flags-hold.ts'
+import {
+  KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN,
+  KILL_FAILURE_VERSION_ORDINARY,
+  killFailureAlertText,
+  PERSONA_KILL_FAILED_LABEL,
+  PERSONA_KILL_SURVIVOR_LABEL,
+  selectKillFailureAlertRoute,
+  type KillFailureAlertContent,
+} from '../src/kill-failure-alert.ts'
+import {
+  KILL_RETRY_ALERT_NONE,
+  KILL_RETRY_ALERT_ORDINARY,
+  KILL_RETRY_ALERT_SURVIVOR,
+  KILL_RETRY_END_EXHAUSTED,
+  KILL_RETRY_END_SETTLED,
+  KILL_RETRY_SPACING_MS,
+  KILL_RETRY_TRIES,
+  type KillRetryAlert,
+} from '../src/kill-retry.ts'
+import { LIVE_ROW_OUTCOME_STOPPED, LIVE_ROW_STOP_HOLD_ENDED, LIVE_ROW_STOP_TEARDOWN } from '../src/live-row-sequence.ts'
+import { LIVENESS_READING_DEAD, LIVENESS_READING_DEAD_ENDED } from '../src/liveness-reading.ts'
+import {
   _resetOutageState,
   clearOutageFlag,
-  type OutageClass,
   getOutageFlags,
   initOutageState,
   resetAllToHealthy,
   setOutageFlag,
   withOutageDetection,
+  type OutageClass,
 } from '../src/outage-state.ts'
 import {
   createPersonaBringUpController,
@@ -120,29 +113,6 @@ import {
 import { checkPersonaConfigDir } from '../src/persona-bringup.ts'
 import { credentialsDigest, readCredentialsFile } from '../src/persona-credentials.ts'
 import {
-  createKillFailureAlerts,
-  createPersonaEpisodes,
-  createUnclassifiedErrorEpisodes,
-  PERSONA_UNCLASSIFIED_ERROR_LABEL,
-  personaUnclassifiedErrorEntryText,
-  unclassifiedErrorAlertText,
-  type UnclassifiedErrorEpisodes,
-  PERSONA_EPISODE_KIND_CONFLICT,
-  PERSONA_EPISODE_KIND_INVALID_FLAGS_HOLD,
-  PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE,
-  PERSONA_EPISODE_KIND_UNUSABLE_RECORDED_NAME,
-  PERSONA_EPISODE_KINDS,
-  type PersonaEpisodes,
-} from '../src/persona-episodes.ts'
-import { unescapeSlackControlCharacters } from '../src/slack-text-escape.ts'
-import {
-  bindInvalidFlagsHoldSetReaction,
-  createInvalidFlagsHold,
-  INVALID_FLAGS_HOLD_ALERT_TEXT,
-  invalidFlagsHoldForgetLine,
-  type InvalidFlagsHold,
-} from '../src/invalid-flags-hold.ts'
-import {
   PERSONA_CONFIG_DIR_UNRESOLVABLE,
   PERSONA_CREDENTIALS_CHANGE_FAILED,
   PERSONA_CREDENTIALS_INVALID,
@@ -151,6 +121,21 @@ import {
   PERSONA_DIRECTORY_MISSING,
   PERSONA_SLACK_UNREACHABLE,
 } from '../src/persona-diagnostics.ts'
+import {
+  createKillFailureAlerts,
+  createPersonaEpisodes,
+  createUnclassifiedErrorEpisodes,
+  PERSONA_EPISODE_KIND_CONFLICT,
+  PERSONA_EPISODE_KIND_INVALID_FLAGS_HOLD,
+  PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE,
+  PERSONA_EPISODE_KIND_UNUSABLE_RECORDED_NAME,
+  PERSONA_EPISODE_KINDS,
+  PERSONA_UNCLASSIFIED_ERROR_LABEL,
+  personaUnclassifiedErrorEntryText,
+  unclassifiedErrorAlertText,
+  type PersonaEpisodes,
+  type UnclassifiedErrorEpisodes,
+} from '../src/persona-episodes.ts'
 import { personaInstanceId, renderPersonaRef } from '../src/persona-identity.ts'
 import {
   createPersonaLifecycle,
@@ -162,6 +147,12 @@ import {
   type PersonaLifecycle,
   type PersonaLifecycleDeps,
 } from '../src/persona-lifecycle.ts'
+import {
+  formatPersonaNotice,
+  PERSONA_TEARDOWN_NOTICE_ALL_CLEAR_AFTER,
+  PERSONA_TEARDOWN_NOTICE_LABEL,
+  PERSONA_TEARDOWN_NOTICE_RAISED,
+} from '../src/persona-notifier.ts'
 import { createPersonaSerializer, type PersonaSerializer } from '../src/persona-serializer.ts'
 import type { PersonaBringUpStep } from '../src/persona-start.ts'
 import type { InPlaceApplyInput } from '../src/reload-apply.ts'
@@ -176,124 +167,30 @@ import {
   runRestartRetry,
   scheduleRestart,
 } from '../src/restart.ts'
-import { LIVENESS_READING_DEAD, LIVENESS_READING_DEAD_ENDED } from '../src/liveness-reading.ts'
-import {
-  APPROVER_LOG_PREFIX,
-  APPROVER_STOP_TEARDOWN,
-  _resetConfiguredPersonaQuery,
-  _whenDialogApproverStopped,
-  approverLogLine,
-  approverNotStartedMessage,
-  killPersonaInstanceForTeardown,
-  latchOnRestartKillOutcome,
-  oldLifeWaitTeardownLine,
-  setConfiguredPersonaQuery,
-  setConflictLatch,
-  setStuckLaunchEpisodes,
-  stopLiveRowSequence,
-  whenLaunchSettled,
-  type PersonaTeardownKillRefusal,
-  type PersonaTeardownKillResult,
-} from '../src/session-manager.ts'
-import { LIVE_ROW_OUTCOME_STOPPED, LIVE_ROW_STOP_HOLD_ENDED, LIVE_ROW_STOP_TEARDOWN } from '../src/live-row-sequence.ts'
-import { UNAVAILABLE_RETRY_ROW_ABSENT, unavailableRetryStoppedLine } from '../src/unavailable-retry.ts'
-import {
-  callCounts,
-  callCountsSince,
-  holdThroughReuse,
-  makeRecoveryHarness,
-  ordinaryAlertContent,
-  personaOf,
-  rowReadsUntilSpawn,
-  scriptLiveRowElsewhere,
-  survivorAlertContent,
-  type RecoveryHarness,
-} from './test-helpers/recovery-harness.ts'
-import { PRE_PERSONA_ID, holdOldAt } from './test-helpers/old-life.ts'
-import {
-  conflictForPersona,
-  RESTART_KILL_CONFLICT_CASE_ROWS,
-  RESTART_KILL_UNUSABLE_NAME_CASE_ROWS,
-} from './test-helpers/conflict-cases.ts'
-import {
-  KILL_RETRY_ALERT_NONE,
-  KILL_RETRY_ALERT_ORDINARY,
-  KILL_RETRY_ALERT_SURVIVOR,
-  KILL_RETRY_END_EXHAUSTED,
-  KILL_RETRY_END_SETTLED,
-  KILL_RETRY_SPACING_MS,
-  KILL_RETRY_TRIES,
-  type KillRetryAlert,
-} from '../src/kill-retry.ts'
-import {
-  KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN,
-  KILL_FAILURE_VERSION_ORDINARY,
-  PERSONA_KILL_FAILED_LABEL,
-  PERSONA_KILL_SURVIVOR_LABEL,
-  killFailureAlertText,
-  selectKillFailureAlertRoute,
-  type KillFailureAlertContent,
-} from '../src/kill-failure-alert.ts'
-import {
-  PERSONA_TEARDOWN_NOTICE_ALL_CLEAR_AFTER,
-  PERSONA_TEARDOWN_NOTICE_LABEL,
-  PERSONA_TEARDOWN_NOTICE_RAISED,
-  formatPersonaNotice,
-} from '../src/persona-notifier.ts'
+import { _resetConfiguredPersonaQuery, killPersonaInstanceForTeardown, latchOnRestartKillOutcome, oldLifeWaitTeardownLine, setConfiguredPersonaQuery, setConflictLatch, setStuckLaunchEpisodes, stopLiveRowSequence, whenLaunchSettled, type PersonaTeardownKillRefusal, type PersonaTeardownKillResult } from '../src/session-manager.ts'
+import { unescapeSlackControlCharacters } from '../src/slack-text-escape.ts'
 import { recordStartupError } from '../src/startup-errors.ts'
-import {
-  KILL_OUTCOME_KILLED,
-  KILL_OUTCOME_NOT_KILLED,
-  KILL_OUTCOME_ROW_GONE,
-  KILL_OUTCOME_SESSION_GONE,
-  KILL_REFUSAL_AT_KILL,
-  KILL_REFUSAL_AT_READ,
-  describeKillOutcome,
-  killOutcomeOf,
-  teardownKillNotSucceededNoticeText,
-  teardownKillRefusalNoticeText,
-  type KillFailure,
-  type KillOutcome,
-} from '../src/checked-kill.ts'
-import {
-  RECHECK_OUTCOME_PASS,
-  RECHECK_OUTCOME_STOP,
-  installAdVersionRecheck,
-  resetAdVersionRecheckForTests,
-} from '../src/ad-version-gate.ts'
-import { DEV_PLACEHOLDER_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
-import {
-  AD_ERROR_CLASS_CONFIG,
-  AD_ERROR_CLASS_CONFLICT,
-  AD_ERROR_CLASS_ENVIRONMENT,
-  AD_ERROR_CLASS_UNAVAILABLE,
-  AD_ERROR_CLASS_UNCLASSIFIED,
-  AD_ERROR_CLASS_UNUSABLE_NAME,
-  classifyAdError,
-  killFailedDescriptionOf,
-} from '../src/ad-error-class.ts'
-import type { StatusResult } from 'agent-director'
-import type { StubKillResult } from './test-helpers/agent-director-stub.ts'
 import {
   createUnavailableRetryController,
   runInAttempt,
   UNAVAILABLE_RETRY_CAUSE_CONFIG,
   UNAVAILABLE_RETRY_CAUSE_PENDING_ROW,
-  UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
-  UNAVAILABLE_RETRY_STOP_SHUTDOWN,
-  UNAVAILABLE_RETRY_STOP_TORN_DOWN,
-  type UnavailableRetryController,
+  UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, UNAVAILABLE_RETRY_ROW_ABSENT, UNAVAILABLE_RETRY_STOP_SHUTDOWN,
+  UNAVAILABLE_RETRY_STOP_TORN_DOWN, unavailableRetryStoppedLine, type UnavailableRetryController
 } from '../src/unavailable-retry.ts'
+import type { StubKillResult } from './test-helpers/agent-director-stub.ts'
 import {
   cannedErr,
+  cannedFindMissing,
+  cannedGetResult,
   cannedKillResult,
   cannedOk,
   cannedStatusResult,
   errCallTimeout,
   errConfigMalformed,
   errGeneric,
-  errInternal,
   errInstanceIdCollision,
+  errInternal,
   errInvalidFlags,
   errSpawnNotFound,
   errSpawnNotResumable,
@@ -304,24 +201,28 @@ import {
   errTmuxSessionConflict,
   errTmuxSessionCreate,
   errTmuxUnresponsive,
-  makeStubResolveSystemBinary,
-  type StubResolveSystemBinaryOutcome,
   errUnknownErrorName,
   errUnusableName,
-  cannedFindMissing,
-  cannedGetResult,
   holdFindMissing,
   holdSpawns,
   makeStubCallLog,
   makeStubClient,
+  makeStubResolveSystemBinary,
   SAMPLE_LAUNCH_START_NONE,
   stubCallCount,
   type CannedResponse,
+  type StubResolveSystemBinaryOutcome,
 } from './test-helpers/agent-director-stub.ts'
-import { APP_TOKEN_PREFIX, BOT_TOKEN_PREFIX, LEAK_SENTINEL, assertNoLeak, fakeToken, sentinelInMessage, writeCredentialsFile } from './test-helpers/credentials.ts'
+import { DEV_PLACEHOLDER_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
+import {
+  RESTART_KILL_CONFLICT_CASE_ROWS,
+  RESTART_KILL_UNUSABLE_NAME_CASE_ROWS
+} from './test-helpers/conflict-cases.ts'
+import { APP_TOKEN_PREFIX, assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, LEAK_SENTINEL, sentinelInMessage, writeCredentialsFile } from './test-helpers/credentials.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
-import { makeConnectionHarness, type ConnectionHarness, type ConnectionHarnessOptions } from './test-helpers/persona-connection-harness.ts'
+import { holdOldAt, PRE_PERSONA_ID } from './test-helpers/old-life.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
+import { makeConnectionHarness, type ConnectionHarness, type ConnectionHarnessOptions } from './test-helpers/persona-connection-harness.ts'
 import {
   makeNotifierHarness,
   readStartupEntries,
@@ -332,13 +233,20 @@ import {
 } from './test-helpers/persona-notifier.ts'
 import { makeRoutingHarness, resetRoutingState } from './test-helpers/persona-routing-harness.ts'
 import {
+  makeRecoveryHarness,
+  ordinaryAlertContent,
+  personaOf,
+  rowReadsUntilSpawn,
+  scriptLiveRowElsewhere,
+  survivorAlertContent
+} from './test-helpers/recovery-harness.ts'
+import {
   INITIAL_CREDENTIALS,
   makeChannelMessage,
   makeDeferredWebApiCall,
   makePrivateChannelMessage,
   type WebApiOutcome,
 } from './test-helpers/slack-stub.ts'
-
 
 /** The kill's success the fixture's `killInstance` answers: `kill_sent: true` (b.jg5 SRJ-701). */
 const KILL_SUCCEEDED: KillOutcome = { kind: KILL_OUTCOME_KILLED, killSent: true }
@@ -433,7 +341,7 @@ type DepName =
 
 /** Dependencies whose production form returns a promise: their failure is a rejection, the others' a throw. */
 const ASYNC_DEPS = new Set<DepName>([
-  'bringUps.bringUp', 'bringUps.changeCredentials', 'stopApprover', 'stopLiveRowSequence', 'whenLaunchSettled', 'connections.stop', 'connections.reconnectCredentials',
+  'bringUps.bringUp', 'bringUps.changeCredentials',  'stopLiveRowSequence', 'whenLaunchSettled', 'connections.stop', 'connections.reconnectCredentials',
   'dropSession', 'killInstance', 'launch', 'notifier.notify',
 ])
 
@@ -572,7 +480,7 @@ function makeFixture(opts: FixtureOptions = {}): Fixture {
     dryRun: opts.dryRun ?? false,
     isShuttingDown: () => false,
     log: (line) => void lines.push(line),
-    stopApprover: rec('stopApprover', byKey, async () => false),
+
     stopLiveRowSequence: rec('stopLiveRowSequence', byKey, async () => false),
     whenLaunchSettled: rec('whenLaunchSettled', byKey, (key: string) => opts.launchInFlight?.(key) ?? Promise.resolve()),
     cancelRestartTimer: rec('cancelRestartTimer', byKey, () => false),
@@ -672,34 +580,11 @@ function turnEnd(p: Persona): string[] {
   return [`notifier.closeTeardownWindow:${p.key}`, `notifier.settleTeardown:${p.key}`]
 }
 
-/**
- * The teardown's own steps for `p` (its serializer turn), outside dry run,
- * with the recorders' defaults (b.jg5 SRJ-715): its outage state forgotten
- * and its notice window opened (`turnStart`); then, first, before the wait
- * for its launch in flight, its dialog approver, its live-row sequence and
- * its UNAVAILABLE retry timer are stopped and its latch, `ErrInvalidFlags`
- * hold and notice episodes forgotten, in that order (b.jg5 SRJ-404, SRJ-706,
- * SRJ-305, SRJ-504, SRJ-207, SRJ-1016); then its bring-up retries and
- * restart timer are cancelled and the launch's wait for a `working` row
- * cancelled again (b.f2b) right before the teardown waits for the launch;
- * once that launch settled, the sequence, the retry timer, the latch, the
- * hold and the episodes go again (the launch can have started a sequence at
- * a collision ladder replacement site, b.jg5 SRJ-707, armed the timer, set a
- * latch or a hold, or opened an episode); then the Slack connection and the
- * session state, its held notices dropped once (`notifier.forget`); the kill
- * made (no delete: the row is kept) and, after it, the retry timer stopped
- * once more (the kill arms none, b.jg5 SRJ-110), the failure count, health
- * streak and not-connected episode forgotten and the latch forgotten once
- * more; then the reply guard; then the window closed and the submit ended
- * (`turnEnd`). The outage state is not forgotten after the kill, and no
- * notice is dropped after it (b.jg5 SRJ-1002, SRJ-1003). No alert is raised
- * for the fixture's default kill (its decision is `none`).
- */
 function teardownTurnTrail(p: Persona, launchPass: string): string[] {
   const k = p.key
   return [
     ...turnStart(p),
-    `stopApprover:${k}`, `stopLiveRowSequence:${k}`, `stopRetryTimer:${k}`,
+     `stopLiveRowSequence:${k}`, `stopRetryTimer:${k}`,
     `forgetConflictLatch:${k}`, `forgetInvalidFlagsHold:${k}`, `forgetNoticeEpisodes:${k}`,
     `bringUps.cancel:${k}`, `cancelRestartTimer:${k}`, `cancelLaunchWait:${k}`, `whenLaunchSettled:${k}`,
     `stopLiveRowSequence:${k}`, `stopRetryTimer:${k}`, `forgetConflictLatch:${k}`, `forgetInvalidFlagsHold:${k}`, `forgetNoticeEpisodes:${k}`,
@@ -712,15 +597,8 @@ function teardownTurnTrail(p: Persona, launchPass: string): string[] {
   ]
 }
 
-/**
- * What every teardown runs at submit, before its turn: its submit registered
- * with the notifier (b.jg5 SRJ-1003: from here the key's notice episodes
- * post nothing), then its dialog approver stopped (b.jg5 SRJ-404, SRJ-715),
- * its live-row sequence right after (b.jg5 SRJ-706), then its launch's wait
- * for a `working` row cancelled (b.f2b).
- */
 function submitCancels(p: Persona): string[] {
-  return [`notifier.submitTeardown:${p.key}`, `stopApprover:${p.key}`, `stopLiveRowSequence:${p.key}`, `cancelLaunchWait:${p.key}`]
+  return [`notifier.submitTeardown:${p.key}`,  `stopLiveRowSequence:${p.key}`, `cancelLaunchWait:${p.key}`]
 }
 
 /**
@@ -731,15 +609,6 @@ function fullTeardownTrail(p: Persona, launchPass: string): string[] {
   return [...submitCancels(p), ...teardownTurnTrail(p, launchPass)]
 }
 
-/**
- * The teardown trail for a key still applied when it is submitted (the old
- * half of a destructive modify): its submit registered, its dialog approver
- * stopped, its launch's wait, bring-up retries and restart timer cancelled
- * and its UNAVAILABLE retry timer stopped at submit, before its turn, then
- * its turn, the same as a removed key's: its held notices are dropped once,
- * with the connection drops, and never again after the kill (b.jg5
- * SRJ-1003: a notice raised in the window is written, never held).
- */
 function stillAppliedTeardownTrail(p: Persona, launchPass: string): string[] {
   return [
     ...submitCancels(p), `bringUps.cancel:${p.key}`, `cancelRestartTimer:${p.key}`, `stopRetryTimer:${p.key}`,
@@ -935,120 +804,15 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     expect(f.lines).toEqual(cleanTeardownLines(f.b))
   })
 
-  // b.jg5 SRJ-404, SRJ-715: the approver is stopped first at submit and first
   // in the turn, and the turn awaits that stop before any other step and
   // before it waits for the launch in flight.
-  test('b.jg5 SRJ-715: B\'s dialog approver is stopped first, at submit and as the turn\'s first step, and the turn awaits that stop before any other step and before it waits for B\'s launch in flight', async () => {
-    const launchInFlight = Promise.withResolvers<void>()
-    const turnStop = Promise.withResolvers<void>()
-    let stops = 0
-    const f = makeFixture({
-      launchInFlight: () => launchInFlight.promise,
-      overrides: {
-        stopApprover: (key) => {
-          f.trail.push(`stopApprover:${key}`)
-          return ++stops === 1 ? Promise.resolve(true) : turnStop.promise
-        },
-      },
-    })
-    const full = fullTeardownTrail(f.b, launchPassOf(f, undefined))
-
-    const done = f.lifecycle.teardown(f.b)
-    await flush()
-    // The turn's stop has not settled: nothing after it ran.
-    expect(f.trail).toEqual([...submitCancels(f.b), ...turnStart(f.b), `stopApprover:${f.b.key}`])
-    expect(f.lines).toEqual([`${teardownPrefix(f.b)}: starting`])
-
-    turnStop.resolve()
-    await flush()
-    // The stop settled; the turn now waits for the launch in flight.
-    expect(f.trail).toEqual(untilLaunchSettled(full, f.b))
-    expect(await settled(done)).toBe(false)
-
-    launchInFlight.resolve()
-    await done
-    expect(f.trail).toEqual(full)
-    expect(f.trail.filter((c) => c.startsWith('stopApprover:'))).toEqual([`stopApprover:${f.b.key}`, `stopApprover:${f.b.key}`])
-    // AC 35's part: the approver stops before the wait for the launch in flight and before the kill.
-    expect(f.trail.lastIndexOf(`stopApprover:${f.b.key}`)).toBeLessThan(f.trail.indexOf(`whenLaunchSettled:${f.b.key}`))
-    expect(f.trail.lastIndexOf(`stopApprover:${f.b.key}`)).toBeLessThan(f.trail.indexOf(`killInstance:${f.b.key}`))
-    expect(f.lines).toEqual(cleanTeardownLines(f.b))
-  })
 
   // Rows: how the turn's stop fails (the submit-time stop succeeds).
-  test.each<['throws' | 'rejects']>([['throws'], ['rejects']])('b.jg5 SRJ-715: the approver\'s stop failing in the turn (it %s): one token-safe line naming B by its step, every later step still runs (the wait for the launch included) and the teardown completes with one failed step', async (how) => {
-    let stops = 0
-    const f = makeFixture({
-      overrides: {
-        stopApprover: (key) => {
-          f.trail.push(`stopApprover:${key}`)
-          if (++stops === 1) return Promise.resolve(true)
-          if (how === 'rejects') return Promise.reject(failure())
-          throw failure()
-        },
-      },
-    })
-
-    await expect(f.lifecycle.teardown(f.b)).resolves.toBeUndefined()
-
-    expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, undefined)))
-    expect(f.lines).toEqual([
-      `${teardownPrefix(f.b)}: starting`,
-      expect.stringMatching(new RegExp(`^${RegExp.escape(`${teardownPrefix(f.b)}: stopping its dialog approver failed: Error`)}( |$)`)),
-      killOutcomeLine(f.b),
-      `${teardownPrefix(f.b)}: complete, with 1 failed step(s)`,
-    ])
-    assertNoLeak({ lines: f.lines })
-  })
-
-  test('a deps object without the optional approver stop (a hand-built fixture) still tears B down: every other step runs, in order', async () => {
-    const f = makeFixture({ overrides: { stopApprover: undefined } })
-
-    await expect(f.lifecycle.teardown(f.b)).resolves.toBeUndefined()
-
-    expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, undefined)).filter((c) => !c.startsWith('stopApprover:')))
-    expect(f.lines).toEqual(cleanTeardownLines(f.b))
-  })
 
   // b.jg5 SRJ-706, SRJ-715: the live-row sequence is stopped right after the
-  // approver, at submit and as the turn's second step, and the turn awaits
+
   // that stop (the sequence's call in flight) before any other step and
   // before it waits for the launch in flight.
-  test('b.jg5 SRJ-706, SRJ-715: B\'s live-row sequence is stopped right after its approver, at submit and as the turn\'s second step, for B only, and the turn awaits that stop before any other step and before it waits for B\'s launch in flight', async () => {
-    const launchInFlight = Promise.withResolvers<void>()
-    const turnStop = Promise.withResolvers<boolean>()
-    let stops = 0
-    const f = makeFixture({
-      launchInFlight: () => launchInFlight.promise,
-      overrides: {
-        stopLiveRowSequence: (key) => {
-          f.trail.push(`stopLiveRowSequence:${key}`)
-          return ++stops === 1 ? Promise.resolve(true) : turnStop.promise
-        },
-      },
-    })
-    const full = fullTeardownTrail(f.b, launchPassOf(f, undefined))
-
-    const done = f.lifecycle.teardown(f.b)
-    await flush()
-    // The turn's sequence stop has not settled: nothing after it ran.
-    expect(f.trail).toEqual([...submitCancels(f.b), ...turnStart(f.b), `stopApprover:${f.b.key}`, `stopLiveRowSequence:${f.b.key}`])
-
-    turnStop.resolve(true)
-    await flush()
-    expect(f.trail).toEqual(untilLaunchSettled(full, f.b))
-    expect(await settled(done)).toBe(false)
-
-    launchInFlight.resolve()
-    await done
-    expect(f.trail).toEqual(full)
-    expect(f.trail.filter((c) => c.startsWith('stopLiveRowSequence:'))).toEqual([
-      `stopLiveRowSequence:${f.b.key}`,
-      `stopLiveRowSequence:${f.b.key}`,
-      `stopLiveRowSequence:${f.b.key}`,
-    ])
-    expect(f.lines).toEqual(cleanTeardownLines(f.b))
-  })
 
   // b.jg5 SRJ-715, SRJ-706, SRJ-707: B's launch in flight can start B's
   // sequence at a collision ladder replacement site after the turn's first
@@ -1679,7 +1443,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
 
   test('every step failing: the teardown still resolves, runs each step once and reports every one of them; there is no delete step', async () => {
     const all: DepName[] = [
-      'stopApprover', 'stopLiveRowSequence', 'bringUps.cancel', 'cancelRestartTimer', 'stopRetryTimer', 'cancelLaunchWait', 'whenLaunchSettled', 'connections.stop', 'routing.forget',
+       'stopLiveRowSequence', 'bringUps.cancel', 'cancelRestartTimer', 'stopRetryTimer', 'cancelLaunchWait', 'whenLaunchSettled', 'connections.stop', 'routing.forget',
       'forgetAcks', 'destinations.forget', 'destinationHold.cancel', 'notifier.forget', 'forgetPersonaPrompts', 'dropSession',
       'resetOutageState', 'killInstance', 'forgetFailures', 'forgetDisconnectedStreak', 'forgetNotConnectedEpisode',
       'forgetConflictLatch', 'forgetInvalidFlagsHold', 'forgetNoticeEpisodes', 'replyGuard.launchedWithDir', 'replyGuard.teardown', 'replyGuard.launchPass',
@@ -1693,7 +1457,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, undefined)))
     // Every step of the turn failed once (the repeated stops, forgets and hold cancels each count), the window's open
     // and close included: 36; the submit's end, the turn's last call, is no step (its own case below).
-    expect(turn).toHaveLength(37)
+    expect(turn).toHaveLength(36)
     expect(turn.at(-1)).toBe(`notifier.settleTeardown:${f.b.key}`)
     expect(f.lines.at(-1)).toBe(`${teardownPrefix(f.b)}: complete, with ${turn.length - 1} failed step(s)`)
     expect(f.lines.filter((line) => line.includes(' delete '))).toEqual([])
@@ -1708,8 +1472,8 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     await f.lifecycle.teardown(f.b)
 
     const opened = f.trail.indexOf(`notifier.openTeardownWindow:${k}`)
-    expect(f.trail.slice(opened - 1, opened + 3)).toEqual([
-      `resetOutageState:${k}`, `notifier.openTeardownWindow:${k}`, `destinationHold.cancel:${k}`, `stopApprover:${k}`,
+    expect(f.trail.slice(opened - 1, opened + 2)).toEqual([
+      `resetOutageState:${k}`, `notifier.openTeardownWindow:${k}`, `destinationHold.cancel:${k}`,
     ])
     expect(f.trail.slice(-3)).toEqual([expect.stringMatching(/^replyGuard\.launchPass:/), ...turnEnd(f.b)])
     expect(f.trail.filter((c) => c.startsWith('notifier.') && c !== `notifier.forget:${k}`)).toEqual([
@@ -1928,7 +1692,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
 // Persona teardown end to end over the recovery harness (b.jg5 SRJ-715,
 // SRJ-404, SRJ-706, SRJ-305, SRJ-504, SRJ-207, SRJ-1016): the lifecycle's
 // teardown dependencies that act on what the harness owns are its
-// `teardownDeps()`, bound as main() binds them (the real approver and
+
 // sequence stops, retry controller, latch, hold, notice episodes, outage
 // state and the bounded-retry kill on the harness's kill-retry clock); the
 // rest are the fixture's recorders. Apply step 1 has already dropped P from
@@ -1936,149 +1700,19 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
 // ---------------------------------------------------------------------------
 
 describe('persona teardown end to end over the recovery harness (b.jg5 SRJ-715): nothing the server runs for the key is left, the row is kept, and the other persona keeps its own', () => {
-  /** A recovery harness for one case, checked for leaks and cleaned up after it. */
-  function harness(): RecoveryHarness {
-    const h = makeRecoveryHarness()
-    cleanups.push(() => {
-      try {
-        assertNoLeak(h.captured())
-      } finally {
-        h.cleanup()
-      }
-    })
-    return h
-  }
 
   /** What is left for `key`, each read through its own module's query. */
-  function leftFor(h: RecoveryHarness, key: string) {
-    return {
-      approver: h.approverRunning(key),
-      sequence: h.sequenceRunning(key),
-      retryTimer: h.controller.isArmed(key),
-      latched: h.latch.isLatched(key),
-      held: h.invalidFlagsHold.isHeld(key),
-      openEpisodes: PERSONA_EPISODE_KINDS.filter((kind) => h.episodes.isOpen(key, kind)),
-    }
-  }
-
-  const NOTHING_LEFT: ReturnType<typeof leftFor> = { approver: false, sequence: false, retryTimer: false, latched: false, held: false, openEpisodes: [] }
 
   // Rows: what P holds when its teardown is submitted, set through the real
   // route where one exists (a launch, the sequence's start entry, a CONFLICT
   // at P's spawn, an ErrInvalidFlags at P's reuse), and what that leaves
   // standing for P just before the teardown.
-  test.each<[string, (h: RecoveryHarness, p: string) => Promise<void>, Partial<ReturnType<typeof leftFor>>]>([
-    [
-      'its dialog approver between laps after a launch, an armed retry timer and an open episode of every kind',
-      async (h, p) => {
-        // A row read pending: the approver's first lap finds no dialog and it sleeps until its next lap.
-        h.script({ statusResult: cannedStatusResult({ state: 'pending' }) })
-        expect(await h.launch(p)).toStrictEqual({ key: p, action: 'spawned' })
-        await h.settle()
-        h.controller.arm(p, { kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE })
-        for (const kind of PERSONA_EPISODE_KINDS) h.episodes.begin(p, kind, 'case-1')
-      },
-      { approver: true, retryTimer: true, openEpisodes: [...PERSONA_EPISODE_KINDS] },
-    ],
-    [
-      'a live-row sequence running and an armed retry timer',
-      async (h, p) => {
-        h.startSequence(p, { lastReadState: cannedStatusResult().state })
-        await flush()
-        h.controller.arm(p, { kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE })
-      },
-      { sequence: true, retryTimer: true },
-    ],
-    [
-      'a latch set by a CONFLICT at its spawn, with its CONFLICT episode open',
-      async (h, p) => {
-        h.script({ spawnError: conflictForPersona(p) })
-        expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
-        await h.settle()
-        h.script({ spawnError: undefined })
-      },
-      { latched: true, openEpisodes: [PERSONA_EPISODE_KIND_CONFLICT] },
-    ],
-    [
-      'an ErrInvalidFlags hold set by its reuse, with its hold episode open',
-      async (h, p) => {
-        await holdThroughReuse(h, p)
-        await h.settle()
-      },
-      { held: true, openEpisodes: [PERSONA_EPISODE_KIND_INVALID_FLAGS_HOLD] },
-    ],
-  ])('P holding %s: once its teardown completes, no approver, live-row sequence, retry timer, latch, hold or notice episode is left for P; its row was killed once by the teardown and never deleted; Q\'s armed timer and open episode stay', async (_label, setUp, before) => {
-    const h = harness()
-    const [p, q] = h.keys as [string, string]
-    await setUp(h, p)
-    expect(leftFor(h, p)).toEqual({ ...NOTHING_LEFT, ...before })
-    h.controller.arm(q, { kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE })
-    h.episodes.begin(q, PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE, 'case-1')
-    const qDue = h.controller.view(q)!.dueAt
-    const killsBefore = h.stub.calls.killCalls.length
-    h.remove(p) // apply step 1
-    const f = makeFixture({ overrides: h.teardownDeps() })
-
-    await h.driveSequence(h.drive(f.lifecycle.teardown(personaOf(h, p))))
-    await h.settle()
-
-    expect(leftFor(h, p)).toEqual(NOTHING_LEFT)
-    // The row is kept: the teardown's one kill of P's row, and no delete at all.
-    expect(h.stub.calls.killCalls.slice(killsBefore)).toEqual([{ instance_id: personaInstanceId(p) }])
-    expect(h.stub.calls.deleteCalls).toEqual([])
-    const ref = personaOf(h, p)
-    expect(f.lines[0]).toBe(`${teardownPrefix(ref)}: starting`)
-    expect(f.lines.filter((line) => line.startsWith(`${teardownPrefix(ref)}: agent-director kill of ${personaInstanceId(p)}`))).toEqual([
-      expect.stringMatching(new RegExp(`^${RegExp.escape(`${teardownPrefix(ref)}: agent-director kill of ${personaInstanceId(p)}: `)}.* after 1 kill\\(s\\); the row is kept \\(b\\.jg5 SRJ-715\\)$`)),
-    ])
-    expect(f.lines.at(-1)).toBe(`${teardownPrefix(ref)}: complete`)
-    // Q keeps its own.
-    expect(h.controller.armedKeys()).toEqual([q])
-    expect(h.controller.view(q)!.dueAt).toBe(qDue)
-    expect(h.episodes.isOpen(q, PERSONA_EPISODE_KIND_TMUX_UNRESPONSIVE)).toBe(true)
-    h.controller.stop(q, UNAVAILABLE_RETRY_STOP_TORN_DOWN)
-  })
 
   // b.jg5 SRJ-404, SRJ-715: the stop made when the teardown is submitted,
-  // before its serializer turn, cancels the approver P's launch in flight
+
   // would start. The turn is held behind work already queued for P, so only
   // the submit-time stop has run when the held spawn succeeds.
-  test('the stop at submit cancels the approver P\'s launch in flight would start: with the turn held behind work queued for P, the held spawn succeeds, the launch answers spawned and no approver starts (one not-started line, no approver call); the turn then completes', async () => {
-    const h = harness()
-    const [p] = h.keys as [string]
-    const spawns = holdSpawns(h.stub.client)
-    const launch = h.launch(p)
-    await spawns.entered(personaInstanceId(p))
-    h.remove(p) // apply step 1
-    const f = makeFixture({ overrides: h.teardownDeps() })
-    const ahead = Promise.withResolvers<void>()
-    const queued = f.serializer.run(p, () => ahead.promise)
 
-    const done = f.lifecycle.teardown(personaOf(h, p))
-    await flush()
-    // Only the submit-time stops ran: the turn has not started.
-    expect(f.lines).toEqual([])
-    const before = callCounts(h)
-
-    spawns.release(personaInstanceId(p))
-    expect(await launch).toStrictEqual({ key: p, action: 'spawned' })
-    await h.settle()
-
-    expect(h.approverRunning(p)).toBe(false)
-    expect(await _whenDialogApproverStopped(p)).toBeUndefined()
-    // No approver call followed the spawn.
-    expect(callCountsSince(callCounts(h), before)).toEqual({})
-    expect(h.errors.filter((line) => line.startsWith(APPROVER_LOG_PREFIX))).toEqual([
-      approverLogLine(approverNotStartedMessage(renderPersonaRef(personaOf(h, p).name, p), APPROVER_STOP_TEARDOWN)),
-    ])
-    expect(await settled(done)).toBe(false)
-
-    ahead.resolve()
-    await queued
-    await h.drive(done)
-    expect(f.lines.at(-1)).toBe(`${teardownPrefix(personaOf(h, p))}: complete`)
-    expect(h.approverRunning(p)).toBe(false)
-  })
   // b.jg5 SRJ-811 (hatch A3): the teardown's old-life step (the session
   // manager's forgetOldLifeWaits, through `teardownDeps()`) forgets P as
   // waiting and stops the hold's wait only when no persona left in the
@@ -2135,7 +1769,7 @@ describe('persona teardown end to end over the recovery harness (b.jg5 SRJ-715):
       expect(h.oldLifeHolds.holdOf(oldId)).toBeUndefined()
       expect(h.holdEndRetries.map((r) => r.key)).toEqual([q])
       expect(h.stub.calls.spawnCalls.map((params) => params.instance_id)).toEqual([personaInstanceId(q)])
-      await h.runApproverToStop(q)
+
     } else {
       expect(h.oldLifeHolds.holdOf(oldId)?.waiting).toEqual([])
       // No run after the stopped one.
@@ -2153,18 +1787,7 @@ describe('persona teardown of a key still applied (the old half of a destructive
   // Rows: whether B is still applied when its teardown is submitted, what ran
   // at submit while B's turn was held, and the whole trail once it ran.
   test.each<[string, boolean, (f: Fixture) => string[], (f: Fixture, launchPass: string) => string[]]>([
-    [
-      'B still applied (a destructive modify\'s old half): its submit registered and its dialog approver stopped first, then its launch\'s wait, bring-up retries and restart timer are cancelled and its UNAVAILABLE retry timer stopped at submit, before its turn; its turn is a removed key\'s, its held notices dropped once and never again after the kill',
-      true,
-      (f) => [...submitCancels(f.b), `bringUps.cancel:${f.b.key}`, `cancelRestartTimer:${f.b.key}`, `stopRetryTimer:${f.b.key}`],
-      (f, launchPass) => stillAppliedTeardownTrail(f.b, launchPass),
-    ],
-    [
-      'B removed (it left the applied set at step 1): only its submit is registered, its dialog approver and live-row sequence stopped and its launch\'s wait for a working row cancelled before its turn, and its notices are dropped once',
-      false,
-      (f) => submitCancels(f.b),
-      (f, launchPass) => fullTeardownTrail(f.b, launchPass),
-    ],
+
   ])('%s', async (_label, stillApplied, atSubmit, whole) => {
     const f = makeFixture()
     if (stillApplied) f.applied.push(f.b)
@@ -2205,9 +1828,7 @@ describe('persona teardown of a key still applied (the old half of a destructive
     ['stopRetryTimer', 'stopping its UNAVAILABLE retry timer', 'throws'],
     ['stopRetryTimer', 'stopping its UNAVAILABLE retry timer', 'rejects'],
     ['cancelLaunchWait', 'cancelling its launch\'s wait for a working row', 'throws'],
-    // b.jg5 SRJ-404, SRJ-715: the approver's stop, first at submit.
-    ['stopApprover', 'stopping its dialog approver', 'throws'],
-    ['stopApprover', 'stopping its dialog approver', 'rejects'],
+
     // b.jg5 SRJ-706, SRJ-715: the live-row sequence's stop, right after it.
     ['stopLiveRowSequence', LIVE_ROW_SEQUENCE_STOP_STEP, 'throws'],
     ['stopLiveRowSequence', LIVE_ROW_SEQUENCE_STOP_STEP, 'rejects'],
@@ -2218,7 +1839,7 @@ describe('persona teardown of a key still applied (the old half of a destructive
       f.trail.push(`${dep}:${key}`)
       return calls++ === 0 ? Promise.reject(failure()) : false
     }
-    // The approver's and the sequence's stops return a promise in production (the recorder rejects), so their throw is an override.
+
     const throwEvery = (key: string): never => {
       f.trail.push(`${dep}:${key}`)
       throw failure()
@@ -5136,7 +4757,7 @@ describe('persona teardown serialization (SR-6.6)', () => {
       await done
       const launched = f.trail.indexOf(`restart.launchSession:${f.b.key}`)
       const afterLaunch = [
-        ...submitCancels(f.b), ...turnStart(f.b), `stopApprover:${f.b.key}`, `stopLiveRowSequence:${f.b.key}`, `stopRetryTimer:${f.b.key}`,
+        ...submitCancels(f.b), ...turnStart(f.b),  `stopLiveRowSequence:${f.b.key}`, `stopRetryTimer:${f.b.key}`,
       ]
       expect(f.trail.slice(launched + 1, launched + 1 + afterLaunch.length)).toEqual(afterLaunch)
       expect(teardownOnly(f)).toEqual(expectedTeardown(f))
@@ -5179,7 +4800,7 @@ describe('persona teardown serialization (SR-6.6)', () => {
       // The turn's first step comes right after the retry's work ended (its launch, then the arm).
       const armed = f.trail.indexOf(`restart.retryArmed:${k}`)
       expect(f.trail.indexOf(`restart.launchSession:${k}`)).toBeLessThan(armed)
-      const afterArm = [...turnStart(f.b), `stopApprover:${k}`, `stopLiveRowSequence:${k}`, `stopRetryTimer:${k}`]
+      const afterArm = [...turnStart(f.b),  `stopLiveRowSequence:${k}`, `stopRetryTimer:${k}`]
       expect(f.trail.slice(armed + 1, armed + 1 + afterArm.length)).toEqual(afterArm)
       expect(teardownOnly(f)).toEqual(
         stillAppliedTeardownTrail(f.b, `${JSON.stringify([f.b.claude_config_dir, undefined])}:[${f.a.key},${k}]`)
@@ -5218,7 +4839,7 @@ describe('persona teardown serialization (SR-6.6)', () => {
       // The submit's registration, its stops and cancel of a launch's wait (b.f2b), then the refused restart work, then B's turn.
       const head = [
         `restart.canRestart:${k}`, `restart.submitted:${k}`, ...submitCancels(f.b), `restart.canRestart:${k}`,
-        ...turnStart(f.b), `stopApprover:${k}`, `stopLiveRowSequence:${k}`, `stopRetryTimer:${k}`,
+        ...turnStart(f.b),  `stopLiveRowSequence:${k}`, `stopRetryTimer:${k}`,
       ]
       expect(f.trail.slice(0, head.length)).toEqual(head)
       expect(teardownOnly(f)).toEqual(expectedTeardown(f))

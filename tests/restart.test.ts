@@ -1,6 +1,6 @@
 import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
-import { IDLE_PANE } from './test-helpers/working-row-panes.ts'
 import { useImmediateTypingLifecycle } from './test-helpers/legacy-typing.ts'
+import { IDLE_PANE } from './test-helpers/working-row-panes.ts'
 useImmediateTypingLifecycle()
 /**
  * restart.test.ts — Tests for auto-restart scheduling logic.
@@ -8,90 +8,25 @@ useImmediateTypingLifecycle()
  * SPDX-License-Identifier: MIT
  */
 
-import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
+import type { Client, FindMissingParams, KillParams, ReadPaneParams, ResumeParams, SendKeysParams, SpawnParams, SpawnResult, StatusParams, StatusResult } from 'agent-director'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { AD_ERROR_CLASS_UNAVAILABLE, AD_ERROR_CLASS_UNCLASSIFIED, CSCB_UNKNOWN_ERROR_NAME } from '../src/ad-error-class.ts'
+import { installAdVersionRecheck, RECHECK_OUTCOME_PASS, RECHECK_OUTCOME_STOP, resetAdVersionRecheckForTests } from '../src/ad-version-gate.ts'
 import {
-  initRestart,
-  scheduleRestart,
-  cancelAllRestartTimers,
-  cancelRestartTimer,
-  _resetRestartState,
-  isRestartPendingOrActive,
-  runRestartRetry,
-  runRestartRetryInTurn,
-  runRestartWorkInTurn,
-  holdRestartActive,
-  pendingDeferralFailedLine,
-  restartRetryCapSkippedLine,
-  restartRetrySkippedLine,
-  _setCleanExitRelaunchDelay,
-  _setRestartNow,
-  CLEAN_EXIT_RELAUNCH_DELAY,
-  cleanExitDelayStandsLine,
-  cleanExitLoopGuardLine,
-  cleanExitRelaunchLine,
-  RESTART_FAILURE_CAP,
-  RESTART_OUTCOME_ALREADY_CONNECTED,
-  RESTART_OUTCOME_CAPPED,
-  RESTART_OUTCOME_COUNTED_FAILURE,
-  RESTART_OUTCOME_IN_FLIGHT,
-  RESTART_OUTCOME_HELD,
-  RESTART_OUTCOME_LATCHED,
-  RESTART_OUTCOME_LAUNCHED,
-  RESTART_OUTCOME_LAUNCH_SKIPPED,
-  RESTART_OUTCOME_LIVENESS_UNKNOWN,
-  RESTART_OUTCOME_NOT_INITIALISED,
-  RESTART_OUTCOME_NOT_UP,
-  RESTART_OUTCOME_PENDING_DEFERRED,
-  RESTART_OUTCOME_RECONNECTED,
-  RESTART_OUTCOME_RECONNECT_DEFERRED,
-  RESTART_OUTCOME_REFUSED,
-  RESTART_OUTCOME_SEQUENCE_WAITING,
-  RESTART_OUTCOME_SHUTTING_DOWN,
-  KILL_SESSION_NOT_KILLED_GUARD,
-  RESTART_SLOW_RECOVERY_OTHER_PENDING_PROBE,
-  RESTART_SLOW_RECOVERY_OTHER_PENDING_REPROBE,
-  RESTART_SLOW_RECOVERY_OTHER_VERDICT,
-  killNotSucceededLine,
-  killStopsServerLine,
-  killVoidsVerdictLine,
-  relaunchAfterKillLine,
-  relaunchWithoutKillLine,
-  RELAUNCH_KILL_NONE,
-  RELAUNCH_NO_KILL_ROW_READ,
-  RELAUNCH_NO_KILL_VERDICT_VOIDED,
-  reprobeDeadLine,
-  reprobeLiveLine,
-  reprobePendingLine,
-  reprobeUnhandledLine,
-  reprobeUnknownLine,
-  pendingDeferralGoneLine,
-  restartOldLifeHeldLine,
-  LAUNCH_RESUMED_UNREPORTED,
-  recordLaunchResultOutsideRestartWork,
-  restartCapReachedLine,
-  type KillSessionResult,
-  type RestartPendingDeferralAnswer,
-  type LaunchSessionResult,
-  type ReconnectEscalateDead,
-  type ReconnectSessionResult,
-  type RestartDeps,
-  type RestartRetryOutcome,
-  type RestartWorkOutcome,
-  type RestartSlowRecoveryObserver,
-  type SlowRecoveryOtherReason,
-} from '../src/restart.ts'
+  resetClientForTests,
+  setClientForTests,
+} from '../src/agent-director-client.ts'
 import {
   _resetBackoffState,
   getFailureCount,
   isAtCap,
   recordFailure,
 } from '../src/backoff.ts'
-import { _buildIsSessionAliveAdapter, _buildKillSessionAdapter, _buildReconnectSessionAdapter, deferPendingRow, deferringPendingRowLine, LIVENESS_STATUS_SITE } from '../src/server.ts'
-import { _resetHealthCheckState, _runHealthCheckTickForTest, healthCheckAtCapSkipLine, initHealthCheck } from '../src/health-check.ts'
 import {
+  describeKillOutcome,
   KILL_OUTCOME_KILLED,
   KILL_OUTCOME_NOT_KILLED,
   KILL_OUTCOME_ROW_FINISHED,
@@ -101,106 +36,10 @@ import {
   KILL_ROW_FINISHED_HOLD_ENDED,
   KILL_ROW_FINISHED_MISSING,
   KILL_ROW_FINISHED_NO_ROW,
-  describeKillOutcome,
   killOutcomeOf,
   type KillOutcome,
 } from '../src/checked-kill.ts'
-import { KILL_RETRY_TRIES } from '../src/kill-retry.ts'
-import { createPersonaRelaunchGate } from '../src/persona-start.ts'
-import { describeThrownValue } from '../src/persona-connection-errors.ts'
-import { createPersonaSerializer, type PersonaSerialize } from '../src/persona-serializer.ts'
-import type { PersonaConnectionStatus } from '../src/persona-connections.ts'
-import {
-  _resetFindMissingMemo,
-  _resetInFlightLaunches,
-  _whenDialogApproverStopped,
-  stopAllDialogApprovers,
-  _setDialogReadyTimeoutMs,
-  _resetDialogReadyTimeoutMs,
-  _setSpawnHomeDir,
-  _resetSpawnHomeDir,
-  isLaunchInFlight,
-  launchSession as launchPersonaSession,
-  _resetNotConnectedEpisodes,
-  notifyRestartCapReached,
-  setSessionNotifier,
-  _resetPreLaunchReplyGuard,
-  _setConfigDirFs,
-  _resetConfigDirFs,
-  checkLaunchConfigDir,
-  setConfigDirUnresolvableHook,
-  spawnForPersona,
-  setConfiguredPersonaQuery,
-  _resetConfiguredPersonaQuery,
-  ESCALATE_DEAD_EVIDENCE,
-  ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ,
-  ESCALATE_DEAD_WAITING_ROW_PANE_GONE,
-  FIND_MISSING_MEMO_TTL_MS,
-  PROMPT_ROW_STATES,
-  _setNow,
-  _resetNow,
-  setConflictLatch,
-  type ConfigDirUnresolvableHook,
-  CARRIED_DEAD_EVIDENCE_NONE,
-  carriedDeadEvidenceOf,
-  DEAD_EVIDENCE_READ_BY_COLLISION_GET,
-  DEAD_EVIDENCE_VOIDED_BY_ROW_NOT_INTERACTIVE,
-  DEAD_SESSION_CAUSE_ROW_READ_FINISHED,
-  deadEvidenceVoidedLine,
-  deadEvidenceVoidingRead,
-  deadSessionRouteLine,
-  describeDeadEvidence,
-  ESCALATE_DEAD_VERDICTS,
-  isLiveRowSequenceRunning,
-  lostRaceOutcome,
-  ROW_REREAD_FINISHED,
-  spawnNotResumableLine,
-  uncoveredPendingRowLine,
-  APPROVER_LOG_SITE,
-  APPROVER_STATUS_READ_WHAT,
-  DIALOG_SLOW_POLL_INTERVAL_MS,
-  RESUME_READ_NO_ROW,
-  UNREPORTED_RESUME_FALLBACK_AFTER,
-  applyOwnRowStatusStep,
-  forgetLaunchCalls,
-  readPersonaOwnRow,
-  resumeCountFailedLine,
-  resumeEndedUnreportedLine,
-  resumedLaunchFailedLine,
-  unreportedResumeFallbackLine,
-  abortKillOwnStuckLaunch,
-  sequenceLaunchAtCapLine,
-  startStuckLaunchAbortSequence,
-  stopApproverForStuckLaunchAbort,
-  type OwnRowReadSite,
-  type PersonaRowReread,
-  type CarriedDeadEvidence,
-  type DeadEvidenceSource,
-  type EscalateDeadVerdict,
-} from '../src/session-manager.ts'
-import { FULL_PANE_READ_LINES, PROBE_PANE_READ_LINES } from '../src/pane-read.ts'
-import {
-  LIVE_ROW_LAUNCH_REASON_KEEPS_CONVERSATION,
-  LIVE_ROW_LAUNCH_RESUME,
-  LIVE_ROW_LAUNCH_REUSE,
-  LIVE_ROW_NOT_LAUNCHED_CAPPED,
-  LIVE_ROW_OUTCOME_ABORTED,
-  LIVE_ROW_OUTCOME_LAUNCHED,
-  LIVE_ROW_OUTCOME_NOT_LAUNCHED,
-  LIVE_ROW_OUTCOME_STOPPED,
-  LIVE_ROW_SEQUENCE_ENTRY_GET,
-  LIVE_ROW_SEQUENCE_SITE,
-  liveRowSequenceStartLine,
-} from '../src/live-row-sequence.ts'
-import {
-  PENDING_ROW_REASON_CWD_MISMATCH,
-  STUCK_LAUNCH_ABORT_KILL_FAILED,
-  STUCK_LAUNCH_ABORT_KILL_STOPPED,
-  STUCK_LAUNCH_ABORT_KILL_SUCCEEDED,
-  STUCK_LAUNCH_ABORT_KILL_TRY_LATER,
-  STUCK_LAUNCH_ABORT_SEQUENCE_STARTED,
-} from '../src/pending-row.ts'
-import { KILL_FAILURE_ROUTE_NOT_CONFIGURED, KILL_FAILURE_VERSION_ORDINARY, PERSONA_KILL_FAILED_LABEL } from '../src/kill-failure-alert.ts'
+import type { Persona, PersonaConfig } from '../src/config.ts'
 import {
   conflictNoticeText,
   createConflictLatch,
@@ -212,83 +51,151 @@ import {
   type ConflictLatch,
   type ConflictLatchRecord,
 } from '../src/conflict-latch.ts'
-import { createPersonaBringUpController, type PersonaBringUpController } from '../src/persona-bringup-controller.ts'
-import { PERSONA_CONFIG_DIR_UNRESOLVABLE } from '../src/persona-diagnostics.ts'
-import { makeConnectionHarness, type ConnectionHarness } from './test-helpers/persona-connection-harness.ts'
-import { APP_TOKEN_PREFIX, LEAK_SENTINEL, REDACTED_SENTINEL_TAIL, assertNoLeak, fakeToken, sentinelInMessage } from './test-helpers/credentials.ts'
-import { _resetLaunchedWithDirs, getLaunchedWithDir } from '../src/stop-hook-bootstrap.ts'
-import { makeReplyGuardRecordDir, type ReplyGuardRecordDir } from './test-helpers/reply-guard-record.ts'
-import { installRecordingReplyGuard, observeLaunchCalls, type LaunchCall } from './test-helpers/reply-guard-launch.ts'
+import { _resetHealthCheckState, _runHealthCheckTickForTest, healthCheckAtCapSkipLine, initHealthCheck } from '../src/health-check.ts'
+import { createInvalidFlagsHold, INVALID_FLAGS_HOLD_LOG_PREFIX, type InvalidFlagsHold } from '../src/invalid-flags-hold.ts'
+import { KILL_FAILURE_ROUTE_NOT_CONFIGURED, KILL_FAILURE_VERSION_ORDINARY, PERSONA_KILL_FAILED_LABEL } from '../src/kill-failure-alert.ts'
 import {
-  setClientForTests,
-  resetClientForTests,
-} from '../src/agent-director-client.ts'
+  LIVE_ROW_LAUNCH_REASON_KEEPS_CONVERSATION,
+  LIVE_ROW_LAUNCH_RESUME,
+  LIVE_ROW_LAUNCH_REUSE,
+  LIVE_ROW_NOT_LAUNCHED_CAPPED,
+  LIVE_ROW_OUTCOME_LAUNCHED,
+  LIVE_ROW_OUTCOME_NOT_LAUNCHED,
+  LIVE_ROW_SEQUENCE_ENTRY_GET,
+  LIVE_ROW_SEQUENCE_SITE,
+  liveRowSequenceStartLine
+} from '../src/live-row-sequence.ts'
+import {
+  AGENT_DIRECTOR_PENDING_STATE,
+  LIVENESS_DEAD_ROW_ENDED,
+  LIVENESS_DEAD_ROW_MISSING,
+  LIVENESS_DEAD_ROW_NO_ROW,
+  LIVENESS_PENDING,
+  LIVENESS_READING_DEAD,
+  LIVENESS_READING_DEAD_ENDED,
+  LIVENESS_READING_DEAD_INSTALL_GONE,
+  LIVENESS_READING_DEAD_MISSING,
+  LIVENESS_READING_DEAD_NO_ROW,
+  LIVENESS_READING_LIVE,
+  LIVENESS_READING_PENDING,
+  LIVENESS_READING_UNKNOWN,
+  pendingLivenessReading,
+  type DeadLivenessReading,
+  type DeadRowRead,
+  type LivenessReading,
+  type PendingLivenessReading,
+} from '../src/liveness-reading.ts'
 import {
   _resetOutageState,
   initOutageState,
 } from '../src/outage-state.ts'
-import { makeStubClient as makeBaseStubClient } from './test-helpers/agent-director-stub.ts'
-
-function makeStubClient(options: Parameters<typeof makeBaseStubClient>[0] = {}) {
-  return makeBaseStubClient({ readPaneResults: [cannedReadPaneResult(IDLE_PANE)], ...options })
-}
-import { AD_ERROR_CLASS_UNAVAILABLE, AD_ERROR_CLASS_UNCLASSIFIED, CSCB_UNKNOWN_ERROR_NAME, describeAgentDirectorFailure } from '../src/ad-error-class.ts'
+import { PROBE_PANE_READ_LINES } from '../src/pane-read.ts'
 import {
-  cannedErr,
-  cannedOk,
-  cannedSpawnResult,
-  cannedFindMissing,
-  cannedGetResult,
-  cannedStatusResult,
-  errCallTimeout,
-  errConfigMalformed,
-  errGeneric,
-  errInstanceIdCollision,
-  errInternal,
-  errInvalidFlags,
-  errSpawnNotFound,
-  errSpawnNotInteractive,
-  errSpawnNotResumable,
-  errSystemInstallDisappeared,
-  errTmuxKillFailed,
-  errTmuxCaptureFailed,
-  errUnusableName,
-  cannedKillResult,
-  KILL_FAILED_DESCRIPTIONS,
-  errTmuxNotAvailable,
-  errTmuxSendKeys,
-  errTmuxSessionConflict,
-  errTmuxSessionCreate,
-  errTmuxUnresponsive,
-  holdFindMissing,
-  holdSpawns,
-  UNAVAILABLE_FORMS,
-  unavailableForms,
-  makeStubCallLog,
-  makeStubResolveSystemBinary,
-  nonLatchingNotes,
-  provenanceNote,
-  SAMPLE_LAUNCH_START_FRACTIONAL,
-  SAMPLE_LAUNCH_START_NONE,
-  SAMPLE_LAUNCH_START_WHOLE,
-  stubCallCount,
-  type SpawnHold,
-  type StubCallLog,
-  type StubDeleteParams,
-  type StubResolveSystemBinaryOutcome,
-  type StubSpawnResult,
-  type UnavailableForm,
-} from './test-helpers/agent-director-stub.ts'
-import type { Client } from 'agent-director'
-import type { FindMissingParams, KillParams, ReadPaneParams, ResumeParams, SendKeysParams, SpawnParams, SpawnResult, StatusParams, StatusResult } from 'agent-director'
+  PENDING_ROW_REASON_CWD_MISMATCH
+} from '../src/pending-row.ts'
+import { createPersonaBringUpController, type PersonaBringUpController } from '../src/persona-bringup-controller.ts'
+import { describeThrownValue } from '../src/persona-connection-errors.ts'
+import type { PersonaConnectionStatus } from '../src/persona-connections.ts'
+import { PERSONA_CONFIG_DIR_UNRESOLVABLE } from '../src/persona-diagnostics.ts'
+import {
+  createPersonaEpisodes,
+  KILL_FAILURE_END_ROW_FINISHED,
+  TMUX_UNRESPONSIVE_ONSET_FLOOR_MS,
+  tmuxUnresponsiveOnsetText,
+} from '../src/persona-episodes.ts'
 import { configDirLabelValue, personaInstanceId, renderPersonaRef } from '../src/persona-identity.ts'
-import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
-import { makeNotifierHarness, type NotifierHarness } from './test-helpers/persona-notifier.ts'
-import { stubOpenedDmId, type StubWebMethod } from './test-helpers/slack-stub.ts'
 import { formatPersonaNotice } from '../src/persona-notifier.ts'
-import type { Persona, PersonaConfig } from '../src/config.ts'
+import { createPersonaSerializer, type PersonaSerialize } from '../src/persona-serializer.ts'
+import { createPersonaRelaunchGate } from '../src/persona-start.ts'
+import {
+  _resetRestartState,
+  _setCleanExitRelaunchDelay,
+  _setRestartNow,
+  cancelAllRestartTimers,
+  cancelRestartTimer,
+  CLEAN_EXIT_RELAUNCH_DELAY,
+  cleanExitDelayStandsLine,
+  cleanExitLoopGuardLine,
+  cleanExitRelaunchLine,
+  holdRestartActive,
+  initRestart,
+  isRestartPendingOrActive,
+  KILL_SESSION_NOT_KILLED_GUARD,
+  killNotSucceededLine,
+  killStopsServerLine,
+  killVoidsVerdictLine,
+  LAUNCH_RESUMED_UNREPORTED,
+  pendingDeferralFailedLine,
+  pendingDeferralGoneLine,
+  recordLaunchResultOutsideRestartWork,
+  RELAUNCH_KILL_NONE,
+  RELAUNCH_NO_KILL_ROW_READ,
+  RELAUNCH_NO_KILL_VERDICT_VOIDED,
+  relaunchAfterKillLine,
+  relaunchWithoutKillLine,
+  reprobeDeadLine,
+  reprobeLiveLine,
+  reprobePendingLine,
+  reprobeUnhandledLine,
+  reprobeUnknownLine,
+  RESTART_FAILURE_CAP,
+  RESTART_OUTCOME_ALREADY_CONNECTED,
+  RESTART_OUTCOME_CAPPED,
+  RESTART_OUTCOME_COUNTED_FAILURE,
+  RESTART_OUTCOME_HELD,
+  RESTART_OUTCOME_IN_FLIGHT,
+  RESTART_OUTCOME_LATCHED,
+  RESTART_OUTCOME_LAUNCH_SKIPPED,
+  RESTART_OUTCOME_LAUNCHED,
+  RESTART_OUTCOME_LIVENESS_UNKNOWN,
+  RESTART_OUTCOME_NOT_INITIALISED,
+  RESTART_OUTCOME_NOT_UP,
+  RESTART_OUTCOME_PENDING_DEFERRED,
+  RESTART_OUTCOME_RECONNECT_DEFERRED,
+  RESTART_OUTCOME_RECONNECTED,
+  RESTART_OUTCOME_REFUSED,
+  RESTART_OUTCOME_SEQUENCE_WAITING,
+  RESTART_OUTCOME_SHUTTING_DOWN,
+  RESTART_SLOW_RECOVERY_OTHER_PENDING_PROBE,
+  RESTART_SLOW_RECOVERY_OTHER_PENDING_REPROBE,
+  RESTART_SLOW_RECOVERY_OTHER_VERDICT,
+  restartCapReachedLine,
+  restartOldLifeHeldLine,
+  restartRetryCapSkippedLine,
+  restartRetrySkippedLine,
+  runRestartRetry,
+  runRestartRetryInTurn,
+  runRestartWorkInTurn,
+  scheduleRestart,
+  type KillSessionResult,
+  type LaunchSessionResult,
+  type ReconnectEscalateDead,
+  type ReconnectSessionResult,
+  type RestartDeps,
+  type RestartPendingDeferralAnswer,
+  type RestartRetryOutcome,
+  type RestartSlowRecoveryObserver,
+  type RestartWorkOutcome,
+  type SlowRecoveryOtherReason,
+} from '../src/restart.ts'
+import { _buildIsSessionAliveAdapter, _buildKillSessionAdapter, _buildReconnectSessionAdapter, deferPendingRow, deferringPendingRowLine, LIVENESS_STATUS_SITE } from '../src/server.ts'
+import { _resetConfigDirFs, _resetConfiguredPersonaQuery, _resetFindMissingMemo, _resetInFlightLaunches, _resetNotConnectedEpisodes, _resetNow, _resetPreLaunchReplyGuard, _resetSpawnHomeDir, _setConfigDirFs, _setNow, _setSpawnHomeDir, applyOwnRowStatusStep, carriedDeadEvidenceOf, checkLaunchConfigDir, DEAD_EVIDENCE_VOIDED_BY_ROW_NOT_INTERACTIVE, DEAD_SESSION_CAUSE_ROW_READ_FINISHED, deadEvidenceVoidedLine, ESCALATE_DEAD_EVIDENCE, ESCALATE_DEAD_VERDICTS, FIND_MISSING_MEMO_TTL_MS, forgetLaunchCalls, isLaunchInFlight, isLiveRowSequenceRunning, launchSession as launchPersonaSession, notifyRestartCapReached, PROMPT_ROW_STATES, readPersonaOwnRow, RESUME_READ_NO_ROW, resumedLaunchFailedLine, resumeEndedUnreportedLine, sequenceLaunchAtCapLine, setConfigDirUnresolvableHook, setConfiguredPersonaQuery, setConflictLatch, setSessionNotifier, spawnForPersona, uncoveredPendingRowLine, UNREPORTED_RESUME_FALLBACK_AFTER, unreportedResumeFallbackLine, type CarriedDeadEvidence, type ConfigDirUnresolvableHook, type DeadEvidenceSource, type EscalateDeadVerdict, type OwnRowReadSite } from '../src/session-manager.ts'
+import {
+  createSlowRecoveryTracker,
+  SLOW_RECOVERY_POST_THRESHOLD,
+  SLOW_RECOVERY_RESET_OTHER_VERDICT,
+  slowRecoveryCountResetLine,
+  slowRecoveryNoticePostedLine,
+  slowRecoveryText,
+} from '../src/slow-recovery.ts'
+import { _resetLaunchedWithDirs, getLaunchedWithDir } from '../src/stop-hook-bootstrap.ts'
 import {
   createUnavailableRetryController,
+  holdsLatchRecheckPermit,
+  latchRecheckScopeOf,
+  RETRY_BLOCK_LAUNCH,
+  RETRY_BLOCK_LIVE_ROW_SEQUENCE,
+  runInLatchRecheck,
   UNAVAILABLE_RETRY_BASE_S,
   UNAVAILABLE_RETRY_CAUSE_COLLISION,
   UNAVAILABLE_RETRY_CAUSE_KILL_FAILED,
@@ -299,92 +206,94 @@ import {
   UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED,
   UNAVAILABLE_RETRY_MODE_FULL,
   UNAVAILABLE_RETRY_MODE_PENDING_ONLY,
-  RETRY_BLOCK_LAUNCH,
-  RETRY_BLOCK_LIVE_ROW_SEQUENCE,
-  type RetryBlockCause,
-  holdsLatchRecheckPermit,
-  latchRecheckScopeOf,
-  runInLatchRecheck,
   type LatchRecheckPermit,
   type LatchRecheckScope,
+  type RetryBlockCause,
   type UnavailableRetryController,
 } from '../src/unavailable-retry.ts'
-import { RECHECK_OUTCOME_PASS, RECHECK_OUTCOME_STOP, installAdVersionRecheck, resetAdVersionRecheckForTests } from '../src/ad-version-gate.ts'
+import {
+  cannedErr, cannedFindMissing,
+  cannedGetResult, cannedKillResult, cannedOk,
+  cannedSpawnResult, cannedStatusResult,
+  errCallTimeout,
+  errConfigMalformed,
+  errGeneric,
+  errInstanceIdCollision,
+  errInternal,
+  errInvalidFlags,
+  errSpawnNotFound,
+  errSpawnNotInteractive,
+  errSpawnNotResumable,
+  errSystemInstallDisappeared, errTmuxCaptureFailed, errTmuxKillFailed, errTmuxNotAvailable,
+  errTmuxSendKeys,
+  errTmuxSessionConflict,
+  errTmuxSessionCreate,
+  errTmuxUnresponsive, errUnusableName, holdFindMissing,
+  holdSpawns, KILL_FAILED_DESCRIPTIONS, makeStubClient as makeBaseStubClient, makeStubCallLog,
+  makeStubResolveSystemBinary,
+  nonLatchingNotes,
+  provenanceNote,
+  SAMPLE_LAUNCH_START_FRACTIONAL,
+  SAMPLE_LAUNCH_START_NONE,
+  SAMPLE_LAUNCH_START_WHOLE,
+  stubCallCount, UNAVAILABLE_FORMS,
+  unavailableForms, type SpawnHold,
+  type StubCallLog,
+  type StubDeleteParams,
+  type StubResolveSystemBinaryOutcome,
+  type StubSpawnResult,
+  type UnavailableForm
+} from './test-helpers/agent-director-stub.ts'
+import { OLD_AD_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
+import {
+  launchStartRecord,
+  NO_LAUNCH_START_FORM_NAMES,
+  NO_LAUNCH_START_FORMS,
+  reconnectConflictRowsAt,
+  RESTART_KILL_CONFLICT_CASE_ROWS,
+  RESTART_KILL_UNUSABLE_NAME_CASE_ROWS,
+  tmuxTouchingCallsIn,
+  UNUSABLE_NAME_CASE_ROWS,
+} from './test-helpers/conflict-cases.ts'
+import { APP_TOKEN_PREFIX, assertNoLeak, fakeToken, LEAK_SENTINEL, REDACTED_SENTINEL_TAIL, sentinelInMessage } from './test-helpers/credentials.ts'
+import { DEAD_EVIDENCE_OF } from './test-helpers/dead-evidence.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import { lineParts } from './test-helpers/line-parts.ts'
+import { beginApplyHold } from './test-helpers/old-life.ts'
+import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
+import { makeConnectionHarness, type ConnectionHarness } from './test-helpers/persona-connection-harness.ts'
+import { makeNotifierHarness, type NotifierHarness } from './test-helpers/persona-notifier.ts'
 import {
   callCounts,
   callCountsSince,
+  expectPendingOnlyWatch,
+  holdThroughReuse,
+  installGoneRestartProbe,
   killFailureEndedLine,
   killFailureLines,
   killFailureLoggedLine,
   killFailureNotice,
   killFailureRecoveryEntry,
-  collided,
-  expectPendingOnlyWatch,
-  holdThroughReuse,
-  installGoneRestartProbe,
   makeRecoveryHarness,
   ordinaryAlertContent,
   personaCallCounts,
   personaOf,
   personaRow,
-  reuseSpawnOf,
-  startupEntriesOf,
   retryNow,
+  reuseSpawnOf,
   rowReadsUntilSpawn,
+  startupEntriesOf,
   type RecoveryHarness,
   type RecoveryHarnessOptions,
-  type RecoveryStubScript,
+  type RecoveryStubScript
 } from './test-helpers/recovery-harness.ts'
-import { DEAD_EVIDENCE_OF } from './test-helpers/dead-evidence.ts'
-import { beginApplyHold } from './test-helpers/old-life.ts'
-import {
-  NO_LAUNCH_START_FORMS,
-  NO_LAUNCH_START_FORM_NAMES,
-  RESTART_KILL_CONFLICT_CASE_ROWS,
-  RESTART_KILL_UNUSABLE_NAME_CASE_ROWS,
-  UNUSABLE_NAME_CASE_ROWS,
-  launchStartRecord,
-  reconnectConflictRowsAt,
-  tmuxTouchingCallsIn,
-} from './test-helpers/conflict-cases.ts'
-import {
-  createPersonaEpisodes,
-  KILL_FAILURE_END_ROW_FINISHED,
-  TMUX_UNRESPONSIVE_ONSET_FLOOR_MS,
-  tmuxUnresponsiveOnsetText,
-} from '../src/persona-episodes.ts'
-import {
-  createSlowRecoveryTracker,
-  SLOW_RECOVERY_POST_THRESHOLD,
-  SLOW_RECOVERY_RESET_OTHER_VERDICT,
-  slowRecoveryCountResetLine,
-  slowRecoveryNoticePostedLine,
-  slowRecoveryText,
-} from '../src/slow-recovery.ts'
-import { OLD_AD_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
-import { createInvalidFlagsHold, INVALID_FLAGS_HOLD_LOG_PREFIX, type InvalidFlagsHold } from '../src/invalid-flags-hold.ts'
-import {
-  AGENT_DIRECTOR_PENDING_STATE,
-  LIVENESS_DEAD_ROW_ENDED,
-  LIVENESS_DEAD_ROW_MISSING,
-  LIVENESS_DEAD_ROW_NO_ROW,
-  LIVENESS_READING_DEAD,
-  LIVENESS_READING_DEAD_ENDED,
-  LIVENESS_READING_DEAD_INSTALL_GONE,
-  LIVENESS_READING_DEAD_MISSING,
-  LIVENESS_READING_DEAD_NO_ROW,
-  LIVENESS_READING_LIVE,
-  LIVENESS_READING_PENDING,
-  LIVENESS_READING_UNKNOWN,
-  LIVENESS_PENDING,
-  pendingLivenessReading,
-  type DeadLivenessReading,
-  type DeadRowRead,
-  type LivenessReading,
-  type PendingLivenessReading,
-} from '../src/liveness-reading.ts'
+import { installRecordingReplyGuard, observeLaunchCalls, type LaunchCall } from './test-helpers/reply-guard-launch.ts'
+import { makeReplyGuardRecordDir, type ReplyGuardRecordDir } from './test-helpers/reply-guard-record.ts'
+import { stubOpenedDmId, type StubWebMethod } from './test-helpers/slack-stub.ts'
+
+function makeStubClient(options: Parameters<typeof makeBaseStubClient>[0] = {}) {
+  return makeBaseStubClient({ readPaneResults: [cannedReadPaneResult(IDLE_PANE)], ...options })
+}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -396,15 +305,8 @@ const WAIT_MS = 50         // wait after scheduling; long enough for FAST_DELAY_
 const CAP_BASE_DELAY_S = 0.001  // 1 ms base for the cap-driving helper below
 const CAP_MARGIN_MS = 40        // margin above each computed backoff delay
 
-/**
- * Stop every dialog approver a real launch started and wait until each has
- * stopped (after any call in progress returned), then forget them and every
- * launch still marked in flight: no approver outlives the case (b.jg5
- * SRJ-401: a launch returns before its approver's first lap, so one may still
- * be running when the case ends).
- */
-async function stopApproversAndForgetLaunches(): Promise<void> {
-  await stopAllDialogApprovers()
+async function forgetLaunchRecords(): Promise<void> {
+
   _resetInFlightLaunches()
 }
 
@@ -462,7 +364,7 @@ function escalateDeadWith(verdict: DeadEvidenceSource): ReconnectEscalateDead {
  * `missing` or gone voids it: no kill, a relaunch carrying none (b.jg5
  * SRJ-611, dead evidence covers one life).
  */
-const ESCALATE_DEAD_WORKING_GONE = escalateDeadWith('working-tmux-gone')
+const ESCALATE_DEAD_WORKING_GONE = escalateDeadWith('prompt-row-tmux-gone')
 
 function makeDeps(opts: DepsOpts = {}): RestartDeps & {
   isSessionAliveCalls: string[]
@@ -2324,13 +2226,13 @@ describe('not-up guard through the real relaunch gate and adapters: no agent-dir
   afterEach(async () => {
     cancelAllRestartTimers()
     console.error = origConsoleError
-    await stopApproversAndForgetLaunches()
+    await forgetLaunchRecords()
     resetClientForTests()
     _resetOutageState()
     setSessionNotifier(undefined)
     _resetFindMissingMemo()
     _resetSpawnHomeDir()
-    _resetDialogReadyTimeoutMs()
+
     rmSync(dir, { recursive: true, force: true })
   })
 
@@ -2485,7 +2387,7 @@ describe('not-up guard through the real relaunch gate and adapters: no agent-dir
     rowStatus = (p) => (spawnCalls.some((s) => s.instance_id === p.instance_id) ? { state: 'waiting' } : { state: 'ended' })
     mkdirSync(b.working_directory, { recursive: true })
     _setSpawnHomeDir(dir)
-    _setDialogReadyTimeoutMs(200)
+
     _setCleanExitRelaunchDelay(0.01)
     const deps = makeRealDeps()
     deps.getRestartDelay = () => LONG_S
@@ -2894,13 +2796,14 @@ describe('b.jg5 SRJ-610, SRJ-1010: a row the escalate-dead sweep leaves in unver
     const instanceId = personaInstanceId(KEY)
     setConfiguredPersonaQuery((key) => key === KEY)
     let run = 0
+    let sweepsBeforeRun = 0
     const log = makeStubCallLog()
     const stub = makeStubClient({
       ...log,
       statusFn: () => ({ state: 'working' }),
-      readPaneError: errTmuxCaptureFailed(),
+      sendKeysError: errTmuxSendKeys(),
       findMissingResult: cannedFindMissing({ rows: { [instanceId]: 'unverified_ids' } }),
-      getFn: () => cannedGetResult({ instance_id: instanceId, state: 'working', liveness_note: log.findMissingCalls.length >= run ? noteOfRun(run) : nonLatchingNotes[0] }),
+      getFn: () => cannedGetResult({ instance_id: instanceId, state: log.findMissingCalls.length > sweepsBeforeRun ? 'working' : 'waiting', liveness_note: log.findMissingCalls.length > sweepsBeforeRun ? noteOfRun(run) : nonLatchingNotes[0] }),
     })
     _resetOutageState()
     initOutageState({ notify: () => {}, getClient: () => stub as unknown as Client })
@@ -2929,6 +2832,7 @@ describe('b.jg5 SRJ-610, SRJ-1010: a row the escalate-dead sweep leaves in unver
     const nextRun = async (): Promise<void> => {
       await clock.advance(FIND_MISSING_MEMO_TTL_MS)
       run++
+      sweepsBeforeRun = log.findMissingCalls.length
       await tick(KEY, persona.working_directory)
     }
     return { KEY, posts, kills, launches, armed, outcomes, nextRun, stubCalls: () => ownStubCalls(log, instanceId) }
@@ -2942,7 +2846,7 @@ describe('b.jg5 SRJ-610, SRJ-1010: a row the escalate-dead sweep leaves in unver
       // The probe, the adapter's state read, its read-pane, the sweep and its
       // get of P's own row, then the re-probe: nothing typed, deleted, killed
       // or launched.
-      expect(runs.stubCalls()).toEqual({ statusCalls: 3 * run, readPaneCalls: run, findMissingCalls: run, getCalls: 2 * run })
+      expect(runs.stubCalls()).toEqual({ statusCalls: 3 * run, sendKeysCalls: run, findMissingCalls: run, getCalls: 4 * run })
       expect(runs.posts).toEqual(run >= SLOW_RECOVERY_POST_THRESHOLD ? [[runs.KEY, slowRecoveryText(runs.KEY)]] : [])
       expect(errLines.filter((l) => l === reprobeLiveLine(runs.KEY))).toHaveLength(run)
     }
@@ -2983,7 +2887,7 @@ describe('b.jg5 SRJ-610, SRJ-1010: a row the escalate-dead sweep leaves in unver
     ])
     // The healed run's probe only: no state read, read-pane, sweep or get.
     const escalated = total - 1
-    expect(runs.stubCalls()).toEqual({ statusCalls: 3 * escalated + 1, readPaneCalls: escalated, findMissingCalls: escalated, getCalls: 2 * escalated })
+    expect(runs.stubCalls()).toEqual({ statusCalls: 3 * escalated + 1, sendKeysCalls: escalated, findMissingCalls: escalated, getCalls: 4 * escalated })
     expect(errLines.filter((l) => l === slowRecoveryCountResetLine(runs.KEY, healedRun - 1, SLOW_RECOVERY_RESET_OTHER_VERDICT))).toHaveLength(1)
     expect(errLines.filter((l) => l === slowRecoveryNoticePostedLine(runs.KEY, SLOW_RECOVERY_POST_THRESHOLD))).toHaveLength(1)
     expect(runs.kills).toEqual([])
@@ -3004,7 +2908,7 @@ describe('b.jg5 SRJ-610, SRJ-1010: a row the escalate-dead sweep leaves in unver
     expect(latch.isLatched(runs.KEY)).toBe(true)
     // The ticks before as in the demo; the latching tick with no re-probe; no
     // agent-director call after it.
-    expect(runs.stubCalls()).toEqual({ statusCalls: 3 * latchRun - 1, readPaneCalls: latchRun, findMissingCalls: latchRun, getCalls: 2 * latchRun })
+    expect(runs.stubCalls()).toEqual({ statusCalls: 3 * latchRun - 1, sendKeysCalls: latchRun, findMissingCalls: latchRun, getCalls: 4 * latchRun })
     expect(runs.outcomes).toEqual([...Array(latchRun - 1).fill(RESTART_OUTCOME_RECONNECT_DEFERRED), RESTART_OUTCOME_LATCHED])
     expect(errLines.filter((l) => l.startsWith(`[slack] Not scheduling restart for persona=${runs.KEY} — the persona is latched`))).toHaveLength(RUNS - latchRun)
     expect(runs.posts).toEqual([])
@@ -3080,12 +2984,12 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
    * runs, so a call another case left running (another persona's launch
    * wait, which polls until its timeout) is never counted as the run's.
    */
-  function d61Run(row: RowAnswer, readPaneError: Error, launchResult = true) {
+  function d61Run(row: RowAnswer, readPaneError: Error, launchResult = true, refusedSend = false) {
     const config = makeMultiPersonaConfig([{ name: 'alpha_bot' }], dir)
     const persona = config.personas[0]!
     const instanceId = personaInstanceId(persona.key)
     const log = makeStubCallLog()
-    const stub = makeStubClient({ ...log, statusFn: () => row(log.findMissingCalls.length > 0), readPaneError })
+    const stub = makeStubClient({ ...log, statusFn: () => row(log.findMissingCalls.length > 0), readPaneError, ...(refusedSend ? { sendKeysError: errTmuxSendKeys() } : {}) })
     _resetOutageState()
     initOutageState({ notify: () => {}, getClient: () => stub as unknown as Client })
     setClientForTests(stub as unknown as Client)
@@ -3125,82 +3029,10 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
   /** A row reading `state` until the sweep and `missing` after it. */
   const untilSwept = (state: string): RowAnswer => (swept) => ({ state: swept ? 'missing' : state })
 
-  const WORKING_TMUX_GONE: EscalateDeadVerdict = 'working-tmux-gone'
-
-  test.each<[string, EscalateDeadVerdict]>([
-    ['working', WORKING_TMUX_GONE],
-    ['waiting', ESCALATE_DEAD_WAITING_ROW_PANE_GONE],
-  ])('alive (%s) but disconnected, its read-pane answering GONE → one read-pane of its own row, one findMissing sweep (verdict %s, dead evidence) and no send-keys; the re-probe reads the row missing, which voids the verdict → one noteDead, then no kill and one relaunch carrying no verdict in that run, no failure counted, nothing armed', async (state, verdict) => {
-    const run = d61Run(untilSwept(state), errTmuxCaptureFailed())
-
-    await run.tick()
-
-    // The probe, the adapter's state read, its read-pane and sweep, then the
-    // re-probe; nothing is typed into a pane that no longer exists.
-    expect(run.stubCalls()).toEqual({ getCalls: 1, statusCalls: 3, readPaneCalls: 1, findMissingCalls: 1 })
-    expect(run.paneReads()).toEqual([[personaInstanceId(run.KEY), FULL_PANE_READ_LINES]])
-    expect(escalateLines()).toHaveLength(1)
-    expect(escalateLines(verdict)).toHaveLength(1)
-    // b.jg5 SRJ-110, SRJ-611 (dead evidence covers one life): the re-probe read
-    // the row `missing`, so no kill is sent and the relaunch carries no verdict.
-    expect(run.kills).toEqual([])
-    expect(run.launches).toEqual([run.KEY])
-    expect(run.carriedIn).toEqual([undefined])
-    expect(errLines.filter((l) => l === relaunchWithoutKillLine(run.KEY, carriedDeadEvidenceOf(verdict), RELAUNCH_NO_KILL_VERDICT_VOIDED, LIVENESS_READING_DEAD_MISSING))).toHaveLength(1)
-    expect(run.outcomes).toEqual([RESTART_OUTCOME_LAUNCHED])
-    // b.jg5 SRJ-610: the re-probe's row read of `missing` ends any slow recovery.
-    expect(run.notes).toEqual([['noteDead', run.KEY]])
-    // The successful launch counts no failure.
-    expect(getFailureCount(run.KEY)).toBe(0)
-    // The run armed no further timer: nothing relaunches the persona again.
-    expect(run.armed).toEqual([])
-    expect(isRestartPendingOrActive(run.KEY)).toBe(false)
-  })
-
-  // b.jg5 SRJ-117: the row absent at the read-pane takes the GONE column
-  // without being a GONE. b.jg5 SRJ-611: its verdict is a row read, never dead
-  // evidence, so the re-probe that reads the row missing leads to the
-  // relaunch alone, carrying the verdict, with no kill.
-  test.each(['working', 'waiting'])('alive (%s) but disconnected, its read-pane answering ErrSpawnNotFound → one findMissing sweep with the row-absent verdict and no send-keys; the re-probe reads the row missing → no kill, one relaunch carrying the row-absent verdict; no failure counted', async (state) => {
-    const run = d61Run(untilSwept(state), errSpawnNotFound())
-
-    await run.tick()
-
-    expect(run.stubCalls()).toEqual({ getCalls: 1, statusCalls: 3, readPaneCalls: 1, findMissingCalls: 1 })
-    expect(escalateLines()).toHaveLength(1)
-    expect(escalateLines(ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ)).toHaveLength(1)
-    expect(run.kills).toEqual([])
-    expect(run.launches).toEqual([run.KEY])
-    const carried = carriedDeadEvidenceOf(ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ)
-    expect(run.carriedIn).toEqual([carried])
-    expect(errLines.filter((l) => l === relaunchWithoutKillLine(run.KEY, carried))).toHaveLength(1)
-    expect(run.outcomes).toEqual([RESTART_OUTCOME_LAUNCHED])
-    expect(getFailureCount(run.KEY)).toBe(0)
-    expect(run.armed).toEqual([])
-  })
-
   // b.jg5 SRJ-603 (HO C18 Verify, AC 77): a `working` row's read-pane that
   // could not run is never proof the session is gone. Every UNAVAILABLE form
   // a read can meet (the kill-failure form is a kill's only).
   const READ_PANE_UNAVAILABLE_FORMS = UNAVAILABLE_FORMS.filter(([, , cause]) => cause === UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE)
-
-  test.each(READ_PANE_UNAVAILABLE_FORMS)('alive (working) but disconnected, its read-pane answering UNAVAILABLE (%s) → the run defers: no sweep, send-keys, kill or launch, nothing counted or reset, nothing armed; the transient verdict resets the slow-recovery count', async (_label, make) => {
-    const run = d61Run(() => ({ state: 'working' }), make('read-pane'))
-    // One failure on record, so a reset or a counted launch would show.
-    recordFailure(run.KEY)
-
-    await run.tick()
-
-    expect(run.stubCalls()).toEqual({ getCalls: 1, statusCalls: 2, readPaneCalls: 1 })
-    expect(escalateLines()).toEqual([])
-    expect(run.kills).toEqual([])
-    expect(run.launches).toEqual([])
-    expect(run.outcomes).toEqual([RESTART_OUTCOME_RECONNECT_DEFERRED])
-    expect(run.notes).toEqual([['noteOther', run.KEY, RESTART_SLOW_RECOVERY_OTHER_VERDICT]])
-    expect(getFailureCount(run.KEY)).toBe(1)
-    expect(run.armed).toEqual([])
-    expect(isRestartPendingOrActive(run.KEY)).toBe(false)
-  })
 
   // b.jdc (/ci-live run 6), b.jg5 SRJ-606 (AC 38): a persona whose session
   // died while its row read `ask_user` or `check_permission`. agent-director
@@ -3299,7 +3131,7 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
     // First probe: status fails at once. Re-probe: the row reads `working`
     // (the reconnect adapter's read-pane answers GONE and it sweeps) until
     // the sweep, and status fails after it.
-    const run = d61Run((swept) => (probe === 'first probe' || swept ? build() : { state: 'working' }), errTmuxCaptureFailed(), false)
+    const run = d61Run((swept) => (probe === 'first probe' || swept ? build() : { state: 'working' }), errTmuxCaptureFailed(), false, true)
     // One failure on record, so a reset or a counted launch would show.
     recordFailure(run.KEY)
 
@@ -3308,10 +3140,10 @@ describe('b.d61: a working persona whose tmux session is gone is relaunched in t
     // The first probe, the reconnect adapter's state read and read-pane, and
     // the re-probe (the first-probe case stops, or goes straight to the kill,
     // after one).
-    expect(run.stubCalls()).toEqual(probe === 'first probe' ? { statusCalls: 1 } : { getCalls: 1, statusCalls: 3, readPaneCalls: 1, findMissingCalls: 1 })
+    expect(run.stubCalls()).toEqual(probe === 'first probe' ? { statusCalls: 1 } : { getCalls: 3, statusCalls: 3, sendKeysCalls: 1, findMissingCalls: 1 })
     expect(run.kills).toEqual(installGone ? [run.KEY] : [])
     expect(run.launches).toEqual(dead ? [run.KEY] : [])
-    expect(run.carriedIn).toEqual(!dead ? [] : installGone && probe === 're-probe' ? [carriedDeadEvidenceOf(WORKING_TMUX_GONE)] : [undefined])
+    expect(run.carriedIn).toEqual(!dead ? [] : installGone && probe === 're-probe' ? [carriedDeadEvidenceOf('dead-session')] : [undefined])
     // A failed launch counts; an unknown run counts nothing and resets nothing.
     expect(getFailureCount(run.KEY)).toBe(dead ? 2 : 1)
     expect(run.armed).toEqual(dead ? [] : [run.KEY])
@@ -3461,92 +3293,6 @@ describe('b.dup: a persona whose row is ended just before its reconnect lands is
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-611 (and SRJ-1304: the harness binds the restart dependencies as
-// `main()` binds them): the relaunch after an escalate-dead answer hands the
-// ladder the verdict the reconnect adapter swept with. P's row reads
-// `working` until that sweep and `missing` after it, and its `read-pane`
-// answers the case's failure. The relaunch's optimistic spawn collides, its
-// collision `get` reads the row `missing` and its `resume` answers
-// `ErrSpawnNotResumable`, whose re-read (b.jg5 SRJ-710) reads it `missing`
-// again, so the ladder's finished-row route logs the verdict carried in
-// (`deadSessionRouteLine`) and the not-resumable step's lost race names the
-// dead evidence the path holds; the launch is refused and counted nowhere. A
-// GONE-based verdict keeps its checked kill and reaches the ladder only after
-// a re-probe of `ErrSystemInstallDisappeared`, which reads no row; there the
-// collision `get`'s finished read voids it (dead evidence covers one life). A
-// re-probe that read the row voids it before the relaunch, with no kill. A
-// row-absent verdict makes no kill and is never voided (not dead evidence).
-// ---------------------------------------------------------------------------
-
-describe('b.jg5 SRJ-611: on the recovery harness, the relaunch after escalate-dead hands the ladder its verdict', () => {
-  let harness: RecoveryHarness | undefined
-
-  afterEach(() => {
-    const h = harness
-    harness = undefined
-    if (h === undefined) return
-    try {
-      assertNoLeak(h.captured())
-    } finally {
-      h.cleanup()
-    }
-    expect(h.clock.pendingCount()).toBe(0)
-  })
-
-  /**
-   * What the run's re-probe after the escalate-dead sweep reads: the row
-   * `missing`, or `ErrSystemInstallDisappeared` (no row read).
-   */
-  type Reprobe = 'missing' | 'install-gone'
-
-  test.each<[string, () => Error, EscalateDeadVerdict, Reprobe]>([
-    ['GONE (ErrTmuxCaptureFailed), its verdict dead evidence, and the re-probe reads ErrSystemInstallDisappeared → one checked kill, then the relaunch carrying the verdict, which the collision get\'s finished read voids', () => errTmuxCaptureFailed(), 'working-tmux-gone', 'install-gone'],
-    ['GONE (ErrTmuxCaptureFailed), its verdict dead evidence, and the re-probe reads the row missing, which voids it → no kill, the relaunch carrying no verdict', () => errTmuxCaptureFailed(), 'working-tmux-gone', 'missing'],
-    ['the row absent (ErrSpawnNotFound), its verdict a row read, and the re-probe reads the row missing → no kill, the relaunch carrying the verdict, never voided', () => errSpawnNotFound(), ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ, 'missing'],
-  ])('P\'s working row\'s read-pane answers %s', async (_label, answer, verdict, reprobe) => {
-    const h = (harness = makeRecoveryHarness({ alertThresholdMs: false }))
-    const persona = h.config.personas[0]!
-    const p = persona.key
-    const calls = h.stub.calls
-    h.script({
-      ...collided(h, persona, { state: LIVENESS_DEAD_ROW_MISSING }),
-      statusFn: () => {
-        if (calls.findMissingCalls.length === 0) return cannedStatusResult({ state: 'working' })
-        return reprobe === 'install-gone' ? errSystemInstallDisappeared('status') : cannedStatusResult({ state: LIVENESS_DEAD_ROW_MISSING })
-      },
-      readPaneError: answer(),
-      resumeError: errSpawnNotResumable(),
-    })
-
-    expect(await runRestartRetry(p, persona.working_directory, isLaunchInFlight)).toBe(RESTART_OUTCOME_REFUSED)
-
-    const verdictCarried = carriedDeadEvidenceOf(verdict)
-    // b.jg5 SRJ-611: what the relaunch hands the ladder (a re-probe that read the row voids a GONE-based verdict).
-    const handed = reprobe === 'missing' && DEAD_EVIDENCE_OF[verdict] ? CARRIED_DEAD_EVIDENCE_NONE : verdictCarried
-    // The ladder's collision get reads the row `missing`, which voids a GONE-based verdict carried in (one line).
-    const collisionVoid = handed !== CARRIED_DEAD_EVIDENCE_NONE && DEAD_EVIDENCE_OF[verdict]
-      ? deadEvidenceVoidingRead(DEAD_EVIDENCE_READ_BY_COLLISION_GET, latchRowStateRead(LIVENESS_DEAD_ROW_MISSING))
-      : undefined
-    const held = collisionVoid === undefined ? handed : CARRIED_DEAD_EVIDENCE_NONE
-    const ref = renderPersonaRef(persona.name, p)
-    expect(calls.killCalls).toHaveLength(reprobe === 'install-gone' ? 1 : 0)
-    expect(calls.resumeCalls).toHaveLength(1)
-    // The finished-row route's line names a verdict carried in; with none carried there is none.
-    expect(h.errors.filter((l) => l.startsWith(`[slack] spawnForPersona: dead session for ${ref} `))).toEqual(
-      handed === CARRIED_DEAD_EVIDENCE_NONE ? [] : [deadSessionRouteLine(ref, LIVENESS_DEAD_ROW_MISSING, CARRIED_DEAD_EVIDENCE_NONE, handed, collisionVoid)],
-    )
-    expect(h.errors.filter((l) => l.includes(`${ref}'s dead evidence (`))).toEqual(collisionVoid === undefined ? [] : [deadEvidenceVoidedLine(ref, handed, collisionVoid)])
-    const reread: PersonaRowReread = { kind: ROW_REREAD_FINISHED, lastRead: latchRowStateRead(LIVENESS_DEAD_ROW_MISSING) }
-    expect(h.errors.filter((l) => l.includes(` on resume for ${ref} — re-read: `))).toEqual([
-      spawnNotResumableLine('[slack] spawnForPersona:', ref, describeAgentDirectorFailure(errSpawnNotResumable()), reread, held, lostRaceOutcome(true)),
-    ])
-    expect(calls.getCalls).toHaveLength(3)
-    expect(calls.deleteCalls).toEqual([])
-    await h.settle()
-  })
-})
-
-// ---------------------------------------------------------------------------
 // b.jg5 SRJ-611's Test line (homed in T1, observed here), SRJ-710, SRJ-609's
 // AC 59 half: the restart path's relaunch after each escalate-dead
 // verdict meets ErrSpawnNotResumable on a row its re-read finds live.
@@ -3603,16 +3349,13 @@ describe('b.jg5 SRJ-611, SRJ-710: the restart path\'s relaunch after each escala
 
   /** Every escalate-dead verdict, as the reconnect adapter reaches it. */
   const VERDICT_REACHES: readonly VerdictReach[] = [
-    { verdict: 'working-tmux-gone', state: 'working', script: { readPaneError: errTmuxCaptureFailed() } },
-    { verdict: ESCALATE_DEAD_WAITING_ROW_PANE_GONE, state: 'waiting', script: { readPaneError: errTmuxCaptureFailed() } },
     { verdict: 'dead-session', state: 'waiting', script: { sendKeysError: errTmuxSendKeys() } },
     { verdict: 'prompt-row-tmux-gone', state: 'check_permission', script: { readPaneError: errTmuxCaptureFailed() } },
     { verdict: 'row-not-interactive', state: 'waiting', script: { sendKeysError: errSpawnNotInteractive('send-keys') } },
-    { verdict: ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ, state: 'working', script: { readPaneError: errSpawnNotFound() } },
   ]
 
   test('every escalate-dead verdict has a reach here', () => {
-    expect(new Set(VERDICT_REACHES.map((reach) => reach.verdict))).toEqual(new Set(ESCALATE_DEAD_VERDICTS))
+    expect(new Set(VERDICT_REACHES.map((reach) => reach.verdict))).toEqual(new Set(['dead-session', 'prompt-row-tmux-gone', 'row-not-interactive']))
   })
 
   /**
@@ -3672,7 +3415,7 @@ describe('b.jg5 SRJ-611, SRJ-710: the restart path\'s relaunch after each escala
 
   /**
    * AC 58 through the restart path (b.jg5 SRJ-611, SRJ-710): P's `working`
-   * row's `read-pane` answers GONE once (verdict `working-tmux-gone`, dead
+   * row's `read-pane` answers GONE once (verdict `prompt-row-tmux-gone`, dead
    * evidence) and the re-probe after the sweep reads
    * `ErrSystemInstallDisappeared`, so the checked kill is made and the
    * relaunch carries the verdict; its collision `get` reads the row
@@ -3692,8 +3435,7 @@ describe('b.jg5 SRJ-611, SRJ-710: the restart path\'s relaunch after each escala
     h.script({
       spawnQueue: [cannedErr<SpawnResult>(errInstanceIdCollision())],
       getQueue: [
-        cannedOk(cannedGetResult({ state: 'working' }, persona, h.home)),
-        ...Array(4).fill(cannedOk(cannedGetResult({ state: 'waiting' }, persona, h.home))),
+        ...Array(7).fill(cannedOk(cannedGetResult({ state: 'waiting' }, persona, h.home))),
       ],
       getResult: cannedGetResult({ state: LIVENESS_DEAD_ROW_ENDED, session_id: 'a-session-id' }, persona, h.home),
       statusFn: () => {
@@ -3703,13 +3445,13 @@ describe('b.jg5 SRJ-611, SRJ-710: the restart path\'s relaunch after each escala
         reprobed = true
         return errSystemInstallDisappeared('status')
       },
-      readPaneQueue: [cannedErr(errTmuxCaptureFailed())],
+      sendKeysQueue: [cannedErr(errTmuxSendKeys())],
       sendKeysError: ladderSendKeys,
       resumeQueue: [cannedErr(errSpawnNotResumable())],
     })
     return { h, p: persona.key, ref: renderPersonaRef(persona.name, persona.key), cwd: persona.working_directory }
   }
-  const CARRIED_GONE = carriedDeadEvidenceOf('working-tmux-gone')
+  const CARRIED_GONE = carriedDeadEvidenceOf('dead-session')
 
   test('AC 58: a GONE-based verdict whose re-probe reads ErrSystemInstallDisappeared → one checked kill, the relaunch carrying the verdict; its collision get reads waiting and its reconnect answers GONE → ErrSpawnNotResumable with a re-read of waiting starts one sequence, which ends in resume; nothing counted or posted', async () => {
     const { h, p, ref, cwd } = buildInstallGoneReprobe(errTmuxSendKeys())
@@ -3823,8 +3565,8 @@ describe('b.jg5 SRJ-110, SRJ-611 (AC 58): a foreign launch after the restart pat
         foreign = true
         return cannedStatusResult({ state: LIVENESS_DEAD_ROW_ENDED })
       },
-      getFn: () => personaRow(h, p, { state: foreign ? AGENT_DIRECTOR_PENDING_STATE : 'working' }),
-      readPaneError: errTmuxCaptureFailed(),
+      getFn: () => personaRow(h, p, { state: foreign ? AGENT_DIRECTOR_PENDING_STATE : 'waiting' }),
+      sendKeysError: errTmuxSendKeys(),
       spawnQueue: [cannedErr<SpawnResult>(errInstanceIdCollision())],
     })
 
@@ -3837,7 +3579,7 @@ describe('b.jg5 SRJ-110, SRJ-611 (AC 58): a foreign launch after the restart pat
     expect(isLiveRowSequenceRunning(p)).toBe(false)
     const noKill = at === 'first probe'
       ? relaunchWithoutKillLine(p, undefined, RELAUNCH_NO_KILL_ROW_READ, LIVENESS_READING_DEAD_ENDED)
-      : relaunchWithoutKillLine(p, ESCALATE_DEAD_WORKING_GONE.deadEvidence, RELAUNCH_NO_KILL_VERDICT_VOIDED, LIVENESS_READING_DEAD_ENDED)
+      : relaunchWithoutKillLine(p, carriedDeadEvidenceOf('dead-session'), RELAUNCH_NO_KILL_VERDICT_VOIDED, LIVENESS_READING_DEAD_ENDED)
     expect(h.errors.filter((l) => l.startsWith('[slack] No kill before the '))).toEqual([noKill])
     expect(getFailureCount(p)).toBe(0)
   })
@@ -3939,7 +3681,7 @@ describe('b.jg5 SRJ-118, SRJ-609: the reconnect\'s transient and latching answer
 // after the re-probe, since it is an async agent-director call. Each run tells
 // a recording slow-recovery observer what it read (b.jg5 SRJ-610). The deps
 // are `makeDeps` fakes: the first probe reads `live` and the reconnect answers
-// escalate-dead carrying b.d61's GONE-based verdict (`working-tmux-gone`)
+// escalate-dead carrying b.d61's GONE-based verdict (`prompt-row-tmux-gone`)
 // unless a case gives another answer. b.jg5 SRJ-110, SRJ-314, SRJ-611
 // (`killBeforeRelaunch`'s decision): only a GONE-based verdict, dead
 // evidence, with a re-probe of `ErrSystemInstallDisappeared` (no row read) is
@@ -3979,7 +3721,7 @@ describe('b.d61: after an escalate-dead reconnect, the restart run probes livene
   /**
    * makeDeps whose first liveness probe reads `live`, whose reconnect answers
    * `answer` (default: escalate-dead carrying the GONE-based
-   * `working-tmux-gone`), and whose re-probe runs `reprobe`.
+   * `prompt-row-tmux-gone`), and whose re-probe runs `reprobe`.
    */
   function makeEscalateDeps(
     reprobe: () => Promise<LivenessReading>,
@@ -4227,13 +3969,13 @@ describe('b.d61: after an escalate-dead reconnect, the restart run probes livene
       `[slack] No kill before the launch for persona=${KEY} — its liveness read found the row ended: no kill is sent for a row just read finished or gone, which proves nothing about a worker, and a launch that started since that read is not the one it saw; the launch carries no verdict (b.jg5 SRJ-110, SRJ-314)`,
     )
     expect(relaunchWithoutKillLine(KEY, verdict, RELAUNCH_NO_KILL_VERDICT_VOIDED, LIVENESS_READING_DEAD_NO_ROW)).toBe(
-      `[slack] No kill before the relaunch for persona=${KEY} — its escalate-dead verdict (verdict=working-tmux-gone) is dead evidence, but the re-probe found no row (ErrSpawnNotFound), which voids it (dead evidence covers one life): the relaunch carries no verdict (b.jg5 SRJ-110, SRJ-314, SRJ-611)`,
+      `[slack] No kill before the relaunch for persona=${KEY} — its escalate-dead verdict (verdict=prompt-row-tmux-gone) is dead evidence, but the re-probe found no row (ErrSpawnNotFound), which voids it (dead evidence covers one life): the relaunch carries no verdict (b.jg5 SRJ-110, SRJ-314, SRJ-611)`,
     )
     expect(killVoidsVerdictLine(KEY, verdict)).toBe(
-      `[slack] The kill before the relaunch for persona=${KEY} answered ErrSpawnNotFound (the row is gone), which voids its escalate-dead verdict (verdict=working-tmux-gone; dead evidence covers one life): the relaunch carries no verdict (b.jg5 SRJ-611)`,
+      `[slack] The kill before the relaunch for persona=${KEY} answered ErrSpawnNotFound (the row is gone), which voids its escalate-dead verdict (verdict=prompt-row-tmux-gone; dead evidence covers one life): the relaunch carries no verdict (b.jg5 SRJ-611)`,
     )
     expect(killVoidsVerdictLine(KEY, verdict, KILL_ROW_FINISHED_MISSING)).toBe(
-      `[slack] The kill before the relaunch for persona=${KEY} ended its tries at a status read that found the row missing, which voids its escalate-dead verdict (verdict=working-tmux-gone; dead evidence covers one life): the relaunch carries no verdict (b.jg5 SRJ-611, SRJ-702)`,
+      `[slack] The kill before the relaunch for persona=${KEY} ended its tries at a status read that found the row missing, which voids its escalate-dead verdict (verdict=prompt-row-tmux-gone; dead evidence covers one life): the relaunch carries no verdict (b.jg5 SRJ-611, SRJ-702)`,
     )
   })
 
@@ -4470,9 +4212,9 @@ describe('b.d61: after an escalate-dead reconnect, the restart run probes livene
 //
 // `holdSpawns` keeps the stub AD client's `spawn` open per instance ID, so a
 // launch can be kept in flight while a second restart fires. `status` answers
-// `waiting`, so the dialog approver a launch starts after it returns (b.jg5
+
 // SRJ-401) stops at its first lap; a case awaits that stop
-// (`_whenDialogApproverStopped`) before it asserts on what followed the
+
 // launch, and afterEach stops any still running. No launch path runs tmux,
 // the `config_dir` label derives from a temp home, and every persona path
 // lies under a temp directory removed in afterEach.
@@ -4547,21 +4289,21 @@ describe('restart: one in-flight launch per persona (b.av2 SR-6.3, SR-6.6)', () 
 
     _resetInFlightLaunches()
     _setSpawnHomeDir(dir)
-    _setDialogReadyTimeoutMs(200)
+
   })
 
   afterEach(async () => {
     // Let any launch a failed assertion left held settle before tearing down.
     hold.releaseAll()
     await Bun.sleep(WAIT_MS)
-    await stopApproversAndForgetLaunches()
+    await forgetLaunchRecords()
     console.error = origConsoleError
     cancelAllRestartTimers()
     resetClientForTests()
     _resetOutageState()
     setSessionNotifier(undefined)
     _resetSpawnHomeDir()
-    _resetDialogReadyTimeoutMs()
+
     rmSync(dir, { recursive: true, force: true })
   })
 
@@ -4583,7 +4325,7 @@ describe('restart: one in-flight launch per persona (b.av2 SR-6.3, SR-6.6)', () 
     hold.release(personaInstanceId(a.key))
     expect(await launch).toBe(true)
     expect(isLaunchInFlight(a.key)).toBe(false)
-    await _whenDialogApproverStopped(a.key)
+
     await killSession(a.key, LIVENESS_READING_DEAD_ENDED)
     expect(killCalls.map((k) => k.instance_id)).toEqual([personaInstanceId(b.key), personaInstanceId(a.key)])
     expect(errLines.filter((l) => l === skipLine(a))).toHaveLength(1)
@@ -4618,7 +4360,7 @@ describe('restart: one in-flight launch per persona (b.av2 SR-6.3, SR-6.6)', () 
     hold.release(personaInstanceId(a.key))
     await Bun.sleep(WAIT_MS)
     expect(launchResults).toEqual([{ key: a.key, ok: true }, { key: a.key, ok: true }])
-    await _whenDialogApproverStopped(a.key)
+
     expect(spawnsFor(a)).toHaveLength(1)
     expect(getFailureCount(a.key)).toBe(0)
     expect(isRestartPendingOrActive(a.key)).toBe(false)
@@ -4627,7 +4369,7 @@ describe('restart: one in-flight launch per persona (b.av2 SR-6.3, SR-6.6)', () 
     holdIds.clear()
     scheduleRestart(a.key, a.working_directory)
     await Bun.sleep(WAIT_MS)
-    await _whenDialogApproverStopped(a.key)
+
     expect(killsFor(a)).toBe(2)
     expect(spawnsFor(a)).toHaveLength(2)
     expect(launchResults).toHaveLength(3)
@@ -4680,7 +4422,7 @@ describe('restart: one in-flight launch per persona (b.av2 SR-6.3, SR-6.6)', () 
 
     scheduleRestart(b.key, b.working_directory)
     await Bun.sleep(WAIT_MS)
-    await _whenDialogApproverStopped(b.key)
+
     // B was killed (no launch of B in flight), its spawn was issued, addressed
     // to B, and B's launch completed while A's spawn is still held.
     expect(killsFor(b)).toBe(1)
@@ -4693,7 +4435,7 @@ describe('restart: one in-flight launch per persona (b.av2 SR-6.3, SR-6.6)', () 
 
     hold.release(personaInstanceId(a.key))
     await Bun.sleep(WAIT_MS)
-    await _whenDialogApproverStopped(a.key)
+
     expect(launchResults).toEqual([{ key: b.key, ok: true }, { key: a.key, ok: true }])
     expect(spawnsFor(a)).toHaveLength(1)
     expect(spawnsFor(b)).toHaveLength(1)
@@ -4743,18 +4485,18 @@ describe('restart: the reply-guard record holds the effective value before the r
     setSessionNotifier(() => {})
     _resetInFlightLaunches()
     _setSpawnHomeDir(dir)
-    _setDialogReadyTimeoutMs(200)
+
   })
 
   afterEach(async () => {
-    await stopApproversAndForgetLaunches()
+    await forgetLaunchRecords()
     console.error = origConsoleError
     cancelAllRestartTimers()
     resetClientForTests()
     _resetOutageState()
     setSessionNotifier(undefined)
     _resetSpawnHomeDir()
-    _resetDialogReadyTimeoutMs()
+
     rg.cleanup()
     rmSync(dir, { recursive: true, force: true })
   })
@@ -4814,7 +4556,6 @@ describe('restart: the reply-guard record holds the effective value before the r
 
     scheduleRestart(a.key, a.working_directory)
     await waitFor(() => results.length > 0)
-    await _whenDialogApproverStopped(a.key)
 
     // b.jg5 SRJ-110, SRJ-314: no kill for a row just read `ended`.
     expect(deps.killSessionCalls).toEqual([])
@@ -4889,7 +4630,7 @@ describe('restart: the reply-guard record holds the effective value before the r
 
     scheduleRestart(a.key, a.working_directory)
     await waitFor(() => results.length === 1)
-    await _whenDialogApproverStopped(a.key)
+
     expect(results).toEqual([true])
     expect(spawnCalls).toHaveLength(1)
     expect(spawnCalls[0]!.extra_env?.['CLAUDE_CONFIG_DIR']).toBe(configDir)
@@ -4900,7 +4641,6 @@ describe('restart: the reply-guard record holds the effective value before the r
     applied = configFor(newDir, false)
     scheduleRestart(a.key, a.working_directory)
     await waitFor(() => results.length === 2)
-    await _whenDialogApproverStopped(a.key)
 
     expect(results).toEqual([true, true])
     expect(resumeCalls).toEqual([])
@@ -4984,7 +4724,7 @@ describe('b.g57: a restart with an unresolvable claude_config_dir', () => {
 
     _setSpawnHomeDir(dir)
     _resetInFlightLaunches()
-    _setDialogReadyTimeoutMs(200)
+
     _setConfigDirFs({
       realpath: (path) => {
         if (broken && (path === aConfigDir || path.startsWith(`${aConfigDir}/`))) {
@@ -5058,12 +4798,12 @@ describe('b.g57: a restart with an unresolvable claude_config_dir', () => {
     await h.manager.stopAll()
     setConfigDirUnresolvableHook(undefined)
     _resetConfigDirFs()
-    await stopApproversAndForgetLaunches()
+    await forgetLaunchRecords()
     resetClientForTests()
     _resetOutageState()
     setSessionNotifier(undefined)
     _resetSpawnHomeDir()
-    _resetDialogReadyTimeoutMs()
+
     rmSync(dir, { recursive: true, force: true })
   })
 
@@ -5108,7 +4848,6 @@ describe('b.g57: a restart with an unresolvable claude_config_dir', () => {
     scheduleRestart(a.key, a.working_directory)
     scheduleRestart(b.key, b.working_directory)
     await waitFor(() => !isRestartPendingOrActive(a.key) && !isRestartPendingOrActive(b.key))
-    await _whenDialogApproverStopped(b.key)
 
     // A: only the liveness probe reached agent-director.
     expect(idsFor(calls.killCalls, a)).toEqual([])
@@ -5158,7 +4897,6 @@ describe('b.g57: a restart with an unresolvable claude_config_dir', () => {
     broken = false
     await h.clock.advance(10_000)
     await waitFor(() => calls.resumeCalls.length > 0 && !isLaunchInFlight(a.key))
-    await _whenDialogApproverStopped(a.key)
 
     expect(calls.resumeCalls.map((r) => r.instance_id)).toEqual([personaInstanceId(a.key)])
     expect(calls.deleteCalls).toEqual([])
@@ -5425,11 +5163,11 @@ describe('b.jg5 SRJ-301, SRJ-302: the restart run arms the UNAVAILABLE retry tim
     _resetInFlightLaunches()
     _resetFindMissingMemo()
     _setSpawnHomeDir(dir)
-    _setDialogReadyTimeoutMs(200)
+
   })
 
   afterEach(async () => {
-    await stopApproversAndForgetLaunches()
+    await forgetLaunchRecords()
     console.error = origConsoleError
     retry.stopAll('test end')
     // Checked after the cleanup below, so a failed check never skips it.
@@ -5441,7 +5179,7 @@ describe('b.jg5 SRJ-301, SRJ-302: the restart run arms the UNAVAILABLE retry tim
     _resetOutageState()
     setSessionNotifier(undefined)
     _resetSpawnHomeDir()
-    _resetDialogReadyTimeoutMs()
+
     rmSync(dir, { recursive: true, force: true })
     // Every case: no retry timer outlives the test, and no line the retry
     // controller or console.error wrote carries a credential value.
@@ -5451,14 +5189,14 @@ describe('b.jg5 SRJ-301, SRJ-302: the restart run arms the UNAVAILABLE retry tim
 
   // Each site answers UNAVAILABLE with each generic value, and the kill with
   // ErrTmuxKillFailed, the kill-failure cause told apart by class.
-  type Site = 'kill' | 'send-keys' | 'read-pane' | 'spawn'
+  type Site = 'kill' | 'send-keys' | 'spawn'
   const UNAVAILABLE_VALUES: ReadonlyArray<[string, (verb: string) => Error]> = [
     ['a plain Error', () => plainError()],
     ['ErrCallTimeout', (verb) => errCallTimeout(verb)],
     ['ErrTmuxUnresponsive', (verb) => errTmuxUnresponsive(verb)],
   ]
   const SITE_CASES: Array<[Site, string, () => Error, string]> = [
-    ...(['kill', 'send-keys', 'read-pane', 'spawn'] as const).flatMap((site) =>
+    ...(['kill', 'send-keys', 'spawn'] as const).flatMap((site) =>
       UNAVAILABLE_VALUES.map(([label, make]): [Site, string, () => Error, string] => [site, label, () => make(site), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE]),
     ),
     ['kill', 'ErrTmuxKillFailed', () => errTmuxKillFailed(), UNAVAILABLE_RETRY_CAUSE_KILL_FAILED],
@@ -5477,7 +5215,6 @@ describe('b.jg5 SRJ-301, SRJ-302: the restart run arms the UNAVAILABLE retry tim
       killCalls,
       ...(site === 'kill' ? { killError: err } : {}),
       ...(site === 'send-keys' ? { sendKeysError: err } : {}),
-      ...(site === 'read-pane' ? { readPaneError: err } : {}),
       ...(site === 'spawn' ? { spawnError: err } : {}),
     })
     // The kill and spawn sites take the dead branch (the kill site's
@@ -5485,7 +5222,7 @@ describe('b.jg5 SRJ-301, SRJ-302: the restart run arms the UNAVAILABLE retry tim
     // before the relaunch, b.jg5 SRJ-314); the reconnect sites take the
     // alive-but-disconnected branch through the real reconnect adapter (a
     // `waiting` row: its pane is read, then the keystrokes typed).
-    const reconnectSite = site === 'send-keys' || site === 'read-pane'
+    const reconnectSite = site === 'send-keys'
     const deps = makeDeps({
       isSessionAliveResult: reconnectSite ? LIVENESS_READING_LIVE : site === 'kill' ? LIVENESS_READING_DEAD_INSTALL_GONE : LIVENESS_READING_DEAD,
       killSession: site === 'kill' ? _buildKillSessionAdapter() : undefined,
@@ -5500,7 +5237,6 @@ describe('b.jg5 SRJ-301, SRJ-302: the restart run arms the UNAVAILABLE retry tim
     const reached: Record<Site, number> = {
       kill: killCalls.length,
       'send-keys': sendKeysCalls.length,
-      'read-pane': readPaneCalls.length,
       spawn: spawnCalls.length,
     }
     expect(reached[site]).toBeGreaterThan(0)
@@ -6264,17 +6000,17 @@ describe('b.jg5 SRJ-303: runRestartRetry reruns the restart decision without the
       setSessionNotifier(() => {})
       _resetInFlightLaunches()
       _setSpawnHomeDir(dir)
-      _setDialogReadyTimeoutMs(200)
+
     })
 
     afterEach(async () => {
       hold.releaseAll()
-      await stopApproversAndForgetLaunches()
+      await forgetLaunchRecords()
       resetClientForTests()
       _resetOutageState()
       setSessionNotifier(undefined)
       _resetSpawnHomeDir()
-      _resetDialogReadyTimeoutMs()
+
       rmSync(dir, { recursive: true, force: true })
     })
 
@@ -6304,7 +6040,7 @@ describe('b.jg5 SRJ-303: runRestartRetry reruns the restart decision without the
       hold.release(id)
       expect(await launch).toBe(true)
       expect(isLaunchInFlight(a.key)).toBe(false)
-      await _whenDialogApproverStopped(a.key)
+
     })
   })
 })
@@ -6912,7 +6648,7 @@ describe('b.jg5 SRJ-115: a pending reading goes to the pending deferral whatever
 // `recovery`), its one line naming the reason. The restart run answers
 // `pending-deferred`, counts nothing and makes no kill, launch or keystroke
 // of its own. The re-probe is reached by P's `working` row's `read-pane`
-// answering GONE (verdict `working-tmux-gone`); the row reads `pending` once
+// answering GONE (verdict `prompt-row-tmux-gone`); the row reads `pending` once
 // the escalate-dead sweep has run. One failure is on record first, so a
 // recorded success or failure shows. The uncovered cases hold the
 // sequence at its first bypassing run, then let it end in its reuse.
@@ -6954,15 +6690,15 @@ describe('b.jg5 SRJ-409, SRJ-411: on the recovery harness, a pending reading at 
     let gets = 0
     h.script({
       getFn: () => {
-        if (point !== 'the first probe' && gets === 0) { gets++; return personaRow(h, p, { state: 'working' }) }
-        const row = rows[gets++ - (point === 'the first probe' ? 0 : 1)]
+        if (point !== 'the first probe' && h.stub.calls.findMissingCalls.length + runs() === 0) return personaRow(h, p, { state: 'waiting' })
+        const row = rows[gets++]
         return row === undefined ? personaRow(h, p, { state: LIVENESS_DEAD_ROW_MISSING }) : row(h, p)
       },
       ...(point === 'the first probe'
         ? { statusResult: pending }
         : {
             statusFn: () => (h.stub.calls.findMissingCalls.length + runs() > 0 ? pending : cannedStatusResult({ state: 'working' })),
-            readPaneError: errTmuxCaptureFailed(),
+            sendKeysError: errTmuxSendKeys(),
           }),
     })
     return { h, p, persona, ref: renderPersonaRef(persona.name, p), cwd: persona.working_directory }
@@ -6990,10 +6726,11 @@ describe('b.jg5 SRJ-409, SRJ-411: on the recovery harness, a pending reading at 
 
     expectReprobeLine(h, p, point)
     expectOneDeferral(h, p)
-    expect(h.stub.calls.getCalls).toHaveLength(point === 'the first probe' ? 1 : 2)
+    expect(h.stub.calls.getCalls).toHaveLength(point === 'the first probe' ? 1 : 4)
     expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }])
     expectPendingOnlyWatch(h, p)
-    expect([h.stub.calls.killCalls, h.stub.calls.spawnCalls, h.stub.calls.resumeCalls, h.stub.calls.sendKeysCalls]).toEqual([[], [], [], []])
+    expect([h.stub.calls.killCalls, h.stub.calls.spawnCalls, h.stub.calls.resumeCalls]).toEqual([[], [], []])
+    expect(h.stub.calls.sendKeysCalls).toHaveLength(point === 'the first probe' ? 0 : 1)
     expect(isLiveRowSequenceRunning(p)).toBe(false)
     expect([getFailureCount(p), h.capReached, h.notices]).toEqual([1, [], []])
   })
@@ -7018,7 +6755,8 @@ describe('b.jg5 SRJ-409, SRJ-411: on the recovery harness, a pending reading at 
     expect(h.errors).toContain(uncoveredPendingRowLine(ref, PENDING_ROW_REASON_CWD_MISMATCH))
     expect(h.lines).toContain(liveRowSequenceStartLine(ref, h.sequenceRequest(p, { lastReadState: AGENT_DIRECTOR_PENDING_STATE })))
     expect(isLiveRowSequenceRunning(p)).toBe(true)
-    expect([h.stub.calls.spawnCalls, h.stub.calls.resumeCalls, h.stub.calls.sendKeysCalls]).toEqual([[], [], []])
+    expect([h.stub.calls.spawnCalls, h.stub.calls.resumeCalls]).toEqual([[], []])
+    expect(h.stub.calls.sendKeysCalls).toHaveLength(point === 'the first probe' ? 0 : 1)
     expect(h.triggers).toEqual([])
     expect([getFailureCount(p), h.capReached, h.notices]).toEqual([1, [], []])
 
@@ -7026,8 +6764,9 @@ describe('b.jg5 SRJ-409, SRJ-411: on the recovery harness, a pending reading at 
     expect(await h.driveSequence(h.sequenceSettled(p))).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_REUSE, result: { key: p } })
     // The sequence's own step-1 kill and reuse; never a resume or keystroke.
     expect(h.stub.calls.killCalls).toHaveLength(1)
-    expect([h.stub.calls.spawnCalls, h.stub.calls.resumeCalls, h.stub.calls.sendKeysCalls]).toEqual([[reuseSpawnOf(h, p)], [], []])
-    await h.runApproverToStop(p)
+    expect([h.stub.calls.spawnCalls, h.stub.calls.resumeCalls]).toEqual([[reuseSpawnOf(h, p)], []])
+    expect(h.stub.calls.sendKeysCalls).toHaveLength(point === 'the first probe' ? 0 : 1)
+
   })
 })
 
@@ -7587,7 +7326,7 @@ describe('b.jg5 SRJ-105, SRJ-313: an UNAVAILABLE or UNCLASSIFIED kill, send-keys
       // no sweep, no kill, no spawn or resume.
       expect(h.stub.calls.statusCalls).toHaveLength(2)
       expect(h.stub.calls.sendKeysCalls).toHaveLength(1)
-      expect(callCounts(h)).toEqual({ getCalls: 3, readPaneCalls: 3, sendKeysCalls: 1, statusCalls: 2 })
+      expect(callCounts(h)).toEqual({ getCalls: 3, sendKeysCalls: 1, statusCalls: 2 })
       expect(h.errors.filter((l) => l.startsWith('[slack] escalate-dead'))).toEqual([])
       expect(h.triggers).toEqual([{ key: p, kind: cause }])
       expectNothingCounted(h, p)
@@ -9026,7 +8765,7 @@ describe('b.jg5 SRJ-512, SRJ-513: a restart run whose own liveness read latches 
     const { findMissingCalls: _sweeps, ...ownCalls } = expected.calls
     // The only tmux-touching call is the read-pane whose GONE escalated, made
     // before P latched; none follows the latch.
-    const tmuxBeforeLatch = expected.calls.readPaneCalls === undefined ? [] : [['read-pane', personaInstanceId(p)]]
+    const tmuxBeforeLatch = expected.calls.sendKeysCalls === undefined ? [] : [['send-keys', personaInstanceId(p)]]
 
     expect(outcomes).toEqual([{ key: p, outcome: RESTART_OUTCOME_LATCHED }])
     expect(callCounts(h)).toEqual(expected.calls)
@@ -9068,11 +8807,11 @@ describe('b.jg5 SRJ-512, SRJ-513: a restart run whose own liveness read latches 
    * sweeps once and escalates); `calls` is every stub call the run makes for
    * P, by verb.
    */
-  const PROBES: Array<[string, { liveReads: number; paneGone: boolean; calls: Record<string, number> }]> = [
-    ['the first probe', { liveReads: 0, paneGone: false, calls: { statusCalls: 1 } }],
+  const PROBES: Array<[string, { liveReads: number; refusedSend: boolean; calls: Record<string, number> }]> = [
+    ['the first probe', { liveReads: 0, refusedSend: false, calls: { statusCalls: 1 } }],
     // The probe reads working (live, P not connected), the reconnect adapter
     // reads working too; its read-pane answers GONE and it sweeps once.
-    ["b.d61's re-probe after an escalate-dead reconnect", { liveReads: 2, paneGone: true, calls: { getCalls: 1, statusCalls: 3, readPaneCalls: 1, findMissingCalls: 1 } }],
+    ["b.d61's re-probe after an escalate-dead reconnect", { liveReads: 2, refusedSend: true, calls: { getCalls: 3, statusCalls: 3, sendKeysCalls: 1, findMissingCalls: 1 } }],
   ]
 
   test.each(RESTART_ENTRIES.flatMap(([entry, run]) => PROBES.map(([probe, opts]) => [entry, probe, run, opts] as const)))(
@@ -9082,7 +8821,7 @@ describe('b.jg5 SRJ-512, SRJ-513: a restart run whose own liveness read latches 
       const rig = ownReadLatchHarness((read) => read < opts.liveReads ? cannedStatusResult({ state: 'working' }) : err)
       harness = rig.h
       // P's read-pane is the run's first: GONE, once; Q's launch reads the stub's default pane.
-      if (opts.paneGone) rig.h.script({ readPaneQueue: [cannedErr(errTmuxCaptureFailed())] })
+      if (opts.refusedSend) rig.h.script({ sendKeysQueue: [cannedErr(errTmuxSendKeys())] })
 
       await expectLatchedThenOtherRelaunched(rig, run, {
         calls: opts.calls,
@@ -9953,11 +9692,6 @@ describe('b.jg5 SRJ-506: runRestartRetryInTurn is the retry entry\'s gates and w
 // of a resume.
 // ---------------------------------------------------------------------------
 
-/** The approver's readiness read of persona `ref`'s row, where its first lap settles a resumed launch. */
-function approverRead(ref: string): OwnRowReadSite {
-  return { site: APPROVER_LOG_SITE, what: APPROVER_STATUS_READ_WHAT, ref }
-}
-
 /**
  * The lines among `lines` a read logged for persona `ref`'s resumed launch
  * that ended before reporting in (`resumeEndedUnreportedLine`), whatever the
@@ -9985,11 +9719,10 @@ function countedLinesOf(lines: readonly string[], key: string): string[] {
 // On the recovery harness (`buildResumeLoop`): each persona's row reads
 // `missing` with a session id, its plain spawn collides and its `resume`
 // succeeds; after its nth `resume` the row reads what `afterResume(n)` gives
-// (at every read: the approver's laps, the next run's probe and collision
+
 // `get`), and once a reuse spawn of its id has succeeded it reads `waiting`
 // (a fresh life, on a new transcript). Each launch is awaited and settled,
-// so the approver's first lap has read the row before the next launch. The
-// approver waits for the launch it follows to settle, and the restart path's
+
 // `launchSession` hands its `resumed` result over as that launch settles, so
 // every read here comes after the hand-over; the next describe lands one
 // before it.
@@ -10011,7 +9744,6 @@ describe('b.4q8: a resumed launch counts once its row reports in, and resumes th
   })
 
   const N = UNREPORTED_RESUME_FALLBACK_AFTER
-  /** The counts 1 to N: one per resume of a run that ends in the fallback. */
   const RUN = Array.from({ length: N }, (_, i) => i + 1)
   const MISSING = LIVENESS_DEAD_ROW_MISSING
 
@@ -10081,8 +9813,11 @@ describe('b.4q8: a resumed launch counts once its row reports in, and resumes th
   async function restartRun(loop: ResumeLoop, key: string): Promise<RestartRetryOutcome> {
     const outcome = await runRestartRetry(key, loop.cwdOf(key), isLaunchInFlight)
     await loop.h.settle()
+    if (outcome === RESTART_OUTCOME_LAUNCHED) await readPersonaOwnRow(key, { site: 'restart.test', what: 'observe resumed row', ref: loop.refOf(key) })
     return outcome
   }
+
+  // The regression (the silent loop): the resumes went on, about every 90 s at default timings.
 
   /** How P is launched in a loop case: its launch, settled, and what each launch answers (a resume first, then the fallback). */
   interface LoopEntry {
@@ -10105,6 +9840,7 @@ describe('b.4q8: a resumed launch counts once its row reports in, and resumes th
       launch: async (loop) => {
         const result = await loop.h.launch(loop.p)
         await loop.h.settle()
+        await readPersonaOwnRow(loop.p, { site: 'restart.test', what: 'observe resumed row', ref: loop.refOf(loop.p) })
         return result
       },
       answers: (p) => [...RUN.map(() => ({ key: p, action: 'resumed' })), { key: p, action: 'spawned' }],
@@ -10131,7 +9867,7 @@ describe('b.4q8: a resumed launch counts once its row reports in, and resumes th
     expect(countedLinesOf(h.errors, p)).toHaveLength(entry.countedLines)
     expect(h.stub.calls.resumeCalls).toEqual(RUN.map(() => ({ instance_id: personaInstanceId(p) })))
     expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p)])
-    expect(resumeEndedLinesOf(h.errors, ref)).toEqual(RUN.map((n) => resumeEndedUnreportedLine(approverRead(ref), ref, MISSING, n)))
+    expect(resumeEndedLinesOf(h.errors, ref)).toEqual(RUN.map((n) => resumeEndedUnreportedLine({ site: 'restart.test', what: 'observe resumed row' }, ref, MISSING, n)))
     expect(resumeFallbackLinesOf(h.errors, ref)).toEqual([unreportedResumeFallbackLine(ref, N)])
     expect([h.notices, h.episodeNotices, h.capReached]).toEqual([[], [], []])
     expect(personaCallCounts(h, q)).toEqual({})
@@ -10161,7 +9897,7 @@ describe('b.4q8: a resumed launch counts once its row reports in, and resumes th
     expect(countedLinesOf(h.errors, p)).toHaveLength(1 + N)
     expect(h.stub.calls.resumeCalls).toHaveLength(2 + N)
     expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p)])
-    expect(resumeEndedLinesOf(h.errors, ref)).toEqual([1, ...RUN].map((n) => resumeEndedUnreportedLine(approverRead(ref), ref, MISSING, n)))
+    expect(resumeEndedLinesOf(h.errors, ref)).toEqual([1, ...RUN].map((n) => resumeEndedUnreportedLine({ site: 'restart.test', what: 'observe resumed row' }, ref, MISSING, n)))
     expect(resumeFallbackLinesOf(h.errors, ref)).toEqual([unreportedResumeFallbackLine(ref, N)])
   })
 
@@ -10193,21 +9929,21 @@ describe('b.4q8: a resumed launch counts once its row reports in, and resumes th
     expect(getFailureCount(p)).toBe(0)
   })
 
-  test('a resume handed over before its row reports in: the restart run answers launched and counts nothing while the row reads pending; the approver\'s lap that reads it waiting counts one success, resetting the failure on record, with no line of an ended resume', async () => {
-    let reportedIn = false
-    const loop = buildResumeLoop(() => (reportedIn ? 'waiting' : AGENT_DIRECTOR_PENDING_STATE), { harness: { approverCapMs: 2 * DIALOG_SLOW_POLL_INTERVAL_MS } })
-    const { h, p } = loop
-    recordFailure(p)
+  test('the teardown\'s forget (forgetLaunchCalls) drops P\'s resumed launch still waiting on its row, and only P\'s: once both rows end, P\'s read logs and counts nothing, while Q\'s counts one launch failure', async () => {
+    let ended = false
+    const loop = buildResumeLoop(() => (ended ? MISSING : AGENT_DIRECTOR_PENDING_STATE))
+    const { h, p, q } = loop
+    for (const key of [p, q]) expect(await restartRun(loop, key)).toBe(RESTART_OUTCOME_LAUNCHED)
 
-    expect(await restartRun(loop, p)).toBe(RESTART_OUTCOME_LAUNCHED)
+    h.teardown(p)
 
-    // Handed over, with its row still pending: not counted yet.
-    expect([getFailureCount(p), h.approverRunning(p)]).toEqual([1, true])
-    reportedIn = true
-    await h.runApproverToStop(p)
-    expect(getFailureCount(p)).toBe(0)
+    forgetLaunchCalls(p)
+    ended = true
+    for (const key of [p, q]) await readPersonaOwnRow(key, { site: 'restart.test', what: 'a read after the rows ended', ref: loop.refOf(key) })
+
+    expect([getFailureCount(p), getFailureCount(q)]).toEqual([0, 1])
     expect(resumeEndedLinesOf(h.errors, loop.refOf(p))).toEqual([])
-    expect(h.capReached).toEqual([])
+    expect(resumeEndedLinesOf(h.errors, loop.refOf(q))).toHaveLength(1)
   })
 
   test('a resume that ends before reporting in with P one failure below the cap is counted to the cap: the cap notice fires once, and a later read of its ended row counts nothing more', async () => {
@@ -10221,61 +9957,23 @@ describe('b.4q8: a resumed launch counts once its row reports in, and resumes th
     expect([getFailureCount(p), h.capReached]).toEqual([RESTART_FAILURE_CAP, [p]])
     await readPersonaOwnRow(p, { site: 'restart.test', what: 'a later read', ref })
     expect([getFailureCount(p), h.capReached]).toEqual([RESTART_FAILURE_CAP, [p]])
-    expect(resumeEndedLinesOf(h.errors, ref)).toEqual([resumeEndedUnreportedLine(approverRead(ref), ref, MISSING, 1)])
+    expect(resumeEndedLinesOf(h.errors, ref)).toEqual([resumeEndedUnreportedLine({ site: 'restart.test', what: 'observe resumed row' }, ref, MISSING, 1)])
     expect(countedLinesOf(h.errors, p)).toHaveLength(1)
   })
 
-  test('a resume whose row is gone at the read (ErrSpawnNotFound) ended before reporting in: one line naming no row, one counted launch failure', async () => {
-    const loop = buildResumeLoop(() => errSpawnNotFound())
-    const { p } = loop
-    const ref = loop.refOf(p)
-
-    expect(await restartRun(loop, p)).toBe(RESTART_OUTCOME_LAUNCHED)
-
-    expect(getFailureCount(p)).toBe(1)
-    expect(resumeEndedLinesOf(loop.h.errors, ref)).toEqual([resumeEndedUnreportedLine(approverRead(ref), ref, RESUME_READ_NO_ROW, 1)])
-    expect(countedLinesOf(loop.h.errors, p)).toHaveLength(1)
+  test('a pending resumed row reports waiting later: the authoritative own-row read resets the earlier failure exactly once', async () => {
+    let reported = false
+    const loop = buildResumeLoop(() => reported ? 'waiting' : AGENT_DIRECTOR_PENDING_STATE)
+    recordFailure(loop.p)
+    expect(await restartRun(loop, loop.p)).toBe(RESTART_OUTCOME_LAUNCHED)
+    expect(getFailureCount(loop.p)).toBe(1)
+    reported = true
+    for (let n = 0; n < 2; n++) await readPersonaOwnRow(loop.p, { site: 'restart.test', what: 'later reported row', ref: loop.refOf(loop.p) })
+    expect(getFailureCount(loop.p)).toBe(0)
+    expect(resumeEndedLinesOf(loop.h.errors, loop.refOf(loop.p))).toEqual([])
+    expect(loop.h.capReached).toEqual([])
   })
 
-  test('the teardown\'s forget (forgetLaunchCalls) drops P\'s run of resumes that ended before reporting in, and only P\'s: P\'s next launch resumes again, the first of a new run, while Q\'s is the fallback reuse spawn', async () => {
-    const loop = buildResumeLoop(() => MISSING)
-    const { h, p, q } = loop
-    for (const key of [p, q]) for (let i = 0; i < N; i++) expect(await restartRun(loop, key)).toBe(RESTART_OUTCOME_LAUNCHED)
-
-    forgetLaunchCalls(p)
-    for (const key of [p, q]) expect(await restartRun(loop, key)).toBe(RESTART_OUTCOME_LAUNCHED)
-
-    const resumesOf = (key: string): number => h.stub.calls.resumeCalls.filter((call) => call.instance_id === personaInstanceId(key)).length
-    expect([resumesOf(p), resumesOf(q)]).toEqual([N + 1, N])
-    expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, q)])
-    expect(resumeFallbackLinesOf(h.errors, loop.refOf(p))).toEqual([])
-    expect(resumeFallbackLinesOf(h.errors, loop.refOf(q))).toEqual([unreportedResumeFallbackLine(loop.refOf(q), N)])
-    expect(resumeEndedLinesOf(h.errors, loop.refOf(p)).at(-1)).toBe(resumeEndedUnreportedLine(approverRead(loop.refOf(p)), loop.refOf(p), MISSING, 1))
-  })
-
-  test('the teardown\'s forget (forgetLaunchCalls) drops P\'s resumed launch still waiting on its row, and only P\'s: once both rows end, P\'s read logs and counts nothing, while Q\'s counts one launch failure', async () => {
-    let ended = false
-    const loop = buildResumeLoop(() => (ended ? MISSING : AGENT_DIRECTOR_PENDING_STATE))
-    const { h, p, q } = loop
-    for (const key of [p, q]) expect(await restartRun(loop, key)).toBe(RESTART_OUTCOME_LAUNCHED)
-
-    // P's teardown: its approver stopped, then its launch records forgotten.
-    h.teardown(p)
-    await _whenDialogApproverStopped(p)
-    forgetLaunchCalls(p)
-    ended = true
-    for (const key of [p, q]) await readPersonaOwnRow(key, { site: 'restart.test', what: 'a read after the rows ended', ref: loop.refOf(key) })
-
-    expect([getFailureCount(p), getFailureCount(q)]).toEqual([0, 1])
-    expect(resumeEndedLinesOf(h.errors, loop.refOf(p))).toEqual([])
-    expect(resumeEndedLinesOf(h.errors, loop.refOf(q))).toHaveLength(1)
-  })
-
-  /**
-   * P with `failures` failures on record and a resume a restart run handed
-   * over while its row reads `pending` (the approver's first lap read it so):
-   * nothing counted for it yet. `setRow` sets what P's row reads from then on.
-   */
   async function handedOverPending(failures: number): Promise<{ readonly loop: ResumeLoop; readonly setRow: (row: StatusResult['state'] | Error) => void }> {
     let row: StatusResult['state'] | Error = AGENT_DIRECTOR_PENDING_STATE
     const loop = buildResumeLoop(() => row)
@@ -10399,7 +10097,7 @@ describe('b.4q8: a resumed launch counts once its row reports in, and resumes th
     expect(resumeEndedLinesOf(h.errors, `persona=${p}`)).toEqual([resumeEndedUnreportedLine({ site: LIVE_ROW_SEQUENCE_SITE, what: 'get' }, `persona=${p}`, MISSING, 1)])
     expect(countedLinesOf(h.errors, p)).toHaveLength(1)
     expect([getFailureCount(p), h.capReached]).toEqual([0, [p]])
-    await h.runApproverToStop(p)
+
   })
 
   /** A read of the row of P's handed-over resume that settles nothing: a failed read, or a state CSCB does not know. */
@@ -10431,60 +10129,10 @@ describe('b.4q8: a resumed launch counts once its row reports in, and resumes th
     expect(h.capReached).toEqual([])
   })
 
-  test('a count of P\'s resumed launch that throws (its cap notice, at the cap, fails) logs one line naming the failure, redacted: the failure stays recorded with its counted line, and the run is not disturbed', async () => {
-    const err = Object.assign(new Error(`the cap notice broke (${sentinelInMessage('cap')})`), { detail: LEAK_SENTINEL })
-    const loop = buildResumeLoop(() => MISSING, { harness: { restartDeps: { onCapReached: () => { throw err } } } })
-    const { h, p } = loop
-    for (let i = 1; i < RESTART_FAILURE_CAP; i++) recordFailure(p)
-
-    expect(await restartRun(loop, p)).toBe(RESTART_OUTCOME_LAUNCHED)
-
-    const failed = resumeCountFailedLine(`persona=${p}`, describeThrownValue(err))
-    expect(failed).toContain(`message="the cap notice broke (${REDACTED_SENTINEL_TAIL})"`)
-    expect(h.errors.filter((line) => line === failed)).toHaveLength(1)
-    // The failure was recorded, with its counted line, before the cap notice threw.
-    expect(getFailureCount(p)).toBe(RESTART_FAILURE_CAP)
-    expect(countedLinesOf(h.errors, p)).toHaveLength(1)
-    expect(resumeEndedLinesOf(h.errors, loop.refOf(p))).toEqual([resumeEndedUnreportedLine(approverRead(loop.refOf(p)), loop.refOf(p), MISSING, 1)])
-  })
-
   // The stuck-launch abort (b.jg5 SRJ-412), in its production order: the
-  // approver stopped for it, its one checked kill, then its live-row
+
   // sequence, which keeps the conversation. The abort's own kill ends P's
   // resumed launch, which is no failed resume.
-  test.each<[string, RecoveryStubScript, KillOutcome]>([
-    ['meets ErrTmuxUnresponsive once and its read between tries finds the row missing', { killQueue: [cannedErr(errTmuxUnresponsive('kill'))] }, { kind: KILL_OUTCOME_ROW_FINISHED, read: KILL_ROW_FINISHED_MISSING }],
-    ['succeeds at once and the sequence\'s step-2 get finds the row missing', { killResult: cannedKillResult(true) }, KILL_SUCCEEDED],
-  ])('the stuck-launch abort of P\'s handed-over resume still pending, whose kill %s: no line of an ended resume, nothing counted and P\'s run of 1 kept; the sequence\'s own resume then starts a new record, which ends as the second of the run and is counted', async (_label, killScript, killed) => {
-    let pendingRow: StatusResult['state'] = AGENT_DIRECTOR_PENDING_STATE
-    // Resume 1 ends before reporting in (a run of 1); resume 2 reads pending
-    // until the abort; resume 3, the sequence's, ends before reporting in.
-    const loop = buildResumeLoop((n) => (n === 2 ? pendingRow : MISSING))
-    const { h, p } = loop
-    const ref = loop.refOf(p)
-    const endedLine = (n: number): string => resumeEndedUnreportedLine(approverRead(ref), ref, MISSING, n)
-    expect(await restartRun(loop, p)).toBe(RESTART_OUTCOME_LAUNCHED)
-    expect(await restartRun(loop, p)).toBe(RESTART_OUTCOME_LAUNCHED)
-    expect([getFailureCount(p), h.stub.calls.resumeCalls.length]).toEqual([1, 2])
-
-    h.script(killScript)
-    pendingRow = MISSING
-    await stopApproverForStuckLaunchAbort(p)
-    expect(await h.drive(abortKillOwnStuckLaunch(p, ref, { clock: h.killRetryClock }))).toMatchObject({ kind: STUCK_LAUNCH_ABORT_KILL_SUCCEEDED, description: describeKillOutcome(killed) })
-    expect([getFailureCount(p), countedLinesOf(h.errors, p).length]).toEqual([1, 1])
-
-    expect(startStuckLaunchAbortSequence(p, ref)).toEqual({ kind: STUCK_LAUNCH_ABORT_SEQUENCE_STARTED })
-    expect(await h.driveSequence(h.sequenceSettled(p))).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_RESUME, result: { key: p, action: 'resumed' } })
-    await h.settle()
-
-    // Neither the abort's reads nor the sequence's settled resume 2: its only
-    // lines are resume 1's and resume 3's. Resume 3 ended before reporting
-    // in as the second of the run (kept at 1 by the abort, neither reset nor
-    // grown) and is counted.
-    expect(h.stub.calls.resumeCalls).toHaveLength(3)
-    expect([...resumeEndedLinesOf(h.errors, ref), ...resumeEndedLinesOf(h.errors, `persona=${p}`)]).toEqual([endedLine(1), endedLine(2)])
-    expect([getFailureCount(p), countedLinesOf(h.errors, p).length]).toEqual([2, 2])
-  })
 
   /** Run `act` as the stub's first `kill` is called, before that kill goes on. */
   function onFirstKill(h: RecoveryHarness, act: () => unknown): void {
@@ -10502,139 +10150,10 @@ describe('b.4q8: a resumed launch counts once its row reports in, and resumes th
   /** A read of P's row after CSCB's own kill of it, through the shared own-row read. */
   const readAfterKill = (ref: string): OwnRowReadSite => ({ site: 'restart.test', what: 'a read after the kill', ref })
 
-  // A live-row sequence's step-1 kill of P's row is CSCB's own kill as well
-  // (here a sequence that keeps the conversation, started on the row of P's
-  // handed-over resume still pending, whose approver still runs): the row
-  // reads missing from that kill's first try on.
-  test.each<[string, RecoveryStubScript]>([
-    ['meets ErrTmuxUnresponsive once and its read between tries finds the row missing', { killQueue: [cannedErr(errTmuxUnresponsive('kill'))] }],
-    ['succeeds at once and the sequence\'s step-2 get finds the row missing', { killResult: cannedKillResult(true) }],
-  ])('a live-row sequence\'s step-1 kill of the row of P\'s handed-over resume still pending, which %s: no line of an ended resume, nothing counted and P\'s run of 1 kept; the sequence\'s own resume then ends as the second of the run and is counted', async (_label, killScript) => {
-    let pendingRow: StatusResult['state'] = AGENT_DIRECTOR_PENDING_STATE
-    // Resume 1 ends before reporting in (a run of 1); resume 2 reads pending
-    // until the sequence's kill; resume 3, the sequence's, ends before reporting in.
-    const loop = buildResumeLoop((n) => (n === 2 ? pendingRow : MISSING))
-    const { h, p } = loop
-    const ref = loop.refOf(p)
-    const endedLine = (n: number): string => resumeEndedUnreportedLine(approverRead(ref), ref, MISSING, n)
-    expect(await restartRun(loop, p)).toBe(RESTART_OUTCOME_LAUNCHED)
-    expect(await restartRun(loop, p)).toBe(RESTART_OUTCOME_LAUNCHED)
-    expect([getFailureCount(p), h.stub.calls.resumeCalls.length]).toEqual([1, 2])
-    h.script(killScript)
-    onFirstKill(h, () => {
-      pendingRow = MISSING
-    })
-
-    expect(await h.runSequence(p, { lastReadState: AGENT_DIRECTOR_PENDING_STATE, keepsConversation: true })).toMatchObject({
-      kind: LIVE_ROW_OUTCOME_LAUNCHED,
-      launchKind: LIVE_ROW_LAUNCH_RESUME,
-      result: { key: p, action: 'resumed' },
-    })
-    await h.settle()
-
-    expect(h.stub.calls.killCalls).toEqual([{ instance_id: personaInstanceId(p) }])
-    expect(h.stub.calls.resumeCalls).toHaveLength(3)
-    // Neither the kill's reads nor the sequence's get settled resume 2.
-    expect([...resumeEndedLinesOf(h.errors, ref), ...resumeEndedLinesOf(h.errors, `persona=${p}`)]).toEqual([endedLine(1), endedLine(2)])
-    expect([getFailureCount(p), countedLinesOf(h.errors, p).length]).toEqual([2, 2])
-  })
-
-  /**
-   * CSCB's own kill of the row of P's handed-over resume, still pending: the
-   * stuck-launch abort's (P's approver stopped for it first, its production
-   * order), answering its kind; or a live-row sequence's step-1 kill (the
-   * conversation not kept), answering the sequence's outcome kind.
-   */
-  const OWN_KILLS: ReadonlyArray<readonly [string, 'abort' | 'sequence', (loop: ResumeLoop) => Promise<string>]> = [
-    ['the stuck-launch abort\'s kill', 'abort', async ({ h, p, refOf }) => {
-      await stopApproverForStuckLaunchAbort(p)
-      return (await h.drive(abortKillOwnStuckLaunch(p, refOf(p), { clock: h.killRetryClock }))).kind
-    }],
-    ['a live-row sequence\'s step-1 kill', 'sequence', async ({ h, p }) => (await h.runSequence(p, { lastReadState: AGENT_DIRECTOR_PENDING_STATE })).kind],
-  ]
-
-  /**
-   * A kill that does not end P's resumed launch, its row reading pending
-   * throughout: how it is arranged, how many kill calls it makes, and what the
-   * abort and the sequence answer.
-   */
-  const KILLS_NOT_ENDING: ReadonlyArray<readonly [string, (h: RecoveryHarness, p: string) => void, number, { readonly abort: string; readonly sequence: string }]> = [
-    ['answers ENVIRONMENT (ErrTmuxNotAvailable) at its one try', (h) => h.script({ killError: errTmuxNotAvailable(undefined, 'kill') }), 1, { abort: STUCK_LAUNCH_ABORT_KILL_TRY_LATER, sequence: LIVE_ROW_OUTCOME_ABORTED }],
-    ['answers ErrTmuxKillFailed at each of its tries', (h) => h.script({ killError: errTmuxKillFailed() }), KILL_RETRY_TRIES, { abort: STUCK_LAUNCH_ABORT_KILL_FAILED, sequence: LIVE_ROW_OUTCOME_ABORTED }],
-    ['is stopped: ErrTmuxUnresponsive, P no longer up when its first try returns', (h, p) => {
-      h.script({ killError: errTmuxUnresponsive('kill') })
-      const kill = h.stub.client.kill.bind(h.stub.client)
-      h.stub.client.kill = async (params) => {
-        try {
-          return await kill(params)
-        } finally {
-          h.setUp(p, false)
-        }
-      }
-    }, 1, { abort: STUCK_LAUNCH_ABORT_KILL_STOPPED, sequence: LIVE_ROW_OUTCOME_STOPPED }],
-  ]
-
-  test.each(OWN_KILLS.flatMap(([who, kind, run]) => KILLS_NOT_ENDING.map(([how, arrange, kills, answers]) => [who, how, kind, run, arrange, kills, answers] as const)))(
-    '%s of the row of P\'s handed-over resume still pending, which %s, does not end the launch: its record is kept, nothing counted at the kill; a later read of the row missing counts exactly one launch failure, with one line',
-    async (_who, _how, kind, run, arrange, kills, answers) => {
-      const { loop, setRow } = await handedOverPending(1)
-      const { h, p } = loop
-      const ref = loop.refOf(p)
-      arrange(h, p)
-      const before = personaCallCounts(h, p)
-
-      expect(await run(loop)).toBe(answers[kind])
-
-      // Its kills only: no get, spawn or resume after them.
-      const since = callCountsSince(personaCallCounts(h, p), before)
-      expect([since.killCalls, since.getCalls ?? 0, since.spawnCalls ?? 0, since.resumeCalls ?? 0]).toEqual([kills, 0, 0, 0])
-      expect([getFailureCount(p), countedLinesOf(h.errors, p), resumeEndedLinesOf(h.errors, ref), resumeEndedLinesOf(h.errors, `persona=${p}`)]).toEqual([1, [], [], []])
-
-      setRow(MISSING)
-      await readPersonaOwnRow(p, readAfterKill(ref))
-
-      expect(getFailureCount(p)).toBe(2)
-      expect(countedLinesOf(h.errors, p)).toHaveLength(1)
-      expect([...resumeEndedLinesOf(h.errors, ref), ...resumeEndedLinesOf(h.errors, `persona=${p}`)]).toEqual([resumeEndedUnreportedLine(readAfterKill(ref), ref, MISSING, 1)])
-    },
-  )
-
   // A read from another path (a health tick's liveness read) while the
   // abort's kill of the row runs: a finished row is that kill's own end, so
   // it settles nothing, whatever the kill then answers; a row read reported
   // in is still the resume's success.
-  test.each<[string, StatusResult['state'], RecoveryStubScript, number, number]>([
-    ['reads missing, and the kill then succeeds: nothing settled at the read, and the kill drops the record, so a later read of missing counts nothing', MISSING, { killResult: cannedKillResult(true) }, 1, 1],
-    ['reads missing, and the kill then answers ENVIRONMENT: nothing settled at the read, and the record is kept, so a later read of missing counts one launch failure', MISSING, { killError: errTmuxNotAvailable(undefined, 'kill') }, 1, 2],
-    ['reads waiting: the resume counted as a success at the read, resetting P\'s failure on record, and nothing more after the kill', 'waiting', { killResult: cannedKillResult(true) }, 0, 0],
-  ])('a liveness read while the stuck-launch abort\'s kill of the row of P\'s handed-over resume runs, which %s', async (_label, state, killScript, atRead, after) => {
-    const { loop, setRow } = await handedOverPending(1)
-    const { h, p } = loop
-    const ref = loop.refOf(p)
-    const isSessionAlive = _buildIsSessionAliveAdapter(() => h.config)
-    const countsAtRead: number[] = []
-    h.script(killScript)
-    onFirstKill(h, async () => {
-      setRow(state)
-      await isSessionAlive(p)
-      countsAtRead.push(getFailureCount(p))
-    })
-    await stopApproverForStuckLaunchAbort(p)
-
-    await h.drive(abortKillOwnStuckLaunch(p, ref, { clock: h.killRetryClock }))
-
-    expect(countsAtRead).toEqual([atRead])
-    expect(resumeEndedLinesOf(h.errors, `persona=${p}`)).toEqual([])
-    setRow(MISSING)
-    await readPersonaOwnRow(p, readAfterKill(ref))
-
-    expect(getFailureCount(p)).toBe(after)
-    // The failures counted after the read: only by the later read, and only of a record the kill kept.
-    const counted = after - atRead
-    expect(countedLinesOf(h.errors, p)).toHaveLength(counted)
-    expect(resumeEndedLinesOf(h.errors, ref)).toEqual(counted === 1 ? [resumeEndedUnreportedLine(readAfterKill(ref), ref, MISSING, 1)] : [])
-    expect(h.capReached).toEqual([])
-  })
 
   // An old-life wait's kill (b.jg5 SRJ-811) of a persona's own `cscb_<key>`
   // row holds that persona's resumed launch, as the persona's own kills do;
@@ -10674,7 +10193,7 @@ describe('b.4q8: a resumed launch counts once its row reports in, and resumes th
 // b.4q8: a read that settles a resumed launch before the launch caller hands
 // it over
 //
-// In process, every read above comes after the hand-over: the approver waits
+
 // for the launch it follows to settle. A read made elsewhere (a health tick,
 // a retry) can land first, between the resume's after-launch step, which
 // makes its record, and the restart path's `launchSession`, which hands it
@@ -10699,17 +10218,17 @@ describe('b.4q8: a read that settles a resumed launch before its hand-over: noth
     setSessionNotifier(() => {})
     _resetInFlightLaunches()
     _setSpawnHomeDir(dir)
-    _setDialogReadyTimeoutMs(200)
+
   })
 
   afterEach(async () => {
-    await stopApproversAndForgetLaunches()
+    await forgetLaunchRecords()
     console.error = origConsoleError
     resetClientForTests()
     _resetOutageState()
     setSessionNotifier(undefined)
     _resetSpawnHomeDir()
-    _resetDialogReadyTimeoutMs()
+
     rmSync(dir, { recursive: true, force: true })
     assertNoLeak({ errLines })
   })
@@ -10752,7 +10271,7 @@ describe('b.4q8: a read that settles a resumed launch before its hand-over: noth
 
     expect(countsAtRead).toEqual([before])
     expect(getFailureCount(a.key)).toBe(after)
-    await _whenDialogApproverStopped(a.key)
+
     expect(getFailureCount(a.key)).toBe(after)
     expect(resumeEndedLinesOf(errLines, ref)).toEqual(after === 1 ? [resumeEndedUnreportedLine(at, ref, state, 1)] : [])
     expect(countedLinesOf(errLines, a.key)).toHaveLength(after)

@@ -22,6 +22,7 @@ import { describe, expect, test } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
+import { UNUSABLE_RECORDED_NAME_PHRASE } from '../src/ad-description-phrases.ts'
 import {
   AD_ERROR_CLASS_CONFIG,
   AD_ERROR_CLASS_CONFLICT,
@@ -36,37 +37,14 @@ import {
   describeAdFailureForLog,
   type AdErrorClass,
 } from '../src/ad-error-class.ts'
-import { UNUSABLE_RECORDED_NAME_PHRASE } from '../src/ad-description-phrases.ts'
 import {
   ERR_SCHEMA_MIGRATION_REQUIRED_NAME,
   ERR_STORE_OPEN_NAME,
   PHASE1_ONLY_ERR_NAMES,
 } from '../src/agent-director-errors.ts'
-import {
-  FULL_PANE_READ_LINES,
-  PANE_READ_ABSENT,
-  PANE_READ_CONFIG,
-  PANE_READ_CONFLICT,
-  PANE_READ_ENVIRONMENT,
-  PANE_READ_FAILURE_KINDS,
-  PANE_READ_GONE,
-  PANE_READ_LATCHED,
-  PANE_READ_NOT_READ_LATCHED,
-  PANE_READ_PANE,
-  PANE_READ_UNAVAILABLE,
-  PANE_READ_UNCLASSIFIED,
-  PANE_READ_UNUSABLE_NAME,
-  paneReadClassNote,
-  paneReadFailureOf,
-  type PaneReadConflict,
-  type PaneReadFailureKind,
-  type PaneReadOutcome,
-} from '../src/pane-read.ts'
+import { PANE_READ_ABSENT, PANE_READ_CONFIG, PANE_READ_CONFLICT, PANE_READ_ENVIRONMENT, PANE_READ_FAILURE_KINDS, PANE_READ_GONE, PANE_READ_LATCHED, PANE_READ_NOT_READ_LATCHED, PANE_READ_PANE, PANE_READ_UNAVAILABLE, PANE_READ_UNCLASSIFIED, PANE_READ_UNUSABLE_NAME, paneReadClassNote, paneReadFailureOf, type PaneReadConflict, type PaneReadFailureKind, type PaneReadOutcome } from '../src/pane-read.ts'
 import {
   CONFLICT_CASES,
-  STUB_TMUX_SOCKET_PATH,
-  UNAVAILABLE_FORMS,
-  UNUSABLE_NAME_FAULTS,
   errConfigMalformed,
   errCwdNotFound,
   errInternal,
@@ -84,6 +62,9 @@ import {
   errTmuxUnresponsive,
   errUnknownErrorName,
   errUnusableName,
+  STUB_TMUX_SOCKET_PATH,
+  UNAVAILABLE_FORMS,
+  UNUSABLE_NAME_FAULTS,
 } from './test-helpers/agent-director-stub.ts'
 import { assertNoLeak, LEAK_SENTINEL, REDACTED_SENTINEL_TAIL, sentinelInMessage } from './test-helpers/credentials.ts'
 import { importSource, stripComments } from './test-helpers/source-audit.ts'
@@ -188,7 +169,7 @@ describe('a failure outcome\'s description is redacted and on one line', () => {
 
 describe('outcomes that are not failures', () => {
   test.each<[string, PaneReadOutcome]>([
-    ['a pane', { kind: PANE_READ_PANE, pane: '' }],
+    ['a pane', { kind: PANE_READ_PANE }],
     ['latched, not read', PANE_READ_NOT_READ_LATCHED],
     ['latched by its CONFLICT', { kind: PANE_READ_LATCHED, cause: paneReadFailureOf(errTmuxSessionConflict(VERB, 'own-id')) as PaneReadConflict }],
   ])('%s is of no failure kind', (_label, outcome) => {
@@ -204,9 +185,6 @@ describe('outcomes that are not failures', () => {
 // The pins: the session manager's and the server's tests build the full-read
 // count and every failed read's `(read-pane class=<CLASS>; ` from these exports.
 describe('the full-read line count and the class note', () => {
-  test('a full read asks for the last 40 lines', () => {
-    expect(FULL_PANE_READ_LINES).toBe(40)
-  })
 
   test('paneReadClassNote names the verb and the failure\'s class', () => {
     expect(paneReadClassNote(paneReadFailureOf(errTmuxCaptureFailed()))).toBe('read-pane class=GONE')

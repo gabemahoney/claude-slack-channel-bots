@@ -1,413 +1,71 @@
-/**
- * server-startup-wiring.test.ts — The server's start-up wiring after the
- * loader switch (b.av2 SR-3.1, SR-10.2, SR-8.7, SR-13.2).
- *
- * - SR-3.1: no Slack client is built and no token is read at module scope in
- *   src/server.ts; the connection manager is built inside main().
- * - SR-10.2: `SLACK_BOT_TOKEN` / `SLACK_APP_TOKEN` are neither required nor
- *   read by the server; only src/cli.ts still names them.
- * - SR-8.7: the `MCP_HOST` / `MCP_PORT` fallback is gone; main() resolves the
- *   start through the reload controller (the last-applied record when there
- *   is one, else the required config file), exits on a refused start, sets
- *   the applied config from the outcome, and requests the start bring-up from
- *   the controller, whose lifecycle runs `startupSessionManager` over the
- *   config the controller hands it.
- * - SR-13.2: importing src/server.ts touches nothing under HOME. Before the
- *   switch the import read the token variables (exiting without them) and
- *   created `~/.claude/channels/slack`; main() now creates the state and
- *   inbox directories.
- * - The connection seams (SR-3.1, SR-3.4, SR-4.1, SR-7.2): the manager's dry
- *   run and up→flush listener, the outage state's notify passing its options
- *   to the persona notifier (b.jg5 SRJ-1002, SRJ-1003), `connections = <manager>`, `clientFor` and
- *   `identityFor` over the connection view, the routing's identity, client,
- *   archive and notice (`notify`, the persona notifier's, SR-7.3) seams, and
- *   the archive writer's per-persona resolver source.
- * - The integration suite's Slack API base URL override (E14 Task 4):
- *   `CSCB_SLACK_API_URL` resolved once in main(), before the manager is
- *   built, from `process.env`, and passed to it as `slackApiUrl`; no other
- *   src file names the variable.
- * - The one destination resolver (SR-7.1): built at module scope and shared
- *   by the persona notifier and the permission poller.
- * - The bring-up controller (SR-6.1, SR-6.4): the start's bring-up, told
- *   every connection status, stored for shutdown and cancelled there before
- *   the connections stop; the health check started only after the start
- *   bring-up returns. Its launch and its live applied set (`appliedPersonas`)
- *   read the applied config at call time (SR-8.6). Bug b.g57: it checks a
- *   persona's claude_config_dir before its Slack step, and re-checks a held
- *   one, with the launch's own check (`checkLaunchConfigDir`), which the
- *   reload preview also gets for an added persona; its
- *   connections are the whole manager, whose `stop` closes a held persona's
- *   connection; its `holdForConfigDir` is the session
- *   manager's hook for an unresolvable one, installed before any launch path,
- *   and the restart module's kill adapter gets `getAppliedPersona`.
- * - The relaunch gate (SR-6.1, SR-6.4): built over the manager and the
- *   bring-up controller and passed to the restart module (`canRestart`), the
- *   restart launch and the health-check work list; the restart delay read
- *   from the applied config; the permission poller not started in dry run.
- * - Not-up personas (SR-6.3, SR-6.4, SR-8.6): the one `isPersonaUp`
- *   predicate (the controller's `isUp` and `isApplied`) handed
- *   to the permission poller, `/interject`, the MCP admission decision and
- *   the persona routing's lost-message branch;
- *   a refused session disconnected and never registered; the controller's
- *   `onLeftUp` dropping the persona's registered session.
- * - SR-5.2: the file guard handed to the session tools protects every persona
- *   credentials file, as the reload controller lists them.
- * - b.jg5 SRJ-203 (AC 20): the agent-director startup gate is called once,
- *   awaited, with no argument, after only the directory creations and the
- *   unhandledRejection install and before the PID check and every later step;
- *   server.ts never names the gate's floor-exempt option, so its start always
- *   runs the Phase 1 floor.
- * - b.jg5 SRJ-204 / SRJ-205: the runtime agent-director version re-check is
- *   installed once, in the statement right after the gate, behind no branch
- *   and with no `health_check_interval` or clock of its own, over the gate's
- *   version, agent-director's `resolveSystemBinary` and `recordStartupError`;
- *   its stop first arms the shutdown deadline (`armShutdownDeadline`, with
- *   the stop's code, `process.exit` and no clock or deadline override; AC
- *   21) and sets `process.exitCode` to that code (nothing else in server.ts
- *   names it), then runs `shutdown` with the code the re-check passes;
- *   `shutdown` disposes it, exits with its code (the signals pass none, so 0,
- *   and arm no deadline) and makes no agent-director call. main() returns
- *   before `Bun.serve`, the start bring-up, the health check and the
- *   detection tick when a shutdown began during an earlier await.
- * - b.jg5 SRJ-209: agent-director's timing settings install
- *   (`installAdSettings`) is called once, with no argument (so the file is
- *   read under the process's own HOME), in main()'s own statement list with
- *   its result dropped, after the startup gate and the start's configuration
- *   resolution and before the start bring-up; nothing else in server.ts
- *   builds a reader, registers on the re-check's tick, or names the settings
- *   file or the TOML parser.
- * - b.jg5 SRJ-213: the call-timeout start step (`_runCallTimeoutStartStep`)
- *   is called once, awaited, in main()'s own statement list (so in dry run
- *   too), after the startup gate (still called once with no argument), the
- *   start's configuration resolution and the settings install, and before the
- *   template install and the start bring-up, with the start-time applied
- *   config as its only argument; it is on no tick and no timer.
- * - b.jg5 SRJ-801 / SRJ-802: the retired-key record's start read
- *   (`readRetiredKeysAtStart`) is called once, bound to a const in main()'s
- *   own statement list (so in dry run too), over the server state directory
- *   (`STATE_DIR`) with only a log of its own, after the startup gate and the
- *   PID check and before the reload controller, its start resolution (which
- *   can write the last-applied record), the start sweep, the start bring-up,
- *   the PID file, the connection manager and `Bun.serve`; a refused read
- *   exits 1 in the next statement, and the loaded store is bound once, the
- *   one store; server.ts names the file only through the module and builds no
- *   other store, and no other src file reads the record at start. The reload
- *   controller gets that store by its binding (`retiredKeys`), so a confirmed
- *   apply's step 1 records through the one store (b.jg5 SRJ-803).
- * - b.jg5 SRJ-301 / SRJ-305: one UNAVAILABLE retry controller is built in
- *   main()'s own statement list on the production clock, held in the one
- *   module-scope handle, and installed as the trigger sink of the one
- *   `initOutageState` call before the start bring-up and the restart module;
- *   its action is the full-mode retry action over `runRestartRetry`,
- *   `getAppliedPersona`, the relaunch gate, the restart cap, the restart
- *   module's shutdown flag, "blocks a retry" (below) and the
- *   session manager's row read `readPersonaRowState` (SRJ-303); the restart
- *   module's arm hook (`armRetryTimer`) arms it with the read-error cause
- *   (SRJ-314); the health check's retry-timer read (`isRetryArmed`) is its
- *   `isArmed` and its arm hook (`armRetryTimer`) is server.ts's one
- *   ENVIRONMENT arm path (`armEnvironmentRetryTimer`), which arms it through
- *   that handle with the environment cause (SRJ-311); shutdown closes it
- *   once, right after `cancelAllRestartTimers`,
- *   after the shutting-down flag and before the HTTP server stops.
- * - b.jg5 SRJ-314 / SRJ-115: the restart module's pending deferral
- *   (`deferPendingRow`) is bound to server.ts's one module-scope
- *   `deferPendingRow` (no import, local shadow or second declaration), passed
- *   the persona's key and the reading's `launchStartedAt`, its answer
- *   returned to the restart work (b.jg5 SRJ-410: a gone answer goes on to the
- *   relaunch).
- * - b.jg5 SRJ-410 / SRJ-404: the one pending-row rule is built once, by the
- *   pending-row module's factory over the session manager's dependency
- *   builder (the live applied-persona lookup, the one notice episodes
- *   instance and the server log), and installed once (`setPendingRowRule`)
- *   in main()'s own statement list with the persona lifecycle serializer's
- *   `run`, after the live-row sequence registry's install and before the
- *   restart module, the start sweep, the start bring-up and the health check;
- *   no other src file builds or installs one.
- * - b.jg5 SRJ-303 / SRJ-305 / SRJ-404: one retry run gate object
- *   (`RetryRunGateDeps`: applied, latched, held, up, cap, shutdown) is
- *   declared once in main(), spread into the full-mode retry action's deps
- *   (no own member overrides it) and installed as the pending-row rule's
- *   `gate`, so the approver-stop run is gated as a retry is.
- * - b.jg5 SRJ-1016: the one set of per-persona notice episodes is built once,
- *   imported from the episodes module, in main()'s own statement list, before
- *   the retry controller, the restart module, the start bring-up and the
- *   health check, on the production clock, with the module-scope persona
- *   notifier's `notify` as its sink (key, text and options passed through)
- *   and that notifier's `teardownWindowState` as its teardown query, read
- *   nowhere else (b.jg5 SRJ-1003), and held in the one module-scope handle
- *   assigned in main(); shutdown closes them once, through that handle,
- *   before it first yields (every episode ends, every alert check is
- *   cancelled, and no episode begins again).
- * - b.jg5 SRJ-307 / SRJ-310 / SRJ-306: the one tmux-unresponsive condition is
- *   built once, in main()'s own statement list, over that episodes instance,
- *   after the retry controller; it is the condition sink of the one
- *   `initOutageState` call (beside the trigger sink, before the start
- *   bring-up); the health check's and the full-mode retry action's
- *   `endTmuxUnresponsive` hooks end it (with the tick's `live` reading and the
- *   retry's own reading), the retry action gets the connectedness and stream
- *   probes the health check reads, and its condition-end hook is the retry
- *   controller's `conditionEnded` for the tmux-unresponsive condition.
- * - b.jg5 SRJ-308 / SRJ-309 / SRJ-210: the condition's onset entries are
- *   bound to the health check's tick-end hook (`onTickEnd`, with the tick's
- *   start read by `now` on the notice episodes' own clock) and to the retry
- *   controller's per-fire observer (`onRetryFire`), and are called nowhere
- *   else; its mode is read at each check from the applied config holder's
- *   `health_check_interval` (the field `startHealthCheck` starts the tick
- *   with), and its alert threshold is E6's `adAlertThresholdMsInEffect`
- *   itself, never a value taken once; its alert is cancelled only by the
- *   teardown's retry-timer stop (pinned in tests/reload-wiring.test.ts) and
- *   by shutdown's close of the episodes.
- * - b.jg5 SRJ-313 / SRJ-1009: the one unclassified-error episodes instance is
- *   built once, imported from the episodes module, in main()'s own statement
- *   list, over the one notice episodes instance (so a teardown's forget and
- *   shutdown's close end it), with the server log, E6's alert threshold
- *   accessor itself, a configured-key lookup over `getAppliedPersona` and a
- *   log-only route through `recordStartupError` with the exported
- *   `persona-unclassified-error` label, the persona's key and the alert's
- *   text, before the retry controller and the start pass; it is the
- *   unclassified sink of the one `initOutageState` call; the retry
- *   controller's stop observer calls the condition's alert cancel and the
- *   instance's `retryStopped`, each isolated; the restart module's
- *   `onCapReached` calls the cap notice and the instance's `end` with the
- *   capped reason, each isolated; the instance is named nowhere else.
- * - b.jg5 SRJ-311 / SRJ-312 / SRJ-305 / SRJ-306: the one `initOutageState`
- *   call (in main()'s own statement list, after the retry controller and
- *   before the start pass) installs the cleared-flag observer
- *   (`onFlagCleared`), named nowhere else, which reports only a
- *   `tmux-unavailable` clear to the retry controller's `conditionEnded` for
- *   the tmux-unavailable condition, with the persona and the clear's reading;
- *   the full-mode retry action's healthy-row hook ends the tmux-unresponsive
- *   condition and clears `tmux-unavailable` through the outage state's
- *   `clearOutageFlag` with the retry's own reading, and that is server.ts's
- *   only `tmux-unavailable` clear (every other clear there is
- *   `ad-unreachable`). These are the only two `conditionEnded` reports in
- *   server.ts.
- * - b.jg5 SRJ-303 / SRJ-315 / SRJ-401 / SRJ-706 / SRJ-811: two named
- *   in-flight bindings, each a module-scope function declared once: "blocks
- *   a retry" is the session manager's `personaRetryBlockCause` answering a
- *   cause (a launch call, a live-row sequence or an old-life wait step) and
- *   is the full-mode retry action's `isInFlight`, beside that cause query as
- *   its `retryBlockCause` (a running dialog approver never skips a retry); "in flight
- *   for P" is built from it and the session manager's
- *   `isDialogApproverRunning`, and is the health check's `isLaunchInFlight`,
- *   the persona routing's read-gate member `isWorkInFlight` (b.jg5 SRJ-1011)
- *   and the `tmux-unavailable` retry check's production deps' `isWorkInFlight`
- *   (b.jg5 SRJ-311); nothing else names either (no no-op, other predicate or
- *   local shadow).
- * - b.jg5 SRJ-404: `shutdown()` stops every dialog approver once, through the
- *   session manager's `stopAllDialogApprovers`, after the shutting-down flag
- *   and `stopAllKeepAliveTimers()`, before it first yields and before
- *   `closeClient()`; nothing else in server.ts calls it. (The teardown's
- *   approver stop is pinned in tests/reload-wiring.test.ts.)
- * - b.jg5 SRJ-706 / SRJ-303: the one live-row sequence registry is built
- *   once in main()'s own statement list over the session manager's
- *   dependency builder (the retry controller's arm, the system clock, the
- *   server log, the applied configuration at call time), production's
- *   detached attempt runner and its outside-every-attempt runner
- *   (`runOutsideAttempts`, b.jg5 SRJ-1512), installed once
- *   (`setLiveRowSequenceRegistry`) after the latch and before the restart
- *   module and the start pass, and held in one module-scope holder that
- *   `shutdown()` closes once, after the shutting-down flag, before the retry
- *   controller closes, before it first yields and before `closeClient()`; the
- *   restart work's running query is the session manager's gate
- *   (`liveRowSequenceGate`, which also arms a persona whose own row carries
- *   an old-life wait, b.jg5 SRJ-811), and server.ts asks the bare
- *   `isLiveRowSequenceRunning` nowhere. (The teardown's sequence stop is
- *   pinned in tests/reload-wiring.test.ts.)
- * - b.jg5 SRJ-811 / SRJ-812 / SRJ-1512: the old-life wait's bindings are
- *   installed once (`setOldLifeWaitBindings`), in main()'s own statement
- *   list, after the registry's install and before the restart module, the
- *   start sweep, the start pass and the health check, with exactly the one
- *   retry controller, the system clock, the server log, the applied
- *   configuration at call time, the one kill-failure alerts instance, one
- *   `recordStartupError(<class>, <entry>)` and the wait's own
- *   unclassified-error episodes (`createOldLifeWaitUnclassifiedErrors`, built
- *   once in main() with the alert threshold in effect, and closed once by
- *   `shutdown()` through its module-scope holder; b.jg5 SRJ-313).
- * - b.jg5 SRJ-501 / SRJ-508: the one per-persona latch is built once,
- *   imported from the latch module, in main()'s own statement list, after the
- *   notice episodes and before the retry controller and the start pass, with
- *   the server log as its only dependency (it is held in server memory: no
- *   option loads it, no statement of main() seeds it and the latch module
- *   imports no file-system module); its CONFLICT notice is bound once, in
- *   main()'s own statement list before the retry controller and the start
- *   pass, to that latch and the one notice episodes instance, and nothing
- *   else in server.ts adds a set observer.
- * - b.jg5 SRJ-502 / SRJ-305 / SRJ-310 / SRJ-313 / SRJ-315: the latch's holds
- *   are bound once (`bindConflictLatchHolds`), in main()'s own statement list,
- *   to that latch and the server log, before its notice is bound (so they run
- *   before the notice) and before the start pass; they are exactly the retry
- *   controller's `stop` with `UNAVAILABLE_RETRY_STOP_LATCHED`, the
- *   tmux-unresponsive condition's silent `end` with
- *   `TMUX_UNRESPONSIVE_END_LATCHED`, the unclassified-error episodes'
- *   `end` with `UNCLASSIFIED_ERROR_END_LATCHED`, the slow-recovery
- *   tracker's latch end and the stuck-launch episode's latch end (both
- *   below). The latch is installed in
- *   the session manager once (`setConflictLatch`), after both bindings and
- *   before the retry controller and the start pass, with no await before the
- *   holds' targets are built; its `isLatched` is bound, as a call-time read,
- *   into the full-mode retry action, `initRestart` and `initHealthCheck`, and
- *   the latch is named nowhere else. The condition's three ends and the
- *   unclassified episodes' two ends are each located in their binding.
- * - b.jg5 SRJ-505: the latch re-check is built exactly once, by the session
- *   manager's builder (`buildLatchRecheck`, which the recovery harness also
- *   calls), bound to a const in main()'s own statement list, over exactly
- *   the one latch, the system clock, the one persona lifecycle serializer's
- *   run (the restart module's), the applied configuration read at each round,
- *   the server log, the one notice episodes instance, the relaunch gate, the
- *   restart cap over the one failure counter (bug b.xkd) and that counter's
- *   reset, `forgetFailures`, for the clear by hand (bug b.ebi), after the latch's
- *   holds and CONFLICT notice are bound and before the start pass; it is bound
- *   to the latch once (`bindLatchRecheck`), after both, with no await since
- *   its build. server.ts builds no re-check controller, round or clear of its
- *   own, adds no set or forget observer by hand, and hands the re-check to
- *   nothing else (the health tick, the restart module and the retry
- *   controller included); it is held in one module-scope holder, assigned it
- *   once, that shutdown() stops once (`stopAll()`), after the shutting-down
- *   flag, before it first yields and before `closeClient()`.
- * - b.jg5 SRJ-610 / SRJ-1010 / SRJ-1016 / SRJ-502: the one slow-recovery
- *   tracker (`createSlowRecoveryTracker`) is built once, in main()'s own
- *   statement list, over the one notice episodes instance and the server log,
- *   after the episodes and before the restart module and the start pass, with
- *   no await between the latch's install and its build; it is `initRestart`'s
- *   `slowRecovery` observer, the health check's `resetSlowRecoveryCount`
- *   hook calls its `noteHealthy` for the key, and the latch's
- *   `endSlowRecovery` hold calls its `endForLatch` for the key. It is named
- *   only there; server.ts calls none of its restart-run notes, and no other
- *   src file builds one.
- * - b.jg5 SRJ-1016 / SRJ-1017 / SRJ-502: the stuck-launch episode lives in
- *   the one notice episodes instance. It is installed in the session manager
- *   once (`setStuckLaunchEpisodes`), in main()'s own statement list, with
- *   exactly that instance, after its build and before the start sweep and
- *   the start pass, and never removed; the latch's `endStuckLaunch` hold
- *   ends the episode through `endStuckLaunchEpisodeForLatch` over that same
- *   instance with the server log, server.ts's only call of it.
- * - b.jg5 SRJ-114 / SRJ-501: the session manager's configured-persona query
- *   is installed once (`setConfiguredPersonaQuery`), in main()'s own
- *   statement list, as a call-time read of the live applied-persona lookup
- *   (`(key) => getAppliedPersona(key) !== undefined`), never reset; it and
- *   the latch's install both come before the start sweep (`reconcileOrphans`)
- *   and the start pass, with no await between them.
- * - b.jg5 SRJ-807 / SRJ-802: the one retired-key store (the start read's
- *   binding, the reload controller's `retiredKeys`) is installed for the
- *   session manager's own-row reads once (`setRetiredKeyStore`), in main()'s
- *   own statement list, behind no branch, after its binding and before the
- *   start sweep, every launch path, the liveness adapter, the connection
- *   manager and `Bun.serve`; server.ts never names the test-only reset, and
- *   no other src file (the CLI included) installs a store.
- * - b.jg5 SRJ-809: the one old-life hold set (`createOldLifeHoldSet`) is
- *   built once, bound to a const in main()'s own statement list with only a
- *   log of its own, before the reload controller, which gets it by that
- *   binding (`oldLifeHolds`); it is installed for the session manager once
- *   (`setOldLifeHolds`), behind no branch, beside the retired-key store's
- *   install and before the start sweep, every launch path, the liveness
- *   adapter, the connection manager and `Bun.serve`; server.ts never names
- *   the test-only reset, and no other src file builds or installs a set.
- * - b.jg5 SRJ-810 / SRJ-1505 / SRJ-812: what a hold refuses.
- *   handleInitialized gives `decideSessionAdmission` the session manager's
- *   held-directory query (`oldLifeHeldDirectory`, by its bare name, so the
- *   hold set is read at call time) beside `isPersonaUp`; the restart work's
- *   old-life hook (`isHeldForOldLife`) runs the session manager's hold step
- *   (`oldLifeHoldStep`) over the live applied persona; the end-retry
- *   observer (`createOldLifeHoldEndRetry`) is registered once on the one
- *   hold set's `onEnd`, after its install, over the one retry controller's
- *   `runNow` (held-for-an-old-life cause, hold-ended label) and the live
- *   applied-persona lookup; none of them names `getClient()`.
- * - b.jg5 SRJ-704 / SRJ-1007 / SRJ-1016: the kill-failure alerts are built
- *   exactly once (`createKillFailureAlerts`), in main()'s own statement list,
- *   over the one notice episodes instance and the server log, with the live
- *   applied-persona lookup as their configured-key lookup and one
- *   `recordStartupError(<class>, <entry>)` as their log-only route; they are
- *   installed in the session manager once (`setKillFailureAlerts`), after
- *   their build and before the restart module, the start sweep and the start
- *   pass, and named only at the build, the install, the routing holder's
- *   assignment, the persona teardown's alert raiser (b.jg5 SRJ-715) and the
- *   old-life wait's bindings (b.jg5 SRJ-811); the restart kill adapter raises the kill retry's decision once, after the
- *   outcome's own handling.
- * - b.jg5 SRJ-1011: the module-scope persona routing's lost-message inputs
- *   are read at call time: its latched query through a module-scope holder
- *   assigned the one latch once in main(), its `tmux-unresponsive` query
- *   through one assigned the one condition (its `holds`, server.ts's only
- *   holds query), both before the start bring-up; its launch-or-approver
- *   query asks the session manager's `isLaunchInFlight` and
- *   `isDialogApproverRunning` for the key at call time, and is neither
- *   in-flight binding; its kill-failed query reads the one kill-failure
- *   alerts' `isOpen` through a module-scope holder assigned that instance
- *   once in main() before the start bring-up, or the session manager's
- *   `waitsOnKillFailedHold` (b.jg5 SRJ-812); its held-on-invalid-flags
- *   query (state 3, cannot launch) reads the one `ErrInvalidFlags` hold's
- *   `isHeld` through a module-scope holder assigned that hold once in main()
- *   before the start bring-up, which shutdown's forget-all also reads; its
- *   sequence/wait query asks the session manager's
- *   `isSequenceOrOldLifeWaitRunning` for the key at call time (b.jg5
- *   SRJ-811). Its read gate's in-flight member (`isWorkInFlight`)
- *   is "in flight for P", and its one row read
- *   (`readRowLiveness`) is the one liveness adapter main() builds
- *   (`_buildIsSessionAliveAdapter`, built once, the restart module's and the
- *   health tick's `isSessionAlive`), read at call time through a module-scope
- *   holder assigned it once in main() before the start bring-up, answering
- *   `unknown` (never `pending`) before then (b.jg5 SRJ-1011, SRJ-115).
- * - b.jg5 SRJ-207 / SRJ-1008 / SRJ-305 / SRJ-303 / SRJ-315 / SRJ-204: the one
- *   `ErrInvalidFlags` hold (`createInvalidFlagsHold`) is built once, in
- *   main()'s own statement list, over the server log, and installed in the
- *   session manager once (`setInvalidFlagsHold`) before the retry
- *   controller, the restart module, the start pass and the health check,
- *   with no await before the retry controller is built; its set reaction is
- *   bound once (`bindInvalidFlagsHoldSetReaction`) to the retry controller's
- *   stop entry with `UNAVAILABLE_RETRY_STOP_HELD` and to the one notice
- *   episodes instance; exactly one version-changed listener
- *   (`onAdVersionChanged`) runs the version-change reaction over the hold,
- *   the episodes, the applied-persona lookup and a retry at once through
- *   `runRestartRetry` with "blocks a retry"; its `isHeld` is bound, as a
- *   call-time read, into the full-mode retry action, `initRestart` and
- *   `initHealthCheck`; shutdown forgets every hold through the routing's
- *   holder; server.ts never sets a hold and the hold module reads no file.
- * - b.jg5 SRJ-311: the one session-disconnect handler is built once, at
- *   module scope, by `_buildRestartDisconnectedPersona` over the
- *   `tmux-unavailable` retry check's one set of production deps (spread
- *   first, nothing overriding it), `getAppliedPersona`, the restart module's
- *   `scheduleRestart` and its shutdown flag, and only the session close and
- *   the SSE abort call it; those deps are exactly the outage flag, the one
- *   retry controller's `isArmed` through its handle, the one latch through
- *   the routing's holder, "in flight for P", the health tick's
- *   arm path (`armEnvironmentRetryTimer`) and the server log; the routing's
- *   `armRetryTimerIfMissing` does nothing while shutting down and otherwise
- *   asks the same check (`armMissingTmuxUnavailableRetry`) over the same
- *   deps. The routing's call binds exactly its pinned members.
- * - b.deo SRI-403 beside b.av2 SR-8.7: the stored-choice store's start load
- *   (`loadChannelDeliveryAtStart`) is called once, in main()'s own statement
- *   list (so in both modes and in dry run too), after the start resolution
- *   and the start-time applied config's assignment, and before the first
- *   await after them, the start sweep, the start bring-up, the PID file, the
- *   connection manager and `Bun.serve`; it loads over the server state
- *   directory, the start's applied personas and the one retired-key store,
- *   with only a log of its own (to console.error). Its result is assigned
- *   once to the one module-scope holder (`channelDeliveryStore`), which is
- *   otherwise only read, at call time: by the reload controller's
- *   `channelDelivery` accessor and by the routing's and the session tools'
- *   `getChannelDelivery`, each exactly `() => channelDeliveryStore`. The
- *   session tools also get the routing's heard set, the applied personas of
- *   the configuration in effect and the server log (b.deo SRI-502, SRI-505).
- *   No other src file calls the start load, and none but the store module
- *   calls the store factory.
- *
- * Why part of this file is a static audit: main() cannot run in a unit test
- * (the agent-director startup gate, a real port, real Slack connections), so
- * its wiring is pinned by auditing the comment-stripped source text, anchored
- * on content and never on line numbers (the tests/jsonl-safeguard-wiring
- * precedent). Import-time behaviour is proven for real, in a child `bun`
- * process with a temp HOME that imports the module (never runs it as the
- * entry point, so `import.meta.main` is false and main() never runs).
- *
- * SPDX-License-Identifier: MIT
- */
 
-import { describe, test, expect, afterEach } from 'bun:test'
+
+import { afterEach, describe, expect, test } from 'bun:test'
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import ts from 'typescript'
+import type * as AdSettingsModule from '../src/ad-settings.ts'
+import { AD_SETTINGS_RELATIVE_PATH } from '../src/ad-settings.ts'
+import type * as AdVersionGateModule from '../src/ad-version-gate.ts'
+import { AD_VERSION_RECHECK_STOP_EXIT_CODE, type AdVersionRecheckDeps } from '../src/ad-version-gate.ts'
+import type * as AdStartupModule from '../src/agent-director-startup.ts'
+import type { runAgentDirectorStartupGate, StartupGateOptions } from '../src/agent-director-startup.ts'
+import type * as ChannelDeliveryModule from '../src/channel-delivery.ts'
+import type { PersonaConfig } from '../src/config.ts'
+import type * as ConflictLatchModule from '../src/conflict-latch.ts'
+import type { ConflictLatch, ConflictLatchDeps, ConflictLatchHolds, LatchRecheckController } from '../src/conflict-latch.ts'
+import type { HealthCheckDeps } from '../src/health-check.ts'
+import type * as InvalidFlagsHoldModule from '../src/invalid-flags-hold.ts'
+import type {
+  InvalidFlagsHold,
+  InvalidFlagsHoldDeps,
+  InvalidFlagsHoldSetReactionDeps,
+  InvalidFlagsHoldVersionChangeDeps,
+} from '../src/invalid-flags-hold.ts'
+import type * as KillRetryModule from '../src/kill-retry.ts'
+import type * as LiveRowSequenceModule from '../src/live-row-sequence.ts'
+import type { LiveRowSequenceRegistry, LiveRowSequenceRegistryOptions } from '../src/live-row-sequence.ts'
+import type * as LivenessReadingModule from '../src/liveness-reading.ts'
+import type { PendingLivenessReading } from '../src/liveness-reading.ts'
+import type * as OutageStateModule from '../src/outage-state.ts'
+import type { OutageClass, OutageStateDeps } from '../src/outage-state.ts'
+import type * as PendingRowModule from '../src/pending-row.ts'
+import type * as PersonaConnectionsModule from '../src/persona-connections.ts'
+import type * as PersonaEpisodesModule from '../src/persona-episodes.ts'
+import type {
+  KillFailureAlerts,
+  KillFailureAlertsDeps,
+  PersonaEpisodes,
+  PersonaEpisodesDeps,
+  TmuxUnresponsiveCondition,
+  TmuxUnresponsiveConditionDeps,
+  UnclassifiedErrorEpisodes,
+  UnclassifiedErrorEpisodesDeps,
+} from '../src/persona-episodes.ts'
+import type { PersonaLifecycleDeps } from '../src/persona-lifecycle.ts'
+import type * as PersonaNotifierModule from '../src/persona-notifier.ts'
+import type { PersonaNotifier } from '../src/persona-notifier.ts'
+import type { PersonaRouting, PersonaRoutingDeps } from '../src/persona-routing.ts'
+import type { SessionAdmissionOptions, SessionToolDeps } from '../src/registry.ts'
+import type { ReloadControllerDeps } from '../src/reload.ts'
+import type * as RestartModule from '../src/restart.ts'
+import type { RestartDeps } from '../src/restart.ts'
+import type * as RetiredKeysModule from '../src/retired-keys.ts'
+import type { OldLifeHoldSet } from '../src/retired-keys.ts'
+import { RETIRED_KEYS_FILE_NAME } from '../src/retired-keys.ts'
+import type * as ServerModule from '../src/server.ts'
+import type { RestartDisconnectedPersonaDeps, TmuxUnavailableRetryDeps } from '../src/server.ts'
+import type * as SessionManagerModule from '../src/session-manager.ts'
+import type { LatchRecheckInput, OldLifeHoldEndRetryDeps, OldLifeWaitBindings, PendingRowRuleDepsInput, PendingRowRuleInstall } from '../src/session-manager.ts'
+import type { ShutdownDeadlineDeps } from '../src/shutdown-deadline.ts'
+import type * as SlowRecoveryModule from '../src/slow-recovery.ts'
+import type { SlowRecoveryTracker, SlowRecoveryTrackerDeps } from '../src/slow-recovery.ts'
+import type * as UnavailableRetryModule from '../src/unavailable-retry.ts'
+import type { FullModeRetryDeps, RetryRunGateDeps, UnavailableRetryController, UnavailableRetryDeps } from '../src/unavailable-retry.ts'
+import { makeStubCallLog } from './test-helpers/agent-director-stub.ts'
+import { runInFakeHome } from './test-helpers/fake-home-subprocess.ts'
 import {
   atMainTopLevel,
   balancedAfter,
@@ -425,66 +83,6 @@ import {
   startResolution,
   stripComments,
 } from './test-helpers/source-audit.ts'
-import { runInFakeHome } from './test-helpers/fake-home-subprocess.ts'
-import { makeStubCallLog } from './test-helpers/agent-director-stub.ts'
-import type { runAgentDirectorStartupGate, StartupGateOptions } from '../src/agent-director-startup.ts'
-import { AD_VERSION_RECHECK_STOP_EXIT_CODE, type AdVersionRecheckDeps } from '../src/ad-version-gate.ts'
-import type { ShutdownDeadlineDeps } from '../src/shutdown-deadline.ts'
-import { AD_SETTINGS_RELATIVE_PATH } from '../src/ad-settings.ts'
-import type * as AdSettingsModule from '../src/ad-settings.ts'
-import type * as AdVersionGateModule from '../src/ad-version-gate.ts'
-import type * as AdStartupModule from '../src/agent-director-startup.ts'
-import type * as ServerModule from '../src/server.ts'
-import type { RestartDisconnectedPersonaDeps, TmuxUnavailableRetryDeps } from '../src/server.ts'
-import type { RestartDeps } from '../src/restart.ts'
-import type * as RestartModule from '../src/restart.ts'
-import type * as InvalidFlagsHoldModule from '../src/invalid-flags-hold.ts'
-import type {
-  InvalidFlagsHold,
-  InvalidFlagsHoldDeps,
-  InvalidFlagsHoldSetReactionDeps,
-  InvalidFlagsHoldVersionChangeDeps,
-} from '../src/invalid-flags-hold.ts'
-import type { PendingLivenessReading } from '../src/liveness-reading.ts'
-import type { ReloadControllerDeps } from '../src/reload.ts'
-import { RETIRED_KEYS_FILE_NAME } from '../src/retired-keys.ts'
-import type * as RetiredKeysModule from '../src/retired-keys.ts'
-import type * as ConflictLatchModule from '../src/conflict-latch.ts'
-import type { ConflictLatch, ConflictLatchDeps, ConflictLatchHolds, LatchRecheckController } from '../src/conflict-latch.ts'
-import type * as PersonaEpisodesModule from '../src/persona-episodes.ts'
-import type * as SlowRecoveryModule from '../src/slow-recovery.ts'
-import type * as PendingRowModule from '../src/pending-row.ts'
-import type { SlowRecoveryTracker, SlowRecoveryTrackerDeps } from '../src/slow-recovery.ts'
-import type {
-  KillFailureAlerts,
-  KillFailureAlertsDeps,
-  PersonaEpisodes,
-  PersonaEpisodesDeps,
-  TmuxUnresponsiveCondition,
-  TmuxUnresponsiveConditionDeps,
-  UnclassifiedErrorEpisodes,
-  UnclassifiedErrorEpisodesDeps,
-} from '../src/persona-episodes.ts'
-import type * as UnavailableRetryModule from '../src/unavailable-retry.ts'
-import type { FullModeRetryDeps, RetryRunGateDeps, UnavailableRetryController, UnavailableRetryDeps } from '../src/unavailable-retry.ts'
-import type * as LivenessReadingModule from '../src/liveness-reading.ts'
-import type * as KillRetryModule from '../src/kill-retry.ts'
-import type * as SessionManagerModule from '../src/session-manager.ts'
-import type * as LiveRowSequenceModule from '../src/live-row-sequence.ts'
-import type { LiveRowSequenceRegistry, LiveRowSequenceRegistryOptions } from '../src/live-row-sequence.ts'
-import type { LatchRecheckInput, OldLifeHoldEndRetryDeps, OldLifeWaitBindings, PendingRowRuleDepsInput, PendingRowRuleInstall } from '../src/session-manager.ts'
-import type { SessionAdmissionOptions, SessionToolDeps } from '../src/registry.ts'
-import type { OldLifeHoldSet } from '../src/retired-keys.ts'
-import type { HealthCheckDeps } from '../src/health-check.ts'
-import type * as OutageStateModule from '../src/outage-state.ts'
-import type { OutageClass, OutageStateDeps } from '../src/outage-state.ts'
-import type * as PersonaConnectionsModule from '../src/persona-connections.ts'
-import type * as PersonaNotifierModule from '../src/persona-notifier.ts'
-import type { PersonaNotifier } from '../src/persona-notifier.ts'
-import type { PersonaConfig } from '../src/config.ts'
-import type { PersonaRouting, PersonaRoutingDeps } from '../src/persona-routing.ts'
-import type { PersonaLifecycleDeps } from '../src/persona-lifecycle.ts'
-import type * as ChannelDeliveryModule from '../src/channel-delivery.ts'
 
 const SRC_DIR = fileURLToPath(new URL('../src/', import.meta.url))
 const SERVER_PATH = join(SRC_DIR, 'server.ts')
@@ -550,13 +148,6 @@ function spreadConstObject(name: string): string {
 /** The retry run's gate type (b.jg5 SRJ-303, SRJ-305, SRJ-404), as imported in server.ts. */
 const RETRY_RUN_GATE_TYPE = 'RetryRunGateDeps'
 
-/**
- * b.jg5 SRJ-303, SRJ-305, SRJ-404: the one `const <name>: RetryRunGateDeps =
- * { … }` in main() that both the full-mode retry action and the pending-row
- * rule's approver-stop run are gated on. Fails unless it is declared exactly
- * once in server.ts. Returns its name, its object literal's [start, end)
- * (braces excluded) and its properties.
- */
 function retryRunGate(): { name: string; at: number; start: number; end: number; props: Map<string, string> } {
   const decls = [...SERVER_CODE.matchAll(new RegExp(`\\bconst\\s+(\\w+)\\s*:\\s*${RETRY_RUN_GATE_TYPE}\\s*=\\s*\\{`, 'g'))]
   expect(decls).toHaveLength(1)
@@ -736,8 +327,7 @@ function withinCall(offsets: number[], at: number): number {
 
 /** The session manager's launch-in-flight query (b.f2b, b.jg5 SRJ-303); renaming it fails the typecheck. */
 const LAUNCH_IN_FLIGHT: keyof typeof SessionManagerModule = 'isLaunchInFlight'
-/** The session manager's approver-running query (b.jg5 SRJ-401); renaming it fails the typecheck. */
-const APPROVER_RUNNING: keyof typeof SessionManagerModule = 'isDialogApproverRunning'
+
 /** The session manager's live-row sequence running query (b.jg5 SRJ-706); renaming it fails the typecheck. */
 const SEQUENCE_RUNNING: keyof typeof SessionManagerModule = 'isLiveRowSequenceRunning'
 /** The session manager's "which work blocks a retry" query (b.jg5 SRJ-303, SRJ-706, SRJ-811); renaming it fails the typecheck. */
@@ -745,42 +335,8 @@ const RETRY_BLOCK_CAUSE: keyof typeof SessionManagerModule = 'personaRetryBlockC
 /** The retry action's cause member (b.jg5 SRJ-303: the again-reason and skip line name the cause); renaming it fails the typecheck. */
 const RETRY_BLOCK_CAUSE_MEMBER: keyof FullModeRetryDeps = 'retryBlockCause'
 
-/**
- * The two named in-flight bindings main() hands out (b.jg5 SRJ-303, SRJ-315,
- * SRJ-401, SRJ-1011), each a module-scope function declared exactly once in
- * server.ts (see moduleFunction), not imported, with one parameter, its key:
- * - "blocks a retry" (`retryBlocked`), as the full-mode retry action's
- *   `isInFlight` binds it: its whole body is
- *   `return personaRetryBlockCause(<key>) !== undefined`, the session
- *   manager's cause query (a launch call, a running live-row sequence, or an
- *   old-life wait step for a hold the persona waits on: b.jg5 SRJ-706,
- *   SRJ-811), never a running dialog approver (SRJ-303: a running approver
- *   does not skip a retry). No other function or const/let/var arrow in
- *   server.ts starts by asking `isLaunchInFlight` or `personaRetryBlockCause`
- *   for its own key (no second narrow predicate, none that drops the
- *   sequence or the wait). It is named exactly four times: its declaration,
- *   the retry action's `isInFlight`, the body of "in flight for P" and the
- *   `ErrInvalidFlags` hold's version-changed listener, whose retry at once
- *   runs the restart module's retry entry with it (b.jg5 SRJ-207, SRJ-303).
- *   The cause query itself is named exactly three times: its import, that
- *   body and the retry action's `retryBlockCause` (bare), so the skip's
- *   again-reason names the same cause that blocked it.
- * - "in flight for P" (`workInFlight`), as the health tick's
- *   `isLaunchInFlight` binds it: its whole body is
- *   `return <blocks a retry>(<key>) || isDialogApproverRunning(<key>)`, built
- *   from the narrow one, so later Epics extend one place. It is named exactly
- *   four times: its declaration, the health tick's `isLaunchInFlight`, the
- *   `tmux-unavailable` retry check's production deps' `isWorkInFlight` (the
- *   session-disconnect handler's and the routing's arm, which mirror the
- *   tick's check, b.jg5 SRJ-311) and the persona routing's read-gate member
- *   `isWorkInFlight` (b.jg5 SRJ-1011), each bound to the bare name.
- * The two names differ, and `isLaunchInFlight`, `personaRetryBlockCause` and
- * `isDialogApproverRunning` are the session manager's imports, declared
- * nowhere in server.ts. Replaces
- * the one shared predicate E11 and E15 pinned. Returns both names.
- */
 function inFlightBindings(): { retryBlocked: string; workInFlight: string } {
-  for (const query of [LAUNCH_IN_FLIGHT, RETRY_BLOCK_CAUSE, APPROVER_RUNNING]) {
+  for (const query of [LAUNCH_IN_FLIGHT, RETRY_BLOCK_CAUSE]) {
     expect([query, importSource(SERVER_CODE, query)]).toEqual([query, './session-manager.ts'])
     expect([query, indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${query}\\b`, 'g'), SERVER_CODE)]).toEqual([query, []])
   }
@@ -796,7 +352,7 @@ function inFlightBindings(): { retryBlocked: string; workInFlight: string } {
   // const/let/var arrow whose body starts by calling isLaunchInFlight or the
   // cause query with its own key, so none can block a retry on a launch alone
   // while a sequence or an old-life wait step runs. (The persona routing's
-  // launch-or-approver member is an inline arrow, pinned separately, b.jg5
+
   // SRJ-1011.)
   const narrowCall = `(?:${LAUNCH_IN_FLIGHT}|${RETRY_BLOCK_CAUSE})\\(\\s*\\1\\s*\\)`
   const wrappers = [
@@ -823,7 +379,7 @@ function inFlightBindings(): { retryBlocked: string; workInFlight: string } {
   const broad = moduleFunction(workInFlight!)
   expect(broad.params).toHaveLength(1)
   const key = broad.params[0]!
-  expect(broad.body.replace(/\s+/g, ' ').trim()).toBe(`return ${retryBlocked}(${key}) || ${APPROVER_RUNNING}(${key})`)
+  expect(broad.body.replace(/\s+/g, ' ').trim()).toBe(`return ${retryBlocked}(${key})`)
 
   // The narrow one: its declaration, the retry action, the broad one's body
   // and the hold's version-changed listener (b.jg5 SRJ-207).
@@ -2388,42 +1944,6 @@ describe('main() installs one UNAVAILABLE retry controller as the trigger sink b
   // makes sure production binds the real one: a stub in-flight or cap read
   // would still launch over an in-flight launch or past the cap. Only these
   // members are pinned, not the full key set.
-  test('the controller\'s action is the full-mode retry action over the restart module\'s retry entry, the live applied persona lookup, the relaunch gate, the restart cap, the restart module\'s shutdown flag, "blocks a retry" (the session manager\'s personaRetryBlockCause answering a cause, never a running dialog approver) with that cause query, and its row read (readPersonaRowState)', () => {
-    expect(onlyCallProps('createUnavailableRetryController').get('action')!.startsWith('createFullModeRetryAction(')).toBe(true)
-    expect(importSource(SERVER_CODE, 'createFullModeRetryAction')).toBe('./unavailable-retry.ts')
-    const props = onlyCallProps('createFullModeRetryAction')
-
-    expect(props.get('retry')).toBe('runRestartRetry')
-    expect(importSource(SERVER_CODE, 'runRestartRetry')).toBe('./restart.ts')
-
-    // getAppliedPersona reads the holder at call time (pinned in tests/reload-wiring.test.ts).
-    expect(props.get('appliedPersona')).toBe('getAppliedPersona')
-
-    const gate = constOf('createPersonaRelaunchGate')
-    // The gate itself, or a call-time wrapper around it (the gate is declared
-    // after the controller is built).
-    const canRelaunch = props.get('canRelaunch')!
-    expect(canRelaunch === gate || new RegExp(`^\\(?(\\w+)\\)? => ${gate}\\(\\1\\)$`).test(canRelaunch)).toBe(true)
-
-    expect(props.get('isAtCap')).toMatch(/^\(?(\w+)\)? => backoffIsAtCap\(\1, RESTART_FAILURE_CAP\)$/)
-    expect(importSource(SERVER_CODE, 'backoffIsAtCap')).toBe('./backoff.ts')
-    expect(importSource(SERVER_CODE, 'RESTART_FAILURE_CAP')).toBe('./restart.ts')
-
-    expect(props.get('isShuttingDown')).toBeDefined()
-    expect(props.get('isShuttingDown')).toBe(onlyCallProps('initRestart').get('isShuttingDown')!)
-
-    // b.jg5 SRJ-303, SRJ-706, SRJ-811: "blocks a retry", a launch call, a
-    // running live-row sequence or an old-life wait step, so a running dialog
-    // approver alone never skips a retry (SRJ-401), and its cause query for
-    // the again-reason (see inFlightBindings).
-    expect(props.get(RETRY_IN_FLIGHT_MEMBER)).toBe(inFlightBindings().retryBlocked)
-    expect(props.get(RETRY_BLOCK_CAUSE_MEMBER)).toBe(RETRY_BLOCK_CAUSE)
-
-    // b.jg5 SRJ-303, SRJ-115: a pending-only retry's row read is the session
-    // manager's, one `status` call through the outage wrapper.
-    expect(props.get('readRow')).toBe('readPersonaRowState')
-    expect(importSource(SERVER_CODE, 'readPersonaRowState')).toBe('./session-manager.ts')
-  })
 
   // b.jg5 SRJ-314: the restart module's arm hook is optional (absent, nothing
   // is armed), so a production wiring that dropped it, or bound it to a stub
@@ -2510,58 +2030,16 @@ describe('main() installs one UNAVAILABLE retry controller as the trigger sink b
 })
 
 // ---------------------------------------------------------------------------
-// Static audit: b.jg5 SRJ-404 — shutdown stops every dialog approver
+
 //
-// The approver runs on its own after its launch returned (b.jg5 SRJ-401), so
+
 // nothing that shutdown already stops ends it: a wiring that dropped the
 // stop-all, ran it after the agent-director client is closed, or ran it only
 // after shutdown's awaits would type-check and pass every behaviour suite
-// while an approver kept reading panes and typing Enter on a row during
-// shutdown. What the stop-all does (every approver marked and woken, none
+
 // starts after it) is tested in tests/session-manager.test.ts and through the
 // recovery harness; pinned here: where shutdown calls it.
 // ---------------------------------------------------------------------------
-
-describe('shutdown stops every dialog approver exactly once, through the session manager\'s stop-all, after the shutting-down flag and the keep-alive stop and before the agent-director client is closed (b.jg5 SRJ-404)', () => {
-  // Tied to src by type: renaming it fails the typecheck.
-  const STOP_ALL: keyof typeof SessionManagerModule = 'stopAllDialogApprovers'
-
-  test('the stop-all is the session manager\'s import, declared nowhere in server.ts, and called exactly once in server.ts, in shutdown(), with no argument', () => {
-    expect(importSource(SERVER_CODE, STOP_ALL)).toBe('./session-manager.ts')
-    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${STOP_ALL}\\b`, 'g'), SERVER_CODE)).toEqual([])
-    // Its import and the one call are its only mentions: no alias, no second stop-all.
-    expect(indicesOf(new RegExp(`\\b${STOP_ALL}\\b`, 'g'), SERVER_CODE)).toHaveLength(2)
-    const at = onlyCallOf(STOP_ALL)
-    const [start, end] = shutdownBody(SERVER_CODE)
-    expect(at > start && at < end).toBe(true)
-    expect(onlyCallArguments(SERVER_CODE, STOP_ALL).trim()).toBe('')
-  })
-
-  test('in shutdown(), it comes after the shutting-down flag is raised and after stopAllKeepAliveTimers(), before shutdown first yields and before closeClient()', () => {
-    const [start, end] = shutdownBody(SERVER_CODE)
-    const inShutdown = (offset: number) => offset > start && offset < end
-    const at = onlyCallOf(STOP_ALL)
-
-    const raises = indicesOf(/(?<![\w.$])shuttingDown\s*=\s*true\b/g, SERVER_CODE)
-    expect(raises).toHaveLength(1)
-    expect(inShutdown(raises[0]!)).toBe(true)
-    expect(at).toBeGreaterThan(raises[0]!)
-
-    const keepAlives = indicesOf(/(?<![\w.$])stopAllKeepAliveTimers\s*\(\s*\)/g, SERVER_CODE).filter(inShutdown)
-    expect(keepAlives).toHaveLength(1)
-    expect(at).toBeGreaterThan(keepAlives[0]!)
-
-    // Before shutdown first yields: every approver is marked and woken before
-    // the transports and connections are awaited, so none types meanwhile.
-    const firstAwait = SERVER_CODE.slice(start, end).search(/\bawait\b/)
-    expect(firstAwait).toBeGreaterThan(-1)
-    expect(at).toBeLessThan(start + firstAwait)
-
-    const closes = indicesOf(/(?<![\w.$])closeClient\s*\(/g, SERVER_CODE).filter(inShutdown)
-    expect(closes).toHaveLength(1)
-    expect(at).toBeLessThan(closes[0]!)
-  })
-})
 
 // ---------------------------------------------------------------------------
 // Static audit: b.jg5 SRJ-706, SRJ-303 — the one live-row sequence registry
@@ -2654,7 +2132,7 @@ describe('main() builds the one live-row sequence registry and installs it befor
   // b.jg5 SRJ-811: the bare running query would refuse a restart over an
   // old-life wait on the persona's own row without arming its retry timer,
   // so nothing would retry it once the wait is over.
-  test('the restart work\'s running query is the session manager\'s gate (liveRowSequenceGate) for the key it is given and a site of its own, which also arms a persona whose own row carries an old-life wait; server.ts asks the bare running query nowhere', () => {
+  test('the restart work uses liveRowSequenceGate to arm old-life retries; the bare running query only guards reconnect deferral and delivery holds', () => {
     const query = onlyCallProps('initRestart').get(RESTART_QUERY)
     expect(query).toMatch(new RegExp(`^\\(?(\\w+)\\)? => ${RESTART_GATE}\\(\\1, '[^']+'\\)$`))
     expect(importSource(SERVER_CODE, RESTART_GATE)).toBe('./session-manager.ts')
@@ -2662,11 +2140,19 @@ describe('main() builds the one live-row sequence registry and installs it befor
     const gates = indicesOf(new RegExp(`\\b${RESTART_GATE}\\b`, 'g'), SERVER_CODE)
     expect(gates).toHaveLength(2)
     expect(withinCall(gates, onlyCallOf('initRestart'))).toBe(1)
-    // The bare query is neither imported nor called: its name appears only as
-    // the restart deps' member.
-    expect(importSource(SERVER_CODE, SEQUENCE_RUNNING)).toBeUndefined()
-    expect(callsOf(SEQUENCE_RUNNING)).toEqual([])
-    expect(indicesOf(new RegExp(`\\b${SEQUENCE_RUNNING}\\b`, 'g'), SERVER_CODE)).toHaveLength(1)
+    // GONE recovery must keep a running sequence from rearming reconnect
+    // deferral or allowing delivery keys, without replacing the restart gate.
+    expect(importSource(SERVER_CODE, SEQUENCE_RUNNING)).toBe('./session-manager.ts')
+    const calls = callsOf(SEQUENCE_RUNNING)
+    expect(calls).toHaveLength(4)
+    expect(withinCall(calls, onlyCallOf('initRestart'))).toBe(0)
+    const [start, end] = exportedFunctionBody('_buildReconnectSessionAdapter')
+    expect(calls.filter(at => at > start && at < end)).toHaveLength(3)
+    expect(withinCall(calls, onlyCallOf('createDeliveryEngines'))).toBe(1)
+    expect(onlyCallProps('createDeliveryEngines').get('isHeld')).toMatch(new RegExp(`\\|\\| ${SEQUENCE_RUNNING}\\(key\\)$`))
+    for (const at of calls) expect(callArguments(SERVER_CODE, at).trim()).toBe('key')
+    // One import, four calls and the restart dependency's member name.
+    expect(indicesOf(new RegExp(`\\b${SEQUENCE_RUNNING}\\b`, 'g'), SERVER_CODE)).toHaveLength(6)
   })
 
   test('shutdown() closes the registry exactly once, through its holder, after the shutting-down flag, before the retry controller closes, before it first yields and before closeClient(); nothing else closes or stops every sequence', () => {
@@ -2853,12 +2339,12 @@ describe('main() passes the full-mode retry action the pending-row step, retryPe
 
 // ---------------------------------------------------------------------------
 // Static audit: b.jg5 SRJ-303, SRJ-305, SRJ-404 — one retry run gate for the
-// retry action and the pending-row rule's approver-stop run
+
 //
-// `PendingRowRuleInstall.gate` is optional (absent, the approver-stop run is
+
 // dropped only at shutdown), and the retry action takes any applied, latched,
 // held, up, cap and shutdown reads. So a production wiring that dropped the
-// install's gate, or gave the approver-stop run a second hand-made gate that
+
 // drifts from the retry action's, would type-check and pass every behaviour
 // suite while a run queued behind P's teardown made calls for a key outside
 // the applied set. What the gate does is tested in tests/pending-row.test.ts
@@ -2920,15 +2406,15 @@ describe('main() builds one retry run gate, spreads it into the full-mode retry 
 // Static audit: b.jg5 SRJ-410, SRJ-404 — main()'s one pending-row rule
 //
 // The session manager's install is optional (with none installed, a retry or
-// an approver's stop that would run the rule logs one line and keeps the
+
 // pending-only arm only), and its dependency builder takes any lookup,
 // episodes and log. So a production wiring that dropped the install, built
 // the rule over a hand-made deps object, gave its held post episodes other
 // than the one notice episodes instance (whose posts the stuck-launch
-// episode counts), ran the approver-stop run outside the persona's lifecycle
+
 // serializer, or installed the rule after the start pass would type-check and
 // pass every behaviour suite. The rule is reached from the retry action, the
-// restart deferral and the approver's stop over this one instance. What it
+
 // does is tested in tests/pending-row.test.ts and through the recovery
 // harness, which composes it the same way; pinned here: the build and the
 // install.
@@ -2942,7 +2428,6 @@ describe('main() builds the one pending-row rule through its factory over the se
   const RESET: keyof typeof SessionManagerModule = '_resetPendingRowRule'
   const REGISTRY_INSTALL: keyof typeof SessionManagerModule = 'setLiveRowSequenceRegistry'
   const START_SWEEP: keyof typeof SessionManagerModule = 'reconcileOrphans'
-  const RULE: keyof PendingRowRuleInstall = 'rule'
   const SERIALIZE: keyof PendingRowRuleInstall = 'serialize'
   const GATE: keyof PendingRowRuleInstall = 'gate'
   const APPLIED: keyof PendingRowRuleDepsInput = 'appliedPersona'
@@ -2961,26 +2446,6 @@ describe('main() builds the one pending-row rule through its factory over the se
     // Named in server.ts only at its import and this call; the test-only reset never.
     expect(indicesOf(new RegExp(`\\b${INSTALL}\\b`, 'g'), SERVER_CODE)).toHaveLength(2)
     expect(indicesOf(new RegExp(`\\b${RESET}\\b`, 'g'), SERVER_CODE)).toEqual([])
-  })
-
-  test('the install is exactly the rule, the pending-row module\'s factory called on the session manager\'s one dependency builder, the persona lifecycle serializer\'s run, the turn the approver-stop run takes, and the retry run\'s gate, the very object the retry action spreads (b.jg5 SRJ-404, SRJ-305)', () => {
-    const props = onlyCallProps(INSTALL)
-    expect([...props.keys()].sort()).toEqual([RULE, SERIALIZE, GATE].sort())
-    expect(props.get(SERIALIZE)).toBe(`${constOf('createPersonaSerializer')}.run`)
-    // The gate is bound by its bare name: the same object, never a copy.
-    expect(props.get(GATE)).toBe(retryRunGate().name)
-    const rule = props.get(RULE)!
-    expect(rule.startsWith(`${FACTORY}(`)).toBe(true)
-    const ruleArgs = splitTopLevel(onlyCallArguments(rule, FACTORY))
-    expect(ruleArgs).toHaveLength(1)
-    expect(ruleArgs[0]!.startsWith(`${BUILDER}(`)).toBe(true)
-    expect(importSource(SERVER_CODE, FACTORY)).toBe('./pending-row.ts')
-    expect(importSource(SERVER_CODE, BUILDER)).toBe('./session-manager.ts')
-    for (const name of [FACTORY, BUILDER]) {
-      expect([name, indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${name}\\b`, 'g'), SERVER_CODE)]).toEqual([name, []])
-      // Called once in server.ts, inside the install.
-      expect([name, withinCall([onlyCallOf(name)], onlyCallOf(INSTALL))]).toEqual([name, 1])
-    }
   })
 
   test('the rule\'s dependencies are exactly the live applied-persona lookup, the one notice episodes instance (its held post\'s), built before the install, and the server log', () => {
@@ -3880,7 +3345,7 @@ describe('main() builds the one per-persona latch, in server memory only, before
     // re-check's build (its `latch` input) and its binding (b.jg5 SRJ-505;
     // both pinned in the re-check's describe below), the session
     // manager's install, the retry run's gate's latched query (the retry
-    // action's and the approver-stop run's, b.jg5 SRJ-404), the health
+
     // check's latched query, and the persona teardown's latch forget (b.jg5 SRJ-504; its
     // form is pinned in tests/reload-wiring.test.ts); twice inside the restart
     // module's call: its own latched query and the reconnect adapter's, asked
@@ -4668,12 +4133,10 @@ describe('main() builds the one ErrInvalidFlags hold before the start pass, inst
 describe('server.ts binds the persona routing\'s lost-message state inputs to the one latch, the one tmux-unresponsive condition, the one kill-failure alerts\' episode or the old-life hold\'s kill-failed mark, and the session manager\'s launch-in-flight, approver-running and sequence-or-wait queries, each read at call time (b.jg5 SRJ-1011, SRJ-502, SRJ-307, SRJ-401, SRJ-704, SRJ-812)', () => {
   /** The session manager's old-life kill-failed query (b.jg5 SRJ-812); renaming it fails the typecheck. */
   const KILL_FAILED_HOLD: keyof typeof SessionManagerModule = 'waitsOnKillFailedHold'
-  /** The session manager's sequence-or-wait query (b.jg5 SRJ-811, SRJ-1011); renaming it fails the typecheck. */
-  const SEQUENCE_OR_WAIT: keyof typeof SessionManagerModule = 'isSequenceOrOldLifeWaitRunning'
   // Tied to src by type: renaming any of these fails the typecheck.
   const IS_LATCHED: keyof ConflictLatch = 'isLatched'
   const HOLDS: keyof TmuxUnresponsiveCondition = 'holds'
-  const LAUNCH_RUNNING: keyof PersonaRoutingDeps = 'isLaunchOrApproverRunning'
+  const LAUNCH_RUNNING: keyof PersonaRoutingDeps = 'isLaunchRunning'
   const KILL_FAILED: keyof PersonaRoutingDeps = 'isKillFailed'
   const IS_OPEN: keyof KillFailureAlerts = 'isOpen'
   /** The sequence/wait input (b.jg5 SRJ-706, SRJ-1011): a running live-row sequence (or an old-life wait step) reports `restarting`. */
@@ -4706,31 +4169,13 @@ describe('server.ts binds the persona routing\'s lost-message state inputs to th
   })
 
   // b.jg5 SRJ-1011 ruling ("two separate inputs"): state 6's input is a
-  // launch call or the dialog approver that runs after it returned, in its own
+
   // registry (SRJ-401), each asked of the session manager for the key at call
   // time; it is neither named in-flight binding main() builds (see
   // inFlightBindings), which later Epics widen with work that must report
   // `restarting` instead. "In flight for P" is named in the routing's call
   // only as its read gate's in-flight member (see the read-gate describe
   // below), and "blocks a retry" not at all.
-  test('the launch-or-approver query answers, for the key it is given, from the session manager\'s isLaunchInFlight and its isDialogApproverRunning, read at call time, separate from both in-flight bindings (state 6, starting)', () => {
-    const binding = onlyCallProps('createPersonaRouting').get(LAUNCH_RUNNING)
-    expect(binding).toBeDefined()
-    const launch = `${LAUNCH_IN_FLIGHT}\\(\\1\\)`
-    const approver = `${APPROVER_RUNNING}\\(\\1\\)`
-    expect(binding).toMatch(new RegExp(`^\\(?(\\w+)\\)? => (?:${launch} \\|\\| ${approver}|${approver} \\|\\| ${launch})$`))
-    // inFlightBindings also pins both queries to the session manager's
-    // imports, declared nowhere in server.ts.
-    const { retryBlocked, workInFlight } = inFlightBindings()
-    const props = onlyCallProps('createPersonaRouting')
-    const naming = (name: string) => [...props].filter(([, value]) => new RegExp(`\\b${name}\\b`).test(value)).map(([member]) => member)
-    expect(naming(workInFlight)).toEqual([ROUTING_WORK_IN_FLIGHT])
-    expect(naming(retryBlocked)).toEqual([])
-    // The approver-running query is asked only here and in "in flight for P".
-    const asked = indicesOf(new RegExp(`(?<![\\w.$])${APPROVER_RUNNING}\\s*\\(`, 'g'), SERVER_CODE)
-    expect(asked).toHaveLength(2)
-    expect(withinCall(asked, onlyCallOf('createPersonaRouting'))).toBe(1)
-  })
 
   // b.jg5 SRJ-1011 state 4, SRJ-704 (E20), SRJ-812 (E27): P's kill-failure
   // episode is open, or P waits on an old-life hold whose old key's kill
@@ -4758,15 +4203,6 @@ describe('server.ts binds the persona routing\'s lost-message state inputs to th
   // time (the registry, the hold set and the wait's bindings are installed in
   // main(), after the routing is built), never the bare sequence query (which
   // misses a wait step for a hold P waits on) nor the state-6
-  // launch-or-approver member (whose exact form is pinned above).
-  test('the sequence/wait query answers, for the key it is given, from the session manager\'s isSequenceOrOldLifeWaitRunning at call time; the state-6 launch-or-approver member does not include it', () => {
-    const props = onlyCallProps('createPersonaRouting')
-    expect(props.get(SEQUENCE_WAIT)).toMatch(new RegExp(`^\\(?(\\w+)\\)? => ${SEQUENCE_OR_WAIT}\\(\\1\\)$`))
-    expect(props.get(LAUNCH_RUNNING)).not.toContain(SEQUENCE_OR_WAIT)
-    expect(importSource(SERVER_CODE, SEQUENCE_OR_WAIT)).toBe('./session-manager.ts')
-    // Named in server.ts only at its import and this member.
-    expect(indicesOf(new RegExp(`\\b${SEQUENCE_OR_WAIT}\\b`, 'g'), SERVER_CODE)).toHaveLength(2)
-  })
 
   // b.jg5 SRJ-1011 state 3, SRJ-207: P is held on ErrInvalidFlags. The
   // hold is built in main() (pinned in the hold's describe above); the
@@ -4867,9 +4303,9 @@ describe('server.ts binds the persona routing\'s read gate to "in flight for P" 
   }
 
   // b.jg5 SRJ-1011, SRJ-401: the gate reads no row while a launch call or a
-  // running dialog approver is in flight for P, as the health tick makes no
+
   // attempt then; the retry action gets the narrow "blocks a retry", since a
-  // running approver never skips a retry (SRJ-303).
+
   test('the read gate\'s in-flight member is "in flight for P", bound by its bare name: the very binding the health tick\'s isLaunchInFlight gets, not "blocks a retry", which the full-mode retry action\'s isInFlight gets (see inFlightBindings)', () => {
     const { retryBlocked, workInFlight } = inFlightBindings()
     expect([
@@ -4945,12 +4381,8 @@ describe('the session-disconnect handler and the routing\'s retry-timer arm deci
   const BUILD: keyof typeof ServerModule = '_buildRestartDisconnectedPersona'
   const CHECK: keyof typeof ServerModule = 'armMissingTmuxUnavailableRetry'
   const ROUTING_ARM: keyof PersonaRoutingDeps = 'armRetryTimerIfMissing'
-  const GET_FLAGS: keyof typeof OutageStateModule = 'getOutageFlags'
   const IS_ARMED: keyof UnavailableRetryController = 'isArmed'
   const IS_LATCHED: keyof ConflictLatch = 'isLatched'
-  const CHECK_MEMBERS: Array<keyof TmuxUnavailableRetryDeps> = [
-    'isTmuxUnavailable', 'isRetryArmed', CHECK_LATCHED, CHECK_IN_FLIGHT, 'armRetryTimer', 'log',
-  ]
   const HANDLER_MEMBERS: Array<Exclude<keyof RestartDisconnectedPersonaDeps, keyof TmuxUnavailableRetryDeps>> = [
     'getPersona', 'scheduleRestart', 'isShuttingDown',
   ]
@@ -4991,28 +4423,6 @@ describe('the session-disconnect handler and the routing\'s retry-timer arm deci
     const calls = callsOf(DISCONNECT_HANDLER).map((at) => splitTopLevel(callArguments(SERVER_CODE, at)))
     expect(calls.map((callArgs) => callArgs[1]).sort()).toEqual(["' (SSE abort)'", "''"])
     for (const callArgs of calls) expect(callArgs).toHaveLength(2)
-  })
-
-  test('the production deps are exactly the six members, each read at call time: the outage state\'s tmux-unavailable flag, the one retry controller\'s isArmed through its handle, the one latch through the routing\'s holder (=== true), "in flight for P" as the health tick takes it (a running dialog approver included), the one ENVIRONMENT arm path and the server log; nothing else names them but the handler\'s build and the routing\'s arm', () => {
-    const { name, props } = retryCheckDeps()
-    expect([...props.keys()].sort()).toEqual([...CHECK_MEMBERS].sort())
-
-    expect(props.get('isTmuxUnavailable')).toMatch(new RegExp(`^\\(?(\\w+)\\)? => ${GET_FLAGS}\\(\\1\\)\\.has\\('${TMUX_UNAVAILABLE_CLASS}'\\)$`))
-    expect(importSource(SERVER_CODE, GET_FLAGS)).toBe('./outage-state.ts')
-    expect(indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${GET_FLAGS}\\b`, 'g'), SERVER_CODE)).toEqual([])
-
-    // The handle is assigned only the one controller (pinned in the controller's describe).
-    expect(props.get('isRetryArmed')).toMatch(new RegExp(`^\\(?(\\w+)\\)? => ${retryHandle()}\\?\\.${IS_ARMED}\\(\\1\\)$`))
-    routingHolder(ROUTING_LATCHED, IS_LATCHED, constOf(LATCH_FACTORY), [CHECK_LATCHED])
-    // It mirrors the health tick's own check, so it follows the tick (b.jg5 SRJ-315, SRJ-401).
-    expect(props.get(CHECK_IN_FLIGHT)).toBe(inFlightBindings().workInFlight)
-    expect(props.get('armRetryTimer')).toBe(ENVIRONMENT_ARM)
-    expect(props.get('log')).toMatch(/^\(?(\w+)\)? => console\.error\(\1\)$/)
-
-    // Its declaration, the handler build's spread and the routing's arm.
-    expect(indicesOf(new RegExp(`\\b${name}\\b`, 'g'), SERVER_CODE)).toHaveLength(3)
-    const [open, close] = balancedAfter(SERVER_CODE, onlyCallOf('createPersonaRouting'), '(', ')')
-    expect(indicesOf(new RegExp(`\\b${name}\\b`, 'g'), SERVER_CODE.slice(open, close))).toHaveLength(1)
   })
 
   test('the routing\'s armRetryTimerIfMissing does nothing while shutting down (the restart module\'s flag, asked first), else asks the check for the key it is given over the production deps, with the lost-message arm line; the check is called nowhere else but in the handler\'s builder', () => {
@@ -5357,57 +4767,6 @@ describe('main() binds what a hold refuses: the held-directory query into the MC
 // it a fresh session's transcript is never found). What each does is tested in tests/health-check.test.ts and
 // tests/session-manager.test.ts.
 // ---------------------------------------------------------------------------
-
-describe('server.ts wires the b.f2b stale-working-row recovery', () => {
-  test('the health check gets "in flight for P" ("blocks a retry" or the session manager\'s isDialogApproverRunning), hasPendingWorkingRowEvidence, notifyDisconnectedWithAutoRestartDisabled and forgetNotConnectedEpisode, and reads session_restart_delay 0 from the config the restart module reads', () => {
-    const props = onlyCallProps('initHealthCheck')
-    // b.jg5 SRJ-315, SRJ-401: "in flight for P", built from "blocks a retry"
-    // and the approver-running query (see inFlightBindings), so the tick makes
-    // no attempt while only P's dialog approver runs.
-    expect(props.get(TICK_IN_FLIGHT_MEMBER)).toBe(inFlightBindings().workInFlight)
-    // A module-scope function declaration (the helper pins it), so the tick's
-    // binding reads the one declaration in scope wherever main() binds it.
-    for (const [dep, value] of [
-      ['hasPendingWorkingRowEvidence', 'hasPendingWorkingRowEvidence'],
-      ['notifyNotConnected', 'notifyDisconnectedWithAutoRestartDisabled'],
-      // A healthy tick ends the persona's not-connected episode.
-      ['endNotConnectedEpisode', 'forgetNotConnectedEpisode'],
-    ] as const) {
-      expect([dep, props.get(dep)]).toEqual([dep, value])
-      expect([value, importSource(SERVER_CODE, value)]).toEqual([value, './session-manager.ts'])
-    }
-    const delay = onlyCallProps('initRestart').get('getRestartDelay')?.match(/^\(\) => (\w+)\.session_restart_delay$/)
-    expect(delay).not.toBeNull()
-    expect(props.get('isAutoRestartDisabled')).toBe(`() => ${delay![1]}.session_restart_delay === 0`)
-  })
-
-  test('the restart module\'s reconnect is the reconnect adapter over the live applied persona lookup, getAppliedPersona, which locates a working row\'s transcript under the persona\'s claude_config_dir, and the one latch\'s latched query, asked right before /mcp reconnect is typed (b.jg5 SRJ-502)', () => {
-    // Tied to src by type: renaming it fails the typecheck.
-    const IS_LATCHED: keyof ConflictLatch = 'isLatched'
-    const latch = constOf(LATCH_FACTORY)
-    const reconnect = onlyCallProps('initRestart').get('reconnectSession')!
-    expect(reconnect).toMatch(new RegExp(`^${RECONNECT_ADAPTER}\\(getAppliedPersona, \\(?(\\w+)\\)? => ${latch}\\.${IS_LATCHED}\\(\\1\\)\\)$`))
-    // The only adapter built (its declaration aside), and it is the one the
-    // restart module gets: no reconnect path without the lookup or the latch.
-    const adapter = onlyReconnectAdapterBuild()
-    const [open, close] = balancedAfter(SERVER_CODE, onlyCallOf('initRestart'), '(', ')')
-    expect(adapter > open && adapter < close).toBe(true)
-    expect(reconnectAdapterArgs()).toHaveLength(2)
-  })
-
-  test('handleInitialized ends the persona\'s not-connected episode once its session is registered: forgetNotConnectedEpisode(persona.key), the session manager\'s, right after registerSession', () => {
-    const decl = SERVER_CODE.search(/\basync\s+function\s+handleInitialized\s*\(/)
-    expect(decl).toBeGreaterThan(-1)
-    const [, paramsEnd] = balancedAfter(SERVER_CODE, decl, '(', ')')
-    const [start, end] = balancedAfter(SERVER_CODE, paramsEnd + 1, '{', '}')
-    const forget = onlyCallOf('forgetNotConnectedEpisode')
-    expect(forget > start && forget < end).toBe(true)
-    expect(onlyCallArgs('forgetNotConnectedEpisode')).toEqual(['persona.key'])
-    const register = onlyCallOf('registerSession')
-    expect(register > start && register < forget).toBe(true)
-    expect(importSource(SERVER_CODE, 'forgetNotConnectedEpisode')).toBe('./session-manager.ts')
-  })
-})
 
 // ---------------------------------------------------------------------------
 // Static audit: a persona that is not up is refused service (SR-6.3, SR-6.4)
@@ -6170,8 +5529,8 @@ describe('typed delivery reporting production wiring', () => {
     expect(engine.get('inspectUpgrade')).toContain('deliveryScope.run(key, client as Client, beforeCall,')
     expect(engine.get('inspectUpgrade')).toContain('inspectPersonaUpgrade(key, getAppliedPersona(key))')
     const life = onlyCallProps('createDeliveryLifecycle')
-    expect(life.get('onReconnectScreen')).toContain("type: 'reconnect-screen'")
-    expect(onlyCallProps('createDeliveryReporting').get('reconnectBlocked')).toContain("reason: 'reconnect-blocked'")
+    expect(life.has('onReconnectScreen')).toBe(false)
+    expect(onlyCallProps('createDeliveryReporting').has('reconnectBlocked')).toBe(false)
   })
   test('durable completion adds configured reactions through the persona own client and pairs its remover', () => {
     const effect = onlyCallProps('createDeliveryReporting').get('delivered')!

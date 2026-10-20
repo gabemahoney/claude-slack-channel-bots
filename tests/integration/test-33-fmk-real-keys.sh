@@ -15,7 +15,7 @@ real_wait_launch "${REAL_KEY}"
 real_fault send-keys key=Enter swallow 1
 real_dm "${REAL_LABEL}" 'one swallowed Enter'
 wait_until 180 'Enter was not swallowed' case_assert enter-fault 1
-real_record_pane "${REAL_KEY}"
+real_record_state "${REAL_KEY}"
 real_wait_delivery "${REAL_KEY}" 1
 case_assert key-proof 1 enter
 real_wait_idle "${REAL_KEY}"
@@ -26,10 +26,13 @@ case_assert key-proof 2 retype
 real_wait_idle "${REAL_KEY}"
 real_fault send-keys no_enter swallow 3
 real_dm "${REAL_LABEL}" 'three swallowed texts'
-real_wait_delivery "${REAL_KEY}" 3
+# Recovery Enter and receipt timeouts put the fourth text attempt near 202s.
+# Bound this leg explicitly without changing the other waits or retry backoff.
+REAL_DELIVERY_WAIT_S=300 real_wait_delivery "${REAL_KEY}" 3
 case_assert key-proof 3 spacing
 # Restart an UNCONFIRMED head during its growing retry episode; the new
-# launch starts its spacing over, rather than inheriting the old backoff.
+# launch restarts at 10s, then uses two guarded 30s recovery stages. Prove
+# each durable Enter/text stage and its launch identity, not a text-gap bound.
 real_wait_idle "${REAL_KEY}"
 real_fault send-keys no_enter swallow 3
 real_dm "${REAL_LABEL}" 'restart resets an in-flight retry episode'
@@ -54,7 +57,7 @@ real_wait_idle "${REAL_KEY}"
 real_fault send-keys key=Enter swallow 1
 real_dm "${REAL_LABEL}" "$(python3 -c 'print("x"*5000,end="")')"
 wait_until 180 'large-part Enter was not swallowed' case_assert enter-fault 2
-real_record_pane "${REAL_KEY}"
+real_record_state "${REAL_KEY}"
 real_wait_delivery "${REAL_KEY}" 7
 case_assert key-proof 7 enter
 

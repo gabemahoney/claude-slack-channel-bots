@@ -115,8 +115,8 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
-  readdirSync,
   readFileSync,
+  readdirSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -124,6 +124,98 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, join, relative, resolve } from 'node:path'
+import {
+  AD_ERROR_CLASS_CONFIG,
+  AD_ERROR_CLASS_CONFLICT,
+  AD_ERROR_CLASS_DIRECTORY,
+  AD_ERROR_CLASS_ENVIRONMENT,
+  AD_ERROR_CLASS_GONE,
+  AD_ERROR_CLASS_LAUNCH_FAILURE,
+  AD_ERROR_CLASS_STATE,
+  AD_ERROR_CLASS_UNAVAILABLE,
+  AD_ERROR_CLASS_UNCLASSIFIED,
+  AD_ERROR_CLASS_UNUSABLE_NAME,
+  describeReportedAdFailure,
+  type AdErrorClass,
+} from '../src/ad-error-class.ts'
+import { getClient, resetClientForTests, setClientForTests } from '../src/agent-director-client.ts'
+import {
+  AgentDirectorError,
+  ERR_SCHEMA_MISMATCH_NAME,
+  ERR_SPAWN_NOT_FOUND_NAME,
+  ErrCallTimeout,
+  STORE_OPEN_ERR_NAMES,
+} from '../src/agent-director-errors.ts'
+import {
+  REFUSAL_KIND_BELOW_PHASE1_FLOOR,
+  REFUSAL_KIND_CLIENT_TOO_OLD,
+  REFUSAL_KIND_OTHER,
+  runStartupGate,
+  type StartupGateDeps,
+  type StartupGateFailure,
+  type StartupGateOptions,
+  type StartupGateRefusalKind,
+} from '../src/agent-director-startup.ts'
+import type * as ChannelDeliveryModule from '../src/channel-delivery.ts'
+import {
+  CHANNEL_DELIVERY_FILE_NAME,
+  CHANNEL_DELIVERY_LOG_PREFIX,
+  CHANNEL_DELIVERY_UNREADABLE,
+  channelDeliveryPath,
+} from '../src/channel-delivery.ts'
+import {
+  KILL_OUTCOME_ROW_FINISHED,
+  KILL_OUTCOME_SESSION_GONE,
+  KILL_ROW_FINISHED_ENDED,
+  describeKillOutcome,
+  killOutcomeOf,
+  type AnyKillOutcome,
+} from '../src/checked-kill.ts'
+import {
+  CLEAR_LATCH_COMMAND,
+  serverPortFilePath,
+  writeServerPortRecord,
+  type ClearLatchDialAnswer,
+} from '../src/clear-latch.ts'
+import {
+  AD_CONFIG_FILE_DISPLAY_NAME,
+  CLEAN_RESTART_NOT_RESTARTED_LABEL,
+  CLI_COMMAND_CLEAN_RESTART,
+  CLI_COMMAND_STOP_BOTS,
+  CLI_TEARDOWN_FAILED_LABEL,
+  PAUSE_VERDICT_ESCALATE,
+  PAUSE_VERDICT_FAIL,
+  PAUSE_VERDICT_RETRY,
+  PRECHECK_CALL_GET,
+  PRECHECK_CALL_READ_PANE,
+  PRECHECK_TRIES,
+  PRECHECK_TRY_SPACING_MS,
+  TEARDOWN_KILL_OPTIONS,
+  TEARDOWN_POLL_FIRST_WAIT_MS,
+  TEARDOWN_POLL_MAX_WAIT_MS,
+  agentDirectorInitFailedLine,
+  answerCheckFailedTryLine,
+  cleanRestartNotRestartedAlert,
+  cleanRestartStartFailedLine,
+  cleanRestartStartingAfterFailedTeardownLine,
+  exitTimeoutMsOf,
+  onlyServerStoppedLine,
+  precheckBoundMs,
+  precheckFailureLine,
+  precheckNothingStoppedLine,
+  precheckVerdictOf,
+  teardownBoundMs,
+  teardownErrorReportOf,
+  teardownFailureLine,
+  teardownKillReadOf,
+  teardownNotStoppedLine,
+  type CleanRestartFailedPersona,
+  type CliTeardownCommand,
+  type CliTeardownPersona,
+  type PrecheckCall,
+  type PrecheckFailure,
+  type PrecheckRow,
+} from '../src/cli-teardown.ts'
 import {
   CLEAR_LATCH_USAGE,
   CLEAR_LATCH_USAGE_ENTRY,
@@ -148,91 +240,20 @@ import {
   type InitClientGateOptions,
 } from '../src/cli.ts'
 import {
-  CLEAR_LATCH_COMMAND,
-  serverPortFilePath,
-  writeServerPortRecord,
-  type ClearLatchDialAnswer,
-} from '../src/clear-latch.ts'
-import {
-  AD_CONFIG_FILE_DISPLAY_NAME,
-  CLEAN_RESTART_NOT_RESTARTED_LABEL,
-  CLI_COMMAND_CLEAN_RESTART,
-  CLI_COMMAND_STOP_BOTS,
-  PRECHECK_CALL_GET,
-  PRECHECK_CALL_READ_PANE,
-  PRECHECK_TRIES,
-  PRECHECK_TRY_SPACING_MS,
-  PAUSE_VERDICT_ESCALATE,
-  PAUSE_VERDICT_FAIL,
-  PAUSE_VERDICT_RETRY,
-  TEARDOWN_POLL_FIRST_WAIT_MS,
-  TEARDOWN_KILL_OPTIONS,
-  TEARDOWN_POLL_MAX_WAIT_MS,
-  teardownKillReadOf,
-  CLI_TEARDOWN_FAILED_LABEL,
-  agentDirectorInitFailedLine,
-  answerCheckFailedTryLine,
-  cleanRestartNotRestartedAlert,
-  cleanRestartStartFailedLine,
-  cleanRestartStartingAfterFailedTeardownLine,
-  exitTimeoutMsOf,
-  onlyServerStoppedLine,
-  precheckBoundMs,
-  precheckFailureLine,
-  precheckNothingStoppedLine,
-  precheckVerdictOf,
-  teardownBoundMs,
-  teardownErrorReportOf,
-  teardownFailureLine,
-  teardownNotStoppedLine,
-  type CleanRestartFailedPersona,
-  type CliTeardownCommand,
-  type CliTeardownPersona,
-  type PrecheckCall,
-  type PrecheckFailure,
-  type PrecheckRow,
-} from '../src/cli-teardown.ts'
-import {
-  AD_ERROR_CLASS_CONFIG,
-  AD_ERROR_CLASS_CONFLICT,
-  AD_ERROR_CLASS_DIRECTORY,
-  AD_ERROR_CLASS_ENVIRONMENT,
-  AD_ERROR_CLASS_GONE,
-  AD_ERROR_CLASS_LAUNCH_FAILURE,
-  AD_ERROR_CLASS_STATE,
-  AD_ERROR_CLASS_UNAVAILABLE,
-  AD_ERROR_CLASS_UNCLASSIFIED,
-  AD_ERROR_CLASS_UNUSABLE_NAME,
-  describeReportedAdFailure,
-  type AdErrorClass,
-} from '../src/ad-error-class.ts'
-import {
-  AgentDirectorError,
-  ERR_SCHEMA_MISMATCH_NAME,
-  ERR_SPAWN_NOT_FOUND_NAME,
-  ErrCallTimeout,
-  STORE_OPEN_ERR_NAMES,
-} from '../src/agent-director-errors.ts'
-import { AGENT_DIRECTOR_DEAD_STATES, AGENT_DIRECTOR_LIVE_STATES, AGENT_DIRECTOR_PENDING_STATE } from '../src/liveness-reading.ts'
-import {
-  REFUSAL_KIND_BELOW_PHASE1_FLOOR,
-  REFUSAL_KIND_CLIENT_TOO_OLD,
-  REFUSAL_KIND_OTHER,
-  runStartupGate,
-  type StartupGateDeps,
-  type StartupGateFailure,
-  type StartupGateOptions,
-  type StartupGateRefusalKind,
-} from '../src/agent-director-startup.ts'
-import { getClient, resetClientForTests, setClientForTests } from '../src/agent-director-client.ts'
-import {
-  KILL_OUTCOME_ROW_FINISHED,
-  KILL_OUTCOME_SESSION_GONE,
-  KILL_ROW_FINISHED_ENDED,
-  describeKillOutcome,
-  killOutcomeOf,
-  type AnyKillOutcome,
-} from '../src/checked-kill.ts'
+  CONFIG_NOT_REGULAR_FILE_CODE,
+  DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
+  DEFAULT_PERSONA_CONFIG_FS,
+  MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
+  MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
+  loadPersonaConfig,
+  prePersonaConversionMessage,
+  resolveServerConfigPath,
+  resolveServerStateDir,
+  type PersonaConfig,
+  type PersonaConfigFs,
+  type PersonaConfigInput,
+} from '../src/config.ts'
+import { AD_BELOW_PHASE1_FLOOR, AD_SYSTEM_INSTALL_NOT_FOUND, AD_SYSTEM_INSTALL_TOO_OLD } from '../src/install-check.ts'
 import {
   KILL_FAILURE_ORDINARY_CLI_TEARDOWN_CLOSING,
   KILL_FAILURE_SURVIVOR_CLI_TEARDOWN_CLOSING,
@@ -244,19 +265,16 @@ import {
   killFailureCliTeardownEntryContext,
   type KillFailureOrdinaryQuotes,
 } from '../src/kill-failure-alert.ts'
-import { appendLogLine } from '../src/logging.ts'
-import { describeThrownValue } from '../src/persona-connection-errors.ts'
-import { recordStartupError } from '../src/startup-errors.ts'
 import {
   KILL_RETRY_ALERT_NONE,
   KILL_RETRY_ALERT_ORDINARY,
   KILL_RETRY_END_READ_CONFIG,
+  KILL_RETRY_END_ROW_FINISHED,
   KILL_RETRY_END_SETTLED,
+  KILL_RETRY_NEXT_AGAIN,
   KILL_RETRY_NEXT_NOT_RETRIED,
   KILL_RETRY_SPACING_MS,
   KILL_RETRY_TRIES,
-  KILL_RETRY_END_ROW_FINISHED,
-  KILL_RETRY_NEXT_AGAIN,
   KILL_RETRY_VERDICT_FINISHED,
   KILL_RETRY_VERDICT_GO,
   killRetryEndLine,
@@ -264,47 +282,15 @@ import {
   killRetrySeedOfState,
   killRetryTryLine,
 } from '../src/kill-retry.ts'
-import { buildBelowPhase1FloorMessage } from '../src/ad-version-gate.ts'
-import { AD_BELOW_PHASE1_FLOOR, AD_SYSTEM_INSTALL_NOT_FOUND, AD_SYSTEM_INSTALL_TOO_OLD } from '../src/install-check.ts'
-import {
-  CONFIG_NOT_REGULAR_FILE_CODE,
-  DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
-  DEFAULT_PERSONA_CONFIG_FS,
-  loadPersonaConfig,
-  MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
-  MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
-  prePersonaConversionMessage,
-  resolveServerConfigPath,
-  resolveServerStateDir,
-  type PersonaConfig,
-  type PersonaConfigFs,
-  type PersonaConfigInput,
-} from '../src/config.ts'
-import { SERVICE_LABEL, personaInstanceId, personaKey, personaTmuxSessionName, renderPersonaRef } from '../src/persona-identity.ts'
+import { AGENT_DIRECTOR_DEAD_STATES, AGENT_DIRECTOR_LIVE_STATES, AGENT_DIRECTOR_PENDING_STATE } from '../src/liveness-reading.ts'
+import { appendLogLine } from '../src/logging.ts'
 import { PROBE_PANE_READ_LINES } from '../src/pane-read.ts'
+import { describeThrownValue } from '../src/persona-connection-errors.ts'
+import { SERVICE_LABEL, personaInstanceId, personaKey, personaTmuxSessionName, renderPersonaRef } from '../src/persona-identity.ts'
 import { readAppliedPersonaConfig } from '../src/reload.ts'
-import { RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY, RETIRED_KEY_CAUSE_REMOVED, retiredKeysPath } from '../src/retired-keys.ts'
 import type * as RetiredKeysModule from '../src/retired-keys.ts'
-import {
-  CHANNEL_DELIVERY_FILE_NAME,
-  CHANNEL_DELIVERY_LOG_PREFIX,
-  CHANNEL_DELIVERY_UNREADABLE,
-  channelDeliveryPath,
-} from '../src/channel-delivery.ts'
-import type * as ChannelDeliveryModule from '../src/channel-delivery.ts'
-import {
-  APP_TOKEN_PREFIX,
-  assertNoLeak,
-  BOT_TOKEN_PREFIX,
-  fakeToken,
-  LEAK_SENTINEL,
-  REDACTED_SENTINEL_TAIL,
-  sentinelInMessage,
-  writeCredentialsFile,
-  writtenFile,
-} from './test-helpers/credentials.ts'
-import { UNKNOWN_STATE, cliAlertLine, teardownKillFailedDescription } from './test-helpers/cli-teardown.ts'
-import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
+import { RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY, RETIRED_KEY_CAUSE_REMOVED, retiredKeysPath } from '../src/retired-keys.ts'
+import { recordStartupError } from '../src/startup-errors.ts'
 import {
   CONFLICT_CASES,
   KILL_FAILED_DESCRIPTIONS,
@@ -343,15 +329,29 @@ import {
   errUnknownErrorName,
   errUnusableName,
   makePassingGateDeps,
-  provenanceNote,
   makeStubCallLog,
   makeStubClient,
   makeStubCreateClient,
+  provenanceNote,
   stubCallCount,
   type StubClientOptions,
   type StubCreateClientOptions,
 } from './test-helpers/agent-director-stub.ts'
 import { BELOW_CLIENT_MIN_VERSION, CLIENT_MIN_VERSION, DEV_PLACEHOLDER_VERSION } from './test-helpers/agent-director-versions.ts'
+import { declarationOf, writeChannelDeliveryRecord } from './test-helpers/channel-delivery.ts'
+import { UNKNOWN_STATE, cliAlertLine, teardownKillFailedDescription } from './test-helpers/cli-teardown.ts'
+import {
+  APP_TOKEN_PREFIX,
+  BOT_TOKEN_PREFIX,
+  LEAK_SENTINEL,
+  REDACTED_SENTINEL_TAIL,
+  assertNoLeak,
+  fakeToken,
+  sentinelInMessage,
+  writeCredentialsFile,
+  writtenFile,
+} from './test-helpers/credentials.ts'
+import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 import {
   makeMultiPersonaConfig,
@@ -361,7 +361,6 @@ import {
 } from './test-helpers/persona-config.ts'
 import { reloadTermsIn } from './test-helpers/reload-terms.ts'
 import { writeRetiredKeysRecord } from './test-helpers/retired-keys.ts'
-import { declarationOf, writeChannelDeliveryRecord } from './test-helpers/channel-delivery.ts'
 import {
   balancedAfter,
   callArguments,
@@ -569,7 +568,7 @@ interface Overrides {
   /** The precheck's `get`; default a live `waiting` row with no note ({@link LIVE_ROW}). */
   directorGet?: (id: string) => Promise<PrecheckRow | null>
   /** The precheck's `read-pane`; default a pane ({@link FAKE_PANE}). */
-  directorReadPane?: (id: string, nLines: number) => Promise<string>
+  directorReadPane?: (id: string, nLines: number) => Promise<void>
   directorStatus?: (id: string) => Promise<{ state: string } | null>
   directorPause?: (id: string) => Promise<void>
   /** The teardown's kill; default the Phase 1 success with a kill sent (`cannedKillResult(true)`). */
@@ -794,7 +793,7 @@ function makeDeps(o: Overrides = {}): Bundle {
     directorReadPane: async (id, nLines) => {
       readPaneCalls.push([id, nLines])
       await directorCall(`${PRECHECK_CALL_READ_PANE}:${id}`)
-      return o.directorReadPane ? o.directorReadPane(id, nLines) : FAKE_PANE
+      if (o.directorReadPane) await o.directorReadPane(id, nLines)
     },
     directorStatus: async (id) => {
       statusCalls.push(id)
@@ -2584,7 +2583,7 @@ describe('createDirectorOps', () => {
     installed = client
 
     expect(await ops.directorGet(opsId())).toEqual(GET_ROW)
-    expect(await ops.directorReadPane(opsId(), PROBE_PANE_READ_LINES)).toBe(FAKE_PANE)
+    expect(await ops.directorReadPane(opsId(), PROBE_PANE_READ_LINES)).toBeUndefined()
     expect(await ops.directorStatus(opsId())).toEqual({ state: 'working' })
     await ops.directorPause(opsId())
     expect(await ops.directorKill(opsId())).toEqual(cannedKillResult(true))
@@ -2974,7 +2973,7 @@ describe('precheck before anything is stopped (b.jg5 SRJ-901, AC 74)', () => {
     }
     let reads = 0
     const b = make({
-      ...(call === PRECHECK_CALL_GET ? { directorGet: flaky<PrecheckRow | null>(LIVE_ROW) } : { directorReadPane: flaky(FAKE_PANE) }),
+      ...(call === PRECHECK_CALL_GET ? { directorGet: flaky<PrecheckRow | null>(LIVE_ROW) } : { directorReadPane: flaky(undefined) }),
       directorStatus: async () => (++reads === 1 ? { state: 'waiting' } : { state: 'ended' }),
     })
     await run(b)
@@ -2995,7 +2994,7 @@ describe('precheck before anything is stopped (b.jg5 SRJ-901, AC 74)', () => {
     const error = errTmuxSessionConflict(PRECHECK_CALL_READ_PANE, 'not-this-launch', personaTmuxSessionName(BETA_PERSONA.key))
     const b = make({
       config: twoPersonas(),
-      directorReadPane: async (id) => { if (id === idOf(BETA_PERSONA)) throw error; return FAKE_PANE },
+      directorReadPane: async (id) => { if (id === idOf(BETA_PERSONA)) throw error; return },
       directorStatus: async () => ({ state: 'waiting' }),
     })
     await run(b)
@@ -3026,7 +3025,7 @@ describe('precheck before anything is stopped (b.jg5 SRJ-901, AC 74)', () => {
     const b = make({
       config: twoPersonas(),
       directorGet: async (id) => { if (id === idOf(ALPHA_PERSONA)) throw alphaError; return LIVE_ROW },
-      directorReadPane: async (id) => { if (id === idOf(BETA_PERSONA)) throw betaError; return FAKE_PANE },
+      directorReadPane: async (id) => { if (id === idOf(BETA_PERSONA)) throw betaError; return },
     })
     await run(b)
     expect([...b.getCalls].sort()).toEqual([idOf(ALPHA_PERSONA), idOf(BETA_PERSONA)].sort())
@@ -4275,7 +4274,7 @@ describe('the precheck\'s and the teardown\'s bounded cost on the injected clock
       config: opsConfig({ exit_timeout: EXIT_TIMEOUT_S, agent_director_call_timeout_ms: CALL_TIMEOUT_MS }),
       callMs,
       directorGet: scripted<PrecheckRow | null>(thrown(errTmuxUnresponsive(PRECHECK_CALL_GET)), thrown(errTmuxUnresponsive(PRECHECK_CALL_GET)), LIVE_ROW),
-      directorReadPane: scripted(thrown(errTmuxUnresponsive(PRECHECK_CALL_READ_PANE)), thrown(errTmuxUnresponsive(PRECHECK_CALL_READ_PANE)), FAKE_PANE),
+      directorReadPane: scripted(thrown(errTmuxUnresponsive(PRECHECK_CALL_READ_PANE)), thrown(errTmuxUnresponsive(PRECHECK_CALL_READ_PANE)), undefined),
       directorPause: async () => {
         if (++pauses <= shape.pauseFailures) throw errTmuxUnresponsive(PAUSE_VERB)
       },

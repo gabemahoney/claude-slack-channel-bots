@@ -71,12 +71,28 @@ import {
   STORE_OPEN_ERR_NAMES,
 } from '../src/agent-director-errors.ts'
 import {
+  KILL_OUTCOME_NOT_KILLED,
+  KILL_OUTCOME_ROW_FINISHED,
+  KILL_OUTCOME_ROW_GONE,
+  KILL_OUTCOME_SESSION_GONE,
+  KILL_ROW_FINISHED_ENDED,
+  KILL_ROW_FINISHED_MISSING,
+  KILL_ROW_FINISHED_NO_ROW,
+  checkedKill,
+  killOutcomeOf,
+  type AnyKillOutcome,
+} from '../src/checked-kill.ts'
+import {
   AD_CONFIG_FILE_DISPLAY_NAME,
   CLEAN_RESTART_NOT_RESTARTED_LABEL,
   CLEAN_RESTART_NOT_STARTED_SENTENCE,
   CLI_COMMAND_CLEAN_RESTART,
   CLI_COMMAND_STOP_BOTS,
   CLI_TEARDOWN_FAILED_LABEL,
+  PAUSE_VERDICT_DONE,
+  PAUSE_VERDICT_ESCALATE,
+  PAUSE_VERDICT_FAIL,
+  PAUSE_VERDICT_RETRY,
   PRECHECK_CALL_GET,
   PRECHECK_CALL_READ_PANE,
   PRECHECK_TRIES,
@@ -86,10 +102,6 @@ import {
   PRECHECK_VERDICT_PASS,
   PRECHECK_VERDICT_RETRY,
   PRECHECK_VERDICT_SKIP,
-  PAUSE_VERDICT_DONE,
-  PAUSE_VERDICT_ESCALATE,
-  PAUSE_VERDICT_FAIL,
-  PAUSE_VERDICT_RETRY,
   STATE_READ_VERDICT_ABSENT,
   STATE_READ_VERDICT_FAIL,
   STATE_READ_VERDICT_FINISHED,
@@ -146,22 +158,19 @@ import {
   type TeardownStoppedReason,
 } from '../src/cli-teardown.ts'
 import {
-  KILL_OUTCOME_NOT_KILLED,
-  KILL_OUTCOME_ROW_FINISHED,
-  KILL_OUTCOME_ROW_GONE,
-  KILL_OUTCOME_SESSION_GONE,
-  KILL_ROW_FINISHED_ENDED,
-  KILL_ROW_FINISHED_MISSING,
-  KILL_ROW_FINISHED_NO_ROW,
-  checkedKill,
-  killOutcomeOf,
-  type AnyKillOutcome,
-} from '../src/checked-kill.ts'
-import {
   DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
   MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
   MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
 } from '../src/config.ts'
+import {
+  KILL_FAILURE_ORDINARY_CLI_TEARDOWN_CLOSING,
+  KILL_FAILURE_SURVIVOR_CLI_TEARDOWN_CLOSING,
+  KILL_FAILURE_VERSION_ORDINARY,
+  KILL_FAILURE_VERSION_SURVIVOR,
+  PERSONA_KILL_FAILED_LABEL,
+  PERSONA_KILL_SURVIVOR_LABEL,
+  type KillFailureOrdinaryQuotes,
+} from '../src/kill-failure-alert.ts'
 import {
   KILL_RETRY_ALERT_NONE,
   KILL_RETRY_ALERT_ORDINARY,
@@ -181,15 +190,6 @@ import {
   type KillRetryEnd,
   type KillRetryResult,
 } from '../src/kill-retry.ts'
-import {
-  KILL_FAILURE_ORDINARY_CLI_TEARDOWN_CLOSING,
-  KILL_FAILURE_SURVIVOR_CLI_TEARDOWN_CLOSING,
-  KILL_FAILURE_VERSION_ORDINARY,
-  KILL_FAILURE_VERSION_SURVIVOR,
-  PERSONA_KILL_FAILED_LABEL,
-  PERSONA_KILL_SURVIVOR_LABEL,
-  type KillFailureOrdinaryQuotes,
-} from '../src/kill-failure-alert.ts'
 import { AGENT_DIRECTOR_DEAD_STATES, AGENT_DIRECTOR_LIVE_STATES, AGENT_DIRECTOR_PENDING_STATE } from '../src/liveness-reading.ts'
 import { personaInstanceId, personaKey, personaTmuxSessionName, renderPersonaRef } from '../src/persona-identity.ts'
 import {
@@ -218,9 +218,9 @@ import {
   errSystemInstallDisappeared,
   errTmuxCaptureFailed,
   errTmuxKillFailed,
-  errTmuxSendKeys,
   errTmuxNotAvailable,
   errTmuxNotAvailableDifferentServer,
+  errTmuxSendKeys,
   errTmuxSessionConflict,
   errTmuxSessionCreate,
   errTmuxUnresponsive,
@@ -230,8 +230,8 @@ import {
   provenanceNote,
   unknownNote,
 } from './test-helpers/agent-director-stub.ts'
-import { assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, REDACTED_SENTINEL_TAIL, sentinelInMessage } from './test-helpers/credentials.ts'
 import { UNKNOWN_STATE, cliAlertLine, teardownKillFailedDescription } from './test-helpers/cli-teardown.ts'
+import { BOT_TOKEN_PREFIX, REDACTED_SENTINEL_TAIL, assertNoLeak, fakeToken, sentinelInMessage } from './test-helpers/credentials.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { forbiddenServerLoads, importedSpecifiers, stripComments } from './test-helpers/source-audit.ts'
 
@@ -344,7 +344,7 @@ describe('precheckVerdictOf: a get that answered (b.jg5 SRJ-901 step 2)', () => 
 
 describe('precheckVerdictOf: a read-pane that answered a pane passes (b.jg5 SRJ-117, SRJ-613)', () => {
   test.each(['> ', ''])('the pane %p passes (and proves nothing; the teardown is the backstop)', (pane) => {
-    expect(precheckVerdictOf({ call: PRECHECK_CALL_READ_PANE, pane })).toEqual({ kind: PRECHECK_VERDICT_PASS })
+    expect(precheckVerdictOf({ call: PRECHECK_CALL_READ_PANE })).toEqual({ kind: PRECHECK_VERDICT_PASS })
   })
 })
 

@@ -68,8 +68,8 @@
 #   (SCENARIO_BIN, `$SCENARIO_ROOT/bin`), in which `claude` is a copy of
 #   fixtures/stub-claude.sh, with a copy of its MCP session client
 #   fixtures/stub-mcp-session.ts beside it (see "Stub workers"), and in which
-#   the stub's mode selections (`stub_mode`), dialog delay settings
-#   (`stub_dialog_delay`) and a lingering stub's marker (`stub_release`) are
+#   the stub's mode selections (`stub_mode`), report-in delay settings
+#   (`stub_report_delay`) and a lingering stub's marker (`stub_release`) are
 #   kept, followed by the
 #   container's PATH without every
 #   directory that holds an `agent-director` (the image's default binary's
@@ -382,29 +382,14 @@
 #
 #   Stub workers (fmk mode; fixtures/stub-claude.sh's header states the modes, the
 #   SessionStart re-fire, its stop line and the MCP session; each runs both guards first)
-#   STUB_MODE_DEV_CHANNELS STUB_MODE_AT_ONCE STUB_MODE_SILENT STUB_MODE_UNRECOGNISED
-#   STUB_MODE_FOLDER_TRUST             the five modes' names (`dev-channels`, the default of a
-#                                      directory with no selection; `at-once`; `silent`;
-#                                      `unrecognised-dialog`; `folder-trust`)
-#   stub_mode <dir> <mode>            select <mode> for every stub worker whose working directory is
-#                                      <dir>: one `<mode> TAB <real path of dir>` line added to
-#                                      $SCENARIO_BIN/stub-claude-modes (by an atomic rewrite), which
-#                                      the stub reads at start-up, so it holds from the next launch or
-#                                      resume in <dir> on; the last selection of a directory wins;
-#                                      fails for an unknown mode, or a <dir> that is not a directory
-#                                      under SCENARIO_ROOT (as written and by real path)
-#   stub_dialog_delay <dir> <seconds>  a harness addition (b.jg5 SRJ-1306): delay the dev-channels dialog of every stub
-#                                      worker whose working directory is <dir> by <seconds> (a whole
-#                                      number; 0 for none): one `<seconds> TAB <real path of dir>`
-#                                      line added to $SCENARIO_BIN/stub-claude-dialog-delays (by an
-#                                      atomic rewrite), which the stub reads at start-up, so it holds
-#                                      from the next launch or resume in <dir> on; the last setting of
-#                                      a directory wins. The stub shows a starting screen holding no
-#                                      approver needle for <seconds>, then the dialog, the same bytes
-#                                      as with no delay (its header, THE DIALOG DELAY). It acts only
-#                                      in `dev-channels`; fails for a <seconds> that is not a whole
-#                                      number, or a <dir> that is not a directory under SCENARIO_ROOT
-#                                      (as written and by real path)
+#   STUB_MODE_AT_ONCE STUB_MODE_SILENT STUB_MODE_MANUAL_START
+#                                      automatic SessionStart, silent pending, or harness-Enter pending
+#   stub_mode <dir> <mode>            select a mode for the next launch by resolved cwd; the last
+#                                      atomic per-directory selection wins. Refuses unknown modes
+#                                      and directories outside SCENARIO_ROOT, including symlinks.
+#   stub_report_delay <dir> <seconds> postpone automatic SessionStart after the next launch;
+#                                      a whole number of seconds (0 for none), stored atomically
+#                                      in stub-claude-report-delays. Last selection wins.
 #   stub_press_enter <target>         a human answering a stub held at a startup dialog: send Enter
 #                                      into the tmux pane <target> (a pane id such as %3, or
 #                                      session[:window[.pane]], the session name matched exactly, never
@@ -420,13 +405,6 @@
 #                                      agent-director's `pause` types, fires SessionEnd (the row reads
 #                                      `ended`) and keeps running, its session with it, until
 #                                      `stub_release`
-#   stub_shown_dialogs <target>       print every dialog the stub in the tmux pane <target> (named
-#                                      as for `stub_press_enter`) printed on its pane, byte for byte
-#                                      (its record $SCENARIO_BIN/stub-claude-shown-dialogs.<pid>; empty
-#                                      when it printed none): the stub clears an answered dialog from
-#                                      the pane and its scrollback, so a pane read after the answer
-#                                      no longer shows it. Reads only; refuses as stub_press_enter
-#                                      does, and fails when the pane is not on the scenario's server
 #   stub_release <target> [<timeout-s>]
 #                                      harness addition (scenario 24, test-26, and scenario 13):
 #                                      release the lingering stub in the tmux pane <target> (named as
@@ -440,7 +418,7 @@
 #   STUB_MODE_TRANSCRIPT_ON_FIRST_MESSAGE
 #                                      (a harness addition) the mode
 #                                      `transcript-on-first-message`, a known mode of `stub_mode`:
-#                                      `dev-channels`, except that reporting in writes no transcript
+#                                      `at-once`, except that reporting in writes no transcript
 #                                      (SessionStart finds none) and the first message after it does
 #   STUB_EXIT_SENTINEL                 (a harness addition) the stub's
 #                                      exit sentinel line, `__CSCB_TEST_EXIT__`: typed into a stub's
@@ -910,11 +888,12 @@
 #   single spaces.
 #   ad_shim_mark                       print the agent-director shim log's position now
 #   tmux_shim_mark                     print the tmux shim log's position now
-#   ad_cscb_calls <instance-id|*> [<from-mark> [<to-mark>]]
+#   ad_cscb_calls <instance-id|*> [<from-mark> [<to-mark> [with-pid]]]
 #                                      print the rows of the CSCB-parented calls whose instance id is
 #                                      exactly <instance-id> (never one it is a prefix of), or, for
 #                                      `*`, of every CSCB-parented call that carries an instance id,
-#                                      in log order
+#                                      in log order; with-pid appends the invocation PID as field 7
+#                                      for exact AD trail correlation (the default six fields stay fixed)
 #   wait_for_ad_cscb_call <instance-id> <verb> <min-count> <timeout-s> [<step>]
 #                                      wait until `ad_cscb_calls <instance-id>` holds at least
 #                                      <min-count> rows of <verb> (a count over the whole log); fail,
@@ -1110,10 +1089,8 @@
 # - a session seeded by hand for agent-director to adopt after a lost create
 #   reply would carry @ad_pane = `<the row's launch token> <the pane's id>`;
 #   no scenario seeds one, so no helper makes one;
-# - a scenario whose launch loses its create reply (the tmux shim's
-#   `slow-create`) runs the stub in a mode that waits for the approver's Enter
-#   before it reports in (`dev-channels`): agent-director applies no hook to a
-#   row whose pane it has not adopted, and the approver's send-keys adopts it;
+# - lost-create-reply scenarios postpone SessionStart until their timeout read;
+#   hook re-fire settles the row once agent-director has adopted its process;
 # - no helper sets base-index: no agent-director verb depends on pane indices.
 #
 # Exit hooks receive the current scenario exit status as their first argument.
@@ -1208,15 +1185,10 @@ SCENARIO_TMUX_SHIM_MODES=(log fail-kill fail-create slow-create wedge)
 
 # The stub worker's modes (fixtures/stub-claude.sh states what each does),
 # its MCP session client, and the file of its mode selections beside it.
-STUB_MODE_DEV_CHANNELS=dev-channels
 STUB_MODE_AT_ONCE=at-once
 STUB_MODE_SILENT=silent
-STUB_MODE_UNRECOGNISED=unrecognised-dialog
-STUB_MODE_FOLDER_TRUST=folder-trust
-# b.omv SR-13.6: forced supported trust dialog, independent of pre-trust.
-STUB_MODE_STARTUP_TRUST=startup-trust
-SCENARIO_STUB_MODES=("${STUB_MODE_DEV_CHANNELS}" "${STUB_MODE_AT_ONCE}" "${STUB_MODE_SILENT}"
-    "${STUB_MODE_UNRECOGNISED}" "${STUB_MODE_FOLDER_TRUST}" "${STUB_MODE_STARTUP_TRUST}")
+STUB_MODE_MANUAL_START=manual-start
+SCENARIO_STUB_MODES=("${STUB_MODE_AT_ONCE}" "${STUB_MODE_SILENT}" "${STUB_MODE_MANUAL_START}")
 # Harness additions: the stub mode that writes
 # its transcript only at the first message after reporting in, and the
 # stub's exit sentinel line (fixtures/stub-claude.sh SENTINEL), which a
@@ -1226,8 +1198,8 @@ SCENARIO_STUB_MODES+=("${STUB_MODE_TRANSCRIPT_ON_FIRST_MESSAGE}")
 STUB_EXIT_SENTINEL=__CSCB_TEST_EXIT__
 SCENARIO_STUB_MCP_SRC="${SCENARIO_FIXTURES}/stub-mcp-session.ts"
 SCENARIO_STUB_MODES_NAME=stub-claude-modes
-# The file of the stub's dialog delay settings beside it (`stub_dialog_delay`).
-SCENARIO_STUB_DELAYS_NAME=stub-claude-dialog-delays
+# The file of the stub's report-in delay settings beside it (`stub_report_delay`).
+SCENARIO_STUB_DELAYS_NAME=stub-claude-report-delays
 
 # Harness addition (scenario 24, and scenario 13): the stub mode that answers
 # `pause`'s `/exit` with SessionEnd and lingers until `stub_release`, the
@@ -1236,9 +1208,6 @@ SCENARIO_STUB_DELAYS_NAME=stub-claude-dialog-delays
 STUB_MODE_LINGER_ON_EXIT=linger-on-exit
 SCENARIO_STUB_MODES+=("${STUB_MODE_LINGER_ON_EXIT}")
 SCENARIO_STUB_LINGER_PREFIX=stub-claude-lingering.
-# The record of the dialogs a stub printed, beside it (this prefix, then its
-# PID): an answered dialog is cleared from the pane (fixtures/stub-claude.sh).
-SCENARIO_STUB_SHOWN_DIALOGS_PREFIX=stub-claude-shown-dialogs.
 SCENARIO_STUB_RELEASE_S=10
 
 # The MCP server name the package's install writes into slack-mcp.json
@@ -2875,12 +2844,12 @@ stub_mode() {
     mv -f -- "${tmp}" "${file}" || fail "${step}: could not rename into ${file}"
 }
 
-stub_dialog_delay() {
+stub_report_delay() {
     local dir="${1:-}" seconds="${2:-}" step real_root real_dir file tmp
-    step="stub_dialog_delay ${dir} ${seconds}"
+    step="stub_report_delay ${dir} ${seconds}"
     require_ci_image "${step}"
     require_scenario_home "${step}"
-    [[ "${SCENARIO_FMK}" == 1 ]] || fail "${step}: the stub's dialog delay is for fmk scripts only"
+    [[ "${SCENARIO_FMK}" == 1 ]] || fail "${step}: the stub's report-in delay is for fmk scripts only"
     [[ "${seconds}" =~ ^[0-9]+$ ]] || fail "${step}: '${seconds}' is not a whole number of seconds"
     [[ "${dir}" == "${SCENARIO_ROOT}"/* ]] \
         || fail "${step}: refused: ${dir} is not under SCENARIO_ROOT ${SCENARIO_ROOT}"
@@ -2927,26 +2896,6 @@ stub_press_enter() {
     (( rc == 0 )) || fail "${step}: tmux send-keys exited ${rc}: $(tr '\n' ' ' < "${err}")"
 }
 
-stub_shown_dialogs() {
-    local target="${1:-}" step exact err pid rc=0 file
-    step="stub_shown_dialogs ${target}"
-    require_ci_image "${step}"
-    _scenario_tmux_check "${step}"
-    [[ -n "${target}" ]] || fail "${step}: no pane named"
-    case "${target}" in
-        %*) exact="${target}" ;;
-        *:*) exact="=${target}" ;;
-        *) exact="=${target}:" ;;
-    esac
-    err="${SCENARIO_ROOT}/stub-shown-dialogs.err"
-    pid="$("${SCENARIO_REAL_TMUX}" display-message -p -t "${exact}" '#{pane_pid}' 2> "${err}")" || rc=$?
-    (( rc == 0 )) || fail "${step}: tmux display-message exited ${rc}: $(tr '\n' ' ' < "${err}")"
-    [[ "${pid}" =~ ^[1-9][0-9]*$ ]] \
-        || fail "${step}: no pane ${target} on the scenario's tmux server (tmux gave pane pid '${pid}')"
-    file="${SCENARIO_BIN}/${SCENARIO_STUB_SHOWN_DIALOGS_PREFIX}${pid}"
-    [[ -f "${file}" ]] || return 0
-    cat -- "${file}"
-}
 
 # Harness addition (scenario 24, test-26, and scenario 13): release a stub
 # lingering in `linger-on-exit` (fixtures/stub-claude.sh, LINGERING).
@@ -5031,61 +4980,108 @@ _scenario_cscb_ad_rows() {
             printf -v args '%q ' "${_L_ARGS[@]}"
             args="${args% }"
         fi
-        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(( i + 1 ))" "$(_scenario_us_text "${_L_US}")" "${_L_PPID}" \
+        printf '%s\t%s\t%s\t%s\t%s\t%s' "$(( i + 1 ))" "$(_scenario_us_text "${_L_US}")" "${_L_PPID}" \
             "${_L_VERB}" "${_L_ID:--}" "${args}"
+        [[ "${6:-}" != with-pid ]] || printf '\t%s' "${_L_PID}"
+        printf '\n'
     done
 }
 
 ad_cscb_calls() {
-    local id="${1:-}" from="${2:--}" to="${3:--}"
+    local id="${1:-}" from="${2:--}" to="${3:--}" pid="${4:-}"
+    [[ -z "${pid}" || "${pid}" == with-pid ]] || fail "ad_cscb_calls: unknown projection ${pid}"
     [[ -n "${id}" ]] || fail "ad_cscb_calls: no instance id given (or * for every call carrying one)"
     _scenario_check_mark ad_cscb_calls "<from-mark>" "${from}"
     _scenario_check_mark ad_cscb_calls "<to-mark>" "${to}"
-    _scenario_cscb_ad_rows ad_cscb_calls "${id}" "" "${from}" "${to}"
+    _scenario_cscb_ad_rows ad_cscb_calls "${id}" "" "${from}" "${to}" "${pid}"
 }
 
-# _scenario_assert_reconnect_rows <step> <server-pid> <delay-ms> <full-lines> <rows>:
+# Match each key to the exact shim invocation, through the first success.
+# AD caller_pid is os.Getpid() inside its CLI, not the CSCB server PID.
+# Rows must carry with-pid field 7; its parent still has to be the server.
+# The millisecond trail timestamp represents [ts, ts + 1 ms), so compare
+# that interval with the invocation and the next key under its lifecycle lease.
+# Other clients can read the same persona concurrently; those reads do not
+# bound a key result.
+# Keep event write order, reject duplicates/missing results, and never match
+# a different operation, instance or merely some child of the server.
+_scenario_reconnect_outcomes() {
+    jq -e -c -s --arg rows "$2" --arg server "$1" '
+        def stamp: .ts | capture("^(?<whole>[^.]+)\\.(?<fraction>[0-9]+)Z$") |
+            ((.whole + "Z" | fromdateiso8601) + (("0." + .fraction) | tonumber));
+        . as $events |
+        ($rows | split("\n") | map(select(length > 0) | split("\t")) |
+            map(select(.[3] == "send-keys"))) as $calls |
+        def keys($i; $last; $found):
+            if $i >= ($calls | length) then error("no successful key")
+            else $calls[$i] as $call |
+                if ($call | length) != 7 or $call[2] != $server or
+                    ($call[6] | test("^[0-9]+$") | not) then error("unproven invocation") else
+                ($events | to_entries | map(select(
+                    .value.event == "ad.send_keys.called" and
+                    .value.instance_id == $call[4] and
+                    .value.caller_pid == ($call[6] | tonumber) and
+                    ((.value | stamp) + 0.001 > ($call[1] | tonumber)) and
+                    (if $i + 1 < ($calls | length) then
+                        (.value | stamp) <= ($calls[$i + 1][1] | tonumber)
+                     else true end)))) as $matches |
+                if ($matches | length) != 1 or $matches[0].key <= $last then
+                    error("missing, duplicate or reordered key result")
+                else $matches[0] as $match |
+                    ($found + [$match.value]) as $next |
+                    if $match.value.outcome == "ok" then $next
+                    else keys($i + 1; $match.key; $next) end
+                end end
+            end;
+        keys(0; -1; [])
+    ' <<< "$3" 2>/dev/null
+}
+
+# _scenario_assert_reconnect_rows <step> <server-pid> <delay-ms> <rows>:
 # inspect an already-filtered ad_cscb_calls table for one persona/window.
-# b.omv SR-5.3/5.4/5.5: existing waiting-row proof, fresh screen, text with
-# no_enter, delayed Enter. Extra reads are allowed for earlier refused runs;
-# every read/key must retain the server parent and AD's dialog guards.
+# AD row guards, text with no_enter, and delayed Enter. Optional fifth arg:
+# AD send_keys.called records for the complete uncertain recovery attempt.
+# Every retry must have its own waiting/invocation/id/outcome record; only the
+# final Enter may succeed. Automatic reconnects
+# must never inspect screen contents or send an expected pane hash.
 _scenario_assert_reconnect_rows() {
-    local step="$1" server="$2" delay="$3" full="$4" rows="$5"
-    local pos time parent verb id args words=() i text key no_enter reads=0 sends=0 typed_at=0 n_lines
-    while IFS=$'\t' read -r pos time parent verb id args; do
+    local step="$1" server="$2" delay="$3" rows="$4" outcomes="${5:-}" recovery="${5+x}"
+    local pos time parent verb id args invocation words=() i text key no_enter sends=0 typed_at=0 instance="" last_key_at=0
+    while IFS=$'\t' read -r pos time parent verb id args invocation; do
         [[ -n "${pos}" ]] || continue
+        if (( sends > 0 )) && [[ "${verb}" == spawn || "${verb}" == resume || "${verb}" == kill ]]; then
+            fail "${step}: reconnect recovery changed the launch"
+        fi
         [[ "${verb}" == read-pane || "${verb}" == send-keys ]] || continue
         [[ "${parent}" == "${server}" ]] || fail "${step}: ${verb} has parent ${parent}, not server ${server}"
+        instance="${instance:-${id}}"
+        [[ -n "${id}" && "${id}" == "${instance}" ]] || fail "${step}: reconnect recovery changed the instance"
         _scenario_eval_words words "${args}" || fail "${step}: cannot decode ${verb} arguments"
         text=""
         key=""
         no_enter=0
-        n_lines=""
         for (( i = 0; i < ${#words[@]}; i++ )); do
             case "${words[i]}" in
                 --text) text="${words[i + 1]:-}" ;;
                 --key) key="${words[i + 1]:-}" ;;
                 --no-enter) no_enter=1 ;;
-                --n-lines) n_lines="${words[i + 1]:-}" ;;
                 --allow-pending|--allow-pending=*|--expect-pane-sha256|--expect-pane-sha256=*)
                     fail "${step}: ${verb} bypasses the ordinary dialog guard: ${args}"
                     ;;
             esac
         done
         if [[ "${verb}" == read-pane ]]; then
-            [[ "${n_lines}" == "${full}" ]] || fail "${step}: reconnect read-pane is not ${full} lines: ${args}"
-            (( sends == 0 )) || fail "${step}: a pane read interrupted the reconnect's keys"
-            reads=$(( reads + 1 ))
-            continue
+            fail "${step}: automatic reconnect read a pane"
         fi
         _scenario_to_us "${time}" || fail "${step}: invalid key timestamp ${time}"
+        (( _SCENARIO_US >= last_key_at )) || fail "${step}: reconnect keys are out of order"
+        last_key_at="${_SCENARIO_US}"
         sends=$(( sends + 1 ))
         if (( sends == 1 )); then
-            (( reads >= 2 )) || fail "${step}: reconnect typed without waiting-row proof and a fresh screen"
             [[ "${text}" == '/mcp reconnect '?* && -z "${key}" && "${no_enter}" == 1 ]] \
                 || fail "${step}: first reconnect key is not no_enter text: ${args}"
             typed_at="${_SCENARIO_US}"
-        elif (( sends == 2 )); then
+        elif (( sends == 2 )) || [[ -n "${recovery}" ]]; then
             [[ "${key}" == Enter && -z "${text}" && "${no_enter}" == 0 ]] \
                 || fail "${step}: second reconnect key is not Enter alone: ${args}"
             (( _SCENARIO_US - typed_at >= delay * 1000 )) \
@@ -5094,7 +5090,22 @@ _scenario_assert_reconnect_rows() {
             fail "${step}: more than one reconnect text/Enter pair in the window"
         fi
     done <<< "${rows}"
-    (( sends == 2 )) || fail "${step}: reconnect has ${sends} key calls, not text then Enter"
+    if [[ -z "${recovery}" ]]; then
+        (( sends == 2 )) || fail "${step}: reconnect has ${sends} key calls, not text then Enter"
+    else
+        (( sends >= 2 )) || fail "${step}: recovery has no originating text and Enter"
+        local matched
+        matched="$(_scenario_reconnect_outcomes "${server}" "${rows}" "${outcomes}")" \
+            || fail "${step}: recovery lacks exact AD invocation/outcome evidence"
+        jq -e --arg id "${instance}" --argjson n "${sends}" '
+            length == $n and
+            all(.[]; .event == "ad.send_keys.called" and .instance_id == $id and
+                .row_state == "waiting" and .allow_pending == false) and
+            (.[-1].outcome == "ok") and
+            all(.[0:-1][]; .outcome == "ErrTmuxUnresponsive")
+        ' <<< "${matched}" > /dev/null \
+            || fail "${step}: recovery lacks matching waiting/instance/invocation/outcome evidence"
+    fi
 }
 
 # True when `ad_cscb_calls <instance-id>` holds at least <min> rows of <verb>;

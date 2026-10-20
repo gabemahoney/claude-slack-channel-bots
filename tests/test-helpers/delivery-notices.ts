@@ -22,7 +22,7 @@ export async function makeDeliveryNoticeHarness(options: { queue?: DeliveryQueue
   const states = new Map(config.personas.map(p => [p.key, { up: true } as DeliveryReportState]))
   const queue = options.queue ?? await makeQueue(root, { now: h.clock.now, onEvent: event => reporting?.queueEvent(event) })
   const reporting = createDeliveryReporting({ queue, episodes: rig.episodes, persona: key => config.personas.find(p => p.key === key), state: key => states.get(key)!,
-    log: line => logs.push(line), notify: (key, text) => h.notifier.notify(key, text), reconnectBlocked: (key, rule) => { blocked.push({ key, rule }) },
+    log: line => logs.push(line), notify: (key, text) => h.notifier.notify(key, text),
     delivered: (key, item) => { delivered.push({ key, item }) }, now: h.clock.now,
   })
   const [alpha, beta] = config.personas.map(p => p.key) as [string, string]
@@ -37,7 +37,7 @@ export async function makeDeliveryNoticeHarness(options: { queue?: DeliveryQueue
       row: 'waiting', retypeCount: item.retypeCount, marker: true, relay: true, connected: true, up: true, latched: false, held: false,
       receiptWorking: false, dialogMaybeOpen: false, reconnectDeferred: false, ...patch }
   }
-  function waiting(item: QueueItem, reason: DeliveryReason = 'menu', patch: Partial<DeliveryStatus> = {}, key = alpha) {
+  function waiting(item: QueueItem, reason: DeliveryReason = 'not-now', patch: Partial<DeliveryStatus> = {}, key = alpha) {
     const facts = status(item, patch, key)
     reporting.engineEvent({ type: 'waiting', key, seq: item.accepted.seq, reason, ageMs: facts.ageMs, status: facts })
   }

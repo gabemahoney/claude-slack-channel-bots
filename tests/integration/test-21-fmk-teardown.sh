@@ -1,200 +1,5 @@
 #!/usr/bin/env bash
-# Test 21 (HO §7 scenario 9; b.jg5 SRJ-1411; AC 4, AC 73, AC 75): teardowns
-# that meet a conflict. One persona in CONFLICT fails the precheck of
-# `clean_restart` and of `stop --stop-bots`, which stop nothing; after a
-# passing precheck a teardown whose kills fail restarts the server under
-# `clean_restart` and leaves it stopped under `stop --stop-bots`; with
-# agent-director not answering `list` at the fallback, `clean_restart` starts
-# nothing and gives one not-restarted alert, printed, logged and recorded; and
-# a `pending` persona's teardown escalates to a kill, after which the next
-# server never kills that row and brings the persona up once CSCB's own
-# `find-missing` run marks the row `missing` (b.jg5 SRJ-901, SRJ-903 to
-# SRJ-907, SRJ-909, SRJ-702, SRJ-704, SRJ-1007, SRJ-1013, SRJ-410, SRJ-713,
-# SRJ-1306, SRJ-1401, SRJ-1418).
-#
-# fmk setup (lib/scenario.sh fmk mode; b.jg5 SRJ-1306, SRJ-1401):
-# - its own HOME, agent-director store and tmux server, all under
-#   SCENARIO_ROOT, with the agent-director shim in front of the binary and the
-#   tmux shim first on the PATH of every CSCB process (the bot server, `start`
-#   and `stop` runs, and the CLI commands this script runs through `cscb_run`,
-#   `t21_cli`), which agent-director inherits;
-# - the release start (SCENARIO_AD_START unset: the 0.11.0 release, installed
-#   by its install.sh at sourcing), at agent-director's default settings (no
-#   config.toml): `[pause] timeout_seconds` 30, so a `pause` whose `/exit` the
-#   stub ignores ends in ErrPauseTimeout and escalates to the kill (SRJ-903);
-#   kill_exit_wait_ms 5000; the pending grace period G printed from
-#   `adGraceMs` of the defaults;
-# - CSCB's configuration: `health_check_interval` 0, so no health tick
-#   reconnects or relaunches a persona, and `session_restart_delay` 0, so a
-#   closed MCP session schedules no restart (SRJ-1401: CSCB's timings are
-#   changed only through its configuration); `exit_timeout` 5;
-# - every start is live (`start_server --live`), against the loopback Slack
-#   stub (fixtures/slack-stub-server.ts, one for the script, every persona's
-#   token pair answered ok); the CLI commands run with SLACK_DRY_RUN unset, so
-#   the server `clean_restart` starts is live too;
-# - each leg has its own personas (key, credentials, channel, directories):
-#   A and B (precheck legs), C and E (teardown-failure legs), F and G
-#   (not-restarted leg), D (pending-persona leg). Between legs the harness
-#   plays the operator while the server is stopped: config.json is rewritten
-#   to the next leg's personas and the last-applied record moved aside, so the
-#   next start applies config.json as it stands (docs/reload.md); that
-#   start's sweep kills the earlier leg's live rows (absent personas), in
-#   `log`, so no earlier persona's teardown enters a later leg's lines;
-# - stub workers: `startup-trust` (the reporting stub: the approver's Enter
-#   makes it report in) for A, B, C, E, F and G; D runs `unrecognised-dialog`
-#   (CSCB's approver never answers it, so D's row stays `pending` at that
-#   dialog), then `startup-trust` for its recovery. The stub ignores `pause`'s
-#   `/exit` (its exit sentinel is `__CSCB_TEST_EXIT__`);
-# - checks read only their own leg's ids and window: server.log,
-#   startup-errors.log and clean_restart.log from the leg's mark line,
-#   CSCB's agent-director calls (`cscb_ad_calls`: only the agent-director
-#   shim's lines whose parent is a CSCB process) from the mark's time, and a
-#   command's own calls (CLI-parented) by its run's PID; rows by a harness
-#   `get`; agent-director's trail ($HOME/.config/agent-director/ad-trail.jsonl) for
-#   its `find-missing` marks and its launch records.
-#
-# How the conflict is injected (S3): the harness respawns A's worker pane
-# with another process (`respawn_worker_pane`, a `sleep`), from the
-# scenario's own shell. The pane keeps its id but runs a new process, so the
-# release's one-line `read-pane` of A's row finds its session (Ours) and no
-# pane with the row's recorded pane id and pid: ErrTmuxSessionConflict, "the
-# agent's pane was not found", while A's row stays live. It touches no other
-# persona. (agent-director's answer `ad-answer-held-clean-restart.md`, which
-# stages CONFLICT by changing the row's `launch_token`, was not needed: a
-# changed launch token makes the lookup Leftover, whose lone leftover's pane
-# `read-pane` reads, so the precheck would pass; the respawn is what the
-# precheck's `read-pane` answers CONFLICT for.)
-#
-# How the teardown failure is injected (S4, S5): the tmux shim in
-# `fail-kill`, unlimited (every kill-session and kill-pane a CSCB-run
-# agent-director makes fails), set just before the command. The stub
-# ignores `/exit`, so each persona's `pause` ends in ErrPauseTimeout after
-# 30 s and escalates to the kill, whose KILL_RETRY_TRIES tries, 2 s apart,
-# each answer ErrTmuxKillFailed (UNAVAILABLE), so the persona's teardown
-# fails with the kill-failure alert's ordinary version (SRJ-702, SRJ-1007).
-# How agent-director stops answering at the fallback (S5): the list-refusing
-# stand-in (fixtures/agent-director-list-refusing.sh, a harness addition) swapped in behind the shim
-# (`swap_ad_binary`, shim check after the swap and after the restore): it
-# refuses `list` and runs the release for every other verb.
-#
-# Legs, in run order (one scenario HOME, store, tmux server and Slack stub):
-#   S3 precheck legs: A and B up, rows `waiting`; A's pane respawned; the
-#      script runs `clean_restart`, then `stop --stop-bots`. Each exits
-#      non-zero and prints the precheck failure line naming A, its key,
-#      `slack_bot_<key>` and CONFLICT (the description matched through
-#      CONFLICT_PANE_NOT_FOUND_PHRASE), no line for B, then its "nothing was
-#      stopped" line, last; A's precheck failure line in neither server.log
-#      nor startup-errors.log; the bot server's PID unchanged and running after
-#      each; at least one CLI-parented `read-pane` of A's id (the command's
-#      calls found) and no CLI-parented `pause` or `kill`; A's and B's rows
-#      unchanged (a
-#      harness `get` before and after). Then the harness ends A's session by
-#      its session id (`end_session`); a harness `read-pane` of A then
-#      answers GONE (ErrTmuxCaptureFailed), which the precheck passes.
-#   S4 teardown-failure legs: a plain stop; C and E configured and started,
-#      rows `waiting`. `fail-kill`, then `clean_restart`: it exits non-zero;
-#      for each of C and E, every kill try answered ErrTmuxKillFailed (read
-#      from its per-try lines), exactly KILL_RETRY_TRIES CLI-parented kills,
-#      the failure line printed once in the command's output (standard
-#      output and error together) and followed there by the ordinary alert
-#      for the CLI-teardown route, both appended once to server.log (and,
-#      under `clean_restart`, to clean_restart.log), and one `persona-kill-failed` entry holding both (context
-#      `clean_restart`); two such entries in all; the last line counting 2;
-#      the bot server running afterwards with a new PID. Then, still
-#      `fail-kill`, `stop --stop-bots`: the same lines and entries (context
-#      `stop --stop-bots`), exit non-zero, the server's PID gone, no
-#      server.pid and no bot server recorded after the command's mark (no
-#      start). No CSCB `delete`; C's and E's rows present and their sessions
-#      still there.
-#   S5 not-restarted leg: `log`; F and G configured and started (the
-#      start sweep kills C's and E's rows), rows `waiting`. The stand-in
-#      swapped in (a harness `list` refused with no result; a harness
-#      `version` and `get` answered); `fail-kill`; `clean_restart`. Its
-#      precheck passes (no precheck line; its `get` and `read-pane` reach the
-#      release through the stand-in, as the teardown's `status`, `pause` and
-#      `kill` do) and its teardown fails (F's and G's UNAVAILABLE failure
-#      lines); exactly 3
-#      CLI-parented `list` calls carrying the `service` label, each refused
-#      (answer-check lines for tries 1 to 3 in clean_restart.log); no bot
-#      server running and none recorded after the mark; exactly one
-#      not-restarted alert naming F and G with their sessions and class
-#      UNAVAILABLE, as the printer renders it, printed once in the command's
-#      output (standard output and error together), appended once to
-#      clean_restart.log and once to server.log and recorded as one
-#      `clean-restart-not-restarted` entry; the last line counting 2; exit
-#      non-zero; no CSCB `delete`. Then the release restored behind the shim
-#      and `log`.
-#   S6 pending-persona leg (working default: the teardown is
-#      `stop --stop-bots`, the SRD names none): D configured with
-#      `unrecognised-dialog` and started (the start sweep kills F's and G's
-#      rows), D's row `pending` with a launch start. `stop --stop-bots` well
-#      before G (the pending grace period; the script fails, saying so,
-#      when G or more has passed since D's launch start before it runs the
-#      command): its precheck passes on D's `pending` row (the release's
-#      `read-pane` has no state guard, SRJ-901), D's CLI-parented `pause`
-#      answers ErrSpawnNotPausable (its escalation line in the CLI's output),
-#      the one CLI-parented `kill` that follows succeeds, the command exits 0,
-#      the server is gone and D's session is gone. D's directory switched to
-#      `startup-trust`; a start. Waited until D's row reads `waiting`, bounded
-#      at D_RECOVER_WAIT_S (below). Then: no CSCB `kill` naming D after the
-#      restart's mark; no harness `find-missing` in the whole run (SRJ-1401:
-#      D is unlatched, so CSCB's own pending-row runs mark it); exactly one
-#      `ad.find_missing.tick` in the trail marking D's row `missing` from
-#      `pending` after the mark, made while a CSCB-parented `find-missing`
-#      ran (one at or before it, after the mark); exactly one launch record
-#      for D after the mark (`ad.spawn.reused` or `ad.resume.moved_to_pending`),
-#      after that tick; D's row `waiting`.
-#
-# Waits: rows reporting in at ROW_WAIT_S; start passes at START_WAIT_S; the
-# CLI commands run to their end (their own bounds, SRJ-908: a teardown's
-# pause tries, exit_timeout and kill tries, each call bounded by CSCB's call
-# timeout). D_RECOVER_WAIT_S, D's recovery: from the restart, D's retry timer
-# (armed by the start pass's `pending` branch) retries at
-# UNAVAILABLE_RETRY_BASE_S, doubling to UNAVAILABLE_RETRY_CEILING_S; the
-# first retry at or past G from D's launch start makes the lap and the
-# bypassing `find-missing` that marks the row, then the recovery's launch and
-# the approver's Enter; bounded at G + UNAVAILABLE_RETRY_CEILING_S +
-# ROW_WAIT_S (at least 300 s, SRJ-1401).
-#
-# Matched values (every one printed by fixtures/fmk-texts.ts from the
-# installed package, never typed here):
-#   - the commands as the lines name them (CLI_COMMAND_CLEAN_RESTART,
-#     CLI_COMMAND_STOP_BOTS), the class labels (`adErrorClass`), the precheck
-#     failure line's head and the "nothing was stopped" line
-#     (`precheckFailureLine`, `precheckNothingStoppedLine`), the teardown
-#     failure line's head (`teardownFailureLine`), a kill-failed persona's
-#     report (`teardownKillOutcomeOf`, `personaTeardownReportOf`: its failure
-#     line, its ordinary alert for the CLI-teardown route and its entry's
-#     class and message), the last line (`teardownNotStoppedLine`), the
-#     not-restarted alert (`cleanRestartNotRestartedAlert`) and its class
-#     (CLEAN_RESTART_NOT_RESTARTED_LABEL), the answer check's try line head
-#     (`answerCheckFailedTryLine`), src/cli-teardown.ts; the CLI-teardown
-#     route's class (PERSONA_KILL_FAILED_LABEL, src/kill-failure-alert.ts);
-#     CONFLICT_PANE_NOT_FOUND_PHRASE (src/ad-description-phrases.ts); the
-#     error names ErrSpawnNotPausable and ErrTmuxCaptureFailed (`adErrorName`,
-#     src/agent-director-errors.ts);
-#   - the per-try line's fixed part before its description
-#     (`killRetryTryLine.description-head`, src/kill-retry.ts,
-#     src/checked-kill.ts) and KILL_RETRY_TRIES; G (`adGraceMs.default`,
-#     src/ad-settings.ts) and the retry schedule's ceiling
-#     (UNAVAILABLE_RETRY_CEILING_S, src/unavailable-retry.ts); instance ids
-#     and session names (`personaInstanceId`, `personaTmuxSessionName`,
-#     src/persona-identity.ts), the `service` label (SERVICE_LABEL) and the
-#     last-applied record's suffix (LAST_APPLIED_FILE_SUFFIX, src/reload.ts).
-#   - Quoted, with no exported builder: the teardown's escalation line
-#     `[slack] teardownBots: pause failed for persona <ref> — escalating to
-#     kill: ` (src/cli.ts teardownPersona); the startup-errors entry's layout
-#     `[<time>] [<class>] <message>` (src/startup-errors.ts
-#     recordStartupError).
-#
-# Outcomes the SRD leaves open are logged as `NOTE:` lines, not asserted:
-# each leg's CSCB calls of its ids by verb, D's row state after the kill,
-# and the restarted server's PID.
-#
-# The script ends with the closing assertions, `assert_no_server_tmux`,
-# `assert_no_cscb_include_finished` and `assert_no_cscb_delete` (b.jg5
-# SRJ-1418), in its own shell; their counts read only the shims' lines whose
-# parent is a CSCB process.
+# AD outcome and lifecycle regression checks; no startup TUI interpretation.
 set -euo pipefail
 
 TEST_NAME="test-21-fmk-teardown"
@@ -267,16 +72,13 @@ CFG_ROOT="${SCENARIO_ROOT}/claude-config"
 mkdir -m 700 "${CREDS_DIR}"
 mkdir -p "${CFG_ROOT}"
 
-# t21_persona <prefix> <short> <channel>: set <prefix>_NAME, _LABEL,
-# _CHANNEL, _WORK, _CFG, _KEY, _ID and _SESSION for one persona, write its
-# credentials file and select `startup-trust` for its working directory.
 t21_persona() {
     local p="$1" short="$2" channel="$3" key value work
     printf -v "${p}_NAME" '%s' "${SCENARIO_TAG}${short}"
     printf -v "${p}_LABEL" '%s' "${SCENARIO_TAG}${short}1"
     printf -v "${p}_CHANNEL" '%s' "${channel}"
     work="$(make_workdir "${SCENARIO_TAG}${short}_work")"
-    stub_mode "${work}" "${STUB_MODE_STARTUP_TRUST}"
+    stub_mode "${work}" "${STUB_MODE_AT_ONCE}"
     printf -v "${p}_WORK" '%s' "${work}"
     printf -v "${p}_CFG" '%s' "${CFG_ROOT}/${SCENARIO_TAG}${short}_cfg"
     mkdir -p "${CFG_ROOT}/${SCENARIO_TAG}${short}_cfg"
@@ -286,7 +88,7 @@ t21_persona() {
     printf -v "${p}_ID" '%s' "${value}"
     t21_value value personaTmuxSessionName "${key}"
     printf -v "${p}_SESSION" '%s' "${value}"
-    stub_mode "${work}" "${STUB_MODE_STARTUP_TRUST}"
+    stub_mode "${work}" "${STUB_MODE_AT_ONCE}"
     printf '{"bot_token": "%s", "app_token": "%s"}\n' \
         "$(fake_token bot "${SCENARIO_TAG}${short}1")" "$(fake_token app "${SCENARIO_TAG}${short}1")" \
         | write_file "${CREDS_DIR}/${SCENARIO_TAG}${short}1.json" 600
@@ -973,7 +775,7 @@ t21_ms_since() {
 
 t21_pending_leg() {
     local step="pending persona" out ref n launch session mark tick tick_t launches fm_before age_ms
-    stub_mode "${D_WORK}" "${STUB_MODE_UNRECOGNISED}"
+    stub_mode "${D_WORK}" "${STUB_MODE_MANUAL_START}"
     t21_config_for_next_start D
     t21_start_and_wait 1
     wait_until "${ROW_WAIT_S}" "${step}: ${D_ID} never read pending with a launch start" t21_row_pending_launched "${D_ID}"
@@ -1004,7 +806,7 @@ t21_pending_leg() {
     echo "${TEST_NAME}: NOTE: ${step}: after the kill ${D_ID} reads '$(t21_row_state "${D_ID}")'"
 
     # The next server: D's directory reports in now.
-    stub_mode "${D_WORK}" "${STUB_MODE_STARTUP_TRUST}"
+    stub_mode "${D_WORK}" "${STUB_MODE_AT_ONCE}"
     t21_mark
     mark="${MARK_TIME}"
     t21_start_and_wait 1

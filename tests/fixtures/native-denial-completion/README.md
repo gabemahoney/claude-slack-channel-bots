@@ -57,8 +57,9 @@ all supplied IDs must agree. Its timestamp must be finite and no earlier than
 the denied result and sidechain completion, and its main-stream offset must
 follow the Agent launch result. Earlier, unlinked, foreign, failed, ambiguous
 and merely enqueued notifications fail. Header extraction excludes summary and
-result prose. The existing timeout, idle check and subsequent dialog-hold
-acceptance are unchanged.
+result prose. The existing timeout and subsequent AD dialog-refusal acceptance remain.
+Readiness comes from agent-director row state; notification records never
+authorize typing.
 
 Retention projects those notification IDs/status from both content locations,
 plus attachment identity fields, through the existing secret scrub. It never
@@ -76,6 +77,6 @@ stop reasons and turn-completion waits:
 | `ai-readback.ts`, `ai-classifier-stop.ts` | Observe parent-linked assistant `end_turn` for exact current-turn answers. Notifications do not certify an assistant answer; existing receipt handling already covers user/queued input. No change. |
 | `ac20-diagnostics.ts` | Delegates completion to `completedAIReadback`; no independent native shape assumption. No change. |
 | `real-case-assertions.ts` busy-proof | Matches a Bash tool result and assistant terminal stop reasons; it does not wait for an async task notification. No change. |
-| `real-scenario.sh` real_wait_idle | Uses production-backed agent state and the actual empty composer, not notification records. No change. |
-| `native-idle-compaction.ts`, `test-104-fmk-real-idle-compact.sh` | Require the own-session native compaction boundary plus durable deliveries, not a task completion notification. No change. |
-| `codex-evidence.ts`, `codex-ai.ts`, `codex-delivery.ts` | Use Codex turn IDs and native rollout completion events through the shared Codex evidence helper. Claude user/attachment representations do not apply. No change. |
+| `real-scenario.sh` real_wait_idle | Waits for AD `waiting`; no empty-composer or notification interpretation. |
+| `test-104-fmk-real-idle-compact.sh` | Uncertain AD text outcome and ordered own-message receipts; no native idle/compaction observation. |
+| `codex-evidence.ts`, `codex-ai.ts`, `codex-delivery.ts` | Exact output/receipt assertions remain independent evidence. Operational readiness uses AD state and refusals, never native task ordering. |

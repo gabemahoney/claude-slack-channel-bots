@@ -1,446 +1,4 @@
-/**
- * test-helpers/conflict-cases.ts — The table of CONFLICT latch cases for
- * `test.each` (b.jg5 SRJ-1304; cases per SRJ-501, SRJ-505 and SRJ-507).
- *
- * One row per refusal CSCB can meet: the stub's `errTmuxSessionConflict`
- * description from the verb (and option) that gives it, and what latching a
- * persona on it records. Every entry of the stub's `CONFLICT_CASES` appears
- * in at least one row.
- *
- * Columns filled here (E13, the latch record):
- *   - `name`: a readable row name, built from the site kind, the stub's case
- *     identifier and the option set;
- *   - `site`: the site kind that meets the refusal ({@link ConflictCaseSite}):
- *     a plain spawn, a reuse spawn, a `resume`, a pane verb or a kill (named
- *     by its verb), one of the dialog approver's calls
- *     ({@link ApproverSite}, `approver <verb>`; select those rows with
- *     {@link isApproverSite} or take {@link APPROVER_CONFLICT_CASE_ROWS}),
- *     or one of the liveness checks' `read-pane` sites
- *     ({@link LivenessPaneSite}; select those rows with
- *     {@link isLivenessPaneSite} or take {@link LIVENESS_PANE_CONFLICT_CASE_ROWS});
- *   - `verb`, `stubCase`, `options`, `sessionName`, and `build`, a thunk that
- *     builds the error through the stub's `errTmuxSessionConflict` with them;
- *   - `latchCase`: the case `src/conflict-latch.ts` recognises (SRJ-507);
- *   - `refusedOperation`: what that verb's refusal refused (SRJ-501): a plain
- *     spawn, a spawn with `--reuse-finished`, a `resume`, or, for a pane verb
- *     or a kill, P's next check or recovery;
- *   - `rowState`: the row state the latch records on that path (SRJ-501): no
- *     row after the pre-spawn scan's refusal, `ended` after a plain spawn's
- *     "duplicate session" answer and on the finished-row path, the state the
- *     path last read for a pane verb or a kill, unreadable where the path
- *     could not read it;
- *   - `rowAfter`, on the plain spawn's rows only (E28 T4; b.jg5 SRJ-111,
- *     {@link PLAIN_SPAWN_CONFLICT_CASE_ROWS}): the row agent-director leaves,
- *     none after the pre-spawn scan's refusal and `ended` after a "duplicate
- *     session" answer, so a case scripts the reads after the refusal from it.
- *
- * Columns filled here (E13 T2, the CONFLICT notice, SRJ-1004):
- *   - `notice`: the {@link ExpectedConflictNotice} for the row's case, quoted
- *     session and description: its `lines` in SRJ-1004's order, its `text`
- *     (the lines joined), and `carries`, the flags for the lines it must
- *     carry: the pointer to "Operator actions", the must-not-be-ended line
- *     (`row` for "a different instance id", `store` for "another
- *     agent-director store", `none` otherwise), the `list` line and the
- *     human-only line.
- *
- * Unrecognised text and "never reported in", which carry no case sentence,
- * are rows of the table (a `resume`'s unrecognised answer and a `kill`'s
- * never-reported-in answer); every `ConflictLatchCase` has at least one row.
- *
- * The dialog approver's CONFLICT rows (E17; b.jg5 SRJ-117, SRJ-118, SRJ-404,
- * SRJ-501), {@link APPROVER_CONFLICT_CASE_ROWS}: one row per stub CONFLICT
- * case its `read-pane` and its `send-keys` can answer on a `pending` row (HO
- * rev 27; agent-director's pane verbs): "the agent's pane was not found",
- * with and without "the agent's pane was not adopted" (a lost create reply),
- * and "conflicting labels" from both; "not this launch's session" from
- * `read-pane` only (more than one leftover session), since `send-keys` on a
- * `pending` row answers a leftover with `ErrSpawnNotInteractive`, not
- * CONFLICT. Each records the refused operation "P's next check or recovery"
- * and the state `pending`, which the lap's `status` read gave before the
- * pane verb. The approver's `status` reads only the store and answers no
- * CONFLICT, so it has no CONFLICT row.
- *
- * The liveness checks' `read-pane` CONFLICT rows (E18; b.jg5 SRJ-117,
- * SRJ-501), {@link LIVENESS_PANE_CONFLICT_CASE_ROWS}: three site kinds
- * ({@link LivenessPaneSite}, {@link LIVENESS_PANE_SITES}; select their rows
- * with {@link isLivenessPaneSite} or {@link livenessPaneConflictRowsAt}):
- * b.d61's working-row verdict, b.f2b's waiting-row check and the launch
- * wait's evidence read, each reading P's own row through the shared reader.
- * Each site has one row per stub CONFLICT case the approver's `read-pane`
- * rows cover (built from those rows, so the two stay in step): "the agent's
- * pane was not found", with and without "the agent's pane was not adopted",
- * "not this launch's session" and "conflicting labels". Each records the
- * refused operation "P's next check or recovery" and the state the site's
- * path last read ({@link LIVENESS_PANE_SITE_ROW_STATE}): `working` at the
- * working-row verdict and at the launch wait's evidence read (the wait's
- * poll read `working`), `waiting` at the waiting-row check.
- *
- * The reconnect's `send-keys` CONFLICT rows (E19 T1; b.jg5 SRJ-118, SRJ-501,
- * SRJ-505, SRJ-613), {@link RECONNECT_CONFLICT_CASE_ROWS}: the site kind
- * {@link RECONNECT_SITE} (`reconnectMcpWithCause`'s one `send-keys` of
- * `/mcp reconnect`; select its rows with {@link isReconnectSite} or
- * {@link reconnectConflictRowsAt}). One row per stub CONFLICT case that
- * `send-keys` can answer on a live row that is not `pending`: the cases the
- * approver's `send-keys` rows cover ("the agent's pane was not found", with
- * and without "the agent's pane was not adopted", and "conflicting labels")
- * and "not this launch's session", which on such a row is a CONFLICT (the
- * approver's `pending` row answers it with `ErrSpawnNotInteractive`
- * instead): the same set the approver's `read-pane` rows cover. Each case
- * has a row for each state the reconnect's caller last read
- * ({@link RECONNECT_ROW_STATES}): `waiting` (the ladder's `waiting` branch,
- * the restart adapter's `waiting` row, the launch wait's poll) and `working`
- * (the adapter's stale `working` row, the launch wait's positive-idle
- * reconnect). Each records the refused operation "P's next check or
- * recovery". The "not this launch's session" rows carry
- * `leftoverOfEarlierLaunch` (SRJ-613's leftover case: a leftover of an
- * earlier launch holds the persona's session), so a test can select them.
- *
- * b.jdc's prompt-row `read-pane` CONFLICT rows (E19 T2; b.jg5 SRJ-117,
- * SRJ-501, SRJ-606, SRJ-607), {@link PROMPT_ROW_PANE_CONFLICT_CASE_ROWS}: two
- * site kinds ({@link PromptRowPaneSite}, {@link PROMPT_ROW_PANE_SITES};
- * select their rows with {@link isPromptRowPaneSite} or
- * {@link promptRowPaneConflictRowsAt}): b.jdc's reconnect verdict
- * (`promptRowReconnectVerdict`) and b.jdc's ladder action
- * (`launchOnPromptRow`), each reading P's own row through the shared reader.
- * Each site has one row per stub CONFLICT case the liveness checks'
- * `read-pane` rows cover (built from the approver's `read-pane` rows, as
- * theirs are), for each prompt state (`PROMPT_ROW_STATES` of
- * `src/session-manager.ts`: the state the path last read, `ask_user` or
- * `check_permission`), each refusing P's next check or recovery. The row
- * name carries the state (`<site> (<state>): <stub case>`).
- *
- * The checked kill's rows (E20; b.jg5 SRJ-110, SRJ-501, SRJ-512, the E13, E16
- * and E19 hatch notes): the restart path's kill before a relaunch
- * ({@link RESTART_KILL_SITE}, `_buildKillSessionAdapter`) and the live-row
- * sequence's two kills (below), the kinds of {@link KillSite}. The collision
- * ladder makes no kill and no delete (E22): a live row's kills are the
- * sequence's. The restart kill has one CONFLICT row per stub case `kill`
- * answers ("not this launch's session", "never reported in", "conflicting
- * labels"), each refusing P's next check or recovery and recording the state
- * the restart run last read, carried by the `dead` reading handed to the
- * kill (`ended`, with no latch-time `status` read: `latchTimeRead` false;
- * b.jg5 SRJ-501; {@link RESTART_KILL_CONFLICT_CASE_ROWS}). Its UNUSABLE NAME
- * rows: {@link RESTART_KILL_UNUSABLE_NAME_CASE_ROWS}, one per fault, refused
- * operation none, their state the one the run's `dead` reading carries.
- *
- * The live-row sequence's kill rows (E21; b.jg5 SRJ-110, SRJ-501, SRJ-512,
- * SRJ-613, SRJ-705; the E13 and E20 hatch notes): two site kinds
- * ({@link SequenceKillSite}, {@link SEQUENCE_KILL_SITES}; select their rows
- * with {@link isSequenceKillSite} or {@link sequenceKillConflictRowsAt}):
- * {@link SEQUENCE_STEP1_KILL_SITE} (step 1's kill, seeded with the state its
- * starter last read) and {@link SEQUENCE_STEP4_KILL_SITE} (step 4's, seeded
- * with the state step 3's last `get` read); {@link SEQUENCE_KILL_STEP} gives
- * each its step. For each, and for each state the sequence last read before
- * the kill ({@link SEQUENCE_KILL_ROW_STATES}, keyed by
- * {@link SequenceKillLastRead}: `pending`, and `waiting`, a live state other
- * than `pending`), one CONFLICT row per stub case `kill` answers, each
- * refusing P's next check or recovery and recording that state, with no
- * latch-time `status` read (`latchTimeRead` false: the sequence hands the
- * latch the state it last read), named `<site> (<state>): <stub case>`
- * ({@link SEQUENCE_KILL_CONFLICT_CASE_ROWS}). The step-1 kill's "not this
- * launch's session" row on a `pending` seed is SRJ-613's kill backstop
- * (`killBackstop`). The UNUSABLE NAME rows: one per fault for each sequence
- * kill and each of those states, refused operation none
- * ({@link SEQUENCE_KILL_UNUSABLE_NAME_CASE_ROWS},
- * {@link sequenceKillUnusableNameRowsAt}).
- *
- * The reuse spawn's rows (E22; b.jg5 SRJ-112, SRJ-501, SRJ-507, SRJ-512;
- * HO rev 15, rev 20): the site kind {@link REUSE_SPAWN_SITE}
- * (`reuseSpawnForPersona`; {@link REUSE_SPAWN_CONFLICT_CASE_ROWS}), one
- * CONFLICT row per stub case a spawn can answer, each refusing the reuse
- * spawn (`REFUSED_OPERATION_REUSE_SPAWN`). A reuse of an id with no row is an
- * ordinary fresh spawn, which the pre-spawn scan refuses with nothing
- * written: its rows (`scan-leftover`, and `conflicting-labels` in its scan
- * form) record no row and carry `noRowWritten`, so a test selects them for
- * the no-row cases ({@link reuseSpawnScanRows}). A reuse of a finished row
- * records the state its path last read, `ended`: `no-valid-id`,
- * `different-id` and `another-store` (each with and without the stub's
- * "duplicate session" extras, its `plainSpawn` option), `own-id`,
- * `leftover`, `duplicate-session-leftover`, `conflicting-labels` in its
- * "duplicate session" form and `unrecognised`. The UNUSABLE NAME rows: one
- * per fault at the reuse spawn, refused operation none, recording `ended`
- * ({@link REUSE_SPAWN_UNUSABLE_NAME_CASE_ROWS}).
- *
- * The stuck-launch abort's kill rows (E29; b.jg5 SRJ-412, SRJ-110, SRJ-501,
- * SRJ-512, SRJ-613): the site kind {@link STUCK_LAUNCH_ABORT_SITE}, the
- * abort kill's own site (`abortKillOwnStuckLaunch`, re-exported from
- * `src/session-manager.ts`, so the kind is the head of its log lines; select
- * its rows with {@link isStuckLaunchAbortSite}). The abort kills only a
- * covered row read `pending` at B, so every row records `pending`, the state
- * the rule's `get` last read, with no latch-time `status` read
- * (`latchTimeRead` false). One CONFLICT row per stub case `kill` answers,
- * each refusing P's next check or recovery
- * ({@link STUCK_LAUNCH_ABORT_CONFLICT_CASE_ROWS}); its "not this launch's
- * session" row is SRJ-613's kill backstop (`killBackstop`: the abort's kill
- * on a `pending` row answering it latches the persona with nothing sent).
- * Its UNUSABLE NAME rows: one per fault, refused operation none, recording
- * `pending` ({@link STUCK_LAUNCH_ABORT_UNUSABLE_NAME_CASE_ROWS}).
- *
- * The re-check columns (E30; b.jg5 SRJ-505, SRJ-506, SRJ-1005, SRJ-1304):
- * every row of every site kind (the CONFLICT rows, the sequence `resume`
- * rows, the plain spawn's rows recorded unreadable or live, the UNUSABLE
- * NAME rows, the launch-start rows and the note rows below) carries
- * `recheck`, its {@link RecheckColumns}:
- *   - `readVerb`: the read step 1 makes, `get` for "conflicting labels",
- *     `status` otherwise;
- *   - `action`: SRJ-505's table action for the row's refused operation and
- *     case (`RECHECK_ACTION_*` of `src/conflict-latch.ts`);
- *   - `entries`, one per state step 1 can read ({@link RecheckReadingName}: a
- *     failed read, no row, `pending`, `waiting`, `ended`, `missing`, and for
- *     a `get` row those three states with the note on the row; select one
- *     with {@link recheckEntryAt}). Each holds the reading (`reading`), the
- *     whole decision (`decision`: step 1's outcome, the action, the one call
- *     after the read, and SRJ-1005's reason when the reading clears), the
- *     call for a retired key (`retiredKeyCall`: the reuse in place of a
- *     `resume` or a plain spawn) and, for a call one verb answers (the probe,
- *     the lap `read-pane`, a plain spawn, a reuse, a `resume`), what its
- *     answers do ({@link RecheckAnswers}: still latched, cleared with their
- *     reason, a probe that finds the condition cleared, a relatch with its
- *     case, no information, CONFIG).
- * The decisions are written from SRJ-505's text here, never by calling
- * `decideLatchRecheck`, so a test compares the two. Thus a plain-spawn row
- * reads: no row, the plain spawn; `pending`, no retry; `ended` or
- * `missing`, a spawn with `--reuse-finished` (on E28 T4's `rowAfter`, which
- * gives the recorded state); a live state other than `pending` clears a
- * latch recorded with no row or `ended` (the row reported in), and gives no
- * retry to one recorded unreadable or live
- * ({@link PLAIN_SPAWN_RECORDED_LIVE_CASE_ROWS}, E30 T3: each plain spawn row
- * again, its latch-time `status` read failed or read the row `waiting`; not
- * in {@link CONFLICT_CASE_ROWS}); a `resume` or reuse row (HO rev 28): a live
- * row, `pending` included, no call and no post; `ended` or `missing`, the
- * case's probe or retry; no row, a `resume` latch cleared and a reuse latch's
- * reuse retried as a fresh spawn, whatever the case ("another agent-director
- * store" is a no-probe retry; "conflicting labels" with no note on a
- * `pending` row makes the one-line `read-pane` and no launch); a "not this
- * launch's session" row at any verb: `status` only, the finished-row retry
- * on `ended`, `missing` or no row ({@link FINISHED_ROW_RETRY_ENTRIES}: its one
- * `get`, then the launch per row state); the hold rows: `status` only. The
- * `resume` and reuse "this row's own id" rows also carry
- * `probeDroppedRecheck`, the columns once the episode's probe is dropped.
- * Every CONFLICT row also carries `record(key)` and every row `latchOn(latch,
- * key)`, which latches persona `key` as the row's site does through the
- * latch's own set entry ({@link RecheckLatchEntries}). Answer sets built with
- * the stub's builders: {@link recheckNoInformationAnswers},
- * {@link RECHECK_CONFIG_ANSWER}, {@link RECHECK_UNUSABLE_NAME_ANSWER} and the
- * one-line probe's {@link RECHECK_PANE_ANSWER}, {@link RECHECK_GONE_ANSWER}
- * and {@link recheckPaneConflictAnswer}; a `resume`'s or reuse's refusals
- * carry HO rev 28's restore sentences (the stub's `withRestoreSentence` with
- * `RESTORE_SENTENCES`, and `errTmuxSessionCreateStaysPending`), on which no
- * expectation depends. Each CONFLICT answer is checked at import to
- * recognise as the case its column says.
- *
- * The note rows ({@link NOTE_LATCH_CASE_ROWS}, b.jg5 SRJ-114): a latch from
- * the `provenance_conflict` note on P's own row read `pending`, `waiting`
- * or `ended` ("conflicting labels", P's bring-up refused, the state read),
- * each with `build(persona, home)` (the row as a `get` answers it),
- * `notice(key)`, `record(key)`, `latchOn` and `recheck`.
- *
- * The `resume` rows (b.jg5 SRJ-113, SRJ-501, SRJ-507; HO rev 15, rev 20):
- * the site kind `resume`, each refusing the `resume`
- * (`REFUSED_OPERATION_RESUME`) and recording `ended`, the state the
- * finished-row path last read, or unreadable for unrecognised text.
- * "another agent-director store" is there in its "duplicate session" form
- * (the stub's `plainSpawn` extras) beside its plain form; "conflicting
- * labels" is a duplicate label's, its "duplicate session" form (the scan's
- * form is a plain spawn's only). The same rows at the live-row sequence's
- * step-6 `resume`: the site kind {@link SEQUENCE_RESUME_SITE}, for each
- * state the sequence's last `get` read before it
- * ({@link SEQUENCE_RESUME_ROW_STATES}: `ended`, `missing`), recording that
- * state ({@link SEQUENCE_RESUME_CONFLICT_CASE_ROWS},
- * {@link sequenceResumeConflictRowsAt}; not in {@link CONFLICT_CASE_ROWS},
- * since only the recorded state differs).
- *
- * Other exports (E13 T2):
- *   - {@link expectedConflictNotice}: the expected notice for any case,
- *     session and description (none: no description line) and the record's
- *     `listLineUnsafe` (true: the unsafe-name line in place of the list
- *     line), assembled from
- *     the fixed lines and the case sentences `src/conflict-latch.ts` exports
- *     (`CONFLICT_NOTICE_*`, `CONFLICT_CASE_SENTENCES`), with the description
- *     rendered as a record holds it (`renderLogMessageText`) and both it and
- *     the session name escaped once for Slack (`escapeSlackControlCharacters`).
- *     It never calls `conflictNoticeText`, so it is an independent check of it;
- *   - {@link SESSION_ENDING_COMMAND_FORMS} and {@link sessionEndingCommandsIn}
- *     (defined in the import-free `session-ending-commands.ts`, re-exported):
- *     the session-ending command forms of ADSRD SR-1.4 that SRJ-1001 lists
- *     (`kill` named as a command to run, `pause`, `--include-finished`,
- *     `tmux kill-session`, `tmux kill-server`), as patterns, and the names of
- *     the forms a text matches. None matches agent-director's own "no kill was
- *     sent", "retry kill later" or "never delete this row". E16's, E29's and
- *     E36's text checks reuse them;
- *   - {@link CSCB_OWN_LINE_FORBIDDEN} and {@link cscbOwnLineForbiddenIn}: what
- *     CSCB's own lines never spell beyond those five forms (`kill-pane`,
- *     `set-option`, `agent-director delete`, the latch-clearing command,
- *     `has-session`, either label option's name), and each entry a line
- *     matches. The CONFLICT notice's and the stuck-launch post's checks reuse
- *     them;
- *   - {@link HUMAN_ONLY_SENTENCE} and {@link humanOnlySentencesIn}: SRJ-1001's
- *     human-only sentence in every wording the SRD, the notices and the docs
- *     use, as the one pattern every test file matches it with, and each
- *     occurrence in a text (for exact counts and for cutting it out);
- *   - {@link cscbOwnLines}:a notice's lines with agent-director's quoted
- *     description taken out, so a check over CSCB's own words lets the quoted
- *     description through. Two forms: a CONFLICT notice's description line
- *     (SRJ-1004; the line that opens with `CONFLICT_NOTICE_DESCRIPTION_LINE_HEAD`)
- *     is dropped whole; a description quoted inside a sentence (SRJ-1019's
- *     one-line notice) is cut out of its line, its frame and every CSCB word
- *     kept ({@link withoutInlineDescription}). {@link cscbOwnText} joins the
- *     lines back.
- *
- * Unusable-name rows (E16 T1 and E17, SRJ-512 and SRJ-1019), {@link UNUSABLE_NAME_CASE_ROWS}:
- * one row per fault in the stub's `UNUSABLE_NAME_FAULTS` for each verb site
- * kind ({@link UNUSABLE_NAME_SITES}): those E16 T1 wires (`resume`, a plain
- * spawn, `read-pane`, `status`, `get`), then the dialog approver's `status`, `read-pane` and `send-keys`
- * (E17, {@link APPROVER_SITES}; {@link APPROVER_UNUSABLE_NAME_CASE_ROWS}),
- * and the reuse spawn's (E22, {@link REUSE_SPAWN_UNUSABLE_NAME_CASE_ROWS},
- * recording `ended`, the state its path last read).
- * Columns ({@link UnusableNameCaseRow}):
- *   - `name` (`<site>: <fault>`), `site`, `verb` (the agent-director verb
- *     that answers), `fault`, and `build`, a thunk building the stub's
- *     `errUnusableName(fault)`;
- *   - `latchCase` and `refusedOperation`: "unusable recorded name" and
- *     "none" (`LATCH_CASE_UNUSABLE_RECORDED_NAME`, `REFUSED_OPERATION_NONE`);
- *   - `rowState`: the row state the path records. A `status` or a `get`
- *     that itself answers UNUSABLE NAME records unreadable, the approver's
- *     `status` included (its read goes through the own-row `status` step).
- *     The others record the state the path last read: `ended` for `resume`
- *     (the finished-row path), `working` for
- *     `read-pane` (the launch wait's evidence read and
- *     `checkWorkingRowPane`), `pending` for the approver's `read-pane` and
- *     `send-keys` (the lap's `status` read before them). The plain spawn
- *     is the first spawn, which read nothing before it, so its state comes
- *     from the one latch-time `status` read (`latchTimeRead: true`); the row
- *     expects no row, so a case arranges that read to answer
- *     `ErrSpawnNotFound`;
- *   - `latchTimeRead`: true when the recorded state comes from the latch-time
- *     `status` read rather than from a read the path made before the call;
- *   - `description`: the classification's message (`classifyAdError(...)
- *     .message`: redacted, on one line, capped), which the record holds;
- *   - `notice(key)`: the SRJ-1019 notice for persona `key`, built by
- *     `unusableNameNoticeText(key, description)` (its instance id from
- *     `personaInstanceId`); `sessionName(key)`: the session the record holds,
- *     `personaTmuxSessionName(key)` (the stub's descriptions quote none);
- *   - `record(key)`: the whole latch record (`ConflictLatchRecord`) a latch
- *     of persona `key` from the row holds (the case, "none", `rowState`, the
- *     quoted session and the description), {@link expectedLatchRecord} of
- *     `src/conflict-latch.ts`'s `unusableNameSetInput(key, build(), rowState)`.
- *     Compare a latch's `record(key)` with it whole (`toEqual`).
- * The dialog approver's rows land here (E17). The reconnect's `send-keys`
- * (E19 T1, {@link RECONNECT_SITE}; {@link RECONNECT_UNUSABLE_NAME_CASE_ROWS})
- * has one row per fault for each state in {@link RECONNECT_ROW_STATES}
- * (`waiting`, `working`), each recording the state its caller last read;
- * its row names carry the state (`reconnect send-keys (waiting): <fault>`).
- * The live-row sequence's two kills (E21, {@link SEQUENCE_KILL_SITES};
- * {@link SEQUENCE_KILL_UNUSABLE_NAME_CASE_ROWS}) have one row per fault for
- * each state in {@link SEQUENCE_KILL_ROW_STATES} (`pending`, `waiting`), each
- * recording the state the sequence last read, named
- * `sequence step-1 kill (pending): <fault>`. The stuck-launch abort's kill
- * (E29, {@link STUCK_LAUNCH_ABORT_SITE};
- * {@link STUCK_LAUNCH_ABORT_UNUSABLE_NAME_CASE_ROWS}) has one row per fault,
- * each recording `pending`.
- *
- * The expected latch records (SRJ-501), for any test that checks what a
- * hold-case latch holds (the server, restart, health-check, unavailable-retry
- * and session-manager tests included), so no test types a record by hand:
- *   - {@link expectedLatchRecord}`(key, input)`: the record a latch holds for
- *     a set input (the session and description rendered by
- *     `renderLogMessageText`, the session `slack_bot_<key>` when empty, no
- *     description when empty);
- *   - an unusable-name row's `record(key)` (above);
- *   - {@link launchStartRecord}`(key)`: the "launch start not recorded"
- *     record, from `launchStartNotRecordedSetInput(key, pending)`: the case
- *     "launch start not recorded", the refused operation "none", the state
- *     `pending`, the session `slack_bot_<key>` and no description; also every
- *     latching launch-start row's `record(key)`.
- *
- * The tmux-touching verbs (SRJ-502), {@link TMUX_TOUCHING_STUB_VERBS} and
- * {@link tmuxTouchingCallsIn}: `resume`, `spawn` in both forms (plain and
- * `--reuse-finished`, both logged in `spawnCalls`), `read-pane`, `send-keys`,
- * `kill` and `pause`, each with its stub call-log list, and the calls a stub
- * log holds for them ({@link tmuxTouchingCallCounts} takes the log's lengths
- * first, so a case can ask only for the calls made since). A test filters
- * the stub's call log through these and never types the list itself.
- *
- * Per-persona CONFLICT helpers (shared by the recovery-harness cases, so no
- * test file keeps its own copy):
- *   - {@link conflictForPersona}: a plain spawn's CONFLICT for persona `key`,
- *     its session left over from an earlier life ("duplicate session"): the
- *     stub's `errTmuxSessionConflict('spawn', 'duplicate-session-leftover',
- *     personaTmuxSessionName(key))`;
- *   - {@link conflictNoticeForPersona}: the CONFLICT notice that error posts
- *     to persona `key`'s destination, `{ key, text }`, the text
- *     {@link expectedConflictNotice} gives for `LATCH_CASE_LEFTOVER`, the
- *     persona's session name and the error's description.
- *
- * Launch-start rows (E16 T2, SRJ-513, SRJ-408 and SRJ-1020): a configured
- * persona P's own row read `pending` with no launch start, and the rows that
- * latch nothing beside it. Every row is built for P (a `CannedRowPersona`)
- * and a `home` with the stub's canned builders in their persona form
- * (`cannedStatusResult`, `cannedGetResult`, `cannedListRow`), each launch
- * start given explicitly, since the builders give a `pending` row a sample
- * launch start when the case gives none. Columns common to both kinds
- * ({@link LaunchStartCaseRowOf}, {@link LaunchStartNonLatchingRowOf}):
- *   - `name`, `shape` (the read: `status`, `get` or `list`,
- *     {@link LAUNCH_START_READ_SHAPES}; narrow a row on it for the read's own
- *     answer type, {@link LaunchStartReadResults}) and `launchStart` (the raw
- *     value; `undefined` for absent);
- *   - `build(persona, home)`: the read's answer as the stub gives it. A
- *     `status` result carries only `state` and `launch_started_at`, so a
- *     row's `cwd`, labels and id are the row behind it and do not show;
- *   - `readKey(persona)` (the key the read is made for: P's own, or the key
- *     the row's id stands for) and `configured` (whether that key is a
- *     configured persona's when P is the one configured persona);
- *   - `readRow(persona, home)`: the row as `decideOwnRowRead` reads it, a
- *     `status` result given its row's id as the own-row `status` step gives
- *     it; `decisionInput(persona, home)`: the decision's whole input.
- * The latching rows, {@link LAUNCH_START_CASE_ROWS}: each read shape × each
- * row variant ({@link LAUNCH_START_ROW_VARIANTS}: P's current life, a `cwd`
- * other than P's, a `config_dir` label other than P's) × each form of "no
- * launch start" ({@link NO_LAUNCH_START_FORMS}: absent, i.e. the stub's
- * `SAMPLE_LAUNCH_START_NONE`; `null`; {@link UNPARSEABLE_LAUNCH_START}, the
- * stub's whole-second sample with its zone dropped). Their own columns:
- * `variant`, `form`, `livenessNote`; `latchCase`, `refusedOperation` and
- * `rowState`: "launch start not recorded", "none" and `pending`
- * (`LATCH_CASE_LAUNCH_START_NOT_RECORDED`, `REFUSED_OPERATION_NONE`,
- * `latchRowStateRead('pending')`); `sessionName(key)`, the quoted session
- * the record holds (`personaTmuxSessionName(key)`); `notice(key)`, the
- * SRJ-1020 notice built by `launchStartNotRecordedNoticeText(key)`; and
- * `record(key)`, the whole latch record, {@link launchStartRecord}`(key)`.
- * {@link LAUNCH_START_AND_NOTE_ROW} is one more such row (P's current-life
- * `get`, launch start absent) that also carries the stub's `provenanceNote`:
- * it expects the launch-start decision only (SRJ-513's precedence).
- * The non-latching rows, {@link LAUNCH_START_NON_LATCHING_ROWS}, per read
- * shape, each with its `kind` and `state`: P's `pending` row with each
- * non-none form of the stub's `SAMPLE_LAUNCH_STARTS` ("launch start
- * recorded"); P's row in every other state with no launch start ("not
- * pending"); and the no-launch-start `pending` row under a key outside the
- * configured set: an absent persona's `cscb_<key>`
- * ({@link LAUNCH_START_ABSENT_PERSONA_KEY}, not configured), another
- * caller's id ({@link LAUNCH_START_ANOTHER_CALLERS_ID}, read for P), and a
- * pre-persona row (`cscb_<key>` of {@link LAUNCH_START_PRE_PERSONA_KEY},
- * labelled `service=cscb` only, not configured). Whether P's row is
- * "covered" (SRJ-409, E28) is no column: the decision never asks.
- *
- * There is no "no pane 0.0" row: that case is withdrawn (rev 17; SRJ-507).
- *
- * No case word, notice text, latch record or session name is written here:
- * the words reach a row only through the stub, the notice's texts and the
- * hold records' fields only through `src/conflict-latch.ts`'s exports, and
- * the session name is the stub's
- * `STUB_TMUX_SESSION_NAME` or, for a persona, `personaTmuxSessionName(key)`
- * (its instance id `personaInstanceId(key)`). No timestamp is written here:
- * launch starts come from the stub's `SAMPLE_LAUNCH_START*` constants, the
- * unparseable one derived from a sample (checked not to parse by
- * `tests/conflict-latch.test.ts`, never at import).
- * Every CONFLICT a row builds is the stub's `errTmuxSessionConflict`, an
- * instance of the `ErrTmuxSessionConflict` binding of
- * `src/agent-director-errors.ts`, so the classifier and `conflictDescriptionOf`
- * take it by class; none is a base `AgentDirectorError` carrying the name.
- * This file imports none of the three Phase-1-only classes, from
- * `agent-director` or elsewhere, and uses no `mock.module()`.
- *
- * SPDX-License-Identifier: MIT
- */
+
 
 import type { GetResult, ListRow, StatusResult } from 'agent-director'
 import {
@@ -548,7 +106,7 @@ import {
 import { classifyAdError, conflictDescriptionOf } from '../../src/ad-error-class.ts'
 import { renderLogMessageText } from '../../src/persona-connection-errors.ts'
 import { personaInstanceId, personaTmuxSessionName } from '../../src/persona-identity.ts'
-import { PROMPT_ROW_STATES, STUCK_LAUNCH_ABORT_SITE, type ApproverVerb } from '../../src/session-manager.ts'
+import { PROMPT_ROW_STATES, STUCK_LAUNCH_ABORT_SITE } from '../../src/session-manager.ts'
 import { escapeSlackControlCharacters } from '../../src/slack-text-escape.ts'
 import {
   RESTORE_SENTENCES,
@@ -586,31 +144,6 @@ import {
 // Site kinds
 // ---------------------------------------------------------------------------
 
-/** One of the dialog approver's calls as a site kind: `approver <verb>` (b.jg5 SRJ-117, SRJ-118, SRJ-402). */
-export type ApproverSite = `approver ${ApproverVerb}`
-
-/** The verb each approver site kind calls, in the order a lap calls them. */
-const APPROVER_SITE_VERB: Readonly<Record<ApproverSite, ApproverVerb>> = Object.freeze({
-  'approver status': 'status',
-  'approver read-pane': 'read-pane',
-  'approver send-keys': 'send-keys',
-})
-
-/** Every approver site kind, in lap order: `status`, `read-pane`, `send-keys`. */
-export const APPROVER_SITES: readonly ApproverSite[] = Object.freeze(Object.keys(APPROVER_SITE_VERB) as ApproverSite[])
-
-/** The stub call list (`StubCallLog`) each approver verb is counted in, in lap order. */
-export const APPROVER_VERB_CALLS: Readonly<Record<ApproverVerb, 'statusCalls' | 'readPaneCalls' | 'sendKeysCalls'>> = Object.freeze({
-  'status': 'statusCalls',
-  'read-pane': 'readPaneCalls',
-  'send-keys': 'sendKeysCalls',
-})
-
-/** Whether `site` is one of the dialog approver's site kinds. */
-export function isApproverSite(site: string): site is ApproverSite {
-  return Object.hasOwn(APPROVER_SITE_VERB, site)
-}
-
 /**
  * One of the liveness checks' `read-pane` sites of persona P's own row as a
  * site kind (b.jg5 SRJ-117's E18 columns): b.d61's working-row verdict
@@ -618,7 +151,6 @@ export function isApproverSite(site: string): site is ApproverSite {
  * and the launch wait's evidence read (`staleWorkingRowIsIdle`), each through
  * the shared reader of P's own row (`readPersonaOwnPane`).
  */
-export type LivenessPaneSite = 'working-row verdict' | 'waiting-row check' | 'launch wait evidence read'
 
 const WORKING = latchRowStateRead('working')
 const WAITING = latchRowStateRead('waiting')
@@ -629,21 +161,10 @@ const WAITING = latchRowStateRead('waiting')
  * working-row verdict and the launch wait's evidence read (the wait's poll
  * read `working`), `waiting` for the waiting-row check.
  */
-export const LIVENESS_PANE_SITE_ROW_STATE: Readonly<Record<LivenessPaneSite, LatchRowState>> = Object.freeze({
-  'working-row verdict': WORKING,
-  'waiting-row check': WAITING,
-  'launch wait evidence read': WORKING,
-})
 
 /** Every liveness pane site kind, in SRJ-117's column order. */
-export const LIVENESS_PANE_SITES: readonly LivenessPaneSite[] = Object.freeze(
-  Object.keys(LIVENESS_PANE_SITE_ROW_STATE) as LivenessPaneSite[],
-)
 
 /** Whether `site` is one of the liveness checks' `read-pane` site kinds. */
-export function isLivenessPaneSite(site: string): site is LivenessPaneSite {
-  return Object.hasOwn(LIVENESS_PANE_SITE_ROW_STATE, site)
-}
 
 /** A pane verb or a kill whose CONFLICT refuses P's next check or recovery, as a site kind. */
 type PaneOrKillSite = 'kill' | 'read-pane' | 'send-keys' | 'pause'
@@ -744,21 +265,11 @@ export function isStuckLaunchAbortSite(site: string): site is StuckLaunchAbortSi
  */
 export type KillSite = typeof RESTART_KILL_SITE | SequenceKillSite | StuckLaunchAbortSite
 
-/**
- * The site kind that meets a CONFLICT row's refusal: a plain spawn, a reuse
- * spawn, a `resume`, a pane verb or a kill (by its verb), one of the dialog
- * approver's pane verbs, one of the liveness checks' `read-pane` sites, the
- * reconnect's `send-keys`, one of b.jdc's prompt-row `read-pane` sites, or
- * one of the checked kill's sites (the restart path's kill, the live-row
- * sequence's two kills, the stuck-launch abort's kill).
- */
 export type ConflictCaseSite =
   | 'plain spawn'
   | typeof REUSE_SPAWN_SITE
   | 'resume'
   | PaneOrKillSite
-  | ApproverSite
-  | LivenessPaneSite
   | ReconnectSite
   | PromptRowPaneSite
   | KillSite
@@ -1687,54 +1198,6 @@ const paneOrKill = (
   s: LatchRowState,
   o?: ConflictOptions,
 ): ConflictCaseRow => row(verb, REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY, verb, c, l, s, o)
-/**
- * The dialog approver's CONFLICT from its pane verb `verb` (b.jg5 SRJ-501):
- * P's next check or recovery, recorded `pending`, the state the lap's
- * `status` read gave before the pane verb.
- */
-const approverPane = (
-  verb: Exclude<ApproverVerb, 'status'>,
-  c: ConflictCase,
-  l: ConflictLatchCase,
-  o?: ConflictOptions,
-): ConflictCaseRow => row(`approver ${verb}`, REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY, verb, c, l, PENDING, o)
-
-/**
- * The dialog approver's pane verbs on a `pending` row (E17): P's next check
- * or recovery, recorded `pending`. `send-keys` on a `pending` row answers a
- * leftover with `ErrSpawnNotInteractive`, so only `read-pane` (more than one
- * leftover) has a not-this-launch row.
- */
-const APPROVER_ROWS: readonly ConflictCaseRow[] = [
-  approverPane('read-pane', 'pane-not-found', LATCH_CASE_PANE_NOT_FOUND),
-  approverPane('read-pane', 'pane-not-found', LATCH_CASE_PANE_NOT_FOUND, { notAdopted: true }),
-  approverPane('read-pane', 'not-this-launch', LATCH_CASE_NOT_THIS_LAUNCH),
-  approverPane('read-pane', 'conflicting-labels', LATCH_CASE_CONFLICTING_LABELS),
-  approverPane('send-keys', 'pane-not-found', LATCH_CASE_PANE_NOT_FOUND),
-  approverPane('send-keys', 'pane-not-found', LATCH_CASE_PANE_NOT_FOUND, { notAdopted: true }),
-  approverPane('send-keys', 'conflicting-labels', LATCH_CASE_CONFLICTING_LABELS),
-]
-
-/**
- * The liveness checks' `read-pane` CONFLICT rows (E18; b.jg5 SRJ-117,
- * SRJ-501): for each liveness pane site, one row per stub CONFLICT case the
- * approver's `read-pane` rows cover (the same case, option set and latch
- * case), each refusing P's next check or recovery and recording the state
- * the site's path last read ({@link LIVENESS_PANE_SITE_ROW_STATE}).
- */
-const LIVENESS_PANE_ROWS: readonly ConflictCaseRow[] = LIVENESS_PANE_SITES.flatMap((site) =>
-  APPROVER_ROWS.filter((approverRow) => approverRow.verb === 'read-pane').map((approverRow) =>
-    row(
-      site,
-      REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY,
-      'read-pane',
-      approverRow.stubCase,
-      approverRow.latchCase,
-      LIVENESS_PANE_SITE_ROW_STATE[site],
-      approverRow.options,
-    ),
-  ),
-)
 
 /** A state the reconnect's caller last read before its `send-keys`: `waiting`, or `working` (a stale row). */
 export type ReconnectLastRead = 'waiting' | 'working'
@@ -1751,24 +1214,23 @@ export const RECONNECT_ROW_STATES: Readonly<Record<ReconnectLastRead, LatchRowSt
 /** Every {@link ReconnectLastRead}, in row order. */
 const RECONNECT_LAST_READS = Object.keys(RECONNECT_ROW_STATES) as ReconnectLastRead[]
 
-/**
- * The reconnect's `send-keys` CONFLICT rows (E19 T1; b.jg5 SRJ-118, SRJ-501):
- * for each state in {@link RECONNECT_ROW_STATES}, one row per stub CONFLICT
- * case the approver's `read-pane` rows cover (the approver's `send-keys`
- * cases and "not this launch's session"), each refusing P's next check or
- * recovery. The row name carries the state; the "not this launch's session"
- * rows carry `leftoverOfEarlierLaunch` (SRJ-613).
- */
+const PANE_CONFLICT_CASES: readonly (Pick<ConflictCaseRow, 'stubCase' | 'latchCase'> & { options?: ConflictOptions })[] = [
+  { stubCase: 'pane-not-found', latchCase: LATCH_CASE_PANE_NOT_FOUND },
+  { stubCase: 'pane-not-found', latchCase: LATCH_CASE_PANE_NOT_FOUND, options: { notAdopted: true } },
+  { stubCase: 'not-this-launch', latchCase: LATCH_CASE_NOT_THIS_LAUNCH },
+  { stubCase: 'conflicting-labels', latchCase: LATCH_CASE_CONFLICTING_LABELS },
+]
+
 const RECONNECT_ROWS: readonly ConflictCaseRow[] = RECONNECT_LAST_READS.flatMap((lastRead) =>
-  APPROVER_ROWS.filter((approverRow) => approverRow.verb === 'read-pane').map((approverRow) => {
+  PANE_CONFLICT_CASES.map((probeRow) => {
     const caseRow = row(
       RECONNECT_SITE,
       REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY,
       'send-keys',
-      approverRow.stubCase,
-      approverRow.latchCase,
+      probeRow.stubCase,
+      probeRow.latchCase,
       RECONNECT_ROW_STATES[lastRead],
-      approverRow.options,
+      probeRow.options,
     )
     return Object.freeze({
       ...caseRow,
@@ -1778,25 +1240,17 @@ const RECONNECT_ROWS: readonly ConflictCaseRow[] = RECONNECT_LAST_READS.flatMap(
   }),
 )
 
-/**
- * b.jdc's prompt-row `read-pane` CONFLICT rows (E19 T2; b.jg5 SRJ-117,
- * SRJ-501): for each prompt-row pane site and each prompt state the path
- * last read (`PROMPT_ROW_STATES`), one row per stub CONFLICT case the
- * approver's `read-pane` rows cover (as the liveness checks' rows), each
- * refusing P's next check or recovery and recording that state. The row
- * name carries the state.
- */
 const PROMPT_ROW_PANE_ROWS: readonly ConflictCaseRow[] = PROMPT_ROW_PANE_SITES.flatMap((site) =>
   [...PROMPT_ROW_STATES].flatMap((state) =>
-    APPROVER_ROWS.filter((approverRow) => approverRow.verb === 'read-pane').map((approverRow) => {
+    PANE_CONFLICT_CASES.map((probeRow) => {
       const caseRow = row(
         site,
         REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY,
         'read-pane',
-        approverRow.stubCase,
-        approverRow.latchCase,
+        probeRow.stubCase,
+        probeRow.latchCase,
         latchRowStateRead(state),
-        approverRow.options,
+        probeRow.options,
       )
       return Object.freeze({ ...caseRow, name: caseRow.name.replace(site, `${site} (${state})`) })
     }),
@@ -2059,10 +1513,9 @@ export const CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object.freeze([
   paneOrKill('read-pane', 'conflicting-labels', LATCH_CASE_CONFLICTING_LABELS, PENDING),
   paneOrKill('kill', 'never-reported-in', LATCH_CASE_NEVER_REPORTED_IN, PENDING),
   paneOrKill('kill', 'conflicting-labels', LATCH_CASE_CONFLICTING_LABELS, WORKING),
-  // The dialog approver's pane verbs on a `pending` row (E17).
-  ...APPROVER_ROWS,
+
   // The liveness checks' `read-pane` sites (E18).
-  ...LIVENESS_PANE_ROWS,
+
   // The reconnect's `send-keys` (E19 T1).
   ...RECONNECT_ROWS,
   // b.jdc's prompt-row `read-pane` sites (E19 T2).
@@ -2075,20 +1528,9 @@ export const CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object.freeze([
   ...STUCK_LAUNCH_ABORT_ROWS,
 ])
 
-/** The dialog approver's CONFLICT rows of {@link CONFLICT_CASE_ROWS} (its `read-pane` and `send-keys`), for `test.each`. */
-export const APPROVER_CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object.freeze(
-  CONFLICT_CASE_ROWS.filter((caseRow) => isApproverSite(caseRow.site)),
-)
-
 /** The liveness checks' `read-pane` CONFLICT rows of {@link CONFLICT_CASE_ROWS} (E18), for `test.each`. */
-export const LIVENESS_PANE_CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object.freeze(
-  CONFLICT_CASE_ROWS.filter((caseRow) => isLivenessPaneSite(caseRow.site)),
-)
 
 /** The liveness pane CONFLICT rows of one site kind, for `test.each`. */
-export function livenessPaneConflictRowsAt(site: LivenessPaneSite): readonly ConflictCaseRow[] {
-  return LIVENESS_PANE_CONFLICT_CASE_ROWS.filter((caseRow) => caseRow.site === site)
-}
 
 /** The reconnect's `send-keys` CONFLICT rows of {@link CONFLICT_CASE_ROWS} (E19 T1), for `test.each`. */
 export const RECONNECT_CONFLICT_CASE_ROWS: readonly ConflictCaseRow[] = Object.freeze(
@@ -2184,14 +1626,12 @@ export function expectedLatchRecord(key: string, input: ConflictLatchSetInput): 
 // The unusable recorded name (b.jg5 SRJ-512, SRJ-1019)
 // ---------------------------------------------------------------------------
 
-/** A verb site kind wired for an UNUSABLE NAME answer: E16 T1's, then the dialog approver's (E17). */
 export type UnusableNameSite =
   | 'resume'
   | 'plain spawn'
   | 'read-pane'
   | 'status'
   | 'get'
-  | ApproverSite
   | ReconnectSite
   | typeof RESTART_KILL_SITE
   | SequenceKillSite
@@ -2205,7 +1645,7 @@ const UNUSABLE_NAME_SITE_VERB: Readonly<Record<UnusableNameSite, string>> = Obje
   'read-pane': 'read-pane',
   'status': 'status',
   'get': 'get',
-  ...APPROVER_SITE_VERB,
+
   [RECONNECT_SITE]: 'send-keys',
   [RESTART_KILL_SITE]: 'kill',
   [SEQUENCE_STEP1_KILL_SITE]: 'kill',
@@ -2264,11 +1704,9 @@ const UNUSABLE_NAME_LAST_READ: Readonly<Record<Exclude<UnusableNameSite, Reconne
   'read-pane': WORKING,
   'status': LATCH_ROW_STATE_UNREADABLE,
   'get': LATCH_ROW_STATE_UNREADABLE,
-  // The approver's `status` goes through the own-row `status` step, which
+
   // read no state; its pane verbs follow the lap's `pending` read.
-  'approver status': LATCH_ROW_STATE_UNREADABLE,
-  'approver read-pane': PENDING,
-  'approver send-keys': PENDING,
+
   // The restart path's kill records the state its run's `dead` reading
   // carries (b.jg5 SRJ-501), with no latch-time `status` read: `ended` here.
   [RESTART_KILL_SITE]: ENDED,
@@ -2332,11 +1770,6 @@ export const UNUSABLE_NAME_CASE_ROWS: readonly UnusableNameCaseRow[] = Object.fr
           )
         : UNUSABLE_NAME_FAULTS.map((fault) => unusableNameRow(site, fault, UNUSABLE_NAME_LAST_READ[site])),
   ),
-)
-
-/** The dialog approver's UNUSABLE NAME rows of {@link UNUSABLE_NAME_CASE_ROWS} (its `status`, `read-pane` and `send-keys`), for `test.each`. */
-export const APPROVER_UNUSABLE_NAME_CASE_ROWS: readonly UnusableNameCaseRow[] = Object.freeze(
-  UNUSABLE_NAME_CASE_ROWS.filter((caseRow) => isApproverSite(caseRow.site)),
 )
 
 /** The reconnect's `send-keys` UNUSABLE NAME rows of {@link UNUSABLE_NAME_CASE_ROWS} (E19 T1), for `test.each`. */

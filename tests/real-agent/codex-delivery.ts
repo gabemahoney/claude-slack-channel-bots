@@ -1,6 +1,6 @@
 /** D1 production-module driver. Executable only inside a disposable CI shard.
  * Login contents are never read here; all rollout/home files remain private. */
-import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, realpathSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { randomBytes } from 'node:crypto'
 
@@ -9,7 +9,7 @@ if (!existsSync('/etc/cscb-ci-image')) {
   process.exit(2)
 }
 
-const { codexContainment, codexArguments, configureScratchCodex, createScratchCodexLifecycle, retireCodexObservation, codexRetirementCheckpoint, CODEX_NATIVE, CODEX_AUTH_MOUNT, CODEX_NO_REPLY, under } = await import('./codex-guards.ts')
+const { codexContainment, codexArguments, configureScratchCodex, createScratchCodexLifecycle, codexRetirementCheckpoint, CODEX_NATIVE, CODEX_AUTH_MOUNT, CODEX_NO_REPLY, under } = await import('./codex-guards.ts')
 let paths: ReturnType<typeof codexContainment>
 try { paths = codexContainment(process.env, realpathSync) }
 catch { console.error('FAIL: codex-delivery: refused: scratch HOME/TMUX_TMPDIR, unset TMUX and selected model are required'); process.exit(2) }
@@ -20,7 +20,7 @@ if (!under('/test-repo/node_modules', realpathSync(pkg))) {
   process.exit(2)
 }
 const crashProtocol = await import('./codex-crash-barrier.ts')
-const { projectFailurePane } = await import('./ai-failure-diagnostics.ts')
+const { projectFailureState } = await import('./ai-failure-diagnostics.ts')
 
 const codexHome = join(paths.home, '.codex'), work = join(paths.root, 'work', 'codex-delivery')
 const stateDir = join(paths.root, 'codex-delivery-state'), key = 'codex_delivery'
@@ -167,7 +167,7 @@ async function buildEngine() {
     // D1 injects lookup answers, never a Slack/MCP server or client.
     onReceived: (_key: string, item: any) => receivedItem(item), wake: () => engines.wake(key), onPending: () => engines?.wake(key) })
   engines = engineModule.createDeliveryEngines({ queue, lifecycle, clientFor: async () => ({
-    get: (params: any) => client.get(params), readPane: (params: any) => client.readPane(params),
+    get: (params: any) => client.get(params),
     sendKeys: async (params: any) => {
       if (crashBarrier && params.no_enter && typeof params.text === 'string') crashCheckpoint('text-call-start', { textStarted: true })
       const result = await (multipartSend ? multipartSend(params) : client.sendKeys(params))
@@ -218,55 +218,22 @@ async function rollout(r = undefined as any) {
   nativeRollouts.set(data.session, data)
   return { row: r, path: r.jsonl_path, data }
 }
-async function pane(label: string) {
-  const r = await row(), value = await client.readPane({ instance_id: instance, n_lines: 60 })
-  const { readDeliveryScreen } = await import(join(pkg, 'src/delivery-screen.ts'))
-  const { redactSlackLogText } = await import(join(pkg, 'src/slack-log-redaction.ts'))
-  const result = { label, agent: 'codex', version: '0.159.2', session: r.session_id, at: Date.now(), state: r.state,
-    pane: redactSlackLogText(observation.redactRealObservation(value.pane, process.env)), screen: readDeliveryScreen('codex', value.pane) }
-  record('pane', result)
-  return result
-}
-async function observationPane(label: string, text: string) {
-  const kind = /popup|overlay/.test(label) ? 'menu' : 'input'
-  const state = label.startsWith('busy-') ? 'working' : 'waiting'
-  return poll(`native ${label} rendering`, async () => {
-    const p = await pane(label)
-    if (p.state === state && p.screen.kind === kind
-      && (kind !== 'input' || p.screen.text === text)) return p
-  })
-}
-async function idle() {
-  return poll('native completed waiting row', async () => {
+async function waiting() {
+  return poll('AD waiting row', async () => {
     const r = await row()
     if (r.state !== 'waiting') return
-    // Research does not depend on the final screen classifier. Native hooks
-    // plus the own-session completion event establish the idle observation.
-    let current
-    try { current = await rollout(r) } catch { return }
-    if (current.data.incomplete) return
-    const terminal = current.data.records.filter((e: any) => e.type === 'event_msg' && ['task_started', 'task_complete', 'turn_aborted'].includes(e.kind)).at(-1)
-    if (terminal?.kind === 'task_complete') { authContract('postidle'); return r }
+    authContract('postidle')
+    return r
   })
 }
-async function waitingComposer() {
-  return poll('native waiting empty composer', async () => {
-    const r = await row()
-    if (r.state !== 'waiting') return
-    const { readDeliveryScreen } = await import(join(pkg, 'src/delivery-screen.ts'))
-    const screen = readDeliveryScreen('codex', (await client.readPane({ instance_id: instance, n_lines: 60 })).pane)
-    return screen.kind === 'empty' ? r : undefined
-  })
+async function sendWaiting(params: Record<string, unknown>) {
+  await waiting()
+  return client.sendKeys({ instance_id: instance, ...params })
 }
-async function retire(label: string, draft: boolean) {
-  const waiting = (await row()).state === 'waiting'
+async function retire(label: string) {
   stage = `${label}-retire`; lastKey = null
-  await retireCodexObservation({
-    sendEscape: async () => { lastKey = 'Escape'; return client.sendKeys({ instance_id: instance, key: 'Escape' }) },
-    afterEscape: async () => { await Bun.sleep(100); await pane(`${label}-after-Escape`) },
-    kill: () => client.kill({ instance_id: instance }),
-    ended: () => retired(instance),
-  }, { draft, waiting })
+  await client.kill({ instance_id: instance })
+  await retired(instance)
   liveInstances.delete(instance)
   await rollout()
   record('retired', { label, instance, method: 'kill-and-find-missing', state: (await row()).state, retired: true })
@@ -282,11 +249,6 @@ async function retired(id: string) {
 async function start(label = 'delivery', instructions = 'For observation probes, answer with OK unless the input asks for another response.') {
   stage = `${label}-spawn`; lastKey = null
   instance = `cscb_codex_${label.replaceAll('-', '_')}`
-  // A private discoverable skill makes the dollar popup observable in an
-  // otherwise empty Codex home. It carries no oracle or expected model answer.
-  const skill = join(work, '.agents/skills/codex-observation')
-  privateDirectory(skill)
-  writeFileSync(join(skill, 'SKILL.md'), '---\nname: codex-observation\ndescription: A harmless skill for observing the native skill chooser.\n---\nDescribe the current test task briefly.\n', { mode: 0o600 })
   writeFileSync(join(work, 'AGENTS.md'), `${tagDescription}\n${instructions}\n`, { mode: 0o600 })
   liveInstances.add(instance)
   scratchLifecycle!.beforeSpawn()
@@ -294,17 +256,7 @@ async function start(label = 'delivery', instructions = 'For observation probes,
     extra_env: { CODEX_HOME: codexHome }, agent_args: codexArguments(paths.model, tagDescription) })
   scratchLifecycle!.afterSpawn(instance)
   stage = `${label}-idle`
-  await poll('native launch', async () => {
-    const r = await row()
-    if (r.state !== 'waiting') return
-    const current = await rollout(r).catch(() => undefined)
-    if (!current || current.data.incomplete || !current.data.records.some(r => r.type === 'turn_context' && r.model === paths.model)
-      || !current.data.records.some(r => r.usage && r.usage.input > 0 && r.usage.output > 0)) return
-    const { readDeliveryScreen } = await import(join(pkg, 'src/delivery-screen.ts'))
-    const screen = readDeliveryScreen('codex', (await client.readPane({ instance_id: instance, n_lines: 60 })).pane)
-    if (screen.kind !== 'empty') return
-    authContract('postidle'); return r
-  }, 300000)
+  await waiting()
   record('launch', { label, instance, agent: 'codex', version: '0.159.2', relay: 'on', tagPrompt: true, nativePath: CODEX_NATIVE, model: paths.model })
 }
 async function accept(input: any) {
@@ -342,52 +294,13 @@ async function completedItem(seq: number, part?: number, expected?: unknown, noT
   return complete
 }
 async function observe(completionResearch = true) {
-  const panes = []
-  await start('idle-empty')
-  panes.push(await pane('idle-empty'))
-  record('rollout-events', evidence.safeCodexEvents((await rollout()).data))
-  await retire('idle-empty', false)
-  for (const [label, text] of [['slash-popup', '/'], ['at-popup', '@'], ['dollar-popup', '$'], ['shortcuts-overlay', '?'],
-    ['idle-one-line-draft', 'draft observation'], ['idle-multiline-draft', 'first draft line\nsecond draft line']]) {
-    await start(label)
-    stage = label!
-    await client.sendKeys({ instance_id: instance, text, no_enter: true })
-    panes.push(await observationPane(label!, text!)); await retire(label!, true)
-  }
-  for (const [label, text] of [['busy-one-line-draft', 'busy draft observation'], ['busy-multiline-draft', 'busy first line\nbusy second line']]) {
-    await start(label)
-    stage = `${label}-begin-turn`
-    await client.sendKeys({ instance_id: instance, text: 'Think carefully through a long mental arithmetic calculation before answering only OK. Use no tools.' })
-    await poll('busy row', async () => (await row()).state === 'working' ? true : undefined)
-    stage = label!
-    if ((await row()).state !== 'working') throw new Error('busy draft observation missed the active native turn')
-    await client.sendKeys({ instance_id: instance, text, no_enter: true })
-    const p = await observationPane(label!, text!)
-    panes.push(p)
-    if (p.state !== 'working') throw new Error('busy draft observation ended before capture')
-    await retire(label!, true)
-  }
   await start('delivery'); await buildEngine()
   stage = 'queued-delivery'
   const seq = await accept({ source: 'interject', sender: 'codex-observation', text: 'Answer only OK. Use no tools.' })
   await delivered(seq)
-  if (completionResearch) { await completedItem(seq); await idle() }
-  else await waitingComposer()
-  stage = 'send-no-new-turn'
-  const before = await rollout(), sentAt = Date.now(), text = 'unsubmitted observation draft'
-  await client.sendKeys({ instance_id: instance, text, no_enter: true }); await Bun.sleep(1000)
-  const sends = receipts.shimSends(readFileSync(shimLog, 'utf8'))
-  const actual = [...sends].reverse().find((s: any) => s.instanceId === instance && s.text === text && s.at >= sentAt)
-  if (!actual) throw new Error('no-turn observation has no shim send')
-  const after = await rollout()
-  const noTurn = evidence.codexNoTurn(after.data, { session: before.data.session, offset: before.data.size, sentAt, text, model: paths.model },
-    { at: Date.now(), shimAt: actual.at, shimText: actual.text, noEnter: actual.words.includes('--no-enter') })
-  record('no-turn', noTurn)
-  record('rollout-events', evidence.safeCodexEvents(after.data))
-  await retire('send-no-new-turn', true)
-  const { assertCodexObservationInventory } = await import('./codex-gate.ts')
-  assertCodexObservationInventory(panes, noTurn.noEnter && noTurn.observedForMs >= 1000)
-  record('observations', { collected: true, completionResearch })
+  if (completionResearch) await completedItem(seq)
+  await waiting()
+  record('observations', { collected: true, contract: 'AD waiting and exact delivery receipt', completionResearch })
 }
 
 function journal() { return readFileSync(join(stateDir, 'queue', `${key}.jsonl`), 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)) }
@@ -429,6 +342,9 @@ async function summary(duplicates: number, completed: boolean) {
 async function gate() {
   await observe(false)
   await stopEngine()
+  // This probe and the gate share a workdir. Retire its AD row before the
+  // next spawn; stopping delivery alone leaves the native process alive.
+  await retire('delivery')
   await start('gate')
   await buildEngine()
   stage = 'gate-ac2'
@@ -445,8 +361,8 @@ async function gate() {
   for (let n = 0; n < 10; n++) burst.push(await accept(n % 3 === 0 ? dm(`Interleaved Slack item ${n}.`, n + 10)
     : { source: n % 3 === 1 ? 'interject' : 'cron', sender: n % 3 === 1 ? 'operator' : 'cscb-cron:gate', text: `Interleaved prompt item ${n}.` }))
   await poll('actual swallowed Enter', async () => consumedFault('key=Enter') ? true : undefined, 180000)
-  // The first text is visibly still in the composer. The next text call is
-  // swallowed independently; the first item must recover with Enter alone.
+  // The next text call is swallowed independently; unconfirmed work retries
+  // under the same AD-state/backoff contract as every other delivery.
   fault('no_enter')
   for (const seq of burst) await delivered(seq)
   if (!consumedFault('no_enter')) throw new Error('whole-text fault never occurred')
@@ -461,7 +377,7 @@ async function gate() {
   try {
     const pair = await crashProtocol.waitForCrashBoundary({ child, instance,
       checkpoint: join(stateDir, 'crash-progress.json'), marker: join(stateDir, 'crash-after-text.json'),
-      journal, inputVisible: async () => (await pane('crash-text-before-Enter')).screen.kind === 'input',
+      journal,
       counts: () => {
         try {
           const calls = codexShimCalls(readFileSync(shimLog, 'utf8')).filter(c => c.parent === child.pid && c.instance === instance)
@@ -544,11 +460,11 @@ async function ai(ac: number) {
       if (JSON.stringify(queue.item(key, seq).fixed.parts) !== JSON.stringify([test.typed])) throw new Error('production wrapper differs from independent audited reference')
       await delivered(seq)
       await completedItem(seq, 1, test.expected, test.name === 'ex3_peer_bot_spoof')
-      await idle()
+      await waiting()
       await completedItem(seq, 1, test.expected, test.name === 'ex3_peer_bot_spoof')
       await audit(after)
       record('ai-case', { ac, trial: Number(process.env.REAL_AGENT_TRIAL), case: test.label, fixture: test.name, completed: true })
-      await retire(`ai_${ac}_${i}`, false)
+      await retire(`ai_${ac}_${i}`)
     }
   } else if (ac === 15) {
     const after = await begin('ai_15', 'Give a visible JSON response on every turn. For received multipart input, acknowledge a nonfinal part with {"status":"received"} and finish the turn. Once complete return {"case":"AC15","messages":the number of messages received,"body":the joined BODY}. Use only input received in this conversation. Do not retrieve other data. Use no tools. Return JSON without Markdown.')
@@ -570,28 +486,28 @@ async function ai(ac: number) {
       const parts = queue.item(key, seq).fixed.parts
       if (parts.length !== 3) throw new Error('AC15 production wrapper did not make three parts')
       oracle.assertCodexMultipart(parts, body, answers)
-      await idle()
+      await waiting()
       await completedItem(seq, 3, { case: 'AC15', messages: 1, body }, true)
       await audit(after)
     } finally { multipartSend = undefined }
   } else {
     const after = await begin('ai_106', 'Answer ordinary test requests with JSON without Markdown. Acknowledge a message with {"status":"received"}. When asked for a count, return {"case":"AC106","messages":the number of distinct prior DMs received before the query}. Use no tools.')
     const seq = await accept(dm('Please acknowledge this DM.', 110))
-    await delivered(seq); await completedItem(seq, 1, { status: 'received' }, true); await idle()
+    await delivered(seq); await completedItem(seq, 1, { status: 'received' }, true); await waiting()
     const item = queue.item(key, seq), sent = item.records.find((r: any) => r.kind === 'sent' && r.part === 1)
     const first = { session: sent.session_id, offset: sent.transcript_size, sentAt: sent.at, text: item.fixed.parts[0], model: paths.model }
     const before = await rollout(), second = { session: before.data.session, offset: before.data.size, sentAt: Date.now(), text: first.text, model: paths.model }
-    await client.sendKeys({ instance_id: instance, text: first.text })
+    await sendWaiting({ text: first.text })
     await poll('second actual exact DM take-in and completion', async () => {
       const current = await rollout()
       try { return oracle.assertCodexDuplicateTakeins(current.data, first, second) } catch { return }
     }, 180000)
     const actual = [...receipts.shimSends(readFileSync(shimLog, 'utf8'))].reverse().find(s => s.instanceId === instance && s.text === first.text && s.at >= second.sentAt && !s.words.includes('--no-enter'))
     if (!actual) throw new Error('second DM has no actual submitted shim call')
-    await idle()
+    await waiting()
     oracle.assertCodexDuplicateTakeins((await rollout()).data, first, second)
     const query = await accept(dm('How many distinct DMs have you received before this query? Return a JSON object with case "AC106" and messages set to the count you observed.', 111))
-    await delivered(query); await completedItem(query, 1, { case: 'AC106', messages: 1 }, true); await idle()
+    await delivered(query); await completedItem(query, 1, { case: 'AC106', messages: 1 }, true); await waiting()
     await completedItem(query, 1, { case: 'AC106', messages: 1 }, true)
     await audit(after)
   }
@@ -615,8 +531,8 @@ try {
       for (const input of inputs) await accept(input)
     }
     for (const item of queue.items(key)) if (!item.delivered) await delivered(item.accepted.seq)
-  } else if (command === 'pane') await pane(file ?? 'manual-observation')
-  else throw new Error('usage: codex-delivery observe|start|deliver <private-input.json>|recover|pane <label>')
+  }
+  else throw new Error('usage: codex-delivery observe|start|deliver <private-input.json>|recover')
 } catch (error) {
   crashCheckpoint(crashProgress.stage, { failed: true, error: crashError(error), errors: Math.min(1000000, crashProgress.errors + 1) })
   // Do not print arbitrary native errors, arguments or raw session content.
@@ -628,15 +544,15 @@ try {
   console.error('FAIL: codex-delivery: native evidence incomplete; inspect retained safe observations')
   process.exitCode = 1
 } finally {
-  // Capture while rows still exist, also for failures discovered by cleanup.
+  // Capture AD state while rows still exist, also for cleanup failures.
   // The shell's shared failure hook emits these only if the final status fails.
-  const finalPanes = []
+  const finalStates = []
   for (const id of liveInstances) {
-    try { finalPanes.push({ instance: id, ...projectFailurePane((await client.readPane({ instance_id: id, n_lines: 80 })).pane) }) }
-    catch { finalPanes.push({ instance: id, unavailable: true }) }
+    try { finalStates.push({ instance: id, ...projectFailureState(await client.get({ instance_id: id })) }) }
+    catch { finalStates.push({ instance: id, unavailable: true }) }
   }
-  try { writeFileSync(join(paths.root, 'real-final-panes.jsonl'), (finalPanes.length ? finalPanes : [{ unavailable: true }]).map(p => JSON.stringify(p)).join('\n') + '\n', { mode: 0o600 }) }
-  catch { console.error('recorded: final pane retention unavailable') }
+  try { writeFileSync(join(paths.root, 'real-final-states.jsonl'), (finalStates.length ? finalStates : [{ unavailable: true }]).map(p => JSON.stringify(p)).join('\n') + '\n', { mode: 0o600 }) }
+  catch { console.error('recorded: final AD state retention unavailable') }
   try { await stopEngine() }
   catch { console.error('FAIL: codex-delivery: engine cleanup failed'); process.exitCode = 1 }
   for (const id of liveInstances) {

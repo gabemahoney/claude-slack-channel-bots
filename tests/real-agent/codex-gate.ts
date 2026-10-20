@@ -4,20 +4,6 @@ import { shimWords } from '../integration/fixtures/transcript-receipts.ts'
 import type { CodexRollout } from './codex-evidence.ts'
 import { requireEvidence } from './codex-ai.ts'
 
-export function assertCodexObservationInventory(panes: { label: string; agent: string; version: string; state: string; screen: { kind: string } }[], noTurn: boolean) {
-  const required = ['idle-empty', 'slash-popup', 'at-popup', 'dollar-popup', 'shortcuts-overlay',
-    'idle-one-line-draft', 'idle-multiline-draft', 'busy-one-line-draft', 'busy-multiline-draft']
-  for (const label of required) {
-    const own = panes.filter(p => p.label === label)
-    requireEvidence(own.length === 1, 'native observation inventory incomplete or ambiguous')
-    const p = own[0]!
-    requireEvidence(p.agent === 'codex' && p.version === '0.159.2', 'native observation version/agent differs')
-    requireEvidence(p.screen.kind === (label === 'idle-empty' ? 'empty' : /popup|overlay/.test(label) ? 'menu' : 'input'), 'native observation classification differs')
-    requireEvidence(p.state === (label.startsWith('busy-') ? 'working' : 'waiting'), 'native observation activity differs')
-  }
-  requireEvidence(noTurn, 'native no-new-turn observation missing')
-}
-
 export function codexShimCalls(log: string) {
   return log.split('\n').filter(line => line.startsWith('call\t')).map(line => {
     const fields = line.split('\t')
@@ -91,7 +77,7 @@ export function auditCodexDelivery(options: {
   return { duplicates, firstReceipts, items: accepted.length }
 }
 
-export function assertCodexRecovery(journal: any[], seq: number, kind: 'enter' | 'retype' | 'no-retype', shim: string, instance: string) {
+export function assertCodexRecovery(journal: any[], seq: number, kind: 'retype' | 'no-retype' | 'enter', shim: string, instance: string) {
   const sends = journal.filter(r => r.seq === seq && r.kind === 'sent' && !r.unknown_outcome)
   const fixed = journal.find(r => r.seq === seq && r.kind === 'fixed')
   const calls = codexShimCalls(shim).filter(c => c.instance === instance)
@@ -99,9 +85,9 @@ export function assertCodexRecovery(journal: any[], seq: number, kind: 'enter' |
   const texts = calls.filter(c => fixed.parts.includes(c.text))
   const delivered = journal.find(r => r.seq === seq && r.kind === 'delivered' && r.part === 1)
   requireEvidence(delivered, 'recovery delivery missing')
-  if (kind === 'enter') requireEvidence(sends.some(r => r.send_kind === 'enter') && texts.length === 1
-    && calls.some(c => c.key === 'Enter' && c.at <= delivered.at && sends.some(r => r.send_kind === 'enter' && c.at >= r.at)), 'Enter-only recovery missing or retyped')
   if (kind === 'retype') requireEvidence(sends.some(r => r.send_kind === 'retype') && texts.length >= 2
     && texts.some(c => c.at <= delivered.at && sends.some(r => r.send_kind === 'retype' && c.at >= r.at)), 'lost text was not retyped')
-  if (kind === 'no-retype') requireEvidence(sends.every(r => r.send_kind !== 'retype') && texts.length === 1, 'trailing popup body was retyped')
+  if (kind === 'enter') requireEvidence(sends.some(r => r.send_kind === 'enter' && r.at <= delivered.at) && texts.length === 1
+    && calls.some(c => c.key === 'Enter' && sends.some(r => r.send_kind === 'enter' && c.at >= r.at && c.at <= delivered.at)), 'durable recovery Enter missing')
+  if (kind === 'no-retype') requireEvidence(sends.every(r => r.send_kind !== 'retype') && texts.length === 1, 'exact body was retyped')
 }

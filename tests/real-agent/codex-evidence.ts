@@ -86,20 +86,6 @@ export function completedCodexTurn(rollout: CodexRollout, window: CodexWindow) {
     tokens: turn.filter(r => r.usage && r.offset > receipt.offset && r.offset <= completion.offset).at(-1)?.usage }
 }
 
-/** Requires a measured before/after interval and actual unsubmitted shim call.
- * This is missing-receipt research evidence, never delivery confirmation. */
-export function codexNoTurn(rollout: CodexRollout, window: CodexWindow, observation: { at: number; shimAt: number; shimText: string; noEnter: boolean }) {
-  if (rollout.session !== window.session || rollout.incomplete || !Number.isSafeInteger(window.offset) || window.offset < 0 || window.offset > rollout.size || !Number.isFinite(window.sentAt)
-    || !Number.isFinite(observation.at) || observation.at <= window.sentAt || !Number.isFinite(observation.shimAt)
-    || observation.shimAt < window.sentAt || observation.shimAt > observation.at
-    || observation.shimText !== window.text || !observation.noEnter) throw new Error('invalid no-turn observation')
-  const after = rollout.records.filter(r => r.offset >= window.offset)
-  if (after.some(r => r.kind === 'task_started' || r.role === 'user' || r.role === 'assistant')) throw new Error('a turn began after send')
-  return { session: rollout.session, sentAt: window.sentAt, shimAt: observation.shimAt, observedAt: observation.at, noEnter: true,
-    afterOffset: window.offset, size: rollout.size, observedForMs: observation.at - window.sentAt,
-    events: after.map(({ offset, end, type, kind }) => ({ offset, end, type, kind })) }
-}
-
 export function safeCodexEvents(rollout: CodexRollout) {
   return rollout.records.map(({ offset, end, at, type, kind, session, turn, model, role, usage }) => ({ offset, end, at, type, kind, session, turn, model, role, usage }))
 }

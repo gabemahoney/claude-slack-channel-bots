@@ -96,7 +96,7 @@ def _validate_accepted_work(root, run, row, envelope, worker, *, deadline=None, 
         ("probe_premise", "NotPremise", "violation", "check"),
         ("core_head_taken_in", "-", "pass", "check")}, "wrong accepted-work row")
     expected_checks = (["TypeOK", "DurableAccept", "NoDrop", "ReceiptBacked", "InOrder",
-                        "TranscriptFIFO", "OneInFlight", "NoTypeIntoText", "NoRetypeWhileWorking",
+                        "TranscriptFIFO", "OneInFlight", "TypingGuards", "NoRetypeWhileWorking",
                         "GateExclusive", "NoDuplicateKey", "HeadTakenIn"]
                        if row["cfg"] == "core_head_taken_in" else ["NotPremise"])
     require(row["checks"] == expected_checks and row["properties"] == [expected_checks[-1]],
@@ -276,7 +276,6 @@ def validate_envelope(root, run, row, envelope, worker, *, deadline=None, result
         metadata["replayField"] = "raw"
     if row["cfg"] == runner.VIEW_ONLY_CONTROL:
         metadata["traceSha256"] = hashlib.sha256(encoded(raw)).hexdigest()
-        metadata["maxEnterRetries"] = max(record["state"]["e"]["enterRetries"] for record in behavior)
         metadata["maxPersistedSendsPerPair"] = max((
             sum(sent["item"] == item["item"] and sent["part"] == item["part"]
                 for sent in record["state"]["p"]["sent"])
@@ -297,8 +296,8 @@ def validate_restart_mutation_behavior(row, behavior):
     TLC checks invariants on boundary successors before pruning constraints.
     A violation on a third-send boundary is therefore insufficient for this
     sensitivity claim and is refused even if the worker named the right target.
-    The authorized original retype control has only a VIEW and keeps its full
-    retry prefix; it makes none of these companion constraint claims.
+    The historical VIEW-only retype control keeps its unrestricted retry
+    prefix; it makes none of these companion constraint claims.
     """
     if row["cfg"] == "control_retype_into_text":
         require(row.get("state_reduction") == {"view": "RestartSafetyView", "constraint": None},
@@ -310,8 +309,8 @@ def validate_restart_mutation_behavior(row, behavior):
         for sent in state["p"]["sent"]:
             pair = (sent["item"], sent["part"])
             counts[pair] = counts.get(pair, 0) + 1
-        require(all(count <= 2 for count in counts.values()),
-                f"companion counterexample leaves two-send constraint: {row['cfg']}")
+        require(all(count <= 4 for count in counts.values()),
+                f"companion counterexample leaves four-send recovery constraint: {row['cfg']}")
         require(all(value in (0, 1) for value in state["e"]["timers"].values()),
                 "companion counterexample has nonbinary timer")
         require(all(value == 0 for name, value in state["faults"].items()
@@ -332,7 +331,7 @@ def executed_bug_steps(row, behavior, *, companion=False):
                         and after["executedAction"] == "reconnectTextAndEnter"
                         and before["GateChoice"] in ("runReconnect", "stealForReconnect")))
         target_diff = (after["executedAction"] in
-                       {"fixText", "recordSend", "recordEnterRetry", "readReceipt", "recordNotice"}
+                       {"fixText", "recordSend", "recordRecoveryEnter", "readReceipt", "recordNotice"}
                        and before["selectedTarget"] != before["correctSelectedTarget"])
         diverged = ((engine_ran and (before["EngineChoice"] != before["correctEngineChoice"] or target_diff))
                     or (gate_ran and before["GateChoice"] != before["correctGateChoice"]))

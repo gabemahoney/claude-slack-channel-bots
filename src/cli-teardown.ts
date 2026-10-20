@@ -281,7 +281,6 @@ export interface PrecheckGetAnswer {
 /** A `read-pane` that answered a pane. */
 export interface PrecheckPaneAnswer {
   readonly call: typeof PRECHECK_CALL_READ_PANE
-  readonly pane: string
 }
 
 /** A call that threw or rejected: the value as thrown. */

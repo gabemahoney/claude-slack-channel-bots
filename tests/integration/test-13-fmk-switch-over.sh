@@ -1,365 +1,5 @@
 #!/usr/bin/env bash
-# Test 13 (b.jg5 SRJ-1402, SRJ-1108, SRJ-1401, SRJ-1418, SRJ-203, SRJ-1013):
-# scenario 1, the switch-over, legs A, B and C. The script follows the
-# switch-over runbook in docs/migration.md (section "Switching over to agent-director
-# Phase 1", steps 1 to 11, each a `Step <n>: …` heading) in the container,
-# entering each step once and in order, and replaces only the host-only parts
-# SRJ-1402 lists (the substitution table below). Legs B and C follow step 11.
-#
-# Runs only in a cscb-ci image (/ci), after Test 1 (which installs the package
-# the default SCENARIO_CLI names). Its TEST_NAME carries `-fmk-` and it sets
-# SCENARIO_AD_START=0.10.0 before sourcing lib/scenario.sh, so the scenario
-# gets its own HOME, store and tmux server under SCENARIO_ROOT, with
-# agent-director 0.10.0 behind the agent-director shim and no store yet
-# (0.10.0's first spawn makes it), and the tmux shim in `log` mode in front of
-# every CSCB process.
-#
-# The starting point (setup, before step 1): the pre-persona 0.10.0-era fleet.
-# - The published pre-persona CSCB 0.10.0 package (the image's tarball) is
-#   installed as the global package, at the scenario's one install path (a bun
-#   global install under SCENARIO_ROOT), with agent-director's 0.10.0 client
-#   (the image's tarball), never swapped. Its CLI there is the old CLI; the
-#   CLI the build under test later has at the same path is the new one.
-# - Its pre-persona config.json (two routed channels) sits where a real
-#   pre-upgrade host has it, in the old state directory
-#   $HOME/.claude/channels/slack, the only place the old package reads
-#   config.json from: its CLI ignores SLACK_STATE_DIR for config.json and always
-#   reads $HOME/.claude/channels/slack/config.json. The same directory holds
-#   the host's other state files the runbook names: a crontable targeting
-#   channels and access.json (credentials files land there too, at step 7). The
-#   `/interject` caller file naming channels and the Slack token variables (fake
-#   tokens, from `fake_token`, in a file never sourced) sit under SCENARIO_ROOT's
-#   host directory. These are fixtures (ruling Q13). SLACK_STATE_DIR is
-#   never exported (the scenario's harness helpers read it as a plain shell
-#   variable naming the directory in use), so no CSCB process, old or new,
-#   sees it. The build under test's default state directory is
-#   $HOME/.config/claude-slack-channel-bots since b.smv; it migrates the old
-#   directory there, once, at its first start (step 10), and leaves a symbolic
-#   link at the old name. The state is laid out the way a real host of 0.13 or
-#   earlier has it, all of it in $HOME/.claude/channels/slack (a real
-#   directory), with neither $HOME/.config/cscb nor the new directory made
-#   beforehand. The 0.14.0 and 0.15.0 layouts are test-30's.
-# - `seed_prepersona_fleet` seeds one row per routed channel on 0.10.0, named
-#   and labelled as the old package does (instance id
-#   `cscb_<name>_<channel id>`, session `slack_bot_<name>_<channel id>`,
-#   labels service=cscb and channel=<channel id>, no persona label), each with
-#   a running stub worker. No pre-persona server is started.
-# - The loopback Slack stub runs with --record; it maps the personas' fake
-#   tokens. The harness, playing the operator, records the operator's dated
-#   go-ahead for this container as an entry in the switch-over log; the
-#   go-ahead is the operator's own, and no runbook step writes that entry.
-# - The build under test is unpacked from the image's package-under-test
-#   tarball into the staging directory (nothing runs from it), so the runbook
-#   the script follows is the staged release's own docs/migration.md; step 1 finishes
-#   staging it (its dependencies resolved).
-#
-# Each step is entered through `runbook_step <n>`, which prints the step's
-# heading title as `switch-over.ts steps` reads it from the package in place
-# (the staged build up to step 7, the installed build from step 8), fails
-# unless <n> is the next step, and, on entering steps 4 to 10, fails if a bot
-# server of the scenario runs (a live server.pid, or the port answering). A
-# host-only part is replaced only through `runbook_substitute <n> <kind>
-# <reason>`, inside step <n>'s section, which records it. Every record a step
-# asks for goes to the switch-over log, a file under SCENARIO_ROOT.
-#
-# SRJ-1402's substitutions (kind: where; what replaces the host-only part):
-#   operator-go-ahead          steps 1, 8: the operator's go-ahead is the
-#                              entry the harness, playing the operator,
-#                              records in the switch-over log before step 1;
-#                              steps 1 and 8 read it from there
-#   container-settings         steps 1, 8: the timing settings are the
-#                              container's (the scenario HOME's
-#                              ~/.config/agent-director/config.toml, through
-#                              `switch-over.ts settings`)
-#   one-socket                 step 1: C7's socket pinning and its
-#                              display-message check run against the
-#                              container's one tmux socket
-#   claude-code-check-skipped  step 1: the workers are stub-claude.sh
-#   staging-build-under-test   steps 1, 7: the release staged, and installed
-#                              at step 7, is the build under test (the image's
-#                              package-under-test tarball)
-#   slack-fixtures             steps 1, 7: the Slack apps and token variables
-#                              are the container's fixtures (the loopback
-#                              Slack stub); step 7's credentials command
-#                              reaches the stub through a curl wrapper first
-#                              on its PATH
-#   prompt-wording-skipped     steps 1, 10, 11: the §6 orchestrator prompt
-#                              wording is skipped
-#   autostart-skipped          steps 2, 10: the host's autostart for CSCB
-#   harness-stops-agents       step 8: the stop of every other agent is the
-#                              harness's (none is seeded)
-#   release-install-script     step 8: the Phase 1 install is the release's
-#                              install.sh, and the `serve` restart
-#                              and start-time check cover only the container's
-#                              agent-director processes
-#   no-agents-restarted        step 9: no other agent is started again
-#   container-list             step 10: the launch-start check reads the
-#                              container's `agent-director list --state
-#                              pending`, sampled from the start until each
-#                              persona row reads waiting
-#   expire-skipped             step 11: the daily `expire` schedule
-#
-# The steps (SRJ-1108):
-#   1   the go-ahead, confirmed in the switch-over log (none fails the run
-#       there: "no go") and recorded; `agent-director version` (0.10.0,
-#       behind the shim, from the scenario's shell); C7 from the CSCB
-#       launcher's environment, the
-#       find-missing loop's environment and a seeded worker's environment
-#       (one socket path, the pinned one under SCENARIO_ROOT, one HOME); tmux
-#       3.2 or later with remain-on-exit off; the staging (dependencies
-#       resolved, exact version recorded); the settings on the staged build
-#       (no config.toml: the defaults), each window at or above its minimum,
-#       the call-timeout need; the persona configuration written to a separate
-#       file, its agent_director_call_timeout_ms above the need and its
-#       health-check settings set so that health ticks run (Q12); `tmux ls`
-#       against `agent-director list`; the rollback copies beside the old
-#       version.
-#   2   the autostart substitution.
-#   3   the old package's own `stop --stop-bots` through the old CLI (a CSCB
-#       process, the tmux shim first on its PATH, no SLACK_STATE_DIR), reading
-#       the pre-persona config.json from the old state directory: exit 0, one teardown outcome per routed channel, its
-#       agent-director calls through the shim with 0.10.0 behind it.
-#   4   `agent-director find-missing`, then at most 5 minutes (the runbook's
-#       bound) for every service=cscb row to read ended or missing; each
-#       seeded row still present.
-#   5   a read-only `tmux ls`: no old session, no live old row.
-#   6   not needed (no leftover with a row), recorded.
-#   7   the build under test installed over the same install path (no
-#       side-by-side path), the global install's agent-director override
-#       first pointed at the image's release client tarball; the release's
-#       client checked with the image's check (ad-client-check.sh --package); nothing started; the persona
-#       configuration put in place as config.json; each persona's credentials
-#       file written by the new CLI's `credentials`; the crontable targets and
-#       `/interject` callers rewritten to name personas (all of it in the old
-#       state directory, which the new CLI still uses until the first start); the new install check
-#       refusing the still-installed 0.10.0 below the release client floor.
-#   8   the go-ahead, confirmed as still standing in the switch-over log (none
-#       fails the run there: "no go") and recorded; the harness's stop of
-#       other agents (none; every non-CSCB row ended or missing, no tmux
-#       session left); the store's online
-#       backup (`ad_store_backup`); the release's install.sh, run in the
-#       scenario HOME as the runbook's install command (`install_ad_release`:
-#       --binary at the image's release binary, --admin-binary at its
-#       agent-director-admin, --no-symlink --no-hooks, stdin from /dev/null),
-#       then the re-shim; `agent-director version` the release's; no [tmux] table
-#       written; no agent-director process older than the install; the
-#       settings again on the installed build, with the call-timeout need
-#       against config.json; `agent-director list` without
-#       ErrConfigMalformed. After the migration a `get` of each seeded row
-#       shows no launch_started_at, and the store has its id.
-#   9   the no-agents-restarted substitution.
-#   10  the new CSCB started live through the CLI at the install path,
-#       against the Slack stub, each persona's working directory in the
-#       stub's startup-trust mode; each persona's row reads waiting within B,
-#       CSCB's launch bound as the installed build computes it from the
-#       settings step 8 recorded. The launch-start check: `agent-director list
-#       --state pending`, through the harness call from a subshell of the
-#       scenario's shell, sampled back to back from before the start until
-#       every persona row has read waiting; every row a sample shows is
-#       pending with a launch_started_at. Each persona's row read pending
-#       from its launch until its SessionStart, from the scenario HOME's
-#       ~/.config/agent-director/ad-trail.jsonl (the records after its length noted
-#       before the start): the row's first `ad.spawn.state_transition` record
-#       has prior_state pending, new_state waiting and triggering_event_name
-#       SessionStart, and an `ad.send_keys.called` record has row_state
-#       pending (the trail records no launch start). Every sample taken
-#       wholly inside the stretch the row provably read pending (from the bot
-#       server's first read-pane of it after its spawn to the server's first
-#       send-keys of it, by their shim lines) shows the row; how many samples
-#       showed each row pending, and how many fell inside that stretch, are
-#       recorded. Before the start, the old state directory is a real directory
-#       and the new default one does not exist; after it, the build under test
-#       has moved the old directory whole to
-#       $HOME/.config/claude-slack-channel-bots: config.json, crontable,
-#       access.json, the credentials files, server.pid and server.log are
-#       there, $HOME/.claude/channels/slack is a symbolic link to it, and
-#       server.log carries the state-migrate line for the whole-directory
-#       rename once and no state-migrate warning. From there the script reads
-#       the new directory (legs B and C included). The post-install check is
-#       recorded in the switch-over log, as the runbook says, and nowhere else.
-#       Then leg A's checks.
-#   11  the expire and prompt-wording substitutions.
-#
-# Leg A's checks (SRJ-1402, AC 12), each its own `fail` naming the persona or
-# row. CSCB's calls are read from the agent-director shim's lines from step
-# 10's start on whose parent is a CSCB process (SRJ-1401); a launch's parent
-# must be the bot server:
-#   - after the migration, a `get` of each seeded row shows no
-#     launch_started_at (step 8);
-#   - every persona starts fresh once: exactly one plain spawn of its instance
-#     id, with no --reuse-finished, no resume and no second launch, and the
-#     start pass counts every persona fresh-spawned and none resumed;
-#   - pre-persona rows are kept and never resumed: no CSCB call names a
-#     seeded instance id, and each seeded row is present (any state);
-#   - each persona's startup-trust dialog is cleared through agent-director:
-#     read-pane and send-keys calls naming its own row, made by the bot
-#     server, before the row read waiting;
-#   - no unknown or UNAVAILABLE error leads to a delete, kill or respawn: no
-#     CSCB kill or delete and no second launch;
-#   - no persona reaches the restart cap: no restart-cap line in server.log
-#     and no cap notice in the Slack stub's record;
-#   - no post repeats: no two chat.postMessage requests in the stub's record
-#     with the same channel and text (the number of posts compared printed),
-#     and the record holds no post at all (nothing in the scenario posts);
-#     its lines from step 10's start on hold, for each persona's label, at
-#     least one apps.connections.open request and one ws-open, so the record
-#     is shown to capture the personas' Slack traffic.
-# Health ticks run (Q12): config.json sets health_check_interval, shorter than
-# leg A's wait, and session_restart_delay. Once each persona's session is
-# connected, the bot server reads each persona's row on at least HEALTH_TICKS
-# more ticks, with no reconnect or restart scheduled for it. A tick that
-# reconnects or relaunches a persona whose stub holds its MCP session fails
-# naming it as a harness defect; no bound, matcher or count is weakened for it.
-#
-# Leg B (SRJ-1402, AC 12), after step 11: a clean_restart of the new CSCB on
-# Phase 1. Each persona's session_id is read (`get`) first. The new
-# CLI's `clean_restart` runs through the install path as a CSCB process
-# (`cscb_run`, the tmux shim first on its PATH, start's environment), in the
-# background, while the harness reads each persona's row (`status`, from the
-# scenario's shell) until it reads waiting; clean_restart's own pause and kill
-# are expected. Each persona's working directory stays in the stub's
-# startup-trust mode, so the resume lap shows the dialog again. The bound B_R
-# on each row reading waiting after clean_restart ends is the stopping window
-# and G as step 1 recorded them (`tmux.stopping_window_seconds`, `grace_ms`)
-# plus one health tick (config.json's health_check_interval). clean_restart
-# itself ends within the installed package's bounds on its precheck and
-# teardown (src/cli-teardown.ts precheckBoundMs and teardownBoundMs, at
-# config.json's call timeout and exit_timeout), plus the harness's bound on
-# the CLI's `stop` (SCENARIO_STOP_CLI_S) and the CLI's daemon startup wait.
-# Each its own `fail` naming the persona or row:
-#   - clean_restart exits 0, leg A's bot server is gone and a new one runs and
-#     answers on the port;
-#   - the restarted server's start pass completes and each persona's session
-#     connects again;
-#   - the restarted server reads each row on HEALTH_TICKS more health ticks,
-#     with no reconnect, and no restart scheduled beyond one per still-stopping
-#     refusal (Q12, as in leg A);
-#   - at most one still-stopping refusal per persona (a server.log line naming
-#     it with the still-stopping phrase);
-#   - from the bot server's shim lines after the restart: a plain spawn of the
-#     persona's id (no --reuse-finished), answered by a collision: a resume of
-#     the id follows it, one resume more per refusal (and one spawn more at
-#     most); the restarted server's collision line for the persona, one per
-#     spawn with no refusal (at most one per spawn with one), the first
-#     written between the first spawn and the first resume;
-#   - the harness's reads see the row pending with a launch start: every read
-#     that starts after the bot server's resumed line (server.log, written
-#     once the resume returned) reads pending with a launch start until one
-#     reads waiting, within B_R. From clean_restart's "starting server" line
-#     (clean_restart.log) on, the rows are read with no pause between reads;
-#   - the row reads pending until its resumed worker reports in, from the
-#     scenario HOME's ~/.config/agent-director/ad-trail.jsonl (the records after its
-#     length noted before clean_restart; a record's `ts` is UTC in whole
-#     milliseconds, taken as rounded down). The records read: the row's first
-#     `ad.spawn.state_transition` record in trail order with
-#     triggering_event_name SessionStart and prior_state pending (the move out
-#     of pending), the last `ad.resume.moved_to_pending` record before it in
-#     trail order, and, by `ts`, the row's `ad.hook.fired` record with
-#     event_name SessionStart nearest the move: the latest at or before it,
-#     else the first after it (the resumed launch's SessionStart, the hook
-#     that made the move, whatever the records' order in the trail). The
-#     moved-to-pending record and the SessionStart record each come after the
-#     bot server's last resume call (its shim line); the SessionStart record
-#     comes at or before the end of the first harness read of waiting that
-#     starts after that call; no harness read that starts after that call and
-#     ends before the transition record reads waiting, and every such read
-#     that starts after the moved-to-pending record reads pending with a
-#     launch start;
-#   - read-pane and send-keys calls naming the row, by the bot server, after
-#     its last resume and before it read waiting;
-#   - the row keeps the session_id read before, and the worker behind
-#     its session's worker pane was started with --resume and that id;
-#   - with no refusal the start pass counts every persona resumed, none
-#     fresh-spawned and none not brought up (with one, none fresh-spawned);
-#   - no CSCB delete and no kill by the restarted server; every persona row
-#     and every pre-persona row is present;
-#   - the stub's record lines from before clean_restart on hold no post, and,
-#     for each persona's label, at least one apps.connections.open request
-#     and one ws-open.
-#
-# Leg C (SRJ-1402, SRJ-203, SRJ-1013, AC 12, AC 20): this build refuses
-# agent-director 0.10.0. Leg B's server is stopped with its bots through the
-# new CLI (`stop_server --stop-bots`), the stub's record holds at least one
-# ws-open and as many ws-close (every Slack socket the stub opened is closed)
-# and no tmux session is left; then the lengths of the shim log, the
-# stub's record, startup-errors.log and server.log are noted. `swap_ad_binary
-# 0.10.0` puts 0.10.0 behind the shim (the binary is compared with the image's,
-# never run: the harness makes no 0.10.0 call against the migrated store), and
-# `run_start --live` starts the new CSCB. The version required is the
-# installed package's PHASE1_FLOOR_VERSION. Each its own `fail`:
-#   - start exits non-zero, with its server-failed line;
-#   - exactly one new startup-errors.log entry, the ad-system-install-too-old
-#     entry naming 0.10.0 and the version required, and exactly one new
-#     server.log line carrying that label, matching it;
-#   - the stub's record has no new line (no auth.test, no
-#     apps.connections.open, no WebSocket, no post);
-#   - no server runs, nothing answers on the port, and no tmux session exists;
-#   - every agent-director shim `call` line since the lengths were noted is a
-#     version probe (the refused server exits before it writes its PID file,
-#     so it is not in the CSCB process record and every line is read): no
-#     launch, kill or delete from any parent, no harness call, and at least
-#     one probe.
-# Then `swap_ad_binary release` puts the release back (compared with the
-# image's binary) before the closing checks. Legs A and B's servers' version
-# probes are `assert_no_cscb_include_finished`'s positive control.
-#
-# Text quoted from src/ (and from the published 0.10.0 package), by source:
-#   src/persona-identity.ts personaInstanceId: a persona's instance id is
-#     `cscb_<key>`
-#   src/ad-phase1-types.ts: a reuse spawn carries `--reuse-finished`
-#   src/session-manager.ts startupSummaryLine: `[slack]
-#     startupSessionManager: complete — <n> persona(s): <n> resumed, <n>
-#     fresh-spawned, …` (through scenario.sh's `completion_match`), with
-#     `0 not brought up` in its ending
-#   src/server.ts: `[slack] Session connected: persona <ref>`
-#   src/restart.ts scheduleRestart: `[slack] Scheduling restart for
-#     persona=<key>`; the restart path: `[slack] Session alive but
-#     disconnected — reconnecting MCP for persona=<key>`; countLaunchFailure:
-#     `[slack] Cap reached for persona=`; restartRetryCapSkippedLine: `the
-#     persona is at the restart cap`
-#   src/health-check.ts: `is at cap — skipping tick`
-#   src/ad-description-phrases.ts STILL_STOPPING_PHRASE: `appears to still be
-#     stopping`
-#   src/session-manager.ts resumeAtSite: `<head> resumed <ref>`
-#   src/session-manager.ts spawnForPersona's collision: `[slack]
-#     spawnForPersona: ErrInstanceIdCollision for <ref> — fetching current
-#     state`
-#   src/cli.ts clean_restart's spawnStart: `[slack] clean_restart: starting
-#     server`
-#   src/cli.ts DAEMON_STARTUP_WAIT_MS: the CLI's daemon startup wait, 30 s
-#   src/cli-teardown.ts precheckBoundMs and teardownBoundMs: read from the
-#     installed package
-#   src/cli.ts reportDaemonFailure: `[slack] Server failed to start (`
-#   src/install-check-labels.ts AD_BELOW_PHASE1_FLOOR: `ad-system-install-too-old`
-#   src/startup-errors.ts recordStartupError: an entry and its server.log line
-#     are `[<time>] [<label>] <message>`
-#   src/ad-version-gate.ts buildSystemInstallTooOldMessage: `agent-director
-#     system install is too old: version <found> is below the client minimum`,
-#     naming both the client minimum and CSCB floor; PHASE1_FLOOR_VERSION
-#     is <floor>, read from the installed package
-#   src/session-manager.ts restartCapReachedError: the cap notice's
-#     `consecutive session-launch failures — automatic restarts suspended`
-#   scripts/install-check.ts renderSuccess: `agent-director install check:
-#     OK`, `  version: <version>` and `  note:    <note>`
-#   scripts/write-credentials.sh cscb_check: its Slack URL,
-#     `https://slack.com/api/<method>`
-#   the published 0.10.0 package's src/cli.ts teardownBots: `[slack]
-#     teardownBots: channel=<channel id> ` followed by `exited cleanly`,
-#     `force-killed` or `already terminal`, and `[slack] teardownBots: pause
-#     failed for channel=<channel id> — escalating to kill`
-#
-# Pinned versions come from the image: the release's from
-# /opt/agent-director/client/release.json, 0.10.0 from scenario.sh's
-# SCENARIO_AD_010_VERSION, the old CSCB's and the build under test's from
-# their tarballs' package.json.
-#
-# The script ends, after legs B and C, by checking that every runbook step
-# was entered once, in order, and that no post repeats over the Slack stub's
-# whole record (legs A and B; the same channel-and-text comparison as leg A's,
-# the number of posts compared printed), then the three closing assertions
-# (`assert_no_server_tmux`, `assert_no_cscb_include_finished`,
-# `assert_no_cscb_delete`); the EXIT trap stops any bot server left (`stop --stop-bots` through
-# the CLI at the install path) and enforces the closing assertions.
+# AD outcome and lifecycle regression checks; no startup TUI interpretation.
 set -euo pipefail
 
 TEST_NAME="test-13-fmk-switch-over"
@@ -907,14 +547,6 @@ check_pending_samples() {
     (( SAMPLES > 0 )) || fail "step 10: the pending sampler took no sample"
 }
 
-# trail_fresh_pending <instance-id>: from step 10's trail lines (the scenario
-# HOME's ad-trail.jsonl after its length noted before the start), fail unless
-# the row's first `ad.spawn.state_transition` record moves it from pending to
-# waiting by SessionStart (a fresh spawn's insert writes no transition, so the
-# row read pending from its launch until its SessionStart), and an
-# `ad.send_keys.called` record shows it read pending (`row_state`) when the
-# bot server's dialog approver sent it keys. The trail records no launch
-# start; the samples show it. Sets TRAIL_NOTE.
 trail_fresh_pending() {
     local id="$1" file="${SCENARIO_ROOT}/step10-trail" kind ts a b c moved="" keys=0 keys_ts=""
     jq -r --arg id "${id}" 'select(.instance_id == $id)
@@ -939,39 +571,25 @@ trail_fresh_pending() {
     read -r ts a b c <<< "${moved}"
     [[ "${a}" == pending && "${b}" == waiting && "${c}" == SessionStart ]] \
         || fail "step 10: row ${id}'s first state transition in the trail after the start (${ts}) is ${a} to ${b} by ${c}, not pending to waiting by SessionStart"
-    (( keys > 0 )) || fail "step 10: the trail holds no ad.send_keys.called record for row ${id} with row_state pending"
-    TRAIL_NOTE="${keys} ad.send_keys.called record(s) with row_state pending (the first at ${keys_ts}); its first ad.spawn.state_transition moves it from pending to waiting by SessionStart at ${ts}"
+    (( keys == 0 )) || fail "step 10: the trail records ${keys} automatic pending startup key call(s) of ${id}"
+    TRAIL_WAITING_US="$(date -u -d "${ts}" +%s%6N)" || fail "step 10: invalid SessionStart transition time ${ts}"
+    TRAIL_NOTE="no startup keys; first AD state transition moves pending to waiting by SessionStart at ${ts}"
 }
 
-# samples_inside_pending <instance-id>: the stretch over which the row
-# provably read pending, from step 10's shim lines, and the samples taken
-# wholly inside it. It starts at the bot server's first read-pane of the row
-# after its spawn of the row (the dialog approver, which starts once the
-# spawn returned, so the row exists, pending) and ends at the server's first
-# send-keys of the row (a send-keys read the row pending, by the trail, and
-# none read it before that call started; in leg A the row leaves pending only
-# once). Fails unless every sample that started and ended inside it shows the
-# row. Sets PENDING_FROM_US, PENDING_TO_US and INSIDE.
 samples_inside_pending() {
-    local id="$1" shim="${SCENARIO_ROOT}/step10-shim.log" times=() t at n from to rc
-    server_calls_naming "${shim}" spawn "${id}" "${SERVER_PID}" "${SCENARIO_ROOT}/step10-spawn"
-    mapfile -t times < <(line_times "${SCENARIO_ROOT}/step10-spawn")
-    (( ${#times[@]} >= 1 )) || fail "step 10: the bot server made no spawn of row ${id}"
-    from="${times[0]}"
-    server_calls_naming "${shim}" read-pane "${id}" "${SERVER_PID}" "${SCENARIO_ROOT}/step10-read-pane"
-    mapfile -t times < <(line_times "${SCENARIO_ROOT}/step10-read-pane")
+    local id="$1" at n from to rc
     PENDING_FROM_US=""
-    for t in ${times[@]+"${times[@]}"}; do
-        if (( t > from )); then
-            PENDING_FROM_US="${t}"
-            break
+    PENDING_TO_US="${TRAIL_WAITING_US}"
+    for at in "${PENDING_SAMPLES}"/*.at; do
+        [[ -f "${at}" ]] || continue
+        n="${at##*/}"
+        n="${n%.at}"
+        if jq -e --arg id "${id}" 'any(.spawns[]; .instance_id == $id)' "${PENDING_SAMPLES}/${n}.out" > /dev/null; then
+            read -r from to rc < "${at}"
+            if [[ -z "${PENDING_FROM_US}" ]] || (( to < PENDING_FROM_US )); then PENDING_FROM_US="${to}"; fi
         fi
     done
-    [[ -n "${PENDING_FROM_US}" ]] || fail "step 10: the bot server made no read-pane of row ${id} after its spawn of it"
-    server_calls_naming "${shim}" send-keys "${id}" "${SERVER_PID}" "${SCENARIO_ROOT}/step10-send-keys"
-    mapfile -t times < <(line_times "${SCENARIO_ROOT}/step10-send-keys")
-    (( ${#times[@]} >= 1 )) || fail "step 10: the bot server made no send-keys of row ${id}"
-    PENDING_TO_US="${times[0]}"
+    [[ -n "${PENDING_FROM_US}" ]] || fail "step 10: no authoritative pending sample for ${id}"
     INSIDE=0
     for at in "${PENDING_SAMPLES}"/*.at; do
         [[ -f "${at}" ]] || continue
@@ -1575,7 +1193,8 @@ runbook_step 10
 runbook_substitute 10 prompt-wording-skipped "the orchestrator prompt's worker-cleanup wording is skipped"
 for cid in "${CHANNELS[@]}"; do
     name="${PERSONA_OF[${cid}]}"
-    stub_mode "${WORKDIR_OF[${name}]}" "${STUB_MODE_STARTUP_TRUST}"
+    stub_mode "${WORKDIR_OF[${name}]}" "${STUB_MODE_AT_ONCE}"
+    stub_report_delay "${WORKDIR_OF[${name}]}" 3
     # src/persona-identity.ts personaInstanceId.
     PERSONA_IDS+=("cscb_$(persona_key "${name}")")
 done
@@ -1766,18 +1385,12 @@ for i in "${!PERSONA_IDS[@]}"; do
     [[ "${e4_new_session}" != "${E4_OLD_SESSION[${id}]}" ]] || fail "E4: ${id} resumed its earlier-release conversation"
     key="$(persona_key "${name}")"
     cmp -s -- "${E4_MEMORY[${id}]}" "${SCENARIO_ROOT}/e4-memory-${key}.before" || fail "E4: ${id}'s memory bytes changed"
-    # Its startup-trust dialog cleared through agent-director, before it read waiting.
     for verb in read-pane send-keys; do
-        calls_naming "${LEG_A_LOG}" "${verb}" "${id}" "${SCENARIO_ROOT}/leg-a-${verb}"
-        cleared=0
-        while IFS= read -r line; do
-            _scenario_split_line "${line}" || continue
-            if [[ "${_L_PPID}" == "${SERVER_PID}" ]] && (( _L_US <= WAITING_US[${id}] )); then
-                cleared=1
-            fi
-        done < "${SCENARIO_ROOT}/leg-a-${verb}"
-        (( cleared )) || fail "leg A: no ${verb} of row ${id} by the bot server before persona ${name}'s row read waiting"
+        server_calls_naming "${LEG_A_LOG}" "${verb}" "${id}" "${SERVER_PID}" "${SCENARIO_ROOT}/leg-a-${verb}"
+        n="$(line_count "${SCENARIO_ROOT}/leg-a-${verb}")"
+        (( n == 0 )) || fail "leg A: ${n} automatic startup ${verb} call(s) of ${id}"
     done
+
 done
 # Pre-persona rows: kept, and never named by a CSCB call.
 for id in "${OLD_IDS[@]}"; do
@@ -2176,16 +1789,13 @@ for i in "${!PERSONA_IDS[@]}"; do
     (( fired_us <= first_waiting_us )) \
         || fail "leg B: row ${id}'s SessionStart record (${fired_ts}) comes after the first harness read of waiting"
 
-    # Its dialog cleared through agent-director, on its row, after the resume.
     for verb in read-pane send-keys; do
         server_calls_naming "${LEG_B_LOG}" "${verb}" "${id}" "${SERVER_PID}" "${SCENARIO_ROOT}/leg-b-${verb}"
-        cleared=0
         while IFS= read -r t; do
             if (( t > last_resume_us && t <= WAITING_B_US[${id}] )); then
-                cleared=1
+                fail "leg B: automatic startup ${verb} call of ${id} after resume"
             fi
         done < <(line_times "${SCENARIO_ROOT}/leg-b-${verb}")
-        (( cleared )) || fail "leg B: no ${verb} of row ${id} by the restarted server after its resume and before it read waiting"
     done
 
     # Its conversation kept: the same session_id, and a worker started with --resume and that id.
@@ -2222,7 +1832,7 @@ for i in "${!PERSONA_IDS[@]}"; do
     done
     [[ "${resumed_with}" == "${SID_OF[${id}]}" ]] \
         || fail "leg B: row ${id}'s worker (PID ${worker_pids[0]}) was started with --resume '${resumed_with}', not ${SID_OF[${id}]}"
-    record "leg B: persona ${name}: ${spawns} spawn(s), ${collisions} answered by a collision, then ${resumes} resume(s) by the bot server, ${refusals} still-stopping refusal(s); its row read pending with a launch start, then waiting; last resume call at ${last_resume_us} (epoch microseconds); the trail: moved to pending ${pending_ts}, out of pending to ${moved_to} by SessionStart ${moved_ts}, SessionStart hook fired ${fired_ts}, first harness read of waiting ended at ${first_waiting_us} (epoch microseconds); ${trail_pending} harness read(s) between the moves, each pending with a launch start; dialog cleared through read-pane and send-keys; conversation ${SID_OF[${id}]} kept, worker started with --resume"
+    record "leg B: persona ${name}: ${spawns} spawn(s), ${collisions} answered by a collision, then ${resumes} resume(s) by the bot server, ${refusals} still-stopping refusal(s); its row read pending with a launch start, then waiting; last resume call at ${last_resume_us} (epoch microseconds); the trail: moved to pending ${pending_ts}, out of pending to ${moved_to} by SessionStart ${moved_ts}, SessionStart hook fired ${fired_ts}, first harness read of waiting ended at ${first_waiting_us} (epoch microseconds); ${trail_pending} harness read(s) between the moves, each pending with a launch start; SessionStart completed without automatic startup keys; conversation ${SID_OF[${id}]} kept, worker started with --resume"
 done
 if (( refusals_total == 0 )); then
     expect_completion "${#PERSONA_IDS[@]}" "leg B: every persona comes back resumed" \

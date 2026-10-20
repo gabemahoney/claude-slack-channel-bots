@@ -1,74 +1,7 @@
 #!/usr/bin/env bash
-# Test 12 (b.cnu SR-8.2; the b.2qu absolute-path rule for the reply guard):
-# every hook a persona's Claude is launched with has a `command` path that is
-# an absolute path to an existing, executable file. agent-director's own hooks
-# point at the user's agent-director install, outside the customer's
-# node_modules; CSCB's Slack Reply Guard Stop hook points at the installed
-# package's stop-hooks/slack-reply-guard.sh.
-#
-# This needs a real agent-director spawn, which a unit test never makes, so
-# it lives here and not in `bun test` (it replaces
-# tests/bot-hook-absoluteness.test.ts, whose one case could only be skipped).
-# The launch is a customer's: Test 1's installed package, a live start
-# (`start_server --live`) against the loopback Slack stub
-# (fixtures/slack-stub-server.ts, through CSCB_SLACK_API_URL, as Test 10) and
-# the real agent-director spawning the persona in tmux, with
-# fixtures/stub-claude.sh first on PATH as `claude`. As in Test 10, the health
-# check is off and `exit_timeout` is 5 s (stub-claude ignores the `/exit` that
-# `stop --stop-bots` sends).
-#
-# Where the hooks are:
-# - agent-director's: the `--settings` JSON on the launched claude's command
-#   line (agent-director builds it for each spawn and writes no file). The
-#   process is found through /proc by its environment:
-#   AGENT_DIRECTOR_INSTANCE_ID=cscb_<key> and CSCB_PERSONA=<key>
-#   (src/persona-identity.ts personaInstanceId, personaSpawnEnv).
-# - CSCB's: <claude_config_dir>/settings.json (src/stop-hook-bootstrap.ts),
-#   the user settings the launched claude reads through CLAUDE_CONFIG_DIR.
-# agent-director registers its hooks in exec form (`command` with `args`, run
-# with no shell between Claude Code and the hook), so the path this test
-# checks is the hook's `command`, read verbatim, never split into words.
-# CSCB's own Stop hook stays a shell-form command (no `args`), so its words
-# are read as a shell reads them (Python's shlex, POSIX mode; nothing is run)
-# and its `command` path is the first of them. An `args` that is not a list
-# of strings is not the settings shape and fails the test.
-#
-# Steps:
-# 1. Start one persona with its own claude_config_dir (a fresh scratch dir;
-#    stop_hook_bootstrap is on by default). It is brought up: one
-#    persona-start line, the start pass ends with `0 not brought up`, no
-#    `[slack] stop-hook-bootstrap:` line (each is a skip or a failure) and
-#    no stop-hook-bootstrap record in startup-errors.log. The dialog approver
-#    runs after the launch returns, so the start pass does not wait for the
-#    launched claude's SessionStart: within TRANSCRIPT_WAIT_S of the start
-#    pass's end the working dir gets a transcript, and every transcript in it
-#    carries stub-claude's marker (the launched claude was the stub).
-# 2. Exactly one live process carries the persona's instance ID and key and
-#    a `--settings` argument; its CLAUDE_CONFIG_DIR is the persona's
-#    claude_config_dir.
-# 3. agent-director's hooks, from that `--settings` JSON: SessionStart and
-#    PermissionRequest (the permission relay) have one each at least, and
-#    every hook's `command` path is an absolute path to an existing
-#    executable file whose real path is the user's agent-director install
-#    (the binary the agent-director client runs:
-#    ~/.config/agent-director/bin/agent-director when present, else agent-director
-#    on PATH), outside the customer's node_modules.
-# 4. CSCB's hooks, from <claude_config_dir>/settings.json: every hook's
-#    `command` path is an absolute path to an existing executable file.
-#    Exactly one command is managed (names slack-reply-guard.sh, the SR-3.7
-#    recognition rule): a shell-form Stop hook of two words, the installed
-#    package's stop-hooks/slack-reply-guard.sh (by real path) and
-#    <state dir>/reply-guard, where the persona's record reads `true`. Run
-#    through sh exactly as written, with no input, it exits 0 (the guard
-#    fails open on empty input; a command the shell cannot run exits 126 or
-#    127).
-# 5. stop --stop-bots.
-#
-# An exit hook (on pass and on failure) kills the persona's tmux session and
-# removes stub-claude's transcripts; the agent-director row is left to the
-# ephemeral container (as Test 10). Like Test 10's, this live start's sweep
-# kills the live rows of personas not in this config and records their keys
-# as retired; it deletes no row. Expected runtime: under a minute.
+# Verify bot hook paths and direct-child SessionStart/SessionEnd execution
+# using a fixture that reports without startup input.
+
 set -euo pipefail
 
 TEST_NAME="test-12-bot-hook-absoluteness"
@@ -80,7 +13,7 @@ FIXTURES="$(realpath "$(dirname "$0")")/fixtures"
 # --- Bounds (seconds) ------------------------------------------------------
 STUB_WAIT_S=20     # the stub writing its ready file
 START_WAIT_S=120   # the start pass: one bring-up and one launch
-TRANSCRIPT_WAIT_S=60  # after the start pass: the dialog approver's Enter and SessionStart
+TRANSCRIPT_WAIT_S=60
 PROC_WAIT_S=15    # the persona's claude being the one process with its IDs
 
 # --- Prerequisites ---------------------------------------------------------
@@ -447,9 +380,6 @@ expect_count "${BOOTSTRAP_LINE}" 0 "start: stop-hook-bootstrap skip or failure l
 n="$(count_in "${SLACK_STATE_DIR}/startup-errors.log" "${BOOTSTRAP_ERROR_CLASS}")"
 [[ "${n}" == 0 ]] || fail "start: ${n} stop-hook-bootstrap record(s) in startup-errors.log"
 
-# The dialog approver runs after the launch returns, so the start pass ends
-# before the launched claude's SessionStart writes its transcript: wait for
-# it.
 wait_until "${TRANSCRIPT_WAIT_S}" \
     "start: no transcript in ${TRANSCRIPTS}: the launched claude did not write one" \
     has_transcript "${TRANSCRIPTS}"

@@ -140,35 +140,8 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { homedir, tmpdir } from 'node:os'
 import { basename, delimiter, dirname, join, relative, resolve, sep } from 'node:path'
 import ts from 'typescript'
-import {
-  AGENT_DIRECTOR_BINARY_NAME,
-  AGENT_DIRECTOR_INSTALL_DIR,
-  AGENT_DIRECTOR_INSTALL_PATH,
-  CHILD_TMUX_TMPDIR_PREFIX,
-  DEFAULT_CHILD_TOOLS,
-  EMPTY_CHILD_PATH,
-  HOST_SAFETY_REFUSAL,
-  HostSafetyError,
-  type HostSafeChildEnvOptions,
-  type HostSafetyRefusal,
-  PRELOAD_CHECK,
-  PRELOAD_ENV_NAMES,
-  PRELOAD_HOME_PREFIX,
-  PRELOAD_STATE_DIR_PATH,
-  type PreloadCheckFailure,
-  type PreloadEnv,
-  RESERVED_CHILD_ENV_NAMES,
-  XDG_CONFIG_DIR,
-  childTmuxTmpDir,
-  hostSafeChildEnv,
-  inheritedChildTmuxTmpDir,
-  isUnder,
-  osTempDir,
-  preloadCheckFailures,
-  preloadRedirectedEnv,
-  realHome,
-  resolveToolDir,
-} from './test-helpers/host-safe-env.ts'
+import { runStartupGate } from '../src/agent-director-startup.ts'
+import { AD_SYSTEM_INSTALL_NOT_FOUND, resetCacheForTests, runInstallCheck } from '../src/install-check.ts'
 import {
   AD_NS,
   agentDirectorValueReads,
@@ -182,9 +155,36 @@ import {
   unwrap,
 } from './test-helpers/ad-value-reads.ts'
 import { runInFakeHome } from './test-helpers/fake-home-subprocess.ts'
+import {
+  AGENT_DIRECTOR_BINARY_NAME,
+  AGENT_DIRECTOR_INSTALL_DIR,
+  AGENT_DIRECTOR_INSTALL_PATH,
+  CHILD_TMUX_TMPDIR_PREFIX,
+  childTmuxTmpDir,
+  DEFAULT_CHILD_TOOLS,
+  EMPTY_CHILD_PATH,
+  HOST_SAFETY_REFUSAL,
+  hostSafeChildEnv,
+  type HostSafeChildEnvOptions,
+  HostSafetyError,
+  type HostSafetyRefusal,
+  inheritedChildTmuxTmpDir,
+  isUnder,
+  osTempDir,
+  PRELOAD_CHECK,
+  PRELOAD_ENV_NAMES,
+  PRELOAD_HOME_PREFIX,
+  PRELOAD_STATE_DIR_PATH,
+  type PreloadCheckFailure,
+  preloadCheckFailures,
+  type PreloadEnv,
+  preloadRedirectedEnv,
+  realHome,
+  RESERVED_CHILD_ENV_NAMES,
+  resolveToolDir,
+  XDG_CONFIG_DIR,
+} from './test-helpers/host-safe-env.ts'
 import { treeSnapshot } from './test-helpers/tree-snapshot.ts'
-import { runStartupGate } from '../src/agent-director-startup.ts'
-import { AD_SYSTEM_INSTALL_NOT_FOUND, resetCacheForTests, runInstallCheck } from '../src/install-check.ts'
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -1292,7 +1292,7 @@ describe('static audit: every child process call’s env is a direct hostSafeChi
 
     expect(files).toContain(join(TESTS_DIR, 'integration', 'session-leader.test.ts'))
     expect(files).toContain(join(TESTS_DIR, 'host-safety.test.ts'))
-    expect(files).toEqual(expect.arrayContaining(filesUnder(TEST_HELPERS_DIR, () => true)))
+    expect(files).toEqual(expect.arrayContaining(filesUnder(TEST_HELPERS_DIR, path => path.endsWith('.ts'))))
     expect(files.filter((path) => path.split(sep).includes('node_modules'))).toEqual([])
   })
 })
@@ -1746,9 +1746,6 @@ const HOME_CHECK_EXEMPT: ReadonlyMap<string, string> = new Map([
   ['_scenario_cleanup', 'the EXIT trap: its only step is _scenario_tmux_shim_reset, and a refusal would skip the stops after it'],
   ['_scenario_fmk_setup', 'the setup that makes and exports the scenario HOME: before the export it only places files under SCENARIO_ROOT (_scenario_place, tmux_shim_mode); the installs after it are audited helpers'],
 ])
-
-
-
 
 /**
  * The scenario.sh functions with a step that run only from audited helpers
@@ -2694,7 +2691,7 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
       // The helpers the audit must find a step in (a parse that lost steps would shrink the set).
       expect(homeCheckedHelpers(source)).toEqual(expect.arrayContaining([
         'install_ad_shim', 'install_ad_admin_shim', 'install_ad_release', 'install_ad_010', 'reshim_ad', 'swap_ad_binary', 'hide_ad_install', 'restore_ad_install',
-        'ad', 'ad_capture', 'ad_admin', 'ad_admin_capture', '_scenario_store_read', 'ad_store_edit', 'ad_store_id', 'ad_store_backup', 'ad_store_pending_no_launch', 'stub_mode', 'stub_dialog_delay', 'write_ad_settings', 'install_ad_stand_in', 'restore_ad_install_with_stand_in',
+        'ad', 'ad_capture', 'ad_admin', 'ad_admin_capture', '_scenario_store_read', 'ad_store_edit', 'ad_store_id', 'ad_store_backup', 'ad_store_pending_no_launch', 'stub_mode', 'stub_report_delay', 'write_ad_settings', 'install_ad_stand_in', 'restore_ad_install_with_stand_in',
         'ad_new_token', 'ad_other_store_id', 'ad_owner_label', 'seed_leftover', 'seed_unlabelled', 'seed_env_only', 'seed_borrowed_name', 'seed_other_store',
         'relabel_session', 'ad_owner_global_set', 'rebind_tmux_socket', 'restore_tmux_socket', 'ad_store_mark_finished', 'ad_store_seed_pending', 'ad_store_unusable_name',
         'ad_kill_include_finished', 'ad_delete_unusable_row', 'run_find_missing_loop', 'seed_010_row', 'seed_prepersona_fleet', 'write_mcp_config',
@@ -2749,7 +2746,7 @@ describe('static audit: the /ci image marker and SCENARIO_ROOT checks come first
       ['seed_leftover', 'its seeding, through _scenario_seed', '_scenario_seed'],
       ['rebind_tmux_socket', 'its socket move', 'mv'],
       ['restore_tmux_socket', 'its socket move', 'mv'],
-      ['stub_dialog_delay', 'its move', 'mv'],
+      ['stub_report_delay', 'its move', 'mv'],
       ['install_ad_release', 'its install.sh run', '${SCENARIO_RELEASE_INSTALL_SH}'],
       ['ad_admin', 'its run of the HOME’s agent-director-admin', '${SCENARIO_AD_ROOT}/admin/agent-director-admin'],
       ['ad', 'its run of the HOME’s agent-director', '${SCENARIO_AD_ROOT}/bin/agent-director'],
@@ -2976,7 +2973,7 @@ function codexCrashProtocolFindings(source: string): string[] {
     'readCrashProgress(options.marker, options.child.pid, options.instance)',
     "checkpoint.status === 'invalid' || marker.status === 'invalid'", 'options.child.signalCode !== null',
     'last.firstSeq !== null && last.successorSeq !== null', "r.kind === 'accepted' && r.seq === seq",
-    'await options.inputVisible() && options.now() <= end', 'catch (error) { diagnostic(); throw error }',
+    '&& options.now() <= end', 'catch (error) { diagnostic(); throw error }',
   ]
   return required.filter(fragment => !source.includes(fragment)).map(() => 'codex-crash-barrier.ts: unreviewed checkpoint/boundary contract')
 }
@@ -3057,7 +3054,7 @@ describe('E7 Codex executable inventory and import safety', () => {
     ['unknown fields', 'Object.keys(v).sort().join(', 'Object.values(v).sort().join('],
     ['non-atomic publication', 'renameSync(temporary, file)', 'void 0'], ['unbounded checkpoint', 'stat.size > 2048', 'false'],
     ['missing successor', 'last.firstSeq !== null && last.successorSeq !== null', 'last.firstSeq !== null'],
-    ['late boundary', 'await options.inputVisible() && options.now() <= end', 'await options.inputVisible()'],
+    ['late boundary', '&& options.now() <= end', ''],
     ['lost diagnostics', 'catch (error) { diagnostic(); throw error }', 'catch (error) { throw error }'],
   ])('private crash protocol audit rejects %s', (_label, before, after) => {
     const source = readFileSync(join(TESTS_DIR, 'real-agent/codex-crash-barrier.ts'), 'utf8'), changed = source.replace(before!, after!)

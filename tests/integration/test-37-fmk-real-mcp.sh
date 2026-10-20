@@ -36,21 +36,14 @@ real_wait_delivery "${REAL_KEY}" 4
 GATE_RELEASE="$(case_assert fault-at delay=5000)"
 GATE_RELEASE="$(python3 -c 'import sys; print(float(sys.argv[1])+5000)' "${GATE_RELEASE}")"
 case_assert reconnect-proof 4 "${GATE_RELEASE}"
-# Empty queue, health checks off, unrelated human text at server start.
+# Empty queue with health checks off: AD waiting permits reconnect at restart.
 real_wait_idle "${REAL_KEY}"
-DRAFT='human draft remains intact'
-real_ad send-keys --instance-id "$(real_instance "${REAL_KEY}")" --text "${DRAFT}" --no-enter >/dev/null
 stop_server
 MARK="$(date +%s%3N)"
 start_server --live
-real_dm "${REAL_LABEL}" 'deferred reconnect after human draft'
-wait_until 180 'held DM not accepted' case_assert accepted 5
-case_assert no-send "${MARK}"
-real_record_pane "${REAL_KEY}"
-CLEAR_MARK="$(date +%s%3N)"
-real_clear_draft "${REAL_KEY}" "${DRAFT}"
+real_dm "${REAL_LABEL}" 'reconnect after empty queue restart'
 real_wait_delivery "${REAL_KEY}" 5
-case_assert reconnect-proof 5 "${CLEAR_MARK}"
+case_assert reconnect-proof 5 "${MARK}"
 case_assert reconnects
 
 case_assert launches

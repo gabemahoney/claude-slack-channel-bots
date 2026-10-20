@@ -1,133 +1,7 @@
 #!/usr/bin/env bash
-# Test 15 (HO §7 scenario 3; b.jg5 SRJ-1404, SRJ-1401; AC 1): a prefix
-# neighbour. Persona `dev` resumes normally beside a session named
-# `slack_bot_dev_x`, which the harness made by hand as another agent-director
-# row, and the dialog approver, `resume` and the restart path never read from
-# or type into it.
-#
-# The fmk set-up (lib/scenario.sh, fmk mode: TEST_NAME carries `-fmk-`):
-# - its own HOME, agent-director store and tmux server under SCENARIO_ROOT;
-#   the release installed through its install.sh, behind the agent-director
-#   shim (agent-director-admin too); agent-director's default settings (no
-#   config.toml);
-# - the tmux shim first on every CSCB process's PATH, in `log` mode
-#   throughout;
-# - the stub as `claude`, in `startup-trust` (no selection, the default) in
-#   both working directories, `dev`'s and the neighbour's: it prints the
-#   startup-trust dialog and reports in only on Enter;
-# - the live server against the Slack stub (fixtures/slack-stub-server.ts
-#   with `--record`; posts are read from that record with `slack_posts`), one
-#   persona `dev` (key `dev`), `health_check_interval` 0.
-# CSCB rejects persona keys that prefix each other, so the neighbour is not a
-# persona: it is a real agent-director row the harness spawns, with an
-# instance id outside CSCB's namespace (`<SCENARIO_TAG>_neighbour`, not
-# `cscb_…`) and no label at all (so no `service=cscb` label, which the start
-# sweep would read as a CSCB row to kill, SRJ-714).
-#
-# Steps, in run order. Steps marked [harness] are the harness playing a human
-# from the scenario's own shell; no CSCB process makes them.
-#   0. [harness] slack_posts' positive control: a CONFLICT notice built by
-#      fmk-texts.ts (`formatPersonaNotice` over `conflictNoticeText`) is
-#      posted to the Slack stub on a control channel, never `dev`'s; it must
-#      equal the notice composed from the per-line entries, and `slack_posts`
-#      must return it whole, its human-only line its last.
-#   1. Configuration: persona `dev`, its working directory in the stub's
-#      startup-trust hold.
-#   2. First life: the live start spawns `dev` fresh; the approver clears the
-#      dialog (a bot-server `send-keys` of `dev`'s row); a harness `get` reads
-#      the row `waiting`; its session_id and tmux session name are
-#      recorded.
-#   3. `stop --stop-bots`: a harness tmux read shows `dev`'s session gone,
-#      and a harness `get` reads its row `ended`, `missing` or `waiting`, with
-#      the same session_id. The stub ignores the `/exit` that
-#      agent-director's `pause` types, so the teardown's `pause` times out and
-#      its `kill` ends the worker, which fires no SessionEnd: the row keeps
-#      reading `waiting` until a `find-missing` marks it, and none runs here
-#      (SRJ-1401: the harness runs `find-missing` only for a latched persona).
-#      The state read is recorded.
-#   4. [harness] With the server stopped, the harness spawns the neighbour
-#      (`ad_capture spawn`, from the scenario's shell): session
-#      `<dev's session name>_x`, which is `slack_bot_dev_x`, in a working
-#      directory of its own. Its session id, window id, pane id and pane
-#      process are recorded; the pane process is the stub; a harness `get`
-#      reads the row `pending` with no label. The tmux shim's position is
-#      marked here.
-#   5. Second life: the live start makes one `resume` of `dev`'s row (parent
-#      the bot server; for a row still reading `waiting`, after its reconnect
-#      `send-keys` finds the worker gone, the dead evidence the resume needs);
-#      the approver clears the resumed dialog (bot-server
-#      `read-pane` and `send-keys` of that row after the resume); the row
-#      reads `waiting` with the same session_id, and the server
-#      registers the stub's MCP session as `dev`'s.
-#   6. Restart leg: a plain `stop` (the bot keeps running: its session is
-#      still there and its row still reads `waiting`), then a live start:
-#      `dev`'s bring-up reads `waiting` and makes its reconnect, a bot-server
-#      `send-keys` of `dev`'s row, with no `resume` or `kill` of it; the
-#      server registers `dev`'s session again, the row still `waiting` with
-#      the same session_id. Then `stop --stop-bots`.
-#   7. Checks (each a stated `fail` step; each reader also finds a line it
-#      must find; each reader's output is saved by its own assignment before
-#      it is filtered or counted, so a reader that fails stops the script):
-#      - every CSCB-parented agent-director call that carries an instance id
-#        (`ad_cscb_calls '*'`) names exactly `dev`'s; no CSCB-parented call's
-#        arguments hold the neighbour's instance id or session name
-#        (`cscb_ad_count`); positive control: calls naming `dev`'s id exist;
-#      - `tmux_shim_targets`, from step 4's mark, finds no command that reads
-#        from, types into, kills or respawns the neighbour's session name,
-#        session id, window id or pane id; positive control: it finds such
-#        commands for `dev`'s second-life session, session id, window id or
-#        pane id;
-#      - the neighbour's row still reads `pending`, its session still holds
-#        the same session id, window and pane, the pane process is the same
-#        stub process, alive, and agent-director's trail holds no `ad.hook.fired`
-#        record for it (`ad_trail_events`); positive control: it holds one
-#        for `dev`;
-#      - `ad_cscb_verb_between` finds the start sweep's `list` in the second
-#        life and in the restart leg (a positive control of the id-less
-#        reader);
-#      - `dev`'s channel holds no latch notice (a post holding the CONFLICT,
-#        unusable-name or launch-start notice head), and server.log holds no
-#        latch line (set, cleared or re-check) for `dev`; positive control:
-#        server.log holds the three start passes' completion lines;
-#      - `dev`'s row is present at the end (after the last `stop
-#        --stop-bots`).
-#   8. The three closing assertions.
-#
-# Waits and their derivation (seconds): STUB_WAIT_S (20) for the Slack
-# stub's ready file; START_WAIT_S (120) per start pass (one bring-up, one
-# launch call); REPORT_WAIT_S (60) after a start pass for the approver's
-# Enter (it reads the pane every lap, about 1 s apart) and the stub's report-in;
-# CONNECT_WAIT_S (30) after the report-in for the server to register the
-# stub's MCP session; NB_WAIT_S (10) for the neighbour's pane process to
-# become the stub; RECONNECT_WAIT_S (60) after the restart's start pass for
-# its reconnect `send-keys`. Expected runtime: about 90 s.
-#
-# Matched values. CSCB's values come from fixtures/fmk-texts.ts, printed from
-# the installed package, never retyped:
-# - personaInstanceId (src/persona-identity.ts), `dev`'s instance id; its
-#   namespace prefix is that id less the key;
-# - the latch notice heads CONFLICT_NOTICE_FIRST_LINE_HEAD,
-#   UNUSABLE_NAME_NOTICE_HEAD and LAUNCH_START_NOTICE_HEAD, and the latch
-#   lines' fragments: the common start of `conflictLatchSetLine` and
-#   `latchClearedLine` for key `dev` (`[slack] conflict-latch: persona=dev `),
-#   and of two `latchRecheckRoundLine`s for `dev` that differ only in the
-#   case (up to `case=`) (src/conflict-latch.ts);
-# - step 0's notice parts: personaNoticePrefix (src/persona-notifier.ts),
-#   conflictNoticeText, conflictNoticeFirstLine, conflictNoticeListLine,
-#   CONFLICT_NOTICE_DESCRIPTION_LINE_HEAD and _TAIL, CONFLICT_NOTICE_POINTER_LINE,
-#   CONFLICT_NOTICE_HUMAN_ONLY_LINE, CONFLICT_NOTICE_LINE_SEPARATOR and
-#   LATCH_CASE_NO_VALID_ID (src/conflict-latch.ts), CONFLICT_NO_VALID_ID_PHRASE
-#   (src/ad-description-phrases.ts).
-# Fragments with no exported builder, each quoted from its source:
-# - `[slack] Session connected: persona <ref>` (src/server.ts, the MCP
-#   session's registration line);
-# - the persona reference `"<name>" (key=<key>)` (lib/scenario.sh
-#   persona_ref, src/persona-identity.ts renderPersonaRef).
-#
-# Closing: the script ends with `assert_no_server_tmux`,
-# `assert_no_cscb_include_finished` and `assert_no_cscb_delete` in its own
-# shell. Every count of CSCB's agent-director calls reads only shim lines
-# whose parent is a CSCB process; no step reads a pane's text.
+# Verify exact persona/session targeting, prefix neighbours, resume and restart.
+# SessionStart reports readiness; CSCB never answers startup UI.
+
 set -euo pipefail
 
 TEST_NAME="test-15-fmk-prefix-neighbour"
@@ -367,7 +241,7 @@ step_first_life() {
     creds="${SCENARIO_ROOT}/credentials"
     mkdir -m 700 "${creds}"
     work="$(make_workdir dev)"
-    stub_mode "${work}" "${STUB_MODE_STARTUP_TRUST}"
+    stub_mode "${work}" "${STUB_MODE_AT_ONCE}"
     printf '{"bot_token": "%s", "app_token": "%s"}\n' "$(fake_token bot "${TOKEN_LABEL}")" "$(fake_token app "${TOKEN_LABEL}")" \
         | write_file "${creds}/dev.json" 600
     write_config << EOF
@@ -398,11 +272,10 @@ EOF
     [[ -n "${DEV_SID}" ]] || fail "${step}: the live row ${DEV_ID} has no session_id"
     [[ -n "${DEV_SESSION}" ]] || fail "${step}: the live row ${DEV_ID} names no tmux session"
     wait_for_count "${CONNECTED}" 1 "${CONNECT_WAIT_S}" "${step}: the server never registered the stub's session as dev's"
-    # The approver cleared the dialog through agent-director on dev's row.
     calls="$(ad_cscb_calls "${DEV_ID}")" || exit 1
     rows="$(verb_rows send-keys "${calls}")"
     rows="$(server_rows "${LIFE1_PID}" "${rows}")"
-    (( $(rows_count "${rows}") >= 1 )) || fail "${step}: no bot-server send-keys of ${DEV_ID}"
+    (( $(rows_count "${rows}") == 0 )) || fail "${step}: automatic startup keys reached ${DEV_ID}"
     echo "${TEST_NAME}: ${step}: ${DEV_ID} reads waiting, session_id ${DEV_SID}, session ${DEV_SESSION}"
 }
 
@@ -419,11 +292,16 @@ step_stop_bots() {
 }
 
 # Step 4 [harness]: the neighbour, made by hand with the server stopped.
+neighbour_reported() {
+    NB_HOOKS="$(ad_trail_events ad.hook.fired "${NB_ID}")" || exit 1
+    (( $(rows_count "${NB_HOOKS}") >= 1 ))
+}
+
 step_make_neighbour() {
     local step="step 4: the neighbour" dir
     NB_SESSION="${DEV_SESSION}_x"
     dir="$(make_workdir neighbour)"
-    stub_mode "${dir}" "${STUB_MODE_STARTUP_TRUST}"
+    stub_mode "${dir}" "${STUB_MODE_AT_ONCE}"
     TMUX_MARK="$(tmux_shim_mark)"
     ad_capture spawn --agent claude --cwd "${dir}" --instance-id "${NB_ID}" --tmux-session-name "${NB_SESSION}" --no-pre-trust
     if (( AD_RC != 0 )); then
@@ -436,12 +314,14 @@ step_make_neighbour() {
     NB_PANE="${PART_PANE}"
     NB_PID="${PART_PID}"
     wait_until "${NB_WAIT_S}" "${step}: the neighbour's pane process ${NB_PID} never became the stub" stub_running "${NB_PID}"
-    read_row "${step}" "${NB_ID}"
-    [[ "${ROW_STATE}" == pending ]] || fail "${step}: ${NB_ID} reads '${ROW_STATE}', not pending"
+    wait_row "${step}" "${NB_WAIT_S}" "${NB_ID}" waiting
+    NB_AD_SID="${ROW_SID}"
+    [[ -n "${NB_AD_SID}" ]] || fail "${step}: the reported neighbour has no session id"
     [[ "${ROW_SESSION}" == "${NB_SESSION}" ]] || fail "${step}: ${NB_ID} records session '${ROW_SESSION}', not ${NB_SESSION}"
     [[ "$(jq -n --argjson l "${ROW_LABELS:-null}" '$l // [] | length')" == 0 ]] \
         || fail "${step}: ${NB_ID} carries labels ${ROW_LABELS}"
-    echo "${TEST_NAME}: ${step}: ${NB_ID} reads pending in ${NB_SESSION} (${NB_SID}, window ${NB_WID}, pane ${NB_PANE}, stub ${NB_PID}); tmux shim mark ${TMUX_MARK}"
+    wait_until "${NB_WAIT_S}" "${step}: no SessionStart record for the neighbour" neighbour_reported
+    echo "${TEST_NAME}: ${step}: ${NB_ID} reads waiting in ${NB_SESSION} (${NB_SID}, window ${NB_WID}, pane ${NB_PANE}, stub ${NB_PID}); tmux shim mark ${TMUX_MARK}"
 }
 
 # Step 5: the second life resumes dev beside the neighbour.
@@ -469,10 +349,10 @@ step_second_life() {
     resume_pos="$(field_of 1 "${resumes}")"
     rows="$(ad_cscb_calls "${DEV_ID}" "${resume_pos}")" || exit 1
     rows="$(server_rows "${LIFE2_PID}" "${rows}")"
-    (( $(rows_count "$(verb_rows read-pane "${rows}")") >= 1 )) \
-        || fail "${step}: no bot-server read-pane of ${DEV_ID} after its resume"
-    (( $(rows_count "$(verb_rows send-keys "${rows}")") >= 1 )) \
-        || fail "${step}: no bot-server send-keys of ${DEV_ID} after its resume (the approver's Enter)"
+    for verb in read-pane send-keys; do
+        n="$(rows_count "$(verb_rows "${verb}" "${rows}")")"
+        (( n == 0 )) || fail "${step}: ${n} bot-server ${verb} call(s) after resume; startup needs no automatic answer"
+    done
     session_parts "${step}" "${DEV_SESSION}"
     DEV_SID2="${PART_SID}"
     DEV_WID2="${PART_WID}"
@@ -540,12 +420,11 @@ step_checks() {
     found="$(ad_cscb_verb_between list "${RESTART_MARK}" -)" || exit 1
     (( $(rows_count "${found}") >= 1 )) || fail "${step}: positive control: no CSCB list call in the restart leg"
 
-    # The trail: dev's worker reported in; the neighbour's never did.
+    # Both fixtures report in themselves; CSCB adds no neighbour hook.
     events="$(ad_trail_events ad.hook.fired "${DEV_ID}")" || exit 1
     (( $(rows_count "${events}") >= 1 )) || fail "${step}: positive control: the trail holds no ad.hook.fired record for ${DEV_ID}"
     events="$(ad_trail_events ad.hook.fired "${NB_ID}")" || exit 1
-    n="$(rows_count "${events}")"
-    (( n == 0 )) || fail "${step}: the trail holds ${n} ad.hook.fired record(s) for the neighbour ${NB_ID}"
+    [[ "${events}" == "${NB_HOOKS}" ]] || fail "${step}: the neighbour's hook trail changed after its own report-in"
 
     # No tmux command CSCB caused reads from, types into, kills or respawns
     # the neighbour, by its session name, session id, window id or pane id.
@@ -560,9 +439,10 @@ step_checks() {
     [[ -n "${control}" ]] || fail "${step}: positive control: tmux_shim_targets found no command acting on dev's ${DEV_SESSION}, ${DEV_SID2}, ${DEV_WID2} or ${DEV_PANE2}"
     echo "${TEST_NAME}: ${step}: tmux commands acting on dev from the neighbour's creation on: ${control}"
 
-    # The neighbour is untouched: pending, the same session, pane and stub.
+    # The neighbour is untouched: waiting, the same AD session, pane and stub.
     read_row "${step}" "${NB_ID}"
-    [[ "${ROW_STATE}" == pending ]] || fail "${step}: the neighbour ${NB_ID} reads '${ROW_STATE}', not pending"
+    [[ "${ROW_STATE}" == waiting && "${ROW_SID}" == "${NB_AD_SID}" && "${ROW_SESSION}" == "${NB_SESSION}" ]] \
+        || fail "${step}: the neighbour's reported state or session identity changed"
     session_parts "${step}" "${NB_SESSION}"
     [[ "${PART_SID} ${PART_WID} ${PART_PANE} ${PART_PID}" == "${NB_SID} ${NB_WID} ${NB_PANE} ${NB_PID}" ]] \
         || fail "${step}: the neighbour's session reads ${PART_SID} ${PART_WID} ${PART_PANE} ${PART_PID}, not ${NB_SID} ${NB_WID} ${NB_PANE} ${NB_PID}"

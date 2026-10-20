@@ -1,11 +1,11 @@
 /** b.omv SR-8.7: durable final receipts trigger reactions through the owning app. */
 import { afterEach, beforeEach, expect, test } from 'bun:test'
-import { addDeliveryAck, createDeliveryAckCallback, consumeAck, forgetPersonaAcks, _resetAckTracker } from '../src/ack-tracker.ts'
-import { createDeliveryReporting, buildDeliveryDispatchLine, MESSAGE_DELIVERED, buildDeliveryDiagnostic, deliveryIdentity } from '../src/delivery-notices.ts'
-import { makeDeliveryNoticeHarness, type DeliveryNoticeHarness } from './test-helpers/delivery-notices.ts'
-import { makeEngineHarness, type EngineHarness } from './test-helpers/delivery-engine.ts'
-import { slackInput } from './test-helpers/delivery-queue.ts'
+import { _resetAckTracker, addDeliveryAck, consumeAck, createDeliveryAckCallback, forgetPersonaAcks } from '../src/ack-tracker.ts'
+import { buildDeliveryDiagnostic, buildDeliveryDispatchLine, createDeliveryReporting, deliveryIdentity, MESSAGE_DELIVERED } from '../src/delivery-notices.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
+import { makeEngineHarness, type EngineHarness } from './test-helpers/delivery-engine.ts'
+import { makeDeliveryNoticeHarness, type DeliveryNoticeHarness } from './test-helpers/delivery-notices.ts'
+import { slackInput } from './test-helpers/delivery-queue.ts'
 const engines: EngineHarness[] = [], notices: DeliveryNoticeHarness[] = []
 beforeEach(_resetAckTracker)
 afterEach(async () => { for (const n of notices.splice(0)) { assertNoLeak({ logs: n.logs, posts: n.h.allPosts() }); await n.cleanup() }; for (const e of engines.splice(0)) await e.cleanup(); _resetAckTracker() })
@@ -15,7 +15,7 @@ async function setup() {
   const e = await makeEngineHarness({ onEvent: event => reporting?.engineEvent(event) }); engines.push(e)
   const n = await makeDeliveryNoticeHarness({ queue: e.queue }); notices.push(n)
   reporting = createDeliveryReporting({ queue: e.queue, episodes: n.rig.episodes, persona: key => n.config.personas.find(p => p.key === key), state: () => ({ up: true }),
-    log: line => n.logs.push(line), notify: (key, text) => n.h.notifier.notify(key, text), reconnectBlocked: () => {},
+    log: line => n.logs.push(line), notify: (key, text) => n.h.notifier.notify(key, text),
     delivered: createDeliveryAckCallback({ getReaction: () => 'white_check_mark', clientFor: key => n.h.stub(key).web }),
   })
   return { e, n, reporting }

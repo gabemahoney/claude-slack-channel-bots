@@ -28,7 +28,7 @@ EXTENDS Naturals, Sequences, TLC, TLCExt, Json
 \* EngineObserve freezes a reading until EngineStep consumes it. GateStep
 \* uses live knowledge, as the production gate does. EngineChoice is pure
 \* and deterministic. Text/Enter inspect permission again at execution:
-\* a good screen reading never bypasses agent-director's live dialog guard.
+\* a waiting row reading never bypasses agent-director's live dialog guard.
 \* To isolate that race, this diagnostic restricts observation scheduling to
 \* EnvTypable moments. Every resulting behavior is still admissible to the
 \* unrestricted read action. In particular the fairness action Observe /\
@@ -44,19 +44,17 @@ Items == {Item}
 Pair == <<Item, 1>>
 Pairs == {Pair}
 None == <<0, 0>>
-EnterRetries == 4
 VARIABLE st
 vars == <<st>>
 
 ReadingOf(s) == [phase |-> s.phase, gate |-> s.gate, request |-> s.request,
-  timer |-> s.timer, enterRetries |-> s.enterRetries, box |-> s.box, taken |-> s.taken,
-  delivered |-> s.delivered, row |-> s.row, actual |-> s.actual,
+  timer |-> s.timer, taken |-> s.taken, made |-> s.made, recovery |-> s.recovery,
+  delivered |-> s.delivered, row |-> s.row,
   permission |-> s.permission, mcp |-> s.mcp]
 SeedReading == [phase |-> "ready", gate |-> "free", request |-> FALSE,
-  timer |-> 0, enterRetries |-> 0, box |-> "empty", taken |-> FALSE, delivered |-> FALSE,
-  row |-> "waiting", actual |-> "idle", permission |-> FALSE, mcp |-> TRUE]
-CanType(k) == k.row \in {"waiting", "working"} /\ ~k.permission
-              /\ k.box = "empty" /\ k.mcp
+  timer |-> 0, taken |-> FALSE, made |-> FALSE, recovery |-> FALSE, delivered |-> FALSE,
+  row |-> "waiting", permission |-> FALSE, mcp |-> TRUE]
+CanType(k) == k.row = "waiting" /\ ~k.permission /\ k.mcp
 EngineChoice(k) ==
  CASE k.taken /\ ~k.delivered -> "recordDelivery"
  [] k.phase = "cooldown" -> "expireRetryTimer"
@@ -65,28 +63,25 @@ EngineChoice(k) ==
  [] k.phase = "text" -> "typeText"
  [] k.phase = "enter" /\ k.timer > 0 -> "expireEnterTimer"
  [] k.phase = "enter" -> "pressEnter"
+ [] k.phase = "recovery-enter" -> "pressEnter"
  [] k.phase = "refused" -> "recordRefusal"
- [] k.phase = "ready" /\ k.gate = "delivery" /\ k.request /\ CanType(k) -> "recordSend"
+ [] k.phase = "ready" /\ k.gate = "delivery" /\ k.request /\ CanType(k) ->
+      IF k.made /\ ~k.recovery THEN "recordRecoveryEnter" ELSE "recordSend"
  [] k.phase = "ready" /\ k.gate = "free" /\ CanType(k) -> "requestGate"
- [] k.phase = "boxed" /\ k.gate = "delivery" /\ k.request
-       /\ k.enterRetries < EnterRetries -> "recordEnterRetry"
- [] k.phase = "boxed" /\ k.gate = "free" /\ k.box = "item"
-       /\ k.enterRetries < EnterRetries
-       /\ ~k.permission /\ k.row = "waiting" -> "requestGate"
  [] OTHER -> "wait"
 GateChoice(k) ==
  CASE k.gate = "free" /\ k.request -> "grantDelivery"
  [] k.gate = "delivery" /\
     (k.phase \in {"cooldown", "done"} \/
-     (k.phase \in {"ready", "boxed"} /\ ~k.request)) -> "releaseDelivery"
+     (k.phase \in {"ready"} /\ ~k.request)) -> "releaseDelivery"
  [] OTHER -> "wait"
-LiveAcceptsKeys == ~st.permission /\ st.row \in {"waiting", "working"}
+LiveAcceptsKeys == ~st.permission /\ st.row = "waiting"
 EnvTypable == st.actual = "idle" /\ st.row = "waiting" /\ ~st.permission
 Work == ~st.delivered \/ st.gate # "free"
 
 Init == st = [accepted |-> Items, acked |-> Items, attempt |-> "none",
-  everSent |-> FALSE, delivered |-> FALSE, made |-> FALSE, retypes |-> 0,
-  phase |-> "ready", timer |-> 0, enterRetries |-> 0, request |-> FALSE, gate |-> "free",
+  everSent |-> FALSE, delivered |-> FALSE, made |-> FALSE, recovery |-> FALSE, retypes |-> 0,
+  phase |-> "ready", timer |-> 0, request |-> FALSE, gate |-> "free",
   observation |-> "none", reading |-> SeedReading, keyReading |-> SeedReading,
   actual |-> "idle", row |-> "waiting", permission |-> FALSE,
   box |-> "empty", submitted |-> FALSE, taken |-> FALSE,
@@ -108,14 +103,17 @@ EngineStep ==
       choice = "requestGate" -> [consumes EXCEPT !.request = TRUE,
                                   !.outcome = "gate-requested"]
    [] choice = "recordSend" -> [consumes EXCEPT !.attempt = "sent",
-       !.everSent = TRUE, !.phase = "text", !.request = FALSE,
+       !.everSent = TRUE, !.phase = "text", !.request = FALSE, !.recovery = FALSE,
        !.keyReading = st.reading,
        !.outcome = "sent-record-durable"]
+   [] choice = "recordRecoveryEnter" -> [consumes EXCEPT !.attempt = "enter",
+       !.phase = "recovery-enter", !.request = FALSE,
+       !.keyReading = st.reading, !.outcome = "recovery-enter-intent-durable"]
    [] choice = "typeText" ->
        IF LiveAcceptsKeys
        THEN [consumes EXCEPT !.phase = "enter", !.timer = 1,
               !.box = "item", !.made = TRUE,
-              !.keySafe = st.gate = "delivery" /\ st.box = "empty" /\
+              !.keySafe = st.gate = "delivery" /\
                           CanType(st.keyReading) /\ ~st.permission,
               !.outcome = "text-accepted"]
        ELSE [consumes EXCEPT !.phase = "refused",
@@ -126,13 +124,11 @@ EngineStep ==
        !.timer = 0, !.outcome = "retry-timer-expired"]
    [] choice \in {"expireEnterTimer", "expireReceiptTimer"} ->
        [consumes EXCEPT !.timer = 0, !.outcome = "timer-expired"]
-   [] choice = "releaseAttempt" -> [consumes EXCEPT !.phase = "boxed",
+   [] choice = "releaseAttempt" -> [consumes EXCEPT !.phase = "ready",
        !.request = FALSE, !.outcome = "receipt-wait-ended"]
-   [] choice = "recordEnterRetry" -> [consumes EXCEPT !.phase = "enter",
-       !.request = FALSE, !.timer = 1, !.enterRetries = @ + 1,
-       !.outcome = "enter-only-retry-record-durable"]
-   [] choice \in {"pressEnter", "retryEnter"} ->
+   [] choice = "pressEnter" ->
        [consumes EXCEPT !.phase = "receipt", !.timer = 1,
+         !.recovery = IF st.phase = "recovery-enter" /\ LiveAcceptsKeys THEN TRUE ELSE @,
          !.submitted = IF LiveAcceptsKeys /\ st.box = "item" THEN TRUE ELSE @,
          !.keySafe = IF LiveAcceptsKeys THEN st.gate = "delivery" ELSE @,
          !.outcome = IF LiveAcceptsKeys THEN "enter-accepted" ELSE "permission-refused-enter"]
@@ -151,7 +147,7 @@ GateStep ==
 \* restriction, rather than removed fairness conjuncts or a premise on MCP.
 ReconnectStep ==
  /\ ~st.mcp /\ st.gate = "free" /\ ~st.reconnectPending
- /\ st.actual = "idle" /\ ~st.permission /\ st.box = "empty"
+ /\ st.row = "waiting" /\ ~st.permission
  /\ st' = [st EXCEPT !.reconnectPending = TRUE,
        !.transition = "ReconnectStep", !.action = "reconnect", !.outcome = "typed"]
 AgentCompletesReconnect ==
@@ -199,14 +195,13 @@ NotDelivered == ~st.delivered
 
 TypeOK ==
  /\ st.accepted = Items /\ st.acked = Items /\ st.retypes = 0
- /\ st.phase \in {"ready", "text", "enter", "refused", "cooldown", "receipt", "boxed", "done"}
- /\ st.attempt \in {"none", "sent", "refused", "delivered"}
+ /\ st.phase \in {"ready", "text", "enter", "recovery-enter", "refused", "cooldown", "receipt", "done"}
+ /\ st.attempt \in {"none", "sent", "enter", "refused", "delivered"}
  /\ st.gate \in {"free", "delivery"} /\ st.observation \in {"none", "ready"}
  /\ st.actual \in {"idle", "busy"}
  /\ st.row \in {"waiting", "working", "check_permission"}
  /\ st.box \in {"empty", "item"} /\ st.timer \in 0..1
- /\ st.enterRetries \in 0..EnterRetries
- /\ \A b \in {st.everSent, st.delivered, st.made, st.request, st.permission,
+ /\ \A b \in {st.everSent, st.delivered, st.made, st.recovery, st.request, st.permission,
                st.submitted, st.taken, st.mcp, st.reconnectPending,
                st.keySafe, st.refusalSeen} : b \in BOOLEAN
 SafetySanity ==
