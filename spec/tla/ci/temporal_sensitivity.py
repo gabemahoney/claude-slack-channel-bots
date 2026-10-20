@@ -619,7 +619,7 @@ NotConcrete == ~(Fairness""" + assumption + " /\\ []RestartStateConstraint /\\ ~
 # The guide never supplies enabledness or fairness to the exact replay proof.
 def targeted_candidate_inputs(cfg_text):
     spec, target, bug, constants = cfg_context(cfg_text)
-    require(bug in {"park_retype", "unreadable_park"}, "unsupported targeted candidate")
+    require(bug in {"park_retype", "unreadable_park", "hold_gate_mcp"}, "unsupported targeted candidate")
     assumption = " /\\ TypableHeadTakeInAssumption" if spec == "Spec" else ""
     module = r'''---------------- MODULE ConcreteCandidate ----------------
 EXTENDS PersonaDelivery
@@ -628,6 +628,8 @@ TargetedMutationWitnessGuide ==
  [] st.h.accepted = {} /\ st.observation = "none" -> Accept
  [] st.e.phase = "text" /\ st.faults["textUnknown"] = 0 ->
       EngineCallFault /\ st'.outcome = "textUnknown" /\ st'.a.box = None
+ [] Bug = "hold_gate_mcp" /\ st.faults["textUnknown"] > 0 /\
+    st.faults["mcpDrop"] = 0 /\ st.g.owner = "delivery" -> MCPDrop
  [] Bug = "park_retype" /\ st.e.retypes[1] >= 1 /\ st.a.box # None /\
     st.faults["agentDrop"] = 0 -> AgentDrop
  [] Bug = "unreadable_park" /\ st.h.everSent # {} /\ st.e.phase = "ready" /\
@@ -646,7 +648,7 @@ NotConcrete == ~(Fairness''' + assumption + " /\\ []RestartStateConstraint /\\ ~
 
 
 def candidate_search_inputs(cfg_text, raw):
-    if cfg_context(cfg_text)[2] in {"park_retype", "unreadable_park"}:
+    if cfg_context(cfg_text)[2] in {"park_retype", "unreadable_park", "hold_gate_mcp"}:
         return "independent-targeted-guide", targeted_candidate_inputs(cfg_text)
     return "view-label-search", candidate_inputs(cfg_text, raw)
 

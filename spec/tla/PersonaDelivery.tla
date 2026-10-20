@@ -179,6 +179,9 @@ FirstSendGate(r,e) == r.up /\ ~r.latched /\ ~r.held /\ r.marker /\ r.relay /\
 RetypeGate(r,e) == FirstSendGate(r,e) /\ r.receipts = {} /\ e.timers.backoff = 0
 ReconnectGate(r) == r.up /\ ~r.latched /\ ~r.held /\ r.relay /\ r.marker /\
  r.row = "waiting"
+\* Reconcile a durable draft before MCP can reconnect; ordinary text still
+\* requires MCP. AD waiting and the same non-screen guards authorize Enter.
+RecoveryEnterGate(r,e) == ReconnectGate(r) /\ e.timers.settle = 0
 \* The transcript records returned by the preceding read are frozen in k.r.
 FrozenReceipt(k,ip) == {n \in k.r.receipts : k.r.records[n].text = Text(ip) /\
                        n > k.p.sent[Min(Made(k.p,ip))].offset /\
@@ -242,15 +245,17 @@ EngineChoice(k) ==
       ELSE IF k.r.gate = "free" THEN "requestGate" ELSE "wait"
  [] k.e.phase = "receipt" /\ k.e.timers.receipt = 0 -> "releaseAttempt"
  [] ip # None /\ ip[1] \notin k.p.fixed -> "fixText"
- [] k.g.deferred /\ ~k.r.mcp /\ k.g.due /\ k.r.gate = "free" -> "deferReconnect"
  [] ip # None /\ k.e.phase = "ready" /\ k.e.timers.notNow = 0 /\
-    (IF retype THEN retryGate ELSE FirstSendGate(k.r,k.e)) /\
+    (IF recoverEnter THEN RecoveryEnterGate(k.r,k.e) /\
+                         k.r.receipts = {} /\ k.e.timers.backoff = 0
+     ELSE IF retype THEN retryGate ELSE FirstSendGate(k.r,k.e)) /\
     (~retype \/ recoverEnter \/ k.e.retypes[ip[1]] < MaxRetypes) /\
     ~(k.bug = "park_retype" /\ k.e.retypes[ip[1]] >= 1) /\
     ~(k.bug = "unreadable_park" /\ ~k.r.readable /\ retype) /\
     ~(k.bug = "hold_gate_mcp" /\ retype /\ ~k.r.mcp) ->
         IF k.r.gate # "delivery" THEN "requestGate"
         ELSE IF recoverEnter THEN "recordRecoveryEnter" ELSE "recordSend"
+ [] k.g.deferred /\ ~k.r.mcp /\ k.g.due /\ k.r.gate = "free" -> "deferReconnect"
  [] k.bug = "hold_gate_mcp" /\ retype /\ ~k.r.mcp /\
     k.r.gate = "free" -> "requestGate"
  [] ip # None /\ retype /\ k.e.retypes[ip[1]] >= 1 /\
@@ -469,7 +474,8 @@ TextAttempt ==
 EnterAttempt ==
  LET refuses == st.a.permission \/ st.a.notNow \/ st.a.dialogHold \/ st.a.overlay \/
                 st.a.row # "waiting" \/ ~st.a.up \/ ~st.a.present \/
-                st.a.latched \/ st.a.held \/ ~st.a.marker \/ ~st.a.relay \/ ~st.a.mcp
+                st.a.latched \/ st.a.held \/ ~st.a.marker \/ ~st.a.relay \/
+                (st.e.phase # "recovery-enter" /\ ~st.a.mcp)
  IN /\ st.e.phase \in {"enter","recovery-enter"}
     /\ st.g.owner = "delivery"
     /\ st' = [st EXCEPT !.e.phase = "receipt", !.e.timers.receipt = 1,
@@ -480,7 +486,8 @@ EnterAttempt ==
        !.e.timers.notNow = IF refuses THEN 1 ELSE @,
        !.a.submitted = IF refuses \/ st.a.box = None THEN @ ELSE TRUE,
        !.h.keys = IF refuses THEN @ ELSE
-           Append(@,KeyEvent("enter","delivery",st.e.keyReading,st.e.target)),
+           Append(@,KeyEvent(IF st.e.phase = "recovery-enter" THEN "recovery-enter" ELSE "enter",
+                            "delivery",st.e.keyReading,st.e.target)),
        !.observation = "none", !.transition = "EngineStep",
        !.action = "pressEnter", !.expired = {},
        !.outcome = IF refuses THEN "refused" ELSE "done", !.bugStep = FALSE]
@@ -590,6 +597,9 @@ GateStep ==
 
 ReconnectStep ==
  /\ Active /\ ~st.a.mcp /\ st.g.deferred /\ st.g.due
+ \* Reconnect and its delivery reconciliation are one abstract operation:
+ \* an in-progress reconnect cannot start or await another reconnect.
+ /\ ~st.a.reconnectRunning
  /\ GateChoice(ObservedKnowledge) \in {"runReconnect","stealForReconnect"}
  /\ Bug # "no_deferred"
  /\ (Bug # "deferred_only_open" \/ Open(st.p) # {})
@@ -615,7 +625,7 @@ AgentCompletesReconnect ==
      !.transition = "AgentCompletesReconnect", !.action = "environment",
      !.expired = {}, !.outcome = "connected", !.bugStep = FALSE]
 ReconnectDue ==
- /\ Active /\ ~st.a.mcp /\ ~st.g.due
+ /\ Active /\ ~st.a.mcp /\ ~st.g.due /\ ~st.a.reconnectRunning
  /\ st' = [st EXCEPT !.g.deferred = TRUE, !.g.due = TRUE, !.g.typed = FALSE,
      !.h.reconnectDeferred = TRUE,
      !.transition = "ReconnectDue", !.action = "health-or-message-or-timer",
@@ -975,6 +985,7 @@ TypingGuards == \A event \in SeqSet(st.h.keys) :
         r.row = "waiting" /\
         r.relay /\ r.marker /\ r.mcp /\ r.up /\ ~r.latched /\ ~r.held
     /\ event.kind = "reconnect" => ReconnectGate(r)
+    /\ event.kind = "recovery-enter" => ReconnectGate(r)
 NoRetypeWhileWorking == \A event \in SeqSet(st.h.keys) :
  event.kind = "retype" => event.reading.row = "waiting" /\
  event.missingReceipt
