@@ -1,8 +1,22 @@
 # Engineering Best Practices
 
+## The two cardinal rules
+
+**These two rules override everything else in this guide, every SRD, every plan and every review. No exception, no workaround, no "just this once".**
+
+1. **CSCB relies on agent-director for agent state.**
+2. **CSCB does not write code that parses an agent's TUI.**
+
+What they mean:
+
+- **Agent state is agent-director's answer, and only agent-director's.** "Working", "waiting", "at a prompt", "safe to type into", "stuck", "idle": CSCB gets each of these from agent-director's verbs and fields (row `state`, `family_state`, request records, and refusals such as `ErrDialogMaybeOpen`). CSCB acts on that answer and on agent-director's refusals. CSCB never works out agent state for itself.
+- **No TUI parsing, of any kind.** CSCB never reads an agent's screen to decide anything: no footer, prompt marker, border, spinner, timer, menu, dialog, picker or status-line text, for Claude Code, Codex or any other agent. Pane text from `read-pane` is never matched, scanned or classified by CSCB code. Agents' TUIs are not a contract. They change every release, and code that reads them breaks every release.
+- **If CSCB needs a state agent-director doesn't report, ask agent-director for it.** File a feature request in agent-director's repository and block the CSCB work on it. Never fill the gap by reading the screen.
+- **Reviews enforce this.** Any SRD, plan, task or diff that reads an agent's TUI, or derives agent state in CSCB, is rejected, even if the SRD asks for it.
+
 ## Layering: agent-director Owns tmux
 
-Two rules hold for every change. Read them before any other section.
+Two more rules hold for every change.
 
 - **CSCB never touches tmux.** No path in `src/` spawns `tmux`, reads a pane or types into a session; every launch, pane read, keystroke, kill and liveness check goes through agent-director. Why: agent-director owns the sessions, so a second caller drifts from its view of them. There is one Claude session per persona, however many channels it serves, in either channel mode: fungible mode adds no session, launch, pane read or agent-director call, and no channel-membership lookup.
 - **CSCB never replicates agent-director functionality.** When CSCB needs something at agent-director's level of the stack, file a feature request against agent-director and wait for the verb; don't build it in CSCB. Why: a copy drifts out of sync with agent-director's real behaviour and doubles the maintenance surface.
@@ -39,8 +53,9 @@ See [Avoiding Duplicated Effort with agent-director](#avoiding-duplicated-effort
 - Build delivery clients only through `createDeliveryClientFactory` in `agent-director-startup.ts`, using the common option builder and version/floor checks. Use `clientFor(key)` instead of replacing the singleton; a persona's failed construction or blocked call must not stall siblings. Wrap every call with the existing outage/class handling and retain the async-local persona client and budget hook across reconnect awaits.
 - Put every automatic key path through the same persona lifecycle lease: delivery text and Enter, reconnect text and Enter, approver answers and pending-row lap answers. Keep the lease across the injected text-to-Enter pause; revalidate unused requests with fresh guards and stop after teardown/shutdown. Startup answers require a freshly proved pending dialog before that launch's first waiting read. Agent-director's separate-process CLI `pause` and `kill` remain its own operations.
 - Persist the attempt before keys and the receipt-backed delivery before advancing the FIFO head/part. Classify text and Enter separately: a definite text refusal differs from an unknown outcome, and Enter failure does not erase already typed text. Release the lease on append failure, retry that append, and revalidate before resuming keys. Never cap production retypes or discard open work.
-- Keep composer markers and transcript schemas behind `delivery-screen.ts` and `delivery-receipt.ts`. Consumers use screen state, exact receipt/negative evidence and idle evidence, never their own UI regex or JSONL parser. Message delivery requires the row's `tag_prompt` marker; E3's missing-marker event does not install E4's launch/upgrade behavior.
-- Native Claude composer ownership includes the observed manual-mode footer, NBSP after the prompt, soft wraps and `[Pasted text` markers for long or tall input. Keep these display rules in `delivery-screen.ts`; never normalize the transcript to accommodate a screen shape. Body escaping in `tag-wrapper.ts` includes U+2028, U+0301 and U+0308 as decimal entities after opener neutralization and before splitting, as amended in b.omv SR-2.2; preserve the original 15 wrapper cases and exact receipt matcher.
+- Keep transcript schemas behind `delivery-receipt.ts`; consumers use exact receipt and negative evidence, never their own JSONL parser. Message delivery requires the row's `tag_prompt` marker; E3's missing-marker event does not install E4's launch/upgrade behavior.
+- **Existing violations, to be removed:** `delivery-screen.ts`, the positive-idle rule, `checkWaitingRowPane`, `checkWorkingRowPane`, the pending-row lap's pane check and every other pane-reading decision in `src/` break both cardinal rules. They are scheduled for replacement by agent-director state. Add no new screen markers, no new callers and no new pane checks. Don't extend or "fix" them for a new agent version. The fix is agent-director state.
+- Body escaping in `tag-wrapper.ts` includes U+2028, U+0301 and U+0308 as decimal entities after opener neutralization and before splitting, as amended in b.omv SR-2.2; preserve the original 15 wrapper cases and exact receipt matcher.
 - Treat `deliveryEngineEvents.emit` as the E5 consumer seam for delivery, retype, waiting reason/age, missing marker and reconnect screen duration. Do not infer a posted notice or ack reaction from the event. A deferred reconnect belongs to the active engine or the lifecycle timer when no engine runs, including with health checks disabled; teardown and shutdown cancel both ownership and delayed keys.
 
 See the architecture's [delivery flow](architecture.md#per-persona-delivery-engine-bomv-sr-5sr-6) and [code/model map](architecture.md#delivery-model-code-map-bomv-sr-156), and the testing guide's [delivery fixtures](testing-guide.md#delivery-engine-and-model-fixtures-bomv-sr-13).
