@@ -4,7 +4,7 @@ EXTENDS Naturals, Sequences, TLC, TLCExt, Json
 \* DIAGNOSTIC ONLY: a one-persona, one-item, one-part restriction of SR-15.
 \* This cannot certify E1 or replace its production suite/bounds. Item names
 \* the already durably accepted head; Item=1 is a symmetry-free finite instance.
-\* Server/persona/relay/marker/queue are healthy, launch settle has elapsed,
+\* Server/persona/relay/marker/queue are healthy,
 \* MCP stays connected, and the transcript stays readable. No bounded fault
 \* occurs: no lost text, overlay, unknown/refused-call fault, or busy-waiting
 \* fault is modeled. Permission refusals arise ONLY from the live AD guard

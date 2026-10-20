@@ -55,9 +55,9 @@ ASSUME /\ ((MaxItems >= 2 /\ MaxParts >= 2) \/ SmallCoreBounds)
 \* both Claude Code and Codex; Codex's stalled composer is lost Enter and its
 \* absence of drop/pull-back records supplies no positive receipt.
 
-TimerNames == {"settle", "receipt", "backoff", "enterDelay",
+TimerNames == {"receipt", "backoff", "enterDelay",
                "notNow", "reconnect"}
-TimerConstants == [LAUNCH_SETTLE_MS |-> 1000, RECEIPT_WAIT_MS |-> 10000,
+TimerConstants == [RECEIPT_WAIT_MS |-> 10000,
  RETYPE_BACKOFF_MS |-> <<10000,30000,60000,120000,300000,900000>>,
  ENTER_DELAY_MS |-> 500,
  NOT_NOW_RETRY_MS |-> <<5000,10000,20000,40000,60000>>,
@@ -69,19 +69,19 @@ Max(S) == CHOOSE x \in S : \A y \in S : x >= y
 SeqSet(q) == {q[n] : n \in 1..Len(q)}
 Filter(q, S) == SelectSeq(q, LAMBDA x : x \in S)
 PairOf(a) == <<a.item,a.part>>
-Record(kind, ip, attempt, how, launch, session, offset, receipt) ==
+Record(kind, ip, attempt, how, session, offset, receipt) ==
  [kind |-> kind, item |-> ip[1], part |-> ip[2], attempt |-> attempt,
-  how |-> how, launch |-> launch, session |-> session, offset |-> offset,
+  how |-> how, session |-> session, offset |-> offset,
   receipt |-> receipt]
-EmptyWrite == Record("none",None,0,"none",0,0,0,0)
+EmptyWrite == Record("none",None,0,"none",0,0,0)
 EmptyReading == [row |-> "missing",
  relay |-> TRUE, marker |-> TRUE, mcp |-> FALSE, up |-> TRUE,
  latched |-> FALSE, held |-> FALSE, readable |-> TRUE, receipts |-> {},
- launch |-> 0, session |-> 0,
+ relaunch |-> FALSE, session |-> 0,
  gate |-> "free", offset |-> 0, records |-> <<>>]
 InitialEngine == [phase |-> "ready", target |-> None, attempt |-> 0,
  recoveryAttempt |-> 0,
- launchSeen |-> 0, sessionSeen |-> 0, retypes |-> [i \in Items |-> 0], timers |-> ZeroTimers,
+ sessionSeen |-> 0, retypes |-> [i \in Items |-> 0], timers |-> ZeroTimers,
  restartCheck |-> TRUE, receipt |-> 0,
  appendBlocked |-> FALSE, noticed |-> {}, request |-> "none", keyReading |-> EmptyReading]
 InitialPersistent == [accepted |-> {}, fixed |-> {}, sent |-> <<>>, refused |-> {},
@@ -138,7 +138,7 @@ ReadOf(s) == [row |-> s.a.row,
  held |-> s.a.held, readable |-> s.a.transcript # "unreadable",
  receipts |-> IF s.a.transcript = "unreadable" THEN {}
               ELSE ReceiptCandidates(s.p,s.h.credited,s.a.log),
- launch |-> s.a.launch, session |-> s.a.session,
+ relaunch |-> s.relaunch, session |-> s.a.session,
  gate |-> s.g.owner, offset |-> Len(s.a.log),
  \* Stat can supply EOF while contents are unreadable. Preserve only transcript
  \* records already returned by a successful read in that case, including loss
@@ -175,13 +175,13 @@ ReplayKnowledgeOf(s) == IF s.observation = "ready" \/ InternalContinuationOf(s)
                         THEN StepKnowledgeOf(s) ELSE KnowledgeOf(s)
 
 FirstSendGate(r,e) == r.up /\ ~r.latched /\ ~r.held /\ r.marker /\ r.relay /\
- r.mcp /\ r.row = "waiting" /\ e.timers.settle = 0
+ r.mcp /\ r.row = "waiting"
 RetypeGate(r,e) == FirstSendGate(r,e) /\ r.receipts = {} /\ e.timers.backoff = 0
 ReconnectGate(r) == r.up /\ ~r.latched /\ ~r.held /\ r.relay /\ r.marker /\
  r.row = "waiting"
 \* Reconcile a durable draft before MCP can reconnect; ordinary text still
 \* requires MCP. AD waiting and the same non-screen guards authorize Enter.
-RecoveryEnterGate(r,e) == ReconnectGate(r) /\ e.timers.settle = 0
+RecoveryEnterGate(r,e) == ReconnectGate(r)
 \* The transcript records returned by the preceding read are frozen in k.r.
 FrozenReceipt(k,ip) == {n \in k.r.receipts : k.r.records[n].text = Text(ip) /\
                        n > k.p.sent[Min(Made(k.p,ip))].offset /\
@@ -231,7 +231,7 @@ EngineChoice(k) ==
       IF ~k.e.appendBlocked \/ k.e.timers.backoff = 0 THEN "commitAppend"
       ELSE "expireTimers"
  [] ~k.r.up -> "stopAbsent"
- [] k.r.launch # k.e.launchSeen \/ k.r.session # k.e.sessionSeen -> "observeLaunch"
+ [] k.r.relaunch \/ k.r.session # k.e.sessionSeen -> "observeLaunch"
  [] k.e.phase = "text" -> IF k.r.gate = "delivery" THEN "typeText"
                             ELSE IF k.r.gate = "free" THEN "requestGate" ELSE "wait"
  [] k.e.phase = "enter" /\ k.e.timers.enterDelay = 0 ->
@@ -320,12 +320,12 @@ Init == st = [
         permission |-> FALSE, overlay |-> FALSE, person |-> Scenario = "empty-reconnect",
         writable |-> TRUE,
         notNow |-> FALSE, dialogHold |-> FALSE, botAlive |-> TRUE,
-        launch |-> 1, session |-> 1, reconnectRunning |-> FALSE],
+        session |-> 1, reconnectRunning |-> FALSE],
  h |-> [accepted |-> {}, acked |-> {}, everSent |-> {}, everDelivered |-> {},
         taken |-> <<>>, credited |-> {}, credits |-> <<>>, keys |-> <<>>,
         reconnectDeferred |-> FALSE, reconnectTyped |-> FALSE, compactions |-> 0],
  faults |-> [f \in FaultNames |-> 0], server |-> "up", starts |-> 1,
- observation |-> "none", knowledge |-> SeedKnowledge,
+ relaunch |-> TRUE, observation |-> "none", knowledge |-> SeedKnowledge,
  compact |-> "none", saved |-> <<>>, redelivery |-> FALSE, transition |-> "Init",
  action |-> "none", expired |-> {}, outcome |-> "none", bugStep |-> FALSE]
 \* SeedKnowledge supplies an empty external reading until EngineObserve. Only
@@ -432,7 +432,7 @@ Accept ==
                THEN IF i = 1 THEN st.starts = 1 ELSE st.starts > 1
                ELSE TRUE)
     /\ (Scenario # "empty-reconnect" \/ st.a.mcp)
-    /\ st' = [st EXCEPT !.w = Record("accepted",<<i,1>>,0,how,0,0,0,0),
+    /\ st' = [st EXCEPT !.w = Record("accepted",<<i,1>>,0,how,0,0,0),
        !.g.deferred = IF how = "slack" /\ ~st.a.mcp THEN TRUE ELSE @,
        !.g.due = IF how = "slack" /\ ~st.a.mcp THEN TRUE ELSE @,
        !.transition = "Accept", !.action = "intake", !.expired = {},
@@ -444,7 +444,7 @@ RedeliverSlack ==
  /\ ~st.redelivery /\ st.starts > 1
  /\ Cardinality(st.h.accepted) < MaxItems
  /\ LET i == Cardinality(st.h.accepted)+1
-    IN st' = [st EXCEPT !.w = Record("accepted",<<i,1>>,0,"slack-redelivery",0,0,0,0),
+    IN st' = [st EXCEPT !.w = Record("accepted",<<i,1>>,0,"slack-redelivery",0,0,0),
       !.redelivery = TRUE, !.transition = "RedeliverSlack", !.action = "intake", !.expired = {},
       !.outcome = "duplicate-received", !.bugStep = FALSE]
 
@@ -536,18 +536,18 @@ EngineStepSuccessful ==
     [] choice = "storeDuplicateKey" -> CommitAppend
     [] choice = "compactQueueFinish" -> QueueCompactFinish
     [] choice = "commitAppend" -> CommitAppend
-    [] choice = "fixText" -> StartWrite(Record("fixed",ip,0,"none",0,0,0,0),"ready")
+    [] choice = "fixText" -> StartWrite(Record("fixed",ip,0,"none",0,0,0),"ready")
     [] choice \in {"recordSend","recordRecoveryEnter"} ->
        StartWrite(Record("sent",ip,NewAttempt(st.p),
           IF choice = "recordRecoveryEnter" THEN "enter"
           ELSE IF HasSent(k.p,ip) THEN "retype" ELSE "text",
-          k.r.launch,k.r.session,k.r.offset,0),"ready")
+          k.r.session,k.r.offset,0),"ready")
     [] choice = "recordRefusal" ->
-       StartWrite(Record("refused",st.e.target,st.e.attempt,"none",0,0,0,0),"refused")
+       StartWrite(Record("refused",st.e.target,st.e.attempt,"none",0,0,0),"refused")
     [] choice = "recordNotice" ->
-       StartWrite(Record("noticed",ip,0,"none",0,0,0,0),st.e.phase)
+       StartWrite(Record("noticed",ip,0,"none",0,0,0),st.e.phase)
     [] choice = "readReceipt" ->
-       StartWrite(Record("delivered",ip,0,"none",0,0,0,
+       StartWrite(Record("delivered",ip,0,"none",0,0,
                         Min(FrozenReceipt(k,ip))),"ready")
     [] choice = "typeText" -> TextAttempt
     [] choice = "pressEnter" -> EnterAttempt
@@ -557,9 +557,9 @@ EngineStepSuccessful ==
          !.expired = {t \in TimerNames : k.e.timers[t] > 0},
          !.outcome = "timer-expiry", !.bugStep = FALSE]
     [] choice = "observeLaunch" ->
-       st' = [st EXCEPT !.e.launchSeen = k.r.launch, !.e.sessionSeen = k.r.session,
+       st' = [st EXCEPT !.relaunch = FALSE, !.e.sessionSeen = k.r.session,
          !.e.recoveryAttempt = 0,
-         !.e.restartCheck = TRUE, !.e.phase = "ready", !.e.request = "none", !.e.timers.settle = 1,
+         !.e.restartCheck = TRUE, !.e.phase = "ready", !.e.request = "none",
          !.e.timers.backoff = 0,
          !.observation = "none", !.transition = "EngineStep", !.action = choice,
          !.expired = {}, !.outcome = "restart-receipt-check", !.bugStep = FALSE]
@@ -802,20 +802,29 @@ Spell(f,on) ==
      !.action = IF on THEN "fault" ELSE "environment", !.expired = {},
      !.outcome = f, !.bugStep = FALSE]
 
+\* This count bounds environment faults only; it is never delivery evidence.
+BotLifeCount == 1 + st.faults["botRestart"] + st.faults["botResume"] + st.faults["newConversation"]
+AdRelaunch(oldRow,newRow,oldSession,newSession) ==
+ (newRow \in {"pending","ended","missing"} /\ oldRow # newRow) \/
+ oldSession # newSession
 BotCrash ==
  /\ CanFault("botCrash") /\ CanLose /\ st.a.botAlive
- /\ st' = [st EXCEPT !.faults["botCrash"] = @+1,
+ /\ LET nextRow == IF BotLifeCount % 2 = 0 THEN "missing" ELSE "ended"
+    IN st' = [st EXCEPT !.faults["botCrash"] = @+1,
+     !.relaunch = @ \/ AdRelaunch(st.a.row,nextRow,st.a.session,st.a.session),
      !.a.botAlive = FALSE, !.a.up = FALSE, !.a.actual = "idle", !.a.earlierRow = st.a.row,
-     !.a.row = IF st.a.launch % 2 = 0 THEN "missing" ELSE "ended", !.a.box = None, !.a.input = <<>>, !.a.submitted = FALSE,
+     !.a.row = nextRow, !.a.box = None, !.a.input = <<>>, !.a.submitted = FALSE,
      !.a.mcp = FALSE, !.a.reconnectRunning = FALSE,
      !.transition = "BotCrash", !.action = "fault", !.expired = {},
      !.outcome = "ended", !.bugStep = FALSE]
 BotLife(f) ==
- /\ CanFault(f) /\ CanLose /\ st.a.launch < MaxLaunches
+ /\ CanFault(f) /\ CanLose /\ BotLifeCount < MaxLaunches
  /\ (f # "botResume" \/ ~st.a.botAlive)
- /\ st' = [st EXCEPT !.faults[f] = @+1,
-     !.a.launch = @+1,
-     !.a.session = IF f = "botResume" THEN @ ELSE @+1,
+ /\ LET nextSession == IF f = "botResume" THEN st.a.session ELSE st.a.session+1
+    IN st' = [st EXCEPT !.faults[f] = @+1,
+     \* AD pending (or a different session) is the relaunch observation.
+     !.relaunch = @ \/ AdRelaunch(st.a.row,"pending",st.a.session,nextSession),
+     !.a.session = nextSession,
      !.a.botAlive = TRUE, !.a.up = FALSE, !.a.actual = "idle", !.a.earlierRow = st.a.row,
      !.a.row = "pending", !.a.box = None, !.a.input = <<>>, !.a.submitted = FALSE,
      !.a.mcp = FALSE, !.a.reconnectRunning = FALSE,
@@ -846,7 +855,7 @@ ServerCrash ==
        THEN {1,2} \subseteq st.h.accepted
        ELSE IF Scenario = "restart-across" THEN 1 \in st.h.accepted ELSE TRUE)
  /\ st' = [st EXCEPT !.faults["serverCrash"] = @+1,
-     !.server = "crashed", !.e = InitialEngine, !.g = InitialGate,
+     !.server = "crashed", !.relaunch = TRUE, !.e = InitialEngine, !.g = InitialGate,
      !.w = EmptyWrite, !.observation = "none",
      !.compact = IF @ = "prepared" THEN "none" ELSE @,
      !.transition = "ServerCrash", !.action = "fault", !.expired = {},
@@ -856,7 +865,7 @@ TornAppend ==
  /\ st.starts < MaxServerStarts
  /\ st' = [st EXCEPT !.faults["tornAppend"] = @+1,
      !.p.torn = Append(@,st.w), !.server = "crashed", !.w = EmptyWrite,
-     !.e = InitialEngine, !.g = InitialGate, !.observation = "none",
+     !.relaunch = TRUE, !.e = InitialEngine, !.g = InitialGate, !.observation = "none",
      !.transition = "TornAppend", !.action = "fault", !.expired = {},
      !.outcome = "unfinished-record-quarantined-on-start", !.bugStep = FALSE]
 ServerStart ==
@@ -872,12 +881,12 @@ ServerStart ==
        !.h.reconnectDeferred = @ \/ ~st.a.mcp,
        !.saved = @ \o st.p.torn, !.p.torn = <<>>, !.compact = "none",
        !.observation = "none", !.transition = "ServerStart", !.action = "environment",
-       !.expired = {"settle","backoff"}, !.outcome = "recovered",
+       !.expired = {"backoff"}, !.outcome = "recovered",
        !.bugStep = FALSE]
 PersonaRemove ==
  /\ Active /\ CanFault("personaRemove") /\ CanLose
  /\ st' = [st EXCEPT !.faults["personaRemove"] = @+1,
-     !.a.present = FALSE, !.e = InitialEngine, !.g = InitialGate, !.w = EmptyWrite,
+     !.a.present = FALSE, !.relaunch = TRUE, !.e = InitialEngine, !.g = InitialGate, !.w = EmptyWrite,
      !.observation = "none", !.transition = "PersonaRemove", !.action = "fault",
      !.expired = {}, !.outcome = "queue-kept", !.bugStep = FALSE]
 PersonaReadd ==
@@ -886,7 +895,7 @@ PersonaReadd ==
      !.e = [InitialEngine EXCEPT !.retypes = [i \in Items |-> RetypesFor(st.p,i)]],
      !.g = [InitialGate EXCEPT !.deferred = ~st.a.mcp, !.due = ~st.a.mcp],
      !.observation = "none", !.transition = "PersonaReadd", !.action = "environment",
-     !.expired = {"settle","backoff"}, !.outcome = "start-as-recovery", !.bugStep = FALSE]
+     !.expired = {"backoff"}, !.outcome = "start-as-recovery", !.bugStep = FALSE]
 
 \* Queue compaction has one prepare/rename/directory-fsync cycle. Only rename
 \* changes the authoritative file. A crash on either side is a separate step.
@@ -1073,8 +1082,8 @@ RestartSentView(p) ==
    [item |-> p.sent[n].item, part |-> p.sent[n].part,
     how |-> p.sent[n].how, attempt |-> p.sent[n].attempt,
     offset |-> IF n \in p.refused THEN 0 ELSE p.sent[n].offset]]
-\* Writer/torn launch and session are copied into durable records but never
-\* branch recovery or an action. Actual and observed lifecycle IDs stay live.
+\* Writer/torn session are copied into durable records but never
+\* branch recovery or an action. AD relaunch observations and session IDs stay live.
 \* Init and Record fix the record domains; every update/reset preserves them.
 \* These constructors therefore equal field removal on every reachable state.
 RestartWriteView(r) == [kind |-> r.kind, item |-> r.item, part |-> r.part,
@@ -1110,7 +1119,7 @@ RestartSafetyView ==
     torn |-> [n \in 1..Len(st.p.torn) |-> RestartWriteView(st.p.torn[n])]],
   e |-> [phase |-> st.e.phase, target |-> st.e.target, attempt |-> st.e.attempt,
     recoveryAttempt |-> st.e.recoveryAttempt,
-    launchSeen |-> st.e.launchSeen, sessionSeen |-> st.e.sessionSeen,
+    sessionSeen |-> st.e.sessionSeen,
     retypes |-> st.e.retypes, timers |-> st.e.timers,
     appendBlocked |-> st.e.appendBlocked, noticed |-> st.e.noticed,
     request |-> st.e.request, keyReading |-> IF RestartKeyProofLive
@@ -1123,7 +1132,7 @@ RestartSafetyView ==
     held |-> st.a.held, permission |-> st.a.permission, overlay |-> st.a.overlay,
     person |-> st.a.person, writable |-> st.a.writable,
     notNow |-> st.a.notNow, dialogHold |-> st.a.dialogHold, botAlive |-> st.a.botAlive,
-    launch |-> st.a.launch, session |-> st.a.session,
+    session |-> st.a.session,
     reconnectRunning |-> st.a.reconnectRunning],
   g |-> [owner |-> st.g.owner, stage |-> st.g.stage, deferred |-> st.g.deferred,
     due |-> st.g.due, typed |-> st.g.typed],
@@ -1137,9 +1146,9 @@ RestartSafetyView ==
     relay |-> st.knowledge.r.relay, marker |-> st.knowledge.r.marker, mcp |-> st.knowledge.r.mcp,
     up |-> st.knowledge.r.up, latched |-> st.knowledge.r.latched, held |-> st.knowledge.r.held,
     readable |-> st.knowledge.r.readable, receipts |-> st.knowledge.r.receipts,
-    launch |-> st.knowledge.r.launch, session |-> st.knowledge.r.session,
+    relaunch |-> st.knowledge.r.relaunch, session |-> st.knowledge.r.session,
     offset |-> st.knowledge.r.offset, records |-> st.knowledge.r.records] ELSE "inactive",
-  faults |-> st.faults, server |-> st.server, starts |-> st.starts,
+  relaunch |-> st.relaunch, faults |-> st.faults, server |-> st.server, starts |-> st.starts,
   observation |-> st.observation, compact |-> st.compact,
   redelivery |-> st.redelivery, w |-> RestartWriteView(st.w),
   temporalStep |-> IF RestartTemporalContext

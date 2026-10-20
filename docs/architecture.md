@@ -344,7 +344,7 @@ Final `item-delivered` calls the delivery reaction callback. Slack items alone u
 
 ### Delivery model code map (b.omv SR-15.6)
 
-[spec/tla/README.md](../spec/tla/README.md) describes the current model boundary and verification status. The b.acu/b.aqj model removes screen, transcript-idle and native-compaction state, using fresh AD `waiting` plus non-screen guards. The final local run matches all 84 expected row results on 107 unchanged inputs; all 266 traces and 40,778 states replay through production policy. The report distinguishes bounded exhaustive checks, sampled simulations and the supplemental finite pullback witness; local `certification: false` establishes no scheduler certificate. Full `/ci` remains with the separate runner. See [the verification report](cardinal-delivery-verification.md).
+[spec/tla/README.md](../spec/tla/README.md) describes the current model boundary and verification status. The b.d6n model retains release 1's AD `waiting` contract and removes synthetic launch IDs and the launch-settle timer. The [b.d6n verification report](bd6n-delivery-verification.md) records current per-row results, frozen inputs and production replay. It distinguishes bounded exhaustive checks, sampled simulations and the supplemental finite pullback witness; local `certification: false` establishes no scheduler certificate. Full `/ci` has no verdict from this follow-up. The [release-1 report](cardinal-delivery-verification.md) remains historical evidence.
 
 `DeliveryPolicyKnowledge.p` projects durable queue facts; `e` is volatile engine state; `r` is an AD/receipt observation separate from hidden agent state. The gate gets an independent reading; an owned key operation retains its saved reading until completion. Replay uses production policy and exact receipt inputs without a native screen renderer.
 
@@ -353,7 +353,7 @@ Final `item-delivered` calls the delivery reaction callback. Slack items alone u
 | Engine/gate choices | `delivery-policy.ts`; conformance replays both decisions and FIFO targets. |
 | Durable acceptance, sends, refusals and receipts | Queue/engine/receipt suites retain no-loss, strict FIFO, one-in-flight and receipt-backed advance checks. |
 | Recovery Enter | `recordRecoveryEnter`, durable `send_kind: enter`, AD waiting/backoff and a receipt wait before full retype. |
-| Launch observation | AD launch/session identity and `delivery-lifecycle.ts`; native compaction is not an observation. |
+| Relaunch observation | AD transitions into `pending`/`ended`/`missing` or changed `session_id`, through `delivery-lifecycle.ts`; no synthetic identity or settle timer. |
 | Typing guards | AD `waiting`, persona/lifecycle/marker/relay/MCP/holds and typed AD refusals. |
 | Reconnect | Persona lease, fresh AD guards and engine/timer retry ownership. |
 | Queue compaction | Durable journal rename/finish remains independent of native agent compaction. |

@@ -37,6 +37,7 @@ function reading(raw: any, constants: any): DeliveryReading {
   // AD observations are the readiness contract. Never render or parse a pane,
   // and never derive idle/busy from transcript contents.
   assert(!('screen' in raw) && !('box' in raw), 'native UI leaked into AD observations')
+  assert(!('launch' in raw) && typeof raw.relaunch === 'boolean', 'retired launch identity or missing AD relaunch observation')
   const records = raw.records.map((record: any, n: number) => {
     const text = textFor(constants, record.text)
     let entry
@@ -67,6 +68,8 @@ function duration(name: string, constants: any, engine: any): number {
 }
 export function renderDeliveryKnowledge(raw: any, constants: any): DeliveryPolicyKnowledge {
   const copy = structuredClone(raw)
+  assert(!('launchSeen' in copy.e) && !('settle' in copy.e.timers), 'retired launch/settle engine state')
+  assert(!('launch' in copy.writer) && copy.p.sent.every((record: any) => !('launch' in record)), 'retired launch identity in durable records')
   const e = { ...copy.e, retypes: Object.fromEntries(copy.e.retypes.map((n: number, i: number) => [i + 1, n])),
     timers: Object.fromEntries(Object.entries(copy.e.timers).map(([name, value]) => [name, value ? duration(name, constants, copy.e) : 0])),
     keyReading: reading(copy.e.keyReading, constants) }
@@ -78,10 +81,32 @@ export async function replayDeliveryFixture(envelope: any, choices = { decideEng
   const metadata = envelope.behaviorMetadata, rows = envelope[metadata.replayField].behavior
   const clock = createFakeClock({ flushTurns: 0 })
   let divergentReadings = 0, savedReadings = 0, expiredSteps = 0, mcpIndependentRecoveries = 0, recoveryEnters = 0
+  let sameSessionResumes = 0, changedSessions = 0
   const outputs: unknown[][] = []
   for (const [index, record] of rows.entries()) {
     const where = `${envelope.cfg}:${index + 1}`
     assert.deepEqual(record.timerConstants, traceTimerConstants, `${where}: timing constants differ`)
+    assert(!('launch' in record.state.a), `${where}: synthetic launch identity in environment`)
+    if (index > 0 && record.state.relaunch && !rows[index - 1].state.relaunch) {
+      const previous = rows[index - 1].state, current = record.state
+      const adChanged = current.a.session !== previous.a.session
+        || (['pending', 'ended', 'missing'].includes(current.a.row) && current.a.row !== previous.a.row)
+      const engineReset = ['ServerCrash', 'TornAppend', 'PersonaRemove'].includes(record.transition)
+      assert(adChanged || engineReset, `${where}: relaunch lacks AD evidence or engine reinitialization`)
+    }
+    if (index > 0 && ['BotResume', 'BotRestart', 'NewConversation'].includes(record.transition)) {
+      const previous = rows[index - 1].state, current = record.state
+      if (current.faults.botResume > previous.faults.botResume) {
+        assert.equal(current.a.session, previous.a.session, `${where}: resume changed session`)
+        assert.notEqual(previous.a.row, 'pending', `${where}: resume lacks a new AD row transition`)
+        assert.equal(current.a.row, 'pending')
+        assert.equal(current.relaunch, true)
+        sameSessionResumes++
+      } else if (current.a.session !== previous.a.session) {
+        assert.equal(current.relaunch, true)
+        changedSessions++
+      }
+    }
     const k = renderDeliveryKnowledge(record.knowledge, record.constants)
     const gate = renderDeliveryKnowledge(record.gateKnowledge, record.constants)
     const before = JSON.stringify([k, gate]), at = clock.now()
@@ -118,5 +143,5 @@ export async function replayDeliveryFixture(envelope: any, choices = { decideEng
     const before = rows[position - 1], actual = outputs[position - 1]
     assert.notDeepEqual(actual, [before.EngineChoice, before.GateChoice, before.selectedTarget], `${envelope.cfg}:${position}: ineffective choice control`)
   }
-  return { states: rows.length, divergentReadings, savedReadings, expiredSteps, mcpIndependentRecoveries, recoveryEnters, elapsed: clock.now() }
+  return { states: rows.length, divergentReadings, savedReadings, expiredSteps, mcpIndependentRecoveries, recoveryEnters, sameSessionResumes, changedSessions, elapsed: clock.now() }
 }

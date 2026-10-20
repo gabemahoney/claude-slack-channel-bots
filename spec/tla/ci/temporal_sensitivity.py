@@ -324,8 +324,12 @@ def environment_inputs(cfg_text, raw):
     # fairness alone is vacuous if an unconsumed event becomes disabled.
     progress = ("[]<><<ContrastNext /\\ ~AdaptiveTransition>>_<<st,environmentPosition>>"
                 if cycle else "<>(environmentPosition = Len(EnvironmentSteps)+1)")
-    # Preserve prefix priority, but let the engine use idle windows between
-    # recurring untargeted events instead of always starting another own turn.
+    # Preserve prefix priority. Between recurring untargeted events, prefer
+    # productive engine steps instead of branching at every idle window.
+    # Removing launch-settle steps otherwise makes the weak-observe contrast
+    # search exceed its chunk. Wait/absent choices must still let events run.
+    # This selects an existential witness only: exact original-Next replay,
+    # the same external schedule, fairness and target checks remain mandatory.
     module = """---------------- MODULE EnvironmentContrast ----------------
 EXTENDS PersonaDelivery
 VARIABLE environmentPosition
@@ -352,8 +356,10 @@ Guide == CASE EnvTypable /\\ ENABLED EngineObserve -> EngineObserve
          [] ENABLED AgentCompletesReconnect -> AgentCompletesReconnect
          [] ENABLED ScheduledEnvironment /\\ EnvironmentSteps[environmentPosition][5].subject # None -> ScheduledEnvironment
          [] ENABLED AgentTakeIn -> AgentTakeIn
-         [] ENABLED ScheduledEnvironment -> ScheduledEnvironment \\/
-                                            (environmentPosition > """ + str(len(prefix)) + """ /\\ AdaptiveEngine)
+         [] ENABLED ScheduledEnvironment ->
+              IF environmentPosition > """ + str(len(prefix)) + """ /\\
+                 EngineChoice(StepKnowledge) \\notin {"wait","stopAbsent"} /\\ ENABLED AdaptiveEngine
+              THEN AdaptiveEngine ELSE ScheduledEnvironment
          [] ENABLED AdaptiveEngine -> AdaptiveEngine
          [] ENABLED AgentTurnEnd -> AgentTurnEnd
          [] OTHER -> EngineObserve \\/ Done

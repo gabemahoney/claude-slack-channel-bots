@@ -1,0 +1,1871 @@
+[
+  {
+    "file": "tests/fixtures/delivery-traces/control_compact_open-001.json",
+    "change": "rewritten",
+    "beforeSha256": "a59eb7f05cf9d4083a145d679c8fc715e2159b254c62648e1310c04a3552384d",
+    "afterSha256": "edff276af5af469e81bcf902c4632e1bd93e59ce86bd320ac74e9933bf5a8be3",
+    "reason": "Regenerate control_compact_open from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its check mode and expected violation result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/control_deferred_only_open-001.json",
+    "change": "rewritten",
+    "beforeSha256": "9b8cbf21853faba590afc11095cc30ea722a26e3c40b8a0c1c5c312c9c9d7c61",
+    "afterSha256": "38d3f44f3012a5158444821de784cda5e47048324ac268ab0be3f38163dd8326",
+    "reason": "Regenerate control_deferred_only_open from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its check mode and expected violation result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/control_duplicate_key-001.json",
+    "change": "rewritten",
+    "beforeSha256": "7baada16fe52227b6245099f6d9ca438c6a7b3dfa128c61d2753efbf840d11d4",
+    "afterSha256": "b65c565f0e443f925b9f7348df4dd53fe723e801e479c6b7123a8021f547fab9",
+    "reason": "Regenerate control_duplicate_key from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its check mode and expected violation result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/control_early_ack-001.json",
+    "change": "rewritten",
+    "beforeSha256": "54e500568b2d361f072fbeca66fdf276d9faffe609a6d801ea9ee507b5ee307c",
+    "afterSha256": "414f3ad36eca213fcd5fdd4fd7796b1e4d719655a4f4de269cb23113ccc114dd",
+    "reason": "Regenerate control_early_ack from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its check mode and expected violation result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/control_hold_gate_mcp_delivery-001.json",
+    "change": "rewritten",
+    "beforeSha256": "c4bd705b15e64febb09edecdbbefbec9e4e269d66845ef90529e1b20a28ba9e1",
+    "afterSha256": "596e2bb13396c3c46e4fd7532f9435194bf31e9f9112f0ff70b138287a3eac53",
+    "reason": "Regenerate control_hold_gate_mcp_delivery from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its check mode and expected violation result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/control_hold_gate_mcp_reconnect-001.json",
+    "change": "rewritten",
+    "beforeSha256": "1a645a43323f13698f4a17136413bbd8c403f7b5f9f62a7abc3f0272a2ba6207",
+    "afterSha256": "9770fd273de3ab62b36d4c18becfd7b9405582a1e999b5a5c2460c3eecf3b161",
+    "reason": "Regenerate control_hold_gate_mcp_reconnect from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its check mode and expected violation result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/control_keep_gate-001.json",
+    "change": "rewritten",
+    "beforeSha256": "1a6da9e16c4a7d05e3cee036c8a0c348802e2f21843f463367110b6a3e79e949",
+    "afterSha256": "d77608eafe47e81ec868e858fccaf779dfcb2f15828656c32efba7ad07b84203",
+    "reason": "Regenerate control_keep_gate from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its check mode and expected violation result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/control_next_item-001.json",
+    "change": "rewritten",
+    "beforeSha256": "f7bdc89eaf38562ec3928cfa2c14970b4cab49a970f4fbea8a91ce68ed8e524b",
+    "afterSha256": "6a98d42cd7b2b24ee073709ab4fd641815d07a11e6d726ee49eb413f4e626d3c",
+    "reason": "Regenerate control_next_item from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its check mode and expected violation result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/control_next_part-001.json",
+    "change": "rewritten",
+    "beforeSha256": "a358fe2d912212a449f044d78de253c60d63d691c0eed85514a6dc54f6dbde75",
+    "afterSha256": "438bc7ab8e19c7f2225f30c419f742b814e5958d46f34ea275d3961c8d69675c",
+    "reason": "Regenerate control_next_part from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its check mode and expected violation result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/control_no_deferred-001.json",
+    "change": "rewritten",
+    "beforeSha256": "8bd3e5307f5af0c2d82d0ff80c229f8e888463eadc04a30ce18dc15d122c4462",
+    "afterSha256": "159a65b9fb64e1ce547129e3f1bf3d161810ad042ad1bb036f2c5d22c30dc733",
+    "reason": "Regenerate control_no_deferred from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its check mode and expected violation result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/control_no_head_takein_assumption-001.json",
+    "change": "rewritten",
+    "beforeSha256": "d30a44476adc4be472bd9384004df628f1683b178203ad35552eb85055b835f7",
+    "afterSha256": "52ab8931a7e1d27785acd3e6ba1694beebafeceb6f9fc1a3ac15af4f94436002",
+    "reason": "Regenerate control_no_head_takein_assumption from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its check mode and expected violation result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/control_park_retype-001.json",
+    "change": "rewritten",
+    "beforeSha256": "2223e0357693ba296253dd219d8e23569d0643d144510e6d14bf6861d61cf285",
+    "afterSha256": "0535420652fbf254108d09f7d63b7e02d904b83fca403ff374676b02c15de6e4",
+    "reason": "Regenerate control_park_retype from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its check mode and expected violation result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/control_queue_is_receipt-001.json",
+    "change": "rewritten",
+    "beforeSha256": "55c463626744909ed8548878f6b15e3a3359fe61d479905731990a9e5b7bf82c",
+    "afterSha256": "a0c65e3f9e98207cb13d9d9f268807df0b6d0974b07ccb157196ec5aba73ecab",
+    "reason": "Regenerate control_queue_is_receipt from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its check mode and expected violation result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/control_reconnect_keys-001.json",
+    "change": "rewritten",
+    "beforeSha256": "b3a82a903bf3151b13b1587c8c0522b23b485d0c0c5ded4a919894946eb26895",
+    "afterSha256": "6bb9195d4dc3883c4929119f4e7aeb5a7ac44eac5e241b4ab8559c98925d18d8",
+    "reason": "Regenerate control_reconnect_keys from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its check mode and expected violation result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/control_reconnect_running-001.json",
+    "change": "rewritten",
+    "beforeSha256": "46ed01eac957c0eab0baadc05488df0cef3ceab9bea5915f9edeb1c0486e16d0",
+    "afterSha256": "2963714256d73feb6526d9c15a37427b5d0b3cb523ab6a981ad8c565b5732d5e",
+    "reason": "Regenerate control_reconnect_running from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its check mode and expected violation result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/control_replace_observation-001.json",
+    "change": "rewritten",
+    "beforeSha256": "c3fd321f14748aa6a958136e0d16b59c3b0c94dbe7de0e80de752efee54f936c",
+    "afterSha256": "2eadf43e59650cb0c1777ebdbc03353423d66a93ac0672ff44bd42e36b58033c",
+    "reason": "Regenerate control_replace_observation from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its check mode and expected violation result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/control_retype_into_text-001.json",
+    "change": "rewritten",
+    "beforeSha256": "582f4e902a662de579b95074e36621ca1667b98c71f1da65f398d4782c7878c5",
+    "afterSha256": "c7c91f3697080429ddbc737d5614bd7453a74cbe85a4c678edf7717841c48121",
+    "reason": "Regenerate control_retype_into_text from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its check mode and expected violation result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/control_retype_working-001.json",
+    "change": "rewritten",
+    "beforeSha256": "176acdfc3f7c7efe632e5428401d89696b1da4277f4119e3d422e614309121e7",
+    "afterSha256": "62291d6ea110c803b19567755ebe0b3a5d27cb1d0c78be6be76708f6a0ab6e45",
+    "reason": "Regenerate control_retype_working from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its check mode and expected violation result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/control_send_is_delivery-001.json",
+    "change": "rewritten",
+    "beforeSha256": "0517cf6165c8979e4a8cdfb5c4acea63b994bedceb8c816b644401ac282bac01",
+    "afterSha256": "c8c888e8aff81e66f068c6ac46eec83273ecaaa46af4dbe0e42638606917cc86",
+    "reason": "Regenerate control_send_is_delivery from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its check mode and expected violation result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/control_skip_refused-001.json",
+    "change": "rewritten",
+    "beforeSha256": "549db2043813051ebc48b3ac030712a890cd38cdc962f9ea6e610f1cdf46b927",
+    "afterSha256": "18b0cd6eb569608245b5d2c981784d1050b9be7f8591692c4ccc317184c67158",
+    "reason": "Regenerate control_skip_refused from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its check mode and expected violation result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/control_start_drop-001.json",
+    "change": "rewritten",
+    "beforeSha256": "7f58000697534450d3d44beaead148547c1b5d1e263f1a45a3543d806dbb9c27",
+    "afterSha256": "e441da788a36863ed7fa75759a4db864fd5de30395ecd7bd0810bb891ec1e6d1",
+    "reason": "Regenerate control_start_drop from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its check mode and expected violation result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/control_start_unsent_head-001.json",
+    "change": "rewritten",
+    "beforeSha256": "ec2bc7f4b90111ae0de8f5cb0d0a9fc2456646a9007a85246c91ca4501319cf3",
+    "afterSha256": "1616691e4b3febf49d41cb6761240e4d7083b7e100d14fc95cd22762bc5cddf4",
+    "reason": "Regenerate control_start_unsent_head from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its check mode and expected violation result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/control_unreadable_park-001.json",
+    "change": "rewritten",
+    "beforeSha256": "d516c43b063718b8314f08fe82000fd42145a2ce5f3c0942fec275c05a9623d0",
+    "afterSha256": "b80c2c4ec31aa3f88a44ebd763fbe4b64ecb0cca7b324ed60f2d63787e03152a",
+    "reason": "Regenerate control_unreadable_park from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its check mode and expected violation result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/control_weak_observe-001.json",
+    "change": "rewritten",
+    "beforeSha256": "e35b945bec1da8372062b1a66bfb8d08e4c2ddf85c4401e4d191242dffd53277",
+    "afterSha256": "d5dc6ba059a089fd934d799c455a2c87c9748e10b9f2064b625b321a9f24b7ff",
+    "reason": "Regenerate control_weak_observe from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its check mode and expected violation result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/core_head_taken_in-001.json",
+    "change": "rewritten",
+    "beforeSha256": "bb57e5acf3568e4a886733de88aa1c54193adf5f547c65e24f3a98fd4effad02",
+    "afterSha256": "8630e2d297f06a54681b44d2f54819f25d5cc237159d539cc85d6237d894547b",
+    "reason": "Regenerate core_head_taken_in from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its check mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/coverage.json",
+    "change": "rewritten",
+    "beforeSha256": "a1591631bb817c8ec9f34070f74c087f802d885614b684caadee4807e7776800",
+    "afterSha256": "8e5bc4096346d0c4a6513cb70a0a833f114f9222d10b80a9f34138d7f4a2a41b",
+    "reason": "Bind the complete 76-row manifest, eight auxiliary results and regenerated proof bundles to 107 unchanged final inputs."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_agent_input-001.json",
+    "change": "rewritten",
+    "beforeSha256": "8b9ffa036919c0620d60c64765d623d64afe15d5045b0574d16400685a850a23",
+    "afterSha256": "72dddb5f1accb6971f5244a6bb7d7388041176f5e2b5aaa6268c535e03969b12",
+    "reason": "Regenerate live_agent_input from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_agent_input-002.json",
+    "change": "rewritten",
+    "beforeSha256": "70dbdcbcefb1d720acde12d66389a8c1404241a87d4eb88314e89fd954ae2672",
+    "afterSha256": "1d9d69c209d2acf9ac15ceeb659a556d5a29396069a233973167e7dee74d7b15",
+    "reason": "Regenerate live_agent_input from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_agent_input-003.json",
+    "change": "rewritten",
+    "beforeSha256": "20440e5ab8f9a19c4c768c60982df41669a8b4a8ce660db36cc39c85d52487ba",
+    "afterSha256": "401296d5111c4a6611f7ba3d5a77c5ba767ab3aca82c110b9f2f46fcd769da56",
+    "reason": "Regenerate live_agent_input from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_agent_input-004.json",
+    "change": "rewritten",
+    "beforeSha256": "e743d96d9bd9c42f9bddbc312dba4b8cfc3514aee0c4a61daf0303c337b58c7b",
+    "afterSha256": "3439587a2c9cf519243dd79104d1a92c4535a21f5436938607114074923e40dd",
+    "reason": "Regenerate live_agent_input from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_agent_input-005.json",
+    "change": "rewritten",
+    "beforeSha256": "7b08be630ecb10935659a2cccb45208088da4cf844905e926496eea12caac39d",
+    "afterSha256": "9630dc01aaf1922b8bcee00d2e707528d978311a74aa56acea9343dad8591cfa",
+    "reason": "Regenerate live_agent_input from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_agent_input-006.json",
+    "change": "rewritten",
+    "beforeSha256": "9805ff860490fc467383f3cc4b2a66cb2d65285b25bfa97b560f0187c5e050aa",
+    "afterSha256": "d7c2f302e40f5e5922cc6221a158aa492775b48bd358fe59ea792c115dfeb871",
+    "reason": "Regenerate live_agent_input from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_agent_input-007.json",
+    "change": "rewritten",
+    "beforeSha256": "8bba9ba0a6dcbaff1153137baa18c0dec985c4c8639cb58c2e7a4814c4868e5b",
+    "afterSha256": "cdf99b8dd08ea430670de2bcb77a904962858834088d1a67ede8c97d63125708",
+    "reason": "Regenerate live_agent_input from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_agent_input-008.json",
+    "change": "rewritten",
+    "beforeSha256": "91144217357f772f1b41cb270eaf8db8e38aea4e43e1745cd27f2da9714730c9",
+    "afterSha256": "c5ce9f7bf0da47a52f743669b176d606900214382b1cecc2c291e1f52988d843",
+    "reason": "Regenerate live_agent_input from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_bot_resume-001.json",
+    "change": "rewritten",
+    "beforeSha256": "5fc6c0e62967db397a8aa0beab7dbd9b192869a242105817e6737c1d3191075f",
+    "afterSha256": "d855549a12b88bf9557c31431296d3a6e49250c02b1d6035cf3ba26e6940e2bf",
+    "reason": "Regenerate live_bot_resume from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_bot_resume-002.json",
+    "change": "rewritten",
+    "beforeSha256": "e060a23252837751195b9114d094be3f8980e3fd824cef7e89e2da0126c722e4",
+    "afterSha256": "4363f97c4fe3ee32601ef4165ce333292e118a3eb5459f50d97b477d7633b4f6",
+    "reason": "Regenerate live_bot_resume from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_bot_resume-003.json",
+    "change": "rewritten",
+    "beforeSha256": "07c927fa0908792466d4b08c5528008a411e35f60ffb3250d7fc1a0d351b44e5",
+    "afterSha256": "5e2873fb6be97865895f25953764a60e78dfb86765e4cb08dc769e9a80bda02b",
+    "reason": "Regenerate live_bot_resume from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_bot_resume-004.json",
+    "change": "rewritten",
+    "beforeSha256": "2087ad7f245de37baf918d64f74f9edb5d3dd96f91503e6e6425faa3b74d1500",
+    "afterSha256": "f8c97949729978fb6859661871de4b7654bb590500eb5d288cc77fc2c5d27eca",
+    "reason": "Regenerate live_bot_resume from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_bot_resume-005.json",
+    "change": "rewritten",
+    "beforeSha256": "3cc9037b95ffb2da878bdd11766ca0859db45f33c44e4ef7566425591f2acf8f",
+    "afterSha256": "2c143fd5774a542d67fdcd45a9bd00c7f0afbf47c973793e341235863a8b325b",
+    "reason": "Regenerate live_bot_resume from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_bot_resume-006.json",
+    "change": "rewritten",
+    "beforeSha256": "21f049ad34cd28733b47a2a4571b71db8f0486dfd76f47b79be77a5eef0bb861",
+    "afterSha256": "a68a0370fd6cc28571dfcf0cae5728a7d7a3a9116cd669d5cf60ed33acf5eba4",
+    "reason": "Regenerate live_bot_resume from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_bot_resume-007.json",
+    "change": "rewritten",
+    "beforeSha256": "d5f3515983473bb90d87e8f40f564413e78fd40ecf239c1041ff0153d4ceee50",
+    "afterSha256": "9a75b2471f2ea3dd62f50d47dd4cd044ca0abcacde3111c53945fd8960b86c48",
+    "reason": "Regenerate live_bot_resume from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_bot_resume-008.json",
+    "change": "rewritten",
+    "beforeSha256": "00416795d20b14ddc94b8f6340a4a9d781d1d8d48e2466290972c122f3578a35",
+    "afterSha256": "1095837ca2abb585bceb9b6b1deededd8071f78cea1246ff81bd08fd1281b599",
+    "reason": "Regenerate live_bot_resume from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_bot_sessions-001.json",
+    "change": "rewritten",
+    "beforeSha256": "036e322180d1c27310a78618d88bb68ecf6c85cc66277413d3545f6159aa85d4",
+    "afterSha256": "2566c8bfa8118238a2a6784a0e5cbcc294d4714b45470f868897e37b8df30524",
+    "reason": "Regenerate live_bot_sessions from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_bot_sessions-002.json",
+    "change": "rewritten",
+    "beforeSha256": "d9152dd10cb3cb5aecc27e08ea255e30cf0a0bb4654ce934297c6416b3b40b8f",
+    "afterSha256": "c09bd0c73305ae78e2e12a82155145c0e33eb550d73241538d58f7b9a11044ad",
+    "reason": "Regenerate live_bot_sessions from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_bot_sessions-003.json",
+    "change": "rewritten",
+    "beforeSha256": "ed9cabbd4d79911d711a9e3192e6605fd8109a84531026c9faed0d87bc7873a1",
+    "afterSha256": "57ec5ca5eff4827b8b2a213ad4c70c917df9c927c7ce40ba8af48afbf19d5f3a",
+    "reason": "Regenerate live_bot_sessions from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_bot_sessions-004.json",
+    "change": "rewritten",
+    "beforeSha256": "ecb725e9bffe61d3f69d1731588fc2578665e84ccd9423c462db9d0119e7cd48",
+    "afterSha256": "6ec779d5dac82013aec23026632d8e021de1f9e1142eade5d581fe287ef7ee36",
+    "reason": "Regenerate live_bot_sessions from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_bot_sessions-005.json",
+    "change": "rewritten",
+    "beforeSha256": "2653a3d983302a2518454b0e3eda204f0ac577d6c66a2c496f23cb5f099f9b6c",
+    "afterSha256": "3f1f74095bf76cd367b13c9353dc42d7393b51fc1e31c7bd26cfe7bb1ad3a7ec",
+    "reason": "Regenerate live_bot_sessions from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_bot_sessions-006.json",
+    "change": "rewritten",
+    "beforeSha256": "8b5ab60bd0b83093ef24b302f4459ae7daed1feadf7d04169aa3d14b3c09cd56",
+    "afterSha256": "03a09214183e897883c684a197c2c685575aed8a981668c4db7b22d1f5d28ca3",
+    "reason": "Regenerate live_bot_sessions from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_bot_sessions-007.json",
+    "change": "rewritten",
+    "beforeSha256": "c28b9dd6944ecb051c48bc130475def61d95b6fd1fee15fa53c17b8a55a39403",
+    "afterSha256": "248a85d11c04fcf73f49b482d2dec6b30d6dec5b58af1736203c40a8670d4645",
+    "reason": "Regenerate live_bot_sessions from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_bot_sessions-008.json",
+    "change": "rewritten",
+    "beforeSha256": "e966169b00680d9c626970e9fd14ef7490bcf9e005dabe4201369501ff5130e6",
+    "afterSha256": "864f854db52baaa45184e946e21b698921c440ac1cbb7376012fcfb76d5f99eb",
+    "reason": "Regenerate live_bot_sessions from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_calls-001.json",
+    "change": "rewritten",
+    "beforeSha256": "5b6d6e4b02794366eb62b77016bc34a93b7ca4a98add48d6c3ac8e80820fff00",
+    "afterSha256": "4476404b3852db0d732cbd2c96b126b0f5eee12a612fe193b01279ee9446e164",
+    "reason": "Regenerate live_calls from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_calls-002.json",
+    "change": "rewritten",
+    "beforeSha256": "584794635d8dadce3a7d2ead984de01237f718c74a9446a21f8da98abaa5b3fe",
+    "afterSha256": "257cfd102746dbef62caa9aa392d79c5382f772e2f18a055481ea384e729282c",
+    "reason": "Regenerate live_calls from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_calls-003.json",
+    "change": "rewritten",
+    "beforeSha256": "6d5e617c62b9c8526621b1c38856717f5bf103c118011f1e84e33a4501cadef0",
+    "afterSha256": "26d43e5b85975750cf2010f4c602bbbf467bfb55518163965c41d27a5ec1b95b",
+    "reason": "Regenerate live_calls from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_calls-004.json",
+    "change": "rewritten",
+    "beforeSha256": "5e555c42d4c701ded15485138de105e6849351f0081e94e9936657cbd5857b30",
+    "afterSha256": "92893ed28d632e4e734e6a8a386b7ad1eb92f6902570657874c290c89f0da935",
+    "reason": "Regenerate live_calls from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_calls-005.json",
+    "change": "rewritten",
+    "beforeSha256": "9eb0bff5cdfb7f12f0f80c605a810e5014df8cd91e0ae01ee3316874567c4588",
+    "afterSha256": "645eb7baf0c68f27867b12f92ced25c17ed94db84c4a8c9ab0bfc9192ce7662e",
+    "reason": "Regenerate live_calls from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_calls-006.json",
+    "change": "rewritten",
+    "beforeSha256": "555a7cd32649a90afd7fffacdbf02f260ed59058ef3bf1288bd55330e24814a7",
+    "afterSha256": "9627d97f6f25fc64f777cef71d962e460624465871e1d478e8a34c01f51ac3ec",
+    "reason": "Regenerate live_calls from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_calls-007.json",
+    "change": "rewritten",
+    "beforeSha256": "3a5f24735812aea9d10ba65d9b2385d3d3552d47e68c673739bb81ee3b30f6be",
+    "afterSha256": "f970438fd674dd1dedb99c2f0caa4b1018c9ad0a7acb660b6fa613fc99c62014",
+    "reason": "Regenerate live_calls from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_calls-008.json",
+    "change": "rewritten",
+    "beforeSha256": "95afa0daf3200b0ac7ec304426cdca853c8607df51cb5d129fc5fca4cd977bc7",
+    "afterSha256": "70521be8a31f8b2559c35b15ba3ca1b269023e28188879225c17228998f0bb91",
+    "reason": "Regenerate live_calls from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_connection-001.json",
+    "change": "rewritten",
+    "beforeSha256": "dbb262c5f866eefe44fe00e9487a9908642ec39e4c2976d95668e00e6e1b72e1",
+    "afterSha256": "c6f834bd1c37324d79fd7f7070d78ae3a640cbffe6a6c51d5626bdcde8a4cb54",
+    "reason": "Regenerate live_connection from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_connection-002.json",
+    "change": "rewritten",
+    "beforeSha256": "5b074598a954195888d0579fe54b2414834ddc708cdddf685b882890e00e1af0",
+    "afterSha256": "515e6c41258ed3853b1b9203e433e74780d3ee1d04ceddf7a9288a71e4a101d0",
+    "reason": "Regenerate live_connection from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_connection-003.json",
+    "change": "rewritten",
+    "beforeSha256": "7d517fb701a984b6a5ea0c43941ef4dca2d336fbbb6f45e67e2700ce5738b209",
+    "afterSha256": "002b5014e740a6f0fef9e503e7371aee3855289dbb2a22bd9466d2e29c379234",
+    "reason": "Regenerate live_connection from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_connection-004.json",
+    "change": "rewritten",
+    "beforeSha256": "ad95a401a2b53a1637a9c3939f41d26b8333c8354874cbba7df2e5601c040b14",
+    "afterSha256": "ad1d02c40c78c00584c955bd076ff9084a1047dfc9dff4f70c020c2daaff9675",
+    "reason": "Regenerate live_connection from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_connection-005.json",
+    "change": "rewritten",
+    "beforeSha256": "c0d0d64c8df5d286f8e354733260d56fa0dcdf569d585865bf5cee290c65329c",
+    "afterSha256": "f8c9e90af6c44a397a06a4a67ede21e3f855ede30d7d742a305e5d683c54e347",
+    "reason": "Regenerate live_connection from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_connection-006.json",
+    "change": "rewritten",
+    "beforeSha256": "d181f14f84fb07f09bbc16f20ddf8ac6dd525c287818e151d89464060bb52caf",
+    "afterSha256": "fb316f8d2df70ce8057961e404e6c104fd2e35a19561eb8209bfb9782e348ea8",
+    "reason": "Regenerate live_connection from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_connection-007.json",
+    "change": "rewritten",
+    "beforeSha256": "98ea27eeaebc11a88a5bfbf4637e17bba25ddc7eefa7b5af8fdc8597925856b7",
+    "afterSha256": "07016fb41baf393ad18e0fada4950d3e5b124e0256dbd82bba4d877e684e0594",
+    "reason": "Regenerate live_connection from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_connection-008.json",
+    "change": "rewritten",
+    "beforeSha256": "516f57ed2fe2d7faf36101aa084fd85a76a26964e809162f300164827df5f1eb",
+    "afterSha256": "22ea17989e673b647941b080098f354bd465db14f82e3bac123bedf7803c772e",
+    "reason": "Regenerate live_connection from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_empty_reconnect-001.json",
+    "change": "rewritten",
+    "beforeSha256": "4e85e9d0a72d03d6b6d10a85a93c07d2602e8aa33313732cbb0d1d2715791bc1",
+    "afterSha256": "457cae0fb77dd39637914cf8e9dca9a105c5f0733144bdc12c9acc2188379200",
+    "reason": "Regenerate live_empty_reconnect from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_empty_reconnect-002.json",
+    "change": "rewritten",
+    "beforeSha256": "13c5ef4fbc4755b4b52dbb3e882c23ea4c2a4f42f98f451bdf89107cd549ae6f",
+    "afterSha256": "ff10f2f9db7b3afc1974e5d4959d86014ff4b858bac96af51c5b37ea03ca5ec0",
+    "reason": "Regenerate live_empty_reconnect from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_empty_reconnect-003.json",
+    "change": "rewritten",
+    "beforeSha256": "9f25d05e6f555ebbb9e9fd19c279699585865570da7b6d71eaac567af188eb27",
+    "afterSha256": "468097e2565856e7809e2bd53390f99542c1a118e8c4cef5fb23a238f7b148b6",
+    "reason": "Regenerate live_empty_reconnect from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_empty_reconnect-004.json",
+    "change": "rewritten",
+    "beforeSha256": "9f8a4a19a87d0a6b04bbe6be48f743dd0de871393f9dfa13caae8b4be3d81aea",
+    "afterSha256": "56580db7ff9bf74580e7aae6d9013770558c8ed29c9605f84baf395b21636764",
+    "reason": "Regenerate live_empty_reconnect from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_empty_reconnect-005.json",
+    "change": "rewritten",
+    "beforeSha256": "2c39cc6c1d9d3b66fe091edb9e1e3b51c7a85f081b34b4f41111a2c8f09bde9d",
+    "afterSha256": "19b15ca6b44333b4711599dd64895018c5f712f5060d4bd546b60cee975e07f2",
+    "reason": "Regenerate live_empty_reconnect from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_empty_reconnect-006.json",
+    "change": "rewritten",
+    "beforeSha256": "13ff12f1074bc3aa6b781679332f2016bb27835949c302ac020c54306bf5bdac",
+    "afterSha256": "fb5f65961ee3f170de6febf53fb1f18a7b5fbcb4b0c69134f538a1dadccd80ee",
+    "reason": "Regenerate live_empty_reconnect from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_empty_reconnect-007.json",
+    "change": "rewritten",
+    "beforeSha256": "b36a8b2aecc0c52f7e32095e9a478ff2a197f79c063cfec101464139844c226e",
+    "afterSha256": "39035904cc38a9b9fa1651b36417233c35ca21f5fe817f0b1ec8f84529d3f89f",
+    "reason": "Regenerate live_empty_reconnect from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_empty_reconnect-008.json",
+    "change": "rewritten",
+    "beforeSha256": "92844c41f779e692f6d289e5d5faf33b6bab11e9836dbc1b7e4e307b758a7bd6",
+    "afterSha256": "45334c23cfd56f85115a8ba3f051cb2508db89e7606eea426c22690021bf7e52",
+    "reason": "Regenerate live_empty_reconnect from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_enter_unknown-001.json",
+    "change": "rewritten",
+    "beforeSha256": "bb042ae80028c6506c151ab0d51ad8c46c9134d835a679e828b9696a22ccb7e5",
+    "afterSha256": "568bae9c900f9a3dbab138cd97f1f9e592cd145c27be34743ff565781861f0b3",
+    "reason": "Regenerate live_enter_unknown from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_enter_unknown-002.json",
+    "change": "rewritten",
+    "beforeSha256": "2f0e5bd3d0548e31d66a9f7ea47bcab33a1c1223d442aa0ed99ca224543617f1",
+    "afterSha256": "a1d89456f532419245f26abaef4488d361f1c8db2b9f5cdf7af92c0f79609d6f",
+    "reason": "Regenerate live_enter_unknown from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_enter_unknown-003.json",
+    "change": "rewritten",
+    "beforeSha256": "3190b3e6cd4c8af845c65c42295cbfa5f62db8b0bc762ce7141b5eee030fe214",
+    "afterSha256": "88afd66f9fc11d5bab94d01a4ff2bc956f533130b6c00ac223006f2ea124a977",
+    "reason": "Regenerate live_enter_unknown from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_enter_unknown-004.json",
+    "change": "rewritten",
+    "beforeSha256": "c83e73e4ae02a8962f288a344c809e12e1b65b9583bbb01508eeb99209b78957",
+    "afterSha256": "1184ff5a1a145301567ce17eff6ef68995763f15749b7ac46e49a9fd22527111",
+    "reason": "Regenerate live_enter_unknown from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_enter_unknown-005.json",
+    "change": "rewritten",
+    "beforeSha256": "e3324112ce2d7e4a5cce5ce4e03be74dcfd4f9883840bc52cf50055bfe9d136a",
+    "afterSha256": "2c94c90f784e8a49c55e311a7ff2fc568688a53b3aed776547b1b3c9aae54e31",
+    "reason": "Regenerate live_enter_unknown from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_enter_unknown-006.json",
+    "change": "rewritten",
+    "beforeSha256": "608cec68a2fcdda888ee0708935c6cf7b36db44ea418e534f124c4fda00078d1",
+    "afterSha256": "76a3a73c884ffb8bc10e3aee121762bf9fa1c7dca4efef3d14a15ce11cda4e61",
+    "reason": "Regenerate live_enter_unknown from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_enter_unknown-007.json",
+    "change": "rewritten",
+    "beforeSha256": "a0b56ec872ac324a1cb5c66a6759ec0e0914c5dfa6102a58e54bd29cea087516",
+    "afterSha256": "fc91508e64efc89c31ce55f144ec063439c3a9febdca03aae0386c3678430908",
+    "reason": "Regenerate live_enter_unknown from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_enter_unknown-008.json",
+    "change": "rewritten",
+    "beforeSha256": "a1308161e7635e1aeb9618a81e18b120ddbe0e6136b44c31646d996a11e5ede0",
+    "afterSha256": "a7a08d0ee6f73caa164dc8477232c947dab6b8fae1481f9fb96bceb8be02b155",
+    "reason": "Regenerate live_enter_unknown from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_persona-001.json",
+    "change": "rewritten",
+    "beforeSha256": "de6787b8c5653ceddebcb2b7df437d6d822d6e9ee4c02fb8686647c91704d9ef",
+    "afterSha256": "ecca52fbf7f6a9604604b08cfc8bc178dbbd79140189c12f8df8a39ec06b8cb7",
+    "reason": "Regenerate live_persona from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_persona-002.json",
+    "change": "rewritten",
+    "beforeSha256": "cde47c89ef501e2bae86125bee60b27bf6dc84c2b4267cd90d8f97f9c3758f6e",
+    "afterSha256": "e5129710917561a919493f0f45fba413d2ea0d43ee47d387e83ac1eaaa33439f",
+    "reason": "Regenerate live_persona from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_persona-003.json",
+    "change": "rewritten",
+    "beforeSha256": "bbce40f69675fae164d21df3d7f2cc144386b66609c63db527386e6ad1d559a7",
+    "afterSha256": "39e5910a2b8b9d42e4ac3e119387e33010883704cc4ac3af4bbed190730c5985",
+    "reason": "Regenerate live_persona from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_persona-004.json",
+    "change": "rewritten",
+    "beforeSha256": "24629dcf03582a01222582f3fa1405ce56954fd3ecae20f3075a9c197a751b64",
+    "afterSha256": "85f9dec8836ffb0c5245cc01a4428219d2b721ed2b398b9716f5bae8b126544b",
+    "reason": "Regenerate live_persona from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_persona-005.json",
+    "change": "rewritten",
+    "beforeSha256": "2e87566a8f3b65dfe646602cebc7ab0951c5b969b5e11914b1fb5c99200555aa",
+    "afterSha256": "366a9d606bb6838af47b07450dfa4c040b652ceb1cc4db4315a74a7276d4c2e8",
+    "reason": "Regenerate live_persona from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_persona-006.json",
+    "change": "rewritten",
+    "beforeSha256": "1a80fa9ced451495a9403febfae7fa7b8dde0a191b4672a6de2ccc0f0f2c6580",
+    "afterSha256": "3613a2cc646a783f10d94fb1c95afef23579c1f786c950d5b8681434bda57b68",
+    "reason": "Regenerate live_persona from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_persona-007.json",
+    "change": "rewritten",
+    "beforeSha256": "abe61920f52acdfe7af5b2468e1b7d4a04248f09da557228ceb27c34cf6e0364",
+    "afterSha256": "58d16f24a78d7a6d0f0142edb16b0e511ad13dc0e58b475e16e13eb9d48e634f",
+    "reason": "Regenerate live_persona from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_persona-008.json",
+    "change": "rewritten",
+    "beforeSha256": "6e158ca3943b4c5176b1839d83ddce8aff967c7981665102b5de04c34d38ba40",
+    "afterSha256": "15be0520d5b92b6ea0791b1deb35bc2da3d02de5d415a21610d221126a973635",
+    "reason": "Regenerate live_persona from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_plain-001.json",
+    "change": "rewritten",
+    "beforeSha256": "71d3550523a4c89972a3bffb4e14c41e6e75eb0f33229270f887f0f9591fdd48",
+    "afterSha256": "9656b9c3de251343a2b9724edd324967b32fde3d7af4b89e8f74d8c2dc588113",
+    "reason": "Regenerate live_plain from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_plain-002.json",
+    "change": "rewritten",
+    "beforeSha256": "c5c2dfd571b5d66005e0f2b31c2a480135facdb29bd4c1a00541b9ffe0fb492f",
+    "afterSha256": "7bbc9fba133806eede47a725e788feda29f83b09ebf02fae5b5cd472ed367485",
+    "reason": "Regenerate live_plain from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_plain-003.json",
+    "change": "rewritten",
+    "beforeSha256": "0c71fb0bd00f87a252b922bea94734ed27cf37f3b17c04e7b87bfc660a3e1d24",
+    "afterSha256": "3d6cec9a442546d785b4cc9019064ce28998d9bc6908a858425c417425b2805f",
+    "reason": "Regenerate live_plain from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_plain-004.json",
+    "change": "rewritten",
+    "beforeSha256": "c8d150d2aed9107cf50a404945c63bd397f75b39ffb93fb903dcfa00db04a629",
+    "afterSha256": "1e6470c27ec4ef3f05f98444609716143085eedfdf5353443202cfbf3f7f5ca9",
+    "reason": "Regenerate live_plain from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_plain-005.json",
+    "change": "rewritten",
+    "beforeSha256": "68689e41f514fb03d6803e2b999983b3a1d6d2aa60c554946b99a8ad6f0d3a3a",
+    "afterSha256": "1b1ee9a65d21b95008e1eb599f084581e907051bc44d2b5306724c744d3a41f0",
+    "reason": "Regenerate live_plain from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_plain-006.json",
+    "change": "rewritten",
+    "beforeSha256": "cbc5ac3d343da0c624904929a0a2ec25b2b84edc550b39a65ead35e506d68ed5",
+    "afterSha256": "41c2912a499a525bfc1ea3cc03b2886d31eff8846a0adb91f05d7c5cc22becd8",
+    "reason": "Regenerate live_plain from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_plain-007.json",
+    "change": "rewritten",
+    "beforeSha256": "81cd2edc4e93737364a51b7e567dce22fb14131b8c9a8b1b9ab71f8f44f4bd02",
+    "afterSha256": "d1c86294ef5f0a2b06277d61697a97df809566179ab66cc930e2018935d1a87b",
+    "reason": "Regenerate live_plain from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_plain-008.json",
+    "change": "rewritten",
+    "beforeSha256": "713e29e1d8eecb03682f86ceb6dc22689b3c24cdf93208aa925d5e7378739241",
+    "afterSha256": "9e3432e33ad126938209e798a67f1614b14f245a2539db42cbaa6992742c61b7",
+    "reason": "Regenerate live_plain from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_screen-001.json",
+    "change": "rewritten",
+    "beforeSha256": "6354a43a023fc314f2a7cd49e10518f67dc660e2b64c6b865b744e7a4ec4ec2f",
+    "afterSha256": "6a4364476a8f7eed4a00fd0b4ec13d2ec4e4782de8945b8ca53b494087dbf8a3",
+    "reason": "Regenerate live_screen from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_screen-002.json",
+    "change": "rewritten",
+    "beforeSha256": "9db7df2610f2fe1ca5aca3ebb5a55546a58b54aca8336db73b9412c3417db584",
+    "afterSha256": "fa0537bd95e084fafdbd2ff06f05b3dee59e23917762a2049e5813cc05568389",
+    "reason": "Regenerate live_screen from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_screen-003.json",
+    "change": "rewritten",
+    "beforeSha256": "02261c565b12128977c47bfcd8df27bcbe1c416c266fb158caf59953fd3e6a90",
+    "afterSha256": "6752b2839871dd893e1c7982ebf70a98ba5815fc99143a16d10c1f6c41e64d9b",
+    "reason": "Regenerate live_screen from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_screen-004.json",
+    "change": "rewritten",
+    "beforeSha256": "5e5c806608d6f95328f78845bba6dfc41028aa548abbaf9ed8fedbbb4f6b3f5f",
+    "afterSha256": "9d72209f4a8355c93d96e90f0f27618be1ee0f6557185648df0d82bb142c84b9",
+    "reason": "Regenerate live_screen from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_screen-005.json",
+    "change": "rewritten",
+    "beforeSha256": "f00d9a2e8d500207cd9c57d5d34311e0f999056c5116f1e376128b8911833e5c",
+    "afterSha256": "17ae48f466a29be5c7931117646d430538a9215631219fd80dce9100e76b2cc7",
+    "reason": "Regenerate live_screen from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_screen-006.json",
+    "change": "rewritten",
+    "beforeSha256": "4aae3b3d223ea158aae45fae300371e34adbeb81c0f190a88105acaa7a0be1ac",
+    "afterSha256": "140728da57723581560547530c66ad0ab44a7aad87639d4d1999a6dc6868a6ee",
+    "reason": "Regenerate live_screen from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_screen-007.json",
+    "change": "rewritten",
+    "beforeSha256": "f9eaa68c29d5a2f37b1c40ad192474d3b8b25e2ae145f63730068fea6baf2b7e",
+    "afterSha256": "342f9d1b059fe213962b12aba2e2f2b273e556d83fb4b92c0e248fce75b53428",
+    "reason": "Regenerate live_screen from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_screen-008.json",
+    "change": "rewritten",
+    "beforeSha256": "b44dd13e7e6950c2c6bf225f31c65a40b3b42f948bc8a241e34aac71e76d8c29",
+    "afterSha256": "c43c3ac69e709d39319bd840a1502ebffb5f8340109c6438bfc2e63a29d39778",
+    "reason": "Regenerate live_screen from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_storage-001.json",
+    "change": "rewritten",
+    "beforeSha256": "fa7fa721b5da4cf0d86cde2906f68972c210152d15a8773a9d95e6991cc3775f",
+    "afterSha256": "7496764bec23f77aa8897cae48449b882583e96cf736a16965da2f134bbbd305",
+    "reason": "Regenerate live_storage from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_storage-002.json",
+    "change": "rewritten",
+    "beforeSha256": "52a69adcb26a3a5ebde701ffe2c9eff39fc2defe6e0ad1d18472ee832f981bc8",
+    "afterSha256": "628df4b5487411b2251331f4d46a6f24ec1f3e43f3bb0bf21ae5a8b865b83d68",
+    "reason": "Regenerate live_storage from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_storage-003.json",
+    "change": "rewritten",
+    "beforeSha256": "ebad5f71120a09d94ea59cb9f2af3c0c38f6b2446fb58de73048929e2803dcdf",
+    "afterSha256": "70ee9f37d36b6e501c37ed636148fb9c1256111f327fa41d9184b665c75c08b7",
+    "reason": "Regenerate live_storage from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_storage-004.json",
+    "change": "rewritten",
+    "beforeSha256": "9bb2afd43dbeeef1765a2587c73024afbe284960973ed23dbeeaa26cb68b526c",
+    "afterSha256": "e840332e1c68b872db6b1e0a017fcd293ac14d8c19149ebb1b506595b60aafb8",
+    "reason": "Regenerate live_storage from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_storage-005.json",
+    "change": "rewritten",
+    "beforeSha256": "8c6db2d8da1a3fd9a78844262e56d5215516dc2b97eed9b4a8058731794895cb",
+    "afterSha256": "125eec913c1e499c48f9aecc102fb6c4d218cd88da288121717eeb0ed796d4b7",
+    "reason": "Regenerate live_storage from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_storage-006.json",
+    "change": "rewritten",
+    "beforeSha256": "3d7357691c338f1fd247c42c2d38606a97beb6cc272233cebb9d12a79f841dd8",
+    "afterSha256": "49a29af6d0aed13c367fb85a9c77331570f343e27544e5e6a0019b9f6919bf3a",
+    "reason": "Regenerate live_storage from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_storage-007.json",
+    "change": "rewritten",
+    "beforeSha256": "90b4cdda0470ee5f25632c608c00e3234b4daf4ff8ab3268701fd03abddb9207",
+    "afterSha256": "33977c8e6a145079569d830f2173d35ff52ab374e9521cc6421ef9494afe9cc0",
+    "reason": "Regenerate live_storage from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/live_storage-008.json",
+    "change": "rewritten",
+    "beforeSha256": "5ff844ddc9e625c6ebea6889c5486f4a9b7d517b1af173eae86ca3e65eef8846",
+    "afterSha256": "5c275ffc71483e1ffbbd62dfaf243b3b688f0deda50df5e2d642dda5a4788e5d",
+    "reason": "Regenerate live_storage from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/probe_premise-001.json",
+    "change": "rewritten",
+    "beforeSha256": "6b58dab423ba7a8d24bf59d457e36405b0042955c60cdd43e80401bb24e87310",
+    "afterSha256": "cb235bcdf908ac43d12e3044265458bec7605d996ea0046782b655f28c9f9aa2",
+    "reason": "Regenerate probe_premise from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its check mode and expected violation result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/restart_control_compact_open-001.json",
+    "change": "rewritten",
+    "beforeSha256": "367419fe0a5e4a34f40cc15ede6c7138c3114dc718588e4d1c27960630175cbf",
+    "afterSha256": "c46549a07baa2c66a2bd318bc8d1b35c7523142f43d8092bae18679097e5e4bf",
+    "reason": "Regenerate restart_control_compact_open from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its check mode and expected violation result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/restart_control_duplicate_key-001.json",
+    "change": "rewritten",
+    "beforeSha256": "a4ca536fc44d9d7e26232fce299d211745e364ae44446517c8d16cc1e97c41f4",
+    "afterSha256": "3b47ef51ff014fbf3e630e77f9b0450ad6ab21debcbe80192c0df0118e86fcc1",
+    "reason": "Regenerate restart_control_duplicate_key from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its check mode and expected violation result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/restart_control_early_ack-001.json",
+    "change": "rewritten",
+    "beforeSha256": "76499c855a9851a7b7fd59af32392ff80a4db15ad7ef677fe2d30a59c70c0006",
+    "afterSha256": "3c69b807a80c52f156010ba25d0d74cae3a1a5884300a5cb56721331caf32897",
+    "reason": "Regenerate restart_control_early_ack from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its check mode and expected violation result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/restart_control_next_item-001.json",
+    "change": "rewritten",
+    "beforeSha256": "d43f441c632c0889a96dddeccf9f96efdd63170b53cda68912bcc455d490c1cc",
+    "afterSha256": "1900e94f06e79dace0c65b8fa6fde7946ba0e768a919b638a63a3568a0af992c",
+    "reason": "Regenerate restart_control_next_item from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its check mode and expected violation result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/restart_control_next_part-001.json",
+    "change": "rewritten",
+    "beforeSha256": "9ea32df7c11b750e122baf5c0700cc36f5ea93530797f00d938360b8e07da6f4",
+    "afterSha256": "12c7818acb77a74e9f021b9842568eb0b519420716bd98416e60f0b7656785b2",
+    "reason": "Regenerate restart_control_next_part from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its check mode and expected violation result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/restart_control_queue_is_receipt-001.json",
+    "change": "rewritten",
+    "beforeSha256": "4c8a35446b0c07b480f1d2478c5f76a0aebc0924e59e117760f7b6cb965c6682",
+    "afterSha256": "07fae499281630cf640d688b394474355ced22031e24730d0a72a225f2a7c4a3",
+    "reason": "Regenerate restart_control_queue_is_receipt from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its check mode and expected violation result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/restart_control_reconnect_keys-001.json",
+    "change": "rewritten",
+    "beforeSha256": "1727dbfb730aa882a377e525b424150121caead1bb7f46432134705b5e6ea41f",
+    "afterSha256": "442e1573d793f1c4010ad0cf252bfc9f9accc5621415a8aee5ce02ced17c720b",
+    "reason": "Regenerate restart_control_reconnect_keys from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its check mode and expected violation result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/restart_control_reconnect_running-001.json",
+    "change": "rewritten",
+    "beforeSha256": "d3f56bfe2a6dc8013d9ff9d6fa5056e57b8a712191fb646650c4d4fd2a5d9444",
+    "afterSha256": "a517e23f06f7d9061f19c6c526b06984f8d101f929ebde56d4ef3f12926e28f9",
+    "reason": "Regenerate restart_control_reconnect_running from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its check mode and expected violation result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/restart_control_retype_into_text-001.json",
+    "change": "rewritten",
+    "beforeSha256": "2de4b704753636dd650f9344153e249d43add43eeee5064d3d27306d144864ad",
+    "afterSha256": "05fcf4820009f25b6c78ddb4ca76bb7014bce38b5c09be6d5e8cb5af40023fba",
+    "reason": "Regenerate restart_control_retype_into_text from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its check mode and expected violation result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/restart_control_retype_working-001.json",
+    "change": "rewritten",
+    "beforeSha256": "8da1e3d7b8fddc0d88a9d0ab7978ee4a836fe4ef19b178dd020b6a59f4a5cc8e",
+    "afterSha256": "996c8e59642d1fe45ccb5e9553adcb4e5dfc812cb7f798c67197fc87e54fbb65",
+    "reason": "Regenerate restart_control_retype_working from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its check mode and expected violation result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/restart_control_send_is_delivery-001.json",
+    "change": "rewritten",
+    "beforeSha256": "73fcc34462bde40da7ae886e52bc378fa35dccc41fe79b6eca9dcae3db7ca33d",
+    "afterSha256": "27cce341236d462e2ae04ee173d28f7b8cdfd5c3be52fe33739b8ab4a8984f5c",
+    "reason": "Regenerate restart_control_send_is_delivery from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its check mode and expected violation result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/restart_control_skip_refused-001.json",
+    "change": "rewritten",
+    "beforeSha256": "2ed2c37ac62d7cae78a024102740e614d410def4ee2b71c7dc4bedf3ca2b6b96",
+    "afterSha256": "06cc608908e1bc3733fe6788d51abbcca73526d604d52702fe208b4b837f25b7",
+    "reason": "Regenerate restart_control_skip_refused from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its check mode and expected violation result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/restart_control_start_drop-001.json",
+    "change": "rewritten",
+    "beforeSha256": "b58b7b4a404f477820a8795598c2fa8f9b945ed19b7534b91425aa37e17d32af",
+    "afterSha256": "3b0cdcadf1ff497f1789b1c1eabe1d23a857f6b4c779f83616c949a1357a55bd",
+    "reason": "Regenerate restart_control_start_drop from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its check mode and expected violation result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/restart_control_start_unsent_head-001.json",
+    "change": "rewritten",
+    "beforeSha256": "485ff7fd759241ab6b87d9b2a11fdb375b8a2375c38359535b13ed05ff78237f",
+    "afterSha256": "3da46cc873ab80a6c02fb3f7ac46bbf8983718cc87fbd81452c128c780099cf3",
+    "reason": "Regenerate restart_control_start_unsent_head from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its check mode and expected violation result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/restart_order_simulation-001.json",
+    "change": "rewritten",
+    "beforeSha256": "a25c09a27ef31e8131cd09af274e2667b2f956fa7848141582e8fe5088b1945f",
+    "afterSha256": "0110abc0aa763dcf582d3db863c3f0b50526c4093ea2a32dcc0a32b60eeef7f5",
+    "reason": "Regenerate restart_order_simulation from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/restart_order_simulation-002.json",
+    "change": "rewritten",
+    "beforeSha256": "d94fa3962b478757168aa003a2adee2cac1a44cb9fc610a1baba66f89f3194db",
+    "afterSha256": "218d5beee0380bd1425bcf855759adbe03a512ed511d4b772e1b274a5a9434c9",
+    "reason": "Regenerate restart_order_simulation from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/restart_order_simulation-003.json",
+    "change": "rewritten",
+    "beforeSha256": "a44738b5e5fc778cfdbdb1ed31a2b6be741fd18e879bee4eed140df5a6a6877e",
+    "afterSha256": "e93a424cb4b29bdc4d1cfadd854a125df7e4ed744f429af304d6c35763a1ba06",
+    "reason": "Regenerate restart_order_simulation from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/restart_order_simulation-004.json",
+    "change": "rewritten",
+    "beforeSha256": "179b18973dc471f66b70c3df8075c2b8c14b3490d863429edd4660b817401232",
+    "afterSha256": "ceb8a340ba9a4c3b7050aa18940c70dfc3b708b85582eb24a155838bcd189ae5",
+    "reason": "Regenerate restart_order_simulation from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/restart_order_simulation-005.json",
+    "change": "rewritten",
+    "beforeSha256": "3c8a401cffbd3471c2a54209bb92f569da8051380b21c593ba427c7ea7a9e1d4",
+    "afterSha256": "e875e846221e92045594e26c8a67724e5c7bb3f9d3645779972de248760d6582",
+    "reason": "Regenerate restart_order_simulation from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/restart_order_simulation-006.json",
+    "change": "rewritten",
+    "beforeSha256": "420c99ecdcbfd0e6d8ea520cefee58f136d82bdacf871b71567ba7242a17e155",
+    "afterSha256": "d5ce787e954bada5523b29915cd1fa439c473e15a35f1c65197fdb06e2db28ef",
+    "reason": "Regenerate restart_order_simulation from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/restart_order_simulation-007.json",
+    "change": "rewritten",
+    "beforeSha256": "cf00b3dd98f9217488a14072ba4febea3083b483ddc9e5cbe8d3be257aeecd14",
+    "afterSha256": "c13934d0cfc84af9ba5d816ea3e23d5eca168fd1febfe8d8f5979cf3e823f7f5",
+    "reason": "Regenerate restart_order_simulation from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/restart_order_simulation-008.json",
+    "change": "rewritten",
+    "beforeSha256": "4a208e544291cb68c60e03e17e59fc34dba08bdc083a316276a61f8466ef63ae",
+    "afterSha256": "0dc0ca89f391a7bc304c70cb7ab42e6ec24c5d5ab3e31f567b8aef22c0f680a8",
+    "reason": "Regenerate restart_order_simulation from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_bot_resume-001.json",
+    "change": "rewritten",
+    "beforeSha256": "5e1e40ab0e55f1269f761e92c6cc4233c04c11377641af2d0e1cbdbe8501b5a0",
+    "afterSha256": "581fce77766fecb8a097913dbfe9365bde476d0b8d8b7f15ec7f82db9c4922e6",
+    "reason": "Regenerate safety_bot_resume from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_bot_resume-002.json",
+    "change": "rewritten",
+    "beforeSha256": "e235e7c6c5dcc3d4bb310d5031274ef3020f20098194bc4a8db0f43ca80e2fbb",
+    "afterSha256": "a328eec5ca789c3e02726970ae73475cf8fa2e91fc70466a7a6f5830bf267601",
+    "reason": "Regenerate safety_bot_resume from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_bot_resume-003.json",
+    "change": "rewritten",
+    "beforeSha256": "3f6285a310f1480a78c927295bbc9110dfef3bdcb9130e283e30a8af6d7c3ce9",
+    "afterSha256": "94ec58d52296a0db914e9c284c5c5e7cd0ababcdb73b8c4a5b459996af4ee6a8",
+    "reason": "Regenerate safety_bot_resume from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_bot_resume-004.json",
+    "change": "rewritten",
+    "beforeSha256": "fe7c5647ab178916cd37fbca083dff521a13feaa5a3d43798e7543d8219c77e6",
+    "afterSha256": "9e8fbb5b4c5d23588acad4cb6567903e2e239684a528cd0e8d21d42920836a5e",
+    "reason": "Regenerate safety_bot_resume from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_bot_resume-005.json",
+    "change": "rewritten",
+    "beforeSha256": "cab5ee74986648733994f293b7c1480646ee97dfa6c7e03efc7fbba4b39b3ae9",
+    "afterSha256": "06298fb0d4575c16bd158349ddf7114506e85de1e88b84a7cfc4a86cadd5d681",
+    "reason": "Regenerate safety_bot_resume from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_bot_resume-006.json",
+    "change": "rewritten",
+    "beforeSha256": "ae8a744bfe10587ad746b99216827fc47b51b5013bddd360c241dd191a1f9227",
+    "afterSha256": "9a0457818c1fed6937e5fc137214470ba6af8f046581b6ce8321a711bb7af3c5",
+    "reason": "Regenerate safety_bot_resume from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_bot_resume-007.json",
+    "change": "rewritten",
+    "beforeSha256": "7d9e707c4ce5b2b11ff3c7f3f45506a15514429e8e5fdfd03888edef82c66947",
+    "afterSha256": "8c335890bcd7ffb0e2f02b3e01ad01e69945a4ea28510ca2500b05553c6649d1",
+    "reason": "Regenerate safety_bot_resume from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_bot_resume-008.json",
+    "change": "rewritten",
+    "beforeSha256": "c5a1f978a67a89226612e07a24d69cc6b1cd8464f5bcc8900222bbb760d10ab7",
+    "afterSha256": "5ed728fccf2f4a7a6e8ddbbaf8d3e7462543a7b86328ec214809d57910cc06cf",
+    "reason": "Regenerate safety_bot_resume from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_bot_sessions-001.json",
+    "change": "rewritten",
+    "beforeSha256": "918532c45615e246e7ce761bb31c3ccadc72eec080c28989028e44e983650371",
+    "afterSha256": "e5f8e9413d119923d4806dd889dc6430163edc4609a86ff3ba86a27cfb591068",
+    "reason": "Regenerate safety_bot_sessions from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_bot_sessions-002.json",
+    "change": "rewritten",
+    "beforeSha256": "e85f657f0a7de6a0512ca1a4e6436409f5400484097106828f92e9bcd998e98c",
+    "afterSha256": "9b930cbb1ff7c3843f27c4834d9024014063e935e4515804c3fd281ebf7bf248",
+    "reason": "Regenerate safety_bot_sessions from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_bot_sessions-003.json",
+    "change": "rewritten",
+    "beforeSha256": "f8c7e0999ce93c0ff8ea84097116c3dae962327acf7c65ff285a995b1620fe45",
+    "afterSha256": "843c026c231fa7ebabb6402883e9a9eb8f377d495584cdeb570ee656fd0504b8",
+    "reason": "Regenerate safety_bot_sessions from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_bot_sessions-004.json",
+    "change": "rewritten",
+    "beforeSha256": "10bdd969ed3f714b5907bacadce530ef69843c86f2c9b1411ff70af6f5c84c3b",
+    "afterSha256": "a88439408ef137e8b80da51492b4334fee5135bf5c80a964d2196f148b890dec",
+    "reason": "Regenerate safety_bot_sessions from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_bot_sessions-005.json",
+    "change": "rewritten",
+    "beforeSha256": "613f067001a8c00b769aad9e0af618fe2274ea140fc62ae8d272972393758e06",
+    "afterSha256": "f5fcfa0fa7351190e7afc041bf69b9882d05d665348252a955a6aba273a3c6e8",
+    "reason": "Regenerate safety_bot_sessions from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_bot_sessions-006.json",
+    "change": "rewritten",
+    "beforeSha256": "478b1af776405e906b1cfedef5545b38efe153c2ec7533dc8dab1b9dd58c5a44",
+    "afterSha256": "c5ace25332b89c402325e43e1532bd43358ecc18e53b3c36e3814defeebc9d74",
+    "reason": "Regenerate safety_bot_sessions from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_bot_sessions-007.json",
+    "change": "rewritten",
+    "beforeSha256": "a1289871b2fd75592a5a27b978eb2ca520a78d1a437379cfa599cf99f3f1ae4e",
+    "afterSha256": "339209f45926ecc2b81d0eefcb45e7c475e90fc1e3428f19b681ba2d39538fad",
+    "reason": "Regenerate safety_bot_sessions from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_bot_sessions-008.json",
+    "change": "rewritten",
+    "beforeSha256": "b857889a01d5956cd30a7c919de13e3a3d66f48f54c0dcc9b71a4f78ac7445c7",
+    "afterSha256": "bfba2acaae0dcf013291988460d09a368f33e9b1508233f97036ae5735cdc1ac",
+    "reason": "Regenerate safety_bot_sessions from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_calls-001.json",
+    "change": "rewritten",
+    "beforeSha256": "d720933f99d8a366d683f16903df8f7a9f62828f45aabdb0624f621eebe073ed",
+    "afterSha256": "d935b890ff72db3e0e855cd19b63db4ef7c00421c1ae10879c0c2807c6dc6177",
+    "reason": "Regenerate safety_calls from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_calls-002.json",
+    "change": "rewritten",
+    "beforeSha256": "c4b4a7e7b1ab8028b1e2676eeb2af5880603cb9638bc32f0a6cc5fbf563c03e1",
+    "afterSha256": "460d58364167c54b343200629edb94687ad72f633952778ecaa271af287f320d",
+    "reason": "Regenerate safety_calls from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_calls-003.json",
+    "change": "rewritten",
+    "beforeSha256": "3628aeaa75a1cb0d4f642b37241dc006b437d0c68940434919052ba96edb7b06",
+    "afterSha256": "cb487433b792db436909f26b3031f09b14fd468eeffd0ede9df8003b1ca061e2",
+    "reason": "Regenerate safety_calls from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_calls-004.json",
+    "change": "rewritten",
+    "beforeSha256": "529b221cae48b3235121509cdd8fc8d6360db806105b7d6c9dd44d16ac66fced",
+    "afterSha256": "abb3ca25aefedaa8956ef48b3fb34ea046e958d5f24b93ff4ab1911914119299",
+    "reason": "Regenerate safety_calls from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_calls-005.json",
+    "change": "rewritten",
+    "beforeSha256": "808c1f5a0ec285a9f10e687be486914f5cb90d2d865fdf0d21be1eb34a858fc9",
+    "afterSha256": "65570a38d306a561a098b7223e4f60ed167fe85b11f0d46a3677b9d2ce39cedc",
+    "reason": "Regenerate safety_calls from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_calls-006.json",
+    "change": "rewritten",
+    "beforeSha256": "2ac355cdaf2e666afc5fd36cc04a67c9cf5e7f43cecf811cf4a1039608d86f49",
+    "afterSha256": "16a725c83bb7a3aea71cb99e11ffe88c69b3c1c24845563cddaf12c9a03a3769",
+    "reason": "Regenerate safety_calls from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_calls-007.json",
+    "change": "rewritten",
+    "beforeSha256": "c331fd62991d00e649b70c8d0ca27c6861973a3205c4d9c3243198ac1d99112e",
+    "afterSha256": "4167a267f3ff34aeefec9ca36c4731568d53f68d4ab6578540f3b7d7801118d7",
+    "reason": "Regenerate safety_calls from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_calls-008.json",
+    "change": "rewritten",
+    "beforeSha256": "493021a164937487208a6a4afc890592e99fc832e3fe87004a47a3ffa9f08359",
+    "afterSha256": "cc1663cac712a357c5e8cf3c78a66c5a607a2b10479f1b841b51ed59a5607105",
+    "reason": "Regenerate safety_calls from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_connection-001.json",
+    "change": "rewritten",
+    "beforeSha256": "efda21e1ab21bf7ef61eb869ed56346eabf07044408f3e4e1453730e733b1d7a",
+    "afterSha256": "3402ea985409193cdb9a5bc5fbaba2ab2b872e1888bd6b65e871820c5f5357c8",
+    "reason": "Regenerate safety_connection from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_connection-002.json",
+    "change": "rewritten",
+    "beforeSha256": "96fd1e91b6c6ab4524354942644647bcbda75cbae26f329153704012dd3dc65e",
+    "afterSha256": "25d332abcdc19232a3ab562eccf1636e96a184fa7719b330af3912d2793c4f84",
+    "reason": "Regenerate safety_connection from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_connection-003.json",
+    "change": "rewritten",
+    "beforeSha256": "9af80973857e20848cc9f4629e551322ccd3adc72e4b71822a2c984dd3d17d93",
+    "afterSha256": "dbf671553fa610192f7e9c53c4e3a7c0a2d72e2fa33d43adf3c29bbb40f1f4c5",
+    "reason": "Regenerate safety_connection from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_connection-004.json",
+    "change": "rewritten",
+    "beforeSha256": "9611c0bb7dd18a24bb29e8e7de03a95912cd7262ee0b3ec45814d5e0f522d9bf",
+    "afterSha256": "fa98d6be3d46fe11bc4afccccddc68321ff8a53feac1f606bda0ca173d712dac",
+    "reason": "Regenerate safety_connection from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_connection-005.json",
+    "change": "rewritten",
+    "beforeSha256": "896503744c7dddb1df055d2aa10f64044d55eea7d1c9eb8fadac2baae9b56ae2",
+    "afterSha256": "e542ea6de79601cf7a193a254df98d3851ad03c2d32361ce565ec21e3fd37591",
+    "reason": "Regenerate safety_connection from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_connection-006.json",
+    "change": "rewritten",
+    "beforeSha256": "a687dc064f7a31dfaa5c67722cd53d014222c596862ec13ead069c9ed9fe0e67",
+    "afterSha256": "d7c1760c48655313256c3cbdb42b3c14e2911415fd6b6edf9d727e2ce1663fcb",
+    "reason": "Regenerate safety_connection from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_connection-007.json",
+    "change": "rewritten",
+    "beforeSha256": "90f60235356854bf6895ef729a16d67034e6514ad19b845598096a8725447bac",
+    "afterSha256": "c5ed79c8a401534a4f1a625e3eb6282e546cd3f39ad234f833ceefe1dd32ab68",
+    "reason": "Regenerate safety_connection from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_connection-008.json",
+    "change": "rewritten",
+    "beforeSha256": "a347e27659c83cdc9d87c80d9103cb91cb989330fcd718ca9ecc6ac767eed916",
+    "afterSha256": "511310e9f47346bf3252696f55f54fdf839354211165f2cccf1b3dc82bbb8970",
+    "reason": "Regenerate safety_connection from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_enter_unknown-001.json",
+    "change": "rewritten",
+    "beforeSha256": "da89ad5b16966d9d469863eb7c9aec69ce18b5d68fbbefe87fd58aea683d8867",
+    "afterSha256": "fa4771ad35baf1c4d6545d93d238317706000bf3929c80d7b1a2dd822404fb4b",
+    "reason": "Regenerate safety_enter_unknown from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_enter_unknown-002.json",
+    "change": "rewritten",
+    "beforeSha256": "4384073d7c4261e8c29fd8cec43ba4d0fd5203a20f75756cb381b098efd0e7ed",
+    "afterSha256": "bebecc41eaca4c8d7ff5eebc8221e64883e66c8eed0f1411364e85a631cb5d05",
+    "reason": "Regenerate safety_enter_unknown from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_enter_unknown-003.json",
+    "change": "rewritten",
+    "beforeSha256": "fd7a1c8122bc764f2f12113ff915df817dc041febf1bf45579d1cb1a8337b598",
+    "afterSha256": "ad2ad014e1e5534315be53f4ad3ae94f974cb40dc9fc1f4934839caf2992ddbf",
+    "reason": "Regenerate safety_enter_unknown from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_enter_unknown-004.json",
+    "change": "rewritten",
+    "beforeSha256": "11e3980a0f76a33b1640b6cafb88132afb194d347669ba748748ff1122e9f980",
+    "afterSha256": "969404c65da1c05932bc2a6963a20365c27cb1bf351d881d35314a8eed8c4194",
+    "reason": "Regenerate safety_enter_unknown from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_enter_unknown-005.json",
+    "change": "rewritten",
+    "beforeSha256": "47cd34584923e8f9edb2de7ef257b7e98cc2006bd7fb7889c6ef32c9dfcd6a35",
+    "afterSha256": "bc4b6d0f469178cd9825069a440b8819718854252b9a6b55fbd92cc70a01816b",
+    "reason": "Regenerate safety_enter_unknown from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_enter_unknown-006.json",
+    "change": "rewritten",
+    "beforeSha256": "2c47d02f7a3670fcfaa232f2a8f9a59cdd8820a09730e417bded9a4af389a8cb",
+    "afterSha256": "a1644c56f3e66e5f778e08efe62cc16644e2dff2d3a68d1fb0a5803cfaee0f71",
+    "reason": "Regenerate safety_enter_unknown from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_enter_unknown-007.json",
+    "change": "rewritten",
+    "beforeSha256": "3ff8857001b30c9fa25870154aeeaa7733ff46beb037a9911aa2d7f9198112fa",
+    "afterSha256": "8ba1d6b1e1b4a6cdbfb4787c99fa9a297d98edae7cb44ab5ae12c3fb3ac57809",
+    "reason": "Regenerate safety_enter_unknown from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_enter_unknown-008.json",
+    "change": "rewritten",
+    "beforeSha256": "4faae02a737232a155b2fa6cf8a42ec7e769fb95ce71ed331f55c01b22dbcefc",
+    "afterSha256": "d2d9e547e9b23d1a1d8c0a979b047cf5ec99185ee306dd590c2901a02c6b4043",
+    "reason": "Regenerate safety_enter_unknown from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_identical-001.json",
+    "change": "rewritten",
+    "beforeSha256": "53112477eeec1c6a990d73e24524db908824dfd63b56b6681e09b127dc8f9d2c",
+    "afterSha256": "8d334154e9f52aa2054d56e24e87d89716c26ee7f44952812384d935d76d369c",
+    "reason": "Regenerate safety_identical from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_identical-002.json",
+    "change": "rewritten",
+    "beforeSha256": "2f322848bc2d7df8eb79d6338d09f4ab4ddc1bd3d04a3adf4ece38843f5beea2",
+    "afterSha256": "196dfe81b887cfd875907a526b9bc5dd51cfa0e5e4c7377a4fa6ffe68045d139",
+    "reason": "Regenerate safety_identical from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_identical-003.json",
+    "change": "rewritten",
+    "beforeSha256": "e3b26d3a3173c6e2882da715b55a068bb33e44a648dcdeece374315885c5f053",
+    "afterSha256": "4f1112ccb485a69f2e2b419c85e11c9b36da20e1830abcb8b96301722e5ac2a8",
+    "reason": "Regenerate safety_identical from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_identical-004.json",
+    "change": "rewritten",
+    "beforeSha256": "81ac7d9880438d9cb051f4453da2424544d52584fe1fb094f4d75777c9bac74a",
+    "afterSha256": "fbe1febe92389364f9eaa88779ab63e9dd9f1cb0b8c1b041d25787a815080532",
+    "reason": "Regenerate safety_identical from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_identical-005.json",
+    "change": "rewritten",
+    "beforeSha256": "d67984abaf27cddffe6a84ae67cf030a3224f923579d8836da11531423e4e431",
+    "afterSha256": "f5d194f2020edffd95b7678acf607f8988fac09d174dc44a0cd4231b43c0d295",
+    "reason": "Regenerate safety_identical from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_identical-006.json",
+    "change": "rewritten",
+    "beforeSha256": "9db57321731845bc28b3290d1f5359b3c2d929e29887f944634a3c6fe0e2ace2",
+    "afterSha256": "ef3185f0257e5274b215b2cdb6b028d38578ec51fe2660dab6ccffbfd76d453e",
+    "reason": "Regenerate safety_identical from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_identical-007.json",
+    "change": "rewritten",
+    "beforeSha256": "856f3e7d59c537cee490744144378dcb3b05d5af470edee14ceb32d93fbe5ab5",
+    "afterSha256": "e7addf65a79f7e44fbffac9562f3a3a3a3694a94fdb6221ba618e3785b5b8528",
+    "reason": "Regenerate safety_identical from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_identical-008.json",
+    "change": "rewritten",
+    "beforeSha256": "299289b3bda376aaab973e7eec0ffbd7b621d80bd182c84c577dd5b5cf7ee86a",
+    "afterSha256": "52ef923a0d837498aeabb8cfaffbb8b21a2f1d7bf94de84878100590b03c688e",
+    "reason": "Regenerate safety_identical from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_persona-001.json",
+    "change": "rewritten",
+    "beforeSha256": "e5abd483c7be6f52ec6a1a1f3efbb34b66c903e235ce690f54e2e2b4e3e5d543",
+    "afterSha256": "43c829bffa32bfdffa950852fad2372a9e9daed465c6543645c8c6dcd75f8303",
+    "reason": "Regenerate safety_persona from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_persona-002.json",
+    "change": "rewritten",
+    "beforeSha256": "221138ae30bf979619c3d18586f2f4febb7c4aebabcef56c897858f622d56491",
+    "afterSha256": "4b8182db0c7149a968af1e68c2a19290bc62e53d1dbad5432c439cb5e31c5764",
+    "reason": "Regenerate safety_persona from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_persona-003.json",
+    "change": "rewritten",
+    "beforeSha256": "61e62d69ca7d704fbce49860c86421656722cc4cba78c4d0ff0f6a33f3d25af0",
+    "afterSha256": "9e6f3ff7d79a5fa9c0ae349822109eafb26bf0d854253a285ae2461e2199bd04",
+    "reason": "Regenerate safety_persona from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_persona-004.json",
+    "change": "rewritten",
+    "beforeSha256": "aecb2e8c60ff345c0a71eaccaa614e1b26fd5c79a2e74b8e53b66c3d7708d638",
+    "afterSha256": "44ceb2021719dc40cf670d1e615fa6bb814a931b3f8f01a292e0b4d0472b29b1",
+    "reason": "Regenerate safety_persona from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_persona-005.json",
+    "change": "rewritten",
+    "beforeSha256": "817481753763000df1533ca08fff5a7dc29c331d427fe9d394df7b4dc86bae5b",
+    "afterSha256": "34f76279c0781dd4a0ab672e5b1f9f92fdca6ccc428cace2b8f17096adc95578",
+    "reason": "Regenerate safety_persona from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_persona-006.json",
+    "change": "rewritten",
+    "beforeSha256": "32fa7b173dc5326453fb0be67ef3cc5b9c7b699c93d1c500928f8720ec4b16af",
+    "afterSha256": "9e43e3b8fb4db8fb3ab34785db1144ef354aa4f45479c256be12eab394dbf728",
+    "reason": "Regenerate safety_persona from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_persona-007.json",
+    "change": "rewritten",
+    "beforeSha256": "dbb4396b91778d46e0ee62988feb2c020641a80b4c65fdaa66b0eaa2b44186d6",
+    "afterSha256": "21e2ae8f4b96c787fba2d6fec9d5976b4d2546fcfd96f35bcca2ea435d72c368",
+    "reason": "Regenerate safety_persona from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_persona-008.json",
+    "change": "rewritten",
+    "beforeSha256": "414ee42383e2f9bf19644fe78b1fb01252917156f03f6dcdba561eee13f797a0",
+    "afterSha256": "ab1f95e93b89ba8b353239ae51bb045b3b6db06b9f13cb947826d5e5b889767b",
+    "reason": "Regenerate safety_persona from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_screen-001.json",
+    "change": "rewritten",
+    "beforeSha256": "ee4e682faea9242f0836dab09fe1bb3851abe07a0ac3b2bafba3031d995acdd0",
+    "afterSha256": "5fae8f7836bbe19ff660985279a1e34295e2c8045ab31488c3e4a4f44b604065",
+    "reason": "Regenerate safety_screen from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_screen-002.json",
+    "change": "rewritten",
+    "beforeSha256": "347d4d27f704280db3ec2ab3a0b2ece77364afa811c641eb88469b86ee876444",
+    "afterSha256": "21a7678cf6d4f03a354e8b5fd633972d041ccaf269fef22df55b7c1109ca32f5",
+    "reason": "Regenerate safety_screen from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_screen-003.json",
+    "change": "rewritten",
+    "beforeSha256": "e3295457d87b3483f491045820dc49ba3160af7d9c430395df68bf2ec99f60b0",
+    "afterSha256": "321480a82258289f774912fee7895b0b887088b139ede174c41dbb8fd4911853",
+    "reason": "Regenerate safety_screen from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_screen-004.json",
+    "change": "rewritten",
+    "beforeSha256": "06a63a86e96348c89af98f35a97dfac81c475c607944d6e4c4c7592adc4d9389",
+    "afterSha256": "a83a1012ff204c26f45666efae8c137b2b4d5e51d0774963eb47aa09a6bf7301",
+    "reason": "Regenerate safety_screen from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_screen-005.json",
+    "change": "rewritten",
+    "beforeSha256": "10faca30e01dd0a32752b2a800a9efe0bc395ccfc6f7df7559bf13b05e28640f",
+    "afterSha256": "b6fdcc4c43f6fb70e18b2588a78528e8388ed92e59f8a884686f212f6c938966",
+    "reason": "Regenerate safety_screen from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_screen-006.json",
+    "change": "rewritten",
+    "beforeSha256": "3f5550ee2a975852302735e4890e0e37799946a04d55a93d9e186e25402ea809",
+    "afterSha256": "5e60b0ec0aa2756aacde60570381dd6fc07593c3013c872fbf2b384c7e1ab73b",
+    "reason": "Regenerate safety_screen from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_screen-007.json",
+    "change": "rewritten",
+    "beforeSha256": "911d4b94a5b81d1fe0605816fdbe944eb4b9dc7052be01b9eff0ffe612ab0977",
+    "afterSha256": "691b6401b95f724da6f4694bf267ab060069a60e3b5d800ad27b9bb9dfd3569e",
+    "reason": "Regenerate safety_screen from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_screen-008.json",
+    "change": "rewritten",
+    "beforeSha256": "7d413ca2ea124dc920aca9defe95c8b20e6ca9f385e614f69ca618fb31e2dc55",
+    "afterSha256": "63ef1ec53af114611fa16f08c23147631aeff7c5b5f099079bc5955bfca98c61",
+    "reason": "Regenerate safety_screen from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_storage-001.json",
+    "change": "rewritten",
+    "beforeSha256": "d7d55568e8763025250ca6a0245b96ba06470b0c1bff656c23753269f050ae1d",
+    "afterSha256": "2917c2f08c741038cd48b30b9f1eceae833f086bb0fe5a83607f2246dafd28c4",
+    "reason": "Regenerate safety_storage from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_storage-002.json",
+    "change": "rewritten",
+    "beforeSha256": "150e4183b9f347454ed257247a6836230c7de6cdffce15bc5428910a3fff82fb",
+    "afterSha256": "bf2a8dc9ef8760abaf9da386fc8858503636746c0b24bc0371c8955462dd96e5",
+    "reason": "Regenerate safety_storage from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_storage-003.json",
+    "change": "rewritten",
+    "beforeSha256": "066b4e81d6917fbab63986552bf82376c2056286198f6b23e9d7ac2472c2f6c8",
+    "afterSha256": "682ec1c6539bd383c2fe719bc74d8c9d20d9f6f25660964f39787fccbe005701",
+    "reason": "Regenerate safety_storage from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_storage-004.json",
+    "change": "rewritten",
+    "beforeSha256": "7306292c840aae0e0c5092998966a7973866fe5e56b036a774fee7befcb1bf8f",
+    "afterSha256": "24aa818ba42706f7c3644934d482887adc88fd2612ae8aaff43c7cc4a7b9dbb9",
+    "reason": "Regenerate safety_storage from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_storage-005.json",
+    "change": "rewritten",
+    "beforeSha256": "6d26691d8084227ac1e7f4267f3ac1864dcf124bec159aa414d675aadb09ab5c",
+    "afterSha256": "8d32652789c7faddcb0bd5ef7e5efedbf37c77e71624a741cccb7a96906a0ac6",
+    "reason": "Regenerate safety_storage from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_storage-006.json",
+    "change": "rewritten",
+    "beforeSha256": "080a36fa77b6a97376d868d7ef658aaf8ac9ab11c2914027bf4e950bda111c68",
+    "afterSha256": "e7d75d104c75e7c5563b94d0b78955bbd75ef1bcc9f2cb6a81144b0a269dcdae",
+    "reason": "Regenerate safety_storage from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_storage-007.json",
+    "change": "rewritten",
+    "beforeSha256": "1256884b6dcef96ed43f022b06d8ebe7347469932a44ee5506f7a9335de8d2d9",
+    "afterSha256": "1d75ddd77d51122116bee4c2e41a1d3134220a4925c4b3d9d7de659bb62be642",
+    "reason": "Regenerate safety_storage from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/safety_storage-008.json",
+    "change": "rewritten",
+    "beforeSha256": "8c7ade4a2807eb49d581d75e5718aebe9506aa93c779c624d73064d3bb11c211",
+    "afterSha256": "15f190f4640adc72578210803ed3b0884943a1e25ca74f8bc504155032ed13c3",
+    "reason": "Regenerate safety_storage from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/supplemental_pullback-001.json",
+    "change": "rewritten",
+    "beforeSha256": "9c402d8913a74176a1f9c6e39782a32d61b0547696a22e055909b2e639cd5809",
+    "afterSha256": "f27bcc8c904a73fd403f69e8a48251d0cb2855f4c2f01c8159c936c49419e201",
+    "reason": "Regenerate the finite original-Next pullback witness without settle steps and retain its independent exact replay."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_agent-001.json",
+    "change": "rewritten",
+    "beforeSha256": "3236efdacbf2db57eb2fffa640e7598a778a0a62c68376f5c88827ff8e83034b",
+    "afterSha256": "cbfa8d6e36929aa471ddefd1efefeaebe0af813d7c983f82968263eddafc5d07",
+    "reason": "Regenerate trace_agent from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_agent-002.json",
+    "change": "rewritten",
+    "beforeSha256": "ebe83856d1713089312209d7ef8ad8b95a5484c9433e1d54ceb9caefe702fb9f",
+    "afterSha256": "44cae72bec277c1e95cd46b78921165f7d16765d4f6267bd15798d949c20acf3",
+    "reason": "Regenerate trace_agent from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_agent-003.json",
+    "change": "rewritten",
+    "beforeSha256": "8c122a2b88886b2122c5e088cbe843f494273151094d0f486a5e9d43b048e30c",
+    "afterSha256": "b7f8581890f11b6e2f0dae9510ab0c0c100057c909c88ea7b8ef67fe4e4d47a8",
+    "reason": "Regenerate trace_agent from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_agent-004.json",
+    "change": "rewritten",
+    "beforeSha256": "44b81078ee3c05a5d9b011cf903a20892274896bd015540309f2b9436c5841b6",
+    "afterSha256": "b01c67bb8583cdae14bd9421cbd21e9cd932cc2c769d90d6925ed82523f7c9df",
+    "reason": "Regenerate trace_agent from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_agent-005.json",
+    "change": "rewritten",
+    "beforeSha256": "1959349452a6fbc74d93828a4a94337e875312e7f69628780d02d57cf626d150",
+    "afterSha256": "51e13fd84ef0fa10bf6b26b20dd736c91fce500ae291881cb2a0bf59d7722dd4",
+    "reason": "Regenerate trace_agent from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_agent-006.json",
+    "change": "rewritten",
+    "beforeSha256": "e63bcde34562f01d5e8a4d1ee58ceed137d5b17e3324ff6b92c207530b0098f1",
+    "afterSha256": "f1ff29bc2b3c19d7a07a38a91cd690d5915b374565b44c077345b594fdf137f3",
+    "reason": "Regenerate trace_agent from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_agent-007.json",
+    "change": "rewritten",
+    "beforeSha256": "9b72fdf708850c3be646612e93ccf73b5ce1bb2c9861fce133e81775b13363e5",
+    "afterSha256": "a18f6f1734e354e1bc5b83785a7057466128473c712d38374b24dda4677fac34",
+    "reason": "Regenerate trace_agent from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_agent-008.json",
+    "change": "rewritten",
+    "beforeSha256": "33d00b9d4463c1ea0638e3b14e2aed332e97218144a1345e5dfdb4f30da28c2d",
+    "afterSha256": "76d6f7c594d05f26c6e60b3ef2fcc112239981592aa2bda8dee3968a44f949f7",
+    "reason": "Regenerate trace_agent from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_calls-001.json",
+    "change": "rewritten",
+    "beforeSha256": "31207755658e9bab2e0998197235713b75731c7703ca05746963db9e7d76ee36",
+    "afterSha256": "16cbc12c1b51d1eabac0d24ac8e0903b6c314ae93c440d59106ff0568142abb1",
+    "reason": "Regenerate trace_calls from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_calls-002.json",
+    "change": "rewritten",
+    "beforeSha256": "fd7c9a151ca9870048adbcbbe57cddd85aa1c886c99a17c5d444ed14e9aff787",
+    "afterSha256": "a749f1f3111feb5189f1febfdcf32e38e29e47a18a2783eb5275b2a82bdf9162",
+    "reason": "Regenerate trace_calls from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_calls-003.json",
+    "change": "rewritten",
+    "beforeSha256": "685928cfddccf24ffcbf76c30d1281409819ec0c35486307f169bee77f5bbb49",
+    "afterSha256": "18d9805f76d2bdac939c31ee2ebe357cb11ad3b962526d2f6f07c2055b7420fd",
+    "reason": "Regenerate trace_calls from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_calls-004.json",
+    "change": "rewritten",
+    "beforeSha256": "caeb69a1071aad314dccc8f2b5e594bb21da20ca753c7492a1bda33ac24563da",
+    "afterSha256": "1bd8c34f23f91f150cafa75c8109d8ab8ade3e067720bf3a4d98ee4808b4cbc8",
+    "reason": "Regenerate trace_calls from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_calls-005.json",
+    "change": "rewritten",
+    "beforeSha256": "eeb5afe4ed697775cc6a113db347e8449191909969478f8e8afcff4dc2c8bcf4",
+    "afterSha256": "d9cff747638582c65860defb1c999e74cec04031b7b23acfadfa1dfef220e796",
+    "reason": "Regenerate trace_calls from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_calls-006.json",
+    "change": "rewritten",
+    "beforeSha256": "d79887e72f0d2bac90b24842a63d2d64ebc9a6e1bd6bde72ea93363522aeaa4d",
+    "afterSha256": "912727db4c903ec893babefab8f591790300b87d2ea13fa1ad8a6a33aba2be5d",
+    "reason": "Regenerate trace_calls from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_calls-007.json",
+    "change": "rewritten",
+    "beforeSha256": "f3c1889bbeda22d51a64acb6185228793d425175adcc4788b1d31ebff8faaeb7",
+    "afterSha256": "257c499da694db882f42728e4c5d059422dce816236add8e57cf216615882060",
+    "reason": "Regenerate trace_calls from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_calls-008.json",
+    "change": "rewritten",
+    "beforeSha256": "d55880f7d4b4178cadc19c4f60c73130131054eb7f691bee2aadd9464b265048",
+    "afterSha256": "9c0e9a46d35914f630922b42f80ede72404802e9f34cf31d35f2220c75e645c6",
+    "reason": "Regenerate trace_calls from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_flapping-001.json",
+    "change": "rewritten",
+    "beforeSha256": "559c21fb78b9bdd14022514cf14165244e7c4275024f696186bfcf797fc11fe6",
+    "afterSha256": "a507e676068655c5e14b84556567d10b334551999fe3c97cfbf677137d233a44",
+    "reason": "Regenerate trace_flapping from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_flapping-002.json",
+    "change": "rewritten",
+    "beforeSha256": "1847b143424bde43d80cb5a2223300d248eb3eeec0f97e7502927353a4194ee0",
+    "afterSha256": "2b109258667cded9a33faf033827b1f7701a54d62b71e65a0f7e34162c3eaae9",
+    "reason": "Regenerate trace_flapping from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_flapping-003.json",
+    "change": "rewritten",
+    "beforeSha256": "7959fdb0fbe24e7373acb240957ea6cc4796d23164a47f4ccb774fe353fd0b56",
+    "afterSha256": "b2b23aed8f6afb259c628fc81b1be1524f1ac7ee3f02d9ca822a6140337218a3",
+    "reason": "Regenerate trace_flapping from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_flapping-004.json",
+    "change": "rewritten",
+    "beforeSha256": "826c61bc14067efc02aca60744d145000432ebdc4d823a118289d4bcbbc7d0e3",
+    "afterSha256": "da7239362182d12427ae940df7e1a8f5b6e0874f858793981e4878ca305c1f70",
+    "reason": "Regenerate trace_flapping from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_flapping-005.json",
+    "change": "rewritten",
+    "beforeSha256": "83340fa9710c18eda491c194594db5a4e0b2a696200c784e171f1ce2c29648f9",
+    "afterSha256": "435c88f6ab8709340b64becc18ffc8c656207ffcdfed6346d9a60ddce7bca95c",
+    "reason": "Regenerate trace_flapping from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_flapping-006.json",
+    "change": "rewritten",
+    "beforeSha256": "30f1e82a5100f3d32a54c554fa2d7d000ba643eaae774e3967770df337b2afca",
+    "afterSha256": "f3d2f262cf798488e6324359151aed2f3df908c9fe0b3d9061b8b3eb4b15ca24",
+    "reason": "Regenerate trace_flapping from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_flapping-007.json",
+    "change": "rewritten",
+    "beforeSha256": "83d5db86c44a3431a32a9fb1462b2bc8b13ad573ef6b7734466c348248e048f5",
+    "afterSha256": "f7586b5e6686745e435ebe4d325118ffd0d3727d9b3fb09fce8855b933f6975d",
+    "reason": "Regenerate trace_flapping from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_flapping-008.json",
+    "change": "rewritten",
+    "beforeSha256": "ce85fd1eb1a59fe2518fe331d6ed4e1eb5d5c68e5296f401503d1f13a6b74080",
+    "afterSha256": "97ac5c3cb8313be27bf2f47a54915306e96320024eea10841105e0fac3d325b4",
+    "reason": "Regenerate trace_flapping from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_identical-001.json",
+    "change": "rewritten",
+    "beforeSha256": "3729a2a3531f799e523e15bec834a066bf34416300ac191b127bfbec25750307",
+    "afterSha256": "26310c138d8eea239c826762be34036018d13428b5eb7808fe76159c4979b29a",
+    "reason": "Regenerate trace_identical from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_identical-002.json",
+    "change": "rewritten",
+    "beforeSha256": "ac1efb29222d9278bc582db0b4b03204ec57b0ab6b1f593ac586518f0896c650",
+    "afterSha256": "a89a8f445d15e758bc0b484ff553e1c768ef4ad58f3ef64cc03ef0642b05ebf4",
+    "reason": "Regenerate trace_identical from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_identical-003.json",
+    "change": "rewritten",
+    "beforeSha256": "d8dff4faf1f8834dce47c22095a7e82f6d3b5b8010d40f2c5a308fcb0606e42e",
+    "afterSha256": "9362d64a3b8c60868df4b85451b99e254b7e00b841c6a73a5b864ae2f3fd656a",
+    "reason": "Regenerate trace_identical from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_identical-004.json",
+    "change": "rewritten",
+    "beforeSha256": "84058d0339ec59fb8e4831d9ebc787fa0b1b9261cf7374d0f2ba930afd78446a",
+    "afterSha256": "6e1ecb78555559c2fdbe1ba0e59c1b4b8e5abb12087fd33f557fe48713a3f18d",
+    "reason": "Regenerate trace_identical from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_identical-005.json",
+    "change": "rewritten",
+    "beforeSha256": "41abe583fa7172f2db5af23bf7ac3c73f7a48861d12da5df765aad3419e03e2f",
+    "afterSha256": "291ca3f4bfa0cbd56bfa7ea3371be636c9935a82ed6fe9a59b3060859f27135e",
+    "reason": "Regenerate trace_identical from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_identical-006.json",
+    "change": "rewritten",
+    "beforeSha256": "840e9698ffb50514a075aef29df492519c5c564e23dde413a5b353de7ab49f46",
+    "afterSha256": "965676ce04c07a65b0bdb5fe2145084d5ad3a5da540355930f0e63f4dd37631b",
+    "reason": "Regenerate trace_identical from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_identical-007.json",
+    "change": "rewritten",
+    "beforeSha256": "c25b2d62af13561223d064c819d547cd65c016b6aa8ee883929d4e33d6606a08",
+    "afterSha256": "92bcb8630ee6c2a14dc45f365a87aeeed918b6ce1b099a8fdf402f59affcd809",
+    "reason": "Regenerate trace_identical from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_identical-008.json",
+    "change": "rewritten",
+    "beforeSha256": "e59b8fe47c1b04757493370e1e5595b7d55c19c845fbeeb3d7258e44a7105d06",
+    "afterSha256": "b0c01cb0dfde4b7ec64e29873f7c71dca94ee24e0ffd2e07b2a1c5520c2c2899",
+    "reason": "Regenerate trace_identical from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_lifecycle-001.json",
+    "change": "rewritten",
+    "beforeSha256": "a03285a484643c87372da585cd89db3e5d793309cf45f5d02407787a22261c57",
+    "afterSha256": "a3b0cd3f0d6078a9eaa7c487bfafc214de8600e03d2113e41c5d3e15a3679edf",
+    "reason": "Regenerate trace_lifecycle from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_lifecycle-002.json",
+    "change": "rewritten",
+    "beforeSha256": "e92c1d3d83bd062aaa103d03395c51b58b88b4104cee6556969332c658ec4a6a",
+    "afterSha256": "41151bbe8a84f3b360272d00fb3dbef4a8f317b847167ed321066ce8fe94f549",
+    "reason": "Regenerate trace_lifecycle from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_lifecycle-003.json",
+    "change": "rewritten",
+    "beforeSha256": "2ff3c0f12237c6c7e6a01ca274b452c019b5d8ac5ea571c3c98965863c5beb2f",
+    "afterSha256": "e65d2912f5a092354d3fc939eaa83c0d21dd5c23572fdda005f4903ac1b4f343",
+    "reason": "Regenerate trace_lifecycle from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_lifecycle-004.json",
+    "change": "rewritten",
+    "beforeSha256": "9cd7b99a9b342d430c4de22a8fbc9ad54003768ff8bc91dca06b51ee93aae0cf",
+    "afterSha256": "091aaee9f96b367b8c9dcea811b5b1c1f9afab8eb665bef1594ffd958ed5284f",
+    "reason": "Regenerate trace_lifecycle from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_lifecycle-005.json",
+    "change": "rewritten",
+    "beforeSha256": "c88957de9375198ad4c18d32bb294d7a45a4672764cefaa4bc669a2e6d0d4493",
+    "afterSha256": "c5e03d6e6d80b50aaf9dcb1477759977f48e0cfedd9f20b6a7b0ff7d0f1a1413",
+    "reason": "Regenerate trace_lifecycle from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_lifecycle-006.json",
+    "change": "rewritten",
+    "beforeSha256": "d857627a10eab6af57aceaf6f81892b75e934ce9e20d483ac1a804e1827cd82f",
+    "afterSha256": "5d5606c7ec97c4aed265fa6331745291db16f839d8328256e2b975d98bbde16e",
+    "reason": "Regenerate trace_lifecycle from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_lifecycle-007.json",
+    "change": "rewritten",
+    "beforeSha256": "0f2adc64071ad503acc004cddf680bbe820a2dafa0eb78ea79aeebc02e91eee1",
+    "afterSha256": "e804ee34ecaba51ceaf17ae676e90ce00a8e6ba765683669defd9605be1c81e7",
+    "reason": "Regenerate trace_lifecycle from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_lifecycle-008.json",
+    "change": "rewritten",
+    "beforeSha256": "2d8d580bc5a2679d54d99d81ee3e308fb1ff60fa09e42dfdff0fa9edb38268d4",
+    "afterSha256": "3ff32036a0d32e2e91720368c52f92384549c2288a2aefa1cf71ac4716833e0c",
+    "reason": "Regenerate trace_lifecycle from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_screen-001.json",
+    "change": "rewritten",
+    "beforeSha256": "e2e1a7485a995772f134e19674c1e35a9dc0adb6a330155ebb909ba7aa99dc0f",
+    "afterSha256": "6c083bb193448188177be945706dbf27b68bdf7fb3a8b377d28fcb2fe550f0ab",
+    "reason": "Regenerate trace_screen from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_screen-002.json",
+    "change": "rewritten",
+    "beforeSha256": "0c75e4668137e264712b360031f2cd78f2d5a0a4b145c5119a6d1d2e86d4d228",
+    "afterSha256": "ca06f852e620c2f8732264f444f9e97935d609490305cfdd0619d536a0e9706a",
+    "reason": "Regenerate trace_screen from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_screen-003.json",
+    "change": "rewritten",
+    "beforeSha256": "20c60d971eabf8622a219abf2a73540ce69a699a05475ef7aab8d3c1eca8049d",
+    "afterSha256": "ccf850b9372b0be7ea1eaaab93323e25687fdf88e0fca1c1f3edd734bdd9054a",
+    "reason": "Regenerate trace_screen from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_screen-004.json",
+    "change": "rewritten",
+    "beforeSha256": "7f376a431f9fd57611bd6769852f41d256911e6d0873aed87b71ad78bae2a333",
+    "afterSha256": "e44f4c0c71e53eeb39efade317e905d51f35e3455ac998a2db9ba6094a2d0432",
+    "reason": "Regenerate trace_screen from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_screen-005.json",
+    "change": "rewritten",
+    "beforeSha256": "d2b36481ce74201a56d4a0721d33ece4dd243a19177f876b6d7f6a150a808d47",
+    "afterSha256": "399ad0752a7aec6aefff9cda7e09ceb25c4ec2714adc6ed7b691598ea18ef15c",
+    "reason": "Regenerate trace_screen from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_screen-006.json",
+    "change": "rewritten",
+    "beforeSha256": "625cf0ef5fd483b1e3f40f993852103429bc62d8e6a6622291a1608d1afb81e1",
+    "afterSha256": "5032c62331a924ac26f9e9ed534e8e1e53e9ea256a46b2cf74378f72b8d110ec",
+    "reason": "Regenerate trace_screen from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_screen-007.json",
+    "change": "rewritten",
+    "beforeSha256": "6003016175f06fb94056e6c15ea4842ef1e4182f4bf224ca54647a85f300098f",
+    "afterSha256": "4705428bc30b3a20d034f13e55ba77132f6bd73935366d6745d426777751a44a",
+    "reason": "Regenerate trace_screen from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_screen-008.json",
+    "change": "rewritten",
+    "beforeSha256": "cbff53610fe599d9565857737632cfa22cb91565ccb0abb1283369f3d7f1f4a0",
+    "afterSha256": "033d38321ebb2e138f5bd8073a5b2d11fb1a394668e3ff6fac170f99f249e749",
+    "reason": "Regenerate trace_screen from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_storage-001.json",
+    "change": "rewritten",
+    "beforeSha256": "c709bef0fe71b8eaa2d8b11be5c4ceaa66b0b711614032826ce018d8761c5145",
+    "afterSha256": "fb0209967ae7508caf01ea9d2eb8b7d82724a9b109ccafe54904b7c368481c8b",
+    "reason": "Regenerate trace_storage from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_storage-002.json",
+    "change": "rewritten",
+    "beforeSha256": "3b18d03066b5d720969fed817e9417ae301cb84e132215df8f7f034e122501f8",
+    "afterSha256": "ff9fd23f3532316bc9adfdd99d12459396b9fb2bce770bc6114de044eb6b51be",
+    "reason": "Regenerate trace_storage from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_storage-003.json",
+    "change": "rewritten",
+    "beforeSha256": "c14a125cca8f8601a77a880b77dc88f88e799e067c83d33313e0804386864442",
+    "afterSha256": "92ec49d6df526a4c094ddbf433bd2782ecf6e92f1ec3994c58a986b8b704730b",
+    "reason": "Regenerate trace_storage from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_storage-004.json",
+    "change": "rewritten",
+    "beforeSha256": "7a57639a3688c32cc23d7519a2b7fe79a39bee76fd5136aa20ca070875ee1e39",
+    "afterSha256": "956e4952391fe598b46ff92ffbd316a2ad4dfa6e71c227ba0411bc83feb76dac",
+    "reason": "Regenerate trace_storage from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_storage-005.json",
+    "change": "rewritten",
+    "beforeSha256": "c4b7814263cb7575245078a8bf72986136501ea731db5007354311d1a24b1a34",
+    "afterSha256": "54bb255044c7406d6c2ae3c2311509541654080caa621e212fb0cd4d8cc11bf0",
+    "reason": "Regenerate trace_storage from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_storage-006.json",
+    "change": "rewritten",
+    "beforeSha256": "b2fb9008f38fe6e801a8d52324e2f3895a18bb2cee5954b89a0ea6e024ac945d",
+    "afterSha256": "aadd04e815e43d372d499718608e895b5bb357f535498915987522d27547d0e2",
+    "reason": "Regenerate trace_storage from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_storage-007.json",
+    "change": "rewritten",
+    "beforeSha256": "b721d754d6d6e3699739ce43fbe7a16734c9c86a2d7021aeadf109aef24f1970",
+    "afterSha256": "a33e7e25ad7701dc175cb4d8786f6267f96e96a822d18a2497397910e1f6e588",
+    "reason": "Regenerate trace_storage from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/trace_storage-008.json",
+    "change": "rewritten",
+    "beforeSha256": "b5cf3911f04fc4f766c4a7dbe9a0552afd4c7bb6344b1f87dd25719ee292cae9",
+    "afterSha256": "4cdb1631d8967a8100e7d5a44c81cae190556361a659b799785ab006fe7eae4b",
+    "reason": "Regenerate trace_storage from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its simulate mode and expected pass result."
+  },
+  {
+    "file": "tests/fixtures/delivery-traces/witness_duplicates-001.json",
+    "change": "rewritten",
+    "beforeSha256": "c5a7ba3d09de920f33973d4f891970217fcf6a63bf30911fb135c83833de0ddd",
+    "afterSha256": "22784d6e62ee1359f01ffc9d4a6442e4c8483f2d654edfcc9dde07fdd08a3e33",
+    "reason": "Regenerate witness_duplicates from AD row/session relaunch observations without synthetic launch IDs or settle metadata; preserve its check mode and expected violation result."
+  }
+]
