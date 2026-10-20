@@ -136,8 +136,26 @@ export function matrixDockerArgs(name: string, image: string, job: MatrixJob, ke
     ...['ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL', 'REAL_AGENT_AI_MODEL'].flatMap(key => ['--env', key]),
     image, job.version, job.runtimeLatest ? '1' : '0', ...(keepGoing ? ['--keep-going'] : []), ...job.invocations.map(i => `${i.script}:${i.trial}:${i.model}`)]
 }
-export interface MatrixOptions { output: string; repo: string; planOnly: boolean; codexOnly?: boolean; keepGoing?: boolean }
-const MATRIX_USAGE = 'bun scripts/real-agent-matrix.ts [--output DIR] [--plan] [--codex-only] [--keep-going]'
+export interface MatrixOptions { output: string; repo: string; planOnly: boolean; codexOnly?: boolean; claudeVersions?: string[]; aiOnly?: boolean; aiCriteria?: number[]; keepGoing?: boolean }
+const MATRIX_USAGE = 'bun scripts/real-agent-matrix.ts [--output DIR] [--plan] [--codex-only | --claude-versions V1,V2 [--ai-only [--ai-criteria 15,...]]] [--keep-going]'
+
+function validAICriteria(criteria: number[]): boolean {
+  return criteria.length > 0 && new Set(criteria).size === criteria.length
+    && criteria.every(ac => AI_CRITERIA.some(known => known === ac))
+}
+
+/** Explicit Claude gate: every gate, heavy scenario and AI criterion, three
+ * trials per version. No Codex admission or host login access in this mode. */
+export function selectedClaudePlan(versions: string[], gates: string[], heavyNames: readonly string[], aiOnly = false, aiCriteria?: number[]): MatrixJob[] {
+  if (!versions.length || versions.some(v => !exactVersion(v)) || new Set(versions).size !== versions.length)
+    throw new Error('Claude versions must be unique exact versions')
+  if (aiCriteria && (!aiOnly || !validAICriteria(aiCriteria))) throw new Error('Invalid AI criteria selection')
+  const full = matrixPlan(versions[0]!, gates, heavyNames).find(job => job.version === AI_VERSION)!
+  return versions.map(version => ({ version, runtimeLatest: false, invocations: full.invocations
+    .filter(item => item.trial === 1 && (!aiOnly || item.model === 'opus')
+      && (!aiCriteria || aiCriteria.some(ac => item.script === `real-agent/test-${100 + ac}-fmk-real-ai-ac${ac}.sh`)))
+    .flatMap(item => [1, 2, 3].map(trial => ({ ...item, trial }))) }))
+}
 /** Resolve existing ancestors too: output need not exist yet, but a link may. */
 function resolvedPath(path: string): string {
   let parent = resolve(path)
@@ -167,8 +185,10 @@ function writePrivate(path: string, content: string, secrets: readonly string[])
   try { writeFileSync(fd, content) } finally { closeSync(fd) }
 }
 export function matrixOptions(args: readonly string[], repo = resolve(dirname(import.meta.path), '..')): MatrixOptions {
-  let output = join(tmpdir(), `cscb-real-agent-${new Date().toISOString().replace(/[^0-9]/g, '')}`), planOnly = false, codexOnly = false, keepGoing = false
+  let output = join(tmpdir(), `cscb-real-agent-${new Date().toISOString().replace(/[^0-9]/g, '')}`), planOnly = false, codexOnly = false, keepGoing = false, aiOnly = false
   const seen = new Set<string>()
+  let claudeVersions: string[] | undefined
+  let aiCriteria: number[] | undefined
   for (let i = 0; i < args.length; i++) {
     const option = args[i]!
     if (seen.has(option)) throw new Error(`Usage: ${MATRIX_USAGE}`)
@@ -176,19 +196,35 @@ export function matrixOptions(args: readonly string[], repo = resolve(dirname(im
     if (option === '--plan') planOnly = true
     else if (option === '--codex-only') codexOnly = true
     else if (option === '--keep-going') keepGoing = true
+    else if (option === '--ai-only') aiOnly = true
+    else if (option === '--ai-criteria' && args[i + 1]) {
+      const values = args[++i]!.split(',')
+      aiCriteria = values.map(Number)
+      if (values.some((value, index) => value !== String(aiCriteria![index])) || !validAICriteria(aiCriteria))
+        throw new Error(`Usage: ${MATRIX_USAGE}`)
+    }
+    else if (option === '--claude-versions' && args[i + 1]) {
+      claudeVersions = args[++i]!.split(',')
+      if (claudeVersions.some(v => !exactVersion(v)) || new Set(claudeVersions).size !== claudeVersions.length)
+        throw new Error(`Usage: ${MATRIX_USAGE}`)
+    }
     else if (option === '--output' && args[i + 1] && !args[i + 1]!.startsWith('-')) output = resolve(args[++i]!)
     else throw new Error(`Usage: ${MATRIX_USAGE}`)
   }
   // Never permit secrets/logs inside the source checkout, nor /test-results.
   outputDirectory(output, repo)
-  return { output, repo, planOnly, ...(codexOnly ? { codexOnly: true } : {}), ...(keepGoing ? { keepGoing: true } : {}) }
+  if (codexOnly && claudeVersions || aiOnly && !claudeVersions || aiCriteria && !aiOnly) throw new Error(`Usage: ${MATRIX_USAGE}`)
+  return { output, repo, planOnly, ...(codexOnly ? { codexOnly: true } : {}), ...(claudeVersions ? { claudeVersions } : {}), ...(aiOnly ? { aiOnly: true } : {}), ...(aiCriteria ? { aiCriteria } : {}), ...(keepGoing ? { keepGoing: true } : {}) }
 }
 export async function runMatrix(options: MatrixOptions): Promise<boolean> {
   // b.omv SR-14.7: focused acceptance uses the same local Codex lifecycle.
   // Its distinct verdict must never certify the unexecuted Claude matrix.
   const codexOnly = options.codexOnly === true
-  const selection = codexOnly ? 'codex-only' : 'full'
-  const recordPrefix = codexOnly ? 'REAL-AGENT-CODEX' : 'REAL-AGENT'
+  const claudeOnly = options.claudeVersions !== undefined
+  if (claudeOnly && codexOnly || options.aiOnly && !claudeOnly) throw new Error('Conflicting matrix selections')
+  if (options.aiCriteria && (!options.aiOnly || !validAICriteria(options.aiCriteria))) throw new Error('Invalid AI criteria selection')
+  const selection = codexOnly ? 'codex-only' : options.aiCriteria ? 'claude-ai-selected' : options.aiOnly ? 'claude-ai-only' : claudeOnly ? 'claude-only' : 'full'
+  const recordPrefix = codexOnly ? 'REAL-AGENT-CODEX' : options.aiCriteria ? 'REAL-AGENT-CLAUDE-AI-SELECTED' : options.aiOnly ? 'REAL-AGENT-CLAUDE-AI' : claudeOnly ? 'REAL-AGENT-CLAUDE' : 'REAL-AGENT'
   const key = codexOnly ? '' : process.env.CI_ANTHROPIC_API_KEY ?? '', model = codexOnly ? '' : process.env.CI_ANTHROPIC_MODEL ?? ''
   // Decision 19: an owner-selected available model can run the AI trials.
   // This is explicit routing, never a refusal-triggered or hidden fallback.
@@ -315,7 +351,7 @@ export async function runMatrix(options: MatrixOptions): Promise<boolean> {
   let passed = false, planned = false, jobFailed = false
   const totals = { input: 0, output: 0, cache_read: 0, cache_creation: 0, duplicates: 0 }
   try {
-    if (!options.planOnly) {
+    if (!options.planOnly && !claudeOnly) {
       codexLogin = await acquireCodexLogin({ env: process.env, uid: process.getuid!(), cancelled: () => stopped, deps: realCodexLoginDeps(path => {
         const opened = openLockFile(path); if (!opened.ok) throw new Error('Codex lock unavailable'); return opened.value
       }) })
@@ -326,7 +362,7 @@ export async function runMatrix(options: MatrixOptions): Promise<boolean> {
       say(`recorded: codex-model ${codexLogin.model}`)
     }
     let latest: string | null = null
-    if (!codexOnly) {
+    if (!codexOnly && !claudeOnly) {
       const latestResponse = await fetch('https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases/latest', { signal: AbortSignal.any([aborted.signal, AbortSignal.timeout(30_000)]) })
       if (!latestResponse.ok) throw new Error('Could not resolve native runtime-latest')
       latest = (await latestResponse.text()).trim()
@@ -335,14 +371,16 @@ export async function runMatrix(options: MatrixOptions): Promise<boolean> {
     const gates = codexOnly ? [] : discoverGateScripts(readdirSync(join(options.repo, 'tests/integration')))
     const heavyDir = join(options.repo, 'tests/real-agent')
     const heavyNames = existsSync(heavyDir) ? readdirSync(heavyDir) : []
-    const jobs = codexOnly ? [] : matrixPlan(latest!, gates, heavyNames)
-    const localAgents = [localCodexExtension(heavyNames)]
+    const jobs = codexOnly ? [] : claudeOnly ? selectedClaudePlan(options.claudeVersions!, gates, heavyNames, options.aiOnly, options.aiCriteria) : matrixPlan(latest!, gates, heavyNames)
+    const localAgents = claudeOnly ? [] : [localCodexExtension(heavyNames)]
     const totalInvocations = jobs.reduce((count, job) => count + job.invocations.length, 0) + localAgents.reduce((count, agent) => count + agent.invocations.length, 0)
     say(`recorded: matrix ${JSON.stringify({ runId, selection, totalInvocations, latest, model: codexOnly ? null : model, aiModel: codexOnly ? null : aiModel, jobs: jobs.map(j => ({ version: j.version, runtimeLatest: j.runtimeLatest, scenarios: j.invocations.length })) })}`)
     writePrivate(join(output, 'plan.json'), JSON.stringify({ runId, selection, totalInvocations, keepGoing: options.keepGoing === true, model: codexOnly ? null : model, aiModel: codexOnly ? null : aiModel, codexModel: codexLogin?.model ?? null, jobs, localAgents, scheduler: codexOnly ? null : SCHEDULER_JOB_CONTRACT }, null, 2) + '\n', secrets)
     if (options.planOnly) { planned = true; return true }
-    const survivors = await run(codexLoginContainerListArgs(), 30_000, true, false, true)
-    assertNoCodexLoginContainers(survivors.code, survivors.text)
+    if (!claudeOnly) {
+      const survivors = await run(codexLoginContainerListArgs(), 30_000, true, false, true)
+      assertNoCodexLoginContainers(survivors.code, survivors.text)
+    }
     if ((await run(['docker', 'image', 'inspect', 'cscb-ci-base:v8', '--format', '{{.Id}}'], 30_000)).code !== 0) {
       if ((await run(['bash', 'scripts/ci-base-build.sh'], 30 * 60_000)).code !== 0) throw new Error('Heavy base build failed')
     }
@@ -390,6 +428,7 @@ export async function runMatrix(options: MatrixOptions): Promise<boolean> {
           if (cleanup.code !== 0) throw new Error('Matrix container cleanup failed')
         }
       }
+      if (claudeOnly) { passed = !jobFailed; return passed }
       if (!codexLogin) throw new Error('Local Codex login was not admitted')
       const name = `${runId}-codex`, extension = localAgents[0]!
       evidenceContext = { job: 'codex', version: CODEX_VERSION }

@@ -503,6 +503,23 @@ assertions).
 
 ### Real Claude gate and heavy legs (b.omv SR-14)
 
+Scenarios that kill a bot use `real_kill_and_reconcile`: retain and validate
+the AD kill result, stop CSCB, respect pending grace, then run the documented
+bounded `find-missing`/status sequence (including the second kill if needed).
+Errors or a still-live row fail the fixture for operator diagnosis.
+The fixture retains the killed row's AD instance and native `session_id`,
+and verifies that this same conversation reaches `ended` or `missing`.
+After restarting CSCB, `real_wait_relaunch` requires that row to become live
+with either a replacement `session_id` or a new AD `last_seen_at` for the
+resumed session, plus an MCP connection logged after the stop.
+AD exposes `launch_started_at` only while pending; an old connection line
+cannot satisfy the check.
+
+The busy scenario pre-allows Slack replies, edits and reactions in its disposable
+Claude HOME so acknowledgement choices cannot open extra permission dialogs.
+Its two deliberate Bash probes still ask for permission. Recovery start and
+completion markers distinguish earlier failures from the kill/resume phase.
+
 Every real-agent failure retains metadata for all main and subagent transcript
 records from its isolated HOME, plus structured AD row and exact-receipt
 evidence captured before retirement. Message text, tool arguments/results and native terminal text are
@@ -755,8 +772,8 @@ independently of timestamps, and stop at another take-in; earlier turns or
 sessions cannot supply the response.
 
 Only timed `environment`, `model`, `agent_listing_delta`,
-`mcp_instructions_delta`, `skill_listing` and `total_tokens_reminder`
-attachments use decision 24's structural membership rule: their `parentUuid`
+`mcp_instructions_delta`, `skill_listing`, `total_tokens_reminder`,
+`deferred_tools_delta` and `deferred_tools_record` attachments use decision 24's structural membership rule: their `parentUuid`
 chain must reach this receipt, their file offset must follow the receipt's
 predecessor, and their time must be strictly later than the previous turn's
 last record with a finite timestamp, as amended on 2026-10-19. Untimed
@@ -765,6 +782,8 @@ bookkeeping records such as `cost-state`, `last-prompt` and
 or a previous turn with no finite timestamp, has no previous-turn time floor. There is no fixed millisecond allowance.
 The captured 6 ms and AC23 resume regressions and timing-sweep inventory are documented in
 [`fixtures/native-attachment-membership/README.md`](fixtures/native-attachment-membership/README.md).
+Setup records are not time anchors for their children; each non-setup record
+is compared exactly with its nearest non-setup ancestor and receipt.
 Assistant, tool-result and system records retain strict timestamp ordering;
 receipt/send checks, exact JSON, model identity, completion and action checks
 remain unchanged.
@@ -775,6 +794,13 @@ floor), the only untimed informational exclusions are exact three-field records 
 `permission-mode`/`permissionMode`, `atis-latch`/`atis`,
 `last-prompt`/`leafUuid` and `ai-title`/`aiTitle`. They carry no timestamp,
 UUID, parent UUID or text; added fields and other untimed records remain checked.
+`api-request-blob` is not a blanket informational exemption. AC15 separately
+recognizes the native request-replay envelope and understood content shapes,
+then recursively checks embedded tool uses against the same reply/ToolSearch
+rule before skipping its clock. Unknown/malformed shapes and forbidden actions
+still fail. Echoes cannot supply receipt or completion evidence. AC11 retains
+its existing rejection. See the captured request-echo inventory in the fixture
+README above.
 
 Ordinary answers must belong to the delivered item's own native turn;
 foreign, stale, sidechain, synthetic, API-error or unfinished responses

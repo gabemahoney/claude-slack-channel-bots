@@ -8,8 +8,9 @@ shift 2
 keep_going=0
 if [[ "${1:-}" == --keep-going ]]; then keep_going=1; shift; fi
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 64
-if [[ "$latest" == 1 && ! -x "/opt/claude-code/$version/claude" ]]; then
-    # Latest was resolved once by the coordinator, never resolved again here.
+if [[ ! -x "/opt/claude-code/$version/claude" ]]; then
+    # The coordinator supplies an exact version, whether explicitly selected or
+    # resolved from latest once. Never resolve a moving version in this job.
     bash /opt/cscb-ci/install-real-agents.sh "$version"
 fi
 actual="$("/opt/claude-code/$version/claude" --version)"

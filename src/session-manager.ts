@@ -487,6 +487,7 @@ import {
   ErrSpawnCapReached,
   ErrSpawnNotFound,
   ErrSpawnNotInteractive,
+  ErrDialogMaybeOpen,
   ErrSpawnNotResumable,
   ErrUnknownErrorName,
   ERR_SPAWN_NOT_FOUND_NAME,
@@ -3635,8 +3636,8 @@ export const DEAD_SESSION_CAUSES = Object.freeze([
  *       wait's `status` read or at the ladder's prompt-row `read-pane`;
  *     - `row-read-finished`: the launch wait read the row `ended` or
  *       `missing`.
- * The reconnect answers only `tmux-gone`, `row-not-interactive` and
- * `row-absent` (`ReconnectDeadSessionCause`).
+ * The reconnect also answers `row-read-finished` when reconciliation after
+ * a dialog hold finds a finished row (`ReconnectDeadSessionCause`).
  */
 export type DeadSessionCause = (typeof DEAD_SESSION_CAUSES)[number]
 
@@ -3645,6 +3646,7 @@ export type ReconnectDeadSessionCause =
   | typeof DEAD_SESSION_CAUSE_TMUX_GONE
   | typeof DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE
   | typeof DEAD_SESSION_CAUSE_ROW_ABSENT
+  | typeof DEAD_SESSION_CAUSE_ROW_READ_FINISHED
 
 /**
  * `reconnectMcpWithCause`'s answer: the outcome, with what goes with it. A
@@ -3656,6 +3658,8 @@ export type ReconnectResult =
       outcome: 'dead-session'
       /** What agent-director answered. */
       deadCause: ReconnectDeadSessionCause
+      /** State read after reconciling a dialog-held disconnected launch. */
+      finishedState?: string
     }
   | {
       outcome: 'transient'
@@ -3822,6 +3826,27 @@ async function reconnectAnswerTo(key: string, lastRead: LatchRowState, ref: stri
     return { outcome: 'transient', latched: true }
   }
   console.error(reconnectTransientLine(ref, failure, errorClass))
+  if (isAdErrorInstance(err, ErrDialogMaybeOpen)) {
+    if (personaLatchedNow(key)) return { outcome: 'transient', latched: true }
+    if (isOwnRowOldLifeHeld(key) || heldGateReadingOf(key) !== undefined || waitsOnKillFailedHold(key)) return { outcome: 'transient' }
+    // AD checks permission holds before process liveness at send-keys.
+    // Startup and subsequent reconnects must still reconcile a launch that
+    // died without SessionEnd. This refusal itself is never death evidence.
+    // Use the bounded shared sweep (including AD's pending grace), then let
+    // AD's fresh row alone route the caller into its existing resume path.
+    const sweep = await reconcileMissingSweep(key, 'reconnect dialog hold', ref, { nextStepGetKey: key })
+    if (sweep === FIND_MISSING_LATCHED) return { outcome: 'transient', latched: true }
+    if (sweep === FIND_MISSING_REFUSED) return { outcome: 'transient' }
+    const read = await readPersonaOwnRow(key, { site: 'reconnect', what: 'get after dialog-held sweep', ref })
+    if (personaLatchedNow(key) || read.kind === OWN_ROW_READ_LATCHED || (read.kind === OWN_ROW_READ_ROW && read.latched)) {
+      return { outcome: 'transient', latched: true }
+    }
+    if (read.kind === OWN_ROW_READ_ROW && AGENT_DIRECTOR_DEAD_STATES.has(read.row.state)) {
+      return { outcome: 'dead-session', deadCause: DEAD_SESSION_CAUSE_ROW_READ_FINISHED, finishedState: read.row.state }
+    }
+    // A live/unverified or unreadable row remains held. No retry key,
+    // Enter, pane read, kill, or launch is authorized by the refusal.
+  }
   return { outcome: 'transient' }
 }
 
@@ -5235,13 +5260,15 @@ export function escalateDeadSweepLine(key: string, verdict: EscalateDeadVerdict)
  * - from a row read: `row-absent-at-pane-read`, the row was absent
  *   (`ErrSpawnNotFound`) at the prompt-row verdict's `read-pane`, which takes the GONE
  *   column without being a GONE (b.jg5 SRJ-117), or at the reconnect's
- *   `send-keys` (cause `row-absent`, b.jg5 SRJ-118).
+ *   `send-keys` (cause `row-absent`, b.jg5 SRJ-118); or
+ *   `row-read-finished`, the fresh row after a dialog-held reconnect's
+ *   liveness sweep read `ended` or `missing`.
  * Neither a GONE (b.jg5 SRJ-613) nor a refusal as not interactive nor a row
  * read proves the worker's process gone, and every evidence text
  * (`ESCALATE_DEAD_EVIDENCE`) says only what was observed. Each verdict
  * records its origin as one of the labels above, apart from its evidence
  * text. Only the GONE-based verdicts are dead evidence (`isDeadEvidence`,
- * b.jg5 SRJ-611); `row-not-interactive` and `row-absent-at-pane-read` never
+ * b.jg5 SRJ-611); `row-not-interactive`, `row-read-finished` and `row-absent-at-pane-read` never
  * are, and never by themselves lead to a kill, a delete or a live-row
  * sequence (SRJ-609, SRJ-611).
  */
@@ -5254,6 +5281,7 @@ export type EscalateDeadVerdict = (typeof ESCALATE_DEAD_VERDICTS)[number]
 export const ESCALATE_DEAD_VERDICTS = Object.freeze([
   'dead-session',
   'row-not-interactive',
+  'row-read-finished',
   'row-absent-at-pane-read',
   'prompt-row-tmux-gone',
 ] as const)
@@ -5285,6 +5313,8 @@ export const ESCALATE_DEAD_EVIDENCE: Readonly<Record<EscalateDeadVerdict, string
     "agent-director's send-keys answered GONE (ErrTmuxSendKeys) at the /mcp reconnect: no session of the row's launch was found",
   'row-not-interactive':
     "row not interactive (agent-director refused the /mcp reconnect keystrokes as not interactive: the row finished, or a pending row's session may be another launch's; this does not prove the worker gone)",
+  'row-read-finished':
+    "agent-director's row read after reconciling a dialog-held reconnect found the row ended or missing: a row read, not a GONE",
   'row-absent-at-pane-read':
     "its agent-director row was absent (ErrSpawnNotFound) at the pane read or the /mcp reconnect's send-keys: a row read, not a GONE",
   'prompt-row-tmux-gone':
@@ -5295,7 +5325,8 @@ export const ESCALATE_DEAD_EVIDENCE: Readonly<Record<EscalateDeadVerdict, string
  * The escalate-dead verdict the restart path's reconnect adapter sweeps with
  * for a `dead-session` reconnect of cause `cause` (b.jg5 SRJ-118, SRJ-609):
  * `tmux-gone` gives `dead-session`, `row-not-interactive` gives
- * `row-not-interactive`, and `row-absent` gives `row-absent-at-pane-read`,
+ * `row-not-interactive`, `row-read-finished` stays `row-read-finished`,
+ * and `row-absent` gives `row-absent-at-pane-read`,
  * never `tmux-gone`'s verdict, so each verdict keeps its cause's dead
  * evidence answer (b.jg5 SRJ-611). Pure.
  */
@@ -5305,6 +5336,8 @@ export function escalateDeadVerdictOfCause(cause: ReconnectDeadSessionCause): Es
       return 'dead-session'
     case DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE:
       return 'row-not-interactive'
+    case DEAD_SESSION_CAUSE_ROW_READ_FINISHED:
+      return 'row-read-finished'
     case DEAD_SESSION_CAUSE_ROW_ABSENT:
       return ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ
   }
@@ -5997,7 +6030,7 @@ export async function waitForWaitingAndReconnectWithCause(
  */
 async function reconnectInWait(key: string, ref: string, wait: WorkingRowWait, lastRead: LatchRowState): Promise<WaitEnd> {
   const result = await reconnectMcpWithCause(key, lastRead, ref)
-  if (result.outcome === 'dead-session') return { outcome: 'dead-session', deadCause: result.deadCause }
+  if (result.outcome === 'dead-session') return { outcome: 'dead-session', deadCause: result.deadCause, ...(result.finishedState === undefined ? {} : { finishedState: result.finishedState }) }
   if (result.outcome === 'transient') {
     if (result.latched) wait.latched = true
     if (result.stopping) wait.stopping = true
@@ -11773,7 +11806,7 @@ async function ladderGetThenAct(run: LadderRun): Promise<SpawnPersonaResult> {
     // the worker is gone (SRJ-609, SRJ-611). A 'transient' answer types
     // nothing and counts nothing.
     const result = await reconnectMcpWithCause(key, lastRead, ref)
-    if (result.outcome === 'dead-session') return deadSessionRoute(run, row, state, result.deadCause, undefined, lastRead)
+    if (result.outcome === 'dead-session') return deadSessionRoute(run, row, state, result.deadCause, result.finishedState, lastRead)
     if (result.outcome === 'transient') return transientReconnectResult(key, ref, state, result)
     return { key, action: 'reconnected' }
   }

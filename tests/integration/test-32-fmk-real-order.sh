@@ -4,6 +4,7 @@ set -euo pipefail
 TEST_NAME="test-32-fmk-real-order"
 source "$(dirname "$0")/lib/scenario.sh"
 source "$(dirname "$0")/lib/real-scenario.sh"
+source "$(dirname "$0")/lib/real-recovery.sh"
 CASE_ASSERT="${SCENARIO_FIXTURES}/real-case-assertions.ts"
 case_assert() { bun "${CASE_ASSERT}" "$1" "${SLACK_STATE_DIR}" "${REAL_KEY}" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" "${@:2}"; }
 real_prepare
@@ -47,10 +48,9 @@ real_fault send-keys key=Enter swallow 1
 real_fault send-keys no_enter swallow 1
 for n in {1..20}; do real_dm "${REAL_LABEL}" "fault order ${n}"; done
 wait_until 180 'first send fault never applied' case_assert fault swallow 1
-real_ad kill --instance-id "$(real_instance "${REAL_KEY}")" >/dev/null
-stop_server
+real_kill_and_reconcile "${REAL_KEY}"
 start_server --live
-real_wait_launch "${REAL_KEY}"
+real_wait_relaunch "${REAL_KEY}"
 real_wait_delivery "${REAL_KEY}" 33
 # Ready-state latency is sequential, with observable idle between samples.
 for n in {1..20}; do

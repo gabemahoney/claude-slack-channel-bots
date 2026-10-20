@@ -247,8 +247,10 @@ test.each(['claude', 'codex'] as const)('recursive %s retention includes subagen
 })
 
 test('AD failure evidence retains only structured state and withholds arbitrary fields', () => {
-  expect(projectFailureState({ state: 'waiting', family_state: 'working', transcript_status: 'present', pane: 'PRIVATE', message: 'PRIVATE' }) as Record<string, unknown>)
-    .toEqual({ state: 'waiting', family_state: 'working', transcript_status: 'present' })
+  for (const state of ['waiting', 'ask_user', 'check_permission', 'missing']) {
+    expect(projectFailureState({ state, family_state: 'working', transcript_status: 'present', pane: 'PRIVATE', message: 'PRIVATE' }) as Record<string, unknown>)
+      .toEqual({ state, family_state: 'working', transcript_status: 'present' })
+  }
   expect(projectFailureState({ state: 'PRIVATE STATE', family_state: { text: 'PRIVATE' } }) as Record<string, unknown>).toEqual({ state: 'unreadable', family_state: '<object>' })
   expect(projectFailureState(null)).toEqual({ unavailable: true })
 })

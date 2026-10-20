@@ -4,6 +4,7 @@ set -euo pipefail
 TEST_NAME="test-33-fmk-real-keys"
 source "$(dirname "$0")/lib/scenario.sh"
 source "$(dirname "$0")/lib/real-scenario.sh"
+source "$(dirname "$0")/lib/real-recovery.sh"
 CASE_ASSERT="${SCENARIO_FIXTURES}/real-case-assertions.ts"
 case_assert() { bun "${CASE_ASSERT}" "$1" "${SLACK_STATE_DIR}" "${REAL_KEY}" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" "${@:2}"; }
 real_prepare
@@ -37,11 +38,10 @@ real_wait_idle "${REAL_KEY}"
 real_fault send-keys no_enter swallow 3
 real_dm "${REAL_LABEL}" 'restart resets an in-flight retry episode'
 wait_until 180 'third swallowed reset text not reached' case_assert fault swallow 8
-real_ad kill --instance-id "$(real_instance "${REAL_KEY}")" >/dev/null
+real_kill_and_reconcile "${REAL_KEY}"
 real_fault send-keys no_enter swallow 1
-stop_server
 start_server --live
-real_wait_launch "${REAL_KEY}"
+real_wait_relaunch "${REAL_KEY}"
 real_wait_delivery "${REAL_KEY}" 4
 case_assert reset-spacing 4
 UNKNOWN_COUNT=4
