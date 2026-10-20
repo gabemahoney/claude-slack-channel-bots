@@ -32,6 +32,7 @@
 import { isFrom, messageText, tsAfter, type BotRef, type SlackMessage } from '../lib/human-session.ts'
 import { MINUTE, REPLY_TIMEOUT_MS, SECOND } from '../lib/wait.ts'
 import type { CheckContext } from './context.ts'
+import { sendPersonaText } from './agent-control.ts'
 import { deliveryLines, waitDeliveryLines } from './delivery-evidence.ts'
 import { expectOneTag, tagAttr } from './channel-checks.ts'
 import { Findings, skipped, type CheckDef } from './framework.ts'
@@ -479,11 +480,7 @@ export const check18: CheckDef<CheckContext> = {
     ctx.promptGuard.expect({ persona: 'c', command: CHECK18_PROMPT })
     const m = await mark(ctx)
     const tm = await tmark(ctx)
-    const typed = await guarded(
-      ctx,
-      `tmux send-keys -t slack_bot_persona_c -l ${q('Run a shell command that writes the current date to a file named dm-prompt-c.txt in your working directory. Do not post anything to Slack.')} && sleep 1 && tmux send-keys -t slack_bot_persona_c Enter`,
-    )
-    if (!f.expect(typed.ok && typed.code === 0, "could not type into C's session")) return f.result()
+    await sendPersonaText(ctx, 'c', 'Run a shell command that writes the current date to a file named dm-prompt-c.txt in your working directory. Do not post anything to Slack.')
     const posts = await waitPromptPost(ctx, tm, 'c', 3 * MINUTE, 1, CHECK18_PROMPT)
     if (!f.expect(posts !== null, 'C posted no permission prompt')) return f.result()
     const post = posts![0]!
