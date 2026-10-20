@@ -57,6 +57,10 @@ export function policyReceipt(k: DeliveryPolicyKnowledge, pair: DeliveryPair): n
 export function firstSendGate(r: DeliveryReading, e: DeliveryPolicyEngine): boolean {
   return r.up && !r.latched && !r.held && r.marker && r.relay && r.mcp && r.row === 'waiting' && e.timers.settle === 0
 }
+/** Enter reconciles an existing draft before MCP can be reconnected. */
+export function recoveryEnterGate(r: DeliveryReading, e: DeliveryPolicyEngine): boolean {
+  return reconnectGate(r) && e.timers.settle === 0
+}
 export function retypeGate(r: DeliveryReading, e: DeliveryPolicyEngine): boolean {
   return firstSendGate(r, e) && r.receipts.length === 0 && e.timers.backoff === 0
 }
@@ -84,11 +88,11 @@ export function decideEngine(k: DeliveryPolicyKnowledge): EngineAction {
   if (e.phase === 'recovery-enter') return r.gate === 'delivery' ? 'pressEnter' : r.gate === 'free' ? 'requestGate' : 'wait'
   if (e.phase === 'receipt' && e.timers.receipt === 0) return 'releaseAttempt'
   if (hasTarget && !k.p.fixed.includes(ip[0])) return 'fixText'
-  if (k.g.deferred && !r.mcp && k.g.due && r.gate === 'free') return 'deferReconnect'
-  if (hasTarget && e.phase === 'ready' && e.timers.notNow === 0 && (retype ? retypeGate(r, e) : firstSendGate(r, e)) && (!retype || recoverEnter || (e.retypes[ip[0]] ?? 0) < (k.MaxRetypes ?? Infinity))) {
+  if (hasTarget && e.phase === 'ready' && e.timers.notNow === 0 && (recoverEnter ? recoveryEnterGate(r, e) && r.receipts.length === 0 && e.timers.backoff === 0 : retype ? retypeGate(r, e) : firstSendGate(r, e)) && (!retype || recoverEnter || (e.retypes[ip[0]] ?? 0) < (k.MaxRetypes ?? Infinity))) {
     if (r.gate !== 'delivery') return 'requestGate'
     return recoverEnter ? 'recordRecoveryEnter' : 'recordSend'
   }
+  if (k.g.deferred && !r.mcp && k.g.due && r.gate === 'free') return 'deferReconnect'
   if (hasTarget && retype && (e.retypes[ip[0]] ?? 0) >= 1 && !e.noticed.includes(ip[0])) return 'recordNotice'
   if (Object.values(e.timers).some(t => t > 0)) return 'expireTimers'
   return 'wait'

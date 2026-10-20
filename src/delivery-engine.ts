@@ -4,7 +4,7 @@ import type { Client, GetResult, SendKeysParams } from 'agent-director'
 import type { DeliveryQueue, QueueItem, QueueRecord, SentRecord } from './delivery-queue.ts'
 import { createDeliveryReceiptReader, effectiveSends, type DeliveryReceiptReader, type ReceiptObservation } from './delivery-receipt.ts'
 import { type DeliveryLifecycle, type DeliveryClock, systemDeliveryClock, NOT_NOW_RETRY_MS } from './delivery-lifecycle.ts'
-import { decideEngine, decideGate, firstSendGate, retypeGate, selectDeliveryTarget, NO_DELIVERY_PAIR, createDeliveryReading, createDeliveryPolicyState, type DeliveryPair, type DeliveryPolicyEngine, type DeliveryPolicyKnowledge, type DeliveryReading, type DeliveryTimer } from './delivery-policy.ts'
+import { decideEngine, decideGate, firstSendGate, recoveryEnterGate, latestDeliveryAttempt, retypeGate, selectDeliveryTarget, NO_DELIVERY_PAIR, createDeliveryReading, createDeliveryPolicyState, type DeliveryPair, type DeliveryPolicyEngine, type DeliveryPolicyKnowledge, type DeliveryReading, type DeliveryTimer } from './delivery-policy.ts'
 import { classifyAdError, isAdErrorInstance, classifyWithInvalidFlagsRecheck, type AdCall } from './ad-error-class.ts'
 import { ErrInvalidFlags, ErrSpawnNotFound, ErrSpawnNotInteractive, ErrSendKeysWhileRelayed, ErrRelayFallenBack, ErrDialogMaybeOpen, ErrPaneChanged, ErrSystemInstallDisappeared } from './agent-director-errors.ts'
 import { LAUNCH_SETTLE_MS, ENTER_DELAY_MS, RECEIPT_WAIT_MS, RETYPE_BACKOFF_MS, DELIVERY_MAX_AD_CALLS_PER_S, DELIVERY_ROW_POLL_MS } from './delivery-constants.ts'
@@ -91,7 +91,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     reader: DeliveryReceiptReader; receiptTarget?: DeliveryPair; receiptAttempt?: number; deadlines: Partial<Record<DeliveryTimer, number>>; budget: () => void
     rowAt: number; waitingAt?: number; notNowStep: number; retryStep: number; appendRetryStep: number; lastSeq?: number; lastPart?: number
     pending?: { record: QueueRecord; complete(): void }; lease?: () => void; timer?: unknown; busy?: Promise<void>; stopped: boolean
-    recover: boolean; restarted?: string; receiptWorking: boolean; pollAfter: number; snapshot?: DeliveryPolicyKnowledge; lastRetypeEvent?: number; dialogHold: boolean; dialogMaybeOpen: boolean
+    restarted?: string; receiptWorking: boolean; pollAfter: number; snapshot?: DeliveryPolicyKnowledge; lastRetypeEvent?: number; dialogHold: boolean; dialogMaybeOpen: boolean
   }
   const states = new Map<string, State>(), budgets = new Map<string, () => void>()
   // Empty queues retire their engine, not the already observed launch. Keep
@@ -102,7 +102,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
   function emit(event: DeliveryEngineEvent): void { try { void Promise.resolve(deps.onEvent?.(event)).catch(() => {}) } catch {} }
   function budget(key: string): () => void { let b = budgets.get(key); if (!b) { b = createDeliveryCallBudget(clock.now); budgets.set(key, b) }; return b }
   function create(key: string): State {
-    const s: State = { e: createDeliveryPolicyState(), reading: createDeliveryReading(), reader: deps.receiptReader?.() ?? createDeliveryReceiptReader(), deadlines: {}, budget: budget(key), rowAt: -Infinity, notNowStep: 0, retryStep: 0, appendRetryStep: 0, stopped: false, recover: true, receiptWorking: false, pollAfter: 0, dialogHold: false, dialogMaybeOpen: false }
+    const s: State = { e: createDeliveryPolicyState(), reading: createDeliveryReading(), reader: deps.receiptReader?.() ?? createDeliveryReceiptReader(), deadlines: {}, budget: budget(key), rowAt: -Infinity, notNowStep: 0, retryStep: 0, appendRetryStep: 0, stopped: false, receiptWorking: false, pollAfter: 0, dialogHold: false, dialogMaybeOpen: false }
     states.set(key, s); life.engineRunning(key, true); return s
   }
   function release(s: State): void { s.lease?.(); s.lease = undefined; s.e.request = 'none' }
@@ -202,7 +202,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
         } else if (r.kind === 'delivered') delivered.push([r.seq, r.part])
       }
     }
-    if (deps.isConnected(key)) life.clearDeferred(key)
+    if (deps.isConnected(key) && !life.reconnectInput(key)) life.clearDeferred(key)
     const deferred = life.deferred(key)
     s.reading = { ...s.reading, gate: life.owner(key), up: deps.isUp(key) && !!deps.persona(key), latched: deps.isLatched(key), held: deps.isHeld(key) || s.restarted === life.launchId(key), mcp: deps.isConnected(key) }
     const k: DeliveryPolicyKnowledge = { p: { accepted: items.map(i => i.accepted.seq), fixed: items.filter(i => i.fixed).map(i => i.accepted.seq), sent: sends, refused, delivered }, e: s.e, r: s.reading, g: { owner: life.owner(key), stage: 'none', deferred: !!deferred, due: deferred?.due ?? false }, writer: { kind: s.pending?.record.kind ?? 'none' }, compact: 'none', parts, MaxRetypes: constants?.MaxRetypes, textFor: pair => items.find(i => i.accepted.seq === pair[0])?.fixed?.parts[pair[1] - 1] ?? pair }
@@ -229,11 +229,11 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     const fresh = await readRow(key, s, true), row = s.row
     const allowed = fresh && row && life.owner(key) === 'delivery' &&
       life.launchId(key) === s.e.launchSeen && row.session_id === s.e.sessionSeen &&
-      firstSendGate({ ...s.reading, row: row.state, marker: row.labels?.tag_prompt === '1',
+      (s.e.phase === 'recovery-enter' ? recoveryEnterGate : firstSendGate)({ ...s.reading, row: row.state, marker: row.labels?.tag_prompt === '1',
         relay: row.relay_mode === 'on', up: deps.isUp(key), mcp: deps.isConnected(key),
         held: deps.isHeld(key), latched: deps.isLatched(key) }, s.e)
     if (allowed) return true
-    s.e.phase = 'receipt'; s.e.request = 'none'; s.recover = true
+    s.e.phase = 'receipt'; s.e.request = 'none'
     s.deadlines.receipt = clock.now() + ms('RECEIPT_WAIT_MS', RECEIPT_WAIT_MS)
     release(s)
     return false
@@ -245,7 +245,6 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     s.deadlines.receipt = at + ms('RECEIPT_WAIT_MS', RECEIPT_WAIT_MS)
     const backoff = constants?.RETYPE_BACKOFF_MS ?? RETYPE_BACKOFF_MS
     s.deadlines.backoff = at + backoff[Math.min(s.retryStep, backoff.length - 1)]!
-    s.recover = false
     if (sent.send_kind === 'retype' && s.lastRetypeEvent !== sent.attempt) { s.lastRetypeEvent = sent.attempt; emit({ type: 'retyped', key, seq: sent.seq, part: sent.part, count: deps.queue.items(key).find(i => i.accepted.seq === sent.seq)?.retypeCount ?? s.e.retypes[sent.seq] ?? 0 }) }
   }
   async function keyError(key: string, s: State, error: unknown, textCall: boolean): Promise<void> {
@@ -255,8 +254,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     if (isAdErrorInstance(error, ErrInvalidFlags) && !deps.onKeyError) await classifyWithInvalidFlagsRecheck(error)
     if (isAdErrorInstance(error, ErrSpawnNotInteractive) || isAdErrorInstance(error, ErrSpawnNotFound)) {
       if (await readRow(key, s, true)) {
-        if (s.row?.state === 'pending') { s.recover = true }
-        else if (s.row?.state === 'ended' || s.row?.state === 'missing') restart(key, s)
+        if (s.row?.state === 'ended' || s.row?.state === 'missing') restart(key, s)
       }
     } else if (classifyAdError(error).errorClass === 'GONE') restart(key, s)
     s.dialogMaybeOpen = isAdErrorInstance(error, ErrDialogMaybeOpen)
@@ -269,7 +267,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     const steps = constants?.NOT_NOW_RETRY_MS ?? NOT_NOW_RETRY_MS
     s.deadlines.notNow = clock.now() + steps[Math.min(s.notNowStep++, steps.length - 1)]!
     if (textCall && deliveryTextWasRefused(error)) s.e.phase = 'refused'
-    else { const sent = effectiveSends(deps.queue.items(key).find(i => i.accepted.seq === s.e.target[0])!, s.e.target[1]).at(-1); if (sent) afterSend(s, key, sent); s.e.phase = 'receipt'; s.e.request = 'none'; s.deadlines.receipt = clock.now() + ms('RECEIPT_WAIT_MS', RECEIPT_WAIT_MS); s.recover = true }
+    else { const sent = effectiveSends(deps.queue.items(key).find(i => i.accepted.seq === s.e.target[0])!, s.e.target[1]).at(-1); if (sent) afterSend(s, key, sent); s.e.phase = 'receipt'; s.e.request = 'none'; s.deadlines.receipt = clock.now() + ms('RECEIPT_WAIT_MS', RECEIPT_WAIT_MS) }
     wait(key, s, 'not-now')
   }
   async function run(key: string, s: State): Promise<void> {
@@ -293,7 +291,6 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
           if (s.lastSeq !== head.accepted.seq) s.retryStep = 0
           s.lastSeq = head.accepted.seq; s.lastPart = part; s.lastRetypeEvent = undefined; s.e.target = pair; s.notNowStep = 0
           s.e.recoveryAttempt = undefined
-          s.recover = effectiveSends(head, part).length > 0 || head.unknownSend
         }
         if (!s.pending && observedItem && (s.e.phase === 'ready' || s.e.phase === 'receipt' || !s.row)
           && (!observedPair || observedPair[0] !== observedItem.accepted.seq || observedPair[1] !== observedPart || (s.e.phase === 'ready' && !readyObserved))) {
@@ -322,7 +319,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
         if (action === 'observeLaunch') {
           release(s); s.e.phase = 'ready'; s.e.launchSeen = k.r.launch; s.e.sessionSeen = k.r.session
           s.e.recoveryAttempt = undefined
-          s.e.retypes = {}; s.dialogHold = false; s.dialogMaybeOpen = false; s.retryStep = 0; s.notNowStep = 0; s.recover = true
+          s.e.retypes = {}; s.dialogHold = false; s.dialogMaybeOpen = false; s.retryStep = 0; s.notNowStep = 0
           s.deadlines.backoff = 0; s.deadlines.notNow = 0; s.deadlines.enterDelay = 0
           const previous = launches.get(key), launchId = life.launchId(key), sessionId = s.row!.session_id
           const sameLaunch = previous?.launchId === launchId && previous.sessionId === sessionId
@@ -339,7 +336,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
           const receipt = s.receipt?.receipt
           if (!receipt) break
           queueWrite(s, { v: 1, kind: 'delivered', seq: pair[0], part, at: clock.now(), receipt: { path: receipt.path, uuid: receipt.uuid, offset: receipt.offset } }, () => {
-            s.e.phase = 'ready'; s.e.target = NO_DELIVERY_PAIR; s.recover = false; release(s)
+            s.e.phase = 'ready'; s.e.target = NO_DELIVERY_PAIR; release(s)
             emit({ type: 'delivered', key, seq: pair[0], part })
             const item = deps.queue.items(key).find(i => i.accepted.seq === pair[0])
             if (item?.delivered) emit({ type: 'item-delivered', key, seq: pair[0], at: clock.now(), waitMs: Math.max(0, clock.now() - item.accepted.received_at) })
@@ -364,8 +361,8 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
           if (s.e.phase === 'text') {
             const sent = effectiveSends(head!, part).at(-1)
             const safe = sent?.send_kind === 'retype' ? retypeGate(gateKnowledge.r, gateKnowledge.e) : firstSendGate(gateKnowledge.r, gateKnowledge.e)
-            if (!safe) { s.e.phase = 'ready'; s.e.request = 'none'; s.recover = true; release(s); break }
-          } else if (['enter', 'recovery-enter'].includes(s.e.phase) && !firstSendGate(gateKnowledge.r, gateKnowledge.e)) {
+            if (!safe) { s.e.phase = 'ready'; s.e.request = 'none'; release(s); break }
+          } else if (['enter', 'recovery-enter'].includes(s.e.phase) && !(s.e.phase === 'recovery-enter' ? recoveryEnterGate : firstSendGate)(gateKnowledge.r, gateKnowledge.e)) {
             s.e.phase = 'receipt'; s.e.request = 'none'; s.deadlines.receipt = clock.now() + ms('RECEIPT_WAIT_MS', RECEIPT_WAIT_MS); release(s); break
           }
           if (choice === 'grantDelivery') {
@@ -420,7 +417,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
           }); continue
         }
         if (action === 'releaseAttempt') {
-          release(s); s.e.phase = 'ready'; s.recover = false
+          release(s); s.e.phase = 'ready'
           // Do not poll a working row with its gate held. Its ten-second
           // receipt deadline restarts when it leaves working.
           if (s.receiptWorking) break
@@ -433,7 +430,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
           queueWrite(s, { v: 1, kind: 'noticed', seq: pair[0], at: clock.now() }, () => { s.e.noticed = [...s.e.noticed, pair[0]]; emit({ type: 'first-unconfirmed-retype', key, seq: pair[0], part, count: head!.retypeCount }) }); continue
         }
         if (action === 'deferReconnect') {
-          release(s); s.recover = false
+          release(s)
           await life.retryReconnect(key); break
         }
         if (action === 'stopAbsent') { release(s); wait(key, s, 'state'); break }
@@ -444,7 +441,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
           if (s.deadlines.receipt !== undefined && clock.now() >= s.deadlines.receipt) { release(s); if (!s.receiptWorking) { s.e.phase = 'ready'; continue } }
           wait(key, s, s.receipt?.availability === 'unreadable' ? 'transcript-unreadable' : 'receipt')
         } else {
-          release(s); s.recover = false
+          release(s)
           const r = s.reading
           const reason: DeliveryReason = s.dialogHold ? 'dialog-hold' : r.held || r.latched ? 'held' : !r.marker ? 'marker' : !r.relay ? 'relay-off' : r.row !== 'waiting' ? 'state' : !r.mcp ? 'mcp' : s.e.timers.settle > 0 ? 'launch-settle' : s.receipt?.availability === 'unreadable' ? 'transcript-unreadable' : 'backoff'
           wait(key, s, reason); if (reason === 'marker') emit({ type: 'marker-missing', key })
@@ -478,11 +475,17 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
       if (!head || (!head.unknownSend && !head.records.some(r => r.kind === 'sent'))) return true
       api.wake(key)
       const s = states.get(key)!
-      if (s.e.launchSeen !== life.launchId(key)) s.recover = true
+      const reconciled = (): boolean => {
+        const k = build(key, s), pair = selectDeliveryTarget(k)
+        if (pair[0] === 0) return true
+        const attempt = latestDeliveryAttempt(k, pair)
+        return !s.pending && life.owner(key) !== 'delivery' && (attempt === undefined ||
+          (s.e.launchSeen === life.launchId(key) && s.e.sessionSeen === s.row?.session_id && s.e.recoveryAttempt === attempt))
+      }
       // A reconnect rerun from this engine cannot wait on its own tick.
-      if (s.busy) return !s.recover
+      if (s.busy) return reconciled()
       await api.tick(key)
-      return !s.recover && life.owner(key) !== 'delivery'
+      return reconciled()
     },
     async forget(key) { launches.delete(key); const s = states.get(key); if (!s) { life.forget(key); return }; s.stopped = true; if (s.timer !== undefined) clock.clearTimeout(s.timer); release(s); await s.busy; states.delete(key); life.engineRunning(key, false); life.forget(key) },
     async stop() { stopped = true; const stoppingLife = life.stop(); for (const [key, s] of states) { s.stopped = true; if (s.timer !== undefined) clock.clearTimeout(s.timer); release(s); life.engineRunning(key, false) }; await Promise.allSettled([...states.values()].flatMap(s => s.busy ? [s.busy] : [])); await stoppingLife; states.clear(); launches.clear() },
@@ -492,7 +495,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
   }
   life.setRecovery(api.recoverBeforeReconnect)
   life.setReconnect(async key => {
-    if (stopped || !deps.persona(key) || deps.isConnected(key)) { life.clearDeferred(key); return }
+    if (stopped || !deps.persona(key) || (deps.isConnected(key) && !life.reconnectInput(key))) { life.clearDeferred(key); return }
     // b.omv SR-5.5, b.jg5 SRJ-502: only the latch re-check may call
     // agent-director while latched. Keep the reconnect for after the clear,
     // and recheck after client creation awaits.

@@ -1902,7 +1902,7 @@ export function _buildReconnectSessionAdapter(
   const run: (key: string) => Promise<'success' | ReconnectEscalateDead | 'transient' | 'pending'> = async (key: string) => {
     const upgrade = await inspectPersonaUpgrade(key, getPersona?.(key) ?? appliedPersona(key))
     if (upgrade !== 'current') { deliveryLifecycle?.defer(key); return 'transient' }
-    if (getSessionByPersona(key)?.connected === true) { deliveryLifecycle?.clearDeferred(key); return 'success' }
+    if (getSessionByPersona(key)?.connected === true && !deliveryLifecycle?.reconnectInput(key)) { deliveryLifecycle?.clearDeferred(key); return 'success' }
     if (deliveryLifecycle?.owner(key) !== undefined && deliveryLifecycle.owner(key) !== 'free') { deliveryLifecycle.defer(key); return 'transient' }
     if (deliveryLifecycle && !await deliveryLifecycle.recoverBeforeReconnect(key)) { deliveryLifecycle.defer(key); return 'transient' }
     let state: string

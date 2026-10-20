@@ -418,7 +418,8 @@
  */
 
 import { ENTER_DELAY_MS } from './delivery-constants.ts'
-import type { DeliveryLifecycle } from './delivery-lifecycle.ts'
+import type { DeliveryLifecycle, ReconnectInput } from './delivery-lifecycle.ts'
+import { deliveryTextWasRefused } from './delivery-engine.ts'
 import { decideGate, createDeliveryPolicyState, type DeliveryReading } from './delivery-policy.ts'
 import type {
   Client,
@@ -2827,7 +2828,8 @@ function ownRowActGoes(key: string, at: OwnRowReadSite): boolean {
  */
 /** Shared E3 gate, installed by main before any launch (b.omv SR-5.5). */
 let deliveryLifecycle: DeliveryLifecycle | undefined
-export function setDeliveryLifecycle(value: DeliveryLifecycle | undefined): void { deliveryLifecycle = value }
+const standaloneReconnectInputs = new Map<string, ReconnectInput>()
+export function setDeliveryLifecycle(value: DeliveryLifecycle | undefined): void { deliveryLifecycle = value; standaloneReconnectInputs.clear() }
 
 /** Delivery reads retain row/pane classification without opening a recovery episode. */
 export async function handleDeliveryReadError(key: string, error: unknown, verb: 'get' | 'read-pane'): Promise<void> {
@@ -3679,6 +3681,8 @@ export async function reconnectMcpWithCause(
   ref: string = keyRef(key),
 ): Promise<ReconnectResult> {
   const life = deliveryLifecycle
+  const getInput = () => life ? life.reconnectInput(key) : standaloneReconnectInputs.get(key)
+  const clearInput = () => { if (life) life.clearReconnectInput(key); else standaloneReconnectInputs.delete(key) }
   if (life?.deferred(key)) life.defer(key)
   const defer = (): ReconnectResult => { life?.defer(key); return { outcome: 'transient' } }
   if (personaLatchedNow(key)) {
@@ -3698,32 +3702,45 @@ export async function reconnectMcpWithCause(
   if (personaLatchedNow(key)) { life?.defer(key); return { outcome: 'transient', latched: true } }
   if (isOwnRowOldLifeHeld(key) || heldGateReadingOf(key) !== undefined || waitsOnKillFailedHold(key)) return defer()
   const read = await readPersonaOwnRow(key, { site: 'reconnect', what: 'fresh get' })
-  if (read.kind === OWN_ROW_READ_ABSENT) { life?.clearDeferred(key); return { outcome: 'dead-session', deadCause: DEAD_SESSION_CAUSE_ROW_ABSENT } }
+  if (read.kind === OWN_ROW_READ_ABSENT) { clearInput(); life?.clearDeferred(key); return { outcome: 'dead-session', deadCause: DEAD_SESSION_CAUSE_ROW_ABSENT } }
   if (read.kind !== OWN_ROW_READ_ROW || read.latched) return defer()
   const row = read.row
+  const priorInput = getInput()
+  if (priorInput && (priorInput.launch !== (life?.launchId(key) ?? '') || priorInput.session !== row.session_id || priorInput.launchStartedAt !== row.launch_started_at)) clearInput()
   if (noteTagPromptReading(key, row) && !AGENT_DIRECTOR_DEAD_STATES.has(row.state)) {
     await inspectPersonaUpgrade(key)
     return defer()
   }
   if (life && !await life.recoverBeforeReconnect(key)) return defer()
-  if (AGENT_DIRECTOR_DEAD_STATES.has(row.state)) { life?.clearDeferred(key); return { outcome: 'dead-session', deadCause: DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE } }
+  if (AGENT_DIRECTOR_DEAD_STATES.has(row.state)) { clearInput(); life?.clearDeferred(key); return { outcome: 'dead-session', deadCause: DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE } }
   if (row.state !== 'waiting' || row.relay_mode !== 'on') return defer()
   const reading: DeliveryReading = { row: row.state, relay: true, marker: row.labels?.tag_prompt === '1', mcp: false, up: true, latched: personaLatchedNow(key), held: isOwnRowOldLifeHeld(key) || heldGateReadingOf(key) !== undefined || waitsOnKillFailedHold(key), readable: true, receipts: [], launch: '', session: row.session_id, gate: life?.owner(key) ?? 'free', offset: 0, records: [] }
   const gateChoice = decideGate({ p: { accepted: [], fixed: [], sent: [], refused: [], delivered: [] }, e: createDeliveryPolicyState(), r: reading, g: { owner: life?.owner(key) ?? 'free', stage: 'none', deferred: true, due: true }, writer: { kind: 'none' }, compact: 'none' })
   if (gateChoice !== 'runReconnect') return defer()
   const release = life?.acquire(key, 'reconnect')
   if (life && !release) return defer()
+  let input = getInput(), textCall = false
+  const launch = life?.launchId(key) ?? ''
   try {
     const textRow = await readPersonaOwnRow(key, { site: 'reconnect', what: 'before text' })
     if (textRow.kind !== OWN_ROW_READ_ROW || textRow.latched || textRow.row.labels?.tag_prompt !== '1' || textRow.row.relay_mode !== 'on' ||
         textRow.row.session_id !== row.session_id || textRow.row.launch_started_at !== row.launch_started_at ||
         textRow.row.state !== 'waiting' || personaLatchedNow(key) ||
         isOwnRowOldLifeHeld(key) || heldGateReadingOf(key) !== undefined || waitsOnKillFailedHold(key) ||
-        (life && (!life.active(key) || life.owner(key) !== 'reconnect'))) return defer()
-    console.error(reconnectStartLine(ref))
-    await withOutageDetection(key, undefined, 'send-keys', client => client.sendKeys({ instance_id: personaInstanceId(key), text: `/mcp reconnect ${MCP_SERVER_NAME}`, no_enter: true }))
-    if (life) await life.pause(ENTER_DELAY_MS)
-    else await new Promise(resolve => setTimeout(resolve, ENTER_DELAY_MS))
+        (life && (!life.active(key) || life.owner(key) !== 'reconnect' || life.launchId(key) !== launch))) return defer()
+    if (!input) {
+      // Save intent before the call: an uncertain result may have left text
+      // in AD's input. Every retry of this launch must finish with Enter.
+      input = { launch, session: row.session_id, launchStartedAt: row.launch_started_at }
+      if (life) life.rememberReconnectInput(key, input)
+      else standaloneReconnectInputs.set(key, input)
+      console.error(reconnectStartLine(ref))
+      textCall = true
+      await withOutageDetection(key, undefined, 'send-keys', client => client.sendKeys({ instance_id: personaInstanceId(key), text: `/mcp reconnect ${MCP_SERVER_NAME}`, no_enter: true }))
+      textCall = false
+      if (life) await life.pause(ENTER_DELAY_MS)
+      else await new Promise(resolve => setTimeout(resolve, ENTER_DELAY_MS))
+    }
     if (life && (!life.active(key) || life.owner(key) !== 'reconnect')) return { outcome: 'transient' }
     if (personaLatchedNow(key) || isOwnRowOldLifeHeld(key)) return defer()
     const enterRow = await readPersonaOwnRow(key, { site: 'reconnect', what: 'before Enter' })
@@ -3733,13 +3750,15 @@ export async function reconnectMcpWithCause(
         enterRow.row.session_id !== row.session_id || enterRow.row.launch_started_at !== row.launch_started_at ||
         enterRow.row.state !== 'waiting' || personaLatchedNow(key) ||
         isOwnRowOldLifeHeld(key) || heldGateReadingOf(key) !== undefined || waitsOnKillFailedHold(key) ||
-        (life && (!life.active(key) || life.owner(key) !== 'reconnect'))) return defer()
+        (life && (!life.active(key) || life.owner(key) !== 'reconnect' || life.launchId(key) !== launch || getInput() !== input))) return defer()
     await withOutageDetection(key, undefined, 'send-keys', client => client.sendKeys({ instance_id: personaInstanceId(key), key: 'Enter' }))
+    if (getInput() === input) clearInput()
     life?.clearDeferred(key)
     return { outcome: 'ok' }
   } catch (err) {
+    if (textCall && deliveryTextWasRefused(err) && getInput() === input) clearInput()
     const deliveryKeyFailureOutcome = await reconnectAnswerTo(key, lastRead, ref, err)
-    if (deliveryKeyFailureOutcome.outcome === 'dead-session') life?.clearDeferred(key)
+    if (deliveryKeyFailureOutcome.outcome === 'dead-session') { if (getInput() === input) clearInput(); life?.clearDeferred(key) }
     else life?.defer(key)
     return deliveryKeyFailureOutcome
   } finally { release?.() }
@@ -5189,10 +5208,6 @@ export function escalateDeadSweepLine(key: string, verdict: EscalateDeadVerdict)
  *   b.jg5 SRJ-104):
  *   - `dead-session`: the reconnect's one `send-keys` answered
  *     `ErrTmuxSendKeys` (cause `tmux-gone`; b.3ce, b.jg5 SRJ-609);
- *   - `working-tmux-gone`: its row reads `working` and the reconnect
- *     adapter's `read-pane` of the row answered GONE (b.d61, b.jg5 SRJ-603);
- *   - `waiting-row-pane-gone`: its row reads `waiting` and the waiting-row
- *     check's `read-pane` answered GONE (b.f2b, b.jg5 SRJ-604);
  *   - `prompt-row-tmux-gone`: its row reads `ask_user` or
  *     `check_permission` and the prompt-row verdict's one-line `read-pane`
  *     answered GONE (b.jdc, b.jg5 SRJ-606);
@@ -5201,8 +5216,7 @@ export function escalateDeadSweepLine(key: string, verdict: EscalateDeadVerdict)
  *   b.dup): a route into the restart path's decision only, which kills
  *   nothing because of it (b.jg5 SRJ-609);
  * - from a row read: `row-absent-at-pane-read`, the row was absent
- *   (`ErrSpawnNotFound`) at the `read-pane` of the `working`-row verdict,
- *   the waiting-row check or the prompt-row verdict, which takes the GONE
+ *   (`ErrSpawnNotFound`) at the prompt-row verdict's `read-pane`, which takes the GONE
  *   column without being a GONE (b.jg5 SRJ-117), or at the reconnect's
  *   `send-keys` (cause `row-absent`, b.jg5 SRJ-118).
  * Neither a GONE (b.jg5 SRJ-613) nor a refusal as not interactive nor a row
@@ -5223,14 +5237,9 @@ export type EscalateDeadVerdict = (typeof ESCALATE_DEAD_VERDICTS)[number]
 export const ESCALATE_DEAD_VERDICTS = Object.freeze([
   'dead-session',
   'row-not-interactive',
-  'working-tmux-gone',
-  'waiting-row-pane-gone',
   'row-absent-at-pane-read',
   'prompt-row-tmux-gone',
 ] as const)
-
-/** The escalate-dead verdict of a `waiting` row whose `read-pane` answered GONE (b.jg5 SRJ-604). */
-export const ESCALATE_DEAD_WAITING_ROW_PANE_GONE = 'waiting-row-pane-gone' satisfies EscalateDeadVerdict
 
 /**
  * The escalate-dead verdict of a row found absent (`ErrSpawnNotFound`) at a
@@ -5249,7 +5258,7 @@ export const ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ = 'row-absent-at-pane-read' s
  * prove the worker gone (a
  * finished row, or a `pending` row whose session may be another launch's,
  * b.jg5 SRJ-609, SRJ-613). The GONE-based verdicts (`dead-session`,
- * `working-tmux-gone`, `waiting-row-pane-gone`, `prompt-row-tmux-gone`) are
+ * `prompt-row-tmux-gone`) are
  * dead evidence; the refusal (`row-not-interactive`) and the row read
  * (`row-absent-at-pane-read`) never are (b.jg5 SRJ-609, SRJ-611;
  * `isDeadEvidence`).
@@ -5259,10 +5268,6 @@ export const ESCALATE_DEAD_EVIDENCE: Readonly<Record<EscalateDeadVerdict, string
     "agent-director's send-keys answered GONE (ErrTmuxSendKeys) at the /mcp reconnect: no session of the row's launch was found",
   'row-not-interactive':
     "row not interactive (agent-director refused the /mcp reconnect keystrokes as not interactive: the row finished, or a pending row's session may be another launch's; this does not prove the worker gone)",
-  'working-tmux-gone':
-    "agent-director's read-pane found no pane of the row's launch (GONE) on its working row",
-  'waiting-row-pane-gone':
-    "agent-director's read-pane found no pane of the row's launch (GONE) on its waiting row",
   'row-absent-at-pane-read':
     "its agent-director row was absent (ErrSpawnNotFound) at the pane read or the /mcp reconnect's send-keys: a row read, not a GONE",
   'prompt-row-tmux-gone':
@@ -5303,8 +5308,7 @@ export const DEAD_EVIDENCE_NONE = 'none'
  * dead evidence for the persona (b.jg5 SRJ-611): true exactly for the
  * GONE-based ones, a `dead-session` caused by `ErrTmuxSendKeys`
  * (`tmux-gone`, and the reconnect adapter's verdict for it, `dead-session`)
- * or by a pane read's `ErrTmuxCaptureFailed` (`working-tmux-gone`,
- * `waiting-row-pane-gone`, `prompt-row-tmux-gone`, and the ladder action's
+ * or by a pane read's `ErrTmuxCaptureFailed` (`prompt-row-tmux-gone`, and the ladder action's
  * `prompt-row-ladder-gone`). False for the refusal as not interactive
  * (`row-not-interactive`, SRJ-609), for the row reads (`row-absent`,
  * `row-absent-at-pane-read`, `row-read-finished`), for
@@ -5318,8 +5322,6 @@ export function isDeadEvidence(source: string | undefined): boolean {
     case DEAD_SESSION_CAUSE_TMUX_GONE:
     case DEAD_SESSION_CAUSE_PROMPT_ROW_LADDER_GONE:
     case 'dead-session':
-    case 'working-tmux-gone':
-    case ESCALATE_DEAD_WAITING_ROW_PANE_GONE:
     case 'prompt-row-tmux-gone':
       return true
     case DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE:
