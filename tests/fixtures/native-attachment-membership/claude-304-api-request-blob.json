@@ -1,0 +1,28 @@
+{
+  "provenance": {
+    "run": "real-1792509656324-1284261",
+    "scenario": "test-111-fmk-real-ai-ac11",
+    "trial": 1,
+    "offset": 117952,
+    "version": "2.1.304",
+    "note": "Observed native field shape and ToolSearch block kind/name; session, hash, id and arguments replaced with synthetic controls."
+  },
+  "record": {
+    "type": "api-request-blob",
+    "sessionId": "session",
+    "hash": "synthetic-hash",
+    "message": {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "tool_use",
+          "name": "ToolSearch",
+          "id": "synthetic-discovery",
+          "input": {
+            "query": "select:mcp__slack-channel-router__reply"
+          }
+        }
+      ]
+    }
+  }
+}

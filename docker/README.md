@@ -424,6 +424,11 @@ Codex model. Its `REAL-AGENT-CLAUDE-VERDICT` certifies only those Claude trials.
 Use `--keep-going` to retain failures and execute the remaining trials; any
 failure still fails the selection.
 
+Add `--ai-only` to `--claude-versions` to run just AC11, AC12, AC15,
+AC20, AC23, AC91 and AC106, three trials each (21 per version).
+This selection records `claude-ai-only` and uses
+`REAL-AGENT-CLAUDE-AI-VERDICT`; it certifies only those AI trials.
+
 Use the established `CI_ANTHROPIC_*` prefix on the `/ci` runner and **every** `ci-verdict.ts` wait/stop/report/recovery call, as the current CI skill describes. The heavy coordinator reads those CI names directly. Never put credential values in arguments or diagnostic output.
 
 Final E7 acceptance passed: default full `/ci` `20261018t042311z-fik3tlbb` (no selection arguments, reader exit 0) passed all 46 executions in 2,521.526 s, including the 17-item native Codex fault/recovery/fidelity gate. Focused local heavy `real-1792299930887-3167396` ended `REAL-AGENT-CODEX-VERDICT PASS`: 15 unique completed native trials, AC11/12/15/20/106 each 3 of 3, in 1,726.57 s, on Codex 0.159.2 / `gpt-6-astra`.

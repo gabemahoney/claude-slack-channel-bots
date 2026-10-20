@@ -21,6 +21,8 @@ function nativeTakeIn(entry: TranscriptEntry, adapters: ReceiptAdapters): boolea
 
 // Native session metadata has no temporal or ancestry identity. Only the five
 // observed three-field shapes are informational; added evidence stays checked.
+// api-request-blob is deliberately excluded: its message can contain tool_use
+// and tool_result blocks, so its kind alone cannot exempt it from action guards.
 export function nativeInformation(entry: TranscriptEntry, adapters: ReceiptAdapters): boolean {
   const value = entry.value, field = new Map([
     ['mode', 'mode'], ['permission-mode', 'permissionMode'], ['atis-latch', 'atis'],
@@ -56,15 +58,18 @@ function nativeChain(session: TranscriptEntry[], entry: TranscriptEntry, target:
   return undefined
 }
 
+function nativeSetup(entry: TranscriptEntry): boolean {
+  return entry.value?.type === 'attachment'
+    && ['environment', 'model', 'agent_listing_delta', 'mcp_instructions_delta', 'skill_listing',
+      'total_tokens_reminder', 'deferred_tools_delta', 'deferred_tools_record'].includes(entry.value.attachment?.type)
+}
+
 export function nativeTime(session: TranscriptEntry[], entry: TranscriptEntry, receipt: TranscriptEntry, adapters: ReceiptAdapters): boolean {
   if (!Number.isFinite(entry.at)) return false
   // Decision 24: setup is prepared before the user record is timestamped.
   // Membership is ancestry/file order, with the previous turn as a time floor;
   // no guessed millisecond allowance applies to these native setup types.
-  const setup = entry.value?.type === 'attachment'
-    && ['environment', 'model', 'agent_listing_delta', 'mcp_instructions_delta', 'skill_listing',
-      'total_tokens_reminder', 'deferred_tools_delta'].includes(entry.value.attachment?.type)
-  if (setup) {
+  if (nativeSetup(entry)) {
     const preceding = session.filter(e => e.offset < receipt.offset)
     const predecessor = preceding.at(-1)
     const previousReceipt = preceding.map(e => nativeTakeIn(e, adapters)).lastIndexOf(true)
@@ -76,7 +81,14 @@ export function nativeTime(session: TranscriptEntry[], entry: TranscriptEntry, r
       && (!predecessor || entry.offset > predecessor.offset)
       && (!previousLast || entry.at > previousLast.at)
   }
-  const parent = nativeParent(session, entry)
+  // Setup can also be serialized after its response was timestamped. Validate
+  // its membership, then compare clocks against the nearest non-setup parent.
+  // Strictly decreasing offsets bound this walk; no elapsed-time tolerance.
+  let parent = nativeParent(session, entry)
+  while (parent && nativeSetup(parent)) {
+    if (!nativeTime(session, parent, receipt, adapters)) return false
+    parent = nativeParent(session, parent)
+  }
   return entry.at >= receipt.at && (!parent || Number.isFinite(parent.at) && entry.at >= parent.at)
 }
 

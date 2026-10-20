@@ -755,8 +755,8 @@ independently of timestamps, and stop at another take-in; earlier turns or
 sessions cannot supply the response.
 
 Only timed `environment`, `model`, `agent_listing_delta`,
-`mcp_instructions_delta`, `skill_listing` and `total_tokens_reminder`
-attachments use decision 24's structural membership rule: their `parentUuid`
+`mcp_instructions_delta`, `skill_listing`, `total_tokens_reminder`,
+`deferred_tools_delta` and `deferred_tools_record` attachments use decision 24's structural membership rule: their `parentUuid`
 chain must reach this receipt, their file offset must follow the receipt's
 predecessor, and their time must be strictly later than the previous turn's
 last record with a finite timestamp, as amended on 2026-10-19. Untimed
@@ -765,6 +765,8 @@ bookkeeping records such as `cost-state`, `last-prompt` and
 or a previous turn with no finite timestamp, has no previous-turn time floor. There is no fixed millisecond allowance.
 The captured 6 ms and AC23 resume regressions and timing-sweep inventory are documented in
 [`fixtures/native-attachment-membership/README.md`](fixtures/native-attachment-membership/README.md).
+Setup records are not time anchors for their children; each non-setup record
+is compared exactly with its nearest non-setup ancestor and receipt.
 Assistant, tool-result and system records retain strict timestamp ordering;
 receipt/send checks, exact JSON, model identity, completion and action checks
 remain unchanged.
@@ -775,6 +777,8 @@ floor), the only untimed informational exclusions are exact three-field records 
 `permission-mode`/`permissionMode`, `atis-latch`/`atis`,
 `last-prompt`/`leafUuid` and `ai-title`/`aiTitle`. They carry no timestamp,
 UUID, parent UUID or text; added fields and other untimed records remain checked.
+`api-request-blob` remains rejected because its native `message.content` can
+contain tool-use/action blocks; its kind is not an informational exemption.
 
 Ordinary answers must belong to the delivered item's own native turn;
 foreign, stale, sidechain, synthetic, API-error or unfinished responses

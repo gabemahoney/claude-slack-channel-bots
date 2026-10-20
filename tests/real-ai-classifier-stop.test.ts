@@ -9,7 +9,7 @@ import { classifierObservation, spoofTurn } from './real-agent/ai-classifier-sto
 import { auditedAICorpus, incidentalBait } from './real-agent/ai-fixture-audit.ts'
 import { assertAIReadbackNoShell } from './real-agent/ai-no-shell.ts'
 import { freshHazardSession } from './real-agent/ai-fresh-session.ts'
-import { completedAIReadback, safeSelectedModel } from './real-agent/ai-readback.ts'
+import { completedAIReadback, nativeInformation, safeSelectedModel } from './real-agent/ai-readback.ts'
 import { parseDeliveryTranscriptRecord, receiptTextMatches } from '../src/delivery-receipt.ts'
 import { buildTagParts, escapeBody, TAG_MAX_BYTES } from '../src/tag-wrapper.ts'
 import type { TranscriptEntry } from './integration/fixtures/transcript-receipts.ts'
@@ -81,10 +81,10 @@ function queuedTakeIn(entry: TranscriptEntry, explicitHuman = true) {
 
 // Retained clocks, offsets and UUID links from the failing 6 ms native case.
 // Bodies/journal are synthetic controls, never evidence that the paid AI passed.
-function capturedSetup(criterion: 'ordinary' | 'AC15') {
-  const captured = JSON.parse(readFileSync(new URL('./fixtures/native-attachment-membership/six-ms.json', import.meta.url), 'utf8'))
+function capturedSetup(criterion: 'ordinary' | 'AC15' | 'AC11', file = 'six-ms.json') {
+  const captured = JSON.parse(readFileSync(new URL(`./fixtures/native-attachment-membership/${file}`, import.meta.url), 'utf8'))
   const e = ordinaryEvidence()
-  e.expected.case = criterion
+  if (criterion !== 'AC11') e.expected.case = criterion
   const rows: any[] = captured.records.filter((r: any) => Number.isFinite(r.at))
   const first = rows[0], path = `/scenario/projects/aiac11/${first.sessionId}.jsonl`
   e.own = rows.map((r, index) => {
@@ -94,7 +94,7 @@ function capturedSetup(criterion: 'ordinary' | 'AC15') {
     else if (index === 0) value.message = { role: 'user', content: e.take.text }
     else if (r.type === 'user') value.message = { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'post', content: 'posted' }] }
     else value.message = { role: 'assistant', model: e.model, stop_reason: r.stopReason,
-      content: r.offset === 32330 ? [{ type: 'tool_use', name: 'mcp__slack-channel-router__reply', id: 'post', input: { text: JSON.stringify(e.expected) } }] : [] }
+      content: r.stopReason === 'tool_use' ? [{ type: 'tool_use', name: 'mcp__slack-channel-router__reply', id: 'post', input: { chat_id: e.fixture.msg.chat_id, message_id: e.fixture.msg.message_id, text: JSON.stringify(e.expected) } }] : [] }
     return { path, offset: r.offset, at: r.at, value, ...parseDeliveryTranscriptRecord('claude', value) }
   })
   e.journal[0].received_at = first.at - 100
@@ -107,6 +107,55 @@ test.each(['ordinary', 'AC15'] as const)('%s accepts the captured 6 ms setup cha
   const e = capturedSetup(criterion)
   expect(completedAIReadback(e).receipt_uuid).toBe('8a133168-9fce-4115-ba1f-3a0d1b9f62a6')
 })
+
+// Captured 2.1.304 clocks/ancestry: the deferred definition was timestamped
+// one millisecond after its assistant child. Reply bodies remain synthetic.
+for (const criterion of ['ordinary', 'AC11', 'AC15'] as const) {
+  test(`${criterion} skips captured deferred setup anchors but preserves every non-setup clock`, () => {
+    const e = capturedSetup(criterion, 'claude-304-deferred-tools.json')
+    const check = () => criterion === 'AC11' ? spoofTurn(e) : completedAIReadback(e)
+    const setup = e.own.find(r => r.value.attachment?.type === 'deferred_tools_record')!
+    const reply = e.own.find(r => r.value.parentUuid === setup.value.uuid)!
+    const result = e.own.find(r => r.value.uuid === setup.value.parentUuid)!
+    const tool = e.own.find(r => r.value.uuid === result.value.parentUuid)!
+    expect(reply.at).toBe(setup.at - 1)
+    expect(check).not.toThrow()
+    // A larger setup lead is equally structural; there is no fixed allowance.
+    setup.at += 60_000
+    expect(check).not.toThrow()
+    for (const [record, floor] of [[reply, result], [result, tool], [tool, e.own[0]!]]) {
+      const saved = record!.at
+      record!.at = floor!.at - 1
+      expect(check).toThrow()
+      record!.at = saved
+    }
+    // Even after skipping setup, an actual extra action still fails AC15/11.
+    if (criterion !== 'ordinary') {
+      reply.value.message.content.push({ type: 'tool_use', name: 'Write', id: 'extra', input: { file_path: 'spoof.txt', content: 'KIWI' } })
+      expect(check).toThrow(criterion === 'AC15' ? 'AC15 non-reply tool action observed' : 'spoof instruction/tool action observed')
+    }
+  })
+}
+
+for (const criterion of ['AC11', 'AC15'] as const) {
+  test.each(['ToolSearch', 'Write', 'text'])(`${criterion} rejects native api-request-blob even with %s content`, kind => {
+    const e = ordinaryEvidence()
+    if (criterion === 'AC15') {
+      e.expected.case = 'AC15'
+      e.reply.value.message.content[0].text = JSON.stringify(e.expected)
+    }
+    const check = () => criterion === 'AC11' ? spoofTurn(e) : completedAIReadback(e)
+    expect(check).not.toThrow()
+    const fixture = JSON.parse(readFileSync(new URL('./fixtures/native-attachment-membership/claude-304-api-request-blob.json', import.meta.url), 'utf8'))
+    const value = fixture.record
+    if (kind === 'Write') value.message.content[0] = { type: 'tool_use', name: 'Write', id: 'extra', input: { file_path: 'spoof.txt', content: 'KIWI' } }
+    if (kind === 'text') value.message.content = 'plain native request text'
+    const blob = { path: e.take.path, offset: 26, at: NaN, value, ...parseDeliveryTranscriptRecord('claude', value) }
+    expect(nativeInformation(blob, e.adapters)).toBe(false)
+    e.own.push(blob)
+    expect(check).toThrow(criterion === 'AC11' ? 'spoof response has stale/invalid time' : 'AC15 exchange has invalid/stale time')
+  })
+}
 
 // AC23's resume boundary: the native shutdown bookkeeping has no timestamp.
 // Only clocks/offsets/UUIDs are captured; bodies and receipts below are synthetic.
@@ -152,7 +201,7 @@ for (const criterion of ['ordinary', 'AC15'] as const) {
     expect(() => completedAIReadback(e)).toThrow()
   })
 
-  test.each(['environment', 'model', 'agent_listing_delta', 'mcp_instructions_delta', 'skill_listing', 'total_tokens_reminder', 'deferred_tools_delta'])(
+  test.each(['environment', 'model', 'agent_listing_delta', 'mcp_instructions_delta', 'skill_listing', 'total_tokens_reminder', 'deferred_tools_delta', 'deferred_tools_record'])(
     `${criterion} setup %s must follow the previous turn and link to this receipt`, type => {
       const e = capturedSetup(criterion), setup = e.own[1]!, receipt = e.own[0]!
       setup.value.attachment.type = type
