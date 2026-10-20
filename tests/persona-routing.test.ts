@@ -30,7 +30,7 @@ describe('persona routing and durable dedupe', () => {
     const h = harness(); const mention = mentionText(h.p('alpha').stub.identity.botUserId)
     const home = makeChannelMessage({ channel: CA, text: 'home' }); const shared = makeChannelMessage({ channel: CS, text: `${mention} shared` }); const dm = makeDm({ text: 'direct' })
     await each(h, home); await each(h, shared); await h.receive(dm, ['alpha'])
-    expect(facts(h, 'alpha')).toEqual([{ channel: CA, ts: home.ts as string, via: 'receive_all', text: 'home' }, { channel: CS, ts: shared.ts as string, via: 'mention', text: 'shared' }, { channel: dm.channel as string, ts: dm.ts as string, via: 'dm', text: 'direct' }]); expect(facts(h, 'beta')).toEqual([])
+    expect(facts(h, 'alpha')).toEqual([{ channel: CA, ts: home.ts as string, via: 'receive_all', text: 'home' }, { channel: CS, ts: shared.ts as string, via: 'mention', text: shared.text as string }, { channel: dm.channel as string, ts: dm.ts as string, via: 'dm', text: 'direct' }]); expect(facts(h, 'beta')).toEqual([])
     expect(h.all.flatMap(p => p.notifications)).toEqual([]); expect(h.allPosts()).toEqual([]); expect(h.all.flatMap(p => p.stub.calls.reactionsAdd)).toEqual([])
   })
   test.each(['mention', 'receive_all', 'dm'] as const)('%s preserves a 5000-byte body through durable acceptance and multipart preparation', async via => {
@@ -40,20 +40,41 @@ describe('persona routing and durable dedupe', () => {
     const text = via === 'receive_all' ? body : body.slice(0, 2) + mentionText(h.p('alpha').stub.identity.botUserId) + ' \t\n' + body.slice(2)
     const event = via === 'dm' ? makeDm({ text }) : makeChannelMessage({ channel: via === 'mention' ? CS : CA, text })
     await each(h, event)
-    expect(facts(h, 'alpha')).toEqual([{ channel: event.channel as string, ts: event.ts as string, via, text: body }])
+    expect(facts(h, 'alpha')).toEqual([{ channel: event.channel as string, ts: event.ts as string, via, text }])
     expect(facts(h, 'beta')).toEqual([])
     const records = readQueue(dir, h.p('alpha').persona.key)
     expect(records.filter(record => record.kind === 'accepted')).toEqual([h.queued('alpha')[0]!.accepted])
     const parts = h.queued('alpha')[0]!.fixed!.parts
     expect(parts.length).toBeGreaterThan(1)
     expect(records.filter(record => record.kind === 'fixed')).toEqual([h.queued('alpha')[0]!.fixed!])
-    expect(parts.map(part => /^<channel [^>]*>([\s\S]*)<\/channel>$/.exec(part)![1]!).join('')).toBe(body)
+    expect(parts.map(part => /^<channel [^>]*>([\s\S]*)<\/channel>$/.exec(part)![1]!).join('')).toBe(text.replace(/\t/g, '    '))
+    expect(h.allPosts()).toEqual([])
+  })
+  test.each([
+    ['quoted mentions', 'mention', (own: string, labelled: string) => `  > "${own}"\r\n\tand \`${labelled}\`  `],
+    ['repeated mentions', 'mention', (own: string, labelled: string) => ` ${own}  first\t${labelled}\n${own} last\r\n `],
+    ['mention only', 'mention', (own: string) => own],
+    ['mentions surrounded by whitespace', 'dm', (own: string, labelled: string) => ` \t${own} \n${labelled}\r\n `],
+    ['whitespace only', 'receive_all', () => ' \t\r\n  \n'],
+    ['empty text', 'receive_all', () => ''],
+  ] as const)('preserves %s verbatim in durable acceptance before documented tag escaping', async (_label, via, makeText) => {
+    const h = harness()
+    const ownId = h.p('alpha').stub.identity.botUserId
+    const text = makeText(mentionText(ownId), mentionText(ownId, 'alpha'))
+    const event = via === 'dm' ? makeDm({ text }) : makeChannelMessage({ channel: via === 'mention' ? CS : CA, text })
+    await each(h, event)
+    expect(facts(h, 'alpha')).toEqual([{ channel: event.channel as string, ts: event.ts as string, via, text }])
+    expect(facts(h, 'beta')).toEqual([])
+    const item = h.queued('alpha')[0]!
+    expect(readQueue(dir, h.p('alpha').persona.key).filter(record => record.kind === 'accepted')).toEqual([item.accepted])
+    const bodies = item.fixed!.parts.map(part => /^<channel [^>]*>([\s\S]*)<\/channel>$/.exec(part)![1]!).join('')
+    expect(bodies).toBe(text.replace(/\r\n?/g, '\n').replace(/\t/g, '    '))
     expect(h.allPosts()).toEqual([])
   })
   test.each([false, true])('message/app_mention pair in either order accepts once (%p)', async mentionFirst => {
     const h = harness(); const text = `${mentionText(h.p('alpha').stub.identity.botUserId)} body`; const message = makeChannelMessage({ channel: CS, text }); const app = { ...message, type: 'app_mention' }
     await h.receive(mentionFirst ? app : message, ['alpha']); await h.receive(mentionFirst ? message : app, ['alpha'])
-    expect(facts(h, 'alpha')).toEqual([{ channel: CS, ts: message.ts as string, via: 'mention', text: 'body' }]); expect(facts(h, 'beta')).toEqual([]); expect(h.order.filter(s => s === 'ack')).toHaveLength(2)
+    expect(facts(h, 'alpha')).toEqual([{ channel: CS, ts: message.ts as string, via: 'mention', text }]); expect(facts(h, 'beta')).toEqual([]); expect(h.order.filter(s => s === 'ack')).toHaveLength(2)
   })
   test('edited.ts distinguishes an edit; forget keeps durable dedupe and original via through mode/config changes', async () => {
     const h = harness(); const event = makeChannelMessage({ channel: CA }); await h.receive(event, ['alpha']); h.forget('alpha'); await h.receive(event, ['alpha'])
@@ -91,15 +112,15 @@ describe('persona routing and durable dedupe', () => {
     const event = makeChannelMessage({ channel: CA, text: `${mentionText(h.p('alpha').stub.identity.botUserId)} threaded files`, thread_ts: '1700000000.000010', files: [...files, null] })
     await h.receive(event, ['alpha'])
     const item = h.queued('alpha')[0]!
-    expect(item.accepted).toMatchObject({ thread_ts: event.thread_ts, text: 'threaded files', files: [files[0], { name: 'unnamed' }] })
-    expect(item.fixed!.parts).toEqual(buildTagParts({ chat_id: CA, channel_name: 'prepared-room', message_id: event.ts as string, user: 'resolved-user', user_id: event.user as string, ts: event.ts as string, thread_ts: event.thread_ts as string, via: 'mention', attachment_count: '2', attachments: `${sanitizeFilename(files[0]!.name!)} (text/csv, 42 bytes); unnamed (unknown, ? bytes)`, text: 'threaded files' }))
+    expect(item.accepted).toMatchObject({ thread_ts: event.thread_ts, text: event.text as string, files: [files[0], { name: 'unnamed' }] })
+    expect(item.fixed!.parts).toEqual(buildTagParts({ chat_id: CA, channel_name: 'prepared-room', message_id: event.ts as string, user: 'resolved-user', user_id: event.user as string, ts: event.ts as string, thread_ts: event.thread_ts as string, via: 'mention', attachment_count: '2', attachments: `${sanitizeFilename(files[0]!.name!)} (text/csv, 42 bytes); unnamed (unknown, ? bytes)`, text: event.text as string }))
     expect(facts(h, 'beta')).toEqual([])
   })
 })
 describe('fungible mode', () => {
   test.each([false, true])('paired app mention is ignored in either order and message enters queue once (%p)', async mentionFirst => {
     const h = harness({ mode: 'fungible' }); const message = makeChannelMessage({ channel: CX, text: mentionText(h.p('alpha').stub.identity.botUserId) + ' hello' }); const app = { ...message, type: 'app_mention' }
-    await h.receive(mentionFirst ? app : message, ['alpha']); await h.receive(mentionFirst ? message : app, ['alpha']); expect(facts(h, 'alpha')).toEqual([{ channel: CX, ts: message.ts as string, via: 'mention', text: 'hello' }]); expect(facts(h, 'beta')).toEqual([]); expect(h.heardChannels('alpha')).toEqual(new Set([CX])); expect(h.logs.filter(s => s.includes('persona-invited-channel'))).toHaveLength(1)
+    await h.receive(mentionFirst ? app : message, ['alpha']); await h.receive(mentionFirst ? message : app, ['alpha']); expect(facts(h, 'alpha')).toEqual([{ channel: CX, ts: message.ts as string, via: 'mention', text: message.text as string }]); expect(facts(h, 'beta')).toEqual([]); expect(h.heardChannels('alpha')).toEqual(new Set([CX])); expect(h.logs.filter(s => s.includes('persona-invited-channel'))).toHaveLength(1)
   })
   test.each(Object.entries(ENVELOPE_FLAG_FORMS))('envelope flag %s retains decision behavior', async (form, envelope) => {
     const h = harness({ mode: 'fungible' }); const event = makeChannelMessage({ channel: CX, text: mentionText(h.p('alpha').stub.identity.botUserId) + ' hello' }); await h.receive(event, ['alpha'], undefined, envelope)

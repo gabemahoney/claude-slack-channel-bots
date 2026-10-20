@@ -1433,7 +1433,7 @@ describe('DM targets (through the MCP server)', () => {
     expect(result.isError).toBeUndefined()
     const log = stubOf(h.alpha).callLog
     expect(log.map((c) => c.method)).toEqual(['conversations.open', 'chat.postMessage', 'chat.postMessage', 'chat.postMessage', 'filesUploadV2'])
-    expect(stubOf(h.alpha).calls.postMessage.map((c) => [c.channel, (c as { text?: string }).text])).toEqual([[OPENED, 'one'], [OPENED, 'two'], [OPENED, 'three']])
+    expect(stubOf(h.alpha).calls.postMessage.map((c) => [c.channel, (c as { text?: string }).text])).toEqual([[OPENED, 'one\n'], [OPENED, 'two\n'], [OPENED, 'three']])
     expect(stubOf(h.alpha).calls.filesUploadV2).toEqual([{ channel_id: OPENED, file }] as any)
     expect(stubOf(h.beta).callLog).toEqual([])
   })
@@ -2690,12 +2690,19 @@ const PHONETIC = 'alpha\nbravo\ncharlie\ndelta'
 // defaults (4000, `newline`). `chunkText`'s own edge cases are in server.test.ts.
 describe('reply — chunking by the server-wide settings', () => {
   test.each<[string, Partial<ReplySettings>, string, string[]]>([
-    ['no chunk settings, 5999 characters on three lines: split on newlines', {}, `${LINE_A}\n${LINE_B}\n${LINE_C}`, [`${LINE_A}\n${LINE_B}`, LINE_C]],
+    ['no chunk settings, 5999 characters on three lines: retain split newline', {}, `${LINE_A}\n${LINE_B}\n${LINE_C}`, [`${LINE_A}\n${LINE_B}\n`, LINE_C]],
     ['no chunk settings, exactly 4000 characters: one post', {}, `${LINE_A}\n${'b'.repeat(2000)}`, [`${LINE_A}\n${'b'.repeat(2000)}`]],
     ['length, limit 12: split at exactly 12 characters', { reply_chunk_mode: 'length', reply_chunk_limit: 12 }, PHONETIC, ['alpha\nbravo\n', 'charlie\ndelt', 'a']],
-    ['newline, limit 12: split on newlines, lines that fit kept together', { reply_chunk_mode: 'newline', reply_chunk_limit: 12 }, PHONETIC, ['alpha\nbravo', 'charlie', 'delta']],
+    ['newline, limit 12: retain newlines and keep fitting lines together', { reply_chunk_mode: 'newline', reply_chunk_limit: 12 }, PHONETIC, ['alpha\nbravo\n', 'charlie\n', 'delta']],
+    ['newline, limit 4: hard-split an oversized line', { reply_chunk_mode: 'newline', reply_chunk_limit: 4 }, 'abcdefgh\n ', ['abcd', 'efgh', '\n ']],
+    ['newline, limit 4: keep CRLF bytes', { reply_chunk_mode: 'newline', reply_chunk_limit: 4 }, 'a\r\nb\r\n', ['a\r\n', 'b\r\n']],
+    ['newline, limit 3: keep whitespace-only chunks', { reply_chunk_mode: 'newline', reply_chunk_limit: 3 }, ' \n\n \t\r\n ', [' \n\n', ' \t\r', '\n ']],
+    ['length, limit 2: count Unicode code points', { reply_chunk_mode: 'length', reply_chunk_limit: 2 }, 'a😀b🦊c', ['a😀', 'b🦊', 'c']],
+    ['newline, limit 2: keep Unicode and newline boundaries', { reply_chunk_mode: 'newline', reply_chunk_limit: 2 }, '😀\n🦊🚀\n ', ['😀\n', '🦊🚀', '\n ']],
+    ['length, limit 1: never split a surrogate pair', { reply_chunk_mode: 'length', reply_chunk_limit: 1 }, '😀🦊', ['😀', '🦊']],
+    ['newline, limit 1: never split a surrogate pair', { reply_chunk_mode: 'newline', reply_chunk_limit: 1 }, '😀🦊', ['😀', '🦊']],
   ])('%s', async (_label, overrides, text, expected) => {
-    const { reply_chunk_limit: limit, reply_chunk_mode: mode } = { ...REPLY_SETTINGS, ...overrides }
+    const { reply_chunk_limit: limit } = { ...REPLY_SETTINGS, ...overrides }
     const session = await openWithSettings(h.alpha, overrides)
 
     const result = await session.call('reply', { chat_id: A_ALL, text })
@@ -2705,9 +2712,9 @@ describe('reply — chunking by the server-wide settings', () => {
     const posts = stubOf(h.alpha).calls.postMessage as Array<{ channel: string; text: string }>
     expect(posts.map((p) => p.text)).toEqual(expected)
     expect(posts.map((p) => p.channel)).toEqual(expected.map(() => A_ALL))
-    expect(posts.filter((p) => p.text.length > limit)).toEqual([])
-    // `newline` mode drops the newline it splits at; `length` mode drops nothing.
-    expect(posts.map((p) => p.text).join(mode === 'newline' ? '\n' : '')).toBe(text)
+    expect(posts.filter((p) => Array.from(p.text).length > limit)).toEqual([])
+    expect(posts.map((p) => p.text).join('')).toBe(text)
+    expect(posts.flatMap((p) => Array.from(p.text))).toEqual(Array.from(text))
     expect(stubOf(h.beta).callLog).toEqual([])
   })
 })

@@ -196,6 +196,7 @@ Do NOT extract prematurely — a few related functions in server.ts are fine unt
 - **Keep functions readable.** Over ~50 lines or more than 3 levels of nesting: extract helpers.
 - **Magic values.** Named constants over mystery numbers and strings (see Naming Conventions).
 - **DRY.** Copying a block of code a second time means it's time for a shared function.
+- **Preserve relayed message text.** Store accepted Slack text exactly as received; mention recognition determines delivery and `via` without removing mentions or their whitespace. Apply terminal formatting and escaping only through `tag-wrapper.ts` during preparation. Outbound splitting uses `chunkText` from `lib.ts`: joining chunks with an empty separator must recover the exact input, each chunk must stay within the positive integer limit in Unicode code points, and surrogate pairs must stay together. Newline preference keeps its delimiter; it never exempts a long line from the limit.
 
 ## Security
 

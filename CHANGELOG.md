@@ -6,6 +6,11 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 ## Unreleased
 
+### Message text preservation
+
+- **Inbound messages retain every own @mention and its following whitespace,** including quoted, repeated and mention-only text. Accepted text is stored as received before terminal tag formatting.
+- **Replies split without losing whitespace.** Both `reply_chunk_mode` values preserve all supplied text, including blank lines and CRLF line endings; concatenating the posted texts in order reproduces the input exactly. `newline` keeps the split newline in the preceding message and now hard-splits oversized lines. `reply_chunk_limit` counts Unicode code points, so chunks stay within the limit without splitting surrogate pairs.
+
 ---
 
 ## 0.17.0 (2026-10-19)
