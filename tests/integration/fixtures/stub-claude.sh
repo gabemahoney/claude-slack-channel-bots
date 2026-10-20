@@ -580,6 +580,10 @@ handle_key() {
     return 0
 }
 
+# The direct-composer self-check opts in by creating this per-process file
+# before sending input. A fixed record after each handled key provides a
+# consumption barrier without exposing message contents or reading the TUI.
+INPUT_CONSUMED_RECORD="${STUB_DIR}/stub-claude-input-consumed.$$"
 while :; do
     key=""
     if (( REPORT_DUE_MS > 0 )); then
@@ -618,6 +622,9 @@ while :; do
     # stdin closed (tmux pane killed): exit.
     (( rc == 0 )) || break
     handle_key "${key}"
+    if [[ -f "${INPUT_CONSUMED_RECORD}" ]]; then
+        printf 'consumed\n' >> "${INPUT_CONSUMED_RECORD}"
+    fi
 done
 
 exit 0

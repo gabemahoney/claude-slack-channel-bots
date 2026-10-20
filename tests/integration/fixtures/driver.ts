@@ -87,7 +87,7 @@ async function main() {
   await waitState(instanceId, ['ended', 'missing'])
   const modeFile = process.env.DRIVER_STUB_MODES_FILE
   if (!modeFile) driverFail('missing private stub mode file')
-  writeFileSync(modeFile, `unrecognised-dialog\t${WORKING_DIRECTORY}\n`)
+  writeFileSync(modeFile, `manual-start\t${WORKING_DIRECTORY}\n`)
   const trailPath = join(homedir(), '.config', 'agent-director', 'ad-trail.jsonl')
   const before = readFileSync(trailPath, 'utf8').split('\n').length
   const held = await spawnForPersona(persona, personaCfg, false)

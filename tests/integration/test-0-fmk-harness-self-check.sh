@@ -750,7 +750,7 @@ stub_running() {
     grep -qzxF -- "${SCENARIO_BIN}/claude" "/proc/$1/cmdline" 2> /dev/null
 }
 
-# True when tmux pane <target> on the scenario's server shows <text>.
+# Only the generic pressed-N shell probe uses this; never inspect an agent pane.
 pane_shows() {
     "${SCENARIO_REAL_TMUX}" capture-pane -p -t "$1" 2> /dev/null | grep -F -- "$2" > /dev/null
 }
@@ -825,18 +825,15 @@ refire_dir() {
     stub_mode "${REFIRE_DIR}" "$2"
 }
 
-# expect_reported_at_once <path>: <path>'s stub reported in with no Enter:
-# its pane shows the live-session banner and no dialog.
+# expect_reported_at_once <path>: the stub fired SessionStart without Enter.
+# This separate process's hook is ignored by AD with its parent PID recorded.
 expect_reported_at_once() {
-    local step="re-fire $1" session="t0-refire-$1"
-    wait_until 10 "${step}: the stub never reported in (no banner in its pane)" \
-        pane_shows "${session}" "Listening for channel messages"
-    ! pane_shows "${session}" "Enter to confirm" || fail "${step}: the stub's pane shows a dialog"
-}
-
-# True when the pane <target>, its scrollback included, shows <text>.
-pane_history_shows() {
-    "${SCENARIO_REAL_TMUX}" capture-pane -p -S - -t "$1" 2> /dev/null | grep -F -- "$2" > /dev/null
+    local step="re-fire $1" pid="${REFIRE_PID[$1]}" times=()
+    wait_until 10 "${step}: no SessionStart hook from the stub" records_from_at_least "${pid}" 1
+    trail_read times "${TRAIL_IGNORED_FROM}" --argjson p "${pid}"
+    awk -v first="${times[0]}" -v started="${REFIRE_FROM[$1]}" -v bound="${REFIRE_FIRST_S}" \
+        'BEGIN { exit !(first >= started && first - started <= bound) }' \
+        || fail "${step}: SessionStart was not fired within ${REFIRE_FIRST_S}s without Enter"
 }
 
 
@@ -1897,12 +1894,13 @@ leg_stub_direct() {
 
     # A directory with no selection reports in immediately, with no dialog.
     dir="$(make_workdir stub-default)"
-    (cd "${dir}" && exec "${SCENARIO_BIN}/claude" < /dev/null) > "${out}" 2> "${err}" &
+    (cd "${dir}" && exec "${SCENARIO_BIN}/claude" --settings "$(linger_settings "${mark}.default")" < /dev/null) > "${out}" 2> "${err}" &
     pid=$!
     wait "${pid}" || rc=$?
     (( rc == 0 )) || fail "${step}: default at-once stub exited ${rc}"
-    grep -qxF "Listening for channel messages from: server:slack-channel-router" "${out}" \
-        || fail "${step}: default stub did not report in immediately"
+    [[ "$(cat "${mark}.default.start")" == "${pid}" ]] \
+        || fail "${step}: default stub did not fire SessionStart from its own process"
+    [[ ! -e "${mark}.default.end" ]] || fail "${step}: EOF unexpectedly fired SessionEnd"
     [[ ! -s "${err}" ]] || fail "${step}: default stub wrote to standard error"
 
     # Silent: no output, no SessionStart, and the sentinel fires no SessionEnd.
@@ -1911,7 +1909,7 @@ leg_stub_direct() {
     (cd "${dir}" && printf 'hello\r__CSCB_TEST_EXIT__\r' | "${SCENARIO_BIN}/claude" --settings "${settings}") \
         > "${out}" 2> "${err}" || rc=$?
     (( rc == 0 )) || fail "${step}: the silent stub exited ${rc}"
-    [[ ! -s "${out}" && ! -s "${err}" ]] || fail "${step}: the silent stub printed: $(head -c 300 "${out}" "${err}")"
+    [[ ! -s "${err}" ]] || fail "${step}: the silent stub wrote to standard error"
     [[ ! -e "${mark}.start" && ! -e "${mark}.end" ]] || fail "${step}: the silent stub fired a hook"
 
     # At once, with no AGENT_DIRECTOR_INSTANCE_ID and hooks naming a binary
@@ -1924,8 +1922,6 @@ leg_stub_direct() {
     (cd "${dir}" && { sleep "$(seconds_plus "${REFIRE_PERIOD_S}" 1.5)"; printf '__CSCB_TEST_EXIT__\r'; } \
         | env -u AGENT_DIRECTOR_INSTANCE_ID "${SCENARIO_BIN}/claude" --settings "${settings}") > "${out}" 2> "${err}" || rc=$?
     (( rc == 0 )) || fail "${step}: the at-once stub exited ${rc}"
-    grep -qxF "Listening for channel messages from: server:slack-channel-router" "${out}" \
-        || fail "${step}: the at-once stub printed no banner: $(head -c 300 "${out}")"
     [[ -e "${mark}.start" && -e "${mark}.end" ]] || fail "${step}: the at-once stub did not fire SessionStart and SessionEnd"
     [[ "$(line_count "${err}")" == 1 ]] || fail "${step}: standard error holds $(line_count "${err}") line(s), not one stop line"
     _scenario_split_line "$(cat "${err}")" && [[ "${_L_KIND}" == stop ]] \
@@ -1965,10 +1961,14 @@ stub_user_receipt_matches() {
     ' "$1" > /dev/null
 }
 
+stub_input_consumed() {
+    [[ "$(line_count "$1")" == "$2" ]]
+}
+
 # Exercise the complete worker read loop in the image, including no_enter
 # text arriving before its CR. All transcript paths belong to this HOME.
 stub_direct_composer() {
-    local step="$1" dir name=stub-composer mark key transcript rc=0 files=()
+    local step="$1" dir name=stub-composer mark key transcript consumed rc=0 files=()
     local text=$'<channel source="slack">\n  first line\nsecond line\n</channel>\n'
     dir="$(make_workdir "${name}")"
     mark="${SCENARIO_ROOT}/${name}-mark"
@@ -1980,9 +1980,12 @@ stub_direct_composer() {
     (( ${#files[@]} == 1 )) && [[ -f "${files[0]}" ]] \
         || fail "${step}: no unique transcript for the stub's working directory"
     transcript="${files[0]}"
+    consumed="${SCENARIO_BIN}/stub-claude-input-consumed.${FIFO_PID}"
+    : > "${consumed}"
     printf '%s' "${text}" >&"${FIFO_FD}"
-    wait_until 10 "${step}: no_enter text never appeared in the composer" \
-        grep -qF '</channel>' "${SCENARIO_ROOT}/${name}.out"
+    # Each fixed record follows handling one key; no input or screen is read.
+    wait_until 10 "${step}: no_enter text was not completely consumed" \
+        stub_input_consumed "${consumed}" "${#text}"
     [[ "$(jq -s '[.[] | select(.type == "user")] | length' "${transcript}")" == 0 ]] \
         || fail "${step}: LF submitted text before Enter"
     printf '\r' >&"${FIFO_FD}"
@@ -2015,7 +2018,7 @@ linger_settings() {
 # fires no hook and the stub keeps running for STUB_LINGER_HOLD_S, until the
 # sentinel, which fires SessionEnd once from its own process. In one selected
 # for `linger-on-exit`, after report-in (SessionStart from the stub's own
-# process and the banner), the `/exit` line fires SessionEnd once, from the
+# process), the `/exit` line fires SessionEnd once, from the
 # stub's own process, the stub writes its lingering marker
 # (SCENARIO_STUB_LINGER_PREFIX and its PID, beside it in SCENARIO_BIN) and
 # keeps running for STUB_LINGER_HOLD_S; it ignores further lines, still
@@ -2073,8 +2076,6 @@ stub_direct_linger() {
     stub_mode "${dir}" "${STUB_MODE_LINGER_ON_EXIT}"
     fifo_stub "${step}" "${dir}" "${name}" "$(linger_settings "${mark}")"
     wait_until 10 "${step}: the linger-on-exit stub never fired SessionStart" test -s "${mark}.start"
-    grep -qxF "Listening for channel messages from: server:slack-channel-router" "${SCENARIO_ROOT}/${name}.out" \
-        || fail "${step}: the linger-on-exit stub printed no banner: $(head -c 300 "${SCENARIO_ROOT}/${name}.out")"
     [[ "$(cat -- "${mark}.start")" == "${FIFO_PID}" ]] \
         || fail "${step}: the linger-on-exit stub's SessionStart record is '$(tr '\n' ' ' < "${mark}.start")', not once from its process ${FIFO_PID}"
     printf '/exit\r' >&"${FIFO_FD}"
@@ -2128,7 +2129,7 @@ leg_reconnect_contract() {
 }
 
 leg_stub_helpers() {
-    local step="stub helpers" dir link file got n
+    local step="stub helpers" dir link file got n mark
     dir="$(make_workdir stub-select)"
     expect_fails_in_home "${step}" "${HOME}" "unknown mode 'bogus'" stub_mode "${dir}" bogus
     expect_fails_in_home "${step}" "${HOME}" "refused: /tmp is not under SCENARIO_ROOT" stub_mode /tmp "${STUB_MODE_AT_ONCE}"
@@ -2142,11 +2143,12 @@ leg_stub_helpers() {
     file="${SCENARIO_BIN}/stub-claude-modes"
     [[ "$(tail -n 1 "${file}")" == "${STUB_MODE_AT_ONCE}"$'\t'"$(realpath -e -- "${dir}")" ]] \
         || fail "${step}: the selection file's last line is '$(tail -n 1 "${file}")'"
-    got="$(cd "${dir}" && printf '__CSCB_TEST_EXIT__\r' | "${SCENARIO_BIN}/claude")" \
+    mark="${SCENARIO_ROOT}/stub-select-mark"
+    got="$(cd "${dir}" && printf '__CSCB_TEST_EXIT__\r' | "${SCENARIO_BIN}/claude" --settings "$(linger_settings "${mark}")")" \
         || fail "${step}: the stub in ${dir} exited non-zero"
-    [[ "${got}" == "Listening for channel messages from: server:slack-channel-router"$'\n'* \
-        && "${got}" == *$'\nbuffer: ' ]] \
-        || fail "${step}: after silent then at-once, the stub did not print its banner and empty input buffer: ${got}"
+    [[ "$(line_count "${mark}.start")" == 1 && "$(line_count "${mark}.end")" == 1 \
+        && "$(cat "${mark}.start")" == "$(cat "${mark}.end")" ]] \
+        || fail "${step}: the last at-once selection did not fire matching SessionStart and SessionEnd hooks"
 
     # The report-in delay setter: its refusals, and the last setting of a
     # directory wins (written as a whole number).
@@ -2296,11 +2298,9 @@ leg_refire_hold() {
     [[ "${bin%/*}" == "${SCENARIO_AD_SHIM_LOG%/*}" ]] \
         || fail "${step}: the SessionStart hook names ${bin}, not a binary beside the shim log ${SCENARIO_AD_SHIM_LOG}"
 
-    # The silent worker prints nothing and fires nothing, for longer than a
-    # period.
+    # The silent worker stays alive without firing hooks for longer than a period.
     sleep "$(seconds_plus "${REFIRE_PERIOD_S}" 0.5)"
-    [[ -z "$("${SCENARIO_REAL_TMUX}" capture-pane -p -t "${REFIRE_ID}" | tr -d '[:space:]')" ]] \
-        || fail "${step}: the silent worker's pane shows output"
+    stub_running "${REFIRE_SILENT_PID}" || fail "${step}: the silent worker is no longer running"
     trail_read times "${TRAIL_FIRED_FOR} or ${TRAIL_IGNORED_FOR}" --arg id "${REFIRE_ID}"
     (( ${#times[@]} == 0 )) || fail "${step}: the trail holds ${#times[@]} SessionStart record(s) for ${REFIRE_ID} before any reporting stub"
     expect_row_state "${step}" "${REFIRE_ID}" pending

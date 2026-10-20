@@ -529,12 +529,6 @@ t19_transcripts_are() {
     [[ "$(t19_transcripts)" == "$1" ]]
 }
 
-# t19_pane_shows <pane> <text>: true when the pane's visible text holds <text>
-# (the harness reading its own stub's pane).
-t19_pane_shows() {
-    "${SCENARIO_REAL_TMUX}" capture-pane -p -t "$1" 2> /dev/null | grep -qF -- "$2"
-}
-
 # t19_transcripts_hold <count> <hold-s> <step>: for <hold-s> seconds the
 # transcripts stay <count>.
 t19_transcripts_hold() {
@@ -547,28 +541,23 @@ t19_transcripts_hold() {
 }
 
 t19_harness_check() {
-    local step="harness check" dir pane before out
+    local step="harness check" dir pane before out marker settings
     require_ci_image "${step}"
     require_scenario_home "${step}"
     dir="$(make_workdir "${SCENARIO_TAG}selfcheck_work")"
     stub_mode "${dir}" "${STUB_MODE_AT_ONCE}"
     stub_mode "${dir}" "${STUB_MODE_TRANSCRIPT_ON_FIRST_MESSAGE}"
     before="$(t19_transcripts)"
-    seed_unlabelled -c "${dir}" "${SCENARIO_TAG}_selfcheck" "${SCENARIO_BIN}/claude" > /dev/null
+    marker="${SCENARIO_ROOT}/transcript-selfcheck.started"
+    settings="$(jq -nc --arg marker "${marker}" '{hooks:{SessionStart:[{hooks:[{type:"command",command:"/usr/bin/touch",args:[$marker]}]}]}}')"
+    seed_unlabelled -c "${dir}" "${SCENARIO_TAG}_selfcheck" "${SCENARIO_BIN}/claude" --settings "${settings}" > /dev/null
     pane="${SEEDED_PANE_ID}"
-    # The stub's own texts (fixtures/stub-claude.sh): its dialog's first line,
-    # and the banner it prints on reporting in.
-    wait_until "${TRANSCRIPT_WAIT_S}" "${step}: the stub never showed its dialog" t19_pane_shows "${pane}" 'Yes, I trust this folder'
-    [[ "$(t19_transcripts)" == "${before}" ]] || fail "${step}: a transcript was written at the dialog"
-    stub_press_enter "${pane}"
-    wait_until "${TRANSCRIPT_WAIT_S}" "${step}: the stub never reported in after Enter" t19_pane_shows "${pane}" 'Listening for channel messages from:'
+    # This mode reports immediately. Its explicit SessionStart hook is the
+    # readiness record; a transcript is delayed until a non-slash message.
+    wait_for_file "${marker}" "${TRANSCRIPT_WAIT_S}" "${step}: the stub never fired SessionStart"
     [[ "$(t19_transcripts)" == "${before}" ]] || fail "${step}: a transcript was written at report-in"
-    # Observe the slash command's draft before Enter clears the composer.
-    # Submitting it (as CSCB's `pause` does) must create no transcript.
-    "${SCENARIO_REAL_TMUX}" send-keys -t "${pane}" -l -- "/exit" \
-        || fail "${step}: could not type /exit into the stub's pane"
-    wait_until "${TRANSCRIPT_WAIT_S}" "${step}: the pane never showed the typed /exit" t19_pane_shows "${pane}" "/exit"
-    stub_press_enter "${pane}"
+    # Submitting the slash command (as CSCB's pause does) must create no transcript.
+    stub_type_line "${pane}" "/exit"
     t19_transcripts_hold "${before}" "${SLASH_HOLD_S}" "${step}: after a typed /exit"
     stub_type_line "${pane}" "a first message"
     wait_until "${TRANSCRIPT_WAIT_S}" "${step}: no transcript after a typed line" t19_transcripts_are "$(( before + 1 ))"

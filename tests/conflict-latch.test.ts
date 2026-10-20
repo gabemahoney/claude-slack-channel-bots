@@ -5736,6 +5736,8 @@ function expectClearedState(h: RecoveryHarness, key: string): void {
   expect(LATCH_NOTICE_EPISODE_KINDS.map((kind) => [kind, h.episodes.isOpen(key, kind)])).toEqual(LATCH_NOTICE_EPISODE_KINDS.map((kind) => [kind, false]))
 }
 
+const LAUNCH_VERBS: ReadonlySet<string> = new Set(['spawn', 'resume'])
+
 /** Every step-1 clear of the case table (gone, reported in) and every "launch start not recorded" clear on `ended` or `missing`, by row and reading. */
 const RECHECK_CLEARS = RECHECK_TABLE.flatMap((row) =>
   row.recheck.entries.filter((entry) => entry.decision.clear !== undefined).map((entry) => [`${row.name}, step 1 reading ${entry.name}`, row, entry] as const),
@@ -5747,6 +5749,38 @@ describe('a clear by step 1 or by a "launch start not recorded" row read finishe
     const launchStartClears = RECHECK_CLEARS.filter(([, row, entry]) => row.noLaunchStart && entry.decision.step === RECHECK_STEP_TABLE)
     // Every launch-start row, LAUNCH_START_AND_NOTE_ROW included.
     expect(launchStartClears).toHaveLength(2 * (LAUNCH_START_CASE_ROWS.length + 1))
+  })
+  test.each(RECHECK_CLEARS)('%s', async (_name, row, entry) => {
+    const { h, p, q, model } = latchForRecheck(row, row.noLaunchStart ? { launchStartedAt: SAMPLE_LAUNCH_START_NONE } : {})
+    if (row.probeDropped) expect(h.latchSet.setProbeDropped(p)).toBe(true)
+    const record = h.latch.record(p)!
+    scriptRecheckReading(model, row.recheck.readVerb, entry)
+    const watched = watchCalls(h, p)
+    const from = h.timedCalls.length
+
+    await h.advanceToRecheck()
+
+    const reason = entry.decision.clear!.reason
+    const stepOne = entry.decision.step !== RECHECK_STEP_TABLE
+    // One recovery post with the column's reason, its line, the episode ended and the timer stopped.
+    expect(h.episodeNotices.slice(1)).toEqual([recoveryPost(p, record, reason)])
+    expect(clearedLinesIn(h.errors, p)).toEqual([latchClearedLine(p, record, reason, true)])
+    expectClearedState(h, p)
+    // Step 1's read; after a step-1 clear, one bypassing find-missing before the next read of P's row; then the retry at once.
+    const verbs: string[] = personaCallsFrom(h, p, from).map((call) => call.verb)
+    expect(verbs[0]).toBe(row.recheck.readVerb)
+    expect(verbs.filter((verb) => verb === 'findMissing')).toHaveLength(stepOne ? 1 : 0)
+    if (stepOne) expect(verbs[1]).toBe('findMissing')
+    // The retry at once launches once over a row gone or finished, and not at all over one that reported in (its run reconnects or defers).
+    const read = pendingRowOfRecheckReading(entry.reading)!
+    const launches = read.state === PENDING_ROW_MODEL_NO_ROW || AGENT_DIRECTOR_DEAD_STATES.has(read.state) ? 1 : 0
+    expect(verbs.filter((verb) => LAUNCH_VERBS.has(verb)).length).toBe(launches)
+    expect(retryAtOnceLinesOf(h, p)).toHaveLength(1)
+    // The post came between step 1's read and the job's first call, made with P unlatched and held active.
+    expect([watched[0]?.posts, watched[0]?.latched]).toEqual([1, true])
+    expect([watched[1]?.verb, watched[1]?.posts, watched[1]?.latched, watched[1]?.active]).toEqual([stepOne ? 'findMissing' : 'status', 2, false, true])
+    expect(isRestartPendingOrActive(p)).toBe(false)
+    expect([h.latch.isLatched(q), personaCallCounts(h, q)]).toEqual([false, {}])
   })
 
 })
@@ -5787,6 +5821,82 @@ describe('AC 42, AC 43: a latch set while the row read live is not cleared by a 
 
 })
 
+/** A retry the re-check makes at its cadence, by table row: the first entry whose call is a launch, with each answer that clears. */
+const CADENCE_RETRY_CLEARS = RECHECK_TABLE.filter((row) => !row.probeDropped).flatMap((row) => {
+  const entry = row.recheck.entries.find(
+    (candidate) => candidate.decision.clear === undefined && LAUNCH_CALL_METHOD[candidate.decision.call] !== undefined && (candidate.answers?.cleared.length ?? 0) > 0,
+  )
+  return entry === undefined ? [] : entry.answers!.cleared.map((answer) => [`${row.name}, step 1 reading ${entry.name}, ${answer.name}`, row, entry, answer] as const)
+})
+
+describe('a retry at the cadence that is not refused: no post before it, no find-missing, one recovery post with "a retry of the refused operation was not refused", and no second launch (recovery harness; SRJ-506, SRJ-1005; hatch A3)', () => {
+  test.each(CADENCE_RETRY_CLEARS)('%s', async (_name, row, entry, answer) => {
+    const { h, p, q, model, record } = latchForRecheck(row, row.noLaunchStart ? { launchStartedAt: SAMPLE_LAUNCH_START_NONE } : {})
+    scriptRecheckReading(model, row.recheck.readVerb, entry)
+    scriptLaunchAnswer(model, entry.decision.call, answer.answer())
+    const watched = watchCalls(h, p)
+    const from = h.timedCalls.length
+
+    await h.advanceToRecheck()
+
+    const verbs: string[] = personaCallsFrom(h, p, from).map((call) => call.verb)
+    const expected = [row.recheck.readVerb, ...guardedLaunchCalls(LAUNCH_CALL_METHOD[entry.decision.call]!)]
+    expect(verbs.slice(0, expected.length)).toEqual(expected)
+    expect([verbs.filter((verb) => LAUNCH_VERBS.has(verb)).length, verbs.includes('findMissing')]).toEqual([1, false])
+    expect(h.stub.calls.spawnCalls.map(call => [call.instance_id, call.reuse_finished === true])).toEqual(
+      entry.decision.call === RECHECK_CALL_RESUME ? [] : [[personaInstanceId(p), entry.decision.call === RECHECK_CALL_REUSE_SPAWN]],
+    )
+    expect(h.stub.calls.resumeCalls.map(call => call.instance_id)).toEqual(entry.decision.call === RECHECK_CALL_RESUME ? [personaInstanceId(p)] : [])
+    // P was still latched with only its latch post when the retry was made.
+    expect(watched.filter((call) => LAUNCH_VERBS.has(call.verb)).map((call) => [call.posts, call.latched])).toEqual([[1, true]])
+    expect(answer.reason).toEqual(LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED)
+    expect(h.episodeNotices.slice(1)).toEqual([recoveryPost(p, record, answer.reason)])
+    expect(clearedLinesIn(h.errors, p)).toEqual([latchClearedLine(p, record, answer.reason, true)])
+    expectClearedState(h, p)
+    // The retry's outcome stands: no retry at once after it.
+    expect(retryAtOnceLinesOf(h, p)).toEqual([])
+    expect([h.latch.isLatched(q), personaCallCounts(h, q)]).toEqual([false, {}])
+  })
+})
+
+/** The finished-row retry's launches, with each answer that clears. */
+const FINISHED_ROW_CLEARS = FINISHED_ROW_RETRY_ENTRIES.filter((entry) => LAUNCH_CALL_METHOD[entry.call] !== undefined).flatMap((entry) =>
+  entry.answers!.cleared.map((answer) => [`get reading ${entry.name}, ${answer.name}`, entry, answer] as const),
+)
+
+describe('"not this launch\'s session": no post before its finished-row retry or when that retry relatches; one "its row finished and a relaunch was not refused" post when it clears (recovery harness; SRJ-505, SRJ-506, SRJ-1005)', () => {
+  test.each(FINISHED_ROW_CLEARS)('%s', async (_name, entry, answer) => {
+    const noRow = entry.reading.kind === RECHECK_READING_NO_ROW_VALUE.kind
+    const state = noRow ? PENDING_ROW_MODEL_NO_ROW : (entry.reading as { state: string }).state
+    const { h, p, q, model, record } = latchForRecheck(statusOnlyRow(), { state, ...(entry.hasSessionId ? {} : { row: { session_id: '' } }) })
+    scriptLaunchAnswer(model, entry.call, answer.answer())
+    const watched = watchCalls(h, p)
+    const from = h.timedCalls.length
+
+    await h.advanceToRecheck()
+
+    const verbs: string[] = personaCallsFrom(h, p, from).map((call) => call.verb)
+    const expected = ['status', 'get', ...guardedLaunchCalls(LAUNCH_CALL_METHOD[entry.call]!)]
+    expect(verbs.slice(0, expected.length)).toEqual(expected)
+    expect([verbs.filter((verb) => LAUNCH_VERBS.has(verb)).length, verbs.includes('findMissing')]).toEqual([1, false])
+    expect(h.stub.calls.spawnCalls.map(call => [call.instance_id, call.reuse_finished === true])).toEqual(
+      entry.call === RECHECK_CALL_RESUME ? [] : [[personaInstanceId(p), entry.call === RECHECK_CALL_REUSE_SPAWN]],
+    )
+    expect(h.stub.calls.resumeCalls.map(call => call.instance_id)).toEqual(entry.call === RECHECK_CALL_RESUME ? [personaInstanceId(p)] : [])
+    expect(watched.filter((call) => call.verb === 'get' || LAUNCH_VERBS.has(call.verb)).map((call) => [call.verb, call.posts, call.latched])).toEqual([
+      ['get', 1, true],
+      ...(entry.call === RECHECK_CALL_RESUME ? [['get', 1, true]] : []),
+      [LAUNCH_CALL_METHOD[entry.call]!, 1, true],
+    ])
+    expect(answer.reason).toEqual(LATCH_RECOVERY_REASON_RELAUNCH_NOT_REFUSED)
+    expect(h.episodeNotices.slice(1)).toEqual([recoveryPost(p, record, answer.reason)])
+    expectClearedState(h, p)
+    expect(retryAtOnceLinesOf(h, p)).toEqual([])
+    expect([h.latch.isLatched(q), personaCallCounts(h, q)]).toEqual([false, {}])
+  })
+
+})
+
 /** Every probe of the case table that finds the condition cleared: a row, a reading whose call is the probe, and the answer. */
 const CLEARED_PROBES = RECHECK_TABLE.filter((row) => !row.probeDropped).flatMap((row) =>
   row.recheck.entries
@@ -5803,6 +5913,47 @@ function failFindMissing(h: RecoveryHarness, err: Error): void {
 }
 
 describe('the cleared probe\'s find-missing and single retry: a refused run holds the retry back, the latched answer goes on, a collision gives no information, and a "this row\'s own id" retry refused again drops the probe (recovery harness; SRJ-505, SRJ-506, SRJ-120; AC 8; E14 build)', () => {
+  test.each(CLEARED_PROBES)('%s', async (_name, row, entry, answer) => {
+    const { h, p, q, model, record } = latchForRecheck(row)
+    scriptRecheckReading(model, row.recheck.readVerb, entry)
+    model.scriptReadPane(answer.answer())
+    const watched = watchCalls(h, p)
+    const from = h.timedCalls.length
+
+    await h.advanceToRecheck()
+
+    const retry = expectedClearedProbeRetry(record.refusedOperation, entry.reading, false)
+    const verbs: string[] = personaCallsFrom(h, p, from).map((call) => call.verb)
+    const first = retry === RECHECK_CALL_RESTART_DECISION ? 'status' : LAUNCH_CALL_METHOD[retry]!
+    const expected = [row.recheck.readVerb, 'readPane', 'findMissing', ...guardedLaunchCalls(first)]
+    expect(verbs.slice(0, expected.length)).toEqual(expected)
+    // The find-missing and the retry are made with P still latched and only its latch post.
+    const guardedRetry = ['findMissing', ...guardedLaunchCalls(first)]
+    expect(watched.slice(2, 2 + guardedRetry.length).map((call) => [call.verb, call.posts, call.latched])).toEqual(
+      guardedRetry.map(verb => [verb, 1, true]),
+    )
+    if (retry !== RECHECK_CALL_RESTART_DECISION) {
+      expect([verbs.filter((verb) => verb === 'findMissing').length, verbs.filter((verb) => LAUNCH_VERBS.has(verb)).length]).toEqual([1, 1])
+      expect(h.stub.calls.spawnCalls).toEqual(retry === RECHECK_CALL_REUSE_SPAWN ? [reuseSpawnOf(h, p)] : [])
+      expect(h.stub.calls.resumeCalls).toHaveLength(retry === RECHECK_CALL_RESUME ? 1 : 0)
+    }
+    // The retry's outcome by step 1's reading: a run of the restart path's
+    // decision over a row read `pending` defers to the pending row, which
+    // clears nothing, so P stays latched with its one post; every other
+    // retry (a launch, or a run over a row read waiting, ended or missing)
+    // completes with no refusal and clears with one recovery post.
+    const staysLatched = retry === RECHECK_CALL_RESTART_DECISION && pendingRowOfRecheckReading(entry.reading)?.state === AGENT_DIRECTOR_PENDING_STATE
+    if (staysLatched) {
+      expect([h.latch.record(p), h.episodeNotices.length, h.latchRecheck.isArmed(p)]).toEqual([record, 1, true])
+    } else {
+      expect(h.episodeNotices.slice(1)).toEqual([recoveryPost(p, record, LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED)])
+      expectClearedState(h, p)
+    }
+    // A retry's clear keeps its outcome: no retry at once after it.
+    expect(retryAtOnceLinesOf(h, p)).toEqual([])
+    expect([h.latch.isLatched(q), personaCallCounts(h, q)]).toEqual([false, {}])
+  })
+
   const REFUSALS: ReadonlyArray<readonly [string, () => Error, readonly OutageClass[]]> = [
     ['UNAVAILABLE (ErrTmuxUnresponsive)', () => errTmuxUnresponsive('find-missing'), []],
     ['UNAVAILABLE (ErrCallTimeout)', () => errCallTimeout('find-missing'), []],
