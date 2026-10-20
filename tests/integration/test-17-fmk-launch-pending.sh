@@ -1,569 +1,8 @@
 #!/usr/bin/env bash
-# Test 17 (HO §7 scenarios 5, 11 and 13; b.jg5 SRJ-1406, SRJ-1413,
-# SRJ-1415, SRJ-401, SRJ-402, SRJ-404, SRJ-406, SRJ-407, SRJ-409, SRJ-410,
-# SRJ-120, SRJ-308, SRJ-310, SRJ-710, SRJ-713, SRJ-1112, SRJ-1306, SRJ-1401,
-# SRJ-1418; AC 3, AC 6, AC 29, AC 32): a launch in progress, and a resume
-# right after an exit, in five legs, run in this order:
-# - scenario 5's leg (`leg_launch_pending`): a resume held at the
-#   startup-trust dialog reads `pending` with its kept session_id and a
-#   launch start; health ticks and a `resume` forced meanwhile change nothing
-#   (no launch, kill, counted failure or post; the forced `resume` gets
-#   ErrSpawnNotResumable, not counted and not posted); the approver clears
-#   the dialog through agent-director `read-pane` and `send-keys` with
-#   `--allow-pending` on the `pending` row, the row reaches `waiting`, and the
-#   bot server starts no tmux process (AC 3);
-# - the launch-timeout legs (`leg_launch_timeouts`): a plain spawn, a reuse
-#   and a `resume` whose session-creating tmux call outlasts agent-director's
-#   create timeout (the tmux shim's `slow-create`) each end in a launch
-#   timeout; one `get` follows, the row reads `pending`, and the approver
-#   answers the dialog through `read-pane` and `send-keys` with
-#   `--allow-pending`, whose `send-keys` adopts the pane after the lost
-#   reply; the stub then reports in and the row reaches `waiting`, with no
-#   launch, kill or post over it (AC 29);
-# - the restart leg (`leg_restart_mid_launch`): a launch held at its starting
-#   screen across a server restart (a plain `stop`, then a start) is found
-#   `pending` by the new server, which made no launch for it and runs no
-#   approver of its own; the pending-row rule's lap from G clears the dialog
-#   and the row reaches `waiting`, with no launch, kill or post (AC 32);
-# - scenario 11's leg (`leg_fail_create`): a fresh spawn whose
-#   session-creating tmux call fails (the tmux shim's `fail-create`) ends in
-#   ErrTmuxSessionCreate and leaves a `pending` row; CSCB never kills it or
-#   launches over it, its own pending-row rule's `find-missing` marks it
-#   `missing` from G, and the persona is then brought up, with no post
-#   calling it a dispatcher bug and no escalation (AC 6);
-# - scenario 13's leg (`leg_still_stopping`): a bot the harness pauses
-#   reads `ended` while its worker still runs; the bot server's immediate
-#   `resume` is refused once as "still stopping" (UNAVAILABLE), followed by
-#   one `get`, and posts nothing; once the harness releases the worker, the
-#   retry timer's retry resumes the bot, before the next health tick.
-#
-# The fmk set-up (lib/scenario.sh, fmk mode: TEST_NAME carries `-fmk-`):
-# - its own HOME, agent-director store and tmux server under SCENARIO_ROOT;
-#   the release installed through its install.sh, behind the agent-director
-#   shim (agent-director-admin too); agent-director's default settings (no
-#   config.toml, so no `[tmux]` table);
-# - the tmux shim first on every CSCB process's PATH, in `log` mode apart
-#   from the launch-timeout legs' start and scenario 11's start (below);
-# - the stub as `claude`, in `startup-trust` (no selection) in every persona's
-#   working directory but scenario 13's, with the dialog delay
-#   (`stub_dialog_delay`) where a leg sets it; scenario 13's working
-#   directory is selected for `linger-on-exit` (`stub_mode`; the stub's
-#   header, LINGERING);
-# - the live server against the Slack stub (fixtures/slack-stub-server.ts
-#   with `--record`; posts are read from that record), one stub per leg,
-#   each answering ok only for that leg's personas' token pairs;
-# - each leg in its own state dir (`new_state_dir`); a start reads its state
-#   dir's last-applied configuration, so a leg that changes a persona's
-#   working directory between two starts makes the second start in a new
-#   state dir.
-#
-# Scenario 5's leg's set-up: one persona P, with CSCB's config shortened:
-# `health_check_interval` HEALTH_TICK_S and `session_restart_delay`
-# RESTART_DELAY_S; the dialog delay set in P's working directory to
-# DIALOG_DELAY_S before the resume.
-#
-# Scenario 5's leg (`leg_launch_pending`), in run order. Steps marked
-# [harness] are the harness playing a human from the scenario's own shell;
-# no CSCB process makes them.
-#   1. The live start brings P up: the stub holds at the startup-trust dialog
-#      (no delay yet), the approver clears it, the row reads `waiting`, the
-#      server registers the stub's MCP session as P's, and the bring-up's
-#      approver has stopped (no bot-server pane read of P for
-#      APPROVER_QUIET_S), so its stop is the silent one, on the live row.
-#   2. [harness] The dialog delay is set in P's working directory.
-#   3. [harness] P's worker is ended with the stub's sentinel, sent into P's
-#      pane with the real tmux: the stub fires SessionEnd and exits, and a
-#      harness `get` reads the row `ended` (or `missing`) with its
-#      session_id.
-#   4. The bot server resumes P through its restart path (the session's
-#      disconnect, or a health tick that reads the row dead, schedules the
-#      restart; ruling S4): one `resume` of P's row, whose parent is the bot
-#      server. The resumed stub shows its starting screen for DIALOG_DELAY_S.
-#   5. During the hold:
-#      - [harness] a harness `get` reads `pending`, the same
-#        session_id and a launch_started_at that parses, and neither
-#        P's pane nor the stub's record of the dialogs it printed
-#        (`stub_shown_dialogs`, keyed by the pane's process: the resumed
-#        stub's own, not the bring-up stub's, which showed a dialog) holds
-#        either approver needle;
-#      - fixtures/fmk-driver.ts forces one `resume` of P (through
-#        `cscb_run`, a CSCB process): its outcome line names
-#        ErrSpawnNotResumable, `called=true` and `counted=false`, and it is
-#        the driver's only launch call; it posted nothing: the driver installs
-#        no notifier, so a notice would be logged on its standard error, and
-#        that holds neither the no-notifier line for P
-#        (src/session-manager.ts sendPersonaNotice) nor the driver's own
-#        outage-notice line for P;
-#      - the row still reads `pending`, and the pane and the record still
-#        hold neither needle, once the driver has returned;
-#      - health ticks run: in the hold, from its first read to its last read
-#        of the pane and the record with no needle (D seconds; step 6), the
-#        bot server's `status` reads of P whose next call of P's row
-#        (`status` or `read-pane`) is not a `read-pane` (an approver lap
-#        reads status, then the pane; a tick reads status only) number at
-#        least ⌊D / HEALTH_TICK_S⌋ - 1 (see Waits).
-#   6. [harness] The pane, then the stub's record, is read every
-#      SCENARIO_POLL_S until either holds the startup-trust needle (the
-#      delay's end). The stub clears an answered dialog from its pane, so a
-#      pane read alone can miss a dialog shown and answered between two reads
-#      (under parallel /ci load it did; b.fyq); the record keeps every dialog
-#      the stub printed. Each read's time is taken before both of its reads,
-#      so the last read with no needle in either is a time before the dialog
-#      showed; it is the one after the forced resume when the first read of
-#      this step already finds the dialog. Then the row is read until it
-#      leaves `pending`: it reads `waiting` with the same session_id,
-#      and the record then holds the startup-trust dialog.
-#   7. Checks over the leg, counting only shim lines whose parent is the bot
-#      server (or, for the forced call, the driver):
-#      - exactly one `resume` of P by the bot server, and no `spawn`
-#        (reuses included), `resume` or `kill` of P by it after that one;
-#      - no `send-keys` of P from any process between the resume and the
-#        delay's end; every `send-keys` of P after the resume is the bot
-#        server's and carries `--allow-pending`; after the delay's end a
-#        bot-server `read-pane` of P with `--allow-pending`, then its
-#        `send-keys`, both before the first harness read that is not
-#        `pending`;
-#      - no post (chat.* or files.* method) reaches the Slack stub's record
-#        from the hold's first `pending` read to that first read that is not
-#        `pending`;
-#      - no server.log line in the hold names P with a reconnect, relaunch,
-#        restart scheduling or not-connected text (ruling S3: a health tick
-#        acting on the stub's missing MCP session stops the run);
-#      - no server.log line across the leg starts with APPROVER_LOG_PREFIX
-#        and names P (ruling S7: the approver writes no line when it sends
-#        Enter or when it stops because the row went live).
-#   The server is then stopped with `stop --stop-bots`.
-# Outcomes the SRD leaves open are recorded in the script's output, not
-# asserted (ruling S8): what scheduled the restart, the driver's `latched`,
-# `class` and `action`, the hold's status and pane-read counts beside the
-# tick reads' count, whether the pane still showed the dialog at the step-6
-# read that found it, and every post across the leg.
-#
-# The launch-timeout legs (`leg_launch_timeouts`), in run order, with
-# `health_check_interval` 0 (ruling S3: no tick is needed). Three personas,
-# by role: `spawn` (no row: a plain spawn), `reuse` (a finished row whose
-# `cwd` differs from the persona's working directory: the ladder's replace
-# step makes a reuse spawn, `spawn --reuse-finished`) and `resume` (a
-# finished row holding its session_id: a `resume`).
-#   1. In state dir `bringup`, the live start brings the reuse and resume
-#      personas up (working directories `reuse-a` and `resume`): each row
-#      reads `waiting` with a session_id, each session is registered,
-#      and the bring-up's approvers have stopped (APPROVER_QUIET_S with no
-#      pane read). A plain `stop` follows (the workers keep running and no
-#      restart path runs); [harness] each worker then ends with the stub's
-#      sentinel, and its row reads `ended` (or `missing`) with its
-#      session_id.
-#   2. In state dir `launch`, the config names the three personas, the reuse
-#      persona now in `reuse-b`; [harness] the dialog delay
-#      LT_DIALOG_DELAY_S is set in the three working directories.
-#   3. [harness] The tmux shim is set to `slow-create` with CREATE_DELAY_S,
-#      then the live start makes the three launches: each launch's
-#      `new-session` creates the session with its labels and the stub, and
-#      agent-director's create timeout ends the launch call with an
-#      ErrTmuxUnresponsive carrying LAUNCH_TIMEOUT_PHRASE.
-#   4. [harness] The three rows are read in turn, every SCENARIO_POLL_S, from
-#      the start until each has left `pending`; once each persona's
-#      post-timeout get line is in server.log (every launch call has ended),
-#      the shim is set back to `log`.
-#   5. Each row reads `waiting`, its session is registered, and the resume's
-#      row keeps the resumed session_id.
-#   6. The leg waits until each persona's retry timer has a stopped line
-#      (recorded, not asserted, when one has not within LT_RETRY_WAIT_S).
-#   7. Checks per persona, over the bot server's agent-director calls of its
-#      row (`call_table`):
-#      - its launch is of its kind: the spawn persona's plain spawn carries
-#        no `--reuse-finished` (and it has no reuse spawn or `resume`); the
-#        reuse persona's `spawn` carries `--reuse-finished` (and it has no
-#        `resume`); the resume persona's launch is a `resume` (and it has no
-#        reuse spawn); the reuse and resume personas' own plain spawn, the
-#        ladder's first step, collided first (recorded);
-#      - the launch timeout: a server.log line naming the persona carries
-#        LAUNCH_TIMEOUT_PHRASE, or its get line names the ErrCallTimeout form
-#        (E28 T3; FORM_CALL_TIMEOUT); exactly one post-timeout get line, which
-#        names a launch timeout (FORM_CALL_TIMEOUT or FORM_TMUX_UNRESPONSIVE
-#        right after the persona's reference) and OUTCOME_APPROVER (the
-#        approver started);
-#      - exactly one bot-server `get` of the row between the launch and the
-#        first bot-server `read-pane` with `--allow-pending`, then a
-#        bot-server `send-keys` with `--allow-pending`, the only `send-keys`
-#        of the row from any CSCB process up to it; no bot-server `spawn`
-#        (reuses included) or `resume` of the row after the launch, and no
-#        `kill` of it from any CSCB process;
-#      - [harness] a harness read after that `get` reads `pending`;
-#      - the stub reports in only after the `send-keys`: the persona's
-#        session registration line and the first harness read out of
-#        `pending` both come after it;
-#      - one of the persona's tmux-unresponsive ended lines
-#        (`tmuxUnresponsiveEndedLines`) comes no later than the first harness
-#        read out of `pending`;
-#      - every retry line of the persona's retry timer (the retry builder's
-#        line exactly, so never the re-armed line) is followed within
-#        LT_RETRY_READ_S by a bot-server `status` or `get` of the row (and no
-#        launch, above); how many there are is recorded, not asserted: a
-#        retry is not certain, as the tmux-unresponsive condition ends before
-#        the timer's first wait (UNAVAILABLE_RETRY_BASE_S) from the launch
-#        timeout has passed, and that end keeps the timer only while the
-#        row's last read is `pending` (src/unavailable-retry.ts
-#        `conditionEnded`): an end that brings a live reading stops it;
-#      - no conflict-latch line names the persona;
-#      and no post reaches the Slack stub's record from the start on (no
-#      spawn-failure or CONFLICT notice among them).
-#   The server is then stopped with a plain `stop`, and [harness] each worker
-#   ends with the sentinel (`stop --stop-bots` would wait out each persona's
-#   pause, which the stub never answers, before its kill).
-# Recorded, not asserted (ruling S8): the start pass's summary line, each
-# persona's agent-director calls with their times, the plain spawns'
-# collision lines, the timeout-phrase and get lines, its tmux-unresponsive
-# and retry-timer lines, its number of retries, and the reuse row's
-# session_id before and after.
-#
-# The restart leg (`leg_restart_mid_launch`), in run order, in state dir
-# `restart`, `health_check_interval` 0, one persona Q (working directory
-# `restart`) with the dialog delay RESTART_DIALOG_DELAY_S:
-#   1. The live start launches Q (the old server); [harness] Q's row reads
-#      `pending` with a launch start L; the old server's approver has read
-#      Q's pane, which shows no dialog yet.
-#   2. [harness] A plain `stop` (no `--stop-bots`), then a live start (the
-#      new server), both inside the delay (checked: the new start pass has
-#      completed before L + RESTART_DIALOG_DELAY_S); the row still reads
-#      `pending` with launch start L.
-#   3. [harness] The row is read every RESTART_POLL_S until it leaves
-#      `pending`, bounded at RESTART_CLEAR_BOUND_S from L; it reads `waiting`
-#      with a session_id.
-#   4. Checks, over the CSCB processes' agent-director calls of Q's row:
-#      - the new server launched nothing: its one plain spawn of Q (its start
-#        pass's ladder's first step) is followed by its collision line
-#        reading the row `pending`, and it made no reuse spawn, `resume` or
-#        `kill` of Q;
-#      - no approver of its own: no line of the new server's starts with
-#        APPROVER_LOG_PREFIX and names Q, and its first `read-pane` of Q
-#        comes at or after L + G;
-#      - its lap's `send-keys` with `--allow-pending` follows that
-#        `read-pane` before the first read out of `pending`, and it is the
-#        only `send-keys` of Q from any CSCB process before then (the old
-#        server's approver typed nothing);
-#      - the old server's approver stopped at shutdown and armed nothing
-#        (SRJ-404): the old server's log holds its shutdown stop line for Q
-#        once, and no arm line for Q after it, neither armed nor not armed
-#        (shutdown closes the retry controller before it stops the
-#        approvers, so an arm after the stop would log the not-armed line).
-#        The pending-row rule's run, which shutdown also rules out, is not
-#        checked: for a row younger than G it writes no line;
-#      - no post reaches the Slack stub's record in the leg.
-#   The server is then stopped with a plain `stop`, and [harness] Q's worker
-#   ends with the sentinel.
-# Recorded, not asserted (ruling S8): the stop's and the start's times from
-# L, both servers' calls of Q with their times, the old server's approver
-# lines, and the new server's retry-timer and pending-row rule lines.
-#
-# Scenario 11's leg (`leg_fail_create`), in run order, in state dir
-# `failcreate`, `health_check_interval` 0 (ruling S3: the failure arms the
-# retry timer at once, so no tick is needed), one persona F (working
-# directory `failcreate`, no dialog delay), the only persona the server
-# launches while the shim is in `fail-create`. The harness runs no
-# `find-missing` (SRJ-1401: F is not latched, so its row is marked by CSCB's
-# own pending-row runs).
-#   1. [harness] F's row is absent (a harness `get` answers ErrSpawnNotFound).
-#   2. [harness] The tmux shim is set to `fail-create`, then the live start
-#      makes F's plain spawn: agent-director writes the row, its
-#      `new-session` call fails (the shim logs it, creates nothing and exits
-#      1), and the spawn ends in ErrTmuxSessionCreate.
-#   3. [harness] Once server.log holds the plain spawn's ErrTmuxSessionCreate
-#      line for F (the launch call has ended), the shim is set back to `log`;
-#      at least one `new-session` call reached the shim in `fail-create`.
-#   4. [harness] A `get` reads F's row `pending` with a launch start L that
-#      parses; a `list --state pending` lists F's row alone.
-#   5. [harness] F's row is read every FC_POLL_S until it is live, bounded at
-#      FC_BRINGUP_BOUND_S from L; each read before G that finds the row
-#      `pending` with launch start L is followed by `list --state pending`,
-#      which must list F's row alone. The row comes up `waiting` and the
-#      server registers F's session.
-#   6. Checks, over the bot server's agent-director calls (`call_table`):
-#      - its one launch call (spawn or `resume`, any row) while the shim was
-#        in `fail-create` is F's plain spawn (no `--reuse-finished`);
-#      - no `find-missing` of its between L and G after it;
-#      - F's next launch (the bot server's first spawn or `resume` of F's row
-#        after the failed spawn) comes after its last `find-missing` before
-#        that launch, which is at or after G, and after a `get` of F's row
-#        between the two;
-#      - exactly one PENDING_ROW_RULE_LOG_HEAD round line for F names its run
-#        PENDING_ROW_RUN_MARKED_MISSING and its get `missing`, written no
-#        later than F's next launch;
-#      - [harness] a harness read of `missing`, when one caught it, comes
-#        after that `find-missing`;
-#      - no `kill` of F's row from any CSCB process, and no `find-missing` in
-#        the leg from any process but the bot server (the scenario's shell
-#        makes none);
-#      - no post in the Slack stub's record holds "dispatcher bug" (matched
-#        case-insensitively over the whole recorded post); at most one post
-#        holds the spawn-failure notice's first line, and that one holds the
-#        notice's head for ErrTmuxSessionCreate; no other post (no cap,
-#        alert or stuck-launch post).
-#   The server is then stopped with a plain `stop`, and [harness] F's worker
-#   ends with the sentinel.
-# Recorded, not asserted (ruling S8): the failure line and how many
-# `new-session` calls failed, the start pass's summary, the harness reads in
-# order (whether one caught `missing`), the bot server's calls of F's row
-# and its `find-missing` runs with their times from L, F's retry-timer,
-# pending-row rule and collision lines, the startup-errors.log lines naming
-# F, and whether the counted failure posted a spawn-failure notice.
-#
-# Scenario 13's leg (`leg_still_stopping`), in run order, in state dir
-# `paused`, one persona S (working directory `paused`, selected for the
-# stub's `linger-on-exit`: the stub reports in at once, and answers the `/exit`
-# that agent-director's `pause` types by firing SessionEnd, ending its MCP
-# session and lingering, its process and tmux session still running, until
-# `stub_release`, by its tmux session), with health ticks on (ruling S3): `health_check_interval`
-# ST_TICK_S and `session_restart_delay` ST_RESTART_DELAY_S, through the
-# config.
-#   1. The live start brings S up: the row reads `waiting` with a
-#      session_id, the server registers the stub's MCP session as
-#      S's, the bring-up's approver has stopped (APPROVER_QUIET_S with no
-#      pane read), and the bring-up launch's pending-only retry timer has
-#      stopped (as many stopped lines as armed lines), so the refusal below
-#      arms a fresh timer.
-#   2. A health tick reads S: the bot server's next `status` of S (with the
-#      approver and the timer stopped, only a tick reads it) at T0.
-#   3. [harness] At once, a harness `pause` of S from the scenario's own
-#      shell, through the agent-director shim (a human's `pause`): it
-#      returns success no later than ST_PAUSE_S after T0 (checked), the row
-#      reads `ended` with the same session_id, and the worker's tmux
-#      session and pane process still run.
-#   4. The stub's MCP session ended with SessionEnd, so the server schedules
-#      S's restart; after the restart delay the restart path resumes S, and
-#      agent-director refuses the resume: the row ended less than the
-#      stopping window ago and its agent still runs.
-#   5. [harness] Once server.log holds that refusal, `stub_release` releases
-#      the worker at once (it waits for the stub's process to end); its tmux
-#      session is gone within
-#      ST_SESSION_END_WAIT_S.
-#   6. The row reads `waiting` again with the same session_id, and
-#      the server registers the resumed stub's session as S's.
-#   7. The next tick's read of S: the bot server's first `status` of S from
-#      T0 + ST_TICK_S - ST_TICK_JITTER_S on, no later than T0 + ST_TICK_S +
-#      ST_TICK_JITTER_S (checked).
-#   8. Checks, over the bot server's agent-director calls of S's row
-#      (`call_table`) and server.log:
-#      - exactly two bot-server `resume`s of S after the pause, and no reuse
-#        spawn (`spawn --reuse-finished`) or `kill` of S from any CSCB
-#        process (each `resume` follows its ladder's plain spawn, which
-#        collides with S's row: recorded);
-#      - the first `resume` came inside the stopping window from the pause;
-#      - exactly one server.log refusal of S's `resume` carries
-#        STILL_STOPPING_PHRASE, between the two `resume`s;
-#      - exactly one post-UNAVAILABLE get line for S's `resume` (SRJ-407),
-#        and exactly one bot-server `get` of S from the refused `resume` to
-#        that line;
-#      - the retry timer's first retry line for S after the refusal comes
-#        after the release and after the worker's session ended, and the
-#        second `resume` follows it within ST_LAUNCH_SLACK_S, before the
-#        next tick's read and before the row read `waiting` again: the
-#        success is a retry's, not a tick's (SRD over the Epic and HO);
-#      - no post reaches the Slack stub's record from the pause on: none
-#        holds S's tmux-unresponsive onset (`tmuxUnresponsiveOnsetText`) or
-#        the spawn-failure notice's first line, and there is no alert or
-#        other post (SRJ-308: the single refusal cleared before the next
-#        tick); checked here and again once the server has stopped (any post
-#        the next tick's onset check made is in the record by then, as
-#        shutdown ends every episode silently; the Slack stub still runs);
-#      - no server.log line after the second `resume` names S with a
-#        reconnect, relaunch, restart scheduling or not-connected text
-#        (ruling S3: a tick acting on a stub with no MCP session stops the
-#        run).
-#   The server is then stopped with a plain `stop` (the record checks above
-#   run again), and [harness] S's worker ends with the sentinel (`stop
-#   --stop-bots` would pause it, and the stub would linger).
-# Recorded, not asserted (ruling S8): what scheduled the resume (the
-# restart-scheduling lines), the bot server's calls of S from the pause with
-# their times from T0, the plain spawns' count and collision lines, the
-# refusal line and every line naming S that carries
-# STILL_STOPPING_PHRASE, the get line, S's retry-timer and tmux-unresponsive
-# lines, and the times of the pause, the refused resume, the release, the
-# retry, the second resume and the next tick from T0.
-#
-# Waits and their derivation (seconds):
-# - Scenario 5's tick reads: health ticks fire every HEALTH_TICK_S, so a
-#   hold of D seconds holds at least ⌊D / HEALTH_TICK_S⌋ tick instants, each
-#   reading P's status once; one is allowed lost at the window's end (a tick
-#   whose read lands just after the hold's last read with no needle). An
-#   approver lap's status read is followed by its `read-pane`, so among the
-#   status reads not followed by a `read-pane` each tick read adds exactly
-#   one (when it falls between a lap's two reads, the lap's status read is
-#   the one counted) and a lap adds none by itself; other status-only reads,
-#   such as a retry's, only raise the count.
-# - DIALOG_DELAY_S = HEALTH_TICK_S + FORCED_RESUME_S + HOLD_SLACK_S: longer
-#   than one health tick interval plus the forced `resume` (bounded at
-#   FORCED_RESUME_S, checked) plus HOLD_SLACK_S for the resume's launch call
-#   to the hold's first harness read; the run fails unless DIALOG_DELAY_S +
-#   APPROVER_CLEAR_S is shorter than G, agent-director's default pending
-#   grace period (DEFAULT_AD_SETTINGS), so the approver clears the dialog
-#   at its 1 s pace, before G.
-# - RESTART_DELAY_S is long enough for the harness to read the row `ended`
-#   before the restart resumes it; RESUME_WAIT_S bounds the resume after the
-#   sentinel (the restart delay, two health ticks and the launch call).
-# - APPROVER_CLEAR_S bounds the dialog's clear after the delay's end: the
-#   approver's next lap (its pace before G), its Enter and the stub's
-#   report-in.
-# - APPROVER_QUIET_S is three laps at the approver's pace before G
-#   (DIALOG_POLL_INTERVAL_MS), rounded up to whole seconds: a running
-#   approver reads the pane every lap while the row is pending, so that long
-#   with no pane read after the row read `waiting` means it has stopped.
-# - CREATE_DELAY_S = ⌈create_timeout_ms / 1000⌉ + CREATE_DELAY_MARGIN_S: the
-#   slow-create wait, above agent-director's create timeout (so each launch
-#   call ends in a launch timeout) and below CSCB's agent-director call
-#   timeout (checked, so the call is not cut first).
-# - LAUNCH_END_WAIT_S = the call timeout + 30: every launch call has ended
-#   and its get line is logged (each call is bounded by the call timeout).
-# - LT_DIALOG_DELAY_S = (number of personas) × ⌈create_timeout_ms / 1000⌉ +
-#   LT_HOLD_SLACK_S: agent-director makes one launch's session-creating call
-#   at a time, so the last launch call ends about one create timeout per
-#   persona after the first launch start, and each get follows; the stub's
-#   starting screen outlasts that, so a harness read after each get still
-#   finds the row `pending` (without a delay the approver answers the dialog
-#   within a fraction of a second of the get); it is shorter than G
-#   (checked), so the approver answers at its 1 s pace.
-# - LT_REPORT_WAIT_S bounds every row leaving `pending` after the launch
-#   calls ended (the dialog delay, the approver's lap and the report-in).
-# - LT_RETRY_WAIT_S = UNAVAILABLE_RETRY_BASE_S + LT_RETRY_SLACK_S: each
-#   persona's retry timer, armed at its launch timeout, has run its first
-#   retry and stopped. LT_RETRY_READ_S bounds a retry's row read after its
-#   retry line.
-# - RESTART_DIALOG_DELAY_S: longer than the stop and the start take (checked
-#   against L), so the old server's approver finds no dialog to answer, and
-#   shorter than G (checked), so the dialog shows when the lap from G reads
-#   the pane.
-# - RESTART_CLEAR_BOUND_S = G + UNAVAILABLE_RETRY_CEILING_S +
-#   RESTART_LAP_SLACK_S, from L: the pending-row rule laps at the first retry
-#   at or after G, and no retry wait is longer than the ceiling;
-#   RESTART_LAP_SLACK_S covers the lap's calls, the stub's report-in and the
-#   harness's read. OLD_APPROVER_WAIT_S bounds the old server's approver's
-#   first pane read after the row read `pending`.
-# - FC_BRINGUP_BOUND_S = G + UNAVAILABLE_RETRY_CEILING_S +
-#   FC_BRINGUP_SLACK_S, from L: the failure armed F's retry timer, whose
-#   retries run the pending-row rule; the first retry at or after G runs the
-#   rule's `find-missing`, and no retry wait is longer than the ceiling;
-#   FC_BRINGUP_SLACK_S covers the rule's calls, the restart path's launch
-#   after the `missing` read (with `session_restart_delay`, 5 s in this
-#   config, should it wait), the approver's Enter, the stub's report-in and
-#   the harness's read. The failure itself is awaited within START_WAIT_S of
-#   the start.
-# - Scenario 13: ST_TICK_S = ST_PAUSE_S + ST_RESTART_DELAY_S +
-#   ST_LAUNCH_SLACK_S + UNAVAILABLE_RETRY_BASE_S + ST_LAUNCH_SLACK_S. From
-#   T0 (a tick's read) come the pause (bounded at ST_PAUSE_S, checked), the
-#   restart delay, the restart path's calls up to its refused `resume`
-#   (ST_LAUNCH_SLACK_S), the retry timer's first wait from the refusal
-#   (UNAVAILABLE_RETRY_BASE_S) and the retry's calls up to its `resume`
-#   (ST_LAUNCH_SLACK_S, checked), so the tick interval exceeds
-#   UNAVAILABLE_RETRY_BASE_S (checked) and the retry after the release comes
-#   before the next tick. The refused `resume` is due within ST_PAUSE_S +
-#   ST_RESTART_DELAY_S + ST_LAUNCH_SLACK_S of T0, shorter than the stopping
-#   window (DEFAULT_AD_SETTINGS.tmux.stopping_window_seconds; checked, and
-#   the first `resume`'s time from the pause is checked against it), so it
-#   meets "still stopping". The release follows the refusal at once, well
-#   inside the retry's first wait (checked: the retry line comes after the
-#   release and the session's end). ST_TIMER_WAIT_S = UNAVAILABLE_RETRY_BASE_S
-#   + LT_RETRY_SLACK_S bounds the bring-up timer's stop.
-#
-# Matched values. CSCB's values are printed by fixtures/fmk-texts.ts from
-# the installed package, never retyped: APPROVER_LOG_PREFIX,
-# DEV_CHANNELS_DIALOG_NEEDLE, TRUST_DIALOG_NEEDLE, DIALOG_POLL_INTERVAL_MS and
-# LAUNCH_UNAVAILABLE_OUTCOME_APPROVER (src/session-manager.ts); G and
-# create_timeout_ms (src/ad-settings.ts DEFAULT_AD_SETTINGS.tmux
-# .pending_grace_seconds and .create_timeout_ms); the call timeout
-# (src/config.ts DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS);
-# LAUNCH_TIMEOUT_PHRASE (src/ad-description-phrases.ts);
-# UNAVAILABLE_RETRY_BASE_S and UNAVAILABLE_RETRY_CEILING_S
-# (src/unavailable-retry.ts); PENDING_ROW_RULE_LOG_HEAD and
-# PENDING_ROW_RUN_MARKED_MISSING (src/pending-row.ts); each persona's
-# tmux-unresponsive ended lines (src/persona-episodes.ts
-# tmuxUnresponsiveEndedLine over the reasons of TMUX_UNRESPONSIVE_END_TEXT,
-# entry `tmuxUnresponsiveEndedLines`); and the spawn-failure notice's head
-# for ErrTmuxSessionCreate (src/session-manager.ts spawnFailureNoticeText,
-# the body notifySpawnFailure posts; entry `spawnFailureNoticeHead`), whose
-# first line is matched on its own to find any spawn-failure post. Scenario
-# 13's: STILL_STOPPING_PHRASE (src/ad-description-phrases.ts), the stopping
-# window (src/ad-settings.ts DEFAULT_AD_SETTINGS.tmux.stopping_window_seconds)
-# and S's tmux-unresponsive onset body (src/persona-episodes.ts
-# tmuxUnresponsiveOnsetText, entry `tmuxUnresponsiveOnsetText`).
-# Log lines with an exported builder are matched by what fmk-texts.ts cuts
-# from the builder, per persona key or reference, a variable part cut at a
-# marker:
-# - the head of every retry-timer line (RT_LINE_HEAD, entry
-#   `unavailableRetryLineHead`: the head unavailableRetryArmedLine,
-#   unavailableRetryRetryLine, unavailableRetryReArmedLine and
-#   unavailableRetryStoppedLine share), for the recorded lines; the arm
-#   line's head in either mode (RT_ARMED, `unavailableRetryArmedHead`), the
-#   stop line's (RT_STOPPED, `unavailableRetryStoppedHead`) and the
-#   not-armed line's (RT_NOT_ARMED, `unavailableRetryNotArmedHead`, from
-#   unavailableRetryNotArmedClosedLine); the retry line in its parts
-#   (`unavailableRetryRetryLineParts`), matched whole (`retry_hits`: the
-#   head, a number and one of its two tails, so the re-armed line, which
-#   starts the same way, never matches) (all src/unavailable-retry.ts);
-# - the post-UNAVAILABLE get line's head before the call's name (GET_HEAD)
-#   and its text from after the name to the form (GET_OF, entry
-#   `launchUnavailableGetLineParts`, src/session-manager.ts
-#   launchUnavailableGetLine); the form right after it: each launch-timeout
-#   form's text (FORM_CALL_TIMEOUT and FORM_TMUX_UNRESPONSIVE, entry
-#   `launchUnavailableFormText` with the src/ad-error-class.ts export names
-#   LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT and LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE)
-#   or a plain UNAVAILABLE's head (FORM_UNAVAILABLE_HEAD, `none`;
-#   src/session-manager.ts launchUnavailableFormText);
-# - the head of the tmux-unresponsive lines (TU_HEAD, entry
-#   `tmuxUnresponsiveLineHead`, src/persona-episodes.ts
-#   tmuxUnresponsiveLine), for the recorded condition lines;
-# - the approver's shutdown stop line for Q (entry `approverShutdownStopLine`:
-#   src/session-manager.ts approverLogLine of approverStopRequestedMessage
-#   with APPROVER_STOP_SHUTDOWN), matched as a whole line.
-# Fragments with no exported builder, each quoted from its source:
-# - `[slack] Session connected: persona <ref>` (src/server.ts, the MCP
-#   session's registration line);
-# - `resume` (RESUME_WHAT), the call's name the post-UNAVAILABLE get line
-#   gives a `resume` (src/session-manager.ts, the resume site's literal);
-# - `[slack] spawnForPersona: collision resolved, state=` and `for <ref>`
-#   (src/session-manager.ts runPersonaLadder's collision line);
-# - `[slack] conflict-latch: persona=<key> ` (src/conflict-latch.ts, the
-#   latch record's lines);
-# - `[slack] spawnForPersona: `, `failed for <ref>: ` and ErrTmuxSessionCreate
-#   (src/session-manager.ts plainSpawnFailedAt, the LAUNCH FAILURE line, with
-#   describeAgentDirectorFailure's error name; ErrTmuxSessionCreate is
-#   agent-director's error name);
-# - `find-missing: ` and `get: missing` in the pending-row rule's round line
-#   (src/pending-row.ts createPendingRowRule's step words and describeRuleGet;
-#   `missing` is agent-director's state name);
-# - "dispatcher bug", quoted from b.jg5 SRJ-1413 for the absence check;
-# - ` rule (` after PENDING_ROW_RULE_LOG_HEAD and the reference
-#   (src/pending-row.ts, the rule's run line);
-# - `Scheduling restart for persona=<key>` (src/restart.ts scheduleRestart);
-# - the hold's trouble words `reconnect`, `relaunch`, `Scheduling restart`
-#   and `not connected` (src/restart.ts, src/session-manager.ts; matched
-#   case-insensitively on lines naming P's key or reference, and S's in
-#   scenario 13);
-# - `[slack] spawnForPersona: resume refused for <ref>: ` (src/session-manager.ts
-#   logRefusal, the refusal line, with `resume` as the call);
-# - the forced resume's notice lines on the driver's standard error:
-#   `no notifier installed — notice for persona=<key> not posted`
-#   (src/session-manager.ts sendPersonaNotice, ruling S7) and
-#   `[fmk-driver] outage-notice persona=<key>: ` (fixtures/fmk-driver.ts);
-# - the driver's outcome fields `called=`, `counted=`, `error=` (the
-#   fmk-driver.ts outcome line) and ErrSpawnNotResumable (agent-director's
-#   error name); ErrSpawnNotFound (agent-director's error name; a harness
-#   `get` of a row not yet made reads `absent`);
-# - the stub's sentinel `__CSCB_TEST_EXIT__` (fixtures/stub-claude.sh);
-# - the persona reference `"<name>" (key=<key>)` (lib/scenario.sh
-#   persona_ref, src/persona-identity.ts renderPersonaRef) and the instance id
-#   `cscb_<key>` (src/persona-identity.ts personaInstanceId).
-# Every match on a persona is whole: no persona's name, key or row id is a
-# prefix of another's, a key is matched as `persona=<key>` followed by no
-# key character (`naming_persona`) or with the text after it, and a row id as
-# a whole word of the call (` --instance-id <id> `).
-#
-# Closing: the script ends with `assert_no_server_tmux` (AC 3's "the bot
-# server starts no tmux process", over every leg's servers, the slow-create
-# and fail-create starts' included), `assert_no_cscb_include_finished` and
-# `assert_no_cscb_delete` in its own shell. Every count of CSCB's
-# agent-director calls reads only shim lines whose parent is a CSCB process;
-# the harness's calls, the stub's own status reads and its stop lines never
-# count.
+# Pending launches, launch timeouts, controller restart, failed create and stopping.
+# Delayed SessionStart keeps rows pending without a screen parser or startup keys.
+# AD row observations and existing retry timers own recovery.
+
 set -euo pipefail
 
 TEST_NAME="test-17-fmk-launch-pending"
@@ -578,24 +17,23 @@ P_REF="$(persona_ref "${P_NAME}")"
 P_ID="cscb_${P_KEY}"
 P_CHANNEL="C0T17PND1"
 
-# CSCB's config for the leg (seconds), and the derived dialog delay.
+# CSCB's config for the leg (seconds), and the derived report-in delay.
 HEALTH_TICK_S=3
 RESTART_DELAY_S=5
 FORCED_RESUME_S=20
 HOLD_SLACK_S=7
-DIALOG_DELAY_S=$(( HEALTH_TICK_S + FORCED_RESUME_S + HOLD_SLACK_S ))
-APPROVER_CLEAR_S=15
+REPORT_DELAY_S=$(( HEALTH_TICK_S + FORCED_RESUME_S + HOLD_SLACK_S ))
+REPORT_SLACK_S=15
 
 # Bounds (seconds).
 STUB_WAIT_S=20        # the Slack stub writing its ready file
 START_WAIT_S=120      # the start pass: one bring-up and one launch
-REPORT_WAIT_S=60      # after the start pass: the approver's Enter and the row reporting in
+REPORT_WAIT_S=60
 CONNECT_WAIT_S=30     # after the row reported in: the server registering the stub's session
-APPROVER_STOP_WAIT_S=20  # after the session connected: the bring-up's approver stopping
 ENDED_WAIT_S=20       # after the sentinel: the row reading ended or missing
 RESUME_WAIT_S=$(( RESTART_DELAY_S + 2 * HEALTH_TICK_S + 30 ))
 SESSION_WAIT_S=10     # after the hold's first pending read: P's tmux session present
-DIALOG_WAIT_S=$(( DIALOG_DELAY_S + 10 ))
+REPORT_WAIT_BOUND_S=$(( REPORT_DELAY_S + 10 ))
 
 # The fixtures the leg runs.
 FMK_TEXTS="${SCENARIO_FIXTURES}/fmk-texts.ts"
@@ -632,15 +70,14 @@ Q_SUFFIX=t17q
 
 # The launch-timeout legs (seconds).
 CREATE_DELAY_MARGIN_S=10  # the slow-create delay past agent-director's create timeout
-LT_HOLD_SLACK_S=8         # the dialog delay past the last launch call's end
+LT_HOLD_SLACK_S=8         # the report-in delay past the last launch call's end
 LT_REPORT_WAIT_S=60       # after the launch calls ended: every row out of pending
 LT_RETRY_READ_S=5         # after a retry line: that retry's read of the row
 LT_RETRY_SLACK_S=30       # past the retry timer's first wait: each persona's timer stopped
 
 # The restart leg (seconds).
-RESTART_DIALOG_DELAY_S=30 # longer than the stop and the start take, shorter than G (checked)
+RESTART_REPORT_DELAY_S=30 # longer than the stop and the start take, shorter than G (checked)
 RESTART_LAP_SLACK_S=10    # past G and the retry ceiling: the lap's calls, the report-in, the harness read
-OLD_APPROVER_WAIT_S=15    # after the row read pending: the old server's approver reading the pane
 RESTART_POLL_S=1          # the harness's read of the row while it waits for the lap
 
 # Scenario 11's persona F (no row before its leg).
@@ -652,7 +89,7 @@ F_CHANNEL="C0T17FCR1"
 F_SUFFIX=t17f
 
 # Scenario 11's leg (seconds).
-FC_BRINGUP_SLACK_S=40     # past G and the retry ceiling: the rule's calls, the bring-up's launch, the approver, the report-in
+FC_BRINGUP_SLACK_S=40
 FC_POLL_S=1               # the harness's read of the row while it waits
 
 # agent-director's error name for a launch whose session-creating call failed.
@@ -859,25 +296,12 @@ row_left_pending() {
 
 # pane_capture <step> <session> <file>: P's pane on the scenario's tmux
 # server, read with the real tmux from the scenario's own shell, into <file>.
-pane_capture() {
-    "${SCENARIO_REAL_TMUX}" capture-pane -p -t "=$2:" > "$3" 2> "$3.err" \
-        || fail "$1: tmux could not read the pane of session $2: $(head -c 300 "$3.err")"
-}
 
 # has_session <session>: true when the scenario's tmux server holds it.
 has_session() {
     "${SCENARIO_REAL_TMUX}" has-session -t "=$1" 2> /dev/null
 }
 
-# expect_no_needle <step> <file> [<what>]: fail when <file> (<what>: P's pane
-# by default) holds either approver needle.
-expect_no_needle() {
-    local needle what="P's pane"
-    (( $# < 3 )) || what="$3"
-    for needle in "${DEV_NEEDLE}" "${TRUST_NEEDLE}"; do
-        ! grep -qF -- "${needle}" "$2" || fail "$1: ${what} holds the approver needle '${needle}' during the delay"
-    done
-}
 
 # server_calls <verb> <from> <to> [<fragment>...]: print the agent-director
 # shim's `call` lines naming P's row whose parent is the bot server
@@ -913,24 +337,7 @@ server_count() {
     wc -l <<< "${out}" | tr -d ' '
 }
 
-# approver_quiet: true once the bot server's last pane read of P (if any) is
-# at least APPROVER_QUIET_S old: at the approver's pace a running approver
-# reads the pane every lap while the row is pending, and stops with no pane
-# read once its lap's status read finds the row live.
-approver_quiet() {
-    approver_quiet_of "${P_ID}"
-}
 
-# approver_quiet_of <id>...: `approver_quiet` for every row <id>.
-approver_quiet_of() {
-    local id last
-    for id in "$@"; do
-        last="$(server_calls_of "${id}" read-pane - - | tail -n 1 | cut -f2)"
-        [[ -z "${last}" ]] && continue
-        awk -v t="${last}" -v n="$(now_s)" -v q="${APPROVER_QUIET_S}" 'BEGIN { exit !(n - t >= q) }' || return 1
-    done
-    return 0
-}
 
 # any_calls_naming <verb> <from> <to>: print every agent-director shim `call`
 # line, from any parent, whose words hold <verb> and P's row id, each as a
@@ -1057,28 +464,20 @@ posts_to() {
 # Values from the installed package
 # ---------------------------------------------------------------------------
 
-APPROVER_PREFIX="$(fmk_text APPROVER_LOG_PREFIX)" || fail "setup: fmk-texts.ts could not print APPROVER_LOG_PREFIX"
-DEV_NEEDLE="$(fmk_text DEV_CHANNELS_DIALOG_NEEDLE)" || fail "setup: fmk-texts.ts could not print DEV_CHANNELS_DIALOG_NEEDLE"
-TRUST_NEEDLE="$(fmk_text TRUST_DIALOG_NEEDLE)" || fail "setup: fmk-texts.ts could not print TRUST_DIALOG_NEEDLE"
 G_S="$(fmk_text DEFAULT_AD_SETTINGS.tmux.pending_grace_seconds)" \
     || fail "setup: fmk-texts.ts could not print DEFAULT_AD_SETTINGS.tmux.pending_grace_seconds"
-PACE_MS="$(fmk_text DIALOG_POLL_INTERVAL_MS)" || fail "setup: fmk-texts.ts could not print DIALOG_POLL_INTERVAL_MS"
-[[ "${PACE_MS}" =~ ^[1-9][0-9]*$ ]] || fail "setup: the approver's pace '${PACE_MS}' is not a whole number of milliseconds"
-# Three approver laps' worth of time, in whole seconds (at least one).
-APPROVER_QUIET_S=$(( (3 * PACE_MS + 999) / 1000 ))
-[[ -n "${APPROVER_PREFIX}" && -n "${TRUST_NEEDLE}" && -n "${TRUST_NEEDLE}" ]] || fail "setup: fmk-texts.ts printed an empty value"
 [[ "${G_S}" =~ ^[0-9]+$ ]] || fail "setup: G '${G_S}' is not a whole number of seconds"
-(( DIALOG_DELAY_S + APPROVER_CLEAR_S < G_S )) \
-    || fail "setup: the dialog delay ${DIALOG_DELAY_S}s plus the approver's clear ${APPROVER_CLEAR_S}s is not shorter than G ${G_S}s"
-echo "${TEST_NAME}: G ${G_S}s; dialog delay ${DIALOG_DELAY_S}s (tick ${HEALTH_TICK_S}s + forced resume ${FORCED_RESUME_S}s + slack ${HOLD_SLACK_S}s)"
+(( REPORT_DELAY_S + REPORT_SLACK_S < G_S )) \
+    || fail "setup: the report-in delay ${REPORT_DELAY_S}s plus reporting slack ${REPORT_SLACK_S}s is not shorter than G ${G_S}s"
+echo "${TEST_NAME}: G ${G_S}s; report-in delay ${REPORT_DELAY_S}s (tick ${HEALTH_TICK_S}s + forced resume ${FORCED_RESUME_S}s + slack ${HOLD_SLACK_S}s)"
 
 CREATE_TIMEOUT_MS="$(fmk_text DEFAULT_AD_SETTINGS.tmux.create_timeout_ms)" \
     || fail "setup: fmk-texts.ts could not print DEFAULT_AD_SETTINGS.tmux.create_timeout_ms"
 CALL_TIMEOUT_MS="$(fmk_text DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS)" \
     || fail "setup: fmk-texts.ts could not print DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS"
 TIMEOUT_PHRASE="$(fmk_text LAUNCH_TIMEOUT_PHRASE)" || fail "setup: fmk-texts.ts could not print LAUNCH_TIMEOUT_PHRASE"
-OUTCOME_APPROVER="$(fmk_text LAUNCH_UNAVAILABLE_OUTCOME_APPROVER)" \
-    || fail "setup: fmk-texts.ts could not print LAUNCH_UNAVAILABLE_OUTCOME_APPROVER"
+OUTCOME_PENDING="$(fmk_text LAUNCH_UNAVAILABLE_OUTCOME_COVERED_NO_APPROVER)" \
+    || fail "setup: fmk-texts.ts could not print LAUNCH_UNAVAILABLE_OUTCOME_COVERED_NO_APPROVER"
 RETRY_BASE_S="$(fmk_text UNAVAILABLE_RETRY_BASE_S)" || fail "setup: fmk-texts.ts could not print UNAVAILABLE_RETRY_BASE_S"
 RETRY_CEILING_S="$(fmk_text UNAVAILABLE_RETRY_CEILING_S)" || fail "setup: fmk-texts.ts could not print UNAVAILABLE_RETRY_CEILING_S"
 PENDING_ROW_HEAD="$(fmk_text PENDING_ROW_RULE_LOG_HEAD)" || fail "setup: fmk-texts.ts could not print PENDING_ROW_RULE_LOG_HEAD"
@@ -1095,27 +494,27 @@ FORM_UNAVAILABLE_HEAD="$(fmk_text launchUnavailableFormText none)" || fail "setu
     || fail "setup: the create timeout '${CREATE_TIMEOUT_MS}' or the call timeout '${CALL_TIMEOUT_MS}' is not a whole number of milliseconds"
 [[ "${RETRY_BASE_S}" =~ ^[1-9][0-9]*$ && "${RETRY_CEILING_S}" =~ ^[1-9][0-9]*$ ]] \
     || fail "setup: the retry base '${RETRY_BASE_S}' or ceiling '${RETRY_CEILING_S}' is not a whole number of seconds"
-[[ -n "${TIMEOUT_PHRASE}" && -n "${OUTCOME_APPROVER}" ]] || fail "setup: fmk-texts.ts printed an empty value"
+[[ -n "${TIMEOUT_PHRASE}" && -n "${OUTCOME_PENDING}" ]] || fail "setup: fmk-texts.ts printed an empty value"
 # The slow-create delay: above agent-director's create timeout, below CSCB's call timeout.
 CREATE_DELAY_S=$(( (CREATE_TIMEOUT_MS + 999) / 1000 + CREATE_DELAY_MARGIN_S ))
 (( CREATE_DELAY_S * 1000 > CREATE_TIMEOUT_MS && CREATE_DELAY_S * 1000 < CALL_TIMEOUT_MS )) \
     || fail "setup: the slow-create delay ${CREATE_DELAY_S}s is not between the create timeout ${CREATE_TIMEOUT_MS}ms and the call timeout ${CALL_TIMEOUT_MS}ms"
 # The start pass's launch calls end within CSCB's call timeout; then each one's get.
 LAUNCH_END_WAIT_S=$(( CALL_TIMEOUT_MS / 1000 + 30 ))
-# The launch-timeout legs' dialog delay: agent-director makes one launch's
+# The launch-timeout legs' report-in delay: agent-director makes one launch's
 # session-creating call at a time, so the last launch call ends about one
 # create timeout per persona after the first launch start, and each get
 # follows; the delay outlasts that by LT_HOLD_SLACK_S, so a harness read after
 # each get still finds the row pending at its starting screen.
-LT_DIALOG_DELAY_S=$(( ${#LT_ROLES[@]} * ((CREATE_TIMEOUT_MS + 999) / 1000) + LT_HOLD_SLACK_S ))
-(( LT_DIALOG_DELAY_S < G_S )) || fail "setup: the launch-timeout legs' dialog delay ${LT_DIALOG_DELAY_S}s is not shorter than G ${G_S}s"
+LT_REPORT_DELAY_S=$(( ${#LT_ROLES[@]} * ((CREATE_TIMEOUT_MS + 999) / 1000) + LT_HOLD_SLACK_S ))
+(( LT_REPORT_DELAY_S < G_S )) || fail "setup: the launch-timeout legs' report-in delay ${LT_REPORT_DELAY_S}s is not shorter than G ${G_S}s"
 # Each persona's retry timer, armed at its launch timeout, has run its first retry or stopped.
 LT_RETRY_WAIT_S=$(( RETRY_BASE_S + LT_RETRY_SLACK_S ))
-(( RESTART_DIALOG_DELAY_S < G_S )) \
-    || fail "setup: the restart leg's dialog delay ${RESTART_DIALOG_DELAY_S}s is not shorter than G ${G_S}s"
+(( RESTART_REPORT_DELAY_S < G_S )) \
+    || fail "setup: the restart leg's report-in delay ${RESTART_REPORT_DELAY_S}s is not shorter than G ${G_S}s"
 # The restart leg's wait: from the launch start, G and one longest retry wait, then the lap and the report-in.
 RESTART_CLEAR_BOUND_S=$(( G_S + RETRY_CEILING_S + RESTART_LAP_SLACK_S ))
-echo "${TEST_NAME}: slow-create delay ${CREATE_DELAY_S}s (create timeout ${CREATE_TIMEOUT_MS}ms, call timeout ${CALL_TIMEOUT_MS}ms); retry base ${RETRY_BASE_S}s, ceiling ${RETRY_CEILING_S}s; restart leg: dialog delay ${RESTART_DIALOG_DELAY_S}s, clear bound ${RESTART_CLEAR_BOUND_S}s"
+echo "${TEST_NAME}: slow-create delay ${CREATE_DELAY_S}s (create timeout ${CREATE_TIMEOUT_MS}ms, call timeout ${CALL_TIMEOUT_MS}ms); retry base ${RETRY_BASE_S}s, ceiling ${RETRY_CEILING_S}s; restart leg: report-in delay ${RESTART_REPORT_DELAY_S}s, clear bound ${RESTART_CLEAR_BOUND_S}s"
 
 MARKED_MISSING="$(fmk_text PENDING_ROW_RUN_MARKED_MISSING)" || fail "setup: fmk-texts.ts could not print PENDING_ROW_RUN_MARKED_MISSING"
 SPAWN_FAILURE_HEAD="$(fmk_text spawnFailureNoticeHead "${SESSION_CREATE_ERR}")" \
@@ -1189,8 +588,6 @@ done
 key_text RT_LINE_HEAD unavailableRetryLineHead "${Q_KEY}"
 key_text RT_ARMED unavailableRetryArmedHead "${Q_KEY}"
 key_text RT_NOT_ARMED unavailableRetryNotArmedHead "${Q_KEY}"
-Q_SHUTDOWN_STOP="$(fmk_text approverShutdownStopLine "${Q_REF}")" || fail "setup: fmk-texts.ts could not print approverShutdownStopLine"
-[[ -n "${Q_SHUTDOWN_STOP}" ]] || fail "setup: fmk-texts.ts printed an empty approverShutdownStopLine"
 key_text RT_LINE_HEAD unavailableRetryLineHead "${F_KEY}"
 retry_texts "${S_KEY}"
 key_text RT_ARMED unavailableRetryArmedHead "${S_KEY}"
@@ -1212,7 +609,7 @@ leg_launch_pending() {
     creds="${SCENARIO_ROOT}/credentials"
     mkdir -m 700 "${creds}"
     work="$(make_workdir p)"
-    stub_mode "${work}" "${STUB_MODE_STARTUP_TRUST}"
+    stub_mode "${work}" "${STUB_MODE_AT_ONCE}"
     start_slack_stub "${SCENARIO_ROOT}/slack-stub" t17p1
     printf '{"bot_token": "%s", "app_token": "%s"}\n' "$(fake_token bot t17p1)" "$(fake_token app t17p1)" \
         | write_file "${creds}/p.json" 600
@@ -1246,14 +643,10 @@ EOF
     # src/server.ts: the MCP session's registration line.
     connected="$(matcher "[slack] Session connected: persona ${P_REF}")"
     wait_for_log "${connected}" "${CONNECT_WAIT_S}" "${step}: the server never registered the stub's session as P's"
-    # The bring-up's approver has stopped (its lap after the Enter read the
-    # row live): no bot-server pane read of P for APPROVER_QUIET_S.
-    wait_until "${APPROVER_STOP_WAIT_S}" "${step}: the bot server still reads P's pane ${APPROVER_STOP_WAIT_S}s after the bring-up" \
-        approver_quiet
 
-    # Step 2 [harness]: the dialog delay in P's working directory.
-    stub_mode "${work}" "${STUB_MODE_STARTUP_TRUST}"
-    stub_dialog_delay "${work}" "${DIALOG_DELAY_S}"
+    # Step 2 [harness]: the report-in delay in P's working directory.
+    stub_mode "${work}" "${STUB_MODE_AT_ONCE}"
+    stub_report_delay "${work}" "${REPORT_DELAY_S}"
 
     # Step 3 [harness]: P's worker ends with the stub's sentinel.
     sentinel_at="$(now_s)"
@@ -1292,16 +685,7 @@ EOF
         || fail "${step}: the bot server resumed ${P_ID} before the sentinel"
     echo "${TEST_NAME}: ${step}: the bot server's calls of ${P_ID} from the sentinel to the resume (recorded, not asserted): $(server_calls "" "${sentinel_at}" "${resume_at}" | cut -f6 | tr '\n' ';')"
 
-    # The pane: present, and showing neither needle; nor does the stub's
-    # record of the dialogs it printed. The record is keyed by the pane's
-    # process, so it is the resumed stub's own, empty until its dialog shows
-    # (the bring-up stub, which showed one, kept its record under its own
-    # process); step 6's record reads are of this one.
     wait_until "${SESSION_WAIT_S}" "${step}: no tmux session ${session} for the held row" has_session "${session}"
-    pane_capture "${step}" "${session}" "${pane}"
-    expect_no_needle "${step}: at the hold's first read" "${pane}"
-    stub_shown_dialogs "${session}" > "${shown}" || fail "${step}: could not read the stub's record of the dialogs P's pane showed"
-    expect_no_needle "${step}: at the hold's first read" "${shown}" "the stub's record of P's dialogs"
 
     # The forced resume (fixtures/fmk-driver.ts, a CSCB process).
     drv_out="${SCENARIO_ROOT}/fmk-driver-resume.out"
@@ -1321,7 +705,7 @@ EOF
     drv_line="${outcome[0]}"
     echo "${TEST_NAME}: ${step}: the forced resume (${drv_s}s): ${drv_line:0:600}"
     awk -v s="${drv_s}" -v b="${FORCED_RESUME_S}" 'BEGIN { exit !(s <= b) }' \
-        || fail "${step}: the forced resume took ${drv_s}s, longer than FORCED_RESUME_S ${FORCED_RESUME_S}s the dialog delay is derived from"
+        || fail "${step}: the forced resume took ${drv_s}s, longer than FORCED_RESUME_S ${FORCED_RESUME_S}s the report-in delay is derived from"
     [[ "${drv_line}" == *" called=true "* ]] || fail "${step}: the forced resume was not called: ${drv_line}"
     [[ "${drv_line}" == *" error=${NOT_RESUMABLE} "* ]] || fail "${step}: the forced resume did not get ${NOT_RESUMABLE}: ${drv_line}"
     [[ "${drv_line}" == *" counted=false "* ]] || fail "${step}: the forced resume's ${NOT_RESUMABLE} was counted: ${drv_line}"
@@ -1358,69 +742,24 @@ EOF
     read_row "${step}: after the forced resume"
     [[ "${ROW_STATE}" == pending && "${ROW_SID}" == "${sid}" ]] \
         || fail "${step}: after the forced resume the row reads ${ROW_STATE} (${ROW_SID}), not still pending: the delay ended too soon"
-    # This read of the pane, then of the stub's record, with no needle in
-    # either, is the hold's first known clear read: the delay's end is
-    # bounded below from it even when the loop below finds the dialog at its
-    # first read.
-    last_clear="$(now_s)"
-    pane_capture "${step}" "${session}" "${pane}"
-    stub_shown_dialogs "${session}" > "${shown}" || fail "${step}: could not read the stub's record of the dialogs P's pane showed"
-    if grep -qF -- "${TRUST_NEEDLE}" "${pane}" "${shown}"; then
-        fail "${step}: the dialog showed before the forced resume returned (${drv_s}s): the hold did not cover it"
-    fi
-    expect_no_needle "${step}: after the forced resume" "${pane}"
-    expect_no_needle "${step}: after the forced resume" "${shown}" "the stub's record of P's dialogs"
-
-    # Step 6 [harness]: read the pane, then the stub's record, until either
-    # holds the dialog (the delay's end). The stub clears an answered dialog
-    # from its pane, so a pane read alone can miss a dialog shown and
-    # answered between two reads (b.fyq); the record keeps it. Each read's
-    # time is taken before both of its reads, and the pane is read first: the
-    # stub writes the record before it reads the Enter that clears the pane,
-    # so a pane with no needle and then a record with none mean the dialog
-    # had not shown at that time, and last_clear stays a time before it.
-    deadline=$(( $(_scenario_now_ms) + DIALOG_WAIT_S * 1000 ))
+    last_clear="${ROW_READ_AT}"
+    deadline=$(( $(_scenario_now_ms) + REPORT_WAIT_BOUND_S * 1000 ))
     while :; do
-        line="$(now_s)"
-        pane_capture "${step}" "${session}" "${pane}"
-        stub_shown_dialogs "${session}" > "${shown}" || fail "${step}: could not read the stub's record of the dialogs P's pane showed"
-        if grep -qF -- "${TRUST_NEEDLE}" "${pane}" "${shown}"; then
-            dialog_at="${line}"
+        read_row "${step}: waiting for SessionStart"
+        if [[ "${ROW_STATE}" != pending ]]; then
+            live_at="${ROW_READ_AT}"
             break
         fi
-        expect_no_needle "${step}: before the dialog" "${pane}"
-        expect_no_needle "${step}: before the dialog" "${shown}" "the stub's record of P's dialogs"
-        last_clear="${line}"
-        (( $(_scenario_now_ms) < deadline )) \
-            || fail "${step}: P's pane never showed the startup-trust dialog within ${DIALOG_WAIT_S}s (neither the pane nor the stub's record holds it)"
+        last_clear="${ROW_READ_AT}"
+        (( $(_scenario_now_ms) < deadline )) || fail "${step}: delayed SessionStart never left pending"
         sleep "${SCENARIO_POLL_S}"
     done
-    on_pane=no
-    grep -qF -- "${TRUST_NEEDLE}" "${pane}" && on_pane=yes
-    echo "${TEST_NAME}: ${step}: the dialog showed between $(seconds_between "${hold_at}" "${last_clear}")s and $(seconds_between "${hold_at}" "${dialog_at}")s after the hold's first read (still on the pane at the read that found it, recorded: ${on_pane})"
-    awk -v s="$(seconds_between "${hold_at}" "${last_clear}")" -v t="${HEALTH_TICK_S}" 'BEGIN { exit !(s >= t) }' \
-        || fail "${step}: the hold lasted less than one health tick interval (${HEALTH_TICK_S}s)"
-    awk -v a="${drv_end}" -v b="${last_clear}" 'BEGIN { exit !(a <= b) }' \
-        || fail "${step}: the forced resume did not end inside the hold"
-
-    # ... then the row until it leaves pending: waiting, the same session id.
-    wait_until "${APPROVER_CLEAR_S}" "${step}: row ${P_ID} still pending ${APPROVER_CLEAR_S}s after the dialog showed" \
-        row_left_pending "${step}: after the dialog"
-    live_at="${ROW_READ_AT}"
-    [[ "${ROW_STATE}" == waiting ]] || fail "${step}: the row left pending for ${ROW_STATE}, not waiting"
-    [[ "${ROW_SID}" == "${sid}" ]] || fail "${step}: the waiting row's session_id is '${ROW_SID}', not the kept ${sid}"
+    [[ "${ROW_STATE}" == waiting && "${ROW_SID}" == "${sid}" ]] \
+        || fail "${step}: delayed SessionStart did not preserve the waiting session"
     hold_log1="$(line_count "${SLACK_STATE_DIR}/server.log")"
-    # The dialog showed on the resumed stub's pane: its record holds it (the
-    # stub writes the record before it reads the Enter that answers it).
-    stub_shown_dialogs "${session}" > "${shown}" || fail "${step}: could not read the stub's record of the dialogs P's pane showed"
-    grep -qF -- "${TRUST_NEEDLE}" "${shown}" \
-        || fail "${step}: the row reads waiting, but the resumed stub's record holds no startup-trust dialog"
+    awk -v s="$(seconds_between "${hold_at}" "${last_clear}")" -v t="${HEALTH_TICK_S}" 'BEGIN { exit !(s >= t) }' \
+        || fail "${step}: the pending hold lasted less than a health tick"
 
-    # Step 7: the checks. Health ticks ran in the hold: the bot server's
-    # status reads of P whose next call of P's row (status or read-pane) is
-    # not a read-pane (an approver lap reads status, then the pane; a tick
-    # reads status only) number at least one per health tick interval in the
-    # hold, less one (see the header).
     statuses="$(server_count status "${hold_at}" "${last_clear}")"
     panes="$(server_count read-pane "${hold_at}" "${last_clear}")"
     ticks="$({ server_calls status - -; server_calls read-pane - -; } | sort -t $'\t' -k2,2n \
@@ -1446,24 +785,10 @@ EOF
         printf '  | %s\n' "${lines[@]}" >&2
         fail "${step}: ${#lines[@]} send-keys call(s) of ${P_ID} before the delay ended"
     }
-    # Every send-keys of P after the resume: the bot server's, with --allow-pending.
-    mapfile -t lines < <(any_calls_naming send-keys "${resume_at}" -)
-    (( ${#lines[@]} >= 1 )) || fail "${step}: no send-keys of ${P_ID} after the resume"
-    for line in "${lines[@]}"; do
-        [[ "$(cut -f4 <<< "${line}")" == "${SERVER_PID}" && "${line}" == *--allow-pending* ]] || {
-            echo "  | ${line}" >&2
-            fail "${step}: a send-keys of ${P_ID} after the resume is not the bot server's with --allow-pending"
-        }
+    for verb in read-pane send-keys; do
+        n="$(server_count "${verb}" "${resume_at}" "${live_at}")"
+        (( n == 0 )) || fail "${step}: ${n} automatic ${verb} call(s) before delayed SessionStart"
     done
-    # After the delay's end: a bot-server read-pane, then its send-keys, both
-    # with --allow-pending, before the first read that is not pending.
-    first_send="$(server_calls send-keys "${last_clear}" "${live_at}" --allow-pending | head -n 1 | cut -f2)"
-    [[ -n "${first_send}" ]] \
-        || fail "${step}: no bot-server send-keys of ${P_ID} with --allow-pending between the delay's end and the first read that is not pending"
-    first_read="$(server_calls read-pane "${last_clear}" "${first_send}" --allow-pending | head -n 1 | cut -f2)"
-    [[ -n "${first_read}" ]] \
-        || fail "${step}: no bot-server read-pane of ${P_ID} with --allow-pending between the delay's end and its send-keys"
-    echo "${TEST_NAME}: ${step}: after the delay's end: read-pane at +$(seconds_between "${last_clear}" "${first_read}")s, send-keys at +$(seconds_between "${last_clear}" "${first_send}")s, waiting read at +$(seconds_between "${last_clear}" "${live_at}")s"
 
     # No post in the hold.
     mapfile -t lines < <(record_posts "${posts0}")
@@ -1479,9 +804,6 @@ EOF
         sed 's/^/  | /' <<< "${hits}" >&2
         fail "${step}: in the hold the server logged a reconnect, relaunch or not-connected line for P (ruling S3: a health tick acted on the stub's missing MCP session)"
     fi
-
-    # Ruling S7: no approver line names P across the leg.
-    expect_count "$(matcher "${APPROVER_PREFIX}" "${P_REF}")" 0 "${step}: approver lines naming P"
 
     # Every post across the leg (recorded, not asserted).
     mapfile -t lines < <(record_posts 1 | jq -c '{method, channel, text: ((.text // "") | .[0:160])}')
@@ -1564,9 +886,6 @@ lt_timers_stopped() {
 }
 
 # server_read_pane_seen <id>: true once the bot server has read row <id>'s pane.
-server_read_pane_seen() {
-    [[ -n "$(server_calls_of "$1" read-pane - -)" ]]
-}
 
 # end_worker <id> <step>: a plain stop has left row <id>'s worker running;
 # end it with the stub's sentinel, sent into its pane with the real tmux, and
@@ -1614,8 +933,6 @@ leg_launch_timeouts() {
         wait_for_log "$(matcher "[slack] Session connected: persona ${LT_REF[${role}]}")" "${CONNECT_WAIT_S}" \
             "${step}: the server never registered the ${role} persona's session at the bring-up"
     done
-    wait_until "${APPROVER_STOP_WAIT_S}" "${step}: the bot server still reads a bring-up pane ${APPROVER_STOP_WAIT_S}s after the bring-up" \
-        approver_quiet_of "${LT_ID[reuse]}" "${LT_ID[resume]}"
     # A plain stop leaves the workers running, and no restart path runs when they end.
     stop_server
     for role in reuse resume; do
@@ -1628,13 +945,13 @@ leg_launch_timeouts() {
     # Step 2: the three personas, the reuse persona in another working
     # directory, in a new state dir (a start reads its state dir's
     # last-applied configuration; a change to it waits for a reload). Each
-    # working directory has the dialog delay.
+    # working directory has the report-in delay.
     new_state_dir launch
     LT_WORK[spawn]="$(make_workdir spawn)"
     LT_WORK[reuse]="$(make_workdir reuse-b)"
     for role in "${LT_ROLES[@]}"; do
-        stub_mode "${LT_WORK[${role}]}" "${STUB_MODE_STARTUP_TRUST}"
-        stub_dialog_delay "${LT_WORK[${role}]}" "${LT_DIALOG_DELAY_S}"
+        stub_mode "${LT_WORK[${role}]}" "${STUB_MODE_AT_ONCE}"
+        stub_report_delay "${LT_WORK[${role}]}" "${LT_REPORT_DELAY_S}"
     done
     write_personas_config \
         "$(persona_json "${LT_NAME[spawn]}" "${creds}/spawn.json" "${LT_WORK[spawn]}" "${LT_CHANNEL[spawn]}")" \
@@ -1725,9 +1042,6 @@ leg_launch_timeouts() {
             echo "${TEST_NAME}: ${step}: ${role}: its plain spawn's collision (recorded): $(log_hits "${log0}" "[slack] spawnForPersona: collision resolved, state=" "for ${ref}" | cut -f3 | tr '\n' '|')"
         fi
 
-        # The launch timeout: a server.log line naming the persona carries
-        # LAUNCH_TIMEOUT_PHRASE (or the get line names ErrCallTimeout), and
-        # its one post-timeout get line started the approver.
         mapfile -t hits < <(log_hits "${log0}" "${TIMEOUT_PHRASE}" | naming_persona "${key}" "${ref}")
         mapfile -t lines < <(log_hits "${log0}" "${GET_HEAD}" "${GET_OF[${key}]}")
         (( ${#lines[@]} == 1 )) || fail "${step}: ${role}: ${#lines[@]} post-timeout get line(s) for ${ref}, not one"
@@ -1736,38 +1050,23 @@ leg_launch_timeouts() {
             || fail "${step}: ${role}: no server.log line naming ${ref} carries the launch-timeout phrase, and its get line names no '${FORM_CALL_TIMEOUT}'"
         [[ "${lines[0]}" == *"${GET_OF[${key}]}${FORM_CALL_TIMEOUT}"* || "${lines[0]}" == *"${GET_OF[${key}]}${FORM_TMUX_UNRESPONSIVE}"* ]] \
             || fail "${step}: ${role}: its get line names no launch timeout ('${FORM_CALL_TIMEOUT}' or '${FORM_TMUX_UNRESPONSIVE}')"
-        [[ "${lines[0]}" == *"${OUTCOME_APPROVER}"* ]] || fail "${step}: ${role}: its get line did not start the approver"
+        [[ "${lines[0]}" == *"${OUTCOME_PENDING}"* ]] || fail "${step}: ${role}: its get line did not leave pending recovery to the timer"
 
-        # One bot-server get after the launch, then read-pane and send-keys
-        # with --allow-pending, and no spawn, reuse or resume after it.
-        pane_at[${role}]="$(first_call_at "${table}" "${srv}" "${id}" read-pane "${launch_at[${role}]}" - --allow-pending)"
-        [[ -n "${pane_at[${role}]}" ]] || fail "${step}: ${role}: no bot-server read-pane of ${id} with --allow-pending after its launch"
-        n="$(count_calls "${table}" "${srv}" "${id}" get "${launch_at[${role}]}" "${pane_at[${role}]}")"
-        (( n == 1 )) || fail "${step}: ${role}: ${n} bot-server get(s) of ${id} between its launch and its first read-pane, not one"
         get_at[${role}]="$(first_call_at "${table}" "${srv}" "${id}" get "${launch_at[${role}]}" -)"
-        send_at[${role}]="$(first_call_at "${table}" "${srv}" "${id}" send-keys "${pane_at[${role}]}" - --allow-pending)"
-        [[ -n "${send_at[${role}]}" ]] || fail "${step}: ${role}: no bot-server send-keys of ${id} with --allow-pending after its read-pane"
-        n="$(count_calls "${table}" - "${id}" send-keys "${lt_start}" "${send_at[${role}]}")"
-        (( n == 1 )) || fail "${step}: ${role}: ${n} send-keys of ${id} by a CSCB process up to the approver's, not one"
+        [[ -n "${get_at[${role}]}" ]] || fail "${step}: ${role}: no recovery get after launch timeout"
+        for verb in read-pane send-keys; do
+            n="$(count_calls "${table}" "${srv}" "${id}" "${verb}" "${launch_at[${role}]}" "${out_at[${role}]}")"
+            (( n == 0 )) || fail "${step}: ${role}: ${n} automatic startup ${verb} call(s)"
+        done
         for verb in spawn resume; do
             n="$(count_calls "${table}" "${srv}" "${id}" "${verb}" "${launch_at[${role}]}" -)"
             (( n == 0 )) || fail "${step}: ${role}: the bot server made ${n} ${verb} call(s) of ${id} after its timed-out launch"
         done
         n="$(count_calls "${table}" - "${id}" kill "${lt_start}" -)"
         (( n == 0 )) || fail "${step}: ${role}: ${n} kill call(s) of ${id} by a CSCB process"
-        echo "${TEST_NAME}: ${step}: ${role}: from the start: launch +$(seconds_between "${lt_start}" "${launch_at[${role}]}")s, get +$(seconds_between "${lt_start}" "${get_at[${role}]}")s, read-pane +$(seconds_between "${lt_start}" "${pane_at[${role}]}")s, send-keys +$(seconds_between "${lt_start}" "${send_at[${role}]}")s, first read out of pending +$(seconds_between "${lt_start}" "${out_at[${role}]}")s"
-
         # [harness] The row read pending after the get.
         pend="$(awk -F'\t' -v r="${role}" -v a="${get_at[${role}]}" '$1 == r && $3 == "pending" && $2 + 0 > a + 0 { n++ } END { print n + 0 }' "${reads}")"
         (( pend > 0 )) || fail "${step}: ${role}: no harness read of ${id} after the bot server's get read pending"
-
-        # The stub reported in only after the send-keys: its session
-        # connected, and the row left pending, after it.
-        connected_at="$(log_hits "${log0}" "[slack] Session connected: persona ${ref}" | head -n 1 | cut -f2)"
-        awk -v c="${connected_at:-0}" -v s="${send_at[${role}]}" 'BEGIN { exit !(c + 0 > s + 0) }' \
-            || fail "${step}: ${role}: the persona's session connected (${connected_at:-never}) before the approver's send-keys (${send_at[${role}]})"
-        awk -v o="${out_at[${role}]}" -v s="${send_at[${role}]}" 'BEGIN { exit !(o + 0 > s + 0) }' \
-            || fail "${step}: ${role}: the row left pending before the approver's send-keys"
 
         # The tmux-unresponsive condition's ended line, no later than the
         # first harness read out of pending.
@@ -1813,9 +1112,6 @@ leg_launch_timeouts() {
     stop_tracked_pid "${SLACK_STUB_PID}" 10 "${step}: the Slack stub did not exit on SIGTERM"
 }
 
-# ---------------------------------------------------------------------------
-# The restart leg: a held dialog with no approver running, cleared by a lap from G
-# ---------------------------------------------------------------------------
 
 leg_restart_mid_launch() {
     local step="restart mid-launch" creds="${SCENARIO_ROOT}/credentials-rs" work log0 old_pid new_pid leg_start
@@ -1828,9 +1124,9 @@ leg_restart_mid_launch() {
     printf '{"bot_token": "%s", "app_token": "%s"}\n' "$(fake_token bot "${Q_SUFFIX}")" "$(fake_token app "${Q_SUFFIX}")" \
         | write_file "${creds}/q.json" 600
     work="$(make_workdir restart)"
-    stub_mode "${work}" "${STUB_MODE_STARTUP_TRUST}"
-    stub_mode "${work}" "${STUB_MODE_STARTUP_TRUST}"
-    stub_dialog_delay "${work}" "${RESTART_DIALOG_DELAY_S}"
+    stub_mode "${work}" "${STUB_MODE_AT_ONCE}"
+    stub_mode "${work}" "${STUB_MODE_AT_ONCE}"
+    stub_report_delay "${work}" "${RESTART_REPORT_DELAY_S}"
     write_personas_config "$(persona_json "${Q_NAME}" "${creds}/q.json" "${work}" "${Q_CHANNEL}")"
 
     # Step 1: the server launches Q, whose stub shows its starting screen.
@@ -1842,9 +1138,6 @@ leg_restart_mid_launch() {
     l_ms="$(launch_ms "${ROW_LAUNCH}")" || fail "${step}: the pending row's launch_started_at '${ROW_LAUNCH}' does not parse"
     l_s="$(awk -v m="${l_ms}" 'BEGIN { printf "%.3f\n", m / 1000 }')"
     echo "${TEST_NAME}: ${step}: Q's row reads pending, launch_started_at ${ROW_LAUNCH}"
-    # The old server's approver runs: it has read the pane, which shows no dialog yet.
-    wait_until "${OLD_APPROVER_WAIT_S}" "${step}: the old server's approver never read Q's pane" server_read_pane_seen "${Q_ID}"
-
     # Step 2 [harness]: a plain stop, then a start, inside the delay.
     stopped_at="$(now_s)"
     stop_server
@@ -1854,8 +1147,8 @@ leg_restart_mid_launch() {
     wait_for_count "$(completion_match 1)" 2 "${START_WAIT_S}" "${step}: the second start pass never completed"
     restarted_at="$(now_s)"
     echo "${TEST_NAME}: ${step}: stopped at +$(seconds_between "${l_s}" "${stopped_at}")s and started again by +$(seconds_between "${l_s}" "${restarted_at}")s from the launch start"
-    awk -v r="${restarted_at}" -v l="${l_s}" -v d="${RESTART_DIALOG_DELAY_S}" 'BEGIN { exit !(r - l < d) }' \
-        || fail "${step}: the stop and start ended past the dialog delay ${RESTART_DIALOG_DELAY_S}s from the launch start"
+    awk -v r="${restarted_at}" -v l="${l_s}" -v d="${RESTART_REPORT_DELAY_S}" 'BEGIN { exit !(r - l < d) }' \
+        || fail "${step}: the stop and start ended past the report-in delay ${RESTART_REPORT_DELAY_S}s from the launch start"
     read_row_of "${Q_ID}" "${step}: after the restart"
     [[ "${ROW_STATE}" == pending && "$(launch_ms "${ROW_LAUNCH}")" == "${l_ms}" ]] \
         || fail "${step}: after the restart Q's row reads ${ROW_STATE} (launch ${ROW_LAUNCH}), not the same pending launch"
@@ -1896,35 +1189,13 @@ leg_restart_mid_launch() {
     (( ${#lines[@]} == 1 )) || fail "${step}: ${#lines[@]} collision line(s) reading Q's row pending in the new server's log, not one"
     awk -v c="${lines[0]}" -v s="${spawn_at}" 'BEGIN { exit !(c + 0 > s + 0) }' \
         || fail "${step}: the new server's collision line came before its plain spawn"
-    # No approver of its own: no approver line names Q in its log, and its
-    # first read-pane of Q comes at or after G past the launch start.
-    n="$(log_hits "${log0}" "${APPROVER_PREFIX}" | grep -cF -- "${Q_REF}" || true)"
-    (( n == 0 )) || fail "${step}: ${n} approver line(s) name Q in the new server's log"
-    first_pane="$(first_call_at "${table}" "${new_pid}" "${Q_ID}" read-pane - -)"
-    [[ -n "${first_pane}" ]] || fail "${step}: the new server never read Q's pane"
-    awk -v p="${first_pane}" -v l="${l_s}" -v g="${G_S}" 'BEGIN { exit !(p + 0 >= l + g) }' \
-        || fail "${step}: the new server's first read-pane of Q came $(seconds_between "${l_s}" "${first_pane}")s after the launch start, before G ${G_S}s"
-    # Its lap's send-keys with --allow-pending cleared the dialog.
-    send="$(first_call_at "${table}" "${new_pid}" "${Q_ID}" send-keys "$(plus_s "${first_pane}" -0.001)" "${out_at}" --allow-pending)"
-    [[ -n "${send}" ]] || fail "${step}: no new-server send-keys of Q with --allow-pending between its first read-pane and the first read out of pending"
-    n="$(count_calls "${table}" - "${Q_ID}" send-keys - "${out_at}")"
-    (( n == 1 )) || fail "${step}: ${n} send-keys of ${Q_ID} by a CSCB process before the row left pending, not the lap's one"
-    echo "${TEST_NAME}: ${step}: the new server's first read-pane +$(seconds_between "${l_s}" "${first_pane}")s, its send-keys +$(seconds_between "${l_s}" "${send}")s from the launch start"
-    # The old server's approver stopped at shutdown and armed nothing
-    # (SRJ-404): its shutdown stop line for Q is in the old server's log, and
-    # no arm line for Q follows it there, neither armed nor refused as not
-    # armed (shutdown closes the retry controller before it stops the
-    # approvers, so an arm after the stop would log the not-armed line).
-    old_log="${SCENARIO_ROOT}/rs-old-server.log"
-    head -n "${log0}" "${SLACK_STATE_DIR}/server.log" > "${old_log}"
-    mapfile -t lines < <(grep -nxF -- "${Q_SHUTDOWN_STOP}" <(sed -E 's/^\[[^]]*\] //' "${old_log}") | cut -d: -f1)
-    (( ${#lines[@]} == 1 )) || fail "${step}: ${#lines[@]} shutdown stop line(s) of the approver for Q in the old server's log, not one"
-    n="$(tail -n "+$(( lines[0] + 1 ))" "${old_log}" | grep -cF -e "${RT_ARMED[${Q_KEY}]}" -e "${RT_NOT_ARMED[${Q_KEY}]}" || true)"
-    (( n == 0 )) || {
-        tail -n "+$(( lines[0] + 1 ))" "${old_log}" | grep -F -e "${RT_ARMED[${Q_KEY}]}" -e "${RT_NOT_ARMED[${Q_KEY}]}" | sed 's/^/  | /' >&2
-        fail "${step}: ${n} arm line(s) for Q after the old approver's shutdown stop"
-    }
-    echo "${TEST_NAME}: ${step}: the old server's approver lines for Q (recorded): $(grep -F -- "${APPROVER_PREFIX}" "${old_log}" | grep -F -- "${Q_REF}" | cut -c1-200 | tr '\n' '|')"
+    for verb in read-pane send-keys; do
+        n="$(count_calls "${table}" - "${Q_ID}" "${verb}" "${leg_start}" "${out_at}")"
+        (( n == 0 )) || fail "${step}: ${n} automatic ${verb} call(s) while Q was pending"
+    done
+    # Shutdown ends the old controller's ownership; its PID makes no later calls.
+    n="$(calls "${table}" "${old_pid}" "${Q_ID}" - "${restarted_at}" - | grep -c . || true)"
+    (( n == 0 )) || fail "${step}: old controller made ${n} calls after restart"
     echo "${TEST_NAME}: ${step}: the new server's retry and pending-row lines for Q (recorded): $(log_hits "${log0}" "" | cut -f3 | grep -F -e "${RT_LINE_HEAD[${Q_KEY}]}" -e "${PENDING_ROW_HEAD} ${Q_REF}" | cut -c1-260 | tr '\n' '|')"
     # No post in the leg.
     mapfile -t posts < <(posts_to "" "${leg_start}")
@@ -1971,7 +1242,7 @@ leg_fail_create() {
     printf '{"bot_token": "%s", "app_token": "%s"}\n' "$(fake_token bot "${F_SUFFIX}")" "$(fake_token app "${F_SUFFIX}")" \
         | write_file "${creds}/f.json" 600
     work="$(make_workdir failcreate)"
-    stub_mode "${work}" "${STUB_MODE_STARTUP_TRUST}"
+    stub_mode "${work}" "${STUB_MODE_AT_ONCE}"
     write_personas_config "$(persona_json "${F_NAME}" "${creds}/f.json" "${work}" "${F_CHANNEL}")"
 
     # Step 1 [harness]: F has no row.
@@ -2186,7 +1457,7 @@ leg_still_stopping() {
     printf '{"bot_token": "%s", "app_token": "%s"}\n' "$(fake_token bot "${S_SUFFIX}")" "$(fake_token app "${S_SUFFIX}")" \
         | write_file "${creds}/s.json" 600
     work="$(make_workdir paused)"
-    stub_mode "${work}" "${STUB_MODE_STARTUP_TRUST}"
+    stub_mode "${work}" "${STUB_MODE_AT_ONCE}"
     stub_mode "${work}" "${STUB_MODE_LINGER_ON_EXIT}"
     persona_json "${S_NAME}" "${creds}/s.json" "${work}" "${S_CHANNEL}" \
         | jq -s --argjson port "${SCENARIO_PORT}" --argjson tick "${ST_TICK_S}" --argjson delay "${ST_RESTART_DELAY_S}" \
@@ -2206,15 +1477,11 @@ leg_still_stopping() {
     # src/server.ts: the MCP session's registration line.
     connected="$(matcher "[slack] Session connected: persona ${S_REF}")"
     wait_for_log "${connected}" "${CONNECT_WAIT_S}" "${step}: the server never registered the stub's session as S's"
-    wait_until "${APPROVER_STOP_WAIT_S}" "${step}: the bot server still reads S's pane ${APPROVER_STOP_WAIT_S}s after the bring-up" \
-        approver_quiet_of "${S_ID}"
     # The bring-up launch's retry timer has stopped, so the refusal arms a
     # fresh timer whose first retry is RETRY_BASE_S after it.
     wait_until "${ST_TIMER_WAIT_S}" "${step}: S's retry timer from the bring-up had not stopped ${ST_TIMER_WAIT_S}s after it" \
         st_timer_idle 0
 
-    # Step 2: a health tick's read of S (with the approver and the timer
-    # stopped, only a tick reads S's status).
     t="$(now_s)"
     wait_until "$(( ST_TICK_S + 10 ))" "${step}: no health tick read S's status within $(( ST_TICK_S + 10 ))s" \
         server_status_seen "${S_ID}" "${t}"

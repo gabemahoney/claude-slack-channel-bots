@@ -1,124 +1,7 @@
+/** AD row and find-missing outcomes for pending launch recovery tests.
+ * Read-pane exposes only an opaque outcome; keys never synthesize an AD state transition. */
 import { cannedReadPaneResult } from './ad-results.ts'
-/**
- * test-helpers/pending-row-model.ts — one persona's scripted agent-director
- * row over the stub's per-call knobs and a fake clock, for the pending-row
- * rule's cases (b.jg5 SRJ-410, SRJ-412; AC 30, AC 32, AC 33, AC 84).
- *
- * What it models
- * --------------
- * One row, the persona's own (`cscb_<key>`): its state, its raw launch start
- * (`launch_started_at`, either form: with or without fractional seconds, or
- * none), its session id (`session_id`), its `started_at`, its `cwd`
- * and labels (the persona's own by default, through the stub's persona-form
- * `cannedGetResult`), and the pane its session shows. It is installed on a
- * stub through the per-call knobs (`statusFn`, `getFn`, `readPaneFn`,
- * `sendKeysFn`, `findMissingFn`, `killFn`, `spawnFn`, `resumeFn`), so each
- * answer follows what was done to the row:
- *
- *   - `status` and `get` read the row (`cannedStatusResult`,
- *     `cannedGetResult`; with no row, `errSpawnNotFound()`). Only a `pending`
- *     row shows its launch start. Scripted answers (`status`, `get`;
- *     `scriptStatus`, `scriptGet`) answer first, in order: an error is a
- *     failed read. `pendingRowOfRecheckReading(reading)` gives the state and
- *     note a latch re-check's step-1 reading reads (E30).
- *   - `read-pane` answers the pane: a known startup dialog
- *     (`PENDING_ROW_DIALOG_TRUST`, `PENDING_ROW_DIALOG_DEV_CHANNELS`, each
- *     built around the approver's needle, `TRUST_DIALOG_NEEDLE` or
- *     `DEV_CHANNELS_DIALOG_NEEDLE`), a prompt the approver does not know
- *     (`PENDING_ROW_DIALOG_UNRECOGNISED`) or no dialog
- *     (`PENDING_ROW_DIALOG_NONE`, the stub's empty pane); scripted errors
- *     (`readPane`, `scriptReadPane`) answer first, in order.
- *   - `send-keys` answers its scripted outcomes (`sendKeys`) in order; once
- *     they run out, a `send-keys` on a pane showing a known dialog clears it
- *     and moves a `pending` row to `waiting` (an unrecognised prompt stays);
- *     on a finished row it answers `errSpawnNotInteractive('send-keys')`.
- *   - `find-missing` follows the judgment (`judgment`): not judged, in
- *     `unverified_ids`, marked `missing` from a clock time (for example G or
- *     B past the row's launch start, read through the accessors at each
- *     call), or a failure. Only a `pending` row is judged; a row marked
- *     `missing` reads `missing` from then on. The row is merged into what
- *     an earlier `findMissingFn` answered.
- *   - `kill` answers its scripted outcomes (`kill`: `cannedKillResult(...)`
- *     or an error builder's value) in order, then `cannedKillResult(true)`;
- *     a success, `kill_sent` true or false, ends the row (`ended`).
- *   - `spawn` (plain or reuse) and `resume` answer their scripted outcomes
- *     in order: each form's own queue first (`plainSpawns`, `reuseSpawns`
- *     for a `spawn` with `reuse_finished: true`, `resumes`) while it holds
- *     an entry, then the queue all forms share (`launches`). An error leaves
- *     the row as it is; a refusal (`PendingRowRefusal`, E30) also leaves the
- *     row as agent-director does: no row after the pre-spawn scan's refusal
- *     (`scanRefusal`), `ended` after "duplicate session"
- *     (`duplicateSessionRefusal`), and for a failed `resume` or reuse (HO
- *     rev 28) the row restored, changed, removed or left `pending`, its
- *     error ending with the matching restore sentence (`restoreRefusal`,
- *     through the stub's `withRestoreSentence` and `RESTORE_SENTENCES`;
- *     `staysPendingLaunchFailure`, the stub's
- *     `errTmuxSessionCreateStaysPending`); a row left `pending` takes the
- *     clock's now as its launch start. A success (`undefined`, and every
- *     call once the queues run out) starts a new launch: state `pending`,
- *     launch start the clock's now (`launchStartText`), the pane
- *     `dialogOnLaunch`, no note, answered with `cannedSpawnResult` or
- *     `cannedResumeResult`.
- *   - The `provenance_conflict` note (E30; b.jg5 SRJ-114): `note` puts it on
- *     the row, shown on `get` only (the stub's `provenanceNote`); a
- *     `find-missing` run removes nothing, the note or the whole row as
- *     `findMissingRemoves` says (`PENDING_ROW_FIND_MISSING_REMOVES_*`, or a
- *     function of the clock and the launch start), whatever the row's state,
- *     before it judges a `pending` row.
- *   - Changes at a clock time (E30; `rowChanges`, `scriptRowChange(at,
- *     change)`): the row's state (no row included), its note, its launch
- *     start, applied in time order before the first call, or read of the
- *     handle, at or after `at` (a live row read `missing`, a `pending` row
- *     whose dialog a human answered read `waiting`, a removed row, a removed
- *     note), so a case drives one row across many latch re-checks.
- *
- * Calls for any other instance go to the knob scripted before the model was
- * installed, then to the verb's other knobs (`statusFn` and `getFn` answer
- * `undefined` for them). Every call the model answers is recorded, read-only,
- * in `calls` (`{ verb, at, state, params }`: the verb, the clock time, the
- * row's state when it came and a copy of the call's parameters, `n_lines`,
- * `allow_pending` and `reuse_finished` among them), and `callTimes(verb)`
- * reads one verb's times, for cadence assertions (AC 33).
- *
- * What it does not model: other rows (only one persona's), `list`,
- * `decide`, `pause` and `delete`, permission prompts, a liveness note other
- * than `provenance_conflict`, the pre-spawn scan on its own (a case scripts
- * its refusal), agent-director's own grace or bound (the judgment is the
- * case's script), a launch call that takes time (`scriptTimedLaunch` in
- * `recovery-harness.ts` does), or what the pane shows once the session runs.
- * A model replaced by a later knob (`h.script({ statusFn })`,
- * `holdFindMissing`) no longer answers that verb.
- *
- * API
- * ---
- * `makePendingRowModel(host, key, options?)` installs the model for persona
- * `key` of `host` (a `RecoveryHarness` fits `PendingRowModelHost` as it is)
- * and answers the handle. For example, a row held at the trust dialog, not
- * judged until G past its launch start, then marked `missing`:
- *
- *   const row = makePendingRowModel(h, key, { dialog: PENDING_ROW_DIALOG_TRUST, judgment: judgeMissingFromG() })
- *   ...
- *   row.callTimes('find-missing') // each run's clock time
- *
- * A latched persona's row across re-checks (E30), each in a few lines:
- *
- *   // a leftover refuses two relaunches, then is gone
- *   makePendingRowModel(h, key, { state: LIVENESS_DEAD_ROW_MISSING, resumes: [refused, refused] })
- *   // a scan refusal with no row, then the spawn succeeds
- *   makePendingRowModel(h, key, { state: PENDING_ROW_MODEL_NO_ROW, plainSpawns: [scanRefusal(scanRow.build())] })
- *   // a refused resume whose row stays pending, then reads ended
- *   const row = makePendingRowModel(h, key, { state: LIVENESS_DEAD_ROW_ENDED, resumes: [restoreRefusal(err, PENDING_ROW_RESTORE_STAYS_PENDING)] })
- *   row.scriptRowChange(at, { state: LIVENESS_DEAD_ROW_ENDED })
- *
- * Every default answer is built by the stub's builders; launch starts are
- * the stub's `SAMPLE_LAUNCH_START*` values or rendered from a clock time
- * by `launchStartText`.
- *
- * Isolation: no top-level `mock.module()`, no real clock (the host's clock
- * only), no module state; every model's state lives in its handle.
- *
- * SPDX-License-Identifier: MIT
- */
+
 
 import type {
   FindMissingParams,
@@ -139,7 +22,6 @@ import { AGENT_DIRECTOR_DEAD_STATES, AGENT_DIRECTOR_PENDING_STATE, LIVENESS_DEAD
 import { RECHECK_READING_NO_ROW, RECHECK_READING_STATE, type LatchRecheckReading } from '../../src/conflict-latch.ts'
 import { parseLaunchStart } from '../../src/pending-row.ts'
 import { personaInstanceId } from '../../src/persona-identity.ts'
-import { IDLE_PANE, TRUST_DIALOG_PANE, DEV_CHANNELS_DIALOG_PANE } from './working-row-panes.ts'
 import {
   cannedFindMissing,
   cannedGetResult,
@@ -189,39 +71,6 @@ export interface PendingRowModelHost {
   script(knobs: PendingRowModelKnobs): void
 }
 
-/** The pane shows no dialog: the stub's own empty pane. */
-export const PENDING_ROW_DIALOG_NONE = 'none'
-/** The pane shows the folder-trust dialog (the approver's `TRUST_DIALOG_NEEDLE`). */
-export const PENDING_ROW_DIALOG_TRUST = 'trust'
-/** The pane shows the dev-channels dialog (the approver's `DEV_CHANNELS_DIALOG_NEEDLE`). */
-export const PENDING_ROW_DIALOG_DEV_CHANNELS = 'dev-channels'
-/** The pane shows a prompt with none of the approver's needles: Enter never clears it here. */
-export const PENDING_ROW_DIALOG_UNRECOGNISED = 'unrecognised'
-
-/** What the row's pane shows. */
-export type PendingRowDialog =
-  | typeof PENDING_ROW_DIALOG_NONE
-  | typeof PENDING_ROW_DIALOG_TRUST
-  | typeof PENDING_ROW_DIALOG_DEV_CHANNELS
-  | typeof PENDING_ROW_DIALOG_UNRECOGNISED
-
-/** The pane each dialog shows: the known ones carry the approver's needle, the unrecognised one none. */
-const DIALOG_PANES: Readonly<Record<PendingRowDialog, string>> = Object.freeze({
-  [PENDING_ROW_DIALOG_NONE]: IDLE_PANE,
-  [PENDING_ROW_DIALOG_TRUST]: TRUST_DIALOG_PANE,
-  [PENDING_ROW_DIALOG_DEV_CHANNELS]: DEV_CHANNELS_DIALOG_PANE,
-  [PENDING_ROW_DIALOG_UNRECOGNISED]: 'Choose an option to continue\n\n> 1. Continue later\n  2. Exit\n',
-})
-
-/** The pane text `dialog` shows, as the model's `read-pane` answers it. */
-export function pendingRowDialogPane(dialog: PendingRowDialog): string {
-  return DIALOG_PANES[dialog]
-}
-
-/** Whether `dialog` is one the approver (and the lap) recognises, so an Enter clears it here. */
-function isKnownDialog(dialog: PendingRowDialog): boolean {
-  return dialog === PENDING_ROW_DIALOG_TRUST
-}
 
 /**
  * The launch start agent-director shows for the instant `ms` (ADSRD SR-22.2:
@@ -471,10 +320,6 @@ export interface PendingRowModelOptions {
   readonly startedAt?: string
   /** Further `get` row overrides (a `cwd` or `labels` that do not match the persona). */
   readonly row?: PersonaGetResultOverrides
-  /** What the pane shows at first: `PENDING_ROW_DIALOG_NONE` when unset. */
-  readonly dialog?: PendingRowDialog
-  /** What the pane shows after a new launch (`spawn`, `resume`): `dialog` when unset. */
-  readonly dialogOnLaunch?: PendingRowDialog
   /** How a `find-missing` run judges the `pending` row: `judgeNotJudged` when unset. */
   readonly judgment?: PendingRowJudgment
   /** The first `read-pane` answers, in order: an error rejects the call, `undefined` answers the pane. */
@@ -520,7 +365,6 @@ export interface PendingRowModel {
   /** The row's launch start now, parsed (`parseLaunchStart`); undefined when it has none. */
   launchStartMs(): number | undefined
   /** What the pane shows now. */
-  dialog(): PendingRowDialog
   /** The row as `status` and `get` answer it now; each throws when there is no row. */
   statusRow(): StatusResult
   getRow(): CannedGetResult
@@ -529,7 +373,6 @@ export interface PendingRowModel {
   /** Change the row: its state, its raw launch start, its pane, its judgment, its note, what a `find-missing` run removes. */
   setState(state: PendingRowModelState): void
   setLaunchStartedAt(raw: string | null | undefined): void
-  setDialog(dialog: PendingRowDialog): void
   setJudgment(judgment: PendingRowJudgment): void
   setNote(note: boolean): void
   setFindMissingRemoves(removes: PendingRowFindMissingRemoves): void
@@ -583,12 +426,9 @@ export function makePendingRowModel(host: PendingRowModelHost, key: string, opti
     spawnFn: before.spawnFn,
     resumeFn: before.resumeFn,
   }
-  const waitingState = cannedStatusResult().state
 
   let state: PendingRowModelState = options.state ?? AGENT_DIRECTOR_PENDING_STATE
   let launchStartedAt: string | null | undefined = 'launchStartedAt' in options ? options.launchStartedAt : SAMPLE_LAUNCH_START_DEFAULT
-  let dialog: PendingRowDialog = options.dialog ?? PENDING_ROW_DIALOG_NONE
-  const dialogOnLaunch: PendingRowDialog = options.dialogOnLaunch ?? dialog
   let judgment: PendingRowJudgment = options.judgment ?? judgeNotJudged
   let note = options.note === true
   let findMissingRemoves: PendingRowFindMissingRemoves = options.findMissingRemoves ?? PENDING_ROW_FIND_MISSING_REMOVES_NOTHING
@@ -652,7 +492,6 @@ export function makePendingRowModel(host: PendingRowModelHost, key: string, opti
   const startLaunch = (): void => {
     state = AGENT_DIRECTOR_PENDING_STATE
     launchStartedAt = launchStartText(host.clock.now())
-    dialog = dialogOnLaunch
     note = false
   }
   /** The row a refusal leaves (`PendingRowRefusal.rowAfter`); a row left `pending` takes the failed launch's own launch start. */
@@ -705,7 +544,7 @@ export function makePendingRowModel(host: PendingRowModelHost, key: string, opti
       const scripted = readPaneAnswers.shift()
       if (scripted !== undefined) return scripted
       if (state === PENDING_ROW_MODEL_NO_ROW) return errSpawnNotFound()
-      return cannedReadPaneResult(pendingRowDialogPane(dialog))
+      return cannedReadPaneResult('arbitrary terminal contents')
     },
     sendKeysFn: (params: SendKeysParams): StubCallAnswer<SendKeysResult> => {
       if (!ownId(params)) return earlier.sendKeysFn?.(params)
@@ -715,10 +554,6 @@ export function makePendingRowModel(host: PendingRowModelHost, key: string, opti
       if (scripted !== undefined) return scripted
       if (state === PENDING_ROW_MODEL_NO_ROW) return errSpawnNotFound()
       if (isFinished(state)) return errSpawnNotInteractive('send-keys')
-      if (isKnownDialog(dialog)) {
-        dialog = PENDING_ROW_DIALOG_NONE
-        if (isPending()) state = waitingState
-      }
       return {}
     },
     findMissingFn: async (params: FindMissingParams): Promise<FindMissingResult | Error | undefined> => {
@@ -780,7 +615,6 @@ export function makePendingRowModel(host: PendingRowModelHost, key: string, opti
       applyDueChanges()
       return launchStartMs()
     },
-    dialog: () => dialog,
     note: () => {
       applyDueChanges()
       return note
@@ -793,9 +627,6 @@ export function makePendingRowModel(host: PendingRowModelHost, key: string, opti
     },
     setLaunchStartedAt(raw) {
       launchStartedAt = raw
-    },
-    setDialog(next) {
-      dialog = next
     },
     setJudgment(next) {
       judgment = next

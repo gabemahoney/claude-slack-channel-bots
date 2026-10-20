@@ -1,6 +1,6 @@
 import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
-import { IDLE_PANE } from './test-helpers/working-row-panes.ts'
 import { useImmediateTypingLifecycle } from './test-helpers/legacy-typing.ts'
+import { IDLE_PANE } from './test-helpers/working-row-panes.ts'
 useImmediateTypingLifecycle()
 /**
  * old-life-wait.test.ts — The old-life hold: start and end (b.jg5 SRJ-809;
@@ -187,13 +187,13 @@ import {
   KILL_FAILURE_ROUTE_NOT_CONFIGURED,
   KILL_FAILURE_VERSION_ORDINARY,
   KILL_FAILURE_VERSION_SURVIVOR,
-  type KillFailureAlertVersion,
   PERSONA_KILL_FAILED_LABEL,
   PERSONA_KILL_SURVIVOR_LABEL,
   PERSONA_TEARDOWN_NOTICE_LABEL,
   killFailureAlertContentOf,
   killFailureAlertEntryText,
   killFailureAlertText,
+  type KillFailureAlertVersion,
 } from '../src/kill-failure-alert.ts'
 import { KILL_RETRY_ALERT_ORDINARY, KILL_RETRY_ALERT_SURVIVOR, KILL_RETRY_TRIES, killRetryHoldEndedLine, type KillRetryAlert } from '../src/kill-retry.ts'
 import {
@@ -222,6 +222,10 @@ import {
   LIVENESS_DEAD_ROW_MISSING,
 } from '../src/liveness-reading.ts'
 import {
+  OLD_LIFE_WAIT_AT_FIND_MISSING,
+  OLD_LIFE_WAIT_AT_GET,
+  OLD_LIFE_WAIT_AT_KILL,
+  OLD_LIFE_WAIT_AT_STATUS_READ,
   OLD_LIFE_WAIT_END_CALL_FAILED,
   OLD_LIFE_WAIT_END_CONFIG,
   OLD_LIFE_WAIT_END_ENVIRONMENT,
@@ -234,10 +238,6 @@ import {
   OLD_LIFE_WAIT_END_STOPPED,
   OLD_LIFE_WAIT_END_UNAVAILABLE,
   OLD_LIFE_WAIT_END_UNCLASSIFIED,
-  OLD_LIFE_WAIT_AT_FIND_MISSING,
-  OLD_LIFE_WAIT_AT_GET,
-  OLD_LIFE_WAIT_AT_KILL,
-  OLD_LIFE_WAIT_AT_STATUS_READ,
   OLD_LIFE_WAIT_SITE,
   oldLifeWaitRef,
   oldLifeWaitRefusalNoticeText,
@@ -246,6 +246,7 @@ import {
   type OldLifeWaitRefusalAt,
 } from '../src/old-life-wait.ts'
 import { getOutageFlags, raiseAdConfigMalformed, type OutageClass } from '../src/outage-state.ts'
+import { describeThrownValue } from '../src/persona-connection-errors.ts'
 import {
   PERSONA_UNCLASSIFIED_ERROR_LABEL,
   UNCLASSIFIED_ERROR_END_HOLD_ENDED,
@@ -253,12 +254,11 @@ import {
   killFailureStoppedRetryText,
   unclassifiedErrorAlertText,
 } from '../src/persona-episodes.ts'
-import { describeThrownValue } from '../src/persona-connection-errors.ts'
 import { personaInstanceId, personaTmuxSessionName } from '../src/persona-identity.ts'
 import { PERSONA_TEARDOWN_NOTICE_DURING_WAIT, personaTeardownNoticeEntryText } from '../src/persona-notifier.ts'
-import { oldLifeHoldsToBegin } from '../src/reload.ts'
-import { buildChangePlan, type ValidChangePlan } from '../src/reload-plan.ts'
 import { sessionHeldRefusalLine } from '../src/registry.ts'
+import { buildChangePlan, type ValidChangePlan } from '../src/reload-plan.ts'
+import { oldLifeHoldsToBegin } from '../src/reload.ts'
 import {
   RESTART_OUTCOME_RECONNECT_DEFERRED,
   RESTART_OUTCOME_SEQUENCE_WAITING,
@@ -291,11 +291,11 @@ import {
 } from '../src/retired-keys.ts'
 import {
   OLD_LIFE_HOLD_ARM_SKIPPED,
-  OLD_LIFE_HOLD_SKIPPED_TIMER_PHRASE,
   OLD_LIFE_HOLD_END_NOT_RETRIED_HELD,
   OLD_LIFE_HOLD_END_NOT_RETRIED_LATCHED,
   OLD_LIFE_HOLD_END_NOT_RETRIED_NOT_APPLIED,
   OLD_LIFE_HOLD_END_NOT_RETRIED_NOT_UP,
+  OLD_LIFE_HOLD_SKIPPED_TIMER_PHRASE,
   OLD_LIFE_HOLD_WAIT_RUNNING,
   OLD_LIFE_NEW_LIFE_AFTER_TIMEOUT_READ,
   OLD_LIFE_NEW_LIFE_READ,
@@ -322,8 +322,8 @@ import {
   oldLifeWaitLatchedLine,
   oldLifeWaitNotUpLine,
   oldLifeWaitRefusalLine,
-  oldLifeWaitUnclassifiedEntryText,
   oldLifeWaitTeardownLine,
+  oldLifeWaitUnclassifiedEntryText,
   oldLifeWaitUnclassifiedNotReportedLine,
   readPersonaOwnRow,
   reconnectMcpWithCause,
@@ -335,6 +335,7 @@ import {
 } from '../src/session-manager.ts'
 import { UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD, UNAVAILABLE_RETRY_ROW_ABSENT, UNAVAILABLE_RETRY_RUN_NOW_RAN } from '../src/unavailable-retry.ts'
 import {
+  SAMPLE_LAUNCH_START_NONE,
   cannedErr,
   cannedFindMissing,
   cannedGetResult,
@@ -353,7 +354,6 @@ import {
   errUnusableName,
   holdFindMissing,
   provenanceNote,
-  SAMPLE_LAUNCH_START_NONE,
   type CannedGetResult,
   type FindMissingHold,
   type PersonaGetResultOverrides,
@@ -378,8 +378,12 @@ import {
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import {
   adConfigMalformedRaiseLines,
-  launchThroughSequence,
   expectPendingOnlyWatch,
+  holdThroughReuse,
+  killFailureLines,
+  killFailureLoggedLine,
+  killFailureStoppedEntryLine,
+  launchThroughSequence,
   makeRecoveryHarness,
   ownRowsLiveThenMissing,
   pastSampleGrace,
@@ -388,10 +392,6 @@ import {
   personaRow,
   recordCallOrder,
   recordSequenceStarts,
-  killFailureLines,
-  killFailureLoggedLine,
-  holdThroughReuse,
-  killFailureStoppedEntryLine,
   rowReadsUntilSpawn,
   scriptTimedLaunch,
   startSequenceHeldAtRun,
@@ -1052,7 +1052,6 @@ describe('b.jg5 SRJ-809, SRJ-806: a reuse that begins the key\'s new life ends i
     if (failMark) h.failRetiredKeyWrites()
 
     expect(await h.launch(p)).toStrictEqual({ key: p, action: SPAWN_ACTION_FRESH_RETIRED })
-    await h.runApproverToStop(p)
 
     expect(h.retiredEntry(p).marked).toBe(true)
     expect(holdsOf(h)).toEqual([fieldsOf(bHold)])
@@ -1295,7 +1294,7 @@ describe('b.jg5 SRJ-811 (AC 54): the wait and a live-row sequence never run at o
     expect([h.stub.callCount(), hold.calls.length, h.oldLifeWaitRunning(personaInstanceId(p))]).toEqual([calls, 1, false])
     hold.release(cannedFindMissing({ rows: { [personaInstanceId(p)]: 'ids' } }))
     expect((await h.driveSequence(run.outcome)).kind).toBe(LIVE_ROW_OUTCOME_LAUNCHED)
-    await h.runApproverToStop(p)
+
     expect(h.oldLifeWaitRunning(personaInstanceId(p))).toBe(false)
   })
 
@@ -1372,7 +1371,6 @@ describe('b.jg5 SRJ-811, SRJ-706: a wait on one id never refuses a waiting perso
     for (let i = 0; i < 3; i++) hold.release(ids)
     expect(await h.driveSequence(wait)).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_HOLD_ENDED })
     for (const run of runs) expect((await h.driveSequence(run.outcome)).kind).toBe(LIVE_ROW_OUTCOME_LAUNCHED)
-    for (const key of [p, b]) await h.runApproverToStop(key)
     expect(h.oldLifeHolds.holdOf(PRE_PERSONA_ID)).toBeUndefined()
   })
 })
@@ -2224,7 +2222,7 @@ async function expectRetriedAtOnceAndUp(h: RecoveryHarness, key: string, endedAt
   expect(spawns).toHaveLength(1)
   expect('reuse_finished' in spawns[0]!).toBe(false)
   expect(h.stub.calls.resumeCalls).toEqual([])
-  await h.runApproverToStop(key)
+
 }
 
 describe('b.jg5 SRJ-810 (AC 53), SRJ-1505: a retired key\'s old life that survived a failed kill is no persona\'s MCP session, and nothing types /mcp reconnect into it', () => {
@@ -2269,7 +2267,7 @@ describe('b.jg5 SRJ-810 (AC 53), SRJ-1505: a retired key\'s old life that surviv
     expect(h.oldLifeHolds.holdOf(old.instanceId)).toBeUndefined()
     expect(h.admitSession(dir)).toMatchObject({ kind: 'admitted', persona: { key: p } })
     expect(h.stub.calls.sendKeysCalls).toEqual([])
-    await h.runApproverToStop(p)
+
   })
 })
 
@@ -2296,7 +2294,7 @@ describe('b.jg5 SRJ-810 bullet 3, SRJ-1502, SRJ-301: the launch gate holds back 
     expect(personaCallCounts(h, q)).toEqual({})
 
     expect((await h.launch(b)).action).toBe('spawned')
-    await h.runApproverToStop(b)
+
     expect(spawnsOf(h, q)).toEqual([])
 
     const endedAt = await endHoldAtRun(h, hold, old.instanceId)
@@ -2316,7 +2314,7 @@ describe('b.jg5 SRJ-810 bullet 3, SRJ-1502, SRJ-301: the launch gate holds back 
     expect([oldLifeArms(h), h.oldLifeWaitRunning(personaInstanceId(p)), h.oldLifeHolds.holdOf(personaInstanceId(p))]).toEqual([[], false, undefined])
     expect(h.reuseSpawns().map((params) => params.instance_id)).toEqual([personaInstanceId(p), personaInstanceId(p)])
     expect(spawnsOf(h, p)).toHaveLength(2)
-    await h.runApproverToStop(p)
+
   })
 })
 
@@ -2718,7 +2716,7 @@ describe('b.jg5 SRJ-809, SRJ-806, SRJ-407: a reuse that timed out but launched e
     expect(h.holdEndRetries).toEqual([{ key: b, at: endedAt, result: UNAVAILABLE_RETRY_RUN_NOW_RAN }])
     await h.settle()
     await expectRetriedAtOnceAndUp(h, b, endedAt)
-    await h.runApproverToStop(p)
+
     // P's reuse is P's one spawn: nothing launched over its new life.
     expect(spawnsOf(h, p)).toHaveLength(1)
   })

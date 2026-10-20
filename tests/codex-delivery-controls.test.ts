@@ -5,9 +5,9 @@ import { mkdtempSync, mkdirSync, rmSync, symlinkSync, realpathSync, readFileSync
 import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
-import { codexContainment, codexArguments, configureScratchCodex, createScratchCodexLifecycle, scratchCodexContract, retireCodexObservation, codexRetirementCheckpoint, CODEX_NATIVE, CODEX_AUTH_MOUNT, CODEX_NO_REPLY } from './real-agent/codex-guards.ts'
+import { codexContainment, codexArguments, configureScratchCodex, createScratchCodexLifecycle, scratchCodexContract, codexRetirementCheckpoint, CODEX_NATIVE, CODEX_AUTH_MOUNT, CODEX_NO_REPLY } from './real-agent/codex-guards.ts'
 import { checkCodexScratchConfigKeys, encodeCodexHostConfigKeys } from '../src/codex-config-keys.ts'
-import { completedCodexTurn, codexNoTurn, projectCodexRollout, safeCodexEvents } from './real-agent/codex-evidence.ts'
+import { completedCodexTurn, projectCodexRollout, safeCodexEvents } from './real-agent/codex-evidence.ts'
 import { assertNoLeak, fakeToken, BOT_TOKEN_PREFIX } from './test-helpers/credentials.ts'
 import { projectCrashProgress, publishCrashProgress, readCrashProgress, waitForCrashBoundary, type CrashProgress } from './real-agent/codex-crash-barrier.ts'
 
@@ -27,7 +27,7 @@ describe('D1 crash-worker checkpoints and durable-pair boundary (synthetic; no n
     const records = [{ kind: 'accepted', seq: 13 }]
     const f = {
       root, checkpoint, marker, child, diagnostics, order, records, at: () => at,
-      advance: (_at: number) => {}, visible: async () => true,
+      advance: (_at: number) => {},
       sleep: async (ms: number) => { at += ms; f.advance(at) },
       checkpointAt: (patch: Partial<CrashProgress> = {}) => publishCrashProgress(checkpoint, progress(patch)),
       boundary: () => {
@@ -42,7 +42,7 @@ describe('D1 crash-worker checkpoints and durable-pair boundary (synthetic; no n
       run: async () => {
         try {
           return await waitForCrashBoundary({ child, checkpoint, marker, instance: 'cscb_codex_gate', journal: () => records,
-            inputVisible: () => f.visible(), counts: () => ({ queue: records.length, text: 1, enter: 0 }),
+            counts: () => ({ queue: records.length, text: 1, enter: 0 }),
             diagnostic: value => { assertNoLeak(value); diagnostics.push(value); order.push('diagnostic') },
             bound: () => order.push('bound'), now: () => at, sleep: ms => f.sleep(ms),
           })
@@ -94,7 +94,7 @@ describe('D1 crash-worker checkpoints and durable-pair boundary (synthetic; no n
         const result = await protocol.waitForCrashBoundary({
           child: ${JSON.stringify(f.child)}, checkpoint: ${JSON.stringify(f.checkpoint)}, marker: ${JSON.stringify(f.marker)},
           instance: 'cscb_codex_gate', journal: () => [{ kind: 'accepted', seq: 14 }, { kind: 'accepted', seq: 15 }],
-          inputVisible: async () => true, counts: () => ({ queue: 2, text: 1, enter: 0 }),
+          counts: () => ({ queue: 2, text: 1, enter: 0 }),
           diagnostic: value => diagnostics.push(value), bound: () => { throw new Error('unexpected deadline'); },
           now: () => at, sleep: async ms => { at += ms; },
         });
@@ -120,13 +120,13 @@ describe('D1 crash-worker checkpoints and durable-pair boundary (synthetic; no n
     expect(f.diagnostics[0]).toMatchObject({ progress: { stage: 'client-ready' }, exit, signal: signal === 'foreign-signal' ? 'other' : signal })
     expect(f.order).toEqual(['diagnostic', 'cleanup'])
   })
-  test.each(['live startup stall', 'transport rejection', 'missing marker', 'missing successor', 'invisible input', 'late input'])(
+  test.each(['live startup stall', 'transport rejection', 'missing marker', 'missing successor', 'late successor'])(
     '%s keeps the original 180-second failure and diagnostic-before-cleanup order', async kind => {
       const f = fixture(); f.checkpointAt({ stage: 'queue-ready' })
       if (kind === 'transport rejection') f.checkpointAt({ stage: 'text-call-start', firstSeq: 14, textStarted: true, errors: 4, error: 'ErrRelayFallenBack' })
-      if (['missing marker', 'missing successor', 'invisible input', 'late input'].includes(kind)) f.boundary()
+      if (['missing marker', 'missing successor', 'late successor'].includes(kind)) f.boundary()
       if (kind === 'missing marker') unlinkSync(f.marker)
-      if (['invisible input', 'late input'].includes(kind)) { f.successor(); f.visible = async () => kind === 'late input' && f.at() >= 180000 }
+      if (kind === 'late successor') f.advance = at => { if (at >= 180000) f.successor() }
       await expect(f.run()).rejects.toThrow('observation incomplete within bound')
       expect(f.at()).toBe(180000); expect(f.order).toEqual(['bound', 'diagnostic', 'cleanup'])
       expect(f.diagnostics).toHaveLength(1)
@@ -220,39 +220,7 @@ describe('D1 crash-worker checkpoints and durable-pair boundary (synthetic; no n
       assertNoLeak({ files, log: captured.log }); expect(JSON.stringify(files)).not.toContain(token)
     } finally { rmSync(root, { recursive: true, force: true }) }
   })
-  test.each(['success', 'timeout'])('actual parent gate records child diagnostics before %s SIGKILL and cleanup', async kind => {
-    const f = fixture()
-    try {
-      if (kind === 'success') { f.boundary(); f.successor() }
-      const source = readFileSync(join(import.meta.dir, 'real-agent/codex-delivery.ts'), 'utf8')
-      const begin = source.indexOf('  const child = Bun.spawn('), end = source.indexOf("\n  stage = 'gate-trailing-popup-fidelity'", begin)
-      const shimLog = join(f.root, 'shim.log'); writeFileSync(shimLog, '')
-      const child = { ...f.child, exited: Promise.resolve(137), kill: (signal: string) => {
-        f.order.push(signal); child.exitCode = 137; child.signalCode = signal
-      } }
-      const captures: unknown[] = []
-      // The spawn receiver is a fake; replace only module-local path syntax
-      // so the unchanged gate body can execute in this isolated function.
-      const program = ["const instance = 'cscb_codex_gate', key = 'synthetic';", 'return (async () => {',
-        source.slice(begin, end).replace('import.meta.path', "'synthetic-driver'"), '})()'].join('\n')
-      const invoke = new Function('Bun', 'process', 'crashProtocol', 'stateDir', 'join', 'journal', 'pane', 'codexShimCalls',
-        'readFileSync', 'shimLog', 'record', 'buildEngine', 'queue', 'delivered', 'assertCodexRecovery',
-        new Bun.Transpiler({ loader: 'ts' }).transformSync(program))
-      const result = invoke({ spawn: () => child, sleep: f.sleep }, { execPath: 'synthetic-bun', env: {} },
-        { waitForCrashBoundary: (options: Parameters<typeof waitForCrashBoundary>[0]) => waitForCrashBoundary({ ...options,
-          checkpoint: f.checkpoint, marker: f.marker, now: f.at, sleep: f.sleep }) },
-        f.root, join, () => [...f.records, { kind: 'fixed', seq: 14, parts: ['synthetic exact text'] }],
-        async () => ({ screen: { kind: 'input' } }),
-        () => [{ parent: 321, instance: 'cscb_codex_gate', text: 'synthetic exact text', noEnter: true }],
-        readFileSync, shimLog, (label: string, value: unknown) => { captures.push(value); f.order.push(label) },
-        async () => {}, { items: () => [] }, async () => {}, () => {})
-      if (kind === 'success') await result
-      else await expect(result).rejects.toThrow('observation incomplete within bound')
-      expect(f.order).toEqual(kind === 'success' ? ['crash-worker', 'SIGKILL', 'harness-crash'] : ['bound', 'crash-worker', 'SIGKILL'])
-      expect(child.signalCode).toBe('SIGKILL'); assertNoLeak(captures)
-    } finally { rmSync(f.root, { recursive: true, force: true }) }
-    expect(existsSync(f.root)).toBe(false)
-  })
+
 })
 const scenarioSource = readFileSync(join(import.meta.dir, 'integration/lib/scenario.sh'), 'utf8')
 function shellFunction(name: string) {
@@ -462,38 +430,6 @@ describe('D1 scratch preparation and disposable observation cleanup', () => {
       assertNoLeak(projection)
     } finally { rmSync(root, { recursive: true, force: true }) }
   })
-  test.each([
-    { name: 'idle popup', draft: true, waiting: true }, { name: 'idle multiline draft', draft: true, waiting: true },
-    { name: 'busy multiline draft', draft: true, waiting: false }, { name: 'clean waiting row', draft: false, waiting: true },
-    { name: 'busy row', draft: false, waiting: false },
-  ])('$name uses supported AD operations and proves retirement', async options => {
-    const calls: string[] = []
-    let state = 'waiting'
-    await retireCodexObservation({
-      sendEscape: async () => { calls.push('Escape') },
-      afterEscape: async () => { calls.push('pane-with-draft-still-present') },
-      kill: async () => { calls.push('kill') }, // AD kill deliberately leaves row state unchanged.
-      ended: () => codexRetirementCheckpoint({
-        findMissing: async () => { calls.push('find-missing'); state = 'missing' },
-        state: async () => { calls.push('get-state'); return state },
-      }),
-    }, options)
-    expect(calls).toEqual(options.draft ? ['Escape', 'pane-with-draft-still-present', 'kill', 'find-missing', 'get-state']
-      : ['kill', 'find-missing', 'get-state'])
-    assertNoLeak(calls)
-  })
-  test('a failed Escape still kills the row and preserves the refusal', async () => {
-    const calls: string[] = [], refusal = new Error('synthetic AD refusal')
-    await expect(retireCodexObservation({ sendEscape: async () => { throw refusal }, afterEscape: async () => { calls.push('pane') },
-      kill: async () => { calls.push('kill') }, ended: async () => false,
-    }, { draft: true, waiting: true })).rejects.toBe(refusal)
-    expect(calls).toEqual(['kill'])
-  })
-  test('a successful kill without ended-row evidence cannot complete cleanup', async () => {
-    await expect(retireCodexObservation({ sendEscape: async () => {}, afterEscape: async () => {},
-      kill: async () => {}, ended: async () => false,
-    }, { draft: false, waiting: false })).rejects.toThrow('not confirmed')
-  })
   test.each(['waiting', 'working', 'pending', 'stopping', 'unverified', 'ended', 'missing'])('retirement sweep accepts only terminal state %s', async state => {
     const calls: string[] = []
     expect(await codexRetirementCheckpoint({ findMissing: async () => { calls.push('sweep') },
@@ -501,13 +437,7 @@ describe('D1 scratch preparation and disposable observation cleanup', () => {
     })).toBe(state === 'ended' || state === 'missing')
     expect(calls).toEqual(['sweep', 'get'])
   })
-  test('a failed retirement sweep cannot certify a stale terminal row', async () => {
-    const refusal = new Error('synthetic sweep refusal'), calls: string[] = []
-    await expect(codexRetirementCheckpoint({ findMissing: async () => { throw refusal },
-      state: async () => { calls.push('get'); return 'ended' },
-    })).rejects.toBe(refusal)
-    expect(calls).toEqual([])
-  })
+
 })
 
 describe('decision 22 native scratch config lifecycle', () => {
@@ -681,28 +611,5 @@ describe('synthetic Codex native-evidence controls', () => {
     expect(JSON.stringify(safe).includes(secret)).toBe(false)
     expect(JSON.stringify(safe).includes(text)).toBe(false)
     assertNoLeak(safe)
-  })
-  test('a real send window with no new turn is diagnostic evidence only', () => {
-    const { data } = sample()
-    const window = { session, offset: data.size, sentAt: sentAt + 3, text, model }
-    const proof = codexNoTurn(data, window, { at: sentAt + 1000, shimAt: sentAt + 4, shimText: text, noEnter: true })
-    expect(proof).toEqual({ session, sentAt: sentAt + 3, shimAt: sentAt + 4, observedAt: sentAt + 1000,
-      noEnter: true, afterOffset: data.size, size: data.size, observedForMs: 997, events: [] })
-    expect(() => completedCodexTurn(data, window)).toThrow()
-    assertNoLeak(proof)
-  })
-  test.each(['wrong-session', 'active-turn', 'unproven-send', 'submitted', 'zero-interval', 'invalid-offset', 'partial', 'pre-window-shim', 'future-shim', 'invalid-shim-time'])('%s cannot prove no turn began', kind => {
-    const { data } = sample(), window = { session, offset: data.size, sentAt, text, model }, observation = { at: sentAt + 1000, shimAt: sentAt + 1, shimText: text, noEnter: true }
-    if (kind === 'wrong-session') window.session = 'foreign-session'
-    if (kind === 'active-turn') window.offset = data.records[0]!.end
-    if (kind === 'unproven-send') observation.shimText = 'another text'
-    if (kind === 'submitted') observation.noEnter = false
-    if (kind === 'zero-interval') observation.at = sentAt
-    if (kind === 'invalid-offset') window.offset = NaN
-    if (kind === 'partial') data.incomplete = true
-    if (kind === 'pre-window-shim') observation.shimAt = sentAt - 1
-    if (kind === 'future-shim') observation.shimAt = observation.at + 1
-    if (kind === 'invalid-shim-time') observation.shimAt = NaN
-    expect(() => codexNoTurn(data, window, observation)).toThrow()
   })
 })

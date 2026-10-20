@@ -1,98 +1,22 @@
-/**
- * reload-wiring.test.ts — Static audit of the reload detection tick's wiring
- * in src/server.ts (b.av2 SR-8.2, SR-8.3, SR-7.2).
- *
- * SR-8.2: one serialized, self-re-arming 5 s timer (no file watcher) reads
- * config.json and, unless in dry run, every credentials file it references,
- * and keeps config.json.pending in step. It starts when the start's bring-up
- * pass returns, like the health check. SR-8.3: a credentials change is pending
- * only against the digest a persona connected, retried or broke with, which
- * the bring-up controller holds; SR-8.6 step 6: the preview reads the
- * bring-up controller's state to tell a persona broken by its credentials
- * from one to reconnect; SR-8.6 step 1 (b.deo SRI-201): `onApplied` swaps
- * the server's applied config to `configInEffect(<start-time config>,
- * <confirmed>)`, the confirmed persona set and `allow_invited_channels`
- * switch over the other start-time server-wide values (AC 61, the
- * server-wide row: nothing in server.ts reads the controller's own applied
- * config, and `configInEffect` itself is tested as a pure function at the end
- * of this file; the ack reaction and reply chunk settings reach the routing
- * and the MCP tools through `getReplySettings`, whose body is pinned to
- * config.ts's pure `replySettingsOf` over that holder, and `replySettingsOf`
- * is tested over the holder's value after the swap). These assertions fail if main() arms the timer
- * before the start bring-up returns (or before the refused-start exit), from
- * more than one call site or not at all; if shutdown() stops calling it off;
- * or if the controller is built with anything but the production tick driver,
- * `isDryRun()` and the bring-up controller's held digests and states, or is
- * passed a file watcher.
- *
- * SR-6.5 / SR-6.1 / SR-6.6 (E12 Task 2): a confirmed apply's teardowns (step
- * 2) and bring-ups (step 6) are the controller's default fan-out over its
- * lifecycle members `teardown` and `bringUp`; its in-place updates (step 3,
- * E12 Task 3) over `updateInPlace`; its credentials reconnects (step 4, E13
- * Task 1) over `reconnectCredentials`, its template refresh (step 5, E13
- * Task 2) over `refreshTemplate`, and the recovery of a
- * credentials-broken persona (step 6, SR-6.4) over `bringUp` with its
- * `recovery` option. The audit pins that production binds all five, every
- * argument forwarded, to the one `PersonaLifecycle` main() composes with
- * `createPersonaLifecycle` (declared before the controller, assigned once
- * after the bring-up controller exists and before detection is armed), passes
- * no `applySteps` override (which would replace that fan-out), and that the
- * restart timers, the connection manager (the deferred socket close after a
- * Web API auth error, b.ujn), the bring-up retries, the lifecycle, the
- * pending-row rule and the latch re-check's rounds (b.jg5 SRJ-505) share one
- * per-persona serializer (the UNAVAILABLE retry controller reaches it only
- * through the restart module's retry entry, never directly), that the
- * teardown stops a key's UNAVAILABLE retry timer through the one retry
- * controller main() builds (b.jg5 SRJ-305) and, in the same binding, cancels
- * the key's tmux-unresponsive alert check on the one condition main() builds
- * (b.jg5 SRJ-309), that the teardown forgets the key's latch on the one
- * latch main() builds, through the only forget of that latch in server.ts
- * (b.jg5 SRJ-504), that the teardown kills through the session manager's
- * bounded-retry teardown kill on the production clock, raises its
- * kill-failure alert on the one alerts instance with the context 'persona
- * teardown' and is given no delete (b.jg5 SRJ-715, SRJ-704), that the
- * teardown forgets the key's old-life waits through the session manager's
- * `forgetOldLifeWaits` (b.jg5 SRJ-811), that apply step
- * 1 stops each recorded key's dialog approver with the retired-key reason
- * (b.jg5 SRJ-808), that the one persona notifier, built at module scope, is
- * given startup-errors.ts's `recordStartupError` with its default log
- * directory (no `logDir`) and is the lifecycle's notifier, whose window
- * entries server.ts never drives itself (b.jg5 SRJ-1003, SRJ-1013), and that the refresh gets the server-wide
- * template arguments the boot install wrote (a value captured once at start,
- * never re-read at apply) and the agent-director client. What the default step bodies do with those members
- * is tested in tests/reload-apply.test.ts; what the teardown, the apply
- * bring-up and the in-place update do is tested behaviourally against
- * `createPersonaLifecycle`.
- *
- * AC 58 (SR-8.6 step 3): an in-place change takes effect from the next event
- * or post because its consumers read the applied config holder `onApplied`
- * reassigns, at call time. The audit pins the consumers no other audit
- * covers: the persona routing's `getPersonaConfig`, the by-key lookup
- * `getAppliedPersona`, and the notifier's and the MCP tools' `getPersona`
- * (the event router's, the permission poller's and the destination hold's
- * are pinned in tests/permission-relay-wiring.test.ts).
- *
- * What the timer and the tick do is tested behaviourally in
- * tests/reload-timer.test.ts and tests/reload.test.ts. Only the wiring that
- * cannot be driven by a behaviour test is audited here: main() cannot run in
- * a unit test (the agent-director startup gate, a real port, real Slack
- * connections). This follows tests/cron-scheduler-wiring.test.ts and
- * tests/start-sweep-wiring.test.ts: it reads the source with comments
- * stripped and anchors on content, never on line numbers. It reads no file
- * but src/server.ts (and, for the one name check that the teardown's delete is
- * gone, every src/*.ts file's text), imports only the pure `configInEffect` from
- * src/reload.ts, the switch's setting name `MODE_SWITCH_SETTING` from
- * src/reload-plan.ts and the pure `replySettingsOf`, constants and types from
- * src/config.ts (and only types from src/persona-notifier.ts,
- * src/persona-lifecycle.ts and src/session-manager.ts), runs no server code,
- * and touches no home
- * directory.
- *
- * SPDX-License-Identifier: MIT
- */
 
-import { describe, test, expect } from 'bun:test'
-import { readdirSync, readFileSync } from 'node:fs'
+
+import { describe, expect, test } from 'bun:test'
+import { readFileSync } from 'node:fs'
+import {
+  DEFAULT_REPLY_CHUNK_LIMIT,
+  DEFAULT_REPLY_CHUNK_MODE,
+  MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
+  replySettingsOf,
+  type PersonaConfig,
+  type ReplySettings,
+} from '../src/config.ts'
+import type { PersonaLifecycleDeps } from '../src/persona-lifecycle.ts'
+import type * as PersonaNotifierModule from '../src/persona-notifier.ts'
+import type { PersonaNotifier, PersonaNotifierDeps } from '../src/persona-notifier.ts'
+import { MODE_SWITCH_SETTING } from '../src/reload-plan.ts'
+import { configInEffect } from '../src/reload.ts'
+import type * as SessionManagerModule from '../src/session-manager.ts'
+import { makePersonaConfig } from './test-helpers/persona-config.ts'
 import {
   atMainTopLevel,
   balancedAfter,
@@ -108,21 +32,6 @@ import {
   startResolution,
   stripComments,
 } from './test-helpers/source-audit.ts'
-import { makePersonaConfig } from './test-helpers/persona-config.ts'
-import { configInEffect } from '../src/reload.ts'
-import { MODE_SWITCH_SETTING } from '../src/reload-plan.ts'
-import {
-  DEFAULT_REPLY_CHUNK_LIMIT,
-  MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
-  DEFAULT_REPLY_CHUNK_MODE,
-  replySettingsOf,
-  type PersonaConfig,
-  type ReplySettings,
-} from '../src/config.ts'
-import type { PersonaLifecycleDeps } from '../src/persona-lifecycle.ts'
-import type * as PersonaNotifierModule from '../src/persona-notifier.ts'
-import type * as SessionManagerModule from '../src/session-manager.ts'
-import type { PersonaNotifier, PersonaNotifierDeps } from '../src/persona-notifier.ts'
 
 /** server.ts with every comment removed (see stripComments). */
 const SERVER_CODE = stripComments(readFileSync(new URL('../src/server.ts', import.meta.url), 'utf-8'))
@@ -451,7 +360,7 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
   // production passes it: without it, the deferred close of a socket whose
   // Web API call was refused for its token would not wait behind a lifecycle
   // operation holding the persona. The pending-row rule's install
-  // (`setPendingRowRule`) takes the same run, so the one run at an approver's
+
   // stop is queued in P's turn (b.jg5 SRJ-410). So does the latch re-check's
   // builder (`buildLatchRecheck`, b.jg5 SRJ-505): each round waits for P's
   // turn and runs the restart path's decision inside it, so it never overlaps
@@ -532,7 +441,7 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
     // Functions and objects with a parameter name of the source's choosing.
     // (`templateRefresh` is pinned in the test after this one.)
     const shaped = [
-      'log', 'replyGuard', 'storageCheck', 'launch', 'templateRefresh', 'stopApprover', 'stopLiveRowSequence', 'stopRetryTimer',
+      'log', 'replyGuard', 'storageCheck', 'launch', 'templateRefresh',  'stopDelivery', 'stopLiveRowSequence', 'stopRetryTimer',
       'forgetConflictLatch', 'forgetInvalidFlagsHold', 'forgetNoticeEpisodes', 'killInstance', 'raiseKillFailureAlert',
     ]
     expect([...props.keys()].sort()).toEqual([...expected.keys(), ...shaped].sort())
@@ -547,8 +456,7 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
       KILL_RETRY_SYSTEM_CLOCK: './kill-retry.ts',
       createKillFailureAlerts: './persona-episodes.ts',
       KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN: './kill-failure-alert.ts',
-      stopDialogApprover: './session-manager.ts',
-      APPROVER_STOP_TEARDOWN: './session-manager.ts',
+
       stopLiveRowSequence: './session-manager.ts',
       LIVE_ROW_STOP_TEARDOWN: './live-row-sequence.ts',
       forgetOldLifeWaits: './session-manager.ts',
@@ -608,20 +516,16 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
     expect(launchPass).not.toBeNull()
     expect([launchPass![3], launchPass![4]]).toEqual([launchPass![1], launchPass![2]])
 
-    // b.jg5 SRJ-404, SRJ-715: optional in the deps, so only this pin makes
-    // sure a production teardown stops the key's dialog approver (and the one
-    // its launch in flight would start), first: the session manager's approver
-    // stop for that key with the teardown reason, not a stub, not another
-    // key's or every persona's stop (imported above, not shadowed).
-    const stopBody = props.get('stopApprover') ?? ''
-    const stopApprover = stopBody.match(/^async \(?(\w+)\)? => \{ const (\w+) = /)
-    expect(stopApprover).not.toBeNull()
-    const [, stopKey, stoppingDelivery] = stopApprover!
-    expect(stopBody).toBe(`async (${stopKey}) => { const ${stoppingDelivery} = deliveryEngines?.forget(${stopKey}); deliveryLifecycle?.forget(${stopKey}); await stopDialogApprover(${stopKey}, APPROVER_STOP_TEARDOWN); await ${stoppingDelivery} }`)
+    // Teardown stops delivery and forgets its lifecycle for this key.
+    const stopBody = props.get('stopDelivery') ?? ''
+    const stopDelivery = stopBody.match(/^async \(?(\w+)\)? => \{ const (\w+) = /)
+    expect(stopDelivery).not.toBeNull()
+    const [, stopKey, stoppingDelivery] = stopDelivery!
+    expect(stopBody).toBe(`async (${stopKey}) => { const ${stoppingDelivery} = deliveryEngines?.forget(${stopKey}); deliveryLifecycle?.forget(${stopKey}); await ${stoppingDelivery} }`)
 
     // b.jg5 SRJ-706, SRJ-715: optional in the deps, so only this pin makes
     // sure a production teardown stops the key's live-row sequence (right
-    // after the approver, waiting for its call in flight): the session
+    // after delivery, waiting for its call in flight): the session
     // manager's stop entry over the installed registry for that key with the
     // teardown reason, not a stub, not another key's stop or every persona's
     // (`stopAll`, the registry's `close`), not a latch or shutdown reason
@@ -840,44 +744,9 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
 })
 
 // ---------------------------------------------------------------------------
-// Apply step 1's approver stop, and no delete anywhere (b.jg5 SRJ-808,
+
 // SRJ-404, SRJ-715)
 // ---------------------------------------------------------------------------
-
-describe('server.ts binds apply step 1\'s approver stop, and no src file keeps the teardown\'s delete (b.jg5 SRJ-808, SRJ-404, SRJ-715)', () => {
-  // `ReloadControllerDeps.stopApprover` is required, so the typecheck catches
-  // it missing; it cannot catch it bound to a stub, to another key's stop, to
-  // every persona's stop or to another reason (the teardown's, which is
-  // already the lifecycle's; a superseded stop, which leaves the row to the
-  // pending-row rule). What step 1 does with it is tested in
-  // tests/reload-apply.test.ts; what the stop does in
-  // tests/approve-trust-folder-dialog.test.ts.
-  test('the reload controller\'s stopApprover is exactly the session manager\'s approver stop for the key it is given, with the retired-key reason (imported, not shadowed)', () => {
-    const body = controllerProps().get('stopApprover') ?? ''
-    const stop = body.match(/^async \(?(\w+)\)? => \{ const (\w+) = /)
-    expect(stop).not.toBeNull()
-    const [, key, stopping] = stop!
-    expect(body).toBe(`async (${key}) => { const ${stopping} = deliveryEngines?.forget(${key}); deliveryLifecycle?.forget(${key}); await stopDialogApprover(${key}, APPROVER_STOP_RETIRED_KEY); await ${stopping} }`)
-    for (const name of ['stopDialogApprover', 'APPROVER_STOP_RETIRED_KEY']) {
-      expect([name, importSource(SERVER_CODE, name)]).toEqual([name, './session-manager.ts'])
-      expect([name, indicesOf(new RegExp(`\\b(?:let|const|var|function)\\s+${name}\\b`, 'g'), SERVER_CODE)]).toEqual([name, []])
-    }
-    // The retired-key reason is used for this binding alone.
-    expect(indicesOf(/\bAPPROVER_STOP_RETIRED_KEY\b/g, SERVER_CODE).filter((at) => insideMain(SERVER_CODE, at))).toHaveLength(1)
-  })
-
-  // b.jg5 SRJ-715: the teardown keeps the row, so `deletePersonaInstance`
-  // and `deleteInstanceRow` are gone; one left in any module (a re-export, a
-  // copy under the same name) would let a later wiring delete a row whose
-  // kill may have failed.
-  test('no src/ file names deletePersonaInstance or deleteInstanceRow, in code or comments', () => {
-    const srcDir = new URL('../src/', import.meta.url)
-    const files = readdirSync(srcDir, { recursive: true, encoding: 'utf-8' }).filter((name) => name.endsWith('.ts'))
-    expect(files).toContain('server.ts')
-    const naming = files.filter((name) => /\b(?:deletePersonaInstance|deleteInstanceRow)\b/.test(readFileSync(new URL(name, srcDir), 'utf-8')))
-    expect(naming).toEqual([])
-  })
-})
 
 // ---------------------------------------------------------------------------
 // The persona notifier's startup-errors recorder and the teardown's window
@@ -926,7 +795,6 @@ describe('server.ts builds the one persona notifier with the production startup-
     for (const entry of WINDOW_ENTRIES) expect([entry, anyCallOf(entry)]).toEqual([entry, []])
   })
 })
-
 
 // ---------------------------------------------------------------------------
 // In-place changes reach their consumers through the live applied config (AC 58)

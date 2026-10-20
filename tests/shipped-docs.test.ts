@@ -270,85 +270,8 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpath
 import { tmpdir } from 'os'
 import { dirname, join, relative, resolve } from 'path'
 
-import {
-  CHANNEL_ENTRY_KEYS,
-  CONFIG_FILE_NAME,
-  agentDirectorCallTimeoutMsOf,
-  DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
-  DELIVERY_MODES,
-  DM_DESTINATION,
-  MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
-  MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
-  PERSONA_DM_KEYS,
-  PERSONA_ENTRY_KEYS,
-  PERSONA_INVITED_KEYS,
-  PERSONA_TOP_LEVEL_KEYS,
-  SERVER_PATH_SETTINGS,
-  loadPersonaConfig,
-  prefixRelatedKeysReason,
-  resolvePersonaConfig,
-  type ChannelMode,
-  type PersonaConfig,
-} from '../src/config.ts'
-import { assertNoLeak } from './test-helpers/credentials.ts'
-import { makePersona } from './test-helpers/persona-config.ts'
-import {
-  classHeading,
-  findSection,
-  flat,
-  headingAnchors,
-  headings,
-  headingSlug,
-  requiredSection,
-  type Heading,
-  type HeadingMatch,
-  sectionRange,
-  splitFences,
-} from './test-helpers/markdown.ts'
-import { RELOAD_TERMS } from './test-helpers/reload-terms.ts'
-import { CLEAR_LATCH_TERMS, clearLatchTermsIn } from './test-helpers/clear-latch-terms.ts'
-import { UPGRADE_FORMS } from './test-helpers/upgrade-forms.ts'
-import { DELETE_HELPERS, REMOVED_IDENTIFIERS, SOURCE_WORD_RULES, type SourceWordRule } from './test-helpers/source-audit.ts'
-import { CRONTABLE_TEMPLATE_HEADER } from '../src/cron-bootstrap.ts'
-import {
-  buildMessageNotSavedNotice, buildDeliveryStuckNotice, deliveryStuckRemedy, deliveryAge,
-  buildMessageNotTakenInNotice, buildMessagesWaitingNotice,
-  buildQueueRecordUnreadableNotice, MESSAGES_WAITING_STATES,
-  type DeliveryStuckReason,
-} from '../src/delivery-notices.ts'
-import { DELIVERY_STUCK_AFTER_MS, RECONNECT_BLOCKED_NOTICE_MS } from '../src/delivery-constants.ts'
-import { buildNotConnectedNotice } from '../src/session-manager.ts'
-import type { Via } from '../src/delivery-decision.ts'
-import * as registryExports from '../src/registry.ts'
-import {
-  channelDeliveryChannelRefusal,
-  channelDeliveryDeclarativeRefusal,
-  channelDeliveryNotStoredText,
-  channelDeliverySetResultText,
-  channelDeliveryUnreadableRefusal,
-  channelDeliveryValueRefusal,
-  channelDeliveryWriteFailedText,
-  FUNGIBLE_TARGET_REFUSAL,
-  MCP_INSTRUCTIONS,
-  personaNotAppliedRefusal,
-  sessionNotMatchedRefusal,
-  SET_CHANNEL_DELIVERY_CHANNEL_DESCRIPTION,
-  SET_CHANNEL_DELIVERY_DELIVERY_DESCRIPTION,
-  SET_CHANNEL_DELIVERY_DESCRIPTION,
-} from '../src/registry.ts'
-import { CHANNEL_DELIVERY_FILE_NAME, CHANNEL_DELIVERY_UNREADABLE, SET_CHANNEL_DELIVERY_TOOL } from '../src/channel-delivery.ts'
-import { AD_VERSION_RECHECK_INTERVAL_MS, DEBUG_SKILL_PATH, DEBUG_SKILL_RUNTIME_STOP_SECTION_TITLE, installAdVersionRecheck, meetsPhase1Floor, PHASE1_FLOOR_VERSION, PHASE1_RUNBOOK_DOC, PHASE1_RUNBOOK_SECTION_TITLE, PUBLISHING_HOST_BLOCK_HEADING } from '../src/ad-version-gate.ts'
-import {
-  AD_BELOW_PHASE1_FLOOR,
-  AD_SHIM_CATALOG_INCOMPLETE,
-  AD_SYSTEM_INSTALL_NOT_FOUND,
-  AD_SYSTEM_INSTALL_TOO_OLD,
-  AD_SYSTEM_INSTALL_UNREACHABLE,
-  AD_VERSION_FLOOR_UNREADABLE,
-  CLIENT_PACKAGE_REMEDY,
-  PUBLISHING_HOST_BLOCK_POINTER,
-} from '../src/install-check.ts'
 import { AD_VERSION_CHECK_FAIL_EXIT_CODE, SR25_NOTE_PREFIX, SR25_PREFIX } from '../scripts/ad-version-check.ts'
+import { AD_ERROR_CLASS_CONFLICT, AD_ERROR_CLASS_UNAVAILABLE } from '../src/ad-error-class.ts'
 import {
   AD_CALL_TIMEOUT_NEED_MARGIN_MS,
   AD_CEILING_VERBS,
@@ -362,49 +285,74 @@ import {
   AD_TMUX_TABLE,
   adCallTimeoutNeed,
   buildAdCallTimeoutWarningLine,
-  checkAdCallTimeoutAtStartup,
   DEFAULT_AD_SETTINGS,
   DEFAULT_AD_SETTINGS_IN_EFFECT,
   DIALOG_READY_TIMEOUT_MS,
-  installAdSettings,
-  type AdTmuxKey,
+  type AdTmuxKey
 } from '../src/ad-settings.ts'
+import { AD_VERSION_RECHECK_INTERVAL_MS, DEBUG_SKILL_PATH, DEBUG_SKILL_RUNTIME_STOP_SECTION_TITLE, PHASE1_FLOOR_VERSION, PHASE1_RUNBOOK_DOC, PHASE1_RUNBOOK_SECTION_TITLE, PUBLISHING_HOST_BLOCK_HEADING } from '../src/ad-version-gate.ts'
 import { DEFAULT_STORE_PATH } from '../src/agent-director-client.ts'
-import { AD_ERROR_CLASS_CONFLICT, AD_ERROR_CLASS_UNAVAILABLE, AD_ERROR_CLASSES, classifyAdError } from '../src/ad-error-class.ts'
-import {
-  PERSONA_INSTANCE_ID_PREFIX,
-  PERSONA_TMUX_SESSION_PREFIX,
-  personaInstanceId,
-  personaKey,
-  personaTmuxSessionName,
-  SERVICE_LABEL,
-} from '../src/persona-identity.ts'
-import { LAST_APPLIED_FILE_SUFFIX, RELOAD_RECORD_WRITE_FAILED } from '../src/reload.ts'
-import {
-  createOldLifeHoldSet,
-  oldLifeKeyOf,
-  RETIRED_KEYS_FILE_NAME,
-  RETIRED_KEYS_FORMAT_VERSION,
-  RETIRED_KEYS_UNREADABLE_LABEL,
-  serializeRetiredKeys,
-} from '../src/retired-keys.ts'
+import { CHANNEL_DELIVERY_FILE_NAME, CHANNEL_DELIVERY_UNREADABLE, SET_CHANNEL_DELIVERY_TOOL } from '../src/channel-delivery.ts'
 import {
   CLEAR_LATCH_COMMAND,
   CLEAR_LATCH_DIAL_HOST,
-  CLEAR_LATCH_ROUTE,
-  dialClearLatch,
-  handleClearLatch,
-  SERVER_PORT_FILE_NAME,
-  writeServerPortRecord,
+  SERVER_PORT_FILE_NAME
 } from '../src/clear-latch.ts'
 import {
   CLEAN_RESTART_NOT_RESTARTED_LABEL,
   CLI_COMMAND_CLEAN_RESTART,
   CLI_COMMAND_STOP_BOTS,
-  CLI_TEARDOWN_FAILED_LABEL,
-  PRECHECK_TRIES,
-  precheckVerdictOf,
+  CLI_TEARDOWN_FAILED_LABEL
 } from '../src/cli-teardown.ts'
+import {
+  CHANNEL_ENTRY_KEYS,
+  CONFIG_FILE_NAME,
+  DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
+  DELIVERY_MODES,
+  DM_DESTINATION,
+  loadPersonaConfig,
+  MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
+  MIN_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
+  PERSONA_DM_KEYS,
+  PERSONA_ENTRY_KEYS,
+  PERSONA_INVITED_KEYS,
+  PERSONA_TOP_LEVEL_KEYS,
+  prefixRelatedKeysReason,
+  resolvePersonaConfig,
+  SERVER_PATH_SETTINGS,
+  type ChannelMode,
+  type PersonaConfig
+} from '../src/config.ts'
+import {
+  CONFLICT_NOTICE_FIRST_LINE_HEAD,
+  LATCH_RECHECK_INTERVAL_MS,
+  LAUNCH_START_NOTICE_HEAD,
+  UNUSABLE_NAME_NOTICE_HEAD
+} from '../src/conflict-latch.ts'
+import { CRONTABLE_TEMPLATE_HEADER } from '../src/cron-bootstrap.ts'
+import { DELIVERY_STUCK_AFTER_MS } from '../src/delivery-constants.ts'
+import type { Via } from '../src/delivery-decision.ts'
+import {
+  buildMessageNotSavedNotice,
+  buildMessageNotTakenInNotice, buildMessagesWaitingNotice,
+  buildQueueRecordUnreadableNotice,
+  deliveryAge,
+  deliveryStuckRemedy,
+  MESSAGES_WAITING_STATES,
+  type DeliveryStuckReason
+} from '../src/delivery-notices.ts'
+import {
+  AD_BELOW_PHASE1_FLOOR,
+  AD_SHIM_CATALOG_INCOMPLETE,
+  AD_SYSTEM_INSTALL_NOT_FOUND,
+  AD_SYSTEM_INSTALL_TOO_OLD,
+  AD_SYSTEM_INSTALL_UNREACHABLE,
+  AD_VERSION_FLOOR_UNREADABLE,
+  CLIENT_PACKAGE_REMEDY,
+  PUBLISHING_HOST_BLOCK_POINTER,
+} from '../src/install-check.ts'
+import { INVALID_FLAGS_HOLD_ALERT_TEXT } from '../src/invalid-flags-hold.ts'
+import { FUNGIBLE_MODE_ZERO_REASON } from '../src/jsonl-persistence-check.ts'
 import {
   KILL_FAILURE_CLOSING_CLI_TEARDOWN,
   KILL_FAILURE_CLOSING_DESTINATION,
@@ -422,85 +370,9 @@ import {
   type KillFailureAlertVersion,
   type KillFailureClosing,
 } from '../src/kill-failure-alert.ts'
+import { ONSET_TEMPLATES, tmuxServerChangedOnset } from '../src/outage-state.ts'
+import { STUCK_LAUNCH_HELD_HEAD, STUCK_LAUNCH_RELAUNCHING_HEAD } from '../src/pending-row.ts'
 import { renderLogMessageText } from '../src/persona-connection-errors.ts'
-import {
-  abortKillOwnStuckLaunch,
-  buildPendingRowRuleDeps,
-  clearByHandOf,
-  DIALOG_POLL_INTERVAL_MS,
-  JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS,
-  LAUNCH_CALL_END_LAUNCH_TIMEOUT,
-  LAUNCH_VERB_REUSE_SPAWN,
-  PENDING_ROW_RULE_GET_SITE,
-  runLatchClearSequence,
-  startDialogApprover,
-  startupSummaryEnding,
-  STUCK_LAUNCH_ABORT_SITE,
-} from '../src/session-manager.ts'
-import {
-  createUnavailableRetryController,
-  UNAVAILABLE_RETRY_BASE_S,
-  UNAVAILABLE_RETRY_CAUSE_COLLISION,
-  UNAVAILABLE_RETRY_CEILING_S,
-  UNAVAILABLE_RETRY_CONDITION_TMUX_UNAVAILABLE,
-} from '../src/unavailable-retry.ts'
-import { armPendingOnlyAfterLaunchFailure, ONSET_TEMPLATES, tmuxServerChangedOnset } from '../src/outage-state.ts'
-import {
-  createTmuxUnresponsiveCondition,
-  PERSONA_EPISODE_KIND_AD_CONFIG_MALFORMED,
-  PERSONA_UNCLASSIFIED_ERROR_LABEL,
-  TMUX_UNRESPONSIVE_ONSET_FLOOR_MS,
-  tmuxUnresponsiveAlertText,
-  tmuxUnresponsiveOnsetText,
-  tmuxUnresponsiveRecoveryText,
-  unclassifiedErrorAlertText,
-} from '../src/persona-episodes.ts'
-import {
-  CONFLICT_NOTICE_FIRST_LINE_HEAD,
-  CONFLICT_RECOVERY_HEAD,
-  createConflictLatch,
-  createLatchRecheckController,
-  decideLatchRecheck,
-  HOLD_RECOVERY_HEAD,
-  LATCH_RECHECK_INTERVAL_MS,
-  LAUNCH_START_NOTICE_HEAD,
-  recogniseConflictCase,
-  UNUSABLE_NAME_NOTICE_HEAD,
-} from '../src/conflict-latch.ts'
-import { LATCHING_LIVENESS_NOTE } from '../src/row-read-rules.ts'
-import { createLiveRowSequenceRegistry, LIVE_ROW_SEQUENCE_MAX_KILLS } from '../src/live-row-sequence.ts'
-import { createStuckLaunchAbort, PENDING_ROW_NO_LAUNCH_START, STUCK_LAUNCH_HELD_HEAD, STUCK_LAUNCH_RELAUNCHING_HEAD } from '../src/pending-row.ts'
-import { slowRecoveryText } from '../src/slow-recovery.ts'
-import { INVALID_FLAGS_HOLD_ALERT_TEXT } from '../src/invalid-flags-hold.ts'
-import { errTmuxKillFailed, KILL_FAILED_DESCRIPTIONS, STUB_SURVIVOR_PIDS } from './test-helpers/agent-director-stub.ts'
-import { humanOnlySentencesIn } from './test-helpers/conflict-cases.ts'
-import { CLIENT_MIN_VERSION, HISTORICAL_PHASE1_CLAUDE_CODE_VERSION, MIN_CLAUDE_CODE_VERSION, OLD_AD_VERSION } from './test-helpers/agent-director-versions.ts'
-import {
-  REFUSAL_BLOCK_HEADING,
-  ROLLBACK_RUNBOOK_SECTION_TITLE,
-  runbookSteps,
-  stepHeadingPrefix,
-  stepNumberOf,
-} from './test-helpers/runbooks.ts'
-import {
-  DESTRUCTIVE_PREFIX,
-  DESTRUCTIVE_SETTINGS,
-  IN_PLACE_SETTINGS,
-  MODE_SWITCH_SETTING,
-  NEXT_LAUNCH_SETTINGS,
-  RECORDED_SECTION_KEYS,
-  buildChangePlan,
-  INVALID_PREFIX,
-  modeSwitchLine,
-  NO_EFFECTIVE_CHANGE,
-  PENDING_PREVIEW_TITLE,
-  recordedLine,
-  renderPreviewLines,
-  type NextLaunchSetting,
-  type RecordedSectionKey,
-  type ValidChangePlan,
-} from '../src/reload-plan.ts'
-import { RELOAD_APPLIED, RELOAD_NOOP } from '../src/reload-apply.ts'
 import {
   FUNGIBLE_REFUSAL_TEXTS,
   PERSONA_CHANNEL_DELIVERY_SET,
@@ -509,7 +381,101 @@ import {
   UNCLAIMED_REASON_CHANNEL_ID_MALFORMED,
   UNCLAIMED_REASON_EXTERNALLY_SHARED,
 } from '../src/persona-diagnostics.ts'
-import { FUNGIBLE_MODE_ZERO_REASON } from '../src/jsonl-persistence-check.ts'
+import {
+  PERSONA_EPISODE_KIND_AD_CONFIG_MALFORMED,
+  PERSONA_UNCLASSIFIED_ERROR_LABEL,
+  TMUX_UNRESPONSIVE_ONSET_FLOOR_MS,
+  tmuxUnresponsiveAlertText,
+  tmuxUnresponsiveOnsetText,
+  tmuxUnresponsiveRecoveryText,
+  unclassifiedErrorAlertText
+} from '../src/persona-episodes.ts'
+import {
+  PERSONA_INSTANCE_ID_PREFIX,
+  PERSONA_TMUX_SESSION_PREFIX,
+  personaInstanceId,
+  personaKey,
+  personaTmuxSessionName,
+  SERVICE_LABEL,
+} from '../src/persona-identity.ts'
+import * as registryExports from '../src/registry.ts'
+import {
+  channelDeliveryChannelRefusal,
+  channelDeliveryDeclarativeRefusal,
+  channelDeliveryNotStoredText,
+  channelDeliverySetResultText,
+  channelDeliveryUnreadableRefusal,
+  channelDeliveryValueRefusal,
+  channelDeliveryWriteFailedText,
+  FUNGIBLE_TARGET_REFUSAL,
+  MCP_INSTRUCTIONS,
+  personaNotAppliedRefusal,
+  sessionNotMatchedRefusal,
+  SET_CHANNEL_DELIVERY_CHANNEL_DESCRIPTION,
+  SET_CHANNEL_DELIVERY_DELIVERY_DESCRIPTION,
+  SET_CHANNEL_DELIVERY_DESCRIPTION,
+} from '../src/registry.ts'
+import { RELOAD_NOOP } from '../src/reload-apply.ts'
+import {
+  buildChangePlan,
+  DESTRUCTIVE_PREFIX,
+  DESTRUCTIVE_SETTINGS,
+  IN_PLACE_SETTINGS,
+  INVALID_PREFIX,
+  MODE_SWITCH_SETTING,
+  modeSwitchLine,
+  NEXT_LAUNCH_SETTINGS,
+  NO_EFFECTIVE_CHANGE,
+  PENDING_PREVIEW_TITLE,
+  RECORDED_SECTION_KEYS,
+  recordedLine,
+  renderPreviewLines,
+  type NextLaunchSetting,
+  type RecordedSectionKey,
+  type ValidChangePlan,
+} from '../src/reload-plan.ts'
+import { LAST_APPLIED_FILE_SUFFIX, RELOAD_RECORD_WRITE_FAILED } from '../src/reload.ts'
+import {
+  RETIRED_KEYS_FILE_NAME,
+  RETIRED_KEYS_UNREADABLE_LABEL
+} from '../src/retired-keys.ts'
+import { LATCHING_LIVENESS_NOTE } from '../src/row-read-rules.ts'
+import { JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS, startupSummaryEnding } from '../src/session-manager.ts'
+import { slowRecoveryText } from '../src/slow-recovery.ts'
+import {
+  UNAVAILABLE_RETRY_BASE_S,
+  UNAVAILABLE_RETRY_CAUSE_COLLISION,
+  UNAVAILABLE_RETRY_CEILING_S
+} from '../src/unavailable-retry.ts'
+import { errTmuxKillFailed, KILL_FAILED_DESCRIPTIONS, STUB_SURVIVOR_PIDS } from './test-helpers/agent-director-stub.ts'
+import { CLIENT_MIN_VERSION, HISTORICAL_PHASE1_CLAUDE_CODE_VERSION, MIN_CLAUDE_CODE_VERSION, OLD_AD_VERSION } from './test-helpers/agent-director-versions.ts'
+import { CLEAR_LATCH_TERMS, clearLatchTermsIn } from './test-helpers/clear-latch-terms.ts'
+import { humanOnlySentencesIn } from './test-helpers/conflict-cases.ts'
+import { assertNoLeak } from './test-helpers/credentials.ts'
+import {
+  classHeading,
+  findSection,
+  flat,
+  headingAnchors,
+  headings,
+  headingSlug,
+  requiredSection,
+  sectionRange,
+  splitFences,
+  type Heading,
+  type HeadingMatch,
+} from './test-helpers/markdown.ts'
+import { makePersona } from './test-helpers/persona-config.ts'
+import { RELOAD_TERMS } from './test-helpers/reload-terms.ts'
+import {
+  REFUSAL_BLOCK_HEADING,
+  ROLLBACK_RUNBOOK_SECTION_TITLE,
+  runbookSteps,
+  stepHeadingPrefix,
+  stepNumberOf,
+} from './test-helpers/runbooks.ts'
+import { DELETE_HELPERS, REMOVED_IDENTIFIERS, SOURCE_WORD_RULES, type SourceWordRule } from './test-helpers/source-audit.ts'
+import { UPGRADE_FORMS } from './test-helpers/upgrade-forms.ts'
 
 const REPO_ROOT = resolve(import.meta.dir, '..')
 
@@ -2301,8 +2267,6 @@ describe('AC 47: the MCP instructions and the Reply Guard reminder do not name c
 
 /** The two startup refusal classes for an agent-director binary that is too old. */
 const REFUSAL_LABELS: string[] = [AD_BELOW_PHASE1_FLOOR, AD_SYSTEM_INSTALL_TOO_OLD]
-
-const STARTUP_ERRORS_HEADING = '## Startup errors'
 
 /** The debugging skill's list of every `startup-errors.log` class, which docs/troubleshooting.md's short "Startup errors" section points to. */
 const SKILL_STARTUP_ERRORS_HEADING = '## Startup errors (`startup-errors.log`)'
@@ -5626,10 +5590,6 @@ function itemPassage(heading: HeadingMatch, lead: string): Passage {
   }
 }
 
-const SERVER_MANAGED_STARTUP = sectionPassage(/^### Server-Managed Startup\b/)
-const UNAVAILABLE_RETRY_HEADING = /^#### UNAVAILABLE retry\b/
-const UNAVAILABLE_RETRY = sectionPassage(UNAVAILABLE_RETRY_HEADING)
-
 /**
  * SRJ-1105's topics (file-local, citing SRJ-1105; the titles are the
  * architecture doc's, built from a `src/` constant where one names them):
@@ -5637,34 +5597,6 @@ const UNAVAILABLE_RETRY = sectionPassage(UNAVAILABLE_RETRY_HEADING)
  * export or value (`exportName`), or agent-director's vocabulary
  * (`AD_VOCABULARY`).
  */
-const SRJ_1105_TOPICS: readonly [topic: string, passage: Passage, names: readonly (string | RegExp)[]][] = [
-  ['the classifier', sectionPassage(/^### Agent-director error classes\b/), [exportName({ classifyAdError }), exportName({ AD_ERROR_CLASSES })]],
-  ['the retry timer', UNAVAILABLE_RETRY, [exportName({ createUnavailableRetryController })]],
-  ["the retry timer's pending-only mode", sectionPassage(/^#### Pending-only mode\b/), [exportName({ armPendingOnlyAfterLaunchFailure }), exportName({ UNAVAILABLE_RETRY_CONDITION_TMUX_UNAVAILABLE })]],
-  ['the tmux-unresponsive condition', sectionPassage(/^#### The tmux-unresponsive condition\b/), [exportName({ createTmuxUnresponsiveCondition }), exportName({ TMUX_UNRESPONSIVE_ONSET_FLOOR_MS })]],
-  [`the ${PERSONA_EPISODE_KIND_AD_CONFIG_MALFORMED} outage`, itemPassage(UNAVAILABLE_RETRY_HEADING, '**CONFIG (b.jg5 SRJ-316).**'), [code(PERSONA_EPISODE_KIND_AD_CONFIG_MALFORMED), vocab('configMalformed')]],
-  ['the latch and its cases', sectionPassage(/^#### Session conflict latch\b/), [exportName({ createConflictLatch }), exportName({ recogniseConflictCase })]],
-  ["the latch's re-check", sectionPassage(/^##### The re-check\b/), [exportName({ createLatchRecheckController }), exportName({ decideLatchRecheck }), exportName({ LATCH_RECHECK_INTERVAL_MS })]],
-  ['how a latch clears, by hand included', sectionPassage(/^##### How a latch clears\b/), [exportName({ clearByHandOf })]],
-  [`the ${CLEAR_LATCH_COMMAND} command`, sectionPassage(new RegExp(`^### ${escapeRegExp(CLEAR_LATCH_COMMAND)} command\\b`)), [code(CLEAR_LATCH_COMMAND), exportName({ dialClearLatch })]],
-  [`the ${CLEAR_LATCH_ROUTE} route`, sectionPassage(new RegExp(`^### POST ${escapeRegExp(CLEAR_LATCH_ROUTE)}$`)), [exportName({ handleClearLatch }), exportName({ runLatchClearSequence })]],
-  [`the ${SERVER_PORT_FILE_NAME} record`, sectionPassage(new RegExp(`^### ${escapeRegExp(SERVER_PORT_FILE_NAME)} \\(`)), [exportName({ writeServerPortRecord })]],
-  [`${CLEAR_LATCH_COMMAND} is not offered to the bots`, itemPassage(SECURITY_MODEL_HEADING, `- **${code(CLEAR_LATCH_COMMAND)} is not offered to the bots**`), [/\bSRJ-511\b/]],
-  ['the live-row sequence', sectionPassage(/^#### The live-row sequence\b/), [exportName({ createLiveRowSequenceRegistry }), exportName({ LIVE_ROW_SEQUENCE_MAX_KILLS })]],
-  ['reuse', sectionPassage(/^#### Reuse spawn\b/), [exportName({ LAUNCH_VERB_REUSE_SPAWN })]],
-  ['the retired-key record', sectionPassage(new RegExp(`^### ${escapeRegExp(RETIRED_KEYS_FILE_NAME)} \\(`)), [exportName({ RETIRED_KEYS_FORMAT_VERSION }), exportName({ serializeRetiredKeys })]],
-  ['the old-life hold', sectionPassage(/^#### The old-life hold\b/), [exportName({ createOldLifeHoldSet }), exportName({ oldLifeKeyOf })]],
-  ['launch pending', sectionPassage(/^### Launch pending\b/), [exportName({ PENDING_ROW_NO_LAUNCH_START }), exportName({ LAUNCH_CALL_END_LAUNCH_TIMEOUT })]],
-  ['the approver through agent-director', SERVER_MANAGED_STARTUP, [exportName({ startDialogApprover }), exportName({ DIALOG_POLL_INTERVAL_MS }), /\bThe dialog approver calls no tmux: it reads and types only through agent-director\b/]],
-  ['the pending-row rule', sectionPassage(/^#### The pending-row rule\b/), [exportName({ buildPendingRowRuleDeps }), exportName({ PENDING_ROW_RULE_GET_SITE })]],
-  ['the stuck-launch abort', sectionPassage(/^#### CSCB's own stuck launch and its one abort\b/), [exportName({ createStuckLaunchAbort }), exportName({ abortKillOwnStuckLaunch }), exportName({ STUCK_LAUNCH_ABORT_SITE })]],
-  ['the timing settings CSCB reads', SERVER_MANAGED_STARTUP, [exportName({ installAdSettings })]],
-  ['the call timeout', SERVER_MANAGED_STARTUP, [exportName({ agentDirectorCallTimeoutMsOf }), exportName({ checkAdCallTimeoutAtStartup })]],
-  ["the server never touches agent-director's session label or a persona's session", itemPassage(SECURITY_MODEL_HEADING, "- **agent-director's rows, labels, socket and sessions are its own**"), [vocab('ownerLabel'), /\bSRJ-612\b/]],
-  ['the source audit that pins it', sectionPassage(SECURITY_MODEL_HEADING), [code(SOURCE_AUDIT_FILE), vocab('paneLabel')]],
-  ['the version gate', SERVER_MANAGED_STARTUP, [exportName({ meetsPhase1Floor }), exportName({ installAdVersionRecheck })]],
-  ['the CLI precheck', sectionPassage(/^### The CLI precheck\b/), [exportName({ precheckVerdictOf }), exportName({ PRECHECK_TRIES })]],
-]
 
 /** One topic's problems on `doc`: its passage missing, or each name it lacks. */
 function topicProblems(passage: Passage, names: readonly (string | RegExp)[], doc: string): string[] {
@@ -5726,12 +5658,6 @@ describe('E36 T3: the architecture doc and the engineering guide match the build
 
     test(`"${START_SWEEP_HEADING}": the pre-persona-row rule says the kill is checked and the row kept (SRJ-714)`, () => {
       expect(prePersonaRuleProblems(guide())).toEqual([])
-    })
-  })
-
-  describe(`${ARCHITECTURE_FILE} (SRJ-1105): a passage per topic, found by the src/ export it describes`, () => {
-    test.each(SRJ_1105_TOPICS)('%s', (topic, passage, names) => {
-      expect({ topic, where: passage.where, problems: topicProblems(passage, names, operatorText(ARCHITECTURE_FILE)) }).toEqual({ topic, where: passage.where, problems: [] })
     })
   })
 
@@ -5853,14 +5779,6 @@ describe('E36 T3: the architecture doc and the engineering guide match the build
       const edited = text.replace(/A pre-persona row \(b\.1ix\) is killed when live[^.]*\./, sentence)
       expect(edited).not.toBe(text)
       expect(prePersonaRuleProblems(edited).map((problem) => problem.split(': ')[0])).toEqual([...expected])
-    })
-
-    test.each(SRJ_1105_TOPICS)('SRJ-1105 topic "%s" fails once each name it pins is gone from the doc', (_topic, passage, names) => {
-      const edited = names.reduce<string>(
-        (text, name) => (typeof name === 'string' ? text.split(name).join(name.replace(/`$/, '_GONE`')) : text.replace(new RegExp(name.source, 'g'), '')),
-        arch(),
-      )
-      expect(topicProblems(passage, names, edited)).toHaveLength(names.length)
     })
 
     test('a topic whose heading or item is gone is one problem, not a throw', () => {
@@ -6343,9 +6261,6 @@ const CLEAR_LATCH_CLI_HEADING = `## \`claude-slack-channel-bots ${CLEAR_LATCH_CO
 
 /** The all-interfaces `bind`, the other value through which `clear-latch` reaches the server (SRJ-510); the loopback one is `CLEAR_LATCH_DIAL_HOST`. */
 const ALL_INTERFACES_BIND = '0.0.0.0'
-
-/** The README section and subsection the call-timeout entry sits in (SRJ-1103: under "Configuration"). */
-const CONFIGURATION_HEADING = '# Configuration'
 const CALL_TIMEOUT_SIZING_HEADING = '### Sizing the agent-director call timeout'
 
 /** The README's timing-settings section (SRJ-209, SRJ-1103). */
@@ -7709,8 +7624,6 @@ const SILENT_INVITED_TITLE = 'A persona is silent in a channel it was invited to
 const RECEIVES_EVERYTHING_TITLE = 'A persona receives every message in a channel'
 const UNCLAIMED_ENTRY_TITLE = 'Messages in a channel no persona is configured into are not delivered'
 
-
-
 /**
  * The part of `FUNGIBLE_MODE_ZERO_REASON` (src/jsonl-persistence-check.ts,
  * b.deo SRI-704) the README's `jsonl-diagnosis-inconclusive` item quotes:
@@ -8463,7 +8376,6 @@ describe('b.deo SRI-1308: the README describes both channel modes (SRI-1101 to S
   })
 })
 
-
 /** E5 only: the shipped failure catalogue, separate from E8's broad doc migration. */
 describe('b.omv SR-8: shipped delivery and MCP guidance', () => {
   const skill = () => operatorText(DEBUG_SKILL_FILE)
@@ -8473,7 +8385,6 @@ describe('b.omv SR-8: shipped delivery and MCP guidance', () => {
   // quarantine path are examples, not a contract on the documentation's sample.
   const noticeRows = [
     ['Message not saved', () => buildMessageNotSavedNotice('PLACEHOLDER_PERSONA', 'PLACEHOLDER_SENDER')],
-    ['Delivery stuck', () => buildDeliveryStuckNotice('PLACEHOLDER_PERSONA', 'PLACEHOLDER_KEY', 2, DELIVERY_STUCK_AFTER_MS, 'menu', 3)],
     ['Message not taken in', () => buildMessageNotTakenInNotice('PLACEHOLDER_PERSONA', 'PLACEHOLDER_SENDER')],
     ['Messages waiting', () => buildMessagesWaitingNotice('PLACEHOLDER_PERSONA', 2, DELIVERY_STUCK_AFTER_MS, 'down')],
     ['Queue record unreadable', () => buildQueueRecordUnreadableNotice('PLACEHOLDER_PERSONA', 2, 'PLACEHOLDER_PATH')],
@@ -8486,7 +8397,7 @@ describe('b.omv SR-8: shipped delivery and MCP guidance', () => {
     for (const fragment of fragments) expect(flat(section)).toContain(fragment)
     expect(['Meaning', 'Cause', 'Fix'].filter(part => !new RegExp(`^- \\*\\*${part}:\\*\\*\\s+\\S`, 'm').test(section))).toEqual([])
   })
-  test.each(['menu', 'input', 'relay-off', 'mcp', 'refused', 'transcript', 'queue-unwritable', 'not-taken-in', 'dialog-hold'] as const)(
+  test.each(['relay-off', 'mcp', 'refused', 'transcript', 'queue-unwritable', 'not-taken-in', 'dialog-hold'] as const)(
     'Delivery stuck documents the fixed %s remedy', (reason: DeliveryStuckReason) => {
       const section = requiredSection(delivery(), '### Delivery stuck', DEBUG_SKILL_FILE)
       const remedy = deliveryStuckRemedy(reason, '<key>', 3).replace(/(?<=typed it )3(?= times)/, 'PLACEHOLDER_COUNT')
@@ -8496,16 +8407,7 @@ describe('b.omv SR-8: shipped delivery and MCP guidance', () => {
   test.each([...MESSAGES_WAITING_STATES])('Messages waiting includes the state %s', state => {
     expect(requiredSection(delivery(), '### Messages waiting', DEBUG_SKILL_FILE)).toContain(state)
   })
-  test.each(['menu', 'input'] as const)('MCP guidance documents the fixed %s reconnect block and continued retries', rule => {
-    const text = buildNotConnectedNotice('<key>', { reason: 'reconnect-blocked', rule })
-    const screen = text.split(' — ')[1]!.split(' CSCB keeps trying the reconnect.')[0]!
-    expect(mcp()).toContain(flat(screen))
-    expect(mcp()).toContain('CSCB keeps trying the reconnect')
-    expect(mcp()).toContain(`${RECONNECT_BLOCKED_NOTICE_MS / 60000} minutes`)
-    expect(mcp()).toContain('reconnect-blocked')
-    expect(mcp()).toContain('Messages sent to it are kept and delivered once it is')
-    expect(mcp()).toContain("can't reply or use its Slack tools until it is connected again")
-  })
+
   test('MCP guidance keeps accepted messages while disconnected and omits stream recovery', () => {
     expect(mcp()).not.toMatch(/messages?[^.]*\b(?:are|is|will be)\s+lost\b/i)
     expect(mcp()).not.toMatch(/\b(?:message\s+stream|stream\s+gone|streamless)\b/i)

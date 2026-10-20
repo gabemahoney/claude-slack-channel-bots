@@ -87,7 +87,6 @@
 
 import { describe, expect, test } from 'bun:test'
 
-import { CLEAR_LATCH_COMMAND, CLEAR_LATCH_ROUTE } from '../src/clear-latch.ts'
 import { NEVER_DELETE_ROW_PHRASE, NO_KILL_SENT_PHRASE, RETRY_KILL_LATER_PHRASE } from '../src/ad-description-phrases.ts'
 import {
   AD_ERROR_CLASS_CONFLICT,
@@ -107,6 +106,12 @@ import {
   FOUND_BY_STARTUP_CHECK,
 } from '../src/ad-version-gate.ts'
 import {
+  ERR_TMUX_KILL_FAILED_NAME,
+  ERR_TMUX_SESSION_CONFLICT_NAME,
+  ErrTmuxKillFailed,
+  ErrTmuxSessionConflict,
+} from '../src/agent-director-errors.ts'
+import {
   KILL_OUTCOME_NOT_KILLED,
   KILL_REFUSAL_AT_KILL,
   KILL_REFUSAL_AT_READ,
@@ -115,10 +120,11 @@ import {
   teardownKillRefusalNoticeText,
   type KillFailure,
 } from '../src/checked-kill.ts'
+import { CLEAR_LATCH_COMMAND, CLEAR_LATCH_ROUTE } from '../src/clear-latch.ts'
 import {
+  cleanRestartNotRestartedAlert,
   CLI_COMMAND_CLEAN_RESTART,
   CLI_COMMAND_STOP_BOTS,
-  cleanRestartNotRestartedAlert,
   teardownErrorReportOf,
   teardownFailureLine,
 } from '../src/cli-teardown.ts'
@@ -136,22 +142,22 @@ import {
   latchRecoveryReasonRowReads,
   latchRecoveryText,
   launchStartNotRecordedNoticeText,
+  unusableNameNoticeText,
   type ConflictLatchCase,
   type LatchKind,
   type LatchRecoveryReason,
-  unusableNameNoticeText,
 } from '../src/conflict-latch.ts'
-import { INVALID_FLAGS_HOLD_ALERT_TEXT } from '../src/invalid-flags-hold.ts'
+import { DELIVERY_STUCK_AFTER_MS } from '../src/delivery-constants.ts'
 import {
-  buildMessageNotSavedNotice,
   buildDeliveryStuckNotice,
+  buildMessageNotSavedNotice,
   buildMessageNotTakenInNotice,
   buildMessagesWaitingNotice,
   buildQueueRecordUnreadableNotice,
   MESSAGES_WAITING_STATES,
   type DeliveryStuckReason,
 } from '../src/delivery-notices.ts'
-import { DELIVERY_STUCK_AFTER_MS } from '../src/delivery-constants.ts'
+import { INVALID_FLAGS_HOLD_ALERT_TEXT } from '../src/invalid-flags-hold.ts'
 import { runJsonlPersistenceSafeguard, runPersonaStorageCheck, UNATTRIBUTABLE_ZERO_REASON } from '../src/jsonl-persistence-check.ts'
 import {
   KILL_FAILURE_CLOSING_CLI_TEARDOWN,
@@ -177,8 +183,8 @@ import {
   type OldLifeWaitRefusalAt,
 } from '../src/old-life-wait.ts'
 import {
-  ALL_CLEAR_TEMPLATE,
   adConfigMalformedOnset,
+  ALL_CLEAR_TEMPLATE,
   ONSET_TEMPLATES,
   OUTAGE_CLASS_ORDER,
   tmuxServerChangedOnset,
@@ -190,10 +196,10 @@ import { buildWedgeWarningText } from '../src/permission-poller.ts'
 import { MAX_LOGGED_MESSAGE_LENGTH } from '../src/persona-connection-errors.ts'
 import {
   killFailureStoppedRetryText,
+  personaUnclassifiedErrorEntryText,
   tmuxUnresponsiveAlertText,
   tmuxUnresponsiveOnsetText,
   tmuxUnresponsiveRecoveryText,
-  personaUnclassifiedErrorEntryText,
   unclassifiedErrorAlertText,
 } from '../src/persona-episodes.ts'
 import { personaInstanceId, personaTmuxSessionName, tmuxExactSessionTarget } from '../src/persona-identity.ts'
@@ -214,19 +220,12 @@ import {
   jsonlTranscriptLostNoticeText,
   restartCapReachedNoticeText,
   spawnFailureNoticeText,
-  UNPROVEN_IDLE_NOTICE_AFTER_MS,
   waitTimedOutUnreadReport,
   type NotConnectedNotice,
 } from '../src/session-manager.ts'
 import { REDACTED_TOKEN_PLACEHOLDER } from '../src/slack-log-redaction.ts'
 import { escapeSlackControlCharacters } from '../src/slack-text-escape.ts'
 import { slowRecoveryText } from '../src/slow-recovery.ts'
-import {
-  ERR_TMUX_KILL_FAILED_NAME,
-  ERR_TMUX_SESSION_CONFLICT_NAME,
-  ErrTmuxKillFailed,
-  ErrTmuxSessionConflict,
-} from '../src/agent-director-errors.ts'
 
 import {
   cannedGetResult,
@@ -700,7 +699,7 @@ function notConnectedCause(notice: NotConnectedNotice): string {
   return notice.cause
 }
 
-/** b.omv SR-8.5: all retained-message MCP variants, including both screen blocks. */
+/** Retained-message MCP notices for authoritative AD prompt and restart states. */
 function notConnectedVariants(): readonly (readonly [label: string, notice: NotConnectedNotice])[] {
   // A real cause, as a launch wait that timed out on an unreadable row words it.
   const cause = notConnectedCause(
@@ -709,11 +708,7 @@ function notConnectedVariants(): readonly (readonly [label: string, notice: NotC
   return [
     ['blocked-on-prompt', { reason: 'blocked-on-prompt', autoRestartDisabled: false }],
     ['blocked-on-prompt, auto-restart disabled', { reason: 'blocked-on-prompt', autoRestartDisabled: true }],
-    ['unproven-idle', { reason: 'unproven-idle', autoRestartDisabled: false, heldMs: UNPROVEN_IDLE_NOTICE_AFTER_MS }],
-    ['unproven-idle, auto-restart disabled', { reason: 'unproven-idle', autoRestartDisabled: true, heldMs: UNPROVEN_IDLE_NOTICE_AFTER_MS }],
     ['auto-restart-disabled, disconnected', { reason: 'auto-restart-disabled', cause }],
-    ['reconnect-blocked, menu', { reason: 'reconnect-blocked', rule: 'menu' }],
-    ['reconnect-blocked, input', { reason: 'reconnect-blocked', rule: 'input' }],
   ]
 }
 
@@ -726,7 +721,7 @@ function notConnectedEntries(): NoticeEntry[] {
 
 /** b.omv SR-8: variants join the existing catalogue and all its safety checks. */
 const DELIVERY_STUCK_REASONS: readonly DeliveryStuckReason[] = [
-  'menu', 'input', 'relay-off', 'mcp', 'refused', 'transcript',
+  'relay-off', 'mcp', 'refused', 'transcript',
   'queue-unwritable', 'not-taken-in', 'dialog-hold',
 ]
 function deliveryEntries(): NoticeEntry[] {
@@ -1161,7 +1156,7 @@ describe('the notice catalogue is complete (SRJ-1001 to SRJ-1021, and every name
     const variantsOf = (...builders: string[]) => NOTICE_CATALOGUE.filter((e) => builders.includes(e.builder)).map((e) => e.variant)
     expect(variantsOf('ONSET_TEMPLATES')).toEqual(expect.arrayContaining(OUTAGE_CLASS_ORDER.map((outage) => `${outage} onset`)))
     expect(variantsOf(buildNotConnectedNotice.name)).toEqual(notConnectedVariants().map(([label]) => label))
-    expect(new Set(notConnectedVariants().map(([, notice]) => notice.reason))).toEqual(new Set(['blocked-on-prompt', 'unproven-idle', 'auto-restart-disabled', 'reconnect-blocked']))
+    expect(new Set(notConnectedVariants().map(([, notice]) => notice.reason))).toEqual(new Set(['blocked-on-prompt', 'auto-restart-disabled']))
     expect(variantsOf(buildDeliveryStuckNotice.name)).toEqual([...DELIVERY_STUCK_REASONS])
     expect(variantsOf(buildMessagesWaitingNotice.name)).toEqual([...MESSAGES_WAITING_STATES])
     expect(variantsOf(runPersonaStorageCheck.name, runJsonlPersistenceSafeguard.name)).toEqual([JSONL_NON_PERSISTENT, JSONL_STALE_PATH, JSONL_LOST])

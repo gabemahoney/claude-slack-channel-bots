@@ -11,7 +11,6 @@ REAL_LAUNCH_WAIT_S=300
 REAL_COMPACT_WAIT_S=120
 REAL_IDLE_WAIT_S=2700
 REAL_RECEIPTS="${SCENARIO_FIXTURES}/transcript-receipts.ts"
-REAL_IDLE_OBSERVER="${SCENARIO_FIXTURES}/native-idle-compaction.ts"
 REAL_PERSONAS="${SCENARIO_ROOT}/real-personas.jsonl"
 REAL_TOKENS="${SCENARIO_ROOT}/real-stub-tokens.jsonl"
 REAL_USAGE_REPORTED=0
@@ -156,67 +155,28 @@ real_ad() {
     "${SCENARIO_AD_ROOT}/bin/agent-director.real" "$@"
 }
 real_instance() { bun "${SCENARIO_FIXTURES}/fmk-texts.ts" personaInstanceId "$1"; }
-real_pane() {
-    real_ad read-pane --instance-id "$(real_instance "$1")" --n-lines "${2:-40}" --allow-pending
-}
 real_wait_launch() {
     # Persona names need not equal their derived key: match by key alone.
     wait_until "${REAL_LAUNCH_WAIT_S}" "real persona $1 never launched/connected" _real_connected "$1"
     real_wait_idle "$1" "${REAL_LAUNCH_WAIT_S}"
 }
-_real_empty() {
-    local key="$1" pane="${SCENARIO_ROOT}/real-pane.json" observation status
-    status="$(real_ad status --instance-id "$(real_instance "${key}")" 2>/dev/null)" || return 1
-    jq -e '.state == "waiting"' <<< "${status}" >/dev/null || return 1
-    real_pane "${key}" 40 > "${pane}" 2>/dev/null || return 1
-    observation="$(bun "${SCENARIO_FIXTURES}/real-observations.ts" "${pane}" 2>/dev/null)" || return 1
-    jq -e '.screen.kind == "empty" and .screen.running == false' <<< "${observation}" >/dev/null
+_real_waiting() {
+    local status
+    status="$(real_ad status --instance-id "$(real_instance "$1")" 2>/dev/null)" || return 1
+    jq -e '.state == "waiting"' <<< "${status}" >/dev/null
 }
 real_wait_idle() {
-    local timeout="${2:-${REAL_DELIVERY_WAIT_S}}" pane="${SCENARIO_ROOT}/real-idle-pane.json" status="${SCENARIO_ROOT}/real-idle-status.json"
+    local timeout="${2:-${REAL_DELIVERY_WAIT_S}}" status="${SCENARIO_ROOT}/real-idle-status.json"
     _scenario_check_timeout "${timeout}" real_wait_idle
-    if _scenario_poll_until "${timeout}" _real_empty "$1"; then return 0; fi
-    # Capture the actual final row and pane before cleanup kills the native
-    # session. This is failure evidence only, never an idle-state substitute.
+    if _scenario_poll_until "${timeout}" _real_waiting "$1"; then return 0; fi
     real_ad status --instance-id "$(real_instance "$1")" > "${status}" 2>/dev/null || printf '{}\n' > "${status}"
-    real_pane "$1" 40 > "${pane}" 2>/dev/null || printf '{}\n' > "${pane}"
-    bun "${SCENARIO_FIXTURES}/real-observations.ts" --idle-diagnostic "${pane}" "${status}" \
-        || echo 'recorded: idle diagnostic unavailable'
-    fail "real persona $1 never showed an empty idle composer (not within ${timeout}s)"
+    bun "${SCENARIO_FIXTURES}/real-observations.ts" "${status}" || echo 'recorded: AD state diagnostic unavailable'
+    fail "real persona $1 never reached AD waiting (not within ${timeout}s)"
 }
-real_record_pane() {
-    local pane="${SCENARIO_ROOT}/real-pane.json" observation
-    real_pane "$1" "${3:-40}" > "${pane}"
-    observation="$(bun "${SCENARIO_FIXTURES}/real-observations.ts" "${pane}" "${2:-}")" || fail 'cannot observe real pane'
-    printf 'recorded: pane %s\n' "${observation}"
-}
-# Heavy-only callers set these before starting their isolated bot. The real
-# native token floor and rollout are checked after launch, never overridden.
-real_idle_environment() {
-    require_scenario_home real_idle_environment
-    [[ "${TEST_NAME}" == test-*-fmk-real-idle-compact ]] || fail 'native idle preparation requires its heavy-only scenario'
-    export CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS=100000
-    export CLAUDE_CODE_PROMPT_CACHE_TTL=1h
-}
-real_idle_capability() {
-    local capability
-    capability="$(bun "${REAL_IDLE_OBSERVER}" capability "${REAL_CLAUDE}" "${HOME}")" || fail 'cannot determine native idle capability'
-    printf 'recorded: native idle capability version=%s %s\n' "${REAL_CLAUDE_VERSION}" "${capability}"
-    if ! jq -e '.supported' <<< "${capability}" >/dev/null; then
-        printf 'recorded: native idle compaction step skipped: %s\n' "$(jq -r .reason <<< "${capability}")"
-        return 1
-    fi
-    REAL_IDLE_MIN_TOKENS="$(jq -r .minTokens <<< "${capability}")"
-    REAL_IDLE_FIRE_MS="$(jq -r .fireAfterMs <<< "${capability}")"
-}
-real_idle_observation() {
-    bun "${REAL_IDLE_OBSERVER}" observe "${SLACK_STATE_DIR}" "$1" "${HOME}/.claude/projects"
-}
-real_clear_draft() {
-    local key="$1" text="$2" clear
-    clear="$(python3 -c 'import sys; print("\x7f"*len(sys.argv[1]),end="")' "${text}")"
-    real_ad send-keys --instance-id "$(real_instance "${key}")" --text "${clear}" --no-enter >/dev/null
-    real_wait_idle "${key}"
+real_record_state() {
+    local status="${SCENARIO_ROOT}/real-status.json"
+    real_ad status --instance-id "$(real_instance "$1")" > "${status}"
+    bun "${SCENARIO_FIXTURES}/real-observations.ts" "${status}" || fail 'cannot observe AD state'
 }
 _real_connected() {
     local status
@@ -234,13 +194,12 @@ real_wait_delivery() {
     fail "real persona $1 has open/unconfirmed deliveries (not within ${REAL_DELIVERY_WAIT_S}s)"
 }
 _real_delivery_diagnostic() {
-    local pane="${SCENARIO_ROOT}/real-delivery-pane.json" status="${SCENARIO_ROOT}/real-delivery-status.json"
+    local status="${SCENARIO_ROOT}/real-delivery-status.json"
     real_ad status --instance-id "$(real_instance "$1")" > "${status}" 2>/dev/null || printf '{}\n' > "${status}"
-    real_pane "$1" 40 > "${pane}" 2>/dev/null || printf '{}\n' > "${pane}"
-    bun "${REAL_RECEIPTS}" diagnostic "${SLACK_STATE_DIR}" "$1" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" "${2:-}" "${3:-}" "${pane}" "${status}" \
+    bun "${REAL_RECEIPTS}" diagnostic "${SLACK_STATE_DIR}" "$1" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" "${2:-}" "${3:-}" "${status}" \
         || echo 'recorded: delivery receipt diagnostic unavailable'
-    bun "${SCENARIO_FIXTURES}/real-observations.ts" --idle-diagnostic "${pane}" "${status}" \
-        || echo 'recorded: delivery composer diagnostic unavailable'
+    bun "${SCENARIO_FIXTURES}/real-observations.ts" "${status}" \
+        || echo 'recorded: delivery AD diagnostic unavailable'
 }
 real_assert_no_retype() {
     bun "${REAL_RECEIPTS}" ready "${SLACK_STATE_DIR}" "$1" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" "${2:-}" no-retype \

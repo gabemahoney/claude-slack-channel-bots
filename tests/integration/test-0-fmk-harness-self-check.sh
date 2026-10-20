@@ -1,494 +1,7 @@
 #!/usr/bin/env bash
-# Test 0 (b.jg5 SRJ-1306, SRJ-1401, SRJ-1418): the fmk harness's self-check.
-# It runs the parts of lib/scenario.sh, fixtures/agent-director-shim.sh and
-# fixtures/tmux-shim.sh that every fmk scenario (test-13 to test-28) stands
-# on, and checks their effect. tests/runner.sh
-# finds it by name and, in version order, runs it right after Tests 1 to 4
-# and before every fmk scenario. Its TEST_NAME carries `-fmk-`, so sourcing
-# lib/scenario.sh gives it its own HOME, agent-director install (the release,
-# through its install.sh, behind the shim, agent-director-admin too), store
-# and tmux server,
-# all under SCENARIO_ROOT.
-#
-# The release's version and commit come from the image's recorded
-# release identity (/opt/agent-director/client/release.json), never from a
-# literal. The shim log is read as the shim's header states its line format:
-# only lines whose first field is `call` are invocations, and a quoted field
-# gives back its words through `eval`.
-#
-# Legs (each a function `leg_<name>`, run in the order LEGS lists them; a
-# failing leg prints one FAIL line naming the leg and what it saw):
-#   isolation        HOME and TMUX_TMPDIR are under SCENARIO_ROOT and are not
-#                    the container user's; TMUX and TMUX_PANE are unset; every
-#                    PATH entry is absolute, the scenario's bin directory is
-#                    first, no entry holds an `agent-director` (the image's
-#                    default binary's directory is gone) and the shell finds
-#                    none; `claude` is the stub; bun is still found; the shim
-#                    and its log are at the scenario HOME's standard path, and
-#                    the container user's own ~/.config/agent-director/bin holds no
-#                    shim log and no `.real` binary.
-#   real_binary      the binary behind the shim, run by its own name, reports
-#                    the recorded version and commit, and adds no log line.
-#   setup_install    after the setup's install the standard path holds the
-#                    shim (a regular file, the fixture byte for byte, with its
-#                    marker), the release's binary is behind it, a
-#                    call through it reports the recorded version, the admin
-#                    path holds the shim with the release's
-#                    agent-director-admin behind it, and the install made
-#                    the HOME's store.
-#   harness_call_log a harness call (`ad_capture`, an argument holding a
-#                    space) adds one `call` line: its time is the call's, its
-#                    parent is the scenario's own shell ($$) with that shell's
-#                    command line, and its words give back the argv exactly.
-#   version_probe    bun runs under the scenario HOME: the installed package's
-#                    agent-director client resolves the shim at the standard
-#                    path, and its version probe (cwd /, scrubbed environment)
-#                    gets the recorded version and is logged, its parent bun.
-#   tmux_and_store   a harness spawn (the stub as `claude`) runs on the
-#                    scenario's own tmux server: the row's socket is under
-#                    TMUX_TMPDIR, the scenario shell's tmux reaches the session
-#                    on that socket, and the server's environment carries this
-#                    SCENARIO_ROOT. `ad_store_id` prints 16 lowercase hex
-#                    characters, and an `ad_store_edit` of the spawned row's
-#                    labels is what a later harness `get` returns.
-#   swap             after a swap to 0.10.0 the shim is in place with 0.10.0
-#                    behind it and a call through it reports 0.10.0; after the
-#                    swap back, the release again.
-#   reinstall        answer startup, await report-in, and quiesce the fixture
-#                    before a second install.sh; then
-#                    and its re-shim, the shim is in place with the release
-#                    behind it at both paths, the terminal row and store id
-#                    are unchanged; respawn the fixture for later checks.
-#   hide_restore     hide leaves no file at the standard path and none behind
-#                    it, and keeps the log; restore puts the shim back with the
-#                    release behind it.
-#   log_kept         the harness call's line is still in the log after every
-#                    install, swap, hide and restore, and every line of the log
-#                    has the format's six fields and a known kind.
-#   start_on_010     a nested fmk run written into SCENARIO_ROOT, set to start
-#                    on 0.10.0 (SCENARIO_AD_START=0.10.0), holds 0.10.0 behind
-#                    the shim, no release binary anywhere in its HOME
-#                    and no store; `install_ad_release` then puts the release
-#                    candidate behind the shim and makes a store with a store
-#                    id. The nested run prints a `CHECK:` marker for each of
-#                    these checks and then exits 0 without the closing
-#                    assertions (it starts no bot server, so it could not meet
-#                    their positive controls): the trap fails it with the
-#                    closing enforcement's line and no other FAIL line. The
-#                    nested run cleans up its own SCENARIO_ROOT.
-#   store_rows       two harness spawns (the stub at once) that the store and
-#                    operator legs use once their sessions are old enough:
-#                    both report in (`waiting`); `ad_new_token` prints 16
-#                    lowercase hex characters other than the row's launch
-#                    token and a given token; `ad_store_mark_finished` refuses
-#                    while the session is younger than the stopping window
-#                    and leaves the row as it was.
-#   guard_refusals   in subshells, with HOME outside SCENARIO_ROOT (a scratch
-#                    directory under /tmp holding a decoy install and store,
-#                    and a symlink under SCENARIO_ROOT that resolves to it),
-#                    every install, re-shim, swap, hide and restore helper,
-#                    `ad`, `ad_store_edit`, `ad_store_id`, `ad_store_row`,
-#                    `ad_store_backup` (which writes no copy),
-#                    `ad_store_pending_no_launch`, `stub_mode`,
-#                    `stub_dialog_delay`, `stub_release`, `stub_press_enter`,
-#                    `stub_type_exit`, `write_mcp_config`, `write_ad_settings`
-#                    and every label,
-#                    seeding, tmux-step, store-statement, operator-action,
-#                    find-missing-loop and 0.10.0-seeder helper fails with the
-#                    guard's reason, and the decoy is left exactly as it was.
-#                    So do `stub_type_line` and `repoint_symlink`.
-#   shim_check       `check_ad_shim` passes a correct layout and fails, with
-#                    its reason, on a symlink to the shim and on a copy of the
-#                    shim without its marker line.
-#
-# The tmux shim's legs call it by its path from the scenario's own shell,
-# whose PATH never holds it, or run a harness agent-director spawn --agent claude with the
-# shim's bin directory put first on that one call's PATH. Its delays are kept
-# short through `tmux_shim_mode`'s delay, each still longer than the
-# agent-director timeout the leg relies on: its create timeout
-# (create_timeout_ms, 5000 at its defaults, the longest of its tmux call
-# timeouts).
-#   tmux_shim_log    in `log` mode a call runs the real tmux (its session
-#                    exists, its -P output and an -e value holding a space
-#                    reach the caller and the session), and adds one `call`
-#                    line: its time is the call's, its pid is not the shell's,
-#                    its parent is the scenario's shell ($$) with that shell's
-#                    command line, and its words give back the argv exactly.
-#                    `tmux_shim_mode` writes `<mode> <delay>` to the mode file
-#                    and refuses an unknown mode, a delay for a mode that
-#                    takes none and a delay that is not a number.
-#   fail_kill        `kill-session`, `kill-pane`, the alias `killp`, the
-#                    prefix `kill-ses`, a kill after a global option and a
-#                    chained call holding one each exit 1 with one `tmux-shim:`
-#                    line on standard error, run nothing (the chained call's
-#                    other command prints nothing) and leave the session; other
-#                    commands run. After a change to `log`, the next call
-#                    kills the session.
-#   fail_kill_targets
-#                    `fail-kill` limited to a target list (a harness addition): `tmux_shim_mode fail-kill
-#                    --targets` writes the mode line, then one target per line;
-#                    a kill-pane of the listed pane id, a kill-session of the
-#                    listed session id (alone, in a flag cluster and in a
-#                    chained call) and, with the session's name listed, a kill
-#                    by `=name` and `name:` each exit 1 with one `tmux-shim:`
-#                    line and leave the session, while a kill of an unlisted
-#                    pane runs and ends its session; each call adds its one log
-#                    line first. The setter refuses --targets with another
-#                    mode, no target and an empty one, changing nothing; a
-#                    list beside mode `log` runs nothing (exit 70); after
-#                    `log` the next kill runs.
-#   fail_create      at the shim: `new-session`, its alias `new` and a call
-#                    with no command (tmux's default new-session) each exit 1
-#                    with no standard output and one `tmux-shim:` line on
-#                    standard error, and leave no session; other commands
-#                    run. A real agent-director spawn --agent claude with the shim first on
-#                    its PATH reaches the shim (a new-session line whose parent
-#                    is that agent-director process), answers
-#                    ErrTmuxSessionCreate, makes no session and leaves its row
-#                    pending.
-#   slow_create      a real spawn's session carries @ad_owner (naming the
-#                    spawn's instance) and @ad_pane before the shim's delay
-#                    ends (read before its new-session line's time plus the
-#                    delay); the spawn answers ErrTmuxUnresponsive with its
-#                    session present and its row pending.
-#   wedge            a call's line is logged (its pid the call's) while the
-#                    call still sleeps; the call then exits 1 no sooner than
-#                    the delay (longer than the create timeout), with one
-#                    `tmux-shim:` line on standard error, no standard output
-#                    and no session made: it ran no tmux.
-#   mode_spawns_not_cscb
-#                    the tmux log holds lines whose parent is an
-#                    agent-director process (the mode legs' harness spawns),
-#                    yet `assert_no_server_tmux` fails its positive control:
-#                    an agent-director process the harness ran is not one a
-#                    CSCB process ran.
-#   path_wiring      a command run through `cscb_run` has the tmux shim's bin
-#                    directory first on its PATH, then the scenario's PATH; it
-#                    is recorded with role `run`, its words, and a `gone`
-#                    entry once it ended; `cscb_run` returns its status. The
-#                    scenario's shell has no shim on PATH and finds the real
-#                    tmux.
-#   live_start       (the E17 hatch note) a live one-persona start against the
-#                    Slack stub, with the stub as `claude` held at the
-#                    dev-channels dialog: the start pass brings it up, the
-#                    bot server (recorded with role `server`) has the shim
-#                    first on its PATH, its dialog approver sends the keys
-#                    through agent-director (a `send-keys` call whose parent
-#                    is the bot server) and the row reports in (`waiting`).
-#                    No tmux line has the bot server as its parent. The three
-#                    closing assertions pass over this start's own lines (the
-#                    lines it added, the whole record), and over the lines
-#                    from before it both positive controls fail, so both are
-#                    met by this start's own lines. `cscb_ad_calls` prints no
-#                    harness call. The start is stopped with --stop-bots.
-#   mcp_session      a live one-persona start in a state directory of its own,
-#                    with health ticks every MCP_TICK_S: once the stub (held
-#                    at the dev-channels dialog until the approver's Enter)
-#                    reports in, the server registers its MCP session as the
-#                    persona's (`Session connected`); the session client is a
-#                    child of the stub. Over at least MCP_TICKS more health
-#                    ticks (the bot server's `status` reads of the row) the
-#                    server logs no reconnect, relaunch, restart or
-#                    not-connected line, no CSCB process runs send-keys,
-#                    spawn, resume or kill for the row, the row reads
-#                    `waiting` and /interject answers 200. The next two legs
-#                    go on with this stub and server.
-#   mcp_reconnect    `/mcp reconnect slack-channel-router` (as CSCB types it),
-#                    then a bare `/mcp reconnect`, typed into that stub's pane
-#                    while its session client runs: each time the client logs
-#                    its SIGTERM end in stub-mcp-session.log and is gone, a new
-#                    client, a child of the stub, logs its connection there,
-#                    the server logs the old session's end and registers the
-#                    new one as the persona's (`Session connected`), and the
-#                    stub still runs.
-#   mcp_end          `stub_type_exit` types the sentinel into that pane: the
-#                    server logs the session's end, the stub and its current
-#                    client are gone and /interject answers 200, appending
-#                    one accepted queue record despite the ended session.
-#                    The start is stopped with
-#                    --stop-bots.
-#   slack_stub_record
-#                    the Slack stub (fixtures/slack-stub-server.ts) records a
-#                    `chat.postMessage` text longer than SLACK_RECORD_CUT (300)
-#                    characters whole, with the fake token it holds replaced
-#                    by `<token>`; the same text sent to another method
-#                    (`chat.update`) is recorded cut to its first 300
-#                    characters after the replacement; the record holds no
-#                    token-like text.
-#   harness_include_finished
-#                    a harness finished-row kill (agent-director-admin's
-#                    `kill-finished`, through its shim) from the scenario's
-#                    shell, from a command substitution and from a pipeline
-#                    each add a line to the one shim log whose parent has
-#                    the shell's command line (the shell itself, then
-#                    subshells of it), and `assert_no_cscb_include_finished`
-#                    passes.
-#   stub_direct      the stub run from the scenario's shell, its hooks each
-#                    touching a marker file: `claude --version` prints
-#                    `2.1.280 (Claude Code)`; in a directory with no selection
-#                    it prints the dev-channels dialog, byte for byte
-#                    tests/fixtures/dev-channels-pane-2.1.120.txt, and its
-#                    record of the dialogs it showed holds the same bytes; `silent`
-#                    prints nothing, fires no hook, and on the sentinel fires
-#                    no SessionEnd; `at-once` with no
-#                    AGENT_DIRECTOR_INSTANCE_ID prints its banner, fires
-#                    SessionStart, writes one stop line (reason
-#                    `AGENT_DIRECTOR_INSTANCE_ID is unset or empty`, id `-`)
-#                    to standard error, as no shim log is beside its hooks'
-#                    binary, and on the sentinel fires SessionEnd. With a
-#                    dialog delay set (`stub_dialog_delay`), partway into the
-#                    delay its screen holds neither approver needle (both
-#                    printed by fixtures/fmk-texts.ts), and its output then
-#                    ends with the dev-channels dialog, byte for byte the
-#                    same fixture, after a screen with neither needle.
-#                    The linger on exit, the stub on a FIFO, its hooks (exec
-#                    form) recording their parent's PID: in `at-once` a C-u
-#                    and `/exit` line fires no hook and the stub keeps
-#                    running until the sentinel; in `linger-on-exit` the
-#                    `/exit` fires SessionEnd once, from the stub's own
-#                    process, the stub writes its lingering marker, keeps
-#                    running and ignores further lines (still running
-#                    STUB_LINGER_HOLD_S after them), and after SIGUSR1 (the
-#                    signal `stub_release` sends) it exits 0, removing its
-#                    marker and firing nothing more.
-#   stub_helpers    `stub_mode` refuses an unknown mode, a directory outside
-#                    SCENARIO_ROOT (as written and by real path) and a path
-#                    that is no directory, and a directory's last selection
-#                    wins (the stub then runs it); `stub_dialog_delay` refuses
-#                    a value that is not a whole number and the same
-#                    directories, and a directory's last setting wins;
-#                    `stub_release` fails for no such pane and refuses when
-#                    TMUX is set;
-#                    `stub_press_enter` fails
-#                    with tmux's answer for no such pane and for a prefix of a
-#                    session's name (which gets no Enter), delivers Enter by
-#                    the full session name and by pane id, and refuses with
-#                    TMUX set or another TMUX_TMPDIR, as `stub_type_exit` does;
-#                    `ad_store_pending_no_launch`
-#                    refuses an id with other characters and an id with no
-#                    row; `write_mcp_config` refuses a value that is not a
-#                    port, and the setup's MCP config names the server
-#                    `slack-channel-router` at the scenario's port over http.
-#                    `stub_type_line` (a harness addition) refuses with TMUX set or another
-#                    TMUX_TMPDIR, an empty or blank line and a line holding a
-#                    control character.
-#   repoint_refusals `repoint_symlink` (a harness addition) refuses by real path, saying why, and
-#                    leaves the link as it was: a link under SCENARIO_ROOT as
-#                    written whose directory resolves outside it (through a
-#                    symlinked directory to the guard_refusals leg's scratch
-#                    directory under /tmp), a target symlink under
-#                    SCENARIO_ROOT that resolves to /tmp, and a target that is
-#                    a file; then it re-points the same link to a directory
-#                    under SCENARIO_ROOT (the positive control). Its refusals
-#                    as written (a link or target outside SCENARIO_ROOT, a
-#                    link that is not a symlink, a missing target) are
-#                    test-14's setup check.
-#
-# The re-fire legs read SessionStart records in the scenario HOME's
-# ~/.config/agent-director/ad-trail.jsonl: `ad.hook.fired` (by instance id) and
-# `ad.hook.ignored` (by instance id, and by the hook's parent PID, which is the
-# stub's own process). G is agent-director's default pending grace period
-# (REFIRE_GRACE_S): the self-check writes no config.toml before the
-# store_statements leg, which runs after them.
-#   refire_hold      a harness spawn of row REFIRE_ID, its working directory
-#                    selected for the silent mode: the row reads `pending` with
-#                    a launch start; its worker's --settings hooks are exec
-#                    form and name the binary beside the shim's log; for longer
-#                    than a re-fire period the worker's pane shows nothing and
-#                    the trail holds no SessionStart record for the row.
-#   refire_at_once, refire_trusted_config_dir, refire_trusted_home,
-#   refire_dev_channels, refire_unrecognised, refire_folder_trust
-#                    one reporting stub per path, each the process of its own
-#                    tmux pane on the scenario's server, given the held row's
-#                    AGENT_DIRECTOR_INSTANCE_ID and its worker's --settings,
-#                    and a working directory selected for the path's mode:
-#                    `at-once`; `folder-trust` in a folder trusted in
-#                    <CLAUDE_CONFIG_DIR>/.claude.json, and in one trusted in
-#                    ~/.claude.json with no CLAUDE_CONFIG_DIR (both report in
-#                    with no dialog); and the dev-channels dialog, the
-#                    unrecognised dialog (which holds neither approver
-#                    needle) and the folder-trust prompt, each shown in its
-#                    pane and answered by `stub_press_enter`: before the Enter,
-#                    for longer than a period, the stub fires no SessionStart
-#                    and shows no banner (and the unrecognised dialog shows
-#                    neither approver needle); once the banner shows, neither
-#                    the pane nor its scrollback holds the dialog's line (the
-#                    stub clears an answered dialog).
-#   stop_status_failure
-#                    a reporting stub given an instance id with no row: its
-#                    report-in fires SessionStart once, then nothing, and the
-#                    shim's log holds exactly one stop line naming the id,
-#                    written by the stub, reason `the status read exited <n>`.
-#   stop_no_launch_start
-#                    a second row held the same way, and a reporting stub for
-#                    it: once it has re-fired, `ad_store_pending_no_launch`
-#                    leaves the row `pending` with no launch start; then
-#                    exactly one stop line names the id, written by the stub,
-#                    reason `the row reads pending with no launch start`, and
-#                    no SessionStart record from the stub comes after it.
-#   refire_grace     after G (plus REFIRE_SETTLE_S): each path's stub's
-#                    records start at its report-in (within REFIRE_FIRST_S of
-#                    its start or its Enter), come about every REFIRE_PERIOD_S
-#                    (each gap within REFIRE_GAP_MIN_S..REFIRE_GAP_MAX_S),
-#                    run until G (the last within REFIRE_GAP_MAX_S of it) and
-#                    none after (REFIRE_HOOK_S allowed for a hook's own run),
-#                    with none added over REFIRE_QUIET_S more; each is
-#                    ignored as `pid_mismatch` against the silent worker's
-#                    pane, and the stub still runs. The silent worker fired
-#                    nothing (every SessionStart fired for the row was
-#                    ignored); the row still reads `pending` with its launch
-#                    start; no stop line names it (the stop past G is
-#                    silent).
-#   stub_lines_not_cscb
-#                    the shim log's lines since the hold are the two stop
-#                    lines and the harness's own calls (their parent the
-#                    scenario's shell), all in its format; over them
-#                    `cscb_ad_count` counts nothing and `cscb_ad_calls`
-#                    prints nothing, and CSCB's whole count is unchanged; the
-#                    three closing assertions pass over a copy of the whole
-#                    record, stop lines included.
-#   synthetic_server_tmux, synthetic_include_finished, synthetic_delete
-#                    in subshells pointed at synthetic logs and records under
-#                    SCENARIO_ROOT: each assertion passes a clean log and
-#                    fails, naming itself and the reason, on each violating
-#                    log (and each positive control on a log that lacks it);
-#                    a stop line never counts. A `kill --include-finished`
-#                    or a `delete` passes only from the scenario's own shell
-#                    (its command line, on a PID no recorded process held at
-#                    that time), so one from a recorded process's command line
-#                    outside its window fails; for the other checks such a
-#                    line never counts. A line not in the shims' format fails.
-#   count_helpers    on a synthetic log, `cscb_ad_count` and `cscb_ad_calls`
-#                    count only the calls a CSCB process made in its window:
-#                    never a harness call or a stop line; the verb is read past
-#                    agent-director's global flags and fragments match in
-#                    order.
-#   synthetic_readers
-#                    on synthetic logs, the latch scenarios' readers:
-#                    `tmux_shim_targets` reports a send-keys, capture-pane,
-#                    pipe-pane, kill-session or respawn-pane whose -t names
-#                    the target as `=<name>:`, `<name>:0.0`, an unambiguous
-#                    prefix of the name, `$N`, `%N`, `@N`, `@N.0` or
-#                    `<name>:@N`, by the alias `send`, the prefix `send-k`, as
-#                    `-t<value>`, after a global option, after options with
-#                    and without an argument (send-keys' -c and -N), and in a
-#                    chained command; it never reports display-message or
-#                    has-session, `%12` for `%1`, `@12` for `@1`, `$30` for
-#                    `$3`, another session or a longer name, and keeps to its
-#                    marks. `ad_cscb_calls` matches the instance id exactly,
-#                    in its `--flag=value` and `--flag value` forms (never
-#                    `cscb_dev_x` for `cscb_dev`), past agent-director's global
-#                    flags, and never prints a harness call, a stop line or a
-#                    line whose parent PID a CSCB process held only outside
-#                    its time; `*` prints every CSCB call carrying an id; both
-#                    it and `ad_cscb_verb_between` keep to their marks, and a
-#                    mark that is not a number fails.
-#   closing_enforcement
-#                    nested fmk runs written into SCENARIO_ROOT, each with a
-#                    stand-in bot server (a process of the run, recorded as a
-#                    bot server, whose agent-director and tmux lines it writes
-#                    into its own logs): one that ends with the three closing
-#                    assertions passes; one that writes a violating line after
-#                    them fails with `after the closing assertions:` and the
-#                    assertion's reason; one whose assertions ran over copies
-#                    of its logs or in a subshell fails naming exactly those
-#                    as not passed; one that fails on its own prints only its
-#                    own FAIL line.
-#
-# The harness-only steps (b.jg5 SRJ-1306, SRJ-1401). Each helper runs once
-# from the scenario's own shell, and each leg reads the effect back itself,
-# with the real tmux on the scenario's server, the store (through
-# `ad_store_edit`) or a harness `get`.
-#   seeding          each seed_* helper once (worker `sleep`): the session's
-#                    name, id, pane and working directory are as printed;
-#                    every label holds its five fields (`ad1`, a 16-hex token,
-#                    the session's own id, the instance id, a store id) and
-#                    ends with the scenario store's id, or with another
-#                    16-hex id for `seed_other_store`; every labelled session's
-#                    pane carries @ad_pane `<that token> <its pane id>`; the
-#                    unlabelled and env-only sessions carry neither, and the
-#                    env-only worker's environment holds its instance id. A
-#                    taken name and a name holding `.` are refused, and the
-#                    refused name makes no session.
-#   tmux_steps       `relabel_session` gives the leftover a new token in both
-#                    labels and refuses the label's own token, an unlabelled
-#                    session and another store's; `attach_viewer` makes a
-#                    session in the leftover's group showing its windows;
-#                    `rename_session`, `set_remain_on_exit`, the global
-#                    @ad_owner set (five fields, `$0`, the store's id) and unset
-#                    (no value in any of the three scopes), `respawn_worker_pane`
-#                    (same pane, a new process, the old one gone) and
-#                    `end_session` each read back from the server; a step
-#                    with TMUX set is refused.
-#   store_statements writes the scenario HOME's agent-director config.toml
-#                    (the starting-session bound and the stopping window at
-#                    their safe minimums; the re-fire legs are done by now);
-#                    once the finished row's session is older than that
-#                    window, `ad_store_mark_finished` writes exactly the
-#                    state, ended_at (the file's window ago), no launch start
-#                    and the next row_version, every other column kept;
-#                    `ad_delete_unusable_row` and `ad_store_unusable_name`
-#                    refuse the live row, unchanged; `ad_store_unusable_name`
-#                    changes only the finished row's session name.
-#                    `ad_store_backup` refuses a destination outside
-#                    SCENARIO_ROOT, an existing one (left as it was) and a path
-#                    holding a `'`, each with its reason and no copy; then a
-#                    copy of the store reads integrity `ok` and the store's id.
-#   operator_actions once the other row's session is past the starting-session
-#                    bound: `ad_store_mark_finished` marks it `ended`, every
-#                    other column kept, its session still running; then
-#                    `ad_kill_include_finished` gets kill_sent from an
-#                    agent-director-admin `kill-finished` whose parent is
-#                    the scenario's shell, the session ends,
-#                    and `assert_no_cscb_include_finished` still passes;
-#                    `ad_store_seed_pending` then makes that row `pending`
-#                    with a launch start and a fresh token (not the leftover's),
-#                    its pane and server identity NULL, every other column
-#                    kept, and a harness `status` reads it so;
-#                    `ad_delete_unusable_row` removes the finished row whose
-#                    name the statement made unusable, with an
-#                    agent-director-admin `delete` from the scenario's
-#                    shell, and `assert_no_cscb_delete` still passes.
-#   find_missing_loop
-#                    `run_find_missing_loop` at a short interval refuses a
-#                    second loop, runs `find-missing` twice (each run logged
-#                    with exit 0, the next starting no sooner than the
-#                    interval after it), its calls' parent the loop subshell
-#                    with the shell's command line and none counted as
-#                    CSCB's; once stopped, the loop is gone and
-#                    `wait_find_missing_runs` refuses.
-#   fmk_driver_reuse_spawn, fmk_driver_read_pane, fmk_driver_resume
-#                    fixtures/fmk-driver.ts, run through `cscb_run` once per
-#                    forced call against a self-check persona: it exits 0
-#                    with exactly one outcome line, `DRIVER: FORCED <call>`
-#                    and its fields; every agent-director call in the shim's
-#                    log during the run has the driver (bun) as its parent,
-#                    and CSCB's count rises by exactly those; the forced
-#                    call's verb is among them; no delete.
-#   seeders_010      a nested fmk run started on 0.10.0: `seed_prepersona_fleet`
-#                    refuses a routed channel with no name before any row or
-#                    store exists; `seed_010_row` and `seed_prepersona_fleet`
-#                    make rows named and labelled as the pre-persona package
-#                    names them, live, in their routes' directories; after
-#                    `install_ad_release` (the release's install.sh, then
-#                    the re-shim) the shim check passes, the store has a store
-#                    id, every row is still present with its name and labels
-#                    and its terminal state; workers end before the install and stay gone;
-#                    then each seeder refuses for
-#                    each of its three reasons. The nested run ends with the
-#                    closing assertions over a stand-in bot server and passes.
-#   tmux_server_steps
-#                    last, as it ends every session: `restart_tmux_server`
-#                    leaves a new server with only its one session and the
-#                    old server gone; `rebind_tmux_socket` leaves the old
-#                    server answering on the moved socket and a new one on
-#                    the socket path. The exit hook confirms the trap stopped
-#                    both.
-# The script then ends with the three closing assertions in its own shell,
-# met by the live start's own lines, with the stub's stop lines in the shim's
-# log.
-# Teardown: an exit hook confirms that the trap stopped the scenario's tmux
-# server (its PID gone, no socket under SCENARIO_ROOT answering).
+# Harness self-check: containment, logging, real AD outcomes, raw message receipts,
+# hook re-fire, lifecycle helpers, fixture refusals and closing assertions.
+
 set -euo pipefail
 
 TEST_NAME="test-0-fmk-harness-self-check"
@@ -534,7 +47,7 @@ LIVE_KEY="$(persona_key "${LIVE_NAME}")"
 LIVE_INSTANCE_ID="cscb_${LIVE_KEY}"
 LIVE_STUB_WAIT_S=20    # the Slack stub writing its ready file
 LIVE_START_WAIT_S=120  # the start pass: one bring-up and one launch
-LIVE_REPORT_WAIT_S=60  # after the start pass: the approver's Enter and the row reporting in
+LIVE_REPORT_WAIT_S=60
 
 # The mcp_session leg's persona, its health-check interval, how many ticks it
 # watches, and a restart delay longer than the MCP legs' run after the
@@ -650,10 +163,7 @@ T4_LEFTOVER_PANE=""
 T4_LEFTOVER_TOKEN=""
 T4_ENV_SID=""
 
-# The stub_direct leg's dialog delay, and how long into it the leg reads the
-# stub's screen, in seconds.
-STUB_DELAY_S=3
-STUB_DELAY_READ_S=1
+
 
 # The stub_direct leg's linger on exit: how long the stub must keep running
 # after a `/exit` it does not end on, and the bound on its exit after the
@@ -1329,34 +839,7 @@ pane_history_shows() {
     "${SCENARIO_REAL_TMUX}" capture-pane -p -S - -t "$1" 2> /dev/null | grep -F -- "$2" > /dev/null
 }
 
-# refire_enter_leg <path> <mode> <dialog-line> [<absent-line>...]: <path>'s
-# stub, held at its dialog (whose pane shows <dialog-line> and no
-# <absent-line>) for longer than a period, fires no SessionStart and shows no
-# banner; the harness's Enter makes it report in, and the answered dialog is
-# cleared: once the banner shows, neither the pane nor its scrollback holds
-# <dialog-line>.
-refire_enter_leg() {
-    local path="$1" mode="$2" text="$3" step="re-fire $1" session="t0-refire-$1" t absent
-    shift 3
-    refire_dir "${path}" "${mode}"
-    refire_start "${path}"
-    wait_until 10 "${step}: the pane never showed the dialog line '${text}'" pane_shows "${session}" "${text}"
-    for absent in "$@"; do
-        ! pane_shows "${session}" "${absent}" || fail "${step}: the dialog holds '${absent}'"
-    done
-    sleep "$(seconds_plus "${REFIRE_PERIOD_S}" 0.5)"
-    [[ "$(records_from "${REFIRE_PID[${path}]}")" == 0 ]] \
-        || fail "${step}: the stub fired SessionStart before the Enter"
-    ! pane_shows "${session}" "Listening for channel messages" || fail "${step}: the stub reported in before the Enter"
-    pid_alive "${REFIRE_PID[${path}]}" || fail "${step}: the stub ended at its dialog"
-    t="$(now_s)"
-    stub_press_enter "${session}"
-    REFIRE_FROM["${path}"]="${t}"
-    wait_until 10 "${step}: the stub never reported in after the Enter" \
-        pane_shows "${session}" "Listening for channel messages"
-    ! pane_history_shows "${session}" "${text}" \
-        || fail "${step}: the answered dialog's line '${text}' is still in the pane or its scrollback"
-}
+
 
 # stop_lines_for <instance-id>: print the shim log's stop lines whose words
 # name instance <instance-id> (`… for instance <id>: …`).
@@ -1568,7 +1051,7 @@ EOF
 leg_tmux_and_store() {
     local step="tmux and store" work row_socket info sock_path store_id got
     work="$(make_workdir self-check)"
-    stub_mode "${work}" "${STUB_MODE_STARTUP_TRUST}"
+    stub_mode "${work}" "${STUB_MODE_AT_ONCE}"
     ad_capture spawn --agent claude --cwd "${work}" --instance-id "${T0_ROW_ID}" \
         --tmux-session-name "${T0_SESSION}" --no-pre-trust --label "t0=spawned"
     if (( AD_RC != 0 )); then
@@ -1623,10 +1106,7 @@ leg_reinstall() {
     (( AD_RC == 0 )) || fail "${step}: cannot read the fixture before quiescence"
     work="$(jq -er '.cwd' "${AD_OUT}")"
     worker_pid="$("${SCENARIO_REAL_TMUX}" display-message -p -t "=${T0_SESSION}:" '#{pane_pid}')"
-    # This fixture uses an explicit dialog mode. A kill while it is
-    # pending leaves find-missing inside the 60 s launch grace, even once
-    # the worker is gone. Complete startup before the bounded shutdown.
-    stub_press_enter "${T0_SESSION}"
+    # Wait for AD reporting before the bounded shutdown.
     wait_until "${SCENARIO_SEED_REPORT_S}" "${step}: fixture must report in before shutdown" \
         nested_seed_row_reported "${T0_ROW_ID}"
     nested_quiesce_seed_row "${T0_ROW_ID}" "${T0_SESSION}" "${worker_pid}"
@@ -1748,7 +1228,7 @@ leg_guard_refusals() {
         [[ ! -e "${backup}" && ! -L "${backup}" ]] || fail "${step}: the refused ad_store_backup wrote ${backup}"
         expect_fails_in_home "${step}" "${home}" "${reason}" ad_store_pending_no_launch "${T0_ROW_ID}"
         expect_fails_in_home "${step}" "${home}" "${reason}" stub_mode "${SCENARIO_ROOT}/work" "${STUB_MODE_AT_ONCE}"
-        expect_fails_in_home "${step}" "${home}" "${reason}" stub_dialog_delay "${SCENARIO_ROOT}/work" 1
+        expect_fails_in_home "${step}" "${home}" "${reason}" stub_report_delay "${SCENARIO_ROOT}/work" 1
         expect_fails_in_home "${step}" "${home}" "${reason}" stub_press_enter "${T0_SESSION}"
         expect_fails_in_home "${step}" "${home}" "${reason}" stub_type_line "${T0_SESSION}" "a line"
         expect_fails_in_home "${step}" "${home}" "${reason}" repoint_symlink "${SCENARIO_ROOT}/t0-guard-link" "${SCENARIO_ROOT}/work"
@@ -2112,7 +1592,7 @@ leg_live_start() {
     config_dir="${SCENARIO_ROOT}/claude-config"
     mkdir -p "${config_dir}"
     work="$(make_workdir live)"
-    stub_mode "${work}" "${STUB_MODE_STARTUP_TRUST}"
+    stub_mode "${work}" "${STUB_MODE_AT_ONCE}"
 
     # The Slack stub: one token pair, answered ok; any other refused.
     start_slack_stub "${SCENARIO_ROOT}/slack-stub" livev1
@@ -2143,8 +1623,7 @@ EOF
     start_server --live
     wait_for_log "$(completion_match 1)" "${LIVE_START_WAIT_S}" "${step}: the start pass never completed"
     expect_completion 1 "${step}" "0 not brought up"
-    # The stub prints the dev-channels dialog and fires SessionStart only on
-    # the Enter the approver sends: the row reports in once it is cleared.
+    # The stub reports immediately through its SessionStart hook.
     wait_until "${LIVE_REPORT_WAIT_S}" "${step}: row ${LIVE_INSTANCE_ID} never reported in (waiting)" \
         row_state_is "${LIVE_INSTANCE_ID}" waiting
     tmux_after="$(line_count "${SCENARIO_TMUX_SHIM_LOG}")"
@@ -2157,13 +1636,10 @@ EOF
     [[ -n "$(awk -F'\t' -v p="${SERVER_PID}" '$1 == "proc" && $2 == "server" && $3 == p' "${SCENARIO_CSCB_RECORD}")" ]] \
         || fail "${step}: the record holds no server entry for the bot server ${SERVER_PID}"
 
-    # The approver answered the dialog through agent-director: a send-keys
-    # whose parent is the bot server.
-    mapfile -t lines < <(cscb_ad_calls send-keys "${LIVE_INSTANCE_ID}")
-    (( ${#lines[@]} >= 1 )) || fail "${step}: no send-keys for ${LIVE_INSTANCE_ID} whose parent is a CSCB process"
-    for line in "${lines[@]}"; do
-        read_call "${step}" "${line}"
-        [[ "${CALL_PPID}" == "${SERVER_PID}" ]] || fail "${step}: a send-keys for ${LIVE_INSTANCE_ID} has parent ${CALL_PPID}, not the bot server ${SERVER_PID}"
+    # Startup reports through SessionStart; no CSCB pane or key call is needed.
+    for verb in read-pane send-keys; do
+        mapfile -t lines < <(cscb_ad_calls "${verb}" "${LIVE_INSTANCE_ID}")
+        (( ${#lines[@]} == 0 )) || fail "${step}: startup made ${#lines[@]} automatic ${verb} call(s)"
     done
     # No harness call is counted as CSCB's.
     mapfile -t lines < <(cscb_ad_calls "")
@@ -2200,7 +1676,7 @@ leg_mcp_session() {
     config_dir="${SCENARIO_ROOT}/claude-config-mcp"
     mkdir -p "${config_dir}"
     work="$(make_workdir mcp)"
-    stub_mode "${work}" "${STUB_MODE_STARTUP_TRUST}"
+    stub_mode "${work}" "${STUB_MODE_AT_ONCE}"
     ref="$(persona_ref "${MCP_NAME}")"
     connected="$(matcher "[slack] Session connected: persona ${ref}")"
 
@@ -2412,7 +1888,6 @@ mcp_ticks_or_trouble() {
 leg_stub_direct() {
     local step="stub direct" dir out="${SCENARIO_ROOT}/stub-direct.out" err="${SCENARIO_ROOT}/stub-direct.err"
     local mark="${SCENARIO_ROOT}/stub-direct-mark" settings got rc=0 before words=() want=() pid
-    local fixture="${SCENARIO_FIXTURES}/../../fixtures/dev-channels-pane-2.1.120.txt"
     settings="$(jq -nc --arg m "${mark}" '{hooks: {
         SessionStart: [{hooks: [{type: "command", command: "/usr/bin/touch", args: [($m + ".start")]}]}],
         SessionEnd: [{hooks: [{type: "command", command: "/usr/bin/touch", args: [($m + ".end")]}]}]}}')"
@@ -2428,21 +1903,7 @@ leg_stub_direct() {
     (( rc == 0 )) || fail "${step}: default at-once stub exited ${rc}"
     grep -qxF "Listening for channel messages from: server:slack-channel-router" "${out}" \
         || fail "${step}: default stub did not report in immediately"
-    [[ ! -s "${SCENARIO_BIN}/${SCENARIO_STUB_SHOWN_DIALOGS_PREFIX}${pid}" ]] \
-        || fail "${step}: default stub showed a dialog"
     [[ ! -s "${err}" ]] || fail "${step}: default stub wrote to standard error"
-
-    # Explicit dev mode preserves the dialog bytes and the shown-dialog record.
-    dir="$(make_workdir stub-dev-dialog)"
-    stub_mode "${dir}" "${STUB_MODE_DEV_CHANNELS}"
-    (cd "${dir}" && exec "${SCENARIO_BIN}/claude" < /dev/null) > "${out}" 2> "${err}" &
-    pid=$!
-    wait "${pid}" || rc=$?
-    (( rc == 0 )) || fail "${step}: the explicit dev stub exited ${rc}"
-    cmp -s -- "${fixture}" "${out}" || fail "${step}: the explicit dev stub's output is not ${fixture##*/}, byte for byte"
-    cmp -s -- "${fixture}" "${SCENARIO_BIN}/${SCENARIO_STUB_SHOWN_DIALOGS_PREFIX}${pid}" \
-        || fail "${step}: the stub's record of the dialogs it showed (${SCENARIO_STUB_SHOWN_DIALOGS_PREFIX}${pid}) is not ${fixture##*/}, byte for byte"
-    [[ ! -s "${err}" ]] || fail "${step}: the explicit dev stub wrote to standard error: $(head -c 300 "${err}")"
 
     # Silent: no output, no SessionStart, and the sentinel fires no SessionEnd.
     dir="$(make_workdir stub-silent)"
@@ -2474,7 +1935,7 @@ leg_stub_direct() {
     same_words words want || fail "${step}: the stop line's words are $(quoted "${words[@]}"), not $(quoted "${want[@]}")"
     [[ "$(line_count "${SCENARIO_AD_SHIM_LOG}")" == "${before}" ]] || fail "${step}: the stub wrote to the shim log"
 
-    stub_direct_delay "${step}: dialog delay" "${fixture}"
+    stub_direct_start_modes "${step}: startup modes"
     stub_direct_linger "${step}: linger on exit"
     stub_direct_composer "${step}: composer"
 }
@@ -2562,6 +2023,29 @@ linger_settings() {
 # `stub_release` sends to a pane's process (this stub runs on a FIFO, not in a
 # pane), it exits 0 within STUB_RELEASE_WAIT_S, its marker removed, with no
 # SessionEnd fired again.
+# Generic holds and delayed hooks exercise AD transitions without native UI fixtures.
+stub_direct_start_modes() {
+    local step="$1" dir name mode marker settings rc
+    for mode in "${STUB_MODE_MANUAL_START}" "${STUB_MODE_AT_ONCE}"; do
+        name="stub-start-${mode}"
+        dir="$(make_workdir "${name}")"
+        marker="${SCENARIO_ROOT}/${name}.started"
+        settings="$(jq -nc --arg m "${marker}" '{hooks:{SessionStart:[{hooks:[{type:"command",command:"/usr/bin/touch",args:[$m]}]}]}}')"
+        stub_mode "${dir}" "${mode}"
+        if [[ "${mode}" == "${STUB_MODE_AT_ONCE}" ]]; then stub_report_delay "${dir}" 1; fi
+        fifo_stub "${step}" "${dir}" "${name}" "${settings}"
+        sleep 0.2
+        [[ ! -e "${marker}" ]] || fail "${step}: ${mode} reported before its release"
+        if [[ "${mode}" == "${STUB_MODE_MANUAL_START}" ]]; then printf '\r' >&"${FIFO_FD}"; fi
+        wait_for_file "${marker}" 5 "${step}: ${mode} never fired SessionStart"
+        printf '__CSCB_TEST_EXIT__\r' >&"${FIFO_FD}"
+        rc=0
+        wait "${FIFO_PID}" || rc=$?
+        exec {FIFO_FD}>&-
+        (( rc == 0 )) || fail "${step}: ${mode} exited ${rc}"
+    done
+}
+
 stub_direct_linger() {
     local step="$1" dir mark rc=0 name marker
     # The at-once stub: `/exit` ignored, the sentinel ends it.
@@ -2621,48 +2105,28 @@ stub_direct_linger() {
         || fail "${step}: the stub did not know the linger-on-exit mode: $(head -c 300 "${SCENARIO_ROOT}/${name}.err")"
 }
 
-# stub_direct_delay <step> <fixture>: a directory with a dialog delay of
-# STUB_DELAY_S. STUB_DELAY_READ_S into it the stub shows a starting screen
-# holding neither approver needle (both printed by fixtures/fmk-texts.ts);
-# its whole output then ends with the dev-channels dialog, <fixture> byte for
-# byte, and what comes before the dialog holds neither needle.
-stub_direct_delay() {
-    local step="$1" fixture="$2" dir out="${SCENARIO_ROOT}/stub-delay.out" err="${SCENARIO_ROOT}/stub-delay.err"
-    local head="${SCENARIO_ROOT}/stub-delay.head" dev trust needle pid rc=0 size
-    dev="$(CSCB_PKG_DIR="${PKG_DIR}" bun --no-install "${SCENARIO_FIXTURES}/fmk-texts.ts" DEV_CHANNELS_DIALOG_NEEDLE)" \
-        || fail "${step}: fmk-texts.ts could not print DEV_CHANNELS_DIALOG_NEEDLE"
-    trust="$(CSCB_PKG_DIR="${PKG_DIR}" bun --no-install "${SCENARIO_FIXTURES}/fmk-texts.ts" TRUST_DIALOG_NEEDLE)" \
-        || fail "${step}: fmk-texts.ts could not print TRUST_DIALOG_NEEDLE"
-    [[ -n "${dev}" && -n "${trust}" ]] || fail "${step}: fmk-texts.ts printed an empty needle"
-    grep -qF -- "${dev}" "${fixture}" || fail "${step}: ${fixture##*/} does not hold the dev-channels needle '${dev}'"
-
-    dir="$(make_workdir stub-delay)"
-    stub_mode "${dir}" "${STUB_MODE_DEV_CHANNELS}"
-    stub_dialog_delay "${dir}" "${STUB_DELAY_S}"
-    (cd "${dir}" && { sleep "$(( STUB_DELAY_S + 2 ))"; printf '__CSCB_TEST_EXIT__\r'; } | "${SCENARIO_BIN}/claude") \
-        > "${out}" 2> "${err}" &
-    pid=$!
-    track_pid "${pid}"
-    sleep "${STUB_DELAY_READ_S}"
-    [[ -s "${out}" ]] || fail "${step}: ${STUB_DELAY_READ_S}s into the delay the stub shows no starting screen"
-    for needle in "${dev}" "${trust}"; do
-        ! grep -qF -- "${needle}" "${out}" \
-            || fail "${step}: ${STUB_DELAY_READ_S}s into the ${STUB_DELAY_S}s delay the stub's screen holds '${needle}'"
-    done
-    wait "${pid}" || rc=$?
-    (( rc == 0 )) || fail "${step}: the stub with a dialog delay exited ${rc}"
-    size="$(stat -c '%s' "${fixture}")"
-    tail -c "${size}" "${out}" | cmp -s - "${fixture}" \
-        || fail "${step}: after the delay the stub's output does not end with ${fixture##*/}, byte for byte"
-    head -c "-${size}" "${out}" > "${head}"
-    [[ -s "${head}" ]] || fail "${step}: the stub printed the dialog with no starting screen before it"
-    for needle in "${dev}" "${trust}"; do
-        ! grep -qF -- "${needle}" "${head}" || fail "${step}: the screen before the dialog holds '${needle}'"
-    done
-    [[ ! -s "${err}" ]] || fail "${step}: the stub with a dialog delay wrote to standard error: $(head -c 300 "${err}")"
-}
 
 # The stub helpers' own refusals, the mode selection file and the MCP config.
+# The reconnect checker accepts AD-guarded keys and rejects screen reads,
+# bypass flags, foreign parents, early Enter and incomplete pairs.
+leg_reconnect_contract() {
+    local step="reconnect contract" text enter rows bad
+    printf -v text '%q ' --instance-id cscb_control --text '/mcp reconnect slack-channel-router' --no-enter
+    printf -v enter '%q ' --instance-id cscb_control --key Enter
+    printf -v rows '1\t1.000000\t42\tsend-keys\tcscb_control\t%s\n2\t2.000000\t42\tsend-keys\tcscb_control\t%s' "${text}" "${enter}"
+    _scenario_assert_reconnect_rows "${step}" 42 1000 "${rows}"
+    printf -v bad '0\t0.500000\t42\tread-pane\tcscb_control\t--n-lines 1\n%s' "${rows}"
+    expect_fails_in_home "${step}" "${HOME}" 'automatic reconnect read a pane' _scenario_assert_reconnect_rows "${step}" 42 1000 "${bad}"
+    bad="${rows/--no-enter/--no-enter --expect-pane-sha256 abc}"
+    expect_fails_in_home "${step}" "${HOME}" 'bypasses the ordinary dialog guard' _scenario_assert_reconnect_rows "${step}" 42 1000 "${bad}"
+    bad="${rows/$'\t42\t'/$'\t43\t'}"
+    expect_fails_in_home "${step}" "${HOME}" 'not server 42' _scenario_assert_reconnect_rows "${step}" 42 1000 "${bad}"
+    bad="${rows/2.000000/1.999999}"
+    expect_fails_in_home "${step}" "${HOME}" 'Enter came before 1000 ms' _scenario_assert_reconnect_rows "${step}" 42 1000 "${bad}"
+    bad="${rows%%$'\n'*}"
+    expect_fails_in_home "${step}" "${HOME}" 'not text then Enter' _scenario_assert_reconnect_rows "${step}" 42 1000 "${bad}"
+}
+
 leg_stub_helpers() {
     local step="stub helpers" dir link file got n
     dir="$(make_workdir stub-select)"
@@ -2681,22 +2145,22 @@ leg_stub_helpers() {
     got="$(cd "${dir}" && printf '__CSCB_TEST_EXIT__\r' | "${SCENARIO_BIN}/claude")" \
         || fail "${step}: the stub in ${dir} exited non-zero"
     [[ "${got}" == "Listening for channel messages from: server:slack-channel-router"$'\n'* \
-        && "${got}" == *$'\n❯ \n'* && "${got}" == *'← for agents' ]] \
-        || fail "${step}: after silent then at-once, the stub did not print its banner and empty Linux composer: ${got}"
+        && "${got}" == *$'\nbuffer: ' ]] \
+        || fail "${step}: after silent then at-once, the stub did not print its banner and empty input buffer: ${got}"
 
-    # The dialog delay's setter: its refusals, and the last setting of a
+    # The report-in delay setter: its refusals, and the last setting of a
     # directory wins (written as a whole number).
-    expect_fails_in_home "${step}" "${HOME}" "'1.5' is not a whole number of seconds" stub_dialog_delay "${dir}" 1.5
-    expect_fails_in_home "${step}" "${HOME}" "'' is not a whole number of seconds" stub_dialog_delay "${dir}"
-    expect_fails_in_home "${step}" "${HOME}" "refused: /tmp is not under SCENARIO_ROOT" stub_dialog_delay /tmp 1
-    expect_fails_in_home "${step}" "${HOME}" "refused: ${link} resolves to" stub_dialog_delay "${link}" 1
-    expect_fails_in_home "${step}" "${HOME}" "is not a directory" stub_dialog_delay "${dir}/none" 1
-    stub_dialog_delay "${dir}" 5
-    stub_dialog_delay "${dir}" 007
-    file="${SCENARIO_BIN}/stub-claude-dialog-delays"
+    expect_fails_in_home "${step}" "${HOME}" "'1.5' is not a whole number of seconds" stub_report_delay "${dir}" 1.5
+    expect_fails_in_home "${step}" "${HOME}" "'' is not a whole number of seconds" stub_report_delay "${dir}"
+    expect_fails_in_home "${step}" "${HOME}" "refused: /tmp is not under SCENARIO_ROOT" stub_report_delay /tmp 1
+    expect_fails_in_home "${step}" "${HOME}" "refused: ${link} resolves to" stub_report_delay "${link}" 1
+    expect_fails_in_home "${step}" "${HOME}" "is not a directory" stub_report_delay "${dir}/none" 1
+    stub_report_delay "${dir}" 5
+    stub_report_delay "${dir}" 007
+    file="${SCENARIO_BIN}/stub-claude-report-delays"
     [[ "$(tail -n 1 "${file}")" == "7"$'\t'"$(realpath -e -- "${dir}")" ]] \
-        || fail "${step}: the dialog delay file's last line is '$(tail -n 1 "${file}")'"
-    stub_dialog_delay "${dir}" 0
+        || fail "${step}: the report-in delay file's last line is '$(tail -n 1 "${file}")'"
+    stub_report_delay "${dir}" 0
 
     # The linger's release: it names a pane, and refuses before any signal.
     expect_fails_in_home "${step}" "${HOME}" "no pane t0-no-such-pane on the scenario's tmux server" stub_release t0-no-such-pane
@@ -2848,44 +2312,10 @@ leg_refire_at_once() {
     expect_reported_at_once at-once
 }
 
-leg_refire_trusted_config_dir() {
-    local cfg="${SCENARIO_ROOT}/refire-claude-config"
-    refire_dir trusted-config-dir "${STUB_MODE_FOLDER_TRUST}"
-    mkdir -p "${cfg}"
-    jq -n --arg d "${REFIRE_DIR}" '{projects: {($d): {hasTrustDialogAccepted: true}}}' | write_file "${cfg}/.claude.json"
-    refire_start trusted-config-dir "CLAUDE_CONFIG_DIR=${cfg}"
-    expect_reported_at_once trusted-config-dir
-}
 
-leg_refire_trusted_home() {
-    local step="re-fire trusted-home" file="${HOME}/.claude.json" pid
-    refire_dir trusted-home "${STUB_MODE_FOLDER_TRUST}"
-    if [[ -f "${file}" ]]; then
-        jq --arg d "${REFIRE_DIR}" '.projects[$d].hasTrustDialogAccepted = true' "${file}" | write_file "${file}"
-    else
-        jq -n --arg d "${REFIRE_DIR}" '{projects: {($d): {hasTrustDialogAccepted: true}}}' | write_file "${file}"
-    fi
-    refire_start trusted-home
-    pid="${REFIRE_PID[trusted-home]}"
-    ! tr '\0' '\n' < "/proc/${pid}/environ" | grep '^CLAUDE_CONFIG_DIR=' > /dev/null \
-        || fail "${step}: the stub ${pid} has CLAUDE_CONFIG_DIR in its environment"
-    expect_reported_at_once trusted-home
-}
 
-leg_refire_dev_channels() {
-    refire_enter_leg dev-channels "${STUB_MODE_DEV_CHANNELS}" "I am using this for local development"
-}
 
-leg_refire_unrecognised() {
-    # The unrecognised dialog holds neither approver needle, read while it is
-    # shown (once answered, the stub clears it).
-    refire_enter_leg unrecognised "${STUB_MODE_UNRECOGNISED}" "Choose the text style that looks best with your terminal" \
-        "I am using this for local development" "Yes, I trust this folder"
-}
 
-leg_refire_folder_trust() {
-    refire_enter_leg folder-trust "${STUB_MODE_FOLDER_TRUST}" "Yes, I trust this folder"
-}
 
 leg_stop_status_failure() {
     local step="stop: the status read fails" dir pid times=()
@@ -4201,101 +3631,30 @@ leg_real_receipt_controls() {
     bun "${SCENARIO_FIXTURES}/real-case-assertions.ts" selfcheck "${SCENARIO_ROOT}"
 }
 
-leg_real_native_idle_controls() {
-    bun "${SCENARIO_FIXTURES}/real-case-assertions.ts" native-idle-selfcheck "${SCENARIO_ROOT}" \
-        /opt/claude-code/2.1.280/claude /opt/claude-code/2.1.296/claude
-}
-
 leg_real_idle_diagnostic_controls() (
-    # Exercise the real wait/formatter without starting a bot or calling AD.
-    # The enclosing self-check already owns the image and scratch HOME.
     TEST_NAME='test-0-fmk-real-idle-diagnostic-controls'
     on_exit() { :; }
     on_before_start() { :; }
     source "${SCENARIO_FIXTURES}/../lib/real-scenario.sh"
     local dir="${SCENARIO_ROOT}/idle-diagnostic-controls" rc mode
     mkdir -p "${dir}"
-    export CONTROL_AUTH_SECRET="$(fake_token app idle)"$'\n"private\\value'
-    export CONTROL_SLACK_FAKE="$(fake_token bot diagnostic)"
-    bun - "${dir}" "${SCENARIO_FIXTURES}" <<'FIXTURES'
-import { join } from 'node:path'
-import { writeFileSync } from 'node:fs'
-const [dir, fixtures] = process.argv.slice(2)
-// Keep this control independent of checkout-only transcript/version helpers:
-// the CI image contains /tests and the installed package, with no /src tree.
-const deliveryPane = (text: string, history = '') => `${history}────────────────
-❯ ${text}
-────────────────
-  ⏵⏵ bypass permissions on (shift+tab to cycle)`
-const { redactRealObservation } = await import(join(fixtures, 'real-observations.ts'))
-const secret = process.env.CONTROL_AUTH_SECRET!
-for (const form of [secret, JSON.stringify(secret).slice(1, -1)]) {
-  const redacted = redactRealObservation(`before ${form} after`, process.env)
-  if (redacted !== 'before <redacted> after') throw new Error('runtime secret masking failed')
-}
-for (const [name, pane] of [
-  ['empty', deliveryPane('')],
-  ['draft', deliveryPane('draft', `${secret} ${process.env.CONTROL_SLACK_FAKE!} wss://wss-stub.invalid/link/?ticket=SCENARIOFAKE\n`)],
-  ['huge', deliveryPane('draft', `${secret} ${'bounded '.repeat(8000)}\n`)],
-]) writeFileSync(join(dir, `${name}.json`), JSON.stringify({ pane }))
-writeFileSync(join(dir, 'status.json'), JSON.stringify({ state: 'waiting' }))
-FIXTURES
     real_instance() { echo 'idle-control'; }
-    real_ad() { cat "${dir}/status.json"; }
-    real_pane() {
-        [[ "$2" == 40 ]] || fail 'idle diagnostic requested an unbounded pane'
-        if [[ "${mode}" == unreadable ]]; then return 1; fi
-        cat "${dir}/${mode}.json"
+    real_ad() {
+        [[ "${mode}" != unreadable ]] || return 1
+        printf '{"state":"%s","pane":"PRIVATE CONTENT"}\n' "${mode}"
     }
-    # One actual observation per control; avoid wall-clock waiting here.
     _scenario_poll_until() { "$2" "$3"; }
-    mode=empty
+    mode=waiting
     real_wait_idle control 1 > "${dir}/success.out" 2>&1
-    [[ ! -s "${dir}/success.out" && ! -e "${SCENARIO_ROOT}/real-idle-pane.json" ]] \
-        || fail 'successful idle wait emitted failure diagnostics'
-    bun "${SCENARIO_FIXTURES}/real-observations.ts" "${dir}/empty.json" > "${dir}/ordinary.out"
-    for mode in draft unreadable; do
+    [[ ! -s "${dir}/success.out" ]] || fail 'successful waiting check emitted failure diagnostics'
+    for mode in working unreadable; do
         rc=0
         (real_wait_idle control 1) > "${dir}/${mode}.out" 2>&1 || rc=$?
-        [[ "${rc}" == 1 ]] || fail 'failed idle wait lost its failure status'
+        [[ "${rc}" == 1 ]] || fail 'failed AD waiting check lost its failure status'
+        grep -q 'FAIL:.*never reached AD waiting' "${dir}/${mode}.out" || fail 'original failure missing'
+        if grep -q PRIVATE "${dir}/${mode}.out"; then fail 'diagnostic leaked unselected AD fields'; fi
     done
-    bun "${SCENARIO_FIXTURES}/real-observations.ts" --idle-diagnostic "${dir}/huge.json" "${dir}/status.json" > "${dir}/huge.out"
-    bun - "${dir}" "${SCENARIO_FIXTURES}" <<'CHECK_DIAGNOSTICS'
-import { join } from 'node:path'
-import { readFileSync } from 'node:fs'
-const [dir, fixtures] = process.argv.slice(2)
-// All control credentials come from the harness's fake_token, so these
-// assertions need no checkout-only unit helper or its source imports.
-const assertNoLeak = (output: string) => {
-  for (const secret of [process.env.CONTROL_AUTH_SECRET!, process.env.CONTROL_SLACK_FAKE!]) {
-    if (output.includes(secret) || output.includes(JSON.stringify(secret).slice(1, -1))) throw new Error('diagnostic leaked a control credential')
-  }
-  if (/SCENARIOFAKE|private/i.test(output)) throw new Error('diagnostic leaked a control marker')
-}
-const check = (ok: boolean, why: string) => { if (!ok) throw new Error(why) }
-const ordinaryText = readFileSync(join(dir, 'ordinary.out'), 'utf8')
-assertNoLeak(ordinaryText)
-const ordinary = JSON.parse(ordinaryText)
-check(JSON.stringify(Object.keys(ordinary).sort()) === JSON.stringify(['pane', 'screen']), 'ordinary observation shape changed')
-check(ordinary.screen.kind === 'empty' && ordinary.screen.running === false, 'ordinary idle observation changed')
-for (const mode of ['draft', 'unreadable', 'huge']) {
-  const output = readFileSync(join(dir, `${mode}.out`), 'utf8')
-  assertNoLeak(output)
-  check(!output.includes('private') && !output.includes('SCENARIOFAKE'), 'diagnostic leaked runtime secret fragments')
-  const lines = output.trim().split('\n'), prefix = 'recorded: idle diagnostic '
-  check(lines[0].startsWith(prefix), 'failure evidence missing')
-  if (mode === 'huge') {
-    check(lines.length === 1 && lines[0].length <= prefix.length + 24000 + ' [truncated]'.length && lines[0].endsWith(' [truncated]'), 'diagnostic output is unbounded')
-    continue
-  }
-  check(lines.length === 2 && lines[1].startsWith('FAIL:'), 'diagnostic changed idle-wait failure')
-  const evidence = JSON.parse(lines[0].slice(prefix.length))
-  check(evidence.state === 'waiting', 'last row state was not retained')
-  if (mode === 'unreadable') check(evidence.pane === null && evidence.screen === null, 'unreadable pane invented idle proof')
-  else check(evidence.screen.kind !== 'empty' && evidence.pane.includes('<redacted>') && evidence.pane.includes('<redacted-token>') && evidence.pane.includes('<redacted-url>'), 'draft evidence lost screen or redaction')
-}
-console.log('recorded: idle diagnostics failure-only, bounded, redacted; unreadable pane unproved')
-CHECK_DIAGNOSTICS
+    echo 'recorded: AD waiting diagnostics preserve original failure and omit native content'
 )
 
 nested_real_usage() {
@@ -4350,7 +3709,6 @@ CHECK_USAGE
 LEGS=(
     real_fault_contract
     real_receipt_controls
-    real_native_idle_controls
     real_idle_diagnostic_controls
     real_usage_controls
     isolation
@@ -4383,14 +3741,10 @@ LEGS=(
     harness_include_finished
     stub_direct
     stub_helpers
+    reconnect_contract
     repoint_refusals
     refire_hold
     refire_at_once
-    refire_trusted_config_dir
-    refire_trusted_home
-    refire_dev_channels
-    refire_unrecognised
-    refire_folder_trust
     stop_status_failure
     stop_no_launch_start
     refire_grace

@@ -3,7 +3,6 @@ import { existsSync, readFileSync, mkdirSync, writeFileSync, rmSync } from 'node
 import { join, resolve } from 'node:path'
 import { auditReceipts, captureReceiptJournal, jsonLines, packedReceiptAdapters, personaTranscripts, readTranscripts, receiptJournal, shimWords, transcriptFiles } from './transcript-receipts.ts'
 import { assertBusyProof, emitBusyProofFailure, pollBusyProof, type BusyProofSnapshot } from './busy-proof.ts'
-import { idleCapability } from './native-idle-compaction.ts'
 const [command, state, key, shim, root, arg = '', arg2 = '', arg3 = ''] = process.argv.slice(2)
 function check(value: unknown, reason: string): asserts value { if (!value) throw new Error(reason) }
 function journal() { return jsonLines(join(state!, 'queue', `${key}.jsonl`)) }
@@ -63,9 +62,10 @@ try {
   } else if(command==='unknown-proof') {
     const faults=readFileSync(shim!,'utf8').split('\n').filter(l=>l.startsWith('fault\t')).map(l=>{const f=l.split('\t');return {at:Number(f[1])*1000,words:shimWords(f[5]!)}})
     const f=faults.find(f=>f.words[2]===arg);check(f,'unknown fault was not applied')
-    const after=calls().filter(c=>c.at>f.at), next=after.findIndex(c=>c.words.includes('send-keys')&&c.words.includes('--no-enter'))
-    check((next<0?after:after.slice(0,next)).some(c=>c.words.includes('read-pane')),'unknown send retyped without a fresh box read')
-    console.log('recorded: unknown outcome checked before retype '+arg)
+    const after=calls().filter(c=>c.at>f.at), next=after.find(c=>c.words.includes('send-keys')&&c.words.includes('--no-enter'))
+    check(next && next.at-f.at>=10000,'unknown send retyped without the existing backoff')
+    check(!after.some(c=>c.words.includes('read-pane')),'unknown recovery read native pane text')
+    console.log('recorded: unknown outcome retried under AD state/backoff '+arg)
   } else if(command==='reset-spacing') {
     const s=cumulativeJournal().filter(r=>r.kind==='sent'&&r.seq===Number(arg)&&r.send_kind!=='enter')
     const launches=[...new Set(s.map(r=>r.launch_id))];check(launches.length>=2,'head was not retried across a real launch')
@@ -75,14 +75,6 @@ try {
   } else if(command==='key-proof') {
     const j=cumulativeJournal(), s=j.filter(r=>r.kind==='sent'&&r.seq===Number(arg))
     const text=s.filter(r=>r.send_kind!=='enter'), enter=s.filter(r=>r.send_kind==='enter')
-    if(arg2==='enter') {
-      // b.omv SR-13.5: real deliveries permit duplicate text. Prove that
-      // the injected missed Enter was followed by an actual Enter-only
-      // attempt; the no-second-text invariant belongs to the unit suite.
-      const faults=readFileSync(shim!,'utf8').split('\n').filter(l=>l.startsWith('fault\t')).map(l=>{const f=l.split('\t');return {at:Number(f[1])*1000,words:shimWords(f[5]!)}})
-      check(enter.some(retry=>text.some(t=>t.part===retry.part&&t.launch_id===retry.launch_id&&t.at<=retry.at&&faults.some(f=>f.at>=t.at&&f.at<=retry.at&&f.words[1]==='key=Enter'&&f.words[2]==='swallow'))
-        &&calls().some(c=>c.at>=retry.at&&c.words.includes('cscb_'+key)&&c.words.includes('--key')&&c.words.includes('Enter'))), 'swallowed Enter has no observed Enter-only recovery')
-    }
     if(arg2==='retype') check(text.length>=2, 'missed text was not retyped')
     if(arg2==='spacing') {
       check(text.length>=4, 'three swallowed texts did not produce three retypes')
@@ -95,13 +87,6 @@ try {
     check(a.length===Number(arg), 'cron fire count differs')
     check(a.every((r,i)=>r.ts&&(!i||Number(r.ts)>Number(a[i-1].ts))), 'cron fire timestamps missing or unordered')
     console.log('recorded: cron fires '+JSON.stringify(a.map(r=>({seq:r.seq,ts:r.ts,received_at:r.received_at}))))
-  } else if(command==='compact-active') {
-    const pane=JSON.parse(readFileSync(arg,'utf8')).pane
-    check(typeof pane==='string'&&/^\s*[✢✳✶✻✽·*]\s+Compacting(?:\s|…|\.)/m.test(pane),'native compacting turn not visible')
-  } else if(command==='compact-count'||command==='compact-after') {
-    const own=personaTranscripts(key!,cumulativeJournal(),readFileSync(join(state!,'server.log'),'utf8').split('\n'),await entries())
-    const n=own.filter(e=>e.value?.type==='system'&&(e.value.subtype==='compact_boundary'||e.value.compactMetadata)).length
-    if(command==='compact-count') console.log(n); else check(n>Number(arg),'no new idle compaction boundary')
   } else if(command==='fault-at') {
     const f=readFileSync(shim!,'utf8').split('\n').filter(l=>l.startsWith('fault\t')&&shimWords(l.split('\t')[5]!)[2]===arg).at(-1);check(f,'fault not found');console.log(Number(f.split('\t')[1])*1000)
   } else if(command==='reconnect-proof') {
@@ -112,16 +97,6 @@ try {
     console.log('recorded: MCP reconnect precedes item '+arg+' after hold '+arg2)
   } else if(command==='reconnects') {
     check(calls().filter(c=>c.words.includes('send-keys')&&c.words.some(w=>w.startsWith('/mcp reconnect'))).length>=4,'not all MCP reconnect variants typed')
-  } else if(command==='compacted') {
-    const own=personaTranscripts(key!,cumulativeJournal(),readFileSync(join(state!,'server.log'),'utf8').split('\n'),await entries())
-    check(own.some(e=>e.value?.type==='system'&&(e.value.subtype==='compact_boundary'||e.value.compactMetadata)), 'no transcript compaction boundary')
-  } else if(command==='idle-read') {
-    const own=personaTranscripts(key!,cumulativeJournal(),readFileSync(join(state!,'server.log'),'utf8').split('\n'),await entries())
-    const use=own.findLast(e=>blocks(e).some(b=>b.type==='tool_use'&&b.name==='Read'&&b.input?.file_path===arg))
-    const id=use&&blocks(use).find(b=>b.type==='tool_use'&&b.name==='Read'&&b.input?.file_path===arg)?.id
-    check(id&&own.some(e=>e.path===use!.path&&e.offset>use!.offset&&e.value?.type==='user'
-      &&Array.isArray(e.value.message?.content)&&e.value.message.content.some((b:any)=>b.type==='tool_result'&&b.tool_use_id===id&&b.is_error!==true)),
-      'native idle preparation has no successful actual Read response')
   } else if(command==='no-shell') {
     check(!(await entries()).some(e=>e.value?.type==='user'&&JSON.stringify(e.value.message?.content).includes('<bash-input>')), 'body entered native bash-input mode')
   } else if(command==='active-tool'||command==='busy-proof'||command==='busy-proof-wait') {
@@ -261,21 +236,6 @@ try {
       } catch(e) { if(e instanceof Error&&e.message==='AI read-back field differs') throw e }
     }
     check(found,'no JSON read-back for this case')
-  } else if(command==='native-idle-selfcheck') {
-    const env={CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS:'100000',CLAUDE_CODE_PROMPT_CACHE_TTL:'1h'}
-    check(key&&shim,'native idle selfcheck requires both installed binary paths')
-    const old=idleCapability(readFileSync(key),{},{},env)
-    check(!old.supported&&old.reason.includes('no interactive idle'),'native 280 unexpectedly has an unaudited idle policy')
-    const binary=readFileSync(shim)
-    for(const [name,flag,supported,minutes] of [
-      ['off',{},false,null],['log',{mode:'log'},false,null],
-      ['default timer',{mode:'compact'},false,54],['eligible timer',{mode:'compact',fireAtFraction:.5},true,30],
-    ] as const) {
-      const result=idleCapability(binary,{cachedGrowthBookFeatures:{tengu_sunny_locket:flag}},{idleCompaction:true},env)
-      check(result.supported===supported&&(!minutes||result.fireAfterMs===minutes*60000),'real native policy control differs: '+name)
-      console.log('recorded: native idle policy '+name+' '+JSON.stringify(result))
-    }
-    console.log('recorded: native idle controls inspect real binary bytes without model calls or changing rollout/settings')
   } else if(command==='selfcheck') {
     const dir=join(state!,'receipt-controls');mkdirSync(join(dir,'queue'),{recursive:true})
     const adapters=await packedReceiptAdapters(), transcript=join(dir,'session-control.jsonl'), log=join(dir,'shim.log')
@@ -392,20 +352,6 @@ try {
     for(const [name,mutate,reason] of downControls) {
       writeDown();mutate();expectControl('DOWN '+name,downProof,reason)
     }
-    const compactPane=join(dir,'compact-pane.json')
-    for(const [pane,active] of [['✢ Compacting conversation…',true],['❯ The previous request said compacting',false],['✢ Processing…',false]] as const) {
-      writeFileSync(compactPane,JSON.stringify({pane}))
-      expectControl('native active compaction pane '+JSON.stringify(pane),()=>invoke('compact-active',compactPane),active?undefined:'native compacting turn not visible')
-    }
-    write()
-    const compactBoundary={type:'system',subtype:'compact_boundary',sessionId:'session-control',timestamp:new Date(24000).toISOString()}
-    writeFileSync(transcript,readFileSync(transcript,'utf8')+JSON.stringify(compactBoundary)+'\n')
-    expectControl('own explicit compaction boundary',()=>invoke('compacted'))
-    write()
-    writeFileSync(foreignPath,JSON.stringify(compactBoundary)+'\n')
-    expectControl('foreign-directory compaction boundary',()=>invoke('compacted'),'no transcript compaction boundary')
-    writeFileSync(transcript,readFileSync(transcript,'utf8')+JSON.stringify({...compactBoundary,sessionId:'other-session'})+'\n')
-    expectControl('foreign embedded-session compaction boundary',()=>invoke('compacted'),'no transcript compaction boundary')
     const call=(at:number,words:string)=>`call\t${at/1000}\t1\t1\tbun\tsend-keys --instance-id cscb_control ${words}\n`
     const textCall=(at:number)=>call(at,'--text '+texts[0]!.replaceAll('<','\\<').replaceAll('>','\\>')+' --no-enter')
     const writeLaunch=(duplicate=false,textAt=2000,enterAt=2500,duplicateEnter=3500)=>{

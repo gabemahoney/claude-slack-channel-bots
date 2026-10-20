@@ -22,7 +22,7 @@
 #    line each, no unreachable/refused/credentials line, the start pass ends
 #    with `0 not brought up`, and the stub recorded each persona's own
 #    auth.test and apps.connections.open (by token hash) and a WebSocket.
-#    The dialog approver runs after the launch returns, so the start pass
+#    SessionStart may run after the launch returns, so the start pass
 #    does not wait for the launched claude's SessionStart: within
 #    TRANSCRIPT_WAIT_S of the start pass's end each working dir gets a
 #    transcript, and every transcript in it carries stub-claude's session
@@ -546,7 +546,7 @@ expect_record_count 0 "start: a call with an unlabelled token" event=api 'label^
 expect_record_count 0 "start: a call without a token" event=api label=no-token
 
 # The launched `claude` was stub-claude: each working dir gets its transcript
-# once the dialog approver's Enter fires SessionStart. The approver runs
+# once the stub fires SessionStart. The hook runs
 # after the launch returns, so the start pass does not wait for it: wait here.
 for dir in "${ALPHA_TRANSCRIPTS}" "${BRAVO_TRANSCRIPTS}"; do
     wait_until "${TRANSCRIPT_WAIT_S}" \

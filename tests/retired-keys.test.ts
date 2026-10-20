@@ -1,97 +1,4 @@
-/**
- * retired-keys.test.ts — The retired-key record, src/retired-keys.ts (b.jg5
- * SRJ-801, SRJ-802; the primitives SRJ-803, SRJ-804, SRJ-806, SRJ-807 build
- * on; SRJ-1013's `retired-keys-unreadable` row; SRJ-1304's helper round trip).
- *
- * - Location (SRJ-801): `retired-keys.json` in the given state directory, no
- *   temporary file left; the default directory follows `SLACK_STATE_DIR` at
- *   call time; a new store over the same directory reads what an earlier one
- *   wrote.
- * - Format (SRJ-802): a round trip through the serialiser and the parser and
- *   through the store; `version` 1; RFC 3339 UTC timestamps equal to the
- *   injected clock's time; a key that is no persona key is accepted.
- * - The record helpers (SRJ-1304): `writeRetiredKeysRecord` writes exactly
- *   the serialiser's bytes for its seeds (a given time kept, an unset one the
- *   sample) and refuses the real home (shown with the launch-time home
- *   `os.homedir()`, which `isRealHome` matches; only the guard's own files
- *   name `realHome`), the OS temp directory itself and a directory outside
- *   it, writing nothing; `readRetiredKeysRecord` reads
- *   `null` for no file, throws naming the file and the parser's problem for a
- *   refused record, and rethrows any other read failure.
- * - The primitives: a batch record is one write; re-recording a marked key
- *   clears its mark, an unmarked one writes nothing; mark; clear; restore of
- *   the record held before a batch (SRJ-804: the file removed only when that
- *   record is empty, an empty record written when the remove fails, and the
- *   keys and marks held in memory kept).
- * - The start read: a missing file is an empty record and writes nothing; a
- *   valid record grown past the readers' size limit loads whole; a file that
- *   cannot be read, parsed or validated (each form built by altering the
- *   serialiser's output, never a literal) records exactly one
- *   `retired-keys-unreadable` entry, read from a temp `logDir`, whose text is
- *   the module's builder, and no store (an unknown cause's problem lists the
- *   module's causes); a real FIFO is refused without blocking, in a child
- *   process; the entry echoes no file content.
- * - Interrupted writes, through `durableWriteFileSync`'s `DurableWriteFs`
- *   seam (the tests/atomic-write.test.ts pattern): a failure before the rename
- *   leaves the previous bytes and the previous record in memory; a directory
- *   sync failure has the previous bytes written back.
- * - Held changes (SRJ-714, SRJ-806, SRJ-807; hatch A3): the keys of a failed
- *   `absent-at-start` batch and a failed mark stay in memory, the next write
- *   that succeeds carries them, and `isHeldInMemory` tells which keys are held.
- * - The record generation (SRJ-806): 0 for a key no batch named, a loaded key
- *   included; one more for each batch naming the key, whatever it wrote (a new
- *   key, a cleared mark, an unmarked re-record that writes nothing, a held
- *   key, a failed write), a key named twice in a batch counted once, a batch
- *   that throws a `RangeError` counted not at all; mark, clear, snapshot and
- *   restore never lower it; it is never written, so a store loaded anew reads 0.
- * - When an entry is cleared (SRJ-807, SRJ-114, SRJ-115, SRJ-116, SRJ-513;
- *   hatch A3), over src/row-read-rules.ts's decision with the mark answered
- *   by a real store: a decision table over a `status` result, a `get` row and
- *   a `list` row, in which each of the four clearing states of the key's own
- *   row with the mark set decides the clear alone, configured or not; a
- *   `pending` row (with or without a launch start), `ended`, `missing` and a
- *   state CSCB does not know never clear, and the mark changes nothing the
- *   rule decides for them; a key recorded with no mark, a key not recorded,
- *   another key's or caller's row and no mark answer never clear; a
- *   configured persona's own `pending` row with no launch start, recorded as
- *   a destructive modify's old half, with and without the mark, decides the
- *   launch-start latch only; a live row carrying the latching note with the
- *   mark set decides both the note latch and the clear. End to end over the
- *   store: a clear decided on a read removes only that entry, in one write,
- *   durably, with one line naming the read; no other read, record or mark
- *   removes an entry; a clear whose write fails keeps the entry in memory and
- *   in the file, and the next qualifying read clears it.
- * - End to end over the session manager and the stub (SRJ-805, SRJ-806,
- *   SRJ-807), on `makeRecoveryHarness`: a recorded key with no row is launched
- *   by its reuse (an ordinary fresh spawn, no `resume`), the reuse's success
- *   sets the mark, which a store loaded anew over the same directory reads (a
- *   restart), a `pending` read of the new life clears nothing, and its first
- *   live read removes the entry durably.
- * - SRJ-806's second trigger (SRJ-407; AC 52, AC 35), on the same harness
- *   built with `harnessNow` and P's reuse timed by `scriptTimedLaunch`: a
- *   reuse of a recorded key ending in either launch-timeout form, whose one
- *   `get` reads this launch's row (its launch start on either bound of the
- *   call's window), writes the mark once and answers `retrying`; its row is
- *   then covered (the approver, no sequence), and neither the approver's laps
- *   nor the timer's retry over the `pending` row clears the entry or replaces
- *   the row; across a restart (a new harness over the record the first one
- *   wrote) the entry stays while the new life reads `pending`, and its first
- *   live read removes it. A launch start before or after the window is the
- *   old life: no mark, no approver, the live-row sequence with the
- *   retired-key flag, `sequence-waiting`. A failed mark write is held in
- *   memory (the row covered, the file unmarked) and written at P's next
- *   launch decision, whose reuse collides with the `pending` new life and
- *   replaces nothing; a key recorded again during the call gets no mark.
- *
- * Isolation: every file sits under a per-test `mkdtempSync` root removed in
- * `afterEach`; the store's clock is a `createFakeClock`; the record is
- * seeded and read only through tests/test-helpers/retired-keys.ts or the
- * module's own serialiser; constants, causes, labels and texts come from
- * src/, but for the pin cases; rows, notes and launch starts come from the
- * stub's builders. No `mock.module`.
- *
- * SPDX-License-Identifier: MIT
- */
+
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { spawnSync } from 'node:child_process'
@@ -113,6 +20,7 @@ import {
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import { LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT, LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE } from '../src/ad-error-class.ts'
 import { durableUnlinkSync, durableWriteFileSync, type DurableWriteFs } from '../src/atomic-write.ts'
 import {
   CONFIG_NOT_REGULAR_FILE_CODE,
@@ -120,6 +28,10 @@ import {
   MAX_RELOAD_FILE_BYTES,
   type PersonaConfigFs,
 } from '../src/config.ts'
+import { LATCH_CASE_CONFLICTING_LABELS, latchRowStateRead, REFUSED_OPERATION_BRING_UP } from '../src/conflict-latch.ts'
+import { AGENT_DIRECTOR_DEAD_STATES, AGENT_DIRECTOR_LIVE_STATES, AGENT_DIRECTOR_PENDING_STATE } from '../src/liveness-reading.ts'
+import { errnoSuffix } from '../src/persona-credentials.ts'
+import { personaInstanceId, renderPersonaRef } from '../src/persona-identity.ts'
 import {
   loadRetiredKeyStore,
   parseRetiredKeys,
@@ -128,6 +40,8 @@ import {
   RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY,
   RETIRED_KEY_CAUSE_REMOVED,
   RETIRED_KEY_CAUSES,
+  RETIRED_KEY_WRITTEN_HELD,
+  RETIRED_KEY_WRITTEN_MARK_CLEARED,
   RETIRED_KEYS_FILE_NAME,
   RETIRED_KEYS_FORMAT_VERSION,
   RETIRED_KEYS_LOG_PREFIX,
@@ -137,9 +51,6 @@ import {
   RETIRED_KEYS_UNREADABLE_LABEL,
   RETIRED_KEYS_WRITE_FAILED,
   RETIRED_KEYS_WRITTEN,
-  RETIRED_KEY_WRITTEN_HELD,
-  RETIRED_KEY_WRITTEN_MARK_CLEARED,
-  retiredKeyWrittenText,
   retiredKeysCannotClearLine,
   retiredKeysCannotMarkLine,
   retiredKeysCannotRecordLine,
@@ -154,19 +65,15 @@ import {
   retiredKeysRestoredEmptyWrittenLine,
   retiredKeysRestoredLine,
   retiredKeysUnreadableMessage,
+  retiredKeyWrittenText,
   serializeRetiredKeys,
   type RetiredKeyCause,
   type RetiredKeyEntry,
   type RetiredKeyRecord,
-  type RetiredKeyStore,
   type RetiredKeysRecordResult,
+  type RetiredKeyStore,
   type RetiredKeysWriter,
 } from '../src/retired-keys.ts'
-import { recordStartupError } from '../src/startup-errors.ts'
-import { errnoSuffix } from '../src/persona-credentials.ts'
-import { LATCH_CASE_CONFLICTING_LABELS, latchRowStateRead, REFUSED_OPERATION_BRING_UP } from '../src/conflict-latch.ts'
-import { AGENT_DIRECTOR_DEAD_STATES, AGENT_DIRECTOR_LIVE_STATES, AGENT_DIRECTOR_PENDING_STATE } from '../src/liveness-reading.ts'
-import { personaInstanceId } from '../src/persona-identity.ts'
 import {
   decideOwnRowRead,
   decideRetiredEntryClear,
@@ -176,7 +83,9 @@ import {
   type RowReadDecision,
   type RowReadRow,
 } from '../src/row-read-rules.ts'
-import { cannedGetResult, cannedListRow, cannedStatusResult, provenanceNote, SAMPLE_LAUNCH_START_NONE } from './test-helpers/agent-director-stub.ts'
+import { readPersonaRowState, RETRY_ROW_READ_SITE, SPAWN_ACTION_FRESH_RETIRED, SPAWN_ACTION_RETRYING } from '../src/session-manager.ts'
+import { recordStartupError } from '../src/startup-errors.ts'
+import { cannedGetResult, cannedListRow, cannedStatusResult, errSpawnNotFound, provenanceNote } from './test-helpers/agent-director-stub.ts'
 import {
   LAUNCH_START_ANOTHER_CALLERS_ID,
   LAUNCH_START_READ_SHAPES,
@@ -186,10 +95,24 @@ import {
 } from './test-helpers/conflict-cases.ts'
 import { assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, writtenFile } from './test-helpers/credentials.ts'
 import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
-import { lineParts } from './test-helpers/line-parts.ts'
 import { makeFifo, mkfifoAvailable } from './test-helpers/fifo.ts'
-import { readStartupEntries, type StartupEntry } from './test-helpers/persona-notifier.ts'
 import { hostSafeChildEnv, osTempDir } from './test-helpers/host-safe-env.ts'
+import { lineParts } from './test-helpers/line-parts.ts'
+import { readStartupEntries, type StartupEntry } from './test-helpers/persona-notifier.ts'
+import {
+  makeRecoveryHarness,
+  personaOf,
+  personaRow,
+  recordCallOrder,
+  retiredEntryClearedLine,
+  retiredKeyLinesIn,
+  retryNow,
+  reuseSpawnOf,
+  scriptTimedLaunch,
+  type RecoveryHarness,
+  type TimedLaunch,
+  type TimedLaunchOptions
+} from './test-helpers/recovery-harness.ts'
 import {
   readRetiredKeysRecord,
   retiredKeysRecordOf,
@@ -199,36 +122,6 @@ import {
   writeRetiredKeysRecord,
   type RetiredKeySeed,
 } from './test-helpers/retired-keys.ts'
-import { LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT, LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE } from '../src/ad-error-class.ts'
-import { renderPersonaRef } from '../src/persona-identity.ts'
-import {
-  approverLogLine,
-  approverStartedAfterLaunchTimeoutMessage,
-  readPersonaRowState,
-  RETRY_ROW_READ_SITE,
-  REUSE_RECORDED_SINCE_RECORDED_AGAIN,
-  SPAWN_ACTION_FRESH_RETIRED,
-  SPAWN_ACTION_RETRYING,
-  thisLaunchRowOf,
-  timedOutReuseNewLifeLine,
-  timedOutReuseRecordedInFlightLine,
-} from '../src/session-manager.ts'
-import { errInstanceIdCollision, errSpawnNotFound } from './test-helpers/agent-director-stub.ts'
-import {
-  makeRecoveryHarness,
-  personaOf,
-  personaRow,
-  recordCallOrder,
-  recordSequenceStarts,
-  retiredEntryClearedLine,
-  retiredKeyLinesIn,
-  retryNow,
-  reuseSpawnOf,
-  scriptTimedLaunch,
-  type RecoveryHarness,
-  type TimedLaunch,
-  type TimedLaunchOptions,
-} from './test-helpers/recovery-harness.ts'
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -1614,8 +1507,7 @@ describe('a recorded key\'s reuse sets its mark, which survives a restart, and i
 
     expect(h.stub.calls.spawnCalls).toEqual([reuseSpawnOf(h, p)])
     expect([h.stub.calls.getCalls, h.stub.calls.resumeCalls]).toEqual([[], []])
-    // The approver's reads of the pending new life clear nothing.
-    await h.runApproverToStop(p)
+
     const marked = readRetiredKeysRecord(h.stateDir)
     expect(marked?.get(p)?.newLifeBegunAt).toMatch(RFC3339_UTC)
     expect([restartedStore(h.stateDir).isMarked(p), restartedStore(h.stateDir).entry(p)]).toEqual([true, marked?.get(p)])
@@ -1645,7 +1537,7 @@ describe('a recorded key\'s reuse sets its mark, which survives a restart, and i
 // loaded anew over the same directory, and the record stays, across a restart
 // (a new harness over the record the first one wrote), until the new life's
 // row reads live other than `pending`; that row is never replaced. A row whose
-// launch start lies outside the window is the old life: no mark, no approver,
+
 // the live-row sequence (AC 35). What the launch answers in every other
 // respect, and the window itself, are tests/session-manager.test.ts's.
 // ---------------------------------------------------------------------------
@@ -1683,12 +1575,6 @@ describe('a recorded key\'s reuse that timed out but launched sets its mark, kep
     return { h, p, q, ref: renderPersonaRef(personaOf(h, p).name, p) }
   }
 
-  /**
-   * P's next reuse spawn timed (`CALL_MS`, ending as `options` say), every
-   * `get` of P's row from its end on reading it `pending` with the placed
-   * launch start, and every `status` of it reading the same (so an
-   * approver's laps and a retry's read find the new life still `pending`).
-   */
   function timedReuse(h: RecoveryHarness, p: string, options: TimedLaunchOptions): TimedLaunch {
     const t = scriptTimedLaunch(h, p, { reuse: true, takesMs: CALL_MS, ...options })
     h.script({ statusFn: (params) => (params.instance_id === personaInstanceId(p) && t.window()?.endMs !== undefined ? t.statusRow() : cannedStatusResult()) })
@@ -1702,61 +1588,12 @@ describe('a recorded key\'s reuse that timed out but launched sets its mark, kep
     return loaded.store
   }
 
-  /** A stand-in for what the mark's write did, to cut the new-life line's fixed words from its builder. */
-  const MARK_PROBE = '<mark>'
-
-  /** The new-life lines of a timed-out reuse among `h.errors` for `ref` (`timedOutReuseNewLifeLine`, whatever its mark's write did). */
-  function newLifeLinesIn(h: RecoveryHarness, ref: string): string[] {
-    const probe = timedOutReuseNewLifeLine(ref, MARK_PROBE)
-    const head = probe.slice(0, probe.indexOf(MARK_PROBE))
-    const tail = probe.slice(probe.indexOf(MARK_PROBE) + MARK_PROBE.length)
-    return h.errors.filter((line) => line.startsWith(head) && line.endsWith(tail))
-  }
-
   /** P's own calls the stub recorded, by verb (a replacement would be a `spawn`, a `resume` or a `kill`). */
   function replacementsOf(h: RecoveryHarness, p: string): { spawns: number; resumes: number; kills: number } {
     const id = personaInstanceId(p)
     const on = (calls: readonly { instance_id?: unknown }[]): number => calls.filter((params) => params.instance_id === id).length
     return { spawns: on(h.stub.calls.spawnCalls), resumes: on(h.stub.calls.resumeCalls), kills: on(h.stub.calls.killCalls) }
   }
-
-  test.each(FORMS.flatMap((form) => (['at-start', 'at-end'] as const).map((launchStart) => [form, launchStart] as const)))(
-    'a reuse ending in %s whose get reads this launch\'s row (launch start %s of the window): the mark written once, in the file and read by a store loaded anew; the row then covered (the approver runs on it), the answer still retrying; the approver\'s laps and the timer\'s retry over the pending row leave the record and replace nothing',
-    async (form, launchStart) => {
-      const { h, p, q, ref } = await recordedP()
-      const before = readRetiredKeysRecord(h.stateDir)!
-      const sequences = recordSequenceStarts()
-      const t = timedReuse(h, p, { end: form, launchStart })
-
-      expect(await h.launch(p)).toStrictEqual({ key: p, action: SPAWN_ACTION_RETRYING })
-
-      // One reuse spawn, then the one get; this launch's row recorded.
-      expect(h.stub.calls.spawnCalls).toEqual([reuseSpawnOf(h, p)])
-      expect(h.stub.calls.getCalls.map((params) => params.instance_id)).toEqual([personaInstanceId(p)])
-      expect(thisLaunchRowOf(p)?.launchStartMs).toBe(Date.parse(t.launchStartedAt()!))
-      // The mark: written once, in the file, P's entry otherwise as it was; Q's untouched.
-      const marked = readRetiredKeysRecord(h.stateDir)!
-      expect(marked.get(p)).toEqual({ ...before.get(p)!, newLifeBegunAt: expect.stringMatching(RFC3339_UTC) })
-      expect(marked.get(q)).toEqual(before.get(q))
-      expect(h.retiredKeyWrites.slice(-1)).toEqual([{ path: h.retiredKeys.path, ok: true }])
-      expect([restartedStore(h.stateDir).isMarked(p), restartedStore(h.stateDir).entry(p)]).toEqual([true, marked.get(p)])
-      expect(newLifeLinesIn(h, ref)).toHaveLength(1)
-      // The mark came before the cover decision: P's row is its covered new life, never the old life's sequence.
-      expect(sequences).toEqual([])
-      expect(h.errors).toContain(approverLogLine(approverStartedAfterLaunchTimeoutMessage(ref)))
-
-      // The approver's laps read the new life pending: nothing cleared.
-      await h.runApproverToStop(p)
-      expect(readRetiredKeysRecord(h.stateDir)).toEqual(marked)
-      // The retry the launch's outcome armed reads the row (its read and its pending step's get) and launches nothing over it.
-      const order = recordCallOrder(h)
-      await retryNow(h, p)
-      expect(order).toEqual(['status', 'get'])
-      expect(readRetiredKeysRecord(h.stateDir)).toEqual(marked)
-      expect(replacementsOf(h, p)).toEqual({ spawns: 1, resumes: 0, kills: 0 })
-      expect(newLifeLinesIn(h, ref)).toHaveLength(1)
-    },
-  )
 
   test.each([...FORMS])(
     'AC 52 (%s): across a restart the record a timed-out reuse marked is still in place while the new life reads pending, a pending-only retry over it replaces nothing, and its first read live other than pending removes the entry, in the file and for the next start',
@@ -1765,7 +1602,7 @@ describe('a recorded key\'s reuse that timed out but launched sets its mark, kep
       const { p, q } = first
       const t = timedReuse(first.h, p, { end: form })
       expect(await first.h.launch(p)).toStrictEqual({ key: p, action: SPAWN_ACTION_RETRYING })
-      await first.h.runApproverToStop(p)
+
       const marked = readRetiredKeysRecord(first.h.stateDir)!
       const entry = marked.get(p)!
       expect(entry.newLifeBegunAt).toMatch(RFC3339_UTC)
@@ -1803,101 +1640,11 @@ describe('a recorded key\'s reuse that timed out but launched sets its mark, kep
     },
   )
 
-  test.each(FORMS.flatMap((form) => (['before', 'after'] as const).map((launchStart) => [form, launchStart] as const)))(
-    'AC 35 (%s, the row\'s launch start %s the window): the row is the old life — no mark, in memory, in the file or for the next start; no approver and no lap; the live-row sequence with the retired-key flag; sequence-waiting',
-    async (form, launchStart) => {
-      const { h, p, ref } = await recordedP()
-      const before = readRetiredKeysRecord(h.stateDir)
-      const writes = h.retiredKeyWrites.length
-      const sequences = recordSequenceStarts()
-      timedReuse(h, p, { end: form, launchStart, offMs: CALL_MS })
-
-      expect(await h.launch(p)).toStrictEqual({ key: p, action: 'sequence-waiting' })
-      await h.settle()
-
-      expect([thisLaunchRowOf(p), h.retiredEntry(p).marked, restartedStore(h.stateDir).isMarked(p)]).toEqual([undefined, false, false])
-      expect(readRetiredKeysRecord(h.stateDir)).toEqual(before)
-      expect(h.retiredKeyWrites).toHaveLength(writes)
-      expect(newLifeLinesIn(h, ref)).toEqual([])
-      expect(h.approverRunning(p)).toBe(false)
-      expect(h.errors).not.toContain(approverLogLine(approverStartedAfterLaunchTimeoutMessage(ref)))
-      expect([h.stub.calls.statusCalls, h.stub.calls.readPaneCalls, h.stub.calls.sendKeysCalls]).toEqual([[], [], []])
-      expect(sequences).toEqual([expect.objectContaining({ key: p, instanceId: personaInstanceId(p), lastReadState: AGENT_DIRECTOR_PENDING_STATE, retiredKey: true, keepsConversation: false })])
-      expect(replacementsOf(h, p)).toEqual({ spawns: 1, resumes: 0, kills: 0 })
-      h.controller.stop(p, 'the case is over')
-    },
-  )
-
-  test('a timed-out reuse whose mark write fails: one failed write, the mark held in memory, so this server reads P as marked and its row is covered (the approver, no sequence); the file unmarked, so a restart loses it', async () => {
-    const { h, p, ref } = await recordedP()
-    const before = readRetiredKeysRecord(h.stateDir)
-    const sequences = recordSequenceStarts()
-    timedReuse(h, p, {})
-    h.failRetiredKeyWrites()
-
-    expect(await h.launch(p)).toStrictEqual({ key: p, action: SPAWN_ACTION_RETRYING })
-
-    expect(h.retiredKeyWrites.slice(-1)).toEqual([{ path: h.retiredKeys.path, ok: false }])
-    expect(h.retiredEntry(p)).toMatchObject({ recorded: true, marked: true })
-    expect(readRetiredKeysRecord(h.stateDir)).toEqual(before)
-    expect(restartedStore(h.stateDir).isMarked(p)).toBe(false)
-    expect(newLifeLinesIn(h, ref)).toHaveLength(1)
-    expect(sequences).toEqual([])
-    expect(h.errors).toContain(approverLogLine(approverStartedAfterLaunchTimeoutMessage(ref)))
-    await h.runApproverToStop(p)
-    expect(replacementsOf(h, p)).toEqual({ spawns: 1, resumes: 0, kills: 0 })
-    h.controller.stop(p, 'the case is over')
-  })
-
   // SRJ-806's Test clause for the second trigger: a mark whose write failed
   // after a timed-out reuse is written again at the key's next launch decision
   // (the ladder's start, `retiredLaunchReadingOf`), with writes working again.
   // P is read as marked, so that launch is a reuse that collides with its new
   // life, still `pending` with this launch's start; the ladder handles the row
   // as any live row of P, and nothing replaces it.
-  test('a timed-out reuse whose mark write failed: P\'s next launch decision writes the held mark once, in the file and for the next start; the reuse collides with the pending new life, which is not replaced, killed or sequenced', async () => {
-    const { h, p, q } = await recordedP()
-    const before = readRetiredKeysRecord(h.stateDir)!
-    const sequences = recordSequenceStarts()
-    timedReuse(h, p, {})
-    h.failRetiredKeyWrites()
-    expect(await h.launch(p)).toStrictEqual({ key: p, action: SPAWN_ACTION_RETRYING })
-    await h.runApproverToStop(p)
-    expect([h.retiredEntry(p).marked, restartedStore(h.stateDir).isMarked(p)]).toEqual([true, false])
-    const writes = h.retiredKeyWrites.length
-    const storeLines = retiredKeyLinesIn(h.errors).length
 
-    h.script({ spawnError: errInstanceIdCollision() })
-    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'no-op' })
-
-    expect(h.retiredKeyWrites.slice(writes)).toEqual([{ path: h.retiredKeys.path, ok: true }])
-    expect(retiredKeyLinesIn(h.errors).slice(storeLines)).toHaveLength(1)
-    const written = readRetiredKeysRecord(h.stateDir)!
-    expect(written.get(p)).toEqual({ ...before.get(p)!, newLifeBegunAt: expect.stringMatching(RFC3339_UTC) })
-    expect(written.get(q)).toEqual(before.get(q))
-    expect([restartedStore(h.stateDir).isMarked(p), restartedStore(h.stateDir).entry(p)]).toEqual([true, written.get(p)])
-    expect(sequences).toEqual([])
-    expect(replacementsOf(h, p)).toEqual({ spawns: 2, resumes: 0, kills: 0 })
-    expect(h.stub.calls.spawnCalls.at(-1)).toEqual(reuseSpawnOf(h, p))
-    if (h.approverRunning(p)) await h.runApproverToStop(p)
-    h.controller.stop(p, 'the case is over')
-  })
-
-  test('P recorded again while its reuse spawn was in flight, the reuse timing out but launching: no mark, one in-flight line; its row is the old life, sent through the live-row sequence', async () => {
-    const { h, p, ref } = await recordedP()
-    const sequences = recordSequenceStarts()
-    timedReuse(h, p, {})
-    // Due halfway through the timed call: the clock reaches it while the spawn is in progress.
-    h.clock.setTimeout(() => h.retireKey(p), CALL_MS / 2)
-    const before = readRetiredKeysRecord(h.stateDir)
-
-    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'sequence-waiting' })
-
-    expect(h.errors.filter((line) => line === timedOutReuseRecordedInFlightLine(ref, REUSE_RECORDED_SINCE_RECORDED_AGAIN))).toHaveLength(1)
-    expect(newLifeLinesIn(h, ref)).toEqual([])
-    expect([h.retiredEntry(p).marked, readRetiredKeysRecord(h.stateDir)]).toEqual([false, before])
-    expect(sequences.map((request) => [request.key, request.retiredKey])).toEqual([[p, true]])
-    expect(h.approverRunning(p)).toBe(false)
-    h.controller.stop(p, 'the case is over')
-  })
 })

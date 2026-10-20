@@ -1,345 +1,7 @@
 #!/usr/bin/env bash
-# Test 19 (HO §7 scenarios 7, 12 and 18; b.jg5 SRJ-1409, SRJ-1414, SRJ-1419;
-# AC 1, AC 49): reuse replaces delete, and a re-added persona starts fresh.
-#
-# Scenario 7 (SRJ-1409): with `resume_enabled=false`, and separately with a
-# missing transcript, a
-# persona whose row is finished is brought up by a reuse spawn of its own id
-# (`spawn --reuse-finished`), never a delete: the row reads `pending` with a
-# `launch_started_at`, then `waiting`; `get`'s `prior_sessions` archives
-# the earlier life's session; the launch's `pre_trust` line says `ok`; and a
-# `resume` of the new life before it is messaged answers
-# ErrJsonlMissing. In the missing-transcript leg the lost-transcript
-# diagnosis runs before the reuse spawn (b.jg5 SRJ-707, SRJ-708, SRJ-711,
-# SRJ-712, SRJ-413, SRJ-716, SRJ-1306, SRJ-1401, SRJ-1418; E22's hatch note:
-# no CSCB `delete`).
-#
-# Scenario 12 (SRJ-1414): a `missing` row with no session id while a session
-# with the persona's exact name and label runs, and an `ended` row with a
-# stale `config_dir` label while its own session still runs. CSCB deletes
-# nothing: the first gets ErrNoSessionId from its `resume`, the second is
-# never resumed; each reuse spawn of the persona's id is refused (UNAVAILABLE
-# or CONFLICT) while the session runs; once the harness has ended the session
-# a reuse succeeds and the persona starts fresh (b.jg5 SRJ-1414, SRJ-707,
-# SRJ-709, SRJ-410, SRJ-501, SRJ-505, SRJ-716, SRJ-1401, SRJ-1418; E22's hatch
-# note: no CSCB `delete`).
-#
-# Scenario 18 (SRJ-1419): a persona that was messaged, removed and applied,
-# then, after a server restart, added back with the same key, working
-# directory and config directory, comes back by a reuse spawn of its id and
-# is never resumed: the first CSCB spawn after the re-add carries
-# `--reuse-finished`, no CSCB `resume` of its id is made from the removal on,
-# and a harness `get` shows a different current session and archives the old one in
-# `prior_sessions`. The same holds for a messaged persona whose
-# `credentials_file` path changes, a destructive modify (AC 49). A removal
-# records the key `removed`, the old half of a destructive modify
-# `destructive-modify`, and while a key is recorded every launch is a reuse
-# (b.jg5 SRJ-1419, SRJ-803, SRJ-805, SRJ-806, SRJ-807, SRJ-715, SRJ-711,
-# SRJ-1401, SRJ-1418; E25's hatch note: a re-added persona starts fresh by
-# reuse, never resumed).
-#
-# fmk setup (lib/scenario.sh fmk mode; b.jg5 SRJ-1306, SRJ-1401):
-# - its own HOME, agent-director store and tmux server, all under
-#   SCENARIO_ROOT, with the agent-director shim in front of the binary and the
-#   tmux shim first on the PATH of every CSCB process (the bot server, `start`
-#   and `stop` runs), which agent-director inherits;
-# - the release start (SCENARIO_AD_START unset: the 0.11.0 release, installed
-#   by its install.sh at sourcing), at agent-director's default settings (no
-#   config.toml);
-# - CSCB's configuration: `health_check_interval` 0, so no health tick
-#   reconnects or relaunches a persona, and `session_restart_delay` 0, so the
-#   MCP session a stub's exit closes schedules no restart (SRJ-1401: CSCB's
-#   timings are changed only through its configuration); `resume_enabled`
-#   false for leg E, true (the default, written out) for legs F, G, H, J and
-#   K;
-# - every start is live (`start_server --live`), against the loopback Slack
-#   stub (fixtures/slack-stub-server.ts, one for the script, every persona's
-#   token pair answered ok);
-# - each leg has its own persona (key, credentials, channel, directories):
-#   E (`resume_enabled=false` leg), F (missing-transcript leg), G (missing-row
-#   leg), H (stale `config_dir` leg), J (removed-and-re-added leg) and K
-#   (`credentials_file` leg); each is a Slack destination (its channel takes
-#   its permission prompts). K has a second credentials file, its own fake
-#   token pair under its own label, written like every persona's (the Slack
-#   stub answers it ok too). J's and K's claude_config_dir is the scenario
-#   HOME's `.claude`, the directory the stub writes every transcript under, so
-#   a messaged life's transcript is where agent-director's `resume` looks for
-#   its session (`<CLAUDE_CONFIG_DIR>/projects/<slug of the cwd>/<session
-#   id>.jsonl`, the path it tries when the row records no `jsonl_path`;
-#   working default). H's claude_config_dir is a symlink
-#   under SCENARIO_ROOT to one directory, re-pointed to another by
-#   `repoint_symlink` (ruling S5's working default: CSCB writes the
-#   `config_dir` label by real path and compares the persona's directory by
-#   real path, so the re-point makes the row's label stale with no config
-#   edit). Each persona's claude_config_dir (both of H's directories) holds
-#   a `.claude.json` (`{}`), as a user's
-#   Claude config does, so agent-director's pre-trust has a file to write
-#   (`pre_trust` `ok`; with no file it reports `failed`). Between legs the
-#   harness plays the operator while the server is stopped: config.json is
-#   rewritten to the next leg's persona and settings and the last-applied
-#   record moved aside, so the next start applies config.json as it stands
-#   (docs/reload.md). In scenario 18 the operator also edits config.json on
-#   the running server and confirms the change by renaming the pending file
-#   the reload tick writes to the apply file;
-# - checks read only their own leg's ids and window: server.log and
-#   startup-errors.log from the leg's mark line, CSCB's agent-director calls
-#   (`cscb_ad_calls`: only the agent-director shim's lines whose parent is a
-#   CSCB process) from the mark's time; rows by a harness `get` or `status`;
-#   posts from the Slack stub's record from the mark's line;
-# - the harness runs no `find-missing` (b.jg5 SRJ-1401): every row is marked
-#   by agent-director's own hooks or by CSCB's own runs.
-#
-# Stub modes (fixtures/stub-claude.sh): each persona's first life runs
-# `startup-trust` (the reporting stub: the approver's Enter makes it report in,
-# and it writes its transcript before SessionStart). Its new life runs
-# `transcript-on-first-message` (a harness addition): the same dialog and report-in, but no transcript until a message is
-# typed, so the new life's SessionStart finds no transcript, as a real
-# never-messaged life's does. Each life is ended by the harness typing the
-# stub's exit sentinel into the persona's pane (`stub_type_line`, a harness
-# addition): the stub fires SessionEnd and
-# exits, and the row reads `ended`. In scenario 12's legs, G's first life
-# and its leftover run `silent` (no dialog and no hook: the row keeps no
-# session id, and a read of the leftover's pane shows no dialog for CSCB to
-# answer) and G's new life `startup-trust`; H's lives run `startup-trust`. In
-# scenario 18 every life of J and K runs `transcript-on-first-message`, and
-# the harness types a first message into each first life (`stub_type_line`),
-# which writes its transcript.
-#
-# Harness check, first: the two harness additions on a stub the harness
-# starts itself (`seed_unlabelled`, no agent-director and no CSCB process): in
-# `transcript-on-first-message` no transcript exists at its dialog, nor after
-# the human's Enter reports it in, nor for SLASH_HOLD_S after a typed slash
-# command (`/exit`, as CSCB's `pause` types it) shows in the pane; one exists
-# once a line has been typed (`stub_type_line`), and the typed sentinel ends
-# it; `stub_type_line` aimed
-# at a pane that does not exist fails with its FAIL line.
-#
-# Legs, in run order (one scenario HOME, store, tmux server and Slack stub):
-# scenario 7's legs E and F, then scenario 12's legs G and H, then scenario
-# 18's legs J and K.
-#
-# Scenario 7's legs (E, F); each:
-#   1. the persona's first life: config.json with the persona, a start, its
-#      row `waiting`; the harness reads the life's session id (`get`'s
-#      `session_id`);
-#   2. the harness ends that life with the exit sentinel, so the row reads
-#      `ended` and its session is gone; leg F also deletes the life's
-#      transcript, the file the row's `jsonl_path` names (working default:
-#      the harness deletes it under SCENARIO_ROOT, a filesystem step);
-#   3. `transcript-on-first-message` selected for the persona's directory; a
-#      plain `stop`, the leg's mark, and a start. CSCB's first spawn of the
-#      persona collides with the finished row, its collision `get` reads it
-#      `ended`, and:
-#        E (`resume_enabled=false`): the reuse spawn, with no `resume`;
-#        F: CSCB's `resume` meets ErrJsonlMissing, the lost-transcript
-#        diagnosis runs, then the reuse spawn;
-#   4. a background harness `get` of the row (a subshell of the scenario's
-#      own shell), started before the start and stopped once the row reads
-#      `waiting` (through a stop file it checks at the top of its loop, then
-#      reaped, so its reads are whole before they are read), records each
-#      read; checked: a read of `pending` with a
-#      `launch_started_at`, then one of `waiting`, and no `waiting` before it;
-#   5. checked after `waiting`:
-#        - exactly one CSCB-parented `spawn` naming the persona's id with
-#          `--reuse-finished` (agent-director shim's argv) after the mark;
-#        - E: no CSCB `resume` of its id after the mark; F: at least one, and
-#          exactly one diagnosis log line for F after the mark, its time no later
-#          than the reuse spawn's call;
-#        - a harness `get`: `prior_sessions` is an array that holds
-#          the first life's session id;
-#        - exactly one server.log line after the mark that is the launch's
-#          `pre_trust` line for a reuse spawn with value `ok`, as the printer
-#          renders it;
-#        - no CSCB `delete` after the mark, and the row present;
-#   6. working default (the SRD names no caller): the harness's own `resume`,
-#      with no CSCB process able to act on the row: a plain `stop`, the
-#      harness ends the unmessaged new life with the exit sentinel (the row
-#      reads `ended`), then one `resume` of the persona's id through the
-#      harness agent-director call (`ad_capture`), which must exit non-zero
-#      answering ErrJsonlMissing; the row is present afterwards.
-#
-# Scenario 12's legs (G, H), each with a background harness `get` of the row
-# (a subshell of the scenario's own shell, every WATCH_PERIOD_S) from the
-# row's first read until it reads `waiting` again, and the leg's mark before
-# its start:
-#   G (a `missing` row with no session id beside a leftover holding its name;
-#     working default: the silent stub ended by its sentinel before G, then
-#     the leftover seeded):
-#     1. `silent` selected for G's directory; config.json with G, the mark
-#        and a start: CSCB's plain spawn; the row reads `pending` with a
-#        launch start and no `session_id`;
-#     2. before G has passed from the launch start (checked against
-#        `adGraceMs.default`), the harness types the exit sentinel into G's
-#        pane (the silent stub exits with no hook, and its session closes
-#        with it), seeds a leftover (`seed_leftover`) named G's session name
-#        whose `@ad_owner` names an earlier launch of G's id with the store's
-#        own id (`ad_store_id`, `ad_owner_label`) and whose pane carries
-#        `@ad_pane` (`ad_pane_label`), its worker the `silent` stub in G's
-#        directory, and then selects `startup-trust` for G's directory;
-#     3. CSCB's own pending-row runs mark the row `missing` past G; its
-#        `resume` answers ErrNoSessionId and the reuse spawn follows, refused
-#        while the leftover runs; the harness waits for at least two refused
-#        reuse spawns (the first, and a retry at the latch re-check's or the
-#        retry timer's cadence), with none in flight, then ends the leftover
-#        by its session id (`end_session`);
-#     4. the next reuse spawn succeeds and the row reads `waiting`;
-#     5. checked: a background read of `missing`, with a CSCB-parented
-#        `find-missing` after the mark no later than it, and no
-#        `find-missing` from any other process after the mark; at least one
-#        CSCB `resume` of G's id after the mark, and a server.log line
-#        naming ErrNoSessionId on a `resume` of G no later than the first
-#        CSCB reuse spawn of G's id; every CSCB-parented `spawn` of G's id
-#        carrying `--reuse-finished` made before the harness began ending
-#        the leftover (the time taken just before `end_session`) has its
-#        refusal line before then, each UNAVAILABLE or CONFLICT (the class
-#        `classifyAdError` gives the error name it names), at least two,
-#        apart from at most one in flight across that time, whose outcome
-#        is accepted either way; no reuse spawn succeeded before then;
-#        exactly one succeeded after the mark; the row
-#        reads `waiting` with a session id; no CSCB `delete` after the mark;
-#        at least one background read answered and none ErrSpawnNotFound
-#        (another failed read is logged);
-#     6. a plain `stop`, and the harness ends G's new life with the exit
-#        sentinel (the row reads `ended`).
-#   H (an `ended` row with a stale `config_dir` label beside its remaining
-#     session; working default: `remain-on-exit` and the symlink re-point):
-#     1. config.json with H (its claude_config_dir the symlink), a start; the
-#        row reads `waiting`; the harness reads its session id;
-#     2. `set_remain_on_exit` on H's session, then the exit sentinel: the
-#        stub fires SessionEnd and exits, the row reads `ended`, and the
-#        session stays with its pane dead;
-#     3. the symlink re-pointed (`repoint_symlink`), a plain `stop`, the mark
-#        and a start: CSCB's collision `get` reads the row `ended` with a
-#        `config_dir` label that is not the persona's, so it makes a reuse
-#        spawn and no `resume` (SRJ-707's pre-resume guard), refused while
-#        the session remains; the harness waits for at least two refused
-#        reuse spawns, with none in flight, then ends the remaining session
-#        by its session id (`end_session`);
-#     4. the next reuse spawn succeeds and the row reads `waiting`;
-#     5. checked: every CSCB-parented `spawn` of H's id after the mark
-#        carries `--reuse-finished`, apart from the collision ladder's first
-#        spawn of each attempt, which answers ErrInstanceIdCollision and
-#        writes nothing (its collision line; SRJ-111, SRJ-114); the reuse
-#        spawns made before the harness began ending the session each have
-#        their refusal line, UNAVAILABLE or CONFLICT, as for G (one in
-#        flight across that time accepted either way), and none succeeded
-#        before then; exactly one succeeded after the mark; no CSCB
-#        `resume` of H's id after the mark; the row reads `waiting` with a
-#        session id other than the first life's; no CSCB `delete` after the
-#        mark; at least one background read answered and none
-#        ErrSpawnNotFound (another failed read is logged);
-#     6. a plain `stop`, and the harness ends H's new life with the exit
-#        sentinel.
-#
-# Scenario 18's legs (J, K), each with the tmux shim in `log`, so a
-# teardown's kill succeeds. "Messaged" (each first life): the harness reads
-# the life's session id and `cwd` (`get`), checks that no transcript is at
-# the path agent-director's `resume` looks for that session under the
-# persona's claude_config_dir, types a first message into the pane, and waits
-# for the transcript there; the row's `jsonl_path` and `transcript_status`
-# after it are logged.
-#   J (removed and re-added):
-#     1. config.json with J, a start; the row reads `waiting`; the human
-#        messages it;
-#     2. the removal mark; the operator removes J from config.json (no persona
-#        left) and confirms the apply: no pending file before the edit, the
-#        pending file renamed to the apply file, then the apply's
-#        `reload-applied` line (one removed); J's session is gone, the
-#        retired-key record gives J's key the cause `removed`, and J's row is
-#        kept (its state logged);
-#     3. a plain `stop` and a start (no persona);
-#     4. the re-add mark; the operator adds J back, with the same key,
-#        working directory and claude_config_dir, and confirms the apply (one
-#        added); the row reads `waiting` with a session other than the old
-#        one;
-#     5. checked: the first CSCB-parented `spawn` naming J's id after the
-#        re-add mark carries `--reuse-finished`; a harness `get` reads the row
-#        `waiting` with a session other than the old one, and `prior_sessions`
-#        archives the old session exactly once; from the removal
-#        mark on, no CSCB `resume` of J's id and no CSCB `delete`;
-#     6. a plain `stop`, and the harness ends J's new life with the exit
-#        sentinel.
-#   K (`credentials_file` changed):
-#     1. config.json with K (its first credentials file), a start; the row
-#        reads `waiting`; the human messages it;
-#     2. the change mark; the operator points K's `credentials_file` at its
-#        second file and confirms the apply (one destructively modified); the
-#        row reads `waiting` with a session other than the old one; the
-#        retired-key record's cause for K's key, when it still has an entry,
-#        is `destructive-modify` (working default: by then the new life may
-#        have begun and the entry been cleared, SRJ-806, SRJ-807; no entry is
-#        logged);
-#     3. checked, from the change mark on, as J's step 5;
-#     4. a plain `stop`, and the harness ends K's new life with the exit
-#        sentinel.
-#
-# Waits: rows reporting in at ROW_WAIT_S; start passes at START_WAIT_S; a
-# row reading `ended` after the sentinel, and its session going, at
-# ENDED_WAIT_S; the harness check's transcript at TRANSCRIPT_WAIT_S; in
-# scenario 12, the first refused reuse spawn at FIRST_REFUSAL_WAIT_S (G
-# past the launch start, then the retry timer's next run), a second at
-# REFUSAL_WAIT_S (the latch re-check's 120 s, or the retry timer's wait of
-# at most 300 s), and the reuse after the session is ended at
-# REUSE_WAIT_S; in scenario 18, the pending file after an edit at
-# RELOAD_WAIT_S and the apply's line at APPLY_WAIT_S. The
-# pending window is read by the background `get` (POLL_PERIOD_S between
-# reads), with no delay added to the stub: the window lasts from the reuse
-# spawn's reset of the row until the approver's Enter reaches the stub and
-# its SessionStart is applied.
-#
-# Matched values (every one printed by fixtures/fmk-texts.ts from the
-# installed package, never typed here): instance ids and session names
-# (`personaInstanceId`, `personaTmuxSessionName`, src/persona-identity.ts);
-# the `pre_trust` line (`preTrustLogLine` with LAUNCH_VERB_REUSE_SPAWN,
-# src/session-manager.ts, b.jg5 SRJ-413); the diagnosis's fixed fragment
-# (JSONL_DIAGNOSIS_REUSE_WORDING) and its startup-errors classes
-# (JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS, JSONL_TRANSCRIPT_LOST_ENTRY_CLASS,
-# src/session-manager.ts); the error names ErrJsonlMissing and ErrNoSessionId, ErrSpawnNotFound and
-# ErrInstanceIdCollision (`adErrorName`,
-# src/agent-director-errors.ts); the class labels UNAVAILABLE and CONFLICT
-# (`adErrorClass`, src/ad-error-class.ts) and the class of each refusal's
-# error name (`classifyAdError`, a printer entry of scenario 12); G
-# at agent-director's default settings (`adGraceMs.default`,
-# src/ad-settings.ts); the last-applied record's suffix
-# (LAST_APPLIED_FILE_SUFFIX, src/reload.ts); in scenario 18, the pending and
-# apply files' suffixes (PENDING_FILE_SUFFIX, APPLY_FILE_SUFFIX,
-# src/reload.ts), the apply's line (`reloadAppliedLogLine`,
-# src/reload-apply.ts renderAppliedLogLine), the retired-key record's path
-# and causes (`retiredKeysPath`, RETIRED_KEY_CAUSE_REMOVED,
-# RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY, src/retired-keys.ts; its `keys` and
-# `cause` fields are the record format's, SRJ-802, which exports no field
-# name).
-# Quoted, with no exported builder: the diagnosis's log line head
-# `[slack] ErrJsonlMissing diagnostic: ` (src/session-manager.ts
-# diagnoseJsonlMissing, reportInconclusiveDiagnosis); the reuse spawn's
-# refusal line head `[slack] reuseSpawnForPersona: reuse spawn refused for `
-# and success line head `[slack] reuseSpawnForPersona: reuse-spawned `
-# (src/session-manager.ts logRefusal, logConflict and reuseSpawnForPersona,
-# with REUSE_SPAWN_SITE and REUSE_SPAWN_WHAT); the collision ladder's line
-# `[slack] spawnForPersona: <ErrInstanceIdCollision> for <ref> — fetching
-# current state` (src/session-manager.ts runPersonaLadder); the
-# no-transcript line's
-# words ` resume ` and `nothing is deleted` (src/session-manager.ts, the
-# `noTranscript` rows of resumeOrFreshSpawn, the live-row sequence and the
-# latch re-check).
-#
-# Outcomes the SRD leaves open are logged as `NOTE:` lines, not asserted:
-# each leg's CSCB calls of its id by verb, the new life's session id and
-# `transcript_status`, the diagnosis's verdict (its startup-errors entries),
-# and the pending reads' launch starts; in scenario 12, each refusal's error
-# name and description, the background reads' states in order, the posts at
-# the persona's channel, the `pre_trust` value of the reuse, and
-# agent-director's trail records naming G's id, by event; in scenario 18, the
-# messaged row's `jsonl_path` and `transcript_status`, the persona's CSCB
-# spawns after the mark (how many carry `--reuse-finished`), its CSCB calls
-# by verb, the row's state after the removal, the new life's
-# `transcript_status` and `prior_sessions`, and a destructive modify's
-# retired-key entry already cleared.
-#
-# The script ends with the closing assertions, `assert_no_server_tmux`,
-# `assert_no_cscb_include_finished` and `assert_no_cscb_delete` (b.jg5
-# SRJ-1418), in its own shell; their counts read only the shims' lines whose
-# parent is a CSCB process. Later legs of test-19 go before them.
+# Reuse/resume contracts through real AD, including missing/lazy transcripts,
+# prior sessions, row identity, process exit and refusal/retry boundaries.
+
 set -euo pipefail
 
 TEST_NAME="test-19-fmk-reuse"
@@ -461,10 +123,6 @@ CFG_ROOT="${SCENARIO_ROOT}/claude-config"
 mkdir -m 700 "${CREDS_DIR}"
 mkdir -p "${CFG_ROOT}"
 
-# t19_persona <prefix> <short> <channel>: set <prefix>_NAME, _LABEL, _CREDS,
-# _CHANNEL, _WORK, _CFG, _KEY, _ID and _SESSION for one persona, write its
-# credentials file and its Claude config's `.claude.json`, and select
-# `startup-trust` for its working directory.
 t19_persona() {
     local p="$1" short="$2" channel="$3" key value work cfg
     printf -v "${p}_NAME" '%s' "${SCENARIO_TAG}${short}"
@@ -472,7 +130,7 @@ t19_persona() {
     printf -v "${p}_CREDS" '%s' "${CREDS_DIR}/${SCENARIO_TAG}${short}1.json"
     printf -v "${p}_CHANNEL" '%s' "${channel}"
     work="$(make_workdir "${SCENARIO_TAG}${short}_work")"
-    stub_mode "${work}" "${STUB_MODE_STARTUP_TRUST}"
+    stub_mode "${work}" "${STUB_MODE_AT_ONCE}"
     printf -v "${p}_WORK" '%s' "${work}"
     cfg="${CFG_ROOT}/${SCENARIO_TAG}${short}_cfg"
     printf -v "${p}_CFG" '%s' "${cfg}"
@@ -484,7 +142,7 @@ t19_persona() {
     printf -v "${p}_ID" '%s' "${value}"
     t19_value value personaTmuxSessionName "${key}"
     printf -v "${p}_SESSION" '%s' "${value}"
-    stub_mode "${work}" "${STUB_MODE_STARTUP_TRUST}"
+    stub_mode "${work}" "${STUB_MODE_AT_ONCE}"
     printf '{"bot_token": "%s", "app_token": "%s"}\n' \
         "$(fake_token bot "${SCENARIO_TAG}${short}1")" "$(fake_token app "${SCENARIO_TAG}${short}1")" \
         | write_file "${CREDS_DIR}/${SCENARIO_TAG}${short}1.json" 600
@@ -893,7 +551,7 @@ t19_harness_check() {
     require_ci_image "${step}"
     require_scenario_home "${step}"
     dir="$(make_workdir "${SCENARIO_TAG}selfcheck_work")"
-    stub_mode "${dir}" "${STUB_MODE_STARTUP_TRUST}"
+    stub_mode "${dir}" "${STUB_MODE_AT_ONCE}"
     stub_mode "${dir}" "${STUB_MODE_TRANSCRIPT_ON_FIRST_MESSAGE}"
     before="$(t19_transcripts)"
     seed_unlabelled -c "${dir}" "${SCENARIO_TAG}_selfcheck" "${SCENARIO_BIN}/claude" > /dev/null
@@ -1306,8 +964,6 @@ t19_leg_missing_row() {
     watch="${SCENARIO_ROOT}/watch-G.jsonl"
     t19_watch_start "${id}" "${watch}"
 
-    # 2. Before G: the sentinel ends the silent worker (no hook) and its
-    #    session; the leftover is seeded; `startup-trust` is selected.
     stub_type_line "${session}" "${STUB_EXIT_SENTINEL}"
     wait_until "${ENDED_WAIT_S}" "${step}: ${session} is still there after the exit sentinel" t19_no_session "${session}"
     seed_leftover -c "${work}" "${session}" "${id}" "${SCENARIO_BIN}/claude" > "${SCENARIO_ROOT}/seed-G.out"
@@ -1316,7 +972,7 @@ t19_leg_missing_row() {
     awk -v e="${elapsed}" -v g="${GRACE_S}" 'BEGIN { exit !(e + 0 < g + 0) }' \
         || fail "${step}: the leftover was seeded ${elapsed} s after ${id}'s launch start, not before G (${GRACE_S} s)"
     t19_row_is "${id}" pending || fail "${step}: ${id} reads '$(t19_row_state "${id}")' after the leftover was seeded, not pending"
-    stub_mode "${work}" "${STUB_MODE_STARTUP_TRUST}"
+    stub_mode "${work}" "${STUB_MODE_AT_ONCE}"
     echo "${TEST_NAME}: ${step}: the silent worker ended and the leftover ${leftover_sid} (pane ${SEEDED_PANE_ID}, token ${SEEDED_TOKEN}, store ${SEEDED_STORE_ID}) seeded ${elapsed} s after ${id}'s launch start (G ${GRACE_S} s)"
 
     # 3. CSCB's own runs mark the row missing; its resume and reuse follow,

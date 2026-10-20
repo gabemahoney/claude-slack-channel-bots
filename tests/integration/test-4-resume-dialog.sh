@@ -1,33 +1,6 @@
 #!/usr/bin/env bash
-# Test 4: NON-dry-run fresh and resumed launches held at the startup-trust
-# dialog, each cleared by CSCB's dialog approver through agent-director on the
-# launch's `pending` row.
-#
-# Tests 1-3 all run under SLACK_DRY_RUN=1, so nothing there spawns a real bot,
-# meets the real --dangerously-load-development-channels dialog, or resumes.
-#
-# This test exercises the REAL agent-director + REAL tmux spawn/resume path (no
-# SLACK_DRY_RUN) via a small driver that calls the shipped spawnForPersona
-# directly (the full daemon needs each persona's Slack credentials file, which
-# CI lacks). spawnForPersona returns once the launch call returns, with the
-# persona's dialog approver still running; the approver reads the `pending`
-# row and its pane through agent-director and presses Enter with `send-keys`.
-# The driver follows the approver through the package's own seams: it must be
-# running when the launch returns, stop because the row went live, and have
-# kept the launch's start, which on the resumed row equals the row's
-# `launch_started_at`. The driver deletes no row; its cleanup kill leaves the
-# row ended and kept. The driver builds a one-persona config (DRIVER_PERSONA,
-# one channel DRIVER_PERSONA_CHANNEL, working directory
-# DRIVER_WORKING_DIRECTORY) through the installed package's persona resolver;
-# its instance is cscb_<persona key>.
-# A stub `claude` on PATH stands in for the model: it prints the exact
-# startup-trust dialog and fires agent-director's SessionStart hooks on Enter,
-# so the test is deterministic and does not burn the Anthropic API.
-#
-# Requires tmux in the image (docker/Dockerfile.test.base).
-#
-# Depends on Test 1 having installed the package tarball into /test-repo.
-# Runs only in a cscb-ci image: without its marker, refuse before any other step.
+# Test 4: real AD fresh/resumed launches and an unanswered startup hold.
+# The stub reports immediately for positive phases; CSCB never interprets its UI.
 if [[ ! -e /etc/cscb-ci-image ]]; then
     echo "FAIL: test-4-resume-dialog: refused: /etc/cscb-ci-image is absent; this test runs only in a cscb-ci image (/ci)" >&2
     exit 1
@@ -81,18 +54,13 @@ command -v claude >/dev/null 2>&1 \
 [ "$(command -v claude)" = "${STUB_BIN_DIR}/claude" ] \
     || fail "PATH resolves claude to $(command -v claude), expected ${STUB_BIN_DIR}/claude"
 
-# The stub-claude dialog text must stay byte-identical to the needle the
-# approver matches; assert the needle is present in the stub.
-grep -q "I am using this for local development" "${STUB_BIN_DIR}/claude" \
-    || fail "stub claude does not emit the startup-trust needle"
-
 # --- Persona working directory ---------------------------------------------
 mkdir -p "${DRIVER_WORKING_DIRECTORY}"
-printf 'startup-trust\t%s\n' "$(realpath -e -- "${DRIVER_WORKING_DIRECTORY}")" > "${STUB_BIN_DIR}/stub-claude-modes"
+printf 'at-once\t%s\n' "$(realpath -e -- "${DRIVER_WORKING_DIRECTORY}")" > "${STUB_BIN_DIR}/stub-claude-modes"
 git -C "${DRIVER_WORKING_DIRECTORY}" init -q 2>/dev/null || true
 
 # --- Run the driver (NON-dry-run: SLACK_DRY_RUN deliberately unset) --------
-# Write stderr (CSCB console.error, the approver's lines included) to a log
+# Write driver errors to a private log
 # shown on failure; keep stdout (DRIVER: markers) for the phase asserts.
 set +e
 CSCB_PKG_DIR="${PKG_DIR}" \
@@ -121,19 +89,9 @@ fi
 
 # --- Assertions -----------------------------------------------------------
 
-# 1. Fresh launch: the approver cleared the dialog on the `pending` row
-#    through agent-director, and the row went live.
-printf '%s\n' "${DRIVER_OUT}" | grep -q '^DRIVER: PHASE1_OK' \
-    || fail "phase 1: the approver did not clear the startup-trust dialog on the fresh launch's pending row"
-
-# 2. Precondition held: the row went ended/missing with a session_id (resumable).
-printf '%s\n' "${DRIVER_OUT}" | grep -q '^DRIVER: PRECONDITION_OK' \
-    || fail "precondition: row did not reach missing/ended with a recorded session_id"
-
-# 3. Resumed launch: the approver cleared the dialog again on the resumed
-#    `pending` row, kept that row's launch start, and the row went live.
-printf '%s\n' "${DRIVER_OUT}" | grep -q '^DRIVER: PHASE2_OK' \
-    || fail "phase 2: the approver did not clear the startup-trust dialog on the resumed launch's pending row"
+for phase in PHASE1_OK PRECONDITION_OK PHASE2_OK; do
+    grep -q "^DRIVER: ${phase}" /tmp/test-4-driver.out || fail "missing AD lifecycle phase ${phase}"
+done
 
 # 4. Both launches carried `--system-prompt-snapshot off` (the template
 #    installed from a config without `fresh_system_prompt`): the stub recorded
@@ -143,9 +101,9 @@ test -f "${LAUNCH_ARGS_FILE}" \
     || fail "launch arguments: the stub recorded no launch (${LAUNCH_ARGS_FILE} is absent)"
 LAUNCH_COUNT="$(wc -l < "${LAUNCH_ARGS_FILE}")"
 [ "${LAUNCH_COUNT}" -eq 3 ] \
-    || fail "launch arguments: expected 3 recorded launches (fresh, resumed, refused dev dialog), found ${LAUNCH_COUNT}: $(cat "${LAUNCH_ARGS_FILE}")"
+    || fail "launch arguments: expected 3 recorded launches (fresh, resumed, unanswered startup hold), found ${LAUNCH_COUNT}: $(cat "${LAUNCH_ARGS_FILE}")"
 launch_no=0
-for launch_label in fresh resumed refused-dev; do
+for launch_label in fresh resumed held-startup; do
     launch_no=$((launch_no + 1))
     launch_line="$(sed -n "${launch_no}p" "${LAUNCH_ARGS_FILE}")"
     [[ "${launch_line}" != *--dangerously-load-development-channels* && "${launch_line}" != *server:slack-channel-router* ]] \
@@ -156,6 +114,6 @@ for launch_label in fresh resumed refused-dev; do
         || fail "launch arguments: the ${launch_label} launch lacks adjacent '--system-prompt-snapshot off': ${launch_line}"
 done
 
-printf '%s\n' "${DRIVER_OUT}" | grep -q '^DRIVER: DEV_DIALOG_REFUSED_OK' \
-    || fail "the deliberately unsupported dev dialog was answered"
+printf '%s\n' "${DRIVER_OUT}" | grep -q '^DRIVER: STARTUP_HOLD_UNANSWERED_OK' \
+    || fail "the startup hold was automatically answered"
 echo "PASS: ${TEST_NAME}"

@@ -1,19 +1,19 @@
 /** b.omv SR-7.6: one fresh conversation through the real collision/checked lifecycle paths. */
+import type { Client, GetResult, SpawnParams } from 'agent-director'
 import { afterEach, describe, expect, test } from 'bun:test'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import type { Client, GetResult, SpawnParams } from 'agent-director'
-import { applyDeliveryOwnRowRead, inspectPersonaUpgrade, isTagUpgradePending, reconnectMcpWithCause, sendPendingRowLapEnter, setDeliveryLifecycle, setDeliveryPersonaLookup, _resetInFlightLaunches } from '../src/session-manager.ts'
+import { latchRowStateRead } from '../src/conflict-latch.ts'
 import { createDeliveryAdScope } from '../src/delivery-ad-scope.ts'
 import { DELIVERY_MAX_AD_CALLS_PER_S, LAUNCH_SETTLE_MS, RECEIPT_WAIT_MS } from '../src/delivery-engine.ts'
 import { _buildReconnectSessionAdapter } from '../src/server.ts'
-import { latchRowStateRead } from '../src/conflict-latch.ts'
-import { makeRecoveryHarness, personaOf, personaRow, type RecoveryHarness } from './test-helpers/recovery-harness.ts'
+import { _resetInFlightLaunches, applyDeliveryOwnRowRead, inspectPersonaUpgrade, isTagUpgradePending, reconnectMcpWithCause, setDeliveryLifecycle, setDeliveryPersonaLookup } from '../src/session-manager.ts'
 import { cannedFindMissing, cannedKillResult, cannedResumeResult, cannedSpawnResult, cannedStatusResult, errInstanceIdCollision, errTmuxKillFailed } from './test-helpers/agent-director-stub.ts'
-import { writeTranscript, endedTurn } from './test-helpers/working-row-panes.ts'
+import { assertNoLeak } from './test-helpers/credentials.ts'
 import { makeEngineHarness, type EngineHarness } from './test-helpers/delivery-engine.ts'
 import { useImmediateTypingLifecycle } from './test-helpers/legacy-typing.ts'
-import { assertNoLeak } from './test-helpers/credentials.ts'
+import { makeRecoveryHarness, personaOf, personaRow, type RecoveryHarness } from './test-helpers/recovery-harness.ts'
+import { endedTurn, writeTranscript } from './test-helpers/working-row-panes.ts'
 useImmediateTypingLifecycle()
 const cleanups: RecoveryHarness[] = []
 const engines: EngineHarness[] = []
@@ -152,47 +152,20 @@ describe('earlier-release replacement', () => {
     kept(f)
   })
 
-  test('partial budget exhaustion resumes with a fresh composer guard and retains FIFO without duplicate keys', async () => {
-    const f = fleet('waiting', true)
-    const engine = await deliveryFleet(f)
-    for (let i = 0; i < 12; i++) await engine.accept(`burst ${i}`, f.p)
-    engine.engine.wake(f.p)
-    await driveDelivery(engine, f.p, () => engine.calls.length === DELIVERY_MAX_AD_CALLS_PER_S * 10 && engine.clock.pending().some(timer => timer.dueAt === engine.calls[0]!.at + 10000))
-    const paused = engine.calls.length, keys = engine.keyCalls(f.p).length
-    expect(engine.queue.openCount(f.p)).toBeGreaterThan(0)
-    engine.p(f.p).box = 'operator draft during budget pause'
-    const resumesAt = engine.calls[0]!.at + 10000
-    await engine.clock.advanceTo(resumesAt - 1)
-    expect(engine.calls).toHaveLength(paused)
-    await engine.clock.advance(1)
-    await engine.tick(f.p)
-    expect(engine.calls[paused]!.at).toBe(resumesAt)
-    expect(engine.keyCalls(f.p)).toHaveLength(keys)
-    expect(engine.queue.openCount(f.p)).toBeGreaterThan(0)
-    engine.p(f.p).box = ''
-    await driveDelivery(engine, f.p)
-    expect(engine.events.filter(event => event.type === 'delivered').map(event => event.seq)).toEqual(Array.from({ length: 12 }, (_, i) => i + 1))
-    expect(engine.keyCalls(f.p).map(call => call.params.key ?? call.params.text)).toEqual(Array.from({ length: 12 }, (_, i) => [`burst ${i}`, 'Enter']).flat())
-    expect(engine.queue.openCount(f.p)).toBe(0)
-    expect(engine.errors).toEqual([])
-    withinBudget(engine)
-    kept(f)
-  })
-
   test('a marker disappearing at the independent gate read prevents keys in the earlier conversation', async () => {
     const f = fleet('waiting', true)
     const engine = await deliveryFleet(f)
     await engine.accept('queued before marker loss', f.p)
     await engine.tick(f.p)
-    let readyPaneReads = 0
-    engine.p(f.p).readHook = () => {
-      if (engine.clock.now() >= LAUNCH_SETTLE_MS && ++readyPaneReads === 1) {
+    let readyRowReads = 0
+    engine.p(f.p).getHook = () => {
+      if (engine.clock.now() >= LAUNCH_SETTLE_MS && ++readyRowReads === 1) {
         const { tag_prompt: _tag, ...labels } = f.row().labels
         f.change({ state: 'working', labels })
       }
     }
     await engine.advance(LAUNCH_SETTLE_MS + RECEIPT_WAIT_MS)
-    expect(readyPaneReads).toBeGreaterThan(0)
+    expect(readyRowReads).toBeGreaterThan(0)
     expect(engine.keyCalls(f.p)).toEqual([])
     expect(engine.queue.openCount(f.p)).toBe(1)
     expect(isTagUpgradePending(f.p)).toBe(true)
@@ -355,14 +328,6 @@ describe('earlier-release replacement', () => {
     await settle(f)
     expect(f.fresh()).toBe(1)
     expect(f.replacements()).toHaveLength(1)
-    expect(f.h.stub.calls.sendKeysCalls).toEqual([])
-    kept(f)
-  })
-
-  test('a supported startup prompt is never answered on an earlier-release row', async () => {
-    const f = fleet('pending')
-    f.h.script({ getResult: f.row() })
-    await sendPendingRowLapEnter(f.p)
     expect(f.h.stub.calls.sendKeysCalls).toEqual([])
     kept(f)
   })

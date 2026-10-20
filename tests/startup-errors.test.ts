@@ -1,48 +1,12 @@
-/**
- * startup-errors.test.ts — `recordStartupError` (`src/startup-errors.ts`):
- * its `omitStderr` option, and one entry of each `startup-errors.log` class,
- * read back from the case's own log directory (b.jg5 SRJ-1013, SRJ-702,
- * SRJ-704, SRJ-909).
- *
- * The `omitStderr` cases run each call in a child `bun` process
- * (`runInFakeHome`), so everything the call writes to fd 2 is captured whole,
- * however it is written. The child's HOME, state directory and `logDir` are
- * the case's own `mkdtempSync` tree, and the case checks that nothing else
- * was written there.
- *
- * The class cases (SRJ-1013's Test line: one case per class, reading the
- * entry from a temp log directory) run in process. Each drives the class's
- * producing path, the route or the entry builder its module exports, with the
- * real `recordStartupError` writing into the case's own directory: through
- * the producer's recorder seam (`logDir`), or, where the producer imports
- * the recorder itself (the start sweep, the launch, the dialog approver),
- * through `SLACK_STATE_DIR`, which the recovery harness or the case points
- * at its own directory and puts back. Every entry is read with
- * `readStartupEntries`; every label, builder, phrase, context and count comes
- * from `src/` or the helpers, and every agent-director error from the stub's
- * builders. The server-log line each entry comes with is `recordStartupError`'s
- * own fd-2 copy (pinned by the `omitStderr` cases above), and the route's own
- * line where the route writes one.
- *
- * The stopped-retry cases (SRJ-702, SRJ-704, SRJ-1013; AC 64) drive a launch
- * attempt's live-row sequence on the recovery harness (its kill-failure
- * alerts installed as `main()` installs them, its notices through the real
- * notifier with one Slack stub per persona): its kill's tries stopped between
- * tries by the persona's removal, its teardown, its stopping being up or a
- * server shutdown. The old-life wait's stopped kills, the hold-end control
- * and the start sweep's stopped kill are their own files' cases
- * (`tests/old-life-wait.test.ts`, `tests/session-manager.test.ts`).
- *
- * SPDX-License-Identifier: MIT
- */
+
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
 import { classifyAdError, describeAgentDirectorFailure, killFailedDescriptionOf } from '../src/ad-error-class.ts'
-import { adAlertThresholdMsInEffect, adLaunchBoundMsInEffect, resetAdSettingsForTests } from '../src/ad-settings.ts'
+import { adAlertThresholdMsInEffect } from '../src/ad-settings.ts'
 import {
   AD_VERSION_RECHECK_INTERVAL_MS,
   AD_VERSION_RECHECK_STOP_EXIT_CODE,
@@ -55,7 +19,7 @@ import {
   createAdVersionRecheck,
   type AdVersionRecheck,
 } from '../src/ad-version-gate.ts'
-import { getClient, resetClientForTests, setClientForTests } from '../src/agent-director-client.ts'
+import { resetClientForTests } from '../src/agent-director-client.ts'
 import { runAgentDirectorStartupGate } from '../src/agent-director-startup.ts'
 import { KILL_OUTCOME_KILLED, describeKillOutcome, killOutcomeOf } from '../src/checked-kill.ts'
 import {
@@ -73,7 +37,7 @@ import {
   type CliTeardownPersona,
 } from '../src/cli-teardown.ts'
 import { configReadFailurePredicate, type Persona } from '../src/config.ts'
-import { AD_SYSTEM_INSTALL_TOO_OLD, AD_BELOW_PHASE1_FLOOR } from '../src/install-check-labels.ts'
+import { AD_BELOW_PHASE1_FLOOR, AD_SYSTEM_INSTALL_TOO_OLD } from '../src/install-check-labels.ts'
 import { renderInstallSkillInstructions } from '../src/install-skill-pointer.ts'
 import {
   KILL_FAILURE_CLOSING_CLI_TEARDOWN,
@@ -106,46 +70,25 @@ import {
   type KillRetryAlert,
   type KillRetryResult,
 } from '../src/kill-retry.ts'
-import { AGENT_DIRECTOR_PENDING_STATE, LIVENESS_DEAD_ROW_ENDED } from '../src/liveness-reading.ts'
 import {
   LIVE_ROW_OUTCOME_STOPPED,
   LIVE_ROW_STOP_SHUTDOWN,
   LIVE_ROW_STOP_TEARDOWN,
   liveRowStopCauseText,
 } from '../src/live-row-sequence.ts'
-import { _resetOutageState, initOutageState } from '../src/outage-state.ts'
-import { parseLaunchStart } from '../src/pending-row.ts'
 import {
   PERSONA_UNCLASSIFIED_ERROR_LABEL,
-  personaUnclassifiedErrorEntryText,
-  type KillFailureAlerts,
-  type UnclassifiedErrorEpisodes,
   unclassifiedErrorAlertText,
+  type KillFailureAlerts,
+  type UnclassifiedErrorEpisodes
 } from '../src/persona-episodes.ts'
 import { personaInstanceId, personaTmuxSessionName, renderPersonaRef } from '../src/persona-identity.ts'
 import { PERSONA_TEARDOWN_NOTICE_RAISED } from '../src/persona-notifier.ts'
 import { RETIRED_KEYS_UNREADABLE_LABEL, readRetiredKeysAtStart, retiredKeysPath, retiredKeysUnreadableMessage } from '../src/retired-keys.ts'
-import {
-  APPROVER_BOUND_FROM_LAUNCH_START,
-  APPROVER_STOP_BOUND,
-  APPROVER_STOP_FINISHED,
-  PERSONA_KILL_STOP_CAUSE_NOT_UP,
-  STARTUP_ERROR_APPROVE_NOT_READY,
-  STARTUP_ERROR_APPROVE_SPAWN_DIED,
-  STARTUP_ERROR_SPAWN_FAILED,
-  _resetApproverClock,
-  _setApproverClock,
-  approvePreSessionDialogs,
-  approverBoundMessage,
-  approverFinishedMessage,
-  approverLogLine,
-  setSessionNotifier,
-  startSweepKillFailedEntry,
-} from '../src/session-manager.ts'
+import { PERSONA_KILL_STOP_CAUSE_NOT_UP, STARTUP_ERROR_SPAWN_FAILED, startSweepKillFailedEntry } from '../src/session-manager.ts'
 import { recordStartupError, type StartupErrorOptions } from '../src/startup-errors.ts'
+import { expectRuntimeEntryPointsToDebugSkill } from './test-helpers/ad-version-entries.ts'
 import {
-  SAMPLE_LAUNCH_START_DEFAULT,
-  cannedStatusResult,
   errInternal,
   errSystemInstallTooOld,
   errTmuxKillFailed,
@@ -155,15 +98,14 @@ import {
   makeStubClient,
   makeStubCreateClient,
   makeStubResolveSystemBinary,
-  type StubResolveSystemBinaryOutcome,
+  type StubResolveSystemBinaryOutcome
 } from './test-helpers/agent-director-stub.ts'
 import { CLIENT_MIN_VERSION, DEV_PLACEHOLDER_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
-import { assertNoLeak, LEAK_SENTINEL, sentinelInMessage, writtenFile } from './test-helpers/credentials.ts'
+import { LEAK_SENTINEL, assertNoLeak, sentinelInMessage, writtenFile } from './test-helpers/credentials.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { runInFakeHome } from './test-helpers/fake-home-subprocess.ts'
 import { STALE_VERSION } from './test-helpers/install-check-fixtures.ts'
 import { flat } from './test-helpers/markdown.ts'
-import { expectRuntimeEntryPointsToDebugSkill } from './test-helpers/ad-version-entries.ts'
 import { listed, sweepOver } from './test-helpers/old-life.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import {
@@ -668,86 +610,6 @@ describe('b.jg5 SRJ-1013, SRJ-802: retired-keys-unreadable', () => {
 
     expect(onlyEntry(logDir, RETIRED_KEYS_UNREADABLE_LABEL)).toBe(retiredKeysUnreadableMessage(path, configReadFailurePredicate('EISDIR')))
     expect(logs).toEqual([])
-  })
-})
-
-// ---------------------------------------------------------------------------
-// The dialog approver's classes (SRJ-402, SRJ-404, SRJ-405), the approver run
-// directly on a fake clock over the stub client, `SLACK_STATE_DIR` pointing at
-// the case's log directory
-// ---------------------------------------------------------------------------
-
-describe('b.jg5 SRJ-1013, SRJ-402, SRJ-405: dev-channels-approve-spawn-died and dev-channels-approve-not-ready, from a start-pass approver', () => {
-  const KEY = 'ops_bot'
-  const REF = renderPersonaRef('Ops Bot', KEY)
-  let savedStateDir: string | undefined
-  let lines: string[]
-  let notices: Array<{ key: string; text: string }>
-  let savedConsoleError: typeof console.error
-
-  beforeEach(() => {
-    savedStateDir = process.env['SLACK_STATE_DIR']
-    process.env['SLACK_STATE_DIR'] = logDir
-    lines = []
-    notices = []
-    savedConsoleError = console.error
-    console.error = (...args: unknown[]) => {
-      lines.push(args.map(String).join(' '))
-    }
-    initOutageState({
-      notify: (key, text) => {
-        notices.push({ key, text })
-      },
-      getClient,
-    })
-    setSessionNotifier((key, text) => {
-      notices.push({ key, text })
-    })
-  })
-
-  afterEach(() => {
-    console.error = savedConsoleError
-    try {
-      // The approver posts nothing (b.jg5 SRJ-405).
-      expect(notices).toEqual([])
-      assertNoLeak({ lines, notices, file: writtenFile(join(logDir, LOG_NAME)) })
-    } finally {
-      _resetApproverClock()
-      _resetOutageState()
-      setSessionNotifier(undefined)
-      resetClientForTests()
-      resetAdSettingsForTests()
-      if (savedStateDir === undefined) delete process.env['SLACK_STATE_DIR']
-      else process.env['SLACK_STATE_DIR'] = savedStateDir
-    }
-  })
-
-  /** Run a start-pass approver for KEY over a stub whose `status` answers `row`, on a fake clock from `startMs`, to its stop. */
-  async function approveOver(row: ReturnType<typeof cannedStatusResult>, startMs: number): Promise<string> {
-    const clock = createFakeClock({ start: startMs })
-    _setApproverClock(clock)
-    setClientForTests(makeStubClient({ statusResult: row }) as unknown as Parameters<typeof setClientForTests>[0])
-    let stop: string | undefined
-    void approvePreSessionDialogs(KEY, true, REF).then((reason) => {
-      stop = reason
-    })
-    for (let fired = 0; stop === undefined && fired < 1_000; fired++) {
-      await clock.flush()
-      if (stop === undefined) await clock.runNext()
-    }
-    expect(clock.pendingCount()).toBe(0)
-    return stop!
-  }
-
-  // Rows: the row's state, the stop, the entry's class and its message (the persona, and the state read or B).
-  test.each<[string, string, string, string, () => string]>([
-    ['dev-channels-approve-spawn-died: a row read ended, written at once, naming the persona and the state read', LIVENESS_DEAD_ROW_ENDED, APPROVER_STOP_FINISHED, STARTUP_ERROR_APPROVE_SPAWN_DIED, () => approverFinishedMessage(REF, LIVENESS_DEAD_ROW_ENDED)],
-    ['dev-channels-approve-not-ready: a row still pending at B, naming the persona and B from its launch start', AGENT_DIRECTOR_PENDING_STATE, APPROVER_STOP_BOUND, STARTUP_ERROR_APPROVE_NOT_READY, () => approverBoundMessage(REF, adLaunchBoundMsInEffect(), APPROVER_BOUND_FROM_LAUNCH_START)],
-  ])('%s: one entry and one approver line; nothing is posted', async (_label, state, stopReason, classLabel, message) => {
-    expect(await approveOver(cannedStatusResult({ state }), parseLaunchStart(SAMPLE_LAUNCH_START_DEFAULT)!)).toBe(stopReason)
-
-    expect(onlyEntry(logDir, classLabel)).toBe(message())
-    expect(lines.filter((line) => line === approverLogLine(message()))).toHaveLength(1)
   })
 })
 

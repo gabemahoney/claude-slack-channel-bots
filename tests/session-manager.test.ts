@@ -1,830 +1,13 @@
 import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
-/**
- * session-manager.test.ts — Library-backed session-manager tests.
- *
- * Replaces the deleted tmux-direct test suite. Drives spawnForPersona via the
- * agent-director-stub (no real FFI). Coverage:
- *
- *   - Fresh-spawn happy path: emits SpawnParams matching SR-1.1 and the
- *     persona identity of b.av2 SR-2.2 (relay_mode='on', template name,
- *     `cscb_<key>` / `slack_bot_<key>`, the `service` / `persona` /
- *     `config_dir` labels plus the interim `channel` label, and the persona
- *     spawn environment).
- *   - The real-path `config_dir` label (b.av2 SR-1.5, SR-2.2).
- *   - AC 3: one persona listed in two channels is spawned exactly once.
- *   - SR-1.4 idempotency: ErrInstanceIdCollision → client.get(); each state
- *     drives the documented branch. Collision fixtures build their row for
- *     the persona under test (`personaRow`), so its `cwd` and `config_dir`
- *     label match and each case stays on the path it tests.
- *   - b.jg5 SRJ-104: a `resume` rejecting with ErrInvalidFlags makes exactly
- *     one immediate version re-check (the real installed re-check over a
- *     counting stub `resolveSystemBinary` and an unmoved fake clock), logs one
- *     UNCLASSIFIED line and kills, deletes, spawns and resumes nothing more;
- *     an ErrNoSessionId makes no re-check. A re-check that answers stop posts
- *     no spawn-failure notice, answers `{ failed, stopping }` and makes
- *     `launchSession` answer `'skipped'`; after a pass or could-not-run it
- *     takes SRJ-105's UNCLASSIFIED row (b.jg5 SRJ-313, on
- *     `makeRecoveryHarness`): no notice, one refusal line, `retrying`
- *     (b.jg5 SRJ-1015), the timer armed with the UNCLASSIFIED cause, never counted,
- *     and reported once (over recording sinks: exactly once, with the site's
- *     classification) to the persona's unclassified-error episode.
- *   - b.jg5 SRJ-313 (SRJ-105's UNCLASSIFIED row, AC 69), on
- *     `makeRecoveryHarness`: every spawn, resume, kill, delete, reconnect
- *     keystroke and findMissing sweep of the ladder, fed an `ErrInternal`
- *     (not the unusable recorded name) and an unhandled name, and every
- *     action site fed `ErrSystemInstallDisappeared` (which still raises
- *     `ad-unreachable`), is refused as an UNAVAILABLE outcome is, arms the
- *     timer with the UNCLASSIFIED cause, never starts the condition, and is
- *     reported to the persona's unclassified-error episode (B's untouched);
- *     an `ErrInternal` at a read keeps the read-error cause and is reported
- *     too. Over recording sinks, each such outcome is handed to the sink
- *     exactly once and arms once; outside an attempt nothing is reported.
- *     The `errGeneric` cases whose point is a launch failure use the LAUNCH
- *     FAILURE answer (`ErrTmuxSessionCreate`), and a findMissing rejection
- *     the launch proceeds past is an UNUSABLE NAME answer (a sweep is not a
- *     verb on the persona's own row, so it latches no one).
- *   - b.jg5 SRJ-301 / SRJ-302 launch attempt: with a trigger sink installed
- *     through `initOutageState` (a recording sink, or the real
- *     `createUnavailableRetryController` on a fake clock, stopped in
- *     afterEach with nothing pending and nothing run), an UNAVAILABLE spawn
- *     and an UNCLASSIFIED collision `get` arm the persona's timer and the
- *     launch answers `retrying` (`launchSession` answers `'refused'`, b.jg5
- *     SRJ-1015); a LAUNCH FAILURE spawn arms the timer pending-only and is
- *     counted, never `retrying`; a DIRECTORY spawn, or no sink at all,
- *     stays `failed` (`launchSession` false); a joiner shares the result; a
- *     start pass with one UNAVAILABLE persona counts it `retrying`, never
- *     failed, and arms only that persona.
- *   - b.jg5 SRJ-105 (AC 25), on `makeRecoveryHarness`: every spawn and
- *     resume (the replacement sites' reuse spawns included) and reconnect
- *     keystroke (its one `send-keys`, at the `waiting` and `working`
- *     branches) of the ladder, fed `ErrUnknownErrorName`,
- *     `ErrCallTimeout`, a wrapped `UnknownError` and `ErrTmuxUnresponsive`,
- *     makes no kill, delete or launch after it and no dead-session resume, posts no spawn-failure
- *     notice, records no `spawn-failed` entry, answers `retrying`
- *     (`launchSession` `'refused'`) and is never counted; B launches as
- *     before. At the reconnect the answer is SRJ-118's `transient` (its
- *     own two lines, `reconnectTransientLine` and the ladder's
- *     `transientReconnectLine`, in place of the refusal line). The read-error row: the collision `get` and the
- *     ErrJsonlMissing diagnosis `get`, fed those forms, an UNCLASSIFIED read
- *     error and a store that cannot be opened, likewise, and start no
- *     condition; `ErrSpawnNotFound` keeps each site's meaning.
- *     SRJ-105's CONFIG row (b.jg5 SRJ-316): every one of those sites, and
- *     each findMissing sweep, fed `ErrConfigMalformed`, is refused the same
- *     way, arms P's timer with the CONFIG cause, starts no condition, never
- *     reaches the inconclusive report, and raises P's
- *     `ad-config-malformed` with one onset. A replace path makes no kill (a
- *     live row's kills are the live-row sequence's: the SRJ-702 and SRJ-704
- *     describes drive them from a replacement site, and SRJ-110 at each such
- *     site is the SRJ-707 describe's). The
- *     approver's pane read and Enter, the working-row pane read and the
- *     persona teardown's kill keep their outcomes. At most one onset across
- *     several retries past the floor; none for a refusal that clears, or for
- *     `ErrTmuxKillFailed`.
- *   - b.jg5 SRJ-105's CONFLICT row, SRJ-501, SRJ-502, SRJ-111, SRJ-113,
- *     SRJ-1015 (AC 7's unit half), on `makeRecoveryHarness` with its latch
- *     composed as `main()` composes it: every spawn and resume of the
- *     ladder, fed each case-table row for its verb
- *     (`tests/test-helpers/conflict-cases.ts`), latches P with the row's case
- *     and session, the site's refused operation and the state the path last
- *     read (one latch-time `status` read where it read nothing, none added
- *     where it did); the refused call is the last; the holds run before one
- *     CONFLICT notice; nothing counted, posted as a spawn failure or recorded
- *     `spawn-failed`. A latched P is launched by no path (`spawnForPersona`
- *     either way, `launchSession` `'skipped'`, the start pass) with no
- *     agent-director call or trust patch; B launches. A failing latch-time
- *     read records an unreadable state and its timer and episode are ended
- *     by the holds. With no latch installed a CONFLICT still answers
- *     `latched` and latches nothing; a latch the gate cannot read is taken as
- *     latched; a latch whose set throws still answers `latched`.
- *   - b.jg5 SRJ-105's UNUSABLE NAME row, SRJ-512 (E16), on
- *     `makeRecoveryHarness`: an UNUSABLE NAME answer, each fault of the
- *     case table's rows for the site (`UNUSABLE_NAME_CASE_ROWS`), at every
- *     ladder spawn and `resume` (its reuse spawns included), at the
- *     working-pane read (the launch wait's evidence read and
- *     `checkWaitingRowPane` → `defer`, never `reconnect`; `checkWorkingRowPane`
- *     on the working-row verdict's pane makes no read of its own), at the
- *     shared own-row `status` read (its four answers; the wait's poll and
- *     timeout, `reconcileAndReadRowState`, the retry timer's row read, the
- *     latch-time read, which records unreadable and reads once) and at E14's
- *     shared own-row `get` read (the collision `get`, the ErrJsonlMissing
- *     diagnosis `get`, the transcript `get`, the post-run `get` after
- *     `unverified_ids`) latches P with "unusable recorded name", "none" and
- *     the state its path last read; nothing is called after it; nothing
- *     counted, no spawn-failure notice, `spawn-failed`
- *     entry, `tmux-unresponsive` onset or unclassified episode; one SRJ-1019
- *     post; B launches. Controls: a phrase-less `ErrInternal` keeps E12's
- *     UNCLASSIFIED handling, and the persona teardown's kill and delete
- *     rethrow and latch nothing.
- *   - b.jg5 SRJ-117 (E18), with SRJ-501, SRJ-502 and SRJ-512, on
- *     `makeRecoveryHarness`: the shared read-pane of a persona's own row
- *     (`readPersonaOwnPane`) makes exactly one `read-pane` of `cscb_<key>`
- *     with the given line count (`FULL_PANE_READ_LINES` at every full read)
- *     and no other verb; a pane, GONE, absent, UNAVAILABLE
- *     (each `read-pane` form of `UNAVAILABLE_FORMS`), UNCLASSIFIED,
- *     ENVIRONMENT (P's `tmux-unavailable` raised once) and CONFIG (P's
- *     `ad-config-malformed` raised once, never GONE) are returned unchanged
- *     with the classifier's class and the redacted description; a CONFLICT
- *     (each `LIVENESS_PANE_CONFLICT_CASE_ROWS` row, with its site's recorded
- *     state) latches P once with "P's next check or recovery", and an
- *     UNUSABLE NAME (each fault) with "none", each with one post and no
- *     further call; a latched P is not read. Controls: no latch installed,
- *     a latch whose set or latched query throws, another persona's reads.
- *     At `readWorkingPane`'s two callers (the launch wait's evidence read
- *     and the waiting-row check) a CONFLICT of the site's rows latches P with
- *     the site's state and nothing is typed. A failed pane read's line at
- *     those callers closes with its `read-pane` class. An `ErrInvalidFlags`
- *     answer makes exactly one immediate version re-check (the real
- *     installed one over a counting stub `resolveSystemBinary`) and is then
- *     UNCLASSIFIED, reported inside P's attempt unless the re-check stops;
- *     no other answer re-checks (b.jg5 SRJ-104, SRJ-204).
- *   - b.jg5 SRJ-605: the working-row wait's `status` reads make no tmux
- *     probe. `ErrSpawnNotFound` at the poll or the timeout read is
- *     `dead-session` with one line, and the ladder's recovery decides what
- *     holds the name (its fresh spawn's CONFLICT latches P). Every other
- *     `status` error (E10's UNAVAILABLE builders, UNCLASSIFIED with
- *     `ErrSystemInstallDisappeared`, ENVIRONMENT in both forms, CONFIG) is no
- *     refusal: at the poll the wait polls on with no post (one line per run
- *     of a class), at the timeout read it ends `not-reconnected` through the
- *     wait-ended report (its line and, at `session_restart_delay` 0, its
- *     notice, from the exported builders); the launch answers the wait's
- *     outcome, never `failed` or refused, with no `spawn-failed` entry and
- *     nothing counted, while the wrapper raises the error's outage once and
- *     arms P's timer. Directly on the session manager's fake clock, and on
- *     `makeRecoveryHarness` for each read-error, ENVIRONMENT, CONFIG and
- *     UNCLASSIFIED describe's errors (`WAIT_STATUS_SITES`).
- *   - b.jg5 SRJ-117's launch-wait column, SRJ-608: at the launch wait's
- *     evidence read, CONFLICT latches P with the state its poll read and ends
- *     the wait with no further call and nothing typed (`latched`,
- *     `launchSession` `'skipped'`); GONE, the row absent, UNAVAILABLE,
- *     ENVIRONMENT, CONFIG and UNCLASSIFIED are no evidence and the wait polls
- *     on; an `ErrInvalidFlags` whose re-check decides the stop ends the wait
- *     with `{ failed, stopping }` and nothing posted or recorded.
- *   - b.jg5 SRJ-117's waiting-row column, SRJ-604: `checkWaitingRowPane`
- *     answers GONE with `gone` and the row absent with `absent`, nothing
- *     typed; ENVIRONMENT defers with `tmux-unavailable` raised; UNAVAILABLE,
- *     CONFIG (`ad-config-malformed` raised) and UNCLASSIFIED reconnect on the
- *     `waiting` row alone with one line; the read is the only call. b.jg5
- *     SRJ-603: `checkWorkingRowPane` folds the pane the
- *     working-row verdict read, makes no `read-pane`, and reads the
- *     transcript only after an idle pane; the adapter's latched gate
- *     (`latchedNow`), asked before a deferral is noted and before the
- *     blocked-on-prompt notice, makes it defer with its evidence forgotten,
- *     no deferral noted and no notice (the waiting-row check asks it before
- *     the notice only). Each escalate-dead verdict's line carries its text
- *     from `ESCALATE_DEAD_EVIDENCE`, and none says "dead"; the sweep's line
- *     (`escalateDeadSweepLine`, pinned once) promises no dead reading, since
- *     the row may stay live for further ticks (b.jg5 SRJ-610), and the five
- *     reconnect lines logged before such a sweep promise no relaunch: each
- *     ends with `ESCALATE_DEAD_REPROBE_DECIDES` (checked once, beside the
- *     sweep line's pin).
- *   - b.jg5 SRJ-513, SRJ-1020 (E16 T2), with SRJ-114's and SRJ-115's sites,
- *     on `makeRecoveryHarness`: a configured persona's own row reading
- *     `pending` with no launch start (`LAUNCH_START_CASE_ROWS`: absent,
- *     `null` or unparseable; P's current life, another `cwd`, another
- *     `config_dir` label) at E14's four `get` sites and at the shared
- *     own-row `status` read's sites latches P with "launch start not
- *     recorded", "none" and `pending`; nothing is called after that read; one
- *     SRJ-1020 post; at the latch-time read that latch
- *     stands alone (no CONFLICT or UNUSABLE NAME latch or post on top).
- *     Controls: the same row with a launch start keeps today's `pending`
- *     branch, a key the configured-persona query does not hold latches no
- *     one, and the permission poller's and the JSONL persistence
- *     safeguard's `get`s (SRJ-122) latch and post nothing.
- *   - b.jg5 SRJ-807, with SRJ-114's and SRJ-115's sites, on
- *     `makeRecoveryHarness` (its one retired-key store installed as `main()`
- *     installs it, the record seeded with P and B marked): a retired key's
- *     own row read `waiting`, `working`, `ask_user` or `check_permission`
- *     with its mark set clears its entry, durably, with one write and one
- *     line naming the read, at the shared own-row `get` read (each state;
- *     the ladder's collision `get`, which then reconnects as before; a key
- *     outside the applied set; a read that also latches on the
- *     `provenance_conflict` note) and at the own-row `status` step (each
- *     state; the working-row wait's poll); every answer is the read's as
- *     before, and B's entry stays. Controls: an unmarked key, a `pending` row
- *     with a launch start, and a configured persona's own `pending` row with
- *     none (which latches P), an absent row (`ErrSpawnNotFound` to the `get`
- *     and the `status` read), no store installed and a mark query that
- *     throws leave the file byte-identical with no write. A
- *     refused write leaves the entry, in memory and in the file, with one
- *     line, the ladder acting as usual, and the next qualifying read clears it.
- *   - b.jg5 SRJ-303 / SRJ-115 the retry timer's row read
- *     (`readPersonaRowState`): one `status` call for `cscb_<key>` and no
- *     other, answering each state as is (`pending` included), a `pending`
- *     row's launch start raw and no launch start for any other state or for a
- *     missing, `null` or empty one, `absent` for
- *     `ErrSpawnNotFound` (by class), and any other error, a base
- *     `AgentDirectorError` merely named `ErrSpawnNotFound` included, rethrown
- *     as the same value, quietly; through the outage wrapper (flags raised and cleared as
- *     for any wrapped `status`; an error reported to a recording sink only
- *     inside a recovery attempt for that persona, with the predicate's cause).
- *   - b.av2 SR-6.2 ladder guards, as amended (b.jg5 SRJ-1503, SRJ-1504,
- *     SRJ-707): a row in another directory (by real path) is replaced on
- *     every path, and a missing or changed `config_dir` label means no
- *     resume (AC 48), with no row deleted: a finished row by one reuse spawn
- *     of the same id, a live row through the live-row sequence first. The
- *     SRJ-707 describe covers each replacement site on the recovery harness:
- *     the reuse's parameters, SRJ-112's rows there, the sequence the ladder
- *     starts for a live row (a dead-session route's only with GONE-based
- *     evidence) and SRJ-110 at its first kill, the non-evidence routes'
- *     re-read, the deferred `cwd` check and the lost race on
- *     `ErrSpawnNotResumable` after a re-read of a finished row (SRJ-710).
- *   - b.jg5 SRJ-113, on `makeRecoveryHarness`: `resume`'s outcome table,
- *     one case per row (`RESUME_OUTCOME_ROWS`), at both `resume` sites:
- *     `resumeOrFreshSpawn` (a collision `get` that read the row `ended` with
- *     a session id) and the sequence-launch entry's `resume`
- *     leg: success `resumed`; UNAVAILABLE (each form) refused and never
- *     counted, P armed, with one `get` after it (b.jg5 SRJ-407) reading the
- *     row `ended`; ENVIRONMENT `tmux-unavailable`; `ErrTmuxSessionCreate`
- *     counted once with no kill, P armed at once in pending-only mode (also
- *     when its description says the row stays pending, with no `get` first);
- *     the DIRECTORY errors `cwd-unreachable`, counted; the no-transcript
- *     answers one reuse spawn (the diagnosis's `get` first after
- *     `ErrJsonlMissing`); `ErrSpawnNotFound` exactly one plain spawn with no
- *     reuse flag and no spawn-failure notice, its scan CONFLICT latching
- *     "plain spawn" with the state last read; `ErrSpawnNotResumable` SRJ-710's
- *     re-read; UNUSABLE NAME, CONFIG and UNCLASSIFIED SRJ-105's;
- *     `ErrInvalidFlags` one re-check, then UNCLASSIFIED, never the hold; a
- *     collision (by class, an answer agent-director's `resume` never gives)
- *     SRJ-713's guard: the collision cause armed, `retrying`, its one line
- *     (`resumeCollisionLine`), never counted or the spawn-failure notice. The
- *     CONFLICT rows (HO rev 15's "another agent-director store" and rev 20's
- *     "conflicting labels" after "duplicate session" included) latch "resume"
- *     with the state last read and kill nothing. HO rev 28's four restore
- *     sentences change no outcome (the stub's `withRestoreSentence`; its
- *     UNAVAILABLE failure gets its one `get` with or without one), and no
- *     file in `src/` holds one.
- *   - b.jg5 SRJ-710: `ErrSpawnNotResumable` makes one `get` through
- *     the shared own-row read (`decideNotResumable` over each re-read):
- *     `pending` is a launch in progress, neither counted nor posted, with no
- *     sequence of its own (a covered row left by the ladder's `pending` step,
- *     its arms those of the ladder's `pending` branch on the same row; a
- *     `config_dir` mismatch SRJ-411's sequence; AC 3's unit half); a latching
- *     re-read latches; a finished row, no row, a refused read or a live row on
- *     a path with no dead evidence is a lost race (nothing killed, deleted,
- *     launched or counted; P armed with the lost-race cause). SRJ-611's
- *     per-cause matrix (AC 58, AC 59): on a row re-read `waiting`, only the
- *     GONE-based causes start one live-row sequence, the conversation kept,
- *     ending in `resume`; SRJ-110's kill outcomes at that sequence's first
- *     kill. A replacement at the resume step on a route with no dead
- *     evidence reads the row again first and never starts the sequence
- *     itself (SRJ-609, SRJ-707).
- *   - b.av2 SR-6.3: the fixed instance ID, one launch in flight per persona,
- *     and the start sweep (`reconcileOrphans`) keyed by the `persona` label
- *     (AC 4). b.1ix: a pre-persona row (no `persona` label) is kept, never
- *     deleted, and killed only when live; one findMissing sweep after the
- *     kills lets a killed row whose session is gone read `missing`, so the
- *     next start doesn't kill it again. b.jg5 SRJ-116, SRJ-714: one `list`
- *     (the service label alone) of rows in every state; a list failure is
- *     one `orphan-cleanup-list-failed` entry and nothing more. Over the
- *     whole list, before any kill, a configured persona's own row (by
- *     instance id, whatever its label) carrying `provenance_conflict` or
- *     reading `pending` with no launch start latches it with one post (the
- *     launch-start case alone when both apply), again after a restart
- *     (AC 45), and none of its rows is killed, another `cwd` included
- *     (AC 55); a persona latched before the sweep is held the same way. The
- *     key of every row labelled with an absent persona is recorded
- *     `absent-at-start` in one write before the first kill (a marked key's
- *     mark cleared, with no SRJ-807 clear at its row); a failed write leaves
- *     the file as it was while the keys read as retired, so a re-added
- *     persona is never resumed, across a restart once the apply wrote them
- *     (hatch A3). SRJ-807's clear applies at a configured persona's listed row.
- *   - b.1ix: the not-connected notices' `tmux attach` text names the exact
- *     `=slack_bot_<key>` target for keys whose session names prefix one
- *     another (`dev`, `dev_2`). (That `src/` starts no tmux process is
- *     tests/fmk-source-audit.test.ts's rule, b.jg5 SRJ-601.)
- *   - b.jg5 SRJ-602: `ErrTmuxSessionCreate` from the first spawn, a `resume`
- *     and a reuse spawn is one counted launch failure: no kill of any kind
- *     and no spawn in its place. SRJ-711: no plain spawn carries the reuse
- *     flag, and a first spawn that collides goes to `get` and `resume`.
- *   - b.jg5 SRJ-707, SRJ-712: `resume`'s `ErrNoSessionId`,
- *     `ErrJsonlNeverWritten` and `ErrJsonlMissing` (by class) go on to exactly
- *     one reuse spawn of `cscb_<key>` with the flag and the persona's
- *     `extra_env`, deleting nothing, at the collision ladder and at the
- *     sequence-launch entry's `resume` leg; on `ErrJsonlMissing` the
- *     diagnosis's `get` comes first. Its lost, never-created and
- *     inconclusive verdicts keep their startup-errors entries (classes
- *     imported from `src/`), notices and start-summary counts; each of their
- *     lines, entries and notices carries `JSONL_DIAGNOSIS_REUSE_WORDING` and
- *     none says delete; the notice is posted only once the reuse brought the
- *     persona up. A reuse collision at the ladder ends the attempt refused,
- *     nothing counted or posted, with the collision cause armed. The
- *     reuse sites are rows of the SRJ-105, SRJ-311, SRJ-316, SRJ-313, CONFLICT
- *     ("reuse spawn"), UNUSABLE NAME and approver site tables.
- *   - b.4ie / b.jg5 SRJ-402 startup-dialog approver, through agent-director
- *     only, on a fake clock (`_setApproverClock`, `useApproverClock`): a
- *     fresh or resumed row reading `pending` with either dialog is cleared
- *     with one `readPane` (40 lines, `allow_pending`) and one `sendKeys`
- *     (empty text, `allow_pending`) on the persona's instance (AC 34,
- *     AC 48); `ended` or
- *     `missing` at the first lap stops it at once with no pane read, the
- *     spawn-died entry written once for a start-pass launch only and the
- *     launch result unchanged; an Enter refused with ErrSpawnNotInteractive
- *     because the row just left `pending` (b.dup) stops it at that lap; the
- *     redacted line of each class's handling (AC 20).
- *   - b.jg5 SRJ-404, SRJ-405, SRJ-118, SRJ-316: what follows the approver's
- *     stops for the persona after a launch through the ladder, on a fake
- *     clock started at the launch start: at B (from the launch start, a
- *     resumed row's older `started_at` never used) or the test cap, one line,
- *     the not-ready entry for a start pass only and nothing posted through
- *     the notifier; ErrSpawnNotInteractive (both causes) stops it with
- *     nothing typed, killed or deleted and one line; CONFIG raises
- *     `ad-config-malformed`, arms P's timer and polls on, backing off, to B;
- *     nothing is counted; `src/` names no `DialogApprovalTimeout`. Group B's
- *     `ErrSystemInstallDisappeared` keeps it polling to B.
- *   - b.jg5 SRJ-401: every spawn or `resume` of the ladder that returns
- *     success, `launchSession`'s included, starts the approver on its own:
- *     the launch returns its own result, with the approver's fake clock held,
- *     while the approver runs, with no launch in flight and the launch
- *     settled, and the approver's `status` and `read-pane` follow the launch
- *     call on the persona's row; no other branch, result or dry run starts
- *     one; a stop made while the launch is in flight cancels the approver
- *     that launch would start. The site table's launch-timeout legs (b.jg5
- *     SRJ-407): each of those launch calls ending in a launch timeout (both
- *     forms), its one `get` reading a covered `pending` row whose launch
- *     start lies in the call's window, answers `retrying` while the approver
- *     it started through the start entry runs, its first call after the
- *     launch returned; the row is this launch's and the pending-only arm
- *     comes before the approver. On `makeRecoveryHarness`, its calls are
- *     outside the launch attempt: an UNAVAILABLE or UNCLASSIFIED answer to its
- *     `status`, `read-pane` or `send-keys` arms nothing and starts or opens
- *     nothing while it polls on (backing off after UNAVAILABLE), while
- *     ENVIRONMENT and CONFIG raise their outages and arm, ENVIRONMENT
- *     stopping it uncounted; each CONFLICT and UNUSABLE NAME row of the case
- *     table at its sites latches P once and stops it, with no kill, delete or
- *     relaunch.
- *   - b.av2 SR-6.1 start: `startupSessionManager` with `bringUp` (a persona
- *     not brought up is counted apart; every Slack bring-up runs at once and
- *     only the launches share the pool, in readiness order; a launch that
- *     throws is one failed persona), and `launchSession`'s relaunch gate
- *     (`canLaunch` false → `'skipped'`, nothing launched or patched), asked
- *     before the key is looked up.
- *   - b.av2 SR-8.6: a key outside the applied set, refused by the real
- *     relaunch gate over a live applied set, is `'skipped'` with no
- *     agent-director call, trust patch or reply-guard record, whether or not
- *     the config passed still holds it; an applied key launches as before.
- *   - b.av2 SR-6.2 pre-launch trust patch: through the injectable seam
- *     (`setPreLaunchTrustPatcher`, empty by default and reset in afterEach,
- *     so no test installs the production patch or writes a `.claude.json`),
- *     once per ladder, before its first spawn or resume, on every launch path;
- *     never in dry run or for a joining caller; a throw is only logged.
- *   - b.av2 SR-9.4 / SR-6.2 pre-launch reply guard: the real
- *     `preLaunchReplyGuard`, installed with `setPreLaunchReplyGuard` over a
- *     `mkdtempSync` state directory (the seam and the launched-with dirs are
- *     reset in afterEach, so no other test writes a record). The persona's
- *     record holds its effective value, and the managed hook is in place,
- *     immediately before every spawn and resume, at each call site that
- *     makes one (one row per site, plus the ticket's named paths); a live
- *     or no-op row and dry run launch nothing, and the optimistic spawn's step
- *     is undone on ErrInstanceIdCollision (E10 Director decision 9); an
- *     unwritable record is one log line and the launch goes on.
- *   - b.av2 SR-7.4 transcript-loss diagnosis: only the persona's
- *     `delivery: all` channels are counted, and a zero count is inconclusive
- *     for a persona with a `mentions` channel or DMs on.
- *     b.deo SRI-704: in fungible mode no channel is counted and a zero is
- *     never attributable, so the diagnosis is inconclusive with
- *     `FUNGIBLE_MODE_ZERO_REASON`, never lost.
- *   - SR-8.6 invariant: every successful spawn call site passes
- *     relay_mode='on'.
- *   - b.svb / b.f2b: every spawn on every launch path carries
- *     `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false` in `extra_env`, and a
- *     resume passes only the instance ID (agent-director restores the env
- *     stored at the row's spawn, modelled in one case).
- *   - Persona notices (b.av2 SR-7.2): spawn failure (generic, a launch
- *     failure, restart cap), lost and inconclusive history,
- *     held-until-validated notices (channel and `dm` destinations) and the
- *     `spawn-failure-post` startup error and restart-path stderr line, whose
- *     cause names a failed DM open's step and code,
- *     through the real per-persona notifier installed with
- *     `setSessionNotifier`. A failed post or DM open is held by the
- *     destination hold (b.av2 SR-7.1), on a fake clock: one
- *     `persona-destination-failed` line per episode, retries on the SR-3.2
- *     backoff, delivery in raised order once the cause clears, and the
- *     failure callback run once per notice, not per retry.
- *   - b.dup: a reconnect whose keystrokes agent-director refuses
- *     (ErrSpawnNotInteractive) because a findMissing sweep ended the row
- *     after it was read is a dead session (cause `row-not-interactive`, which
- *     proves nothing about the worker), recovered through resume with no
- *     `[spawn-failed]` entry or notice, at a launch's `waiting` row (the live
- *     race: another persona's wait sweeps) and in each reconnect of the wait.
- *   - b.jg5 SRJ-118, SRJ-609 (E19 T1), on `makeRecoveryHarness`:
- *     `reconnectMcpWithCause` makes one `send-keys` and no other call (no
- *     second try), and answers by
- *     class, one case per cell: success `ok`; GONE `dead-session`
- *     (`tmux-gone`); `ErrSpawnNotInteractive` (each stub form)
- *     `dead-session` (`row-not-interactive`); `ErrSpawnNotFound`
- *     `dead-session` (`row-absent`); UNAVAILABLE, ENVIRONMENT, CONFIG and
- *     UNCLASSIFIED (`ErrSendKeysWhileRelayed` included) `transient` with
- *     what their class asks and no notice, `spawn-failed` entry or count;
- *     `ErrInvalidFlags` one re-check, then `transient` (`stopping` on a
- *     stop); CONFLICT and UNUSABLE NAME (the case table's reconnect rows)
- *     latch P once with the caller's last read, `transient`, and a later
- *     reconnect types nothing; a latched P gets no `send-keys`. Each line
- *     comes from its builder. The ladder's `waiting` and `working` branches
- *     map `ok` to `reconnected`, every `dead-session` cause to one
- *     find-missing run and `resume`, CONFLICT to `latched` (no path launches
- *     P again), and a re-check stop to `failed` marked `stopping`. The
- *     `row-not-interactive` evidence text claims no dead worker.
- *   - b.jdc, b.jg5 SRJ-607: a launch that meets an `ask_user` or
- *     `check_permission` row makes one one-line `read-pane` of the persona's
- *     own row (`PROBE_PANE_READ_LINES`) and no other call, one case per cell
- *     of SRJ-117's ladder-action column: a pane, UNAVAILABLE, CONFIG,
- *     UNCLASSIFIED or ENVIRONMENT is no action; GONE or the row absent
- *     sweeps and resumes the persona once its row reads dead; CONFLICT and
- *     UNUSABLE NAME latch it with the prompt state; the restart
- *     path's run of deferrals on such a row (`checkPromptRowDeferral`)
- *     sweeps from 10 min on; the escalate-dead line is worded by its verdict.
- *   - b.f2b stale `working` rows: how a pane read is classified (a Linux
- *     screen's `●` reply and tool lines are not a spinner; a custom spinner
- *     verb of several words is) and folded into evidence, the restart path's
- *     evidence across reconnect attempts (`checkWorkingRowPane`, on the pane
- *     the working-row verdict read), the
- *     once-per-episode not-connected notice, the unproven-idle notice once
- *     deferrals on a `working` row have run for 10 min at any restart delay,
- *     the wait at a launch reconnecting a stale row within 60 s (never typing
- *     into a running turn or a prompt) and giving up honestly
- *     (`not-reconnected`, the notice at `session_restart_delay` 0), and the
- *     start pass leaving a launch that waits on a `working` row in flight in
- *     the background. These
- *     cases pass a fake clock's `now` to the session manager's clock seam
- *     (`_setNow`, reset in afterEach) and build their screens and transcripts
- *     from `tests/test-helpers/working-row-panes.ts`.
- *   - b.jg5 SRJ-413: over every success site of the ladder, and the reuse
- *     spawn, no spawn or `resume` call carries `no_pre_trust` (and no file
- *     in `src/` names it outside a comment); each launch writes exactly one
- *     `pre_trust` line, the persona's, from `preTrustLogLine`: every site
- *     with one present value of the stub's `PRE_TRUST_VALUES` (the values
- *     taken in turn), and a first spawn, a `resume` of an `ended` row and a
- *     reuse spawn with each value and an absent field; a `resume` whose
- *     result is no object writes the absent field's line and still returns
- *     `resumed`; on those three launches the four have identical effects
- *     otherwise, the approver still clearing the folder-trust dialog that
- *     follows.
- *   - b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708 (on
- *     `makeRecoveryHarness`): the live-row sequence's launch entry
- *     (`launchForLiveRowSequence`) is a launch call (in flight while its
- *     launch is held, waiting for a launch already in flight and never
- *     overlapping it, making no call once its sequence is stopped) that
- *     makes one `resume`, whose outcomes follow SRJ-113's table (below); a
- *     restart-path launch joining the entry's launch gets its result. The reuse block covers the session manager's reuse spawn
- *     (`reuseSpawnForPersona`) through the entry's reuse kind: its
- *     parameters (AC 57), the deferral on an unresolvable
- *     `claude_config_dir`, the trust patch and reply guard, its success line
- *     (no earlier life kept when the id had no row) and SRJ-112's outcome
- *     table, one case per row; no case deletes or kills, and a spawn is
- *     only the reuse. The dependency builder (`buildLiveRowSequenceDeps`, as the
- *     harness's `sequenceDeps`) reads and starts nothing when called, reads
- *     each row through the shared own-row read (a note latches), runs each
- *     `find-missing` as a bypassing run with P's key as its next-step `get`,
- *     makes each kill through the bounded retry over the deferred-report
- *     binding with the shared `status` read between tries, launches no key
- *     outside the applied set, and takes the launch-kind facts from
- *     `resume_enabled` and the row comparison.
- *   - b.jg5 SRJ-1015 (AC 72), on `makeRecoveryHarness` over one persona:
- *     the start pass counts each launch result (`spawned`, `latched`,
- *     `retrying` from an UNAVAILABLE spawn and a launch timeout (each with
- *     its one `get`, b.jg5 SRJ-407), a `transient`
- *     reconnect, SRJ-710's two lost races and a reuse's second collision,
- *     `sequence-waiting`, `held`, `fresh-retired`) once, in its own count,
- *     never failed, `fresh-retired` never a fresh spawn; `launchSession`
- *     answers each as SRJ-1015 maps it, and a retry that meets a `retrying`
- *     relaunch re-arms at the doubled wait recording nothing. A persona the
- *     bring-up controller holds `retrying` and a `deferred` launch are not
- *     brought up, never `retrying`; one case pins the summary line's ending
- *     literally. SRJ-205 (the E4 gate): the launch pool starts no queued
- *     launch once the shutdown query answers true (or throws); those
- *     personas get the not-launched outcome, counted in no count.
- *   - b.jg5 SRJ-407 (E28 T3), on `makeRecoveryHarness` with the session
- *     manager's clock on the harness clock (`harnessNow`, `scriptTimedLaunch`):
- *     each launch call's window (`launchCallWindowOf`) on success and on a
- *     launch timeout, at the ladder's first spawn, a reuse spawn and a
- *     `resume`; after a launch timeout in either form, exactly one `get`,
- *     one case per answer of its table at each verb, asserting the calls
- *     (none after the `get`), the "this launch's row" record (only inside
- *     the window, both bounds included: AC 31), the approver (only for a
- *     covered `pending` row), the arms and the answer (`retrying`,
- *     `latched`, `sequence-waiting`); every other UNAVAILABLE launch outcome
- *     (tmux unreadable, still stopping or starting, HO rev 15's scan, HO rev
- *     20's holder) gets the one `get` too, with no approver and no record;
- *     AC 35 (a recorded key's timed-out reuse over its old life: no mark, no
- *     approver, the sequence), AC 83 (no retry launch while the row reads
- *     `pending`) and AC 29 end to end (the approver clears a startup dialog
- *     after the timeout; retries launch nothing).
- *   - b.jg5 SRJ-811, SRJ-812, SRJ-1512, SRJ-1015 (E27 T2), on
- *     `makeRecoveryHarness`: `ensureOldLifeWait` answers `started`,
- *     `already-running`, `closed`, `not-held` and `not-installed`;
- *     `buildOldLifeWaitDeps` reads the old id, with the shared own-row read
- *     (its provenance latch) only for a configured persona's own row, a
- *     latch never stopping the wait and nothing armed for the old key;
- *     `personaRetryBlockCause`, `isOldLifeWaitRunningFor` and
- *     `isSequenceOrOldLifeWaitRunning` for nothing running, P's sequence, a
- *     wait on a row in P's directory or on P's own row, a removed P and a
- *     launch in flight; a launch of P, the restart gate and P's sequence
- *     start refused because a wait runs on P's own row arm P's timer with
- *     the old-life cause, `launchSession` answers the uncounted `refused`
- *     for a wait and for a sequence, and the start pass counts the wait's
- *     `sequence-waiting` once.
- *   - b.jg5 SRJ-1306, SRJ-1401 (E39 T3), on `makeRecoveryHarness`: the
- *     forced-launch seams `tests/integration/fixtures/fmk-driver.ts` calls
- *     (`_forceResumeForPersona`, `_forceReuseSpawnForPersona`) each make
- *     their one call, the `resume` of P's own id or its reuse spawn, with
- *     nothing read of the row first, whatever the row reads (`pending`
- *     included), and no kill, delete or other call beyond what the
- *     production handling of the answer makes. For success, the
- *     `resume`'s ErrSpawnNotResumable and ErrNoSessionId, and the reuse's
- *     ErrInvalidFlags, ErrInternal (an ErrUnknownErrorName) in its
- *     UNCLASSIFIED and UNUSABLE NAME forms and ErrTmuxSessionCreate, the
- *     seam's calls, answer (result, the error with `classifyAdError`'s
- *     class, counted, latched) and effects on P equal what a production path
- *     meeting the same answer gives B on the same harness: the live-row
- *     sequence's launch entry; for ErrSpawnNotResumable the latch re-check's
- *     `resume`; for UNUSABLE NAME a retired key's first launch, whose reuse
- *     also read nothing first, so both latch after the one latch-time
- *     `status` read. A launch of P in flight is joined and an unresolvable
- *     `claude_config_dir` defers, each with no call.
- *
- * Most blocks use a stand-in persona keyed by its channel ID
- * (`makeStandInPersonaConfig`), so their `cscb_<channelId>` ids and outage
- * keys stay short and fixed. Every test gets a bare notice capture
- * (`notices`); the notice-routing cases replace it with the real notifier
- * over a two-persona config whose notice persona's name, key and destination
- * all differ.
- *
- * SPDX-License-Identifier: MIT
- */
 
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
-import { createDeliveryLifecycle, NOT_NOW_RETRY_MS, type DeliveryLifecycle } from '../src/delivery-lifecycle.ts'
-import { handleDeliveryKeyError, handleDeliveryReadError } from '../src/session-manager.ts'
-import { _setDeliveryLifecycle as setDeliveryLifecycle, _buildReconnectSessionAdapter } from '../src/server.ts'
-import { useImmediateTypingLifecycle } from './test-helpers/legacy-typing.ts'
-useImmediateTypingLifecycle()
-import { ENTER_DELAY_MS, RECONNECT_BLOCKED_NOTICE_MS } from '../src/delivery-constants.ts'
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, existsSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'fs'
 import { homedir, tmpdir } from 'os'
 import { join } from 'path'
+import { ENTER_DELAY_MS } from '../src/delivery-constants.ts'
+import { createDeliveryLifecycle, NOT_NOW_RETRY_MS, type DeliveryLifecycle } from '../src/delivery-lifecycle.ts'
 import {
-  reconcileOrphans,
-  findMissingRunReadName,
-  setKillFailureAlerts,
-  reconnectMcp,
-  reconnectMcpWithCause,
-  reconnectConflictLine,
-  reconnectGoneLine,
-  reconnectInvalidFlagsLine,
-  reconnectLatchedLine,
-  reconnectNotInteractiveLine,
-  reconnectRowAbsentLine,
-  reconnectStartLine,
-  reconnectTransientLine,
-  reconnectUnusableNameLine,
-  RECONNECT_NOT_THIS_LAUNCH_NOTE,
-  CARRIED_DEAD_EVIDENCE_NONE,
-  carriedDeadEvidenceOf,
-  DEAD_EVIDENCE_NONE,
-  DEAD_SESSION_CAUSE_PROMPT_ROW_LADDER_GONE,
-  DEAD_SESSION_CAUSE_ROW_ABSENT,
-  DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE,
-  DEAD_SESSION_CAUSE_ROW_READ_FINISHED,
-  DEAD_SESSION_CAUSE_TMUX_GONE,
-  DEAD_SESSION_CAUSES,
-  DEAD_EVIDENCE_READ_BY_COLLISION_GET,
-  DEAD_EVIDENCE_READ_BY_PATH,
-  DEAD_EVIDENCE_READ_BY_POST_SWEEP_GET,
-  DEAD_EVIDENCE_READ_BY_PROMPT_ROW_REREAD,
-  DEAD_EVIDENCE_VOIDED_BY_RESUME_NOT_FOUND,
-  DEAD_EVIDENCE_VOIDED_BY_RETIRED_KEY_FIRST_LAUNCH,
-  DEAD_EVIDENCE_VOIDED_BY_REUSE_COLLISION_RERUN,
-  DEAD_EVIDENCE_VOIDED_BY_ROW_NOT_INTERACTIVE,
-  deadEvidenceReadByCause,
-  deadEvidenceVoidedLine,
-  deadEvidenceVoidingRead,
-  deadSessionRouteLine,
-  describeDeadEvidence,
-  ESCALATE_DEAD_VERDICTS,
-  isDeadEvidence,
-  joinedLaunchDropsDeadEvidenceLine,
-  waitForWaitingAndReconnectWithCause,
-  waitRowFinishedLine,
-  type CarriedDeadEvidence,
-  type DeadEvidenceSource,
-  type DeadSessionCause,
-  escalateDeadVerdictOfCause,
-  transientReconnectLine,
-  type ReconnectResult,
-  waitForWaitingAndReconnect,
-  approvePreSessionDialogs,
-  spawnForPersona,
-  startupSessionManager,
-  launchSession,
-  personaConfigDirLabelValue,
-  AGENT_DIRECTOR_LIVE_STATES,
-  DEV_CHANNELS_DIALOG_NEEDLE,
-  TRUST_DIALOG_NEEDLE,
-  _setDialogReadyTimeoutMs,
-  _resetDialogReadyTimeoutMs,
-  _setWaitForWaitingTimeoutMs,
-  _resetWaitForWaitingTimeoutMs,
-  _setFindMissingMemoTtlMs,
-  _resetFindMissingMemo,
-  bypassingFindMissingSweep,
-  readFindMissingRow,
-  FIND_MISSING_LATCHED,
-  FIND_MISSING_MEMO_TTL_MS,
-  FIND_MISSING_REFUSED,
-  FIND_MISSING_ROW_JUDGED_ALIVE,
-  FIND_MISSING_ROW_LEFT_LIVE,
-  FIND_MISSING_ROW_MARKED_MISSING,
-  FIND_MISSING_ROW_NOT_JUDGED,
-  type FindMissingRowReading,
-  sweepDeadTmuxChannel,
-  escalateDeadSweepLine,
-  ESCALATE_DEAD_EVIDENCE,
-  ESCALATE_DEAD_REPROBE_DECIDES,
-  ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ,
-  ESCALATE_DEAD_WAITING_ROW_PANE_GONE,
-  type EscalateDeadVerdict,
-  _setApproverClock,
-  _resetApproverClock,
-  _whenDialogApproverStopped,
-  isDialogApproverRunning,
-  stopDialogApprover,
-  stopAllDialogApprovers,
-  approverStopArmsPendingRow,
-  approverNotStartedMessage,
-  APPROVER_STOP_ABSENT,
-  APPROVER_STOP_FAILED,
-  APPROVER_STOP_FINISHED,
-  APPROVER_STOP_LATCHED,
-  APPROVER_STOP_NO_LAUNCH_START,
-  APPROVER_STOP_RETIRED_KEY,
-  APPROVER_STOP_SHUTDOWN,
-  APPROVER_STOP_SUPERSEDED,
-  APPROVER_STOP_TEARDOWN,
-  type ApproverOutcome,
-  DIALOG_POLL_INTERVAL_MS,
-  DIALOG_SLOW_POLL_INTERVAL_MS,
-  APPROVER_BOUND_FROM_LAUNCH_START,
-  APPROVER_LOG_PREFIX,
-  APPROVER_PANE_LINES,
-  APPROVER_STOP_BOUND,
-  APPROVER_STOP_CAP,
-  APPROVER_STOP_GONE,
-  APPROVER_STOP_LIVE,
-  APPROVER_STOP_NOT_INTERACTIVE,
-  APPROVER_STOP_TMUX_UNAVAILABLE,
-  STARTUP_ERROR_APPROVE_NOT_READY,
-  STARTUP_ERROR_APPROVE_SPAWN_DIED,
-  STARTUP_ERROR_SPAWN_FAILED,
-  approverBoundMessage,
-  approverCapMessage,
-  approverFinishedMessage,
-  approverGoneMessage,
-  approverLogLine,
-  approverNotInteractiveMessage,
-  approverPaneCallFailedMessage,
-  approverStatusRefusedMessage,
-  approverTmuxUnavailableMessage,
-  type ApproverStopReason,
-  LAUNCH_VERB_RESUME,
-  LAUNCH_VERB_REUSE_SPAWN,
-  LAUNCH_VERB_SPAWN,
-  PRE_TRUST_LOG_PREFIX,
-  preTrustLogLine,
-  type LaunchVerb,
-  _setSpawnHomeDir,
-  _resetSpawnHomeDir,
-  checkLaunchConfigDir,
-  _resetInFlightLaunches,
-  isLaunchInFlight,
-  compareRowToPersona,
-  setSessionNotifier,
-  notifySpawnFailure,
-  spawnFailureNoticeText,
-  notifyRestartCapReached,
-  setPreLaunchTrustPatcher,
-  _resetPreLaunchTrustPatcher,
-  _resetPreLaunchReplyGuard,
-  setPreLaunchReplyGuard,
-  KILL_CONTEXT_TEARDOWN,
-  killPersonaInstance,
-  killPersonaInstanceForTeardown,
-  type PersonaTeardownKillResult,
-  readPersonaRowState,
-  whenLaunchSettled,
-  ConfigDirUnresolvableError,
-  _setConfigDirFs,
-  _resetConfigDirFs,
-  setConfigDirUnresolvableHook,
-  STALE_WORKING_WINDOW_MS,
-  UNPROVEN_IDLE_NOTICE_AFTER_MS,
-  WAIT_FOR_WAITING_TIMEOUT_MS,
-  _resetNow,
-  _setNow,
-  _resetNotConnectedEpisodes,
-  _resetUnprovenIdleNoticeAfterMs,
-  _setUnprovenIdleNoticeAfterMs,
-  cancelWorkingRowWait,
-  checkPromptRowDeferral,
-  PROMPT_ROW_STATES,
-  PROMPT_ROW_SWEEP_AFTER_MS,
-  promptRowLadderAfterSweepLine,
-  promptRowLadderLatchedLine,
-  promptRowLadderNoActionLine,
-  promptRowLadderNoPaneLine,
-  promptRowLadderStoppingLine,
-  checkWaitingRowPane,
-  checkWorkingRowPane,
-  forgetWorkingRowEvidence,
-  WAITING_ROW_PANE_ABSENT,
-  WAITING_ROW_PANE_GONE,
-  type WaitingRowPaneVerdict,
-  waitingRowAbsentAtPaneReadLine,
-  waitingRowPaneGoneLine,
-  type WorkingRowPaneCheckOptions,
-  classifyWorkingPane,
-  foldWorkingPaneRun,
-  endWorkingRowDeferral,
-  forgetNotConnectedEpisode,
-  hasPendingWorkingRowEvidence,
-  noteWorkingRowDeferral,
-  notifyDisconnectedWithAutoRestartDisabled,
-  notifyPersonaNotConnected,
-  buildNotConnectedNotice,
-  setConflictLatch,
-  _resetConfiguredPersonaQuery,
-  setConfiguredPersonaQuery,
-  readPersonaOwnRow,
-  readPersonaOwnRowStatus,
-  readPersonaOwnPane,
-  type OwnPaneReadOutcome,
-  type PersonaPaneReadRequest,
-  ORPHAN_CLEANUP_LIST_FAILED_LABEL,
-  OWN_ROW_READ_ABSENT,
-  OWN_ROW_READ_ROW,
-  OWN_ROW_STATUS_ABSENT,
-  OWN_ROW_STATUS_LATCHED,
-  OWN_ROW_STATUS_REFUSED,
-  OWN_ROW_STATUS_STATE,
-  WAIT_OUTCOME_LATCHED,
-  waitEndedDisconnectedLine,
-  waitEndedOnStateReport,
-  waitPollStatusErrorLine,
-  waitRowAbsentLine,
-  waitTimedOutLiveReport,
-  waitTimedOutUnreadReport,
-  type WaitEndedReport,
-  type OwnRowReadSite,
-  type SessionConflictLatch,
-  type ConfigDirUnresolvableHook,
-  type NotConnectedNotice,
-  type SpawnPersonaResult,
-  type StartupPersonaOutcome,
-  type UndeliverableCause,
-  type WorkingPaneReading,
-  type WorkingPaneRun,
-  _resetLiveRowSequenceRegistry,
-  buildLiveRowSequenceDeps,
-  isLiveRowSequenceRunning,
-  launchForLiveRowSequence,
-  LIVE_ROW_START_NOT_INSTALLED,
-  sequenceLaunchAtCapLine,
-  startLiveRowSequence,
-  stopLiveRowSequence,
-  JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS,
-  JSONL_DIAGNOSIS_REUSE_WORDING,
-  JSONL_TRANSCRIPT_LOST_ENTRY_CLASS,
-  NOT_RESUMABLE_LATCHED,
-  NOT_RESUMABLE_LOST_RACE,
-  NOT_RESUMABLE_PENDING,
-  NOT_RESUMABLE_PENDING_OUTCOME,
-  NOT_RESUMABLE_SEQUENCE,
-  REPLACE_REREAD_FINISHED_OUTCOME,
-  REPLACE_REREAD_PENDING_OUTCOME,
-  REPLACE_REREAD_REFUSED_OUTCOME,
-  ROW_REREAD_FINISHED,
-  ROW_REREAD_LATCHED,
-  ROW_REREAD_LIVE,
-  ROW_REREAD_PENDING,
-  ROW_REREAD_REFUSED,
-  ROW_REREAD_UNKNOWN,
-  SEQUENCE_NOT_RESUMABLE_LOST_RACE_OUTCOME,
-  decideNotResumable,
-  describePersonaRowReread,
-  lostRaceOutcome,
-  notResumableSequenceOutcome,
-  replaceRereadLine,
-  resumeNotFoundSpawnLine,
-  resumeCollisionLine,
-  plainSpawnCollisionLine,
-  spawnNotResumableLine,
-  type PersonaRowReread,
-  PENDING_ROW_STEP_LOG_PREFIX,
-  undecidedPendingRowLine,
-  SPAWN_CAP_REACHED_REMEDIATION,
-  SPAWN_FAILURE_DEFAULT_REMEDIATION,
-  SPAWN_NOT_FOUND_REMEDIATION,
-} from '../src/session-manager.ts'
-import {
+  createLiveRowSequenceStop,
   LIVE_ROW_ARM_ENDED,
   LIVE_ROW_ARM_LOST_RACE,
   LIVE_ROW_LAUNCH_ANSWER_LAUNCHED,
@@ -847,12 +30,11 @@ import {
   LIVE_ROW_RUN_LEFT_LIVE,
   LIVE_ROW_SEQUENCE_LOG_PREFIX,
   LIVE_ROW_SEQUENCE_NO_ROW,
+  LIVE_ROW_START_STARTED,
   LIVE_ROW_STOP_LATCHED,
   LIVE_ROW_STOP_NOT_UP,
   LIVE_ROW_STOP_SHUTDOWN,
   LIVE_ROW_STOP_TEARDOWN,
-  createLiveRowSequenceStop,
-  LIVE_ROW_START_STARTED,
   liveRowSequenceStartLine,
   liveRowStopCauseText,
   runLiveRowSequence,
@@ -860,159 +42,147 @@ import {
   type LiveRowSequenceRequest,
   type RetiredKeyAttemptStart,
 } from '../src/live-row-sequence.ts'
-import type { TranscriptReading, TranscriptSnapshot } from '../src/session-transcript.ts'
-import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
-import { lineParts } from './test-helpers/line-parts.ts'
-import { balancedAfter, srcModules, stripComments } from './test-helpers/source-audit.ts'
+import { _buildReconnectSessionAdapter, _setDeliveryLifecycle as setDeliveryLifecycle } from '../src/server.ts'
+import { _resetConfigDirFs, _resetConfiguredPersonaQuery, _resetFindMissingMemo, _resetInFlightLaunches, _resetLiveRowSequenceRegistry, _resetNotConnectedEpisodes, _resetNow, _resetPreLaunchReplyGuard, _resetPreLaunchTrustPatcher, _resetSpawnHomeDir, _resetWaitForWaitingTimeoutMs, _setConfigDirFs, _setFindMissingMemoTtlMs, _setNow, _setSpawnHomeDir, _setWaitForWaitingTimeoutMs, AGENT_DIRECTOR_LIVE_STATES, buildLiveRowSequenceDeps, bypassingFindMissingSweep, cancelWorkingRowWait, CARRIED_DEAD_EVIDENCE_NONE, carriedDeadEvidenceOf, checkLaunchConfigDir, checkPromptRowDeferral, compareRowToPersona, ConfigDirUnresolvableError, DEAD_EVIDENCE_NONE, DEAD_EVIDENCE_READ_BY_COLLISION_GET, DEAD_EVIDENCE_READ_BY_PATH, DEAD_EVIDENCE_READ_BY_POST_SWEEP_GET, DEAD_EVIDENCE_READ_BY_PROMPT_ROW_REREAD, DEAD_EVIDENCE_VOIDED_BY_RESUME_NOT_FOUND, DEAD_EVIDENCE_VOIDED_BY_RETIRED_KEY_FIRST_LAUNCH, DEAD_EVIDENCE_VOIDED_BY_REUSE_COLLISION_RERUN, DEAD_EVIDENCE_VOIDED_BY_ROW_NOT_INTERACTIVE, DEAD_SESSION_CAUSE_PROMPT_ROW_LADDER_GONE, DEAD_SESSION_CAUSE_ROW_ABSENT, DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE, DEAD_SESSION_CAUSE_ROW_READ_FINISHED, DEAD_SESSION_CAUSE_TMUX_GONE, DEAD_SESSION_CAUSES, deadEvidenceReadByCause, deadEvidenceVoidedLine, deadEvidenceVoidingRead, deadSessionRouteLine, decideNotResumable, describeDeadEvidence, describePersonaRowReread, ESCALATE_DEAD_EVIDENCE, ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ, ESCALATE_DEAD_VERDICTS, ESCALATE_DEAD_WAITING_ROW_PANE_GONE, escalateDeadSweepLine, escalateDeadVerdictOfCause, FIND_MISSING_LATCHED, FIND_MISSING_MEMO_TTL_MS, FIND_MISSING_REFUSED, FIND_MISSING_ROW_JUDGED_ALIVE, FIND_MISSING_ROW_LEFT_LIVE, FIND_MISSING_ROW_MARKED_MISSING, FIND_MISSING_ROW_NOT_JUDGED, findMissingRunReadName, forgetNotConnectedEpisode, handleDeliveryKeyError, handleDeliveryReadError, isDeadEvidence, isLaunchInFlight, isLiveRowSequenceRunning, joinedLaunchDropsDeadEvidenceLine, JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS, JSONL_DIAGNOSIS_REUSE_WORDING, JSONL_TRANSCRIPT_LOST_ENTRY_CLASS, KILL_CONTEXT_TEARDOWN, killPersonaInstance, killPersonaInstanceForTeardown, LAUNCH_VERB_RESUME, LAUNCH_VERB_REUSE_SPAWN, LAUNCH_VERB_SPAWN, launchForLiveRowSequence, launchSession, LIVE_ROW_START_NOT_INSTALLED, lostRaceOutcome, NOT_RESUMABLE_LATCHED, NOT_RESUMABLE_LOST_RACE, NOT_RESUMABLE_PENDING, NOT_RESUMABLE_PENDING_OUTCOME, NOT_RESUMABLE_SEQUENCE, notifyDisconnectedWithAutoRestartDisabled, notifyPersonaNotConnected, notifyRestartCapReached, notifySpawnFailure, notResumableSequenceOutcome, ORPHAN_CLEANUP_LIST_FAILED_LABEL, OWN_ROW_READ_ABSENT, OWN_ROW_READ_ROW, OWN_ROW_STATUS_ABSENT, OWN_ROW_STATUS_LATCHED, OWN_ROW_STATUS_REFUSED, OWN_ROW_STATUS_STATE, personaConfigDirLabelValue, plainSpawnCollisionLine, PRE_TRUST_LOG_PREFIX, preTrustLogLine, PROMPT_ROW_STATES, PROMPT_ROW_SWEEP_AFTER_MS, promptRowLadderAfterSweepLine, promptRowLadderLatchedLine, promptRowLadderNoActionLine, promptRowLadderNoPaneLine, promptRowLadderStoppingLine, readFindMissingRow, readPersonaOwnRow, readPersonaOwnRowStatus, readPersonaRowState, reconcileOrphans, RECONNECT_NOT_THIS_LAUNCH_NOTE, reconnectConflictLine, reconnectGoneLine, reconnectInvalidFlagsLine, reconnectLatchedLine, reconnectMcp, reconnectMcpWithCause, reconnectNotInteractiveLine, reconnectRowAbsentLine, reconnectStartLine, reconnectTransientLine, reconnectUnusableNameLine, REPLACE_REREAD_FINISHED_OUTCOME, REPLACE_REREAD_PENDING_OUTCOME, REPLACE_REREAD_REFUSED_OUTCOME, replaceRereadLine, resumeNotFoundSpawnLine, ROW_REREAD_FINISHED, ROW_REREAD_LATCHED, ROW_REREAD_LIVE, ROW_REREAD_PENDING, ROW_REREAD_REFUSED, ROW_REREAD_UNKNOWN, SEQUENCE_NOT_RESUMABLE_LOST_RACE_OUTCOME, sequenceLaunchAtCapLine, setConfigDirUnresolvableHook, setConfiguredPersonaQuery, setConflictLatch, setKillFailureAlerts, setPreLaunchReplyGuard, setPreLaunchTrustPatcher, setSessionNotifier, SPAWN_CAP_REACHED_REMEDIATION, SPAWN_FAILURE_DEFAULT_REMEDIATION, SPAWN_NOT_FOUND_REMEDIATION, spawnFailureNoticeText, spawnForPersona, spawnNotResumableLine, startLiveRowSequence, STARTUP_ERROR_SPAWN_FAILED, startupSessionManager, stopLiveRowSequence, sweepDeadTmuxChannel, transientReconnectLine, WAIT_OUTCOME_LATCHED, waitEndedDisconnectedLine, waitEndedOnStateReport, waitForWaitingAndReconnect, waitForWaitingAndReconnectWithCause, waitPollStatusErrorLine, waitRowAbsentLine, waitRowFinishedLine, waitTimedOutUnreadReport, whenLaunchSettled, type CarriedDeadEvidence, type ConfigDirUnresolvableHook, type DeadEvidenceSource, type DeadSessionCause, type FindMissingRowReading, type LaunchVerb, type NotConnectedNotice, type OwnRowReadSite, type PersonaRowReread, type PersonaTeardownKillResult, type ReconnectResult, type SessionConflictLatch, type SpawnPersonaResult, type StartupPersonaOutcome } from '../src/session-manager.ts'
+import { useImmediateTypingLifecycle } from './test-helpers/legacy-typing.ts'
+useImmediateTypingLifecycle()
+
+import type { GetResult, ListRow, SpawnParams, StatusResult } from 'agent-director'
+import { UNUSABLE_RECORDED_NAME_PHRASE } from '../src/ad-description-phrases.ts'
 import {
-  _resetLaunchedWithDirs,
-  getLaunchedWithDir,
-  managedHookCommand,
-  preLaunchReplyGuard,
-} from '../src/stop-hook-bootstrap.ts'
-import { makeReplyGuardRecordDir, type ReplyGuardRecordDir } from './test-helpers/reply-guard-record.ts'
-import { installRecordingReplyGuard, observeLaunchCalls, type LaunchCall } from './test-helpers/reply-guard-launch.ts'
-import { FUNGIBLE_MODE_ZERO_REASON, UNATTRIBUTABLE_ZERO_REASON, runJsonlPersistenceSafeguard } from '../src/jsonl-persistence-check.ts'
-import { _resetPollerState, stopPermissionPoller, type PollerDeps } from '../src/permission-poller.ts'
-import { makePersonaClients, makeTrailCapture, posts, startManualPoller } from './test-helpers/permission-relay-harness.ts'
-import { resolveJsonlPath } from '../src/cozempic.ts'
-import type { PersonaNoticeOptions } from '../src/persona-notifier.ts'
-import type { PersonaDestinationHold } from '../src/persona-destination-hold.ts'
-import { PERSONA_CONFIG_DIR_UNRESOLVABLE, PERSONA_DESTINATION_FAILED } from '../src/persona-diagnostics.ts'
-import { describeThrownValue, MAX_LOGGED_MESSAGE_LENGTH, renderLogMessageText } from '../src/persona-connection-errors.ts'
-import { escapeSlackControlCharacters, unescapeSlackControlCharacters } from '../src/slack-text-escape.ts'
+  AD_ERROR_CLASS_CONFIG,
+  AD_ERROR_CLASS_CONFLICT,
+  AD_ERROR_CLASS_ENVIRONMENT,
+  AD_ERROR_CLASS_UNAVAILABLE,
+  AD_ERROR_CLASS_UNCLASSIFIED,
+  AD_ERROR_CLASS_UNUSABLE_NAME,
+  classifyAdError,
+  describeAdErrorClassification,
+  describeAdFailureForLog,
+  describeAgentDirectorFailure,
+  killFailedDescriptionOf,
+  LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT, LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE,
+  type AdErrorClass,
+  type LaunchTimeoutForm
+} from '../src/ad-error-class.ts'
+import type { PreTrust } from '../src/ad-phase1-types.ts'
+import { adLaunchBoundMsInEffect } from '../src/ad-settings.ts'
 import {
-  makeDeferredConnect,
-  makeStubSlack,
-  openedDm,
-  type DeferredConnect,
-  type StubSlackOptions,
-  type WebApiOutcome,
-} from './test-helpers/slack-stub.ts'
-import type { PersonaConnectionManager, PersonaConnectionStatus } from '../src/persona-connections.ts'
-import { createPersonaRelaunchGate, type PersonaBringUpStep } from '../src/persona-start.ts'
+  AD_VERSION_RECHECK_INTERVAL_MS,
+  AD_VERSION_RECHECK_STOP_EXIT_CODE,
+  installAdVersionRecheck,
+  PHASE1_FLOOR_VERSION,
+  RECHECK_OUTCOME_COULD_NOT_RUN,
+  RECHECK_OUTCOME_NOT_RUNNING,
+  RECHECK_OUTCOME_PASS,
+  RECHECK_OUTCOME_STOP,
+  resetAdVersionRecheckForTests,
+} from '../src/ad-version-gate.ts'
+import { getClient, resetClientForTests, setClientForTests } from '../src/agent-director-client.ts'
 import {
-  createPersonaBringUpController,
-  type PersonaBringUpController,
-  type PersonaBringUpOutcome,
-} from '../src/persona-bringup-controller.ts'
-import { makeConnectionHarness } from './test-helpers/persona-connection-harness.ts'
-import { makeNotifierHarness, type NotifierHarness } from './test-helpers/persona-notifier.ts'
+  AgentDirectorError,
+  ERR_STORE_OPEN_NAME,
+  ErrCwdNotFound,
+  ErrJsonlMissing,
+  ErrSpawnNotFound,
+  ErrSystemInstallDisappeared,
+  ErrTmuxNotAvailable,
+  ErrTmuxSessionCreate
+} from '../src/agent-director-errors.ts'
+import { getFailureCount, recordFailure } from '../src/backoff.ts'
 import {
-  APP_TOKEN_PREFIX,
-  BOT_TOKEN_PREFIX,
-  LEAK_SENTINEL,
-  REDACTED_SENTINEL_TAIL,
-  assertNoLeak,
-  fakeToken,
-  sentinelInMessage,
-  writtenFile,
-} from './test-helpers/credentials.ts'
-import { MCP_SERVER_NAME, type Persona, type PersonaConfig, resolvePersonaConfig, resolveRealPath } from '../src/config.ts'
-import {
-  PERSONA_INSTANCE_ID_PREFIX,
-  PROMPT_SUGGESTION_OFF_ENV,
-  SERVICE_LABEL,
-  configDirLabelValue,
-  personaInstanceId,
-  personaKey,
-  personaSpawnEnv,
-  personaTmuxSessionName,
-  renderPersonaRef,
-} from '../src/persona-identity.ts'
-import { resetClientForTests, setClientForTests, getClient } from '../src/agent-director-client.ts'
-import {
-  cannedGetResult,
-  cannedListRow,
-  cannedPermissionRequest,
-  cannedResumeResult,
-  cannedSpawnResult,
-  cannedStatusResult,
-  PRE_TRUST_VALUES,
-  SAMPLE_LAUNCH_START_DEFAULT,
-  SAMPLE_LAUNCH_START_FRACTIONAL,
-  SAMPLE_LAUNCH_START_NONE,
-  SAMPLE_LAUNCH_START_WHOLE,
-  cannedFindMissing,
-  cannedKillResult,
-  cannedOk,
-  cannedErr,
-  errCallTimeout,
-  errTmuxKillFailed,
-  errTmuxSessionConflict,
-  KILL_FAILED_DESCRIPTIONS,
-  errCwdNotADirectory,
-  errCwdNotFound,
-  errInstanceIdCollision,
-  errNoSessionId,
-  errJsonlMissing,
-  errJsonlNeverWritten,
-  errSpawnNotFound,
-  errSpawnNotResumable,
-  errTmuxCaptureFailed,
-  errGeneric,
-  errSpawnNotInteractive,
-  errSpawnNotInteractiveLeftover,
-  errSpawnNotInteractiveNoLaunchStart,
-  errTmuxSendKeys,
-  errTmuxSessionCreate,
-  errTmuxSessionCreateStaysPending,
-  errInvalidFlags,
-  errInternal,
-  errTmuxUnresponsive,
-  errTmuxNotAvailable,
-  errTmuxNotAvailableDifferentServer,
-  errTmuxNotAvailableNewRowEnded,
-  errTmuxUnresponsiveNewRowEnded,
-  errConfigMalformed,
-  errUnusableName,
-  errSchemaMismatch,
-  errSystemInstallDisappeared,
-  errUnknownErrorName,
-  errSendKeysWhileRelayed,
-  holdFindMissing,
-  holdSpawns,
-  makeStubCallLog,
-  makeStubClient,
-  makeStubResolveSystemBinary,
-  nonLatchingNotes,
-  provenanceNote,
-  stubCallCount,
-  unknownNote,
-  type CannedGetResult,
-  type CannedResponse,
-  type CannedRowPersona,
-  type FindMissingRowPlacement,
-  type PersonaGetResultOverrides,
-  type StubCallLog,
-  type StubClient,
-  type StubClientOptions,
-  type StubResolveSystemBinaryOutcome,
-  unavailableForms,
-  UNAVAILABLE_FORMS,
-  UNUSABLE_NAME_FAULTS,
-  RESTORE_SENTENCES,
-  STUB_INSTANCE_ID,
-  STUB_TMUX_SESSION_NAME,
-  STUB_TMUX_SOCKET_PATH,
-  withRestoreSentence,
-} from './test-helpers/agent-director-stub.ts'
-import { makeMultiPersonaConfig, makePersonaConfigInput, makeStandInPersonaConfig } from './test-helpers/persona-config.ts'
-import {
+  describeKillOutcome,
   KILL_OUTCOME_KILLED,
   KILL_OUTCOME_NOT_KILLED,
   KILL_OUTCOME_ROW_FINISHED,
   KILL_OUTCOME_ROW_GONE,
   KILL_OUTCOME_SESSION_GONE,
+  KILL_REFUSAL_AT_KILL,
+  KILL_REFUSAL_AT_READ,
   KILL_ROW_FINISHED_ENDED,
   KILL_ROW_FINISHED_MISSING,
   KILL_ROW_FINISHED_NO_ROW,
-  KILL_REFUSAL_AT_KILL,
-  KILL_REFUSAL_AT_READ,
-  describeKillOutcome,
   killOutcomeOf,
   type KillOutcome,
 } from '../src/checked-kill.ts'
+import { MCP_SERVER_NAME, resolvePersonaConfig, resolveRealPath, type Persona, type PersonaConfig } from '../src/config.ts'
+import {
+  CONFLICT_LATCH_SET_LATCHED,
+  CONFLICT_LATCH_SET_RELATCHED,
+  createConflictLatch,
+  describeLatchRowState,
+  LATCH_CASE_ANOTHER_STORE,
+  LATCH_CASE_CONFLICTING_LABELS,
+  LATCH_CASE_LAUNCH_START_NOT_RECORDED,
+  LATCH_CASE_LEFTOVER,
+  LATCH_CASE_NO_VALID_ID,
+  LATCH_CASE_NOT_THIS_LAUNCH,
+  LATCH_CASE_UNUSABLE_RECORDED_NAME,
+  LATCH_KIND_CONFLICT,
+  LATCH_RECHECK_INTERVAL_MS,
+  LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED,
+  LATCH_ROW_STATE_KIND_NO_ROW,
+  LATCH_ROW_STATE_KIND_READ,
+  LATCH_ROW_STATE_NO_ROW,
+  LATCH_ROW_STATE_UNREADABLE,
+  latchRecheckRoundLine,
+  latchRecoveryText,
+  latchRowStateRead,
+  notConfiguredLatchOutcome,
+  RECHECK_CALL_FINISHED_ROW,
+  RECHECK_CALL_PLAIN_SPAWN,
+  RECHECK_CALL_RESTART_DECISION,
+  RECHECK_CALL_RESUME,
+  RECHECK_CALL_REUSE_SPAWN,
+  RECHECK_CLEARED_BY_FINISHED_ROW_RETRY,
+  RECHECK_CLEARED_BY_RESTART_DECISION,
+  RECHECK_CLEARED_BY_RETRY,
+  RECHECK_STEP_FINISHED_ROW_RETRY,
+  RECHECK_STEP_SPAWN_RETRY,
+  RECHECK_STEP_TABLE,
+  REFUSED_OPERATION_BRING_UP,
+  REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY,
+  REFUSED_OPERATION_NONE,
+  REFUSED_OPERATION_PLAIN_SPAWN,
+  REFUSED_OPERATION_RESUME,
+  REFUSED_OPERATION_REUSE_SPAWN,
+  type ConflictLatch,
+  type ConflictLatchRecord,
+  type ConflictLatchSetInput,
+  type LatchCase,
+  type LatchRecheckCleared,
+  type LatchRecheckLineStep,
+  type LatchRowState,
+  type RefusedOperation
+} from '../src/conflict-latch.ts'
+import { resolveJsonlPath } from '../src/cozempic.ts'
+import { AD_BELOW_PHASE1_FLOOR } from '../src/install-check-labels.ts'
+import {
+  describeHoldVersion,
+  INVALID_FLAGS_HOLD_ALERT_TEXT,
+  invalidFlagsHeldNoLaunchLine,
+  invalidFlagsHoldEndLine,
+  invalidFlagsHoldSetLine,
+} from '../src/invalid-flags-hold.ts'
+import { FUNGIBLE_MODE_ZERO_REASON, runJsonlPersistenceSafeguard, UNATTRIBUTABLE_ZERO_REASON } from '../src/jsonl-persistence-check.ts'
+import {
+  KILL_FAILURE_CLOSING_DESTINATION,
+  KILL_FAILURE_CLOSING_DESTINATION_LATCHED,
+  KILL_FAILURE_CLOSING_LOG_ONLY,
+  KILL_FAILURE_CONTEXT_OLD_LIFE_WAIT,
+  KILL_FAILURE_CONTEXT_RECOVERY,
+  KILL_FAILURE_CONTEXT_START_SWEEP,
+  KILL_FAILURE_CONTEXT_STUCK_LAUNCH_ABORT,
+  KILL_FAILURE_VERSION_ORDINARY,
+  KILL_FAILURE_VERSION_SURVIVOR,
+  killFailureAlertEntryText,
+  killFailureAlertText,
+  killFailureClosingSentence,
+  ORPHAN_CLEANUP_LABEL,
+  PERSONA_KILL_FAILED_LABEL,
+  PERSONA_KILL_SURVIVOR_LABEL,
+  type KillFailureAlertContent,
+} from '../src/kill-failure-alert.ts'
 import {
   KILL_RETRY_ALERT_NONE,
   KILL_RETRY_ALERT_ORDINARY,
@@ -1029,354 +199,80 @@ import {
   type KillRetryAlert,
   type KillRetryResult,
 } from '../src/kill-retry.ts'
-import { buildTempArchiveDb, messagesSince } from './test-helpers/archive-db.ts'
+import { LIVE_ROW_SEQUENCE_ENTRY_GET, LIVE_ROW_START_ALREADY_RUNNING, LIVE_ROW_START_CLOSED, type LiveRowSequenceRegistry } from '../src/live-row-sequence.ts'
+import { AGENT_DIRECTOR_DEAD_STATES, AGENT_DIRECTOR_PENDING_STATE, LIVENESS_DEAD_ROW_ENDED, LIVENESS_DEAD_ROW_MISSING, LIVENESS_DEAD_ROW_NO_ROW, type DeadRowRead } from '../src/liveness-reading.ts'
 import {
-  CUSTOM_VERB_SPINNER_PANE,
-  TRUST_DIALOG_PANE,
-  IDLE_PANE,
-  LINUX_IDLE_PANE,
-  MCP_SERVER_DIALOG_PANE,
-  MODEL_PICKER_PANE,
-  OTHER_IDLE_PANE,
-  PERMISSION_PANE,
-  PLAN_APPROVAL_PANE,
-  QUOTED_DIALOG_PANE,
-  QUOTED_MENU_PANE,
-  SELECT_MENU_PANE,
-  SPINNER_PANE,
-  TRANSCRIPT_SESSION_ID,
-  DEV_CHANNELS_DIALOG_PANE,
-  appendTranscript,
-  endedTurn,
-  linuxWithLastLine,
-  promptEntry,
-  queuedPromptEntry,
-  toolResultEntry,
-  toolUseEntry,
-  withLastLine,
-  writeTranscript,
-  type TranscriptEntry,
-} from './test-helpers/working-row-panes.ts'
-import {
-  initOutageState,
-  getOutageFlags,
-  setOutageFlag,
-  ALL_CLEAR_TEMPLATE,
-  ONSET_TEMPLATES,
-  tmuxServerChangedOnset,
-  adConfigMalformedOnset,
   _resetOutageState,
+  adConfigMalformedOnset,
+  ALL_CLEAR_TEMPLATE,
+  getOutageFlags,
+  initOutageState,
+  ONSET_TEMPLATES,
+  setOutageFlag,
+  tmuxServerChangedOnset,
   type OutageClass,
 } from '../src/outage-state.ts'
+import { PANE_READ_UNCLASSIFIED, paneReadClassNote, paneReadFailureOf, PROBE_PANE_READ_LINES, type PaneReadFailure } from '../src/pane-read.ts'
 import {
-  AgentDirectorError,
-  ErrSystemInstallDisappeared,
-  ErrTmuxNotAvailable,
-  ErrCwdNotFound,
-  ErrInstanceIdCollision,
-  ErrJsonlMissing,
-  ErrSpawnNotFound,
-  ErrSpawnNotInteractive,
-  ErrSpawnNotResumable,
-  ErrTmuxCaptureFailed,
-  ErrTmuxSendKeys,
-  ErrTmuxSessionCreate,
-  ErrUnknownErrorName,
-  ERR_STORE_OPEN_NAME,
-} from '../src/agent-director-errors.ts'
-import { REDACTED_TOKEN_PLACEHOLDER, REDACTED_URL_PLACEHOLDER } from '../src/slack-log-redaction.ts'
-import { UNUSABLE_RECORDED_NAME_PHRASE } from '../src/ad-description-phrases.ts'
-import { LAUNCH_RESUMED_UNREPORTED, RESTART_FAILURE_CAP, RESTART_OUTCOME_LAUNCHED, RESTART_OUTCOME_REFUSED, runRestartRetry, type LaunchSessionResult } from '../src/restart.ts'
+  describePendingRowRuleAnswer, parseLaunchStart, PENDING_ROW_RULE_GONE, PENDING_ROW_RULE_LOG_HEAD, PENDING_ROW_RULE_ORIGIN_RETRY, PENDING_ROW_RULE_READ_REFUSED, postStuckLaunchHeld, STUCK_LAUNCH_ABORT_KILL_FAILED,
+  STUCK_LAUNCH_ABORT_KILL_LATCHED,
+  STUCK_LAUNCH_ABORT_KILL_STOPPED,
+  STUCK_LAUNCH_ABORT_KILL_SUCCEEDED,
+  STUCK_LAUNCH_ABORT_KILL_TRY_LATER,
+  STUCK_LAUNCH_ABORT_SEQUENCE_NOT_STARTED,
+  STUCK_LAUNCH_ABORT_SEQUENCE_STARTED, STUCK_LAUNCH_POSTED, stuckLaunchAbortKillUsesAbort, stuckLaunchEndRowLiveReason,
+  stuckLaunchEpisodeEndedLine, stuckLaunchHeldText, type PendingRowRuleAnswer, type StuckLaunchAbortKillAnswer, type StuckLaunchPosterDeps
+} from '../src/pending-row.ts'
+import { _resetPollerState, stopPermissionPoller, type PollerDeps } from '../src/permission-poller.ts'
 import {
-  AD_ERROR_CLASS_CONFIG,
-  AD_ERROR_CLASS_CONFLICT,
-  AD_ERROR_CLASS_ENVIRONMENT,
-  AD_ERROR_CLASS_GONE,
-  AD_ERROR_CLASS_LAUNCH_FAILURE,
-  AD_ERROR_CLASS_STATE,
-  AD_ERROR_CLASS_UNAVAILABLE,
-  AD_ERROR_CLASS_UNCLASSIFIED,
-  AD_ERROR_CLASS_UNUSABLE_NAME,
-  classifyAdError,
-  describeAdErrorClassification,
-  describeAdFailureForLog,
-  describeAgentDirectorFailure,
-  killFailedDescriptionOf,
-  type AdErrorClass,
-} from '../src/ad-error-class.ts'
+  createPersonaBringUpController,
+  type PersonaBringUpController,
+  type PersonaBringUpOutcome,
+} from '../src/persona-bringup-controller.ts'
+import { describeThrownValue, MAX_LOGGED_MESSAGE_LENGTH, renderLogMessageText } from '../src/persona-connection-errors.ts'
+import type { PersonaConnectionManager, PersonaConnectionStatus } from '../src/persona-connections.ts'
+import type { PersonaDestinationHold } from '../src/persona-destination-hold.ts'
+import { PERSONA_CONFIG_DIR_UNRESOLVABLE, PERSONA_DESTINATION_FAILED } from '../src/persona-diagnostics.ts'
 import {
-  FULL_PANE_READ_LINES,
-  PANE_READ_ABSENT,
-  PANE_READ_CONFIG,
-  PANE_READ_CONFLICT,
-  PANE_READ_ENVIRONMENT,
-  PANE_READ_GONE,
-  PANE_READ_LATCHED,
-  PANE_READ_NOT_READ_LATCHED,
-  PANE_READ_PANE,
-  PANE_READ_UNAVAILABLE,
-  PANE_READ_UNCLASSIFIED,
-  PANE_READ_UNUSABLE_NAME,
-  type PaneReadFailure,
-  type PaneReadUnclassified,
-  PROBE_PANE_READ_LINES,
-  paneReadClassNote,
-  paneReadFailureOf,
-} from '../src/pane-read.ts'
-import { promptRowAbsentAtPaneReadLine, promptRowPaneGoneLine, workingRowAbsentAtPaneReadLine, workingRowPaneGoneLine } from '../src/server.ts'
-import {
-  KILL_FAILURE_END_ROW_FINISHED,
-  KILL_FAILURE_END_ROW_GONE,
   createKillFailureAlerts,
   createPersonaEpisodes,
+  KILL_FAILURE_END_ROW_FINISHED,
+  KILL_FAILURE_END_ROW_GONE,
   killFailureStoppedRetryText,
+  PERSONA_EPISODE_KIND_STUCK_LAUNCH,
   type KillFailureAlerts,
   type KillFailureRaiseInput,
   type UnclassifiedErrorSink,
 } from '../src/persona-episodes.ts'
 import {
-  KILL_FAILURE_CLOSING_DESTINATION_LATCHED,
-  KILL_FAILURE_CLOSING_LOG_ONLY,
-  KILL_FAILURE_CONTEXT_RECOVERY,
-  KILL_FAILURE_CONTEXT_START_SWEEP,
-  KILL_FAILURE_CONTEXT_OLD_LIFE_WAIT,
-  KILL_FAILURE_VERSION_ORDINARY,
-  KILL_FAILURE_VERSION_SURVIVOR,
-  ORPHAN_CLEANUP_LABEL,
-  PERSONA_KILL_FAILED_LABEL,
-  PERSONA_KILL_SURVIVOR_LABEL,
-  killFailureAlertEntryText,
-  killFailureAlertText,
-  killFailureClosingSentence,
-  type KillFailureAlertContent,
-} from '../src/kill-failure-alert.ts'
-import { getFailureCount } from '../src/backoff.ts'
-import {
-  adConfigMalformedRaiseLines,
-  callCounts,
-  callCountsSince,
-  collided,
-  conditionStartedLines,
-  expectLostMessageReports,
-  expectPendingOnlyWatch,
-  DISPATCHER_BUG_WORDING,
-  dispatcherBugWordingIn,
-  killFailureEndedLine,
-  killFailureLines,
-  killFailureNotRaisedLine,
-  killFailureNotice,
-  killFailurePostedLine,
-  killFailureRecoveryEntry,
-  killFailureStoppedEntry,
-  killFailureStoppedEntryLine,
-  makeRecoveryHarness,
-  ordinaryAlertContent,
-  ownRowsLiveThenMissing,
-  personaCallCounts,
-  personaOf as harnessPersona,
-  holdSequenceReuse,
-  launchThroughSequence,
-  putAtRestartCap,
-  recheckAtCapLinesOf,
-  recordCallOrder,
-  retryNow,
-  reuseSpawnOf,
-  scriptLiveRowElsewhere,
-  startSequenceHeldAtRun,
-  startupEntriesOf,
-  survivorAlertContent,
-  unavailableAt,
-  unclassifiedLinePrefix,
-  unclassifiedStartedLine,
-  unclassifiedStartedLines,
-  type RecoveryHarness,
-  type RecoveryHarnessOptions,
-  type RecoverySequenceRequest,
-  type RecoveryRowState,
-  type RecoveryStubScript,
-} from './test-helpers/recovery-harness.ts'
-import {
-  CONFLICT_CASE_ROWS,
-  PLAIN_SPAWN_CONFLICT_CASE_ROWS,
-  LAUNCH_START_ABSENT_PERSONA_KEY,
-  LAUNCH_START_AND_NOTE_ROW,
-  LAUNCH_START_CASE_ROWS,
-  LAUNCH_START_NON_LATCHING_ROWS,
-  LIVENESS_PANE_CONFLICT_CASE_ROWS,
-  RECONNECT_CONFLICT_CASE_ROWS,
-  RECONNECT_UNUSABLE_NAME_CASE_ROWS,
-  REUSE_SPAWN_CONFLICT_CASE_ROWS,
-  REUSE_SPAWN_SITE,
-  RESTART_KILL_SITE,
-  REUSE_SPAWN_UNUSABLE_NAME_CASE_ROWS,
-  UNUSABLE_NAME_CASE_ROWS,
-  expectedConflictNotice,
-  expectedLatchRecord,
-  HUMAN_ONLY_SENTENCE,
-  humanOnlySentencesIn,
-  livenessPaneConflictRowsAt,
-  promptRowPaneConflictRowsAt,
-  reconnectConflictRowsAt,
-  reuseSpawnScanRows,
-  sequenceResumeConflictRowsAt,
-  type ConflictCaseRow,
-  type LaunchStartCaseRow,
-  type PlainSpawnRowAfter,
-  type LaunchStartCaseRowOf,
-  type LaunchStartNonLatchingRowOf,
-  type LaunchStartReadShape,
-  type ReconnectLastRead,
-  type UnusableNameCaseRow,
-  type UnusableNameSite,
-} from './test-helpers/conflict-cases.ts'
-import {
-  CONFLICT_LATCH_SET_LATCHED,
-  CONFLICT_NOTICE_HUMAN_ONLY_LINE,
-  LATCH_CASE_CONFLICTING_LABELS,
-  LATCH_CASE_LAUNCH_START_NOT_RECORDED,
-  LATCH_CASE_LEFTOVER,
-  LATCH_CASE_UNUSABLE_RECORDED_NAME,
-  LATCH_ROW_STATE_KIND_NO_ROW,
-  LATCH_ROW_STATE_KIND_READ,
-  LATCH_ROW_STATE_NO_ROW,
-  LATCH_ROW_STATE_UNREADABLE,
-  REFUSED_OPERATION_BRING_UP,
-  REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY,
-  REFUSED_OPERATION_NONE,
-  REFUSED_OPERATION_PLAIN_SPAWN,
-  REFUSED_OPERATION_RESUME,
-  REFUSED_OPERATION_REUSE_SPAWN,
-  createConflictLatch,
-  describeLatchRowState,
-  latchRowStateRead,
-  notConfiguredLatchOutcome,
-  type ConflictLatch,
-  type ConflictLatchRecord,
-  type ConflictLatchSetInput,
-  type LatchRowState,
-  type RefusedOperation,
-} from '../src/conflict-latch.ts'
-import {
-  installAdVersionRecheck,
-  RECHECK_OUTCOME_COULD_NOT_RUN,
-  RECHECK_OUTCOME_PASS,
-  RECHECK_OUTCOME_STOP,
-  resetAdVersionRecheckForTests,
-} from '../src/ad-version-gate.ts'
-import { DEV_PLACEHOLDER_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
-import {
-  AD_VERSION_RECHECK_INTERVAL_MS,
-  AD_VERSION_RECHECK_STOP_EXIT_CODE,
-  PHASE1_FLOOR_VERSION,
-  RECHECK_OUTCOME_NOT_RUNNING,
-} from '../src/ad-version-gate.ts'
-import { AD_BELOW_PHASE1_FLOOR } from '../src/install-check-labels.ts'
-import {
-  describeHoldVersion,
-  INVALID_FLAGS_HOLD_ALERT_TEXT,
-  invalidFlagsHeldNoLaunchLine,
-  invalidFlagsHoldEndLine,
-  invalidFlagsHoldSetLine,
-} from '../src/invalid-flags-hold.ts'
-import { _resetInvalidFlagsHold, LIVE_ROW_START_HELD, reuseInvalidFlagsHeldLine, setInvalidFlagsHold } from '../src/session-manager.ts'
-import { recordFailure } from '../src/backoff.ts'
-import {
-  CONFLICT_LATCH_SET_RELATCHED,
-  CONFLICT_LATCH_SET_SAME_CASE,
-  LATCH_CASE_ANOTHER_STORE,
-  LATCH_CASE_NO_VALID_ID,
-  LATCH_CASE_NOT_THIS_LAUNCH,
-  LATCH_RECHECK_INTERVAL_MS,
-  LATCH_RECOVERY_REASON_RELAUNCH_NOT_REFUSED,
-  LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED,
-  LATCH_KIND_CONFLICT,
-  latchRecoveryText,
-  RECHECK_CALL_FINISHED_ROW,
-  RECHECK_CALL_NONE,
-  RECHECK_CALL_PLAIN_SPAWN,
-  RECHECK_CALL_RESTART_DECISION,
-  RECHECK_CALL_RESUME,
-  RECHECK_CALL_REUSE_SPAWN,
-  RECHECK_CLEARED_BY_FINISHED_ROW_RETRY,
-  RECHECK_CLEARED_BY_RESTART_DECISION,
-  RECHECK_CLEARED_BY_RETRY,
-  RECHECK_STEP_FINISHED_ROW_RETRY,
-  RECHECK_STEP_SPAWN_RETRY,
-  RECHECK_STEP_TABLE,
-  latchRecheckRoundLine,
-  type LatchCase,
-  type LatchRecheckCleared,
-  type LatchRecheckLineStep,
-} from '../src/conflict-latch.ts'
-import {
-  LATCH_RECHECK_AT_CAP,
-  LATCH_RECHECK_OBSERVER_FAILED,
-  LATCH_RECHECK_STATUS_READ_SITE,
-  latchRecheckAtCapLine,
-  latchedElsewhereDuringCallLine,
-  latchRecheckCollidedAfterClearLine,
-  latchRecheckCollisionNoInformationLine,
-  latchRecheckNotUpLine,
-  latchRecheckObserverFailedLine,
-  latchedLaunchSkipLine,
-  oldLifeHoldLaunchLine,
-  reuseSpawnForPersona,
-  runLatchRecheckRound,
-  type LatchRecheckRoundDeps,
-} from '../src/session-manager.ts'
+  configDirLabelValue,
+  PERSONA_INSTANCE_ID_PREFIX,
+  personaInstanceId,
+  personaKey,
+  personaSpawnEnv,
+  personaTmuxSessionName,
+  PROMPT_SUGGESTION_OFF_ENV,
+  renderPersonaRef,
+  SERVICE_LABEL,
+} from '../src/persona-identity.ts'
+import type { PersonaNoticeOptions } from '../src/persona-notifier.ts'
+import { createPersonaRelaunchGate, type PersonaBringUpStep } from '../src/persona-start.ts'
 import * as restartModule from '../src/restart.ts'
 import {
-  RESTART_OUTCOME_ALREADY_CONNECTED,
+  LAUNCH_RESUMED_UNREPORTED, RESTART_FAILURE_CAP, RESTART_OUTCOME_ALREADY_CONNECTED,
   RESTART_OUTCOME_CAPPED,
   RESTART_OUTCOME_COUNTED_FAILURE,
   RESTART_OUTCOME_HELD,
   RESTART_OUTCOME_IN_FLIGHT,
   RESTART_OUTCOME_LATCHED,
-  RESTART_OUTCOME_LAUNCH_SKIPPED,
-  RESTART_OUTCOME_LIVENESS_UNKNOWN,
+  RESTART_OUTCOME_LAUNCH_SKIPPED, RESTART_OUTCOME_LAUNCHED, RESTART_OUTCOME_LIVENESS_UNKNOWN,
   RESTART_OUTCOME_NOT_INITIALISED,
   RESTART_OUTCOME_NOT_UP,
   RESTART_OUTCOME_PENDING_DEFERRED,
   RESTART_OUTCOME_RECONNECT_DEFERRED,
-  RESTART_OUTCOME_RECONNECTED,
-  RESTART_OUTCOME_SEQUENCE_WAITING,
-  RESTART_OUTCOME_SHUTTING_DOWN,
-  type RestartRetryOutcome,
+  RESTART_OUTCOME_RECONNECTED, RESTART_OUTCOME_REFUSED, RESTART_OUTCOME_SEQUENCE_WAITING,
+  RESTART_OUTCOME_SHUTTING_DOWN, runRestartRetry, type LaunchSessionResult, type RestartRetryOutcome
 } from '../src/restart.ts'
-import type { ConflictCase as StubConflictCase } from './test-helpers/agent-director-stub.ts'
-import { errSystemInstallNotFound, errTmuxUnresponsiveAfterDuplicateSession } from './test-helpers/agent-director-stub.ts'
-import { DEAD_EVIDENCE_OF } from './test-helpers/dead-evidence.ts'
-import { holdThroughReuse, scriptReuseInvalidFlags } from './test-helpers/recovery-harness.ts'
-import {
-  createUnavailableRetryController,
-  runInAttempt,
-  UNAVAILABLE_RETRY_BASE_S,
-  UNAVAILABLE_RETRY_CAUSE_CONFIG,
-  UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT,
-  UNAVAILABLE_RETRY_CAUSE_KILL_FAILED,
-  UNAVAILABLE_RETRY_CAUSE_PENDING_ROW,
-  UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
-  UNAVAILABLE_RETRY_CAUSE_LOST_RACE,
-  UNAVAILABLE_RETRY_CAUSE_COLLISION,
-  UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED,
-  UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
-  UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED,
-  UNAVAILABLE_RETRY_MODE_FULL,
-  UNAVAILABLE_RETRY_MODE_PENDING_ONLY,
-  UNAVAILABLE_RETRY_ROW_ABSENT,
-  UNAVAILABLE_RETRY_STOP_LATCHED,
-  UNAVAILABLE_RETRY_STOP_RECOVERED,
-  type AttemptView,
-  type UnavailableRetryController,
-  type UnavailableRetryRowRead,
-  type UnavailableRetryTriggerSink,
-} from '../src/unavailable-retry.ts'
-import { AGENT_DIRECTOR_DEAD_STATES, AGENT_DIRECTOR_PENDING_STATE, LIVENESS_DEAD_ROW_ENDED, LIVENESS_DEAD_ROW_MISSING } from '../src/liveness-reading.ts'
-import { adLaunchBoundMsInEffect } from '../src/ad-settings.ts'
-import { PENDING_ROW_REASON_CONFIG_DIR_UNRESOLVED, parseLaunchStart } from '../src/pending-row.ts'
-import type { GetResult, ListRow, SpawnParams, StatusResult } from 'agent-director'
-import type { PreTrust } from '../src/ad-phase1-types.ts'
-import type { StubDeleteParams, StubKillResult, StubResumeResult, StubSpawnResult } from './test-helpers/agent-director-stub.ts'
 import {
   loadRetiredKeyStore,
   OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL,
@@ -1396,261 +292,291 @@ import {
 } from '../src/retired-keys.ts'
 import { RETIRED_ENTRY_CLEARING_STATES } from '../src/row-read-rules.ts'
 import {
-  _resetOldLifeHolds,
-  _resetRetiredKeyStore,
-  COLLISION_GET_SITE,
+  _forceResumeForPersona, _forceReuseSpawnForPersona, _resetInvalidFlagsHold, _resetOldLifeHolds, _resetOldLifeWaitBindings, _resetRetiredKeyStore, abortKillOwnStuckLaunch, buildOldLifeWaitDeps, buildPendingRowRuleDeps, COLLISION_GET_SITE, createOldLifeHoldEndRetry, createOldLifeWaitRecord,
+  ensureOldLifeWait, forgetLaunchCalls, isCscbOwnLaunch, isOldLifeWaitRunningFor, isOwnRowOldLifeHeld, isSequenceOrOldLifeWaitRunning, JSONL_NO_CANDIDATES_TEXT, jsonlCandidatesInconclusiveNoticeText, jsonlCandidatesText, jsonlTranscriptLostNoticeText, ladderRuleRetryingLine, LATCH_RECHECK_AT_CAP,
+  LATCH_RECHECK_OBSERVER_FAILED,
+  LATCH_RECHECK_STATUS_READ_SITE, latchedElsewhereDuringCallLine, latchedLaunchSkipLine, latchEntryQueryFailedLine, latchRecheckAtCapLine,
+  latchRecheckNotUpLine,
+  latchRecheckObserverFailedLine,
+  LAUNCH_CALL_END_RETURNED,
+  launchCallWindowOf, launchMetSendKeysNotInteractive, launchUnavailableFormText, LIVE_ROW_START_HELD, liveRowSequenceGate, NOT_LAUNCHED_FOR_SHUTDOWN, OLD_LIFE_HOLD_ARM_SKIPPED, OLD_LIFE_HOLD_END_NOT_RETRIED_HELD,
+  OLD_LIFE_HOLD_END_NOT_RETRIED_LATCHED,
+  OLD_LIFE_HOLD_END_NOT_RETRIED_NOT_APPLIED,
+  OLD_LIFE_HOLD_END_NOT_RETRIED_NOT_UP,
+  OLD_LIFE_HOLD_END_RETRY_FAILED_PREFIX, OLD_LIFE_HOLD_SKIPPED_TIMER_PHRASE, OLD_LIFE_WAIT_START_NOT_HELD, OLD_LIFE_WAIT_STOP_CAUSE_SHUTDOWN,
+  OLD_LIFE_WAIT_STOP_CAUSE_TEARDOWN,
+  OLD_LIFE_WAIT_STOP_CAUSE_UNKNOWN, oldLifeHeldDirectory,
+  oldLifeHoldEndRetryLine, oldLifeHoldLaunchLine, oldLifeHoldStep, oldLifeWaitNotAppliedLine,
+  oldLifeWaitNotStartedLine,
+  oldLifeWaitRefusalLine, ownLaunchRecordOf,
   PERSONA_KILL_STOP_CAUSE_GENERIC,
   PERSONA_KILL_STOP_CAUSE_NOT_UP,
   PERSONA_KILL_STOP_CAUSE_RECHECK,
-  PERSONA_KILL_STOP_CAUSE_SHUTDOWN,
-  raisePersonaKillFailureAlert,
-  retiredKeyReadingOf,
-  setPersonaKillKeepGoingQuery,
-  type PersonaKillKeepGoingQuery,
-  setLiveRowSequenceRegistry,
-  REUSE_RECORDED_SINCE_GENERATION_UNREADABLE,
+  PERSONA_KILL_STOP_CAUSE_SHUTDOWN, personaKillStoppedNoAlertsLine, personaRetryBlockCause, raisePersonaKillFailureAlert, reconnectHeldLine, recordSendKeysNotInteractive, retiredKeyReadingOf, REUSE_RECORDED_SINCE_GENERATION_UNREADABLE,
   REUSE_RECORDED_SINCE_NOT_RECORDED_AT_START,
-  REUSE_RECORDED_SINCE_RECORDED_AGAIN,
-  reuseRecordedInFlightLine,
-  setRetiredKeyStore,
-  SPAWN_ACTION_FRESH_RETIRED,
-  SPAWN_ACTION_RETRYING,
-  NOT_LAUNCHED_FOR_SHUTDOWN,
-  startLaunchNotStartedForShutdownLine,
-  startupSummaryEnding,
-  startupSummaryLine,
-  START_SWEEP_LIST_SITE,
-  TEARDOWN_KILL_STATUS_SITE,
-  WORKING_WAIT_STATUS_SITE,
-  type ReuseRecordedSince,
+  REUSE_RECORDED_SINCE_RECORDED_AGAIN, reuseInvalidFlagsHeldLine, reuseRecordedInFlightLine, reuseSpawnForPersona,
+  runLatchRecheckRound, setInvalidFlagsHold, setLiveRowSequenceRegistry, setPersonaKillKeepGoingQuery, setRetiredKeyStore, setStuckLaunchEpisodes, SPAWN_ACTION_FRESH_RETIRED,
+  SPAWN_ACTION_RETRYING, START_SWEEP_KILL_STATUS_SITE,
+  START_SWEEP_KILL_STOP_RECHECK,
+  START_SWEEP_KILL_STOP_SHUTDOWN, START_SWEEP_LIST_SITE, START_SWEEP_SHUTDOWN_STOP_LINE, startLaunchNotStartedForShutdownLine, startStuckLaunchAbortSequence, startSweepKillFailedEntry,
+  startSweepKillSucceededLine,
+  startSweepLatchedFromOwnRowLine,
+  startSweepLatchedLine,
+  startSweepOutageNotRaisedLine, startSweepPostKillFailedLine,
+  startSweepPostKillLine,
+  startSweepStoppedKillLine,
+  startSweepSummaryLine, startSweepSweepingRowLine, startupSummaryEnding,
+  startupSummaryLine, TEARDOWN_KILL_STATUS_SITE, thisLaunchRowOf,
+  type ForcedLaunchOutcome, type JsonlCandidate, type LatchRecheckRoundDeps, type OldLifeHoldWaitStart, type OrphanReconcileResult, type OwnLaunchRecord, type PersonaKillKeepGoingQuery, type ReuseRecordedSince
 } from '../src/session-manager.ts'
-import { readRetiredKeysRecord, retiredKeysRecordOf, RFC3339_UTC, type RetiredKeySeed } from './test-helpers/retired-keys.ts'
+import { REDACTED_TOKEN_PLACEHOLDER, REDACTED_URL_PLACEHOLDER } from '../src/slack-log-redaction.ts'
+import { escapeSlackControlCharacters, unescapeSlackControlCharacters } from '../src/slack-text-escape.ts'
 import {
-  PRE_PERSONA_ID,
+  _resetLaunchedWithDirs,
+  getLaunchedWithDir,
+  managedHookCommand,
+  preLaunchReplyGuard,
+} from '../src/stop-hook-bootstrap.ts'
+import {
+  createUnavailableRetryController,
+  RETRY_BLOCK_LAUNCH,
+  runInAttempt,
+  runInTimerRetry,
+  UNAVAILABLE_RETRY_BASE_S,
+  UNAVAILABLE_RETRY_CAUSE_COLLISION,
+  UNAVAILABLE_RETRY_CAUSE_CONFIG,
+  UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT,
+  UNAVAILABLE_RETRY_CAUSE_KILL_FAILED,
+  UNAVAILABLE_RETRY_CAUSE_LOST_RACE,
+  UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD,
+  UNAVAILABLE_RETRY_CAUSE_PENDING_ROW,
+  UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
+  UNAVAILABLE_RETRY_CAUSE_SEQUENCE_ENDED,
+  UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE,
+  UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED,
+  UNAVAILABLE_RETRY_MODE_PENDING_ONLY,
+  UNAVAILABLE_RETRY_ROW_ABSENT,
+  UNAVAILABLE_RETRY_STOP_LATCHED,
+  UNAVAILABLE_RETRY_STOP_RECOVERED,
+  type AttemptView,
+  type UnavailableRetryController,
+  type UnavailableRetryRowRead,
+  type UnavailableRetryTriggerSink
+} from '../src/unavailable-retry.ts'
+import type { ConflictCase as StubConflictCase, StubDeleteParams, StubKillResult, StubSpawnResult } from './test-helpers/agent-director-stub.ts'
+import {
+  cannedErr,
+  cannedFindMissing,
+  cannedGetResult,
+  cannedKillResult,
+  cannedListRow,
+  cannedOk,
+  cannedPermissionRequest,
+  cannedSpawnResult,
+  cannedStatusResult,
+  errCallTimeout,
+  errConfigMalformed,
+  errCwdNotADirectory,
+  errCwdNotFound,
+  errGeneric,
+  errInstanceIdCollision,
+  errInternal,
+  errInvalidFlags,
+  errJsonlMissing,
+  errJsonlNeverWritten,
+  errNoSessionId,
+  errSchemaMismatch,
+  errSendKeysWhileRelayed,
+  errSpawnNotFound,
+  errSpawnNotInteractive,
+  errSpawnNotInteractiveLeftover,
+  errSpawnNotInteractiveNoLaunchStart,
+  errSpawnNotResumable,
+  errSystemInstallDisappeared,
+  errSystemInstallNotFound,
+  errTmuxCaptureFailed,
+  errTmuxKillFailed,
+  errTmuxNotAvailable,
+  errTmuxNotAvailableDifferentServer,
+  errTmuxNotAvailableNewRowEnded,
+  errTmuxSendKeys,
+  errTmuxSessionConflict,
+  errTmuxSessionCreate,
+  errTmuxSessionCreateStaysPending,
+  errTmuxUnresponsive,
+  errTmuxUnresponsiveAfterDuplicateSession,
+  errUnknownErrorName,
+  errUnusableName,
+  holdFindMissing,
+  holdSpawns,
+  KILL_FAILED_DESCRIPTIONS,
+  makeStubCallLog,
+  makeStubClient,
+  makeStubResolveSystemBinary,
+  nonLatchingNotes,
+  PRE_TRUST_VALUES,
+  provenanceNote,
+  RESTORE_SENTENCES,
+  SAMPLE_LAUNCH_START_DEFAULT,
+  SAMPLE_LAUNCH_START_FRACTIONAL,
+  SAMPLE_LAUNCH_START_NONE,
+  SAMPLE_LAUNCH_START_WHOLE,
+  STUB_INSTANCE_ID,
+  STUB_TMUX_SESSION_NAME,
+  stubCallCount,
+  UNAVAILABLE_FORMS,
+  unavailableForms,
+  unknownNote,
+  UNUSABLE_NAME_FAULTS,
+  withRestoreSentence,
+  type CannedGetResult,
+  type CannedResponse,
+  type CannedRowPersona,
+  type FindMissingRowPlacement,
+  type PersonaGetResultOverrides,
+  type StubClient,
+  type StubClientOptions,
+  type StubResolveSystemBinaryOutcome
+} from './test-helpers/agent-director-stub.ts'
+import { DEV_PLACEHOLDER_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
+import { buildTempArchiveDb, messagesSince } from './test-helpers/archive-db.ts'
+import {
+  CONFLICT_CASE_ROWS,
+  expectedConflictNotice,
+  expectedLatchRecord,
+  LAUNCH_START_ABSENT_PERSONA_KEY,
+  LAUNCH_START_AND_NOTE_ROW,
+  LAUNCH_START_CASE_ROWS,
+  LAUNCH_START_NON_LATCHING_ROWS,
+  PLAIN_SPAWN_CONFLICT_CASE_ROWS,
+  promptRowPaneConflictRowsAt,
+  RECONNECT_CONFLICT_CASE_ROWS,
+  RECONNECT_UNUSABLE_NAME_CASE_ROWS,
+  reconnectConflictRowsAt,
+  RESTART_KILL_SITE,
+  REUSE_SPAWN_CONFLICT_CASE_ROWS,
+  REUSE_SPAWN_SITE,
+  REUSE_SPAWN_UNUSABLE_NAME_CASE_ROWS,
+  reuseSpawnScanRows,
+  sequenceResumeConflictRowsAt,
+  STUCK_LAUNCH_ABORT_CONFLICT_CASE_ROWS, STUCK_LAUNCH_ABORT_UNUSABLE_NAME_CASE_ROWS,
+  UNUSABLE_NAME_CASE_ROWS,
+  type ConflictCaseRow,
+  type LaunchStartCaseRow,
+  type LaunchStartCaseRowOf,
+  type LaunchStartNonLatchingRowOf,
+  type LaunchStartReadShape,
+  type PlainSpawnRowAfter,
+  type UnusableNameCaseRow,
+  type UnusableNameSite
+} from './test-helpers/conflict-cases.ts'
+import {
+  APP_TOKEN_PREFIX,
+  assertNoLeak,
+  BOT_TOKEN_PREFIX,
+  fakeToken,
+  LEAK_SENTINEL,
+  REDACTED_SENTINEL_TAIL,
+  sentinelInMessage,
+  writtenFile,
+} from './test-helpers/credentials.ts'
+import { DEAD_EVIDENCE_OF } from './test-helpers/dead-evidence.ts'
+import { createFakeClock, type FakeClock } from './test-helpers/fake-clock.ts'
+import { lineParts } from './test-helpers/line-parts.ts'
+import {
   absentRow,
   beginApplyHold,
   gateLine,
   gateLinesIn,
-  heldBack,
   holdOldAt,
   listed,
+  PRE_PERSONA_ID,
   sweepOver,
-  type SweepRun,
+  type SweepRun
 } from './test-helpers/old-life.ts'
-import { expectUntouched, recordSequenceStarts, retiredEntryClearedLine, retiredEntryClearFailedLine, retiredKeyLinesIn } from './test-helpers/recovery-harness.ts'
+import { makePersonaClients, makeTrailCapture, posts, startManualPoller } from './test-helpers/permission-relay-harness.ts'
+import { makeMultiPersonaConfig, makePersonaConfigInput, makeStandInPersonaConfig } from './test-helpers/persona-config.ts'
+import { makeConnectionHarness } from './test-helpers/persona-connection-harness.ts'
+import { makeNotifierHarness, type NotifierHarness } from './test-helpers/persona-notifier.ts'
 import {
-  OLD_LIFE_WAIT_START_NOT_HELD,
-  SEQUENCE_WAITING_CAUSE_OLD_LIFE_HOLD,
-  _resetOldLifeWaitBindings,
-  OLD_LIFE_WAIT_STOP_CAUSE_SHUTDOWN,
-  OLD_LIFE_WAIT_STOP_CAUSE_TEARDOWN,
-  OLD_LIFE_WAIT_STOP_CAUSE_UNKNOWN,
-  buildOldLifeWaitDeps,
-  createOldLifeWaitRecord,
-  ensureOldLifeWait,
-  isOldLifeWaitRunningFor,
-  isSequenceOrOldLifeWaitRunning,
-  liveRowSequenceGate,
-  oldLifeWaitNotAppliedLine,
-  oldLifeWaitNotStartedLine,
-  oldLifeWaitRefusalLine,
-  latchEntryQueryFailedLine,
-  personaKillStoppedNoAlertsLine,
-  JSONL_NO_CANDIDATES_TEXT,
-  jsonlCandidatesText,
-  jsonlCandidatesInconclusiveNoticeText,
-  jsonlTranscriptLostNoticeText,
-  type JsonlCandidate,
-  OLD_LIFE_HOLD_ARM_SKIPPED,
-  OLD_LIFE_HOLD_SKIPPED_TIMER_PHRASE,
-  personaRetryBlockCause,
-  buildPendingRowRuleDeps,
-} from '../src/session-manager.ts'
-import { LIVE_ROW_START_ALREADY_RUNNING, LIVE_ROW_START_CLOSED } from '../src/live-row-sequence.ts'
-import {
-  OLD_LIFE_HOLD_END_NOT_RETRIED_HELD,
-  OLD_LIFE_HOLD_END_NOT_RETRIED_LATCHED,
-  OLD_LIFE_HOLD_END_NOT_RETRIED_NOT_APPLIED,
-  OLD_LIFE_HOLD_END_NOT_RETRIED_NOT_UP,
-  OLD_LIFE_HOLD_END_RETRY_FAILED_PREFIX,
-  type OldLifeHoldWaitStart,
-  createOldLifeHoldEndRetry,
-  isOwnRowOldLifeHeld,
-  oldLifeHeldDirectory,
-  oldLifeHoldEndRetryLine,
-  oldLifeHoldEndSettledRetryLine,
-  oldLifeHoldStep,
-  reconnectHeldLine,
-} from '../src/session-manager.ts'
-import {
-  RETRY_BLOCK_LAUNCH,
-  RETRY_BLOCK_LIVE_ROW_SEQUENCE,
-  RETRY_BLOCK_OLD_LIFE_WAIT,
-  UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD,
-  UNAVAILABLE_RETRY_RUN_NOW_RAN,
-  UNAVAILABLE_RETRY_RUN_NOW_ARMED,
-  type RetryBlockCause,
-} from '../src/unavailable-retry.ts'
-import {
-  START_SWEEP_KILL_STATUS_SITE,
-  START_SWEEP_KILL_STOP_RECHECK,
-  START_SWEEP_KILL_STOP_SHUTDOWN,
-  START_SWEEP_SHUTDOWN_STOP_LINE,
-  startSweepKillFailedEntry,
-  startSweepKillSucceededLine,
-  startSweepLatchedFromOwnRowLine,
-  startSweepLatchedLine,
-  startSweepOutageNotRaisedLine,
-  startSweepSweepingRowLine,
-  startSweepPostKillFailedLine,
-  startSweepPostKillLine,
-  startSweepStoppedKillLine,
-  startSweepSummaryLine,
-  type OrphanReconcileResult,
-} from '../src/session-manager.ts'
-import {
-  LAUNCH_CALL_END_LAUNCH_TIMEOUT,
-  LAUNCH_CALL_END_RETURNED,
-  LAUNCH_UNAVAILABLE_GET_SITE,
-  LAUNCH_UNAVAILABLE_OUTCOME_APPROVER,
-  LAUNCH_UNAVAILABLE_OUTCOME_COVERED_NO_APPROVER,
-  LAUNCH_UNAVAILABLE_OUTCOME_FINISHED,
-  LAUNCH_UNAVAILABLE_OUTCOME_LATCHED,
-  LAUNCH_UNAVAILABLE_OUTCOME_LIVE,
-  LAUNCH_UNAVAILABLE_OUTCOME_NO_ROW,
-  LAUNCH_UNAVAILABLE_OUTCOME_REFUSED,
-  LAUNCH_UNAVAILABLE_OUTCOME_UNKNOWN,
-  LAUNCH_UNAVAILABLE_OUTCOME_APPROVER_NOT_STARTED,
-  approverStartedAfterLaunchTimeoutMessage,
-  launchCallWindowOf,
-  launchUnavailableFormText,
-  launchUnavailableGetLine,
-  launchUnavailableSequenceOutcome,
-  thisLaunchRowOf,
-  type LaunchCallWindowRecord,
-  type OwnLaunchRecord,
-  type ThisLaunchRowRecord,
-} from '../src/session-manager.ts'
-import { LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT, LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE, type LaunchTimeoutForm } from '../src/ad-error-class.ts'
-import { TMUX_UNRESPONSIVE_END_TMUX_VERB } from '../src/persona-episodes.ts'
-import { PENDING_ROW_REASON_CWD_MISMATCH, PENDING_ROW_REASON_RETIRED_OLD_LIFE } from '../src/pending-row.ts'
-import {
-  errTmuxUnresponsiveLaunchTimeout,
-  errTmuxUnresponsiveStillStarting,
-  errTmuxUnresponsiveStillStopping,
-} from './test-helpers/agent-director-stub.ts'
-import {
-  TIMED_LAUNCH_SUCCESS,
-  conditionEndedLine,
-  conditionEndedLines,
+  adConfigMalformedRaiseLines,
+  callCounts,
+  callCountsSince,
+  collided,
+  conditionStartedLines,
+  DISPATCHER_BUG_WORDING,
+  dispatcherBugWordingIn,
+  expectLostMessageReports,
+  expectPendingOnlyWatch,
+  expectUntouched,
+  personaOf as harnessPersona,
+  holdSequenceReuse,
+  holdThroughReuse,
+  killFailureEndedLine,
+  killFailureLines,
+  killFailureNotice,
+  killFailureNotRaisedLine,
+  killFailurePostedLine,
+  killFailureRecoveryEntry,
+  killFailureStoppedEntry,
+  killFailureStoppedEntryLine,
+  launchThroughSequence,
+  makeRecoveryHarness,
+  ordinaryAlertContent,
+  ownRowsLiveThenMissing,
+  pastSampleGrace,
+  personaCallCounts,
+  putAtRestartCap,
+  recheckAtCapLinesOf,
+  recordCallOrder,
+  recordSequenceStarts, retiredEntryClearedLine, retiredEntryClearFailedLine, retiredKeyLinesIn,
+  retryNow,
+  reuseSpawnOf,
+  scriptLiveRowElsewhere,
+  scriptReuseInvalidFlags,
   scriptTimedLaunch,
-  type TimedLaunch,
-  type TimedLaunchStart,
+  startSequenceHeldAtRun,
+  startupEntriesOf,
+  survivorAlertContent,
+  TIMED_LAUNCH_SUCCESS,
+  unavailableAt,
+  unclassifiedLinePrefix,
+  unclassifiedStartedLine,
+  unclassifiedStartedLines,
+  type RecoveryHarness,
+  type RecoveryHarnessOptions,
+  type RecoveryRowState,
+  type RecoverySequenceRequest,
+  type RecoveryStubScript,
+  type TimedLaunch
 } from './test-helpers/recovery-harness.ts'
+import { installRecordingReplyGuard, observeLaunchCalls, type LaunchCall } from './test-helpers/reply-guard-launch.ts'
+import { makeReplyGuardRecordDir, type ReplyGuardRecordDir } from './test-helpers/reply-guard-record.ts'
+import { readRetiredKeysRecord, retiredKeysRecordOf, RFC3339_UTC, type RetiredKeySeed } from './test-helpers/retired-keys.ts'
 import {
-  forgetLaunchCalls,
-  launchMetSendKeysNotInteractive,
-  recordSendKeysNotInteractive,
-  setStuckLaunchEpisodes,
-} from '../src/session-manager.ts'
+  makeDeferredConnect,
+  makeStubSlack,
+  openedDm,
+  type DeferredConnect,
+  type StubSlackOptions,
+  type WebApiOutcome,
+} from './test-helpers/slack-stub.ts'
+import { balancedAfter, srcModules, stripComments } from './test-helpers/source-audit.ts'
 import {
-  describeLaunchStartForLog,
-  STUCK_LAUNCH_POSTED,
-  postStuckLaunchHeld,
-  stuckLaunchEndRowLiveReason,
-  stuckLaunchEpisodeEndedLine,
-  type StuckLaunchPosterDeps,
-} from '../src/pending-row.ts'
-import { PERSONA_EPISODE_KIND_STUCK_LAUNCH } from '../src/persona-episodes.ts'
-import {
-  ladderRuleRetryingLine,
-  PENDING_ROW_RULE_SITE,
-  readPendingRowLapPane,
-  sendPendingRowLapEnter,
-} from '../src/session-manager.ts'
-import {
-  describePendingRowRuleAnswer,
-  PENDING_ROW_LAP_ENTER_ABSENT,
-  PENDING_ROW_LAP_ENTER_CONFIG,
-  PENDING_ROW_LAP_ENTER_CONFLICT,
-  PENDING_ROW_LAP_ENTER_ENVIRONMENT,
-  PENDING_ROW_LAP_ENTER_GONE,
-  PENDING_ROW_LAP_ENTER_LATCHED,
-  PENDING_ROW_LAP_ENTER_NOT_INTERACTIVE,
-  PENDING_ROW_LAP_ENTER_NOT_SENT_LATCHED,
-  PENDING_ROW_LAP_ENTER_SENT,
-  PENDING_ROW_LAP_ENTER_UNAVAILABLE,
-  PENDING_ROW_LAP_ENTER_UNCLASSIFIED,
-  PENDING_ROW_LAP_ENTER_UNUSABLE_NAME,
-  PENDING_ROW_RULE_GONE,
-  PENDING_ROW_RULE_LOG_HEAD,
-  PENDING_ROW_RULE_ORIGIN_RETRY,
-  PENDING_ROW_RULE_READ_REFUSED,
-  stuckLaunchHeldText,
-  type PendingRowLapEnterOutcome,
-  type PendingRowRuleAnswer,
-} from '../src/pending-row.ts'
-import { runInTimerRetry } from '../src/unavailable-retry.ts'
-import { LIVENESS_DEAD_ROW_NO_ROW, type DeadRowRead } from '../src/liveness-reading.ts'
-import { pastSampleGrace } from './test-helpers/recovery-harness.ts'
-import {
-  APPROVER_STOP_STUCK_LAUNCH_ABORT,
-  abortKillOwnStuckLaunch,
-  approverStopRequestedMessage,
-  dialogApproverLaunchStart,
-  isCscbOwnLaunch,
-  ownLaunchRecordOf,
-  startStuckLaunchAbortSequence,
-  stopApproverForStuckLaunchAbort,
-} from '../src/session-manager.ts'
-import {
-  STUCK_LAUNCH_ABORT_KILL_FAILED,
-  STUCK_LAUNCH_ABORT_KILL_LATCHED,
-  STUCK_LAUNCH_ABORT_KILL_STOPPED,
-  STUCK_LAUNCH_ABORT_KILL_SUCCEEDED,
-  STUCK_LAUNCH_ABORT_KILL_TRY_LATER,
-  STUCK_LAUNCH_ABORT_SEQUENCE_NOT_STARTED,
-  STUCK_LAUNCH_ABORT_SEQUENCE_STARTED,
-  stuckLaunchAbortKillUsesAbort,
-  type StuckLaunchAbortKillAnswer,
-} from '../src/pending-row.ts'
-import { KILL_FAILURE_CLOSING_DESTINATION, KILL_FAILURE_CONTEXT_STUCK_LAUNCH_ABORT } from '../src/kill-failure-alert.ts'
-import { LIVE_ROW_SEQUENCE_ENTRY_GET, type LiveRowSequenceRegistry } from '../src/live-row-sequence.ts'
-import { STUCK_LAUNCH_ABORT_CONFLICT_CASE_ROWS, STUCK_LAUNCH_ABORT_UNUSABLE_NAME_CASE_ROWS } from './test-helpers/conflict-cases.ts'
-import { _forceResumeForPersona, _forceReuseSpawnForPersona, type ForcedLaunchError, type ForcedLaunchOutcome } from '../src/session-manager.ts'
+  IDLE_PANE,
+  SPINNER_PANE,
+  TRANSCRIPT_SESSION_ID
+} from './test-helpers/working-row-panes.ts'
 
 // ---------------------------------------------------------------------------
 // Test fixture helpers
 // ---------------------------------------------------------------------------
 
-let approverFixtureRows = false
 function installStub(opts: StubClientOptions = {}): StubClient {
   // A normal legacy session has a real empty composer; callers can still
   // script blank panes and can change this options object between calls.
   if (!Object.hasOwn(opts, 'readPaneResults')) Object.defineProperty(opts, 'readPaneResults', { value: [cannedReadPaneResult(IDLE_PANE)], writable: true, configurable: true })
   const stub = makeStubClient(opts)
-  if (approverFixtureRows) {
-    const status = stub.status, get = stub.get
-    let latest: StatusResult | undefined
-    let fresh = false
-    stub.status = async params => { latest = await status(params); fresh = false; return latest }
-    stub.get = async params => {
-      if (latest?.state !== 'pending') return get(params)
-      opts.getCalls?.push(params)
-      if (!fresh) {
-        fresh = true
-        const next = opts.statusFn?.(params)
-        if (next instanceof Error) throw next
-        if (next) latest = next
-        else if (opts.statusQueue?.length) {
-          const item = opts.statusQueue.shift()!
-          if (item.kind === 'reject') throw item.error
-          latest = item.value
-        }
-      }
-      return cannedGetResult({ ...(opts.getResult ?? { instance_id: params.instance_id }), ...latest })
-    }
-  }
   setClientForTests(stub as unknown as Parameters<typeof setClientForTests>[0])
   return stub
 }
@@ -1755,11 +681,9 @@ let savedEnv: NodeJS.ProcessEnv
 beforeEach(() => {
   savedEnv = { ...process.env }
   fixtureDir = mkdtempSync(join(tmpdir(), 'cscb-sm-'))
-  // A launch that returns success starts the persona's dialog approver in
+
   // the background (b.jg5 SRJ-401). Cap it short, so one left on the real
-  // clock stops soon; afterEach stops every approver (`_resetInFlightLaunches`).
-  // An approver case runs it on a fake clock (`useApproverClock`).
-  _setDialogReadyTimeoutMs(200)
+
   // Wire the outage-state module so withOutageDetection / withSpawnDetection
   // can resolve the AD client and emit Slack onset/all-clear messages.
   outageEmissions = []
@@ -1780,16 +704,14 @@ beforeEach(() => {
 })
 
 afterEach(() => {
-  // First: stop every dialog approver a launch started (b.jg5 SRJ-401), so
+
   // none makes a call after this test's client and seams are put back.
   _resetInFlightLaunches()
-  approverFixtureRows = false
   resetClientForTests()
-  _resetDialogReadyTimeoutMs()
+
   _resetWaitForWaitingTimeoutMs()
   _resetFindMissingMemo()
-  // An approver case runs the approver on a fake clock (`useApproverClock`).
-  _resetApproverClock()
+
   _resetOutageState()
   _resetSpawnHomeDir()
   _resetPreLaunchTrustPatcher()
@@ -1797,7 +719,7 @@ afterEach(() => {
   _resetLaunchedWithDirs()
   _resetConfigDirFs()
   _resetNotConnectedEpisodes()
-  _resetUnprovenIdleNoticeAfterMs()
+
   // b.f2b cases pass a fake clock's `now` to the session manager (`_setNow`).
   _resetNow()
   setConfigDirUnresolvableHook(undefined)
@@ -1951,83 +873,6 @@ async function settleNotices(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 0))
 }
 
-/**
- * Run the startup-dialog approver on a fresh fake clock for this test
- * (`_setApproverClock`; the file's afterEach restores the real clock),
- * starting at `start` (0 by default), at its real pace and stopping at B
- * (`adLaunchBoundMsInEffect`, the test cap unset) unless the case sets a cap.
- * A case about B starts the clock at the launch start its `pending` row
- * shows (`SAMPLE_LAUNCH_START_MS`), so B is reached on the clock. Every
- * approver case settles its call with `runOnApproverClock`, never on real
- * time.
- */
-function useApproverClock(start = 0): FakeClock {
-  approverFixtureRows = true
-  const clock = createFakeClock({ start })
-  _setApproverClock(clock)
-  _resetDialogReadyTimeoutMs()
-  return clock
-}
-
-/** Most event-loop turns `runOnApproverClock` gives a call to settle. */
-const APPROVER_DRIVE_TURNS = 5_000
-
-/**
- * Settle `work` (an approver call, or a launch that awaits one) on `clock`,
- * the approver's clock (`useApproverClock`). Virtual time moves only while
- * the approver sleeps between laps, that is while a timer besides its cap is
- * pending, and then by one `runNext` (the next lap, or the cap when that is
- * due first). Between steps it yields one event-loop turn, so a launch's own
- * file I/O before the approver starts goes on. Fails the test when `work`
- * has not settled after `APPROVER_DRIVE_TURNS` turns.
- */
-async function runOnApproverClock<T>(clock: FakeClock, work: Promise<T>): Promise<T> {
-  let settled = false
-  work.then(
-    () => { settled = true },
-    () => { settled = true },
-  )
-  for (let turn = 0; !settled && turn < APPROVER_DRIVE_TURNS; turn++) {
-    await new Promise<void>((resolve) => setImmediate(resolve))
-    if (!settled && clock.pendingCount() >= 2) await clock.runNext()
-  }
-  if (!settled) throw new Error(`the approver did not stop within ${APPROVER_DRIVE_TURNS} event-loop turns (virtual time ${clock.now()} ms)`)
-  return work
-}
-
-/**
- * Settle `work` without moving the approver's clock: yield event-loop turns,
- * at most `APPROVER_DRIVE_TURNS`, and fail the test when `work` has not
- * settled by then. A launch settles so whatever its dialog approver does:
- * the approver runs on its own after the launch call (b.jg5 SRJ-401), and
- * its laps after the first wait for the clock.
- */
-async function settleOffApproverClock<T>(work: Promise<T>): Promise<T> {
-  let settled = false
-  work.then(
-    () => { settled = true },
-    () => { settled = true },
-  )
-  for (let turn = 0; !settled && turn < APPROVER_DRIVE_TURNS; turn++) {
-    await new Promise<void>((resolve) => setImmediate(resolve))
-  }
-  if (!settled) throw new Error(`the call did not settle within ${APPROVER_DRIVE_TURNS} event-loop turns with the approver's clock held`)
-  return work
-}
-
-/**
- * Settle `launch`, a launch of persona `key`, with the approver's clock held
- * (`settleOffApproverClock`), then run the dialog approver its success
- * started (b.jg5 SRJ-401) to its stop on `clock` (`useApproverClock`), awaited
- * through the stop seam (`_whenDialogApproverStopped`). Answers the launch's
- * result; the seam answers how the approver ended.
- */
-async function launchThenRunApprover<T>(clock: FakeClock, key: string, launch: Promise<T>): Promise<T> {
-  const result = await settleOffApproverClock(launch)
-  await runOnApproverClock(clock, _whenDialogApproverStopped(key))
-  return result
-}
-
 /** The stub's default launch start on a `pending` row, in ms, read with E16's reader (`parseLaunchStart`). */
 const SAMPLE_LAUNCH_START_MS = parseLaunchStart(SAMPLE_LAUNCH_START_DEFAULT)!
 
@@ -2036,7 +881,6 @@ function statusReads(...states: string[]): CannedResponse<StatusResult>[] {
   return states.map((state) => cannedOk(cannedStatusResult({ state })))
 }
 
-/** The trigger one pending-only arm of persona `key` records (b.jg5 SRJ-301, SRJ-409): a launch that returned, a covered `pending` row, an approver's arming stop. */
 function pendingRowTrigger(key: string): { key: string; kind: string } {
   return { key, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }
 }
@@ -3174,14 +2018,6 @@ function labelConfig(
   return { cfg, home, configDir }
 }
 
-/**
- * Drive `entry` to its resume decision. `ended` / `missing` resolve straight
- * to it; `waiting` meets a dead session through the reconnect's GONE (ErrTmuxSendKeys);
- * `working` through the up-front findMissing sweep reconciling the row to
- * `missing`. The resumed or fresh session reports `waiting`, so the dialog
- * approver returns at once. `key` is the persona's key (default the stand-in
- * `C`). Returns the installed stub.
- */
 function installResumeEntry(entry: ResumeEntry, row: CannedGetResult, calls: LadderCalls, key = 'C'): StubClient {
   const state = entry.split(' ')[0] as 'ended' | 'missing' | 'waiting' | 'working'
   if (state === 'working') _setWaitForWaitingTimeoutMs(30)
@@ -5059,7 +3895,6 @@ function sweepKillFailedEntry(
   return `${entry}; kill-failure alert: ${sweepAlertEntry(row, { version: KILL_FAILURE_VERSION_ORDINARY, session: row.tmux_session_name, instanceId: row.instance_id, quotes: ordinary })}`
 }
 
-
 describe('reconcileOrphans: the start sweep by persona kills its live strays with the result checked and deletes no row (b.av2 SR-6.3, AC 4; b.jg5 SRJ-714, SRJ-1506, SRJ-1514)', () => {
   /**
    * Three applied personas in real temp working directories, except that
@@ -6401,7 +5236,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       expect(await h.launch(p)).toStrictEqual({ key: p, action: SPAWN_ACTION_FRESH_RETIRED })
       expect(h.stub.calls.spawnCalls.slice(spawnsBefore)).toEqual([reuseSpawnOf(h, p)])
       expect(h.stub.calls.resumeCalls).toEqual([])
-      await h.runApproverToStop(p)
+
     }
 
     test('hatch A3: a failed absent-at-start write is one store line; the file is unchanged, the key reads as retired by this server (held in memory) and is counted, the kills are still made with no orphan-cleanup entry; P re-added before a restart gets one reuse spawn and no resume', async () => {
@@ -6480,7 +5315,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       expect(h.retiredKeyWrites).toEqual([])
       h.script({ listError: undefined })
       expect(await h.launch(p)).toStrictEqual({ key: p, action: 'spawned' })
-      await h.runApproverToStop(p)
+
     })
 
     test('a dry run makes no list and latches, records and kills nothing', async () => {
@@ -7329,34 +6164,6 @@ describe('b.g57: an unresolvable claude_config_dir keeps the row and skips the l
   // b.jg5 SRJ-409 (b.g57, b.av2 SR-6.4): at the ladder's pending branch a
   // claude_config_dir that cannot be resolved leaves the row undecided: kept,
   // P's retry timer armed in pending-only mode to decide again at its next
-  // read, no approver and no sequence; the launch keeps its deferral.
-  test('b.jg5 SRJ-409: a pending row with its matching label, the claude_config_dir unresolvable once the row is fetched: deferred, the row kept and undecided — P armed pending-only once, one undecided line; no approver, sequence, kill or further launch', async () => {
-    const f = unresolvableFixture()
-    const calls = makeStubCallLog()
-    const arms = recordPendingOnlyArms(calls)
-    installStub({
-      ...calls,
-      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
-      getResult: personaRow(f.cfg, GUARD_KEY, { state: AGENT_DIRECTOR_PENDING_STATE }),
-    })
-    _setConfigDirFs({ realpath: realpathFailingUnder(f.configDir, () => calls.getCalls.length > 0) })
-
-    let result: SpawnPersonaResult | undefined
-    const errLog = await withCapturedErr(async () => {
-      result = await spawnForPersona(f.persona, f.cfg)
-    })
-
-    expect(result).toMatchObject({ key: GUARD_KEY, action: 'deferred' })
-    expect(arms.pendingOnly.map((arm) => arm.key)).toEqual([GUARD_KEY])
-    expect(arms.full).toEqual([])
-    expect([calls.spawnCalls.length, calls.getCalls.length, calls.resumeCalls, calls.killCalls, calls.deleteCalls, calls.sendKeysCalls]).toEqual([1, 1, [], [], [], []])
-    expect(isDialogApproverRunning(GUARD_KEY)).toBe(false)
-    expect(errLog.split('\n').filter((line) => line.startsWith(PENDING_ROW_STEP_LOG_PREFIX))).toEqual([
-      undecidedPendingRowLine(renderPersonaRef(f.persona.name, f.persona.key), PENDING_ROW_REASON_CONFIG_DIR_UNRESOLVED, true),
-    ])
-    expect(errLog).not.toContain(LIVE_ROW_SEQUENCE_LOG_PREFIX)
-    assertNoLeak({ errLog, result })
-  })
 
   // AC 20 (b.av2 SR-10.3): the same mid-launch line when the realpath error
   // carries fake tokens in its message and properties; every console.error
@@ -8351,12 +7158,6 @@ const WAIT_REF_C = 'persona=C'
 /** `WAIT_STATUS_ERRORS` as `test.each` rows, named by label. */
 const WAIT_STATUS_ERROR_ROWS = WAIT_STATUS_ERRORS.map((e) => [e.label, e] as const)
 
-/** The cause an `auto-restart-disabled` notice names; fails the test for any other notice. */
-function noticeCause(notice: NotConnectedNotice): string {
-  if (notice.reason !== 'auto-restart-disabled') throw new Error(`a ${notice.reason} notice names no cause`)
-  return notice.cause
-}
-
 /**
  * The text persona `key`'s not-connected notice posts for `notice`, rendered
  * through `notifyPersonaNotConnected` on a scratch sink with its log line
@@ -8566,34 +7367,6 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
   // is logged (one line for a run of one class); the poll after the run reads
   // the row waiting, and C is reconnected. An error that raises an outage
   // raises it once, at the first failed read.
-  test.each(WAIT_STATUS_ERROR_ROWS)('b.jg5 SRJ-605: %s at the poll → the wait polls on with no post or notice, never failed or dead-session; one line for the run of failed reads; the next poll reads waiting and C is reconnected; no probe; its outage, if any, raised once', async (_label, { make, errorClass, outage }) => {
-    const clock = useFakeNow()
-    const err = make()
-    const row = installWorkingRow(clock, { state: (r) => (r.statusCalls.length <= 3 ? err : 'waiting'), pane: SPINNER_PANE, stepMs: 1_000 })
-
-    let result: string | undefined
-    const errLog = await withCapturedErr(async () => {
-      result = await waitForWaitingAndReconnect('C', waitConfig({ session_restart_delay: 0 }))
-    })
-
-    expect(result).toBe('ok')
-    expect(row.statusCalls).toHaveLength(4)
-    expect(row.readPaneCalls).toEqual([paneReadOf('C'), paneReadOf('C')])
-    expect(row.sendKeysCalls.map((c) => c.text)).toEqual([RECONNECT_TEXT, undefined])
-    expect(notices).toEqual([])
-    expect(linesWith(errLog, 'waitForWaitingAndReconnect: status read failed for ')).toEqual([
-      waitPollStatusErrorLine(WAIT_REF_C, describeAdFailureForLog(err), errorClass),
-    ])
-    expect(linesWith(errLog, 'dead session')).toEqual([])
-    expect(linesWith(errLog, 'refused for persona=C')).toEqual([])
-    if (outage === undefined) {
-      expect(outageEmissions).toEqual([])
-    } else {
-      expect(outageEmissions[0]).toEqual({ key: 'C', text: outage.onset(err) })
-      expect(outageEmissions.filter((e) => e.text === outage.onset(err))).toHaveLength(1)
-    }
-    assertNoLeak({ errLog, notices })
-  })
 
   test('b.jg5 SRJ-605: a run of failed polls is logged at its first read and again only when the class changes: UNAVAILABLE, UNAVAILABLE, CONFIG, UNAVAILABLE gives three lines, then the row reads waiting and C is reconnected', async () => {
     const clock = useFakeNow()
@@ -8698,7 +7471,7 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
   // ever reaching the deadline — the timeout branch never runs. spawnForPersona then
   // drives the dead-session recovery (findMissing-before-resume → resume).
   test('spawnForPersona working branch: loop ended/missing early-abort → dead-session → resume recovery', async () => {
-    captureStartupErrors() // the dialog approver records dev-channels-approve-spawn-died here
+    captureStartupErrors()
     _setWaitForWaitingTimeoutMs(30)
     const resumeCalls: import('agent-director').ResumeParams[] = []
     const findMissingCalls: import('agent-director').FindMissingParams[] = []
@@ -8803,7 +7576,7 @@ describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
   // the raw tmux probe). TTL=0 makes the timeout sweep observable
   // and lets the reconciled `missing` verdict flip in.
   test('working dead-session: findMissing runs (sweep + reconcile) BEFORE resume → resumed', async () => {
-    captureStartupErrors() // the dialog approver records dev-channels-approve-spawn-died here
+    captureStartupErrors()
     _setWaitForWaitingTimeoutMs(30)
     _setFindMissingMemoTtlMs(0)
     const callLog: string[] = []
@@ -9245,49 +8018,6 @@ describe('t1.tkk.e4: sweepDeadTmuxChannel escalate-dead wrapper', () => {
   // description where it names one) and what it does not do, then the shared
   // tail, then its own references. The lines' one literal pin; every other
   // case compares with the line's builder.
-  test('the six escalate-dead reconnect lines: what each found, then ESCALATE_DEAD_REPROBE_DECIDES and their references; none says "relaunches it"', () => {
-    const gone = paneReadFailureOf(errTmuxCaptureFailed())
-    const absent = paneReadFailureOf(errSpawnNotFound())
-    const lines: ReadonlyArray<readonly [line: string, opening: string, references: string]> = [
-      [
-        promptRowPaneGoneLine('C', 'ask_user', gone),
-        `[slack] reconnectSession: persona=C is ask_user but agent-director's read-pane found no pane of its launch: ${gone.description} — not deferring; `,
-        ` (${paneReadClassNote(gone)}; b.jdc, b.jg5 SRJ-606)`,
-      ],
-      [
-        promptRowAbsentAtPaneReadLine('C', 'check_permission', absent),
-        `[slack] reconnectSession: persona=C is check_permission but its agent-director row was absent at the pane read: ${absent.description} — not deferring; `,
-        ` (${paneReadClassNote(absent)}; b.jdc, b.jg5 SRJ-117)`,
-      ],
-      [
-        workingRowPaneGoneLine('C', gone),
-        `[slack] reconnectSession: persona=C is working but agent-director's read-pane found no pane of its launch: ${gone.description} — not deferring; `,
-        ` (${paneReadClassNote(gone)}; b.d61, b.jg5 SRJ-603)`,
-      ],
-      [
-        workingRowAbsentAtPaneReadLine('C', absent),
-        `[slack] reconnectSession: persona=C is working but its agent-director row was absent at the pane read: ${absent.description} — not deferring; `,
-        ` (${paneReadClassNote(absent)}; b.jg5 SRJ-117)`,
-      ],
-      [
-        waitingRowPaneGoneLine('C', gone),
-        `[slack] reconnectSession: persona=C is waiting but agent-director's read-pane found no pane of its launch: ${gone.description} — not typing /mcp reconnect; `,
-        ` (${paneReadClassNote(gone)}; b.jg5 SRJ-604)`,
-      ],
-      [
-        waitingRowAbsentAtPaneReadLine('C', absent),
-        `[slack] reconnectSession: persona=C is waiting but its agent-director row was absent at the pane read: ${absent.description} — not typing /mcp reconnect; `,
-        ` (${paneReadClassNote(absent)}; b.jg5 SRJ-117)`,
-      ],
-    ]
-
-    expect(ESCALATE_DEAD_REPROBE_DECIDES).toBe("sweeping and escalating (escalate-dead); the restart path's re-probe decides")
-    for (const [line, opening, references] of lines) {
-      expect(line).toBe(`${opening}${ESCALATE_DEAD_REPROBE_DECIDES}${references}`)
-      expect(line).not.toContain('relaunches it')
-    }
-    assertNoLeak(lines.map(([line]) => line))
-  })
 
   test('ESCALATE_DEAD_EVIDENCE is frozen and holds exactly one text per verdict, all different; none says "dead" or "provably"', () => {
     expect(Object.isFrozen(ESCALATE_DEAD_EVIDENCE)).toBe(true)
@@ -9375,7 +8105,7 @@ describe('b.c3o: waitForWaitingAndReconnect early-abort liveness verdict', () =>
   })
 
   test('spawnForPersona working branch: transition to missing → resume recovery instead of misreported ok', async () => {
-    captureStartupErrors() // the dialog approver records dev-channels-approve-spawn-died here
+    captureStartupErrors()
     const resumeCalls: import('agent-director').ResumeParams[] = []
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
     installStub({
@@ -9448,13 +8178,6 @@ interface Transcript {
   fields: { jsonl_path: string; session_id: string }
 }
 
-/** Write `entries` (default: a finished turn) to `<fixtureDir>/transcripts/<session id>.jsonl`; the row fields name it. */
-function transcriptOf(entries: TranscriptEntry[] = endedTurn()): Transcript {
-  const path = join(fixtureSubdir('transcripts'), `${TRANSCRIPT_SESSION_ID}.jsonl`)
-  writeTranscript(path, entries)
-  return { path, fields: { jsonl_path: path, session_id: TRANSCRIPT_SESSION_ID } }
-}
-
 /** What a persona's row reads at a status poll: a state, or an Error the poll rejects with. */
 type RowReading = string | Error
 
@@ -9465,20 +8188,6 @@ type PaneReading = string | Error
 function showPane(opts: StubClientOptions, pane: PaneReading): void {
   opts.readPaneError = pane instanceof Error ? pane : undefined
   opts.readPaneResults = pane instanceof Error ? undefined : [cannedReadPaneResult(pane)]
-}
-
-/** The pane read of persona `key`'s own instance: its last `FULL_PANE_READ_LINES` lines (b.jg5 SRJ-117). */
-function paneReadOf(key: string): import('agent-director').ReadPaneParams {
-  return { instance_id: personaInstanceId(key), n_lines: FULL_PANE_READ_LINES }
-}
-
-/**
- * How a failed pane read's line of class `errorClass` opens its closing
- * references: `(`, the class note `paneReadClassNote` gives (it reads only
- * the failure's class), then `; `.
- */
-function paneReadClassOpening(errorClass: AdErrorClass): string {
-  return `(${paneReadClassNote({ kind: PANE_READ_UNCLASSIFIED, errorClass, description: '' })}; `
 }
 
 /** Persona `C`'s agent-director row reading `working`, naming `transcript` (without one: no transcript). */
@@ -9560,739 +8269,25 @@ function linesWith(log: string, fragment: string): string[] {
 
 const RECONNECT_TEXT = `/mcp reconnect ${MCP_SERVER_NAME}`
 
-/** The blocked-on-prompt notice's follow-up with auto-restart on: true whichever path reconnects the persona (b.f2b). */
-const PROMPT_NOTICE_AUTO_RESTART_ON = 'Once it is answered, CSCB reconnects it when it can tell the session is idle again'
-
-/** What the unproven-idle notice says is wrong (b.f2b). */
-const UNPROVEN_IDLE_CLAIM = 'its session reads working but CSCB can\'t prove it\'s idle, so it won\'t type into it'
-
 /** A transcript's identity for the pure fold cases (no file behind it). */
-const SNAPSHOT: TranscriptSnapshot = { path: `/t/${TRANSCRIPT_SESSION_ID}.jsonl`, dev: 1, ino: 7, size: 4_096, mtimeMs: 1_000 }
 
 /** A transcript read that ended with a completed turn, its snapshot `SNAPSHOT` with `change`. */
-function endedReading(change: Partial<TranscriptSnapshot> = {}): { kind: 'ended'; snapshot: TranscriptSnapshot } {
-  return { kind: 'ended', snapshot: { ...SNAPSHOT, ...change } }
-}
-
-describe('b.f2b: reading a working row\'s pane (classifyWorkingPane, foldWorkingPaneRun)', () => {
-  test.each<[string, WorkingPaneReading, string]>([
-    ['a real Claude Code idle screen (the finished turn, its summary line, the empty prompt box)', 'idle', IDLE_PANE],
-    ['a real Claude Code screen mid-turn (the spinner line: glyph, verb, ellipsis)', 'busy', SPINNER_PANE],
-    ['a `*` spinner line (some terminals)', 'busy', withLastLine('* Pondering… (12s)')],
-    ['a `●` spinner line (prefersReducedMotion)', 'busy', withLastLine('● Pondering… (12s · ↓ 1.2k tokens)')],
-    ['a spinner line with no timer (screen-reader mode)', 'busy', withLastLine('✶ Pondering…')],
-    ['a hyphenated verb (`Fiddle-faddling`)', 'busy', withLastLine('✢ Fiddle-faddling… (3s)')],
-    ['a status of thinking only', 'busy', withLastLine('✽ Flambéing… (thinking)')],
-    ['a custom spinner verb of several words (the spinnerVerbs setting), with its status', 'busy', CUSTOM_VERB_SPINNER_PANE],
-    ['a custom spinner verb of several words, before its status shows', 'busy', linuxWithLastLine('· 🐝 Foraging for nectar…')],
-    ['a task\'s activeForm as the message', 'busy', linuxWithLastLine('✶ Fixing the nightly build\'s flaky test… (1m 3s · ↑ 2.1k tokens · thought for 3s)')],
-    ['a `●` spinner line with a single word and no status yet (prefersReducedMotion)', 'busy', linuxWithLastLine('● Harmonizing…')],
-    ['a `●` spinner line with a custom verb and its status (prefersReducedMotion)', 'busy', linuxWithLastLine('● 🐝 Foraging for nectar… (12s · ↓ 1.2k tokens)')],
-    ['REPRO: a real Linux idle screen: `●` before every reply and tool call, several with an ellipsis', 'idle', LINUX_IDLE_PANE],
-    ['REPRO: a `●` reply that trails off with an ellipsis at the end of its line', 'idle', linuxWithLastLine('● Let me look at the failing job…')],
-    ['REPRO: a `●` reply with an ellipsis before a parenthesis that is no status', 'idle', linuxWithLastLine('● Checked the build… (2 jobs left)')],
-    ['REPRO: a `●` tool call whose arguments were cut with an ellipsis', 'idle', linuxWithLastLine('● Bash(gh run view 4121 --log-failed …)')],
-    ['REPRO: a `●` tool call whose quoted text ends with an ellipsis', 'idle', linuxWithLastLine('● slack-channel-router - reply (MCP)(chat_id: "C0123456789", text: "Looking into it…")')],
-    ['a glyph line whose first ellipsis is followed by more text, not the end or a status', 'idle', linuxWithLastLine('✻ Worked… then stopped…')],
-    ['"esc to interrupt" (earlier Claude Code versions)', 'busy', withLastLine('  esc to interrupt')],
-    ['a rebound interrupt key', 'busy', withLastLine('  ctrl+c to interrupt')],
-    ['a turn paused on a usage limit', 'busy', withLastLine('  continuing automatically at 3pm · esc to cancel')],
-    ['the no-response retry row', 'busy', withLastLine('  ⎿  No response from the API after 2m · retrying, waiting up to 5m')],
-    ['the no-response retry row\'s second line alone', 'busy', withLastLine('     A proxy or gateway that buffers streaming responses can cause this.')],
-    ['the rate-limit retry row', 'busy', withLastLine('  ⎿  Rate limit reached · Retrying in 7m (resets 3pm)')],
-    ['the waiting-for-response retry row', 'busy', withLastLine('  ⎿  Waiting for API response · will retry in 30s')],
-    ['a retry row\'s attempt counter', 'busy', withLastLine('  ⎿  API Error: 529 Overloaded · attempt 3/10')],
-    ['a reply that mentions a rate limit, a retry and an attempt, with no `·` separator', 'idle', withLastLine('  The rate limit was reached; retrying in 7m would miss it (attempt 2/3 failed).')],
-    ['the spinner text quoted, indented, in a reply', 'idle', withLastLine('  ✳ Harmonizing… (2m 42s)')],
-    ['a tool-permission dialog (boxed, its question and deny option)', 'prompt', PERMISSION_PANE],
-    ['the plan-approval dialog (only its question anchors it)', 'prompt', PLAN_APPROVAL_PANE],
-    ['an AskUserQuestion select menu (only its "Enter to select" footer anchors it)', 'prompt', SELECT_MENU_PANE],
-    ['the /model picker (its "Enter to confirm" footer; the cursor on option 2)', 'prompt', MODEL_PICKER_PANE],
-    ['the folder trust dialog', 'prompt', TRUST_DIALOG_PANE],
-    ['the development channels dialog', 'prompt', DEV_CHANNELS_DIALOG_PANE],
-    ['the MCP server dialog (only its box anchors it)', 'prompt', MCP_SERVER_DIALOG_PANE],
-    ['a dialog under a running turn\'s spinner (the prompt wins)', 'prompt', `${SPINNER_PANE}\n${PERMISSION_PANE}`],
-    ['a reply that quotes a dialog\'s question and options, with no `❯` cursor', 'idle', QUOTED_DIALOG_PANE],
-    ['a reply that quotes a menu with its cursor, but no question, footer or box', 'idle', QUOTED_MENU_PANE],
-    ['a dialog answered long ago, scrolled above the bottom lines', 'idle', `${PERMISSION_PANE}\n${IDLE_PANE}`],
-    ['an empty pane', 'blank', ''],
-    ['only spaces and blank lines', 'blank', '   \n\n  \n'],
-  ])('%s → %s', (_label, reading, pane) => {
-    expect(classifyWorkingPane(pane)).toBe(reading)
-  })
-
-  test('an idle run lasts while the screen (trailing spaces and blank lines aside) and the ended transcript are unchanged; a changed screen starts a new run', () => {
-    const run = foldWorkingPaneRun(undefined, IDLE_PANE, 1_000, endedReading())
-    expect(run).toMatchObject({ reading: 'idle', since: 1_000, transcript: SNAPSHOT })
-    const padded = `${IDLE_PANE.split('\n').map((line) => `${line}   `).join('\n')}\n\n`
-    expect(foldWorkingPaneRun(run, padded, 5_000, endedReading())).toBe(run)
-    expect(foldWorkingPaneRun(run, OTHER_IDLE_PANE, 9_000, endedReading())).toMatchObject({ reading: 'idle', since: 9_000 })
-  })
-
-  test.each<[string, Partial<TranscriptSnapshot>]>([
-    ['it grew', { size: 5_000 }],
-    ['it was written again', { mtimeMs: 2_000 }],
-    ['another file took its path', { ino: 8 }],
-  ])('an idle run whose transcript changed (%s) starts a new run, though the screen did not', (_label, change) => {
-    const run = foldWorkingPaneRun(undefined, IDLE_PANE, 1_000, endedReading())
-    const changed = endedReading(change)
-    expect(foldWorkingPaneRun(run, IDLE_PANE, 5_000, changed)).toMatchObject({ reading: 'idle', since: 5_000, transcript: changed.snapshot })
-  })
-
-  test.each<[string, TranscriptReading | undefined]>([
-    ['does not end with a completed turn', { kind: 'open', snapshot: SNAPSHOT }],
-    ['can\'t be read', { kind: 'unreadable', reason: 'it is empty' }],
-    ['was not read', undefined],
-  ])('an idle pane whose transcript %s is no evidence: it ends the run and starts none', (_label, transcript) => {
-    const run = foldWorkingPaneRun(undefined, IDLE_PANE, 1_000, endedReading())
-    expect(foldWorkingPaneRun(run, IDLE_PANE, 5_000, transcript)).toBeUndefined()
-    expect(foldWorkingPaneRun(undefined, IDLE_PANE, 5_000, transcript)).toBeUndefined()
-  })
-
-  test.each<[string, string | undefined]>([
-    ['a failed read', undefined],
-    ['a running turn', SPINNER_PANE],
-    ['a blank pane', ''],
-  ])('%s ends the run, whatever the transcript: no evidence', (_label, pane) => {
-    const run = foldWorkingPaneRun(undefined, IDLE_PANE, 1_000, endedReading())
-    expect(foldWorkingPaneRun(run, pane, 5_000, endedReading())).toBeUndefined()
-  })
-
-  test('a prompt run lasts across prompt screens that differ, with no transcript read; an idle run and a prompt run never continue each other', () => {
-    const prompt: WorkingPaneRun | undefined = foldWorkingPaneRun(undefined, PERMISSION_PANE, 1_000)
-    expect(prompt).toMatchObject({ reading: 'prompt', since: 1_000 })
-    expect(foldWorkingPaneRun(prompt, SELECT_MENU_PANE, 5_000)).toBe(prompt)
-    expect(foldWorkingPaneRun(prompt, IDLE_PANE, 9_000, endedReading())).toMatchObject({ reading: 'idle', since: 9_000 })
-    const idle = foldWorkingPaneRun(undefined, IDLE_PANE, 1_000, endedReading())
-    expect(foldWorkingPaneRun(idle, PERMISSION_PANE, 9_000, endedReading())).toMatchObject({ reading: 'prompt', since: 9_000 })
-  })
-})
-
-describe('b.f2b: the restart path\'s evidence for a working row across reconnect attempts (checkWorkingRowPane)', () => {
-  let clock: FakeClock
-  beforeEach(() => {
-    clock = useFakeNow()
-  })
-
-  /**
-   * A stub for persona C's `working` row whose `get` answers a `working` row
-   * with `fields` (default: naming a finished turn's transcript; null: the
-   * stub's default row, which names no transcript), and the pane the
-   * reconnect adapter's one read gave: `first` until `show` changes it.
-   * `check` runs `checkWorkingRowPane` on that pane (b.jg5 SRJ-603).
-   */
-  function paneStub(first: string, fields: PersonaGetResultOverrides | null = transcriptOf().fields) {
-    const opts: StubClientOptions = { sendKeysCalls: [], readPaneCalls: [], getCalls: [] }
-    if (fields !== null) opts.getResult = cannedGetResult({ instance_id: 'cscb_C', state: 'working', ...fields })
-    installStub(opts)
-    let pane = first
-    return {
-      show: (next: string) => {
-        pane = next
-      },
-      check: (key = 'C', options?: WorkingRowPaneCheckOptions) => checkWorkingRowPane(key, pane, options),
-      sendKeysCalls: opts.sendKeysCalls!,
-      readPaneCalls: opts.readPaneCalls!,
-      getCalls: opts.getCalls!,
-    }
-  }
-
-  test('the same idle screen and the same ended transcript on attempts spanning 60 s: defer until then, then reconnect; pending until it concludes, forgotten after; every attempt reads C\'s own row with one get and makes no read-pane; nothing typed, no notice', async () => {
-    const stub = paneStub(IDLE_PANE)
-    const verdicts: string[] = []
-    const pending: boolean[] = []
-    const attempt = async (): Promise<void> => {
-      verdicts.push(await stub.check())
-      pending.push(hasPendingWorkingRowEvidence('C'))
-    }
-    await attempt()
-    await clock.advance(30_000)
-    await attempt()
-    await clock.advance(STALE_WORKING_WINDOW_MS - 30_000 - 1)
-    await attempt()
-    await clock.advance(1)
-    await attempt()
-    // A later attempt starts afresh.
-    await attempt()
-
-    expect(verdicts).toEqual(['defer', 'defer', 'defer', 'reconnect', 'defer'])
-    expect(pending).toEqual([true, true, true, false, true])
-    expect(stub.readPaneCalls).toEqual([])
-    expect(stub.getCalls).toEqual(Array(5).fill({ instance_id: 'cscb_C' }))
-    expect(stub.sendKeysCalls).toEqual([])
-    expect(notices).toEqual([])
-  })
-
-  test.each<[string, string, number]>([
-    ['an idle screen', IDLE_PANE, 1],
-    ['a running turn (its spinner line)', SPINNER_PANE, 0],
-    ['a blank pane', '', 0],
-    ['a prompt or dialog', PERMISSION_PANE, 0],
-  ])('b.jg5 SRJ-603: on %s, the transcript get follows an idle pane only (%d get); no read-pane, nothing typed', async (_label, pane, gets) => {
-    const stub = paneStub(pane)
-
-    expect(await stub.check()).toBe('defer')
-
-    expect(stub.getCalls).toEqual(Array(gets).fill({ instance_id: 'cscb_C' }))
-    expect(stub.readPaneCalls).toEqual([])
-    expect(stub.sendKeysCalls).toEqual([])
-  })
-
-  test('a changed screen restarts the window', async () => {
-    const stub = paneStub(IDLE_PANE)
-    const verdicts = [await stub.check()]
-    await clock.advance(40_000)
-    stub.show(OTHER_IDLE_PANE)
-    verdicts.push(await stub.check())
-    await clock.advance(30_000) // 70 s since the first read, 30 s of this screen
-    verdicts.push(await stub.check())
-    await clock.advance(30_000)
-    verdicts.push(await stub.check())
-
-    expect(verdicts).toEqual(['defer', 'defer', 'defer', 'reconnect'])
-  })
-
-  test('a transcript written to mid-window (the session ran another turn behind the same screen) restarts the window, though it ends with a completed turn again', async () => {
-    const transcript = transcriptOf()
-    const stub = paneStub(IDLE_PANE, transcript.fields)
-    const verdicts = [await stub.check()]
-    await clock.advance(30_000)
-    appendTranscript(transcript.path, endedTurn())
-    verdicts.push(await stub.check())
-    await clock.advance(30_000) // 60 s since the first read, 30 s of this transcript
-    verdicts.push(await stub.check())
-    await clock.advance(30_000)
-    verdicts.push(await stub.check())
-
-    expect(verdicts).toEqual(['defer', 'defer', 'defer', 'reconnect'])
-  })
-
-  // The verdict's read that gave no pane (GONE, UNAVAILABLE, CONFIG and the
-  // rest; its cells are in tests/server.test.ts) forgets the evidence
-  // (`forgetWorkingRowEvidence`) and calls no fold.
-  test.each<[string, (stub: ReturnType<typeof paneStub>) => Promise<unknown>]>([
-    ['a running turn (its spinner line)', async (stub) => {
-      stub.show(SPINNER_PANE)
-      return stub.check()
-    }],
-    ['a blank pane', async (stub) => {
-      stub.show('')
-      return stub.check()
-    }],
-    ['a read that gave no pane (the verdict forgets the evidence)', async () => forgetWorkingRowEvidence('C')],
-  ])('%s between idle reads ends the evidence: defer, nothing pending, and the window starts over', async (_label, interrupt) => {
-    const stub = paneStub(IDLE_PANE)
-    const verdicts: string[] = []
-    verdicts.push(await stub.check())
-    await clock.advance(30_000)
-    await interrupt(stub)
-    const pendingAfter = hasPendingWorkingRowEvidence('C')
-    await clock.advance(30_000) // 60 s since the first idle read: without the break, it would reconnect here
-    stub.show(IDLE_PANE)
-    verdicts.push(await stub.check())
-    await clock.advance(STALE_WORKING_WINDOW_MS)
-    verdicts.push(await stub.check())
-
-    expect(verdicts).toEqual(['defer', 'defer', 'reconnect'])
-    expect(pendingAfter).toBe(false)
-    expect(stub.readPaneCalls).toEqual([])
-    expect(stub.sendKeysCalls).toEqual([])
-  })
-
-  test.each<[string, () => PersonaGetResultOverrides | null, string]>([
-    ['the prompt, waiting on the API (a retry or a stall with no spinner)', () => transcriptOf([...endedTurn(), promptEntry('post it in #ops')]).fields, 'does not end with a completed turn'],
-    ['a tool result, waiting on the API', () => transcriptOf([promptEntry(), toolUseEntry(), toolResultEntry()]).fields, 'does not end with a completed turn'],
-    ['a tool call, waiting on its result', () => transcriptOf([promptEntry(), toolUseEntry()]).fields, 'does not end with a completed turn'],
-    ['a prompt queued behind the turn', () => transcriptOf([...endedTurn(), queuedPromptEntry()]).fields, 'does not end with a completed turn'],
-    ['nothing: the row names no transcript', () => null, 'its transcript can\'t be read: its agent-director row names no transcript for its session'],
-    ['nothing: its file is gone', () => { const t = transcriptOf(); rmSync(t.path); return t.fields }, 'opening it failed (ENOENT)'],
-  ])('b.rmy: the same still, idle screen for minutes while the transcript shows %s is no evidence: every attempt defers and logs why, nothing is pending or typed', async (_label, fields, why) => {
-    const stub = paneStub(IDLE_PANE, fields())
-    const verdicts: string[] = []
-    const errLog = await withCapturedErr(async () => {
-      for (let i = 0; i < 4; i++) {
-        if (i > 0) await clock.advance(STALE_WORKING_WINDOW_MS)
-        verdicts.push(await stub.check())
-      }
-    })
-
-    expect(verdicts).toEqual(['defer', 'defer', 'defer', 'defer'])
-    expect(hasPendingWorkingRowEvidence('C')).toBe(false)
-    expect(stub.sendKeysCalls).toEqual([])
-    expect(linesWith(errLog, 'persona=C is working and its pane shows an idle screen, but').filter((line) => line.includes(why))).toHaveLength(4)
-  })
-
-  test('a fresh session\'s row (no persisted transcript path) is read through the transcript composed under the persona\'s claude_config_dir; without the persona nothing is found and the evidence ends', async () => {
-    const configDir = fixtureSubdir('persona-claude')
-    const cwd = '/work/nightly bot'
-    const composed = resolveJsonlPath(cwd, TRANSCRIPT_SESSION_ID, configDir)
-    mkdirSync(join(composed, '..'), { recursive: true })
-    writeTranscript(composed, endedTurn())
-    const stub = paneStub(IDLE_PANE, { session_id: TRANSCRIPT_SESSION_ID, cwd })
-    const persona = { claude_config_dir: configDir }
-
-    const verdicts = [await stub.check('C', { persona })]
-    await clock.advance(STALE_WORKING_WINDOW_MS)
-    verdicts.push(await stub.check('C', { persona }))
-    verdicts.push(await stub.check())
-
-    expect(verdicts).toEqual(['defer', 'reconnect', 'defer'])
-    expect(hasPendingWorkingRowEvidence('C')).toBe(false)
-  })
-
-  test('a prompt: every attempt defers and nothing is typed; once shown on attempts spanning 60 s, one blocked-on-prompt notice for the episode; never pending evidence', async () => {
-    const stub = paneStub(PERMISSION_PANE)
-    const verdicts = [await stub.check()]
-    expect(notices).toEqual([])
-    for (let i = 0; i < 3; i++) {
-      await clock.advance(STALE_WORKING_WINDOW_MS)
-      verdicts.push(await stub.check())
-    }
-
-    expect(verdicts).toEqual(['defer', 'defer', 'defer', 'defer'])
-    expect(hasPendingWorkingRowEvidence('C')).toBe(false)
-    expect(stub.sendKeysCalls).toEqual([])
-    expect(notices.map((n) => n.key)).toEqual(['C'])
-    expect(notices[0]!.text).toStartWith(':warning: *Waiting on a prompt*')
-    expect(notices[0]!.text).toContain('`tmux attach -t =slack_bot_C`')
-  })
-
-  test('forgetNotConnectedEpisode(key) ends only that persona\'s episode: its evidence and notice latch go, another persona\'s stay', async () => {
-    const stub = paneStub(IDLE_PANE)
-    await stub.check('K')
-    await stub.check('L')
-    const notice = { reason: 'auto-restart-disabled', cause: 'a test cause' } as const
-    expect([notifyPersonaNotConnected('K', notice), notifyPersonaNotConnected('L', notice)]).toEqual([true, true])
-
-    forgetNotConnectedEpisode('K')
-
-    expect([hasPendingWorkingRowEvidence('K'), hasPendingWorkingRowEvidence('L')]).toEqual([false, true])
-    // K's next episode is reported again; L's is still the same one.
-    expect([notifyPersonaNotConnected('K', notice), notifyPersonaNotConnected('L', notice)]).toEqual([true, false])
-    expect(notices.map((n) => n.key)).toEqual(['K', 'L', 'K'])
-  })
-
-  test('any launch for the persona forgets its evidence: the session it brings up says nothing about the old row', async () => {
-    const cfg = waitConfig()
-    const stub = paneStub(IDLE_PANE)
-    await stub.check()
-    expect(hasPendingWorkingRowEvidence('C')).toBe(true)
-
-    expect((await spawnForPersona(personaOf(cfg, 'C'), cfg, false)).action).toBe('spawned')
-
-    expect(hasPendingWorkingRowEvidence('C')).toBe(false)
-  })
-
-  // b.jg5 SRJ-502 (E14's note): the adapter's latched gate (`latchedNow`) is
-  // asked right before a deferral is noted and right before the
-  // blocked-on-prompt notice; a persona latched meanwhile gets `defer`, its
-  // evidence forgotten, no deferral noted, no notice and nothing typed.
-  test('b.jg5 SRJ-502: latched right before each deferral is noted: every attempt defers with its evidence forgotten (the same idle proof never reaches reconnect), no deferral noted (16 min of attempts raise no unproven-idle notice), nothing typed; once unlatched the run and the window start from that attempt', async () => {
-    const stub = paneStub(IDLE_PANE)
-    let latched = true
-    let asked = 0
-    const latchedNow = (): boolean => {
-      asked++
-      return latched
-    }
-    const verdicts: string[] = []
-    const pending: boolean[] = []
-    for (const minute of [0, 4, 8, 12, 16]) {
-      await clock.advance(minute * 60_000 - clock.now())
-      verdicts.push(await stub.check('C', { latchedNow }))
-      pending.push(hasPendingWorkingRowEvidence('C'))
-    }
-
-    expect(verdicts).toEqual(Array(5).fill('defer'))
-    expect(pending).toEqual(Array(5).fill(false))
-    expect(asked).toBe(5)
-    expect(notices).toEqual([])
-
-    latched = false
-    asked = 0
-    await clock.advance(60_000)
-    verdicts.push(await stub.check('C', { latchedNow }))
-    expect(hasPendingWorkingRowEvidence('C')).toBe(true)
-    await clock.advance(STALE_WORKING_WINDOW_MS)
-    verdicts.push(await stub.check('C', { latchedNow }))
-
-    // Asked before the first deferral; a reconnect asks nothing.
-    expect(verdicts.slice(5)).toEqual(['defer', 'reconnect'])
-    expect(asked).toBe(1)
-    expect(notices).toEqual([])
-    expect(stub.sendKeysCalls).toEqual([])
-    expect(stub.readPaneCalls).toEqual([])
-  })
-
-  test('b.jg5 SRJ-502: a prompt shown across 60 s whose persona latched right before the blocked-on-prompt notice: defer, no notice and no blocked line, its run forgotten (the next prompt run starts afresh); the gate asked once there, nothing typed', async () => {
-    const stub = paneStub(PERMISSION_PANE)
-    let latched = false
-    let asked = 0
-    const latchedNow = (): boolean => {
-      asked++
-      return latched
-    }
-    const verdicts = [await stub.check('C', { latchedNow })]
-    await clock.advance(STALE_WORKING_WINDOW_MS)
-    latched = true
-    asked = 0
-    const errLog = await withCapturedErr(async () => {
-      verdicts.push(await stub.check('C', { latchedNow }))
-    })
-
-    expect(verdicts).toEqual(['defer', 'defer'])
-    expect(asked).toBe(1)
-    expect(notices).toEqual([])
-    expect(linesWith(errLog, 'blocked on it')).toEqual([])
-
-    // The run was forgotten: unlatched, the prompt must be shown across a new window.
-    latched = false
-    await clock.advance(1)
-    verdicts.push(await stub.check('C', { latchedNow }))
-    expect(notices).toEqual([])
-    await clock.advance(STALE_WORKING_WINDOW_MS)
-    verdicts.push(await stub.check('C', { latchedNow }))
-
-    expect(verdicts).toEqual(['defer', 'defer', 'defer', 'defer'])
-    expect(notices.map((n) => n.key)).toEqual(['C'])
-    expect(notices[0]!.text).toStartWith(':warning: *Waiting on a prompt*')
-    expect(stub.sendKeysCalls).toEqual([])
-  })
-})
-
-describe('b.f2b: the restart path\'s check of a waiting row\'s pane before it reconnects (checkWaitingRowPane)', () => {
-  /** A stub whose pane reads show `pane` (an Error fails the read). */
-  function paneOnly(pane: PaneReading): StubClientOptions & { readPaneCalls: import('agent-director').ReadPaneParams[]; sendKeysCalls: import('agent-director').SendKeysParams[] } {
-    const opts = { readPaneCalls: [], sendKeysCalls: [] } as StubClientOptions & { readPaneCalls: import('agent-director').ReadPaneParams[]; sendKeysCalls: import('agent-director').SendKeysParams[] }
-    showPane(opts, pane)
-    installStub(opts)
-    return opts
-  }
-
-  test.each<[string, 'reconnect' | 'defer', () => PaneReading, string | undefined]>([
-    ['an idle screen', 'reconnect', () => IDLE_PANE, undefined],
-    ['REPRO: a Linux idle screen, `●` before its replies and tool calls, several with an ellipsis', 'reconnect', () => LINUX_IDLE_PANE, undefined],
-    ['a blank pane', 'reconnect', () => '', undefined],
-    ['a running turn (its spinner line)', 'defer', () => SPINNER_PANE, 'persona=C is waiting but its pane shows a running turn — deferring /mcp reconnect to a later tick'],
-    ['a running turn with a custom spinner verb of several words', 'defer', () => CUSTOM_VERB_SPINNER_PANE, 'persona=C is waiting but its pane shows a running turn — deferring /mcp reconnect to a later tick'],
-    ['an API retry row', 'defer', () => withLastLine('  ⎿  Waiting for API response · will retry in 30s'), 'persona=C is waiting but its pane shows a running turn — deferring /mcp reconnect to a later tick'],
-    // A name CSCB gives no handling: the line closes with its read-pane class, UNCLASSIFIED.
-    ['a failed read (the waiting row alone decides)', 'reconnect', () => errGeneric('read-pane', 'ErrPaneRead', leakyMessage('pane read failed', 'waiting')), `persona=C is waiting and reading its pane failed: ErrPaneRead message=${JSON.stringify(redactedLeakyMessage('pane read failed'))} — reconnecting on the waiting row alone ${paneReadClassOpening(AD_ERROR_CLASS_UNCLASSIFIED)}b.f2b, b.jg5 SRJ-604)`],
-  ])('%s → %s: C\'s own pane read once, nothing typed here, no notice, one line unless it goes ahead plainly', async (_label, verdict, pane, line) => {
-    const opts = paneOnly(pane())
-    let got: string | undefined
-    const errLog = await withCapturedErr(async () => {
-      got = await checkWaitingRowPane('C')
-    })
-
-    expect(got).toBe(verdict)
-    expect(opts.readPaneCalls).toEqual([paneReadOf('C')])
-    expect(opts.sendKeysCalls).toEqual([])
-    expect(notices).toEqual([])
-    expect(linesWith(errLog, 'persona=C is waiting')).toEqual(line === undefined ? [] : [expect.stringContaining(line)])
-    assertNoLeak({ errLog })
-  })
-
-  test('a prompt or dialog → defer on every call and never typed into; one blocked-on-prompt notice for the episode, saying CSCB reconnects it once it can tell the session is idle again', async () => {
-    const opts = paneOnly(PERMISSION_PANE)
-    let verdicts: string[] = []
-    const errLog = await withCapturedErr(async () => {
-      verdicts = [await checkWaitingRowPane('C'), await checkWaitingRowPane('C')]
-    })
-
-    expect(verdicts).toEqual(['defer', 'defer'])
-    expect(opts.sendKeysCalls).toEqual([])
-    expect(notices.map((n) => n.key)).toEqual(['C'])
-    expect(notices[0]!.text).toStartWith(':warning: *Waiting on a prompt*')
-    expect(notices[0]!.text).toContain(PROMPT_NOTICE_AUTO_RESTART_ON)
-    expect(notices[0]!.text).not.toContain('Once its turn ends it is reconnected')
-    expect(linesWith(errLog, 'persona=C is waiting but its pane shows a prompt or dialog — not typing into it')).toHaveLength(2)
-  })
-
-  // b.jg5 SRJ-502: the adapter's latched gate is asked right before the
-  // blocked-on-prompt notice, and only there.
-  test.each<[string, string, string, number]>([
-    ['a prompt or dialog', PERMISSION_PANE, 'defer', 1],
-    ['a running turn', SPINNER_PANE, 'defer', 0],
-    ['an idle screen', IDLE_PANE, 'reconnect', 0],
-  ])('b.jg5 SRJ-502: %s with the persona latched by the time the pane is judged → %s, the gate asked %d time(s); no notice, no prompt line, nothing typed', async (_label, pane, verdict, asks) => {
-    const opts = paneOnly(pane)
-    let asked = 0
-    let got: string | undefined
-    const errLog = await withCapturedErr(async () => {
-      got = await checkWaitingRowPane('C', () => {
-        asked++
-        return true
-      })
-    })
-
-    expect(got).toBe(verdict)
-    expect(asked).toBe(asks)
-    expect(notices).toEqual([])
-    expect(linesWith(errLog, 'shows a prompt or dialog')).toEqual([])
-    expect(opts.readPaneCalls).toEqual([paneReadOf('C')])
-    expect(opts.sendKeysCalls).toEqual([])
-  })
-})
 
 describe('b.f2b: the not-connected notice, once per episode', () => {
-  test.each(['menu', 'input'] as const)('%s deferred reconnect shares the existing not-connected episode and resets on reconnection', rule => {
-    const prompt: NotConnectedNotice = { reason: 'blocked-on-prompt', autoRestartDisabled: false }
-    const blocked: NotConnectedNotice = { reason: 'reconnect-blocked', rule }
-    expect(notifyPersonaNotConnected('C', prompt)).toBe(true)
-    expect(notifyPersonaNotConnected('C', blocked)).toBe(false)
-    expect(notices.map(n => n.text)).toEqual([buildNotConnectedNotice('C', prompt)])
-    forgetNotConnectedEpisode('C')
-    expect(notifyPersonaNotConnected('C', blocked)).toBe(true)
-    expect(notifyPersonaNotConnected('C', prompt)).toBe(false)
-    expect(notices.map(n => n.text)).toEqual([buildNotConnectedNotice('C', prompt), buildNotConnectedNotice('C', blocked)])
-    assertNoLeak(notices)
-  })
-
-  test.each<[string, NotConnectedNotice, string, string]>([
-    ['blocked on a prompt, auto-restart on', { reason: 'blocked-on-prompt', autoRestartDisabled: false }, ':warning: *Waiting on a prompt*', PROMPT_NOTICE_AUTO_RESTART_ON],
-    ['blocked on a prompt, session_restart_delay 0', { reason: 'blocked-on-prompt', autoRestartDisabled: true }, ':warning: *Waiting on a prompt*', 'Automatic restarts are disabled'],
-    ['a working row whose idleness can\'t be proven, auto-restart on', { reason: 'unproven-idle', autoRestartDisabled: false, heldMs: 12 * 60_000 }, ':warning: *Not connected*', `${UNPROVEN_IDLE_CLAIM}, and has held back for 12 min`],
-    ['a working row whose idleness can\'t be proven, auto-restart on (what happens next)', { reason: 'unproven-idle', autoRestartDisabled: false, heldMs: 12 * 60_000 }, ':warning: *Not connected*', 'CSCB keeps checking it and reconnects it once its row reads waiting or its screen and transcript prove it idle'],
-    ['a working row whose idleness can\'t be proven, session_restart_delay 0', { reason: 'unproven-idle', autoRestartDisabled: true, heldMs: 10 * 60_000 }, ':warning: *Not connected*', 'Automatic restarts are disabled (`session_restart_delay` is 0), so nothing will reconnect it on its own'],
-    ['disconnected, session_restart_delay 0', { reason: 'auto-restart-disabled', cause: 'a test cause' }, ':warning: *Not connected*', '(a test cause), and automatic restarts are disabled'],
-  ])('%s: raised once, one log line; its first line says what is wrong, the second how to recover (attaching by the exact session name, b.1ix) and ends with the human-only sentence, once (SRJ-1001); a second call in the episode raises nothing', async (_label, notice, head, detail) => {
-    let raised: boolean[] = []
-    const errLog = await withCapturedErr(() => {
-      raised = [notifyPersonaNotConnected('C', notice), notifyPersonaNotConnected('C', notice)]
-    })
-
-    expect(raised).toEqual([true, false])
-    expect(notices.map((n) => n.key)).toEqual(['C'])
-    // The posting path posts the builder's rendering, unchanged.
-    expect(notices[0]!.text).toBe(buildNotConnectedNotice('C', notice))
-    const [first, second, ...rest] = notices[0]!.text.split('\n')
-    expect(rest).toEqual([])
-    expect(first).toStartWith(head)
-    expect(notices[0]!.text).toContain(detail)
-    expect(second).toContain('`tmux attach -t =slack_bot_C`')
-    // A bare target would attach to a prefix neighbour (`slack_bot_C_2`) once `slack_bot_C` is gone.
-    expect(notices[0]!.text).not.toContain('attach -t slack_bot_')
-    expect(second).toContain(`\`${RECONNECT_TEXT}\``)
-    // b.jg5 SRJ-1001: the notice names commands, so it carries the
-    // human-only sentence exactly once, at the end of its second line.
-    expect(humanOnlySentencesIn(notices[0]!.text)).toHaveLength(1)
-    expect(second).toMatch(new RegExp(` (?:${HUMAN_ONLY_SENTENCE.source})$`))
-    expect(linesWith(errLog, `persona=C is not connected (${notice.reason})`)).toHaveLength(1)
-  })
 
   // The existing first-line pin also owns SR-8.5's one-line reconnect
   // variants; those include the human-only ending on that same line.
-  test.each<[string, NotConnectedNotice, string]>([
-    ['blocked on a prompt, auto-restart on', { reason: 'blocked-on-prompt', autoRestartDisabled: false }, ":warning: *Waiting on a prompt* — this persona is not connected to this server, and its session shows a prompt or dialog in its terminal that no one has answered. CSCB never types into a prompt, so it won't reconnect the persona while the prompt is up; this persona can't reply or use its Slack tools until it is connected again. Messages sent to it are kept and delivered once it is."],
-    ['blocked on a prompt, session_restart_delay 0', { reason: 'blocked-on-prompt', autoRestartDisabled: true }, ":warning: *Waiting on a prompt* — this persona is not connected to this server, and its session shows a prompt or dialog in its terminal that no one has answered. CSCB never types into a prompt, so it won't reconnect the persona while the prompt is up; this persona can't reply or use its Slack tools until it is connected again. Messages sent to it are kept and delivered once it is."],
-    ['a working row whose idleness can\'t be proven, auto-restart on', { reason: 'unproven-idle', autoRestartDisabled: false, heldMs: 12 * 60_000 }, ":warning: *Not connected* — this persona is not connected to this server: its session reads working but CSCB can't prove it's idle, so it won't type into it, and has held back for 12 min. This persona can't reply or use its Slack tools until it is connected again. Messages sent to it are kept and delivered once it is."],
-    ['a working row whose idleness can\'t be proven, session_restart_delay 0', { reason: 'unproven-idle', autoRestartDisabled: true, heldMs: 10 * 60_000 }, ":warning: *Not connected* — this persona is not connected to this server: its session reads working but CSCB can't prove it's idle, so it won't type into it, and has held back for 10 min. This persona can't reply or use its Slack tools until it is connected again. Messages sent to it are kept and delivered once it is."],
-    ['disconnected, session_restart_delay 0', { reason: 'auto-restart-disabled', cause: 'a test cause' }, ":warning: *Not connected* — this persona's session is running but is not connected to this server (a test cause), and automatic restarts are disabled (`session_restart_delay` is 0), so nothing will reconnect it; this persona can't reply or use its Slack tools until it is connected again. Messages sent to it are kept and delivered once it is."],
-    ['reconnect blocked by a menu', { reason: 'reconnect-blocked', rule: 'menu' }, ":warning: *Waiting on a prompt* — A menu, overlay or dialog is open in its terminal, so CSCB can't type `/mcp reconnect` into it. Attach with `tmux attach -t =slack_bot_C` and close it. CSCB keeps trying the reconnect. This persona can't reply or use its Slack tools until it is connected again. Messages sent to it are kept and delivered once it is. Delivery waits until it is closed or cleared. " + CONFLICT_NOTICE_HUMAN_ONLY_LINE],
-    ['reconnect blocked by input', { reason: 'reconnect-blocked', rule: 'input' }, ":warning: *Waiting on a prompt* — Text is left in its input box, so CSCB can't type `/mcp reconnect` into it. Attach with `tmux attach -t =slack_bot_C` and submit or clear it. CSCB keeps trying the reconnect. This persona can't reply or use its Slack tools until it is connected again. Messages sent to it are kept and delivered once it is. Delivery waits until it is closed or cleared. " + CONFLICT_NOTICE_HUMAN_ONLY_LINE],
-  ])('%s: fixed first-line wording, with the human-only ending on one-line reconnect blocks', (_label, notice, firstLine) => {
-    const [first] = buildNotConnectedNotice('C', notice).split('\n')
-    expect(first).toBe(firstLine)
-    expect(humanOnlySentencesIn(first!)).toHaveLength(notice.reason === 'reconnect-blocked' ? 1 : 0)
-  })
 
-  test.each<[UndeliverableCause | undefined, string, string]>([
+  test.each<['disconnected' | undefined, string, string]>([
     [undefined, ':warning: *Not connected*', '(its connection has been down on two health checks in a row)'],
     ['disconnected', ':warning: *Not connected*', '(its connection has been down on two health checks in a row)'],
   ])('the health check\'s report (notifyDisconnectedWithAutoRestartDisabled) for cause %s: the notice worded for it, once per episode', (cause, head, detail) => {
-    notifyDisconnectedWithAutoRestartDisabled('C', cause)
-    notifyDisconnectedWithAutoRestartDisabled('C', cause)
+    notifyDisconnectedWithAutoRestartDisabled('C')
+    notifyDisconnectedWithAutoRestartDisabled('C')
 
     expect(notices.map((n) => n.key)).toEqual(['C'])
     expect(notices[0]!.text).toStartWith(head)
     expect(notices[0]!.text).toContain(detail)
-  })
-})
-
-// b.f2b: at any restart delay, CSCB holding back from a `working` row it can't
-// prove idle is bounded: once its deferrals on the row have run for
-// UNPROVEN_IDLE_NOTICE_AFTER_MS (10 min) from the first, the unproven-idle
-// not-connected notice is raised, once per episode through the shared latch.
-// Before it, a row whose idleness could never be proven (an unreadable
-// transcript, a compaction summary, a screen that keeps changing) was held
-// back from for good at a non-zero delay, and nothing reported it.
-describe('b.f2b: a working row whose idleness can\'t be proven is reported (unproven-idle)', () => {
-  let clock: FakeClock
-  beforeEach(() => {
-    clock = useFakeNow()
-  })
-
-  /** Minutes on the fake clock. */
-  const min = (n: number): number => n * 60_000
-
-  /**
-   * A stub for persona C's `working` row whose `get` names `transcript`
-   * (without one, the row names no transcript), and the pane the reconnect
-   * adapter's read gave: `pane` until `show` changes it. `pane` is what
-   * `attemptsAt` folds (`checkWorkingRowPane` on the verdict's pane, b.jg5
-   * SRJ-603); no case here makes a `read-pane`.
-   */
-  function rowStub(pane: string, transcript?: Transcript) {
-    const opts: StubClientOptions = { sendKeysCalls: [], readPaneCalls: [], getCalls: [] }
-    opts.getResult = cannedGetResult({ instance_id: 'cscb_C', state: 'working', ...transcript?.fields })
-    installStub(opts)
-    const stub = {
-      pane,
-      show: (next: string) => {
-        stub.pane = next
-      },
-      sendKeysCalls: opts.sendKeysCalls!,
-      readPaneCalls: opts.readPaneCalls!,
-    }
-    return stub
-  }
-
-  /** Restart-path attempts on C's row (`stub`'s pane) at each of `at` (minutes on the fake clock, ascending); the verdicts and the notices raised by each. */
-  async function attemptsAt(
-    stub: ReturnType<typeof rowStub>,
-    at: number[],
-    before?: (minute: number) => void,
-  ): Promise<{ verdicts: string[]; noticesAfter: number[] }> {
-    const verdicts: string[] = []
-    const noticesAfter: number[] = []
-    for (const minute of at) {
-      await clock.advance(min(minute) - clock.now())
-      before?.(minute)
-      verdicts.push(await checkWorkingRowPane('C', stub.pane))
-      noticesAfter.push(notices.length)
-    }
-    expect(stub.readPaneCalls).toEqual([])
-    return { verdicts, noticesAfter }
-  }
-
-  test('the run is measured from its first deferral: nothing 1 ms short of UNPROVEN_IDLE_NOTICE_AFTER_MS, the notice at it, then nothing more in the episode; ending the run starts a new one', async () => {
-    const raised: boolean[] = []
-    await clock.advance(5_000)
-    raised.push(noteWorkingRowDeferral('C', false)) // the run starts at 5 s
-    await clock.advance(UNPROVEN_IDLE_NOTICE_AFTER_MS - 1)
-    raised.push(noteWorkingRowDeferral('C', false))
-    await clock.advance(1)
-    raised.push(noteWorkingRowDeferral('C', false))
-    await clock.advance(min(5))
-    raised.push(noteWorkingRowDeferral('C', false))
-    // Another persona's run is its own.
-    raised.push(noteWorkingRowDeferral('D', false))
-
-    expect(UNPROVEN_IDLE_NOTICE_AFTER_MS).toBe(min(10))
-    expect(raised).toEqual([false, false, true, false, false])
-    expect(notices.map((n) => [n.key, n.text])).toEqual([
-      ['C', await renderedNotice('C', { reason: 'unproven-idle', autoRestartDisabled: false, heldMs: UNPROVEN_IDLE_NOTICE_AFTER_MS })],
-    ])
-
-    // A new episode: a run ended and started again is measured afresh.
-    forgetNotConnectedEpisode('C')
-    expect(noteWorkingRowDeferral('C', true)).toBe(false)
-    await clock.advance(min(9))
-    endWorkingRowDeferral('C')
-    expect(noteWorkingRowDeferral('C', true)).toBe(false)
-    await clock.advance(min(9))
-    expect(noteWorkingRowDeferral('C', true)).toBe(false)
-    await clock.advance(min(1))
-    expect(noteWorkingRowDeferral('C', true)).toBe(true)
-    expect(notices.map((n) => n.key)).toEqual(['C', 'C'])
-    expect(notices[1]!.text).toBe(await renderedNotice('C', { reason: 'unproven-idle', autoRestartDisabled: true, heldMs: UNPROVEN_IDLE_NOTICE_AFTER_MS }))
-  })
-
-  // A read that gave no pane (UNAVAILABLE or CONFIG) is the verdict's
-  // deferral, with its unproven-idle case in tests/server.test.ts.
-  test.each<[string, () => { pane: string | ((minute: number) => string); transcript?: Transcript }]>([
-    ['REPRO: an idle screen whose row names no transcript (unreadable)', () => (cannedReadPaneResult(IDLE_PANE))],
-    ['REPRO: an idle screen whose transcript ends with a compaction summary', () => ({
-      pane: IDLE_PANE,
-      transcript: transcriptOf([...endedTurn(), { ...promptEntry('This session is being continued from a previous conversation that ran out of context.'), isCompactSummary: true }]),
-    })],
-    ['REPRO: an idle screen that changes at every attempt, its transcript ended', () => ({
-      pane: (minute) => (minute % 8 === 0 ? IDLE_PANE : OTHER_IDLE_PANE),
-      transcript: transcriptOf(),
-    })],
-    ['a turn that keeps running (its spinner line)', () => ({ pane: SPINNER_PANE, transcript: transcriptOf() })],
-    ['a blank pane', () => ({ pane: '', transcript: transcriptOf() })],
-  ])('%s: restart-path attempts 4 min apart defer with nothing typed; the attempt 12 min after the first raises one unproven-idle notice, worded for auto-restart on; later attempts raise nothing more', async (_label, make) => {
-    const { pane, transcript } = make()
-    const stub = rowStub(typeof pane === 'function' ? pane(0) : pane, transcript)
-    let result!: { verdicts: string[]; noticesAfter: number[] }
-    const errLog = await withCapturedErr(async () => {
-      result = await attemptsAt(stub, [0, 4, 8, 12, 16], (minute) => {
-        if (typeof pane === 'function') stub.show(pane(minute))
-      })
-    })
-
-    expect(result.verdicts).toEqual(Array(5).fill('defer'))
-    expect(stub.sendKeysCalls).toEqual([])
-    expect(result.noticesAfter).toEqual([0, 0, 0, 1, 1])
-    expect(linesWith(errLog, 'persona=C is not connected (unproven-idle) — raising a not-connected notice')).toHaveLength(1)
-    expect(notices.map((n) => [n.key, n.text])).toEqual([
-      ['C', await renderedNotice('C', { reason: 'unproven-idle', autoRestartDisabled: false, heldMs: min(12) })],
-    ])
-  })
-
-  test('a reconnect on idle proof ends the run: deferrals after it are measured from their own first', async () => {
-    const transcript = transcriptOf()
-    rmSync(transcript.path) // unreadable at first
-    const stub = rowStub(IDLE_PANE, transcript)
-    const { verdicts, noticesAfter } = await attemptsAt(stub, [0, 3, 6, 9, 10, 11, 15, 19, 21], (minute) => {
-      if (minute === 9) writeTranscript(transcript.path, endedTurn())
-      if (minute === 11) rmSync(transcript.path)
-    })
-
-    // Proof from 9 min, held for the 60 s window at 10 min: the reconnect; the
-    // run that follows starts at 11 min and is reported at 21 min.
-    expect(verdicts).toEqual(['defer', 'defer', 'defer', 'defer', 'reconnect', 'defer', 'defer', 'defer', 'defer'])
-    expect(noticesAfter).toEqual([0, 0, 0, 0, 0, 0, 0, 0, 1])
-    expect(notices.map((x) => x.text)).toEqual([await renderedNotice('C', { reason: 'unproven-idle', autoRestartDisabled: false, heldMs: min(10) })])
-  })
-
-  test('a prompt reported first holds the episode\'s one notice: the run passing 10 min raises nothing more', async () => {
-    const stub = rowStub(PERMISSION_PANE)
-    const { verdicts, noticesAfter } = await attemptsAt(stub, [0, 2, 6, 10, 14])
-
-    expect(verdicts).toEqual(Array(5).fill('defer'))
-    expect(stub.sendKeysCalls).toEqual([])
-    expect(noticesAfter).toEqual([0, 1, 1, 1, 1])
-    expect(notices[0]!.text).toStartWith(':warning: *Waiting on a prompt*')
-  })
-
-  test('any launch for the persona starts a new run: deferrals before it don\'t count toward the notice', async () => {
-    const cfg = waitConfig()
-    const stub = rowStub(IDLE_PANE)
-    await checkWorkingRowPane('C', stub.pane)
-    await clock.advance(min(9))
-    expect((await spawnForPersona(personaOf(cfg, 'C'), cfg, false)).action).toBe('spawned')
-
-    const { noticesAfter } = await attemptsAt(stub, [10, 14, 18, 19, 20])
-
-    expect(noticesAfter).toEqual([0, 0, 0, 0, 1])
-  })
-
-  test.each([60, 0])('a launch wait (session_restart_delay %d) on a working row it can\'t prove idle reports it mid-wait once the run has lasted the bound (3 min here), goes on waiting, and raises nothing more at the deadline; nothing typed', async (delay) => {
-    _setUnprovenIdleNoticeAfterMs(min(3))
-    const cfg = waitConfig({ session_restart_delay: delay })
-    const row = installWorkingRow(clock, { pane: IDLE_PANE, stepMs: 30_000 }, { getResult: workingRowOf(cfg) })
-    const raisedAt: number[] = []
-    setSessionNotifier((key, text, options) => {
-      notices.push({ key, text, options })
-      raisedAt.push(clock.now())
-    })
-
-    let result: string | undefined
-    await withCapturedErr(async () => {
-      result = await waitForWaitingAndReconnect('C', cfg)
-    })
-
-    expect(result).toBe('not-reconnected')
-    expect(row.sendKeysCalls).toEqual([])
-    // The first poll (30 s) starts the run; the poll at 3 min 30 s reports it.
-    expect(raisedAt).toEqual([30_000 + min(3)])
-    expect(clock.now()).toBeGreaterThanOrEqual(WAIT_FOR_WAITING_TIMEOUT_MS)
-    expect(notices.map((n) => [n.key, n.text])).toEqual([
-      ['C', await renderedNotice('C', { reason: 'unproven-idle', autoRestartDisabled: delay === 0, heldMs: min(3) })],
-    ])
   })
 })
 
@@ -10308,19 +8303,6 @@ describe('b.f2b, b.jg5 SRJ-605: the wait-ended reports and the wait\'s lines (on
       logHead: '[slack] waitForWaitingAndReconnect: timed out for persona=C after 600000ms — its status read failed: ErrTimeout message="timed out" (class=UNCLASSIFIED), so its state is not known — not reconnected (b.jg5 SRJ-605)',
       enabledFollowUp: 'the health check recovers it from its own reads of the row: once agent-director answers with the row live and the persona disconnected, the tick schedules a reconnect (b.9a7)',
       notice: { reason: 'auto-restart-disabled', cause: 'agent-director could not report its state when CSCB stopped waiting for it, 10 min after launching it' },
-    })
-  })
-
-  test('waitTimedOutLiveReport: the live state at the deadline, the health check\'s idle rule, and a notice by state (working: unproven-idle; a prompt: blocked-on-prompt; any other: the state and no proof of idle)', () => {
-    expect(waitTimedOutLiveReport(WAIT_REF_C, 10 * 60_000, 10 * 60_000, 'working', 12 * 60_000)).toEqual({
-      logHead: '[slack] reconnect: gave up waiting for persona=C after 600000ms — claude process state=working (alive)',
-      enabledFollowUp: 'the health check schedules a reconnect once it has seen the persona disconnected on two ticks; for a working row it types /mcp reconnect only once its pane has shown the same idle screen and its transcript has ended with a completed turn, both unchanged, across attempts, and never into a prompt, and it reports the persona once CSCB has held back from the row for 10 min (b.9a7/b.rmy/b.f2b)',
-      notice: { reason: 'unproven-idle', autoRestartDisabled: true, heldMs: 12 * 60_000 },
-    })
-    expect(waitTimedOutLiveReport(WAIT_REF_C, 90_000, 30_000, 'check_permission').notice).toEqual({ reason: 'blocked-on-prompt', autoRestartDisabled: true })
-    expect(waitTimedOutLiveReport(WAIT_REF_C, 90_000, 30_000, 'compacting').notice).toEqual({
-      reason: 'auto-restart-disabled',
-      cause: 'its agent-director row still read compacting 2 min after launch, and CSCB found no proof it was idle',
     })
   })
 
@@ -10379,377 +8361,6 @@ describe('b.f2b, b.jg5 SRJ-605: the wait-ended reports and the wait\'s lines (on
   })
 })
 
-describe('b.f2b: the wait for a working row at a launch (waitForWaitingAndReconnect)', () => {
-  let clock: FakeClock
-  beforeEach(() => {
-    clock = useFakeNow()
-  })
-
-  test.each([60, 0])('REPRO: a stale working row at startup, its pane showing the same idle screen and its transcript ending with a completed turn, both unchanged, is reconnected once that has held for 60 s, not after the 10-minute wait (session_restart_delay %d); every read is of C\'s own pane and row', async (delay) => {
-    const cfg = waitConfig({ session_restart_delay: delay })
-    const row = installWorkingRow(clock, { pane: IDLE_PANE, stepMs: 10_000 }, workingCollision(cfg, transcriptOf()))
-
-    let result!: Awaited<ReturnType<typeof spawnForPersona>>
-    const errLog = await withCapturedErr(async () => {
-      result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
-    })
-
-    expect(result).toEqual({ key: 'C', action: 'reconnected' })
-    expect(row.sendKeysCalls).toEqual([
-      { instance_id: 'cscb_C', text: RECONNECT_TEXT, no_enter: true },
-      { instance_id: 'cscb_C', key: 'Enter' },
-    ])
-    expect(clock.now()).toBeGreaterThanOrEqual(STALE_WORKING_WINDOW_MS)
-    expect(clock.now()).toBeLessThan(STALE_WORKING_WINDOW_MS + 30_000)
-    expect(row.readPaneCalls.length).toBeGreaterThan(0)
-    expect(row.readPaneCalls).toEqual(row.readPaneCalls.map(() => paneReadOf('C')))
-    // The collision lookup, evidence reads and the final fresh row/composer.
-    expect(row.getCalls).toEqual(Array(row.readPaneCalls.length + row.statusCalls.length + 3).fill({ instance_id: 'cscb_C' }))
-    expect(notices).toEqual([])
-    expect(linesWith(errLog, 'treating the row as stale and reconnecting')).toHaveLength(1)
-  })
-
-  test('the wait reads the evidence at most every 5 s, not on each status poll: polled every second, the stale row is reconnected at the read that completes the 60 s', async () => {
-    const cfg = waitConfig()
-    const row = installWorkingRow(clock, { pane: IDLE_PANE, stepMs: 1_000 }, { getResult: workingRowOf(cfg, transcriptOf()) })
-
-    expect(await waitForWaitingAndReconnect('C', cfg)).toBe('ok')
-
-    // Evidence reads at 1 s, 6 s, …, 61 s complete the window; reconnect
-    // then reads the row and composer once more before typing.
-    expect(clock.now()).toBe(61_000)
-    expect(row.statusCalls).toHaveLength(61)
-    expect(row.readPaneCalls).toHaveLength(14)
-    expect(row.getCalls).toHaveLength(row.statusCalls.length + row.readPaneCalls.length + 2)
-    expect(row.sendKeysCalls).toEqual([
-      { instance_id: 'cscb_C', text: RECONNECT_TEXT, no_enter: true },
-      { instance_id: 'cscb_C', key: 'Enter' },
-    ])
-  })
-
-  test('the composed route: a fresh session\'s row (no persisted transcript path) is read through the transcript under the persona\'s claude_config_dir (its spawn home\'s .claude here), and reconnected', async () => {
-    const cfg = waitConfig()
-    const persona = personaOf(cfg, 'C')
-    const configDir = join(ladderHome(), '.claude')
-    const composed = resolveJsonlPath(persona.working_directory, TRANSCRIPT_SESSION_ID, configDir)
-    mkdirSync(join(composed, '..'), { recursive: true })
-    writeTranscript(composed, endedTurn())
-    const row = installWorkingRow(clock, { pane: IDLE_PANE, stepMs: 10_000 }, {
-      getResult: personaRow(cfg, 'C', { state: 'working', session_id: TRANSCRIPT_SESSION_ID }),
-    })
-
-    expect(await waitForWaitingAndReconnect('C', cfg)).toBe('ok')
-    expect(row.sendKeysCalls).toEqual([
-      { instance_id: 'cscb_C', text: RECONNECT_TEXT, no_enter: true },
-      { instance_id: 'cscb_C', key: 'Enter' },
-    ])
-  })
-
-  test('a running turn mid-window (idle → spinner → idle): nothing is typed until the idle evidence has held for a full window after it', async () => {
-    const cfg = waitConfig()
-    const row = installWorkingRow(clock, {
-      pane: (now) => (now === 35_000 ? SPINNER_PANE : IDLE_PANE),
-      stepMs: 5_000,
-    }, { getResult: workingRowOf(cfg, transcriptOf()) })
-
-    expect(await waitForWaitingAndReconnect('C', cfg)).toBe('ok')
-
-    // Idle from 5 s, the spinner at 35 s, idle again from 40 s: typed at 100 s, not at 65 s.
-    expect(clock.now()).toBe(40_000 + STALE_WORKING_WINDOW_MS)
-    expect(row.sendKeysCalls).toEqual([
-      { instance_id: 'cscb_C', text: RECONNECT_TEXT, no_enter: true },
-      { instance_id: 'cscb_C', key: 'Enter' },
-    ])
-  })
-
-  test('b.rmy: a stalled turn (an API retry or stall drawn with no spinner) — the same still, idle screen for the whole 10 minutes, its transcript ending with the prompt — is never typed into: not-reconnected, and why is logged once', async () => {
-    const cfg = waitConfig()
-    const row = installWorkingRow(clock, { pane: IDLE_PANE, stepMs: 60_000 }, {
-      getResult: workingRowOf(cfg, transcriptOf([...endedTurn(), promptEntry('post it in #ops')])),
-    })
-
-    let result: string | undefined
-    const errLog = await withCapturedErr(async () => {
-      result = await waitForWaitingAndReconnect('C', cfg)
-    })
-
-    expect(result).toBe('not-reconnected')
-    expect(row.sendKeysCalls).toEqual([])
-    expect(clock.now()).toBeGreaterThanOrEqual(WAIT_FOR_WAITING_TIMEOUT_MS)
-    expect(row.readPaneCalls.length).toBeGreaterThan(5)
-    expect(linesWith(errLog, 'does not end with a completed turn — no idle evidence; still waiting for its working row')).toHaveLength(1)
-  })
-
-  test('REPRO: a row that reads waiting at the deadline is reconnected, not left to the health check', async () => {
-    _setFindMissingMemoTtlMs(0) // the deadline's fresh sweep is the second findMissing
-    const row = installWorkingRow(clock, {
-      pane: SPINNER_PANE,
-      stepMs: 60_000,
-      state: (r) => (r.findMissingCalls.length >= 2 ? 'waiting' : 'working'),
-    })
-
-    const result = await waitForWaitingAndReconnect('C', waitConfig())
-
-    expect(result).toBe('ok')
-    expect(row.sendKeysCalls.map((c) => c.text)).toEqual([RECONNECT_TEXT])
-    expect(clock.now()).toBeGreaterThanOrEqual(WAIT_FOR_WAITING_TIMEOUT_MS)
-  })
-
-  /**
-   * The wait's give-ups with the session alive: how the stub makes each, the
-   * report its builder gives (the line the wait writes and, at
-   * session_restart_delay 0, the notice it raises), and the notice raised at
-   * session_restart_delay 60, if any: only the deadline on a `working` row,
-   * held back from for 10 min, raises one then (unproven-idle, from the
-   * run's own deferral). A failed status read at the deadline is a give-up
-   * too, with its own cases below; a row agent-director has lost
-   * (`ErrSpawnNotFound`) is a dead session, not a give-up (b.jg5 SRJ-605).
-   */
-  const GIVE_UPS: Array<[string, Pick<WorkingRow, 'pane' | 'stepMs' | 'state'>, () => WaitEndedReport, NotConnectedNotice | undefined]> = [
-    [
-      'the deadline, with the row still working and its pane mid-turn',
-      { state: 'working', pane: SPINNER_PANE, stepMs: 60_000 },
-      () => waitTimedOutLiveReport(WAIT_REF_C, WAIT_FOR_WAITING_TIMEOUT_MS, UNPROVEN_IDLE_NOTICE_AFTER_MS, 'working', WAIT_FOR_WAITING_TIMEOUT_MS),
-      { reason: 'unproven-idle', autoRestartDisabled: false, heldMs: WAIT_FOR_WAITING_TIMEOUT_MS },
-    ],
-    ['the row moving to ask_user', { state: 'ask_user', pane: IDLE_PANE, stepMs: 1_000 }, () => waitEndedOnStateReport(WAIT_REF_C, 'ask_user'), undefined],
-  ]
-
-  test.each(GIVE_UPS)('REPRO: session_restart_delay 0 and %s → not-reconnected with nothing typed; each wait logs its report\'s line saying nothing will reconnect it, and the report\'s one not-connected notice is raised for the episode', async (_label, init, report) => {
-    _setFindMissingMemoTtlMs(0)
-    const cfg = waitConfig({ session_restart_delay: 0 })
-    const row = installWorkingRow(clock, init)
-
-    const results: string[] = []
-    const errLog = await withCapturedErr(async () => {
-      results.push(await waitForWaitingAndReconnect('C', cfg))
-      // A second give-up in the same episode raises nothing more.
-      results.push(await waitForWaitingAndReconnect('C', cfg))
-    })
-
-    expect(results).toEqual(['not-reconnected', 'not-reconnected'])
-    expect(row.sendKeysCalls).toEqual([])
-    expect(linesWith(errLog, report().logHead)).toEqual(Array(2).fill(waitEndedDisconnectedLine(report(), 0)))
-    expect(linesWith(errLog, 'session_restart_delay is 0, so nothing will reconnect it')).toHaveLength(2)
-    expect(errLog).not.toContain('health-check will')
-    expect(notices.map((n) => [n.key, n.text])).toEqual([['C', await renderedNotice('C', report().notice)]])
-  })
-
-  test.each(GIVE_UPS)('session_restart_delay 60 and %s → not-reconnected with nothing typed; the wait logs its report\'s line saying what the health check does next; a notice only for a working row held back from for 10 min (unproven-idle)', async (_label, init, report, delay60Notice) => {
-    _setFindMissingMemoTtlMs(0)
-    const cfg = waitConfig({ session_restart_delay: 60 })
-    const row = installWorkingRow(clock, init)
-
-    let result: string | undefined
-    const errLog = await withCapturedErr(async () => {
-      result = await waitForWaitingAndReconnect('C', cfg)
-    })
-
-    expect(result).toBe('not-reconnected')
-    expect(row.sendKeysCalls).toEqual([])
-    expect(linesWith(errLog, report().logHead)).toEqual([waitEndedDisconnectedLine(report(), 60)])
-    expect(errLog).not.toContain('nothing will reconnect it')
-    expect(linesWith(errLog, 'is not connected (')).toHaveLength(delay60Notice === undefined ? 0 : 1)
-    expect(notices.map((n) => [n.key, n.text])).toEqual(
-      delay60Notice === undefined ? [] : [['C', await renderedNotice('C', delay60Notice)]],
-    )
-  })
-
-  // b.jg5 SRJ-605: agent-director losing the row (ErrSpawnNotFound) at a poll
-  // or at the deadline's status call is no give-up: 'dead-session', with one
-  // line and no notice at either restart delay, nothing typed and no tmux
-  // probe, whatever the probe would answer.
-  const ROW_LOST: ReadonlyArray<readonly [string, Pick<WorkingRow, 'pane' | 'stepMs' | 'state'>, number | undefined]> = [
-    ['a poll', { state: errSpawnNotFound(), pane: IDLE_PANE, stepMs: 1_000 }, undefined],
-    [
-      'the deadline\'s status call',
-      { state: (r) => (r.findMissingCalls.length % 2 === 0 ? errSpawnNotFound() : 'working'), pane: SPINNER_PANE, stepMs: 60_000 },
-      WAIT_FOR_WAITING_TIMEOUT_MS,
-    ],
-  ]
-
-  test.each(ROW_LOST.flatMap(([at, init, timedOutAfterMs]) => [0, 60].map((delay) => [delay, at, init, timedOutAfterMs] as const)))('b.jg5 SRJ-605: session_restart_delay %d and agent-director losing the row (ErrSpawnNotFound) at %s → dead-session with one row-absent line, no notice, nothing typed, no probe', async (delay, _at, init, timedOutAfterMs) => {
-    _setFindMissingMemoTtlMs(0)
-    const row = installWorkingRow(clock, init)
-
-    let result: string | undefined
-    const errLog = await withCapturedErr(async () => {
-      result = await waitForWaitingAndReconnect('C', waitConfig({ session_restart_delay: delay }))
-    })
-
-    expect(result).toBe('dead-session')
-    expect(row.sendKeysCalls).toEqual([])
-    expect(notices).toEqual([])
-    expect(linesWith(errLog, ' agent-director row is absent (ErrSpawnNotFound)')).toEqual([waitRowAbsentLine(WAIT_REF_C, timedOutAfterMs)])
-    expect(errLog).not.toContain('nothing will reconnect it')
-  })
-
-  /**
-   * The deadline's failed status reads (b.jg5 SRJ-605), each with its class
-   * and the outage it raises for C: an UNCLASSIFIED error raises none; a
-   * CONFIG answer raises `ad-config-malformed` (b.jg5 SRJ-316).
-   */
-  const DEADLINE_READ_ERRORS: ReadonlyArray<readonly [string, () => Error, AdErrorClass, OutageClass[]]> = [
-    ['an UNCLASSIFIED error (ErrTimeout)', () => errGeneric('status', 'ErrTimeout'), AD_ERROR_CLASS_UNCLASSIFIED, []],
-    ['a CONFIG answer (ErrConfigMalformed, b.jg5 SRJ-316)', () => errConfigMalformed(), AD_ERROR_CLASS_CONFIG, ['ad-config-malformed']],
-  ]
-
-  test.each(DEADLINE_READ_ERRORS.flatMap(([what, make, errorClass, flags]) => [0, 60].map((delay) => [delay, what, make, errorClass, flags] as const)))('b.jg5 SRJ-605: session_restart_delay %d and the deadline\'s status call failing with %s → not-reconnected through the wait-ended report, never failed or dead-session: nothing typed, no probe; one line per wait from the builders; the episode\'s one notice (at delay 0 the deadline\'s, naming that agent-director could not report its state; at 60 the second wait\'s polls\' unproven-idle one)', async (delay, _what, make, errorClass, flags) => {
-    _setFindMissingMemoTtlMs(0)
-    const cfg = waitConfig({ session_restart_delay: delay })
-    const err = make()
-    const row = installWorkingRow(clock, {
-      state: (r) => (r.findMissingCalls.length % 2 === 0 ? err : 'working'),
-      pane: SPINNER_PANE,
-      stepMs: 60_000,
-    })
-
-    const results: string[] = []
-    const errLog = await withCapturedErr(async () => {
-      results.push(await waitForWaitingAndReconnect('C', cfg))
-      results.push(await waitForWaitingAndReconnect('C', cfg))
-    })
-
-    const report = waitTimedOutUnreadReport(WAIT_REF_C, WAIT_FOR_WAITING_TIMEOUT_MS, describeAgentDirectorFailure(err), errorClass)
-    expect(results).toEqual(['not-reconnected', 'not-reconnected'])
-    expect(row.sendKeysCalls).toEqual([])
-    expect(linesWith(errLog, 'waitForWaitingAndReconnect: timed out for ')).toEqual(Array(2).fill(waitEndedDisconnectedLine(report, delay)))
-    expect(linesWith(errLog, 'dead session')).toEqual([])
-    expect(linesWith(errLog, 'refused for persona=C')).toEqual([])
-    // One notice for the episode. At delay 0 the first wait's failed deadline
-    // read raises it; at 60 that read raises none, and a poll of the second
-    // wait, once the run of deferrals on the `working` row begun in the first
-    // wait has passed 10 min, raises the unproven-idle one (held for 11 min:
-    // the stub's clock moves a minute per status call).
-    const episodeNotice: NotConnectedNotice =
-      delay === 0 ? report.notice : { reason: 'unproven-idle', autoRestartDisabled: false, heldMs: 11 * 60_000 }
-    expect(notices.map((n) => [n.key, n.text])).toEqual([['C', await renderedNotice('C', episodeNotice)]])
-    // The second wait's successful polls clear the outage the first raised
-    // (b.jg5 SRJ-312), so each wait's CONFIG read posts its own onset, with
-    // one all-clear listing the bare class between them.
-    expect([...getOutageFlags('C')]).toEqual(flags)
-    const allClear = ALL_CLEAR_TEMPLATE(new Map(flags.map((cls) => [cls, { detail: undefined }])))
-    expect(outageEmissions).toEqual(
-      flags.length === 0 ? [] : [adConfigMalformedOnset(err), allClear, adConfigMalformedOnset(err)].map((text) => ({ key: 'C', text })),
-    )
-    assertNoLeak({ errLog, notices })
-  })
-
-  // b.jg5 SRJ-105, SRJ-512: an UNUSABLE NAME answer at the deadline's status
-  // call latches C (unreadable) and ends the wait latched: nothing typed, and no notice for the deadline's read; nothing is called
-  // after the read. A pane read answering UNUSABLE NAME on the first poll
-  // latches C with the state the poll read (working) and ends the wait there,
-  // though the next poll would read waiting: no further poll, nothing typed.
-  test.each([0, 60])('b.jg5 SRJ-105, SRJ-512: session_restart_delay %d and the deadline\'s status call answering UNUSABLE NAME → latched: C latched (unreadable), nothing typed, no call after the read', async (delay) => {
-    _setFindMissingMemoTtlMs(0)
-    const latch = createConflictLatch({ log: () => {} })
-    setConflictLatch(latch)
-    const row = installWorkingRow(clock, {
-      state: (r) => (r.findMissingCalls.length % 2 === 0 ? errUnusableName('stored-differently') : 'working'),
-      pane: SPINNER_PANE,
-      stepMs: 60_000,
-    })
-
-    let result: string | undefined
-    const errLog = await withCapturedErr(async () => {
-      result = await waitForWaitingAndReconnect('C', waitConfig({ session_restart_delay: delay }))
-    })
-
-    expect(result).toBe(WAIT_OUTCOME_LATCHED)
-    expect(row.sendKeysCalls).toEqual([])
-    expect(row.findMissingCalls).toHaveLength(2)
-    const statusCallsAtLatch = row.statusCalls.length
-    expect(latch.record('C')).toMatchObject({ latchCase: LATCH_CASE_UNUSABLE_RECORDED_NAME, rowState: LATCH_ROW_STATE_UNREADABLE })
-    expect(notices.filter((n) => n.text.includes('could not report its state'))).toEqual([])
-    expect(linesWith(errLog, ' — UNUSABLE NAME: the persona latched; ')).toHaveLength(1)
-    expect(linesWith(errLog, 'refused for persona=C')).toEqual([])
-    // A later wait for the latched persona makes no call at all.
-    expect(await waitForWaitingAndReconnect('C', waitConfig({ session_restart_delay: delay }))).toBe(WAIT_OUTCOME_LATCHED)
-    expect(row.statusCalls).toHaveLength(statusCallsAtLatch)
-    expect(row.findMissingCalls).toHaveLength(2)
-    assertNoLeak({ errLog, notices })
-  })
-
-  test('b.jg5 SRJ-117, SRJ-512: the first poll\'s pane read answering UNUSABLE NAME latches C with the state that poll read (working) and ends the wait latched: no second poll though the row would read waiting, no transcript get, nothing typed, no notice', async () => {
-    const latch = createConflictLatch({ log: () => {} })
-    setConflictLatch(latch)
-    const row = installWorkingRow(clock, {
-      state: (r) => (r.statusCalls.length > 1 ? 'waiting' : 'working'),
-      pane: errUnusableName('control-character'),
-      stepMs: 1_000,
-    })
-
-    let result: string | undefined
-    const errLog = await withCapturedErr(async () => {
-      result = await waitForWaitingAndReconnect('C', waitConfig())
-    })
-
-    expect(result).toBe(WAIT_OUTCOME_LATCHED)
-    expect(row.statusCalls).toHaveLength(1)
-    expect(row.readPaneCalls).toEqual([paneReadOf('C')])
-    expect(row.getCalls).toEqual([{ instance_id: 'cscb_C' }])
-    expect(row.sendKeysCalls).toEqual([])
-    expect(latch.record('C')).toMatchObject({ latchCase: LATCH_CASE_UNUSABLE_RECORDED_NAME, refusedOperation: REFUSED_OPERATION_NONE, rowState: latchRowStateRead('working') })
-    expect(notices).toEqual([])
-    expect(linesWith(errLog, '[slack] readWorkingPane: pane read refused for persona=C: ')).toHaveLength(1)
-    expect(linesWith(errLog, 'reading the pane of persona=C failed')).toEqual([])
-    assertNoLeak({ errLog, notices })
-  })
-
-  test.each<[number, string]>([
-    [60, PROMPT_NOTICE_AUTO_RESTART_ON],
-    [0, 'Automatic restarts are disabled'],
-  ])('a prompt shown for 60 s while the row reads working is never typed into: one log line and one blocked-on-prompt notice (session_restart_delay %d); the wait goes on and reconnects once the row reads waiting', async (delay, wording) => {
-    const cfg = waitConfig({ session_restart_delay: delay })
-    const row = installWorkingRow(clock, {
-      pane: PERMISSION_PANE,
-      stepMs: 20_000,
-      // Answered after 3 minutes: the turn ends and the row reads waiting.
-      state: () => (clock.now() > 3 * 60_000 ? 'waiting' : 'working'),
-    })
-
-    let result: string | undefined
-    const errLog = await withCapturedErr(async () => {
-      result = await waitForWaitingAndReconnect('C', cfg)
-    })
-
-    expect(result).toBe('ok')
-    // Typed once, and only after the row read waiting.
-    expect(row.sendKeysCalls.map((c) => c.text)).toEqual([RECONNECT_TEXT])
-    expect(clock.now()).toBeGreaterThan(3 * 60_000)
-    expect(notices.map((n) => n.key)).toEqual(['C'])
-    expect(notices[0]!.text).toStartWith(':warning: *Waiting on a prompt*')
-    expect(notices[0]!.text).toContain(wording)
-    expect(linesWith(errLog, 'its pane has shown a prompt or dialog')).toHaveLength(1)
-  })
-
-  test.each<[string, () => PaneReading]>([
-    ['a running turn (its spinner line)', () => SPINNER_PANE],
-    ['a blank pane', () => ''],
-    ['an unreadable pane', () => errGeneric('read-pane', 'ErrPaneRead', leakyMessage('pane read failed', 'wait'))],
-  ])('b.rmy: %s for the whole 10 minutes is never typed into, though the transcript ends with a completed turn — the wait gives up not-reconnected; a read failure is logged once, token-safe', async (_label, pane) => {
-    const cfg = waitConfig()
-    const row = installWorkingRow(clock, { pane: pane(), stepMs: 30_000 }, { getResult: workingRowOf(cfg, transcriptOf()) })
-
-    let result: string | undefined
-    const errLog = await withCapturedErr(async () => {
-      result = await waitForWaitingAndReconnect('C', cfg)
-    })
-
-    expect(result).toBe('not-reconnected')
-    expect(row.sendKeysCalls).toEqual([])
-    expect(clock.now()).toBeGreaterThanOrEqual(WAIT_FOR_WAITING_TIMEOUT_MS)
-    // Only the wait's first failed read is logged, by its errName and redacted
-    // message, closing with its read-pane class (UNCLASSIFIED).
-    const failure = `reading the pane of persona=C failed: ErrPaneRead message=${JSON.stringify(redactedLeakyMessage('pane read failed'))}`
-    expect(linesWith(errLog, 'reading the pane of persona=C failed')).toHaveLength(row.pane instanceof Error ? 1 : 0)
-    const failed = linesWith(errLog, failure)
-    expect(failed).toHaveLength(row.pane instanceof Error ? 1 : 0)
-    for (const line of failed) expect(line).toEndWith(`${paneReadClassOpening(AD_ERROR_CLASS_UNCLASSIFIED)}b.f2b)`)
-    assertNoLeak({ errLog })
-  })
-})
-
 // ---------------------------------------------------------------------------
 // b.jg5 SRJ-613 (AC 44), the launch wait's half: with no session of the
 // row's current launch there and exactly one leftover of the persona,
@@ -10769,84 +8380,6 @@ describe('b.f2b: the wait for a working row at a launch (waitForWaitingAndReconn
 // startup-errors entry the harness captured. T1's per-cell CONFLICT cases
 // (the ladder's branches, over every reconnect row) are the cells' evidence.
 // ---------------------------------------------------------------------------
-
-describe('b.jg5 SRJ-613: the launch wait for a working row acts on no pane alone; its reconnect\'s send-keys is the backstop (AC 44)', () => {
-  afterEach(srj105AfterEach)
-
-  /** How far the wait's clock moves at each status poll: the positive-idle window is held after a few polls. */
-  const POLL_STEP_MS = STALE_WORKING_WINDOW_MS / 6
-
-  /**
-   * How the wait reaches its reconnect after reading an idle pane: its name,
-   * the state the wait last reads (the backstop row's), and the `status`
-   * answers that take it there.
-   */
-  const ROUTES: ReadonlyArray<readonly [string, ReconnectLastRead, (lastRead: ReconnectLastRead) => RecoveryStubScript]> = [
-    ['the positive-idle rule shows the row stale from an idle pane', 'working', (lastRead) => ({ statusResult: cannedStatusResult({ state: lastRead }) })],
-    [
-      'a poll reads the row waiting after a poll read the row working and its pane idle',
-      'waiting',
-      (lastRead) => ({ statusQueue: [cannedOk(cannedStatusResult({ state: 'working' }))], statusResult: cannedStatusResult({ state: lastRead }) }),
-    ],
-  ]
-
-  /** Where P's launch comes from, and what it answers once the backstop latched P. */
-  const ENTRIES: ReadonlyArray<readonly [string, (h: RecoveryHarness, p: string) => Promise<unknown>, (p: string) => unknown]> = [
-    ['the start pass (spawnForPersona)', (h, p) => h.launch(p), (p) => ({ key: p, action: 'latched' })],
-    ['the restart path (launchSession)', (h, p) => launchSession(p, h.config), () => 'skipped'],
-  ]
-
-  const CASES = ROUTES.flatMap(([route, lastRead, statuses]) =>
-    reconnectConflictRowsAt(lastRead)
-      .filter((row) => row.leftoverOfEarlierLaunch === true)
-      .flatMap((row) => ENTRIES.map(([entry, run, answer]) => [route, row.name, entry, lastRead, statuses, run, answer, row] as const)),
-  )
-
-  test.each(CASES)('%s; the reconnect\'s send-keys answering %s; P launched by %s → the launch answers latched with nothing typed: the pane read came first and the one refused send-keys was the last call; P latched once with the state the wait last read and one CONFLICT notice posted; no resume, kill, delete or second send-keys; nothing counted, posted as a failure or recorded; then no launch path reaches agent-director', async (_route, _row, _entry, lastRead, statuses, run, answer, row) => {
-    const { h, p, b } = srj105Build()
-    fastPolls(h)
-    const clock = useFakeNow()
-    const persona = harnessPersona(h, p)
-    let latestState = 'working'
-    const ownRow = harnessRow(h, persona, { state: 'working', ...transcriptOf().fields })
-    const script: RecoveryStubScript = {
-      ...collided(h, persona, ownRow),
-      ...statuses(lastRead),
-      getFn: (params) => params.instance_id === personaInstanceId(p)
-        ? { ...ownRow, state: latestState }
-        : undefined,
-      readPaneResults: [cannedReadPaneResult(IDLE_PANE)],
-      sendKeysError: row.build(),
-    }
-    h.script(script)
-    // Each status poll moves the wait's clock first, as `installWorkingRow` does.
-    const client = h.stub.client as unknown as { status: (params: import('agent-director').StatusParams) => Promise<unknown> }
-    const status = client.status.bind(client)
-    client.status = async (params) => {
-      await clock.advance(POLL_STEP_MS)
-      const result = await status(params) as import('agent-director').StatusResult
-      latestState = result.state
-      return result
-    }
-    const order = recordCallOrder(h)
-
-    expect(await run(h, p)).toStrictEqual(answer(p))
-
-    // The wait read P's own pane before it typed, and read or typed nothing after the refused send-keys.
-    expect(h.stub.calls.readPaneCalls.length).toBeGreaterThan(0)
-    expect(h.stub.calls.readPaneCalls).toEqual(h.stub.calls.readPaneCalls.map(() => paneReadOf(p)))
-    expect(order.indexOf('readPane')).toBeLessThan(order.indexOf('sendKeys'))
-    expect(order.at(-1)).toBe('sendKeys')
-    expect(h.stub.calls.sendKeysCalls.map((c) => [c.instance_id, c.text])).toEqual([[personaInstanceId(p), RECONNECT_TEXT]])
-    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, sendKeys: 1 }))
-    const latched = reconnectConflictLatch(p, row)
-    expectLatchedOnce(h, p, latched)
-    expect(latched.lines(h, p)[0]).toContain(RECONNECT_NOT_THIS_LAUNCH_NOTE)
-    expect(hasPendingWorkingRowEvidence(p)).toBe(false)
-
-    await expectLaunchedByNoPath(h, p, b, script)
-  })
-})
 
 // ---------------------------------------------------------------------------
 // b.dup — a findMissing sweep ends a row just before its /mcp reconnect lands
@@ -10979,10 +8512,7 @@ describe('b.dup: a row a findMissing sweep ended just before /mcp reconnect land
    */
   const WAIT_RECONNECTS: Array<[string, (cfg: PersonaConfig) => { init: Parameters<typeof installWorkingRow>[1]; opts: StubClientOptions }]> = [
     ['the row reads waiting at a poll', () => ({ init: { state: 'waiting', pane: IDLE_PANE, stepMs: 1_000 }, opts: {} })],
-    [
-      'the positive-idle rule shows the working row stale',
-      (cfg) => ({ init: { pane: IDLE_PANE, stepMs: 10_000 }, opts: { getResult: workingRowOf(cfg, transcriptOf()) } }),
-    ],
+
     [
       'the row reads waiting at the deadline',
       () => ({
@@ -11369,37 +8899,6 @@ describe('b.f2b: one persona waiting for its working row does not hold up the st
     assertNoLeak({ errLog, startupErrors: writtenFile(join(fixtureDir, 'state', 'startup-errors.log')) })
   })
 
-  test('a start launch that joins a launch already waiting on a working row waits with it; when that wait gives up with the session alive, both count it a launch that did not fail, and the summary ends ", 1 not reconnected"', async () => {
-    captureStartupErrors()
-    const clock = useFakeNow()
-    const cfg = waitConfig()
-    // The wait spins without moving time until the start pass has joined it.
-    const row = installWorkingRow(clock, { pane: SPINNER_PANE, stepMs: 0 }, workingCollision(cfg))
-    const lines: string[] = []
-    const orig = console.error
-    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')) }
-    let restarted: LaunchSessionResult | undefined
-    let result!: Awaited<ReturnType<typeof startupSessionManager>>
-    try {
-      const restart = launchSession('C', cfg)
-      await pollUntil(() => isLaunchInFlight('C'))
-      const start = startupSessionManager(cfg, { concurrency: 1 })
-      await pollUntil(() => lines.some((l) => l.includes('launch already in flight for')))
-      row.stepMs = 60_000 // now time runs out
-      ;[restarted, result] = await Promise.all([restart, start])
-    } finally {
-      console.error = orig
-    }
-    const errLog = lines.join('\n')
-
-    expect(restarted).toBe(true)
-    expect(row.spawnCalls).toHaveLength(1) // one launch, joined
-    expect(row.sendKeysCalls).toEqual([])
-    expect(result.perPersona).toEqual([{ key: 'C', action: 'not-reconnected' }])
-    expect(result).toMatchObject({ notReconnected: 1, succeeded: 1, reconnected: 0, waitingInBackground: 0, failed: 0 })
-    expect(errLog).toContain('0 reconnected, 0 no-op, 0 failed, 0 not brought up, 1 not reconnected')
-    expect(errLog).not.toContain('still waiting in the background')
-  })
 })
 
 // ---------------------------------------------------------------------------
@@ -11449,382 +8948,15 @@ describe('SR-8.6 invariants', () => {
 // that lap with no pane read, and a start-pass launch writes the spawn-died
 // entry. A launch, fresh or resumed, reads `pending` until it reports in
 // (HO C5), so the server runs no tmux command for it. A launch that returns
-// success starts the approver on its own after the launch call (b.jg5
-// SRJ-401), so a case settles the launch, then runs its approver to its stop
-// (`launchThenRunApprover`). Every approver case runs it on a fake clock
-// (`useApproverClock`, `runOnApproverClock`) and installs `pending` answers
+
 // through the stub's canned builder, so each carries a launch start.
 // ---------------------------------------------------------------------------
 
-describe('approvePreSessionDialogs (b.4ie)', () => {
-  const DEV_CHANNELS_PANE = TRUST_DIALOG_PANE
-  const WELCOME_PANE = 'Listening for channel messages from: server:slack-channel-router'
-  const C_ID = personaInstanceId('C')
-  const C_REF = renderPersonaRef('C', 'C')
-  /** The one pane read a lap makes. */
-  const PANE_READ: import('agent-director').ReadPaneParams = { instance_id: C_ID, n_lines: APPROVER_PANE_LINES, allow_pending: true }
-  /** The one Enter a lap presses on a dialog. */
-  const ENTER: import('agent-director').SendKeysParams = { instance_id: C_ID, text: '', allow_pending: true }
-
-  /** Capture lists for the approver's verbs and the ladder's resume. */
-  function approverCalls() {
-    return {
-      statusCalls: [] as import('agent-director').StatusParams[],
-      readPaneCalls: [] as import('agent-director').ReadPaneParams[],
-      sendKeysCalls: [] as import('agent-director').SendKeysParams[],
-      resumeCalls: [] as import('agent-director').ResumeParams[],
-    }
-  }
-
-  // -------------------------------------------------------------------------
-  // Happy path: dialog detected → Enter sent (via spawnForPersona, the SR-1.1
-  // fresh-spawn path that calls approvePreSessionDialogs).
-  // -------------------------------------------------------------------------
-
-  test('happy path: a fresh spawn reading pending with the dialog: one readPane and one Enter (allow_pending, cscb_<key>), then the next lap reads waiting', async () => {
-    const clock = useApproverClock()
-    const calls = approverCalls()
-    installStub({
-      ...calls,
-      statusQueue: statusReads('pending', 'pending', 'waiting'),
-      readPaneResults: [cannedReadPaneResult(DEV_CHANNELS_PANE), cannedReadPaneResult(DEV_CHANNELS_PANE), cannedReadPaneResult(WELCOME_PANE)],
-    })
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
-
-    const result = await launchThenRunApprover(clock, 'C', spawnForPersona(personaOf(cfg, 'C'), cfg))
-
-    expect(result).toEqual({ key: 'C', action: 'spawned' })
-    expect(calls.statusCalls).toEqual(Array(2).fill({ instance_id: C_ID }))
-    expect(calls.readPaneCalls).toEqual([PANE_READ, PANE_READ])
-    expect(calls.sendKeysCalls).toEqual([ENTER])
-    expect(clock.now()).toBe(DIALOG_POLL_INTERVAL_MS)
-  })
-
-  // -------------------------------------------------------------------------
-  // needle lock-in constant test
-  // -------------------------------------------------------------------------
-
-  test('supported trust dialog retains its verified needle', () => { expect(TRUST_DIALOG_PANE).toContain(TRUST_DIALOG_NEEDLE) })
-
-  // -------------------------------------------------------------------------
-  // The collision ladder
-  // -------------------------------------------------------------------------
-
-  test('collision-resume path: the approver stops at its first lap when the resumed row already reads a live state (no readPane)', async () => {
-    const clock = useApproverClock()
-    const calls = approverCalls()
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
-    installStub({
-      ...calls,
-      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
-      getResult: personaRow(cfg, 'C', { state: 'ended' }),
-      statusResult: cannedStatusResult({ state: 'waiting' }),
-    })
-
-    const result = await launchThenRunApprover(clock, 'C', spawnForPersona(personaOf(cfg, 'C'), cfg))
-
-    expect(result).toEqual({ key: 'C', action: 'resumed' })
-    expect(calls.statusCalls).toHaveLength(1)
-    expect(calls.readPaneCalls).toHaveLength(0)
-    expect(clock.firedCount()).toBe(0)
-  })
-
-  test('skipped on collision-reconnect path (waiting state → no readPane)', async () => {
-    const readPaneCalls: import('agent-director').ReadPaneParams[] = []
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
-    installStub({
-      readPaneCalls,
-      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
-      getResult: personaRow(cfg, 'C', { state: 'waiting' }),
-    })
-    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
-
-    expect(result.action).toBe('reconnected')
-    expect(readPaneCalls).toHaveLength(2)
-  })
-
-  test('skipped on collision-noop path (pending state → no readPane)', async () => {
-    const readPaneCalls: import('agent-director').ReadPaneParams[] = []
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
-    installStub({
-      readPaneCalls,
-      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
-      getResult: personaRow(cfg, 'C', { state: 'pending' }),
-    })
-    const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
-
-    expect(result.action).toBe('no-op')
-    expect(readPaneCalls).toHaveLength(0)
-  })
-
-  // AC 34, AC 48: a resumed launch reads `pending` until it reports in, like a
-  // fresh one, so its dialog is cleared through agent-director, never raw tmux.
-  test.each([
-    ['the folder trust dialog', TRUST_DIALOG_PANE],
-  ])('AC 34, AC 48: a collision on an ended row is resumed and the resumed row reads pending with %s: one readPane (40 lines, allow_pending) and one Enter (empty text, allow_pending) on P\'s instance only clear it, the next lap reads waiting', async (_label, pane) => {
-    const clock = useApproverClock()
-    const calls = approverCalls()
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
-    installStub({
-      ...calls,
-      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
-      getResult: personaRow(cfg, 'C', { state: 'ended' }),
-      statusQueue: statusReads('pending', 'pending', 'waiting'),
-      readPaneResults: [cannedReadPaneResult(pane), cannedReadPaneResult(pane), cannedReadPaneResult(WELCOME_PANE)],
-    })
-
-    const result = await launchThenRunApprover(clock, 'C', spawnForPersona(personaOf(cfg, 'C'), cfg))
-
-    expect(result).toEqual({ key: 'C', action: 'resumed' })
-    expect(calls.resumeCalls).toEqual([{ instance_id: C_ID }])
-    expect(calls.statusCalls).toEqual(Array(2).fill({ instance_id: C_ID }))
-    expect(calls.readPaneCalls).toEqual([PANE_READ, PANE_READ])
-    expect(calls.sendKeysCalls).toEqual([ENTER])
-  })
-
-  /** A launch of `C` whose approver then runs: the stub knobs that reach it and the result the launch answers. */
-  const LADDER_LAUNCHES: Array<[string, (cfg: PersonaConfig) => StubClientOptions, SpawnPersonaResult]> = [
-    ['a fresh spawn', () => ({}), { key: 'C', action: 'spawned' }],
-    [
-      'a resume at the collision ladder (its row read ended)',
-      (cfg) => ({
-        spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
-        getResult: personaRow(cfg, 'C', { state: 'ended' }),
-      }),
-      { key: 'C', action: 'resumed' },
-    ],
-  ]
-  // b.jg5 SRJ-402: `ended` or `missing` means the launch is over: the approver
-  // stops at that lap, at once (no streak, no sleep), with no pane read, and
-  // the restart path decides. Here each launch kind, at the start pass, reads
-  // `ended`; `missing` and the restart path's launch (no entry) are
-  // tests/approve-trust-folder-dialog.test.ts's.
-  test.each(LADDER_LAUNCHES)('the row reads ended at the first lap after %s, during a start-pass launch: the approver stops there at once with no pane read, no Enter, no further status; the spawn-died entry once; the launch result unchanged', async (_launch, knobs, result) => {
-    const state = 'ended'
-    const clock = useApproverClock()
-    const readLog = captureStartupErrors()
-    const calls = approverCalls()
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
-    installStub({
-      ...calls,
-      ...knobs(cfg),
-      statusQueue: statusReads(state, 'pending', 'waiting'),
-      readPaneResults: [cannedReadPaneResult(TRUST_DIALOG_PANE)],
-    })
-
-    let launched: SpawnPersonaResult | undefined
-    const errLog = await withCapturedErr(async () => {
-      launched = await launchThenRunApprover(clock, 'C', spawnForPersona(personaOf(cfg, 'C'), cfg, true))
-    })
-
-    expect(launched).toStrictEqual(result)
-    expect(calls.statusCalls).toEqual([{ instance_id: C_ID }])
-    expect(calls.readPaneCalls).toEqual([])
-    expect(calls.sendKeysCalls).toEqual([])
-    // At once: no timer fired and no virtual time passed.
-    expect(clock.firedCount()).toBe(0)
-    expect(clock.now()).toBe(0)
-    expect(clock.pendingCount()).toBe(0)
-    const finished = approverFinishedMessage(C_REF, state)
-    expect(linesWith(errLog, approverLogLine(finished))).toHaveLength(1)
-    const log = readLog()
-    expect(onlyStartupEntry(log, STARTUP_ERROR_APPROVE_SPAWN_DIED)).toContain(finished)
-    expect(countStartupEntries(log, STARTUP_ERROR_APPROVE_NOT_READY)).toBe(0)
-    expect(notices).toEqual([])
-  })
-
-  // -------------------------------------------------------------------------
-  // b.ben regression: the approver addresses the persona's cscb_<key>, derived
-  // from the key and never from the name (the two differ here).
-  // -------------------------------------------------------------------------
-
-  test('b.ben: dialog approval addresses cscb_<key> for a persona whose key differs from its name', async () => {
-    const clock = useApproverClock()
-    const calls = approverCalls()
-    installStub({
-      ...calls,
-      statusQueue: statusReads('pending', 'pending', 'waiting'),
-      readPaneResults: [cannedReadPaneResult(DEV_CHANNELS_PANE), cannedReadPaneResult(DEV_CHANNELS_PANE), cannedReadPaneResult(WELCOME_PANE)],
-    })
-    const key = personaKey('My Chan')
-    expect(key).not.toBe('My Chan')
-    const cfg = makeMultiPersonaConfig([{ name: 'My Chan', working_directory: '/x' }], fixtureDir)
-    const result = await launchThenRunApprover(clock, key, spawnForPersona(personaOf(cfg, key), cfg))
-
-    expect(result.action).toBe('spawned')
-    const id = personaInstanceId(key)
-    expect(calls.statusCalls).toEqual(Array(2).fill({ instance_id: id }))
-    expect(calls.readPaneCalls).toEqual(Array(2).fill({ ...PANE_READ, instance_id: id }))
-    expect(calls.sendKeysCalls).toEqual([{ ...ENTER, instance_id: id }])
-  })
-
-  // -------------------------------------------------------------------------
-  // New behavior tests for merged approver (b.4ie)
-  // -------------------------------------------------------------------------
-
-  test('already-live: the first lap reads waiting → no readPane, no sendKeys, no startup error', async () => {
-    const clock = useApproverClock()
-    const calls = approverCalls()
-    installStub({ ...calls, statusQueue: statusReads('waiting') })
-    const readLog = captureStartupErrors()
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
-    await launchThenRunApprover(clock, 'C', spawnForPersona(personaOf(cfg, 'C'), cfg))
-
-    expect(calls.statusCalls).toHaveLength(1)
-    expect(calls.readPaneCalls).toHaveLength(0)
-    expect(calls.sendKeysCalls).toHaveLength(0)
-    expect(readLog()).toBe('')
-  })
-
-  test('self-heal: pending, pending, waiting + sticky dialog → Enter pressed once per pending lap', async () => {
-    const clock = useApproverClock()
-    const sendKeysCalls: import('agent-director').SendKeysParams[] = []
-    installStub({
-      sendKeysCalls,
-      statusQueue: statusReads('pending', 'pending', 'pending', 'pending', 'waiting'),
-      // sticky: every readPane returns the dialog needle
-      readPaneResults: [cannedReadPaneResult(DEV_CHANNELS_PANE)],
-    })
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
-    await launchThenRunApprover(clock, 'C', spawnForPersona(personaOf(cfg, 'C'), cfg))
-
-    // Enter pressed each time the pane shows the needle while pending
-    expect(sendKeysCalls).toEqual([ENTER, ENTER])
-    expect(clock.now()).toBe(2 * DIALOG_POLL_INTERVAL_MS)
-  })
-
-  // -------------------------------------------------------------------------
-  // AC 20 (b.av2 SR-10.3): every line the approver's class handling writes
-  // for a refused status, readPane or sendKeys (b.jg5 SRJ-117, SRJ-118,
-  // SRJ-404) logs describeAgentDirectorFailure of the error (type, safe code
-  // or errName, redacted message, frames), never the error or its raw
-  // message: the polling-on lines (the approver then reads the ready state)
-  // and the lines of the stops (GONE, ErrSpawnNotInteractive, ENVIRONMENT).
-  // Each error carries fake tokens in its message and properties; every
-  // console.error argument is kept unformatted (errors whole).
-  // -------------------------------------------------------------------------
-
-  /** An error at `site` whose message and properties carry fake tokens, with a safe code. */
-  const tokenError = (site: string): Error =>
-    Object.assign(new Error(leakyMessage(`${site} refused`, site)), {
-      code: 'ECONNRESET',
-      detail: fakeToken(APP_TOKEN_PREFIX, site),
-      note: LEAK_SENTINEL,
-    })
-
-  /**
-   * An agent-director error of `ErrorClass` (the client's class for a name it
-   * declares; the base class for a name CSCB gives no handling) named
-   * `errName` at `verb`, its message carrying fake tokens, and its expected
-   * redacted form.
-   */
-  const namedTokenError = (
-    verb: string,
-    errName: string,
-    ErrorClass: new (verb: string, errName: string, description: string) => AgentDirectorError = AgentDirectorError,
-  ): { err: Error; shown: string } => ({
-    err: new ErrorClass(verb, errName, leakyMessage('refused', verb)),
-    shown: `${errName} message=${JSON.stringify(redactedLeakyMessage('refused'))}`,
-  })
-
-  /** Stub answers that reach the approver's Enter on a `pending` row, then (when the approver goes on) the ready state. */
-  const toEnter = (err: Error): StubClientOptions => ({
-    statusQueue: statusReads('pending', 'pending', 'waiting'),
-    readPaneResults: [cannedReadPaneResult(DEV_CHANNELS_PANE)],
-    sendKeysError: err,
-  })
-
-  test.each<[string, () => { err: Error; opts: StubClientOptions; shown: string }, (failure: string) => string, ApproverStopReason]>([
-    [
-      'status',
-      () => {
-        const err = tokenError('status')
-        return {
-          err,
-          opts: { statusQueue: [cannedErr(err), ...statusReads('waiting')] },
-          shown: `Error code=ECONNRESET message=${JSON.stringify(redactedLeakyMessage('status refused'))}`,
-        }
-      },
-      (failure) => approverStatusRefusedMessage(C_REF, failure),
-      APPROVER_STOP_LIVE,
-    ],
-    [
-      'readPane (pending row)',
-      () => {
-        const err = tokenError('readpane')
-        return {
-          err,
-          opts: { statusQueue: statusReads('pending', 'waiting'), readPaneError: err },
-          shown: `Error code=ECONNRESET message=${JSON.stringify(redactedLeakyMessage('readpane refused'))}`,
-        }
-      },
-      (failure) => approverPaneCallFailedMessage(C_REF, 'read-pane', failure),
-      APPROVER_STOP_LIVE,
-    ],
-    [
-      'sendKeys (pending row, needle on screen)',
-      () => {
-        const { err, shown } = namedTokenError('send-keys', 'ErrSendKeysBroken')
-        return { err, opts: toEnter(err), shown }
-      },
-      (failure) => approverPaneCallFailedMessage(C_REF, 'send-keys', failure),
-      APPROVER_STOP_LIVE,
-    ],
-    [
-      'readPane GONE (ErrTmuxCaptureFailed)',
-      () => {
-        const { err, shown } = namedTokenError('read-pane', 'ErrTmuxCaptureFailed', ErrTmuxCaptureFailed)
-        return { err, opts: { statusQueue: statusReads('pending', 'waiting'), readPaneError: err }, shown }
-      },
-      (failure) => approverGoneMessage(C_REF, 'read-pane', failure),
-      APPROVER_STOP_GONE,
-    ],
-    [
-      'sendKeys ErrSpawnNotInteractive',
-      () => {
-        const { err, shown } = namedTokenError('send-keys', 'ErrSpawnNotInteractive', ErrSpawnNotInteractive)
-        return { err, opts: toEnter(err), shown }
-      },
-      (failure) => approverNotInteractiveMessage(C_REF, 'send-keys', failure),
-      APPROVER_STOP_NOT_INTERACTIVE,
-    ],
-    [
-      'status ENVIRONMENT (ErrTmuxNotAvailable)',
-      () => {
-        const { err, shown } = namedTokenError('status', 'ErrTmuxNotAvailable', ErrTmuxNotAvailable)
-        return { err, opts: { statusQueue: [cannedErr(err), ...statusReads('waiting')] }, shown }
-      },
-      (failure) => approverTmuxUnavailableMessage(C_REF, 'status', failure),
-      APPROVER_STOP_TMUX_UNAVAILABLE,
-    ],
-  ])('AC 20: a %s error carrying fake tokens — one approver line naming the error with its redacted message, then the class\'s stop or the ready state; nothing logged leaks', async (_label, arrange, message, expectedStop) => {
-    const clock = useApproverClock()
-    const { err, opts, shown } = arrange()
-    installStub(opts)
-    const errArgs: unknown[][] = []
-    const orig = console.error
-    console.error = (...args: unknown[]) => { errArgs.push(args) }
-    let stop: ApproverStopReason | undefined
-    try {
-      stop = await runOnApproverClock(clock, approvePreSessionDialogs('C', false, C_REF))
-    } finally {
-      console.error = orig
-    }
-
-    expect(stop).toBe(expectedStop)
-    const lines = errArgs.map((args) => args.map(String).join(' ')).filter((l) => l.startsWith(APPROVER_LOG_PREFIX))
-    expect(lines).toEqual([approverLogLine(message(describeAdFailureForLog(err)))])
-    expect(lines[0]).toContain(`: ${shown}`)
-    assertNoLeak({ errArgs, outageEmissions })
-  })
-})
-
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-404, SRJ-405, SRJ-118 (the approver's row), SRJ-316: what follows
-// the dialog approver's stops for the persona, after a launch through the
+
 // ladder
 //
-// The approver stops at B, measured never-early from the launch start its
+
 // first `pending` lap kept (from its own start until then), or at the test
 // cap from its own start while `_setDialogReadyTimeoutMs` is set. At either it
 // writes one server-log line and, for a start-pass launch only, the
@@ -11832,248 +8964,24 @@ describe('approvePreSessionDialogs (b.4ie)', () => {
 // (SRJ-405: the `DialogApprovalTimeout` spawn-failure notice is gone).
 // `ErrSpawnNotInteractive` on its Enter stops it with nothing typed and one
 // line; a CONFIG answer raises `ad-config-malformed` and arms P's retry timer
-// as from any verb while the approver polls on, backing off, to B. None of
+
 // these counts a failure, kills or deletes. Each case launches through the
-// real `spawnForPersona` and runs the approver to its stop on a fake clock
-// started at the stub's launch start (`useApproverClock`), so B is reached on
+
 // the clock; B comes from `adLaunchBoundMsInEffect`, never a literal. The
-// approver's ENVIRONMENT, CONFLICT and UNUSABLE NAME stops are covered on the
-// recovery harness below ("the dialog approver's calls are outside P's
+
 // launch attempt").
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-404, SRJ-405, SRJ-118, SRJ-316: what follows the dialog approver\'s stops for the persona, after a launch through the ladder', () => {
-  const C_ID = personaInstanceId('C')
-  const C_REF = renderPersonaRef('C', 'C')
-  const NOTICE_REF = renderPersonaRef(NOTICE_NAME, NOTICE_KEY)
-  /** A pane that shows no startup dialog: the approver presses nothing. */
-  const NO_DIALOG_PANE = 'unrelated pane text'
-
-  /** The approver's lines in a captured log, in order. */
-  function approverLines(errLog: string): string[] {
-    return errLog.split('\n').filter((line) => line.startsWith(APPROVER_LOG_PREFIX))
-  }
-
-  /** How a time limit ends the approver: its stop reason, the time from the launch start (the clock's start) and its line's message. */
-  interface ApproverLimitCase {
-    readonly reason: ApproverStopReason
-    readonly elapsedMs: number
-    readonly message: string
-  }
-
-  /** B, with the test cap unset (the file's afterEach unsets it, and `useApproverClock` too), and the test cap, set by the arrangement. */
-  const LIMITS: ReadonlyArray<readonly [string, () => ApproverLimitCase]> = [
-    [
-      'B (the test cap unset), measured from the launch start',
-      () => {
-        const boundMs = adLaunchBoundMsInEffect()
-        return { reason: APPROVER_STOP_BOUND, elapsedMs: boundMs, message: approverBoundMessage(NOTICE_REF, boundMs, APPROVER_BOUND_FROM_LAUNCH_START) }
-      },
-    ],
-    [
-      'the test cap, measured from the approver\'s start',
-      () => {
-        const capMs = 4 * DIALOG_POLL_INTERVAL_MS
-        _setDialogReadyTimeoutMs(capMs)
-        return { reason: APPROVER_STOP_CAP, elapsedMs: capMs, message: approverCapMessage(NOTICE_REF, capMs) }
-      },
-    ],
-  ]
-  const LIMIT_CROSS = LIMITS.flatMap(([limit, arrange]) =>
-    ([['a start-pass launch', true], ['a restart-path launch', false]] as const).map(([pass, isStartup]) => [limit, pass, arrange, isStartup] as const),
-  )
-
-  test.each(LIMIT_CROSS)('at %s, during %s, on a row that stays pending with no dialog: one approver line; the not-ready entry for a start pass only; nothing posted through the notice notifier (zero posts to the persona\'s destination and to the other persona); nothing counted, typed, killed or deleted; the launch result unchanged', async (_limit, _pass, arrange, isStartup) => {
-    // The approver starts at the launch start its `pending` row shows.
-    const clock = useApproverClock(SAMPLE_LAUNCH_START_MS)
-    const limit = arrange()
-    const calls = makeStubCallLog()
-    installStub({ ...calls, statusResult: cannedStatusResult({ state: 'pending' }), readPaneResults: [cannedReadPaneResult(NO_DIALOG_PANE)] })
-    const readLog = captureStartupErrors()
-    const cfg = makeNoticeConfig()
-    const h = installNoticeNotifier(cfg)
-
-    let launched: SpawnPersonaResult | undefined
-    const errLog = await withCapturedErr(async () => {
-      launched = await launchThenRunApprover(clock, NOTICE_KEY, spawnForPersona(personaOf(cfg, NOTICE_KEY), cfg, isStartup))
-    })
-    await settleNotices()
-
-    expect(launched).toEqual({ key: NOTICE_KEY, action: 'spawned' })
-    expect(await _whenDialogApproverStopped(NOTICE_KEY)).toEqual({ reason: limit.reason, launchStartMs: SAMPLE_LAUNCH_START_MS })
-    // Never early, never late: exactly at the limit, and nothing left armed.
-    expect(clock.now()).toBe(SAMPLE_LAUNCH_START_MS + limit.elapsedMs)
-    expect(clock.pendingCount()).toBe(0)
-    expect(approverLines(errLog)).toEqual([approverLogLine(limit.message)])
-    const log = readLog()
-    if (isStartup) {
-      expect(onlyStartupEntry(log, STARTUP_ERROR_APPROVE_NOT_READY)).toContain(limit.message)
-    } else {
-      expect(log).toBe('')
-    }
-    expect(countStartupEntries(log, STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
-    // SRJ-405: nothing reaches the notifier from the approver.
-    expect(h.posts(NOTICE_KEY).filter((post) => post.channel === NOTICE_DEST)).toEqual([])
-    expect(h.posts(NOTICE_KEY)).toEqual([])
-    expect(h.posts(OTHER_KEY)).toEqual([])
-    expect(getFailureCount(NOTICE_KEY)).toBe(0)
-    expect(calls.sendKeysCalls).toEqual([])
-    expect(calls.killCalls).toEqual([])
-    expect(calls.deleteCalls).toEqual([])
-    assertNoLeak({ errLog, log, posts: h.posts(NOTICE_KEY), logs: h.logs })
-  })
-
-  // b.jg5 SRJ-404, SRJ-406, SRJ-210: a resumed row's `started_at` is the
-  // original spawn time; B is measured from its launch start. The approver
-  // starts after the launch start, so a stop measured from its own start
-  // would come later, and one measured from `started_at` at its first lap.
-  test('B on a resumed row: a collision on an ended row whose started_at is older than B is resumed and reads pending with a later launch start; the approver, started after that launch start, polls on and stops at the launch start plus B, never from started_at or its own start; the launch answers resumed; no notice, nothing counted, killed or deleted', async () => {
-    const boundMs = adLaunchBoundMsInEffect()
-    const approverStartMs = SAMPLE_LAUNCH_START_MS + 3 * DIALOG_POLL_INTERVAL_MS
-    const clock = useApproverClock(approverStartMs)
-    const calls = makeStubCallLog()
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
-    const startedAt = new Date(SAMPLE_LAUNCH_START_MS - 2 * boundMs).toISOString()
-    installStub({
-      ...calls,
-      spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
-      getResult: personaRow(cfg, 'C', { state: 'ended', started_at: startedAt }),
-      statusResult: cannedStatusResult({ state: 'pending' }),
-      readPaneResults: [cannedReadPaneResult(NO_DIALOG_PANE)],
-    })
-    const readLog = captureStartupErrors()
-
-    let launched: SpawnPersonaResult | undefined
-    const errLog = await withCapturedErr(async () => {
-      launched = await launchThenRunApprover(clock, 'C', spawnForPersona(personaOf(cfg, 'C'), cfg))
-    })
-
-    expect(launched).toEqual({ key: 'C', action: 'resumed' })
-    expect(calls.resumeCalls).toEqual([{ instance_id: C_ID }])
-    expect(await _whenDialogApproverStopped('C')).toEqual({ reason: APPROVER_STOP_BOUND, launchStartMs: SAMPLE_LAUNCH_START_MS })
-    expect(clock.now()).toBe(SAMPLE_LAUNCH_START_MS + boundMs)
-    // It polled on past its first lap (started_at plus B had long passed there).
-    expect(calls.statusCalls.length).toBeGreaterThan(1)
-    expect(approverLines(errLog)).toEqual([approverLogLine(approverBoundMessage(C_REF, boundMs, APPROVER_BOUND_FROM_LAUNCH_START))])
-    expect(countStartupEntries(readLog(), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
-    expect(notices).toEqual([])
-    expect(getFailureCount('C')).toBe(0)
-    expect(calls.sendKeysCalls).toEqual([])
-    expect(calls.killCalls).toEqual([])
-    expect(calls.deleteCalls).toEqual([])
-  })
-
-  // b.jg5 SRJ-118 (the approver's row), SRJ-404: both causes agent-director
-  // names for ErrSpawnNotInteractive on a `pending` row, and the row having
-  // just left `pending` between the approver's status read and its Enter
-  // (b.dup): the approver presses Enter through agent-director only.
-  test.each([
-    ['a leftover of an earlier launch holds the session', () => errSpawnNotInteractiveLeftover()],
-    ['the pending row has no launch start', () => errSpawnNotInteractiveNoLaunchStart()],
-    ['the row just left pending', () => errSpawnNotInteractive('send-keys')],
-  ])('ErrSpawnNotInteractive on the approver\'s Enter (%s): the approver stops at that lap (not-interactive) with nothing typed; no further lap, no kill or delete; one approver line; no notice and no startup entry; nothing counted; the launch result unchanged', async (_label, make) => {
-    const clock = useApproverClock()
-    const readLog = captureStartupErrors()
-    const refused = make()
-    const calls = makeStubCallLog()
-    installStub({
-      ...calls,
-      statusResult: cannedStatusResult({ state: 'pending' }),
-      readPaneResults: [cannedReadPaneResult(TRUST_DIALOG_PANE)],
-      sendKeysError: refused,
-    })
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
-
-    let launched: SpawnPersonaResult | undefined
-    const errLog = await withCapturedErr(async () => {
-      launched = await launchThenRunApprover(clock, 'C', spawnForPersona(personaOf(cfg, 'C'), cfg))
-    })
-
-    expect(launched).toEqual({ key: 'C', action: 'spawned' })
-    expect(await _whenDialogApproverStopped('C')).toEqual({ reason: APPROVER_STOP_NOT_INTERACTIVE, launchStartMs: SAMPLE_LAUNCH_START_MS })
-    // The one refused Enter, and nothing after it: no sleep, no second lap.
-    expect(calls.statusCalls).toEqual([{ instance_id: C_ID }])
-    expect(calls.readPaneCalls).toHaveLength(2)
-    expect(calls.sendKeysCalls).toEqual([{ instance_id: C_ID, text: '', allow_pending: true }])
-    expect(clock.firedCount()).toBe(0)
-    expect(clock.now()).toBe(0)
-    expect(clock.pendingCount()).toBe(0)
-    expect(calls.killCalls).toEqual([])
-    expect(calls.deleteCalls).toEqual([])
-    expect(approverLines(errLog)).toEqual([approverLogLine(approverNotInteractiveMessage(C_REF, 'send-keys', describeAdFailureForLog(refused)))])
-    expect(notices).toEqual([])
-    expect(readLog()).toBe('')
-    expect(getFailureCount('C')).toBe(0)
-  })
-
-  // b.jg5 SRJ-117, SRJ-316, SRJ-301 (hatch A2): CONFIG at the approver is
-  // taken as its UNAVAILABLE column (keep polling, backing off, within B),
-  // and its wrapper raises `ad-config-malformed` and arms P's retry timer as
-  // from any verb (E12). A malformed config refuses every store-backed call,
-  // so after the first lap's `pending` read every `status` answers CONFIG too
-  // (a successful store read would clear the outage, SRJ-316).
-  test('CONFIG (ErrConfigMalformed) on the approver\'s pane read, then on every later status read: P\'s ad-config-malformed raised with one onset and P\'s retry timer armed with the CONFIG cause, as from any verb; the approver keeps polling, one lap every 5 s, and stops at B from the launch start its first lap kept; no notice, nothing counted, typed, killed or deleted', async () => {
-    const boundMs = adLaunchBoundMsInEffect()
-    const clock = useApproverClock(SAMPLE_LAUNCH_START_MS)
-    const armed: Array<{ key: string; kind: string }> = []
-    initOutageState({
-      getClient,
-      notify: (key, text) => { outageEmissions.push({ key, text }) },
-      triggerSink: { arm: (key, cause) => { armed.push({ key, kind: cause.kind }); return true } },
-    })
-    const err = errConfigMalformed()
-    const calls = makeStubCallLog()
-    installStub({ ...calls, statusQueue: statusReads('pending'), statusError: err, readPaneError: err })
-    const readLog = captureStartupErrors()
-    const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
-
-    let launched: SpawnPersonaResult | undefined
-    const errLog = await withCapturedErr(async () => {
-      launched = await launchThenRunApprover(clock, 'C', spawnForPersona(personaOf(cfg, 'C'), cfg))
-    })
-
-    expect(launched).toEqual({ key: 'C', action: 'spawned' })
-    expect(await _whenDialogApproverStopped('C')).toEqual({ reason: APPROVER_STOP_BOUND, launchStartMs: SAMPLE_LAUNCH_START_MS })
-    expect(clock.now()).toBe(SAMPLE_LAUNCH_START_MS + boundMs)
-    // Backing off from the first lap: one lap every 5 s until B.
-    const laps = boundMs / DIALOG_SLOW_POLL_INTERVAL_MS
-    expect(calls.statusCalls).toHaveLength(laps)
-    expect(calls.readPaneCalls).toHaveLength(1)
-    const failure = describeAdFailureForLog(err)
-    expect(approverLines(errLog)).toEqual([
-      approverLogLine(approverPaneCallFailedMessage(C_REF, 'read-pane', failure)),
-      ...Array.from({ length: laps - 1 }, () => approverLogLine(approverStatusRefusedMessage(C_REF, failure))),
-      approverLogLine(approverBoundMessage(C_REF, boundMs, APPROVER_BOUND_FROM_LAUNCH_START)),
-    ])
-    expect([...getOutageFlags('C')]).toEqual(['ad-config-malformed'])
-    expect(outageEmissions).toEqual([{ key: 'C', text: adConfigMalformedOnset(err) }])
-    expect(armed[0]).toEqual({ key: 'C', kind: UNAVAILABLE_RETRY_CAUSE_CONFIG })
-    expect(armed.filter((a) => a.key !== 'C' || a.kind !== UNAVAILABLE_RETRY_CAUSE_CONFIG)).toEqual([])
-    expect(notices).toEqual([])
-    expect(countStartupEntries(readLog(), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
-    expect(getFailureCount('C')).toBe(0)
-    expect(calls.sendKeysCalls).toEqual([])
-    expect(calls.killCalls).toEqual([])
-    expect(calls.deleteCalls).toEqual([])
-  })
-
-})
-
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-401 — the approver after every launch that returns success,
+
 // outside the launch call
 //
 // Every spawn or `resume` of the collision ladder that returns success starts
-// the persona's dialog approver on its own; `spawnForPersona` returns the
-// launch's result as soon as the launch call returns, and the approver's
+
 // first call comes once the launch has settled, so `isLaunchInFlight` is
-// false while only the approver runs. No other branch, result or dry run
+
 // starts one, and a stop made while the launch is in flight cancels the
-// approver that launch would start. Each case runs the approver on a fake
-// clock (`useApproverClock`): a launch settles with that clock held
-// (`settleOffApproverClock`), so a launch that waited for its approver would
-// fail the case, and the approver then runs to its stop
-// (`runOnApproverClock` over `_whenDialogApproverStopped`). Every
+
 // agent-director call is recorded with whether a launch of the persona was
 // in flight when it was made (`recordCallsWithInFlight`).
 //
@@ -12089,132 +8997,10 @@ describe('b.jg5 SRJ-404, SRJ-405, SRJ-118, SRJ-316: what follows the dialog appr
 const SUCCESS_SITE_KEY = 'C'
 const SUCCESS_SITE_ID = personaInstanceId(SUCCESS_SITE_KEY)
 
-/** Persona `C` in a real working directory; `overrides` go to the whole config. */
-function successSiteConfig(overrides: Partial<Omit<PersonaConfig, 'personas'>> = {}): PersonaConfig {
-  return makeStandInPersonaConfig({ [SUCCESS_SITE_KEY]: { working_directory: fixtureSubdir('work') } }, fixtureDir, overrides)
-}
-
 type SpawnResultOf = import('agent-director').SpawnResult
 const collision = () => cannedErr<SpawnResultOf>(errInstanceIdCollision())
 /** A spawn that succeeds, its result carrying `preTrust` (the field absent when it is undefined). */
 const spawnOk = (preTrust?: PreTrust) => cannedOk<StubSpawnResult>(cannedSpawnResult(SUCCESS_SITE_ID, preTrust))
-
-/**
- * A success site of the ladder: the stub answers that reach it (the launch
- * call that succeeds answering with `preTrust`), the config it needs, the
- * launch call's verb and the launch's result.
- */
-interface SuccessSite {
-  readonly script: (cfg: PersonaConfig, preTrust?: PreTrust) => StubClientOptions
-  readonly config?: Partial<Omit<PersonaConfig, 'personas'>>
-  readonly launchVerb: LaunchVerb
-  readonly action: SpawnPersonaResult['action']
-  /** The launch that reaches the site; the start pass's `spawnForPersona` when unset. */
-  readonly launch?: (cfg: PersonaConfig) => Promise<SpawnPersonaResult>
-}
-
-/** Launch persona `C` through `site`: its own launch, or `spawnForPersona` with `isStartup`. */
-function launchAtSite(site: SuccessSite, cfg: PersonaConfig, isStartup = false): Promise<SpawnPersonaResult> {
-  return site.launch === undefined ? spawnForPersona(personaOf(cfg, SUCCESS_SITE_KEY), cfg, isStartup) : site.launch(cfg)
-}
-
-/** The agent-director verb a launch verb's call is: `resume`, or `spawn` (a plain spawn and a reuse spawn alike). */
-function launchCallVerb(launchVerb: LaunchVerb): 'spawn' | 'resume' {
-  return launchVerb === LAUNCH_VERB_RESUME ? 'resume' : 'spawn'
-}
-
-/** The persona's row reading `ended`, its labels its current ones. */
-const endedRow = (cfg: PersonaConfig) => personaRow(cfg, SUCCESS_SITE_KEY, { state: 'ended' })
-/** A collision on the persona's `ended` row whose `resume` answers `err`, then a spawn (fresh or reuse) that succeeds. */
-const resumeAnswers = (err: Error) => (cfg: PersonaConfig, preTrust?: PreTrust): StubClientOptions => ({
-  spawnQueue: [collision(), spawnOk(preTrust)],
-  getResult: endedRow(cfg),
-  resumeError: err,
-})
-
-/** The ladder's first spawn, succeeding. */
-const FIRST_SPAWN_SITE: SuccessSite = { script: (_cfg, preTrust) => ({ spawnQueue: [spawnOk(preTrust)] }), launchVerb: 'spawn', action: 'spawned' }
-/** A collision on the persona's `ended` row, then a `resume` that succeeds. */
-const ENDED_ROW_RESUME_SITE: SuccessSite = {
-  script: (cfg, preTrust) => ({ spawnQueue: [collision()], getResult: endedRow(cfg), resumeResult: cannedResumeResult(SUCCESS_SITE_ID, preTrust) }),
-  launchVerb: 'resume',
-  action: 'resumed',
-}
-
-/**
- * The reuse spawn (b.jg5 SRJ-112, SRJ-401, SRJ-413) through the live-row
- * sequence's launch entry, the sequence having last read the row `ended`.
- */
-const REUSE_SPAWN_SUCCESS_SITE: SuccessSite = {
-  script: (_cfg, preTrust) => ({ spawnQueue: [spawnOk(preTrust)] }),
-  launchVerb: LAUNCH_VERB_REUSE_SPAWN,
-  action: 'spawned',
-  launch: (cfg) =>
-    launchForLiveRowSequence(personaOf(cfg, SUCCESS_SITE_KEY), cfg, {
-      kind: LIVE_ROW_LAUNCH_REUSE,
-      lastRead: latchRowStateRead(LIVENESS_DEAD_ROW_ENDED),
-    }) as Promise<SpawnPersonaResult>,
-}
-
-/** Every spawn and `resume` of the collision ladder that returns success, and the reuse spawn. */
-const SUCCESS_SITES: ReadonlyArray<readonly [string, SuccessSite]> = [
-  ['the first spawn', FIRST_SPAWN_SITE],
-  [
-    'the retry spawn after the collision get answers ErrSpawnNotFound',
-    { script: (_cfg, preTrust) => ({ spawnQueue: [collision(), spawnOk(preTrust)], getError: errSpawnNotFound() }), launchVerb: 'spawn', action: 'spawned' },
-  ],
-  // b.jg5 SRJ-707: a finished row the ladder cannot keep is replaced by one reuse spawn of the same id.
-  [
-    'the reuse spawn replacing an ended row in another directory',
-    {
-      script: (cfg, preTrust) => ({
-        spawnQueue: [collision(), spawnOk(preTrust)],
-        getResult: personaRow(cfg, SUCCESS_SITE_KEY, { state: 'ended', cwd: fixtureSubdir('elsewhere') }),
-      }),
-      launchVerb: LAUNCH_VERB_REUSE_SPAWN,
-      action: 'spawned',
-    },
-  ],
-  [
-    'the reuse spawn replacing an ended row whose config_dir label changed',
-    {
-      script: (cfg, preTrust) => {
-        const labels = { ...endedRow(cfg).labels, config_dir: personaConfigDirLabelValue(fixtureSubdir('earlier-config'), ladderHome()) }
-        return { spawnQueue: [collision(), spawnOk(preTrust)], getResult: personaRow(cfg, SUCCESS_SITE_KEY, { state: 'ended', labels }) }
-      },
-      launchVerb: LAUNCH_VERB_REUSE_SPAWN,
-      action: 'spawned',
-    },
-  ],
-  [
-    'the reuse spawn replacing an ended row with resume_enabled false',
-    {
-      script: (cfg, preTrust) => ({ spawnQueue: [collision(), spawnOk(preTrust)], getResult: endedRow(cfg) }),
-      config: { resume_enabled: false },
-      launchVerb: LAUNCH_VERB_REUSE_SPAWN,
-      action: 'spawned',
-    },
-  ],
-  // b.jg5 SRJ-707, SRJ-712: the no-transcript answers go on to one reuse spawn of the same id.
-  ['the reuse spawn after resume\'s ErrNoSessionId', { script: resumeAnswers(errNoSessionId()), launchVerb: LAUNCH_VERB_REUSE_SPAWN, action: 'spawned' }],
-  ['the reuse spawn after resume\'s ErrJsonlMissing and its diagnosis', { script: resumeAnswers(errJsonlMissing()), launchVerb: LAUNCH_VERB_REUSE_SPAWN, action: 'fresh-after-inconclusive-amnesia' }],
-  ['the reuse spawn after resume\'s ErrJsonlNeverWritten', { script: resumeAnswers(errJsonlNeverWritten()), launchVerb: LAUNCH_VERB_REUSE_SPAWN, action: 'spawned' }],
-  ['the spawn after resume\'s ErrSpawnNotFound', { script: resumeAnswers(errSpawnNotFound()), launchVerb: 'spawn', action: 'spawned' }],
-  ['the resume of an ended row', ENDED_ROW_RESUME_SITE],
-  [
-    'the resume of a missing row',
-    {
-      script: (cfg, preTrust) => ({
-        spawnQueue: [collision()],
-        getResult: personaRow(cfg, SUCCESS_SITE_KEY, { state: 'missing' }),
-        resumeResult: cannedResumeResult(SUCCESS_SITE_ID, preTrust),
-      }),
-      launchVerb: 'resume',
-      action: 'resumed',
-    },
-  ],
-  ['the reuse spawn at the live-row sequence\'s final launch', REUSE_SPAWN_SUCCESS_SITE],
-]
 
 /** What a launch result can carry: each `pre_trust` value, then no field at all. */
 const PRE_TRUST_CASES: ReadonlyArray<PreTrust | undefined> = [...PRE_TRUST_VALUES, undefined]
@@ -12233,651 +9019,8 @@ const PRE_TRUST_LINE_END = commonEnd(
   ),
 )
 
-/** The `pre_trust` lines of a captured log, for any persona, verb or value. */
-function preTrustLines(errLog: string): string[] {
-  return errLog.split('\n').filter((line) => line.startsWith(PRE_TRUST_LOG_PREFIX) && line.endsWith(PRE_TRUST_LINE_END))
-}
-
-/**
- * Each success site with one present `pre_trust` value, the values taken in
- * turn, so a site that logs anything but its own launch's result (the absent
- * field's line among them) fails. The absent field is crossed on a spawn and
- * a `resume` in the SRJ-413 describe.
- */
-const SUCCESS_SITES_WITH_PRE_TRUST = SUCCESS_SITES.map(
-  ([name, site], i) => [name, PRE_TRUST_VALUES[i % PRE_TRUST_VALUES.length]!, site] as const,
-)
-
 /** Both forms of a launch timeout (b.jg5 SRJ-407): `ErrCallTimeout`, and `ErrTmuxUnresponsive` carrying "the session may have been created". */
 const LAUNCH_TIMEOUT_FORMS: readonly LaunchTimeoutForm[] = [LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT, LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE]
-
-/** The launch timeout of `form` ending a `verb` call of instance `id`, from the stub's builder for its class. */
-function launchTimeoutOf(form: LaunchTimeoutForm, verb: 'spawn' | 'resume', id: string): Error {
-  return form === LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT ? errCallTimeout(verb) : errTmuxUnresponsiveLaunchTimeout(verb, id)
-}
-
-/** Event-loop turns (`setImmediate`) given to a launch's approver to make its first lap, with the approver's clock held. */
-const APPROVER_FIRST_LAP_TURNS = 10
-
-/** Yield `APPROVER_FIRST_LAP_TURNS` event-loop turns; no timer is set and no clock moves. */
-async function approverFirstLapTurns(): Promise<void> {
-  for (let turn = 0; turn < APPROVER_FIRST_LAP_TURNS; turn++) await new Promise<void>((resolve) => setImmediate(resolve))
-}
-
-describe('b.jg5 SRJ-401: the approver runs after every launch that returns success, outside the launch call', () => {
-  const KEY = SUCCESS_SITE_KEY
-  const ID = SUCCESS_SITE_ID
-  const REF = renderPersonaRef(KEY, KEY)
-  /** The launch start the approver's `pending` read shows. */
-  const LAUNCH_START = SAMPLE_LAUNCH_START_WHOLE
-
-  /** One agent-director call: its verb, the instance it names and whether a launch of the persona was in flight when it was made. */
-  interface CallInFlight {
-    readonly verb: string
-    readonly id: string
-    readonly inFlight: boolean
-  }
-
-  /** The verbs a launch or its approver can call. */
-  const RECORDED_VERBS = ['spawn', 'resume', 'status', 'get', 'readPane', 'sendKeys', 'kill', 'delete', 'findMissing'] as const
-
-  /** Record each call of `RECORDED_VERBS` through `stub` from now on, in order, with `isLaunchInFlight(key)` at the call. */
-  function recordCallsWithInFlight(stub: StubClient, key: string): CallInFlight[] {
-    const calls: CallInFlight[] = []
-    const client = stub as unknown as Record<string, (params: { instance_id?: unknown }) => Promise<unknown>>
-    for (const verb of RECORDED_VERBS) {
-      const original = client[verb]!
-      client[verb] = (params) => {
-        calls.push({ verb, id: String(params.instance_id), inFlight: isLaunchInFlight(key) })
-        return original.call(stub, params)
-      }
-    }
-    return calls
-  }
-
-  /**
-   * The `status` answers for persona `key`: `waiting` while its launch is in
-   * flight (the ladder's own reads), and after it the approver's laps:
-   * `pending` with `launchStart` (`LAUNCH_START` by default), then `waiting`.
-   */
-  function approverReadsPendingThenLive(key: string, launchStart: string = LAUNCH_START): () => StatusResult {
-    let laps = 0
-    return () => {
-      if (isLaunchInFlight(key)) return cannedStatusResult({ state: 'waiting' })
-      laps++
-      return laps === 1 ? cannedStatusResult({ state: 'pending', launch_started_at: launchStart }) : cannedStatusResult({ state: 'waiting' })
-    }
-  }
-
-  /** The approver's calls for one launch that reads `pending`, then live: a lap with its pane read, then a lap that stops it. */
-  const APPROVER_LAPS: readonly CallInFlight[] = ['status', 'readPane', 'status'].map((verb) => ({ verb, id: ID, inFlight: false }))
-
-  /** Persona `C` in a real working directory; `overrides` go to the whole config. */
-  const launchConfig = successSiteConfig
-
-  /**
-   * Assert `calls`: the launch's last call is the call of its launch verb
-   * `launchVerb` on P's instance (the approver makes no spawn or `resume`),
-   * and every call after it is the approver's, on P's instance with no launch
-   * in flight, exactly `APPROVER_LAPS`. Every launch call but the ladder's
-   * very first is made with the launch in flight; that one is issued as the
-   * launch starts.
-   */
-  function expectLaunchThenApprover(calls: readonly CallInFlight[], launchVerb: LaunchVerb): void {
-    let launchCall = calls.length - 1
-    while (launchCall >= 0 && calls[launchCall]!.verb !== 'spawn' && calls[launchCall]!.verb !== 'resume') launchCall--
-    expect(launchCall).toBeGreaterThanOrEqual(0)
-    expect(calls[launchCall]).toMatchObject({ verb: launchCallVerb(launchVerb), id: ID })
-    expect(calls.slice(1, launchCall + 1).every((c) => c.inFlight)).toBe(true)
-    expect(calls.slice(launchCall + 1)).toEqual([...APPROVER_LAPS])
-  }
-
-  test.each(SUCCESS_SITES_WITH_PRE_TRUST)('%s, its result\'s pre_trust %s: spawnForPersona returns the launch\'s own result while the approver still runs, with no launch in flight and the launch settled; then P\'s status and read-pane follow the launch call on P\'s row, until a live read stops the approver; no spawn or resume call carries no_pre_trust, and the launch writes exactly one pre_trust line, P\'s, for its verb and value (b.jg5 SRJ-413)', async (_name, preTrust, site) => {
-    const clock = useApproverClock()
-    const cfg = launchConfig(site.config)
-    const log = makeStubCallLog()
-    const stub = installStub({ ...log, ...site.script(cfg, preTrust), statusFn: approverReadsPendingThenLive(KEY) })
-    const calls = recordCallsWithInFlight(stub, KEY)
-
-    let result: SpawnPersonaResult | undefined
-    let outcome: ApproverOutcome | undefined
-    let runningAtReturn: boolean | undefined
-    let inFlightAtReturn: boolean | undefined
-    let callsAfterFirstLap: CallInFlight[] = []
-    const errLog = await withCapturedErr(async () => {
-      result = await settleOffApproverClock(launchAtSite(site, cfg))
-      runningAtReturn = isDialogApproverRunning(KEY)
-      inFlightAtReturn = isLaunchInFlight(KEY)
-      await settleOffApproverClock(whenLaunchSettled(KEY))
-      await approverFirstLapTurns()
-      callsAfterFirstLap = [...calls]
-      outcome = await runOnApproverClock(clock, _whenDialogApproverStopped(KEY))
-    })
-
-    expect(result).toStrictEqual({ key: KEY, action: site.action })
-    // Returned while its approver runs: the approver is outside the launch call.
-    expect(runningAtReturn).toBe(true)
-    expect(inFlightAtReturn).toBe(false)
-    // The turns a launch with no approver is given (below) were enough for this one's first lap, the clock held.
-    expect(callsAfterFirstLap.slice(-2)).toEqual(APPROVER_LAPS.slice(0, 2))
-    expectLaunchThenApprover(calls, site.launchVerb)
-    expect(outcome).toEqual({ reason: APPROVER_STOP_LIVE, launchStartMs: Date.parse(LAUNCH_START) })
-    expect(isDialogApproverRunning(KEY)).toBe(false)
-    expect(clock.now()).toBe(DIALOG_POLL_INTERVAL_MS)
-    const launchCalls: object[] = [...log.spawnCalls, ...log.resumeCalls]
-    expect(launchCalls.length).toBeGreaterThan(0)
-    expect(launchCalls.filter((params) => 'no_pre_trust' in params)).toEqual([])
-    expect(preTrustLines(errLog)).toEqual([preTrustLogLine(REF, site.launchVerb, preTrust)])
-    assertNoLeak({ errLog })
-  })
-
-  test('a launchSession launch (the restart path, isStartup false) runs it too: launchSession answers true while the approver still runs, and P\'s status and read-pane follow the spawn; no startup entry', async () => {
-    const clock = useApproverClock()
-    const readLog = captureStartupErrors()
-    const cfg = launchConfig()
-    const stub = installStub({ statusFn: approverReadsPendingThenLive(KEY) })
-    const calls = recordCallsWithInFlight(stub, KEY)
-
-    let launched: Awaited<ReturnType<typeof launchSession>> | undefined
-    let runningAtReturn: boolean | undefined
-    const errLog = await withCapturedErr(async () => {
-      launched = await settleOffApproverClock(launchSession(KEY, cfg))
-      runningAtReturn = isDialogApproverRunning(KEY)
-      await runOnApproverClock(clock, _whenDialogApproverStopped(KEY))
-    })
-
-    expect(launched).toBe(true)
-    expect(runningAtReturn).toBe(true)
-    expect(isLaunchInFlight(KEY)).toBe(false)
-    expectLaunchThenApprover(calls, 'spawn')
-    expect(await _whenDialogApproverStopped(KEY)).toEqual({ reason: APPROVER_STOP_LIVE, launchStartMs: Date.parse(LAUNCH_START) })
-    expect(readLog()).toBe('')
-    assertNoLeak({ errLog })
-  })
-
-  // b.jg5 SRJ-401, SRJ-407 (E28 T3): the site table's launch-timeout legs.
-  // Each launch call a success site makes, ending instead in a launch timeout
-  // (either form), whose one `get` reads P's own row `pending` with its
-  // launch start inside the call's window: the approver starts through the
-  // start entry after the launch call returned, never inside it. The window
-  // is read on the approver's clock (`_setNow`), which the launch does not
-  // move, so the launch start lies on both of its bounds. The rows that get
-  // no approver (an old life, a `cwd` or `config_dir` mismatch, no launch
-  // start) are the SRJ-407 describe's.
-
-  /** A launch call of the ladder, or of the sequence's launch entry, that a launch timeout ends. */
-  interface LaunchTimeoutSite {
-    /** The stub answers that reach the call, which answers `err`; every `get` after the earlier ones reads `pendingRow`. */
-    readonly script: (cfg: PersonaConfig, err: Error, pendingRow: CannedGetResult) => StubClientOptions
-    readonly launchVerb: LaunchVerb
-    /** The launch that reaches the call; the start pass's `spawnForPersona` when unset. */
-    readonly launch?: (cfg: PersonaConfig) => Promise<SpawnPersonaResult>
-  }
-
-  /** The collision `get` reads the persona's row `ended`; the call after `resume` answers `resumeErr` is the timed one. */
-  const afterResume = (resumeErr: Error) => (cfg: PersonaConfig, err: Error, pendingRow: CannedGetResult): StubClientOptions => ({
-    spawnQueue: [collision(), cannedErr<SpawnResultOf>(err)],
-    getQueue: [cannedOk<GetResult>(endedRow(cfg))],
-    getResult: pendingRow,
-    resumeError: resumeErr,
-  })
-
-  const LAUNCH_TIMEOUT_SITES: ReadonlyArray<readonly [string, LaunchTimeoutSite]> = [
-    ['the first spawn', { script: (_cfg, err, pendingRow) => ({ spawnQueue: [cannedErr<SpawnResultOf>(err)], getResult: pendingRow }), launchVerb: 'spawn' }],
-    [
-      'the retry spawn after the collision get answers ErrSpawnNotFound',
-      {
-        script: (_cfg, err, pendingRow) => ({ spawnQueue: [collision(), cannedErr<SpawnResultOf>(err)], getQueue: [cannedErr<GetResult>(errSpawnNotFound())], getResult: pendingRow }),
-        launchVerb: 'spawn',
-      },
-    ],
-    [
-      'the reuse spawn replacing an ended row in another directory',
-      {
-        script: (cfg, err, pendingRow) => ({
-          spawnQueue: [collision(), cannedErr<SpawnResultOf>(err)],
-          getQueue: [cannedOk<GetResult>(personaRow(cfg, KEY, { state: 'ended', cwd: fixtureSubdir('elsewhere') }))],
-          getResult: pendingRow,
-        }),
-        launchVerb: LAUNCH_VERB_REUSE_SPAWN,
-      },
-    ],
-    ['the reuse spawn after resume\'s ErrNoSessionId', { script: afterResume(errNoSessionId()), launchVerb: LAUNCH_VERB_REUSE_SPAWN }],
-    ['the spawn after resume\'s ErrSpawnNotFound', { script: afterResume(errSpawnNotFound()), launchVerb: 'spawn' }],
-    [
-      'the resume of an ended row',
-      {
-        script: (cfg, err, pendingRow) => ({ spawnQueue: [collision()], getQueue: [cannedOk<GetResult>(endedRow(cfg))], getResult: pendingRow, resumeError: err }),
-        launchVerb: 'resume',
-      },
-    ],
-    [
-      'the reuse spawn at the live-row sequence\'s final launch',
-      { script: (_cfg, err, pendingRow) => ({ spawnError: err, getResult: pendingRow }), launchVerb: LAUNCH_VERB_REUSE_SPAWN, launch: REUSE_SPAWN_SUCCESS_SITE.launch },
-    ],
-  ]
-
-  test.each(LAUNCH_TIMEOUT_SITES.flatMap(([name, site]) => LAUNCH_TIMEOUT_FORMS.map((form) => [name, form, site] as const)))('%s, ending in a launch timeout (%s) whose one get reads P\'s covered pending row with its launch start inside the call\'s window: the launch answers retrying while the approver it started runs, with no launch in flight; the get is the launch\'s last call, then P\'s status and read-pane follow until a live read stops the approver; the row is this launch\'s; one pending-only arm, before the approver started; no pre_trust line, no kill (b.jg5 SRJ-401, SRJ-407)', async (_name, form, site) => {
-    const clock = useApproverClock(SAMPLE_LAUNCH_START_MS)
-    _setNow(clock.now)
-    const launchStart = new Date(SAMPLE_LAUNCH_START_MS).toISOString()
-    const cfg = launchConfig()
-    const log = makeStubCallLog()
-    const arms = recordPendingOnlyArms(log)
-    const verb = launchCallVerb(site.launchVerb)
-    const pendingRow = personaRow(cfg, KEY, { state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: launchStart })
-    const stub = installStub({ ...log, ...site.script(cfg, launchTimeoutOf(form, verb, ID), pendingRow), statusFn: approverReadsPendingThenLive(KEY, launchStart) })
-    const calls = recordCallsWithInFlight(stub, KEY)
-
-    let result: SpawnPersonaResult | undefined
-    let runningAtReturn: boolean | undefined
-    let inFlightAtReturn: boolean | undefined
-    let ownRow: ReturnType<typeof thisLaunchRowOf>
-    let outcome: ApproverOutcome | undefined
-    const errLog = await withCapturedErr(async () => {
-      result = await settleOffApproverClock(site.launch === undefined ? spawnForPersona(personaOf(cfg, KEY), cfg) : site.launch(cfg))
-      runningAtReturn = isDialogApproverRunning(KEY)
-      inFlightAtReturn = isLaunchInFlight(KEY)
-      await approverFirstLapTurns()
-      ownRow = thisLaunchRowOf(KEY)
-      outcome = await runOnApproverClock(clock, _whenDialogApproverStopped(KEY))
-    })
-
-    expect(result).toStrictEqual({ key: KEY, action: SPAWN_ACTION_RETRYING })
-    expect([runningAtReturn, inFlightAtReturn]).toEqual([true, false])
-    const window: LaunchCallWindowRecord = { verb, startMs: SAMPLE_LAUNCH_START_MS, endMs: SAMPLE_LAUNCH_START_MS, end: LAUNCH_CALL_END_LAUNCH_TIMEOUT }
-    expect(launchCallWindowOf(KEY)).toEqual(window)
-    expect(ownRow).toEqual({ launchStartMs: SAMPLE_LAUNCH_START_MS, window })
-    let launchCall = calls.length - 1
-    while (launchCall >= 0 && calls[launchCall]!.verb !== 'spawn' && calls[launchCall]!.verb !== 'resume') launchCall--
-    expect(calls[launchCall]).toMatchObject({ verb, id: ID })
-    expect(calls.slice(1, launchCall + 1).every((c) => c.inFlight)).toBe(true)
-    expect(calls.slice(launchCall + 1)).toEqual([{ verb: 'get', id: ID, inFlight: true }, ...APPROVER_LAPS])
-    expect(outcome).toEqual({ reason: APPROVER_STOP_LIVE, launchStartMs: SAMPLE_LAUNCH_START_MS })
-    expect(linesWith(errLog, APPROVER_LOG_PREFIX)).toContain(approverLogLine(approverStartedAfterLaunchTimeoutMessage(REF)))
-    // A timed-out launch has no result, so no pre_trust line.
-    expect(preTrustLines(errLog)).toEqual([])
-    expect(arms.pendingOnly).toEqual([{ key: KEY, approverRunning: false, launchCalls: log.spawnCalls.length + log.resumeCalls.length }])
-    expect(arms.full).toEqual([{ key: KEY, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }])
-    expect([log.killCalls, log.deleteCalls]).toEqual([[], []])
-    assertNoLeak({ errLog })
-  })
-
-  /** A launch that returns no success: what reaches it and its result. */
-  interface NoLaunchPath {
-    readonly arrange: (cfg: PersonaConfig) => { cfg?: PersonaConfig; opts: StubClientOptions }
-    readonly config?: Partial<Omit<PersonaConfig, 'personas'>>
-    readonly action: SpawnPersonaResult['action']
-  }
-
-  const NO_LAUNCH_PATHS: ReadonlyArray<readonly [string, NoLaunchPath]> = [
-    [
-      'a collision on a waiting row (reconnected)',
-      {
-        arrange: (cfg) => {
-          return { opts: { spawnQueue: [collision()], getResult: personaRow(cfg, KEY, { state: 'waiting' }) } }
-        },
-        action: 'reconnected',
-      },
-    ],
-    [
-      'a collision on a working row (the wait reads waiting and reconnects)',
-      {
-        arrange: (cfg) => {
-          return { opts: { spawnQueue: [collision()], getQueue: [cannedOk(personaRow(cfg, KEY, { state: 'working' }))], getResult: personaRow(cfg, KEY, { state: 'waiting' }) } }
-        },
-        config: { agent_director_poll_interval_ms: 1 },
-        action: 'reconnected',
-      },
-    ],
-    [
-      'a collision on a row waiting on a prompt whose read-pane answers a pane (no-op)',
-      { arrange: (cfg) => ({ opts: { spawnQueue: [collision()], getResult: personaRow(cfg, KEY, { state: 'ask_user' }), statusResult: cannedStatusResult({ state: 'ask_user' }) } }), action: 'no-op' },
-    ],
-    [
-      'a collision on a pending row (no-op)',
-      { arrange: (cfg) => ({ opts: { spawnQueue: [collision()], getResult: personaRow(cfg, KEY, { state: 'pending' }) } }), action: 'no-op' },
-    ],
-    [
-      'a latched persona (latched)',
-      {
-        arrange: () => {
-          const latch: SessionConflictLatch = {
-            isLatched: () => true,
-            record: () => undefined,
-            set: () => {
-              throw new Error('no latch is set here')
-            },
-            setFromConflict: () => {
-              throw new Error('no latch is set here')
-            },
-          }
-          setConflictLatch(latch)
-          return { opts: {} }
-        },
-        action: 'latched',
-      },
-    ],
-    [
-      'a spawn that fails (ErrCwdNotFound: failed)',
-      { arrange: (cfg) => ({ opts: { spawnError: new ErrCwdNotFound('spawn', 'ErrCwdNotFound', `cwd ${personaOf(cfg, KEY).working_directory} does not exist`) } }), action: 'failed' },
-    ],
-    [
-      'a spawn that is refused (an UNAVAILABLE answer: retrying)',
-      {
-        arrange: () => {
-          // As `main()` wires it: the trigger sink arms P's timer, so the attempt is refused.
-          initOutageState({ getClient, notify: () => {}, triggerSink: { arm: () => true } })
-          return { opts: { spawnError: unavailableForms('ErrCallTimeout')[0]![1]('spawn') } }
-        },
-        action: SPAWN_ACTION_RETRYING,
-      },
-    ],
-    [
-      'a launch deferred on an unresolvable claude_config_dir (deferred)',
-      {
-        arrange: () => {
-          const configDir = fixtureSubdir('claude-config')
-          const cfg = makeStandInPersonaConfig({ [KEY]: { working_directory: fixtureSubdir('deferred-work'), claude_config_dir: configDir } }, fixtureDir)
-          setConfigDirUnresolvableHook(() => false)
-          _setConfigDirFs({ realpath: realpathFailingUnder(configDir, () => true) })
-          return { cfg, opts: {} }
-        },
-        action: 'deferred',
-      },
-    ],
-    [
-      'a dry run (no-op)',
-      {
-        arrange: () => {
-          process.env['SLACK_DRY_RUN'] = '1'
-          return { opts: {} }
-        },
-        action: 'no-op',
-      },
-    ],
-  ]
-
-  test.each(NO_LAUNCH_PATHS)('no approver without a launch that returns success: %s starts none — no approver running or stopped for P, no approver line, no call after the launch', async (_name, path) => {
-    useApproverClock()
-    const base = launchConfig(path.config)
-    const { cfg = base, opts } = path.arrange(base)
-    const stub = installStub(opts)
-    const calls = recordCallsWithInFlight(stub, KEY)
-
-    let result: SpawnPersonaResult | undefined
-    let callsAtReturn = 0
-    const errLog = await withCapturedErr(async () => {
-      result = await settleOffApproverClock(spawnForPersona(personaOf(cfg, KEY), cfg))
-      callsAtReturn = calls.length
-      // Turns enough for an approver the launch had started to make its first lap.
-      await approverFirstLapTurns()
-    })
-
-    expect(result?.action).toBe(path.action)
-    expect(isDialogApproverRunning(KEY)).toBe(false)
-    // An approver that had started would still run (its stub reads `waiting`
-    // stop it at its first lap) or have left its outcome.
-    expect(await _whenDialogApproverStopped(KEY)).toBeUndefined()
-    expect(calls.slice(callsAtReturn)).toEqual([])
-    // No call but the ladder's first was made with no launch in flight.
-    expect(calls.slice(1).filter((c) => !c.inFlight)).toEqual([])
-    expect(linesWith(errLog, APPROVER_LOG_PREFIX)).toEqual([])
-    assertNoLeak({ errLog })
-  })
-
-  test('a stop made while P\'s launch is held in flight cancels the approver that launch would start: the launch still returns spawned, its approver makes no call (one not-started line); the next launch\'s approver runs', async () => {
-    const clock = useApproverClock()
-    const cfg = launchConfig()
-    const stub = installStub({ statusFn: approverReadsPendingThenLive(KEY) })
-    let first = true
-    const hold = holdSpawns(stub, () => {
-      const held = first
-      first = false
-      return held
-    })
-    const calls = recordCallsWithInFlight(stub, KEY)
-
-    let heldResult: SpawnPersonaResult | undefined
-    let stopped: boolean | undefined
-    let inFlightAtStop: boolean | undefined
-    const errLog = await withCapturedErr(async () => {
-      const launching = spawnForPersona(personaOf(cfg, KEY), cfg)
-      await hold.entered(ID)
-      inFlightAtStop = isLaunchInFlight(KEY)
-      stopped = await stopDialogApprover(KEY, APPROVER_STOP_TEARDOWN)
-      hold.release(ID)
-      heldResult = await settleOffApproverClock(launching)
-      await approverFirstLapTurns()
-    })
-
-    expect(inFlightAtStop).toBe(true)
-    // No approver ran when the stop was made.
-    expect(stopped).toBe(false)
-    expect(heldResult).toStrictEqual({ key: KEY, action: 'spawned' })
-    expect(isDialogApproverRunning(KEY)).toBe(false)
-    expect(await _whenDialogApproverStopped(KEY)).toBeUndefined()
-    // Only the held spawn: no approver call followed it.
-    expect(calls.map((c) => [c.verb, c.id])).toEqual([['spawn', ID]])
-    expect(linesWith(errLog, APPROVER_LOG_PREFIX)).toEqual([approverLogLine(approverNotStartedMessage(REF, APPROVER_STOP_TEARDOWN))])
-
-    // The stop ended with that launch: the next launch's approver runs.
-    const next = await launchThenRunApprover(clock, KEY, spawnForPersona(personaOf(cfg, KEY), cfg))
-    expect(next).toStrictEqual({ key: KEY, action: 'spawned' })
-    expect(await _whenDialogApproverStopped(KEY)).toEqual({ reason: APPROVER_STOP_LIVE, launchStartMs: Date.parse(LAUNCH_START) })
-    expectLaunchThenApprover(calls.slice(1), 'spawn')
-    expect(calls.slice(1).map((c) => c.verb)).toEqual(['spawn', ...APPROVER_LAPS.map((c) => c.verb)])
-    assertNoLeak({ errLog })
-  })
-})
-
-// ---------------------------------------------------------------------------
-// b.jg5 SRJ-301, SRJ-409 (AC 33), SRJ-404: the row a launch that returned
-// leaves, and the row an approver leaves `pending` when it stops, are
-// watched: P's retry timer is armed in pending-only mode (the trigger sink's
-// `armPendingOnly`, the pending-row cause), with no kill and no launch.
-// Every success site (`SUCCESS_SITES`) arms once, after its launch call and
-// before its approver starts. An approver's stop arms once more only for B
-// or the test cap, GONE, not interactive, tmux unavailable, the one-approver
-// rule and a loop that threw, and only when its last `status` read was
-// `pending` or read no row; never for shutdown, a latch, the key's
-// retired-key recording or a teardown. Each case records the sink's arms
-// (`recordPendingOnlyArms`) and runs the approver on its fake clock.
-// ---------------------------------------------------------------------------
-
-/** One pending-only arm the trigger sink received: the persona, whether its approver ran then, and the launch calls (`spawn`, `resume`) made by then. */
-interface PendingOnlyArm {
-  readonly key: string
-  readonly approverRunning: boolean
-  readonly launchCalls: number
-}
-
-/**
- * Install a trigger sink, as `main()` wires the retry controller, recording
- * every pending-only arm (with the launch calls `calls` holds by then) and
- * every full-mode cause; answers both records.
- */
-function recordPendingOnlyArms(calls: StubCallLog): { pendingOnly: PendingOnlyArm[]; full: Array<{ key: string; kind: string }> } {
-  const pendingOnly: PendingOnlyArm[] = []
-  const full: Array<{ key: string; kind: string }> = []
-  initOutageState({
-    getClient,
-    notify: (key, text) => { outageEmissions.push({ key, text }) },
-    triggerSink: {
-      arm: (key, cause) => {
-        full.push({ key, kind: cause.kind })
-        return true
-      },
-      armPendingOnly: (key) => {
-        pendingOnly.push({ key, approverRunning: isDialogApproverRunning(key), launchCalls: calls.spawnCalls.length + calls.resumeCalls.length })
-      },
-    },
-  })
-  return { pendingOnly, full }
-}
-
-describe('b.jg5 SRJ-301, SRJ-409 (AC 33): every launch that returns success arms P\'s retry timer in pending-only mode, before its approver starts', () => {
-  test.each(SUCCESS_SITES)('%s: one pending-only arm for P, after the launch call and before the approver started; no launch, kill or delete after it; the approver stopping on a live row arms nothing more', async (_name, site) => {
-    const clock = useApproverClock()
-    const cfg = successSiteConfig(site.config)
-    const calls = makeStubCallLog()
-    const arms = recordPendingOnlyArms(calls)
-    installStub({ ...calls, ...site.script(cfg), statusResult: cannedStatusResult({ state: 'waiting' }) })
-
-    let result: SpawnPersonaResult | undefined
-    const errLog = await withCapturedErr(async () => {
-      result = await launchThenRunApprover(clock, SUCCESS_SITE_KEY, launchAtSite(site, cfg))
-    })
-
-    expect(result).toStrictEqual({ key: SUCCESS_SITE_KEY, action: site.action })
-    expect(await _whenDialogApproverStopped(SUCCESS_SITE_KEY)).toMatchObject({ reason: APPROVER_STOP_LIVE })
-    const launchCalls = calls.spawnCalls.length + calls.resumeCalls.length
-    expect(arms.pendingOnly).toEqual([{ key: SUCCESS_SITE_KEY, approverRunning: false, launchCalls }])
-    expect(arms.full).toEqual([])
-    expect([calls.killCalls, calls.deleteCalls]).toEqual([[], []])
-    assertNoLeak({ errLog })
-  })
-})
-
-describe('b.jg5 SRJ-409, SRJ-404: the row an approver leaves pending when it stops is watched only after the stops SRJ-404 follows with a pending-row run', () => {
-  const KEY = SUCCESS_SITE_KEY
-  /** A pane that shows no startup dialog: the approver presses nothing and polls on. */
-  const NO_DIALOG_PANE = 'unrelated pane text'
-  /** P's row read `pending` with the stub's default launch start, its pane showing no dialog. */
-  const PENDING_NO_DIALOG: StubClientOptions = { statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE }), readPaneResults: [cannedReadPaneResult(NO_DIALOG_PANE)] }
-
-  /** How a case ends P's approver after its launch. */
-  interface ApproverStopCase {
-    readonly stub: StubClientOptions
-    /** Run after the stub is installed (`useApproverClock`'s clock, the installed stub). */
-    readonly arrange?: (clock: FakeClock, stub: StubClient) => void
-    /** Stops the approver from outside once its first lap has run; unset, the approver runs to its own stop on the clock. */
-    readonly stop?: () => Promise<unknown>
-    readonly reason: ApproverStopReason
-    /** Whether the stop arms P's timer once more. */
-    readonly arms: boolean
-  }
-
-  const STOPS: ReadonlyArray<readonly [string, ApproverStopCase]> = [
-    ['B, measured from the launch start, on a row still pending', { stub: PENDING_NO_DIALOG, reason: APPROVER_STOP_BOUND, arms: true }],
-    ['the test cap, on a row still pending', { stub: PENDING_NO_DIALOG, arrange: () => _setDialogReadyTimeoutMs(4 * DIALOG_POLL_INTERVAL_MS), reason: APPROVER_STOP_CAP, arms: true }],
-    ['GONE at its pane read (ErrTmuxCaptureFailed), the row read pending', { stub: { ...PENDING_NO_DIALOG, readPaneError: errTmuxCaptureFailed() }, reason: APPROVER_STOP_GONE, arms: true }],
-    [
-      'ErrSpawnNotInteractive on its Enter, the row read pending',
-      { stub: { ...PENDING_NO_DIALOG, readPaneResults: [cannedReadPaneResult(TRUST_DIALOG_PANE)], sendKeysError: errSpawnNotInteractive('send-keys') }, reason: APPROVER_STOP_NOT_INTERACTIVE, arms: true },
-    ],
-    ['ErrTmuxNotAvailable at its pane read, the row read pending', { stub: { ...PENDING_NO_DIALOG, readPaneError: errTmuxNotAvailable(undefined, 'read-pane') }, reason: APPROVER_STOP_TMUX_UNAVAILABLE, arms: true }],
-    ['ErrTmuxNotAvailable at its first status read (no row read)', { stub: { statusError: errTmuxNotAvailable(undefined, 'status') }, reason: APPROVER_STOP_TMUX_UNAVAILABLE, arms: true }],
-    [
-      'the one-approver rule (a later lap reads another launch start), the row read pending',
-      {
-        stub: {
-          statusQueue: [cannedOk(cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_FRACTIONAL }))],
-          statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_WHOLE }),
-          readPaneResults: [cannedReadPaneResult(NO_DIALOG_PANE)],
-        },
-        reason: APPROVER_STOP_SUPERSEDED,
-        arms: true,
-      },
-    ],
-    [
-      'a loop that threw (its clock failed after a lap read the row pending)',
-      {
-        stub: PENDING_NO_DIALOG,
-        arrange: (clock, stub) => {
-          let failing = false
-          const client = stub as unknown as { readPane: (params: unknown) => Promise<unknown> }
-          const readPane = client.readPane.bind(stub)
-          client.readPane = async (params) => {
-            const pane = await readPane(params)
-            failing = true
-            return pane
-          }
-          _setApproverClock({
-            now: () => {
-              if (failing) throw new Error('the clock failed')
-              return clock.now()
-            },
-            setTimeout: (callback, delayMs) => clock.setTimeout(callback, delayMs),
-            clearTimeout: (handle) => clock.clearTimeout(handle),
-          })
-        },
-        reason: APPROVER_STOP_FAILED,
-        arms: true,
-      },
-    ],
-    // SRJ-404: these stops leave the row to no pending-row run, so nothing is armed for it.
-    ['the teardown\'s stop', { stub: PENDING_NO_DIALOG, stop: () => stopDialogApprover(KEY, APPROVER_STOP_TEARDOWN), reason: APPROVER_STOP_TEARDOWN, arms: false }],
-    ['the retired-key recording\'s stop', { stub: PENDING_NO_DIALOG, stop: () => stopDialogApprover(KEY, APPROVER_STOP_RETIRED_KEY), reason: APPROVER_STOP_RETIRED_KEY, arms: false }],
-    ['the latch\'s stop', { stub: PENDING_NO_DIALOG, stop: () => stopDialogApprover(KEY, APPROVER_STOP_LATCHED), reason: APPROVER_STOP_LATCHED, arms: false }],
-    ['the shutdown\'s stop', { stub: PENDING_NO_DIALOG, stop: () => stopAllDialogApprovers(), reason: APPROVER_STOP_SHUTDOWN, arms: false }],
-    // An arming stop whose last status read was not `pending` (a state CSCB does not know, on which it polls on) arms nothing.
-    [
-      'the test cap after its last status read a state CSCB does not know',
-      {
-        stub: { statusQueue: statusReads(AGENT_DIRECTOR_PENDING_STATE), statusResult: cannedStatusResult({ state: 'hibernating' }), readPaneResults: [cannedReadPaneResult(NO_DIALOG_PANE)] },
-        arrange: () => _setDialogReadyTimeoutMs(4 * DIALOG_POLL_INTERVAL_MS),
-        reason: APPROVER_STOP_CAP,
-        arms: false,
-      },
-    ],
-  ]
-
-  test.each(STOPS)('%s: the stop arms P pending-only once more exactly when SRJ-404 follows it with a pending-row run; no kill, delete or launch after the launch', async (_name, row) => {
-    const clock = useApproverClock(SAMPLE_LAUNCH_START_MS)
-    const cfg = successSiteConfig()
-    const calls = makeStubCallLog()
-    const arms = recordPendingOnlyArms(calls)
-    const stub = installStub({ ...calls, ...FIRST_SPAWN_SITE.script(cfg), ...row.stub })
-    row.arrange?.(clock, stub)
-
-    let result: SpawnPersonaResult | undefined
-    const errLog = await withCapturedErr(async () => {
-      if (row.stop === undefined) {
-        result = await launchThenRunApprover(clock, KEY, spawnForPersona(personaOf(cfg, KEY), cfg))
-      } else {
-        result = await settleOffApproverClock(spawnForPersona(personaOf(cfg, KEY), cfg))
-        await approverFirstLapTurns()
-        await row.stop()
-      }
-    })
-
-    expect(result).toStrictEqual({ key: KEY, action: 'spawned' })
-    expect((await _whenDialogApproverStopped(KEY))?.reason).toBe(row.reason)
-    expect(isDialogApproverRunning(KEY)).toBe(false)
-    // The launch's own arm, then the stop's when it arms: no launch call made since the launch.
-    const launchArm: PendingOnlyArm = { key: KEY, approverRunning: false, launchCalls: 1 }
-    expect(arms.pendingOnly).toEqual(row.arms ? [launchArm, launchArm] : [launchArm])
-    expect([calls.spawnCalls.length, calls.resumeCalls, calls.killCalls, calls.deleteCalls]).toEqual([1, [], [], []])
-    assertNoLeak({ errLog })
-  })
-
-  // The closed set of stop reasons: exactly SRJ-404's pending-row stops (and a loop that threw) arm.
-  test('approverStopArmsPendingRow answers for every stop reason', () => {
-    // Keyed by every reason: a reason added to ApproverStopReason fails the typecheck here until it has a row.
-    const ARMS: Record<ApproverStopReason, boolean> = {
-      [APPROVER_STOP_BOUND]: true,
-      [APPROVER_STOP_CAP]: true,
-      [APPROVER_STOP_GONE]: true,
-      [APPROVER_STOP_NOT_INTERACTIVE]: true,
-      [APPROVER_STOP_TMUX_UNAVAILABLE]: true,
-      [APPROVER_STOP_SUPERSEDED]: true,
-      [APPROVER_STOP_FAILED]: true,
-      [APPROVER_STOP_LIVE]: false,
-      [APPROVER_STOP_FINISHED]: false,
-      [APPROVER_STOP_ABSENT]: false,
-      [APPROVER_STOP_NO_LAUNCH_START]: false,
-      [APPROVER_STOP_SHUTDOWN]: false,
-      [APPROVER_STOP_LATCHED]: false,
-      [APPROVER_STOP_TEARDOWN]: false,
-      [APPROVER_STOP_RETIRED_KEY]: false,
-      // b.jg5 SRJ-412: the abort of CSCB's own stuck launch kills the row; nothing is left to arm for.
-      [APPROVER_STOP_STUCK_LAUNCH_ABORT]: false,
-    }
-    const reasons = Object.keys(ARMS) as ApproverStopReason[]
-    expect(reasons.map((reason) => [reason, approverStopArmsPendingRow(reason)])).toEqual(reasons.map((reason) => [reason, ARMS[reason]]))
-  })
-})
 
 // ---------------------------------------------------------------------------
 // b.jg5 SRJ-413 — each launch's pre_trust is logged, and no launch passes
@@ -12888,7 +9031,7 @@ describe('b.jg5 SRJ-409, SRJ-404: the row an approver leaves pending when it sto
 // `no_pre_trust` on any spawn or `resume`, writes one line per successful
 // launch from `preTrustLogLine` (for a result without the field, that it came
 // from a binary older than Phase 1) and lets no value change anything else: a
-// folder-trust dialog that follows is still the approver's to clear. Values
+
 // come from the stub's `PRE_TRUST_VALUES` and lines from the builder. Each
 // success site's own line, for one present value, is checked in the SRJ-401
 // describe above.
@@ -12896,7 +9039,6 @@ describe('b.jg5 SRJ-409, SRJ-404: the row an approver leaves pending when it sto
 
 describe('b.jg5 SRJ-413: each launch\'s pre_trust is logged once with the persona reference and changes nothing else; no launch carries no_pre_trust', () => {
   const KEY = SUCCESS_SITE_KEY
-  const ID = SUCCESS_SITE_ID
   const REF = renderPersonaRef(KEY, KEY)
   const VERBS: readonly LaunchVerb[] = [LAUNCH_VERB_SPAWN, LAUNCH_VERB_RESUME, LAUNCH_VERB_REUSE_SPAWN]
   const caseName = (preTrust: PreTrust | undefined): string => preTrust ?? 'absent'
@@ -12939,134 +9081,6 @@ describe('b.jg5 SRJ-413: each launch\'s pre_trust is logged once with the person
     assertNoLeak({ line })
   })
 
-  /** A launch result that is no object at all. */
-  const NO_OBJECT_RESULTS: ReadonlyArray<readonly [string, null | undefined]> = [
-    ['null', null],
-    ['missing (undefined)', undefined],
-  ]
-
-  test.each(NO_OBJECT_RESULTS)('the resume of an ended row whose result is %s: the launch writes the absent field\'s line, P\'s, and the ladder still returns resumed', async (_name, value) => {
-    const clock = useApproverClock()
-    const cfg = successSiteConfig()
-    installStub({ spawnQueue: [collision()], getResult: endedRow(cfg), resumeQueue: [cannedOk(value as unknown as StubResumeResult)] })
-
-    let result: SpawnPersonaResult | undefined
-    const errLog = await withCapturedErr(async () => {
-      result = await launchThenRunApprover(clock, KEY, spawnForPersona(personaOf(cfg, KEY), cfg))
-    })
-
-    expect(result).toStrictEqual({ key: KEY, action: 'resumed' })
-    expect(preTrustLines(errLog)).toEqual([preTrustLogLine(REF, LAUNCH_VERB_RESUME, undefined)])
-    assertNoLeak({ errLog })
-  })
-
-  const LAUNCH_KINDS: ReadonlyArray<readonly [string, SuccessSite]> = [
-    ['a first spawn', FIRST_SPAWN_SITE],
-    ['a resume of an ended row', ENDED_ROW_RESUME_SITE],
-    ['a reuse spawn', REUSE_SPAWN_SUCCESS_SITE],
-  ]
-
-  /** The one Enter the approver presses on the folder-trust dialog. */
-  const ENTER: import('agent-director').SendKeysParams = { instance_id: ID, text: '', allow_pending: true }
-
-  /** What one launch did, besides its `pre_trust` line. */
-  interface LaunchEffects {
-    readonly result: SpawnPersonaResult | undefined
-    readonly calls: StubCallLog
-    readonly notices: typeof notices
-    readonly outageNotices: typeof outageEmissions
-    /** Its startup-errors entries, each without its timestamp. */
-    readonly startupEntries: string[]
-    readonly outageFlags: string[]
-    readonly failureCount: number
-    readonly approver: ApproverOutcome | undefined
-    readonly approverClockMs: number
-    /** Its log lines but the `pre_trust` lines. */
-    readonly otherLines: string[]
-  }
-
-  /**
-   * Launch P at the start pass through `site`, its result carrying
-   * `preTrust`, with the folder-trust dialog on P's pane: once the launch
-   * has settled, P's row reads `pending` at the approver's first lap and live
-   * after it. Run the approver to its stop on a fresh approver clock. Answers
-   * the launch's `pre_trust` lines, its log and everything else it did, then
-   * forgets the launch, its approver and the findMissing memo, so a next
-   * launch in the same case starts as this one did.
-   */
-  async function launchWithTrustDialog(
-    cfg: PersonaConfig,
-    site: SuccessSite,
-    preTrust: PreTrust | undefined,
-  ): Promise<{ lines: string[]; errLog: string; effects: LaunchEffects }> {
-    const clock = useApproverClock()
-    const calls = makeStubCallLog()
-    let laps = 0
-    installStub({
-      ...calls,
-      ...site.script(cfg, preTrust),
-      statusFn: () => {
-        if (isLaunchInFlight(KEY)) return cannedStatusResult({ state: 'waiting' })
-        laps++
-        return cannedStatusResult({ state: laps <= 2 ? AGENT_DIRECTOR_PENDING_STATE : 'waiting' })
-      },
-      readPaneResults: [cannedReadPaneResult(TRUST_DIALOG_PANE)],
-    })
-    const readLog = captureStartupErrors()
-    const before = { notices: notices.length, outage: outageEmissions.length, log: readLog().length }
-
-    let result: SpawnPersonaResult | undefined
-    const errLog = await withCapturedErr(async () => {
-      result = await launchThenRunApprover(clock, KEY, launchAtSite(site, cfg, true))
-    })
-    await settleNotices()
-
-    const lines = preTrustLines(errLog)
-    const effects: LaunchEffects = {
-      result,
-      calls,
-      notices: notices.slice(before.notices),
-      outageNotices: outageEmissions.slice(before.outage),
-      startupEntries: readLog().slice(before.log).split('\n').filter((entry) => entry !== '').map((entry) => entry.replace(/^\[[^\]]*\] /, '')),
-      outageFlags: [...getOutageFlags(KEY)].sort(),
-      failureCount: getFailureCount(KEY),
-      approver: await _whenDialogApproverStopped(KEY),
-      approverClockMs: clock.now(),
-      otherLines: errLog.split('\n').filter((line) => !lines.includes(line)),
-    }
-    _resetInFlightLaunches()
-    _resetFindMissingMemo()
-    return { lines, errLog, effects }
-  }
-
-  const KIND_CROSS = LAUNCH_KINDS.flatMap(([kind, site]) => PRE_TRUST_CASES.map((preTrust) => [kind, caseName(preTrust), site, preTrust] as const))
-
-  test.each(KIND_CROSS)('%s whose result\'s pre_trust is %s: exactly one pre_trust line, P\'s, with the value (for an absent field, the older-binary wording); the approver still clears the folder-trust dialog that follows', async (_kind, _name, site, preTrust) => {
-    const { lines, errLog, effects } = await launchWithTrustDialog(successSiteConfig(), site, preTrust)
-
-    expect(effects.result).toStrictEqual({ key: KEY, action: site.action })
-    expect(lines).toEqual([preTrustLogLine(REF, site.launchVerb, preTrust)])
-    expect(effects.calls.sendKeysCalls).toEqual([ENTER])
-    expect(effects.approver).toEqual({ reason: APPROVER_STOP_LIVE, launchStartMs: SAMPLE_LAUNCH_START_MS })
-    assertNoLeak({ errLog })
-  })
-
-  test.each(LAUNCH_KINDS)('%s: each pre_trust value and an absent field have the same effects but their line — the same agent-director calls (none carrying no_pre_trust), launch result, notices, startup entries, outage flags, failure count and approver run', async (_kind, site) => {
-    const cfg = successSiteConfig()
-    const runs: Array<Awaited<ReturnType<typeof launchWithTrustDialog>>> = []
-    for (const preTrust of PRE_TRUST_CASES) runs.push(await launchWithTrustDialog(cfg, site, preTrust))
-    const effects = runs.map((run) => run.effects)
-
-    expect(effects).toEqual(effects.map(() => effects[0]!))
-    // The run every other is compared with cleared the dialog and wrote nothing beside its line.
-    expect(effects[0]!.calls.sendKeysCalls).toEqual([ENTER])
-    expect(effects[0]!.notices).toEqual([])
-    expect(effects[0]!.startupEntries).toEqual([])
-    const launchCalls: object[] = effects.flatMap((e) => [...e.calls.spawnCalls, ...e.calls.resumeCalls])
-    expect(launchCalls).toHaveLength(PRE_TRUST_CASES.length * (site.launchVerb === LAUNCH_VERB_RESUME ? 2 : 1))
-    expect(launchCalls.filter((params) => 'no_pre_trust' in params)).toEqual([])
-    for (const run of runs) assertNoLeak({ errLog: run.errLog })
-  })
 })
 
 // ---------------------------------------------------------------------------
@@ -13076,43 +9090,6 @@ describe('b.jg5 SRJ-413: each launch\'s pre_trust is logged once with the person
 // Shared constants for wrapper tests
 const BIN = '/usr/bin/agent-director'
 const CWD = '/test/cwd'
-
-// ---------------------------------------------------------------------------
-// Group A: 13 non-dialog wrapped catch sites
-// Each asserts: outage-class typed error raises the matching flag AND
-// no spawn-failure notice is raised.
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// b.1ix — the operator's attach text names the exact session
-// ---------------------------------------------------------------------------
-
-describe('b.1ix: the operator\'s attach text names the exact session of a persona whose key prefixes another\'s', () => {
-  const KEYS = [personaKey('dev'), personaKey('dev_2')] as const
-
-  test.each<[string, NotConnectedNotice]>([
-    ['blocked on a prompt', { reason: 'blocked-on-prompt', autoRestartDisabled: false }],
-    ['a working row whose idleness can\'t be proven', { reason: 'unproven-idle', autoRestartDisabled: false, heldMs: 12 * 60_000 }],
-    ['disconnected, session_restart_delay 0', { reason: 'auto-restart-disabled', cause: 'a test cause' }],
-  ])('%s: each persona\'s notice attaches with `=` and its own session name, never a bare name a prefix neighbour would answer', async (_label, notice) => {
-    const [dev, dev2] = KEYS
-    // The premise: one session name is a prefix of the other's.
-    expect(personaTmuxSessionName(dev2).startsWith(personaTmuxSessionName(dev))).toBe(true)
-
-    const errLog = await withCapturedErr(() => {
-      for (const key of KEYS) notifyPersonaNotConnected(key, notice)
-    })
-
-    expect(notices.map((n) => n.key)).toEqual([...KEYS])
-    for (const [i, key] of KEYS.entries()) {
-      const text = notices[i]!.text
-      expect(text).toContain(`\`tmux attach -t =${personaTmuxSessionName(key)}\``)
-      expect(text).not.toContain(`attach -t ${personaTmuxSessionName(key)}`)
-    }
-    expect(notices[0]!.text).not.toContain(personaTmuxSessionName(dev2))
-    assertNoLeak({ errLog, notices })
-  })
-})
 
 describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
   // -------------------------------------------------------------------------
@@ -13291,62 +9268,6 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
     expect(notices).toHaveLength(0)
   })
 
-})
-
-// ---------------------------------------------------------------------------
-// Group B: the dialog approver's wrapped catch sites
-// Each asserts: (a) the approver keeps polling and stops at B (b.jg5
-// SRJ-404: `ErrSystemInstallDisappeared` is UNCLASSIFIED, so it keeps
-// polling within B), (b) the ad-unreachable flag is raised, (c) the
-// binaryPath detail is captured in the onset emission. Runs on the
-// approver's fake clock started at the stub's launch start
-// (`useApproverClock`), with the test cap unset, so B is reached on the
-// clock.
-// ---------------------------------------------------------------------------
-
-describe('wrapper-migration: dialog outage cases (Group B)', () => {
-  const CH = 'C_DIALOG'
-  const errSID = () => new ErrSystemInstallDisappeared('read-pane', BIN)
-
-  // -------------------------------------------------------------------------
-  // Merged approvePreSessionDialogs — 3 wrapped call sites: status, readPane,
-  // sendKeys. Each exercises an AD-outage error at one site, asserting the
-  // outage flag is raised and the approver polls on to B
-  // (`adLaunchBoundMsInEffect`), measured from the launch start a `pending`
-  // lap read, or from its own start when no lap read one (the status site),
-  // and answers `bound`.
-  // -------------------------------------------------------------------------
-
-  test.each<[string, () => StubClientOptions]>([
-    ['status outage: status always throws ErrSystemInstallDisappeared', () => ({ statusError: errSID() })],
-    [
-      'readPane outage: status=pending, readPane throws ErrSystemInstallDisappeared',
-      () => ({ statusResult: cannedStatusResult({ state: 'pending' }), readPaneError: errSID() }),
-    ],
-    [
-      // readPane returns the dialog needle so sendKeys is reached; sendKeys throws
-      'sendKeys outage: status=pending + dialog pane, sendKeys throws ErrSystemInstallDisappeared',
-      () => ({
-        statusResult: cannedStatusResult({ state: 'pending' }),
-        readPaneResults: [cannedReadPaneResult(TRUST_DIALOG_PANE)],
-        sendKeysError: new ErrSystemInstallDisappeared('send-keys', BIN),
-      }),
-    ],
-  ])('%s → ad-unreachable, polls on and resolves bound at B', async (_label, opts) => {
-    // The approver starts at the launch start a `pending` row shows, so B from either start ends at the same time.
-    const clock = useApproverClock(SAMPLE_LAUNCH_START_MS)
-    const statusCalls: import('agent-director').StatusParams[] = []
-    installStub({ ...opts(), statusCalls })
-
-    expect(await runOnApproverClock(clock, approvePreSessionDialogs(CH, false))).toBe(APPROVER_STOP_BOUND)
-
-    expect(clock.now()).toBe(SAMPLE_LAUNCH_START_MS + adLaunchBoundMsInEffect())
-    expect(clock.pendingCount()).toBe(0)
-    // Polled on past the first lap.
-    expect(statusCalls.length).toBeGreaterThan(1)
-    expect(getOutageFlags(CH).has('ad-unreachable')).toBe(true)
-    expect(outageEmissions.some(e => e.key === CH && e.text.includes(BIN))).toBe(true)
-  })
 })
 
 // ---------------------------------------------------------------------------
@@ -16834,13 +12755,6 @@ function fastPolls(h: RecoveryHarness): void {
   h.config.agent_director_poll_interval_ms = 1
 }
 
-/** The working-row wait gives up after 30 ms and re-sweeps at its deadline (memo TTL 0), polling every 1 ms. */
-function shortWait(h: RecoveryHarness): void {
-  fastPolls(h)
-  _setWaitForWaitingTimeoutMs(30)
-  _setFindMissingMemoTtlMs(0)
-}
-
 /**
  * The working-row wait's deadline is its start (b.jg5 SRJ-605): it makes no
  * poll, only its up-front sweep, the timeout sweep and the timeout `status`
@@ -16856,13 +12770,6 @@ function noResume(h: RecoveryHarness): void {
   h.config.resume_enabled = false
 }
 
-/**
- * Every `read-pane` answers GONE (`ErrTmuxCaptureFailed`: agent-director
- * found no pane of the row's launch), so a prompt row's one-line read
- * (`launchOnPromptRow`, b.jg5 SRJ-607) reaches its findMissing sweep. The
- * knob stays for every launch of the case; a site using it never reaches a
- * launch that succeeds, so no dialog approver reads a pane after it.
- */
 function promptRowPanesGone(h: RecoveryHarness): void {
   h.script({ readPaneError: errTmuxCaptureFailed() })
 }
@@ -16957,7 +12864,6 @@ const SPAWN_AND_RESUME_SITES: readonly LadderSite[] = [
   ...REPLACEMENT_REUSE_SITES,
 ]
 
-
 /**
  * The reconnect's one `send-keys` (b.jg5 SRJ-118, SRJ-609: never retried, so
  * there is no second site): never 'dead-session' (no resume) for these
@@ -16979,137 +12885,6 @@ const RECONNECT_SITES: readonly LadderSite[] = [
     script: (h, p, err) => ({ ...collided(h, p, { state: 'waiting' }), getQueue: [cannedOk(harnessRow(h, p, { state: 'working' }))], statusResult: cannedStatusResult({ state: 'waiting' }), sendKeysError: err }),
     calls: ladderCallsOf({ spawn: 1, sendKeys: 1 }),
     reconnectBranch: 'working',
-  },
-]
-
-/**
- * Every action site of the ladder: each spawn and resume, the replacement
- * sites' reuse spawns among them, and each reconnect site above. The ladder
- * makes no kill and no delete (b.jg5 SRJ-707): a live row's kills are the
- * live-row sequence's (tests/live-row-sequence.test.ts, and SRJ-110 at each
- * replacement site in the SRJ-707 describe).
- */
-const ACTION_SITES: readonly LadderSite[] = [...SPAWN_AND_RESUME_SITES, ...RECONNECT_SITES]
-
-/**
- * The `get` reads of the ladder (b.jg5 SRJ-105's read-error row): the
- * collision `get` and the ErrJsonlMissing diagnosis `get` (SRJ-114), made
- * after the resume and before its reuse spawn (SRJ-712). The working-row
- * wait's `status` reads are no refusal (b.jg5 SRJ-605): `WAIT_STATUS_SITES`.
- */
-const READ_SITES: readonly LadderSite[] = [
-  {
-    name: 'the collision get',
-    verb: 'get',
-    script: (_h, _p, err) => ({ spawnQueue: [cannedErr(errInstanceIdCollision())], getError: err }),
-    calls: ladderCallsOf({ spawn: 1 }),
-  },
-  {
-    name: 'the ErrJsonlMissing diagnosis get',
-    verb: 'get',
-    script: (h, p, err) => jsonlMissingDiagnosisGets(h, p, cannedErr(err)),
-    calls: ladderCallsOf({ spawn: 1, resume: 1 }),
-  },
-]
-
-/** A `status` read of the working-row wait, and what the launch answers when it fails (b.jg5 SRJ-605). */
-interface WaitStatusSite extends LadderSite {
-  /** The launch's result: the wait's outcome. */
-  readonly action: SpawnPersonaResult['action']
-  /** The `status` reads one such launch makes. */
-  readonly statusReads: number
-  /** How the site's line and notice describe the failed read's error (the poll: `describeAdFailureForLog`, b.jg5 SRJ-1014). */
-  describe(err: unknown): string
-  /** The wait's one line for the failed read of persona `ref`'s row, the error `described` and of class `errorClass`. */
-  line(ref: string, described: string, errorClass: AdErrorClass): string
-  /** The cause the not-connected notice names at the harness's session_restart_delay 0, when the read raises one. */
-  noticeCause?(ref: string, described: string, errorClass: AdErrorClass): string
-}
-
-/**
- * The working-row wait's two `status` reads (b.jg5 SRJ-605). The poll: the
- * first poll fails and the wait polls on; the next reads the row waiting, and
- * the wait reconnects it (`reconnected`). The timeout read, made at once (the
- * deadline is the wait's start, `deadlineAtStart`): the wait ends
- * `not-reconnected` through the wait-ended report, whose notice the
- * harness's restart delay 0 raises.
- */
-const WAIT_STATUS_SITES: readonly WaitStatusSite[] = [
-  {
-    name: 'the working-row wait\'s poll status',
-    verb: 'status',
-    setup: fastPolls,
-    script: (h, p, err) => ({ ...collided(h, p, { state: 'waiting' }), getQueue: [cannedOk(harnessRow(h, p, { state: 'working' }))], statusQueue: [cannedErr(err)], statusResult: cannedStatusResult({ state: 'waiting' }) }),
-    calls: ladderCallsOf({ spawn: 1, sendKeys: 2 }),
-    action: 'reconnected',
-    statusReads: 2,
-    describe: describeAdFailureForLog,
-    line: waitPollStatusErrorLine,
-  },
-  {
-    name: 'the working-row wait\'s timeout status',
-    verb: 'status',
-    setup: deadlineAtStart,
-    script: (h, p, err) => ({ ...collided(h, p, { state: 'working' }), statusError: err }),
-    calls: ladderCallsOf({ spawn: 1 }),
-    action: 'not-reconnected',
-    statusReads: 1,
-    describe: describeAgentDirectorFailure,
-    line: (ref, described, errorClass) => waitEndedDisconnectedLine(waitTimedOutUnreadReport(ref, 0, described, errorClass), 0),
-    noticeCause: (ref, described, errorClass) => noticeCause(waitTimedOutUnreadReport(ref, 0, described, errorClass).notice),
-  },
-]
-
-/** A findMissing sweep of the ladder, with the log prefix of its refusal line. */
-interface SweepSite extends LadderSite {
-  readonly logPrefix: string
-}
-
-/**
- * The ladder's findMissing sweeps (b.jg5 SRJ-105): an UNAVAILABLE sweep stops
- * the attempt there. The before-resume sweep of a dead session
- * (`resumeOrFreshSpawn`), the working-row wait's up-front and timeout sweeps,
- * and the sweep of a prompt row whose read-pane answers GONE
- * (`launchOnPromptRow`).
- */
-const SWEEP_SITES: readonly SweepSite[] = [
-  {
-    name: 'the before-resume sweep of a waiting row\'s dead session (resumeOrFreshSpawn)',
-    verb: 'find-missing',
-    logPrefix: 'spawnForPersona: before resume',
-    script: (h, p, err) => ({ ...collided(h, p, { state: 'waiting' }), sendKeysError: errSpawnNotInteractive('send-keys'), findMissingError: err }),
-    calls: ladderCallsOf({ spawn: 1, sendKeys: 1 }),
-  },
-  {
-    name: 'the working-row wait\'s up-front sweep',
-    verb: 'find-missing',
-    logPrefix: 'waitForWaitingAndReconnect',
-    setup: fastPolls,
-    script: (h, p, err) => ({ ...collided(h, p, { state: 'working' }), findMissingError: err }),
-    calls: ladderCallsOf({ spawn: 1 }),
-  },
-  {
-    name: 'the working-row wait\'s timeout sweep',
-    verb: 'find-missing',
-    logPrefix: 'waitForWaitingAndReconnect: timeout',
-    setup: shortWait,
-    // The up-front sweep succeeds and the row reads working at every poll;
-    // the sweep at the deadline fails.
-    script: (h, p, err) => ({
-      ...collided(h, p, { state: 'working' }),
-      statusResult: cannedStatusResult({ state: 'working' }),
-      findMissingQueue: [cannedOk(cannedFindMissing())],
-      findMissingError: err,
-    }),
-    calls: ladderCallsOf({ spawn: 1 }),
-  },
-  {
-    name: 'the sweep of a check_permission row whose read-pane answers GONE (launchOnPromptRow)',
-    verb: 'find-missing',
-    logPrefix: 'spawnForPersona: prompt row',
-    setup: promptRowPanesGone,
-    script: (h, p, err) => ({ ...collided(h, p, { state: 'check_permission' }), findMissingError: err }),
-    calls: ladderCallsOf({ spawn: 1 }),
   },
 ]
 
@@ -17297,85 +13072,6 @@ async function expectRefusedAt(
 }
 
 /**
- * Launch P as the start pass does, with the working-row wait's `site` read
- * meeting `err` of class `errorClass` (b.jg5 SRJ-605), and assert it was no
- * refusal: the launch answers the wait's outcome (`site.action`), never
- * `failed` or refused, after exactly the site's calls; the wait's one line
- * for the read; no tmux probe and no dead-session line; no
- * spawn-failure notice (only, at the timeout read, the one not-connected
- * notice naming why, at the harness's restart delay 0); no `spawn-failed`
- * entry, "reconnect failed (state=working)" included; no refusal line; P's
- * timer armed once with `triggerKind` (and still armed, unless the
- * reconnect's keystrokes cleared P's `tmux-unavailable` outage, which ends
- * it); nothing counted. Without `onsetText`
- * the outage state posts nothing; with it, the first outage notice is P's
- * onset reading exactly `onsetText`, posted once. Then the restart path's
- * launch over the same answers (`launchSession`) answers true, uncounted, and
- * B launches over the stub's defaults, untouched (no trigger, and no
- * `outageClass` flag).
- */
-async function expectWaitGoesOnAt(
-  site: WaitStatusSite,
-  err: Error,
-  errorClass: AdErrorClass,
-  triggerKind: string,
-  onsetText?: string,
-  outageClass: OutageClass = 'tmux-unavailable',
-): Promise<{ h: RecoveryHarness; p: string }> {
-  const { h, p, b } = srj105Build()
-  const persona = harnessPersona(h, p)
-  site.setup?.(h)
-  const script = site.script(h, persona, err)
-  h.script(script)
-  const order = recordCallOrder(h)
-
-  expect(await h.launch(p)).toStrictEqual({ key: p, action: site.action })
-
-  const ref = renderPersonaRef(p, p)
-  const described = site.describe(err)
-  expect(ladderCallsMade(h)).toEqual(site.calls)
-  expect(h.stub.calls.statusCalls).toHaveLength(site.statusReads)
-  expect(order.filter((call) => call.startsWith('tmux '))).toEqual([])
-  expect(h.errors.filter((line) => line === site.line(ref, described, errorClass))).toHaveLength(1)
-  expect(h.errors.filter((line) => line.includes('dead session'))).toEqual([])
-  if (site.noticeCause === undefined) {
-    expect(h.notices).toEqual([])
-  } else {
-    expect(h.notices.map((n) => n.key)).toEqual([p])
-    expect(h.notices[0]!.text).toContain(`(${site.noticeCause(ref, described, errorClass)})`)
-  }
-  if (onsetText === undefined) {
-    expect(h.outageNotices).toEqual([])
-  } else {
-    expect(h.outageNotices[0]).toEqual({ key: p, text: onsetText })
-    expect(h.outageNotices.filter((n) => n.text === onsetText)).toHaveLength(1)
-  }
-  expect(countStartupEntries(h.startupErrors().join('\n'), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
-  expect(h.startupErrors().join('\n')).not.toContain('reconnect failed')
-  expect(refusalLines(h, p)).toEqual([])
-  expect(h.triggers).toEqual([{ key: p, kind: triggerKind }])
-  // The timer stays armed, unless the reconnect's keystrokes (a tmux-touching
-  // success) cleared P's tmux-unavailable outage, which ends it (b.jg5 SRJ-311).
-  const clearedByReconnect = onsetText !== undefined && outageClass === 'tmux-unavailable' && site.calls.sendKeys > 0
-  expect(h.controller.isArmed(p)).toBe(!clearedByReconnect)
-  expect(h.outageClears.map((c) => c.key)).toEqual(clearedByReconnect ? [p] : [])
-  expect(getFailureCount(p)).toBe(0)
-
-  // The restart path's launch over the same answers: a launch that did not fail, never counted.
-  h.script(site.script(h, persona, err))
-  expect(await launchSession(p, h.config)).toBe(true)
-  expect(getFailureCount(p)).toBe(0)
-  expect(countStartupEntries(h.startupErrors().join('\n'), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
-
-  // B's launch is unaffected: only its own launch's pending-only watch.
-  h.script(clearedScript(script))
-  expect(await h.launch(b)).toEqual({ key: b, action: 'spawned' })
-  expectOnlyPendingRowWatch(h, b)
-  expect(getOutageFlags(b).has(outageClass)).toBe(false)
-  return { h, p }
-}
-
-/**
  * Launch P, then B, as the start pass does, both meeting a prompt row whose
  * read-pane answers GONE, so each reaches the prompt-row findMissing sweep.
  * P's sweep is held in flight until B has joined it, then answers `answer`
@@ -17485,23 +13181,11 @@ describe('b.jg5 SRJ-105: UNAVAILABLE is never destructive', () => {
     readonly sendKeys: number
   }
 
-  // The dialog approver's pane read and Enter left this table: the approver
   // runs after its launch call returned, outside P's attempt (b.jg5 SRJ-401),
-  // and its rows are the describe "the dialog approver's calls are outside
+
   // P's launch attempt" below.
   const PASS_THROUGH_SITES: readonly PassThroughSite[] = [
-    {
-      name: 'the working-row wait\'s pane read',
-      verb: 'read-pane',
-      script: (h, p, err) => ({ ...collided(h, p, { state: 'working' }), statusResult: cannedStatusResult({ state: 'working' }), readPaneError: err }),
-      setup: (h) => {
-        shortWait(h)
-        // At a restart delay the wait's give-up raises no not-connected notice.
-        h.config.session_restart_delay = 60
-      },
-      action: 'not-reconnected',
-      sendKeys: 0,
-    },
+
   ]
 
   const passThroughCross = PASS_THROUGH_SITES.flatMap((site) => SRJ105_UNAVAILABLE.map(([what, make]) => [site.name, what, make, site] as const))
@@ -17518,168 +13202,6 @@ describe('b.jg5 SRJ-105: UNAVAILABLE is never destructive', () => {
     expect(countStartupEntries(h.startupErrors().join('\n'), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
     expect(refusalLines(h, p)).toEqual([])
     expect(getFailureCount(p)).toBe(0)
-  })
-})
-
-describe('b.jg5 SRJ-105, SRJ-605: a read error at the collision get or the ErrJsonlMissing diagnosis get is handled as UNAVAILABLE, at the working-row wait\'s status it lets the wait go on, and an UNAVAILABLE findMissing sweep stops the attempt', () => {
-  afterEach(srj105AfterEach)
-
-  /** The UNAVAILABLE forms, then an UNCLASSIFIED read error and a store that cannot be opened (UNCLASSIFIED too), each with its retry cause and its class. */
-  const READ_ERRORS: ReadonlyArray<readonly [string, (verb: string) => Error, string, AdErrorClass]> = [
-    ...SRJ105_UNAVAILABLE.map(([what, make, kind]) => [what, make, kind, AD_ERROR_CLASS_UNAVAILABLE] as const),
-    ['an UNCLASSIFIED read error (ErrTimeout)', (verb) => errGeneric(verb, 'ErrTimeout'), UNAVAILABLE_RETRY_CAUSE_READ_ERROR, AD_ERROR_CLASS_UNCLASSIFIED],
-    ['a store that cannot be opened (ErrSchemaMismatch)', () => errSchemaMismatch(), UNAVAILABLE_RETRY_CAUSE_READ_ERROR, AD_ERROR_CLASS_UNCLASSIFIED],
-  ]
-
-  const cross = READ_ERRORS.flatMap(([what, make, kind]) => READ_SITES.map((site) => [what, site.name, make, kind, site] as const))
-  test.each(cross)('%s at %s: no delete, kill, launch, notice, inconclusive entry or dead-session, refused and never counted, P\'s condition is not started and nothing latches; B launches', async (_what, _site, make, kind, site) => {
-    const { h, p } = await expectRefusedAt(site, make(site.verb), kind)
-    expect(h.tmuxUnresponsive.holds(p)).toBe(false)
-    expect(conditionStartedLines(h, p)).toEqual([])
-    expect(countStartupEntries(h.startupErrors().join('\n'), JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toBe(0)
-    // b.jg5 SRJ-114: a read error at a get site latches no one.
-    expect(h.latchEvents).toEqual([])
-  })
-
-  // b.jg5 SRJ-605: at the working-row wait's `status` reads the same errors
-  // are no refusal: the wait polls on, or ends not reconnected at its
-  // timeout read, and the launch answers its outcome; P's timer is armed.
-  const waitCross = READ_ERRORS.flatMap(([what, make, kind, errorClass]) => WAIT_STATUS_SITES.map((site) => [what, site.name, make, kind, errorClass, site] as const))
-  test.each(waitCross)('b.jg5 SRJ-605: %s at %s: the launch answers the wait\'s outcome, never failed or refused; one line; no tmux probe, delete, kill, resume, spawn-failure notice, spawn-failed entry or dead-session; P armed, never counted, P\'s condition not started, nothing latches; B launches', async (_what, _site, make, kind, errorClass, site) => {
-    const { h, p } = await expectWaitGoesOnAt(site, make(site.verb), errorClass, kind)
-    expect(h.tmuxUnresponsive.holds(p)).toBe(false)
-    expect(conditionStartedLines(h, p)).toEqual([])
-    expect(h.latchEvents).toEqual([])
-  })
-
-  // b.jg5 SRJ-114: the diagnosis get fed the kill-failure form too (E10's
-  // fifth builder) is refused the same way, with its own cause.
-  test('b.jg5 SRJ-114: ErrTmuxKillFailed at the ErrJsonlMissing diagnosis get: no delete, kill, launch, notice or inconclusive entry, refused and never counted, P\'s condition is not started and nothing latches; B launches', async () => {
-    const site = READ_SITES.find((s) => s.name === 'the ErrJsonlMissing diagnosis get')!
-    const { h, p } = await expectRefusedAt(site, SRJ105_KILL_FAILED[1](site.verb), SRJ105_KILL_FAILED[2])
-    expect(h.tmuxUnresponsive.holds(p)).toBe(false)
-    expect(conditionStartedLines(h, p)).toEqual([])
-    expect(countStartupEntries(h.startupErrors().join('\n'), JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toBe(0)
-    expect(h.latchEvents).toEqual([])
-  })
-
-  // b.jg5 SRJ-114: readPersonaTranscript's get, reached from the restart
-  // path's check of a working row on the idle pane its verdict read (b.jg5
-  // SRJ-603: the check makes no read-pane of its own). A read error there is
-  // no evidence: the check defers, so the restart path types nothing, kills
-  // and launches nothing, and nothing is counted or started.
-  test.each([...READ_ERRORS, SRJ105_KILL_FAILED].map(([what, make]) => [what, make] as const))('b.jg5 SRJ-114: %s at the transcript get of the restart path\'s working-row check (checkWorkingRowPane): unreadable, no evidence: defer, nothing typed, killed or launched, nothing counted, P\'s condition not started, nothing latched', async (_what, make) => {
-    const { h, p } = srj105Build()
-    h.script({ getError: make('get') })
-
-    expect(await checkWorkingRowPane(p, IDLE_PANE, { persona: harnessPersona(h, p) })).toBe('defer')
-
-    expect(hasPendingWorkingRowEvidence(p)).toBe(false)
-    expect(h.stub.calls.getCalls.map((c) => c.instance_id)).toEqual([personaInstanceId(p)])
-    expect(h.stub.calls.readPaneCalls).toEqual([])
-    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({}))
-    expect(getFailureCount(p)).toBe(0)
-    expect(h.tmuxUnresponsive.holds(p)).toBe(false)
-    expect(conditionStartedLines(h, p)).toEqual([])
-    expect(h.latchEvents).toEqual([])
-    expect(h.notices).toEqual([])
-    const unreadable = h.errors.filter((line) => line.includes(`persona=${p} is working and its pane shows an idle screen, but`))
-    expect(unreadable).toHaveLength(1)
-    expect(unreadable[0]).toContain('reading its agent-director row failed: ')
-  })
-
-  test('regression: ErrSpawnNotFound at the transcript get of checkWorkingRowPane reads the row as absent: unreadable, defer, one line naming ErrSpawnNotFound; nothing latches', async () => {
-    const { h, p } = srj105Build()
-    h.script({ getError: errSpawnNotFound() })
-
-    expect(await checkWorkingRowPane(p, IDLE_PANE, { persona: harnessPersona(h, p) })).toBe('defer')
-
-    expect(hasPendingWorkingRowEvidence(p)).toBe(false)
-    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({}))
-    expect(h.latchEvents).toEqual([])
-    const unreadable = h.errors.filter((line) => line.includes(`persona=${p} is working and its pane shows an idle screen, but`))
-    expect(unreadable).toHaveLength(1)
-    expect(unreadable[0]).toContain(ErrSpawnNotFound.name)
-    expect(unreadable[0]).not.toContain('reading its agent-director row failed: ')
-  })
-
-  // A sweep is no read verb: of READ_ERRORS the UNAVAILABLE forms are a
-  // refusal there with the UNAVAILABLE cause; the UNCLASSIFIED ones are a
-  // refusal with the UNCLASSIFIED cause (b.jg5 SRJ-313's describe below).
-  const sweepCross = SRJ105_UNAVAILABLE.flatMap(([what, make, kind]) => SWEEP_SITES.map((site) => [what, site.name, make, kind, site] as const))
-  test.each(sweepCross)('%s at %s: the attempt stops there: no resume, kill, delete, launch, notice or spawn-failed entry, refused and never counted, and P\'s condition is not started; B launches', async (_what, _site, make, kind, site) => {
-    const { h, p } = await expectRefusedAt(site, make(site.verb), kind)
-    // Both launches (the start pass's and launchSession's) were refused at this sweep.
-    const refusedAt = `[slack] ${site.logPrefix}: findMissing sweep refused for ${renderPersonaRef(p, p)}: `
-    expect(refusalLines(h, p).map((line) => line.startsWith(refusedAt))).toEqual([true, true])
-    expect(h.tmuxUnresponsive.holds(p)).toBe(false)
-    expect(conditionStartedLines(h, p)).toEqual([])
-  })
-
-  // The UNCLASSIFIED read errors at this sweep are refused (b.jg5 SRJ-313's
-  // describe below); an UNUSABLE NAME answer is still no refusal there, and,
-  // the sweep being no verb on P's own row, latches no one (b.jg5 SRJ-512).
-  test('contrast: an UNUSABLE NAME answer at the before-resume sweep is no refusal and latches no one: logged, and the resume goes on', async () => {
-    const { h, p } = srj105Build()
-    h.script({ ...SWEEP_SITES[0]!.script(h, harnessPersona(h, p), errUnusableName()) })
-
-    expect(await h.launch(p)).toEqual({ key: p, action: 'resumed' })
-
-    expect(h.stub.calls.findMissingCalls).toHaveLength(1)
-    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, sendKeys: 1, resume: 1 }))
-    expect(h.errors.filter((line) => line.startsWith(`[slack] spawnForPersona: before resume: findMissing sweep failed for ${renderPersonaRef(p, p)}: `) && line.endsWith(' — proceeding'))).toHaveLength(1)
-    expect(refusalLines(h, p)).toEqual([])
-    // No refusal arm: only the resume's own pending-only watch (b.jg5 SRJ-409).
-    expectOnlyPendingRowWatch(h, p)
-    expect(h.triggers).toHaveLength(1)
-    expect(h.unclassifiedErrorOpen(p)).toBe(false)
-    expect(h.latch.isLatched(p)).toBe(false)
-    expect(h.latchEvents).toEqual([])
-  })
-
-  test.each<[string, (h: RecoveryHarness, persona: Persona) => RecoveryStubScript, ((h: RecoveryHarness) => void) | undefined, SpawnPersonaResult['action'], Partial<LaunchVerbCalls>]>([
-    ['the collision get (the row went away: one retry spawn)', () => ({ spawnQueue: [cannedErr(errInstanceIdCollision())], getError: errSpawnNotFound() }), undefined, 'spawned', { spawn: 2 }],
-    // b.jg5 SRJ-605: at the working-row wait's reads the row is absent: a dead
-    // session, recovered by the resume (no tmux probe decides it).
-    ['the working-row wait\'s poll status (an absent row: dead session, resumed)', (h, p) => ({ ...collided(h, p, { state: 'working' }), statusError: errSpawnNotFound() }), fastPolls, 'resumed', { spawn: 1, resume: 1 }],
-    ['the working-row wait\'s timeout status (an absent row: dead session, resumed)', (h, p) => ({ ...collided(h, p, { state: 'working' }), statusError: errSpawnNotFound() }), deadlineAtStart, 'resumed', { spawn: 1, resume: 1 }],
-    [
-      // b.jg5 SRJ-712: the reuse of an id with no row is an ordinary fresh spawn (SRJ-112); nothing is deleted.
-      'the ErrJsonlMissing diagnosis get (the row went away: inconclusive, then the reuse spawn)',
-      (h, p) => jsonlMissingDiagnosisGets(h, p, cannedErr(errSpawnNotFound())),
-      undefined,
-      'fresh-after-inconclusive-amnesia',
-      { spawn: 2, resume: 1 },
-    ],
-  ])('regression: ErrSpawnNotFound at %s keeps its meaning; nothing is refused', async (_site, script, setup, action, calls) => {
-    const { h, p } = srj105Build()
-    setup?.(h)
-    h.script(script(h, harnessPersona(h, p)))
-
-    expect(await h.launch(p)).toEqual({ key: p, action })
-
-    expect(ladderCallsMade(h)).toEqual(ladderCallsOf(calls))
-    expect(refusalLines(h, p)).toEqual([])
-    // No refusal arm: only the launch's own pending-only watch (b.jg5 SRJ-409).
-    expectOnlyPendingRowWatch(h, p)
-    expect(h.triggers).toHaveLength(1)
-  })
-
-  // The refusal cases' "no notice, no inconclusive entry" is only evidence if
-  // the harness captures that notice and entry: ErrSpawnNotFound at the
-  // diagnosis get (the row read as absent, b.jg5 SRJ-114) still posts the one
-  // inconclusive notice and writes the one jsonl-diagnosis-inconclusive
-  // entry, both naming ErrSpawnNotFound, and latches nothing.
-  test('regression: ErrSpawnNotFound at the ErrJsonlMissing diagnosis get still posts the inconclusive notice and writes the jsonl-diagnosis-inconclusive entry the harness captures, both naming the absent row\'s ErrSpawnNotFound; nothing latches', async () => {
-    const { h, p } = srj105Build()
-    h.script(jsonlMissingDiagnosisGets(h, harnessPersona(h, p), cannedErr(errSpawnNotFound())))
-
-    expect(await h.launch(p)).toEqual({ key: p, action: 'fresh-after-inconclusive-amnesia' })
-
-    expect(h.notices.filter((n) => n.key === p && n.text.includes(ErrSpawnNotFound.name))).toHaveLength(1)
-    expect(onlyStartupEntry(h.startupErrors().join('\n'), JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toContain(ErrSpawnNotFound.name)
-    expect(countStartupEntries(h.startupErrors().join('\n'), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
-    expect(h.latchEvents).toEqual([])
   })
 })
 
@@ -17885,7 +13407,6 @@ describe('b.jg5 SRJ-704, SRJ-1007, SRJ-702: the kill-failure alert at the live-r
     const survivor = survivorErr()
     scriptLiveRowElsewhere(h, p, { killQueue: [cannedErr(survivor)], statusQueue: [cannedOk(cannedStatusResult({ state: 'ended' }))] })
     await launchThroughSequence(h, p)
-    await h.runApproverToStop(p)
 
     const err = errTmuxKillFailed(undefined, 'no-session-no-kill')
     // Only a dead reading that read no row (ErrSystemInstallDisappeared) leads
@@ -18337,7 +13858,6 @@ describe('b.jg5 SRJ-704, SRJ-1016: the shared own-row status and get reads end P
     expect(h.episodeNotices).toEqual([alert])
     expect(killFailureLines(h, p)).toEqual([...openLines, killFailureEndedLine(p, reason)])
 
-    await h.runApproverToStop(p)
     // State 4 no longer applies: the message reads P's row and reports a later state.
     await expectLostMessageReports(h, p, 'auto-restart-disabled')
 
@@ -18586,49 +14106,6 @@ const SRJ311_ENVIRONMENT: ReadonlyArray<readonly [string, (verb: string) => Erro
   ['ErrTmuxNotAvailable (not the tmux server the agent was launched on)', (verb) => errTmuxNotAvailableDifferentServer(undefined, verb), tmuxServerChangedOnset()],
 ]
 
-describe('b.jg5 SRJ-311: ENVIRONMENT (ErrTmuxNotAvailable) at the collision ladder and the reconnect is a refusal, and at the working-row wait no refusal: never destructive, never counted, one tmux-unavailable onset', () => {
-  afterEach(srj105AfterEach)
-
-  const destructiveCross = SRJ311_ENVIRONMENT.flatMap(([what, make, text]) =>
-    ACTION_SITES.map((site) => [what, site.name, make, text, site] as const),
-  )
-  test.each(destructiveCross)('b.jg5 SRJ-311: %s at %s: nothing destructive after it, never dead-session, no notice or spawn-failed entry, refused and never counted, one tmux-unavailable onset, P\'s condition not started; B launches', async (_what, _site, make, text, site) => {
-    const { h, p } = await expectRefusedAt(site, make(site.verb), UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT, text)
-    expect(h.tmuxUnresponsive.holds(p)).toBe(false)
-    expect(conditionStartedLines(h, p)).toEqual([])
-  })
-
-  const readCross = SRJ311_ENVIRONMENT.flatMap(([what, make, text]) => READ_SITES.map((site) => [what, site.name, make, text, site] as const))
-  test.each(readCross)('b.jg5 SRJ-311: %s at %s: no read-pane of P\'s row, no delete, kill, launch, notice, inconclusive entry or dead-session, refused and never counted, one tmux-unavailable onset, P\'s condition not started; B launches', async (_what, _site, make, text, site) => {
-    const { h, p } = await expectRefusedAt(site, make(site.verb), UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT, text)
-    expect(h.stub.calls.readPaneCalls.filter((c) => c.instance_id === personaInstanceId(p))).toEqual([])
-    expect(h.tmuxUnresponsive.holds(p)).toBe(false)
-    expect(conditionStartedLines(h, p)).toEqual([])
-    expect(countStartupEntries(h.startupErrors().join('\n'), JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toBe(0)
-  })
-
-  // b.jg5 SRJ-605: at the working-row wait's `status` reads ENVIRONMENT is
-  // no refusal: nothing is typed for it, no dead-session, no spawn-failed
-  // entry; the wait polls on, or ends not reconnected at its timeout read,
-  // and the launch answers its outcome; the onset is posted once.
-  const waitCross = SRJ311_ENVIRONMENT.flatMap(([what, make, text]) => WAIT_STATUS_SITES.map((site) => [what, site.name, make, text, site] as const))
-  test.each(waitCross)('b.jg5 SRJ-311, SRJ-605: %s at %s: the launch answers the wait\'s outcome, never failed or refused; nothing typed for it, no tmux probe, no delete, kill, resume, spawn-failure notice, spawn-failed entry or dead-session; P armed with the ENVIRONMENT cause, never counted, one tmux-unavailable onset, P\'s condition not started; B launches', async (_what, _site, make, text, site) => {
-    const { h, p } = await expectWaitGoesOnAt(site, make(site.verb), AD_ERROR_CLASS_ENVIRONMENT, UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT, text)
-    expect(h.tmuxUnresponsive.holds(p)).toBe(false)
-    expect(conditionStartedLines(h, p)).toEqual([])
-  })
-
-  const sweepCross = SRJ311_ENVIRONMENT.flatMap(([what, make, text]) => SWEEP_SITES.map((site) => [what, site.name, make, text, site] as const))
-  test.each(sweepCross)('b.jg5 SRJ-311: %s at %s: the sweep is refused and the attempt stops there: no resume, kill, delete, launch, notice or spawn-failed entry, refused and never counted, one tmux-unavailable onset; B launches', async (_what, _site, make, text, site) => {
-    const { h, p } = await expectRefusedAt(site, make(site.verb), UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT, text)
-    // Both launches (the start pass's and launchSession's) were refused at this sweep.
-    const refusedAt = `[slack] ${site.logPrefix}: findMissing sweep refused for ${renderPersonaRef(p, p)}: `
-    expect(refusalLines(h, p).map((line) => line.startsWith(refusedAt))).toEqual([true, true])
-    expect(h.tmuxUnresponsive.holds(p)).toBe(false)
-    expect(conditionStartedLines(h, p)).toEqual([])
-  })
-})
-
 // ---------------------------------------------------------------------------
 // b.jg5 SRJ-105's CONFIG row, SRJ-316: a CONFIG answer (`ErrConfigMalformed`)
 // at the collision ladder, the reconnect, the working-row wait and the
@@ -18647,68 +14124,6 @@ describe('b.jg5 SRJ-311: ENVIRONMENT (ErrTmuxNotAvailable) at the collision ladd
 // writes no inconclusive entry. The working-row wait's `status` reads are no
 // refusal (b.jg5 SRJ-605, `expectWaitGoesOnAt`).
 // ---------------------------------------------------------------------------
-
-describe('b.jg5 SRJ-105, SRJ-316: a CONFIG answer (ErrConfigMalformed) at the collision ladder, the reconnect and the findMissing sweeps is a refusal, and at the working-row wait no refusal: no action, never counted, never dead, P\'s timer armed with the CONFIG cause, one ad-config-malformed onset', () => {
-  afterEach(srj105AfterEach)
-
-  /**
-   * What every CONFIG refusal adds to `expectRefusedAt`'s checks: P holds the
-   * `ad-config-malformed` flag only, its condition was never started, every
-   * outage notice was P's onset (one per raise, each with its raise line; a
-   * later launch's successful wrapped call may clear the flag and post the
-   * all-clear before its own CONFIG raises it again), and B holds no flag.
-   */
-  function expectConfigOutageOnly(h: RecoveryHarness, p: string, onset: string): void {
-    const [, b] = h.keys as [string, string]
-    expect([...getOutageFlags(p)]).toEqual(['ad-config-malformed'])
-    expect([...getOutageFlags(b)]).toEqual([])
-    expect(h.tmuxUnresponsive.holds(p)).toBe(false)
-    expect(conditionStartedLines(h, p)).toEqual([])
-    expect(h.outageNotices.every((n) => n.key === p)).toBe(true)
-    const onsets = h.outageNotices.filter((n) => n.text === onset)
-    expect(onsets.length).toBeGreaterThanOrEqual(1)
-    expect(adConfigMalformedRaiseLines(h, p)).toHaveLength(onsets.length)
-    expect(adConfigMalformedRaiseLines(h, b)).toEqual([])
-  }
-
-  test.each(ACTION_SITES.map((site) => [site.name, site] as const))('b.jg5 SRJ-105, SRJ-316: CONFIG at %s: nothing destructive after it, never dead-session, no notice or spawn-failed entry, refused and never counted, P armed with the CONFIG cause, one ad-config-malformed onset, P\'s condition not started; B launches', async (_name, site) => {
-    const err = errConfigMalformed()
-    const onset = adConfigMalformedOnset(err)
-    const { h, p } = await expectRefusedAt(site, err, UNAVAILABLE_RETRY_CAUSE_CONFIG, onset, 'ad-config-malformed')
-    expectConfigOutageOnly(h, p, onset)
-  })
-
-  test.each(READ_SITES.map((site) => [site.name, site] as const))('b.jg5 SRJ-105, SRJ-114, SRJ-115, SRJ-316: CONFIG at %s: no read-pane of P\'s row, no delete, kill, launch, notice, inconclusive entry or dead-session, refused and never counted, P armed with the CONFIG cause, one ad-config-malformed onset; B launches', async (_name, site) => {
-    const err = errConfigMalformed()
-    const onset = adConfigMalformedOnset(err)
-    const { h, p } = await expectRefusedAt(site, err, UNAVAILABLE_RETRY_CAUSE_CONFIG, onset, 'ad-config-malformed')
-    expect(h.stub.calls.readPaneCalls.filter((c) => c.instance_id === personaInstanceId(p))).toEqual([])
-    expect(countStartupEntries(h.startupErrors().join('\n'), JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toBe(0)
-    expectConfigOutageOnly(h, p, onset)
-  })
-
-  // b.jg5 SRJ-605: at the working-row wait's `status` reads CONFIG is no
-  // refusal: the wait polls on, or ends not reconnected at its timeout read,
-  // and the launch answers its outcome; each onset has its raise line.
-  test.each(WAIT_STATUS_SITES.map((site) => [site.name, site] as const))('b.jg5 SRJ-316, SRJ-605: CONFIG at %s: the launch answers the wait\'s outcome, never failed or refused; no tmux probe, delete, kill, resume, spawn-failure notice, spawn-failed entry or dead-session; P armed with the CONFIG cause, never counted, its ad-config-malformed onset first and once, P\'s condition not started; B launches', async (_name, site) => {
-    const err = errConfigMalformed()
-    const onset = adConfigMalformedOnset(err)
-    const { h, p } = await expectWaitGoesOnAt(site, err, AD_ERROR_CLASS_CONFIG, UNAVAILABLE_RETRY_CAUSE_CONFIG, onset, 'ad-config-malformed')
-    expect(h.tmuxUnresponsive.holds(p)).toBe(false)
-    expect(conditionStartedLines(h, p)).toEqual([])
-    expect(adConfigMalformedRaiseLines(h, p)).toHaveLength(h.outageNotices.filter((n) => n.key === p && n.text === onset).length)
-  })
-
-  test.each(SWEEP_SITES.map((site) => [site.name, site] as const))('b.jg5 SRJ-105, SRJ-316: CONFIG at %s: the sweep is refused and the attempt stops there: no resume, kill, delete, launch, notice or spawn-failed entry, refused and never counted, P armed with the CONFIG cause, one ad-config-malformed onset; B launches', async (_name, site) => {
-    const err = errConfigMalformed()
-    const onset = adConfigMalformedOnset(err)
-    const { h, p } = await expectRefusedAt(site, err, UNAVAILABLE_RETRY_CAUSE_CONFIG, onset, 'ad-config-malformed')
-    // Both launches (the start pass's and launchSession's) were refused at this sweep.
-    const refusedAt = `[slack] ${site.logPrefix}: findMissing sweep refused for ${renderPersonaRef(p, p)}: `
-    expect(refusalLines(h, p).map((line) => line.startsWith(refusedAt))).toEqual([true, true])
-    expectConfigOutageOnly(h, p, onset)
-  })
-})
 
 // ---------------------------------------------------------------------------
 // b.jg5 SRJ-105's UNCLASSIFIED row, SRJ-313: an UNCLASSIFIED outcome at the
@@ -18753,161 +14168,6 @@ const SRJ313_SWEEP_UNCLASSIFIED: ReadonlyArray<readonly [string, (verb: string) 
   ['an UNCLASSIFIED read error (ErrTimeout)', (verb) => errGeneric(verb, 'ErrTimeout')],
   ['a store that cannot be opened (ErrSchemaMismatch)', () => errSchemaMismatch()],
 ]
-
-describe('b.jg5 SRJ-105, SRJ-313: an UNCLASSIFIED outcome at the collision ladder, the reconnect and the findMissing sweeps is a refusal, and at the working-row wait no refusal: no step follows, never counted, never dead, P\'s timer armed, reported once to P\'s unclassified-error episode', () => {
-  afterEach(srj105AfterEach)
-
-  /**
-   * What every UNCLASSIFIED refusal adds to `expectRefusedAt`'s checks: P's
-   * condition was never started; `err` was reported to P's unclassified-error
-   * episode (one started line, quoting the classifier's rendering of it, for
-   * both launches) and the episode is open with no alert posted; B's episode
-   * never began.
-   */
-  function expectReportedToEpisode(h: RecoveryHarness, p: string, err: unknown): void {
-    const [, b] = h.keys as [string, string]
-    expect(h.tmuxUnresponsive.holds(p)).toBe(false)
-    expect(conditionStartedLines(h, p)).toEqual([])
-    expect(unclassifiedStartedLines(h, p)).toEqual([unclassifiedStartedLine(p, err)])
-    expect(h.unclassifiedErrorOpen(p)).toBe(true)
-    expect(h.unclassifiedErrorOpen(b)).toBe(false)
-    expect(unclassifiedStartedLines(h, b)).toEqual([])
-    expect(h.episodeNotices).toEqual([])
-  }
-
-  const actionCross = SRJ313_UNCLASSIFIED.flatMap(([what, make]) => ACTION_SITES.map((site) => [what, site.name, make, site] as const))
-  test.each(actionCross)('b.jg5 SRJ-313: %s at %s: no kill, delete or launch after it, never dead-session, no notice or spawn-failed entry, refused and never counted, P armed with the UNCLASSIFIED cause, reported once to P\'s episode, P\'s condition not started; B launches', async (_what, _site, make, site) => {
-    const err = make(site.verb)
-    const { h, p } = await expectRefusedAt(site, err, UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED)
-    expectReportedToEpisode(h, p, err)
-  })
-
-  test.each(ACTION_SITES.map((site) => [site.name, site] as const))('b.jg5 SRJ-104, SRJ-313: ErrSystemInstallDisappeared at %s: refused as any UNCLASSIFIED outcome (nothing after it, never counted, P armed with the UNCLASSIFIED cause, reported once to P\'s episode), and P\'s ad-unreachable is raised with one onset; B launches', async (_name, site) => {
-    const err = errSystemInstallDisappeared(site.verb)
-    const { h, p } = await expectRefusedAt(site, err, UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED, ONSET_TEMPLATES['ad-unreachable'](err.binaryPath), 'ad-unreachable')
-    expectReportedToEpisode(h, p, err)
-  })
-
-  test.each(READ_SITES.map((site) => [site.name, site] as const))('b.jg5 SRJ-105, SRJ-313: an ErrInternal at %s keeps the read-error outcome (no read-pane of P\'s row, no delete, kill, launch, notice, inconclusive entry or dead-session, refused and never counted, P armed with the read-error cause) and is reported once to P\'s episode; B launches', async (_name, site) => {
-    const err = errInternal()
-    const { h, p } = await expectRefusedAt(site, err, UNAVAILABLE_RETRY_CAUSE_READ_ERROR)
-    expect(h.stub.calls.readPaneCalls.filter((c) => c.instance_id === personaInstanceId(p))).toEqual([])
-    expect(countStartupEntries(h.startupErrors().join('\n'), JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toBe(0)
-    expectReportedToEpisode(h, p, err)
-  })
-
-  // b.jg5 SRJ-605: at the working-row wait's `status` reads an ErrInternal,
-  // and ErrSystemInstallDisappeared (raising ad-unreachable), are no refusal:
-  // the wait polls on, or ends not reconnected at its timeout read, and the
-  // launch answers its outcome, never failed (AC 69, AC 77); P's timer is
-  // armed with the read-error cause and the outcome reported once to P's
-  // episode.
-  test.each(WAIT_STATUS_SITES.map((site) => [site.name, site] as const))('b.jg5 SRJ-313, SRJ-605: an ErrInternal at %s: the launch answers the wait\'s outcome, never failed or refused; no tmux probe, delete, kill, resume, spawn-failure notice, spawn-failed entry or dead-session; P armed with the read-error cause, never counted, reported once to P\'s episode; B launches', async (_name, site) => {
-    const err = errInternal()
-    const { h, p } = await expectWaitGoesOnAt(site, err, AD_ERROR_CLASS_UNCLASSIFIED, UNAVAILABLE_RETRY_CAUSE_READ_ERROR)
-    expectReportedToEpisode(h, p, err)
-  })
-
-  test.each(WAIT_STATUS_SITES.map((site) => [site.name, site] as const))('b.jg5 SRJ-104, SRJ-605: ErrSystemInstallDisappeared at %s: the launch answers the wait\'s outcome, never failed or refused, and never reaches recordFailure (launchSession true, the count 0); P\'s ad-unreachable raised with one onset; P armed with the read-error cause, reported once to P\'s episode; B launches', async (_name, site) => {
-    const err = errSystemInstallDisappeared(site.verb)
-    const { h, p } = await expectWaitGoesOnAt(site, err, AD_ERROR_CLASS_UNCLASSIFIED, UNAVAILABLE_RETRY_CAUSE_READ_ERROR, ONSET_TEMPLATES['ad-unreachable'](err.binaryPath), 'ad-unreachable')
-    expectReportedToEpisode(h, p, err)
-  })
-
-  const sweepCross = SRJ313_SWEEP_UNCLASSIFIED.flatMap(([what, make]) => SWEEP_SITES.map((site) => [what, site.name, make, site] as const))
-  test.each(sweepCross)('b.jg5 SRJ-105, SRJ-313: %s at %s: the sweep is refused and the attempt stops there: no resume, kill, delete, launch, notice or spawn-failed entry, refused and never counted, P armed with the UNCLASSIFIED cause, reported once to P\'s episode; B launches', async (_what, _site, make, site) => {
-    const err = make(site.verb)
-    const { h, p } = await expectRefusedAt(site, err, UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED)
-    // Both launches (the start pass's and launchSession's) were refused at this sweep.
-    const refusedAt = `[slack] ${site.logPrefix}: findMissing sweep refused for ${renderPersonaRef(p, p)}: `
-    expect(refusalLines(h, p).map((line) => line.startsWith(refusedAt))).toEqual([true, true])
-    expectReportedToEpisode(h, p, err)
-  })
-
-  test.each(SRJ105_UNAVAILABLE)('contrast: an UNAVAILABLE outcome (%s) at the first spawn is refused but never reported to P\'s unclassified-error episode', async (_what, make, kind) => {
-    const { h, p } = await expectRefusedAt(SPAWN_AND_RESUME_SITES[0]!, make('spawn'), kind)
-    expect(unclassifiedStartedLines(h, p)).toEqual([])
-    expect(h.unclassifiedErrorOpen(p)).toBe(false)
-  })
-
-  test('outside a launch or recovery attempt nothing is reported or armed: the persona teardown\'s kill (killPersonaInstance) answering an ErrInternal answers its UNCLASSIFIED outcome carrying it (b.jg5 SRJ-701: never rethrown), quietly, and begins no episode', async () => {
-    const { h, p } = srj105Build()
-    const err = errInternal()
-    h.script({ killError: err })
-
-    expect(await killPersonaInstance(p, { context: KILL_CONTEXT_TEARDOWN })).toEqual({ kind: KILL_OUTCOME_NOT_KILLED, errorClass: AD_ERROR_CLASS_UNCLASSIFIED, error: err })
-
-    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ kill: 1 }))
-    expect(h.errors).toEqual([])
-    expect(h.notices).toEqual([])
-    expect(h.triggers).toEqual([])
-    expect(h.controller.isArmed(p)).toBe(false)
-    expect(unclassifiedStartedLines(h, p)).toEqual([])
-    expect(h.unclassifiedErrorOpen(p)).toBe(false)
-  })
-
-  // The exact count, over recording sinks installed as `main()` installs the
-  // real ones (`initOutageState`'s trigger and unclassified sinks): each
-  // UNCLASSIFIED outcome in a launch is handed to the unclassified sink once
-  // (by the reporting point, which leaves the classification to the sink) and
-  // arms the timer once.
-  describe('each UNCLASSIFIED outcome in a launch is reported once and arms once (recording sinks)', () => {
-    /** Each site, the cause it arms, whether resume is enabled, and the stub answers that make C's launch meet `err` there. */
-    const ONCE_SITES: ReadonlyArray<readonly [string, string, boolean, (cfg: PersonaConfig, err: Error) => StubClientOptions]> = [
-      ['the first spawn', UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED, true, (_cfg, err) => ({ spawnError: err })],
-      ['the resume of an ended row', UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED, true, (cfg, err) => ({
-        spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
-        getResult: personaRow(cfg, 'C', { state: 'ended' }),
-        resumeError: err,
-      })],
-      // b.jg5 SRJ-707, SRJ-112 (AC 69): the replace step's reuse spawn of a finished row.
-      ['the reuse spawn of a replacement (resume_enabled false)', UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED, false, (cfg, err) => ({
-        spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision()), cannedErr<import('agent-director').SpawnResult>(err)],
-        getResult: personaRow(cfg, 'C', { state: 'ended' }),
-      })],
-      ['the reconnect of a waiting row', UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED, true, (cfg, err) => ({
-        spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
-        getResult: personaRow(cfg, 'C', { state: 'waiting' }),
-        sendKeysError: err,
-      })],
-      ['the before-resume sweep of a waiting row\'s dead session', UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED, true, (cfg, err) => ({
-        spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
-        getResult: personaRow(cfg, 'C', { state: 'waiting' }),
-        sendKeysError: errSpawnNotInteractive('send-keys'),
-        findMissingError: err,
-      })],
-      ['the collision get (a read: the read-error cause)', UNAVAILABLE_RETRY_CAUSE_READ_ERROR, true, (_cfg, err) => ({
-        spawnQueue: [cannedErr<import('agent-director').SpawnResult>(errInstanceIdCollision())],
-        getError: err,
-      })],
-    ]
-
-    test.each(ONCE_SITES)('b.jg5 SRJ-313: an ErrInternal at %s is handed to the unclassified sink exactly once, as thrown, and arms C once (%s); the launch is refused with no notice', async (_site, kind, resumeEnabled, script) => {
-      captureStartupErrors()
-      const reports: Array<{ key: string; error: unknown; classification: unknown }> = []
-      const armed: Array<{ key: string; kind: string }> = []
-      initOutageState({
-        getClient,
-        notify: (key, text) => { outageEmissions.push({ key, text }) },
-        triggerSink: { arm: (key, cause) => { armed.push({ key, kind: cause.kind }); return true } },
-        unclassifiedSink: { report: (key, error, classification) => { reports.push({ key, error, classification }) } },
-      })
-      const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { resume_enabled: resumeEnabled })
-      const err = errInternal()
-      installStub(script(cfg, err))
-
-      let result: Awaited<ReturnType<typeof spawnForPersona>> | undefined
-      await withCapturedErr(async () => {
-        result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
-      })
-
-      expect(result).toStrictEqual({ key: 'C', action: SPAWN_ACTION_RETRYING })
-      expect(reports).toEqual([{ key: 'C', error: err, classification: undefined }])
-      expect(armed).toEqual([{ key: 'C', kind }])
-      expect(notices).toEqual([])
-    })
-  })
-})
 
 // ---------------------------------------------------------------------------
 // b.jg5 SRJ-301, SRJ-105: a persona that joins another's in-flight shared
@@ -18974,210 +14234,6 @@ describe('b.jg5 SRJ-301, SRJ-105: a persona that joins another\'s in-flight shar
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-401 (hatch A2; SRJ-301, SRJ-307, SRJ-311, SRJ-313, SRJ-316), with
-// SRJ-404's class rules (SRJ-117, SRJ-118, SRJ-501, SRJ-512): the dialog
-// approver's calls are outside P's launch attempt
-//
-// The approver runs after its launch call returned, on its own, so none of
-// its calls is part of P's launch or recovery attempt. E10's SRJ-105
-// regression rows for its `read-pane` and `send-keys` ran it inside the
-// attempt; they are here, with its `status`. An UNAVAILABLE or UNCLASSIFIED
-// answer to any of the three is logged once per lap and the approver polls
-// on within B, its next lap at the slow pace after an UNAVAILABLE answer
-// (backing off) and at the 1 s pace after an UNCLASSIFIED one: the launch
-// result is the launch's own, nothing destructive follows, nothing is counted
-// or refused, and no retry timer is armed, no `tmux-unresponsive` condition is
-// started and no unclassified-error episode is opened (an UNAVAILABLE
-// answer's `tmux-unresponsive` start and arming, and an UNCLASSIFIED answer's
-// arming and episode, belong to an attempt); another persona Q's timer, armed
-// before P's launch, keeps its view. Its ENVIRONMENT and CONFIG answers still
-// raise their outages and arm P's retry timer with their cause, as from any
-// verb; ENVIRONMENT then stops the approver (`tmux-unavailable`), uncounted,
-// while CONFIG keeps it polling (its stop at B is covered by the
-// ladder-level describe of the approver's stops). The approver's CONFLICT and
-// UNUSABLE NAME rows are tests/conflict-latch.test.ts's. The approver runs on
-// the recovery harness's clock: `settle()` lets its first lap's calls be
-// made, and `advance` its second, under a cap above both.
-// ---------------------------------------------------------------------------
-
-/** A call of the dialog approver: its verb, the stub answers that make every lap meet `err` there, and the pane reads and Enters one lap makes. */
-interface ApproverCallSite {
-  readonly name: string
-  readonly verb: 'status' | 'read-pane' | 'send-keys'
-  script(err: Error): RecoveryStubScript
-  readonly paneReadsPerLap: number
-  readonly entersPerLap: number
-  /** The line the approver logs for `err` there, for persona ref `ref`. */
-  line(ref: string, err: Error): string
-}
-
-const APPROVER_CALL_SITES: readonly ApproverCallSite[] = [
-  {
-    name: 'the dialog approver\'s status read',
-    verb: 'status',
-    script: (err) => ({ statusError: err }),
-    paneReadsPerLap: 0,
-    entersPerLap: 0,
-    line: (ref, err) => approverLogLine(approverStatusRefusedMessage(ref, describeAdFailureForLog(err))),
-  },
-  {
-    name: 'the dialog approver\'s pane read',
-    verb: 'read-pane',
-    script: (err) => ({ statusResult: cannedStatusResult({ state: 'pending' }), readPaneError: err }),
-    paneReadsPerLap: 1,
-    entersPerLap: 0,
-    line: (ref, err) => approverLogLine(approverPaneCallFailedMessage(ref, 'read-pane', describeAdFailureForLog(err))),
-  },
-  {
-    name: 'the dialog approver\'s Enter on a dialog',
-    verb: 'send-keys',
-    script: (err) => ({ statusResult: cannedStatusResult({ state: 'pending' }), getResult: cannedGetResult({ instance_id: 'cscb_test_bot_1', state: 'pending' }), readPaneResults: [cannedReadPaneResult(TRUST_DIALOG_PANE)], sendKeysError: err }),
-    paneReadsPerLap: 2,
-    entersPerLap: 1,
-    line: (ref, err) => approverLogLine(approverPaneCallFailedMessage(ref, 'send-keys', describeAdFailureForLog(err))),
-  },
-]
-
-/** The answers that arm nothing outside an attempt: E4's UNAVAILABLE forms (`ErrTmuxUnresponsive` included), which back off, and the UNCLASSIFIED ones, which keep the pace; with whether the answer backs off. */
-const APPROVER_UNARMED_ANSWERS: ReadonlyArray<readonly [string, (verb: string) => Error, boolean]> = [
-  ...SRJ105_UNAVAILABLE.map(([what, make]) => [`${what} (UNAVAILABLE)`, make, true] as const),
-  ...SRJ313_UNCLASSIFIED.map(([what, make]) => [`${what} (UNCLASSIFIED)`, make, false] as const),
-  ['an UNCLASSIFIED read error (ErrTimeout)', (verb) => errGeneric(verb, 'ErrTimeout'), false],
-]
-
-/** An answer raised and armed from any verb: ENVIRONMENT or CONFIG. */
-interface ApproverRaisedAnswer {
-  readonly what: string
-  make(verb: string): Error
-  /** The cause P's timer is armed with. */
-  readonly kind: string
-  /** The outage it raises, and that outage's onset for `err`. */
-  readonly outage: OutageClass
-  onset(err: Error): string
-  /** The approver's one line for `err` at `site`, for persona ref `ref`. */
-  line(site: ApproverCallSite, ref: string, err: Error): string
-  /** The approver's stop at that lap; `undefined` when it polls on. */
-  readonly stop: ApproverStopReason | undefined
-}
-
-/** ENVIRONMENT stops the approver (b.jg5 SRJ-311, SRJ-404); CONFIG keeps it polling, as its UNAVAILABLE column (SRJ-316). */
-const APPROVER_RAISED_ANSWERS: readonly ApproverRaisedAnswer[] = [
-  ...SRJ311_ENVIRONMENT.map(([what, make, text]): ApproverRaisedAnswer => ({
-    what,
-    make,
-    kind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT,
-    outage: 'tmux-unavailable',
-    onset: () => text,
-    line: (site, ref, err) => approverLogLine(approverTmuxUnavailableMessage(ref, site.verb, describeAdFailureForLog(err))),
-    stop: APPROVER_STOP_TMUX_UNAVAILABLE,
-  })),
-  {
-    what: 'a CONFIG answer (ErrConfigMalformed)',
-    make: () => errConfigMalformed(),
-    kind: UNAVAILABLE_RETRY_CAUSE_CONFIG,
-    outage: 'ad-config-malformed',
-    onset: (err) => adConfigMalformedOnset(err),
-    line: (site, ref, err) => site.line(ref, err),
-    stop: undefined,
-  },
-]
-
-describe('b.jg5 SRJ-401, SRJ-404, SRJ-105, SRJ-311, SRJ-313, SRJ-316, SRJ-501, SRJ-512: the dialog approver\'s calls are outside P\'s launch attempt', () => {
-  afterEach(srj105AfterEach)
-
-  const unarmedCross = APPROVER_UNARMED_ANSWERS.flatMap(([what, make, backsOff]) =>
-    APPROVER_CALL_SITES.map((site) => [site.name, what, make, backsOff, site] as const),
-  )
-  test.each(unarmedCross)('%s answering %s keeps the launch\'s outcome (spawned), logged once per lap while the approver polls on, its next lap after 5 s when the answer is UNAVAILABLE and after 1 s otherwise; no kill, delete, resume, notice or spawn-failed entry, never refused or counted; no trigger or retry timer, no tmux-unresponsive condition, no unclassified-error episode; another persona Q\'s armed timer keeps its view', async (_site, _what, make, backsOff, site) => {
-    const { h, p, b } = srj105Build({ approverCapMs: 2 * DIALOG_SLOW_POLL_INTERVAL_MS, personas: [{}, {}, {}] })
-    const q = h.keys[2]!
-    // Q's timer is armed first, with a cause no approver answer gives.
-    h.controller.arm(q, { kind: UNAVAILABLE_RETRY_CAUSE_KILL_FAILED })
-    const qView = h.controller.view(q)
-    const err = make(site.verb)
-    h.script(site.script(err))
-
-    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'spawned' })
-    // The approver's first lap, then the 1 s pace: a second lap there only when the answer does not back off.
-    await h.settle()
-    await h.advance(DIALOG_POLL_INTERVAL_MS)
-    expect(h.stub.calls.statusCalls).toHaveLength(backsOff ? 1 : 2)
-    // Backing off: the second lap comes at the slow pace from the first.
-    if (backsOff) await h.advance(DIALOG_SLOW_POLL_INTERVAL_MS - DIALOG_POLL_INTERVAL_MS)
-
-    expect(h.approverRunning(p)).toBe(true)
-    expect(h.stub.calls.statusCalls).toHaveLength(2)
-    expect(h.stub.calls.readPaneCalls).toHaveLength(2 * site.paneReadsPerLap)
-    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, sendKeys: 2 * site.entersPerLap }))
-    expect(h.errors.filter((line) => line === site.line(renderPersonaRef(p, p), err))).toHaveLength(2)
-    expect(h.notices).toEqual([])
-    expect(h.outageNotices).toEqual([])
-    expect([...getOutageFlags(p)]).toEqual([])
-    expect(countStartupEntries(h.startupErrors().join('\n'), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
-    expect(refusalLines(h, p)).toEqual([])
-    expect(getFailureCount(p)).toBe(0)
-    // Outside the attempt: nothing armed, started or opened but the launch's
-    // own pending-only watch (b.jg5 SRJ-409), and Q's timer as it was.
-    expectOnlyPendingRowWatch(h, p)
-    expect(h.triggers).toHaveLength(1)
-    expect(h.controller.armedKeys()).toEqual([q, p])
-    expect(h.controller.view(q)).toEqual(qView)
-    expect(h.tmuxUnresponsive.holds(p)).toBe(false)
-    expect(conditionStartedLines(h, p)).toEqual([])
-    expect(unclassifiedStartedLines(h, p)).toEqual([])
-    expect(h.unclassifiedErrorOpen(p)).toBe(false)
-    expect(h.episodeNotices).toEqual([])
-    expect(h.latchEvents).toEqual([])
-    expect(h.approverRunning(b)).toBe(false)
-  })
-
-  const raisedCross = APPROVER_RAISED_ANSWERS.flatMap((answer) => APPROVER_CALL_SITES.map((site) => [site.name, answer.what, answer, site] as const))
-  test.each(raisedCross)('%s answering %s raises it as from any verb: P\'s outage raised with one onset and P\'s timer armed once with its cause; ENVIRONMENT stops the approver at that lap (tmux-unavailable), CONFIG keeps it polling; the launch keeps its outcome (spawned), never refused or counted; no kill, delete, resume or notice; no tmux-unresponsive condition, no unclassified-error episode', async (_site, _what, answer, site) => {
-    const { h, p, b } = srj105Build()
-    const err = answer.make(site.verb)
-    h.script(site.script(err))
-
-    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'spawned' })
-    // The approver's first lap only.
-    await h.settle()
-
-    if (answer.stop === undefined) {
-      expect(h.approverRunning(p)).toBe(true)
-    } else {
-      expect(h.approverRunning(p)).toBe(false)
-      expect(await _whenDialogApproverStopped(p)).toEqual({
-        reason: answer.stop,
-        launchStartMs: site.verb === 'status' ? undefined : SAMPLE_LAUNCH_START_MS,
-      })
-    }
-    expect(h.stub.calls.statusCalls).toHaveLength(1)
-    expect(h.stub.calls.readPaneCalls).toHaveLength(site.paneReadsPerLap)
-    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, sendKeys: site.entersPerLap }))
-    const ref = renderPersonaRef(p, p)
-    expect(h.errors.filter((line) => line.startsWith(APPROVER_LOG_PREFIX) && line.includes(ref))).toEqual([answer.line(site, ref, err)])
-    expect([...getOutageFlags(p)]).toEqual([answer.outage])
-    expect(h.outageNotices).toEqual([{ key: p, text: answer.onset(err) }])
-    expect(adConfigMalformedRaiseLines(h, p)).toHaveLength(answer.outage === 'ad-config-malformed' ? 1 : 0)
-    // The launch's pending-only watch, the answer's cause (which promotes the
-    // timer to full mode), and, when the answer stopped the approver with the
-    // row still pending, the stop's pending-only arm (b.jg5 SRJ-409, SRJ-404).
-    const stopArm = answer.stop === undefined ? [] : [pendingRowTrigger(p)]
-    expect(h.triggers).toEqual([pendingRowTrigger(p), { key: p, kind: answer.kind }, ...stopArm])
-    expect(h.controller.view(p)).toMatchObject({ mode: UNAVAILABLE_RETRY_MODE_FULL, causes: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW, answer.kind] })
-    expect(getFailureCount(p)).toBe(0)
-    expect(refusalLines(h, p)).toEqual([])
-    expect(h.notices).toEqual([])
-    expect(countStartupEntries(h.startupErrors().join('\n'), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
-    expect(h.tmuxUnresponsive.holds(p)).toBe(false)
-    expect(conditionStartedLines(h, p)).toEqual([])
-    expect(unclassifiedStartedLines(h, p)).toEqual([])
-    expect(h.unclassifiedErrorOpen(p)).toBe(false)
-    expect(h.latchEvents).toEqual([])
-    expect([...getOutageFlags(b)]).toEqual([])
-  })
-})
-
-// ---------------------------------------------------------------------------
 // b.jg5 SRJ-105's CONFLICT row, SRJ-501, SRJ-502, SRJ-111, SRJ-113, SRJ-1015:
 // a CONFLICT at every spawn and resume of the collision ladder latches the
 // persona, and a latched persona is launched by no path (AC 7's unit half,
@@ -19223,7 +14279,6 @@ function statusAnswering(state: LatchRowState): RecoveryStubScript {
   if (state.kind === LATCH_ROW_STATE_KIND_READ) return { statusResult: cannedStatusResult({ state: state.state as RecoveryRowState }) }
   return { statusError: errTmuxUnresponsive('status') }
 }
-
 
 /**
  * The latch row state a read of the row a plain spawn's CONFLICT left gives
@@ -19914,9 +14969,6 @@ describe('b.jg5 SRJ-501, SRJ-502: the session manager\'s latch install', () => {
 const WORKING_READ = latchRowStateRead('working')
 
 /** The working-row verdict's one read of P's row (`workingReconnectVerdict` in `src/server.ts`, b.jg5 SRJ-603): full, the row read `working`. */
-function workingVerdictRead(): PersonaPaneReadRequest {
-  return { nLines: FULL_PANE_READ_LINES, lastRead: WORKING_READ, site: 'reconnectSession' }
-}
 
 /** A get site of SRJ-114 that P's launch reaches. */
 interface NoteSite {
@@ -19944,21 +14996,7 @@ const NOTE_SITES: readonly NoteSite[] = [
     plain: { action: 'fresh-after-inconclusive-amnesia', calls: ladderCallsOf({ spawn: 2, resume: 1 }) },
     latched: { calls: ladderCallsOf({ spawn: 1, resume: 1 }), gets: 2, statusReads: 0, rowState: ENDED_READ },
   },
-  {
-    // The wait's first poll reads working and its pane idle, so it reads the
-    // transcript; every later poll reads waiting.
-    name: 'the transcript get of the working-row wait (an idle pane; the next status reads waiting)',
-    setup: fastPolls,
-    script: (h, p, noted) => ({
-      spawnQueue: [cannedErr(errInstanceIdCollision())],
-      getQueue: [cannedOk(harnessRow(h, p, { state: 'working' })), cannedOk(harnessRow(h, p, { state: 'working' })), cannedOk(harnessRow(h, p, { state: 'working', ...noted }))],
-      statusQueue: [cannedOk(cannedStatusResult({ state: 'working' }))],
-      statusResult: cannedStatusResult({ state: 'waiting' }),
-      readPaneResults: [cannedReadPaneResult(IDLE_PANE)],
-    }),
-    plain: { action: 'reconnected', calls: ladderCallsOf({ spawn: 1, sendKeys: 2 }) },
-    latched: { calls: ladderCallsOf({ spawn: 1 }), gets: 3, statusReads: 1, rowState: WORKING_READ },
-  },
+
 ]
 
 /** The CONFLICT notice a note latch posts for persona `key`: "conflicting labels", the session `slack_bot_<key>`, no description line. */
@@ -20041,29 +15079,6 @@ const NOT_A_CONFIGURED_OWN_ROW: ReadonlyArray<readonly [string, (h: RecoveryHarn
       return {}
     },
   ],
-]
-
-/**
- * The working-row wait's calls, in order, for a row that reads `working`
- * with an idle pane: the up-front findMissing sweep, the status poll, the
- * pane read and the transcript `get`. The launch reaches the wait through
- * the collision ladder (`spawn`, then the collision `get`).
- */
-const WAIT_CALLS = ['findMissing', 'status', 'get', 'readPane', 'get'] as const
-const LADDER_CALLS_BEFORE_WAIT = ['spawn', 'get'] as const
-
-/** Each of the wait's calls by name, with its place in `WAIT_CALLS`. */
-const WAIT_CALL_KINDS: ReadonlyArray<readonly [string, number]> = [
-  ['the up-front findMissing sweep', 0],
-  ['the status poll', 1],
-  ['the pane read', 2],
-  ['the transcript get', 3],
-]
-
-/** How the wait is entered: directly, or through the launch's collision ladder. */
-const WAIT_ENTRIES: ReadonlyArray<readonly [string, typeof LADDER_CALLS_BEFORE_WAIT | readonly []]> = [
-  ['waitForWaitingAndReconnect', []],
-  ['the collision ladder\'s launch', LADDER_CALLS_BEFORE_WAIT],
 ]
 
 /** The record a latch set elsewhere gives P: a case, P's bring-up and the working row. */
@@ -20210,83 +15225,6 @@ describe('b.jg5 SRJ-114, SRJ-501, SRJ-502: a provenance_conflict note on a confi
     expectNoteLatchedOnce(h, p, ENDED_READ)
   })
 
-  test('the restart path\'s working-row check (checkWorkingRowPane) whose transcript get reads the note on P\'s own row answers defer: P latched once with the row read working; nothing typed, pending or posted but the one CONFLICT notice; the next check\'s read (the working-row verdict\'s read-pane) is not made and posts nothing', async () => {
-    const { h, p } = srj105Build()
-    const persona = harnessPersona(h, p)
-    h.script({ getResult: harnessRow(h, persona, { state: 'working', liveness_note: provenanceNote }) })
-
-    expect(await checkWorkingRowPane(p, IDLE_PANE, { persona })).toBe('defer')
-
-    expect(h.stub.calls.getCalls).toHaveLength(1)
-    expect(h.stub.calls.readPaneCalls).toEqual([])
-    expect(hasPendingWorkingRowEvidence(p)).toBe(false)
-    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({}))
-    expectNoteLatchedOnce(h, p, WORKING_READ)
-
-    // b.jg5 SRJ-603: the next check starts with the verdict's one read, which a latched P never makes.
-    expect(await readPersonaOwnPane(p, workingVerdictRead())).toStrictEqual(PANE_READ_NOT_READ_LATCHED)
-    expect(h.stub.calls.getCalls).toHaveLength(1)
-    expect(h.stub.calls.readPaneCalls).toEqual([])
-    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({}))
-    expect(h.latchEvents).toHaveLength(ONE_LATCH_STEPS.length)
-    expect(h.episodeNotices).toHaveLength(1)
-    expect(h.notices).toEqual([])
-  })
-
-  test.each(SAMPLE_PLAIN_NOTES)('the restart path\'s working-row check, %s on P\'s own row: today\'s reading (an idle screen and an ended transcript start the evidence: defer, pending); nothing latched', async (_label, note) => {
-    const { h, p } = srj105Build()
-    const persona = harnessPersona(h, p)
-    h.script({ getResult: harnessRow(h, persona, { state: 'working', ...transcriptOf().fields, liveness_note: note }) })
-
-    expect(await checkWorkingRowPane(p, IDLE_PANE, { persona })).toBe('defer')
-
-    expect(hasPendingWorkingRowEvidence(p)).toBe(true)
-    expectNoNoteLatch(h)
-  })
-
-  // b.jg5 SRJ-502: the wait asks after each of its agent-director calls
-  // whether P is latched, so a persona latched elsewhere while it waits (no
-  // note on any row it reads) ends the wait there. The harness's latch is
-  // read-only, so the case installs a latch of its own, as main() installs
-  // one, and sets P on it from the stub during one of the wait's calls, as
-  // another path would.
-  const waitCross = WAIT_ENTRIES.flatMap(([entry, before]) => WAIT_CALL_KINDS.map(([kind, at]) => [entry, kind, before, at] as const))
-  test.each(waitCross)('%s: P latched elsewhere during %s of the working-row wait (no note on the row) ends the wait latched: no further call, nothing typed, no not-connected notice; the latch keeps the record set elsewhere', async (_entry, _kind, before, at) => {
-    const { h, p } = srj105Build()
-    fastPolls(h)
-    const persona = harnessPersona(h, p)
-    const elsewhere = createConflictLatch({ log: () => {} })
-    setConflictLatch(elsewhere)
-    h.script({
-      spawnQueue: [cannedErr(errInstanceIdCollision())],
-      getResult: harnessRow(h, persona, { state: 'working' }),
-      statusResult: cannedStatusResult({ state: 'working' }),
-      readPaneResults: [cannedReadPaneResult(IDLE_PANE)],
-    })
-    const latchedAt = before.length + at
-    const order = recordCallOrder(h, {
-      at: latchedAt,
-      run: () => {
-        elsewhere.set(p, LATCHED_ELSEWHERE)
-      },
-    })
-
-    if (before.length === 0) {
-      expect(await waitForWaitingAndReconnect(p, h.config)).toBe(WAIT_OUTCOME_LATCHED)
-    } else {
-      expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
-    }
-
-    // The call during which P latched is the last call made.
-    expect(order).toEqual([...before, ...WAIT_CALLS.slice(0, at + 1)])
-    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: before.length === 0 ? 0 : 1 }))
-    expect(h.notices).toEqual([])
-    expect(waitLatchedLines(h)).toHaveLength(1)
-    expect(elsewhere.record(p)).toStrictEqual({ ...LATCHED_ELSEWHERE, sessionName: personaTmuxSessionName(p) })
-    expect(hasPendingWorkingRowEvidence(p)).toBe(false)
-    expect(getFailureCount(p)).toBe(0)
-    expect(h.controller.isArmed(p)).toBe(false)
-  })
 })
 
 // ---------------------------------------------------------------------------
@@ -21335,31 +16273,6 @@ describe('b.jg5 SRJ-120, SRJ-502: a persona latched by a run\'s get stops its ca
     expect(clock.pendingCount()).toBe(0)
   })
 
-  test.each(WAIT_ENTRIES)('the working-row wait entered by %s: its up-front run lists P\'s own row and the get reads the note: the wait ends latched with nothing typed, no status read and no not-connected notice', async (_entry, before) => {
-    const { h, p } = srj105Build()
-    fastPolls(h)
-    const persona = harnessPersona(h, p)
-    const noted = cannedOk(harnessRow(h, persona, { state: 'working', liveness_note: provenanceNote }))
-    h.script({
-      spawnQueue: [cannedErr(errInstanceIdCollision())],
-      getQueue: before.length === 0 ? [noted] : [cannedOk(harnessRow(h, persona, { state: 'working' })), noted],
-      statusResult: cannedStatusResult({ state: 'working' }),
-      readPaneResults: [cannedReadPaneResult(IDLE_PANE)],
-      findMissingResult: unverifiedRowsOf(p),
-    })
-    const order = recordCallOrder(h)
-
-    if (before.length === 0) {
-      expect(await waitForWaitingAndReconnect(p, h.config)).toBe(WAIT_OUTCOME_LATCHED)
-    } else {
-      expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
-    }
-
-    expect(order).toEqual([...before, 'findMissing', 'get'])
-    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: before.length === 0 ? 0 : 1 }))
-    expect(waitLatchedLines(h)).toHaveLength(1)
-    expectNoteLatchedOnce(h, p, WORKING_READ)
-  })
 })
 
 // ---------------------------------------------------------------------------
@@ -21761,128 +16674,7 @@ describe('b.jg5 SRJ-502, SRJ-1014: the latched gate logs one latched-launch-skip
   })
 })
 
-/** How the working-row wait's evidence read is reached: directly, or through the launch's collision ladder. */
-const PANE_WAIT_CROSS = WAIT_ENTRIES.flatMap(([entry, before]) => unusableNameRowsAt('read-pane').map((row) => [entry, row.fault, before, row] as const))
-
-describe('b.jg5 SRJ-117, SRJ-512, SRJ-502: an UNUSABLE NAME answer at a working-pane read latches the persona with the state its caller last read; nothing is typed', () => {
-  afterEach(srj105AfterEach)
-
-  test.each(PANE_WAIT_CROSS)('the working-row wait entered by %s, its evidence pane read answering UNUSABLE NAME (%s): P latched with the state its poll read (working); the wait ends latched with no further call, though the next poll would read waiting; nothing typed, no not-connected notice', async (_entry, _fault, before, row) => {
-    const { h, p, b } = srj105Build()
-    fastPolls(h)
-    const script: RecoveryStubScript = {
-      spawnQueue: [cannedErr(errInstanceIdCollision())],
-      getResult: harnessRow(h, harnessPersona(h, p), { state: 'working' }),
-      statusQueue: [cannedOk(cannedStatusResult({ state: 'working' }))],
-      statusResult: cannedStatusResult({ state: 'waiting' }),
-      readPaneError: row.build(),
-    }
-    h.script(script)
-    const order = recordCallOrder(h)
-
-    if (before.length === 0) {
-      expect(await waitForWaitingAndReconnect(p, h.config)).toBe(WAIT_OUTCOME_LATCHED)
-    } else {
-      expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
-    }
-
-    expect(order).toEqual([...before, 'findMissing', 'status', 'get', 'readPane'])
-    expect(h.stub.calls.readPaneCalls).toEqual([paneReadOf(p)])
-    expect(waitLatchedLines(h)).toHaveLength(1)
-    expect(hasPendingWorkingRowEvidence(p)).toBe(false)
-    expectLatchedOnce(h, p, unusableNameLatch(p, row, WORKING_READ))
-
-    if (before.length > 0) await expectLaunchedByNoPath(h, p, b, script)
-  })
-
-  // b.jg5 SRJ-603: the working row's pane is read once, by the verdict
-  // (`workingReconnectVerdict`), whose UNUSABLE NAME cell (P latched with the
-  // row read working, nothing typed, no deferral noted) is in
-  // tests/server.test.ts. The fold on that pane reads none of its own, so an
-  // UNUSABLE NAME a read-pane would answer is never met there.
-  test.each(unusableNameRowsAt('read-pane').map((row) => [row.fault, row] as const))('the restart path\'s working-row check (checkWorkingRowPane) on the verdict\'s pane, with a read-pane that would answer UNUSABLE NAME (%s): no read-pane (only the transcript get of the idle pane); nothing latched, posted or typed', async (_fault, row) => {
-    const { h, p } = srj105Build()
-    h.script({ readPaneError: row.build() })
-    const order = recordCallOrder(h)
-
-    expect(await checkWorkingRowPane(p, IDLE_PANE, { persona: harnessPersona(h, p) })).toBe('defer')
-
-    expect(order).toEqual(['get'])
-    expect(h.stub.calls.readPaneCalls).toEqual([])
-    expect(unusableNameLinesOf(h, p)).toEqual([])
-    expect(h.errors.filter((line) => line.includes(`persona=${p} is working and is latched`))).toEqual([])
-    expectNoNoteLatch(h)
-    expect(h.notices).toEqual([])
-  })
-
-  test.each(unusableNameRowsAt('get').map((row) => [row.fault, row] as const))('the restart path\'s working-row check (checkWorkingRowPane), its transcript get after the verdict\'s idle pane answering UNUSABLE NAME (%s): defer, P latched with the state unreadable; the get the only call; nothing typed, no evidence pending, no notice', async (_fault, row) => {
-    const { h, p } = srj105Build()
-    h.script({ getError: row.build() })
-    const order = recordCallOrder(h)
-
-    expect(await checkWorkingRowPane(p, IDLE_PANE, { persona: harnessPersona(h, p) })).toBe('defer')
-
-    expect(order).toEqual(['get'])
-    expect(hasPendingWorkingRowEvidence(p)).toBe(false)
-    expectLatchedOnce(h, p, unusableNameLatch(p, row, LATCH_ROW_STATE_UNREADABLE))
-  })
-
-  test.each(unusableNameRowsAt('read-pane').map((row) => [row.fault, row] as const))('the restart path\'s waiting-row check (checkWaitingRowPane), its pane read answering UNUSABLE NAME (%s): defer, never reconnect; P latched with the row read waiting; nothing typed, no notice', async (_fault, row) => {
-    const { h, p } = srj105Build()
-    h.script({ readPaneError: row.build() })
-    const order = recordCallOrder(h)
-
-    expect(await checkWaitingRowPane(p)).toBe('defer')
-
-    expect(order).toEqual(['readPane'])
-    expect(h.errors.filter((line) => line.startsWith(`[slack] reconnectSession: persona=${p} is waiting and is latched — deferring; nothing typed`))).toHaveLength(1)
-    expectLatchedOnce(h, p, unusableNameLatch(p, row, WAITING_READ))
-  })
-})
-
-// ---------------------------------------------------------------------------
-// b.jg5 SRJ-117 (with SRJ-501, SRJ-502, SRJ-512; E18): the shared read-pane
-// of a persona's own row (`readPersonaOwnPane`), which `readWorkingPane`
-// calls for the launch wait's evidence read and `checkWaitingRowPane`, and
-// the working-row verdict in `src/server.ts` calls for the pane
-// `checkWorkingRowPane` folds.
-//
-// One read is exactly one `read-pane` of `cscb_<key>` with the line count it
-// is given (`FULL_PANE_READ_LINES` at a full read), and no other verb
-// (`recordCallOrder`). A pane,
-// GONE, absent, UNAVAILABLE, UNCLASSIFIED, ENVIRONMENT (which raises P's
-// `tmux-unavailable` once, in the wrapper) and CONFIG (which raises P's
-// `ad-config-malformed` once and is never GONE) are returned unchanged, with
-// the classifier's class and the redacted description, and latch nothing.
-// A CONFLICT, each liveness pane row of the case table
-// (`LIVENESS_PANE_CONFLICT_CASE_ROWS`) with its site's recorded state,
-// latches P once through the latch's CONFLICT entry with "P's next check or
-// recovery" and that state, posts one notice after the holds and makes no
-// further call; an UNUSABLE NAME answer (each fault) latches P through the
-// unusable-name entry with the refused operation "none" and the state given.
-// A P already latched is not read. Controls: with no latch installed, or a
-// latch whose set throws, CONFLICT and UNUSABLE NAME still answer latched
-// and the reader never throws; another persona's reads and latch are
-// untouched. At `readWorkingPane`'s two callers, a CONFLICT of the site's
-// rows latches P with the site's state and nothing is typed:
-// `checkWaitingRowPane` defers, the launch wait ends latched;
-// `checkWorkingRowPane` on the verdict's pane reads none. Every case runs
-// on `makeRecoveryHarness` (the real latch installed as `main()` installs
-// it, a recording notice sink); `srj105AfterEach` runs `assertNoLeak` over
-// what it captured, and the file's `afterEach` clears the latch install and
-// the session notifier.
-// ---------------------------------------------------------------------------
-
-/** The site label the direct cases give the shared reader. */
-const PANE_READ_TEST_SITE = 'paneReadTest'
-
-/** The site label `readWorkingPane` gives the shared reader (its callers' reads). */
-const READ_WORKING_PANE_SITE = 'readWorkingPane'
-
 /** A full read of P's own row by the direct cases, recording `lastRead` on a latch. */
-function fullPaneRead(lastRead: LatchRowState): PersonaPaneReadRequest {
-  return { nLines: FULL_PANE_READ_LINES, lastRead, site: PANE_READ_TEST_SITE }
-}
 
 /** The SRJ each latch kind's reader line cites. */
 const PANE_LATCH_SRJ = { 'CONFLICT': 'SRJ-501', 'UNUSABLE NAME': 'SRJ-512' } as const
@@ -21898,11 +16690,6 @@ function paneReadLatchLinesOf(lines: readonly string[], key: string, kind: PaneL
       line.includes(` — ${kind}: `) &&
       line.endsWith(`; nothing is typed and nothing more is called for it (b.jg5 SRJ-105, ${PANE_LATCH_SRJ[kind]})`),
   )
-}
-
-/** Every latch line the shared reader logged, at any site, for any persona. */
-function allPaneReadLatchLines(h: RecoveryHarness): string[] {
-  return h.errors.filter((line) => line.includes(': pane read refused for persona='))
 }
 
 /**
@@ -21925,29 +16712,11 @@ function paneUnusableNameLatch(p: string, row: UnusableNameCaseRow, rowState: La
   }
 }
 
-/** The failure outcome the reader answers for `err` of `kind`: the class given and the redacting describer's text. */
-function paneFailure(kind: string, errorClass: string, err: unknown): OwnPaneReadOutcome {
-  return { kind, errorClass, description: describeAdFailureForLog(err) } as OwnPaneReadOutcome
-}
-
-/** The latched outcome the reader answers for a latching `err` of `kind`: the answer kept as its cause. */
-function paneLatchedBy(kind: string, errorClass: string, err: unknown): OwnPaneReadOutcome {
-  return { kind: PANE_READ_LATCHED, cause: { kind, errorClass, description: describeAdFailureForLog(err), error: err } } as OwnPaneReadOutcome
-}
-
 /**
  * One read and nothing else: `order` (every stub verb, `recordCallOrder`)
  * holds only P's `readPane`, made with the full-read count; nothing latched,
  * posted or logged as a latch.
  */
-function expectOneQuietRead(h: RecoveryHarness, order: readonly string[], p: string): void {
-  expect(order).toEqual(['readPane'])
-  expect(h.stub.calls.readPaneCalls).toEqual([paneReadOf(p)])
-  expect(h.stub.callCount()).toBe(1)
-  expectNoNoteLatch(h)
-  expect(h.notices).toEqual([])
-  expect(allPaneReadLatchLines(h)).toEqual([])
-}
 
 /** The stub's UNAVAILABLE forms a `read-pane` can answer (every one but the kill-only `ErrTmuxKillFailed`). */
 const PANE_UNAVAILABLE_FORMS = UNAVAILABLE_FORMS.filter(([, , cause]) => cause !== UNAVAILABLE_RETRY_CAUSE_KILL_FAILED)
@@ -21958,9 +16727,6 @@ const TMUX_UNAVAILABLE_CLASS: OutageClass = 'tmux-unavailable'
 /** The outage class a CONFIG answer raises (b.jg5 SRJ-316). */
 const AD_CONFIG_MALFORMED_CLASS: OutageClass = 'ad-config-malformed'
 
-/** The liveness pane row of the case table each control takes: the first. */
-const FIRST_LIVENESS_PANE_ROW = LIVENESS_PANE_CONFLICT_CASE_ROWS[0]!
-
 /** The UNUSABLE NAME row of the `read-pane` site kind for each fault the stub builds. */
 const PANE_UNUSABLE_NAME_ROWS = UNUSABLE_NAME_FAULTS.map((fault) => {
   const row = unusableNameRowsAt('read-pane').find((r) => r.fault === fault)
@@ -21968,543 +16734,12 @@ const PANE_UNUSABLE_NAME_ROWS = UNUSABLE_NAME_FAULTS.map((fault) => {
   return row
 })
 
-/** The two answers the reader latches on, each with a builder, its kind, its class and its line's kind. */
-const PANE_LATCHING_ANSWERS: ReadonlyArray<readonly [string, () => Error, string, string, PaneLatchKind]> = [
-  ['a CONFLICT', () => FIRST_LIVENESS_PANE_ROW.build(), PANE_READ_CONFLICT, AD_ERROR_CLASS_CONFLICT, 'CONFLICT'],
-  ['an UNUSABLE NAME', () => PANE_UNUSABLE_NAME_ROWS[0]!.build(), PANE_READ_UNUSABLE_NAME, AD_ERROR_CLASS_UNUSABLE_NAME, 'UNUSABLE NAME'],
-]
-
-describe('b.jg5 SRJ-117, SRJ-501, SRJ-502, SRJ-512: the shared read-pane of a persona\'s own row (readPersonaOwnPane): one read-pane, every outcome but CONFLICT and UNUSABLE NAME returned unchanged, and those two latch the persona', () => {
-  afterEach(srj105AfterEach)
-
-  test('a pane: one read-pane of P\'s own row with the full-read line count, answered as the pane; no other verb; nothing latched or posted', async () => {
-    const { h, p } = srj105Build()
-    h.script({ readPaneResults: [cannedReadPaneResult(IDLE_PANE)] })
-    const order = recordCallOrder(h)
-
-    expect(await readPersonaOwnPane(p, fullPaneRead(WORKING_READ))).toStrictEqual({ kind: PANE_READ_PANE, pane: IDLE_PANE })
-
-    expectOneQuietRead(h, order, p)
-  })
-
-  test.each<[string, () => Error, string, string]>([
-    ['GONE (ErrTmuxCaptureFailed)', () => errTmuxCaptureFailed(), PANE_READ_GONE, AD_ERROR_CLASS_GONE],
-    ['the row absent (ErrSpawnNotFound)', () => errSpawnNotFound(), PANE_READ_ABSENT, AD_ERROR_CLASS_STATE],
-    ['UNCLASSIFIED: an ErrInternal not naming the recorded tmux session name', () => errInternal(), PANE_READ_UNCLASSIFIED, AD_ERROR_CLASS_UNCLASSIFIED],
-    ['UNCLASSIFIED: a name CSCB gives no handling (ErrNotHandled)', () => errGeneric('read-pane', 'ErrNotHandled'), PANE_READ_UNCLASSIFIED, AD_ERROR_CLASS_UNCLASSIFIED],
-    ['UNCLASSIFIED: a store that cannot be opened (ErrSchemaMismatch)', () => errSchemaMismatch(), PANE_READ_UNCLASSIFIED, AD_ERROR_CLASS_UNCLASSIFIED],
-    ['UNCLASSIFIED: ErrSystemInstallDisappeared', () => errSystemInstallDisappeared('read-pane'), PANE_READ_UNCLASSIFIED, AD_ERROR_CLASS_UNCLASSIFIED],
-    ['UNCLASSIFIED: a STATE name other than ErrSpawnNotFound (ErrSpawnNotInteractive)', () => errSpawnNotInteractive('read-pane'), PANE_READ_UNCLASSIFIED, AD_ERROR_CLASS_STATE],
-    ['UNCLASSIFIED: a LAUNCH FAILURE name (ErrTmuxSessionCreate)', () => errTmuxSessionCreate('read-pane'), PANE_READ_UNCLASSIFIED, AD_ERROR_CLASS_LAUNCH_FAILURE],
-  ])('%s: returned unchanged, with the classifier\'s class and the redacted description; one read-pane and nothing else; nothing latched or posted', async (_label, build, kind, errorClass) => {
-    const { h, p } = srj105Build()
-    const err = build()
-    h.script({ readPaneError: err })
-    const order = recordCallOrder(h)
-
-    expect(await readPersonaOwnPane(p, fullPaneRead(WORKING_READ))).toStrictEqual(paneFailure(kind, errorClass, err))
-
-    expectOneQuietRead(h, order, p)
-  })
-
-  test.each(PANE_UNAVAILABLE_FORMS)('UNAVAILABLE (%s): returned unchanged as UNAVAILABLE; one read-pane and nothing else; no outage raised, nothing latched or posted', async (_label, make) => {
-    const { h, p } = srj105Build()
-    const err = make('read-pane')
-    h.script({ readPaneError: err })
-    const order = recordCallOrder(h)
-
-    expect(await readPersonaOwnPane(p, fullPaneRead(WORKING_READ))).toStrictEqual(paneFailure(PANE_READ_UNAVAILABLE, AD_ERROR_CLASS_UNAVAILABLE, err))
-
-    expectOneQuietRead(h, order, p)
-    expect([...getOutageFlags(p)]).toEqual([])
-    expect(h.outageNotices).toEqual([])
-  })
-
-  test.each(SRJ311_ENVIRONMENT.map(([what, make, onset]) => [what, make, onset] as const))('ENVIRONMENT (%s): returned unchanged as ENVIRONMENT; P\'s tmux-unavailable raised once with its onset, B\'s untouched; one read-pane and nothing else; nothing latched', async (_what, make, onset) => {
-    const { h, p, b } = srj105Build()
-    const err = make('read-pane')
-    h.script({ readPaneError: err })
-    const order = recordCallOrder(h)
-
-    expect(await readPersonaOwnPane(p, fullPaneRead(WORKING_READ))).toStrictEqual(paneFailure(PANE_READ_ENVIRONMENT, AD_ERROR_CLASS_ENVIRONMENT, err))
-
-    expectOneQuietRead(h, order, p)
-    expect([...getOutageFlags(p)]).toEqual([TMUX_UNAVAILABLE_CLASS])
-    expect([...getOutageFlags(b)]).toEqual([])
-    expect(h.outageNotices).toEqual([{ key: p, text: onset }])
-  })
-
-  test('CONFIG (ErrConfigMalformed): returned unchanged as CONFIG, never GONE; P\'s ad-config-malformed raised once with its onset and one raise line, B\'s untouched; one read-pane and nothing else; nothing latched', async () => {
-    const { h, p, b } = srj105Build()
-    const err = errConfigMalformed()
-    h.script({ readPaneError: err })
-    const order = recordCallOrder(h)
-
-    const read = await readPersonaOwnPane(p, fullPaneRead(WORKING_READ))
-
-    expect(read).toStrictEqual(paneFailure(PANE_READ_CONFIG, AD_ERROR_CLASS_CONFIG, err))
-    expect(read.kind).not.toBe(PANE_READ_GONE)
-    expectOneQuietRead(h, order, p)
-    expect([...getOutageFlags(p)]).toEqual([AD_CONFIG_MALFORMED_CLASS])
-    expect([...getOutageFlags(b)]).toEqual([])
-    expect(h.outageNotices).toEqual([{ key: p, text: adConfigMalformedOnset(err) }])
-    expect(adConfigMalformedRaiseLines(h, p)).toHaveLength(1)
-  })
-
-  test.each(LIVENESS_PANE_CONFLICT_CASE_ROWS.map((row) => [row.name, row] as const))('CONFLICT at %s: answered latched with the CONFLICT as its cause; P latched once through the CONFLICT entry with the row\'s case, "P\'s next check or recovery" and the site\'s recorded state; one notice after the holds; that read is the only call; a later read of P makes no call; B is not latched', async (_name, row) => {
-    const { h, p, b } = srj105Build()
-    const err = row.build()
-    h.script({ readPaneError: err })
-    const order = recordCallOrder(h)
-
-    expect(await readPersonaOwnPane(p, fullPaneRead(row.rowState))).toStrictEqual({
-      kind: PANE_READ_LATCHED,
-      cause: { kind: PANE_READ_CONFLICT, errorClass: AD_ERROR_CLASS_CONFLICT, description: describeAdFailureForLog(err), error: err },
-    })
-
-    expect(order).toEqual(['readPane'])
-    expect(h.stub.calls.readPaneCalls).toEqual([paneReadOf(p)])
-    expectLatchedOnce(h, p, paneConflictLatch(p, row, PANE_READ_TEST_SITE))
-    expect(h.latch.record(p)?.refusedOperation).toBe(REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY)
-    expect(h.latch.record(p)?.rowState).toEqual(row.rowState)
-
-    // Latched now: the next read of P is not made, and nothing more is set or posted.
-    expect(await readPersonaOwnPane(p, fullPaneRead(row.rowState))).toStrictEqual(PANE_READ_NOT_READ_LATCHED)
-    expect(order).toEqual(['readPane'])
-    expect(h.latchEvents).toHaveLength(ONE_LATCH_STEPS.length)
-    expect(h.episodeNotices).toHaveLength(1)
-    expect(h.latch.isLatched(b)).toBe(false)
-  })
-
-  const unusableCross = PANE_UNUSABLE_NAME_ROWS.flatMap((row) =>
-    [WORKING_READ, WAITING_READ].map((lastRead) => [row.fault, describeLatchRowState(lastRead), row, lastRead] as const),
-  )
-  test.each(unusableCross)('UNUSABLE NAME (%s) with the state last read %s: answered latched with it as its cause; P latched once through the unusable-name entry, refused operation "none" and that state; one SRJ-1019 post; that read is the only call; a later read makes no call', async (_fault, _state, row, lastRead) => {
-    const { h, p } = srj105Build()
-    const err = row.build()
-    h.script({ readPaneError: err })
-    const order = recordCallOrder(h)
-
-    expect(await readPersonaOwnPane(p, fullPaneRead(lastRead))).toStrictEqual({
-      kind: PANE_READ_LATCHED,
-      cause: { kind: PANE_READ_UNUSABLE_NAME, errorClass: AD_ERROR_CLASS_UNUSABLE_NAME, description: describeAdFailureForLog(err), error: err },
-    })
-
-    expect(order).toEqual(['readPane'])
-    expectLatchedOnce(h, p, paneUnusableNameLatch(p, row, lastRead, PANE_READ_TEST_SITE))
-    expect(h.latch.record(p)?.refusedOperation).toBe(REFUSED_OPERATION_NONE)
-
-    expect(await readPersonaOwnPane(p, fullPaneRead(lastRead))).toStrictEqual(PANE_READ_NOT_READ_LATCHED)
-    expect(order).toEqual(['readPane'])
-    expect(h.latchEvents).toHaveLength(ONE_LATCH_STEPS.length)
-  })
-
-  test('a P already latched (elsewhere): no read-pane call and no other call, answered latched with no cause; nothing set or posted; B\'s read is made as before', async () => {
-    const { h, p, b } = srj105Build()
-    const elsewhere = installLatchElsewhere()
-    elsewhere.latch.set(p, LATCHED_ELSEWHERE)
-    h.script({ readPaneResults: [cannedReadPaneResult(IDLE_PANE)] })
-    const order = recordCallOrder(h)
-
-    expect(await readPersonaOwnPane(p, fullPaneRead(WORKING_READ))).toStrictEqual(PANE_READ_NOT_READ_LATCHED)
-
-    expect(order).toEqual([])
-    expect(h.stub.callCount()).toBe(0)
-    expect(allPaneReadLatchLines(h)).toEqual([])
-    expectLatchedElsewhereOnly(h, p, elsewhere)
-
-    expect(await readPersonaOwnPane(b, fullPaneRead(WORKING_READ))).toStrictEqual({ kind: PANE_READ_PANE, pane: IDLE_PANE })
-    expect(h.stub.calls.readPaneCalls).toEqual([paneReadOf(b)])
-    expect(elsewhere.latch.isLatched(b)).toBe(false)
-  })
-
-  test('an installed latch whose latched query throws is taken as latched: no call, answered latched with no cause, and the reader does not throw', async () => {
-    const { h, p } = srj105Build()
-    setConflictLatch({
-      isLatched: () => {
-        throw new Error('latch query broken')
-      },
-      record: () => undefined,
-      set: () => CONFLICT_LATCH_SET_LATCHED,
-      setFromConflict: () => undefined,
-    })
-    const order = recordCallOrder(h)
-
-    expect(await readPersonaOwnPane(p, fullPaneRead(WORKING_READ))).toStrictEqual(PANE_READ_NOT_READ_LATCHED)
-
-    expect(order).toEqual([])
-    expect(allPaneReadLatchLines(h)).toEqual([])
-  })
-
-  test.each(PANE_LATCHING_ANSWERS)('control: with no latch installed, %s still answers latched with it as its cause and latches nothing; its one line says no latch is installed; nothing posted; the next read is made again', async (_what, build, kind, errorClass, lineKind) => {
-    const { h, p } = srj105Build()
-    setConflictLatch(undefined)
-    const err = build()
-    h.script({ readPaneError: err })
-    const order = recordCallOrder(h)
-
-    expect(await readPersonaOwnPane(p, fullPaneRead(WORKING_READ))).toStrictEqual(paneLatchedBy(kind, errorClass, err))
-
-    expect(order).toEqual(['readPane'])
-    expect(h.latch.isLatched(p)).toBe(false)
-    expect(h.latchEvents).toEqual([])
-    expect(h.episodeNotices).toEqual([])
-    expect(h.notices).toEqual([])
-    const lines = paneReadLatchLinesOf(h.errors, p, lineKind, PANE_READ_TEST_SITE)
-    expect(lines).toHaveLength(1)
-    expect(lines[0]).toContain(` — ${lineKind}: no latch is installed, so nothing is latched; `)
-
-    // Nothing holds P back: the next read is made.
-    await readPersonaOwnPane(p, fullPaneRead(WORKING_READ))
-    expect(order).toEqual(['readPane', 'readPane'])
-  })
-
-  test.each(PANE_LATCHING_ANSWERS)('control: an installed latch whose set throws: %s still answers latched with no throw and nothing more called; its one line names the failure', async (_what, build, kind, errorClass, lineKind) => {
-    const { h, p } = srj105Build()
-    const sets: string[] = []
-    setConflictLatch({
-      isLatched: () => false,
-      record: () => undefined,
-      set: (key) => {
-        sets.push(key)
-        throw new Error('latch store broken')
-      },
-      setFromConflict: (key) => {
-        sets.push(key)
-        throw new Error('latch store broken')
-      },
-    })
-    const err = build()
-    h.script({ readPaneError: err })
-    const order = recordCallOrder(h)
-
-    expect(await readPersonaOwnPane(p, fullPaneRead(WORKING_READ))).toStrictEqual(paneLatchedBy(kind, errorClass, err))
-
-    expect(order).toEqual(['readPane'])
-    expect(sets).toEqual([p])
-    const lines = paneReadLatchLinesOf(h.errors, p, lineKind, PANE_READ_TEST_SITE)
-    expect(lines).toHaveLength(1)
-    expect(lines[0]).toContain(` — ${lineKind}: latching the persona failed: `)
-    expect(lines[0]).toContain('latch store broken')
-    expect(h.notices).toEqual([])
-  })
-
-  test('control: P latched by a CONFLICT at its read leaves B alone: B\'s read is one read-pane of B\'s own row, answered as its pane; B is not latched and nothing is set for it', async () => {
-    const { h, p, b } = srj105Build()
-    const row = FIRST_LIVENESS_PANE_ROW
-    h.script({ readPaneQueue: [cannedErr(row.build()), cannedOk(cannedReadPaneResult(SPINNER_PANE))] })
-
-    expect((await readPersonaOwnPane(p, fullPaneRead(row.rowState))).kind).toBe(PANE_READ_LATCHED)
-    expect(await readPersonaOwnPane(b, fullPaneRead(WORKING_READ))).toStrictEqual({ kind: PANE_READ_PANE, pane: SPINNER_PANE })
-
-    expect(h.stub.calls.readPaneCalls).toEqual([paneReadOf(p), paneReadOf(b)])
-    expect(h.stub.callCount()).toBe(2)
-    expect(h.latch.isLatched(p)).toBe(true)
-    expect(h.latch.isLatched(b)).toBe(false)
-    expect(h.latchEvents.filter((event) => event.key === b)).toEqual([])
-    expect(h.episodeNotices.map((n) => n.key)).toEqual([p])
-  })
-
-  test('no secret reaches a line, an outcome or a post: an UNUSABLE NAME and an UNCLASSIFIED answer whose descriptions carry a token are rendered redacted', async () => {
-    const { h, p, b } = srj105Build()
-    const token = fakeToken(BOT_TOKEN_PREFIX)
-    h.script({
-      readPaneQueue: [
-        cannedErr(errInternal(`${UNUSABLE_RECORDED_NAME_PHRASE} is empty; token ${token}`)),
-        cannedErr(errGeneric('read-pane', 'ErrNotHandled', `boom ${token}`)),
-      ],
-    })
-
-    const latched = await readPersonaOwnPane(p, fullPaneRead(WORKING_READ))
-    const unclassified = await readPersonaOwnPane(b, fullPaneRead(WORKING_READ))
-
-    expect(latched.kind).toBe(PANE_READ_LATCHED)
-    expect(unclassified.kind).toBe(PANE_READ_UNCLASSIFIED)
-    // The outcomes keep the thrown value only as `error`; their descriptions are redacted.
-    const descriptions = [
-      latched.kind === PANE_READ_LATCHED ? latched.cause?.description : undefined,
-      unclassified.kind === PANE_READ_UNCLASSIFIED ? unclassified.description : undefined,
-    ]
-    // The UNCLASSIFIED answer's message is quoted, its token redacted.
-    expect(descriptions[1]).toContain(REDACTED_TOKEN_PLACEHOLDER)
-    expect(paneReadLatchLinesOf(h.errors, p, 'UNUSABLE NAME', PANE_READ_TEST_SITE)).toHaveLength(1)
-    expect(h.episodeNotices.map((n) => n.key)).toEqual([p])
-    assertNoLeak({ descriptions, errors: h.errors, episodeNotices: h.episodeNotices })
-  })
-})
-
-describe('b.jg5 SRJ-117, SRJ-501, SRJ-502, SRJ-603: a CONFLICT from the pane read at each of readWorkingPane\'s callers (the waiting-row check and the launch wait\'s evidence read) latches the persona with the state its caller last read, and the working-row fold reads no pane; nothing is typed', () => {
-  afterEach(srj105AfterEach)
-
-  // b.jg5 SRJ-603: the working-row verdict's rows latch at the verdict's own
-  // read (tests/server.test.ts); the fold on its pane reads no pane, so the
-  // CONFLICT a read-pane would answer is never met there.
-  test.each(livenessPaneConflictRowsAt('working-row verdict').map((row) => [row.name, row] as const))('the restart path\'s working-row check (checkWorkingRowPane) on the verdict\'s pane, with a read-pane that would answer %s: no read-pane; a running turn defers; nothing latched, posted or typed', async (_name, row) => {
-    const { h, p } = srj105Build()
-    h.script({ readPaneError: row.build() })
-    const order = recordCallOrder(h)
-
-    expect(await checkWorkingRowPane(p, SPINNER_PANE, { persona: harnessPersona(h, p) })).toBe('defer')
-
-    expect(order).toEqual([])
-    expect(h.stub.calls.readPaneCalls).toEqual([])
-    expect(allPaneReadLatchLines(h)).toEqual([])
-    expectNoNoteLatch(h)
-    expect(h.notices).toEqual([])
-  })
-
-  test.each(livenessPaneConflictRowsAt('waiting-row check').map((row) => [row.name, row] as const))('the restart path\'s waiting-row check (checkWaitingRowPane), its pane read answering %s: defer, never reconnect; P latched once with "P\'s next check or recovery" and waiting; nothing typed, no notice', async (_name, row) => {
-    const { h, p } = srj105Build()
-    h.script({ readPaneError: row.build() })
-    const order = recordCallOrder(h)
-
-    expect(await checkWaitingRowPane(p)).toBe('defer')
-
-    expect(order).toEqual(['readPane'])
-    expect(h.stub.calls.readPaneCalls).toEqual([paneReadOf(p)])
-    expect(h.errors.filter((line) => line.startsWith(`[slack] reconnectSession: persona=${p} is waiting and is latched — deferring; nothing typed`))).toHaveLength(1)
-    expectLatchedOnce(h, p, paneConflictLatch(p, row, READ_WORKING_PANE_SITE))
-  })
-
-  const waitCross = WAIT_ENTRIES.flatMap(([entry, before]) =>
-    livenessPaneConflictRowsAt('launch wait evidence read').map((row) => [entry, row.name, before, row] as const),
-  )
-  test.each(waitCross)('the working-row wait entered by %s, its evidence pane read answering %s: P latched once with "P\'s next check or recovery" and the state its poll read (working); the wait ends latched with no further call, though the next poll would read waiting; nothing typed, no not-connected notice', async (_entry, _name, before, row) => {
-    const { h, p, b } = srj105Build()
-    fastPolls(h)
-    const script: RecoveryStubScript = {
-      spawnQueue: [cannedErr(errInstanceIdCollision())],
-      getResult: harnessRow(h, harnessPersona(h, p), { state: 'working' }),
-      statusQueue: [cannedOk(cannedStatusResult({ state: 'working' }))],
-      statusResult: cannedStatusResult({ state: 'waiting' }),
-      readPaneError: row.build(),
-    }
-    h.script(script)
-    const order = recordCallOrder(h)
-
-    if (before.length === 0) {
-      expect(await waitForWaitingAndReconnect(p, h.config)).toBe(WAIT_OUTCOME_LATCHED)
-    } else {
-      expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
-    }
-
-    expect(order).toEqual([...before, 'findMissing', 'status', 'get', 'readPane'])
-    expect(h.stub.calls.readPaneCalls).toEqual([paneReadOf(p)])
-    expect(waitLatchedLines(h)).toHaveLength(1)
-    expect(hasPendingWorkingRowEvidence(p)).toBe(false)
-    expectLatchedOnce(h, p, paneConflictLatch(p, row, READ_WORKING_PANE_SITE))
-
-    if (before.length > 0) await expectLaunchedByNoPath(h, p, b, script)
-  })
-
-  // b.jg5 SRJ-608, SRJ-1015: the restart path's launch whose wait latches at
-  // the evidence read answers 'skipped', as for a launch that latches at a
-  // spawn; nothing is counted.
-  test('b.jg5 SRJ-608, SRJ-1015: launchSession whose launch wait meets a CONFLICT at its evidence read answers \'skipped\': P latched once, nothing typed, no further poll, nothing counted, no spawn-failure notice or spawn-failed entry', async () => {
-    const { h, p } = srj105Build()
-    fastPolls(h)
-    const row = livenessPaneConflictRowsAt('launch wait evidence read')[0]!
-    h.script({
-      spawnQueue: [cannedErr(errInstanceIdCollision())],
-      getResult: harnessRow(h, harnessPersona(h, p), { state: 'working' }),
-      statusQueue: [cannedOk(cannedStatusResult({ state: 'working' }))],
-      statusResult: cannedStatusResult({ state: 'waiting' }),
-      readPaneError: row.build(),
-    })
-
-    expect(await launchSession(p, h.config)).toBe('skipped')
-
-    expect(h.stub.calls.statusCalls).toHaveLength(1)
-    expect(h.stub.calls.sendKeysCalls).toEqual([])
-    expectLatchedOnce(h, p, paneConflictLatch(p, row, READ_WORKING_PANE_SITE))
-  })
-})
-
-// ---------------------------------------------------------------------------
-// b.jg5 SRJ-117's waiting-row column, SRJ-604: the restart path's check of a
-// `waiting` row (`checkWaitingRowPane`) answers by the class of its one
-// `read-pane` (through `readWorkingPane`). The pane cells (a running turn or
-// a prompt defers, anything else reconnects) are in the b.f2b describe
-// above, CONFLICT and UNUSABLE NAME in their describes; here, every other
-// answer: GONE answers `gone` and the row absent `absent`, both with nothing
-// typed; ENVIRONMENT raises `tmux-unavailable` and defers; UNAVAILABLE (E10's
-// builders), CONFIG (raising `ad-config-malformed`) and UNCLASSIFIED let the
-// reconnect go ahead on the `waiting` row alone, with one line. The read is
-// the only call (`recordCallOrder`); nothing latches or is
-// posted; `srj105AfterEach` runs `assertNoLeak` over what was captured.
-// ---------------------------------------------------------------------------
-
-/** The check's one line for P's waiting row whose read-pane answered `err` of class `errorClass`: `says` (what it found), then `then` (what it does), closing with `srj`. */
-function waitingRowLine(p: string, says: string, err: Error, then: string, errorClass: AdErrorClass, srj: string): string {
-  return `[slack] reconnectSession: persona=${p} is waiting ${says}: ${describeAdFailureForLog(err)} — ${then} ${paneReadClassOpening(errorClass)}${srj})`
-}
-
-/** The check's lines for persona `p`'s waiting row. */
-function waitingRowLinesOf(h: RecoveryHarness, p: string): string[] {
-  return h.errors.filter((line) => line.startsWith(`[slack] reconnectSession: persona=${p} is waiting`))
-}
-
-/** The reconnect-going-ahead line's two halves. */
-const WAITING_READ_FAILED = 'and reading its pane failed'
-const WAITING_GOES_AHEAD = 'reconnecting on the waiting row alone'
-const WAITING_GOES_AHEAD_SRJ = 'b.f2b, b.jg5 SRJ-604'
-
 /** UNCLASSIFIED answers a `read-pane` can give, each of the class UNCLASSIFIED. */
 const PANE_UNCLASSIFIED_ANSWERS: ReadonlyArray<readonly [string, () => Error]> = [
   ['an ErrInternal not naming the recorded tmux session name', () => errInternal()],
   ['a name CSCB gives no handling (ErrNotHandled)', () => errGeneric('read-pane', 'ErrNotHandled')],
   ['a store that cannot be opened (ErrSchemaMismatch)', () => errSchemaMismatch()],
 ]
-
-describe('b.jg5 SRJ-117, SRJ-604: the restart path\'s waiting-row check (checkWaitingRowPane) answers by its read-pane\'s class', () => {
-  afterEach(srj105AfterEach)
-
-  /** Script P's read-pane to answer `err`, run the check, and answer what it did. */
-  async function checkAnswering(err: Error) {
-    const { h, p, b } = srj105Build()
-    h.script({ readPaneError: err })
-    const order = recordCallOrder(h)
-    const verdict = await checkWaitingRowPane(p)
-    return { h, p, b, order, verdict }
-  }
-
-  /** The read was the only call, so nothing was typed; nothing latched or posted. */
-  function expectOnlyTheRead(h: RecoveryHarness, p: string, order: readonly string[]): void {
-    expect(order).toEqual(['readPane'])
-    expect(h.stub.calls.readPaneCalls).toEqual([paneReadOf(p)])
-    expect(h.stub.calls.sendKeysCalls).toEqual([])
-    expectNoNoteLatch(h)
-    expect(h.notices).toEqual([])
-  }
-
-  test.each<[string, () => Error, WaitingRowPaneVerdict, (key: string, read: PaneReadFailure) => string]>([
-    ['GONE (ErrTmuxCaptureFailed)', () => errTmuxCaptureFailed(), WAITING_ROW_PANE_GONE, waitingRowPaneGoneLine],
-    ['the row absent (ErrSpawnNotFound)', () => errSpawnNotFound(), WAITING_ROW_PANE_ABSENT, waitingRowAbsentAtPaneReadLine],
-  ])('%s → %s, never reconnect: one line saying nothing is typed; the read the only call; nothing latched or posted', async (_label, build, verdict, lineOf) => {
-    const err = build()
-    const { h, p, order, verdict: got } = await checkAnswering(err)
-
-    expect(got).toBe(verdict)
-    expectOnlyTheRead(h, p, order)
-    expect(waitingRowLinesOf(h, p)).toEqual([lineOf(p, paneReadFailureOf(err))])
-  })
-
-  test.each(SRJ311_ENVIRONMENT.map(([what, make, onset]) => [what, make, onset] as const))('ENVIRONMENT (%s) → defer, never reconnect: P\'s tmux-unavailable raised once with its onset, B\'s untouched; one line; the read the only call; nothing latched', async (_what, make, onset) => {
-    const err = make('read-pane')
-    const { h, p, b, order, verdict } = await checkAnswering(err)
-
-    expect(verdict).toBe('defer')
-    expectOnlyTheRead(h, p, order)
-    expect([...getOutageFlags(p)]).toEqual([TMUX_UNAVAILABLE_CLASS])
-    expect([...getOutageFlags(b)]).toEqual([])
-    expect(h.outageNotices).toEqual([{ key: p, text: onset }])
-    expect(waitingRowLinesOf(h, p)).toEqual([
-      waitingRowLine(p, WAITING_READ_FAILED, err, 'tmux is not available; not typing /mcp reconnect, deferring to a later tick', AD_ERROR_CLASS_ENVIRONMENT, 'b.jg5 SRJ-117, SRJ-311'),
-    ])
-  })
-
-  test.each(PANE_UNAVAILABLE_FORMS)('UNAVAILABLE (%s) → reconnect on the waiting row alone, with one line naming the class; no outage raised; the read the only call; nothing latched or posted', async (_label, make) => {
-    const err = make('read-pane')
-    const { h, p, order, verdict } = await checkAnswering(err)
-
-    expect(verdict).toBe('reconnect')
-    expectOnlyTheRead(h, p, order)
-    expect([...getOutageFlags(p)]).toEqual([])
-    expect(waitingRowLinesOf(h, p)).toEqual([
-      waitingRowLine(p, WAITING_READ_FAILED, err, WAITING_GOES_AHEAD, AD_ERROR_CLASS_UNAVAILABLE, WAITING_GOES_AHEAD_SRJ),
-    ])
-  })
-
-  test('CONFIG (ErrConfigMalformed) → reconnect on the waiting row alone, as UNAVAILABLE: P\'s ad-config-malformed raised once with its onset, B\'s untouched; one line naming the class; the read the only call; nothing latched', async () => {
-    const err = errConfigMalformed()
-    const { h, p, b, order, verdict } = await checkAnswering(err)
-
-    expect(verdict).toBe('reconnect')
-    expectOnlyTheRead(h, p, order)
-    expect([...getOutageFlags(p)]).toEqual([AD_CONFIG_MALFORMED_CLASS])
-    expect([...getOutageFlags(b)]).toEqual([])
-    expect(h.outageNotices).toEqual([{ key: p, text: adConfigMalformedOnset(err) }])
-    expect(waitingRowLinesOf(h, p)).toEqual([
-      waitingRowLine(p, WAITING_READ_FAILED, err, WAITING_GOES_AHEAD, AD_ERROR_CLASS_CONFIG, WAITING_GOES_AHEAD_SRJ),
-    ])
-  })
-
-  test.each(PANE_UNCLASSIFIED_ANSWERS)('UNCLASSIFIED (%s) → reconnect on the waiting row alone, with one line naming the class; the read the only call; nothing latched or posted', async (_label, build) => {
-    const err = build()
-    const { h, p, order, verdict } = await checkAnswering(err)
-
-    expect(verdict).toBe('reconnect')
-    expectOnlyTheRead(h, p, order)
-    expect(waitingRowLinesOf(h, p)).toEqual([
-      waitingRowLine(p, WAITING_READ_FAILED, err, WAITING_GOES_AHEAD, AD_ERROR_CLASS_UNCLASSIFIED, WAITING_GOES_AHEAD_SRJ),
-    ])
-  })
-})
-
-// ---------------------------------------------------------------------------
-// b.jg5 SRJ-117's launch-wait column, SRJ-608: the launch wait's evidence
-// read of P's `working` row answers by its `read-pane`'s class. CONFLICT and
-// UNUSABLE NAME latch P and end the wait (the describes above); every other
-// failure (GONE, the row absent, UNAVAILABLE, ENVIRONMENT and CONFIG with
-// their outages, UNCLASSIFIED) is no evidence: one line naming the class,
-// the wait makes its next poll and types nothing for it, and once the row
-// reads waiting P is reconnected. A pane keeps the positive-idle judgement of
-// the b.f2b describes. The read's ErrInvalidFlags with a re-check stop is in
-// the next describe. Every stub call is recorded (`recordCallOrder`);
-// `srj105AfterEach` runs `assertNoLeak`.
-// ---------------------------------------------------------------------------
-
-/** The evidence read's answers that are no evidence, each built for `read-pane`, with its class and, when it raises P's outage, the onset. */
-const EVIDENCE_READ_NO_EVIDENCE: ReadonlyArray<readonly [string, () => Error, AdErrorClass, ((err: Error) => string) | undefined]> = [
-  ['GONE (ErrTmuxCaptureFailed)', () => errTmuxCaptureFailed(), AD_ERROR_CLASS_GONE, undefined],
-  ['the row absent (ErrSpawnNotFound)', () => errSpawnNotFound(), AD_ERROR_CLASS_STATE, undefined],
-  ...PANE_UNAVAILABLE_FORMS.map(([label, make]) => [`UNAVAILABLE (${label})`, () => make('read-pane'), AD_ERROR_CLASS_UNAVAILABLE, undefined] as const),
-  ...SRJ311_ENVIRONMENT.map(([label, make, onset]) => [`ENVIRONMENT (${label})`, () => make('read-pane'), AD_ERROR_CLASS_ENVIRONMENT, () => onset] as const),
-  ['CONFIG (ErrConfigMalformed)', () => errConfigMalformed(), AD_ERROR_CLASS_CONFIG, (err) => adConfigMalformedOnset(err)],
-  ...PANE_UNCLASSIFIED_ANSWERS.map(([label, build]) => [`UNCLASSIFIED (${label})`, build, AD_ERROR_CLASS_UNCLASSIFIED, undefined] as const),
-]
-
-describe('b.jg5 SRJ-117, SRJ-608: the launch wait\'s evidence read — every failure but CONFLICT and UNUSABLE NAME is no evidence, and the wait goes on', () => {
-  afterEach(srj105AfterEach)
-
-  test.each(EVIDENCE_READ_NO_EVIDENCE)('%s at the evidence read of P\'s working row: no evidence, one line naming its class; the wait makes its next poll and types nothing for it; once the row reads waiting P is reconnected; nothing latched, posted or counted; its outage, if any, raised once', async (_label, build, errorClass, onset) => {
-    const { h, p } = srj105Build()
-    fastPolls(h)
-    const err = build()
-    h.script({
-      spawnQueue: [cannedErr(errInstanceIdCollision())],
-      getQueue: [cannedOk(harnessRow(h, harnessPersona(h, p), { state: 'working' }))],
-      getResult: harnessRow(h, harnessPersona(h, p), { state: 'waiting' }),
-      statusQueue: [cannedOk(cannedStatusResult({ state: 'working' })), cannedOk(cannedStatusResult({ state: 'working' }))],
-      statusResult: cannedStatusResult({ state: 'waiting' }),
-      readPaneQueue: [cannedErr(err)],
-    })
-    const order = recordCallOrder(h)
-
-    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'reconnected' })
-
-    // Two working polls (the pane read at least at the first), the poll that
-    // reads waiting, then the reconnect's keystrokes: nothing typed before it.
-    expect(order.filter((call) => call !== 'readPane')).toEqual(['spawn', 'get', 'findMissing', 'status', 'get', 'status', 'get', 'status', 'get', 'get', 'get', 'sendKeys', 'get', 'sendKeys'])
-    expect(order.indexOf('readPane')).toBe(order.indexOf('status') + 2)
-    expect(h.stub.calls.sendKeysCalls.map((c) => c.text)).toEqual([RECONNECT_TEXT])
-    expect(h.errors.filter((line) => line.includes(`reading the pane of ${renderPersonaRef(p, p)} failed`))).toEqual([
-      `[slack] waitForWaitingAndReconnect: reading the pane of ${renderPersonaRef(p, p)} failed: ${describeAdFailureForLog(err)} — no idle evidence from it; still waiting for its working row ${paneReadClassOpening(errorClass)}b.f2b)`,
-    ])
-    expectNoNoteLatch(h)
-    expect(allPaneReadLatchLines(h)).toEqual([])
-    expect(waitLatchedLines(h)).toEqual([])
-    expect(h.notices).toEqual([])
-    expect(getFailureCount(p)).toBe(0)
-    expect(countStartupEntries(h.startupErrors().join('\n'), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
-    if (onset === undefined) {
-      expect(h.outageNotices).toEqual([])
-    } else {
-      expect(h.outageNotices[0]).toEqual({ key: p, text: onset(err) })
-      expect(h.outageNotices.filter((n) => n.text === onset(err))).toHaveLength(1)
-    }
-  })
-})
 
 // ---------------------------------------------------------------------------
 // b.jdc, b.jg5 SRJ-607 (SRJ-117's ladder-action column, with SRJ-501,
@@ -22849,215 +17084,6 @@ describe('b.jdc, b.jg5 SRJ-117, SRJ-607: the collision ladder\'s action on a pro
   })
 })
 
-// ---------------------------------------------------------------------------
-// b.jg5 SRJ-104, SRJ-204: `read-pane` gives `ErrInvalidFlags` no meaning, so
-// the shared reader (`readPersonaOwnPane`) answers it with exactly one
-// immediate agent-director version re-check, then the UNCLASSIFIED outcome,
-// as the resume path does (the collision ladder's ErrInvalidFlags describe).
-// The re-check is the real installed one over a counting stub
-// `resolveSystemBinary` and an unmoved fake clock, reset after each case. No
-// other answer makes a re-check.
-// ---------------------------------------------------------------------------
-
-describe('b.jg5 SRJ-104, SRJ-204: an ErrInvalidFlags answer at the shared read-pane makes one immediate version re-check, then is UNCLASSIFIED; no other answer re-checks', () => {
-  /** Every `resolveSystemBinary` call the installed re-check made. */
-  let resolveCalls: Array<object | undefined>
-  /** The exit codes the re-check stopped with. */
-  let stops: number[]
-
-  /** Install the real re-check, its `resolveSystemBinary` answering `outcome` (default: the installed baseline, a pass). */
-  function installRecheck(outcome?: StubResolveSystemBinaryOutcome): void {
-    resetAdVersionRecheckForTests()
-    installAdVersionRecheck({
-      resolveSystemBinary: makeStubResolveSystemBinary({ calls: resolveCalls, ...(outcome === undefined ? {} : { outcomes: [outcome] }) }),
-      baselineVersion: PHASE1_RC_VERSION,
-      recordStartupError: () => {},
-      stop: (exitCode) => { stops.push(exitCode) },
-      log: () => {},
-      clock: createFakeClock(),
-    })
-  }
-
-  beforeEach(() => {
-    resolveCalls = []
-    stops = []
-    installRecheck()
-  })
-
-  afterEach(() => {
-    resetAdVersionRecheckForTests()
-    srj105AfterEach()
-  })
-
-  /** The reader's one line for P's ErrInvalidFlags at `site` (default: the direct cases' site) after the re-check answered `kind`. */
-  function invalidFlagsLine(p: string, err: Error & { errName: string; errDescription: string }, kind: string, site = PANE_READ_TEST_SITE): string {
-    return (
-      `[slack] ${site}: pane read for persona=${p} answered class=${AD_ERROR_CLASS_UNCLASSIFIED} name=${err.errName} message=${JSON.stringify(err.errDescription)} ` +
-      `— UNCLASSIFIED after one immediate agent-director version re-check: ${kind} (b.jg5 SRJ-104, SRJ-204)`
-    )
-  }
-
-  /** The reader's re-check lines, any persona. */
-  function recheckLines(h: RecoveryHarness): string[] {
-    return h.errors.filter((line) => line.includes('after one immediate agent-director version re-check'))
-  }
-
-  test.each([
-    [RECHECK_OUTCOME_PASS, undefined],
-    [RECHECK_OUTCOME_COULD_NOT_RUN, { throws: new Error('the resolve failed') }],
-  ] as const)('the re-check answers %s: exactly one resolveSystemBinary call and no stop; answered UNCLASSIFIED with the redacted description and one line; the read the only call; nothing latched or posted; inside P\'s recovery attempt P\'s timer armed once with the UNCLASSIFIED cause and P\'s episode started once; B untouched', async (kind, outcome) => {
-    if (outcome !== undefined) installRecheck(outcome)
-    const { h, p, b } = srj105Build()
-    const err = errInvalidFlags('read-pane')
-    h.script({ readPaneError: err })
-    const order = recordCallOrder(h)
-
-    const read = await runInAttempt(p, 'recovery', () => readPersonaOwnPane(p, fullPaneRead(WORKING_READ)))
-
-    expect(read).toStrictEqual(paneFailure(PANE_READ_UNCLASSIFIED, AD_ERROR_CLASS_UNCLASSIFIED, err))
-    // No stop decided: the outcome carries no stop mark.
-    expect(read).not.toHaveProperty('stopping')
-    expect(resolveCalls).toHaveLength(1)
-    expect(stops).toEqual([])
-    expectOneQuietRead(h, order, p)
-    expect(recheckLines(h)).toEqual([invalidFlagsLine(p, err, kind)])
-    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED }])
-    expect(unclassifiedStartedLines(h, p)).toHaveLength(1)
-    expect(h.unclassifiedErrorOpen(p)).toBe(true)
-    expect(h.unclassifiedErrorOpen(b)).toBe(false)
-  })
-
-  test('the re-check answers stop: one resolveSystemBinary call and one stop; answered UNCLASSIFIED carrying the stop mark, with one line naming stop; nothing armed or reported, even inside P\'s recovery attempt', async () => {
-    installRecheck({ version: DEV_PLACEHOLDER_VERSION })
-    const { h, p } = srj105Build()
-    const err = errInvalidFlags('read-pane')
-    h.script({ readPaneError: err })
-    const order = recordCallOrder(h)
-
-    const read = await runInAttempt(p, 'recovery', () => readPersonaOwnPane(p, fullPaneRead(WORKING_READ)))
-
-    expect(read).toStrictEqual({ ...(paneFailure(PANE_READ_UNCLASSIFIED, AD_ERROR_CLASS_UNCLASSIFIED, err) as PaneReadUnclassified), stopping: true })
-    expect(resolveCalls).toHaveLength(1)
-    expect(stops).toHaveLength(1)
-    expectOneQuietRead(h, order, p)
-    expect(recheckLines(h)).toEqual([invalidFlagsLine(p, err, RECHECK_OUTCOME_STOP)])
-    expect(h.triggers).toEqual([])
-    expect(unclassifiedStartedLines(h, p)).toEqual([])
-  })
-
-  test('outside any attempt: one re-check, answered UNCLASSIFIED with one line; nothing armed or reported', async () => {
-    const { h, p } = srj105Build()
-    const err = errInvalidFlags('read-pane')
-    h.script({ readPaneError: err })
-
-    const read = await readPersonaOwnPane(p, fullPaneRead(WAITING_READ))
-
-    expect(read).toStrictEqual(paneFailure(PANE_READ_UNCLASSIFIED, AD_ERROR_CLASS_UNCLASSIFIED, err))
-    expect(read).not.toHaveProperty('stopping')
-    expect(resolveCalls).toHaveLength(1)
-    expect(recheckLines(h)).toEqual([invalidFlagsLine(p, err, RECHECK_OUTCOME_PASS)])
-    expect(h.triggers).toEqual([])
-    expect(unclassifiedStartedLines(h, p)).toEqual([])
-  })
-
-  // b.jg5 SRJ-205 at the waiting-row check: a marked outcome defers with its
-  // own line and nothing typed; an unmarked one (the re-check passed) lets the
-  // reconnect go ahead on the waiting row alone, as any UNCLASSIFIED does.
-  test.each<[string, WaitingRowPaneVerdict, StubResolveSystemBinaryOutcome | undefined, number, string, string]>([
-    [
-      RECHECK_OUTCOME_STOP,
-      'defer',
-      { version: DEV_PLACEHOLDER_VERSION },
-      1,
-      'the agent-director version re-check decided that the server stops; not typing /mcp reconnect, nothing more is called for it',
-      'b.jg5 SRJ-204, SRJ-205',
-    ],
-    [RECHECK_OUTCOME_PASS, 'reconnect', undefined, 0, WAITING_GOES_AHEAD, WAITING_GOES_AHEAD_SRJ],
-  ])('the waiting-row check (checkWaitingRowPane), the re-check answering %s → %s: exactly one re-check with the stops it decides, and one line saying what the check does; the read the only call, nothing typed; nothing latched or posted', async (kind, verdict, outcome, stopCount, then, srj) => {
-    if (outcome !== undefined) installRecheck(outcome)
-    const { h, p } = srj105Build()
-    const err = errInvalidFlags('read-pane')
-    h.script({ readPaneError: err })
-    const order = recordCallOrder(h)
-
-    expect(await checkWaitingRowPane(p)).toBe(verdict)
-
-    expect(resolveCalls).toHaveLength(1)
-    expect(stops).toHaveLength(stopCount)
-    expectOneQuietRead(h, order, p)
-    expect(h.stub.calls.sendKeysCalls).toEqual([])
-    expect(recheckLines(h)).toEqual([invalidFlagsLine(p, err, kind, READ_WORKING_PANE_SITE)])
-    expect(waitingRowLinesOf(h, p)).toEqual([waitingRowLine(p, WAITING_READ_FAILED, err, then, AD_ERROR_CLASS_UNCLASSIFIED, srj)])
-  })
-
-  // b.jg5 SRJ-205, SRJ-608 at the launch wait's evidence read: a marked
-  // outcome ends the wait with no further call and nothing typed; the ladder
-  // answers a `failed` result marked `stopping`, as a resume's stop does.
-  test('the launch wait\'s evidence read of P\'s working row, the re-check answering stop: the wait ends at once, with no further call though the next poll would read waiting, and nothing typed; one line; the ladder answers { failed, stopping } and launchSession \'skipped\'; nothing posted, armed, latched, counted or recorded spawn-failed', async () => {
-    installRecheck({ version: DEV_PLACEHOLDER_VERSION })
-    const { h, p } = srj105Build()
-    fastPolls(h)
-    const err = errInvalidFlags('read-pane')
-    // Fresh queues for each launch: the stub consumes them.
-    const script = (): RecoveryStubScript => ({
-      spawnQueue: [cannedErr(errInstanceIdCollision())],
-      getResult: harnessRow(h, harnessPersona(h, p), { state: 'working' }),
-      statusQueue: [cannedOk(cannedStatusResult({ state: 'working' }))],
-      statusResult: cannedStatusResult({ state: 'waiting' }),
-      readPaneError: err,
-    })
-    h.script(script())
-    const order = recordCallOrder(h)
-
-    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed', stopping: true })
-
-    expect(order).toEqual(['spawn', 'get', 'findMissing', 'status', 'get', 'readPane'])
-    expect(resolveCalls).toHaveLength(1)
-    expect(stops).toHaveLength(1)
-    expect(recheckLines(h)).toEqual([invalidFlagsLine(p, err, RECHECK_OUTCOME_STOP, READ_WORKING_PANE_SITE)])
-    const ref = renderPersonaRef(p, p)
-    expect(h.errors.filter((line) => line.includes(`reading the pane of ${ref} failed`))).toEqual([
-      `[slack] waitForWaitingAndReconnect: reading the pane of ${ref} failed: ${describeAdFailureForLog(err)} — the agent-director version re-check decided that the server stops; the wait ends, nothing more is called and nothing is typed ${paneReadClassOpening(AD_ERROR_CLASS_UNCLASSIFIED)}b.jg5 SRJ-204, SRJ-205)`,
-    ])
-    expect(h.notices).toEqual([])
-    expect(h.triggers).toEqual([])
-    expectNoNoteLatch(h)
-    expect(getFailureCount(p)).toBe(0)
-    expect(countStartupEntries(h.startupErrors().join('\n'), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
-
-    // The restart path's launch meets the same stop: 'skipped', never counted.
-    installRecheck({ version: DEV_PLACEHOLDER_VERSION })
-    h.script(script())
-    expect(await launchSession(p, h.config)).toBe('skipped')
-    expect(stops).toHaveLength(2)
-    expect(h.stub.calls.sendKeysCalls).toEqual([])
-    expect(getFailureCount(p)).toBe(0)
-    expect(h.notices).toEqual([])
-    expect(countStartupEntries(h.startupErrors().join('\n'), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
-  })
-
-  test.each<[string, () => { readPaneError?: Error; readPaneResults?: Array<import('agent-director').ReadPaneResult> }]>([
-    ['a pane', () => ({ readPaneResults: [cannedReadPaneResult(IDLE_PANE)] })],
-    ['GONE (ErrTmuxCaptureFailed)', () => ({ readPaneError: errTmuxCaptureFailed() })],
-    ['the row absent (ErrSpawnNotFound)', () => ({ readPaneError: errSpawnNotFound() })],
-    ['UNAVAILABLE (ErrTmuxUnresponsive)', () => ({ readPaneError: errTmuxUnresponsive('read-pane') })],
-    ['CONFIG (ErrConfigMalformed)', () => ({ readPaneError: errConfigMalformed() })],
-    ['ENVIRONMENT (ErrTmuxNotAvailable)', () => ({ readPaneError: errTmuxNotAvailable(undefined, 'read-pane') })],
-    ['UNCLASSIFIED (an ErrInternal not naming the recorded tmux session name)', () => ({ readPaneError: errInternal() })],
-    ['CONFLICT', () => ({ readPaneError: FIRST_LIVENESS_PANE_ROW.build() })],
-    ['UNUSABLE NAME', () => ({ readPaneError: PANE_UNUSABLE_NAME_ROWS[0]!.build() })],
-  ])('%s makes no version re-check and no re-check line', async (_label, script) => {
-    const { h, p } = srj105Build()
-    h.script(script())
-
-    await readPersonaOwnPane(p, fullPaneRead(WORKING_READ))
-
-    expect(resolveCalls).toEqual([])
-    expect(stops).toEqual([])
-    expect(recheckLines(h)).toEqual([])
-  })
-})
-
 /** Who reads, for the shared `status` read's direct cases. */
 const STATUS_READ_SITE: OwnRowReadSite = { site: 'test', what: 'own-row status read' }
 
@@ -23070,25 +17096,7 @@ interface StatusSite {
 }
 
 const UNUSABLE_STATUS_SITES: readonly StatusSite[] = [
-  {
-    name: 'the working-row wait\'s poll status',
-    setup: fastPolls,
-    script: (h, p, err) => ({ ...collided(h, p, { state: 'working' }), statusError: err }),
-    calls: ladderCallsOf({ spawn: 1 }),
-  },
-  {
-    name: 'the working-row wait\'s timeout status (every poll read working)',
-    setup: shortWait,
-    script: (h, p, err) => {
-      const sweepsBefore = h.stub.calls.findMissingCalls.length
-      return {
-        ...collided(h, p, { state: 'working' }),
-        readPaneResults: [cannedReadPaneResult(SPINNER_PANE)],
-        statusFn: () => (h.stub.calls.findMissingCalls.length >= sweepsBefore + 2 ? err : cannedStatusResult({ state: 'working' })),
-      }
-    },
-    calls: ladderCallsOf({ spawn: 1 }),
-  },
+
   {
     name: 'the re-read after the sweep of a check_permission row whose read-pane answered GONE (reconcileAndReadRowState)',
     setup: promptRowPanesGone,
@@ -23245,21 +17253,7 @@ const UNUSABLE_GET_SITES: readonly GetSite[] = [
     calls: ladderCallsOf({ spawn: 1, resume: 1 }),
     reads: { get: 2, status: 0 },
   },
-  {
-    // The wait's first poll reads working and its pane idle, so it reads the
-    // transcript; every later poll would read waiting.
-    name: 'the transcript get of the working-row wait (an idle pane)',
-    setup: fastPolls,
-    script: (h, p, err) => ({
-      spawnQueue: [cannedErr(errInstanceIdCollision())],
-      getQueue: [cannedOk(harnessRow(h, p, { state: 'working' })), cannedErr(err)],
-      statusQueue: [cannedOk(cannedStatusResult({ state: 'working' }))],
-      statusResult: cannedStatusResult({ state: 'waiting' }),
-      readPaneResults: [cannedReadPaneResult(IDLE_PANE)],
-    }),
-    calls: ladderCallsOf({ spawn: 1 }),
-    reads: { get: 2, status: 1 },
-  },
+
 ]
 
 describe('b.jg5 SRJ-114, SRJ-105, SRJ-512: an UNUSABLE NAME answer at E14\'s shared own-row get read latches the persona and its caller stops', () => {
@@ -23309,16 +17303,6 @@ describe('b.jg5 SRJ-313, SRJ-1002, SRJ-512: the controls — a phrase-less ErrIn
     const read = await readPersonaOwnRowStatus(p, STATUS_READ_SITE)
 
     expect(read.kind === OWN_ROW_STATUS_REFUSED && read.error).toBe(err)
-    expectNoNoteLatch(h)
-    expect(unusableNameLinesOf(h, p)).toEqual([])
-  })
-
-  test('a phrase-less ErrInternal at the waiting-row check\'s pane read: reconnect on the waiting row alone, as for any UNCLASSIFIED read; never latched', async () => {
-    const { h, p } = srj105Build()
-    h.script({ readPaneError: errInternal() })
-
-    expect(await checkWaitingRowPane(p)).toBe('reconnect')
-
     expectNoNoteLatch(h)
     expect(unusableNameLinesOf(h, p)).toEqual([])
   })
@@ -23581,23 +17565,7 @@ const LAUNCH_START_GET_SITES: readonly LaunchStartGetSite[] = [
     calls: ladderCallsOf({ spawn: 1, resume: 1 }),
     gets: 2,
   },
-  {
-    // The wait's first poll reads working and its pane idle, so it reads the
-    // transcript; every later poll would read waiting.
-    name: 'readPersonaTranscript\'s get in the working-row wait (an idle pane)',
-    setup: fastPolls,
-    script: (h, p, row) => ({
-      spawnQueue: [cannedErr(errInstanceIdCollision())],
-      getQueue: [cannedOk(harnessRow(h, p, { state: 'working' })), cannedOk(harnessRow(h, p, { state: 'working' })), cannedOk(row)],
-      statusQueue: [cannedOk(cannedStatusResult({ state: 'working' }))],
-      statusResult: cannedStatusResult({ state: 'waiting' }),
-      readPaneResults: [cannedReadPaneResult(IDLE_PANE)],
-    }),
-    order: ['spawn', 'get', 'findMissing', 'status', 'get', 'readPane', 'get'],
-    whole: true,
-    calls: ladderCallsOf({ spawn: 1 }),
-    gets: 3,
-  },
+
   {
     // b.4dk: a waiting row whose reconnect found its session dead runs the
     // sweep before resume; the run lists P's own row in unverified_ids.
@@ -23691,28 +17659,6 @@ describe('b.jg5 SRJ-513, SRJ-114, SRJ-1020: a configured persona\'s own pending 
     expectLatchedOnce(h, p, launchStartLatch(p, row))
   })
 
-  test.each(byName(launchStartSampleOf('get')))('the restart path\'s working-row check (checkWorkingRowPane) whose transcript get after the verdict\'s idle pane reads %s answers defer: P latched with pending; the get the only call (no read-pane); no evidence pending, nothing typed; the next check\'s read (the working-row verdict\'s read-pane) is not made and posts nothing', async (_name, row) => {
-    const { h, p } = srj105Build()
-    const persona = harnessPersona(h, p)
-    h.script({ getResult: row.build(persona, h.home) })
-    const order = recordCallOrder(h)
-
-    expect(await checkWorkingRowPane(p, IDLE_PANE, { persona })).toBe('defer')
-
-    expect(order).toEqual(['get'])
-    expect(hasPendingWorkingRowEvidence(p)).toBe(false)
-    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({}))
-    expectLatchedOnce(h, p, launchStartLatch(p, row))
-
-    // b.jg5 SRJ-603: the next check starts with the verdict's one read, which a latched P never makes.
-    expect(await readPersonaOwnPane(p, workingVerdictRead())).toStrictEqual(PANE_READ_NOT_READ_LATCHED)
-    expect(order).toEqual(['get'])
-    expect(getIds(h)).toEqual([personaInstanceId(p)])
-    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({}))
-    expect(h.latchEvents).toHaveLength(ONE_LATCH_STEPS.length)
-    expect(h.episodeNotices).toHaveLength(1)
-  })
-
   test.each(byName(launchStartSampleOf('get')))('a bypassing run listing P\'s and B\'s own rows in unverified_ids, P\'s get reading %s: P latched and the caller gets FIND_MISSING_LATCHED; B\'s row is still read and B latches nothing', async (_name, row) => {
     const { h, p, b } = srj105Build()
     const pId = personaInstanceId(p)
@@ -23773,25 +17719,7 @@ interface LaunchStartStatusSite {
 }
 
 const LAUNCH_START_STATUS_SITES: readonly LaunchStartStatusSite[] = [
-  {
-    name: 'the working-row wait\'s poll status',
-    setup: fastPolls,
-    script: (h, p, result) => ({ ...collided(h, p, { state: 'working' }), statusResult: result }),
-    wait: true,
-  },
-  {
-    name: 'the working-row wait\'s timeout status (every poll read working)',
-    setup: shortWait,
-    script: (h, p, result) => {
-      const sweepsBefore = h.stub.calls.findMissingCalls.length
-      return {
-        ...collided(h, p, { state: 'working' }),
-        readPaneResults: [cannedReadPaneResult(SPINNER_PANE)],
-        statusFn: () => (h.stub.calls.findMissingCalls.length >= sweepsBefore + 2 ? result : cannedStatusResult({ state: 'working' })),
-      }
-    },
-    wait: true,
-  },
+
   {
     name: 'the re-read after the sweep of a check_permission row whose read-pane answered GONE (reconcileAndReadRowState)',
     setup: promptRowPanesGone,
@@ -24096,24 +18024,7 @@ describe('b.jg5 SRJ-807, SRJ-115: a retired key\'s own row read live other than 
   // P is marked, so its live row is its new life (b.jg5 SRJ-805) and the
   // ladder takes the working branch. The collision get's clear is refused
   // (its write fails), so the entry stays and the clear is the poll's.
-  test('a launch whose working-row wait\'s poll reads P\'s own row waiting with P\'s mark set: the poll clears P\'s entry, and the wait reconnects as it does today (one spawn, one send-keys, reconnected); the collision get before it, its clear\'s write refused, left the entry', async () => {
-    const { h, p, b } = retiredBuild()
-    fastPolls(h)
-    h.failRetiredKeyWrites()
-    h.script({
-      ...collided(h, harnessPersona(h, p), { state: 'waiting' }),
-      getQueue: [cannedOk(harnessRow(h, harnessPersona(h, p), { state: 'working' }))],
-      statusResult: cannedStatusResult({ state: 'waiting' }),
-    })
 
-    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'reconnected' })
-
-    expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, sendKeys: 2 }))
-    expect(h.retiredKeyWrites[0]).toEqual({ path: h.retiredKeys.path, ok: false })
-    expect(retiredKeyLinesIn(h.errors)[0]).toBe(retiredEntryClearFailedLine(h.retiredKeys.path, p, 'working', COLLISION_GET_SITE))
-    expectClearedOnce(h, p, b, clearedLine(h, p, 'waiting', WORKING_WAIT_STATUS_SITE), 1)
-    expectUntouched(h, b)
-  })
 })
 
 describe('b.jg5 SRJ-807: the controls — an unmarked key, a pending row, a configured persona\'s own pending row with no launch start, an absent row, no store installed and a throwing mark query clear nothing', () => {
@@ -24498,7 +18409,7 @@ describe('b.jg5 SRJ-118, SRJ-609: reconnectMcpWithCause makes one send-keys and 
   /** Exactly one send-keys of `/mcp reconnect` for P and no other call; nothing posted as a spawn failure, recorded or counted. */
   function expectOneSendKeysOnly(h: RecoveryHarness, p: string, order: readonly string[]): void {
     const keys = h.stub.calls.sendKeysCalls
-    expect(order).toEqual(['get', 'readPane', 'readPane', 'get', 'sendKeys', ...(keys.length === 2 ? ['get', 'sendKeys'] : [])])
+    expect(order).toEqual(['get', 'get', 'sendKeys', ...(keys.length === 2 ? ['get', 'sendKeys'] : [])])
     expect(keys).toEqual([{ instance_id: personaInstanceId(p), text: RECONNECT_TEXT, no_enter: true }, ...(keys.length === 2 ? [{ instance_id: personaInstanceId(p), key: 'Enter' }] : [])])
     expect(h.notices).toEqual([])
     expect(countStartupEntries(h.startupErrors().join('\n'), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
@@ -24630,7 +18541,7 @@ describe('b.jg5 SRJ-118, SRJ-609: reconnectMcpWithCause makes one send-keys and 
     // The next reconnect of P (any caller) finds it latched: no send-keys, nothing more posted or set.
     const events = h.latchEvents.length
     expect(await reconnectMcpWithCause(p, row.rowState, ref)).toStrictEqual({ outcome: 'transient', latched: true } satisfies ReconnectResult)
-    expect(order).toEqual(['get', 'readPane', 'readPane', 'get', 'sendKeys'])
+    expect(order).toEqual(['get', 'get', 'sendKeys'])
     expect(h.latchEvents).toHaveLength(events)
     expect(h.episodeNotices).toHaveLength(1)
     expect(h.errors.filter((l) => l === reconnectLatchedLine(ref))).toHaveLength(1)
@@ -24644,7 +18555,7 @@ describe('b.jg5 SRJ-118, SRJ-609: reconnectMcpWithCause makes one send-keys and 
     expectLatchedOnce(h, p, reconnectUnusableNameLatch(p, row))
 
     expect(await reconnectMcpWithCause(p, row.rowState, ref)).toStrictEqual({ outcome: 'transient', latched: true } satisfies ReconnectResult)
-    expect(order).toEqual(['get', 'readPane', 'readPane', 'get', 'sendKeys'])
+    expect(order).toEqual(['get', 'get', 'sendKeys'])
     expect(h.episodeNotices).toHaveLength(1)
   })
 
@@ -24701,7 +18612,7 @@ describe('b.jg5 SRJ-118, SRJ-609: reconnectMcpWithCause makes one send-keys and 
 // verdict is GONE-based. What a path hands `resumeOrFreshSpawn` shows in the
 // not-resumable step's line: every such case has its `resume` answer
 // `ErrSpawnNotResumable` and the re-read find the row `ended` (a lost race,
-// SRJ-710), so no dialog approver and no live-row sequence starts. A call joining a
+
 // launch in flight drops its verdict with one line. Each line is compared
 // with its exported builder, with one literal pin per builder. The
 // dead-session routes' own lines and their find-missing run before the
@@ -24932,7 +18843,7 @@ describe('b.jg5 SRJ-611: dead evidence, the launch wait\'s dead-session cause an
     expect(h.errors.filter((l) => l.startsWith(`[slack] spawnForPersona: the joining call for ${ref} `))).toEqual(
       carried === undefined ? [] : [joinedLaunchDropsDeadEvidenceLine(ref, carried)],
     )
-    await h.runApproverToStop(p)
+
   })
 })
 
@@ -25063,190 +18974,10 @@ describe('b.jg5 SRJ-118, SRJ-609: the ladder\'s waiting and working branches map
   })
 })
 
-// ---------------------------------------------------------------------------
-// b.jg5 SRJ-113: `resume`'s outcome table, one row per outcome, shared by
-// its two sites' cases: `resumeOrFreshSpawn` (the collision ladder, its
-// collision `get` reading the row `ended` with a session id) and the
-// live-row sequence's launch entry's `resume` leg (its last `get` read the
-// row `ended`). Each row gives, at each site, the launch's answer, the
-// launch and read calls from the `resume` on, the retry causes sent for P,
-// the outage flags raised, the failures counted (the entry counts its own
-// launch; the restart path counts a ladder launch from its answer), the
-// spawn-failure notices and the reuse spawns. An UNAVAILABLE outcome is
-// followed by exactly one `get` of the row (b.jg5 SRJ-407), which reads it
-// `ended` at both sites, so nothing more is called and the launch still
-// answers `retrying`; that `get`'s other answers are the SRJ-407
-// describe's. The CONFLICT rows are the case table's
-// (`tests/test-helpers/conflict-cases.ts`): at the ladder every `resume`
-// row crossed with every `resume` site (`LATCH_CROSS`), at the entry the
-// sequence `resume` rows.
-// ---------------------------------------------------------------------------
-
-/** What one row of SRJ-113's table gives at one `resume` site. */
-interface ResumeSiteOutcome {
-  /** The launch's answer, without its key. */
-  readonly answer: Readonly<Record<string, unknown>>
-  /** The launch and read calls from the `resume` on, in order (`LAUNCH_AND_READ_VERBS`). */
-  readonly calls: readonly string[]
-  /** The retry causes the launch sent for P, in order (a launch that returned success: its pending-only watch). */
-  readonly triggers: readonly string[]
-  /** The outage flags raised for P; none when unset. */
-  readonly flags?: readonly OutageClass[]
-  /** P's counted failures afterwards; none when unset. */
-  readonly counted?: number
-  /** The session manager's notices for P (a spawn failure, or the diagnosis's once the reuse brought P up); none when unset. */
-  readonly notices?: number
-  /** The reuse spawns made; none when unset. */
-  readonly reuses?: number
-  /** Lines the launch wrote for persona `p`, each exactly once; none checked when unset. */
-  readonly lines?: (p: string) => readonly string[]
-}
-
-/** One row of SRJ-113's table: the `resume`'s answer (success when `make` is unset) and what it gives at each site. */
-interface ResumeOutcomeRow {
-  readonly name: string
-  readonly make?: () => Error
-  /** Install agent-director's version re-check (ErrInvalidFlags's one immediate re-check, b.jg5 SRJ-204). */
-  readonly recheck?: true
-  readonly ladder: ResumeSiteOutcome
-  readonly entry: ResumeSiteOutcome
-}
-
-/** The verbs a row's call list holds: launches, reads of the row, kills, deletes and sweeps (the dialog approver's `status`, `read-pane` and `send-keys` left out). */
 const LAUNCH_AND_READ_VERBS: ReadonlySet<string> = new Set(['spawn', 'resume', 'get', 'kill', 'delete', 'findMissing'])
 
 /** The `retrying` launch result, uncounted (b.jg5 SRJ-105, SRJ-301, SRJ-1015). */
 const RETRYING_ANSWER = { action: SPAWN_ACTION_RETRYING } as const
-
-/** A `resume`'s collision: the client's `ErrInstanceIdCollision`, built for `resume` (decided by class, b.jg5 SRJ-101). */
-const resumeCollision = (): Error => new ErrInstanceIdCollision('resume', 'ErrInstanceIdCollision', 'instance_id already in use')
-
-/** The same outcome at both sites. */
-const atBothSites = (outcome: ResumeSiteOutcome): Pick<ResumeOutcomeRow, 'ladder' | 'entry'> => ({ ladder: outcome, entry: outcome })
-
-/** SRJ-113's UNAVAILABLE row's forms: still stopping, still starting, a launch timeout, a call timeout and an unknown name (b.jg5 SRJ-104). */
-const RESUME_UNAVAILABLE_FORMS = unavailableForms(
-  'ErrTmuxUnresponsive, still stopping',
-  'ErrTmuxUnresponsive, still starting',
-  'ErrTmuxUnresponsive, launch timeout',
-  'ErrCallTimeout',
-  'ErrUnknownErrorName',
-)
-
-const RESUME_OUTCOME_ROWS: readonly ResumeOutcomeRow[] = [
-  // A launch that returned arms P's pending-only watch over the `pending` row it left (b.jg5 SRJ-301, SRJ-409).
-  { name: 'success → resumed', ...atBothSites({ answer: { action: 'resumed' }, calls: ['resume'], triggers: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW] }) },
-  ...RESUME_UNAVAILABLE_FORMS.map(([label, make, cause]): ResumeOutcomeRow => ({
-    // b.jg5 SRJ-407: one `get` after the outcome, reading the row `ended`; no launch after it.
-    name: `UNAVAILABLE (${label}) → refused, never counted, no notice, P's timer armed; one get of the row, nothing after it`,
-    make: () => make('resume'),
-    ...atBothSites({ answer: RETRYING_ANSWER, calls: ['resume', 'get'], triggers: [cause] }),
-  })),
-  {
-    name: 'ENVIRONMENT (ErrTmuxNotAvailable) → tmux-unavailable, refused, never counted',
-    make: () => errTmuxNotAvailable(undefined, 'resume'),
-    ...atBothSites({ answer: RETRYING_ANSWER, calls: ['resume'], triggers: [UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT], flags: ['tmux-unavailable'] }),
-  },
-  {
-    name: 'LAUNCH FAILURE (ErrTmuxSessionCreate) → counted once, no kill, P armed at once in pending-only mode',
-    make: () => errTmuxSessionCreate('resume'),
-    ladder: { answer: { action: 'failed', countedClass: true, pendingOnlyArmed: true }, calls: ['resume'], triggers: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW], notices: 1 },
-    entry: { answer: { action: 'failed', countedClass: true, pendingOnlyArmed: true }, calls: ['resume'], triggers: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW], notices: 1, counted: 1 },
-  },
-  ...[errCwdNotFound, errCwdNotADirectory].map((make): ResumeOutcomeRow => ({
-    name: `DIRECTORY (${make('resume').errName}) → cwd-unreachable, counted`,
-    make: () => make('resume'),
-    ladder: { answer: { action: 'failed' }, calls: ['resume'], triggers: [], flags: ['cwd-unreachable'] },
-    entry: { answer: { action: 'failed', countedClass: true }, calls: ['resume'], triggers: [], flags: ['cwd-unreachable'], counted: 1 },
-  })),
-  ...[errNoSessionId, errJsonlNeverWritten].map((make): ResumeOutcomeRow => ({
-    name: `${make().errName} → one reuse spawn of the same id`,
-    make,
-    ...atBothSites({ answer: { action: 'spawned' }, calls: ['resume', 'spawn'], triggers: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW], reuses: 1 }),
-  })),
-  {
-    name: 'ErrJsonlMissing → the diagnosis\'s get, then one reuse spawn of the same id',
-    make: () => errJsonlMissing(),
-    ...atBothSites({ answer: { action: 'fresh-after-inconclusive-amnesia' }, calls: ['resume', 'get', 'spawn'], triggers: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW], reuses: 1, notices: 1 }),
-  },
-  {
-    name: 'ErrSpawnNotFound → exactly one plain spawn of the same id, no reuse flag, no spawn-failure notice',
-    make: () => errSpawnNotFound(),
-    ...atBothSites({ answer: { action: 'spawned' }, calls: ['resume', 'spawn'], triggers: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW] }),
-  },
-  {
-    name: 'ErrSpawnNotResumable → SRJ-710\'s one re-read (here of the ended row: a lost race)',
-    make: () => errSpawnNotResumable(),
-    ladder: { answer: RETRYING_ANSWER, calls: ['resume', 'get'], triggers: [UNAVAILABLE_RETRY_CAUSE_LOST_RACE] },
-    // At the entry the sequence's end arms (tests/live-row-sequence.test.ts); the entry arms nothing itself.
-    entry: { answer: { action: LIVE_ROW_OUTCOME_NOT_LAUNCHED, reason: LIVE_ROW_NOT_LAUNCHED_NOT_RESUMABLE }, calls: ['resume', 'get'], triggers: [] },
-  },
-  {
-    name: 'UNUSABLE NAME → latched (SRJ-105, SRJ-512), never counted',
-    make: () => errUnusableName(),
-    ...atBothSites({ answer: { action: 'latched' }, calls: ['resume'], triggers: [] }),
-  },
-  {
-    name: 'CONFIG (ErrConfigMalformed) → ad-config-malformed, refused, never counted',
-    make: () => errConfigMalformed(),
-    ...atBothSites({ answer: RETRYING_ANSWER, calls: ['resume'], triggers: [UNAVAILABLE_RETRY_CAUSE_CONFIG], flags: ['ad-config-malformed'] }),
-  },
-  {
-    name: 'UNCLASSIFIED (ErrInternal) → refused, never counted',
-    make: () => errInternal(),
-    ...atBothSites({ answer: RETRYING_ANSWER, calls: ['resume'], triggers: [UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED] }),
-  },
-  {
-    name: 'ErrInvalidFlags → one immediate version re-check, then UNCLASSIFIED; never the hold',
-    make: () => errInvalidFlags('resume'),
-    recheck: true,
-    ...atBothSites({ answer: RETRYING_ANSWER, calls: ['resume'], triggers: [UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED] }),
-  },
-  // b.jg5 SRJ-713: agent-director's `resume` gives no such answer; the guard keeps a collision from the spawn-failure notice.
-  {
-    name: 'a collision (ErrInstanceIdCollision, by class) → the collision cause armed, retrying; never counted, never the spawn-failure notice',
-    make: resumeCollision,
-    ...atBothSites({
-      answer: RETRYING_ANSWER,
-      calls: ['resume'],
-      triggers: [UNAVAILABLE_RETRY_CAUSE_COLLISION],
-      lines: (p) => [resumeCollisionLine(renderPersonaRef(p, p), describeAgentDirectorFailure(resumeCollision()), true)],
-    }),
-  },
-]
-
-/**
- * Assert what a row's outcome at one site, `outcome`, shows for persona `p`
- * once the launch answered `result`: the answer, the calls from the `resume`
- * on (`order`, every stub call in order), the causes sent, the flags raised,
- * the failures counted, the notices, each line the row names (once) and the
- * reuse spawns; no kill or delete;
- * one version re-check where the row makes one. Then P's dialog approver,
- * when a launch started it, is run to its stop.
- */
-async function expectResumeOutcome(
-  h: RecoveryHarness,
-  p: string,
-  outcome: ResumeSiteOutcome,
-  result: unknown,
-  order: readonly string[],
-  rechecks: { readonly resolves: readonly unknown[] } | undefined,
-): Promise<void> {
-  expect(result).toStrictEqual({ key: p, ...outcome.answer })
-  const fromResume = order.slice(order.indexOf('resume')).filter((verb) => LAUNCH_AND_READ_VERBS.has(verb))
-  expect(fromResume).toEqual([...outcome.calls])
-  expect(h.triggers.filter((t) => t.key === p).map((t) => t.kind)).toEqual([...outcome.triggers])
-  expect([...getOutageFlags(p)]).toEqual([...(outcome.flags ?? [])])
-  expect(getFailureCount(p)).toBe(outcome.counted ?? 0)
-  expect(h.notices.filter((n) => n.key === p)).toHaveLength(outcome.notices ?? 0)
-  for (const line of outcome.lines?.(p) ?? []) expect(h.errors.filter((logged) => logged === line)).toHaveLength(1)
-  expect(h.reuseSpawns()).toHaveLength(outcome.reuses ?? 0)
-  // A plain spawn never carries the reuse flag: only the reuses do.
-  expect(h.stub.calls.spawnCalls.filter((call) => call.reuse_finished === true)).toHaveLength(outcome.reuses ?? 0)
-  expect([h.stub.calls.killCalls, h.stub.calls.deleteCalls]).toEqual([[], []])
-  if (rechecks !== undefined) expect(rechecks.resolves).toHaveLength(1)
-  if (h.approverRunning(p)) await h.runApproverToStop(p)
-}
 
 // ---------------------------------------------------------------------------
 // b.jg5 SRJ-705 step 6, SRJ-706 (E21 T1), SRJ-112, SRJ-708 (E22 T1): the
@@ -25273,7 +19004,7 @@ async function expectResumeOutcome(
 // outcome table, one case per row, with the CONFLICT and UNUSABLE NAME rows'
 // whole matrices (their records and posts) left to
 // tests/conflict-latch.test.ts and the other arms through the sequence to
-// tests/unavailable-retry.test.ts; its approver and `pre_trust` line are the
+
 // SRJ-401 and SRJ-413 describes' (a `SUCCESS_SITES` row). No case makes a
 // `delete` or a `kill` from the entry, and no call sets `include_finished`
 // or `no_pre_trust` (checked after each case). The sequence's other steps
@@ -25320,21 +19051,6 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
     return { entered, release }
   }
 
-  test('the resume kind: one resume of cscb_<key>; on success the after-launch step logs pre_trust once and starts the approver', async () => {
-    const { h, p } = srj105Build()
-    const id = personaInstanceId(p)
-    const [preTrust] = PRE_TRUST_VALUES
-    h.script({ resumeResult: cannedResumeResult(id, preTrust) })
-
-    expect(await launchEntry(h, p, LIVE_ROW_LAUNCH_RESUME)).toEqual({ key: p, action: 'resumed' })
-
-    expect(h.stub.calls.resumeCalls).toEqual([{ instance_id: id }])
-    expect(preTrustLines(h.errors.join('\n'))).toEqual([preTrustLogLine(renderPersonaRef(p, p), LAUNCH_VERB_RESUME, preTrust)])
-    expect(h.approverRunning(p)).toBe(true)
-    expect(await h.runApproverToStop(p)).toBeDefined()
-    expect(destructiveCalls(h)).toEqual([[], [], []])
-  })
-
   test('a launch call: isLaunchInFlight is true while its resume is held and whenLaunchSettled waits for it; both clear once it settles', async () => {
     const { h, p } = srj105Build()
     const held = holdResume(h)
@@ -25351,7 +19067,7 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
     expect(await entry).toEqual({ key: p, action: 'resumed' })
     await waited
     expect([isLaunchInFlight(p), settled]).toEqual([false, true])
-    await h.runApproverToStop(p)
+
   })
 
   test('with a launch for P already held in flight, the entry waits for it to settle and never overlaps it', async () => {
@@ -25372,7 +19088,7 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
     expect(await entry).toEqual({ key: p, action: 'resumed' })
     expect(h.stub.calls.resumeCalls).toEqual([{ instance_id: id }])
     expect(isLaunchInFlight(p)).toBe(false)
-    await h.runApproverToStop(p)
+
   })
 
   // b.jg5 SRJ-706: the sequence's stop signal goes with its launch; once it
@@ -25400,7 +19116,7 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
       hold.release(id)
       expect(await first).toEqual({ key: p, action: 'spawned' })
       expect([h.stub.calls.resumeCalls, h.reuseSpawns(), isLaunchInFlight(p)]).toEqual([[], [], false])
-      await h.runApproverToStop(p)
+
     },
   )
 
@@ -25444,7 +19160,7 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
     expect(h.notices).toEqual(Array.from({ length: diagnoses }, () => ({ key: p, text: expect.stringContaining(JSONL_DIAGNOSIS_REUSE_WORDING) })))
     expect(h.startupErrors()).toEqual([])
     expect(getFailureCount(p)).toBe(0)
-    await h.runApproverToStop(p)
+
   })
 
   // b.jg5 SRJ-113 at the sequence-launch entry's `resume` leg: one case per
@@ -25452,18 +19168,6 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
   // read `ended`, with a session id. Every non-success but the three
   // no-transcript fallbacks and ErrSpawnNotFound's plain spawn ends the
   // launch with no further launch; ErrSpawnNotResumable makes its one re-read.
-  test.each(RESUME_OUTCOME_ROWS.map((row) => [row.name, row] as const))('SRJ-113 at the entry: resume answering %s', async (_name, row) => {
-    const { h, p } = srj105Build()
-    const rechecks = row.recheck === true ? h.recheckAnswers(PHASE1_RC_VERSION) : undefined
-    h.script({ getResult: harnessRow(h, harnessPersona(h, p), ENDED_WITH_SESSION), ...(row.make === undefined ? {} : { resumeError: row.make() }) })
-    const order = recordCallOrder(h)
-
-    const result = await launchEntry(h, p, LIVE_ROW_LAUNCH_RESUME)
-
-    await expectResumeOutcome(h, p, row.entry, result, order, rechecks)
-    // No second sequence: the entry starts none, whatever the answer.
-    expect(h.sequenceRunning(p)).toBe(false)
-  })
 
   // b.jg5 SRJ-113, SRJ-501 (HO rev 15, rev 20): each sequence `resume` row of
   // the case table latches P with its case, the refused operation "resume"
@@ -25532,7 +19236,7 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
     expectPendingOnlyWatch(h, p)
     expect(order.filter((verb) => LAUNCH_AND_READ_VERBS.has(verb))).toEqual(['kill', 'get', 'findMissing', 'get', 'resume', 'spawn'])
     expect(h.stub.calls.spawnCalls.map((call) => [call.instance_id, call.reuse_finished])).toEqual([[personaInstanceId(p), undefined]])
-    await h.runApproverToStop(p)
+
   })
 
   describe('b.jg5 SRJ-112, SRJ-708: the reuse spawn through the entry\'s reuse kind', () => {
@@ -25553,9 +19257,8 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
       expect(persona.claude_config_dir !== undefined).toBe(ownConfigDir)
 
       expect(await h.launch(p)).toEqual({ key: p, action: 'spawned' })
-      await h.runApproverToStop(p)
+
       expect(await reuseEntry(h, p)).toEqual({ key: p, action: 'spawned' })
-      await h.runApproverToStop(p)
 
       const [plain, reuse] = h.stub.calls.spawnCalls
       expect(h.stub.calls.spawnCalls).toHaveLength(2)
@@ -25598,7 +19301,7 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
 
       expect(order).toEqual([...events])
       expect(h.reuseSpawns()).toEqual(oneReuseOf(h, p))
-      await h.runApproverToStop(p)
+
     })
 
     // SRJ-112: the success line says whether the id had a row when the
@@ -25624,7 +19327,7 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
         `[slack] reuseSpawnForPersona: reuse-spawned ${renderPersonaRef(p, p)} instanceId=${personaInstanceId(p)} — a fresh conversation on its own id; ${earlierLife} (b.jg5 SRJ-112)`,
       ])
       expect(h.reuseSpawns()).toEqual(oneReuseOf(h, p))
-      await h.runApproverToStop(p)
+
     })
 
     test('a launch call: isLaunchInFlight is true while the reuse spawn is held, and false once it settled', async () => {
@@ -25638,7 +19341,7 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
       expect(await entry).toEqual({ key: p, action: 'spawned' })
       expect(isLaunchInFlight(p)).toBe(false)
       expect(hold.calls).toEqual(oneReuseOf(h, p))
-      await h.runApproverToStop(p)
+
     })
 
     // b.jg5 SRJ-112, SRJ-602: the entry counts a counted failure once; a
@@ -25801,7 +19504,7 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
         expect(h.controller.view(p)).toMatchObject({ mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, causes: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW] })
       }
       expect(personaCallCounts(h, b)).toEqual({})
-      if (row.answer.action === 'spawned') await h.runApproverToStop(p)
+
     })
 
     // b.jg5 SRJ-112, SRJ-207: the reuse's ErrInvalidFlags gets one immediate
@@ -25947,7 +19650,7 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
       result: { key: b, action: 'resumed' },
     })
     expect(h.stub.calls.resumeCalls).toEqual([{ instance_id: personaInstanceId(b) }])
-    await h.runApproverToStop(b)
+
   })
 
   test('the launch-kind facts come from the applied resume_enabled, the row comparison and the store\'s retired-key reading at the call', () => {
@@ -26046,7 +19749,7 @@ describe('b.4q8: the live-row sequence\'s start entry forwards whether P was bel
     expect(h.stub.calls.spawnCalls).toEqual([reuseSpawnOf(h, p)])
     expect(h.errors.filter((line) => line === sequenceLaunchAtCapLine(renderPersonaRef(p, p)))).toEqual([])
     expect(getFailureCount(p)).toBe(0)
-    await h.runApproverToStop(p)
+
   })
 })
 
@@ -26201,7 +19904,7 @@ describe('b.jg5 SRJ-602, SRJ-711: ErrTmuxSessionCreate is one counted launch fai
     expect(h.stub.calls.spawnCalls).toHaveLength(order.filter((verb) => verb === 'spawn').length)
     expect(h.stub.calls.spawnCalls.filter((params) => 'reuse_finished' in params)).toEqual([])
     expect(h.reuseSpawns()).toEqual([])
-    await h.runApproverToStop(p)
+
   })
 
   test('SRJ-711: a first spawn that collides with an ended row carrying a session id goes to get and then resume, with no reuse: the conversation is kept', async () => {
@@ -26216,7 +19919,7 @@ describe('b.jg5 SRJ-602, SRJ-711: ErrTmuxSessionCreate is one counted launch fai
     expect(h.stub.calls.spawnCalls).toHaveLength(1)
     expect('reuse_finished' in h.stub.calls.spawnCalls[0]!).toBe(false)
     expect(h.reuseSpawns()).toEqual([])
-    await h.runApproverToStop(p)
+
   })
 })
 
@@ -26263,7 +19966,7 @@ describe('b.jg5 SRJ-707, SRJ-712: resume\'s no-transcript answers go on to one r
     expect(h.stub.calls.spawnCalls.map((call) => call.reuse_finished)).toEqual([undefined, true])
     expect([h.stub.calls.deleteCalls, h.stub.calls.killCalls]).toEqual([[], []])
     expect(personaCallCounts(h, b)).toEqual({})
-    await h.runApproverToStop(p)
+
   })
 
   test('AD 0.12 unmessaged same-agent reuse with rotated history diagnoses ErrJsonlMissing before reuse, preserving uncertainty', async () => {
@@ -26285,7 +19988,7 @@ describe('b.jg5 SRJ-707, SRJ-712: resume\'s no-transcript answers go on to one r
     expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p)])
     expect([h.stub.calls.deleteCalls, h.stub.calls.killCalls]).toEqual([[], []])
     expect(h.startupErrors().join('\n')).toContain(JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)
-    await h.runApproverToStop(p)
+
   })
 
   // b.jg5 SRJ-112, SRJ-301: the first reuse collision re-runs the ladder's
@@ -26470,14 +20173,14 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
       name: 'a waiting row with no config_dir label (the guard before resume)',
       row: (h, p, state) => unlabelledRow(h, harnessPersona(h, p), state),
       swept: true,
-      before: ['spawn', 'get', 'get', 'readPane', 'readPane', 'get', 'sendKeys', 'findMissing'],
+      before: ['spawn', 'get', 'get', 'get', 'sendKeys', 'findMissing'],
       pendingCovered: false,
     },
     {
       name: 'a waiting row whose config_dir label differs (the guard before resume)',
       row: (h, p, state) => relabelledRow(h, harnessPersona(h, p), state),
       swept: true,
-      before: ['spawn', 'get', 'get', 'readPane', 'readPane', 'get', 'sendKeys', 'findMissing'],
+      before: ['spawn', 'get', 'get', 'get', 'sendKeys', 'findMissing'],
       pendingCovered: false,
     },
     {
@@ -26485,7 +20188,7 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
       setup: noResume,
       row: (_h, _p, state) => ({ state }),
       swept: false,
-      before: ['spawn', 'get', 'get', 'readPane', 'readPane', 'get', 'sendKeys'],
+      before: ['spawn', 'get', 'get', 'get', 'sendKeys'],
       pendingCovered: true,
     },
   ]
@@ -26556,7 +20259,7 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
     // Nothing armed but the step-6 reuse's pending-only watch (b.jg5 SRJ-409).
     expect([getFailureCount(p), h.triggers, h.notices]).toEqual([0, [pendingRowTrigger(p)], []])
     expect(personaCallCounts(h, b)).toEqual({})
-    await h.runApproverToStop(p)
+
   })
 
   // b.jg5 SRJ-609, SRJ-611, SRJ-707 (S4): on a route whose verdict is not
@@ -26619,7 +20322,7 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
       expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p)])
       // Nothing armed but the reuse's pending-only watch (b.jg5 SRJ-409).
       expect([h.sequenceRunning(p), h.triggers]).toEqual([false, [pendingRowTrigger(p)]])
-      await h.runApproverToStop(p)
+
       return
     }
     if (reread === LIVE || UNKNOWN_STATES.has(reread)) {
@@ -26650,7 +20353,7 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
     expect(h.lines).toContain(liveRowSequenceStartLine(renderPersonaRef(p, p), h.sequenceRequest(p, { lastReadState: AGENT_DIRECTOR_PENDING_STATE })))
     expect(await h.driveSequence(h.sequenceSettled(p))).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_REUSE, result: { key: p, action: 'spawned' } })
     expect([getFailureCount(p), h.notices]).toEqual([0, []])
-    await h.runApproverToStop(p)
+
   })
 
   // The re-read's own error rows (b.jg5 SRJ-114, SRJ-105): a refused re-read
@@ -26780,7 +20483,7 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
     expect(h.reuseSpawns()[0]!.label).toContain(`config_dir=${personaConfigDirLabelValue(persona.claude_config_dir, h.home)}`)
     expect([h.stub.calls.killCalls, h.stub.calls.resumeCalls]).toEqual([[], []])
     expect(personaCallCounts(h, b)).toEqual({})
-    await h.runApproverToStop(p)
+
   })
 
   // SRJ-112: a collision means the row turned live; the ladder re-runs its
@@ -26796,7 +20499,7 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
     expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p), reuseSpawnOf(h, p)])
     expect(h.stub.calls.killCalls).toEqual([])
     expect([getFailureCount(p), h.triggers, h.episodeNotices]).toEqual([0, [pendingRowTrigger(p)], []])
-    await h.runApproverToStop(p)
+
   })
 
   test.each(REUSE_SITES.map((site) => [site.name, site] as const))('SRJ-112, %s: a second collision, in the one re-run, arms the collision cause and answers retrying; no third launch, nothing counted or posted', async (_name, site) => {
@@ -26902,7 +20605,7 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
   // and replace, at any path that resumes: its re-read of a row that has
   // finished since is a lost race, whatever evidence the path holds.
   test.each<[string, RecoveryStubScript, readonly string[]]>([
-    ['the dead-session path of a waiting row (after its sweep)', { ...NOT_INTERACTIVE_WAITING }, ['spawn', 'get', 'get', 'readPane', 'readPane', 'get', 'sendKeys', 'findMissing', 'resume', 'get']],
+    ['the dead-session path of a waiting row (after its sweep)', { ...NOT_INTERACTIVE_WAITING }, ['spawn', 'get', 'get', 'get', 'sendKeys', 'findMissing', 'resume', 'get']],
     ['a check_permission row whose read-pane answered GONE, swept and re-read ended', { readPaneError: errTmuxCaptureFailed(), statusResult: cannedStatusResult({ state: LIVENESS_DEAD_ROW_ENDED }) }, ['spawn', 'get', 'readPane', 'findMissing', 'status', 'resume', 'get']],
   ])('SRJ-710: resume answering ErrSpawnNotResumable on %s, its re-read finding the row ended, is a lost race: no kill, delete or launch, nothing counted or posted, P armed with the lost-race cause', async (_name, script, order) => {
     const { h, p } = srj105Build()
@@ -26981,7 +20684,7 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
     const log = h.startupErrors().join('\n')
     expect([countStartupEntries(log, JSONL_TRANSCRIPT_LOST_ENTRY_CLASS), countStartupEntries(log, JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)]).toEqual([0, 0])
     expect(getFailureCount(p)).toBe(0)
-    await h.runApproverToStop(p)
+
   })
 })
 
@@ -27025,11 +20728,10 @@ describe('b.jg5 SRJ-706: the sequence registry\'s installer and entries, the sta
     expect(personaCallCounts(h, p)).toEqual(pCalls)
     expect(personaCallCounts(h, b)).toMatchObject({ spawnCalls: 1 })
     expect(getFailureCount(p)).toBe(0)
-    await h.runApproverToStop(b)
 
     hold.release(cannedFindMissing({ rows: { [personaInstanceId(p)]: 'ids' } }))
     expect(await h.driveSequence(run.outcome)).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, result: { key: p, action: 'spawned' } })
-    await h.runApproverToStop(p)
+
     expect(await h.launch(p)).toEqual({ key: p, action: 'spawned' })
     // B's start-pass spawn, P's sequence's reuse spawn, then P's own launch.
     expect(h.stub.calls.spawnCalls.map((call) => [call.instance_id, call.reuse_finished])).toEqual([
@@ -27037,7 +20739,7 @@ describe('b.jg5 SRJ-706: the sequence registry\'s installer and entries, the sta
       [personaInstanceId(p), true],
       [personaInstanceId(p), undefined],
     ])
-    await h.runApproverToStop(p)
+
   })
 
   test('with no registry installed, the running query answers false, a stop resolves false, a start answers not-installed with one line and no call, and a launch of P is not held', async () => {
@@ -27051,7 +20753,7 @@ describe('b.jg5 SRJ-706: the sequence registry\'s installer and entries, the sta
     expect(h.stub.callCount()).toBe(0)
     expect(h.errors.filter((line) => line.startsWith(LIVE_ROW_SEQUENCE_LOG_PREFIX))).toEqual([expect.stringContaining('no sequence registry is installed')])
     expect(await h.launch(p)).toEqual({ key: p, action: 'spawned' })
-    await h.runApproverToStop(p)
+
   })
 
   // The registry installed after the latch, as main() installs them, is
@@ -27059,7 +20761,8 @@ describe('b.jg5 SRJ-706: the sequence registry\'s installer and entries, the sta
   // from another path).
   test('a latch installed after the registry: a latch of P stops P\'s running sequence and makes no further call for it; B\'s sequence, not latched, runs on to its launch', async () => {
     const { h, p, b } = srj105Build()
-    setConflictLatch(createConflictLatch({ log: () => {} }))
+    const replacementLatch = createConflictLatch({ log: () => {} })
+    setConflictLatch(replacementLatch)
     const hold = holdFindMissing(h.stub.client)
     ownRowsLiveThenMissing(h)
     const pRun = await startSequenceHeldAtRun(h, p, hold)
@@ -27068,7 +20771,7 @@ describe('b.jg5 SRJ-706: the sequence registry\'s installer and entries, the sta
     h.script({ statusFn: (params) => (params.instance_id === personaInstanceId(p) ? pending : cannedStatusResult()) })
 
     // Another path's own-row read latches P (SRJ-513).
-    await readPersonaRowState(p)
+    replacementLatch.set(p, LATCHED_ELSEWHERE)
     const pCalls = personaCallCounts(h, p)
     expect(h.lines.filter((line) => line.includes('stop asked'))).toEqual([expect.stringContaining(`persona=${p}: stop asked`)])
     hold.release(cannedFindMissing({ rows: { [personaInstanceId(p)]: 'ids' } }))
@@ -27108,47 +20811,12 @@ describe('b.jg5 SRJ-113: resume\'s outcome table at resumeOrFreshSpawn, one case
     ...(err === undefined ? {} : { resumeError: err }),
   })
 
-  test.each(RESUME_OUTCOME_ROWS.map((row) => [row.name, row] as const))('SRJ-113 at resumeOrFreshSpawn: resume answering %s', async (_name, row) => {
-    const { h, p } = srj105Build()
-    const rechecks = row.recheck === true ? h.recheckAnswers(PHASE1_RC_VERSION) : undefined
-    h.script(endedRowResume(h, p, row.make?.()))
-    const order = recordCallOrder(h)
-
-    const result = await h.launch(p)
-
-    await expectResumeOutcome(h, p, row.ladder, result, order, rechecks)
-    expect(h.sequenceRunning(p)).toBe(false)
-  })
-
   // HO rev 28: a `resume` whose description says
   // the row could not be restored and stays pending is counted and arms P's
   // retry timer at once in pending-only mode, with no `get` first, so the
   // retry's read decides; nothing is killed. At the first pending-only retry
   // the row, P's own and not a retired key's, is covered (apply21; b.jg5
   // SRJ-409): its one `get` reads it, and it is left, with no kill and no launch.
-  test('ErrTmuxSessionCreate saying the row could not be restored and stays pending (session_restart_delay 0): counted once, no kill and no get after it; the stub\'s row stays pending; P armed at once in pending-only mode; the first retry reads the covered row and leaves it, the watch kept', async () => {
-    const { h, p } = srj105Build()
-    expect(h.config.session_restart_delay).toBe(0)
-    h.script({ ...endedRowResume(h, p, errTmuxSessionCreateStaysPending('resume')), statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE }) })
-    const order = recordCallOrder(h)
-
-    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed', countedClass: true, pendingOnlyArmed: true })
-
-    expect(order).toEqual(['spawn', 'get', 'resume'])
-    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }])
-    expect(h.controller.view(p)).toMatchObject({ phase: 'waiting', mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, causes: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW] })
-    expect(h.notices.map((notice) => notice.key)).toEqual([p])
-    expect(h.stub.calls.killCalls).toEqual([])
-
-    h.script({ getResult: harnessRow(h, harnessPersona(h, p), { ...ENDED_WITH_SESSION, state: AGENT_DIRECTOR_PENDING_STATE }) })
-    const before = personaCallCounts(h, p)
-    const countedBefore = getFailureCount(p)
-    await retryNow(h, p)
-
-    expect(callCountsSince(personaCallCounts(h, p), before)).toEqual({ statusCalls: 1, getCalls: 1 })
-    expect([h.sequenceRunning(p), h.approverRunning(p), getFailureCount(p)]).toEqual([false, false, countedBefore])
-    expect(h.controller.view(p)).toMatchObject({ phase: 'waiting', mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY })
-  })
 
   /**
    * One of HO rev 28's four failures met after the `resume`'s move, and the
@@ -27409,7 +21077,7 @@ describe('b.jg5 SRJ-710: ErrSpawnNotResumable\'s one re-read through the shared 
 
     expect(await h.launch(p)).toStrictEqual({ key: p, action: 'sequence-waiting' })
 
-    const pathCalls = path === 'dead evidence' ? ['spawn', 'get', 'get', 'readPane', 'readPane', 'get', 'sendKeys', 'findMissing', 'resume'] : PATH_CALLS[path]
+    const pathCalls = path === 'dead evidence' ? ['spawn', 'get', 'get', 'get', 'sendKeys', 'findMissing', 'resume'] : PATH_CALLS[path]
     expect(order.slice(0, pathCalls.length + 1)).toEqual([...pathCalls, 'get'])
     expect(notResumableLines(h, p)).toEqual([expect.stringContaining(` — ${NOT_RESUMABLE_PENDING_OUTCOME} `)])
     expect(h.lines).toContain(liveRowSequenceStartLine(renderPersonaRef(p, p), h.sequenceRequest(p, { lastReadState: AGENT_DIRECTOR_PENDING_STATE })))
@@ -27417,7 +21085,7 @@ describe('b.jg5 SRJ-710: ErrSpawnNotResumable\'s one re-read through the shared 
     expect(await h.driveSequence(h.sequenceSettled(p))).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_REUSE, result: { key: p, action: 'spawned' }, kills: 1 })
     expect(h.stub.calls.resumeCalls).toHaveLength(1)
     expect([getFailureCount(p), h.notices, h.episodeNotices]).toEqual([0, [], []])
-    await h.runApproverToStop(p)
+
   })
 
   test.each<[string, (h: RecoveryHarness, p: string) => CannedGetResult]>([
@@ -27430,7 +21098,7 @@ describe('b.jg5 SRJ-710: ErrSpawnNotResumable\'s one re-read through the shared 
 
     expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
 
-    expect(order).toEqual(['spawn', 'get', 'get', 'readPane', 'readPane', 'get', 'sendKeys', 'findMissing', 'resume', 'get'])
+    expect(order).toEqual(['spawn', 'get', 'get', 'get', 'sendKeys', 'findMissing', 'resume', 'get'])
     expect(h.latch.isLatched(p)).toBe(true)
     expect([h.sequenceRunning(p), getFailureCount(p), h.notices]).toEqual([false, 0, []])
     expect(notResumableLines(h, p)).toEqual([expect.stringContaining(` — re-read: ${describePersonaRowReread({ kind: ROW_REREAD_LATCHED })}; `)])
@@ -27476,7 +21144,7 @@ describe('b.jg5 SRJ-710: ErrSpawnNotResumable\'s one re-read through the shared 
 
     expect(await h.launch(p)).toStrictEqual({ key: p, action: SPAWN_ACTION_RETRYING })
 
-    expect(order).toEqual(path === 'dead evidence' ? ['spawn', 'get', 'get', 'readPane', 'readPane', 'get', 'sendKeys', 'findMissing', 'resume', 'get'] : [...PATH_CALLS[path], 'get'])
+    expect(order).toEqual(path === 'dead evidence' ? ['spawn', 'get', 'get', 'get', 'sendKeys', 'findMissing', 'resume', 'get'] : [...PATH_CALLS[path], 'get'])
     expect(h.triggers.map((t) => t.kind)).toEqual([cause, UNAVAILABLE_RETRY_CAUSE_LOST_RACE])
     expect([h.sequenceRunning(p), h.stub.calls.killCalls, getFailureCount(p), h.notices]).toEqual([false, [], 0, []])
     expect(notResumableLines(h, p)).toEqual([expect.stringContaining(` — re-read: ${describePersonaRowReread({ kind: ROW_REREAD_REFUSED })}; `)])
@@ -27714,7 +21382,7 @@ describe('b.jg5 SRJ-611, SRJ-710 (AC 58, AC 59): an ErrSpawnNotResumable on a ro
     // Nothing armed but the step-6 resume's pending-only watch (b.jg5 SRJ-409).
     expectOnlyPendingRowWatch(h, p)
     expect(personaCallCounts(h, b)).toEqual({})
-    await h.runApproverToStop(p)
+
   })
 
   /** The not-resumable step's re-read of P's row in `state`, of the `unknown` kind. */
@@ -27838,7 +21506,7 @@ describe('b.jg5 SRJ-611, SRJ-710 (AC 58, AC 59): an ErrSpawnNotResumable on a ro
     expect(await h.launch(p)).toStrictEqual({ key: p, action: 'sequence-waiting' })
     expect(await h.driveSequence(h.sequenceSettled(p))).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_RESUME, result: { key: p, action: 'resumed' } })
     expect(h.stub.calls.resumeCalls).toHaveLength(2)
-    await h.runApproverToStop(p)
+
   })
 
   // b.jg5 SRJ-710: a `pending` re-read after a path whose evidence was
@@ -27978,7 +21646,7 @@ describe('b.jg5 SRJ-611, SRJ-710 (AC 58, AC 59): an ErrSpawnNotResumable on a ro
     expect(await h.driveSequence(h.sequenceSettled(p))).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_RESUME, result: { key: p, action: 'resumed' }, kills: 1 })
     expect(order.filter((verb) => LAUNCH_AND_READ_VERBS.has(verb) && verb !== 'findMissing')).toEqual([...reuseRerun.calls, 'kill', 'get', 'get', 'resume'])
     expect([h.stub.calls.killCalls.length, getFailureCount(p)]).toEqual([1, 0])
-    await h.runApproverToStop(p)
+
   })
 
   // b.jg5 SRJ-805, SRJ-611 (R11): a retired key's first launch is a reuse
@@ -28070,7 +21738,7 @@ describe('b.jg5 SRJ-611, SRJ-710 (AC 58, AC 59): an ErrSpawnNotResumable on a ro
     expect(await h.driveSequence(h.sequenceSettled(p))).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_RESUME, kills: 1 })
     // No get after the run before the resume; then the sequence's kill, gets and resume.
     expect(order.filter((verb) => LAUNCH_AND_READ_VERBS.has(verb) && verb !== 'findMissing')).toEqual(['spawn', 'get', 'get', 'get', 'resume', 'get', 'kill', 'get', 'get', 'resume'])
-    await h.runApproverToStop(p)
+
   })
 
   // R12: the SRJ-120 get's finished read is the path's last read from then
@@ -28094,7 +21762,7 @@ describe('b.jg5 SRJ-611, SRJ-710 (AC 58, AC 59): an ErrSpawnNotResumable on a ro
     expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p)])
     expect([h.sequenceRunning(p), h.stub.calls.killCalls, h.stub.calls.resumeCalls, getFailureCount(p)]).toEqual([false, [], [], 0])
     expect(voidedEvidenceLines(h, renderPersonaRef(p, p))).toEqual([deadEvidenceVoidedLine(renderPersonaRef(p, p), OWN_GONE, deadEvidenceVoidingRead(DEAD_EVIDENCE_READ_BY_POST_SWEEP_GET, latchRowStateRead(LIVENESS_DEAD_ROW_ENDED)))])
-    await h.runApproverToStop(p)
+
   })
 
   test('R12: a waiting row whose reconnect answers GONE, the run listing P in unverified_ids and the get after it reading ended, then a resume CONFLICT: P latched with the refused operation resume and the state that get read', async () => {
@@ -28137,7 +21805,7 @@ describe('b.jg5 SRJ-611, SRJ-710 (AC 58, AC 59): an ErrSpawnNotResumable on a ro
     expect(voidedEvidenceLines(h, ref)).toEqual(
       carried === undefined ? [] : [deadEvidenceVoidedLine(ref, carried, deadEvidenceVoidingRead(DEAD_EVIDENCE_READ_BY_COLLISION_GET, latchRowStateRead(LIVENESS_DEAD_ROW_ENDED)))],
     )
-    await h.runApproverToStop(p)
+
   })
 })
 
@@ -28207,7 +21875,7 @@ describe('b.jg5 SRJ-207, SRJ-1015: every launch path for a held persona answers 
     // Q is not held: its launch reaches agent-director and brings it up.
     expect(await h.launch(b)).toStrictEqual({ key: b, action: 'spawned' })
     expect(h.invalidFlagsHold.heldKeys()).toEqual([p])
-    await h.runApproverToStop(b)
+
   })
 
   test('b.jg5 SRJ-1015: the start pass over a held P and an unheld Q: P\'s outcome is held with no call, counted neither failed nor succeeded; Q is spawned and counted', async () => {
@@ -28222,7 +21890,7 @@ describe('b.jg5 SRJ-207, SRJ-1015: every launch path for a held persona answers 
     expect(personaCallCounts(h, p)).toEqual(before)
     expect(h.episodeNotices).toEqual([holdAlert(p)])
     await h.settle()
-    await h.runApproverToStop(b)
+
   })
 
   // The latched gate answers for a persona both latched and held: the latch
@@ -28282,7 +21950,7 @@ describe('b.jg5 SRJ-207, SRJ-1015: every launch path for a held persona answers 
     const order = recordCallOrder(h)
     expect(await h.launch(p)).toStrictEqual({ key: p, action: 'spawned' })
     expect(order[0]).toBe('spawn')
-    await h.runApproverToStop(p)
+
   })
 
   test('a hold whose set throws: the reuse still answers held, with one line naming what the set threw, redacted; nothing is posted', async () => {
@@ -28349,7 +22017,6 @@ describe('b.jg5 SRJ-207, SRJ-1008, SRJ-204 (AC 23) end to end: a forced reuse ge
     expect(h.reuseSpawns().slice(reusesBefore)).toEqual([reuseSpawnOf(h, p)])
     expect(h.episodeNotices).toEqual([holdAlert(p)])
     expect(h.lines.filter((line) => line === invalidFlagsHoldEndLine(p, PHASE1_RC_VERSION, NEW_VERSION))).toHaveLength(1)
-    await h.runApproverToStop(p)
 
     // A new ErrInvalidFlags after that: a new hold, under the version now seen, with one new alert.
     await holdThroughReuse(h, p)
@@ -28388,7 +22055,7 @@ describe('b.jg5 SRJ-207, SRJ-1008, SRJ-204 (AC 23) end to end: a forced reuse ge
     expect(h.invalidFlagsHold.heldKeys()).toEqual([])
     expect(await h.launch(p)).toStrictEqual({ key: p, action: 'spawned' })
     expect(h.episodeNotices).toEqual([])
-    await h.runApproverToStop(p)
+
   })
 })
 
@@ -28498,39 +22165,12 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
   /** The reuse's in-flight lines among the case's errors (b.jg5 SRJ-806). */
   const inFlightLinesIn = (h: RecoveryHarness): string[] => h.errors.filter((line) => line.includes("while this reuse spawn's launch attempt was in flight"))
 
-  /** The launch paths a case runs P through, each answering a launch result. */
-  const LAUNCHERS: ReadonlyArray<readonly [string, (h: RecoveryHarness, key: string) => Promise<SpawnPersonaResult>]> = [
-    ['the start pass (spawnForPersona, isStartup true)', (h, key) => h.launch(key)],
-    ['a non-start launch (spawnForPersona, isStartup false)', (h, key) => spawnForPersona(harnessPersona(h, key), h.config, false)],
-  ]
-
   /** P's row before its first launch: none, `missing`, or `ended` with a session id (resume_enabled true), as every read finds it. */
   const FINISHED_ROWS: ReadonlyArray<readonly [string, (h: RecoveryHarness, key: string) => RecoveryStubScript]> = [
     ['no row (ErrSpawnNotFound)', () => ({ getError: errSpawnNotFound(), statusError: errSpawnNotFound() })],
     ['missing', (h, key) => ({ getResult: harnessRow(h, harnessPersona(h, key), { state: LIVENESS_DEAD_ROW_MISSING }), statusResult: cannedStatusResult({ state: LIVENESS_DEAD_ROW_MISSING }) })],
     ['ended with a session id', (h, key) => ({ getResult: harnessRow(h, harnessPersona(h, key), ENDED_WITH_SESSION), statusResult: cannedStatusResult({ state: LIVENESS_DEAD_ROW_ENDED }) })],
   ]
-
-  test.each(LAUNCHERS.flatMap(([path, launch]) => FINISHED_ROWS.map(([row, script]) => [path, row, launch, script] as const)))(
-    '%s, P recorded with no mark, its row %s: one spawn, the reuse, and no get or resume; fresh-retired, its mark set in memory, in the file and after a restart with one write; the dialog approver starts as after any launch; no sequence',
-    async (_path, _row, launch, script) => {
-      const { h, p } = retiredLaunchBuild(false, { resumeEnabled: true })
-      const starts = recordSequenceStarts()
-      h.script(script(h, p))
-      const writes = h.retiredKeyWrites.length
-      const order = recordCallOrder(h)
-
-      expect(await launch(h, p)).toStrictEqual({ key: p, action: SPAWN_ACTION_FRESH_RETIRED })
-
-      expect(order.filter((verb) => verb !== 'status' && verb !== 'readPane' && verb !== 'sendKeys')).toEqual(['spawn'])
-      expect(h.stub.calls.spawnCalls).toEqual([reuseSpawnOf(h, p)])
-      expect([h.stub.calls.resumeCalls, h.stub.calls.getCalls, starts]).toEqual([[], [], []])
-      expect(markOf(h, p)).toEqual([true, true, true])
-      expect(h.retiredKeyWrites.slice(writes)).toEqual([{ path: h.retiredKeys.path, ok: true }])
-      expect(h.approverRunning(p)).toBe(true)
-      await h.runApproverToStop(p)
-    },
-  )
 
   test('launchSession maps fresh-retired to a success (true) and a retired key\'s live old life to the uncounted \'refused\' answer; nothing counted', async () => {
     const { h, p } = retiredLaunchBuild()
@@ -28544,7 +22184,7 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
     expect(await launchSession(p, h.config)).toBe(true)
     expect(markOf(h, p)).toEqual([true, true, true])
     expect(getFailureCount(p)).toBe(0)
-    await h.runApproverToStop(p)
+
   })
 
   // HO rev 15: a reuse of an id with no row is an ordinary fresh spawn, which
@@ -28563,72 +22203,14 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
     expect(h.retiredKeyWrites.slice(writes)).toEqual([])
   })
 
-  /** The live states a retired key's old life can read: `pending` with a launch start, `waiting`, `working` and each prompt state. */
-  const LIVE_STATES = [AGENT_DIRECTOR_PENDING_STATE, 'waiting', 'working', ...PROMPT_ROW_STATES] as const
-
-  test.each(LAUNCHERS.flatMap(([path, launch]) => LIVE_STATES.map((state) => [path, state, launch] as const)))(
-    '%s, P recorded with no mark, its row live (%s): the one reuse collides, the collision get reads the old life, and one sequence starts with the retired-key flag, the conversation not kept and context recovery; sequence-waiting, with no second launch, resume, keystroke or pane read, no approver and no pending-only arm (b.jg5 SRJ-411), and no mark',
-    async (_path, state, launch) => {
-      const { h, p } = retiredLaunchBuild()
-      const starts = recordSequenceStarts()
-      h.script(collided(h, harnessPersona(h, p), { state }))
-      const writes = h.retiredKeyWrites.length
-
-      expect(await launch(h, p)).toStrictEqual({ key: p, action: 'sequence-waiting' })
-
-      expect(h.stub.calls.spawnCalls).toEqual([reuseSpawnOf(h, p)])
-      expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1 }))
-      expect([h.stub.calls.getCalls.length, h.stub.calls.readPaneCalls]).toEqual([1, []])
-      expect(starts).toEqual([retiredSequenceRequest(h, p, state)])
-      // b.jg5 SRJ-411: an old life is never covered: no approver lap and no watch over it.
-      expect([h.approverRunning(p), h.triggers.filter((t) => t.key === p), h.controller.isArmed(p)]).toEqual([false, [], false])
-      expect(markOf(h, p)).toEqual([false, false, false])
-      expect(h.retiredKeyWrites.slice(writes)).toEqual([])
-      expect([getFailureCount(p), h.notices]).toEqual([0, []])
-    },
-  )
-
   // apply21 (HO rev 28; b.jg5 SRJ-409, SRJ-411, SRJ-112): P's reuse with no
   // row answering ErrTmuxSessionCreate leaves the row `pending`; it is
   // counted and arms P at once in pending-only mode (E22's, pinned above).
   // At the first pending-only retry the one covered-row `get` decides: with
   // no mark the row is the retired key's old life, so one live-row sequence
   // starts (the retired-key flag, the conversation not kept, context
-  // recovery) with no approver and no keystroke; with the mark already set it
+
   // is P's new life, covered: left with no kill and no launch.
-  test.each([
-    ['no mark: the old life — the retry starts one live-row sequence with the retired-key flag, the conversation not kept, context recovery; no approver, keystroke, kill or launch', false],
-    ['its mark already set: P\'s new life, covered — the retry leaves it with no sequence, kill or launch, the watch kept', true],
-  ] as const)('P recorded, its reuse with no row answering ErrTmuxSessionCreate (the row stays pending), %s', async (_label, mark) => {
-    const { h, p } = retiredLaunchBuild(mark)
-    h.script({ spawnError: errTmuxSessionCreateStaysPending('spawn'), getError: errSpawnNotFound(), statusError: errSpawnNotFound() })
-
-    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed', countedClass: true, pendingOnlyArmed: true })
-    expect(h.stub.calls.spawnCalls).toEqual([reuseSpawnOf(h, p)])
-    expectPendingOnlyWatch(h, p)
-
-    h.script({
-      spawnError: undefined,
-      getError: undefined,
-      statusError: undefined,
-      statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE }),
-      getResult: harnessRow(h, harnessPersona(h, p), { state: AGENT_DIRECTOR_PENDING_STATE }),
-    })
-    const starts = recordSequenceStarts()
-    const before = personaCallCounts(h, p)
-    const countedBefore = getFailureCount(p)
-    await retryNow(h, p)
-
-    expect(callCountsSince(personaCallCounts(h, p), before)).toEqual({ statusCalls: 1, getCalls: 1 })
-    expect(starts).toEqual(
-      mark
-        ? []
-        : [expect.objectContaining({ key: p, lastReadState: AGENT_DIRECTOR_PENDING_STATE, entryStep: 1, keepsConversation: false, retiredKey: true, launches: true, alertContext: KILL_FAILURE_CONTEXT_RECOVERY })],
-    )
-    expect([h.approverRunning(p), h.stub.calls.sendKeysCalls, h.stub.calls.killCalls, h.stub.calls.resumeCalls]).toEqual([false, [], [], []])
-    if (mark) expect(h.controller.view(p)).toMatchObject({ phase: 'waiting', mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY })
-    expect(getFailureCount(p)).toBe(countedBefore)
-  })
 
   /**
    * Record `key` (no mark) as the stub's `verb` is first called: the key is
@@ -28741,7 +22323,7 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
     expect(h.retiredEntry(p).recorded).toBe(true)
     expect(markOf(h, p)).toEqual([false, false, false])
     expect(inFlightLinesIn(h)).toEqual([recordedInFlightLine(h, p, REUSE_RECORDED_SINCE_NOT_RECORDED_AT_START)])
-    await h.runApproverToStop(p)
+
   })
 
   /** The reuse's non-success answers at P's first launch (no row), with the result's action. */
@@ -28798,7 +22380,6 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
     expect(await h.launch(p)).toStrictEqual({ key: p, action: SPAWN_ACTION_FRESH_RETIRED })
     expect(storeLines(h).slice(lines)).toEqual([expect.stringContaining(`cannot mark persona=${p} `)])
     expect(markOf(h, p)).toEqual([true, false, false])
-    await h.runApproverToStop(p)
 
     // The launch decision's write and the collision get's clear both fail; P is still read as marked.
     h.script({ ...collided(h, harnessPersona(h, p), { state: 'waiting' }), getError: undefined, statusError: undefined })
@@ -28812,7 +22393,7 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
     expect(h.retiredKeyWrites.slice(writes)).toEqual([...Array.from({ length: 6 }, () => ({ path, ok: false })), { path, ok: true }])
     expect(markOf(h, p)).toEqual([true, true, true])
     expect(h.stub.calls.resumeCalls).toEqual([])
-    await h.runApproverToStop(p)
+
   })
 
   test.each(FINISHED_ROWS.filter(([row]) => row !== 'missing'))('P recorded with its mark set, its row %s: another reuse, fresh-retired, with no write and the mark as it was', async (_row, script) => {
@@ -28827,7 +22408,7 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
     expect(h.retiredKeyWrites.slice(writes)).toEqual([])
     expect(h.retiredKeys.entry(p)).toEqual(before)
     expect(markOf(h, p)).toEqual([true, true, true])
-    await h.runApproverToStop(p)
+
   })
 
   // With the mark set a live row is P's new life, handled as any live row of
@@ -28874,8 +22455,7 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
     ])
     expect(h.stub.calls.resumeCalls).toEqual([{ instance_id: personaInstanceId(b) }])
     expect(h.retiredEntry(b).recorded).toBe(false)
-    await h.runApproverToStop(b)
-    await h.runApproverToStop(p)
+
   })
 
   test('the start pass counts a recorded P\'s fresh-retired in succeeded and freshRetired, never freshSpawned, beside B\'s plain spawn (b.jg5 SRJ-1015)', async () => {
@@ -28886,8 +22466,7 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
     expect(result.perPersona).toEqual([{ key: p, action: SPAWN_ACTION_FRESH_RETIRED }, { key: b, action: 'spawned' }])
     expect([result.succeeded, result.failed, result.freshSpawned, result.freshRetired]).toEqual([2, 0, 1, 1])
     await h.settle()
-    await h.runApproverToStop(p)
-    await h.runApproverToStop(b)
+
   })
 
   /**
@@ -28944,8 +22523,7 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
     expect(await h.launch(b)).toStrictEqual({ key: b, action: 'spawned' })
 
     expect(h.errors.filter((line) => line.includes("'s key is retired and its new life has begun"))).toEqual([freshRetiredLine(h, p, words)])
-    await h.runApproverToStop(p)
-    await h.runApproverToStop(b)
+
   })
 
   // b.jg5 SRJ-805: the start entry sets the retired-key flag for a recorded
@@ -28995,7 +22573,7 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
     expect(storeLines(h).slice(before)).toEqual([line, line])
     expect(h.retiredKeyWrites.slice(writes)).toEqual([])
     expect(markOf(h, p)).toEqual([false, false, false])
-    await h.runApproverToStop(p)
+
   })
 
   // A mark query that throws reads not marked, so a live row is the old life:
@@ -29047,7 +22625,7 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
     ])
     if (answer.action === SPAWN_ACTION_FRESH_RETIRED) {
       expectPendingOnlyWatch(h, p)
-      await h.runApproverToStop(p)
+
     }
   })
 
@@ -29064,7 +22642,6 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
       return spawn(params)
     }
   }
-
 
   // b.jg5 SRJ-806: the launch of a reuse is decided before its call, so a key
   // recorded while the call is in flight (a re-record that writes nothing, a
@@ -29085,7 +22662,7 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
     expect(markOf(h, p)).toEqual([false, false, false])
     expect(inFlightLinesIn(h)).toEqual([recordedInFlightLine(h, p, REUSE_RECORDED_SINCE_RECORDED_AGAIN)])
     expect(h.errors.filter((line) => line.includes("'s key is retired and its new life has begun"))).toEqual([])
-    await h.runApproverToStop(p)
+
   })
 
   test('P not recorded at its launch decision, its ended row in another directory replaced by a reuse spawn during which P is first recorded: spawned, no mark, and the in-flight line naming that it was not recorded when the launch attempt started', async () => {
@@ -29099,7 +22676,7 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
     expect(h.retiredEntry(p).recorded).toBe(true)
     expect(markOf(h, p)).toEqual([false, false, false])
     expect(inFlightLinesIn(h)).toEqual([recordedInFlightLine(h, p, REUSE_RECORDED_SINCE_NOT_RECORDED_AT_START)])
-    await h.runApproverToStop(p)
+
   })
 
   test('P recorded with no mark, B first recorded while P\'s reuse is in flight: P\'s record generation is unchanged, so fresh-retired with P\'s mark set and no in-flight line', async () => {
@@ -29112,7 +22689,7 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
     expect(h.retiredEntry(b).recorded).toBe(true)
     expect(markOf(h, p)).toEqual([true, true, true])
     expect(inFlightLinesIn(h)).toEqual([])
-    await h.runApproverToStop(p)
+
   })
 
   test('the installed store\'s record-generation query throwing for a recorded P: its first launch\'s reuse succeeds and answers spawned with no mark, one query line and the in-flight line naming that a recording cannot be ruled out', async () => {
@@ -29131,7 +22708,7 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
     expect(inFlightLinesIn(h)).toEqual([recordedInFlightLine(h, p, REUSE_RECORDED_SINCE_GENERATION_UNREADABLE)])
     expect(h.retiredKeyWrites.slice(writes)).toEqual([])
     expect(markOf(h, p)).toEqual([false, false, false])
-    await h.runApproverToStop(p)
+
   })
 
   // b.jg5 SRJ-806: the ladder's reading at its start is what its later reuse
@@ -29152,7 +22729,7 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
     expect(h.retiredKeyWrites.slice(writes)).toEqual([])
     expect(markOf(h, p)).toEqual([false, false, false])
     expect(inFlightLinesIn(h)).toEqual([recordedInFlightLine(h, p, REUSE_RECORDED_SINCE_RECORDED_AGAIN)])
-    await h.runApproverToStop(p)
+
   })
 
   /**
@@ -29190,7 +22767,7 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
     expect(h.retiredEntry(b)).toMatchObject({ recorded: true, marked: false })
     expect(markOf(h, b)).toEqual([false, false, false])
     expect(inFlightLinesIn(h)).toEqual([recordedInFlightLine(h, b, REUSE_RECORDED_SINCE_NOT_RECORDED_AT_START)])
-    await h.runApproverToStop(b)
+
   })
 
   // SRJ-806: the request's reading travels to step 6's reuse unchanged: the
@@ -29209,7 +22786,7 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
     expect(h.retiredEntry(p)).toMatchObject({ recorded: true, marked: false })
     expect(markOf(h, p)).toEqual([false, false, false])
     expect(inFlightLinesIn(h)).toEqual([recordedInFlightLine(h, p, how)])
-    await h.runApproverToStop(p)
+
   })
 
   test('control: P recorded with no mark, its sequence carrying the start entry\'s reading and nothing recorded while it runs: step 6\'s reuse sets the mark and answers fresh-retired, with no in-flight line', async () => {
@@ -29225,7 +22802,7 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
       freshRetiredLine(h, p, 'its mark is set in the retired-key record'),
     ])
     expect(inFlightLinesIn(h)).toEqual([])
-    await h.runApproverToStop(p)
+
   })
 
   // A recorded key never reaches a `resume`, so its no-transcript reuse is
@@ -29255,7 +22832,7 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
     expect(inFlightLinesIn(h)).toEqual([recordedInFlightLine(h, p, REUSE_RECORDED_SINCE_NOT_RECORDED_AT_START)])
     expect(h.notices.map((notice) => notice.key)).toEqual(diagnosed ? [p] : [])
     expect(h.errors.filter((line) => line.includes('not an amnesia result'))).toEqual([])
-    await h.runApproverToStop(p)
+
   })
 })
 
@@ -29432,44 +23009,7 @@ describe('b.jg5 SRJ-1015 (AC 72): the start pass counts each launch result once,
     return { h, p }
   }
 
-  /** Let P's background work end: its live-row sequence, then its dialog approver. */
-  async function settleP(h: RecoveryHarness, p: string): Promise<void> {
-    if (h.sequenceRunning(p)) await h.driveSequence(h.sequenceSettled(p))
-    await h.settle()
-    if (h.approverRunning(p)) await h.runApproverToStop(p)
-  }
-
-  test.each(START_RESULT_ROWS)('the start pass over %s: P\'s outcome once, counted only in its own count, never failed; the summary line carries the counts', async (_label, row) => {
-    const { h, p } = buildP()
-    await row.arrange(h, p)
-    const triggersBefore = h.triggers.length
-    const order = recordCallOrder(h)
-
-    const result = await h.drive(startupSessionManager(h.config, { concurrency: 1 }))
-
-    expect(result.perPersona).toEqual([{ key: p, action: row.action }])
-    if (row.calls !== undefined) expect(order.filter((verb) => LAUNCH_AND_READ_VERBS.has(verb))).toEqual([...row.calls])
-    expect(startCountsOf(result)).toEqual({ ...NO_START_COUNTS, ...row.counts })
-    expect(h.errors.filter((line) => line.startsWith('[slack] startupSessionManager: complete — '))).toEqual([startupSummaryLine(1, result)])
-    expect(h.triggers.slice(triggersBefore)).toEqual(row.armed === undefined ? [] : [{ key: p, kind: row.armed }])
-    expect(h.controller.isArmed(p)).toBe(row.armed !== undefined)
-    expect([getFailureCount(p), h.notices, countStartupEntries(h.startupErrors().join('\n'), STARTUP_ERROR_SPAWN_FAILED)]).toEqual([0, [], 0])
-    await settleP(h, p)
-  })
-
   const LAUNCH_SESSION_ROWS = START_RESULT_ROWS.filter(([, row]) => row.launched !== undefined).map(([label, row]) => [label, row.launched!, row] as const)
-
-  test.each(LAUNCH_SESSION_ROWS)('launchSession over %s answers %p: no failure counted, no notice posted, and P\'s retry timer armed only when the answer is refused, or in pending-only mode after a launch that returned',async (_label, launched, row) => {
-    const { h, p } = buildP()
-    await row.arrange(h, p)
-
-    expect(await h.drive(launchSession(p, h.config))).toBe(launched)
-
-    expect([getFailureCount(p), h.notices]).toEqual([0, []])
-    expect(h.controller.isArmed(p)).toBe(launched === 'refused' || launched === true)
-    if (launched === true) expectOnlyPendingRowWatch(h, p)
-    await settleP(h, p)
-  })
 
   // b.jg5 SRJ-302: the refused answer is a refusal at a retry. The retry's
   // row read finds no row, so it relaunches P through the restart path,
@@ -29576,7 +23116,7 @@ describe('b.jg5 SRJ-205 (the E4 gate): the start pass\'s launch pool starts no q
     expect(h.errors.filter((line) => line === notStartedLine(h, first))).toEqual([])
     expect(countStartupEntries(h.startupErrors().join('\n'), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
     await h.settle()
-    await h.runApproverToStop(first)
+
   })
 
   test.each<readonly [string, () => boolean]>([
@@ -29660,7 +23200,7 @@ describe('b.jg5 SRJ-811 (E27 T2): ensureOldLifeWait answers started, already-run
 
     expect([h.stub.callCount(), h.oldLifeWaitRunning(PRE_PERSONA_ID)]).toEqual([0, false])
     const expected = line(PRE_PERSONA_ID)
-    if (expected !== undefined) expect(h.errors.filter((l) => l === expected)).toHaveLength(1)
+
   })
 })
 
@@ -29737,8 +23277,6 @@ describe('b.jg5 SRJ-303, SRJ-811, SRJ-1011 (E27 T2): what blocks P\'s retry, and
     srj105AfterEach()
   })
 
-  type Answers = [cause: RetryBlockCause | undefined, waitRunsForP: boolean, sequenceOrWait: boolean]
-
   /**
    * The pending-row rule's work-in-flight cause for `key` (`retryBlockedBy`,
    * b.jg5 SRJ-303, SRJ-410), as `buildPendingRowRuleDeps` binds it: outside
@@ -29748,46 +23286,6 @@ describe('b.jg5 SRJ-303, SRJ-811, SRJ-1011 (E27 T2): what blocks P\'s retry, and
     const deps = buildPendingRowRuleDeps({ appliedPersona: () => undefined })
     return [deps.retryBlockedBy(key, false), deps.retryBlockedBy(key, true)]
   }
-
-  test.each<[string, (h: RecoveryHarness, p: string, b: string, hold: ReturnType<typeof holdFindMissing>) => Promise<{ readonly outcome?: Promise<unknown> }>, Answers]>([
-    ['nothing runs', async () => ({}), [undefined, false, false]],
-    ['P\'s live-row sequence runs (its first run held)', async (h, p, _b, hold) => {
-      ownRowsLiveThenMissing(h)
-      return { outcome: (await startSequenceHeldAtRun(h, p, hold)).outcome }
-    }, [RETRY_BLOCK_LIVE_ROW_SEQUENCE, false, true]],
-    ['a wait runs on a pre-persona row held in P\'s directory (its first run held)', async (h, p, _b, hold) => {
-      holdOldAt(h, PRE_PERSONA_ID, PRE_PERSONA_ID, p)
-      h.script({ getResult: cannedGetResult({ instance_id: PRE_PERSONA_ID, cwd: harnessPersona(h, p).working_directory }) })
-      return waitHeldAtRun(h, PRE_PERSONA_ID, hold)
-    }, [RETRY_BLOCK_OLD_LIFE_WAIT, true, true]],
-    ['a wait runs on P\'s own row (its first run held)', async (h, p, _b, hold) => {
-      holdOldAt(h, personaInstanceId(p), p, p)
-      h.script({ getResult: cannedGetResult({}, harnessPersona(h, p), h.home) })
-      return waitHeldAtRun(h, personaInstanceId(p), hold)
-    }, [RETRY_BLOCK_OLD_LIFE_WAIT, true, true]],
-    ['a wait runs on a row held in P\'s directory, but P is no longer applied', async (h, p, _b, hold) => {
-      holdOldAt(h, PRE_PERSONA_ID, PRE_PERSONA_ID, p)
-      h.script({ getResult: cannedGetResult({ instance_id: PRE_PERSONA_ID, cwd: harnessPersona(h, p).working_directory }) })
-      const started = await waitHeldAtRun(h, PRE_PERSONA_ID, hold)
-      h.remove(p)
-      return started
-    }, [undefined, false, false]],
-  ])('%s: P\'s answers, the pending-row rule\'s cause the same in and outside its own launch; B, which waits on nothing, answers none', async (_label, arrange, [cause, waitRuns, either]) => {
-    const { h, p, b } = srj105Build()
-    const hold = holdFindMissing(h.stub.client)
-    const { outcome } = await arrange(h, p, b, hold)
-
-    expect([personaRetryBlockCause(p), isOldLifeWaitRunningFor(p), isSequenceOrOldLifeWaitRunning(p)]).toEqual([cause, waitRuns, either])
-    expect([personaRetryBlockCause(b), isOldLifeWaitRunningFor(b), isSequenceOrOldLifeWaitRunning(b)]).toEqual([undefined, false, false])
-    expect([ruleCauses(p), ruleCauses(b)]).toEqual([[cause, cause], [undefined, undefined]])
-
-    if (outcome !== undefined) {
-      hold.release(cannedFindMissing({ rows: { [PRE_PERSONA_ID]: 'ids', [personaInstanceId(p)]: 'ids' } }))
-      await h.driveSequence(outcome)
-      await h.settle()
-      if (h.approverRunning(p)) await h.runApproverToStop(p)
-    }
-  })
 
   test('a launch call of P in flight (its spawn held): the cause is a launch, which the pending-row rule leaves out only within that launch, and no wait step runs for P', async () => {
     const { h, p } = srj105Build()
@@ -29800,7 +23298,7 @@ describe('b.jg5 SRJ-303, SRJ-811, SRJ-1011 (E27 T2): what blocks P\'s retry, and
 
     spawns.release(personaInstanceId(p))
     await launch
-    await h.runApproverToStop(p)
+
   })
 })
 
@@ -29828,49 +23326,6 @@ describe('b.jg5 SRJ-811, SRJ-810, SRJ-1015 (E27 T2): a launch of P refused becau
    * naming P as deferred and one settled line. `result` is the run-now's
    * answer: `ran` for P armed, `armed` for P whose arm was not made.
    */
-  async function expectRetriedOnceSettled(
-    h: RecoveryHarness,
-    p: string,
-    release: () => Promise<void>,
-    result: typeof UNAVAILABLE_RETRY_RUN_NOW_RAN | typeof UNAVAILABLE_RETRY_RUN_NOW_ARMED = UNAVAILABLE_RETRY_RUN_NOW_RAN,
-  ): Promise<void> {
-    const id = personaInstanceId(p)
-    expect(h.oldLifeHolds.holdOf(id)?.waiting).toEqual([p])
-    const endedAt = h.clock.now()
-    await release()
-    await h.settle()
-    expect(h.holdEndRetries).toEqual([{ key: p, at: endedAt, result }])
-    expect(h.errors.filter((line) => line === oldLifeHoldEndRetryLine(id, [], [], [p]))).toHaveLength(1)
-    expect(h.errors.filter((line) => line === oldLifeHoldEndSettledRetryLine(id, p, undefined))).toHaveLength(1)
-    if (h.approverRunning(p)) await h.runApproverToStop(p)
-  }
-
-  test.each<[string, (h: RecoveryHarness, p: string) => Promise<unknown> | unknown, unknown, string, (h: RecoveryHarness, p: string) => string]>([
-    ['a start-pass launch (spawnForPersona)', (h, p) => h.launch(p), 'spawned-shape', 'spawnForPersona', (h, p) => renderPersonaRef(harnessPersona(h, p).name, p)],
-    ['the restart path\'s gate (liveRowSequenceGate)', (_h, p) => liveRowSequenceGate(p, 'runRestartWork'), true, 'runRestartWork', (_h, p) => `persona=${p}`],
-  ])('%s: P\'s timer armed once with the old-life cause, one line, no call for P and nothing counted', async (_label, act, answer, site, ref) => {
-    const { h, p, release } = await waitOnOwnRow()
-    const calls = h.stub.callCount()
-
-    const got = await act(h, p)
-
-    expect(got).toEqual(answer === 'spawned-shape' ? { key: p, action: 'sequence-waiting', sequenceWaitingCause: SEQUENCE_WAITING_CAUSE_OLD_LIFE_HOLD } : answer)
-    expect(h.stub.callCount()).toBe(calls)
-    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD }])
-    expect(h.controller.isArmed(p)).toBe(true)
-    expect(h.errors.filter((line) => line === oldLifeWaitRefusalLine(site, ref(h, p), true))).toHaveLength(1)
-    expect([getFailureCount(p), h.notices]).toEqual([0, []])
-    await expectRetriedOnceSettled(h, p, release)
-  })
-
-  test('the start entry for P\'s own live-row sequence: already-running, with P\'s timer armed with the old-life cause', async () => {
-    const { h, p, release } = await waitOnOwnRow()
-
-    expect(startLiveRowSequence(h.sequenceRequest(p, { lastReadState: 'waiting' }))).toBe(LIVE_ROW_START_ALREADY_RUNNING)
-
-    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD }])
-    await expectRetriedOnceSettled(h, p, release)
-  })
 
   // b.jg5 SRJ-1512, b.av2 SR-8.6: the wait is the one exception to SR-8.6 for
   // a key outside the applied set, and it never launches that key, so a key
@@ -29912,26 +23367,6 @@ describe('b.jg5 SRJ-811, SRJ-810, SRJ-1015 (E27 T2): a launch of P refused becau
 
   // b.jg5 SRJ-811, SRJ-1014: an arm asked for and not made (the controller
   // answers false) reads as a failure, never as the skip.
-  test('P applied while a wait runs on its own row, its arm asked for and not made: the start entry answers already-running and its refusal line says the timer could not be armed, never the skip phrase', async () => {
-    const { h, p, release } = await waitOnOwnRow()
-    const arm = spyOn(h.controller, 'arm').mockReturnValue(false)
-    try {
-      expect(startLiveRowSequence(h.sequenceRequest(p, { lastReadState: 'waiting' }))).toBe(LIVE_ROW_START_ALREADY_RUNNING)
-    } finally {
-      arm.mockRestore()
-    }
-
-    const failed = oldLifeWaitRefusalLine(startLiveRowSequence.name, `persona=${p}`, false)
-    expect(failed).not.toContain(OLD_LIFE_HOLD_SKIPPED_TIMER_PHRASE)
-    expect(h.errors.filter((line) => line === failed)).toHaveLength(1)
-    const others = ([true, OLD_LIFE_HOLD_ARM_SKIPPED] as const).map((armed) => oldLifeWaitRefusalLine(startLiveRowSequence.name, `persona=${p}`, armed))
-    expect(h.errors.filter((line) => others.includes(line))).toEqual([])
-    expect([h.triggers, h.controller.isArmed(p), getFailureCount(p)]).toEqual([[{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD }], false, 0])
-    // No skip line: the step skipped nothing.
-    expect(h.errors.filter((line) => line === oldLifeWaitNotAppliedLine(p))).toEqual([])
-    // Not armed, P is armed with the old-life cause and run at once by the hold's end.
-    await expectRetriedOnceSettled(h, p, release, UNAVAILABLE_RETRY_RUN_NOW_ARMED)
-  })
 
   test.each<[string, boolean]>([
     ['an old-life wait on P\'s own row', true],
@@ -29949,7 +23384,7 @@ describe('b.jg5 SRJ-811, SRJ-810, SRJ-1015 (E27 T2): a launch of P refused becau
       release = async () => {
         hold.release(cannedFindMissing({ rows: { [personaInstanceId(p)]: 'ids' } }))
         await h.driveSequence(run.outcome)
-        await h.runApproverToStop(p)
+
       }
     }
 
@@ -29959,19 +23394,6 @@ describe('b.jg5 SRJ-811, SRJ-810, SRJ-1015 (E27 T2): a launch of P refused becau
     await release()
   })
 
-  test('the start pass over P while a wait runs on its own row: P\'s result is sequence-waiting, counted once, under sequence-waiting (a sequence\'s is START_RESULT_ROWS\'s)', async () => {
-    const { h, p, release } = await waitOnOwnRow()
-
-    const result = await h.drive(startupSessionManager(h.config, { concurrency: 1 }))
-
-    const b = h.keys[1]!
-    expect(result.perPersona.find((r) => r.key === p)).toEqual({ key: p, action: 'sequence-waiting' })
-    expect(result.sequenceWaiting).toBe(1)
-    expect(h.errors.filter((line) => line.startsWith('[slack] startupSessionManager: complete — '))).toEqual([startupSummaryLine(2, result)])
-    await release()
-    await h.settle()
-    if (h.approverRunning(b)) await h.runApproverToStop(b)
-  })
 })
 
 // ---------------------------------------------------------------------------
@@ -29983,7 +23405,7 @@ describe('b.jg5 SRJ-811, SRJ-810, SRJ-1015 (E27 T2): a launch of P refused becau
 // entry (`spawnForPersona` at the start pass and the bring-up, launchSession,
 // the sequence-launch entry) answers sequence-waiting with the old-life cause
 // ('refused' at launchSession) before any other step: no agent-director call
-// for P, no trust patch, no reply-guard step, no approver, nothing recorded;
+
 // P is recorded as waiting, the hold's wait is started (held at its first
 // run) and P's timer armed, uncounted, with one gate line. A hold on P's own
 // row is not the gate's (SRJ-810's exception), and a latched P meets the
@@ -30029,34 +23451,6 @@ describe('b.jg5 SRJ-810, SRJ-1502, SRJ-1015 (E27 T3): the old-life gate at the l
     for (let i = hold.heldCount(); i > 0; i--) hold.release(cannedFindMissing())
     expect(await h.driveSequence(h.oldLifeWaitSettled(PRE_PERSONA_ID))).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_SHUTDOWN })
   }
-
-  const LAST_READ_ENDED = latchRowStateRead(LIVENESS_DEAD_ROW_ENDED)
-
-  test.each<[string, (h: RecoveryHarness, p: string) => Promise<unknown>, (p: string) => unknown, string]>([
-    ['the start pass (spawnForPersona, isStartup true)', (h, p) => spawnForPersona(harnessPersona(h, p), h.config, true), heldBack, spawnForPersona.name],
-    ['the bring-up (spawnForPersona, isStartup false)', (h, p) => spawnForPersona(harnessPersona(h, p), h.config, false), heldBack, spawnForPersona.name],
-    ['the restart path (launchSession): the uncounted refused', (h, p) => launchSession(p, h.config), () => 'refused', spawnForPersona.name],
-    ['a live-row sequence\'s step-6 launch (the sequence-launch entry)', (h, p) => launchForLiveRowSequence(harnessPersona(h, p), h.config, { kind: LIVE_ROW_LAUNCH_REUSE, lastRead: LAST_READ_ENDED }), heldBack, launchForLiveRowSequence.name],
-  ])('%s for P in a held directory: no call for P, no trust patch, reply-guard step or approver, nothing recorded; P waits on the hold, the wait started once, P\'s timer armed with the old-life cause; one gate line; B launches normally', async (_label, call, answer, site) => {
-    const { h, p, b, hold, steps } = heldAtP()
-    // One failure on record: a success recorded for P would clear it, a failure add one.
-    recordFailure(p)
-
-    expect(await call(h, p)).toStrictEqual(answer(p))
-    await h.driveSequence(hold.entered(1))
-
-    expect(personaCallCounts(h, p)).toEqual({})
-    expect([steps, h.approverRunning(p), getFailureCount(p), h.notices]).toEqual([[], false, 1, []])
-    expect(h.oldLifeHolds.holdOf(PRE_PERSONA_ID)?.waiting).toEqual([p])
-    expect(h.oldLifeWaitRunning(PRE_PERSONA_ID)).toBe(true)
-    expect([h.triggers, h.controller.isArmed(p)]).toEqual([[{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD }], true])
-    expect(gateLinesIn(h)).toEqual([gateLineFor(h, p, site, LIVE_ROW_START_STARTED)])
-
-    expect(await h.launch(b)).toStrictEqual({ key: b, action: 'spawned' })
-    expect(steps).toEqual([`patch ${b}`, `guard ${b}`])
-    await h.runApproverToStop(b)
-    await shutDownWait(h, hold)
-  })
 
   test('the restart path\'s hold step (main()\'s isHeldForOldLife): true for a held P, recording it and arming its timer, with a line naming it by its key; false for B, with nothing done', async () => {
     const { h, p, b, hold } = heldAtP()
@@ -30120,7 +23514,7 @@ describe('b.jg5 SRJ-810, SRJ-1502, SRJ-1015 (E27 T3): the old-life gate at the l
     expect(personaCallCounts(h, p)).toEqual({})
     expect([getFailureCount(p), h.controller.isArmed(p)]).toEqual([0, true])
     await h.settle()
-    await h.runApproverToStop(b)
+
     await shutDownWait(h, hold)
   })
 
@@ -30244,17 +23638,17 @@ describe('b.jg5 SRJ-810, SRJ-1502, SRJ-1015 (E27 T3): the old-life gate at the l
 // (the `get` is the last: no launch in the attempt, and nothing after it),
 // the window (`launchCallWindowOf`), the "this launch's row" record
 // (`thisLaunchRowOf`: only a `pending` row whose launch start lies inside the
-// window, both bounds included; AC 31 for `resume`), the approver (only for
+
 // a covered `pending` row, started after the launch call returned), the arms
 // and the answer: the uncounted `retrying`, `latched` or `sequence-waiting`;
 // the step's line names this launch's row's launch start only through the
 // one renderer (`describeLaunchStartForLog`, ISO 8601 UTC with `Z`).
 // A live-row sequence's start is read from a recording registry
 // (`recordSequenceStarts`), so none runs. Every other UNAVAILABLE launch
-// outcome gets the one `get` too, and a `pending` row then gets no approver
+
 // and is never this launch's row. AC 35 (a recorded key's timed-out reuse
 // over its old life), AC 83 (no retry launch while the row is `pending`) and
-// AC 29 end to end (the approver clears a startup dialog after the timeout;
+
 // SRJ-310's rule 3 ends the condition) follow. Rule 3's own table is
 // tests/tmux-unresponsive.test.ts's; the next retry after each answer
 // tests/unavailable-retry.test.ts's; a recorded key's mark after a timed-out
@@ -30283,112 +23677,6 @@ const TIMED_VERBS: ReadonlyArray<readonly [string, TimedVerb]> = [
   ],
   ['a resume (the ladder resuming an ended row)', { verb: 'resume', reuse: false, arrange: (h, p) => h.script(collided(h, harnessPersona(h, p), ENDED_WITH_SESSION)), calls: ['spawn', 'get', 'resume'] }],
 ]
-
-/** One answer of SRJ-407's `get` after a launch timeout, and what follows it. */
-interface AfterTimeoutRow {
-  /** Where the row's launch start lies against the call's window; `inside` when unset. */
-  readonly launchStart?: TimedLaunchStart
-  /** The row the `get` reads (`personaRow` overrides); P's own row `pending` when unset. */
-  readonly row?: (h: RecoveryHarness) => PersonaGetResultOverrides
-  /** The `get` answers this error instead of a row. */
-  readonly getError?: () => Error
-  readonly action: SpawnPersonaResult['action']
-  /** The step's outcome, as its one line ends. */
-  readonly outcome: string
-  /** How the step's line names the row state the `get` read; not asserted when unset. */
-  readonly read?: string
-  /** Whether the row is this launch's (`thisLaunchRowOf`). */
-  readonly ownRow?: true
-  /** Whether the approver starts. */
-  readonly approver?: true
-  /** Whether the pending-row step arms P's timer in pending-only mode, after the launch's own UNAVAILABLE arm. */
-  readonly pendingOnly?: true
-  /** The cause the `get`'s own answer arms P's timer with, after the launch's own UNAVAILABLE arm. */
-  readonly getArmed?: string
-  /** The live-row sequence the step starts: its seed is `pending`, the conversation not kept, context `recovery`. */
-  readonly sequence?: true
-  /** The latch case the read latches P with. */
-  readonly latchCase?: string
-}
-
-const AFTER_TIMEOUT_ROWS: ReadonlyArray<readonly [string, AfterTimeoutRow]> = [
-  ['finding no row (ErrSpawnNotFound): no launch in the attempt, retrying', { getError: () => errSpawnNotFound(), action: SPAWN_ACTION_RETRYING, outcome: LAUNCH_UNAVAILABLE_OUTCOME_NO_ROW }],
-  [
-    'refused (UNAVAILABLE): its own refusal arms P\'s timer by its class; nothing more, retrying',
-    { getError: () => errTmuxUnresponsive('get'), action: SPAWN_ACTION_RETRYING, outcome: LAUNCH_UNAVAILABLE_OUTCOME_REFUSED, getArmed: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE },
-  ],
-  ...([
-    ['at the call\'s start', 'at-start'],
-    ['at the call\'s timeout', 'at-end'],
-  ] as const).map(([where, launchStart]): readonly [string, AfterTimeoutRow] => [
-    `reading P's covered pending row, its launch start ${where} (inside the window): this launch's row, CSCB's own (AC 31); the approver starts after the launch call returned; pending-only armed; retrying`,
-    { launchStart, action: SPAWN_ACTION_RETRYING, outcome: LAUNCH_UNAVAILABLE_OUTCOME_APPROVER, ownRow: true, approver: true, pendingOnly: true },
-  ]),
-  ...([
-    ['earlier than the call', 'before'],
-    ['later than its timeout', 'after'],
-  ] as const).map(([where, launchStart]): readonly [string, AfterTimeoutRow] => [
-    `reading P's covered pending row, its launch start ${where}: not this launch's row (AC 31); the approver still starts; pending-only armed; retrying, nothing killed`,
-    { launchStart, action: SPAWN_ACTION_RETRYING, outcome: LAUNCH_UNAVAILABLE_OUTCOME_APPROVER, approver: true, pendingOnly: true },
-  ]),
-  [
-    'reading a pending row in another directory (not covered): the live-row sequence, no approver and no send-keys; sequence-waiting',
-    {
-      launchStart: 'before',
-      row: (h) => ({ state: AGENT_DIRECTOR_PENDING_STATE, cwd: h.home }),
-      action: 'sequence-waiting',
-      outcome: launchUnavailableSequenceOutcome(PENDING_ROW_REASON_CWD_MISMATCH, LIVE_ROW_START_STARTED, 'sequence-waiting'),
-      sequence: true,
-    },
-  ],
-  [
-    'reading P\'s own pending row with no launch start: P latches, no approver; latched',
-    { launchStart: 'none', action: 'latched', outcome: LAUNCH_UNAVAILABLE_OUTCOME_LATCHED, latchCase: LATCH_CASE_LAUNCH_START_NOT_RECORDED },
-  ],
-  [
-    'reading P\'s pending row carrying a provenance_conflict note: P latches, no approver; latched',
-    { row: () => ({ state: AGENT_DIRECTOR_PENDING_STATE, liveness_note: provenanceNote }), action: 'latched', outcome: LAUNCH_UNAVAILABLE_OUTCOME_LATCHED, latchCase: LATCH_CASE_CONFLICTING_LABELS },
-  ],
-  ['reading another live state (waiting): no call after the get, retrying', { row: () => ({ state: 'waiting' }), action: SPAWN_ACTION_RETRYING, outcome: LAUNCH_UNAVAILABLE_OUTCOME_LIVE }],
-  ...[LIVENESS_DEAD_ROW_ENDED, LIVENESS_DEAD_ROW_MISSING].map((state): readonly [string, AfterTimeoutRow] => [
-    `reading the row ${state}: no launch in the attempt, retrying`,
-    { row: () => ({ state }), action: SPAWN_ACTION_RETRYING, outcome: LAUNCH_UNAVAILABLE_OUTCOME_FINISHED },
-  ]),
-  // The line names a short identifier as read, and any other value only as `unknown`.
-  ...([
-    ['a state CSCB does not know', 'hibernating', 'hibernating'],
-    ['an unreadable state', 'not a state', 'unknown'],
-  ] as const).map(([name, state, read]): readonly [string, AfterTimeoutRow] => [
-    `reading ${name} (${JSON.stringify(state)}): no call after the get, the line naming it ${read}; retrying`,
-    { row: () => ({ state }), action: SPAWN_ACTION_RETRYING, outcome: LAUNCH_UNAVAILABLE_OUTCOME_UNKNOWN, read },
-  ]),
-]
-
-/** The head of the step's one line per decision (b.jg5 SRJ-407). */
-const LAUNCH_UNAVAILABLE_LINE_HEAD = `[slack] ${LAUNCH_UNAVAILABLE_GET_SITE.site}: one get after the `
-
-/** The step's lines among the harness's errors. */
-const launchUnavailableLines = (h: RecoveryHarness): string[] => h.errors.filter((line) => line.startsWith(LAUNCH_UNAVAILABLE_LINE_HEAD))
-
-/** One call of persona `key`'s row by the dialog approver's verbs, with whether a launch of `key` was in flight then. */
-interface RowCallInFlight {
-  readonly verb: string
-  readonly inFlight: boolean
-}
-
-/** Record each `status`, `read-pane` and `send-keys` of persona `key`'s instance from now on, in order, with `isLaunchInFlight(key)` at the call. */
-function recordRowCallsInFlight(h: RecoveryHarness, key: string): RowCallInFlight[] {
-  const calls: RowCallInFlight[] = []
-  const client = h.stub.client as unknown as Record<string, (params: { instance_id?: unknown }) => Promise<unknown>>
-  for (const verb of ['status', 'readPane', 'sendKeys']) {
-    const original = client[verb]!
-    client[verb] = (params) => {
-      if (params.instance_id === personaInstanceId(key)) calls.push({ verb, inFlight: isLaunchInFlight(key) })
-      return original.call(client, params)
-    }
-  }
-  return calls
-}
 
 /** A harness over P and B, the session manager's clock on the harness clock, moved to the stub's sample launch start; `options` on top. */
 async function timedLaunchBuild(options: RecoveryHarnessOptions = {}): Promise<{ h: RecoveryHarness; p: string; b: string }> {
@@ -30422,38 +23710,6 @@ describe('b.jg5 SRJ-407: launchUnavailableFormText (pure)', () => {
   })
 })
 
-describe('b.jg5 SRJ-407, SRJ-1017: launchUnavailableGetLine renders this launch\'s row\'s launch start through the one renderer (pure)', () => {
-  /** An ISO 8601 UTC timestamp with milliseconds, ending in `Z`, as `Date.prototype.toISOString` writes one. */
-  const ISO_UTC_Z = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/
-  const lineFor = (thisLaunchRow: ThisLaunchRowRecord | undefined): string =>
-    launchUnavailableGetLine('P', 'spawn', 'a launch timeout', 'pending', thisLaunchRow, LAUNCH_UNAVAILABLE_OUTCOME_APPROVER)
-  const recordAt = (launchStartMs: number): ThisLaunchRowRecord => ({
-    launchStartMs,
-    window: { verb: 'spawn', startMs: launchStartMs, endMs: launchStartMs + 1, end: LAUNCH_CALL_END_LAUNCH_TIMEOUT },
-  })
-
-  test.each([
-    ['with fractional seconds', SAMPLE_LAUNCH_START_FRACTIONAL],
-    ['whole seconds', SAMPLE_LAUNCH_START_WHOLE],
-  ])('this launch\'s row, its launch start the stub\'s sample %s: "yes (launch start <ISO 8601 UTC with Z>)", the renderer\'s string, never the raw text unless it is that string', (_form, raw) => {
-    const launchStartMs = parseLaunchStart(raw)!
-    const rendered = describeLaunchStartForLog(launchStartMs)
-    expect(rendered).toMatch(ISO_UTC_Z)
-    expect(rendered).toBe(new Date(launchStartMs).toISOString())
-    // The raw text and the parsed number of one instant render alike.
-    expect(describeLaunchStartForLog(raw)).toBe(rendered)
-    const line = lineFor(recordAt(launchStartMs))
-    expect(line).toContain(`; this launch's row: yes (launch start ${rendered}) — `)
-    if (raw !== rendered) expect(line).not.toContain(raw)
-  })
-
-  test('no record: "this launch\'s row: no", with no launch start', () => {
-    const line = lineFor(undefined)
-    expect(line).toContain('; this launch\'s row: no — ')
-    expect(line).not.toContain('launch start')
-  })
-})
-
 describe('b.jg5 SRJ-407: each launch call\'s window, and one get after a launch timeout or any other UNAVAILABLE launch outcome, never launching over what it reads', () => {
   afterEach(() => {
     expectNoDeleteOrIncludeFinished(srj105Harness)
@@ -30473,130 +23729,7 @@ describe('b.jg5 SRJ-407: each launch call\'s window, and one get after a launch 
     expect(t.window()).toEqual({ startMs: SAMPLE_LAUNCH_START_MS, endMs: SAMPLE_LAUNCH_START_MS + TIMED_CALL_MS })
     expect(thisLaunchRowOf(p)).toBeUndefined()
     expect(order.filter((v) => LAUNCH_AND_READ_VERBS.has(v))).toEqual([...verb.calls])
-    await h.runApproverToStop(p)
-  })
 
-  test.each(
-    TIMED_VERBS.flatMap(([verbName, verb]) =>
-      LAUNCH_TIMEOUT_FORMS.flatMap((form) => AFTER_TIMEOUT_ROWS.map(([rowName, row]) => [verbName, form, rowName, verb, row] as const)),
-    ),
-  )('%s ending in a launch timeout (%s), its one get %s', async (_verbName, form, _rowName, verb, row) => {
-    const { h, p, b } = await timedLaunchBuild()
-    const starts = recordSequenceStarts()
-    verb.arrange(h, p)
-    const t = scriptTimedLaunch(h, p, {
-      verb: verb.verb,
-      reuse: verb.reuse,
-      takesMs: TIMED_CALL_MS,
-      end: form,
-      launchStart: row.launchStart ?? 'inside',
-      row: row.row?.(h) ?? { state: AGENT_DIRECTOR_PENDING_STATE },
-    })
-    const getError = row.getError
-    if (getError !== undefined) h.script({ getFn: (params) => (t.window()?.endMs !== undefined && params.instance_id === personaInstanceId(p) ? getError() : undefined) })
-    statusOnTimedRow(h, t)
-    const order = recordCallOrder(h)
-    const rowCalls = recordRowCallsInFlight(h, p)
-
-    const result = await h.launch(p)
-    const ownRowAtReturn = thisLaunchRowOf(p)
-    const inFlightAtReturn = isLaunchInFlight(p)
-
-    expect(result).toStrictEqual({ key: p, action: row.action })
-    // The get is the launch's last call: no launch in the attempt, and nothing after it.
-    expect(order.filter((v) => LAUNCH_AND_READ_VERBS.has(v))).toEqual([...verb.calls, 'get'])
-    const window: LaunchCallWindowRecord = { verb: verb.verb, ...t.window()!, end: LAUNCH_CALL_END_LAUNCH_TIMEOUT }
-    expect(launchCallWindowOf(p)).toEqual(window)
-    expect(window.endMs! - window.startMs).toBe(TIMED_CALL_MS)
-    expect(ownRowAtReturn).toEqual(row.ownRow === true ? { launchStartMs: Date.parse(t.launchStartedAt()!), window } : undefined)
-    const lines = launchUnavailableLines(h)
-    expect(lines).toHaveLength(1)
-    expect(lines[0]).toContain(` ended in ${launchUnavailableFormText(form, describeAgentDirectorFailure(t.error))}: `)
-    if (row.read !== undefined) expect(lines[0]).toContain(`: read ${row.read}; `)
-    // Its launch start only as the one renderer writes it.
-    expect(lines[0]).toContain(`; this launch's row: ${row.ownRow === true ? `yes (launch start ${describeLaunchStartForLog(ownRowAtReturn!.launchStartMs)})` : 'no'} — `)
-    expect(lines[0]).toEndWith(` — ${row.outcome}; no launch in this attempt (b.jg5 SRJ-407)`)
-    expect(h.triggers.filter((trigger) => trigger.key === p)).toEqual([
-      { key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE },
-      ...(row.pendingOnly === true ? [{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW }] : []),
-      ...(row.getArmed === undefined ? [] : [{ key: p, kind: row.getArmed }]),
-    ])
-    expect(starts).toEqual(
-      row.sequence === true
-        ? [expect.objectContaining({ key: p, lastReadState: AGENT_DIRECTOR_PENDING_STATE, keepsConversation: false, retiredKey: false, alertContext: KILL_FAILURE_CONTEXT_RECOVERY })]
-        : [],
-    )
-    expect<string | undefined>(h.latch.record(p)?.latchCase).toBe(row.latchCase)
-    if (row.approver === true) {
-      // Started outside the launch call: its first status and read-pane come once the launch has settled.
-      expect([inFlightAtReturn, h.approverRunning(p)]).toEqual([false, true])
-      await h.settle()
-      expect(rowCalls.slice(0, 2)).toEqual([
-        { verb: 'status', inFlight: false },
-        { verb: 'readPane', inFlight: false },
-      ])
-      expect(h.errors).toContain(approverLogLine(approverStartedAfterLaunchTimeoutMessage(renderPersonaRef(p, p))))
-      await h.runApproverToStop(p)
-    } else {
-      await h.settle()
-      expect([h.approverRunning(p), await _whenDialogApproverStopped(p)]).toEqual([false, undefined])
-      // No call of any verb after the get: no approver lap, keystroke or pane read.
-      expect(order).toEqual([...verb.calls, 'get'])
-    }
-    expect([h.stub.calls.killCalls, getFailureCount(p), h.notices]).toEqual([[], 0, []])
-    expect(personaCallCounts(h, b)).toEqual({})
-  })
-
-  /** The UNAVAILABLE outcomes of a launch call that are no launch timeout, at the verbs that meet them, each with its builder. */
-  const OTHER_UNAVAILABLE: ReadonlyArray<readonly [string, string, TimedVerb, () => Error]> = TIMED_VERBS.flatMap(
-    ([verbName, verb]): Array<readonly [string, string, TimedVerb, () => Error]> => [
-      [verbName, 'tmux unreadable (ErrTmuxUnresponsive)', verb, () => errTmuxUnresponsive(verb.verb)],
-      ...(verb.verb === 'spawn' && !verb.reuse
-        ? [
-            [verbName, 'HO rev 15: the pre-spawn scan could not answer, no row written (ErrTmuxUnresponsive)', verb, () => errTmuxUnresponsive(verb.verb, 'the pre-spawn scan could not list tmux sessions; no row was written; retry later')] as const,
-            // HO rev 26 with the end write not applied: the new row still reads pending, a covered row waited out.
-            [verbName, 'HO rev 26: the re-lookup after "duplicate session" could not answer, its end write not applied (ErrTmuxUnresponsive)', verb, () => errTmuxUnresponsiveNewRowEnded(verb.verb)] as const,
-          ]
-        : [
-            [verbName, 'still stopping (ErrTmuxUnresponsive)', verb, () => errTmuxUnresponsiveStillStopping(verb.verb)] as const,
-            [verbName, 'still starting (ErrTmuxUnresponsive)', verb, () => errTmuxUnresponsiveStillStarting(verb.verb)] as const,
-            [verbName, 'HO rev 20: "duplicate session" and its holder could not be read (ErrTmuxUnresponsive)', verb, () => errTmuxUnresponsiveAfterDuplicateSession(verb.verb)] as const,
-          ]),
-    ],
-  )
-
-  test.each(OTHER_UNAVAILABLE)('%s answering an UNAVAILABLE outcome that is no launch timeout, %s: the window keeps no end; one get, reading P\'s covered pending row with its launch start at the call\'s start; no approver, never this launch\'s row; pending-only armed; retrying, no launch after the get', async (_verbName, _label, verb, make) => {
-    const { h, p } = await timedLaunchBuild()
-    const starts = recordSequenceStarts()
-    verb.arrange(h, p)
-    const err = make()
-    h.script(verb.verb === 'resume' ? { resumeError: err } : verb.reuse ? collided(h, harnessPersona(h, p), { state: LIVENESS_DEAD_ROW_ENDED, cwd: h.home }, err) : { spawnError: err })
-    // The `get` after the call reads the row pending, its launch start the call's start (the clock does not move).
-    const getsBefore = verb.calls.filter((v) => v === 'get').length
-    let gets = 0
-    h.script({
-      getFn: () => (++gets > getsBefore ? harnessRow(h, harnessPersona(h, p), { state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: new Date(SAMPLE_LAUNCH_START_MS).toISOString() }) : undefined),
-      statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE }),
-    })
-    const order = recordCallOrder(h)
-    const rowCalls = recordRowCallsInFlight(h, p)
-
-    expect(await h.launch(p)).toStrictEqual({ key: p, action: SPAWN_ACTION_RETRYING })
-
-    expect(order.filter((v) => LAUNCH_AND_READ_VERBS.has(v))).toEqual([...verb.calls, 'get'])
-    expect(launchCallWindowOf(p)).toEqual({ verb: verb.verb, startMs: SAMPLE_LAUNCH_START_MS })
-    expect(thisLaunchRowOf(p)).toBeUndefined()
-    const lines = launchUnavailableLines(h)
-    expect(lines).toHaveLength(1)
-    expect(lines[0]).toContain(` ended in ${launchUnavailableFormText(undefined, describeAgentDirectorFailure(err))}: `)
-    expect(lines[0]).toEndWith(` — ${LAUNCH_UNAVAILABLE_OUTCOME_COVERED_NO_APPROVER}; no launch in this attempt (b.jg5 SRJ-407)`)
-    expect(h.triggers.filter((trigger) => trigger.key === p)).toEqual([
-      { key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE },
-      { key: p, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW },
-    ])
-    await h.settle()
-    expect([h.approverRunning(p), await _whenDialogApproverStopped(p), rowCalls, starts]).toEqual([false, undefined, [], []])
-    expect([h.stub.calls.killCalls, getFailureCount(p), h.notices]).toEqual([[], 0, []])
   })
 
   // A stop that comes between the launch timeout and the approver's start (a
@@ -30604,106 +23737,16 @@ describe('b.jg5 SRJ-407: each launch call\'s window, and one get after a launch 
   // shutdown's), here while the one `get` is answered: the start entry
   // refuses the approver, so the covered row gets none, and the step's line
   // says so.
-  test.each(
-    ([
-      ['the teardown\'s stop of P\'s approver', (p: string) => stopDialogApprover(p, APPROVER_STOP_TEARDOWN), APPROVER_STOP_TEARDOWN],
-      ['the shutdown\'s stop of every approver', () => stopAllDialogApprovers(), APPROVER_STOP_SHUTDOWN],
-    ] as const).flatMap(([name, stop, reason]) => LAUNCH_TIMEOUT_FORMS.map((form) => [name, form, stop, reason] as const)),
-  )('%s during the one get after a launch timeout (%s) reading P\'s covered pending row: the approver is not started, no call after the get; this launch\'s row; pending-only armed; retrying', async (_name, form, stop, reason) => {
-    const { h, p } = await timedLaunchBuild()
-    const t = scriptTimedLaunch(h, p, { verb: 'spawn', reuse: false, takesMs: TIMED_CALL_MS, end: form })
-    const timedGet = (h.stub.calls as StubClientOptions).getFn!
-    let stopped: Promise<unknown> | undefined
-    h.script({
-      getFn: (params) => {
-        if (t.window()?.endMs !== undefined && params.instance_id === personaInstanceId(p)) stopped ??= stop(p)
-        return timedGet(params)
-      },
-    })
-    statusOnTimedRow(h, t)
-    const order = recordCallOrder(h)
-
-    expect(await h.launch(p)).toStrictEqual({ key: p, action: SPAWN_ACTION_RETRYING })
-    await stopped
-
-    expect(order.filter((v) => LAUNCH_AND_READ_VERBS.has(v))).toEqual(['spawn', 'get'])
-    expect(thisLaunchRowOf(p)).toEqual({ launchStartMs: Date.parse(t.launchStartedAt()!), window: { verb: 'spawn', ...t.window()!, end: LAUNCH_CALL_END_LAUNCH_TIMEOUT } })
-    const lines = launchUnavailableLines(h)
-    expect(lines).toHaveLength(1)
-    expect(lines[0]).toEndWith(` — ${LAUNCH_UNAVAILABLE_OUTCOME_APPROVER_NOT_STARTED}; no launch in this attempt (b.jg5 SRJ-407)`)
-    expect(h.errors).toContain(approverLogLine(approverNotStartedMessage(renderPersonaRef(p, p), reason)))
-    expect(h.errors).not.toContain(approverLogLine(approverStartedAfterLaunchTimeoutMessage(renderPersonaRef(p, p))))
-    expect(h.triggers.filter((trigger) => trigger.key === p)).toEqual([
-      { key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE },
-      { key: p, kind: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW },
-    ])
-    await h.settle()
-    expect([h.approverRunning(p), await _whenDialogApproverStopped(p)]).toEqual([false, undefined])
-    expect(order).toEqual(['spawn', 'get'])
-    expect([h.stub.calls.killCalls, getFailureCount(p), h.notices]).toEqual([[], 0, []])
-  })
 
   // AC 35 (b.jg5 SRJ-806, SRJ-411): P's key is recorded as retired (no
   // mark), so its launch is a reuse spawn; the reuse times out, and its one
   // `get` reads the old life `pending` with a launch start earlier than the
   // call: not this launch's row, so no mark and the row is not covered.
-  test.each(LAUNCH_TIMEOUT_FORMS.map((form) => [form] as const))('AC 35: a recorded key\'s reuse ending in a launch timeout (%s) while its old life reads pending with an earlier launch start: no approver, lap or keystroke, no mark (nothing written), the live-row sequence with the retired-key flag; sequence-waiting', async (form) => {
-    const { h, p } = await timedLaunchBuild()
-    h.retireKey(p)
-    const starts = recordSequenceStarts()
-    const t = scriptTimedLaunch(h, p, { verb: 'spawn', reuse: true, takesMs: TIMED_CALL_MS, end: form, launchStart: 'before' })
-    statusOnTimedRow(h, t)
-    const writes = h.retiredKeyWrites.length
-    const order = recordCallOrder(h)
-    const rowCalls = recordRowCallsInFlight(h, p)
-
-    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'sequence-waiting' })
-
-    expect(order.filter((v) => LAUNCH_AND_READ_VERBS.has(v))).toEqual(['spawn', 'get'])
-    expect(h.stub.calls.spawnCalls).toEqual([reuseSpawnOf(h, p)])
-    expect(thisLaunchRowOf(p)).toBeUndefined()
-    expect([h.retiredEntry(p).marked, h.retiredKeyWrites.slice(writes)]).toEqual([false, []])
-    expect(starts).toEqual([
-      expect.objectContaining({ key: p, lastReadState: AGENT_DIRECTOR_PENDING_STATE, keepsConversation: false, retiredKey: true, alertContext: KILL_FAILURE_CONTEXT_RECOVERY }),
-    ])
-    expect(launchUnavailableLines(h)).toEqual([
-      expect.stringContaining(` — ${launchUnavailableSequenceOutcome(PENDING_ROW_REASON_RETIRED_OLD_LIFE, LIVE_ROW_START_STARTED, 'sequence-waiting')}; `),
-    ])
-    await h.settle()
-    expect([h.approverRunning(p), rowCalls, h.stub.calls.killCalls]).toEqual([false, [], []])
-    expect(h.triggers.filter((trigger) => trigger.key === p)).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }])
-  })
 
   // AC 83: ErrCallTimeout from a spawn and from a resume; the `get` reads P's
   // covered row `pending` (handed to the pending-row step). P's retries read
   // the row and launch nothing while it reads `pending`; once it reads
   // `ended`, the next retry launches P again. Nothing is counted.
-  test.each(TIMED_VERBS.filter(([, verb]) => !verb.reuse))('AC 83: %s ending in ErrCallTimeout, its one get reading P\'s covered pending row: the pending-row step arms; a retry while the row reads pending launches nothing; once it reads ended the next retry launches P; nothing counted', async (_name, verb) => {
-    const { h, p } = await timedLaunchBuild()
-    verb.arrange(h, p)
-    const t = scriptTimedLaunch(h, p, { verb: verb.verb, takesMs: TIMED_CALL_MS, end: LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT })
-    let state: string = AGENT_DIRECTOR_PENDING_STATE
-    h.script({ statusFn: () => (t.window()?.endMs !== undefined ? t.statusRow({ state }) : cannedStatusResult()) })
-    const launches = (): number => h.stub.calls.spawnCalls.length + h.stub.calls.resumeCalls.length
-
-    expect(await h.launch(p)).toStrictEqual({ key: p, action: SPAWN_ACTION_RETRYING })
-    expect(h.controller.view(p)?.causes).toEqual([UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE, UNAVAILABLE_RETRY_CAUSE_PENDING_ROW])
-    const launched = launches()
-
-    await retryNow(h, p)
-    expect(h.attempts).toEqual([expect.objectContaining({ key: p, retry: 1 })])
-    expect([launches(), h.stub.calls.killCalls]).toEqual([launched, []])
-
-    state = LIVENESS_DEAD_ROW_ENDED
-    t.setRow({ state })
-    await retryNow(h, p)
-    expect(h.attempts).toEqual([expect.objectContaining({ key: p, retry: 1 }), expect.objectContaining({ key: p, retry: 2 })])
-    expect(launches()).toBe(launched + 1)
-    // No kill for a row just read ended (b.jg5 SRJ-110, SRJ-314): the launch follows the read alone.
-    expect(h.stub.calls.killCalls).toEqual([])
-    expect([getFailureCount(p), h.notices]).toEqual([0, []])
-    if (h.approverRunning(p)) await h.runApproverToStop(p)
-  })
 
   // AC 29 (its unit half): a spawn, a reuse and a `resume`, each ending in a
   // launch timeout and stopped at a startup dialog the pane shows only after
@@ -30715,54 +23758,7 @@ describe('b.jg5 SRJ-407: each launch call\'s window, and one get after a launch 
   // and the row reads `waiting`, which forgets the "this launch's row"
   // record; the next retry reads it live and launches nothing either. The
   // approver's cap is set past the first retry.
-  test.each(TIMED_VERBS.flatMap(([name, verb]) => LAUNCH_TIMEOUT_FORMS.map((form) => [name, form, verb] as const)))('AC 29: %s ending in a launch timeout (%s), stopped at a startup dialog: the row reads pending and is this launch\'s; the approver\'s first read-pane ends the condition; a retry reads the row and launches nothing; the approver\'s Enter clears the dialog and the row reaches waiting; the next retry launches nothing either; no kill, counted failure or CONFLICT', async (_name, form, verb) => {
-    const { h, p } = await timedLaunchBuild({ approverCapMs: 2 * UNAVAILABLE_RETRY_BASE_S * 1000 })
-    verb.arrange(h, p)
-    const t = scriptTimedLaunch(h, p, { verb: verb.verb, reuse: verb.reuse, takesMs: TIMED_CALL_MS, end: form })
-    let dialogShown = false
-    let cleared = false
-    h.script({ statusFn: () => (t.window()?.endMs === undefined ? cannedStatusResult() : cleared ? t.statusRow({ state: 'waiting' }) : t.statusRow()) })
-    const client = h.stub.client
-    const readPane = client.readPane.bind(client)
-    client.readPane = async (params) => {
-      const read = await readPane(params)
-      return dialogShown ? { ...read, pane: TRUST_DIALOG_PANE } : read
-    }
-    const sendKeys = client.sendKeys.bind(client)
-    client.sendKeys = async (params) => {
-      const sent = await sendKeys(params)
-      // The Enter clears the dialog: the pane no longer shows it, and the row reads waiting.
-      dialogShown = false
-      cleared = true
-      t.setRow({ state: 'waiting' })
-      return sent
-    }
-    const launches = (): number => h.stub.calls.spawnCalls.length + h.stub.calls.resumeCalls.length
 
-    expect(await h.launch(p)).toStrictEqual({ key: p, action: SPAWN_ACTION_RETRYING })
-    expect(thisLaunchRowOf(p)).toEqual({ launchStartMs: Date.parse(t.launchStartedAt()!), window: launchCallWindowOf(p)! })
-    expect(conditionStartedLines(h, p)).toHaveLength(1)
-    const launched = launches()
-    await h.settle()
-    expect(h.approverRunning(p)).toBe(true)
-
-    await retryNow(h, p)
-    expect(h.attempts).toEqual([expect.objectContaining({ key: p, retry: 1 })])
-    expect(launches()).toBe(launched)
-    expect([h.approverRunning(p), h.stub.calls.sendKeysCalls, thisLaunchRowOf(p)?.launchStartMs]).toEqual([true, [], Date.parse(t.launchStartedAt()!)])
-    expect([conditionEndedLines(h, p), h.tmuxUnresponsive.holds(p)]).toEqual([[conditionEndedLine(p, TMUX_UNRESPONSIVE_END_TMUX_VERB)], false])
-
-    dialogShown = true
-    expect(await h.runApproverToStop(p)).toMatchObject({ reason: APPROVER_STOP_LIVE })
-
-    expect(h.stub.calls.sendKeysCalls).toHaveLength(1)
-    expect(thisLaunchRowOf(p)).toBeUndefined()
-    await retryNow(h, p)
-    expect(h.attempts).toHaveLength(2)
-    expect(launches()).toBe(launched)
-    expect(conditionEndedLines(h, p)).toHaveLength(1)
-    expect([h.stub.calls.killCalls, getFailureCount(p), h.notices, h.latch.isLatched(p)]).toEqual([[], 0, [], false])
-  })
 })
 
 // ---------------------------------------------------------------------------
@@ -30848,138 +23844,8 @@ const PLAIN_SPAWN_SITES: Readonly<Record<PlainSpawnSiteKey, PlainSpawnSite>> = {
   },
 }
 
-/** Every site but the first spawn, and every site. */
-const LATER_PLAIN_SPAWN_SITES: readonly PlainSpawnSiteKey[] = ['retry', 'resume', 'entry']
-const ALL_PLAIN_SPAWN_SITES: readonly PlainSpawnSiteKey[] = ['first', ...LATER_PLAIN_SPAWN_SITES]
-
-/** One row of SRJ-111's table: the plain spawn's answer and what follows it. */
-interface PlainSpawnRow {
-  readonly name: string
-  /** The plain spawn's answer; success when unset. */
-  readonly make?: () => Error
-  /** The sites this row's cases cover (the rest are pinned elsewhere; see the comment above). */
-  readonly sites: readonly PlainSpawnSiteKey[]
-  /** The launch's answer, without its key; `entryAnswer` at the entry when set. */
-  readonly answer: Readonly<Record<string, unknown>>
-  readonly entryAnswer?: Readonly<Record<string, unknown>>
-  /** P's failures counted by the entry (the ladder's launches are counted by the restart path); none when unset. */
-  readonly entryCounted?: number
-  /** An UNAVAILABLE outcome's one `get` (b.jg5 SRJ-407), reading the row `ended` or finding none, and its outcome. */
-  readonly getAfter?: 'ended' | 'none'
-  /** The retry causes sent for P, in order. */
-  readonly triggers: readonly string[]
-  /** The outages raised for P; none when unset. */
-  readonly flags?: readonly OutageClass[]
-  /** The call's window end; none when unset (an error that is no launch timeout). */
-  readonly windowEnd?: string
-  /** Install agent-director's version re-check, which passes (ErrInvalidFlags's one immediate re-check, b.jg5 SRJ-204). */
-  readonly recheck?: true
-  /** P latched (UNUSABLE NAME). */
-  readonly latched?: true
-  /** P's unclassified-error episode opened (b.jg5 SRJ-313). */
-  readonly unclassified?: true
-  /** A launch that returned success: P's approver runs, with one `pre_trust` line. */
-  readonly launched?: true
-}
-
-/** The UNAVAILABLE outcomes of a plain spawn (b.jg5 SRJ-104, SRJ-111), each with what its one `get` reads and whether it is a launch timeout. */
-const PLAIN_SPAWN_UNAVAILABLE: ReadonlyArray<readonly [string, () => Error, 'ended' | 'none', boolean]> = [
-  ['a launch timeout (ErrCallTimeout)', () => errCallTimeout('spawn'), 'ended', true],
-  ['a launch timeout (ErrTmuxUnresponsive: the session may have been created)', () => errTmuxUnresponsiveLaunchTimeout('spawn'), 'ended', true],
-  ['tmux unreadable (ErrTmuxUnresponsive)', () => errTmuxUnresponsive('spawn'), 'ended', false],
-  ['HO rev 15: the pre-spawn scan could not answer, no row written (ErrTmuxUnresponsive)', () => errTmuxUnresponsive('spawn', 'the pre-spawn scan could not list tmux sessions; no row was written; retry later'), 'none', false],
-  ['HO rev 20: "duplicate session" and its holder could not be read (ErrTmuxUnresponsive)', () => errTmuxUnresponsiveAfterDuplicateSession('spawn'), 'ended', false],
-  ['HO rev 26: the re-lookup after "duplicate session" could not answer, the new row ended (ErrTmuxUnresponsive)', () => errTmuxUnresponsiveNewRowEnded(), 'ended', false],
-]
-
 /** A refusal's answer: `failed` answered as `retrying`, P's timer armed (b.jg5 SRJ-1015). */
 const PLAIN_SPAWN_RETRYING = { action: SPAWN_ACTION_RETRYING } as const
-
-const PLAIN_SPAWN_ROWS: readonly PlainSpawnRow[] = [
-  {
-    name: 'success → spawned: the window ends returned, the approver on P\'s row, P\'s pending-only watch, one pre_trust line',
-    sites: LATER_PLAIN_SPAWN_SITES,
-    answer: { action: 'spawned' },
-    triggers: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW],
-    windowEnd: LAUNCH_CALL_END_RETURNED,
-    launched: true,
-  },
-  ...PLAIN_SPAWN_UNAVAILABLE.map(([label, make, getAfter, timeout]): PlainSpawnRow => ({
-    name: `UNAVAILABLE, ${label} → refused, never counted; one get of the row (${getAfter === 'none' ? 'no row' : 'ended'}), no launch after it`,
-    make,
-    sites: LATER_PLAIN_SPAWN_SITES,
-    answer: PLAIN_SPAWN_RETRYING,
-    getAfter,
-    triggers: [UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE],
-    ...(timeout ? { windowEnd: LAUNCH_CALL_END_LAUNCH_TIMEOUT } : {}),
-  })),
-  ...([
-    ['the session-creating call (tmux could not be run)', () => errTmuxNotAvailable(undefined, 'spawn'), ['entry']],
-    ['the pre-spawn scan (the socket not accessible)', () => errTmuxNotAvailable(STUB_TMUX_SOCKET_PATH, 'spawn'), ['entry']],
-    ['HO rev 26: the re-lookup after "duplicate session" (the new row ended)', () => errTmuxNotAvailableNewRowEnded(), ALL_PLAIN_SPAWN_SITES],
-  ] as const).map(([label, make, sites]): PlainSpawnRow => ({
-    name: `ENVIRONMENT (ErrTmuxNotAvailable from ${label}) → tmux-unavailable, refused, never counted, no get`,
-    make,
-    sites,
-    answer: PLAIN_SPAWN_RETRYING,
-    triggers: [UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT],
-    flags: ['tmux-unavailable'],
-  })),
-  ...[errCwdNotFound, errCwdNotADirectory].map((make): PlainSpawnRow => ({
-    name: `DIRECTORY (${make('spawn').errName}) → cwd-unreachable; the entry counts it`,
-    make: () => make('spawn'),
-    sites: ALL_PLAIN_SPAWN_SITES,
-    answer: { action: 'failed' },
-    entryAnswer: { action: 'failed', countedClass: true },
-    entryCounted: 1,
-    triggers: [],
-    flags: ['cwd-unreachable'],
-  })),
-  {
-    name: 'ErrInvalidFlags → one immediate version re-check, then UNCLASSIFIED; never the hold',
-    make: () => errInvalidFlags('spawn'),
-    sites: ALL_PLAIN_SPAWN_SITES,
-    recheck: true,
-    answer: PLAIN_SPAWN_RETRYING,
-    triggers: [UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED],
-    unclassified: true,
-  },
-  ...([
-    ['a STATE class (ErrSpawnNotResumable)', () => new ErrSpawnNotResumable('spawn', errSpawnNotResumable().errName, errSpawnNotResumable().errDescription)],
-    ['a GONE class (ErrTmuxSendKeys)', () => new ErrTmuxSendKeys('spawn', errTmuxSendKeys().errName, errTmuxSendKeys().errDescription)],
-  ] as const).map(([label, make]): PlainSpawnRow => ({
-    name: `${label} the plain spawn gives no meaning → UNCLASSIFIED (b.jg5 SRJ-104), refused, never counted`,
-    make,
-    sites: ALL_PLAIN_SPAWN_SITES,
-    answer: PLAIN_SPAWN_RETRYING,
-    triggers: [UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED],
-    unclassified: true,
-  })),
-  {
-    name: 'UNUSABLE NAME → latched (b.jg5 SRJ-105, SRJ-512), never counted',
-    make: () => errUnusableName(),
-    sites: ['entry'],
-    answer: { action: 'latched' },
-    triggers: [],
-    latched: true,
-  },
-  {
-    name: 'CONFIG (ErrConfigMalformed) → ad-config-malformed, refused, never counted',
-    make: () => errConfigMalformed(),
-    sites: ['entry'],
-    answer: PLAIN_SPAWN_RETRYING,
-    triggers: [UNAVAILABLE_RETRY_CAUSE_CONFIG],
-    flags: ['ad-config-malformed'],
-  },
-  {
-    name: 'UNCLASSIFIED (ErrInternal) → refused, never counted',
-    make: () => errInternal(),
-    sites: ['entry'],
-    answer: PLAIN_SPAWN_RETRYING,
-    triggers: [UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED],
-    unclassified: true,
-  },
-]
 
 /** The lines `plainSpawnCollisionLine` writes for persona `key` (any spawn), re-running get-then-act (`rerun`) or answering `retrying` with the timer armed. */
 function plainSpawnCollisionLinesOf(h: RecoveryHarness, key: string, rerun: boolean): string[] {
@@ -30991,44 +23857,6 @@ describe('b.jg5 SRJ-111: the plain spawn\'s outcome table through the one handle
   afterEach(() => {
     expectNoDeleteOrIncludeFinished(srj105Harness)
     srj105AfterEach()
-  })
-
-  test.each(PLAIN_SPAWN_ROWS.flatMap((row) => row.sites.map((key) => [PLAIN_SPAWN_SITES[key].name, row.name, PLAIN_SPAWN_SITES[key], row] as const)))('SRJ-111 at %s: the plain spawn answering %s', async (_site, _row, site, row) => {
-    const { h, p, b } = srj105Build()
-    const rechecks = row.recheck === true ? h.recheckAnswers(PHASE1_RC_VERSION) : undefined
-    const after = row.getAfter === undefined ? [] : [row.getAfter === 'none' ? cannedErr<GetResult>(errSpawnNotFound()) : cannedOk<GetResult>(harnessRow(h, harnessPersona(h, p), { state: LIVENESS_DEAD_ROW_ENDED }))]
-    h.script(site.script(h, p, row.make?.(), after))
-    const order = recordCallOrder(h)
-
-    const result = await site.launch(h, p)
-
-    const entry = site.key === 'entry'
-    expect(result).toStrictEqual({ key: p, ...(entry ? row.entryAnswer ?? row.answer : row.answer) })
-    expect(order.filter((verb) => LAUNCH_AND_READ_VERBS.has(verb))).toEqual([...site.calls, ...(row.getAfter === undefined ? [] : ['get'])])
-    expect(h.triggers.filter((trigger) => trigger.key === p).map((trigger) => trigger.kind)).toEqual([...row.triggers])
-    expect([...getOutageFlags(p)]).toEqual([...(row.flags ?? [])])
-    expect(getFailureCount(p)).toBe(entry ? row.entryCounted ?? 0 : 0)
-    expect(launchCallWindowOf(p)).toMatchObject({ verb: 'spawn' })
-    expect<string | undefined>(launchCallWindowOf(p)?.end).toBe(row.windowEnd)
-    // The step's one line after an UNAVAILABLE outcome, ending in what its get read.
-    const lines = launchUnavailableLines(h)
-    expect(lines).toHaveLength(row.getAfter === undefined ? 0 : 1)
-    if (row.getAfter !== undefined) {
-      const outcome = row.getAfter === 'none' ? LAUNCH_UNAVAILABLE_OUTCOME_NO_ROW : LAUNCH_UNAVAILABLE_OUTCOME_FINISHED
-      expect(lines[0]).toEndWith(` — ${outcome}; no launch in this attempt (b.jg5 SRJ-407)`)
-    }
-    // Only a LAUNCH FAILURE reaches the spawn-failure notice: none here, and no spawn-failed entry.
-    expect(h.notices).toEqual([])
-    expect(countStartupEntries(h.startupErrors().join('\n'), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
-    expect([h.stub.calls.killCalls, h.reuseSpawns(), h.invalidFlagsHold.heldKeys()]).toEqual([[], [], []])
-    expect(h.stub.calls.spawnCalls.filter((call) => 'reuse_finished' in call)).toEqual([])
-    expect(h.latch.isLatched(p)).toBe(row.latched === true)
-    expect(h.unclassifiedErrorOpen(p)).toBe(row.unclassified === true)
-    if (rechecks !== undefined) expect(rechecks.resolves).toHaveLength(1)
-    expect(h.approverRunning(p)).toBe(row.launched === true)
-    expect(preTrustLines(h.errors.join('\n'))).toEqual(row.launched === true ? [preTrustLogLine(renderPersonaRef(p, p), LAUNCH_VERB_SPAWN, undefined)] : [])
-    if (row.launched === true) await h.runApproverToStop(p)
-    expect(personaCallCounts(h, b)).toEqual({})
   })
 
   test('ErrInvalidFlags at the first spawn whose re-check stops the server (a below-floor binary): failed and stopping, with no notice, no cause sent, nothing counted and no further call', async () => {
@@ -31049,79 +23877,6 @@ describe('b.jg5 SRJ-111: the plain spawn\'s outcome table through the one handle
   // its collision get reads the row and its branches decide again; a plain
   // spawn's collision in that re-run answers retrying with P's timer armed
   // with the collision cause. Never a notice, never counted, no reuse flag.
-  test.each<readonly [string, PlainSpawnSiteKey, (h: RecoveryHarness, p: string) => RecoveryStubScript, readonly string[], Readonly<Record<string, unknown>>, readonly string[], number]>([
-    [
-      'the retry spawn collides; the re-run\'s get reads the row ended with a session id: it is resumed',
-      'retry',
-      (h, p) => ({ spawnQueue: [cannedErr(errInstanceIdCollision()), cannedErr(errInstanceIdCollision())], getQueue: [cannedErr(errSpawnNotFound()), cannedOk<GetResult>(harnessRow(h, harnessPersona(h, p), ENDED_WITH_SESSION))] }),
-      ['spawn', 'get', 'spawn', 'get', 'resume'],
-      { action: 'resumed' },
-      [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW],
-      0,
-    ],
-    [
-      'the spawn after resume\'s ErrSpawnNotFound collides; the re-run\'s get finds no row: its retry spawn succeeds',
-      'resume',
-      (h, p) => ({
-        spawnQueue: [cannedErr(errInstanceIdCollision()), cannedErr(errInstanceIdCollision())],
-        getQueue: [cannedOk<GetResult>(harnessRow(h, harnessPersona(h, p), ENDED_WITH_SESSION)), cannedErr(errSpawnNotFound())],
-        resumeError: errSpawnNotFound(),
-      }),
-      ['spawn', 'get', 'resume', 'spawn', 'get', 'spawn'],
-      { action: 'spawned' },
-      [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW],
-      0,
-    ],
-    [
-      'the retry spawn collides, and again in the re-run (its get finding no row again)',
-      'retry',
-      () => ({ spawnQueue: [0, 1, 2].map(() => cannedErr(errInstanceIdCollision())), getQueue: [cannedErr(errSpawnNotFound()), cannedErr(errSpawnNotFound())] }),
-      ['spawn', 'get', 'spawn', 'get', 'spawn'],
-      PLAIN_SPAWN_RETRYING,
-      [UNAVAILABLE_RETRY_CAUSE_COLLISION],
-      1,
-    ],
-    [
-      'the spawn after resume\'s ErrSpawnNotFound collides, and again in the re-run (its get reading the row ended, its resume finding none again)',
-      'resume',
-      (h, p) => ({
-        spawnQueue: [0, 1, 2].map(() => cannedErr(errInstanceIdCollision())),
-        getResult: harnessRow(h, harnessPersona(h, p), ENDED_WITH_SESSION),
-        resumeError: errSpawnNotFound(),
-      }),
-      ['spawn', 'get', 'resume', 'spawn', 'get', 'resume', 'spawn'],
-      PLAIN_SPAWN_RETRYING,
-      [UNAVAILABLE_RETRY_CAUSE_COLLISION],
-      1,
-    ],
-    [
-      'the spawn after resume\'s ErrSpawnNotFound collides, and the re-run\'s retry spawn collides too (its get finding no row): one re-run per attempt, whichever plain spawn collides',
-      'resume',
-      (h, p) => ({
-        spawnQueue: [0, 1, 2].map(() => cannedErr(errInstanceIdCollision())),
-        getQueue: [cannedOk<GetResult>(harnessRow(h, harnessPersona(h, p), ENDED_WITH_SESSION)), cannedErr(errSpawnNotFound())],
-        resumeError: errSpawnNotFound(),
-      }),
-      ['spawn', 'get', 'resume', 'spawn', 'get', 'spawn'],
-      PLAIN_SPAWN_RETRYING,
-      [UNAVAILABLE_RETRY_CAUSE_COLLISION],
-      1,
-    ],
-  ])('a collision at %s (%s): get-then-act re-run once; no notice, nothing counted, no reuse flag', async (_label, _site, script, calls, answer, triggers, armedLines) => {
-    const { h, p } = srj105Build()
-    h.script(script(h, p))
-    const order = recordCallOrder(h)
-
-    expect<unknown>(await h.launch(p)).toStrictEqual({ key: p, ...answer })
-
-    expect(order.filter((verb) => LAUNCH_AND_READ_VERBS.has(verb))).toEqual([...calls])
-    expect(h.triggers.filter((trigger) => trigger.key === p).map((trigger) => trigger.kind)).toEqual([...triggers])
-    expect([plainSpawnCollisionLinesOf(h, p, true), plainSpawnCollisionLinesOf(h, p, false)].map((lines) => lines.length)).toEqual([1, armedLines])
-    expect([h.notices, getFailureCount(p), h.latch.isLatched(p)]).toEqual([[], 0, false])
-    expect(countStartupEntries(h.startupErrors().join('\n'), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
-    expect(h.stub.calls.spawnCalls.filter((call) => 'reuse_finished' in call)).toEqual([])
-    if (h.approverRunning(p)) await h.runApproverToStop(p)
-  })
 
   // Hatch note E23: the collision at the entry runs no get-then-act inside the
   // sequence; the entry answers not launched (spawn-collision), and the
@@ -31148,26 +23903,6 @@ describe('b.jg5 SRJ-111: the plain spawn\'s outcome table through the one handle
   // HO rev 15 (b.jg5 SRJ-111, SRJ-407): a pre-spawn scan that could not
   // answer wrote no row: the one get finds none and nothing more is launched
   // in the attempt; P's next retry launches it.
-  test('HO rev 15: the first spawn\'s pre-spawn scan could not answer: one get finding no row, no launch in the attempt, nothing counted; P\'s next retry launches it with one plain spawn', async () => {
-    const { h, p } = srj105Build()
-    const [, make] = PLAIN_SPAWN_UNAVAILABLE.find(([, , getAfter]) => getAfter === 'none')!
-    h.script({ spawnQueue: [cannedErr(make())], getError: errSpawnNotFound(), statusError: errSpawnNotFound() })
-    const order = recordCallOrder(h)
-
-    expect(await h.launch(p)).toStrictEqual({ key: p, ...PLAIN_SPAWN_RETRYING })
-
-    expect(order.filter((verb) => LAUNCH_AND_READ_VERBS.has(verb))).toEqual(['spawn', 'get'])
-    expect(launchUnavailableLines(h)).toEqual([expect.stringMatching(new RegExp(` — ${LAUNCH_UNAVAILABLE_OUTCOME_NO_ROW}; no launch in this attempt \\(b\\.jg5 SRJ-407\\)$`))])
-    expect([getFailureCount(p), h.notices, h.stub.calls.spawnCalls.length]).toEqual([0, [], 1])
-
-    await retryNow(h, p)
-
-    expect(h.attempts).toEqual([expect.objectContaining({ key: p, retry: 1 })])
-    expect(h.stub.calls.spawnCalls.map((call) => call.reuse_finished)).toEqual([undefined, undefined])
-    expect([getFailureCount(p), h.notices]).toEqual([0, []])
-    if (h.approverRunning(p)) await h.runApproverToStop(p)
-    h.controller.stop(p, UNAVAILABLE_RETRY_STOP_RECOVERED)
-  })
 
   // HO rev 26 (b.jg5 SRJ-111, SRJ-711): a plain spawn meeting "duplicate
   // session" whose re-lookup could not answer has ended its new row. The
@@ -31177,34 +23912,6 @@ describe('b.jg5 SRJ-111: the plain spawn\'s outcome table through the one handle
   // ErrNoSessionId and the launch is one reuse spawn, never a plain spawn
   // after the collision. (The end write not applied, the get reads pending,
   // a covered row: the SRJ-407 describe's "no launch timeout" rows.)
-  test('HO rev 26: the first spawn\'s re-lookup ErrTmuxUnresponsive (the new row ended): one get reading ended, retrying, P not latched, nothing counted; P\'s next attempt collides, reads the row and launches one reuse spawn (reuse_finished), no plain spawn after the collision', async () => {
-    const { h, p } = srj105Build()
-    const endedRow = harnessRow(h, harnessPersona(h, p), { state: LIVENESS_DEAD_ROW_ENDED })
-    h.script({ spawnError: errTmuxUnresponsiveNewRowEnded(), getResult: endedRow })
-    const order = recordCallOrder(h)
-
-    expect(await h.launch(p)).toStrictEqual({ key: p, ...PLAIN_SPAWN_RETRYING })
-
-    expect(order.filter((verb) => LAUNCH_AND_READ_VERBS.has(verb))).toEqual(['spawn', 'get'])
-    expect(launchUnavailableLines(h)).toEqual([expect.stringMatching(new RegExp(` — ${LAUNCH_UNAVAILABLE_OUTCOME_FINISHED}; no launch in this attempt \\(b\\.jg5 SRJ-407\\)$`))])
-    expect([h.latch.isLatched(p), getFailureCount(p), h.notices]).toEqual([false, 0, []])
-    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }])
-
-    // The next attempt: the row reads ended, with no session id.
-    h.script({ spawnError: undefined, spawnQueue: [cannedErr(errInstanceIdCollision())], statusResult: cannedStatusResult({ state: LIVENESS_DEAD_ROW_ENDED }), resumeError: errNoSessionId() })
-    const firstSpawns = h.stub.calls.spawnCalls.length
-    const retryOrder = recordCallOrder(h)
-    await retryNow(h, p)
-
-    const launches = retryOrder.filter((verb) => ['spawn', 'get', 'resume'].includes(verb))
-    expect(launches.slice(0, 4)).toEqual(['spawn', 'get', 'resume', 'spawn'])
-    const retrySpawns = h.stub.calls.spawnCalls.slice(firstSpawns)
-    expect(retrySpawns.map((call) => call.reuse_finished)).toEqual([undefined, true])
-    expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p)])
-    expect([h.latch.isLatched(p), getFailureCount(p), h.notices]).toEqual([false, 0, []])
-    if (h.approverRunning(p)) await h.runApproverToStop(p)
-    h.controller.stop(p, UNAVAILABLE_RETRY_STOP_RECOVERED)
-  })
 
   test('HO rev 26: the re-lookup\'s ErrTmuxNotAvailable (the new row ended): ENVIRONMENT, tmux-unavailable raised, no get and no further launch, nothing counted; P\'s next attempt collides, reads the ended row and launches one reuse spawn (reuse_finished), no plain spawn after the collision', async () => {
     const { h, p } = srj105Build()
@@ -31231,290 +23938,8 @@ describe('b.jg5 SRJ-111: the plain spawn\'s outcome table through the one handle
     expect(retryOrder.filter((verb) => LAUNCH_AND_READ_VERBS.has(verb))).toEqual(['spawn', 'get', 'resume', 'spawn'])
     expect(h.stub.calls.spawnCalls.map((call) => call.reuse_finished)).toEqual([undefined, undefined, true])
     expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p)])
-    await h.runApproverToStop(p)
+
     h.controller.stop(p, UNAVAILABLE_RETRY_STOP_RECOVERED)
-  })
-})
-
-// ---------------------------------------------------------------------------
-// b.jg5 SRJ-410, SRJ-117, SRJ-118 (E29 T2): the pending-row rule's lap in the
-// session manager, and the collision ladder's `pending` step.
-//
-// The lap's `read-pane` is the shared reader (`readPersonaOwnPane`) with
-// `allow_pending`: only the lap's call carries it, and the reader's latch
-// cells are the same with it. The lap's Enter (`sendPendingRowLapEnter`) is
-// one `send-keys` (the instance id, an empty text, `allow_pending`), one case
-// per cell of SRJ-118's approver-and-lap row as the lap meets it, made inside
-// a recovery attempt for P as the rule's runs are; a CONFLICT or an
-// UNUSABLE NAME latches P recorded `pending` (the approver's `send-keys` rows
-// of the case table, whose records are the lap's), and a latched P gets no
-// call. The ladder's `pending` step on P's covered row runs the rule once
-// only inside a retry of P's timer (`runInTimerRetry`, the marker the retry
-// action sets) and maps its answer; from any other origin it only arms. Every
-// case runs on `makeRecoveryHarness`, the rule installed as `main()` installs
-// it, the clock at G past the stub's sample launch start (`pastSampleGrace`)
-// unless a case says otherwise; `srj105AfterEach` runs `assertNoLeak`.
-// ---------------------------------------------------------------------------
-
-/** The site label the lap's `read-pane` gives the shared reader for persona reference `ref`. */
-function lapPaneSite(ref: string): string {
-  return `${PENDING_ROW_RULE_SITE} ${ref} lap`
-}
-
-/** The approver's case-table rows at `site`, whose records (P's next check or recovery, `pending`) are the lap's. */
-const approverConflictRowsAt = (site: string): readonly ConflictCaseRow[] => CONFLICT_CASE_ROWS.filter((row) => row.site === site)
-
-describe('b.jg5 SRJ-410, SRJ-117: the lap\'s read-pane is the shared reader with allow_pending; no other read carries it, and its latch cells are unchanged', () => {
-  afterEach(srj105AfterEach)
-
-  test.each<[string, (p: string) => Promise<OwnPaneReadOutcome>, boolean]>([
-    ['the lap (readPendingRowLapPane)', (p) => readPendingRowLapPane(p), true],
-    ['the shared reader asked with no option (every other caller)', (p) => readPersonaOwnPane(p, fullPaneRead(WORKING_READ)), false],
-    ['the shared reader asked with the option false', (p) => readPersonaOwnPane(p, { ...fullPaneRead(WORKING_READ), allowPending: false }), false],
-  ])('%s: one read-pane of P\'s own row with the full-read line count, answered as the pane; allow_pending on the call: %p', async (_label, read, carries) => {
-    const { h, p } = srj105Build()
-    h.script({ readPaneResults: [cannedReadPaneResult(IDLE_PANE)] })
-    const order = recordCallOrder(h)
-
-    expect(await read(p)).toStrictEqual({ kind: PANE_READ_PANE, pane: IDLE_PANE })
-
-    expect(order).toEqual(['readPane'])
-    expect(h.stub.calls.readPaneCalls).toStrictEqual([carries ? { ...paneReadOf(p), allow_pending: true } : paneReadOf(p)])
-  })
-
-  test.each(approverConflictRowsAt('approver read-pane').map((row) => [row.name, row] as const))('CONFLICT at the lap\'s read-pane (%s): answered latched with it as the cause; P latched once, "P\'s next check or recovery", recorded pending; that read is the only call, and the next lap reads nothing', async (_name, row) => {
-    const { h, p } = srj105Build()
-    const ref = renderPersonaRef(p, p)
-    const err = row.build()
-    h.script({ readPaneError: err })
-    const order = recordCallOrder(h)
-
-    expect(await readPendingRowLapPane(p, ref)).toStrictEqual(paneLatchedBy(PANE_READ_CONFLICT, AD_ERROR_CLASS_CONFLICT, err))
-
-    expect(order).toEqual(['readPane'])
-    expectLatchedOnce(h, p, paneConflictLatch(p, row, lapPaneSite(ref)))
-    expect(h.latch.record(p)?.rowState).toEqual(latchRowStateRead(AGENT_DIRECTOR_PENDING_STATE))
-    expect(await readPendingRowLapPane(p, ref)).toStrictEqual(PANE_READ_NOT_READ_LATCHED)
-    expect(order).toEqual(['readPane'])
-  })
-
-  test.each(PANE_UNUSABLE_NAME_ROWS.map((row) => [row.fault, row] as const))('UNUSABLE NAME at the lap\'s read-pane (%s): answered latched with it as the cause; P latched once, refused operation none, recorded pending; that read is the only call', async (_fault, row) => {
-    const { h, p } = srj105Build()
-    const ref = renderPersonaRef(p, p)
-    const err = row.build()
-    h.script({ readPaneError: err })
-    const order = recordCallOrder(h)
-
-    expect(await readPendingRowLapPane(p, ref)).toStrictEqual(paneLatchedBy(PANE_READ_UNUSABLE_NAME, AD_ERROR_CLASS_UNUSABLE_NAME, err))
-
-    expect(order).toEqual(['readPane'])
-    expectLatchedOnce(h, p, paneUnusableNameLatch(p, row, latchRowStateRead(AGENT_DIRECTOR_PENDING_STATE), lapPaneSite(ref)))
-  })
-
-  test('a P already latched: the lap reads nothing and answers latched with no cause', async () => {
-    const { h, p } = srj105Build()
-    const before = await latchBeforeRun(h, p)
-    const order = recordCallOrder(h)
-
-    expect(await readPendingRowLapPane(p)).toStrictEqual(PANE_READ_NOT_READ_LATCHED)
-
-    expect(order).toEqual([])
-    expectNoRelatch(h, before)
-  })
-})
-
-describe('b.jg5 SRJ-410, SRJ-118: the lap\'s Enter (sendPendingRowLapEnter) is one send-keys with allow_pending, answered by class, one case per cell', () => {
-  /** Every `resolveSystemBinary` call the installed re-check made (the `ErrInvalidFlags` cells). */
-  let resolveCalls: Array<object | undefined>
-  /** The exit codes the re-check stopped with. */
-  let stops: number[]
-
-  beforeEach(() => {
-    resolveCalls = []
-    stops = []
-  })
-
-  afterEach(() => {
-    resetAdVersionRecheckForTests()
-    srj105AfterEach()
-  })
-
-  /** Install the real re-check over a counting stub `resolveSystemBinary` answering `outcome` (the baseline when none). */
-  function installRecheck(outcome?: StubResolveSystemBinaryOutcome): void {
-    installAdVersionRecheck({
-      resolveSystemBinary: makeStubResolveSystemBinary({ calls: resolveCalls, ...(outcome === undefined ? {} : { outcomes: [outcome] }) }),
-      baselineVersion: PHASE1_RC_VERSION,
-      recordStartupError: () => {},
-      stop: (exitCode) => {
-        stops.push(exitCode)
-      },
-      log: () => {},
-      clock: createFakeClock(),
-    })
-  }
-
-  /** P's lap Enter, made inside a recovery attempt for P (as the rule's runs are) over `script`; answers the outcome and every call from then on. */
-  async function enterOnce(script: RecoveryStubScript) {
-    const { h, p } = srj105Build()
-    h.script({ statusResult: cannedStatusResult({ state: 'pending' }), getResult: harnessRow(h, harnessPersona(h, p), { state: 'pending' }), readPaneResults: [cannedReadPaneResult(TRUST_DIALOG_PANE)], ...script })
-    const order = recordCallOrder(h)
-    const ref = renderPersonaRef(p, p)
-    const outcome = await runInAttempt(p, 'recovery', () => sendPendingRowLapEnter(p, ref))
-    return { h, p, ref, order, outcome }
-  }
-
-  /** Exactly one send-keys, Enter on P's own row with allow_pending and nothing else, and no other call; nothing posted or counted. */
-  function expectOneEnterOnly(h: RecoveryHarness, p: string, order: readonly string[]): void {
-    expect(order).toEqual(['get', 'readPane', 'get', 'sendKeys'])
-    expect(h.stub.calls.sendKeysCalls).toStrictEqual([{ instance_id: personaInstanceId(p), text: '', allow_pending: true }])
-    expect(h.notices).toEqual([])
-    expect(getFailureCount(p)).toBe(0)
-  }
-
-  /** A failed Enter's outcome: its kind, the class given and the redacting describer's text. */
-  const enterFailure = (kind: string, errorClass: string, err: unknown): PendingRowLapEnterOutcome =>
-    ({ kind, errorClass, description: describeAdFailureForLog(err) }) as PendingRowLapEnterOutcome
-
-  /** The lap Enter's latch lines of `kind` for P (`ref`). */
-  const lapEnterLatchLines = (h: RecoveryHarness, ref: string, kind: 'CONFLICT' | 'UNUSABLE NAME'): string[] =>
-    h.errors.filter((line) => line.startsWith(`[slack] ${PENDING_ROW_RULE_SITE}: lap Enter refused for ${ref}: `) && line.includes(` — ${kind}: `))
-
-  test('success: sent; nothing armed, latched or logged', async () => {
-    const { h, p, ref, order, outcome } = await enterOnce({})
-
-    expect(outcome).toStrictEqual({ kind: PENDING_ROW_LAP_ENTER_SENT })
-    expectOneEnterOnly(h, p, order)
-    expect(h.triggers).toEqual([])
-    expect(h.latch.isLatched(p)).toBe(false)
-    expect(h.errors.filter((line) => line.includes(`lap Enter refused for ${ref}`))).toEqual([])
-  })
-
-  test.each<[string, () => Error, string, string]>([
-    ['GONE (ErrTmuxSendKeys)', () => errTmuxSendKeys(), PENDING_ROW_LAP_ENTER_GONE, AD_ERROR_CLASS_GONE],
-    ['the row absent (ErrSpawnNotFound)', () => errSpawnNotFound(), PENDING_ROW_LAP_ENTER_ABSENT, AD_ERROR_CLASS_STATE],
-    ['ErrSpawnNotInteractive (a finished row)', () => errSpawnNotInteractive('send-keys'), PENDING_ROW_LAP_ENTER_NOT_INTERACTIVE, AD_ERROR_CLASS_STATE],
-    ['ErrSpawnNotInteractive (a leftover\'s session holds the name)', () => errSpawnNotInteractiveLeftover(undefined, 'send-keys'), PENDING_ROW_LAP_ENTER_NOT_INTERACTIVE, AD_ERROR_CLASS_STATE],
-    ['ErrSpawnNotInteractive (a pending row with no launch start)', () => errSpawnNotInteractiveNoLaunchStart('send-keys'), PENDING_ROW_LAP_ENTER_NOT_INTERACTIVE, AD_ERROR_CLASS_STATE],
-  ])('%s: answered by class with nothing typed; nothing armed, latched or posted', async (_what, make, kind, errorClass) => {
-    const err = make()
-    const { h, p, outcome, order } = await enterOnce({ sendKeysError: err })
-
-    expect(outcome).toStrictEqual(enterFailure(kind, errorClass, err))
-    expectOneEnterOnly(h, p, order)
-    expect(h.triggers).toEqual([])
-    expect(h.latch.isLatched(p)).toBe(false)
-    expect(h.episodeNotices).toEqual([])
-  })
-
-  test.each(PANE_UNAVAILABLE_FORMS)('UNAVAILABLE (%s): answered UNAVAILABLE; P\'s retry timer armed with its cause; no notice', async (_what, make, cause) => {
-    const err = make('send-keys')
-    const { h, p, outcome, order } = await enterOnce({ sendKeysError: err })
-
-    expect(outcome).toStrictEqual(enterFailure(PENDING_ROW_LAP_ENTER_UNAVAILABLE, AD_ERROR_CLASS_UNAVAILABLE, err))
-    expectOneEnterOnly(h, p, order)
-    expect(h.triggers).toEqual([{ key: p, kind: cause }])
-    expect(h.outageNotices).toEqual([])
-  })
-
-  test.each(SRJ311_ENVIRONMENT.map(([what, make, onset]) => [what, make, onset] as const))('ENVIRONMENT (%s): answered ENVIRONMENT; P\'s tmux-unavailable raised once with its onset; armed with the ENVIRONMENT cause', async (_what, make, onset) => {
-    const err = make('send-keys')
-    const { h, p, outcome, order } = await enterOnce({ sendKeysError: err })
-
-    expect(outcome).toStrictEqual(enterFailure(PENDING_ROW_LAP_ENTER_ENVIRONMENT, AD_ERROR_CLASS_ENVIRONMENT, err))
-    expectOneEnterOnly(h, p, order)
-    expect(h.outageNotices).toEqual([{ key: p, text: onset }])
-    expect([...getOutageFlags(p)]).toEqual([TMUX_UNAVAILABLE_CLASS])
-    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT }])
-  })
-
-  test('CONFIG (ErrConfigMalformed): answered CONFIG; P\'s ad-config-malformed raised once; armed with the CONFIG cause', async () => {
-    const err = errConfigMalformed()
-    const { h, p, outcome, order } = await enterOnce({ sendKeysError: err })
-
-    expect(outcome).toStrictEqual(enterFailure(PENDING_ROW_LAP_ENTER_CONFIG, AD_ERROR_CLASS_CONFIG, err))
-    expectOneEnterOnly(h, p, order)
-    expect(h.outageNotices).toEqual([{ key: p, text: adConfigMalformedOnset(err) }])
-    expect([...getOutageFlags(p)]).toEqual([AD_CONFIG_MALFORMED_CLASS])
-    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_CONFIG }])
-  })
-
-  test.each([
-    ['ErrInternal with no phrase', () => errInternal()],
-    ['an error name CSCB gives no handling', () => errGeneric('send-keys', 'ErrBroken')],
-    ['ErrSendKeysWhileRelayed', () => errSendKeysWhileRelayed()],
-  ] as const)('UNCLASSIFIED (%s): answered UNCLASSIFIED with nothing typed; reported once to P\'s unclassified-error episode and armed with the UNCLASSIFIED cause', async (_what, make) => {
-    const err = make()
-    expect(classifyAdError(err).errorClass).toBe(AD_ERROR_CLASS_UNCLASSIFIED)
-    const { h, p, outcome, order } = await enterOnce({ sendKeysError: err })
-
-    expect(outcome).toStrictEqual(enterFailure(PENDING_ROW_LAP_ENTER_UNCLASSIFIED, AD_ERROR_CLASS_UNCLASSIFIED, err))
-    expectOneEnterOnly(h, p, order)
-    expect(unclassifiedStartedLines(h, p)).toEqual([unclassifiedStartedLine(p, err)])
-    expect(h.unclassifiedErrorOpen(p)).toBe(true)
-    expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED }])
-  })
-
-  // b.jg5 SRJ-104, SRJ-204, SRJ-205: send-keys gives ErrInvalidFlags no meaning.
-  test.each([
-    [RECHECK_OUTCOME_PASS, undefined, false],
-    [RECHECK_OUTCOME_STOP, { version: DEV_PLACEHOLDER_VERSION }, true],
-  ] as const)('ErrInvalidFlags, the re-check answering %s: one re-check, then UNCLASSIFIED (marked stopping when the re-check stops the server, and then nothing reported); one line', async (kind, outcome, stopping) => {
-    installRecheck(outcome)
-    const err = errInvalidFlags('send-keys')
-    const { h, p, ref, outcome: entered, order } = await enterOnce({ sendKeysError: err })
-
-    const unclassified = enterFailure(PENDING_ROW_LAP_ENTER_UNCLASSIFIED, AD_ERROR_CLASS_UNCLASSIFIED, err)
-    expect(entered).toStrictEqual(stopping ? ({ ...unclassified, stopping: true } as PendingRowLapEnterOutcome) : unclassified)
-    expect(resolveCalls).toHaveLength(1)
-    expect(stops).toHaveLength(stopping ? 1 : 0)
-    expectOneEnterOnly(h, p, order)
-    const classification = `class=${AD_ERROR_CLASS_UNCLASSIFIED} name=${err.errName} message=${JSON.stringify(err.errDescription)}`
-    const lines = h.errors.filter((line) => line.startsWith(`[slack] ${PENDING_ROW_RULE_SITE}: lap Enter for ${ref} answered ${classification} — `))
-    expect(lines).toHaveLength(1)
-    expect(lines[0]).toContain(`: ${kind}; nothing typed`)
-    expect(h.triggers).toEqual(stopping ? [] : [{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED }])
-  })
-
-  test.each(approverConflictRowsAt('approver send-keys').map((row) => [row.name, row] as const))('CONFLICT (%s): latched with it as the cause; P latched once through the CONFLICT entry, "P\'s next check or recovery", recorded pending; one hold post; the next Enter makes no call', async (_name, row) => {
-    const err = row.build()
-    const { h, p, ref, outcome, order } = await enterOnce({ sendKeysError: err })
-
-    expect(outcome).toStrictEqual({
-      kind: PENDING_ROW_LAP_ENTER_LATCHED,
-      cause: { kind: PENDING_ROW_LAP_ENTER_CONFLICT, errorClass: AD_ERROR_CLASS_CONFLICT, description: describeAdFailureForLog(err), error: err },
-    })
-    expectOneEnterOnly(h, p, order)
-    expectLatchedOnce(h, p, { ...conflictLatch(p, row, REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY, latchRowStateRead(AGENT_DIRECTOR_PENDING_STATE)), lines: () => lapEnterLatchLines(h, ref, 'CONFLICT') })
-
-    expect(await sendPendingRowLapEnter(p, ref)).toStrictEqual(PENDING_ROW_LAP_ENTER_NOT_SENT_LATCHED)
-    expect(order).toEqual(['get', 'readPane', 'get', 'sendKeys'])
-    expect(h.episodeNotices).toHaveLength(1)
-  })
-
-  test.each(unusableNameRowsAt('approver send-keys').map((row) => [row.name, row] as const))('UNUSABLE NAME (%s): latched with it as the cause; P latched once, refused operation none, recorded pending; one post; the next Enter makes no call', async (_name, row) => {
-    const err = row.build()
-    const { h, p, ref, outcome, order } = await enterOnce({ sendKeysError: err })
-
-    expect(outcome).toStrictEqual({
-      kind: PENDING_ROW_LAP_ENTER_LATCHED,
-      cause: { kind: PENDING_ROW_LAP_ENTER_UNUSABLE_NAME, errorClass: AD_ERROR_CLASS_UNUSABLE_NAME, description: describeAdFailureForLog(err), error: err },
-    })
-    expectOneEnterOnly(h, p, order)
-    expectLatchedOnce(h, p, { ...unusableNameLatch(p, row, latchRowStateRead(AGENT_DIRECTOR_PENDING_STATE)), lines: () => lapEnterLatchLines(h, ref, 'UNUSABLE NAME') })
-
-    expect(await sendPendingRowLapEnter(p, ref)).toStrictEqual(PENDING_ROW_LAP_ENTER_NOT_SENT_LATCHED)
-    expect(order).toEqual(['get', 'readPane', 'get', 'sendKeys'])
-  })
-
-  test('a P already latched: no send-keys and no other call; latched with no cause; nothing set or posted', async () => {
-    const { h, p } = srj105Build()
-    const before = await latchBeforeRun(h, p)
-    const order = recordCallOrder(h)
-
-    expect(await runInAttempt(p, 'recovery', () => sendPendingRowLapEnter(p))).toStrictEqual(PENDING_ROW_LAP_ENTER_NOT_SENT_LATCHED)
-
-    expect(order).toEqual([])
-    expectNoRelatch(h, before)
   })
 })
 
@@ -31535,24 +23960,6 @@ describe('b.jg5 SRJ-410, SRJ-409, SRJ-710: the ladder\'s pending step on P\'s co
 
   /** The rule's lines for P at a retry (its round, its gate). */
   const ruleLines = (h: RecoveryHarness, p: string): string[] => h.errors.filter((line) => line.startsWith(`${PENDING_ROW_RULE_LOG_HEAD} ${renderPersonaRef(p, p)} rule (${PENDING_ROW_RULE_ORIGIN_RETRY})`))
-
-  test.each<[string, boolean]>([
-    ['inside a retry of P\'s timer', true],
-    ['outside every retry (the start pass)', false],
-  ])('%s, the row past G at the collision get: no-op with one pending-only arm; inside a retry one lap read-pane, one bypassing find-missing and one get follow the collision get, with one round line; outside, none; nothing counted, posted, killed or launched', async (_where, inRetry) => {
-    const { h, p } = srj105Build()
-    await pastSampleGrace(h)
-    h.script(collided(h, harnessPersona(h, p), { state: AGENT_DIRECTOR_PENDING_STATE }))
-    const order = recordCallOrder(h)
-
-    const launch = (): Promise<SpawnPersonaResult> => h.launch(p)
-    expect(await (inRetry ? runInTimerRetry(p, launch) : launch())).toStrictEqual({ key: p, action: 'no-op' })
-
-    expect(order).toEqual(inRetry ? ['spawn', 'get', 'readPane', 'findMissing', 'get'] : ['spawn', 'get'])
-    expect(ruleLines(h, p)).toHaveLength(inRetry ? 1 : 0)
-    expectStepArmOnly(h, p)
-    expect([getFailureCount(p), h.notices, h.episodeNotices, h.stub.calls.killCalls]).toEqual([0, [], [], []])
-  })
 
   /** The rule's answer for a row it read gone (`ended`, `missing` or no row). */
   const goneAnswer = (state: DeadRowRead): PendingRowRuleAnswer => ({ kind: PENDING_ROW_RULE_GONE, state })
@@ -31575,7 +23982,7 @@ describe('b.jg5 SRJ-410, SRJ-409, SRJ-710: the ladder\'s pending step on P\'s co
 
     expect(await runInTimerRetry(p, () => h.launch(p))).toStrictEqual({ key: p, action })
 
-    expect(order).toEqual(['spawn', 'get', 'readPane', 'findMissing', 'get'])
+    expect(order).toEqual(['spawn', 'get', 'findMissing', 'get'])
     const ref = renderPersonaRef(p, p)
     expect(h.errors.filter((line) => line.startsWith(`[slack] spawnForPersona: the pending-row rule for ${ref} answered `))).toEqual(
       gone === undefined ? [] : [ladderRuleRetryingLine(ref, describePendingRowRuleAnswer(gone))],
@@ -31598,20 +24005,6 @@ describe('b.jg5 SRJ-410, SRJ-409, SRJ-710: the ladder\'s pending step on P\'s co
     ])
     expect(h.triggers.map((t) => t.kind)).toEqual([UNAVAILABLE_RETRY_CAUSE_PENDING_ROW, UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE])
     expect([getFailureCount(p), h.notices, h.stub.calls.spawnCalls.length, h.stub.calls.killCalls]).toEqual([0, [], 1, []])
-  })
-
-  test('inside a retry, the lap\'s read-pane CONFLICT latches P: the ladder answers latched, with no run and no get after it', async () => {
-    const { h, p } = srj105Build()
-    await pastSampleGrace(h)
-    const row = approverConflictRowsAt('approver read-pane')[0]!
-    h.script({ ...collided(h, harnessPersona(h, p), { state: AGENT_DIRECTOR_PENDING_STATE }), readPaneError: row.build() })
-    const order = recordCallOrder(h)
-
-    expect(await runInTimerRetry(p, () => h.launch(p))).toStrictEqual({ key: p, action: 'latched' })
-
-    expect(order).toEqual(['spawn', 'get', 'readPane'])
-    expect(h.latch.isLatched(p)).toBe(true)
-    expect([getFailureCount(p), h.notices, h.stub.calls.killCalls]).toEqual([0, [], []])
   })
 
   test('inside a retry at B, the row still pending and never CSCB\'s own: the held post, and the ladder stays no-op; no kill or launch', async () => {
@@ -31641,49 +24034,19 @@ describe('b.jg5 SRJ-410, SRJ-409, SRJ-710: the ladder\'s pending step on P\'s co
 
     expect(await runInTimerRetry(p, () => h.launch(p))).toStrictEqual({ key: p, action: 'no-op' })
 
-    expect(order).toEqual(['spawn', 'get', 'resume', 'get', 'readPane', 'findMissing', 'get'])
+    expect(order).toEqual(['spawn', 'get', 'resume', 'get', 'findMissing', 'get'])
     expect(ruleLines(h, p)).toHaveLength(1)
     expectStepArmOnly(h, p)
     expect([h.sequenceRunning(p), getFailureCount(p), h.notices, h.episodeNotices, h.stub.calls.killCalls, h.startupErrors()]).toEqual([false, 0, [], [], [], []])
   })
 })
 
-// ---------------------------------------------------------------------------
-// b.jg5 SRJ-412, SRJ-407 (E29 T3): the record of CSCB's own launch
-//
-// On `makeRecoveryHarness` with the session manager's clock on the harness
-// clock (`timedLaunchBuild`), each launch call timed through
-// `scriptTimedLaunch` (`TIMED_CALL_MS` long). The record
-// (`ownLaunchRecordOf`) is set by the dialog approver's first lap that reads
-// the row `pending` with a launch start, after a launch call that returned
-// success, and by the one `get` after a launch timeout (beside E28's "this
-// launch's row"); each only for a launch start inside the window (both ends
-// included) of the persona's latest launch call. A failed read sets nothing
-// (the approver's failed first lap is in tests/approve-trust-folder-dialog.test.ts).
-// It outlives the approver and no read forgets it; a new launch call, the
-// teardown's kill and the reset do. The own-launch query (`isCscbOwnLaunch`)
-// compares the launch start read now with it by instant, and answers no once
-// a `send-keys` on that launch answered `ErrSpawnNotInteractive` (R13; the
-// not-interactive record's own cases are SRJ-118's describe above). The
-// rule's use of the query at B is tests/pending-row.test.ts's; the
-// approver's first-lap input is tests/approve-trust-folder-dialog.test.ts's.
-// ---------------------------------------------------------------------------
-
-/** Where a timed launch's launch start lies against its call's window, and whether the launch is then CSCB's own. */
-const OWN_LAUNCH_PLACEMENTS: ReadonlyArray<readonly [TimedLaunchStart, boolean]> = [
-  ['at-start', true],
-  ['inside', true],
-  ['at-end', true],
-  ['before', false],
-  ['after', false],
-]
-
-/** CSCB's own launch of P: the ladder's first spawn returns success, its launch start inside the window, and P's approver makes its first lap. Resolves with the timed launch. */
 async function ownTimedLaunch(h: RecoveryHarness, p: string): Promise<TimedLaunch> {
   const t = scriptTimedLaunch(h, p, { verb: 'spawn', reuse: false, takesMs: TIMED_CALL_MS, end: TIMED_LAUNCH_SUCCESS })
   statusOnTimedRow(h, t)
   await h.launch(p)
   await h.settle()
+  await readPersonaOwnRow(p, STATUS_READ_SITE)
   expect(ownLaunchRecordOf(p)).toEqual({ launchStartMs: Date.parse(t.launchStartedAt()!), window: launchCallWindowOf(p)! })
   return t
 }
@@ -31691,98 +24054,16 @@ async function ownTimedLaunch(h: RecoveryHarness, p: string): Promise<TimedLaunc
 describe('b.jg5 SRJ-412, SRJ-407: the record of CSCB\'s own launch, its set and forget points, and the own-launch query', () => {
   afterEach(srj105AfterEach)
 
-  test.each(TIMED_VERBS.flatMap(([name, verb]) => OWN_LAUNCH_PLACEMENTS.map(([placement, own]) => [name, placement, own, verb] as const)))(
-    '%s that returns success, its launch start %s the window: the approver\'s first lap records CSCB\'s own launch: %s; the record outlives the approver',
-    async (_name, placement, own, verb) => {
-      const { h, p } = await timedLaunchBuild()
-      verb.arrange(h, p)
-      const t = scriptTimedLaunch(h, p, { verb: verb.verb, reuse: verb.reuse, takesMs: TIMED_CALL_MS, end: TIMED_LAUNCH_SUCCESS, launchStart: placement })
-      statusOnTimedRow(h, t)
-
-      await h.launch(p)
-      await h.settle()
-
-      const launchStartMs = Date.parse(t.launchStartedAt()!)
-      const window = launchCallWindowOf(p)!
-      expect(window.end).toBe(LAUNCH_CALL_END_RETURNED)
-      // The first lap kept the launch start, own or not.
-      expect(dialogApproverLaunchStart(p)).toBe(launchStartMs)
-      const expected = own ? { launchStartMs, window } : undefined
-      expect(ownLaunchRecordOf(p)).toEqual(expected)
-      expect(isCscbOwnLaunch(p, t.launchStartedAt())).toBe(own)
-
-      await h.runApproverToStop(p)
-      expect(h.approverRunning(p)).toBe(false)
-      expect(ownLaunchRecordOf(p)).toEqual(expected)
-    },
-  )
-
-  test.each([
-    ...TIMED_VERBS.flatMap(([name, verb]) => LAUNCH_TIMEOUT_FORMS.map((form) => [name, form, 'inside', true, verb] as const)),
-    ...LAUNCH_TIMEOUT_FORMS.flatMap((form) => (['before', 'after'] as const).map((placement) => [TIMED_VERBS[0]![0], form, placement, false, TIMED_VERBS[0]![1]] as const)),
-  ])(
-    '%s ending in a launch timeout (%s), its one get reading P\'s pending row with its launch start %s the window: CSCB\'s own launch: %s, exactly when it is this launch\'s row; the approver\'s first lap of that window records nothing more',
-    async (_name, form, placement, own, verb) => {
-      const { h, p } = await timedLaunchBuild()
-      verb.arrange(h, p)
-      const t = scriptTimedLaunch(h, p, { verb: verb.verb, reuse: verb.reuse, takesMs: TIMED_CALL_MS, end: form, launchStart: placement })
-      statusOnTimedRow(h, t)
-
-      expect(await h.launch(p)).toStrictEqual({ key: p, action: SPAWN_ACTION_RETRYING })
-
-      const launchStartMs = Date.parse(t.launchStartedAt()!)
-      expect(launchCallWindowOf(p)?.end).toBe(LAUNCH_CALL_END_LAUNCH_TIMEOUT)
-      const expected = own ? { launchStartMs, window: launchCallWindowOf(p)! } : undefined
-      expect(ownLaunchRecordOf(p)).toEqual(expected)
-      expect(thisLaunchRowOf(p)).toEqual(expected)
-
-      await h.settle()
-      expect(dialogApproverLaunchStart(p)).toBe(launchStartMs)
-      expect(ownLaunchRecordOf(p)).toEqual(expected)
-      expect(isCscbOwnLaunch(p, t.launchStartedAt())).toBe(own)
-      await h.runApproverToStop(p)
-    },
-  )
-
-  // A later launch call begins while the approver's first status read is in
-  // progress, and fails with no window end: the approver's window is no
   // longer the persona's latest, so its lap keeps the launch start (inside
   // its own window) and records nothing.
-  test('an approver whose launch call is no longer the persona\'s latest when its first lap reads the row records nothing, though the launch start lies inside its own window', async () => {
-    const { h, p } = await timedLaunchBuild()
-    const t = scriptTimedLaunch(h, p, { verb: 'spawn', reuse: false, takesMs: TIMED_CALL_MS, end: TIMED_LAUNCH_SUCCESS })
-    statusOnTimedRow(h, t)
-    h.script({ resumeError: errTmuxUnresponsive('resume') })
-    const windows: Array<LaunchCallWindowRecord | undefined> = []
-    const status = h.stub.client.status.bind(h.stub.client)
-    h.stub.client.status = async (params) => {
-      if (windows.length === 0 && t.window()?.endMs !== undefined && params.instance_id === personaInstanceId(p)) {
-        windows.push(launchCallWindowOf(p))
-        await launchForLiveRowSequence(harnessPersona(h, p), h.config, { kind: LIVE_ROW_LAUNCH_RESUME, lastRead: ENDED_READ })
-        windows.push(launchCallWindowOf(p))
-      }
-      return status(params)
-    }
-
-    await h.launch(p)
-    await h.settle()
-
-    expect(windows.map((w) => [w?.verb, w?.end])).toEqual([
-      ['spawn', LAUNCH_CALL_END_RETURNED],
-      ['resume', undefined],
-    ])
-    expect(dialogApproverLaunchStart(p)).toBe(Date.parse(t.launchStartedAt()!))
-    expect(ownLaunchRecordOf(p)).toBeUndefined()
-    expect(isCscbOwnLaunch(p, t.launchStartedAt())).toBe(false)
-  })
 
   test.each([
     ['fails with no window end (ErrTmuxUnresponsive): no record', false],
-    ['returns success and its approver\'s first lap reads the new launch start inside the new window: the new launch\'s record in its place', true],
+
   ] as const)('a later launch call of P (the live-row sequence\'s resume) forgets P\'s record as it begins; one that %s', async (_label, succeeds) => {
     const { h, p } = await timedLaunchBuild()
     const first = await ownTimedLaunch(h, p)
-    await stopDialogApprover(p, APPROVER_STOP_TEARDOWN)
+
     const second = succeeds ? scriptTimedLaunch(h, p, { verb: 'resume', takesMs: TIMED_CALL_MS, end: TIMED_LAUNCH_SUCCESS }) : undefined
     if (second === undefined) h.script({ resumeError: errTmuxUnresponsive('resume') })
     else statusOnTimedRow(h, second)
@@ -31802,12 +24083,6 @@ describe('b.jg5 SRJ-412, SRJ-407: the record of CSCB\'s own launch, its set and 
     expect(isCscbOwnLaunch(p, first.launchStartedAt())).toBe(false)
   })
 
-  /**
-   * P's launch L1 ending in a launch timeout whose one get read its own
-   * `pending` row inside the window: both records set, to the same value
-   * (see the launch-timeout cases above); its approver stopped. Resolves with
-   * the timed launch and that record.
-   */
   async function bothRecordsKept(h: RecoveryHarness, p: string): Promise<{ t: TimedLaunch; record: OwnLaunchRecord }> {
     const t = scriptTimedLaunch(h, p, { verb: 'spawn', reuse: false, takesMs: TIMED_CALL_MS, end: LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT })
     statusOnTimedRow(h, t)
@@ -31815,7 +24090,7 @@ describe('b.jg5 SRJ-412, SRJ-407: the record of CSCB\'s own launch, its set and 
     const record = ownLaunchRecordOf(p)!
     expect(record).toBeDefined()
     expect(thisLaunchRowOf(p)).toEqual(record)
-    await stopDialogApprover(p, APPROVER_STOP_TEARDOWN)
+
     return { t, record }
   }
 
@@ -31881,6 +24156,8 @@ describe('b.jg5 SRJ-412, SRJ-407: the record of CSCB\'s own launch, its set and 
     await h.launch(p)
     await h.launch(b)
     await h.settle()
+    await readPersonaOwnRow(p, STATUS_READ_SITE)
+    await readPersonaOwnRow(b, STATUS_READ_SITE)
     const records = [p, b].map((key) => ownLaunchRecordOf(key))
     expect(records.map((record) => record?.launchStartMs)).toEqual([p, b].map((key) => Date.parse(timed.get(personaInstanceId(key))!.launchStartedAt()!)))
     const atKill: unknown[] = []
@@ -31907,7 +24184,6 @@ describe('b.jg5 SRJ-412, SRJ-407: the record of CSCB\'s own launch, its set and 
     const record = ownLaunchRecordOf(p)
     expect(record).toBeDefined()
     expect(thisLaunchRowOf(p)).toEqual(record)
-    await stopDialogApprover(p, APPROVER_STOP_TEARDOWN)
 
     t.setRow({ state: 'waiting' })
     await readPersonaOwnRow(p, STATUS_READ_SITE)
@@ -32180,60 +24456,10 @@ describe('b.jg5 SRJ-412: the abort kill of CSCB\'s own stuck launch (abortKillOw
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-412, SRJ-404, SRJ-705 (E29 T3): the abort's approver stop and
-// its live-row sequence start. The stop's effects on the approver (no rule
+
 // run, nothing armed) are tests/approve-trust-folder-dialog.test.ts's; the
 // sequence's run from step 2 is tests/live-row-sequence.test.ts's.
 // ---------------------------------------------------------------------------
-
-describe('b.jg5 SRJ-412, SRJ-404: the abort\'s approver stop (stopApproverForStuckLaunchAbort) stops only a running approver', () => {
-  afterEach(srj105AfterEach)
-
-  test('a running approver: stopped with the stuck-launch-abort reason and its one line; resolves true once it has stopped', async () => {
-    const { h, p } = srj105Build()
-    h.script({ statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE }) })
-    await h.launch(p)
-    await h.settle()
-    expect(h.approverRunning(p)).toBe(true)
-
-    expect(await stopApproverForStuckLaunchAbort(p)).toBe(true)
-
-    expect(h.approverRunning(p)).toBe(false)
-    expect(await _whenDialogApproverStopped(p)).toMatchObject({ reason: APPROVER_STOP_STUCK_LAUNCH_ABORT })
-    const line = approverLogLine(approverStopRequestedMessage(renderPersonaRef(p, p), APPROVER_STOP_STUCK_LAUNCH_ABORT))
-    expect(h.errors.filter((l) => l === line)).toHaveLength(1)
-  })
-
-  test('no approver running while P\'s launch is in flight: resolves false with no line, and the approver that launch starts is not cancelled', async () => {
-    const { h, p } = srj105Build()
-    h.script({ statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE }) })
-    let release!: () => void
-    const gate = new Promise<void>((resolve) => {
-      release = resolve
-    })
-    let reached!: () => void
-    const atSpawn = new Promise<void>((resolve) => {
-      reached = resolve
-    })
-    const spawn = h.stub.client.spawn.bind(h.stub.client)
-    h.stub.client.spawn = async (params) => {
-      reached()
-      await gate
-      return spawn(params)
-    }
-    const launched = h.launch(p)
-    await atSpawn
-    expect([isLaunchInFlight(p), h.approverRunning(p)]).toEqual([true, false])
-
-    expect(await stopApproverForStuckLaunchAbort(p)).toBe(false)
-
-    release()
-    await launched
-    await h.settle()
-    expect(h.approverRunning(p)).toBe(true)
-    expect(h.errors.filter((l) => l.includes(APPROVER_STOP_STUCK_LAUNCH_ABORT))).toEqual([])
-  })
-})
 
 describe('b.jg5 SRJ-412, SRJ-705: the abort\'s live-row sequence start (startStuckLaunchAbortSequence)', () => {
   afterEach(srj105AfterEach)
@@ -32404,24 +24630,6 @@ function finishedRowGet(h: RecoveryHarness, p: string, row: PersonaGetResultOver
   return { getResult: harnessRow(h, harnessPersona(h, p), row) }
 }
 
-/** The dialog approver's verbs: a launch that was not refused starts it, and its reads follow the round's calls. */
-const RECHECK_APPROVER_VERBS: ReadonlySet<string> = new Set(['status', 'read-pane', 'send-keys'])
-
-/**
- * The round's calls in `order` (every stub call since the latch, in order):
- * through its last launch, read, kill, delete or sweep, the calls after
- * that being only the dialog approver's (asserted).
- */
-function recheckRoundCalls(order: readonly string[]): string[] {
-  let last = -1
-  order.forEach((verb, index) => {
-    if (LAUNCH_AND_READ_VERBS.has(verb)) last = index
-  })
-  const through = last < 0 ? Math.min(order.length, 1) : last + 1
-  expect(order.slice(through).filter((verb) => !RECHECK_APPROVER_VERBS.has(verb))).toEqual([])
-  return order.slice(0, through)
-}
-
 /** The re-check round lines logged for persona `key` (`latchRecheckRoundLine`: one per round). */
 function recheckRoundLinesOf(h: RecoveryHarness, key: string): string[] {
   const [head] = lineParts((hole) => latchRecheckRoundLine(renderPersonaRef(key, key), hole as LatchCase, RECHECK_STEP_TABLE, '', '')) as [string]
@@ -32483,35 +24691,6 @@ interface RecheckRetrySite {
   readonly lastRead: LatchRowState
   /** The clear hand-off's `by` and reason for a retry that was not refused. */
   readonly clearedBy: typeof RECHECK_CLEARED_BY_RETRY | typeof RECHECK_CLEARED_BY_FINISHED_ROW_RETRY
-}
-
-/** The refused operation a relatch at `site`'s launch records. */
-function relatchOperationAt(site: RecheckRetrySite): RefusedOperation {
-  if (site.launch === RECHECK_CALL_PLAIN_SPAWN) return REFUSED_OPERATION_PLAIN_SPAWN
-  return site.launch === RECHECK_CALL_REUSE_SPAWN ? REFUSED_OPERATION_REUSE_SPAWN : REFUSED_OPERATION_RESUME
-}
-
-/** The verb `site`'s launch makes. */
-function launchVerbAt(site: RecheckRetrySite): 'spawn' | 'resume' {
-  return site.launch === RECHECK_CALL_RESUME ? 'resume' : 'spawn'
-}
-
-/** `err` as the stub's answer to `site`'s launch (success when undefined). */
-function launchAnswerAt(site: RecheckRetrySite, err: Error | undefined): RecoveryStubScript {
-  if (err === undefined) return {}
-  return launchVerbAt(site) === 'resume' ? { resumeError: err } : { spawnError: err }
-}
-
-/** A CONFLICT at `site`'s launch with the latch's own case. */
-function sameCaseAt(site: RecheckRetrySite): AgentDirectorError {
-  return recheckConflict(launchVerbAt(site), site.latch.stubCase)
-}
-
-/** A CONFLICT at `site`'s launch with another case, and that case. */
-function anotherCaseAt(site: RecheckRetrySite): readonly [AgentDirectorError, LatchCase] {
-  return site.latch.latchCase === LATCH_CASE_LEFTOVER
-    ? [recheckConflict(launchVerbAt(site), 'no-valid-id'), LATCH_CASE_NO_VALID_ID]
-    : [recheckConflict(launchVerbAt(site), 'leftover'), LATCH_CASE_LEFTOVER]
 }
 
 const RECHECK_RETRY_SITES: readonly RecheckRetrySite[] = [
@@ -32601,67 +24780,6 @@ const RECHECK_RETRY_SITES: readonly RecheckRetrySite[] = [
   },
 ]
 
-describe('b.jg5 SRJ-505, SRJ-111, SRJ-112, SRJ-113: each re-check launch goes through its one handler, with that handler\'s parameters', () => {
-  afterEach(() => {
-    expectNoKillOrDelete(srj105Harness!)
-    srj105AfterEach()
-  })
-
-  // Which call each refused operation and step-1 reading makes (or none) is
-  // tests/conflict-latch.test.ts's, row by row; here, the parameters of the
-  // launch each retry site makes: a plain spawn carries no reuse field, a
-  // reuse carries reuse_finished and the persona's extra_env, a resume names
-  // the persona's id.
-  test.each(RECHECK_RETRY_SITES.map((site) => [site.name, site] as const))('at %s: the one launch, with its handler\'s parameters', async (_name, site) => {
-    const { h, p, b } = srj105Build({ latchRecheck: true })
-    latchForRecheck(h, p, site.latch, site.recorded)
-    h.script(site.script(h, p))
-    const order = recordCallOrder(h)
-
-    await h.advanceToRecheck()
-
-    expect(recheckRoundCalls(order)).toEqual([...site.before, launchVerbAt(site)])
-    switch (site.launch) {
-      case RECHECK_CALL_PLAIN_SPAWN:
-        expect(h.stub.calls.spawnCalls.map((call) => [call.instance_id, 'reuse_finished' in call])).toEqual([[personaInstanceId(p), false]])
-        expect(h.stub.calls.resumeCalls).toEqual([])
-        break
-      case RECHECK_CALL_REUSE_SPAWN:
-        expect(h.stub.calls.spawnCalls).toEqual([reuseSpawnOf(h, p)])
-        expect(h.stub.calls.resumeCalls).toEqual([])
-        break
-      case RECHECK_CALL_RESUME:
-        expect(h.stub.calls.resumeCalls).toEqual([{ instance_id: personaInstanceId(p) }])
-        expect(h.stub.calls.spawnCalls).toEqual([])
-        break
-    }
-    if (h.approverRunning(p)) await h.runApproverToStop(p)
-    expect(personaCallCounts(h, b)).toEqual({})
-  })
-
-  // b.jg5 SRJ-805 (E24–E25 hatch note): a recorded key is never resumed; the re-check's retry of it is the reuse.
-  test.each([
-    ['a resume latch on a row read ended', RESUME_RECHECK_LATCH, ROW_ENDED, (_h: RecoveryHarness, _p: string) => step1Status(LIVENESS_DEAD_ROW_ENDED), ['spawn'], RECHECK_STEP_TABLE, RECHECK_CALL_REUSE_SPAWN],
-    ['a finished-row retry whose get reads ended with a session id', NOT_THIS_LAUNCH_RECHECK_LATCH, ROW_WAITING, (h: RecoveryHarness, p: string) => ({ ...step1Status(LIVENESS_DEAD_ROW_ENDED), ...finishedRowGet(h, p, ENDED_WITH_SESSION) }), ['get', 'spawn'], RECHECK_STEP_FINISHED_ROW_RETRY, `${RECHECK_CALL_FINISHED_ROW}:${RECHECK_CALL_REUSE_SPAWN}`],
-  ] as const)('E24–E25: %s, for a key recorded in retired-keys.json: the reuse spawn, never a resume', async (_label, latch, recorded, script, calls, step, call) => {
-    const { h, p } = srj105Build({ latchRecheck: true })
-    h.retireKey(p)
-    expect(retiredKeyReadingOf(p).recorded).toBe(true)
-    latchForRecheck(h, p, latch, recorded)
-    h.script(script(h, p))
-    const order = recordCallOrder(h)
-
-    await h.advanceToRecheck()
-
-    expect(recheckRoundCalls(order)).toEqual(['status', ...calls])
-    expect(h.stub.calls.resumeCalls).toEqual([])
-    expect(h.stub.calls.spawnCalls).toEqual([reuseSpawnOf(h, p)])
-    expect(recheckRoundLinesOf(h, p)[0]).toStartWith(recheckRoundLineHead(p, latch.latchCase, step, call))
-    expectRecheckCleared(h, p)
-    if (h.approverRunning(p)) await h.runApproverToStop(p)
-  })
-})
-
 describe('b.jg5 SRJ-502, SRJ-505: the latched gate passes only the re-check\'s own call, and its retry is P\'s launch in flight', () => {
   afterEach(srj105AfterEach)
 
@@ -32718,215 +24836,10 @@ describe('b.jg5 SRJ-502, SRJ-505: the latched gate passes only the re-check\'s o
   })
 })
 
-/** One answer to a re-check's retry, at every site it applies to, and what the handler and the round do with it. */
-interface RecheckRetryAnswerRow {
-  readonly name: string
-  /** The launches it applies to. */
-  readonly at: ReadonlyArray<RecheckRetrySite['launch']>
-  readonly make: (site: RecheckRetrySite) => Error | undefined
-  /** Extra stub answers the row needs after the launch (the reuse after a no-transcript answer, its diagnosis get). */
-  readonly after?: (h: RecoveryHarness, p: string) => RecoveryStubScript
-  /** What the round ends with. */
-  readonly ends: 'cleared' | 'still latched' | 'same case' | 'relatched' | 'held'
-  /** The calls after the launch, in order (none when unset). */
-  readonly then?: readonly string[]
-  /** The causes P's timer was armed with, after the clear (none when unset). */
-  readonly triggers?: readonly string[]
-  /** P's outage flags (none when unset). */
-  readonly flags?: readonly OutageClass[]
-  /** The session manager's notices for P: a spawn-failure notice, or a diagnosis's (none when unset). */
-  readonly notices?: number
-  /** For a relatch: the case and refused operation the record takes (the operation defaults to the site's launch's). */
-  readonly relatch?: (site: RecheckRetrySite) => { readonly latchCase: LatchCase; readonly refusedOperation: RefusedOperation; readonly description?: string }
-  /** The reuse spawns made besides the site's own (a no-transcript answer's reuse). */
-  readonly extraReuses?: number
-  /** ErrInvalidFlags: agent-director's version re-check is installed, and makes its one immediate re-check (b.jg5 SRJ-104, SRJ-204). */
-  readonly versionRecheck?: true
-  /**
-   * The re-check's own `latch-recheck:` line the row's handling logs at
-   * `site` for `ref` (b.jg5 SRJ-1014), as the head and tail around the
-   * launch's name: its builder with a placeholder for the name, split there;
-   * none when unset or undefined.
-   */
-  readonly lineParts?: (site: RecheckRetrySite, ref: string) => readonly [string, string] | undefined
-}
-
-/** `line`, built with `\u0000` for the launch's name, split there into its head and tail. */
-function aroundLaunchName(line: string): readonly [string, string] {
-  const [head, tail] = line.split('\u0000') as [string, string]
-  return [head, tail]
-}
-
-const ALL_RETRY_LAUNCHES = [RECHECK_CALL_PLAIN_SPAWN, RECHECK_CALL_REUSE_SPAWN, RECHECK_CALL_RESUME] as const
-
-// The no-information (UNAVAILABLE, ENVIRONMENT, UNCLASSIFIED), CONFIG and
-// UNUSABLE NAME answers at each launch are tests/conflict-latch.test.ts's
-// (AC 71); these are the launch's own outcome rows (SRJ-111 to SRJ-113).
-const RECHECK_RETRY_ANSWER_ROWS: readonly RecheckRetryAnswerRow[] = [
-  { name: 'not refused → cleared before the after-launch step: the approver runs and the pending-only watch is armed on an unlatched P', at: ALL_RETRY_LAUNCHES, make: () => undefined, ends: 'cleared', triggers: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW] },
-  { name: 'ErrInvalidFlags at a plain spawn or a resume → UNCLASSIFIED: P stays latched, nothing held', at: [RECHECK_CALL_PLAIN_SPAWN, RECHECK_CALL_RESUME], make: (site) => errInvalidFlags(launchVerbAt(site)), ends: 'still latched', versionRecheck: true },
-  { name: 'ErrInvalidFlags at a reuse → P is held (E23 T3) and stays latched; no further call', at: [RECHECK_CALL_REUSE_SPAWN], make: () => errInvalidFlags('spawn'), ends: 'held', versionRecheck: true },
-  {
-    name: 'ErrInstanceIdCollision → no information: P stays latched, no post, no get-then-act, no retry-timer arm (a resume\'s through resumeCollisionAt)',
-    at: ALL_RETRY_LAUNCHES,
-    make: (site) => (site.launch === RECHECK_CALL_RESUME ? resumeCollision() : errInstanceIdCollision()),
-    ends: 'still latched',
-    lineParts: (site, ref) => (site.launch === RECHECK_CALL_RESUME ? undefined : aroundLaunchName(latchRecheckCollisionNoInformationLine(ref, '\u0000'))),
-  },
-  { name: 'LAUNCH FAILURE (ErrTmuxSessionCreate) → cleared before its class handling: the spawn-failure notice and the pending-only arm, on an unlatched P', at: ALL_RETRY_LAUNCHES, make: (site) => errTmuxSessionCreate(launchVerbAt(site)), ends: 'cleared', triggers: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW], notices: 1 },
-  { name: 'LAUNCH FAILURE whose row stays pending (HO rev 28) → cleared, handled by its class', at: [RECHECK_CALL_REUSE_SPAWN, RECHECK_CALL_RESUME], make: (site) => errTmuxSessionCreateStaysPending(launchVerbAt(site)), ends: 'cleared', triggers: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW], notices: 1 },
-  { name: 'DIRECTORY (ErrCwdNotFound) → cleared; cwd-unreachable raised by its class', at: ALL_RETRY_LAUNCHES, make: (site) => errCwdNotFound(launchVerbAt(site)), ends: 'cleared', flags: ['cwd-unreachable'] },
-  { name: 'DIRECTORY (ErrCwdNotADirectory) → cleared; cwd-unreachable raised by its class', at: ALL_RETRY_LAUNCHES, make: (site) => errCwdNotADirectory(launchVerbAt(site)), ends: 'cleared', flags: ['cwd-unreachable'] },
-  { name: 'a CONFLICT with the latch\'s own case → P stays latched, the record unchanged, no post', at: ALL_RETRY_LAUNCHES, make: (site) => sameCaseAt(site), ends: 'same case' },
-  ...RESTORE_SENTENCES.map((sentence): RecheckRetryAnswerRow => ({
-    name: `a CONFLICT with the latch's own case ending "${sentence}" → the sentence decides nothing: P stays latched, no post`,
-    at: [RECHECK_CALL_REUSE_SPAWN, RECHECK_CALL_RESUME],
-    make: (site) => withRestoreSentence(sameCaseAt(site), sentence),
-    ends: 'same case',
-  })),
-  {
-    name: 'a CONFLICT with another case → relatched with that case, the retry\'s operation and the state the re-check read; one post (the in-call latch check is skipped inside the re-check)',
-    at: ALL_RETRY_LAUNCHES,
-    make: (site) => anotherCaseAt(site)[0],
-    ends: 'relatched',
-    relatch: (site) => {
-      const [err, latchCase] = anotherCaseAt(site)
-      return { latchCase, refusedOperation: relatchOperationAt(site), description: err.errDescription }
-    },
-  },
-  // SRJ-113's rows only a `resume` has.
-  ...[errNoSessionId, errJsonlNeverWritten].map((make): RecheckRetryAnswerRow => ({
-    name: `${make().errName} → cleared before its row: one reuse spawn of the same id`,
-    at: [RECHECK_CALL_RESUME],
-    make: () => make(),
-    ends: 'cleared',
-    then: ['spawn'],
-    triggers: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW],
-    extraReuses: 1,
-  })),
-  {
-    name: 'ErrJsonlMissing → cleared before its row: the diagnosis\'s get, then one reuse spawn',
-    at: [RECHECK_CALL_RESUME],
-    make: () => errJsonlMissing(),
-    ends: 'cleared',
-    then: ['get', 'spawn'],
-    triggers: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW],
-    notices: 1,
-    extraReuses: 1,
-  },
-  {
-    name: 'ErrSpawnNotFound → cleared before its row: one plain spawn of the same id, no reuse field',
-    at: [RECHECK_CALL_RESUME],
-    make: () => errSpawnNotFound(),
-    ends: 'cleared',
-    then: ['spawn'],
-    triggers: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW],
-  },
-  {
-    name: 'ErrSpawnNotResumable (definite) → cleared; nothing killed or launched, the lost-race cause armed on an unlatched P',
-    at: [RECHECK_CALL_RESUME],
-    make: () => errSpawnNotResumable(),
-    ends: 'cleared',
-    triggers: [UNAVAILABLE_RETRY_CAUSE_LOST_RACE],
-  },
-  {
-    name: 'ErrSpawnNotFound, then the plain spawn collides after the latch cleared → retrying with the collision cause armed; no get',
-    at: [RECHECK_CALL_RESUME],
-    make: () => errSpawnNotFound(),
-    after: () => ({ spawnError: errInstanceIdCollision() }),
-    ends: 'cleared',
-    then: ['spawn'],
-    triggers: [UNAVAILABLE_RETRY_CAUSE_COLLISION],
-    lineParts: (_site, ref) => aroundLaunchName(latchRecheckCollidedAfterClearLine(ref, '\u0000', true)),
-  },
-  // The no-transcript answers' variant: the reuse spawn after the cleared latch collides.
-  ...[errNoSessionId, errJsonlNeverWritten].map((make): RecheckRetryAnswerRow => ({
-    name: `${make().errName}, then the reuse spawn collides after the latch cleared → retrying with the reuse-collision cause armed; no get`,
-    at: [RECHECK_CALL_RESUME],
-    make: () => make(),
-    after: () => ({ spawnError: errInstanceIdCollision() }),
-    ends: 'cleared',
-    then: ['spawn'],
-    triggers: [UNAVAILABLE_RETRY_CAUSE_COLLISION],
-    extraReuses: 1,
-    lineParts: (_site, ref) => aroundLaunchName(latchRecheckCollidedAfterClearLine(ref, '\u0000', true)),
-  })),
-]
-
 describe('b.jg5 SRJ-506, SRJ-111, SRJ-112, SRJ-113: every row of the launch\'s outcome table at each re-check retry site, handled by the one handler, and the answer the round needs', () => {
   afterEach(() => {
     expectNoKillOrDelete(srj105Harness!)
     srj105AfterEach()
-  })
-
-  const CROSS = RECHECK_RETRY_SITES.flatMap((site) =>
-    RECHECK_RETRY_ANSWER_ROWS.filter((row) => row.at.includes(site.launch)).map((row) => [site.name, row.name, site, row] as const),
-  )
-
-  test.each(CROSS)('at %s: %s', async (_site, _row, site, row) => {
-    const { h, p, b } = srj105Build({ latchRecheck: true })
-    const rechecks = row.versionRecheck === true ? h.recheckAnswers(PHASE1_RC_VERSION) : undefined
-    const record = latchForRecheck(h, p, site.latch, site.recorded)
-    const err = row.make(site)
-    h.script({ ...site.script(h, p), ...launchAnswerAt(site, err), ...row.after?.(h, p) })
-    const eventsBefore = h.latchEvents.length
-    const postsBefore = h.episodeNotices.length
-    const order = recordCallOrder(h)
-
-    await h.advanceToRecheck()
-
-    // Step 1's read (and the finished-row get), the one launch, and only what the row's own handling calls after it.
-    expect(recheckRoundCalls(order)).toEqual([...site.before, launchVerbAt(site), ...(row.then ?? [])])
-    const reuses = (site.launch === RECHECK_CALL_REUSE_SPAWN ? 1 : 0) + (row.extraReuses ?? 0)
-    expect(h.reuseSpawns()).toHaveLength(reuses)
-    expect(h.stub.calls.spawnCalls.filter((call) => call.reuse_finished === true)).toHaveLength(reuses)
-    expect(recheckRoundLinesOf(h, p)).toHaveLength(1)
-    expect(recheckRoundLinesOf(h, p)[0]).toStartWith(recheckRoundLineHead(p, site.latch.latchCase, site.step, site.call))
-    const parts = row.lineParts?.(site, renderPersonaRef(p, p))
-    if (parts !== undefined) expect(h.errors.filter((line) => line.startsWith(parts[0]) && line.endsWith(parts[1]))).toHaveLength(1)
-    expect([...getOutageFlags(p)]).toEqual([...(row.flags ?? [])])
-    expect(h.notices.filter((notice) => notice.key === p)).toHaveLength(row.notices ?? 0)
-    if (rechecks !== undefined) expect(rechecks.resolves).toHaveLength(1)
-    switch (row.ends) {
-      case 'cleared':
-        expectRecheckCleared(h, p)
-        expect(h.triggers.filter((t) => t.key === p).map((t) => t.kind)).toEqual([...(row.triggers ?? [])])
-        break
-      case 'still latched':
-        expectRecheckStillLatched(h, p, record, eventsBefore)
-        expect(h.latchEvents.slice(eventsBefore)).toEqual([])
-        expect(h.episodeNotices).toHaveLength(postsBefore)
-        expect(h.invalidFlagsHold.heldKeys()).toEqual([])
-        break
-      case 'same case':
-        expectRecheckStillLatched(h, p, record, eventsBefore)
-        expect(h.latchEvents.slice(eventsBefore).find((event) => event.step === 'set')).toMatchObject({ key: p, outcome: CONFLICT_LATCH_SET_SAME_CASE })
-        expect(h.episodeNotices).toHaveLength(postsBefore)
-        break
-      case 'held':
-        expectRecheckStillLatched(h, p, record, eventsBefore)
-        expect(h.invalidFlagsHold.heldKeys()).toEqual([p])
-        expect(h.episodeNotices.slice(postsBefore)).toEqual([holdAlert(p)])
-        break
-      case 'relatched': {
-        const expected = row.relatch!(site)
-        expect(h.latch.record(p)).toMatchObject({ latchCase: expected.latchCase, refusedOperation: expected.refusedOperation, rowState: site.lastRead })
-        if (expected.description !== undefined) {
-          expect(h.latch.record(p)).toStrictEqual(
-            expectedLatchRecord(p, { latchCase: expected.latchCase, refusedOperation: expected.refusedOperation, rowState: site.lastRead, sessionName: STUB_TMUX_SESSION_NAME, description: expected.description }),
-          )
-        }
-        expect(h.latchEvents.slice(eventsBefore).map((event) => event.step)).toEqual([...ONE_LATCH_STEPS])
-        expect(h.latchEvents[eventsBefore]).toMatchObject({ step: 'set', key: p, outcome: CONFLICT_LATCH_SET_RELATCHED })
-        expect(h.episodeNotices.slice(postsBefore).map((notice) => notice.key)).toEqual([p])
-        // A relatch neither restarts nor adds a timer.
-        expect([h.latchRecheck.isArmed(p), h.latchRecheck.pendingTimers()]).toEqual([true, 1])
-        expect([h.controller.isArmed(p), h.triggers.filter((t) => t.key === p), getFailureCount(p)]).toEqual([false, [], 0])
-        break
-      }
-    }
-    if (h.approverRunning(p)) await h.runApproverToStop(p)
-    expect(personaCallCounts(h, b)).toEqual({})
   })
 
   // b.jg5 SRJ-113, SRJ-111, SRJ-501: the plain spawn after the re-check resume's
@@ -32960,70 +24873,6 @@ describe('b.jg5 SRJ-506, SRJ-111, SRJ-112, SRJ-113: every row of the launch\'s o
   })
 })
 
-// b.jg5 SRJ-506, SRJ-105, SRJ-111 to SRJ-113: a re-check retry's definite
-// answer is handled by its own class, counting included, as any launch
-// outside the restart path's is (`countLaunchOutsideRestartWork` over
-// `recordLaunchResultOutsideRestartWork`): a success resets P's count, a
-// LAUNCH FAILURE or DIRECTORY answer is one counted launch failure, with the
-// cap notice at the cap. A no-information answer counts nothing (the outcome
-// table's still-latched rows above).
-describe('b.jg5 SRJ-506: a re-check retry\'s definite answer is counted by its class, once', () => {
-  afterEach(() => {
-    expectNoKillOrDelete(srj105Harness!)
-    srj105AfterEach()
-  })
-
-  const COUNTED: ReadonlyArray<readonly [string, (site: RecheckRetrySite) => Error]> = [
-    ['LAUNCH FAILURE (ErrTmuxSessionCreate)', (site) => errTmuxSessionCreate(launchVerbAt(site))],
-    ['DIRECTORY (ErrCwdNotFound)', (site) => errCwdNotFound(launchVerbAt(site))],
-  ]
-  const SITE_ANSWERS = RECHECK_RETRY_SITES.flatMap((site) => COUNTED.map(([label, make]) => [site.name, label, site, make] as const))
-
-  test.each(SITE_ANSWERS)('at %s, a retry answering %s: cleared, and counted once (no cap notice below the cap)', async (_site, _label, site, make) => {
-    const { h, p } = srj105Build({ latchRecheck: true })
-    latchForRecheck(h, p, site.latch, site.recorded)
-    h.script({ ...site.script(h, p), ...launchAnswerAt(site, make(site)) })
-
-    await h.advanceToRecheck()
-
-    expectRecheckCleared(h, p)
-    expect([getFailureCount(p), h.capReached]).toEqual([1, []])
-    if (h.approverRunning(p)) await h.runApproverToStop(p)
-  })
-
-  test.each(RECHECK_RETRY_SITES.map((site) => [site.name, site] as const))('at %s, a retry that was not refused resets P\'s earlier failure count', async (_site, site) => {
-    const { h, p } = srj105Build({ latchRecheck: true })
-    recordFailure(p)
-    recordFailure(p)
-    latchForRecheck(h, p, site.latch, site.recorded)
-    // b.4q8: a resume counts once its row reports in, so P's row reads waiting after it.
-    const id = personaInstanceId(p)
-    h.script({
-      ...site.script(h, p),
-      statusFn: (params) => (params.instance_id === id && h.stub.calls.resumeCalls.length > 0 ? cannedStatusResult({ state: 'waiting' }) : undefined),
-    })
-
-    await h.advanceToRecheck()
-
-    expectRecheckCleared(h, p)
-    expect([getFailureCount(p), h.capReached]).toEqual([0, []])
-    if (h.approverRunning(p)) await h.runApproverToStop(p)
-  })
-
-  test.each(SITE_ANSWERS)('at %s, a retry answering %s with P one failure below the cap: counted to the cap, and the cap notice fires once', async (_site, _label, site, make) => {
-    const { h, p } = srj105Build({ latchRecheck: true })
-    for (let i = 1; i < RESTART_FAILURE_CAP; i++) recordFailure(p)
-    latchForRecheck(h, p, site.latch, site.recorded)
-    h.script({ ...site.script(h, p), ...launchAnswerAt(site, make(site)) })
-
-    await h.advanceToRecheck()
-
-    expectRecheckCleared(h, p)
-    expect([getFailureCount(p), h.capReached]).toEqual([RESTART_FAILURE_CAP, [p]])
-    if (h.approverRunning(p)) await h.runApproverToStop(p)
-  })
-})
-
 /** What the clear hand-off saw when the round called it. */
 interface RecordedHandOff {
   readonly cleared: LatchRecheckCleared
@@ -33031,7 +24880,7 @@ interface RecordedHandOff {
   readonly calls: readonly string[]
   readonly triggers: readonly string[]
   readonly notices: number
-  readonly approverRunning: boolean
+
 }
 
 /**
@@ -33080,7 +24929,7 @@ async function roundRecordingHandOff(h: RecoveryHarness, p: string, order: reado
           calls: [...order],
           triggers: h.triggers.filter((t) => t.key === key).map((t) => t.kind),
           notices: h.notices.filter((notice) => notice.key === key).length,
-          approverRunning: h.approverRunning(key),
+
         })
         h.teardownDeps().forgetConflictLatch(key)
       },
@@ -33095,49 +24944,6 @@ describe('b.jg5 SRJ-506 (hatch A3): a retry\'s answer that clears hands the clea
   afterEach(() => {
     expectNoKillOrDelete(srj105Harness!)
     srj105AfterEach()
-  })
-
-  const ORDER_ROWS: ReadonlyArray<readonly [string, RecheckRetrySite, Error | undefined, readonly string[], number]> = RECHECK_RETRY_SITES.flatMap((site) => [
-    [site.name, site, undefined, [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW], 0] as const,
-    [site.name, site, errTmuxSessionCreate(launchVerbAt(site)), [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW], 1] as const,
-  ])
-
-  test.each(ORDER_ROWS.map(([name, site, err, triggers, notices]) => [name, err === undefined ? 'not refused' : 'ErrTmuxSessionCreate', site, err, triggers, notices] as const))(
-    'at %s, a launch %s: one hand-off while P is still latched, after the launch and before the approver, the pending-only arm and the spawn-failure notice',
-    async (_name, _answer, site, err, triggers, notices) => {
-      const { h, p } = srj105Build()
-      const record = latchForRecheckUnbound(h, p, site.latch, site.recorded)
-      h.script({ ...site.script(h, p), ...launchAnswerAt(site, err) })
-      const order = recordCallOrder(h)
-
-      const handOffs = await roundRecordingHandOff(h, p, order)
-
-      const reason = site.clearedBy === RECHECK_CLEARED_BY_FINISHED_ROW_RETRY ? LATCH_RECOVERY_REASON_RELAUNCH_NOT_REFUSED : LATCH_RECOVERY_REASON_RETRY_NOT_REFUSED
-      expect(handOffs).toEqual([
-        { cleared: { by: site.clearedBy, record, reason }, latched: true, calls: [...site.before, launchVerbAt(site)], triggers: [], notices: 0, approverRunning: false },
-      ])
-      expect(h.latch.isLatched(p)).toBe(false)
-      expect(h.triggers.filter((t) => t.key === p).map((t) => t.kind)).toEqual([...triggers])
-      expect(h.notices.filter((notice) => notice.key === p)).toHaveLength(notices)
-      if (h.approverRunning(p)) await h.runApproverToStop(p)
-    },
-  )
-
-  test.each([
-    ['ErrNoSessionId: before the reuse spawn of the same id', errNoSessionId(), ['status', 'get', 'resume']],
-    ['ErrSpawnNotFound: before the plain spawn of the same id', errSpawnNotFound(), ['status', 'get', 'resume']],
-    ['ErrCwdNotFound: before the class handling (after the wrapper raised cwd-unreachable)', errCwdNotFound('resume'), ['status', 'get', 'resume']],
-  ] as const)('a resume retry answering %s', async (_label, err, calls) => {
-    const { h, p } = srj105Build()
-    latchForRecheckUnbound(h, p, RESUME_RECHECK_LATCH, ROW_ENDED)
-    h.script({ ...step1Status(LIVENESS_DEAD_ROW_ENDED), resumeError: err })
-    const order = recordCallOrder(h)
-
-    const handOffs = await roundRecordingHandOff(h, p, order)
-
-    expect(handOffs.map((handOff) => [handOff.cleared.by, handOff.latched, handOff.calls, handOff.approverRunning])).toEqual([[RECHECK_CLEARED_BY_RETRY, true, [...calls], false]])
-    expect(h.latch.isLatched(p)).toBe(false)
-    if (h.approverRunning(p)) await h.runApproverToStop(p)
   })
 
   test.each([
@@ -33337,45 +25143,6 @@ describe('bug b.xkd (b.av2 SR-6.3; b.jg5 SRJ-505, SRJ-506): the restart cap wins
     ],
   ]
 
-  test.each(CAP_QUERIES)('a reuse retry, the cap query %s: asked once for P, before the relaunch gate; at the cap no launch, the relaunch gate never asked, one cap line, no-information (at-cap) and no hand-off; otherwise the reuse, which clears', async (_label, query, capped, countAtCap) => {
-    const { h, p } = srj105Build()
-    if (countAtCap) putAtRestartCap(p)
-    const record = latchForRecheckUnbound(h, p, REUSE_RECHECK_LATCH, ROW_ENDED)
-    h.script(step1Status(LIVENESS_DEAD_ROW_ENDED))
-    const postsBefore = h.episodeNotices.length
-    const order = recordCallOrder(h)
-    const asked: string[] = []
-
-    const handOffs = await roundRecordingHandOff(h, p, order, {
-      canRelaunch: (key) => {
-        asked.push(`up ${key}`)
-        return true
-      },
-      ...(query === undefined
-        ? {}
-        : {
-            isAtCap: (key: string) => {
-              asked.push(`cap ${key}`)
-              return query(key)
-            },
-          }),
-    })
-
-    if (capped) {
-      expect([asked, order, handOffs]).toEqual([[`cap ${p}`], ['status'], []])
-      expect(recheckAtCapLinesOf(h, p)).toEqual([latchRecheckAtCapLine(renderPersonaRef(p, p), RECHECK_CALL_REUSE_SPAWN)])
-      expect(recheckRoundLinesOf(h, p)).toEqual([atCapRoundLine(p, LATCH_CASE_NO_VALID_ID, RECHECK_STEP_TABLE, RECHECK_CALL_REUSE_SPAWN)])
-      expect([h.latch.record(p), h.episodeNotices.length, h.stub.calls.spawnCalls]).toEqual([record, postsBefore, []])
-    } else {
-      expect(asked).toEqual(query === undefined ? [`up ${p}`] : [`cap ${p}`, `up ${p}`])
-      expect(recheckRoundCalls(order)).toEqual(['status', 'spawn'])
-      expect(h.stub.calls.spawnCalls).toEqual([reuseSpawnOf(h, p)])
-      expect(handOffs.map((handOff) => handOff.cleared.by)).toEqual([RECHECK_CLEARED_BY_RETRY])
-      expect(recheckAtCapLinesOf(h, p)).toEqual([])
-      if (h.approverRunning(p)) await h.runApproverToStop(p)
-    }
-  })
-
   test.each(CAP_QUERIES.filter(([, query]) => query !== undefined))('a bring-up latch\'s run of the restart path\'s decision, the cap query %s: at the cap no run and no set observer added, one cap line naming the run, no-information (at-cap) and no hand-off; otherwise the one run, which clears', async (_label, query, capped) => {
     const { h, p } = srj105Build()
     const record = latchForRecheckUnbound(h, p, BRING_UP_RECHECK_LATCH, ROW_WAITING)
@@ -33570,21 +25337,6 @@ describe('b.jg5 SRJ-506 (hatch A3): the re-check\'s run of the restart path\'s d
     expectRecheckCleared(h, p)
   })
 
-  test('the run launches P (its first plain spawn not refused) → cleared before the after-launch step: the pending-only arm on an unlatched P', async () => {
-    const { h, p } = srj105Build({ latchRecheck: true })
-    latchForRecheck(h, p, BRING_UP_RECHECK_LATCH, ROW_WAITING)
-    h.script(bothRead(LIVENESS_DEAD_ROW_ENDED))
-    const order = recordCallOrder(h)
-
-    await h.advanceToRecheck()
-
-    expect(recheckRoundCalls(order).filter((verb) => verb !== 'status')).toEqual(['spawn'])
-    expectRecheckCleared(h, p)
-    expect(h.triggers.filter((t) => t.key === p).map((t) => t.kind)).toEqual([UNAVAILABLE_RETRY_CAUSE_PENDING_ROW])
-    expect(getFailureCount(p)).toBe(0)
-    if (h.approverRunning(p)) await h.runApproverToStop(p)
-  })
-
   test('the run\'s launch fails (ErrTmuxSessionCreate) → a counted failure, cleared before its class handling; counted once', async () => {
     const { h, p } = srj105Build({ latchRecheck: true })
     latchForRecheck(h, p, BRING_UP_RECHECK_LATCH, ROW_WAITING)
@@ -33646,20 +25398,6 @@ describe('b.jg5 SRJ-506 (hatch A3): the re-check\'s run of the restart path\'s d
     expect(order).toEqual(['status', 'status', 'spawn'])
     expect([...getOutageFlags(p)]).toEqual([...flags])
     expectRecheckStillLatched(h, p, record, eventsBefore)
-  })
-
-  test('the run\'s first plain spawn collides: the ladder\'s own get follows (get-then-act), and its reuse, not refused, clears', async () => {
-    const { h, p } = srj105Build({ latchRecheck: true, resumeEnabled: false })
-    latchForRecheck(h, p, BRING_UP_RECHECK_LATCH, ROW_WAITING)
-    h.script({ ...bothRead(LIVENESS_DEAD_ROW_ENDED), spawnQueue: [cannedErr(errInstanceIdCollision())], getResult: harnessRow(h, harnessPersona(h, p), { state: LIVENESS_DEAD_ROW_ENDED }) })
-    const order = recordCallOrder(h)
-
-    await h.advanceToRecheck()
-
-    expect(recheckRoundCalls(order)).toEqual(['status', 'status', 'spawn', 'get', 'spawn'])
-    expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p)])
-    expectRecheckCleared(h, p)
-    if (h.approverRunning(p)) await h.runApproverToStop(p)
   })
 
   test('a run that ends on the reuse\'s second collision keeps P latched, with no post, nothing counted or armed and no call after it', async () => {
@@ -33793,36 +25531,6 @@ describe('b.jg5 SRJ-506 (hatch A3): the re-check\'s run of the restart path\'s d
   })
 })
 
-describe('b.jg5 SRJ-506 (hatch A3): the re-check\'s run of the restart path\'s decision that reaches a live-row sequence clears the latch before the sequence begins', () => {
-  afterEach(() => {
-    expectNoDeleteOrIncludeFinished(srj105Harness)
-    srj105AfterEach()
-  })
-
-  test('the run\'s collision get reads P\'s row live in another directory: cleared before the sequence starts, so the sequence (which stops for a latched P) makes its kill and ends in its reuse spawn', async () => {
-    const { h, p } = srj105Build({ latchRecheck: true })
-    latchForRecheck(h, p, BRING_UP_RECHECK_LATCH, ROW_WAITING)
-    h.script({
-      statusResult: cannedStatusResult({ state: LIVENESS_DEAD_ROW_ENDED }),
-      spawnQueue: [cannedErr(errInstanceIdCollision())],
-      getQueue: [cannedOk<GetResult>(harnessRow(h, harnessPersona(h, p), elsewhere(h, 'waiting')))],
-      getError: errSpawnNotFound(),
-    })
-    const order = recordCallOrder(h)
-
-    await h.advanceToRecheck()
-
-    expectRecheckCleared(h, p)
-    expect(recheckRoundLinesOf(h, p)).toHaveLength(1)
-    expect(recheckRoundLinesOf(h, p)[0]).toStartWith(recheckRoundLineHead(p, LATCH_CASE_NO_VALID_ID, RECHECK_STEP_TABLE, RECHECK_CALL_RESTART_DECISION))
-    expect(order.slice(0, 5)).toEqual(['status', 'status', 'spawn', 'get', 'kill'])
-    expect(await h.driveSequence(h.sequenceSettled(p))).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_REUSE })
-    expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p)])
-    expect(h.latch.isLatched(p)).toBe(false)
-    if (h.approverRunning(p)) await h.runApproverToStop(p)
-  })
-})
-
 // ---------------------------------------------------------------------------
 // b.jg5 SRJ-1306, SRJ-1401 (E39 T3): the forced-launch seams
 // `tests/integration/fixtures/fmk-driver.ts` calls, on `makeRecoveryHarness`.
@@ -33863,33 +25571,6 @@ function sequenceEntryLaunch(kind: LiveRowSequenceLaunchKind): (h: RecoveryHarne
   return (h, key) => launchForLiveRowSequence(harnessPersona(h, key), h.config, { kind, lastRead: FORCED_COMPARED_LAST_READ })
 }
 
-/** The latch re-check's `resume` of persona `key` (a resume latch on a row read ended), run as its timer runs it; it answers no launch result. */
-async function recheckResumeLaunch(h: RecoveryHarness, key: string): Promise<undefined> {
-  latchForRecheck(h, key, RESUME_RECHECK_LATCH, ROW_ENDED)
-  h.script(step1Status(LIVENESS_DEAD_ROW_ENDED))
-  await h.advanceToRecheck()
-  return undefined
-}
-
-/**
- * The latch re-check's `resume` of persona `key` answered `make`'s error
- * (`recheckResumeLaunch`): a definite answer clears the latch before its row,
- * so a launch after it that collides is handled as after the clear
- * (`latchRecheckCollided`: the collision cause armed, `retrying`).
- */
-function recheckResumeMeeting(make: () => AgentDirectorError): (h: RecoveryHarness, key: string) => Promise<undefined> {
-  return (h, key) => {
-    h.script({ resumeError: make() })
-    return recheckResumeLaunch(h, key)
-  }
-}
-
-/** A retired key's first launch of persona `key` (b.jg5 SRJ-805): a reuse spawn with nothing of the row read first. */
-function retiredFirstLaunch(h: RecoveryHarness, key: string): Promise<unknown> {
-  h.retireKey(key)
-  return spawnForPersona(harnessPersona(h, key), h.config, false)
-}
-
 /** What a launch of persona `key` left, which a forced launch and the production path are compared on. */
 function forcedComparedEffectsOf(h: RecoveryHarness, key: string): Record<string, unknown> {
   return {
@@ -33902,150 +25583,9 @@ function forcedComparedEffectsOf(h: RecoveryHarness, key: string): Record<string
     latched: h.latch.isLatched(key),
     latchRecord: [h.latch.record(key)?.latchCase, h.latch.record(key)?.refusedOperation, h.latch.record(key)?.rowState],
     posts: h.episodeNotices.filter((notice) => notice.key === key).length,
-    approverRunning: h.approverRunning(key),
+
   }
 }
-
-/**
- * The forced call's own error `err` as a seam answers it: its name, the class
- * CSCB's classifier gives it, its description rendered for a line (an
- * ErrUnknownErrorName's from its envelope) and an ErrUnknownErrorName's
- * unknown name.
- */
-function expectedForcedError(err: AgentDirectorError): ForcedLaunchError {
-  const { errorClass } = classifyAdError(err)
-  if (err instanceof ErrUnknownErrorName) {
-    const reported = (err.envelope as { readonly err_description: string }).err_description
-    return { name: err.errName, errorClass, description: renderLogMessageText(reported), unknownName: err.unknownName }
-  }
-  return { name: err.errName, errorClass, description: renderLogMessageText(err.errDescription) }
-}
-
-/** One answer a forced launch meets, and the production path it is compared with. */
-interface ForcedLaunchRow {
-  readonly seam: ForcedSeamName
-  /** The forced call's answer: an error to throw, or success. */
-  readonly make: () => AgentDirectorError | undefined
-  /** The stub calls the forced launch makes, in order: its one call, then only what the production handling of the answer calls. */
-  readonly calls: readonly string[]
-  /** The production path meeting the same answer for persona `key`: its result, or undefined where it answers none. */
-  readonly production: (h: RecoveryHarness, key: string) => Promise<unknown>
-  /** The result, where the production path answers none: the result that site's handler answers. */
-  readonly result?: (key: string) => SpawnPersonaResult
-  readonly options?: RecoveryHarnessOptions
-  /** Install agent-director's version re-check: an ErrInvalidFlags makes its one immediate re-check (b.jg5 SRJ-104, SRJ-204). */
-  readonly versionRecheck?: true
-  /** Effects the production site adds of its own, left out of the comparison: the latch re-check's latch and recovery posts. */
-  readonly siteOwn?: readonly string[]
-  /** The answer of the launch call the production handling makes after the forced `resume`'s: its spawn's. */
-  readonly after?: () => RecoveryStubScript
-  /** The spawn after the forced `resume` is the handler's plain spawn of the same id (no reuse field), not a reuse. */
-  readonly plainSpawn?: true
-  /** What the forced launch itself leaves for P (`forcedComparedEffectsOf`), beyond its equality with the production path's. */
-  readonly effects?: Record<string, unknown>
-}
-
-/** A collision's answer to the forced launch: the collision cause armed for P, nothing counted, latched, held or posted. */
-const FORCED_COLLISION_EFFECTS: Record<string, unknown> = {
-  armed: [UNAVAILABLE_RETRY_CAUSE_COLLISION],
-  failures: 0,
-  notices: 0,
-  held: false,
-  latched: false,
-  posts: 0,
-  approverRunning: false,
-}
-
-/**
- * The harness of a collision row: the latch re-check bound, for B's
- * production `resume`; the scripted retry action, so P's retry, armed by the
- * forced launch, makes no launch of its own when the clock moves to B's round.
- */
-const FORCED_COLLISION_OPTIONS: RecoveryHarnessOptions = { latchRecheck: true, action: 'scripted' }
-
-const FORCED_LAUNCH_ROWS: ReadonlyArray<readonly [string, ForcedLaunchRow]> = [
-  ['the resume, success', { seam: 'resume', make: () => undefined, calls: ['resume'], production: sequenceEntryLaunch(LIVE_ROW_LAUNCH_RESUME) }],
-  [
-    'the resume, ErrSpawnNotResumable: no re-read, nothing killed or launched; retrying with the lost-race cause, not counted, not posted',
-    {
-      seam: 'resume',
-      make: () => errSpawnNotResumable(),
-      calls: ['resume'],
-      production: recheckResumeLaunch,
-      result: (key) => ({ key, action: SPAWN_ACTION_RETRYING }),
-      options: { latchRecheck: true },
-      siteOwn: ['posts'],
-    },
-  ],
-  [
-    'the resume, ErrNoSessionId: the one reuse spawn of the same id follows, and the error answered is the resume\'s',
-    { seam: 'resume', make: () => errNoSessionId(), calls: ['resume', 'spawn'], production: sequenceEntryLaunch(LIVE_ROW_LAUNCH_RESUME) },
-  ],
-  [
-    'the resume, ErrNoSessionId, then the reuse spawn collides: no get, nothing more called; retrying with the collision cause armed, not counted, not latched, not posted',
-    {
-      seam: 'resume',
-      make: () => errNoSessionId(),
-      after: () => ({ spawnError: errInstanceIdCollision() }),
-      calls: ['resume', 'spawn'],
-      production: recheckResumeMeeting(errNoSessionId),
-      result: (key) => ({ key, action: SPAWN_ACTION_RETRYING }),
-      options: FORCED_COLLISION_OPTIONS,
-      siteOwn: ['posts'],
-      effects: FORCED_COLLISION_EFFECTS,
-    },
-  ],
-  [
-    'the resume, ErrSpawnNotFound: the handler\'s one plain spawn of the same id follows, and the error answered is the resume\'s',
-    { seam: 'resume', make: () => errSpawnNotFound(), calls: ['resume', 'spawn'], production: sequenceEntryLaunch(LIVE_ROW_LAUNCH_RESUME), plainSpawn: true },
-  ],
-  [
-    'the resume, ErrSpawnNotFound, then the plain spawn collides: no get, nothing more called; retrying with the collision cause armed, not counted, not latched, not posted',
-    {
-      seam: 'resume',
-      make: () => errSpawnNotFound(),
-      after: () => ({ spawnError: errInstanceIdCollision() }),
-      calls: ['resume', 'spawn'],
-      production: recheckResumeMeeting(errSpawnNotFound),
-      result: (key) => ({ key, action: SPAWN_ACTION_RETRYING }),
-      options: FORCED_COLLISION_OPTIONS,
-      siteOwn: ['posts'],
-      plainSpawn: true,
-      effects: FORCED_COLLISION_EFFECTS,
-    },
-  ],
-  ['the reuse spawn, success', { seam: 'reuse', make: () => undefined, calls: ['spawn'], production: sequenceEntryLaunch(LIVE_ROW_LAUNCH_REUSE) }],
-  [
-    'the reuse spawn, ErrInvalidFlags: one version re-check, then P held',
-    { seam: 'reuse', make: () => errInvalidFlags('spawn'), calls: ['spawn'], production: sequenceEntryLaunch(LIVE_ROW_LAUNCH_REUSE), versionRecheck: true },
-  ],
-  [
-    'the reuse spawn, ErrUnknownErrorName for ErrInternal: UNCLASSIFIED, refused, not counted, reported to P\'s episode',
-    { seam: 'reuse', make: () => errInternal(), calls: ['spawn'], production: sequenceEntryLaunch(LIVE_ROW_LAUNCH_REUSE) },
-  ],
-  [
-    'the reuse spawn, ErrUnknownErrorName for ErrInternal naming the recorded tmux session name: UNUSABLE NAME, P latched with one post after the one latch-time status read; nothing counted',
-    { seam: 'reuse', make: () => errUnusableName(), calls: ['spawn', 'status'], production: retiredFirstLaunch },
-  ],
-  [
-    'the reuse spawn, ErrTmuxSessionCreate: one counted launch failure',
-    { seam: 'reuse', make: () => errTmuxSessionCreate('spawn'), calls: ['spawn'], production: sequenceEntryLaunch(LIVE_ROW_LAUNCH_REUSE) },
-  ],
-  [
-    // The production reuse whose collision answers retrying: the latch re-check's, after its resume's definite answer cleared the latch.
-    'the reuse spawn, ErrInstanceIdCollision: no get, nothing more called; retrying with the collision cause armed, not counted, not latched, not posted',
-    {
-      seam: 'reuse',
-      make: () => errInstanceIdCollision(),
-      calls: ['spawn'],
-      production: recheckResumeMeeting(errNoSessionId),
-      result: (key) => ({ key, action: SPAWN_ACTION_RETRYING }),
-      options: FORCED_COLLISION_OPTIONS,
-      siteOwn: ['posts'],
-      effects: FORCED_COLLISION_EFFECTS,
-    },
-  ],
-]
 
 describe('b.jg5 SRJ-1306, SRJ-1401: the forced-launch seams make their one call through the production launch path, and answer as it does', () => {
   afterEach(() => {
@@ -34053,69 +25593,7 @@ describe('b.jg5 SRJ-1306, SRJ-1401: the forced-launch seams make their one call 
     srj105AfterEach()
   })
 
-  test.each(FORCED_LAUNCH_ROWS)('%s: the forced launch\'s calls, answer and effects on P equal the production path\'s for B', async (_label, row) => {
-    const { h, p, b } = srj105Build(row.options)
-    const rechecks = row.versionRecheck === true ? h.recheckAnswers(PHASE1_RC_VERSION) : undefined
-    const err = row.make()
-    if (err !== undefined) h.script(FORCED_SEAMS[row.seam].verb === 'resume' ? { resumeError: err } : { spawnError: err })
-    if (row.after !== undefined) h.script(row.after())
-    const order = recordCallOrder(h)
-
-    const forced = await forceLaunch(h, p, row.seam)
-
-    expect(order).toEqual([...row.calls])
-    expect(h.stub.calls.resumeCalls).toEqual(row.calls.includes('resume') ? [{ instance_id: personaInstanceId(p) }] : [])
-    // Every spawn is P's: its reuse (the reuse seam's call, or the reuse after a no-transcript answer), or the plain spawn after ErrSpawnNotFound.
-    const spawned = row.calls.includes('spawn')
-    expect(h.stub.calls.spawnCalls).toEqual(spawned ? [row.plainSpawn === true ? expect.objectContaining({ instance_id: personaInstanceId(p) }) : reuseSpawnOf(h, p)] : [])
-    expect(h.stub.calls.spawnCalls.filter((call) => 'reuse_finished' in call)).toHaveLength(spawned && row.plainSpawn !== true ? 1 : 0)
-    expect(rechecks?.resolves.length).toBe(rechecks === undefined ? undefined : 1)
-    const forcedEffects = forcedComparedEffectsOf(h, p)
-    if (row.effects !== undefined) expect(forcedEffects).toMatchObject(row.effects)
-
-    const produced = await row.production(h, b)
-
-    expect<unknown>(forced).toStrictEqual({
-      called: true,
-      result: produced === undefined ? row.result!(p) : { ...(produced as object), key: p },
-      ...(err === undefined ? {} : { error: expectedForcedError(err) }),
-      // Counted when it was counted as one launch failure, as the production path counted B's.
-      counted: getFailureCount(p) > 0,
-      latched: h.latch.isLatched(p),
-    })
-    const siteOwn = (effects: Record<string, unknown>) => Object.fromEntries(Object.entries(effects).filter(([name]) => !(row.siteOwn ?? []).includes(name)))
-    expect(siteOwn(forcedEffects)).toEqual(siteOwn(forcedComparedEffectsOf(h, b)))
-    // The production site's own effects are none for the forced launch: nothing posted for P.
-    for (const name of row.siteOwn ?? []) expect(forcedEffects[name]).toBe(0)
-    for (const key of [p, b]) if (h.approverRunning(key)) await h.runApproverToStop(key)
-  })
-
   // The forced resume decides on no row state: whatever P's row reads, nothing reads it before the one resume.
-  test.each([...AGENT_DIRECTOR_LIVE_STATES, ...AGENT_DIRECTOR_DEAD_STATES, 'no row'])('the forced resume with P\'s row reading %s: the one resume, nothing read first; it answers as the production resume does', async (state) => {
-    const { h, p, b } = srj105Build()
-    h.script(
-      state === 'no row'
-        ? { statusError: errSpawnNotFound(), getError: errSpawnNotFound() }
-        : {
-            // With no launch start, a read of a pending row would latch P (b.jg5 SRJ-513).
-            statusResult: cannedStatusResult({ state, launch_started_at: SAMPLE_LAUNCH_START_NONE }),
-            getResult: harnessRow(h, harnessPersona(h, p), { state }),
-          },
-    )
-    const order = recordCallOrder(h)
-
-    const forced = await forceLaunch(h, p, 'resume')
-
-    expect(order).toEqual(['resume'])
-    expect(h.stub.calls.resumeCalls).toEqual([{ instance_id: personaInstanceId(p) }])
-    expect<unknown>(forced).toStrictEqual({
-      called: true,
-      result: { ...((await sequenceEntryLaunch(LIVE_ROW_LAUNCH_RESUME)(h, b)) as object), key: p },
-      counted: false,
-      latched: false,
-    })
-    for (const key of [p, b]) if (h.approverRunning(key)) await h.runApproverToStop(key)
-  })
 
   const SEAM_NAMES = Object.keys(FORCED_SEAMS) as ForcedSeamName[]
 
@@ -34138,7 +25616,7 @@ describe('b.jg5 SRJ-1306, SRJ-1401: the forced-launch seams make their one call 
 
     expect(await forced).toStrictEqual({ called: false, result: launched, counted: false, latched: false })
     expect([seamCalls, hold.calls.length, h.stub.calls.resumeCalls]).toEqual([[], 1, []])
-    await h.runApproverToStop(p)
+
   })
 
   test.each(SEAM_NAMES)('the forced %s of a persona whose claude_config_dir does not resolve: deferred as the production launch is, with no call; called false, nothing counted', async (name) => {
@@ -34164,7 +25642,7 @@ describe('b.jg5 SRJ-1306, SRJ-1401: the forced-launch seams make their one call 
 
     expect<unknown>(forced).toStrictEqual({ called: false, result: await sequenceEntryLaunch(FORCED_SEAMS[name].kind)(h, p), counted: false, latched: false })
     expect([forcedCalls, h.stub.callCount(), getFailureCount(p), h.notices]).toEqual([[], 0, 0, []])
-    expect(forcedEffects).toMatchObject({ armed: [], failures: 0, latched: false, posts: 0, approverRunning: false })
+    expect(forcedEffects).toMatchObject({ armed: [], failures: 0, latched: false, posts: 0,  })
   })
 })
 
@@ -34186,21 +25664,6 @@ describe('E4 guard: latch retry pre-resume provenance read', () => {
     const run = () => roundRecordingHandOff(h, p, order, { latch: observed.latch })
     return { h, p, record, observed, order, run }
   }
-
-  test.each<[string, PersonaGetResultOverrides, boolean]>([
-    ['marked finished provenance conflict', { liveness_note: provenanceNote }, true],
-    ['markerless finished provenance conflict', { liveness_note: provenanceNote }, false],
-    ['pending without a launch start', { state: 'pending', launch_started_at: SAMPLE_LAUNCH_START_NONE }, true],
-  ])('%s cannot launch or clear its newly asserted latch', async (_label, overrides, marked) => {
-    const f = fixture(overrides, marked)
-    expect(await f.run()).toEqual([])
-    expect(f.order).toEqual(['status', 'get'])
-    expect(f.h.latch.isLatched(f.p)).toBe(true)
-    expect(f.h.latch.record(f.p)?.latchCase).toBe(overrides.state === 'pending' ? LATCH_CASE_LAUNCH_START_NOT_RECORDED : LATCH_CASE_CONFLICTING_LABELS)
-    expect([getFailureCount(f.p), f.h.notices, f.h.approverRunning(f.p)]).toEqual([1, [], false])
-    expect(f.observed.observers.size).toBe(0)
-    expectNoKillOrDelete(f.h)
-  })
 
   test.each([
     ['same case, marked finished', true, 'marked'],
@@ -34249,17 +25712,6 @@ describe('E4 guard: latch retry pre-resume provenance read', () => {
     expect(getFailureCount(f.p)).toBe(1)
   })
 
-  test.each([true, false])('clean finished row, marker=%s: one normal launch and clear, observer removed', async marked => {
-    const f = fixture({}, marked)
-    expect(await f.run()).toHaveLength(1)
-    expect(f.h.stub.calls.resumeCalls).toHaveLength(marked ? 1 : 0)
-    expect(f.h.stub.calls.spawnCalls).toHaveLength(marked ? 0 : 1)
-    if (!marked) expect(f.h.stub.calls.spawnCalls[0]).toMatchObject({ reuse_finished: true })
-    expect(f.h.latch.isLatched(f.p)).toBe(false)
-    expect(f.observed.observers.size).toBe(0)
-    if (f.h.approverRunning(f.p)) await f.h.runApproverToStop(f.p)
-    expectNoKillOrDelete(f.h)
-  })
 })
 
 // b.omv SR-5.5: exercise the automatic entry points through their real
@@ -34293,18 +25745,6 @@ describe('automatic reconnect and startup typing entry points', () => {
     }
     return { cfg, calls, options, run }
   }
-
-  test.each(entries.flatMap(entry => [
-    ['a menu', SELECT_MENU_PANE], ['a running turn', SPINNER_PANE],
-    ["a person's draft", IDLE_PANE.replace('\n> \n', '\n> unfinished draft\n')],
-  ].map(([label, pane]) => [entry, label!, pane!] as const)))('%s defers on %s and preserves every key', async (entry, _label, pane) => {
-    const f = entryFixture()
-    f.options.readPaneResults = [cannedReadPaneResult(pane)]
-    expect(await f.run(entry)).toBe(entry === 'launch ladder' ? 'retrying' : 'transient')
-    expect(f.calls.sendKeysCalls).toEqual([])
-    expect(life.deferred('C')).toBeDefined()
-    expect(life.owner('C')).toBe('free')
-  })
 
   test.each(entries.map(entry => [entry] as const))('%s holds the gate from text through delayed Enter and releases it on success', async entry => {
     const f = entryFixture()
@@ -34370,99 +25810,8 @@ describe('automatic reconnect and startup typing entry points', () => {
   })
 
   // b.omv SR-8.5/AC108: production lifecycle callback, empty queue, no health tick.
-  test.each([
-    ['menu', SELECT_MENU_PANE],
-    ['input', IDLE_PANE.replace('\n> \n', '\n> unfinished draft\n')],
-  ] as const)('%s reconnect remains deferred after its one five-minute notice and retries until clear', async (rule, blockedPane) => {
-    const f = entryFixture()
-    await life.stop()
-    life = createDeliveryLifecycle({ startId: 'blocked-notice', clock,
-      onReconnectScreen: (key, screen, blockedMs) => {
-        if (blockedMs >= RECONNECT_BLOCKED_NOTICE_MS) notifyPersonaNotConnected(key, { reason: 'reconnect-blocked', rule: screen })
-      },
-    })
-    setDeliveryLifecycle(life)
-    let pane: string = blockedPane
-    f.options.readPaneFn = () => cannedReadPaneResult(pane)
-    const cfg = waitConfig({ health_check_interval: 0, session_restart_delay: 0 })
-    const p = personaOf(cfg, 'C')
-    const reconnect = _buildReconnectSessionAdapter(key => key === 'C' ? p : undefined, () => false, key => key === 'C' ? p : undefined, { noNotice: true })
-    life.setReconnect(async key => { await reconnect(key) })
-    expect(await reconnect('C')).toBe('transient')
-    notifyDisconnectedWithAutoRestartDisabled('C')
-    expect(notices).toEqual([])
-    await clock.advance(RECONNECT_BLOCKED_NOTICE_MS - 1)
-    notifyDisconnectedWithAutoRestartDisabled('C')
-    expect(notices).toEqual([])
-    await clock.advance(1)
-    expect(notices.map(n => n.text)).toEqual([buildNotConnectedNotice('C', { reason: 'reconnect-blocked', rule })])
-    expect(life.deferred('C')).toBeDefined()
-    expect(f.calls.sendKeysCalls).toEqual([])
-    const blockedReads = f.calls.readPaneCalls.length
-    await clock.advance(NOT_NOW_RETRY_MS[0] * 2)
-    notifyDisconnectedWithAutoRestartDisabled('C')
-    expect(f.calls.readPaneCalls.length).toBeGreaterThan(blockedReads)
-    expect(notices).toHaveLength(1)
-    pane = IDLE_PANE
-    await clock.advance(NOT_NOW_RETRY_MS[0] + ENTER_DELAY_MS)
-    expect(f.calls.sendKeysCalls).toEqual([{ instance_id: 'cscb_C', text: RECONNECT_TEXT, no_enter: true }, { instance_id: 'cscb_C', key: 'Enter' }])
-    expect(life.deferred('C')).toBeUndefined()
-    expect(clock.pendingCount()).toBe(0)
-    assertNoLeak({ notices })
-  })
 
-  test('a fresh screen replacing the waiting-row check with a draft blocks the direct reconnect', async () => {
-    const f = entryFixture()
-    f.options.readPaneResults = [cannedReadPaneResult(IDLE_PANE), cannedReadPaneResult(IDLE_PANE.replace('\n> \n', '\n> fresh draft\n'))]
-    expect(await f.run('direct')).toBe('transient')
-    expect(f.calls.sendKeysCalls).toEqual([])
-    expect(life.deferred('C')?.screen).toBe('input')
-  })
-
-  test('a failed fresh screen read keeps reconnect deferred without starting a screen-blocked notice clock', async () => {
-    const f = entryFixture()
-    f.options.readPaneQueue = [cannedOk(cannedReadPaneResult(IDLE_PANE)), cannedErr(errCallTimeout('read-pane'))]
-    expect(await f.run('direct')).toBe('transient')
-    expect(f.calls.sendKeysCalls).toEqual([])
-    expect(life.deferred('C')).toEqual({ due: false, screen: undefined, blockedMs: 0 })
-  })
-
-  test.each([
-    ['the fresh row already reads waiting', 'waiting', TRUST_DIALOG_PANE],
-    ['the startup prompt has disappeared', 'pending', IDLE_PANE],
-    ['a historical startup needle above an empty composer', 'pending', DEV_CHANNELS_DIALOG_NEEDLE + '\n' + IDLE_PANE],
-  ] as const)('startup refuses Enter when %s', async (_label, state, pane) => {
-    const f = entryFixture()
-    f.options.statusResult = cannedStatusResult({ state })
-    f.options.getResult = personaRow(f.cfg, 'C', { state })
-    f.options.readPaneResults = [cannedReadPaneResult(pane)]
-    expect((await sendPendingRowLapEnter('C')).kind).not.toBe(PENDING_ROW_LAP_ENTER_SENT)
-    expect(f.calls.sendKeysCalls).toEqual([])
-    expect(life.owner('C')).toBe('free')
-  })
-
-  test('startup answers require the fresh pending row and visible prompt, and stop after the first waiting reading of that launch', async () => {
-    const f = entryFixture()
-    f.options.statusResult = cannedStatusResult({ state: 'pending' })
-    f.options.getResult = personaRow(f.cfg, 'C', { state: 'pending' })
-    f.options.readPaneResults = [cannedReadPaneResult(TRUST_DIALOG_PANE)]
-    const lease = life.acquire('C', 'delivery')!
-    expect((await sendPendingRowLapEnter('C')).kind).not.toBe(PENDING_ROW_LAP_ENTER_SENT)
-    expect(stubCallCount(f.calls)).toBe(0)
-    lease()
-    expect(await sendPendingRowLapEnter('C')).toEqual({ kind: PENDING_ROW_LAP_ENTER_SENT })
-    expect(f.calls.sendKeysCalls).toEqual([{ instance_id: personaInstanceId('C'), text: '', allow_pending: true }])
-    life.observeRow('C', { state: 'waiting' })
-    const before = stubCallCount(f.calls)
-    expect((await sendPendingRowLapEnter('C')).kind).not.toBe(PENDING_ROW_LAP_ENTER_SENT)
-    expect(stubCallCount(f.calls)).toBe(before)
-    life.beforeLaunch('C')
-    f.options.readPaneResults = [cannedReadPaneResult(IDLE_PANE)]
-    expect((await sendPendingRowLapEnter('C')).kind).not.toBe(PENDING_ROW_LAP_ENTER_SENT)
-    expect(f.calls.sendKeysCalls).toHaveLength(1)
-  })
 })
-
 
 // b.omv SR-5.5/7.6: pause only the last get, after text and its delay.
 // Restart uses the production adapter, without the delivery engine's guard.

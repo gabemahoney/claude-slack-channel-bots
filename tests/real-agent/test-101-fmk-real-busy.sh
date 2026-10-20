@@ -29,7 +29,7 @@ wait_until 180 'preallowed sleep tool never observed active' case_assert active-
 real_dm "${REAL_LABEL}" 'message while long sleep is running'
 real_wait_delivery "${REAL_KEY}" 2
 real_wait_idle "${REAL_KEY}"
-# Idle UI/state can precede the durable assistant end_turn record. Poll the
+# AD waiting can precede the durable assistant end_turn record. Poll the
 # unchanged proof for at most 180 s; timeout retains its exact final snapshot.
 case_assert busy-proof-wait "${SCENARIO_ROOT}/busy-tool.json" 2
 real_dm "${REAL_LABEL}" 'Use Bash to run printf permission-probe. Wait for approval.'
@@ -52,7 +52,7 @@ printf '%s\n' "${ACTION}" > "${SCENARIO_ROOT}/deny-click.json"
 curl -fsS --max-time 20 -X POST -H 'Content-Type: application/json' --data-binary "${ACTION}" "${SCENARIO_SLACK_STUB_URL}/_push" > "${SCENARIO_ROOT}/deny-action.json"
 wait_until 180 'Deny click did not reach CSCB relay' case_assert relay-decision "${SCENARIO_SLACK_RECORD}" deny
 # A Stop can precede background Agent completion. Observe the actual matching
-# denial and native completion first, then the production-backed idle composer.
+# denial and native completion first, then AD waiting.
 wait_until 180 'denied subagent did not settle after successful relay response' \
     bun "${BUSY_SETTLED}" "${SLACK_STATE_DIR}" "${REAL_KEY}" \
     "${HOME}/.claude/projects" "${SCENARIO_SLACK_RECORD}" "${SCENARIO_ROOT}/deny-click.json"

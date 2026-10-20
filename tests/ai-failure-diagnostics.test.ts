@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { assertNativeSpoofResponse } from './real-agent/ai-classifier-stop.ts'
-import { claudeFailureRecords, diagnosticValue, projectClaudeFailure, projectCodexFailure, projectFailurePane, scenarioFailureRecords, retainFailureLine, scrubDiagnosticText } from './real-agent/ai-failure-diagnostics.ts'
+import { captureFailureEvidence, claudeFailureRecords, diagnosticValue, projectClaudeFailure, projectCodexFailure, projectFailureState, scenarioFailureRecords, retainFailureLine, scrubDiagnosticText } from './real-agent/ai-failure-diagnostics.ts'
 import type { TranscriptEntry } from './integration/fixtures/transcript-receipts.ts'
 import { assertNoLeak, fakeToken, BOT_TOKEN_PREFIX } from './test-helpers/credentials.ts'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
@@ -172,10 +172,10 @@ test.each([[0, false], [1, false], [0, true]] as const)('shared cleanup retains 
     const helper = join(root, 'capture.ts')
     // Exercise the actual shared shell hooks and exported capture; only the
     // production container-marker guard is replaced by this isolated adapter.
-    writeFileSync(helper, `import { existsSync, readFileSync } from 'node:fs'; import { captureFailureEvidence, projectFailurePane } from ${JSON.stringify(resolve('tests/real-agent/ai-failure-diagnostics.ts'))};
+    writeFileSync(helper, `import { existsSync, readFileSync } from 'node:fs'; import { captureFailureEvidence, projectFailureState } from ${JSON.stringify(resolve('tests/real-agent/ai-failure-diagnostics.ts'))};
 if (!existsSync(process.env.SCENARIO_ROOT!)) throw new Error('capture ran after cleanup');
 const [command, agent, root, scenario, trial, panes] = process.argv.slice(2);
-if (command === 'pane') console.log(JSON.stringify(projectFailurePane(JSON.parse(readFileSync(root, 'utf8')).pane)));
+if (command === 'state') console.log(JSON.stringify(projectFailureState(JSON.parse(readFileSync(root, 'utf8')))));
 else await captureFailureEvidence(agent, root, {scenario, trial}, panes);`)
     const personas = join(scenario, 'personas.jsonl')
     writeFileSync(personas, JSON.stringify({ name: 'native' }) + '\n')
@@ -192,7 +192,8 @@ on_before_cleanup() { _SCENARIO_BEFORE_CLEANUP_HOOKS+=("$1"); }
 on_failure() { _SCENARIO_FAILURE_HOOKS+=("$1"); }
 late_failure() { return 1; }
 persona_key() { printf '%s' "$1"; }
-real_pane() { printf '%s' '{"pane":"PRIVATE PANE\\n❯ PRIVATE DRAFT"}'; }
+real_instance() { printf own-row; }
+real_ad() { printf '%s' '{"state":"working","family_state":"working","pane":"PRIVATE PANE"}'; }
 source ${JSON.stringify(resolve('tests/integration/lib/real-failure.sh'))}
 REAL_FAILURE_HELPER=${JSON.stringify(helper)}
 ${cleanup}
@@ -214,7 +215,7 @@ exit ${status}
       expect(statSync(file).mode & 0o777).toBe(0o600)
       expect(records.filter(r => r.event === 'transcript')).toHaveLength(2)
       expect(text).toContain('permission-rule'); expect(text).toContain('child'); expect(text).toContain('end_turn')
-      expect(records.find(r => r.event === 'pane').pane.lines).toEqual(['[text withheld]', '❯ [text withheld]'])
+      expect(records.find(r => r.event === 'ad-state').state).toEqual({ state: 'working', family_state: 'working' })
       expect(text).not.toContain('PRIVATE')
     }
   } finally { rmSync(root, { recursive: true, force: true }) }
@@ -245,7 +246,24 @@ test.each(['claude', 'codex'] as const)('recursive %s retention includes subagen
   } finally { rmSync(root, { recursive: true, force: true }) }
 })
 
-test('final pane keeps layout and exact UI markers without conversation or draft text', () => {
-  expect(projectFailurePane('\x1b[31mPRIVATE TEXT\x1b[0m\n────────────\n❯\u00a0\n⏸ manual mode on · ? for shortcuts · ← for agents\n')).toEqual({ lines: ['[text withheld]', '────────────', '❯\u00a0', '⏸ manual mode on · ? for shortcuts · ← for agents', ''] })
-  expect(projectFailurePane(null)).toEqual({ unavailable: true })
+test('AD failure evidence retains only structured state and withholds arbitrary fields', () => {
+  expect(projectFailureState({ state: 'waiting', family_state: 'working', transcript_status: 'present', pane: 'PRIVATE', message: 'PRIVATE' }) as Record<string, unknown>)
+    .toEqual({ state: 'waiting', family_state: 'working', transcript_status: 'present' })
+  expect(projectFailureState({ state: 'PRIVATE STATE', family_state: { text: 'PRIVATE' } }) as Record<string, unknown>).toEqual({ state: 'unreadable', family_state: '<object>' })
+  expect(projectFailureState(null)).toEqual({ unavailable: true })
+})
+
+test('retention reprojects AD snapshots so stale raw panes and unknown fields never escape', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'ad-state-retention-'))
+  try {
+    const transcripts = join(root, 'transcripts'); mkdirSync(transcripts)
+    const states = join(root, 'states.jsonl')
+    writeFileSync(states, JSON.stringify({ state: 'waiting', instance: 'own-row', pane: 'PRIVATE', request: 'PRIVATE' }) + '\n')
+    const lines: string[] = []
+    await captureFailureEvidence('claude', transcripts, { scenario: 'state-control' }, states, line => lines.push(line))
+    const evidence = lines.map(line => JSON.parse(line.slice('real-agent-failure-evidence: '.length)))
+    expect(evidence.find(value => value.event === 'ad-state').state).toEqual({ state: 'waiting', instance: 'own-row' })
+    expect(lines.join('\n')).not.toContain('PRIVATE')
+    assertNoLeak(lines)
+  } finally { rmSync(root, { recursive: true, force: true }) }
 })

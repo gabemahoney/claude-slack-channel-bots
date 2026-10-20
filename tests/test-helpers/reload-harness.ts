@@ -1,615 +1,5 @@
 import { createDeliveryQueue, type QueueItem, type QueueEvent } from '../../src/delivery-queue.ts'
 import { createDeliveryPreparation } from '../../src/delivery-intake.ts'
-/**
- * test-helpers/reload-harness.ts — The shared reload harness (b.av2 SR-13.4,
- * b.deo SRI-1203):
- * the reload controller (`src/reload.ts`) over a temp configuration directory,
- * a manual tick driver, a lifecycle recorder and the real bring-up checks.
- *
- * `makeReloadHarness(opts?)` builds, under one fresh `mkdtempSync` root
- * (real-path resolved, so symlink comparisons hold):
- *
- * - `h.dir`: the configuration directory. It holds only the SR-8.1 files,
- *   named in `h.paths` (`config`, `pending`, `apply`, `lastApplied`, from
- *   `reloadFilePaths`), so `h.configDirEntries()` shows exactly what the
- *   controller left there (no temporary sibling, no stray file);
- * - `h.home`: a temp home handed to the controller, so a `~` in a
- *   test-written configuration expands under it, never the operator's home;
- * - persona fixtures: `h.persona(name, overrides?)` is a file-form persona
- *   (`makePersona`) with its own `all` channel and its credentials file and
- *   working directory under `<root>/personas/<key>/`. Nothing is created on
- *   disk until the test asks: `h.writeCredentials(persona)` writes a valid
- *   file (mode 0600, through `writeCredentialsFile`) holding a fresh
- *   sentinel-bearing token set and returns it (each call rotates: the tokens
- *   differ from every earlier set); `h.writeCredentialsContent(persona, c)`
- *   writes invalid or hand-shaped content; `h.makeWorkingDirectory(persona)`
- *   creates the directory; `h.materialize(...personas)` does both for each.
- *   `h.tokens(name)` is the persona's latest valid set. A persona whose
- *   first credentials are written after a run was built (a brand-new file
- *   created while the server runs, AC 22) is registered with that run's stub
- *   factory then, so its tokens route to its own stub (`run.stub(name)`,
- *   scripted by the run's `opts.slack[name]`);
- * - credentials rotations (b.av2 SR-8.6 credentials row): every set written
- *   has a harness label, `credentials-<n>` (`h.credentialsLabel(name)` is
- *   the latest). `h.rotateCredentials(persona, { slack? })` is
- *   `h.writeCredentials` returning `{ tokens, label }`, with `slack`
- *   scripting the new set: a live run that already routes the persona
- *   registers the new pair as another credential set of it
- *   (`addCredentials`), with its own stub, identity and script, so a
- *   reconnect builds its clients there while the old set keeps serving
- *   (`h.writeCredentials` does the same, unscripted). `run.credentialsStub(
- *   name, label?)` is a set's stub in that run, `run.currentStub(name)` the
- *   one whose socket connected last (the set serving it now), and
- *   `run.socketActivity(name)` the persona's socket clients' events in
- *   order, labelled by set (`'connected credentials-2'`, `'discarded
- *   credentials-1'`, …), which tells "new opened, then old closed" apart.
- *   Its current identity is `run.connections.manager.identity(key)`; a
- *   set's scripted one is `run.credentialsStub(name, label).identity`;
- * - configuration and record files: `h.writeConfig(input)` and
- *   `h.writeRecord(input)` write `input` as JSON in the same format (so the
- *   same input gives byte-identical files) and return the bytes;
- *   `h.writeConfigBytes` / `h.writeRecordBytes` write raw bytes (syntax
- *   errors, pre-persona shapes); `h.readConfig()` / `h.readRecord()` read
- *   them back (undefined when absent); `h.remove(path)` deletes a path and
- *   `h.replaceWithDirectory(path)` puts a directory there (unreadable as a
- *   file even as root). Every helper refuses a path outside the root;
- * - the AC 20 directory sweep: `h.serverSideFiles(...operatorWritten)` is
- *   every regular file under the root but those, keyed by root-relative
- *   path, for `assertNoLeak` (names and contents);
- * - edits between ticks (detection, b.av2 SR-8.2, SR-8.3):
- *   - config: `h.writeConfig` / `h.writeConfigBytes`, `h.deleteConfig()`,
- *     `h.replaceWithDirectory(h.paths.config)`;
- *   - credentials: `h.writeCredentials(persona)` rotates to a new valid set,
- *     `h.writeCredentialsContent(persona, c)` writes invalid content,
- *     `h.deleteCredentials(persona)`, `h.makeCredentialsUnreadable(persona)`
- *     (a directory), `h.makeFifo(path)` (guard with `mkfifoAvailable()`);
- *     `h.saveCredentials(persona)` returns a function restoring the file's
- *     exact bytes (or its absence, or the unreadable directory) and its token
- *     set, to revert an edit;
- *     `h.readCredentialsBytes(persona)`, and `h.credentialsDigestOf(persona)`,
- *     the production reader's digest or marker for the file as it stands, to
- *     compare with `run.bringUps.credentialsDigest(key)` (never print it);
- *   - the pending file: `h.pendingExists()`, `h.readPending()` /
- *     `h.readPendingText()` (undefined unless a regular file),
- *     `h.pendingFingerprint()` (`parsePendingFingerprint`), and
- *     `h.writePendingBytes(b)` for a leftover or hand-placed file;
- *   - the preview in the pending file (b.av2 SR-8.4): `h.pendingBody()` is
- *     the text after the two fingerprint lines and the blank line (found
- *     through `parsePendingFingerprint` and `composePendingFile`, not by
- *     re-parsing the layout), without the final newline, so it equals
- *     `renderPreview(plan)`; `h.pendingLines()` its lines,
- *     `h.pendingHeader()` the first (the counted header, the `no effective
- *     change` header or the `INVALID:` line) and
- *     `h.pendingDestructiveLines()` those starting `DESTRUCTIVE:`. Each is
- *     undefined when the file is absent, not a regular file or not in the
- *     pending layout;
- * - prospective bring-up fixtures, for an added persona that cannot come up
- *   (b.av2 SR-8.4, SR-6.1 steps 1 and 2):
- *   `h.preparePersona(name, { credentials?, workingDirectory? }, overrides?)`
- *   is `h.persona(name, overrides)` with its files left in the stated
- *   states: credentials `valid` (default, `h.writeCredentials`), `missing`,
- *   `invalid` (parseable, no `bot_token`) or `unreadable` (a directory);
- *   working directory `present` (default), `missing` or `file` (a plain
- *   file). Singly: `h.deleteWorkingDirectory(persona)`,
- *   `h.makeWorkingDirectoryAFile(persona)`, with `h.deleteCredentials`,
- *   `h.makeCredentialsUnreadable` and `h.writeCredentialsContent` above.
- *   The controller judges these with the real checks (below), never canned
- *   outcomes;
- * - the write-failure seam: `h.failWrites({ step?, code?, call? })` makes the
- *   controller's durable writer (`durableWriteFileSync` over an fs seam, as
- *   in production) throw an errno-style error at that `DurableWriteFs` call
- *   (default `openSync`, `EIO`) until `h.clearWriteFailure()`: every call of
- *   the step, or only its `call`-th call (1-based, counted from
- *   `failWrites`), e.g. `{ step: 'fsyncSync', call: 2 }` for the directory
- *   fsync after the rename. The retired-key store's writes go through the
- *   same writer, so a confirmed apply with a retired key to record makes the
- *   retired-key write first and the last-applied write second (count `call`
- *   accordingly). The stored-choice store's writes go through the same
- *   writer path but never fail on this seam, which does not count their
- *   calls: their own seam is `h.failChannelDeliveryWrites` (see the
- *   stored-choice store, below). `h.failRemoves(...)` /
- *   `h.clearRemoveFailure()` do the same for the controller's durable
- *   delete (`durableUnlinkSync` over its own seam, default `unlinkSync`;
- *   `{ step: 'fsyncSync' }` fails the directory fsync after the unlink).
- *   Each of the three seams counts its calls apart from the others.
- *   File permissions are never the seam: the suite may run as root;
- * - confirmations (b.av2 SR-8.5): `h.confirm()` is the operator's gesture
- *   exactly, one rename of `paths.pending` to `paths.apply` with no content
- *   change (AC 73); `run.confirmPending()` is a tick that must write the
- *   pending file, that rename, then the applying tick, returned unawaited as
- *   `{ applying }`; `run.beforeApplySteps(hook)` runs `hook` once at the
- *   next apply's step 1, after the applied set was swapped and before step 2
- *   (to change the file system between the candidate's validation and steps
- *   4 and 6, b.av2 SR-1.4 apply part); `h.writeApplyBytes(b)` places any bytes at the apply
- *   path (an older copy of the pending file kept with `h.readPending()`, for
- *   the stale gesture, or garbage for a malformed one); `h.applyExists()` and
- *   `h.readApply()` show what is there. A confirmation that cannot be deleted
- *   is `h.failRemoves()` (its own unlink seam, never permissions);
- * - `h.writeOversized(path, { prefix?, size? })` writes a file larger than
- *   the 64 KiB read cap (`MAX_RELOAD_FILE_BYTES + 1` bytes by default):
- *   `prefix`, then sentinel-bearing fake-token text, so a leak of its
- *   content shows in `assertNoLeak`.
- *
- * A run (`h.build(opts?)`, or `h.start(opts?)` = build, `resolveStart`, then
- * `runStartBringUp` when the start resolved `applied`) is one server start.
- * `h.start` arms no detection tick; `h.startDetecting(opts?)` = `h.start`
- * then `run.startDetection()`, as `main()` does, and throws when nothing was
- * armed (to test a refused or early `startDetection`, call it yourself).
- * Each run builds, fresh:
- *
- * - `run.connections`: `makeConnectionHarness` over the personas the harness
- *   wrote credentials for, registering each one's latest token set with a new
- *   `makeStubSlackFactory` (so a start after a rotation routes the rotated
- *   tokens), the real connection manager and a fake clock (`run.clock`).
- *   `opts.slack` scripts a persona's stub by name: unscripted it comes up,
- *   `SLACK_UNREACHABLE` leaves it `retrying` (for good, however far the clock
- *   advances) and `SLACK_AUTH_REJECTED` (`invalid_auth`) leaves it `broken`;
- *   each holds the digest of the credentials bytes its bring-up read. A
- *   record in which two personas share one `credentials_file` (e.g.
- *   `h.persona('bravo', { credentials_file: alpha.credentials_file })`) leaves
- *   both `broken`, each holding the digest of its own path's bytes: the file
- *   is read (stat-first) only to be hashed, never parsed, and no token from
- *   it reaches a Slack client.
- *   `opts.dryRun` reaches the manager, the bring-up controller and the reload
- *   controller as a flag (`process.env` is never read or set);
- *   `opts.configFs` overrides the controller's file-system seam for reading
- *   the record, the configuration file and the pending file
- *   (`PersonaConfigFs`); `opts.credentialsFs` overrides the detection tick's
- *   credentials reads (`CredentialsFs`, e.g. an `fstatFile` reporting a FIFO);
- * - `run.bringUps`: the real `createPersonaBringUpController` over that
- *   manager and clock, so the start runs the real credentials check, the real
- *   working-directory check and the real-path "no other applied persona"
- *   rule. `opts.bringUpFs` overrides its file-system seam;
- * - `run.lifecycle`: the recorder. Its `ops` are the controller's
- *   `ReloadLifecycleOps`. The start pass (`startBringUp`) brings every
- *   applied persona up at once through `run.bringUps` and launches each one
- *   that ends `up`; a launch is only recorded (nothing is spawned; with
- *   `opts.realLaunch` it runs the real launch path, below).
- *   `bringUp` does the same for one persona; `teardown` cancels the persona's
- *   bring-up and stops its connection (for the old half of a destructive
- *   modify, whose key stays applied, it refuses a persona that has had a `dm`
- *   destination, as below); `refreshTemplate` (step 5) is recorded as a
- *   `template-refresh` record (key `TEMPLATE_REFRESH_KEY`) and calls
- *   nothing; `updateInPlace` is recorded (with the
- *   changed `settings`) and does nothing else; `reconnectCredentials` (step
- *   4) runs the real controller's `changeCredentials` over the manager (the
- *   real reconnect: new connection first, the 10 s `start()` bound and the
- *   SR-3.2 retries on `run.clock`) and records how it settled (`change`); a
- *   recovery bring-up (`{ recovery: true }`, step 6) is recorded with
- *   `recovery: true`, cancels its bring-up, stops its connection and
- *   brings it up afresh. These two stand-ins cover only what they do as the
- *   lifecycle does: they never forget a cached DM conversation (the
- *   lifecycle's forget), so a reconnect or recovery of a persona that has had
- *   a `dm` destination in this run, and a recovery of a persona no longer
- *   credentials-broken when it runs (the lifecycle applies the change as a
- *   reconnect then), need `opts.realLifecycle`: the stand-in rejects the
- *   call and `h.cleanup()` throws, naming it. With `opts.realLifecycle`, `bringUp` (a recovery
- *   included), `teardown`, `reconnectCredentials`, `updateInPlace` and
- *   `refreshTemplate` run the real composition instead (`run.composition`, see
- *   `RealLifecycleComposition`: `createPersonaLifecycle` over the run's
- *   controller and manager, a real serializer, the run's destination
- *   resolver, the teardown's real agent-director kill with the bounded retry
- *   on `run.clock` and no delete (the row is kept, b.jg5 SRJ-715) over a
- *   `makeStubClient` stub, its kill-failure alert on the persona-teardown
- *   route, `opts.agentDirector`, a recorded launch, the template refresh over
- *   that stub keeping `installedTemplate`, and never shutting down). The
- *   controller's default step bodies call them for every confirmed apply run
- *   without `opts.applySteps`: step 2 tears down each removed persona and the
- *   old half of each destructive modify (`credentials_file` path,
- *   `working_directory`), step 6 brings up each added persona and the new
- *   half, so a destructive modify is a `teardown` then a `bring-up` record
- *   of the same key; step 5 runs only when the plan's config directories
- *   changed; a next-launch change (`claude_config_dir`,
- *   `stop_hook_bootstrap`) gets no record. Every call is a
- *   `ReloadLifecycleRecord` in call order (`records`, `of(op)`, `keys(op)`);
- *   a bring-up record gets its `result` (outcome `up`/`broken`/`retrying` and
- *   each failure's class) when it resolves (`outcome(key)`, `classes(key)`).
- *   `startPasses` holds the applied configuration of each start pass;
- *   `holdStartPass()` keeps the next start pass from resolving until the
- *   returned release is called, or makes it reject once `release.fail(err)`
- *   is called (a start pass that throws after its bring-ups and launches).
- *   Apply-time calls: `hold(op, key)` holds the next `teardown`,
- *   `update-in-place`, `reconnect` or `bring-up` of one persona before its body runs
- *   until `release()`, or makes it reject with `fail(err)`; `timeline` lists
- *   every apply-time teardown, in-place update, reconnect and bring-up as it started and
- *   settled or rejected, across personas and steps (b.av2 SR-8.6 step order
- *   without timing); `hold('template-refresh')` holds step 5 the same way,
- *   and `applyTimeline` is `timeline` with step 5 in its place. The bring-up controller's `onLeftUp` is server.ts's
- *   `createNotUpSessionDropper` over the real `dropPersonaSession`, so a
- *   persona that stops being up has its registered session dropped (one
- *   line). `run.serverConfig()` is `server.ts`'s `personaConfig`
- *   (`configInEffect`: the applied persona set over the start's server-wide
- *   settings), which every consumer and real launch reads; `h.readRecord()`
- *   holds a changed server-wide value, and a later `h.start()` over the same
- *   directories (the next server start) runs it. With `opts.realLifecycle` the manager gets the composition's
- *   serializer (`makeConnectionHarness`'s `serialize`, as `server.ts` passes
- *   `personaLifecycle.run`), so a b.ujn mark's network close of its detached
- *   socket waits for the persona's serializer turn (behind a lifecycle
- *   operation of that persona in flight; a `hold` gate is outside the
- *   serializer and holds no turn). Without it the manager
- *   gets no serializer, like the recorder's stand-ins (which take none), and
- *   that close runs at once;
- * - the real consumers of the applied settings (b.av2 SR-13.1), wired as
- *   `server.ts` wires them and reading the controller's applied
- *   configuration at each use: the routing (`createPersonaRouting`) behind
- *   the real event router on the manager's `onEvent`, and one destination
- *   resolver, destination hold (on its own fake clock, never the real one or
- *   `run.clock`) and notifier (`makeNotifierStack`), whose up-flush listener
- *   joins the bring-up controller on `onStatus`; with `opts.realLifecycle`
- *   the composition's `destinations.forget` is that resolver's. Post-apply
- *   drivers (b.av2 SR-13.1): `run.registerSession(name)` registers the
- *   persona's MCP session in the real registry (`run.session(name)` is it
- *   now, compared by identity to show it was kept); `run.deliver(name,
- *   event, envelope?)` delivers an event on its socket stub, with
- *   `envelope`'s overrides passed to the stub unchanged (b.deo SRI-1203,
- *   e.g. an `is_ext_shared_channel` form; none gives `false`), and
- *   `run.deliveries(name)` is what reached its session (`chat_id`, `via`,
- *   `content`); `run.notice(name, text)` raises a notice through the
- *   notifier (its Slack calls are on `run.stub(name).callLog`);
- *   `run.callTool(name, tool, args, session?)` calls an MCP tool as its
- *   instance over `createSessionServer`, through its registered session
- *   now, or through `session`, an entry kept from `run.session(name)`, even
- *   after the registry dropped or replaced it (b.deo SRI-502, SRI-1203).
- *   The routing and the tool deps are bound as server.ts binds them (b.deo
- *   SRI-1203): the routing reads the run's stored-choice store (below) at
- *   each event; the tools read, at each call, the channel mode of
- *   `run.serverConfig()`, that same store, the routing's heard set and the
- *   applied personas, so `set_channel_delivery` runs as in production, its
- *   `persona-channel-delivery-set` line in `run.logs` in every run. The
- *   notifier's destination resolver reads the switch from
- *   `run.serverConfig()` at each attempt, as server.ts's does.
- *   Deliver only to a persona with a registered session (a lost message
- *   would reach the restart module, which the harness does not set up).
- *   The routing and the MCP tools get the server-wide reply settings
- *   (`ack_reaction`, `reply_chunk_limit`, `reply_chunk_mode`) as server.ts's
- *   `getReplySettings` reads them: from `run.serverConfig()` at call time
- *   (so after an apply, the start's values), with no reaction, 4000 and
- *   `newline` when the config sets none; set them in the config the run
- *   starts with. A delivery makes a `users.info` call (the author's name),
- *   and, by default, no ack reaction. `run.noticeClock` is the destination
- *   hold's clock.
- *   Not-up personas (b.av2 SR-6.3, SR-6.4): `run.isUp(name)` is server.ts's
- *   up check (`createPersonaUpPredicate`), `run.admitSession(name)` its MCP
- *   admission (`decideSessionAdmission`: registers when admitted, else one
- *   refusal line), and `run.bringUps.state(key)` the up/broken/retrying
- *   state. Breaking a running persona: `run.revokeBotToken(name, opts?)`
- *   scripts `token_revoked` (or `opts.error`) at the front of every Web API
- *   queue of its current stub, so the first call a consumer makes (a notice,
- *   a tool call, a delivery's `users.info`) marks it broken (bug b.ujn);
- *   `run.refuseReopen(name, error?)` drops its socket with a refused reopen
- *   queued and resolves once it is broken. `run.linesOf(name)` is every log
- *   line naming the persona (lifecycle, bring-up, manager, diagnostics);
- * - `run.ticks`: a manual `ReloadTickDriver`. Nothing runs until the test
- *   calls `tick()` or `ticks(n)` (each awaited until the pass settles; `tick`
- *   rejects when nothing is armed); no real timer is ever armed. `armed`,
- *   `startCalls`, `stopCalls` and `ticksRun` show how the controller used it.
- *   `opts.tickDriver` swaps in another driver (the production one on
- *   `run.clock`) for the single 5 s cadence case; `run.ticks` is then unused;
- * - `run.controller`: the real `createReloadController` over `h.paths`, the
- *   recorder's ops, the seam writer and remover, the run's retired-key store
- *   and its stored-choice store accessor (below), `run.ticks`, the dry-run
- *   flag, `heldCredentialsDigest` bound to `run.bringUps.credentialsDigest`
- *   (as `server.ts` binds it; `opts.heldCredentialsDigest` wraps that lookup,
- *   e.g. to make it throw so a detection pass fails), `bringUpState` bound
- *   to `run.bringUps.state` (as `server.ts` binds it; `opts.bringUpState`
- *   wraps it the same way, e.g. to throw so the preview leaves a fact out),
- *   the stub factory and `h.home`. The tick's prospective checks of an
- *   added persona are the controller's own: the real credentials content
- *   check over the bytes the tick read (none in dry run) and the real
- *   working-directory check (`checkPersonaWorkingDirectory`) over the temp
- *   directory. Both seams (the credentials reads through
- *   `opts.credentialsFs` when given) are wrapped to record what the tick
- *   touched:
- *   `run.tickCredentialsReads` (every credentials path the tick opened; it
- *   stays empty in dry run, b.av2 SR-3.4, SR-8.2) and
- *   `run.tickDirectoryChecks` (every working directory it stat'd). Neither
- *   is part of `since`; slice them by length around a stretch of ticks.
- *   `run.resolveStart()` calls its `resolveStart` and keeps the outcome as
- *   `run.outcome`; `run.startDetection()` calls its `startDetection`.
- *   A confirmed apply (b.av2 SR-8.6): `opts.applySteps` is handed to the
- *   controller as its step 2–6 slots (none bound by default);
- *   `run.appliedConfigs` holds every configuration its `onApplied` was told
- *   (`opts.onApplied` is called too), and `run.appliedKeys()` is the
- *   controller's applied persona keys now (`controller.applied()`).
- *   `opts.beforeWrite(path)` runs before every writer call, e.g. to see
- *   whether `paths.apply` still exists when the record is written. Its
- *   approver stop (`stopApprover`, b.jg5 SRJ-808: step 1 stops each recorded
- *   key's dialog approver, right after the record and before the rewrite)
- *   is recorded in `run.approverStops`, each call with the key and how many
- *   `run.writes`, `run.lifecycle.timeline` and agent-director call entries
- *   there were then (`ReloadApproverStop`); with `opts.realLaunch` it is
- *   also the session manager's real `stopDialogApprover` with the
- *   retired-key reason (`APPROVER_STOP_RETIRED_KEY`), as `main()` binds it.
- *   `opts.approverClock` puts a realLaunch run's approver on a fake clock,
- *   so a case holds an approver polling a `pending` row
- *   (`opts.leaveSpawnsPending`) across an apply;
- * - the retired-key store (b.jg5 SRJ-802, SRJ-803, SRJ-804): every run
- *   loads one store over `h.stateDir` (`loadRetiredKeyStore`, as `main()`
- *   loads its one store before the start resolution) and hands it to the
- *   controller as `retiredKeys`, so a confirmed apply's step 1 records
- *   through it and restores it after a failed rewrite. The store writes and
- *   deletes through the run's own writer and delete, so its writes are in
- *   `run.writes` and its deletes in `run.removes`, `h.failWrites` /
- *   `h.failRemoves` count its calls with the controller's, `run.captured()`
- *   holds the record while it exists and `h.serverSideFiles` sweeps it; its
- *   lines go to `run.logs` and its times come from `run.clock`. `run
- *   .retiredKeys` is the store (to seed a key held only in memory, record a
- *   batch through it with the writer failing). The record's path is
- *   `retiredKeysPath(h.stateDir)` (`h.retiredKeysFile`; `h.retiredKeysWrite(ok?)`
- *   and `h.lastAppliedWrite(ok?)` are the writer calls on it and on the
- *   last-applied record, as `run.writes` holds them); seed and read it with
- *   `tests/test-helpers/retired-keys.ts`. A later run over the same
- *   directories (a restart) loads a new store from the disk; a record it
- *   cannot load makes `h.build` throw. A realLaunch run also installs that
- *   same store for the session manager (`setRetiredKeyStore`, as `main()`
- *   does right after the configured-persona query, b.jg5 SRJ-805, SRJ-806),
- *   before its start pass; `run.stop()` resets the install when it is the
- *   run's own, and `h.cleanup()` always does. A run without `realLaunch`
- *   installs none;
- * - the stored-choice store (b.deo SRI-403, SRI-1203): every run loads one
- *   store over `h.stateDir` (`loadChannelDeliveryAtStart`) in
- *   `run.resolveStart()` once the start resolves to an applied
- *   configuration, as `main()` loads its one store: after the resolution and
- *   before the start bring-up pass, in both modes and in dry run, with the
- *   start rules over the applied personas and the run's retired-key store. A
- *   refused start loads none. The controller gets it as `channelDelivery`,
- *   an accessor with `main()`'s guard (it throws when an apply runs before
- *   the load), so a confirmed apply's step 1 writes unwritten drops before a
- *   bring-up, drops the retired keys' choices and marks the retiring keys
- *   through it (b.deo SRI-406, SRI-408, SRI-502). The routing's
- *   `getChannelDelivery` and the session tools' `getChannelDelivery` read
- *   the same store at call time (b.deo SRI-305, SRI-502, SRI-1203), so a
- *   choice it holds reaches the routing's decision and a
- *   `set_channel_delivery` call writes through it; before the load, and
- *   after a refused start, both read none (no stored choice applies; the
- *   tool refuses). `run.channelDelivery` is
- *   the store; reading it before the start resolved to an applied
- *   configuration throws. Its lines go to `run.logs` and its times come from
- *   `run.clock`. Its writes take the run's writer path, so they are in
- *   `run.writes` in order with the record writes, `opts.beforeWrite` and
- *   `opts.stopBeforeWrite` see them, `run.captured()` holds the file while it
- *   exists and `h.serverSideFiles` sweeps it; their failures come from their
- *   own seam, `h.failChannelDeliveryWrites({ step?, code?, call? })` /
- *   `h.clearChannelDeliveryWriteFailure()` (`failWrites`' options, its own
- *   call count; `h.failWrites` never fails a stored-choice write). Its
- *   deletes go through the run's delete (`run.removes`, `h.failRemoves`).
- *   The file's path is `channelDeliveryPath(h.stateDir)`
- *   (`h.channelDeliveryFile`; `h.channelDeliveryWrite(ok?)` is a writer call
- *   on it as `run.writes` holds it). `h.readChannelDelivery()` reads the
- *   record through the module's parser (null when there is no file); seed a
- *   valid record with `writeChannelDeliveryRecord(h.stateDir, entries)` from
- *   `tests/test-helpers/channel-delivery.ts`, and invalid or unreadable bytes
- *   with `h.writeChannelDeliveryBytes(bytes)`, which writes exactly those
- *   bytes outside every seam and record. A later run over the same
- *   directories (a restart) loads a fresh store from the disk, so its
- *   retiring keys and unwritten drops start empty;
- * - the old-life holds (b.jg5 SRJ-809): every run builds one hold set, empty
- *   (`createOldLifeHoldSet`, its lines to `run.logs`, as `main()` builds its
- *   one set beside the store), and hands it to the controller as
- *   `oldLifeHolds`, so a confirmed apply's step 1 begins its holds in it once
- *   the last-applied rewrite succeeded. A realLaunch run also installs that
- *   same set for the session manager (`setOldLifeHolds`, beside the store, as
- *   `main()` does), so its reads end or re-point a hold, a recorded key's
- *   reuse that begins its new life ends one, and the teardown's kill marks
- *   one kill-failed; `run.stop()` resets the install when it is the run's
- *   own, and `h.cleanup()` always does. A run without `realLaunch` installs
- *   none. `run.oldLifeHolds` reads the set (`holdOf`, `holdsOnDirectory`,
- *   `holdsWaitedOnBy`, `waitsOnKillFailed`, `snapshot`). Holds live in server
- *   memory: a later run over the same directories (a restart) starts with a
- *   new, empty set, and the harness runs no start sweep to rebuild one;
- * - what a hold refuses, and its end (b.jg5 SRJ-810, SRJ-811, SRJ-301;
- *   realLaunch runs only): the run builds, as `main()` builds its one
- *   controller, UNAVAILABLE retry timers (`createUnavailableRetryController`
- *   on `run.clock`, its lines to `run.logs`; read-only as `run.retryTimers`),
- *   whose retry action stands in for the restart module's retry entry (the
- *   harness has none): a stopped run, a key outside the applied set, a
- *   latched or `ErrInvalidFlags`-held persona and one the relaunch gate
- *   refuses stop the timer; work that blocks a retry
- *   (`personaRetryBlockCause`) is a refusal with no call; else one launch
- *   in the persona's serializer turn, a `launch` record via
- *   `unavailable-retry` with its `action`, which stops the timer once the
- *   persona is up and is a refusal on `sequence-waiting` or a failure. Bound
- *   as `main()` binds them: the lifecycle's `stopRetryTimer` (the timers'
- *   `stop` with the torn-down reason) and its forget-and-stop member
- *   (`forgetOldLifeWaits`, recorded as `'forgetOldLifeWaits'`), and, right
- *   after the hold set is installed (so after the session manager's own end
- *   observer), the end-retry observer on the run's hold set
- *   (`createOldLifeHoldEndRetry` over the timers' `runNow`, cause
- *   held-for-old-life, label `old-life-hold-ended`), so a hold's end retries
- *   each applied, unlatched waiting persona at once. `run.admitSession`
- *   passes the session manager's held-directory query
- *   (`oldLifeHeldDirectory`), as server.ts does. Unless `opts.oldLifeWait`
- *   is `false`, the old-life wait's bindings are installed too, as `main()`
- *   always installs them (`setOldLifeWaitBindings`:
- *   the timers as its arm, `run.clock`, `run.logs`, the configuration the
- *   server runs, the run's kill-failure alerts and a startup-errors
- *   recorder into `run.composition.killFailureEntries`), so a launch the
- *   old-life gate holds back starts the hold's wait; with `false` no wait
- *   starts and no waiting persona is armed. `opts.killLeavesRowLive` keeps a
- *   row live through a kill that succeeds, so a wait's round reaches its
- *   `find-missing` steps. `run.stop()` removes the observer, closes the
- *   timers (no timer is left pending) and removes the bindings when they
- *   are the run's; `h.cleanup()` always removes the bindings;
- * - a stop between writes: `opts.stopBeforeWrite` names a path; just before
- *   the run's writer is first called for it, the harness keeps an image of
- *   every regular file under the configuration and state directories, and
- *   `run.stop()` puts that image back, so the next run (a restart) sees the
- *   disk as it stood when that write was about to start. The run itself goes
- *   on and the controller sees no failure, so no failure path (no restore)
- *   runs for it; `run.stoppedBeforeWrite` says the point was reached, and
- *   `h.build` throws until such a run is stopped;
- * - captures: `run.logs` is the one `[slack]` stream (reload controller,
- *   bring-up controller and connection manager lines, in order), and
- *   `run.logsOf(label)` its lines starting `[slack] <label>: ` (a class such
- *   as `RELOAD_NOTHING_PENDING`, or `'reload'` for the unclassed failures);
- *   `run.invalidLines()` is `logsOf(RELOAD_INVALID)`;
- * - preview emissions (b.av2 SR-8.4, SR-10.3): one logged preview spans
- *   several `reload-preview` lines, the first (the header) starting
- *   `PREVIEW_EMISSION_START` (`[slack] reload-preview: ` then
- *   `PENDING_PREVIEW_TITLE`). `run.previewEmissions()` groups `run.logs`
- *   into emissions (a header and the `reload-preview` lines right after
- *   it), `run.previewEmissionCount()` counts them,
- *   `run.lastPreviewEmission()` is the latest one's full log lines and
- *   `run.lastPreviewText()` the same as body lines (prefix removed, and the
- *   header's ` (preview in "<h.paths.pending>")` suffix), which equals
- *   `h.pendingLines()` when the file was written. The exported
- *   `previewEmissions(lines)` and `previewEmissionText(emission, path)` do
- *   the same over any slice, e.g. `run.since(cp).logs`. A `reload-invalid`
- *   line is not an emission;
- * - `run.writes` every call of the controller's writer (path, success), the
- *   retired-key store's and the stored-choice store's included;
- *   `run.removes` every call of its durable delete as what happened to the
- *   file (`ok`: it is gone; `removed`: this call removed it; `unsynced`: it
- *   was removed but the directory sync failed, so the delete threw although
- *   the file is gone; see `ReloadRemoveRecord`); `run.pendingWrites()` /
- *   `run.pendingRemoves()` those on `h.paths.pending`;
- *   `run.slackCalls()` every Web API call by persona key and
- *   `run.slackPosts()` the `chat.postMessage` calls among them;
- *   `run.captured(extra?)` gathers the logs, statuses, lifecycle records,
- *   outcome, writer and delete calls, Slack calls and every file the run's
- *   writer wrote that still exists (as `writtenFile`, so the pending file is
- *   checked) for `assertNoLeak`. Files the test itself wrote are left out, so
- *   a test-written malformed file that holds `LEAK_SENTINEL` does not fail
- *   the check;
- * - "nothing happened": `const cp = run.checkpoint()`, drive ticks, then
- *   `run.since(cp)` is every log line, writer and delete call, lifecycle
- *   record (any op, any `via`), Slack client build and Web API call made
- *   since. `expect(run.since(cp)).toEqual(NO_RUN_ACTIVITY)` shows the ticks
- *   did nothing at all; `run.since(cp).lifecycle` alone is `[]` for "no
- *   lifecycle call from a tick" (AC 55). Bring-up retries run only when the
- *   test advances `run.clock`, so they never mix into a stretch of ticks.
- *
- * The real launch path (`opts.realLaunch`, implies `opts.realLifecycle`; see
- * the option): every launch (start pass, bring-up retry, apply bring-up,
- * `run.relaunch`) runs `spawnForPersona` over `run.serverConfig()`, with the
- * trust patch, the reply-guard steps over `h.stateDir` and the collision
- * ladder, against the composition's agent-director stub and the harness's
- * row table (`AgentDirectorRow`, shared by every run as agent-director's
- * store outlives a server restart): a plain spawn creates a `waiting` row
- * and collides with any row; a reuse spawn (`reuse_finished`) over an `ended`
- * or `missing` row, or of an id with no row, starts a new `waiting` life with
- * its own `cwd` and labels, and collides with a live row; a resume sets the
- * row `waiting`, a kill that succeeds `ended`; nothing removes a row (no CSCB
- * path deletes one, b.jg5 SRJ-715), and a spawn
- * `opts.leaveSpawnsPending` picks leaves its row `pending` with a
- * launch start until the case moves it. A launch record gets
- * the ladder's `action`: for a key the run's retired-key store has recorded
- * (b.jg5 SRJ-805, SRJ-806) a reuse spawn that succeeded answers
- * `SPAWN_ACTION_FRESH_RETIRED` (`fresh-retired`, from
- * `src/session-manager.ts`) with the key's "new life has begun" mark set
- * through the store, so a case tells it from a plain `spawned`, a `resumed`
- * and a `reconnected`. `run.composition.agentDirectorCalls` is every
- * agent-director call in order (a spawn with its `cwd`, `CLAUDE_CONFIG_DIR`,
- * `config_dir` label and whether it was a reuse; each with its `result`),
- * and `instanceCallsOf(name)` the persona's spawn, resume and kill (a
- * delete would show there too; none is made).
- * `h.seedRow(persona, { state?, cwd?, configDir?, labels?, launchStartedAt? })` sets or
- * changes a row before a launch, to choose its path (`h.rowOf(name)` reads
- * it); `run.relaunch(name)` is the persona's next launch through the
- * restart path (the relaunch gate, then `launchSession`, in its serializer
- * turn), with no apply. `h.stateDir` is the temp state directory, and
- * `h.replyGuardDir` its record directory (the guard's argument);
- * `h.readReplyGuardRecord(name)` reads a record. `h.configDir(name)` makes
- * a temp `claude_config_dir`; with `makeReloadHarness({ personaConfigDirs:
- * true })` every `h.persona` gets its own. A persona with none resolves to
- * the temp home's `.claude`, never the operator's. Session-manager notices
- * are `run.sessionNotices` (also raised through the run's notifier), and
- * the session manager's `console.error` lines join `run.logs`.
- *
- * The latch (b.jg5 SRJ-501, SRJ-504, SRJ-508): every run builds, as `main()`
- * does, one set of notice episodes (on `run.clock`, posting through the
- * run's notifier, each post recorded in `run.episodeNotices`) and one latch
- * (`createConflictLatch`, its lines to `run.logs`) whose CONFLICT notice is
- * bound to those episodes (`bindConflictNotice`). A realLaunch run installs
- * the latch in the session manager (`setConflictLatch`), and beside it, as
- * `main()` does, the configured-persona query over the run's live applied
- * configuration (`setConfiguredPersonaQuery`) and, after the latch, the
- * run's live-row sequence registry (b.jg5 SRJ-706:
- * `createLiveRowSequenceRegistry` over the session manager's builder on
- * `run.clock` and `run.serverConfig()`, each sequence in its own detached
- * recovery attempt, its retry arm arming nothing as the run has no retry
- * controller; `setLiveRowSequenceRegistry`). `run.startSequence(name)`
- * starts the persona's sequence through the session manager's start entry,
- * `run.sequenceRunning(name)` reads the running query, and
- * `run.composition.holdFindMissing()` holds its runs (the stub's
- * `holdFindMissing`), so a case can hold a sequence across an apply, and
- * `run.composition.holdSpawns(shouldHold)` holds the spawns that reach the
- * stub (the stub's `holdSpawns`), so a case can hold a reuse mid-call;
- * `run.stop()` closes the registry, as `main()`'s shutdown does, and
- * `h.cleanup()` removes it. So a CONFLICT at a
- * ladder spawn or `resume` latches the persona (its launch record's `action`
- * is `latched`, with one CONFLICT notice to its destination) and a latched
- * persona's launch makes no agent-director call. The composition's
- * `forgetConflictLatch`, `forgetInvalidFlagsHold` and `forgetNoticeEpisodes`
- * are the latch's, the hold's (below) and the episodes' `forget`, in the
- * teardown's order. `run.latch` reads it
- * (`isLatched`, `record`). The latch is per run: a later run (a server
- * restart) and another harness start with none. The holds `main()` binds
- * before the notice are not bound (a run has no retry controller,
- * tmux-unresponsive condition or unclassified-error episode), and
- * `run.stop()` closes the episodes as `main()`'s shutdown does.
- *
- * The `ErrInvalidFlags` hold (b.jg5 SRJ-207, SRJ-1008): every run builds, as
- * `main()` does, one hold (`createInvalidFlagsHold`, its lines to
- * `run.logs`) with its set reaction bound to the run's episodes
- * (`bindInvalidFlagsHoldSetReaction`: a new hold posts SRJ-1008's alert once
- * through the run's notifier, recorded in `run.episodeNotices`; the reaction's
- * retry-timer stop stops nothing, as a run has no retry controller). A
- * realLaunch run installs it in the session manager (`setInvalidFlagsHold`)
- * beside the latch, so a reuse spawn's `ErrInvalidFlags` holds the persona
- * (its launch record's `action` is `held`; no version re-check is installed,
- * so the re-check answers not running and the hold begins under no version)
- * and a held persona's launch makes no agent-director call. The
- * composition's `forgetInvalidFlagsHold` is the hold's `forget`, right after
- * the latch's. `run.invalidFlagsHold` reads it (`isHeld`, `beganUnder`). The
- * hold is per run: a later run (a server restart) and another harness start
- * with none; `h.cleanup()` removes the install.
- *
- * Step 5 (b.av2 SR-8.6): with the real composition the refresh calls the
- * stub's `makeTemplate` (params on `run.composition.agentDirector
- * .makeTemplateCalls`) with `run.composition.installedTemplate`'s start-time
- * arguments (`buildTemplateParams` over the start configuration, built when
- * the start applies; nothing is installed at the start), and its record gets
- * how it settled (`refresh`).
- * `run.composition.failTemplateRefresh(err)` makes the next one reject (the
- * refresh logs one line and settles `failed`); `run.lifecycle.hold(
- * 'template-refresh')` keeps it pending until released.
- *
- * Call `await h.cleanup()` in `afterEach`: it stops every run (detection,
- * bring-up retries, connections) and removes the root, then throws if a
- * stand-in refused a call that needs `opts.realLifecycle`. A test that must show
- * no timer is left calls `await run.stop()` and checks
- * `run.clock.pendingCount()`.
- *
- * The token environment: `h.poisonTokenEnvironment()` sets
- * `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` to distinct sentinel-bearing fakes
- * and records every read of either through `process.env` (AC 19/22: tokens
- * come from the file, never the environment), until its `restore()` or
- * `h.cleanup()`.
- *
- * Isolation (b.av2 SR-13.2): every path is explicit and under the root; the
- * harness reads and sets no environment variable (except through
- * `h.poisonTokenEnvironment()`, restored by `h.cleanup()`), never resolves
- * the operator's home, builds no real Slack client or agent-director client,
- * arms no real timer and holds no token literal. The real composition
- * installs the outage state's module dependencies (its stub client and a
- * recording notice sink), and a registered session or delivered event
- * touches the registry and ack tracker; `h.cleanup()` resets them. A
- * realLaunch run also installs the session manager's module seams (the
- * process's agent-director client — through it the startup-dialog approver
- * reads and types; the prompt-row checks only read —, the approver's 200 ms
- * cap, the spawn home, the trust patcher, the reply guard, the claude_config_dir hook, the
- * session notifier, the latch, the `ErrInvalidFlags` hold, the configured-persona query, the
- * retired-key store and the old-life hold set) and captures
- * `console.error`; `h.cleanup()` first stops every dialog approver a launch
- * started (it runs on its own after the launch call, b.jg5 SRJ-401), then
- * resets and restores them. No launch is a startup launch, so nothing resolves the
- * state directory from the environment. It
- * spawns nothing itself: `mkfifoAvailable` and `h.makeFifo` start `mkfifo`
- * through the shared FIFO helper (`fifo.ts`), with a host-safe environment.
- *
- * SPDX-License-Identifier: MIT
- */
 
 import {
   accessSync,
@@ -746,55 +136,7 @@ import {
   type SessionEntry,
   type SessionToolDeps,
 } from '../../src/registry.ts'
-import {
-  APPROVER_STOP_RETIRED_KEY,
-  APPROVER_STOP_TEARDOWN,
-  _resetApproverClock,
-  _resetConfiguredPersonaQuery,
-  _resetDialogReadyTimeoutMs,
-  _resetFindMissingMemo,
-  _resetInFlightLaunches,
-  _resetInvalidFlagsHold,
-  _resetLiveRowSequenceRegistry,
-  _resetOldLifeHolds,
-  _resetOldLifeWaitBindings,
-  _resetPreLaunchReplyGuard,
-  _resetPreLaunchTrustPatcher,
-  _resetRetiredKeyStore,
-  _resetSpawnHomeDir,
-  _setApproverClock,
-  _setDialogReadyTimeoutMs,
-  _setSpawnHomeDir,
-  buildLiveRowSequenceDeps,
-  checkLaunchConfigDir,
-  createOldLifeHoldEndRetry,
-  forgetOldLifeWaits,
-  isLiveRowSequenceRunning,
-  oldLifeHeldDirectory,
-  personaRetryBlockCause,
-  killPersonaInstanceForTeardown,
-  launchSession,
-  oldLifeHoldStep,
-  personaConfigDirLabelValue,
-  setConfigDirUnresolvableHook,
-  setConfiguredPersonaQuery,
-  setConflictLatch,
-  setInvalidFlagsHold,
-  setLiveRowSequenceRegistry,
-  setOldLifeHolds,
-  setOldLifeWaitBindings,
-  setPreLaunchReplyGuard,
-  setPreLaunchTrustPatcher,
-  setRetiredKeyStore,
-  setSessionNotifier,
-  SPAWN_ACTION_FRESH_RETIRED,
-  spawnForPersona,
-  startLiveRowSequence,
-  stopDialogApprover,
-  stopLiveRowSequence,
-  whenLaunchSettled,
-  type SpawnPersonaResult,
-} from '../../src/session-manager.ts'
+import { _resetConfiguredPersonaQuery, _resetFindMissingMemo, _resetInFlightLaunches, _resetInvalidFlagsHold, _resetLiveRowSequenceRegistry, _resetOldLifeHolds, _resetOldLifeWaitBindings, _resetPreLaunchReplyGuard, _resetPreLaunchTrustPatcher, _resetRetiredKeyStore, _resetSpawnHomeDir, _setSpawnHomeDir, buildLiveRowSequenceDeps, checkLaunchConfigDir, createOldLifeHoldEndRetry, forgetOldLifeWaits, isLiveRowSequenceRunning, oldLifeHeldDirectory, personaRetryBlockCause, killPersonaInstanceForTeardown, launchSession, oldLifeHoldStep, personaConfigDirLabelValue, setConfigDirUnresolvableHook, setConfiguredPersonaQuery, setConflictLatch, setInvalidFlagsHold, setLiveRowSequenceRegistry, setOldLifeHolds, setOldLifeWaitBindings, setPreLaunchReplyGuard, setPreLaunchTrustPatcher, setRetiredKeyStore, setSessionNotifier, SPAWN_ACTION_FRESH_RETIRED, spawnForPersona, startLiveRowSequence, stopLiveRowSequence, whenLaunchSettled, type SpawnPersonaResult } from '../../src/session-manager.ts'
 import {
   _resetLaunchedWithDirs,
   getLaunchedWithDir,
@@ -1125,30 +467,6 @@ export interface LifecycleTimelineEntry {
   readonly phase: 'start' | 'settled' | 'rejected'
 }
 
-/**
- * The real lifecycle composition a run binds with `opts.realLifecycle`
- * (`run.composition`): `createPersonaLifecycle` (`persona-lifecycle.ts`) over
- * the run's real bring-up controller and connection manager, a real
- * per-persona serializer (shared with that controller and manager), the
- * teardown's real kill (`killPersonaInstanceForTeardown`, the bounded retry
- * with its waits between tries on `run.clock`; b.jg5 SRJ-715, SRJ-702) over a
- * `makeStubClient` agent-director stub, with no delete, so the row is kept
- * whatever the kill's outcome, its kill-failure alert raised through the
- * run's kill-failure alerts with the context 'persona teardown'
- * (`raiseKillFailureAlert`, as `main()` binds it; the log-only route's
- * entries in `killFailureEntries`), the
- * session manager's real `whenLaunchSettled` and approver stop
- * (`stopApprover`: `stopDialogApprover` with the teardown reason, as `main()`
- * binds it, so a teardown stops the key's dialog approver first, b.jg5
- * SRJ-404, SRJ-715), its real live-row sequence stop right after
- * (`stopLiveRowSequence`: the session manager's `stopLiveRowSequence` with
- * the teardown reason, as `main()` binds it, b.jg5 SRJ-706, SRJ-715), with
- * the real launch path the run's retry timers' stop (`stopRetryTimer`) and
- * the session manager's `forgetOldLifeWaits` (b.jg5 SRJ-811, SRJ-715), the
- * run's routing's `forget` (`routing.forget`, recorded and forwarded, as
- * `server.ts` binds it, so a torn-down key's heard set is dropped; b.deo
- * SRI-307), and a recording stand-in for every other dependency.
- */
 export interface RealLifecycleComposition {
   /** The composition the recorder's `teardown`, `updateInPlace`, `reconnectCredentials` and `bringUp` call. */
   readonly lifecycle: PersonaLifecycle
@@ -1161,24 +479,7 @@ export interface RealLifecycleComposition {
    * `delete <instance IDs>`, and leave the row as it was.
    */
   readonly agentDirectorOrder: readonly string[]
-  /**
-   * Every call of a dependency the composition got, in call order, as
-   * `[member, key]` with the member named as in `PersonaLifecycleDeps`
-   * (`'stopApprover'`, recorded at a teardown's submission and again as its
-   * first step, `'stopLiveRowSequence'`, right after it both times,
-   * `'bringUps.cancel'`, `'cancelRestartTimer'`, `'stopRetryTimer'`, `'whenLaunchSettled'`,
-   * `'connections.stop'`, `'routing.forget'`, `'forgetAcks'`, `'destinations.forget'`,
-   * `'destinationHold.cancel'`, `'notifier.forget'`, `'forgetPersonaPrompts'`,
-   * `'forgetOldLifeWaits'` (with the real launch path only),
-   * `'dropSession'`, `'resetOutageState'`, `'killInstance'`,
-   * `'raiseKillFailureAlert'`, `'forgetFailures'`, `'forgetDisconnectedStreak'`,
-   * `'forgetConflictLatch'`, `'forgetInvalidFlagsHold'`, `'forgetNoticeEpisodes'`, `'replyGuard.launchedWithDir'`, `'replyGuard.teardown'`,
-   * `'replyGuard.launchPass'`, `'storageCheck'`, `'bringUps.bringUp'`,
-   * `'bringUps.changeCredentials'`, `'connections.reconnectCredentials'`,
-   * `'connections.replaceRetryTokens'`, `'launch'`) plus `'outage-notice'`
-   * for a notice the outage state raised. The one query, `bringUps.state`
-   * (a recovery's re-check), is not recorded.
-   */
+
   readonly calls: ReadonlyArray<readonly [string, string]>
   /**
    * Every agent-director call the stub received, in call order, with what a
@@ -1695,55 +996,11 @@ export interface ReloadRunOptions {
    * serializer, as `server.ts` wires them.
    */
   realLifecycle?: boolean
-  /**
-   * The real persona launch path (implies `realLifecycle`): every launch (the
-   * start pass's, a bring-up retry's, an apply bring-up's and
-   * `run.relaunch`'s) runs `spawnForPersona` (the pre-launch
-   * claude_config_dir check, the collision ladder, the trust patch and the
-   * reply-guard steps) over the composition's agent-director stub and the
-   * harness's row table, with the configuration the server runs
-   * (`run.serverConfig()`), never as a startup launch (no
-   * `startup-errors.log`). The run installs, as `server.ts` does, the stub
-   * as the process's agent-director client, `trustPatchPersona`, the
-   * reply-guard steps over `h.stateDir` and the applied set, the bring-up
-   * controller's claude_config_dir hold and re-check, and a session notifier
-   * that records each notice (`run.sessionNotices`) and raises it through
-   * the run's notifier, the run's latch (`run.latch`), the run's
-   * retired-key store (`run.retiredKeys`, b.jg5 SRJ-805) and the run's
-   * old-life hold set (`run.oldLifeHolds`, b.jg5 SRJ-809); a launch that
-   * returns success starts the startup-dialog approver on its own, after the
-   * launch call (b.jg5 SRJ-401), which reads and types through the stub only,
-   * its laps `DIALOG_POLL_INTERVAL_MS` apart on the approver's clock with a
-   * 200 ms cap; a prompt row (`ask_user`, `check_permission`) a launch meets is read
-   * through the stub's `read-pane` (b.jg5 SRJ-607); the spawn home is `h.home`. The composition's reply-guard members are the
-   * real ones over `h.stateDir`. Every `console.error` line (the session
-   * manager's, the reply guard's) goes to `run.logs` while the run is the
-   * latest live one. The start-time bootstraps (the sweep, the trust and
-   * Stop-hook bootstraps, the template install) are not run. A new run
-   * forgets the launched-with directories and in-flight launches, as a new
-   * server process would; the row table and the record files persist.
-   */
+
   realLaunch?: boolean
   /** With `realLifecycle`: options for the agent-director stub (e.g. `killError`). Its call captures are the harness's own. */
   agentDirector?: StubClientOptions
-  /**
-   * With `realLaunch`: the startup-dialog approver's clock
-   * (`_setApproverClock`, reset by `h.cleanup()`), so its laps, its sleeps
-   * between them and its 200 ms cap run only when the case moves this clock
-   * (pass a `createFakeClock()`, never `run.clock`). Absent, the approver
-   * runs on the real clock.
-   */
-  approverClock?: FakeClock
-  /**
-   * With `realLaunch`: a spawn that creates or resets a row and whose
-   * instance ID satisfies this leaves the row `pending`, with a launch start
-   * (`SAMPLE_LAUNCH_START_DEFAULT`), instead of `waiting`, until the case
-   * moves it (`h.seedRow`) or a kill that succeeds ends it; its `status` and
-   * `get` carry that launch start. The launch's startup-dialog approver then
-   * polls the row (b.jg5 SRJ-404), lap by lap on the approver's clock
-   * (`approverClock`), until it is stopped. Absent: every spawn leaves its
-   * row `waiting`.
-   */
+
   leaveSpawnsPending?: (id: string) => boolean
   /**
    * With `realLaunch`: install the old-life wait's bindings
@@ -1788,22 +1045,6 @@ export interface ReloadRunOptions {
    * that reached it must be stopped before the next run is built.
    */
   stopBeforeWrite?: string
-}
-
-/**
- * One call of the reload controller's approver stop (`run.approverStops`):
- * the key, and how many entries `run.writes`, `run.lifecycle.timeline` and
- * (with the real composition) `run.composition.agentDirectorCalls` held when
- * it was made, so a case orders it against the retired-key write, the
- * last-applied write, the teardown's start and the agent-director calls.
- * Holds no token.
- */
-export interface ReloadApproverStop {
-  readonly key: string
-  readonly writes: number
-  readonly timeline: number
-  /** Undefined without the real composition. */
-  readonly agentDirectorCalls: number | undefined
 }
 
 /** A run's latch, read-only: the latched query and the record. */
@@ -1888,15 +1129,7 @@ export interface ReloadRun {
   readonly retryTimers: ReloadRetryTimersView | undefined
   /** Whether the run reached its `opts.stopBeforeWrite` stop point (the disk image was kept). */
   readonly stoppedBeforeWrite: boolean
-  /**
-   * Every call of the controller's approver stop (`stopApprover`, b.jg5
-   * SRJ-808: apply step 1 stops the dialog approver of each key it recorded,
-   * right after the record), in order, with where the run stood at the call
-   * (see `ReloadApproverStop`). With `opts.realLaunch` each call is also the
-   * session manager's real `stopDialogApprover(key, APPROVER_STOP_RETIRED_KEY)`,
-   * as `main()` binds it; otherwise it is only recorded.
-   */
-  readonly approverStops: readonly ReloadApproverStop[]
+
   /** The latest `run.resolveStart()` outcome (also set by `h.start`). */
   readonly outcome: ReloadStartOutcome | undefined
   /** The real lifecycle composition, with `opts.realLifecycle`; undefined otherwise. */
@@ -3074,11 +2307,9 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         isShuttingDown: () => false,
         log,
         // As main() binds it (b.jg5 SRJ-404, SRJ-715): a teardown stops the
-        // key's dialog approver first, and the one its launch in flight would
-        // start; the real stop over the session manager's approver registry.
-        stopApprover: rec('stopApprover', (key) => stopDialogApprover(key, APPROVER_STOP_TEARDOWN)),
+
         // As main() binds it (b.jg5 SRJ-706, SRJ-715): right after the
-        // approver, the key's live-row sequence, through the session
+
         // manager's stop entry (with a realLaunch run's registry installed;
         // with none it stops nothing).
         stopLiveRowSequence: rec('stopLiveRowSequence', (key) => stopLiveRowSequence(key, LIVE_ROW_STOP_TEARDOWN)),
@@ -3488,8 +2719,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         { log, write: writeChannelDelivery, remove, now: () => connections.clock.now() },
       )
     }
-    const approverStops: ReloadApproverStop[] = []
     controller = createReloadController({
+      stopDelivery: async () => {},
       queueOpenCount: queue.openCount,
       onQueueRetained: key => queue.retained(key),
       paths,
@@ -3506,18 +2737,9 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       // manager.
       oldLifeHolds,
       // As main() binds it (b.jg5 SRJ-808, SRJ-404): apply step 1 stops the
-      // dialog approver of each key it recorded. Recorded with where the run
+
       // stood; with the real launch path also the session manager's real stop
-      // with the retired-key reason, as nothing else starts an approver.
-      stopApprover: (key) => {
-        approverStops.push({
-          key,
-          writes: writes.length,
-          timeline: timeline.length,
-          agentDirectorCalls: composition?.agentDirectorCalls.length,
-        })
-        return realLaunch ? stopDialogApprover(key, APPROVER_STOP_RETIRED_KEY) : undefined
-      },
+
       lifecycle: ops,
       log,
       write,
@@ -3714,7 +2936,6 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         waitsOnKillFailed: (persona: Parameters<OldLifeHoldSet['waitsOnKillFailed']>[0]) => oldLifeHolds.waitsOnKillFailed(persona),
         snapshot: () => oldLifeHolds.snapshot(),
       }),
-      approverStops,
       get stoppedBeforeWrite() {
         return stopImage !== undefined
       },
@@ -3958,12 +3179,9 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       launchSeamsInstalled = true
       captureConsole({ lines: logs, live: () => !stopped })
       setClientForTests(composition!.client as Parameters<typeof setClientForTests>[0])
-      _setDialogReadyTimeoutMs(200)
-      if (runOpts.approverClock === undefined) _resetApproverClock()
-      else _setApproverClock(runOpts.approverClock)
       _setSpawnHomeDir(home)
       // A new server process: nothing in flight (no launch, no dialog
-      // approver), no launched-with dir known.
+
       _resetInFlightLaunches()
       _resetLaunchedWithDirs()
       _resetFindMissingMemo()
@@ -4362,11 +3580,9 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         tokenWatch?.restore()
         if (consoleCaptured) console.error = originalConsoleError
         if (launchSeamsInstalled) {
-          // First, so no dialog approver makes a call after the client goes.
+
           _resetInFlightLaunches()
           resetClientForTests()
-          _resetDialogReadyTimeoutMs()
-          _resetApproverClock()
           _resetSpawnHomeDir()
           _resetLaunchedWithDirs()
           _resetFindMissingMemo()

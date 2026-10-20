@@ -15,9 +15,9 @@ real_wait_launch "${REAL_KEY}"
 real_fault send-keys key=Enter swallow 1
 real_dm "${REAL_LABEL}" 'one swallowed Enter'
 wait_until 180 'Enter was not swallowed' case_assert enter-fault 1
-real_record_pane "${REAL_KEY}"
+real_record_state "${REAL_KEY}"
 real_wait_delivery "${REAL_KEY}" 1
-case_assert key-proof 1 enter
+case_assert key-proof 1 retype
 real_wait_idle "${REAL_KEY}"
 real_fault send-keys no_enter swallow 1
 real_dm "${REAL_LABEL}" 'one swallowed text'
@@ -54,9 +54,9 @@ real_wait_idle "${REAL_KEY}"
 real_fault send-keys key=Enter swallow 1
 real_dm "${REAL_LABEL}" "$(python3 -c 'print("x"*5000,end="")')"
 wait_until 180 'large-part Enter was not swallowed' case_assert enter-fault 2
-real_record_pane "${REAL_KEY}"
+real_record_state "${REAL_KEY}"
 real_wait_delivery "${REAL_KEY}" 7
-case_assert key-proof 7 enter
+case_assert key-proof 7 retype
 
 case_assert launches
 real_finish "${REAL_KEY}"

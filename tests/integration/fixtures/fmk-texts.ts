@@ -164,10 +164,6 @@
  *                                                <persona-key> and B <launch-bound-ms>
  *                                                (posted as a persona notice: wrap it in
  *                                                formatPersonaNotice)
- *   DIALOG_POLL_INTERVAL_MS                      src/session-manager.ts, the dialog approver's
- *                                                pace before G, in decimal
- *   DIALOG_SLOW_POLL_INTERVAL_MS                 src/session-manager.ts, the dialog approver's
- *                                                slow pace from G, in decimal
  *   STARTUP_ERROR_SPAWN_FAILED                   src/session-manager.ts, the startup-errors
  *                                                label of a launch failure
  *   liveRowSequenceWaitArmedLine <persona-ref> <launch-start-ms> <grace-ms>
@@ -503,8 +499,7 @@
  *                                                to <retry> - 1, the waits src/unavailable-retry.ts
  *                                                arms (each re-arm is measured from the end of the
  *                                                run before it, so the real due time is no earlier)
- *   waitingRowPaneGoneLineHead <key>             src/session-manager.ts: the head of a line, the
- *   escalateDeadSweepLineHead <key>              text the builder (waitingRowPaneGoneLine,
+ *   escalateDeadSweepLineHead <key>              text the builder (escalateDeadSweepLine,
  *   reconnectGoneLineHead                        escalateDeadSweepLine, reconnectGoneLine) writes
  *                                                before the part agent-director's answer or a
  *                                                verdict fills: for persona <key> (as the builder's
@@ -541,8 +536,6 @@
  *                                                DEFAULT_AD_SETTINGS_IN_EFFECT)
  *   restartCapReachedNoticeText                  src/session-manager.ts, the restart-cap notice's body,
  *                                                a spawn-failure notice (several lines)
- *   FULL_PANE_READ_LINES                         src/pane-read.ts, in decimal: the line count of a
- *                                                full pane read (the waiting-row check's)
  *   ENTER_DELAY_MS                              src/delivery-constants.ts, reconnect's delay
  *                                                between text/no_enter and Enter (b.omv SR-5.4)
  *
@@ -853,14 +846,6 @@
  * fixed-argument entries above; `personaInstanceId <key>` and
  * `personaTmuxSessionName <key>`, which test-24 and test-25 read, are the
  * shared ones.
- *   APPROVER_LOG_PREFIX           src/session-manager.ts APPROVER_LOG_PREFIX: the head
- *                                 of every log line the dialog approver writes
- *   DEV_CHANNELS_DIALOG_NEEDLE    src/session-manager.ts DEV_CHANNELS_DIALOG_NEEDLE: the
- *                                 approver's needle for the dev-channels dialog
- *   TRUST_DIALOG_NEEDLE           src/session-manager.ts TRUST_DIALOG_NEEDLE: the
- *                                 approver's needle for the folder-trust prompt
- *   DIALOG_POLL_INTERVAL_MS       src/session-manager.ts DIALOG_POLL_INTERVAL_MS: the
- *                                 approver's pace before G, in milliseconds
  *   DEFAULT_AD_SETTINGS.tmux.pending_grace_seconds
  *                                 src/ad-settings.ts DEFAULT_AD_SETTINGS, its
  *                                 `tmux.pending_grace_seconds`: agent-director's
@@ -882,11 +867,11 @@
  *   STILL_STOPPING_PHRASE         src/ad-description-phrases.ts STILL_STOPPING_PHRASE:
  *                                 the phrase an ErrTmuxUnresponsive carries for a
  *                                 row that appears to still be stopping
- *   LAUNCH_UNAVAILABLE_OUTCOME_APPROVER
+ *   LAUNCH_UNAVAILABLE_OUTCOME_COVERED_NO_APPROVER
  *                                 src/session-manager.ts
- *                                 LAUNCH_UNAVAILABLE_OUTCOME_APPROVER: the outcome the
+ *                                 LAUNCH_UNAVAILABLE_OUTCOME_COVERED_NO_APPROVER: the outcome the
  *                                 one `get` after a launch timeout logs for a covered
- *                                 `pending` row whose approver it started
+ *                                 `pending` row watched by the retry timer
  *   LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT
  *                                 src/ad-error-class.ts LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT:
  *                                 the name the post-timeout get line gives a launch
@@ -963,19 +948,6 @@
  *                                 src/persona-episodes.ts tmuxUnresponsiveLine for <key>,
  *                                 cut where its text begins: the head of every
  *                                 tmux-unresponsive line of the persona
- *   approverShutdownStopLine <ref>
- *                                 src/session-manager.ts approverLogLine of
- *                                 approverStopRequestedMessage for persona reference
- *                                 <ref> and APPROVER_STOP_SHUTDOWN: the line shutdown
- *                                 logs when it stops the persona's running approver
- * A <key> is a persona key (lower-case letters, digits and `_`); a <ref> is
- * one line. A head or part is printed as it is, a trailing space included.
- *
- * The stuck-launch entries (scenario 21), each printing a `src/` export or a
- * builder's output for its arguments. <ref> is a persona reference as the
- * server logs it (`"<name>" (key=<key>)`), <key> a persona key, <name> a
- * persona name, <launch-start> a row's `launch_started_at` as agent-director
- * prints it, and <bound-ms> B in milliseconds:
  *   PENDING_ROW_RUN_NOT_JUDGED    src/pending-row.ts PENDING_ROW_RUN_NOT_JUDGED: the
  *                                 placement a pending-row rule round's line gives
  *                                 its bypassing `find-missing` run when the run left
@@ -983,33 +955,12 @@
  *   PENDING_ROW_RULE_ORIGIN_RETRY src/pending-row.ts PENDING_ROW_RULE_ORIGIN_RETRY: the
  *                                 origin a rule line names for a run at a retry of
  *                                 the persona's retry timer
- *   PENDING_ROW_RULE_ORIGIN_APPROVER_STOP
- *                                 src/pending-row.ts
- *                                 PENDING_ROW_RULE_ORIGIN_APPROVER_STOP: the origin a
- *                                 rule line names for the run at the dialog
- *                                 approver's stop
  *   adLaunchBoundMs(DEFAULT_AD_SETTINGS_IN_EFFECT)
  *                                 src/ad-settings.ts adLaunchBoundMs over
  *                                 DEFAULT_AD_SETTINGS_IN_EFFECT: B, CSCB's launch
  *                                 bound at agent-director's default settings, in
  *                                 milliseconds
  * None of the above takes an argument.
- *   approverBoundLine <ref> <bound-ms>
- *                                 src/session-manager.ts approverLogLine over
- *                                 approverBoundMessage(<ref>, <bound-ms>,
- *                                 APPROVER_BOUND_FROM_LAUNCH_START): the one line the
- *                                 dialog approver writes when it stops at B measured
- *                                 from the launch start
- *   pendingRowRuleApproverStopRelaunchLine <ref>
- *                                 src/session-manager.ts
- *                                 pendingRowRuleApproverStopLine(<ref>,
- *                                 APPROVER_STOP_BOUND, …) for the rule's answer
- *                                 PENDING_ROW_RULE_RELAUNCH with
- *                                 PENDING_ROW_RELAUNCH_SEQUENCE_STARTED
- *                                 (src/pending-row.ts): the line of the rule's run at
- *                                 the approver's stop at B that made the relaunching
- *                                 post and the abort, and started the live-row
- *                                 sequence
  *   stuckLaunchRelaunchingPost <name> <key> <bound-ms>
  *                                 src/persona-notifier.ts formatPersonaNotice for the
  *                                 persona over src/pending-row.ts
@@ -1061,7 +1012,7 @@
  *                                 src/pending-row.ts pendingRowRuleRoundLine(<ref>,
  *                                 <origin>, …), where <origin> is
  *                                 PENDING_ROW_RULE_ORIGIN_RETRY or
- *                                 PENDING_ROW_RULE_ORIGIN_APPROVER_STOP by its value,
+ *                                 PENDING_ROW_RULE_ORIGIN_RETRY by its value,
  *                                 cut where the launch start's rendering
  *                                 (describeLaunchStartForLog) begins: the head of every
  *                                 round line of the pending-row rule for <ref> from
@@ -1866,18 +1817,6 @@ function headBefore(entry: string, line: string): string {
   return line.slice(0, at)
 }
 
-/** `waitingRowPaneGoneLine(<key>, <a GONE pane read>)` before the read's description. */
-const waitingRowPaneGoneHead: Entry = {
-  synopsis: '<key>',
-  async print(args, context) {
-    const entry = 'waitingRowPaneGoneLineHead'
-    expectArguments(entry, args, ['key'])
-    const kind = await packageString(context, 'pane-read.ts', 'PANE_READ_GONE')
-    const errorClass = await packageString(context, 'ad-error-class.ts', 'AD_ERROR_CLASS_GONE')
-    const build = await packageFunction<(key: string, read: object) => unknown>(context, 'session-manager.ts', 'waitingRowPaneGoneLine')
-    return headBefore(entry, builtString(entry, build(args[0], { kind, errorClass, description: HEAD_SENTINEL })))
-  },
-}
 
 /** `escalateDeadSweepLine(<key>, <verdict>)` before the verdict. */
 const escalateDeadSweepHead: Entry = {
@@ -3528,23 +3467,6 @@ async function tmuxUnresponsiveLineHead(key: string): Promise<string> {
   return checkKeyHead(builder, cutAtMark(builder, build(key, VALUE_MARK), VALUE_MARK), key)
 }
 
-/**
- * The approver's line when shutdown stops it for persona reference `ref`:
- * the package's `approverLogLine(approverStopRequestedMessage(ref,
- * APPROVER_STOP_SHUTDOWN))` (src/session-manager.ts), the line
- * `stopAllDialogApprovers` logs.
- */
-async function approverShutdownStopLine(ref: string): Promise<string> {
-  checkOneLine('approverShutdownStopLine', 'ref', ref)
-  const logLine = await functionExport('session-manager.ts', 'approverLogLine')
-  const message = await functionExport('session-manager.ts', 'approverStopRequestedMessage')
-  const reason = await stringExport('session-manager.ts', 'APPROVER_STOP_SHUTDOWN')
-  const line = logLine(message(ref, reason))
-  if (typeof line !== 'string' || line.includes('\n') || !line.includes(ref) || !line.includes(reason)) {
-    throw new PrinterFailure("the installed package's src/session-manager.ts approverStopRequestedMessage gave no one-line text naming the reference and the shutdown reason", PRINTER_FAIL_EXIT)
-  }
-  return line
-}
 
 /** A builder's output, which must be a string. */
 function builtText(relPath: string, name: string, value: unknown): string {
@@ -3577,23 +3499,7 @@ async function formattedPersonaNotice(name: string, key: string, text: string): 
   return builtText('persona-notifier.ts', 'formatPersonaNotice', format({ name, key }, text))
 }
 
-/** The approver's one line at B measured from the launch start, for `ref` and B `boundMs`. */
-async function approverBoundLine(ref: string, boundMs: number): Promise<string> {
-  const lineOf = await functionExport('session-manager.ts', 'approverLogLine')
-  const messageOf = await functionExport('session-manager.ts', 'approverBoundMessage')
-  const from = await stringExport('session-manager.ts', 'APPROVER_BOUND_FROM_LAUNCH_START')
-  const message = builtText('session-manager.ts', 'approverBoundMessage', messageOf(ref, boundMs, from))
-  return builtText('session-manager.ts', 'approverLogLine', lineOf(message))
-}
 
-/** The line of the rule's run at the approver's stop at B that answered the relaunch with the sequence started, for `ref`. */
-async function pendingRowRuleApproverStopRelaunchLine(ref: string): Promise<string> {
-  const lineOf = await functionExport('session-manager.ts', 'pendingRowRuleApproverStopLine')
-  const bound = await stringExport('session-manager.ts', 'APPROVER_STOP_BOUND')
-  const relaunch = await stringExport('pending-row.ts', 'PENDING_ROW_RULE_RELAUNCH')
-  const started = await stringExport('pending-row.ts', 'PENDING_ROW_RELAUNCH_SEQUENCE_STARTED')
-  return builtText('session-manager.ts', 'pendingRowRuleApproverStopLine', lineOf(ref, bound, { kind: relaunch, answer: { kind: started } }))
-}
 
 /** The relaunching post for the persona `name` with key `key`, with B `boundMs`. */
 async function stuckLaunchRelaunchingPost(name: string, key: string, boundMs: number): Promise<string> {
@@ -3660,7 +3566,6 @@ const LAUNCH_START_MARK_MS = 946_684_800_000
 async function pendingRowRuleRoundLineHead(ref: string, origin: string): Promise<string> {
   const o = await oneOfExports('pendingRowRuleRoundLineHead', 'origin', origin, 'pending-row.ts', [
     'PENDING_ROW_RULE_ORIGIN_RETRY',
-    'PENDING_ROW_RULE_ORIGIN_APPROVER_STOP',
   ])
   const lineOf = await functionExport('pending-row.ts', 'pendingRowRuleRoundLine')
   const render = await functionExport('pending-row.ts', 'describeLaunchStartForLog')
@@ -3790,9 +3695,6 @@ async function personaDefaultConfigDirLabels(key: string, home: string): Promise
 
 /** The one-function entries, by the name a script passes. */
 const FN_ENTRIES: Readonly<Record<string, FnEntry>> = {
-  APPROVER_LOG_PREFIX: noArguments('APPROVER_LOG_PREFIX', () => stringExport('session-manager.ts', 'APPROVER_LOG_PREFIX')),
-  DEV_CHANNELS_DIALOG_NEEDLE: noArguments('DEV_CHANNELS_DIALOG_NEEDLE', () => stringExport('session-manager.ts', 'DEV_CHANNELS_DIALOG_NEEDLE')),
-  TRUST_DIALOG_NEEDLE: noArguments('TRUST_DIALOG_NEEDLE', () => stringExport('session-manager.ts', 'TRUST_DIALOG_NEEDLE')),
   'DEFAULT_AD_SETTINGS.tmux.pending_grace_seconds': noArguments('DEFAULT_AD_SETTINGS.tmux.pending_grace_seconds', () =>
     wholeNumberAt('ad-settings.ts', 'DEFAULT_AD_SETTINGS', ['tmux', 'pending_grace_seconds']),
   ),
@@ -3802,8 +3704,8 @@ const FN_ENTRIES: Readonly<Record<string, FnEntry>> = {
   'DEFAULT_AD_SETTINGS.tmux.stopping_window_seconds': noArguments('DEFAULT_AD_SETTINGS.tmux.stopping_window_seconds', () =>
     wholeNumberAt('ad-settings.ts', 'DEFAULT_AD_SETTINGS', ['tmux', 'stopping_window_seconds']),
   ),
-  LAUNCH_UNAVAILABLE_OUTCOME_APPROVER: noArguments('LAUNCH_UNAVAILABLE_OUTCOME_APPROVER', () =>
-    stringExport('session-manager.ts', 'LAUNCH_UNAVAILABLE_OUTCOME_APPROVER'),
+  LAUNCH_UNAVAILABLE_OUTCOME_COVERED_NO_APPROVER: noArguments('LAUNCH_UNAVAILABLE_OUTCOME_COVERED_NO_APPROVER', () =>
+    stringExport('session-manager.ts', 'LAUNCH_UNAVAILABLE_OUTCOME_COVERED_NO_APPROVER'),
   ),
   LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT: noArguments('LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT', () =>
     stringExport('ad-error-class.ts', 'LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT'),
@@ -3822,12 +3724,8 @@ const FN_ENTRIES: Readonly<Record<string, FnEntry>> = {
   launchUnavailableGetLineParts: oneArgument('launchUnavailableGetLineParts', 'ref', launchUnavailableGetLineParts),
   launchUnavailableFormText: oneArgument('launchUnavailableFormText', 'form', launchUnavailableFormText),
   tmuxUnresponsiveLineHead: oneArgument('tmuxUnresponsiveLineHead', 'key', tmuxUnresponsiveLineHead),
-  approverShutdownStopLine: oneArgument('approverShutdownStopLine', 'ref', approverShutdownStopLine),
   PENDING_ROW_RUN_NOT_JUDGED: noArguments('PENDING_ROW_RUN_NOT_JUDGED', () => stringExport('pending-row.ts', 'PENDING_ROW_RUN_NOT_JUDGED')),
   PENDING_ROW_RULE_ORIGIN_RETRY: noArguments('PENDING_ROW_RULE_ORIGIN_RETRY', () => stringExport('pending-row.ts', 'PENDING_ROW_RULE_ORIGIN_RETRY')),
-  PENDING_ROW_RULE_ORIGIN_APPROVER_STOP: noArguments('PENDING_ROW_RULE_ORIGIN_APPROVER_STOP', () =>
-    stringExport('pending-row.ts', 'PENDING_ROW_RULE_ORIGIN_APPROVER_STOP'),
-  ),
   'adLaunchBoundMs(DEFAULT_AD_SETTINGS_IN_EFFECT)': noArguments('adLaunchBoundMs(DEFAULT_AD_SETTINGS_IN_EFFECT)', async () => {
     const bound = await functionExport('ad-settings.ts', 'adLaunchBoundMs')
     const value: unknown = bound(await exportOf('ad-settings.ts', 'DEFAULT_AD_SETTINGS_IN_EFFECT'))
@@ -3836,10 +3734,6 @@ const FN_ENTRIES: Readonly<Record<string, FnEntry>> = {
     }
     return String(value)
   }),
-  approverBoundLine: exactArguments('approverBoundLine', ['ref', 'bound-ms'], ([ref, ms]) =>
-    approverBoundLine(ref!, wholeMsArgument('approverBoundLine', 'bound-ms', ms!)),
-  ),
-  pendingRowRuleApproverStopRelaunchLine: oneArgument('pendingRowRuleApproverStopRelaunchLine', 'ref', pendingRowRuleApproverStopRelaunchLine),
   stuckLaunchRelaunchingPost: exactArguments('stuckLaunchRelaunchingPost', ['name', 'key', 'bound-ms'], ([name, key, ms]) =>
     stuckLaunchRelaunchingPost(name!, key!, wholeMsArgument('stuckLaunchRelaunchingPost', 'bound-ms', ms!)),
   ),
@@ -4147,7 +4041,6 @@ const ENTRIES: Readonly<Record<string, Entry>> = joinEntryTables({
   UNAVAILABLE_RETRY_BASE_S: constantEntry('unavailable-retry.ts', 'UNAVAILABLE_RETRY_BASE_S'),
   UNAVAILABLE_RETRY_CEILING_S: constantEntry('unavailable-retry.ts', 'UNAVAILABLE_RETRY_CEILING_S'),
   unavailableRetryDueS: unavailableRetryDue,
-  waitingRowPaneGoneLineHead: waitingRowPaneGoneHead,
   escalateDeadSweepLineHead: escalateDeadSweepHead,
   reconnectGoneLineHead: reconnectGoneHead,
   relaunchAfterKillLine: relaunchAfterKill,
@@ -4157,7 +4050,6 @@ const ENTRIES: Readonly<Record<string, Entry>> = joinEntryTables({
   tmuxUnresponsiveOnsetText: builderEntry('persona-episodes.ts', 'tmuxUnresponsiveOnsetText', ['key']),
   tmuxUnresponsiveAlertText: unresponsiveAlert,
   restartCapReachedNoticeText: builderEntry('session-manager.ts', 'restartCapReachedNoticeText', []),
-  FULL_PANE_READ_LINES: constantEntry('pane-read.ts', 'FULL_PANE_READ_LINES'),
   // b.omv SR-5.4: reconnect's text and Enter use the production delay.
   ENTER_DELAY_MS: constantEntry('delivery-constants.ts', 'ENTER_DELAY_MS'),
   // Scenario 8 (test-20-fmk-old-binary.sh).
@@ -4175,8 +4067,6 @@ const ENTRIES: Readonly<Record<string, Entry>> = joinEntryTables({
   adAlertThresholdMs: derivedWaitEntry('adAlertThresholdMs'),
   wholeMinutes: minutesOf,
   stuckLaunchRelaunchingText: relaunchingText,
-  DIALOG_POLL_INTERVAL_MS: constantEntry('session-manager.ts', 'DIALOG_POLL_INTERVAL_MS'),
-  DIALOG_SLOW_POLL_INTERVAL_MS: constantEntry('session-manager.ts', 'DIALOG_SLOW_POLL_INTERVAL_MS'),
   STARTUP_ERROR_SPAWN_FAILED: constantEntry('session-manager.ts', 'STARTUP_ERROR_SPAWN_FAILED'),
   liveRowSequenceWaitArmedLine: liveRowWaitArmedLine,
   liveRowSequenceWaitEndedLine: liveRowWaitEndedLine,

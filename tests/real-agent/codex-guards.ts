@@ -172,21 +172,6 @@ export function createScratchCodexLifecycle(options: {
   }
 }
 
-/** AD 0.12 accepts no draft-clearing key. Each probe owns a disposable row.
- * Escape is captured before retirement, never treated as proof of an empty
- * composer. Every probe row is killed through AD, which confirms process exit;
- * the caller then runs find-missing because kill does not change row state. */
-export async function retireCodexObservation(io: {
-  sendEscape(): Promise<unknown>; afterEscape(): Promise<unknown>;
-  kill(): Promise<unknown>; ended(): Promise<boolean>
-}, options: { draft: boolean; waiting: boolean }) {
-  if (options.draft) {
-    try { await io.sendEscape(); await io.afterEscape() }
-    finally { await io.kill() }
-  } else await io.kill()
-  if (!await io.ended()) throw new Error('observation row retirement was not confirmed')
-}
-
 /** Called only after a successful supported kill, never as process-exit proof. */
 export async function codexRetirementCheckpoint(io: {
   findMissing(): Promise<unknown>; state(): Promise<string>

@@ -80,20 +80,7 @@
  *   reuse-spawn    the package's `_forceReuseSpawnForPersona`: one reuse
  *                  spawn (`reuse_finished`) of the persona's own id
  *                  (scenarios 8 and 25).
- *     A launch that returned success starts the persona's dialog approver
- *     without awaiting it; before printing its line, each of the two stops
- *     it through the package's shutdown stop (`stopAllDialogApprovers`) and
- *     waits until it has ended, its call in progress included, so no
- *     agent-director call it caused is in flight when the driver exits.
- *     Their line:
- *       DRIVER: FORCED <call> called=<bool> action=<action> counted=<bool> latched=<bool> error=<name> class=<class> [unknown_name=<name>] description=<json> result=<json>
- *     with `error=none` and no class or description when the call returned
- *     success or was not made. `action` and `result` are what the
- *     production path answered; `error`, `class`, `unknown_name` and
- *     `description` the forced call's own error as CSCB classified it;
- *     `counted` whether the result was counted as a launch failure;
- *     `latched` whether the persona is latched afterwards (no latch is
- *     installed, so only a `latched` answer reads true).
+ *     Successful launches leave readiness and startup holds to AD.
  *
  *   read-pane-other-tmux-tmpdir
  *                  the package's `readPersonaOwnPane` (the persona's
@@ -103,7 +90,7 @@
  *                  once it settles (scenario 26).
  *     Its line:
  *       DRIVER: FORCED read-pane-other-tmux-tmpdir tmux_tmpdir=<json> restored=<bool> outcome=<kind> …
- *     followed, for a pane, by `lines=<n> last_line=<json>`; for a failure,
+ *     followed by AD outcome/error class fields only; for a failure,
  *     by `class=<class> description=<json>` (the description starts with the
  *     reported name) and `stopping=true` when its version re-check decided
  *     the stop; for a latched answer, by `cause=none`, or by the latching
@@ -179,8 +166,6 @@ interface ForcedLaunchOutcome {
 /** What the package's own-pane reader answers. */
 interface OwnPaneReadOutcome {
   readonly kind: string
-  readonly pane?: string
-  pane_sha256?: string
   readonly errorClass?: string
   readonly description?: string
   readonly stopping?: boolean
@@ -337,17 +322,7 @@ function forcedLaunchCall(call: keyof typeof FORCED_LAUNCH_SEAMS): ForcedCall {
       'session-manager.ts',
       FORCED_LAUNCH_SEAMS[call],
     )
-    const stopAllDialogApprovers = await packageFunction<() => Promise<void>>(
-      context,
-      'session-manager.ts',
-      'stopAllDialogApprovers',
-    )
     const outcome = await seam(prepared.persona, prepared.config)
-    // A launch that returned success started the persona's dialog approver
-    // without awaiting it. Its stop (the package's shutdown stop) waits for
-    // the call in progress, so no agent-director call of the driver's is left
-    // running when it prints its line and exits.
-    await stopAllDialogApprovers()
     console.log(forcedLaunchLine(call, outcome))
     return 0
   }
@@ -365,11 +340,6 @@ function latchingErrorFields(value: unknown): string[] {
 
 /** The fields of the pane read's outcome line after `outcome=<kind>`. */
 function paneOutcomeFields(outcome: OwnPaneReadOutcome): string[] {
-  if (typeof outcome.pane === 'string') {
-    const lines = outcome.pane.split('\n')
-    const lastLine = [...lines].reverse().find((line) => line.trim() !== '') ?? ''
-    return [`lines=${lines.length}`, `last_line=${JSON.stringify(lastLine)}`]
-  }
   if (outcome.errorClass !== undefined) {
     const fields = [`class=${outcome.errorClass}`, `description=${JSON.stringify(outcome.description ?? '')}`]
     if (outcome.stopping === true) fields.push('stopping=true')
@@ -405,7 +375,7 @@ const readPaneOtherTmuxTmpdir: ForcedCall = async (args, context) => {
     'session-manager.ts',
     'readPersonaOwnPane',
   )
-  const nLines = await packageValue(context, 'pane-read.ts', 'FULL_PANE_READ_LINES')
+  const nLines = await packageValue(context, 'pane-read.ts', 'PROBE_PANE_READ_LINES')
   // The driver reads no row state before the call; a latch the read set
   // would record the row as unreadable (no latch is installed here).
   const lastRead = await packageValue(context, 'conflict-latch.ts', 'LATCH_ROW_STATE_UNREADABLE')

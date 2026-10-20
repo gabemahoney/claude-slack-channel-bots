@@ -88,18 +88,12 @@ export function projectCodexFailure(entry: TranscriptEntry) {
     ...fields(v, identityFields), ...errorFields(v), payload: { ...fields(p, [...identityFields, 'id', 'role', 'model', 'turn_id', 'call_id', 'name',
       'status', 'decision', 'approval', 'request_id', 'thread_id', 'parent_thread_id']), ...errorFields(p), content: contentMetadata(p?.content) } }
 }
-/** Preserve the final pane's rows and UI markers, never conversation or draft text.
- * Unknown text is withheld, including history, menu labels and tool arguments. */
-export function projectFailurePane(pane: unknown) {
-  if (typeof pane !== 'string') return { unavailable: true }
-  const lines = pane.replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, '').replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '').replace(/\r/g, '').split('\n')
-  return { lines: lines.map(line => {
-    if (/^\s*$/.test(line) || /^\s*(?:l>)?[─━-]{8,}\s*$/.test(line)
-      || /^\s*⏸ manual mode on(?: · \? for shortcuts(?: · ← for agents)?)?\s*$/.test(line)) return line
-    const prompt = line.match(/^(\s*[❯›>][ \u00a0]?)(.*)$/)
-    if (prompt) return prompt[1] + (prompt[2] ? '[text withheld]' : '')
-    return '[text withheld]'
-  }) }
+/** Only AD contract fields leave the container. Native pane text is never read. */
+export function projectFailureState(row: unknown) {
+  if (!row || typeof row !== 'object' || Array.isArray(row)) return { unavailable: true }
+  const value = row as Record<string, unknown>
+  const state = ['pending', 'waiting', 'working', 'ended', 'paused'].includes(String(value.state)) ? value.state : 'unreadable'
+  return { state, ...fields(value, ['family_state', 'transcript_status']) }
 }
 /** Reads only JSONL below the scenario's isolated transcript directory. No
  * auth/config path or symlink is read. Partial/malformed records stay visible. */
@@ -138,12 +132,15 @@ export function emitFailureEvidence(scope: Record<string, unknown>, records: unk
   for (const record of records) emit(AI_FAILURE_PREFIX + scrubDiagnosticText(JSON.stringify({ ...scope, event: 'transcript', record })))
 }
 
-export async function captureFailureEvidence(agent: 'claude' | 'codex', root: string, scope: Record<string, unknown>, panes: string, emit = console.log) {
+export async function captureFailureEvidence(agent: 'claude' | 'codex', root: string, scope: Record<string, unknown>, states: string, emit = console.log) {
   emitFailureEvidence({ ...scope, agent }, await scenarioFailureRecords(root, agent), emit)
   let snapshots: unknown[] = []
-  try { snapshots = readFileSync(panes, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line)) }
-  catch { /* Missing panes remain explicit even when transcript capture succeeds. */ }
-  for (const pane of snapshots.length ? snapshots : [{ unavailable: true }]) emit(AI_FAILURE_PREFIX + scrubDiagnosticText(JSON.stringify({ ...scope, agent, event: 'pane', pane })))
+  try { snapshots = readFileSync(states, 'utf8').split('\n').filter(Boolean).map(line => {
+    const value = JSON.parse(line)
+    return { ...projectFailureState(value), ...fields(value, ['key', 'instance']) }
+  }) }
+  catch { /* Missing AD state remains explicit even when transcript capture succeeds. */ }
+  for (const state of snapshots.length ? snapshots : [{ unavailable: true }]) emit(AI_FAILURE_PREFIX + scrubDiagnosticText(JSON.stringify({ ...scope, agent, event: 'ad-state', state })))
 }
 
 /** Called by the coordinator before deleting a failed job's container. The
@@ -160,15 +157,15 @@ export function retainFailureLine(output: string, line: string, redact: (value: 
 if (import.meta.main) {
   try {
     if (!existsSync('/etc/cscb-ci-image')) throw new Error('CI image required')
-    const [command, agent, root, scenario, trial, panes] = process.argv.slice(2)
-    if (command === 'pane') {
+    const [command, agent, root, scenario, trial, states] = process.argv.slice(2)
+    if (command === 'state') {
       const value = JSON.parse(readFileSync(root!, 'utf8'))
-      console.log(JSON.stringify({ key: diagnosticValue(scenario), ...projectFailurePane(value?.pane) }))
+      console.log(JSON.stringify({ key: diagnosticValue(scenario), ...projectFailureState(value) }))
     } else if (command === 'capture' && (agent === 'claude' || agent === 'codex')) {
-      await captureFailureEvidence(agent, root!, { scenario, trial }, panes!)
+      await captureFailureEvidence(agent, root!, { scenario, trial }, states!)
     } else throw new Error('Unknown diagnostic command')
   } catch {
-    if (process.argv[2] === 'pane') console.log(JSON.stringify({ unavailable: true }))
+    if (process.argv[2] === 'state') console.log(JSON.stringify({ unavailable: true }))
     else emitFailureEvidence({ agent: diagnosticValue(process.argv[3]), scenario: diagnosticValue(process.argv[5]), unavailable: true }, [])
   }
 }

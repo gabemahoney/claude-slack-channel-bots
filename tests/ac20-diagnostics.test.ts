@@ -1,13 +1,13 @@
 /** Decision21(c) observation controls. No model, native binary or integration driver runs here. */
 import { describe, expect, test } from 'bun:test'
-import { readFileSync, writeFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs'
-import { join } from 'node:path'
-import { tmpdir } from 'node:os'
-import { createHash } from 'node:crypto'
-import { createServer, request, type Server } from 'node:http'
 import { spawnSync } from 'node:child_process'
-import { AC20_COMPLETION_MS, AC20_DIAGNOSTIC_CEILING_MS, AC20_AFTER_RETRY_MS, AC20_NATIVE_SHA256, observeAC20Completion, nativeDebugProjection, gatewayCorrelations, linkedRetryForStalledRequest, startDiagnosticGateway, parseNativeProcessStat } from './real-agent/ac20-diagnostics.ts'
-import { assertNoLeak, fakeToken, BOT_TOKEN_PREFIX } from './test-helpers/credentials.ts'
+import { createHash } from 'node:crypto'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { createServer, request, type Server } from 'node:http'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { AC20_AFTER_RETRY_MS, AC20_COMPLETION_MS, AC20_DIAGNOSTIC_CEILING_MS, AC20_NATIVE_SHA256, gatewayCorrelations, linkedRetryForStalledRequest, nativeDebugProjection, observeAC20Completion, parseNativeProcessStat, startDiagnosticGateway } from './real-agent/ac20-diagnostics.ts'
+import { assertNoLeak, BOT_TOKEN_PREFIX, fakeToken } from './test-helpers/credentials.ts'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 
 type Row = Parameters<Parameters<typeof nativeDebugProjection>[0]>[0]
@@ -353,9 +353,9 @@ test.each([[20, 'decision21c', 1], [20, '', 1], [20, 'other', 2], [12, 'decision
     expect(result.stdout).toBe(`${enabled ? `scope:${seq}\n` : ''}intake\ndelivery\n${enabled ? `diagnostic:expected/${seq}.json:${seq}` : `ordinary:180:${criterion === 11 && seq === 3 ? 'ai_spoof_readback' : 'ai_readback'}`}\n`)
   } finally { rmSync(home, { recursive: true, force: true }) }
 })
-test('removing only diagnostic additions restores the exact previously captured scenario bytes', () => {
+test('removing diagnostic additions preserves the approved AD-state-only scenario bytes', () => {
   expect(scenario.split(caseGate)).toHaveLength(2); expect(scenario.split(waitGate)).toHaveLength(2)
-  expect(createHash('sha256').update(scenario.replace(caseGate, '').replace(waitGate, '')).digest('hex')).toBe('4a96b137596887ccbc4705365ad9ac625002aa513015142a1c6bcca91106bef7')
+  expect(createHash('sha256').update(scenario.replace(caseGate, '').replace(waitGate, '')).digest('hex')).toBe('e7db0b966873a660553d314ba53e0144d4f7d035b654d890caa1bdfa8516a273')
 })
 
 function procStat(pid: number, state = 'S', started = '111', comm = 'native ) spaced') {

@@ -49,7 +49,7 @@ src/agent-director-template.ts | refreshSlackChannelBotTemplate | const client =
 src/session-manager.ts | reconcileOrphans | const client = getClient()  # reconcileOrphans start sweep (its rows have no single-persona attribution)
 src/permission-poller.ts | runTick | const client = deps.getClient()  # list-level client.list at top of runTick (no single-persona context)
 src/cli.ts | directorGet | const r: GetResult = await getClient().get({ instance_id: id })  # CLI precheck: get of cscb_<key>
-src/cli.ts | directorReadPane | const r = await getClient().readPane({ instance_id: id, n_lines: nLines })  # CLI precheck: one-line read-pane of cscb_<key>
+src/cli.ts | directorReadPane | await getClient().readPane({ instance_id: id, n_lines: nLines })  # CLI precheck: one-line read-pane of cscb_<key>
 src/cli.ts | directorStatus | const r = await getClient().status({ instance_id: id })  # CLI persona teardown: status of cscb_<key>
 src/cli.ts | directorPause | await getClient().pause({ instance_id: id })  # CLI persona teardown: pause cscb_<key>
 src/cli.ts | directorKill | return getClient().kill({ instance_id: id })  # CLI persona teardown: kill cscb_<key>

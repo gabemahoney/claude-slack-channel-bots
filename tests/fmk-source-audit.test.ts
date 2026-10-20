@@ -98,29 +98,28 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import * as agentDirectorClient from 'agent-director'
-import { existsSync, lstatSync, readlinkSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
-import { tmpdir } from 'node:os'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { spawnSync } from 'node:child_process'
-import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
-import { assertNoLeak, writtenFile } from './test-helpers/credentials.ts'
+import { existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import ts from 'typescript'
+import { assertNoLeak, writtenFile } from './test-helpers/credentials.ts'
+import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 
-import { classifyAdError, AD_ERROR_CLASS_UNUSABLE_NAME, AD_ERROR_CLASS_UNCLASSIFIED, AD_ERROR_CLASS_CONFIG, AD_ERROR_CLASS_UNAVAILABLE, AD_ERROR_CLASS_CONFLICT } from '../src/ad-error-class.ts'
+import { AD_ERROR_CLASS_CONFIG, AD_ERROR_CLASS_CONFLICT, AD_ERROR_CLASS_UNAVAILABLE, AD_ERROR_CLASS_UNCLASSIFIED, AD_ERROR_CLASS_UNUSABLE_NAME, classifyAdError } from '../src/ad-error-class.ts'
 import { adConfigMalformedOnset } from '../src/outage-state.ts'
-import { paneReadFailureOf, PANE_READ_GONE } from '../src/pane-read.ts'
-import { ENTER_DELAY_MS } from '../src/delivery-constants.ts'
-import { FULL_PANE_READ_LINES, readDeliveryScreen } from '../src/delivery-screen.ts'
-import { parseDeliveryTranscriptRecord } from '../src/delivery-receipt.ts'
-import { latchRecheckRoundLine, decideLatchRecheckProbe, RECHECK_VERDICT_CLEARED, recogniseConflictCase, LATCH_CASE_OWN_ID } from '../src/conflict-latch.ts'
+import { PANE_READ_GONE, paneReadFailureOf } from '../src/pane-read.ts'
+
 import { AD_TMUX_TABLE } from '../src/ad-settings.ts'
-import { PHASE1_ONLY_ERR_NAMES } from '../src/agent-director-errors.ts'
 import { buildSystemInstallTooOldMessage, compareAdVersions, FOUND_BY_RUNTIME_RECHECK, FOUND_BY_STARTUP_CHECK, meetsPhase1Floor, PHASE1_FLOOR_VERSION } from '../src/ad-version-gate.ts'
+import { PHASE1_ONLY_ERR_NAMES } from '../src/agent-director-errors.ts'
+import { decideLatchRecheckProbe, LATCH_CASE_OWN_ID, latchRecheckRoundLine, RECHECK_VERDICT_CLEARED, recogniseConflictCase } from '../src/conflict-latch.ts'
+import { parseDeliveryTranscriptRecord } from '../src/delivery-receipt.ts'
 import { renderInstallSkillInstructions } from '../src/install-skill-pointer.ts'
-import { CLIENT_MIN_VERSION } from './test-helpers/agent-director-versions.ts'
 import { AD_NS, AGENT_DIRECTOR_MODULE, agentDirectorNamespaceArguments, agentDirectorValueReads, finding } from './test-helpers/ad-value-reads.ts'
+import { CLIENT_MIN_VERSION } from './test-helpers/agent-director-versions.ts'
 import {
   callArguments,
   DELETE_HELPERS,
@@ -1506,7 +1505,6 @@ describe('released client unknown-envelope classification audit', () => {
   })
 })
 
-
 // b.m2o: evaluate only extracted helper declarations with inert shell stubs.
 // Never source the integration harness or start a real AD/tmux/worker process.
 describe('b.m2o: deliberate pre-0.12 integration contracts', () => {
@@ -1566,23 +1564,7 @@ printf 'SESSION=%s\\n' "\${E4_OLD_SESSION[$id]}")
 printf 'RESULT=%s' "$?"`, ['jq'])
     expect(output).toBe(accepted ? 'SESSION=old-session\nRESULT=0' : 'RESULT=1')
   })
-  test.each(['test-16-fmk-conflict.sh', 'test-23-fmk-latch-recheck.sh'])('%s ordinary personas explicitly await supported trust input', file => {
-    const source = readFileSync(join(import.meta.dir, 'integration', file), 'utf8')
-    const output = shell(`${helper('prepare_persona', source)}
-SCENARIO_ROOT="$HOME"
-STUB_MODE_STARTUP_TRUST=startup-trust
-declare -A PERSONA_TOKEN=([fixture]=fixture) PERSONA_WORK PERSONA_CREDS PERSONA_ID PERSONA_NAMED PERSONA_REF PERSONA_NAME
-make_workdir() { printf /fixture; }
-stub_mode() { printf 'MODE=%s:%s\\n' "$1" "$2"; }
-fake_token() { printf inert; }
-write_file() { while IFS= read -r line; do :; done; }
-fmk_text() { printf fixture; }
-persona_ref() { printf fixture; }
-fail() { exit 1; }
-prepare_persona fixture`, ['mkdir'])
-    expect(output).toBe('MODE=/fixture:startup-trust')
-    assertNoLeak({ output })
-  })
+
   const worker = readFileSync(join(import.meta.dir, 'integration/fixtures/stub-claude.sh'), 'utf8')
   // b.omv SR-13.6: inspect only extracted byte-writing declarations, never
   // execute the integration worker, source the harness, or launch AD/tmux.
@@ -1629,10 +1611,7 @@ cat "$TRANSCRIPT"`, ['mkdir', 'jq', 'cat', 'date'])
     expect(parseDeliveryTranscriptRecord('claude', records[1])).toMatchObject({ kind: 'take-in', text })
     assertNoLeak(output)
   })
-  test('b.omv SR-13.6: reported Linux box is accepted by the production screen reader', () => {
-    const pane = shell(`${helper('draw_composer', worker)}\ncomposer=''\ndraw_composer`)
-    expect(readDeliveryScreen('claude', pane)).toEqual({ kind: 'empty', running: false })
-  })
+
   test('b.omv SR-13.6: first-message mode ignores blank/slash commands, reconnects, and recognises a sentinel in submitted text', () => {
     const output = shell(`${helper('handle_line', worker)}
 MODE=transcript-on-first-message
@@ -1653,38 +1632,7 @@ handle_line $'leftover\\n__CSCB_TEST_EXIT__'
 exit 9`)
     expect(output).toBe('reconnect\nreceipt:<first\nmessage>\nend')
   })
-  const reconnectRows = (change: string): string => {
-    const pane = `--instance-id fixture --n-lines ${FULL_PANE_READ_LINES}`
-    const rows = [
-      ['1', '1.000000', '42', 'read-pane', 'fixture', pane],
-      ['2', '1.100000', '42', 'read-pane', 'fixture', pane],
-      ['3', '1.200000', '42', 'send-keys', 'fixture', "--instance-id fixture --text '/mcp reconnect slack-channel-router' --no-enter"],
-      ['4', `${Math.floor((1200 + ENTER_DELAY_MS) / 1000)}.${String(((1200 + ENTER_DELAY_MS) % 1000) * 1000).padStart(6, '0')}`, '42', 'send-keys', 'fixture', '--instance-id fixture --key Enter'],
-    ]
-    if (change === 'wrong-parent') rows[2]![2] = '43'
-    if (change === 'short-read') rows[1]![5] = '--instance-id fixture --n-lines 1'
-    if (change === 'no-fresh-screen') rows.splice(1, 1)
-    if (change === 'early-enter') rows[3]![1] = '1.200001'
-    if (change === 'combined-enter') rows[2]![5] = rows[2]![5]!.replace(' --no-enter', '')
-    if (change === 'wrong-key') rows[3]![5] = '--instance-id fixture --key Escape'
-    if (change === 'guard-bypass') rows[2]![5] += ' --allow-pending'
-    if (change === 'hash-guard') rows[3]![5] += ' --expect-pane-sha256 fixture'
-    return rows.map(row => row.join('\t')).join('\n')
-  }
-  test.each(['pass', 'wrong-parent', 'short-read', 'no-fresh-screen', 'early-enter', 'combined-enter', 'wrong-key', 'guard-bypass', 'hash-guard'])(
-    'b.omv SR-5.3/5.4/5.5: fmk reconnect assertion %s keeps provenance, screen proof, delay and guards', change => {
-      const rows = reconnectRows(change).replaceAll("'", "'\\''")
-      const output = shell(`${['_scenario_to_us', '_scenario_eval_words', '_scenario_assert_reconnect_rows'].map(name => helper(name)).join('\n')}
-fail() { printf 'REFUSED: %s\\n' "$*"; exit 1; }
-(_scenario_assert_reconnect_rows fixture 42 ${ENTER_DELAY_MS} ${FULL_PANE_READ_LINES} '${rows}')
-printf 'RESULT=%s\\n' "$?"`)
-      if (change === 'pass') expect(output).toBe('RESULT=0')
-      else {
-        expect(output).toContain('REFUSED: fixture:')
-        expect(output).toEndWith('RESULT=1')
-      }
-    },
-  )
+
   test.each([
     ['0.10 hook', '.agent-director', '17', '29', '17'],
     ['0.11 hook', '.agent-director', '23', '31', '23'],
@@ -1893,7 +1841,7 @@ while IFS= read -r line; do printf '%s\\n' "$line"; done < "$HOME/calls"`
     }
     expect(output).not.toMatch(/--agent|expire|delete/)
   })
-  test.each(['reports', 'never-reports'])('reinstall %s: answer startup and await report before kill', (mode) => {
+  test.each(['reports', 'never-reports'])('reinstall %s: await an AD report before kill', (mode) => {
     const output = shell(`${helper('leg_reinstall', selfCheck)}
 ${helper('nested_seed_row_quiescent', selfCheck)}
 ${helper('nested_quiesce_seed_row', selfCheck)}
@@ -1907,11 +1855,9 @@ T0_SESSION=t0-self-check
 AD_OUT="$HOME/row.json"
 AD_ERR="$HOME/err"
 state=pending
-entered=0
 polls=0
 killed=0
 fail() { printf 'REFUSED: %s\\n' "$*"; exit 1; }
-stub_press_enter() { [[ "$1" == "$T0_SESSION" ]] || exit 8; entered=1; printf 'ENTER\\n'; }
 fixture_tmux() { [[ "$1" != display-message ]] || { printf 101; return 0; }; (( killed == 0 )); }
 pid_alive() { (( killed == 0 )); }
 ad_capture() {
@@ -1927,7 +1873,7 @@ wait_until() {
   local bound="$1"; shift 2
   for attempt in 1 2 3; do
     polls=$((polls + 1))
-    if [[ '${mode}' == reports && "$entered" == 1 && "$polls" == 2 ]]; then state=waiting; fi
+    if [[ '${mode}' == reports && "$polls" == 2 ]]; then state=waiting; fi
     "$@" && return 0
   done
   fail "bounded wait $bound"
@@ -1936,7 +1882,7 @@ install_ad_release() { [[ "$state" == missing && "$killed" == 1 ]] || exit 10; p
 (leg_reinstall)
 printf 'RESULT=%s' "$?"`, ['jq', 'head'])
     if (mode === 'reports') {
-      expect(output).toBe('ENTER\nKILL:waiting\nINSTALL\nRESULT=0')
+      expect(output).toBe('KILL:waiting\nINSTALL\nRESULT=0')
     } else {
       expect(output).toContain('REFUSED: bounded wait 90')
       expect(output).toContain('RESULT=1')
@@ -1954,7 +1900,6 @@ SVC_LABEL=service=cscb
 PERSONA_LABEL=persona
 STUB_MODE_SILENT=silent
 STUB_MODE_AT_ONCE=at-once
-STUB_MODE_STARTUP_TRUST=startup-trust
 declare -A modes
 persona_key() { printf '%s' "$1"; }
 t14_value() { printf -v "$1" p; }
@@ -1968,7 +1913,7 @@ seed_010_row() { [[ "\${modes[$3]}" == at-once ]] || exit 7; }
 fail() { exit 1; }
 (set -e
 ${seed}
-[[ "\${modes[$P_WORK]}" == startup-trust ]])
+[[ "\${modes[$P_WORK]}" == at-once ]])
 printf 'RESULT=%s' "$?"`, ['jq', 'grep'])
     expect(output).toBe('RESULT=0')
     const upgrade = source.indexOf('\nt14_upgrade_seeded_rows\n')
@@ -2285,7 +2230,6 @@ printf 'RESULT=%s' "$?"`, ['head'])
     expect(renamed).not.toContain('spawn --cwd "${dir}" --claude-instance-id "${id}"')
   })
 })
-
 
 /** Old tokens are permitted only inside specific old-release/mixed-log helper
  * bodies, with a deliberate legacy comment and the expected number of lines.

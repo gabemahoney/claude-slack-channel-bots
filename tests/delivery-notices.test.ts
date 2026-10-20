@@ -1,14 +1,14 @@
 /** b.omv SR-8: notice decisions only; engine/intake/ack suites own their transitions. */
 import { afterEach, expect, test } from 'bun:test'
-import { DELIVERY_STUCK_AFTER_MS, RECONNECT_BLOCKED_NOTICE_MS } from '../src/delivery-constants.ts'
-import { deliveryStuckRemedy, buildDeliveryDiagnostic, buildMessageNotTakenInNotice, deliveryIdentity, QUEUE_UNWRITABLE, QUEUE_KEPT, MESSAGE_RECEIVED, MESSAGE_RETYPED, MESSAGE_NOT_TAKEN_IN, buildDeliveryStuckNotice, buildMessagesWaitingNotice, buildMessageNotSavedNotice, buildQueueRecordUnreadableNotice, type DeliveryStuckReason, type DeliveryReportState } from '../src/delivery-notices.ts'
-import type { DeliveryReason, DeliveryStatus } from '../src/delivery-engine.ts'
-import { formatPersonaNotice } from '../src/persona-notifier.ts'
 import { CONFLICT_NOTICE_HUMAN_ONLY_LINE } from '../src/conflict-latch.ts'
-import { makeEngineHarness } from './test-helpers/delivery-engine.ts'
-import { replyEntry, appendTranscript } from './test-helpers/working-row-panes.ts'
-import { makeDeliveryNoticeHarness, type DeliveryNoticeHarness } from './test-helpers/delivery-notices.ts'
+import { DELIVERY_STUCK_AFTER_MS } from '../src/delivery-constants.ts'
+import type { DeliveryReason, DeliveryStatus } from '../src/delivery-engine.ts'
+import { buildDeliveryDiagnostic, buildDeliveryStuckNotice, buildMessageNotSavedNotice, buildMessageNotTakenInNotice, buildMessagesWaitingNotice, buildQueueRecordUnreadableNotice, deliveryIdentity, deliveryStuckRemedy, MESSAGE_NOT_TAKEN_IN, MESSAGE_RECEIVED, MESSAGE_RETYPED, QUEUE_KEPT, QUEUE_UNWRITABLE, type DeliveryReportState, type DeliveryStuckReason } from '../src/delivery-notices.ts'
+import { formatPersonaNotice } from '../src/persona-notifier.ts'
 import { assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
+import { makeEngineHarness } from './test-helpers/delivery-engine.ts'
+import { makeDeliveryNoticeHarness, type DeliveryNoticeHarness } from './test-helpers/delivery-notices.ts'
+import { appendTranscript, replyEntry } from './test-helpers/working-row-panes.ts'
 const runs: DeliveryNoticeHarness[] = []
 async function run() { const h = await makeDeliveryNoticeHarness(); runs.push(h); return h }
 afterEach(async () => { for (const r of runs.splice(0)) { try { assertNoLeak({ logs: r.logs, posts: r.h.allPosts(), lines: r.rig.lines }) } finally { await r.cleanup() } } })
@@ -37,8 +37,6 @@ test('launch timing diagnostics preserve structured engine evidence without post
 // The sole literal wording pin for this notice module; behavior uses its builders.
 test('SR-8 delivery notices and all nine fixed remedies keep their required wording', () => {
   expect(reasons.map(([reason]) => deliveryStuckRemedy(reason, 'alpha', 3))).toEqual([
-    'A menu, overlay or dialog is open in its terminal. Attach with `tmux attach -t =slack_bot_alpha` and close it.',
-    'Text is left in its input box. Attach with `tmux attach -t =slack_bot_alpha` and submit or clear it.',
     "Its permission relay is off. Restart the persona's bot.",
     "It is not connected to this server over MCP. Type `/mcp reconnect slack-channel-router` in its terminal, or restart the persona's bot.",
     'agent-director keeps refusing to type into it. Check its state with `agent-director get --instance-id cscb_alpha`.',
@@ -47,8 +45,8 @@ test('SR-8 delivery notices and all nine fixed remedies keep their required word
     "It doesn't take the message in: CSCB has typed it 3 times and keeps offering it. Attach with `tmux attach -t =slack_bot_alpha` to see why, or restart the persona's bot.",
     "agent-director won't type into it until it can prove an answered permission prompt is gone; a subagent's denied prompt stays held until the bot ends. Restart the persona's bot.",
   ])
-  expect(buildDeliveryStuckNotice('Alpha', 'alpha', 2, DELIVERY_STUCK_AFTER_MS, 'menu', 3)).toBe(
-    ':warning: *Delivery stuck* — 2 message(s) for Alpha are waiting; the oldest has waited 5m. ' + deliveryStuckRemedy('menu', 'alpha', 3) + ' ' + CONFLICT_NOTICE_HUMAN_ONLY_LINE)
+  expect(buildDeliveryStuckNotice('Alpha', 'alpha', 2, DELIVERY_STUCK_AFTER_MS, 'refused', 3)).toBe(
+    ':warning: *Delivery stuck* — 2 message(s) for Alpha are waiting; the oldest has waited 5m. ' + deliveryStuckRemedy('refused', 'alpha', 3) + ' ' + CONFLICT_NOTICE_HUMAN_ONLY_LINE)
   expect(buildMessageNotSavedNotice('Alpha', 'U0SENDER1')).toBe(":warning: *Message not saved* — a message from U0SENDER1 for Alpha could not be saved. Slack will send it again a few times; it is delivered if one copy is saved, otherwise it is lost and should be sent again. Further messages to this persona may fail the same way until storing works; server.log counts them. Check the server's disk.")
   expect(buildMessageNotTakenInNotice('Alpha', 'U0SENDER1')).toBe(":warning: *Message not taken in* — the message from U0SENDER1 for Alpha is still queued. CSCB keeps offering it (again at least every 15 minutes while it can type it) until the bot's transcript shows it. Later messages for this persona wait behind it. The bot may see it more than once.")
   expect(buildMessagesWaitingNotice('Alpha', 2, DELIVERY_STUCK_AFTER_MS, 'down')).toBe(':warning: *Messages waiting* — 2 message(s) for Alpha are waiting; the oldest has waited 5m. The persona is down. The messages are kept and delivered once the persona is up.')
@@ -56,7 +54,7 @@ test('SR-8 delivery notices and all nine fixed remedies keep their required word
 })
 
 const reasons: [DeliveryStuckReason, DeliveryReason, Partial<DeliveryStatus>][] = [
-  ['menu', 'menu', {}], ['input', 'input', {}], ['relay-off', 'relay-off', {}], ['mcp', 'mcp', {}],
+  ['relay-off', 'relay-off', {}], ['mcp', 'mcp', {}],
   ['refused', 'not-now', {}], ['transcript', 'transcript-unreadable', {}], ['queue-unwritable', 'queue-unwritable', {}],
   ['not-taken-in', 'receipt', { retypeCount: 3 }], ['dialog-hold', 'dialog-hold', {}],
 ]
@@ -71,7 +69,7 @@ test.each(reasons)('%s: over five minutes, once until queue progress; only the o
   expect(posts[0]!.text.endsWith(CONFLICT_NOTICE_HUMAN_ONLY_LINE)).toBe(true)
   expect(JSON.stringify({ logs: r.logs, posts })).not.toContain(body)
   await r.accept({ key: { chat_id: 'C0SOURCE1', ts: 'later' } })
-  r.waiting(item, 'input', { ageMs: DELIVERY_STUCK_AFTER_MS + 100 }); await r.flush()
+  r.waiting(item, 'not-now', { ageMs: DELIVERY_STUCK_AFTER_MS + 100 }); await r.flush()
   expect(posts).toHaveLength(1)
   expect(r.h.posts(r.beta)).toEqual([])
   expect(posts.filter(p => p.channel === 'C0SOURCE1')).toEqual([])
@@ -100,13 +98,13 @@ test.each(waiting)('%s: waiting immediately, extra work/state alone does not sta
 })
 
 const suppressions: [string, Partial<DeliveryReportState>, Partial<DeliveryStatus>, DeliveryReason][] = [
-  ['bring-up not up', { up: false }, {}, 'menu'], ['not-up down persona', { up: false }, { row: 'ended' }, 'menu'], ['outage', { outage: true }, {}, 'menu'],
-  ['native prompt or waiting/not-connected episode', { prompt: true }, {}, 'menu'], ['launch episode', { launch: true }, {}, 'menu'],
-  ['pending row', {}, { row: 'pending' }, 'menu'], ['permission row', {}, { row: 'check_permission' }, 'menu'],
+  ['bring-up not up', { up: false }, {}, 'not-now'], ['not-up down persona', { up: false }, { row: 'ended' }, 'not-now'], ['outage', { outage: true }, {}, 'not-now'],
+  ['native prompt or waiting/not-connected episode', { prompt: true }, {}, 'not-now'], ['launch episode', { launch: true }, {}, 'not-now'],
+  ['pending row', {}, { row: 'pending' }, 'not-now'], ['permission row', {}, { row: 'check_permission' }, 'not-now'],
   ['working with dialog uncertainty', {}, { row: 'working', dialogMaybeOpen: true }, 'dialog-hold'],
   ['working with typed text', {}, { row: 'working', receiptWorking: true }, 'receipt'],
-  ['working receipt wait', {}, { row: 'working' }, 'receipt'], ['deferred reconnect', {}, { reconnectDeferred: true, reconnectScreen: 'input' }, 'mcp'],
-  ['waiting takes precedence', { latched: true }, {}, 'menu'],
+  ['working receipt wait', {}, { row: 'working' }, 'receipt'],
+  ['waiting takes precedence', { latched: true }, {}, 'not-now'],
 ]
 test.each(suppressions)('%s suppresses delivery stuck', async (_label, state, status, reason) => {
   const r = await run(), item = await r.accept()
@@ -154,15 +152,6 @@ test('startup corruption aggregates each persona once and excludes torn tails/re
   r.reporting.startupFindings(findings); r.reporting.startupFindings(findings); await r.flush()
   expect(r.h.posts(r.alpha)).toMatchObject([{ channel: 'C0ALPHA01', text: formatPersonaNotice(r.config.personas[0]!, buildQueueRecordUnreadableNotice(r.ref(), 2, '/scratch/quarantine')) }])
   expect(r.h.posts(r.beta)).toEqual([])
-})
-
-test.each(['menu', 'input'] as const)('%s reconnect block reports at five minutes even with no queued item', async reason => {
-  const r = await run()
-  r.reporting.engineEvent({ type: 'reconnect-screen', key: r.alpha, reason, blockedMs: RECONNECT_BLOCKED_NOTICE_MS - 1 })
-  expect(r.blocked).toEqual([])
-  r.reporting.engineEvent({ type: 'reconnect-screen', key: r.alpha, reason, blockedMs: RECONNECT_BLOCKED_NOTICE_MS })
-  expect(r.blocked).toEqual([{ key: r.alpha, rule: reason }])
-  expect(r.queue.openCount(r.alpha)).toBe(0)
 })
 
 test('unwritable and retained diagnostics contain only safe facts; one line until writability recovers', async () => {

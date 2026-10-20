@@ -1,286 +1,16 @@
 #!/usr/bin/env bash
-# stub-claude.sh — a fake `claude` binary for the integration tests that launch
-# a real bot through agent-director and tmux (Test 4, Test 10, Test 12,
-# Test 29 and the fmk scenarios, test-0 and test-13 to test-28).
-#
-# Each of those tests copies this file first on PATH as `claude`, so the real
-# agent-director and tmux launch path runs without the Anthropic API or a
-# model. agent-director starts `claude` in a tmux pane with at least two argv
-# elements, so no shell stands between tmux and this script: the stub's own
-# process is the pane's main process.
-#
-# `claude --version` (or `-v`) prints `2.1.280 (Claude Code)` and exits 0, the
-# version line of the Claude Code agent-director states as its minimum.
-#
-# LAUNCH ARGUMENTS
-# ----------------
-# Every launch (not a `--version` call) appends one line, its argument list, to
-# the file `stub-claude-launch-args` beside the stub (the directory of the path
-# the stub was run by). Each argument is shell-quoted (`printf %q`) and the
-# words are separated by one space, so an argument holding spaces or newlines
-# (the `--settings` JSON) stays one word, and a pair such as
-# `--system-prompt-snapshot off` reads as two adjacent plain words. The line is
-# written under flock in one append, so concurrent stubs do not interleave.
-# Test 4 reads it; other stub users ignore it.
-#
-# MODES
-# -----
-# The stub's working directory, by its resolved real path, chooses its mode.
-# The harness writes the selection (lib/scenario.sh `stub_mode`) to the file
-# `stub-claude-modes` beside the stub (the directory of the path the stub was
-# run by), one line per selection: `<mode> TAB <real path>`; the last line
-# naming the directory wins. The selection reads no environment variable, so
-# it holds whatever environment tmux or agent-director gives the worker. A
-# directory with no selection, or a stub with no such file beside it (Test 4,
-# Test 10, Test 12, Test 29), runs `at-once`. The modes:
-#
-#   dev-channels         print the dev-channels warning dialog, byte-identical
-#                        to tests/fixtures/dev-channels-pane-2.1.120.txt, which
-#                        holds CSCB's DEV_CHANNELS_DIALOG_NEEDLE
-#                        (src/session-manager.ts), and report in on the first
-#                        line that reaches stdin (the approver's Enter, sent
-#                        through `agent-director send-keys`).
-#   at-once              report in at once.
-#   silent               print nothing and never report in: no SessionStart,
-#                        no re-fire, no MCP session. The sentinel ends it with
-#                        no hook fired.
-#   unrecognised-dialog  print a startup dialog (Claude Code's theme picker)
-#                        that holds neither DEV_CHANNELS_DIALOG_NEEDLE nor
-#                        TRUST_DIALOG_NEEDLE, so CSCB's approver never answers
-#                        it, and report in on the first line that reaches stdin
-#                        (the harness's `stub_press_enter`, a human answering).
-#   folder-trust         when the working directory is trusted, report in at
-#                        once; otherwise print the folder-trust prompt, which
-#                        holds TRUST_DIALOG_NEEDLE, and report in on the first
-#                        line that reaches stdin (the prompt answered by
-#                        Enter). Trust is read from
-#                        `<CLAUDE_CONFIG_DIR>/.claude.json`, or from
-#                        `~/.claude.json` only when CLAUDE_CONFIG_DIR is unset
-#                        or empty, as src/trust-bootstrap.ts writes it: the
-#                        directory is trusted when
-#                        `projects[<dir>].hasTrustDialogAccepted` is `true` for
-#                        its real path or for $PWD.
-#   startup-trust        always show the supported trust prompt; Enter reports in.
-#   transcript-on-first-message
-#                        (a harness addition)
-#                        as `startup-trust` (the same dialog, reporting in on
-#                        the first line that reaches stdin), except that
-#                        reporting in writes no transcript: until the first
-#                        message, every SessionStart (the report-in's and the
-#                        re-fire's) names a `transcript_path` with no file at
-#                        it, so agent-director's SessionStart finds none. The
-#                        transcript is written at the first message after
-#                        reporting in: the first line that is not the
-#                        sentinel, does not start with `/` (a slash command
-#                        typed into the pane, such as CSCB's `/exit` at a
-#                        `pause` or `/mcp reconnect`, is no message) and is
-#                        not empty or blank (an extra Enter, which writes
-#                        nothing in Claude Code either), as a human typing
-#                        into the pane (lib/scenario.sh `stub_type_line`).
-#                        Once written it stays, as in every other mode: the
-#                        life's later SessionStarts (its re-fire's) name it,
-#                        and a resumed launch of that session id (see
-#                        RESUME) finds it at its SessionStart; a resumed
-#                        launch of a session never messaged finds none until
-#                        its own first message.
-#   linger-on-exit       harness addition (scenario 24, and scenario 13's
-#                        "still stopping"): report in at once, as `at-once`;
-#                        then, on the `/exit` line agent-director's `pause`
-#                        types, end the session but keep the process running,
-#                        as a Claude Code still shutting down does, until the
-#                        harness releases it (see LINGERING).
-#
-# Only the dev-channels dialog holds DEV_CHANNELS_DIALOG_NEEDLE, and only the
-# folder-trust prompt holds TRUST_DIALOG_NEEDLE.
-#
-# THE DIALOG DELAY
-# ----------------
-# A harness addition (b.jg5 SRJ-1306): an
-# optional delay before the dev-channels dialog, set per working directory,
-# so a launch stays `pending` at the dialog long enough for a scenario to act
-# on it before CSCB's approver can answer. The harness writes it
-# (lib/scenario.sh `stub_dialog_delay`) to the file `stub-claude-dialog-delays`
-# beside the stub, one line per setting: `<seconds> TAB <real path>`; the last
-# line naming the directory wins. A directory with no setting, a setting of
-# 0, or a stub with no such file beside it has no delay, and the stub behaves
-# as the modes above state. The delay acts only in `dev-channels`:
-#   - for the set number of seconds, from the stub's start, it shows a
-#     starting screen that holds neither DEV_CHANNELS_DIALOG_NEEDLE nor
-#     TRUST_DIALOG_NEEDLE, so the approver finds nothing to answer;
-#   - it then clears the screen and prints the dev-channels dialog, the same
-#     bytes as with no delay, and holds until Enter, reporting in as the
-#     dialog mode does (the re-fire and the MCP session included);
-#   - while the delay runs the sentinel ends the stub, as in a dialog mode,
-#     and any other line is ignored: it answers no dialog;
-#   - a setting that is not a whole number is reported on stderr and read as
-#     no delay.
-# Hook firing, the sentinel, the stop line and the re-fire are as stated
-# below, with or without a delay.
-#
-# LINGERING
-# ---------
-# Harness addition (scenario 24, test-26, and scenario 13): a finished row
-# whose own session still runs. In `linger-on-exit`, once reported in, the
-# line `/exit` (agent-director's `pause` sends C-u, types `/exit` and Enter)
-# makes the stub linger:
-#   - it marks itself lingering: the file `stub-claude-lingering.<stub pid>`
-#     beside the stub, holding its working directory's real path, written by
-#     one rename;
-#   - it fires every SessionEnd hook the `--settings` JSON registers, as the
-#     sentinel does (see HOOK FIRING; reason `exit`, which agent-director takes
-#     as a session that ended), so the row reads `ended`;
-#   - it stops the SessionStart re-fire and ends its MCP session;
-#   - it keeps running, its pane and session with it, ignoring every further
-#     line, until it gets SIGUSR1 (the harness's release, lib/scenario.sh
-#     `stub_release`) or its stdin closes; then it removes its marker and
-#     exits 0.
-# Before it lingers, `/exit` is an ordinary line (ignored), and SIGUSR1 is
-# not handled.
-#
-# Every mode keeps these rules:
-#   - Reporting in writes a minimal transcript JSONL at Claude Code's canonical
-#     location, fires every SessionStart hook the `--settings` JSON registers
-#     (see HOOK FIRING), prints a live-session banner, opens the MCP session
-#     (see THE MCP SESSION) and starts the re-fire (see THE SESSIONSTART
-#     RE-FIRE). agent-director derives the row's session_id from the payload's
-#     `transcript_path` basename, so a later `claude --resume <session_id>`
-#     finds that transcript.
-#   - In `transcript-on-first-message` reporting in writes no transcript; the
-#     first message does (see its entry above). Everything else here holds.
-#   - After reporting in the stub keeps reading stdin, so the process and its
-#     tmux pane stay alive. Further lines are ignored, apart from the sentinel
-#     and `/mcp reconnect`, alone or with a server's name (see THE MCP
-#     SESSION), and, in `linger-on-exit`, `/exit` (see LINGERING).
-#   - Answering a dialog (`dev-channels`, `unrecognised-dialog`, and
-#     `folder-trust` when it printed its prompt): the line that answers it
-#     first clears the screen and the scrollback (`ESC[H ESC[2J ESC[3J`), as
-#     Claude Code redraws its screen once a dialog is answered, and then the
-#     stub reports in. So a pane read after the answer (CSCB's waiting-row
-#     check reads `FULL_PANE_READ_LINES` lines, scrollback included) finds the
-#     live-session banner and no dialog text, which it would read as a
-#     prompt. Output before the answer, and a dialog left unanswered (stdin
-#     closed, or the sentinel), is unchanged.
-#   - Every dialog the stub prints is also appended, byte for byte, to
-#     `stub-claude-shown-dialogs.<stub pid>` beside it, so a scenario can
-#     still read what its pane showed once the answer has cleared it.
-#   - The sentinel line `__CSCB_TEST_EXIT__` fires every SessionEnd hook the
-#     `--settings` JSON registers and exits 0 (in `silent`, it fires none). In
-#     a dialog mode it does so before the dialog is answered too.
-#   - In `linger-on-exit`, the `/exit` line too (see LINGERING).
-#   - When stdin closes (the pane was killed), the stub exits 0.
-#
-# RESUME
-# ------
-# agent-director resume re-execs `claude --resume <session_id> …`. The stub
-# reuses that session_id and its transcript and follows its directory's mode
-# again: a dialog mode prints its dialog again, so the resumed launch's dialog
-# must be answered too.
-#
-# HOOK FIRING
-# -----------
-# agent-director applies a hook only when the hook's parent process is the
-# pane's recorded main process, so every hook runs as a direct child of this
-# script's process: the script runs the hook's argv as a simple command, with
-# the payload on stdin by redirect from a file, never through `sh -c`, `eval`,
-# a subshell, a pipeline, a background job, a coprocess or a command
-# substitution.
-#
-#   - Every group of the event and every `"type": "command"` entry in it is
-#     fired, in the order `--settings` lists them.
-#   - An entry with an `args` array (exec form) runs `command` verbatim with
-#     those `args`.
-#   - An entry with no `args` (shell form) runs the words of its `command`.
-#   - An entry's `timeout` is not acted on and no timeout wraps a hook: each
-#     hook runs until it exits.
-#   - The payload carries `hook_event_name`, `session_id`, `cwd`,
-#     `transcript_path` and `source` (SessionStart) or `reason` (SessionEnd),
-#     and no `agent_id`.
-#
-# The entries are read once, at start-up, into one flat array per event: for
-# each entry its argv length, then its argv elements.
-#
-# THE SESSIONSTART RE-FIRE
-# ------------------------
-# After every report-in, whatever caused it (at once, Enter at a dialog, the
-# folder-trust prompt answered, a trusted folder, a resume lap), the stub reads
-# its own row every 2 s and fires SessionStart again while the row reads
-# `pending`. agent-director applies a SessionStart that arrives before it has
-# recorded the launch's pane once that record exists, waiting up to the
-# pending grace period G from the launch start; the re-fire keeps /ci
-# deterministic and is harmless under that wait.
-#   - The read: `<bin> status --instance-id <id>`, where <bin> is the
-#     program the first registered SessionStart entry names (exec form's
-#     `command`, or a shell form's first word), run as a direct child, and <id>
-#     is AGENT_DIRECTOR_INSTANCE_ID, which agent-director puts in the worker's
-#     environment (the hooks' `args` carry no id). Under the RC's hooks <bin>
-#     is the real binary, so these reads bypass the agent-director shim.
-#   - `pending` with a launch start (`launch_started_at`), and G not yet passed
-#     since that launch start: fire every registered SessionStart hook again,
-#     by the rules above, then read again 2 s after the hooks finished.
-#   - `pending` with G passed since the launch start, or any state other than
-#     `pending`: stop re-firing, writing nothing.
-#   - A failed read (no instance id, a non-zero exit, or output that is not a
-#     status object or carries a launch start that is not a time), or `pending`
-#     with no launch start: stop re-firing, fire nothing more, and write one
-#     stop line (below).
-#   - G is `[tmux] pending_grace_seconds` from
-#     `$HOME/.config/agent-director/config.toml`, read at every tick; a missing file,
-#     a missing key, 0 or a value that is not a whole number gives 60 s,
-#     agent-director's default (DefaultPendingGraceSeconds in its
-#     internal/config/tmux.go).
-#   - With no registered SessionStart hook there is nothing to re-fire: no read
-#     and no stop line.
-#   - The timer runs in the stub's main process, as the timeout of its stdin
-#     read: Enter, the sentinel and `/mcp reconnect` are still handled between
-#     ticks, and each tick's hooks finish before the next tick.
-#
-# THE STOP LINE
-# -------------
-# One line in the agent-director shim's line format (its header,
-# fixtures/agent-director-shim.sh, states it), kind `stop`:
-#   stop TAB <time> TAB <stub pid> TAB <stub ppid> TAB <parent> TAB <words>
-# whose words are `stub-claude`, then the reason as words:
-#   stopped re-firing SessionStart for instance <id>: <why>
-# where <why> is one of
-#   AGENT_DIRECTOR_INSTANCE_ID is unset or empty   (<id> is then `-`)
-#   the status read exited <n>
-#   the status read printed no status object
-#   the status read gave a launch start that is not a time: <text>
-#   the row reads pending with no launch start
-# It is appended in one write, under `/usr/bin/flock -x` on the log, to
-# `agent-director-shim.log` in the directory of the read's <bin> (the shim's
-# log, beside the real binary, in an fmk HOME); where no such file exists
-# (test-1 to test-12, and test-29), to the stub's stderr. A reader that counts
-# invocations takes only `call` lines, so the stop line is never read as one.
-#
-# THE MCP SESSION
-# ---------------
-# Once it has fired SessionStart on reporting in, the stub opens an MCP
-# session to the bot server, as the real `claude` does for its launch, and
-# holds it until the stub ends, so the server registers it as the persona's
-# session and a health tick reads the persona connected. The session is the
-# client `stub-mcp-session.ts` beside the stub, run with bun as a child of the
-# stub's process (never a CSCB process), its output appended to
-# `stub-mcp-session.log` beside the stub. It reads the `--mcp-config` the stub
-# was given (a file path, `~/` expanded, or inline JSON), connects to the
-# server's URL, and answers the server's roots request with the stub's
-# working directory, by which the server matches the persona. It ends when the
-# stub ends: on the stub's exit (the sentinel or stdin closing) the stub sends
-# it SIGTERM, and on any other end of the stub (a kill) it sees its parent
-# change and exits, or dies with the pane's hang-up. When the server ends the
-# session (a refusal, a stop), the client exits; a later `/mcp reconnect` line,
-# alone or followed by a space and a server name as CSCB types it
-# (`/mcp reconnect slack-channel-router`) into a persona's pane to reconnect
-# it, opens a new session, as the real `claude` reconnects: a client still
-# running then (one whose server restarted before its next ping noticed) is
-# ended first, with SIGTERM, then SIGKILL if it still runs 3 s later, and
-# reaped, so a reconnect never holds the stub's read loop longer than that.
-# In `linger-on-exit` the `/exit` line ends the session and the lingering
-# stub opens none (see LINGERING).
-# No session is opened when the client is not beside the stub (Test 4, Test 10
-# and Test 12, which copy only the stub), when the stub was given no
-# `--mcp-config`, or in a mode that has not reported in (`silent`, a dialog not
-# yet answered).
+# Fake claude for contained integration launches through real AD and tmux.
+# Modes are selected by resolved cwd in stub-claude-modes (last selection wins):
+# at-once reports SessionStart immediately; manual-start waits for harness Enter;
+# silent fires no hooks; transcript-on-first-message delays its transcript until
+# message receipt; linger-on-exit fires SessionEnd but waits for harness SIGUSR1.
+# Optional stub-claude-report-delays postpones at-once SessionStart in seconds.
+# Hooks execute as direct children, preserving AD's process identity checks.
+# SessionStart re-fires every two seconds while AD says pending, until its grace
+# bound, to make lost-create-reply cases deterministic. Exact user messages go
+# to the transcript for receipt assertions. No native dialog bytes are fixtures.
+# Launch argv are recorded under flock; --version only prints its pinned line.
+
 set -uo pipefail
 
 # The version line `claude --version` prints: the Claude Code minimum
@@ -344,12 +74,9 @@ ensure_transcript() {
 # The mode. STUB_DIR is the directory of the path the stub was run by (the
 # kernel hands bash the path execvp found, so a PATH lookup gives it whole).
 # ---------------------------------------------------------------------------
-MODE_DEV_CHANNELS=dev-channels
 MODE_AT_ONCE=at-once
 MODE_SILENT=silent
-MODE_UNRECOGNISED=unrecognised-dialog
-MODE_FOLDER_TRUST=folder-trust
-MODE_STARTUP_TRUST=startup-trust
+MODE_MANUAL_START=manual-start
 # A harness addition.
 MODE_TRANSCRIPT_ON_FIRST_MESSAGE=transcript-on-first-message
 MODE_LINGER_ON_EXIT=linger-on-exit
@@ -378,7 +105,7 @@ if [[ -f "${STUB_MODES_FILE}" ]]; then
     done < "${STUB_MODES_FILE}"
 fi
 case "${MODE}" in
-    "${MODE_DEV_CHANNELS}" | "${MODE_AT_ONCE}" | "${MODE_SILENT}" | "${MODE_UNRECOGNISED}" | "${MODE_FOLDER_TRUST}" | "${MODE_STARTUP_TRUST}") ;;
+    "${MODE_AT_ONCE}" | "${MODE_SILENT}" | "${MODE_MANUAL_START}") ;;
     "${MODE_TRANSCRIPT_ON_FIRST_MESSAGE}") ;;
     "${MODE_LINGER_ON_EXIT}") ;;
     *)
@@ -388,21 +115,21 @@ case "${MODE}" in
         ;;
 esac
 
-# The dialog delay, in whole seconds (see THE DIALOG DELAY): the last setting
+# The report-in delay, in whole seconds: the last setting
 # naming the directory, 0 when none does.
-STUB_DELAYS_FILE="${STUB_DIR}/stub-claude-dialog-delays"
-DIALOG_DELAY_S=0
+STUB_DELAYS_FILE="${STUB_DIR}/stub-claude-report-delays"
+REPORT_DELAY_S=0
 if [[ -f "${STUB_DELAYS_FILE}" ]]; then
     while IFS=$'\t' read -r sel_delay sel_dir; do
-        [[ "${sel_dir}" == "${REALCWD}" ]] && DIALOG_DELAY_S="${sel_delay}"
+        [[ "${sel_dir}" == "${REALCWD}" ]] && REPORT_DELAY_S="${sel_delay}"
     done < "${STUB_DELAYS_FILE}"
 fi
-if [[ ! "${DIALOG_DELAY_S}" =~ ^[0-9]+$ ]]; then
-    printf 'stub-claude: dialog delay %q set for %s is not a whole number of seconds; no delay\n' \
-        "${DIALOG_DELAY_S}" "${REALCWD}" >&2
-    DIALOG_DELAY_S=0
+if [[ ! "${REPORT_DELAY_S}" =~ ^[0-9]+$ ]]; then
+    printf 'stub-claude: report-in delay %q set for %s is not a whole number of seconds; no delay\n' \
+        "${REPORT_DELAY_S}" "${REALCWD}" >&2
+    REPORT_DELAY_S=0
 fi
-DIALOG_DELAY_S=$(( 10#${DIALOG_DELAY_S} ))
+REPORT_DELAY_S=$(( 10#${REPORT_DELAY_S} ))
 
 # ---------------------------------------------------------------------------
 # Registered hooks. HOOK_ARGV_JQ emits, for each `"type": "command"` entry of
@@ -438,9 +165,6 @@ if [[ -n "${SETTINGS_JSON}" ]]; then
     rm -f "${HOOK_FILE}"
 fi
 
-# Sentinel line the driver sends via `agent-director send-keys` to request a
-# clean session end. Distinct from the bare Enter the dialog approver sends, so
-# the resume lap's approval Enter never triggers an exit.
 SENTINEL="__CSCB_TEST_EXIT__"
 
 # fire_hooks <len> <argv…> [<len> <argv…> …]
@@ -482,108 +206,12 @@ fire_session_end() {
 # Dialogs
 # ---------------------------------------------------------------------------
 
-print_dev_channels_dialog() {
-    # MUST stay byte-identical to tests/fixtures/dev-channels-pane-2.1.120.txt.
-    cat <<'DIALOG'
-WARNING: Loading development channels
-
---dangerously-load-development-channels is for local channel development only. Do not
-use this option to run channels you have downloaded off the internet.
-
-Please use --channels to run a list of approved channels.
-
-Channels: server:slack-channel-router
-
-❯ 1. I am using this for local development
-  2. Exit
-
-Enter to confirm · Esc to cancel
-DIALOG
+# Pending fixture controlled by a human/harness Enter. It contains no native UI.
+print_manual_start() {
+    printf 'Waiting for operator\n'
 }
 
-# The starting screen the dialog delay shows: no needle of CSCB's approver.
-print_delay_screen() {
-    printf 'Starting Claude Code...\n'
-}
-
-# Clear the screen, so the dialog after the delay is all the pane shows.
-clear_screen() {
-    printf '\033[H\033[2J'
-}
-
-# A startup dialog no needle of CSCB's approver matches.
-print_unrecognised_dialog() {
-    cat <<'DIALOG'
-Let's get started.
-
-Choose the text style that looks best with your terminal
-To change this later, run /theme
-
-❯ 1. Dark mode
-  2. Light mode
-  3. Dark mode (colorblind-friendly)
-  4. Light mode (colorblind-friendly)
-
-Enter to confirm · Esc to cancel
-DIALOG
-}
-
-print_trust_dialog() {
-    cat <<DIALOG
-Accessing workspace:
-
-${REALCWD}
-
-Quick safety check: Is this a project you created or one you trust? (Like your
-own code, a well-known open source project, or work from your team). If not,
-take a moment to review what's in this folder first.
-
-Claude Code'll be able to read, edit, and execute files here.
-
-❯ 1. Yes, I trust this folder
-  2. No, exit
-
-Enter to confirm · Esc to cancel
-DIALOG
-}
-
-# True when the working directory is trusted in the Claude config's
-# .claude.json, as src/trust-bootstrap.ts writes it.
-folder_trusted() {
-    local file
-    if [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then
-        file="${CLAUDE_CONFIG_DIR}/.claude.json"
-    else
-        file="${HOME}/.claude.json"
-    fi
-    [[ -f "${file}" ]] || return 1
-    jq -e --arg real "${REALCWD}" --arg pwd "${PWD:-}" '
-        .projects | objects
-        | ((.[$real] | objects | .hasTrustDialogAccepted) == true)
-          or ($pwd != "" and ((.[$pwd] | objects | .hasTrustDialogAccepted) == true))
-    ' "${file}" > /dev/null 2>&1
-}
-
-# The record of every dialog this stub printed on its pane, beside it: the
-# dialog's bytes, as printed, appended to `stub-claude-shown-dialogs.<stub
-# pid>`. A pane read after an answer finds no dialog (see
-# clear_answered_dialog), so a scenario reads what its pane showed here.
-SHOWN_DIALOGS_FILE="${STUB_DIR}/stub-claude-shown-dialogs.$$"
-
-# show_dialog <printer>: run the dialog printer, its output to the pane and,
-# byte for byte, to SHOWN_DIALOGS_FILE (a failed record write is reported on
-# standard error and changes nothing on the pane).
-show_dialog() {
-    "$1" | tee -a -- "${SHOWN_DIALOGS_FILE}" 2> /dev/null \
-        || printf 'stub-claude[%s]: could not record the dialog in %s\n' "$$" "${SHOWN_DIALOGS_FILE}" >&2
-}
-
-# A dialog answered: clear the screen (cursor home, erase the screen) and the
-# scrollback (erase saved lines, which tmux fills with the erased screen),
-# as Claude Code redraws its screen once a dialog is answered, so no pane
-# read after the answer finds the dialog's text (its record stays in
-# SHOWN_DIALOGS_FILE).
-clear_answered_dialog() {
+clear_manual_start() {
     printf '\033[H\033[2J\033[3J'
 }
 
@@ -810,9 +438,9 @@ trap 'close_key_reader; close_mcp_session; rm -f "${HOOK_FILE}" "${STATUS_OUT}" 
 
 REPORTED=0
 AWAITING_ENTER=0
-# While the dialog delay runs: the time the dialog is due, in milliseconds
+# While the report-in delay runs: when SessionStart is due, in milliseconds
 # since the epoch; 0 otherwise.
-DIALOG_DUE_MS=0
+REPORT_DUE_MS=0
 
 report_in() {
     REPORTED=1
@@ -823,21 +451,12 @@ report_in() {
     start_refire
 }
 
-# b.omv SR-13.6: the Linux composer is visible to delivery-screen.ts. Read
-# raw keys below so literal LF belongs to the message; CR alone submits it.
+# Read raw keys so literal LF belongs to a message and CR alone submits it.
 # C-u is the clear used by agent-director's pause path.
 composer=""
 draw_composer() {
-    # Keep the report-in banner visible above the box: the harness reads it
-    # after answering a startup dialog. FIFO self-check output stays plain.
-    if [[ -t 1 ]]; then
-        printf '\033[H\033[2J'
-    fi
     printf '%s\n' 'Listening for channel messages from: server:slack-channel-router'
-    printf '%s\n' '────────────────────────────────────────────────────────────────────────'
-    printf '❯ %s\n' "${composer}"
-    printf '%s\n' '────────────────────────────────────────────────────────────────────────'
-    printf '%s\n' '  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents'
+    printf 'buffer: %s\n' "${composer}"
 }
 
 append_user_receipt() {
@@ -863,49 +482,20 @@ if [[ -t 0 ]]; then
 fi
 
 case "${MODE}" in
-    "${MODE_DEV_CHANNELS}")
-        if (( DIALOG_DELAY_S > 0 )); then
-            print_delay_screen
-            now_ms
-            DIALOG_DUE_MS=$(( NOW_MS + DIALOG_DELAY_S * 1000 ))
-        else
-            show_dialog print_dev_channels_dialog
-            AWAITING_ENTER=1
-        fi
-        ;;
-    "${MODE_TRANSCRIPT_ON_FIRST_MESSAGE}")
-        show_dialog print_trust_dialog
+    "${MODE_MANUAL_START}")
+        print_manual_start
         AWAITING_ENTER=1
         ;;
-    "${MODE_UNRECOGNISED}")
-        show_dialog print_unrecognised_dialog
-        AWAITING_ENTER=1
-        ;;
-    "${MODE_STARTUP_TRUST}")
-        if (( DIALOG_DELAY_S > 0 )); then
-            print_delay_screen
+    "${MODE_AT_ONCE}" | "${MODE_TRANSCRIPT_ON_FIRST_MESSAGE}" | "${MODE_LINGER_ON_EXIT}")
+        if (( REPORT_DELAY_S > 0 )); then
+            printf 'Starting worker\n'
             now_ms
-            DIALOG_DUE_MS=$(( NOW_MS + DIALOG_DELAY_S * 1000 ))
+            REPORT_DUE_MS=$(( NOW_MS + REPORT_DELAY_S * 1000 ))
         else
-            show_dialog print_trust_dialog
-            AWAITING_ENTER=1
-        fi
-        ;;
-    "${MODE_FOLDER_TRUST}")
-        if folder_trusted; then
             report_in
-        else
-            show_dialog print_trust_dialog
-            AWAITING_ENTER=1
         fi
-        ;;
-    "${MODE_AT_ONCE}")
-        report_in
         ;;
     "${MODE_SILENT}")
-        ;;
-    "${MODE_LINGER_ON_EXIT}")
-        report_in
         ;;
 esac
 
@@ -955,15 +545,15 @@ handle_line() {
         append_user_receipt "${line}"
     fi
     if (( AWAITING_ENTER )); then
-        clear_answered_dialog
+        clear_manual_start
         report_in
     elif (( REPORTED )) && [[ "${line}" == '/mcp reconnect' || "${line}" == '/mcp reconnect '?* ]]; then
         reconnect_mcp_session
     fi
 }
 
-# Read loop. While the dialog delay runs, each read waits at most until the
-# dialog is due, and once it is due the dialog is shown. While the re-fire
+# Read loop. While report-in is delayed, each read waits until SessionStart
+# is due. While the re-fire
 # runs, each read waits at most until the next tick. A timeout cannot discard
 # a partially typed message: each completed key is already in the composer.
 handle_key() {
@@ -992,18 +582,12 @@ handle_key() {
 
 while :; do
     key=""
-    if (( DIALOG_DUE_MS > 0 )); then
+    if (( REPORT_DUE_MS > 0 )); then
         now_ms
-        wait_ms=$(( DIALOG_DUE_MS - NOW_MS ))
+        wait_ms=$(( REPORT_DUE_MS - NOW_MS ))
         if (( wait_ms <= 0 )); then
-            DIALOG_DUE_MS=0
-            clear_screen
-            if [[ "${MODE}" == "${MODE_STARTUP_TRUST}" ]]; then
-                show_dialog print_trust_dialog
-            else
-                show_dialog print_dev_channels_dialog
-            fi
-            AWAITING_ENTER=1
+            REPORT_DUE_MS=0
+            report_in
             continue
         fi
         printf -v wait_s '%d.%03d' $(( wait_ms / 1000 )) $(( wait_ms % 1000 ))

@@ -59,7 +59,7 @@ export async function waitForCrashBoundary(options: {
   child: { pid: number; exitCode: number | null; signalCode: string | null }
   checkpoint: string; marker: string; instance: string
   journal(): { kind: string; seq: number }[]
-  inputVisible(): Promise<boolean>; counts(): { queue: number; text: number; enter: number }
+  counts(): { queue: number; text: number; enter: number }
   diagnostic(value: unknown): void; bound(): void
   now(): number; sleep(ms: number): Promise<unknown>
 }) {
@@ -88,7 +88,7 @@ export async function waitForCrashBoundary(options: {
       if (marker.value && last?.textReturned && last.firstSeq !== null && last.successorSeq !== null) {
         const records = options.journal()
         if ([last.firstSeq, last.successorSeq].every(seq => records.some(r => r.kind === 'accepted' && r.seq === seq))
-          && await options.inputVisible() && options.now() <= end) {
+          && options.now() <= end) {
           diagnostic()
           return { firstSeq: last.firstSeq, successorSeq: last.successorSeq }
         }

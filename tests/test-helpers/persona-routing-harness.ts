@@ -1,219 +1,4 @@
-/**
- * test-helpers/persona-routing-harness.ts — The real inbound routing module
- * over stub Slack clients, the real registry and the real restart state
- * (b.av2 SR-4.1 with b.deo SRI-301 and SRI-302, SR-4.2 with b.deo SRI-303
- * to SRI-309 as decided by src/delivery-decision.ts, SR-13.4 with b.deo
- * SRI-1203).
- *
- * `makeRoutingHarness(specs, baseDir, opts?)` builds the real
- * `createPersonaRouting` from src/persona-routing.ts over:
- * - the applied config (`h.config`), built by `makeMultiPersonaConfig` and
- *   read by the routing at call time, in the channel mode the `mode` option
- *   picks through its `allow_invited_channels` switch (b.deo SRI-101,
- *   SRI-201): declarative with no `invited` section when absent.
- *   `fungibleDestinations` sets, by persona name, the persona's
- *   `invited.permission_prompts`, so the decision's fungible destinations
- *   (b.deo SRI-305) and the notifier's destination (SRI-701) come from the
- *   one configuration. `h.setMode(mode)` replaces `h.config` with the same
- *   personas built under the other switch, as a confirmed switch change
- *   applies in place (SRI-203);
- * - the stored choices (b.deo SRI-305, SRI-403), the routing's
- *   `getChannelDelivery`, read at call time from `h.channelDelivery`: null
- *   unless the `channelDelivery` option loads the real store
- *   (`loadChannelDeliveryStore`, src/channel-delivery.ts) over the caller's
- *   own temp state directory, or loads it unreadable through the store's
- *   read seam (the open fails), so the module's own unreadable state and
- *   line apply. Choices are seeded only with
- *   tests/test-helpers/channel-delivery.ts's `writeChannelDeliveryRecord`
- *   before the harness is built; the harness writes no stored-choice file.
- *   Every write the store makes is recorded, by path, in
- *   `h.channelDeliveryWrites`, then made durably;
- * - the envelope flag (b.deo SRI-301): `h.receive` and `h.receiveKeys`
- *   take envelope overrides as the Slack stub's `deliver` does
- *   (`ENVELOPE_FLAG_FORMS`), and hand the routing the flag an envelope with
- *   them carries (`envelopeFlagOf`): `false` by default;
- * - the heard set and the per-key forget (b.deo SRI-307), read and called
- *   through the routing's own `heardChannels` and `forget`
- *   (`h.heardChannels(key)`, `h.forget(key)`);
- * - one `makeStubSlack` stub per persona (leak marker on), handed out through
- *   `makePersonaClients` as the injected `clientFor` (`h.clients.setUnavailable`
- *   takes a persona's client away, as before validation or in dry run);
- * - the real persona-keyed registry: each persona named in `sessions` (default
- *   all) gets a registered session with a fake transport (holding `_GET_stream`
- *   unless `streamless`) and a fake MCP server that records
- *   `notifications/claude/channel` calls (or throws, with `throwOnNotify`, an
- *   error whose message carries the leak marker inside a token and a URL).
- *   An `onNotify` hook runs when `notification()` is called and is awaited
- *   before the call is recorded, so a test can put the send in an ordered log,
- *   hold it open or make it fail (a throwing hook: not recorded);
- * - the real restart and backoff state, with `initRestart` given
- *   `makeRestartDeps`: every liveness probe answers the `dead` reading
- *   (`LIVENESS_READING_DEAD`, src/liveness-reading.ts), the kill answers the
- *   success outcome (`killed`, `kill_sent: true`, src/checked-kill.ts), so the
- *   launch follows it (b.jg5 SRJ-701), launches are recorded in
- *   `h.launches`, every relaunch-gate ask (`canRestart`, made when a restart
- *   is scheduled and when its timer fires) in `h.restartAsks`, and the restart
- *   delay is read from `h.restartDelayS` at call time. `launchSession`
- *   replaces the launch outcome (hold a launch open to keep the persona in
- *   flight: it then reads as a launch running); `holdLaunches` holds every
- *   launch's outcome open until `h.releaseLaunches()` settles them;
- * - the real persona notifier as the injected `notify`, built by
- *   `makeNotifierStack` (tests/test-helpers/persona-notifier.ts) over the
- *   same `clientFor` and stubs and the applied config (`h.config`, read at
- *   call time, its switch included), never in dry run, so a lost-message notice is a
- *   `chat.postMessage` on the persona's own stub at its destination (a
- *   channel, or for `permission_prompts: 'dm'` the DM `conversations.open`
- *   returns). Its destination hold (`h.hold`) runs on a fake clock
- *   (`h.holdClock`), never the real one. A persona whose client is
- *   unavailable has its notices held until `h.notifier.flush(key)`. Every
- *   notice the routing raises is also recorded, body only, in `h.notices`;
- *   the `notify` option replaces the notifier (for example with a throwing
- *   sink);
- * - the user-name lookup, as src/server.ts does it: `users.info` through the
- *   persona's client from `clientFor`, or the user ID when the persona has no
- *   client (`h.clients.setUnavailable`); the `resolveUserName` option
- *   replaces it;
- * - the up predicate (`isPersonaUp`), only when the caller passes one or asks
- *   for the up check (`upCheck`, or `notUp` with persona names), so by
- *   default every persona counts as up. The up check is the real
- *   `createPersonaUpPredicate` over a connection that serves for every
- *   persona and a bring-up outcome that is `up` except for the keys in
- *   `h.notUp` (read at call time; `h.upOutcomes` is that outcome, for a
- *   relaunch gate over the same state); every key it is asked about is
- *   recorded in `h.upAsks`;
- * - the lost-message state inputs (b.jg5 SRJ-1011), each composed as `main()`
- *   binds it and asked with the persona key at call time:
- *   - latched (`held-for-human`): `h.latch`, one real latch instance built by
- *     E13's factory (`createConflictLatch`) bare, with no set observer, so a
- *     set (`h.latch.set`, `h.latch.setFromConflict`) logs one line to
- *     `h.logs` and posts nothing; `h.latch.forget(key)` is its silent drop.
- *     The restart deps are not given the latch, so the routing's own rule
- *     (only `starting-now` restarts) is what keeps a latched persona's
- *     message from restarting it;
- *   - not answering (`not-answering`): `h.tmuxUnresponsive`, E10's real
- *     condition over `h.episodes`, one real episodes instance on its own fake
- *     clock (`h.episodesClock`), whose sink records into `h.episodeNotices`,
- *     never a Slack stub. The condition is built with no alert threshold, so
- *     it arms no timer. The routing asks its `holds`; P's `tmux-unavailable`
- *     and `ad-config-malformed` flags are read by the routing itself from the
- *     real outage state. With the `outageState` option the harness installs
- *     that state (`initOutageState`) with a recording sink (`h.outageNotices`),
- *     never a Slack stub, so `raiseTmuxUnavailable`, `raiseAdConfigMalformed`,
- *     `setOutageFlag` and `clearOutageFlag` work and their notices are not
- *     posts; without it a raise does nothing. An unclassified-error episode
- *     opened in `h.episodes` is not an input (SRJ-1011);
- *   - P's retry timer armed (`isRetryArmed`, b.jg5 SRJ-1011 as amended:
- *     "state 5 applies only while P's retry timer is armed"): whether the key
- *     is in `h.retryArmed`, read at call time, exactly as `main()` reads the
- *     one retry controller's `isArmed`. In production every state-5 source
- *     arms P's timer (E10's condition start, the `tmux-unavailable` and
- *     `ad-config-malformed` raises), so by default every persona's timer is
- *     armed (`retryArmed` replaces that, with persona names: `[]` for none);
- *     a case takes it away with `h.retryArmed.delete(key)`, as a retry that
- *     stopped. The restart cap is the routing's own read of the real backoff
- *     state: `putAtRestartCap(key)` records `RESTART_FAILURE_CAP` real
- *     failures there;
- *   - a launch or dialog approver running (`session-starting`): by default,
- *     as `main()` binds it (`isLaunchInFlight` or `isDialogApproverRunning`,
- *     b.jg5 SRJ-401), whether one of the harness's own restart launches is in
- *     flight for the key (`h.isLaunchInFlight`), so a restart launch held
- *     open (`launchSession`) reads as a launch running, or the session
- *     manager's `isDialogApproverRunning` answers true for it (the approver a
- *     real launch started runs on after its launch call returned; the
- *     harness's own launches are recorded fakes and start none); the
- *     `isLaunchOrApproverRunning` option replaces it;
- *   - held on `ErrInvalidFlags` (`cannot-launch`): `h.invalidFlagsHold`, one
- *     real hold built by the hold's factory (`createInvalidFlagsHold`) bare, with
- *     no set reaction, so a set (`h.invalidFlagsHold.set(key, version?)`)
- *     logs one line to `h.logs` and posts nothing; `forget(key)` is its
- *     silent end. The routing asks its `isHeld`, as `main()` binds it
- *     (b.jg5 SRJ-207, SRJ-1011 state 3); the `heldOnInvalidFlags` option
- *     holds the named personas once the harness is built;
- *   - kill failed (`kill-failed`, b.jg5 SRJ-1011 state 4, SRJ-812): as
- *     `main()` composes it, P's kill-failure episode open (the key in
- *     `h.killFailed`, seeded by the option of the same name, with persona
- *     names: a case's own arrangement of the episode half) or P waiting on an
- *     old-life hold whose old key's kill failed: the session manager's
- *     `waitsOnKillFailedHold` (false while no hold set and wait bindings are
- *     installed; `waitOnKillFailedHold(h, key)` installs both with a hold of
- *     P's own row marked kill-failed, the shared table's arrangement);
- *   - a live-row sequence or old-life wait step running (`restarting`): as
- *     `main()` binds it (b.jg5 SRJ-706, SRJ-811), the session manager's
- *     `isSequenceOrOldLifeWaitRunning` for the key, read at call time (false
- *     while no sequence registry, hold set and wait bindings are installed,
- *     as here unless a case installs them), or the key in
- *     `h.sequenceOrWaitRunning` (seeded by the option of the same name, with
- *     persona names), a case's own arrangement;
- *   - in flight for P (the read gate's `isWorkInFlight`): as `main()`
- *     composes "in flight for P" (`isPersonaWorkInFlight`) from "blocks a
- *     retry" (`isPersonaRetryBlocked`) and a running dialog approver: one of
- *     the harness's own restart launches in flight (`h.isLaunchInFlight`),
- *     the session manager's `personaRetryBlockCause` naming a cause for the
- *     key (a launch call, a live-row sequence, b.jg5 SRJ-706, or an old-life
- *     wait step P waits on, SRJ-811), the key in `h.workInFlight` (seeded by
- *     `workInFlight`, with persona names), other work in flight that is not a
- *     launch, or the session manager's `isDialogApproverRunning` answering
- *     true for the key (b.jg5 SRJ-401). With no approver, sequence or wait
- *     running, a harness built with no option behaves as before. The
- *     state-6 launch-or-approver input is unchanged;
- *   - the one lost-message row read (`readRowLiveness`), only with the
- *     `rowRead` option; without it the routing gets no read and makes none.
- *     Each persona's answer is scripted in `h.rowReadScripts` (by key, read at
- *     call time, seeded from `rowRead` by persona name): a reading from
- *     src/liveness-reading.ts (`pending`, `live`, `dead` for no row,
- *     `unknown`), or `ROW_READ_REJECTS`, a rejection whose message carries
- *     the leak sentinel only through `sentinelInMessage`
- *     (`ROW_READ_REJECTION_MESSAGE`; `ROW_READ_REJECTION_REDACTED` once
- *     redacted) and whose `detail` carries it bare. An unscripted persona
- *     answers `UNSCRIPTED_ROW_READING` (`dead`, as the restart deps' probe).
- *     A script's `during` runs, awaited, after the read is recorded and
- *     before it settles (to latch P or raise an outage during the read, or
- *     hold the read open). Every read is recorded at its start in
- *     `h.rowReads` (its key) and in `h.readOrder` (`read:<key>`), which also
- *     gets `notice:<key>` for every notice the routing raises, so a case sees
- *     each read's place relative to the notices;
- *   - the missing-retry-timer arm (`armRetryTimerIfMissing`, b.jg5 SRJ-311),
- *     only with the `armRetryTimer` option: a member that records every ask,
- *     by key, in `h.retryTimerArms` and then arms P's timer (adds the key to
- *     `h.retryArmed`; nothing new when it is armed already, as production's
- *     check arms only when none is); without it the member is absent, as a
- *     caller that does not wire it leaves it;
- * - the server-wide reply settings source (`getReplySettings`, as src/server.ts
- *   passes its start-time settings): it returns the `ackReaction` option and
- *   the default chunking, so by default there is no ack reaction and a
- *   delivery makes no `reactions.add` call;
- * - `h.reply(name, args)`: persona `name`'s `reply` tool call through the real
- *   session server (`createSessionServer` over an in-memory MCP link) with the
- *   same `clientFor`, the real ack tracker and the same reply settings source
- *   as the routing, as src/server.ts shares one source between the inbound ack
- *   step and the `reply` tool. So an ack-tracker entry the routing recorded is
- *   observed as a `reactions.remove` on the persona's own stub. Its posting
- *   scope follows the harness's mode: the session tools' `getChannelMode`
- *   reads `h.config`'s switch at each call, as `h.setMode` leaves it
- *   (b.deo SRI-201, SRI-601), so with no `mode` option and no switch in
- *   `overrides` it is declarative;
- * - a line capture for the module's log seam, the notifier and the hold
- *   (`h.logs`), and an order capture (`h.order`) for ack, archive, config and
- *   identity reads.
- *
- * Every call builds a new routing, so every harness starts with empty
- * per-persona dedupe stores and heard sets; `dedupeClock` injects their clock (default
- * `Date.now`).
- *
- * The harness calls `initRestart` (and, with `outageState`,
- * `initOutageState`) and registers sessions; reset the registry, restart,
- * backoff, ack-tracker and outage state, and any old-life hold set and wait
- * bindings an arrangement installed, between tests with
- * `resetRoutingState()`. A case that can hold a notice (a failing destination)
- * calls `h.hold.cancelAll()` in teardown; the hold's timers are on
- * `h.holdClock`, so nothing fires unless the test moves it.
- *
- * Isolation (b.av2 SR-13.2): every path is under the caller's `baseDir`, and
- * the store's under the caller's state directory, which must be under the
- * OS temp directory; no I/O of its own, no timers, no token literal.
- *
- * SPDX-License-Identifier: MIT
- */
+
 
 import { createDeliveryQueue, type QueueItem } from '../../src/delivery-queue.ts'
 import { createDeliveryPreparation, type DeliveryPreparationDeps } from '../../src/delivery-intake.ts'
@@ -250,16 +35,7 @@ import {
   type TmuxUnresponsiveCondition,
 } from '../../src/persona-episodes.ts'
 import { _resetOutageState, initOutageState } from '../../src/outage-state.ts'
-import {
-  _resetOldLifeHolds,
-  _resetOldLifeWaitBindings,
-  isDialogApproverRunning,
-  isSequenceOrOldLifeWaitRunning,
-  personaRetryBlockCause,
-  setOldLifeHolds,
-  setOldLifeWaitBindings,
-  waitsOnKillFailedHold,
-} from '../../src/session-manager.ts'
+import { _resetOldLifeHolds, _resetOldLifeWaitBindings, isSequenceOrOldLifeWaitRunning, personaRetryBlockCause, setOldLifeHolds, setOldLifeWaitBindings, waitsOnKillFailedHold } from '../../src/session-manager.ts'
 import { OLD_LIFE_HOLD_CAUSE_APPLY_STEP_1, createOldLifeHoldSet } from '../../src/retired-keys.ts'
 import { personaInstanceId } from '../../src/persona-identity.ts'
 import { createSessionServer, registerSession, _resetRegistry, type SessionEntry, type SessionToolDeps } from '../../src/registry.ts'
@@ -734,13 +510,8 @@ export interface RoutingHarnessOptions {
    * installed, and a raise does nothing. `resetRoutingState()` removes it.
    */
   outageState?: boolean
-  /**
-   * Replaces the routing's launch-or-approver query (b.jg5 SRJ-1011 state 6);
-   * default `h.isLaunchInFlight` (the harness's own restart launches in
-   * flight) or the session manager's `isDialogApproverRunning`, as `main()`
-   * binds it.
-   */
-  isLaunchOrApproverRunning?: PersonaRoutingDeps['isLaunchOrApproverRunning']
+
+  isLaunchRunning?: PersonaRoutingDeps['isLaunchRunning']
   /** Names first held on `ErrInvalidFlags` (`h.invalidFlagsHold`, `cannot-launch`). */
   heldOnInvalidFlags?: readonly string[]
   /** Names whose kill failed first (`h.killFailed`, `kill-failed`). */
@@ -1264,8 +1035,8 @@ export function makeRoutingHarness(
     isTmuxUnresponsive: (key) => h.tmuxUnresponsive.holds(key),
     isRetryArmed: (key) => h.retryArmed.has(key),
     // As main() binds it (b.jg5 SRJ-401): a launch call, or the dialog
-    // approver that runs after it returned.
-    isLaunchOrApproverRunning: opts.isLaunchOrApproverRunning ?? ((key) => h.isLaunchInFlight(key) || isDialogApproverRunning(key)),
+
+    isLaunchRunning: opts.isLaunchRunning ?? ((key) => h.isLaunchInFlight(key)),
     // As main() binds it (b.jg5 SRJ-207, SRJ-1011 state 3): the one hold's
     // isHeld, read at call time.
     isHeldOnInvalidFlags: (key) => h.invalidFlagsHold.isHeld(key) === true,
@@ -1284,12 +1055,12 @@ export function makeRoutingHarness(
     // manager's `personaRetryBlockCause`: a launch call, a running live-row
     // sequence or an old-life wait step P waits on; the harness's own restart
     // launches; the non-launch work a case marks), or a
-    // running dialog approver (b.jg5 SRJ-401).
+
     isWorkInFlight: (key) =>
       h.isLaunchInFlight(key) ||
       personaRetryBlockCause(key) !== undefined ||
       h.workInFlight.has(key) ||
-      isDialogApproverRunning(key),
+      false,
     readRowLiveness,
     ...(opts.armRetryTimer === true
       ? {
