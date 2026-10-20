@@ -10,7 +10,7 @@ import { injectedInput, slackInput } from './test-helpers/delivery-queue.ts'
 import { cannedGetResult } from './test-helpers/agent-director-stub.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { promptEntry } from './test-helpers/working-row-panes.ts'
-import { auditReceipts, deliveryFailureEvidence, jsonLines, readTranscripts } from './integration/fixtures/transcript-receipts.ts'
+import { auditReceipts, deliveryFailureEvidence, jsonLines, readTranscripts, receiptJournal, workloadItem, workloadItems } from './integration/fixtures/transcript-receipts.ts'
 
 const cleanups: (() => Promise<void>)[] = []
 afterEach(async () => { for (const cleanup of cleanups.splice(0)) await cleanup() })
@@ -70,6 +70,29 @@ test('original Slack and injected inputs retain exact counts and latency samples
   expect(h.audit()).toMatchObject({ items: 4, reminders: 1, duplicates: 0 })
 })
 
+test('workload ordinals retain original input identities across interleaved reminders and recovery', async () => {
+  const h = await fixture()
+  const assertSelection = () => {
+    const journal = receiptJournal(h.options.stateDir, 'alpha')
+    const inputs = workloadItems(journal)
+    expect(inputs.map(r => [r.seq, r.source])).toEqual([[1, 'slack'], [3, 'slack'], [4, 'interject'], [5, 'cron']])
+    expect(inputs.map((_, i) => workloadItem(journal, i + 1).seq)).toEqual([1, 3, 4, 5])
+    expect(() => workloadItem(journal, 5)).toThrow('Workload item 5 has not been accepted')
+    // Selecting a workload must leave reminder evidence in the full journal.
+    expect(journal.some(r => r.kind === 'accepted' && r.reminder_for === 1)).toBe(true)
+  }
+  assertSelection()
+  await h.queue.compact()
+  expect(jsonLines(h.journal).some(r => r.kind === 'accepted' && r.compact)).toBe(true)
+  await h.queue.stop()
+  await h.queue.start()
+  assertSelection()
+})
+
+test.each([0, -1, 1.5, NaN, Infinity])('workload selection rejects invalid ordinal %s', ordinal => {
+  expect(() => workloadItem([], ordinal)).toThrow('Invalid workload ordinal')
+})
+
 test.each([
   ['missing original input', 'Accepted item count differs'],
   ['missing reminder receipt', 'still open'],
@@ -79,6 +102,9 @@ test.each([
   ['cron reminder', 'Invalid reply reminder provenance'],
   ['duplicate reminder', 'Invalid reply reminder provenance'],
   ['premature reminder', 'Invalid reply reminder provenance'],
+  ['reminder sent before workload delivery log', 'Successor send preceded prior receipt/delivery log'],
+  ['workload sent before reminder delivery log', 'Successor send preceded prior receipt/delivery log'],
+  ['reminder retyped', 'Text fidelity case retyped'],
 ] as const)('receipt accounting rejects %s despite excluding reminders from the expected input count', async (mode, reason) => {
   const h = await fixture()
   expect(h.audit().items).toBe(4)
@@ -93,5 +119,20 @@ test.each([
   writeFileSync(h.journal, rows.map(r => JSON.stringify(r)).join('\n') + '\n')
   if (mode === 'missing reminder take-in') writeFileSync(h.transcript, jsonLines(h.transcript).filter(r => r.uuid !== 'take-2').map(r => JSON.stringify(r)).join('\n') + '\n')
   if (mode === 'missing reminder send') writeFileSync(h.shimLog, readFileSync(h.shimLog, 'utf8').split('\n').filter((_, i) => i !== 1).join('\n'))
-  expect(h.audit).toThrow(reason)
+  if (mode === 'reminder sent before workload delivery log' || mode === 'workload sent before reminder delivery log') {
+    const previousSeq = mode === 'reminder sent before workload delivery log' ? 1 : 2
+    const previous = rows.find(r => r.kind === 'accepted' && r.seq === previousSeq)
+    const sent = rows.find(r => r.kind === 'sent' && r.seq === previousSeq + 1)
+    const logPath = join(h.options.stateDir, 'server.log')
+    const lines = readFileSync(logPath, 'utf8').split('\n').map(line =>
+      line.includes('message-delivered:') && line.includes(`ts=${JSON.stringify(previous.ts)}`)
+        ? line.replace(/^\[[^\]]+\]/, `[${new Date(sent.at + 1).toISOString()}]`) : line)
+    writeFileSync(logPath, lines.join('\n'))
+  }
+  if (mode === 'reminder retyped') {
+    const calls = readFileSync(h.shimLog, 'utf8').trimEnd().split('\n')
+    calls.splice(2, 0, calls[1]!)
+    writeFileSync(h.shimLog, calls.join('\n') + '\n')
+  }
+  expect(() => auditReceipts({ ...h.options, noRetype: mode === 'reminder retyped' }, h.entries(), h.adapters)).toThrow(reason)
 })

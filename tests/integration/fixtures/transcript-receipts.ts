@@ -18,6 +18,19 @@ export async function packedReceiptAdapters(pkg = process.env.CSCB_PKG_DIR ?? '/
 export function jsonLines(path: string): any[] {
   return readFileSync(path, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line))
 }
+/** Scenario ordinals count original inputs, not the reminders allocated between
+ * them. Use the cumulative receipt journal so recovery cannot renumber inputs.
+ * This selection never filters the journal used for receipt/FIFO assertions. */
+export function workloadItems(journal: readonly any[]): any[] {
+  return journal.filter(r => r.kind === 'accepted' && !r.compact && r.reminder_for === undefined)
+    .sort((a, b) => a.seq - b.seq)
+}
+export function workloadItem(journal: readonly any[], ordinal: number): any {
+  if (!Number.isSafeInteger(ordinal) || ordinal < 1) throw new Error('Invalid workload ordinal')
+  const item = workloadItems(journal)[ordinal - 1]
+  if (!item) throw new Error(`Workload item ${ordinal} has not been accepted`)
+  return item
+}
 function queuePath(stateDir: string, key: string): string {
   if (!/^[a-z0-9_]+$/.test(key)) throw new Error('Invalid receipt persona key')
   return join(stateDir, 'queue', `${key}.jsonl`)
@@ -234,7 +247,7 @@ export function auditReceipts(options: AuditOptions, entries: readonly Transcrip
   const journal = receiptJournal(options.stateDir, options.key)
   const accepted = journal.filter(r => r.kind === 'accepted' && !r.compact).sort((a, b) => a.seq - b.seq)
   // Scenario counts describe original Slack/cron/interject inputs; reminders still need full receipt/FIFO proof.
-  const inputs = accepted.filter(r => r.reminder_for === undefined), reminders = accepted.filter(r => r.reminder_for !== undefined)
+  const inputs = workloadItems(journal), reminders = accepted.filter(r => r.reminder_for !== undefined)
   if (!inputs.length || (options.expectedCount !== undefined && inputs.length !== options.expectedCount)) throw new Error('Accepted item count differs')
   const reminded = new Set<number>()
   for (const item of reminders) {

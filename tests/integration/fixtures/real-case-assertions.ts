@@ -1,12 +1,11 @@
 /** Lane-1 scenario assertions, not transport or production matching (b.omv SR-14). */
 import { existsSync, readFileSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { join, resolve } from 'node:path'
-import { auditReceipts, captureReceiptJournal, jsonLines, packedReceiptAdapters, personaTranscripts, readTranscripts, receiptJournal, shimWords, transcriptFiles } from './transcript-receipts.ts'
+import { auditReceipts, captureReceiptJournal, jsonLines, packedReceiptAdapters, personaTranscripts, readTranscripts, receiptJournal, shimWords, transcriptFiles, workloadItem, workloadItems } from './transcript-receipts.ts'
 import { assertBusyProof, emitBusyProofFailure, pollBusyProof, type BusyProofSnapshot } from './busy-proof.ts'
 import { idleCapability } from './native-idle-compaction.ts'
 const [command, state, key, shim, root, arg = '', arg2 = '', arg3 = ''] = process.argv.slice(2)
 function check(value: unknown, reason: string): asserts value { if (!value) throw new Error(reason) }
-function journal() { return jsonLines(join(state!, 'queue', `${key}.jsonl`)) }
 function cumulativeJournal() { return receiptJournal(state!, key!) }
 function calls() { return readFileSync(shim!, 'utf8').split('\n').filter(l => l.startsWith('call\t')).map(l => { const f=l.split('\t'); return { at:Number(f[1])*1000, words:shimWords(f[5]!) } }) }
 function blocks(e:any):any[] { return e.value?.type==='assistant'&&Array.isArray(e.value?.message?.content)?e.value.message.content:[] }
@@ -14,7 +13,7 @@ async function entries() { return readTranscripts(transcriptFiles(root!), await 
 try {
   check(existsSync('/etc/cscb-ci-image'), 'scenario assertions require the CI image')
   if (command === 'accepted' || command === 'delivered') {
-    const j=cumulativeJournal(), a=j.filter(r=>r.kind==='accepted'&&!r.compact&&r.reminder_for===undefined)
+    const j=cumulativeJournal(), a=workloadItems(j)
     check(a.length>=Number(arg), 'not enough accepted items')
     if(command==='delivered') for(const i of a.slice(0,Number(arg))) {
       const f=j.find(r=>r.kind==='fixed'&&r.seq===i.seq)
@@ -25,7 +24,7 @@ try {
     for(const row of [before,after]) check(row.instance_id==='cscb_'+key&&row.state==='ended','DOWN interval has a live or wrong native row')
     check(before.session_id&&before.ended_at,'DOWN interval lacks the paused native session')
     for(const field of ['session_id','started_at','ended_at','launch_started_at']) check(before[field]===after[field],'native launch changed during DOWN interval')
-    const j=cumulativeJournal(), accepted=j.filter(r=>r.kind==='accepted'&&!r.compact)
+    const j=cumulativeJournal(), accepted=workloadItems(j)
     check(accepted.length===Number(arg3),'DOWN interval acceptance count differs')
     for(const [source,count] of [['slack',10],['interject',2],['cron',1]] as const) check(accepted.filter(r=>r.source===source).length===count,'DOWN interval source count differs: '+source)
     check(!j.some(r=>r.kind==='sent'),'send recorded during DOWN interval')
@@ -48,7 +47,7 @@ try {
   } else if(command==='no-send') {
     check(!calls().some(c=>c.at>=Number(arg)&&c.words.includes('send-keys')), 'keys typed during a hold')
   } else if(command==='open') {
-    const j=journal(),seq=Number(arg),f=j.find(r=>r.seq===seq&&r.kind==='fixed')
+    const j=cumulativeJournal(),seq=workloadItem(j,Number(arg)).seq,f=j.find(r=>r.seq===seq&&r.kind==='fixed')
     check(f?.parts?.some((_:unknown,n:number)=>!j.some(r=>r.seq===seq&&r.kind==='delivered'&&r.part===n+1)),'expected head is already complete')
   } else if(command==='no-enter-fault') {
     check(readFileSync(shim!,'utf8').split('\n').filter(l=>l.startsWith('fault\t')&&shimWords(l.split('\t')[5]!)[1]==='no_enter').length>=Number(arg),'text fault not yet applied')
@@ -57,7 +56,8 @@ try {
   } else if(command==='fault') {
     check(readFileSync(shim!,'utf8').split('\n').filter(l=>l.startsWith('fault\t')&&shimWords(l.split('\t')[5]!)[2]===arg).length>=Number(arg2||1), 'fault not yet consumed')
   } else if(command==='fidelity-shapes') {
-    const j=cumulativeJournal();for(const [seq,bytes] of [[9,850],[10,1400],[11,1900]]) {
+    const j=cumulativeJournal();for(const [ordinal,bytes] of [[9,850],[10,1400],[11,1900]] as const) {
+      const seq=workloadItem(j,ordinal).seq
       const f=j.find(r=>r.kind==='fixed'&&r.seq===seq);check(f?.parts?.length===1&&Buffer.byteLength(f.parts[0])===bytes,'single-part native fidelity size differs')
     }
   } else if(command==='unknown-proof') {
@@ -67,13 +67,14 @@ try {
     check((next<0?after:after.slice(0,next)).some(c=>c.words.includes('read-pane')),'unknown send retyped without a fresh box read')
     console.log('recorded: unknown outcome checked before retype '+arg)
   } else if(command==='reset-spacing') {
-    const s=cumulativeJournal().filter(r=>r.kind==='sent'&&r.seq===Number(arg)&&r.send_kind!=='enter')
+    const j=cumulativeJournal(),seq=workloadItem(j,Number(arg)).seq
+    const s=j.filter(r=>r.kind==='sent'&&r.seq===seq&&r.send_kind!=='enter')
     const launches=[...new Set(s.map(r=>r.launch_id))];check(launches.length>=2,'head was not retried across a real launch')
     const newer=s.filter(r=>r.launch_id===launches.at(-1));check(newer.length>=2,'restarted head did not exercise a new retry')
     check(newer[1].at-newer[0].at<60000,'restart retained later backoff instead of resetting')
     console.log('recorded: restart reset spacing '+JSON.stringify(newer.map(r=>r.at)))
   } else if(command==='key-proof') {
-    const j=cumulativeJournal(), s=j.filter(r=>r.kind==='sent'&&r.seq===Number(arg))
+    const j=cumulativeJournal(), seq=workloadItem(j,Number(arg)).seq, s=j.filter(r=>r.kind==='sent'&&r.seq===seq)
     const text=s.filter(r=>r.send_kind!=='enter'), enter=s.filter(r=>r.send_kind==='enter')
     if(arg2==='enter') {
       // b.omv SR-13.5: real deliveries permit duplicate text. Prove that
@@ -87,9 +88,9 @@ try {
     if(arg2==='spacing') {
       check(text.length>=4, 'three swallowed texts did not produce three retypes')
       for(let i=1;i<4;i++) check(text[i].at-text[i-1].at >= [10000,30000,60000][i-1]!, 'retype spacing below growing backoff')
-      check(j.filter(r=>r.kind==='noticed'&&r.seq===Number(arg)).length===1, 'not-taken-in notice not once')
+      check(j.filter(r=>r.kind==='noticed'&&r.seq===seq).length===1, 'not-taken-in notice not once')
     }
-    console.log('recorded: key proof '+JSON.stringify({seq:Number(arg),sends:s.map(r=>({kind:r.send_kind,at:r.at}))}))
+    console.log('recorded: key proof '+JSON.stringify({ordinal:Number(arg),seq,sends:s.map(r=>({kind:r.send_kind,at:r.at}))}))
   } else if(command==='cron') {
     const a=cumulativeJournal().filter(r=>r.kind==='accepted'&&r.source==='cron'&&!r.compact)
     check(a.length===Number(arg), 'cron fire count differs')
@@ -105,7 +106,7 @@ try {
   } else if(command==='fault-at') {
     const f=readFileSync(shim!,'utf8').split('\n').filter(l=>l.startsWith('fault\t')&&shimWords(l.split('\t')[5]!)[2]===arg).at(-1);check(f,'fault not found');console.log(Number(f.split('\t')[1])*1000)
   } else if(command==='reconnect-proof') {
-    const j=cumulativeJournal(),target=j.filter(r=>r.kind==='accepted'&&!r.compact&&r.reminder_for===undefined)[Number(arg)-1]
+    const j=cumulativeJournal(),target=workloadItem(j,Number(arg))
     const fixed=j.find(r=>r.kind==='fixed'&&r.seq===target?.seq);check(fixed,'reconnect target not fixed')
     const c=calls(), sent=c.find(c=>c.words.includes('--text')&&c.words[c.words.indexOf('--text')+1]===fixed.parts[0]);check(sent,'delivery was not typed')
     const reconnect=c.filter(c=>c.at>=Number(arg2)&&c.at<sent.at&&c.words.includes('send-keys')&&c.words.some(w=>w.startsWith('/mcp reconnect')))
