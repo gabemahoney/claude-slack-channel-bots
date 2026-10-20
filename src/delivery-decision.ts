@@ -486,10 +486,10 @@ function nonEmptyString(value: unknown): string | undefined {
 // ---------------------------------------------------------------------------
 
 /** P's user mention token (`<@P>` or `<@P|label>`); undefined for an empty or unknown ID. */
-function personaMentionPattern(botUserId: string | undefined, flags?: string): RegExp | undefined {
+function personaMentionPattern(botUserId: string | undefined): RegExp | undefined {
   const id = nonEmptyString(botUserId)
   if (id === undefined) return undefined
-  return new RegExp(`<@${escapeRegExp(id)}(?:\\|[^>]*)?>`, flags)
+  return new RegExp(`<@${escapeRegExp(id)}(?:\\|[^>]*)?>`)
 }
 
 /** True when `text` contains P's user mention; never for an empty or unknown ID. */
@@ -501,20 +501,6 @@ function mentionsPersona(text: unknown, botUserId: string | undefined): boolean 
 /** True when `text` contains `<!here>` or `<!channel>`, with or without a label. */
 function hasBroadcast(text: unknown): boolean {
   return typeof text === 'string' && BROADCAST_PATTERN.test(text)
-}
-
-/**
- * Remove every P's own mention token (`<@P>` and `<@P|label>`) and the
- * whitespace after it from `text`, preserving all other text. Mention-only
- * text with surrounding whitespace becomes empty. Other personas' mentions
- * and broadcasts stay. An empty or unknown ID leaves the text unchanged.
- */
-export function stripPersonaMention(text: string, botUserId: string | undefined): string {
-  const pattern = personaMentionPattern(botUserId, 'g')
-  if (!pattern) return text
-  const parts = text.split(pattern)
-  const stripped = parts.map((part, i) => (i === 0 ? part : part.trimStart())).join('')
-  return parts.length > 1 && stripped.trim() === '' ? '' : stripped
 }
 
 /** Escape `value` for literal use inside a regular expression. */

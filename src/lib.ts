@@ -87,25 +87,33 @@ export function assertSendable(
 // Text chunking
 // ---------------------------------------------------------------------------
 
+/**
+ * Split into at most `limit` Unicode code points per chunk, without changing
+ * text: joining the chunks with '' recovers the input exactly. Empty input
+ * returns ['']. Newline mode prefers a boundary after the last newline that
+ * fits, retaining that newline; lines longer than the limit are hard-split.
+ * Surrogate pairs stay together, including when the limit is one.
+ */
 export function chunkText(text: string, limit: number, mode: 'length' | 'newline'): string[] {
+  if (!Number.isInteger(limit) || limit <= 0) {
+    throw new RangeError('Text chunk limit must be a positive integer.')
+  }
   if (text.length <= limit) return [text]
 
   const chunks: string[] = []
-
-  if (mode === 'newline') {
-    let current = ''
-    for (const line of text.split('\n')) {
-      if (current.length + line.length + 1 > limit && current.length > 0) {
-        chunks.push(current)
-        current = ''
-      }
-      current += (current ? '\n' : '') + line
+  let start = 0
+  while (start < text.length) {
+    let end = start
+    let newlineEnd = start
+    for (let count = 0; count < limit && end < text.length; count++) {
+      end += text.codePointAt(end)! > 0xffff ? 2 : 1
+      if (text[end - 1] === '\n') newlineEnd = end
     }
-    if (current) chunks.push(current)
-  } else {
-    for (let i = 0; i < text.length; i += limit) {
-      chunks.push(text.slice(i, i + limit))
+    if (mode === 'newline' && end < text.length && newlineEnd > start) {
+      end = newlineEnd
     }
+    chunks.push(text.slice(start, end))
+    start = end
   }
 
   return chunks
