@@ -180,3 +180,5 @@ A persona that answers only with `edit_message`, `react` or another service can 
 ### When it stays silent
 
 A reminder requires an observed `working` → `waiting` transition after delivery in the same session. A first observation of `waiting` alone is insufficient; CSCB does not infer a missed transition. A changed session, a finished or missing row, or persona teardown cancels pending reminder checks. For diagnosis, see [A persona isn't reminded to reply, or is reminded after opting out](../skills/debug-slack-channel-bots/SKILL.md#a-persona-isnt-reminded-to-reply-or-is-reminded-after-opting-out).
+
+A pending reminder check expires 24 hours after delivery. A reminder already queued follows normal delivery.

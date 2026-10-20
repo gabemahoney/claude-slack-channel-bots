@@ -3,7 +3,7 @@ import * as fs from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import type { GetResult } from 'agent-director'
-import { createDeliveryQueue, QUEUE_KEY_KEEP_MS, type AcceptedInput, type ReplyReminderQueue, type QueueItem } from '../src/delivery-queue.ts'
+import { createDeliveryQueue, REPLY_REMINDER_KEEP_MS, type AcceptedInput, type ReplyReminderQueue, type QueueItem } from '../src/delivery-queue.ts'
 import { createReplyReminders, REPLY_REMINDER_TEXT, REPLY_REMINDER_POLL_MS, type ReplyReminders } from '../src/reply-reminder.ts'
 import { cannedGetResult } from './test-helpers/agent-director-stub.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
@@ -21,7 +21,7 @@ afterEach(async () => {
   fs.rmSync(dir, { recursive: true, force: true })
 })
 async function open(options: Omit<Parameters<typeof createDeliveryQueue>[0], 'stateDir'> = {}) {
-  const q = createDeliveryQueue({ stateDir: dir, ...options }); queues.push(q); await q.start(); return q
+  const q = createDeliveryQueue({ stateDir: dir, now: () => 1000, ...options }); queues.push(q); await q.start(); return q
 }
 function harness(queue: ReplyReminderQueue, options: { prepare?: (key: string, item: QueueItem) => Promise<void> } = {}) {
   const clock = createFakeClock()
@@ -367,7 +367,8 @@ describe('AD row reply reminders (b.js7)', () => {
     const q = await open({ now: () => now }), h = harness(q)
     const seq = await send(q)
     await h.monitor.observe('alpha', h.row('working'))
-    await h.monitor.stop(); now += QUEUE_KEY_KEEP_MS + 1; await q.compact(); await q.stop()
+    // Unresolved facts survive restart only within their bounded eligibility window.
+    await h.monitor.stop(); now += REPLY_REMINDER_KEEP_MS - 1; await q.compact(); await q.stop()
     const records = readQueue(dir)
     expect(JSON.stringify(records)).not.toContain('delivered body')
     expect(records.filter(r => r.kind === 'reply-reminder')).toEqual([expect.objectContaining({ seq, state: 'observed', row_state: 'working' })])
@@ -380,6 +381,54 @@ describe('AD row reply reminders (b.js7)', () => {
     await final.monitor.observe('alpha', final.row('waiting'))
     expect(nudges(again)).toHaveLength(1)
     expect(final.prepared).toEqual([])
+  })
+
+  test.each([false, true])('pending facts expire without rearming after observations, compaction and restart (legacy: %s)', async legacy => {
+    let now = 1000
+    const q = await open({ now: () => now })
+    const seq = await send(q)
+    await q.compact(); await q.stop()
+    if (legacy) seedQueue(dir, readQueue(dir).map(r => r.kind === 'reply-reminder' ? { ...r, delivered_at: undefined } : r))
+    const replay = await open({ now: () => now }), h = harness(replay)
+    now += REPLY_REMINDER_KEEP_MS - 1
+    await h.monitor.observe('alpha', h.row('working'))
+    await replay.compact()
+    const facts = readQueue(dir).filter(r => r.kind === 'reply-reminder')
+    expect(facts).toEqual([expect.objectContaining({ seq, state: 'observed', delivered_at: 1000 })])
+    expect(Object.keys(facts[0]!).sort()).toEqual(['at', 'delivered_at', 'delivery_attempts', 'kind', 'row_state', 'seq', 'session_id', 'state', 'v'])
+    now++
+    await h.monitor.observe('alpha', h.row('waiting'))
+    expect(replay.replyReminderItems('alpha')).toEqual([])
+    expect(nudges(replay)).toEqual([])
+    await h.monitor.stop(); await replay.compact(); await replay.stop()
+    expect(readQueue(dir).filter(r => r.kind === 'reply-reminder')).toEqual([])
+    const final = await open({ now: () => now }), resumed = harness(final)
+    await resumed.monitor.observe('alpha', resumed.row('working'))
+    await resumed.monitor.observe('alpha', resumed.row('waiting'))
+    expect(nudges(final)).toEqual([])
+    expect(resumed.prepared).toEqual([])
+  })
+
+  test.each(['reply', 'forget', 'nudge'] as const)('compaction drops resolved %s facts and all delivered bodies', async action => {
+    const q = await open(), h = harness(q)
+    await send(q)
+    if (action === 'reply') await h.monitor.noteReplyCall('alpha')
+    else if (action === 'forget') await h.monitor.forget('alpha')
+    else {
+      await h.monitor.observe('alpha', h.row('working'))
+      await h.monitor.observe('alpha', h.row('waiting'))
+      const seq = nudges(q)[0]!.accepted.seq
+      await q.append('alpha', { v: 1, kind: 'fixed', seq, parts: [REPLY_REMINDER_TEXT] })
+      await q.append('alpha', sentRecord(seq))
+      await q.append('alpha', deliveredRecord(seq))
+    }
+    await h.monitor.stop(); await q.compact(); await q.stop()
+    expect(readQueue(dir).every(r => r.kind === 'accepted' && 'compact' in r)).toBe(true)
+    const replay = await open(), resumed = harness(replay)
+    await resumed.monitor.observe('alpha', resumed.row('working'))
+    await resumed.monitor.observe('alpha', resumed.row('waiting'))
+    expect(replay.replyReminderItems('alpha')).toEqual([])
+    expect(resumed.prepared).toEqual([])
   })
 
   test('a torn append retaining reminder acceptance but losing its terminal fact replays without a duplicate', async () => {
@@ -410,16 +459,18 @@ describe('AD row reply reminders (b.js7)', () => {
   })
 
   test.each(['reply', 'forget'] as const)('%s before a final delivery receipt survives compaction and restart', async action => {
-    const q = await open(), h = harness(q)
+    let now = 1000
+    const q = await open({ now: () => now }), h = harness(q)
     const seq = await send(q, 'alpha', slackInput(), false)
     if (action === 'reply') await h.monitor.noteReplyCall('alpha')
     else await h.monitor.forget('alpha')
+    now += REPLY_REMINDER_KEEP_MS + 1
     await h.monitor.stop(); await q.compact(); await q.stop()
-    if (action === 'reply') expect(readQueue(dir).filter(record => record.kind === 'reply-reminder')).toEqual([
-      expect.objectContaining({ seq, state: 'replied', reply_attempts: [1] }),
+    expect(readQueue(dir).filter(record => record.kind === 'reply-reminder')).toEqual([
+      expect.objectContaining({ seq, ...(action === 'reply' ? { state: 'replied', reply_attempts: [1] } : { state: 'cancelled' }) }),
     ])
-    const replay = await open(), resumed = harness(replay)
-    await replay.append('alpha', deliveredRecord(seq))
+    const replay = await open({ now: () => now }), resumed = harness(replay)
+    await replay.append('alpha', deliveredRecord(seq, now))
     await resumed.monitor.observe('alpha', resumed.row('working'))
     await resumed.monitor.observe('alpha', resumed.row('waiting'))
     expect(nudges(replay)).toEqual([])

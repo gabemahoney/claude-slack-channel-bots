@@ -23,6 +23,7 @@ real_wait_idle "${REAL_KEY}"
 DROP_MARK="$(date +%s%3N)"
 real_drop_mcp "${REAL_KEY}"
 real_dm "${REAL_LABEL}" 'message-triggered reconnect'
+# Counts and reconnect targets follow original Slack inputs, skipping reminder sequence numbers.
 real_wait_delivery "${REAL_KEY}" 2
 case_assert reconnect-proof 2 "${DROP_MARK}"
 # Session loss while the delivery attempt owns the typing gate.

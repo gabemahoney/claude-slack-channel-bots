@@ -19,6 +19,7 @@ real_wait_idle "${REAL_KEY}"
 real_ad send-keys --instance-id "$(real_instance "${REAL_KEY}")" --text '/compact' >/dev/null
 for n in {1..3}; do real_dm "${REAL_LABEL}" "during compact ${n}"; done
 wait_until "${REAL_COMPACT_WAIT_S}" 'explicit compact not observed in transcript' case_assert compacted
+# Four Slack inputs remain four even when their no-tool persona receives reply reminders.
 real_wait_delivery "${REAL_KEY}" 4
 case_assert launches
 real_finish "${REAL_KEY}"

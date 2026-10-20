@@ -14,7 +14,7 @@ async function entries() { return readTranscripts(transcriptFiles(root!), await 
 try {
   check(existsSync('/etc/cscb-ci-image'), 'scenario assertions require the CI image')
   if (command === 'accepted' || command === 'delivered') {
-    const j=cumulativeJournal(), a=j.filter(r=>r.kind==='accepted'&&!r.compact)
+    const j=cumulativeJournal(), a=j.filter(r=>r.kind==='accepted'&&!r.compact&&r.reminder_for===undefined)
     check(a.length>=Number(arg), 'not enough accepted items')
     if(command==='delivered') for(const i of a.slice(0,Number(arg))) {
       const f=j.find(r=>r.kind==='fixed'&&r.seq===i.seq)
@@ -105,7 +105,8 @@ try {
   } else if(command==='fault-at') {
     const f=readFileSync(shim!,'utf8').split('\n').filter(l=>l.startsWith('fault\t')&&shimWords(l.split('\t')[5]!)[2]===arg).at(-1);check(f,'fault not found');console.log(Number(f.split('\t')[1])*1000)
   } else if(command==='reconnect-proof') {
-    const j=cumulativeJournal(),fixed=j.find(r=>r.kind==='fixed'&&r.seq===Number(arg));check(fixed,'reconnect target not fixed')
+    const j=cumulativeJournal(),target=j.filter(r=>r.kind==='accepted'&&!r.compact&&r.reminder_for===undefined)[Number(arg)-1]
+    const fixed=j.find(r=>r.kind==='fixed'&&r.seq===target?.seq);check(fixed,'reconnect target not fixed')
     const c=calls(), sent=c.find(c=>c.words.includes('--text')&&c.words[c.words.indexOf('--text')+1]===fixed.parts[0]);check(sent,'delivery was not typed')
     const reconnect=c.filter(c=>c.at>=Number(arg2)&&c.at<sent.at&&c.words.includes('send-keys')&&c.words.some(w=>w.startsWith('/mcp reconnect')))
     check(reconnect.length>=1,'delivery preceded its reconnect or reconnect violated the hold interval')
@@ -557,7 +558,9 @@ try {
     await queue.stop()
     queue=createDeliveryQueue({stateDir:compactDir,now:()=>50000});await queue.start()
     try {
-      check(jsonLines(compactQueue).every(r=>r.compact),'real restart retained a completed full item')
+      // Pending reminder metadata survives restart; completed message bodies must not.
+      const reminderFields=['v','kind','seq','at','delivered_at','state','row_state','session_id','launch_started_at','delivery_attempts']
+      check(jsonLines(compactQueue).every(r=>r.compact||(r.kind==='reply-reminder'&&r.state==='observed'&&Object.keys(r).every(k=>reminderFields.includes(k)))),'real restart retained a completed full item')
       check(auditCompact().items===5,'real queue compaction lost original five-item count')
       expectControl('cumulative delivered prefix after actual restart',()=>invokeCompact('delivered','5'))
       const compactBytes=readFileSync(compactQueue,'utf8'), historyBytes=readFileSync(historyPath,'utf8')

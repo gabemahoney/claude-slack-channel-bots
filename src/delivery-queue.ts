@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto'
 import { PERSONA_KEY_RE } from './persona-identity.ts'
 
 export const QUEUE_KEY_KEEP_MS = 24 * 60 * 60 * 1000
+export const REPLY_REMINDER_KEEP_MS = 24 * 60 * 60 * 1000
 export const QUEUE_COMPACT_INTERVAL_MS = 60 * 60 * 1000
 export const QUEUE_DIRECTORY_MODE = 0o700
 export const QUEUE_FILE_MODE = 0o600
@@ -59,6 +60,8 @@ export interface DeliveredRecord extends BaseRecord {
 export interface RefusedRecord extends BaseRecord { kind: 'refused'; attempt: number; at: number }
 export interface ReplyReminderRecord extends BaseRecord {
   kind: 'reply-reminder'; at: number
+  /** Fixed eligibility origin; repeated AD observations must not extend retention. */
+  delivered_at?: number
   state: 'observed' | 'replied' | 'nudged' | 'cancelled'
   row_state?: string; session_id?: string; launch_started_at?: string | null
   /** A pre-receipt reply covers only these attempts, while they remain unrefused. */
@@ -147,7 +150,7 @@ export function isQueueRecord(value: unknown): value is QueueRecord {
       return positive(r.part) && ['text', 'enter', 'retype'].includes(String(r.send_kind)) && str(r.launch_id) && str(r.session_id) && str(r.transcript_path) && integer(r.transcript_size)
     case 'delivered': return positive(r.part) && number(r.at) && object(r.receipt) && str(r.receipt.path) && (str(r.receipt.uuid) || integer(r.receipt.offset))
     case 'refused': return positive(r.attempt) && number(r.at)
-    case 'reply-reminder': return number(r.at) && ['observed', 'replied', 'nudged', 'cancelled'].includes(String(r.state)) && (r.row_state === undefined || str(r.row_state)) && (r.session_id === undefined || str(r.session_id)) && (r.launch_started_at === undefined || r.launch_started_at === null || str(r.launch_started_at)) && (r.reply_attempts === undefined || (r.state === 'replied' && Array.isArray(r.reply_attempts) && r.reply_attempts.length > 0 && r.reply_attempts.every(positive))) && (r.delivery_attempts === undefined || (Array.isArray(r.delivery_attempts) && r.delivery_attempts.length > 0 && r.delivery_attempts.every(positive)))
+    case 'reply-reminder': return number(r.at) && (r.delivered_at === undefined || number(r.delivered_at)) && ['observed', 'replied', 'nudged', 'cancelled'].includes(String(r.state)) && (r.row_state === undefined || str(r.row_state)) && (r.session_id === undefined || str(r.session_id)) && (r.launch_started_at === undefined || r.launch_started_at === null || str(r.launch_started_at)) && (r.reply_attempts === undefined || (r.state === 'replied' && Array.isArray(r.reply_attempts) && r.reply_attempts.length > 0 && r.reply_attempts.every(positive))) && (r.delivery_attempts === undefined || (Array.isArray(r.delivery_attempts) && r.delivery_attempts.length > 0 && r.delivery_attempts.every(positive)))
     case 'noticed': return number(r.at)
     default: return false
   }
@@ -388,10 +391,16 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     if (!item.delivered || item.accepted.source !== 'slack' || reminderResolved(j, item)) return
     const sent = lastSend(item)
     if (!sent) return
-    j.reminders.set(item.accepted.seq, { v: 1, kind: 'reply-reminder', seq: item.accepted.seq, at: Math.max(...item.records.flatMap(r => r.kind === 'delivered' ? [r.at] : [])), state: 'observed', session_id: sent.session_id, delivery_attempts: unrefusedAttempts(item) })
+    const delivered_at = Math.max(...item.records.flatMap(r => r.kind === 'delivered' ? [r.at] : []))
+    j.reminders.set(item.accepted.seq, { v: 1, kind: 'reply-reminder', seq: item.accepted.seq, at: delivered_at, delivered_at, state: 'observed', session_id: sent.session_id, delivery_attempts: unrefusedAttempts(item) })
+  }
+  function reminderExpired(record: ReplyReminderRecord, at = now()): boolean {
+    // Older journals have only their last observation timestamp. Freeze that
+    // fallback on the next observation instead of refreshing it indefinitely.
+    return at - (record.delivered_at ?? record.at) >= REPLY_REMINDER_KEEP_MS
   }
   function replyCandidates(j: Journal): ReplyReminderRecord[] {
-    return [...j.reminders.values()].filter(record => record.state === 'observed')
+    return [...j.reminders.values()].filter(record => record.state === 'observed' && !reminderExpired(record))
   }
   function replySequences(j: Journal): number[] {
     return replyTargets(j).map(target => target.seq)
@@ -430,10 +439,11 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     }
     // Pending reminder facts contain no delivered body, fixed text, or receipt
     // path. A terminal fact for an unfinished item prevents re-arming when
-    // its delivery is confirmed later. Completed facts can then disappear.
+    // its delivery is confirmed later. Completed and expired facts disappear;
+    // expiry never discards an accepted delivery or its suppression facts.
     for (const record of j.reminders.values()) {
       if (queuedReminders.has(record.seq)) continue
-      if (record.state === 'observed' || (j.items.has(record.seq) && !j.items.get(record.seq)!.delivered)) retained.push(record)
+      if ((record.state === 'observed' && !reminderExpired(record, at)) || (j.items.has(record.seq) && !j.items.get(record.seq)!.delivered)) retained.push(record)
     }
     // Preserve both sequence allocation and the injected microsecond watermark forever.
     retained.push({ v: 1, kind: 'accepted', seq: j.nextSeq - 1, compact: 'allocation', ...(j.lastInjected === undefined ? {} : { injected_ts: formatMicros(j.lastInjected) }) })
@@ -516,7 +526,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
             const accepted: AcceptedRecord = { v: 1, kind: 'accepted', seq: seq++, source: 'interject', sender: 'reply-reminder', text, received_at: at, ts: formatMicros(injectedAt), reminder_for: originalSeq }
             records.push(accepted); injected.push(accepted.seq)
           }
-          records.push({ v: 1, kind: 'reply-reminder', seq: originalSeq, at: now(), state: cancelled ? 'cancelled' : alreadyQueued || nudge ? 'nudged' : 'observed', row_state: row.state, session_id: row.session_id, launch_started_at: row.launch_started_at, ...(previous.delivery_attempts === undefined ? {} : { delivery_attempts: previous.delivery_attempts }) })
+          records.push({ v: 1, kind: 'reply-reminder', seq: originalSeq, at: now(), delivered_at: previous.delivered_at ?? previous.at, state: cancelled ? 'cancelled' : alreadyQueued || nudge ? 'nudged' : 'observed', row_state: row.state, session_id: row.session_id, launch_started_at: row.launch_started_at, ...(previous.delivery_attempts === undefined ? {} : { delivery_attempts: previous.delivery_attempts }) })
         }
         appendReminderRecords(key, records)
         return injected.map(seq => structuredClone(j.items.get(seq)!))

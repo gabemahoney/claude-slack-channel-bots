@@ -43,12 +43,14 @@ describe('durable record schemas', () => {
   test.each(['{', 'null', '[]', '{"v":1,"seq":1,"kind":"future"}'])('invalid line %s is unreadable', line => expect(parseQueueRecord(line)).toBeUndefined())
 
   test.each(['observed', 'replied', 'nudged', 'cancelled'] as const)('reply reminder state %s roundtrips with its row facts', state => {
-    const record: QueueRecord = { v: 1, kind: 'reply-reminder', seq: 1, at: 1000, state, row_state: 'working', session_id: 'session', launch_started_at: null, delivery_attempts: [1, 3], ...(state === 'replied' ? { reply_attempts: [3] } : {}) }
+    const record: QueueRecord = { v: 1, kind: 'reply-reminder', seq: 1, at: 1000, delivered_at: 900, state, row_state: 'working', session_id: 'session', launch_started_at: null, delivery_attempts: [1, 3], ...(state === 'replied' ? { reply_attempts: [3] } : {}) }
     expect(parseQueueRecord(JSON.stringify(record))).toEqual(record)
   })
 
   test.each([
     { state: 'future' }, { at: null }, { row_state: 4 }, { session_id: false }, { launch_started_at: 5 },
+    // A malformed retention origin must not keep a candidate eligible forever.
+    { delivered_at: null }, { delivered_at: '1000' },
     { reply_attempts: [1] }, { state: 'replied', reply_attempts: [] }, { state: 'replied', reply_attempts: [0] },
     { state: 'replied', reply_attempts: ['1'] }, { state: 'replied', reply_attempts: [1.5] },
     { delivery_attempts: [] }, { delivery_attempts: [0] }, { delivery_attempts: ['1'] }, { delivery_attempts: [1.5] },

@@ -233,7 +233,17 @@ export interface AuditOptions { stateDir: string; key: string; shimLog: string; 
 export function auditReceipts(options: AuditOptions, entries: readonly TranscriptEntry[], adapters: ReceiptAdapters) {
   const journal = receiptJournal(options.stateDir, options.key)
   const accepted = journal.filter(r => r.kind === 'accepted' && !r.compact).sort((a, b) => a.seq - b.seq)
-  if (!accepted.length || (options.expectedCount !== undefined && accepted.length !== options.expectedCount)) throw new Error('Accepted item count differs')
+  // Scenario counts describe original Slack/cron/interject inputs; reminders still need full receipt/FIFO proof.
+  const inputs = accepted.filter(r => r.reminder_for === undefined), reminders = accepted.filter(r => r.reminder_for !== undefined)
+  if (!inputs.length || (options.expectedCount !== undefined && inputs.length !== options.expectedCount)) throw new Error('Accepted item count differs')
+  const reminded = new Set<number>()
+  for (const item of reminders) {
+    const original = inputs.find(r => r.seq === item.reminder_for), fixed = journal.find(r => r.kind === 'fixed' && r.seq === original?.seq)
+    if (item.source !== 'interject' || item.sender !== 'reply-reminder' || original?.source !== 'slack' || original.seq >= item.seq
+      || reminded.has(original.seq) || !fixed?.parts?.length
+      || !fixed.parts.every((_: unknown, i: number) => journal.some(r => r.kind === 'delivered' && r.seq === original.seq && r.part === i + 1 && r.at <= item.received_at))) throw new Error('Invalid reply reminder provenance')
+    reminded.add(original.seq)
+  }
   const log = readFileSync(join(options.stateDir, 'server.log'), 'utf8').split('\n')
   const ownEntries = personaTranscripts(options.key, journal, log, entries)
   const takes = ownEntries.filter(e => e.kind === 'take-in' && e.text !== undefined)
@@ -241,7 +251,9 @@ export function auditReceipts(options: AuditOptions, entries: readonly Transcrip
   let previousAppearance = -1, previousDelivered = -Infinity, duplicates = 0
   const timings: { seq: number; typing_ms: number; delivery_ms: number }[] = []
   for (const item of accepted) {
-    const receivedAt = diagnosticTime(log, 'message-received', options.key, item)
+    // Internal acceptance bypasses Slack intake's received diagnostic.
+    const receivedAt = item.reminder_for === undefined ? diagnosticTime(log, 'message-received', options.key, item) : item.received_at
+    if (!Number.isFinite(receivedAt) || receivedAt < 0) throw new Error('Invalid reminder acceptance timestamp')
     const loggedAt = diagnosticTime(log, 'message-delivered', options.key, item)
     const fixed = journal.find(r => r.seq === item.seq && r.kind === 'fixed')
     if (!fixed?.parts?.length) throw new Error(`Item ${item.seq} has no fixed parts`)
@@ -269,9 +281,9 @@ export function auditReceipts(options: AuditOptions, entries: readonly Transcrip
     }
     if (loggedAt < firstTyped || loggedAt < receivedAt) throw new Error('Negative or inconsistent delivery measurement')
     previousDelivered = loggedAt
-    timings.push({ seq: item.seq, typing_ms: firstTyped - receivedAt, delivery_ms: loggedAt - receivedAt })
+    if (item.reminder_for === undefined) timings.push({ seq: item.seq, typing_ms: firstTyped - receivedAt, delivery_ms: loggedAt - receivedAt })
   }
-  return { items: accepted.length, duplicates, tokens: transcriptTokens(ownEntries), timings }
+  return { items: inputs.length, reminders: reminders.length, duplicates, tokens: transcriptTokens(ownEntries), timings }
 }
 export function percentile(values: number[], quantile: number): number {
   if (!values.length) throw new Error('No latency samples')
@@ -288,6 +300,7 @@ export function deliveryFailureEvidence(options: AuditOptions, entries: readonly
     // Only audit-owned, complete fixed strings survive, never arbitrary error
     // messages (JSON/parser and filesystem errors can contain private bytes).
     if (/^Accepted item count differs$/.test(message)) reason = 'accepted-count-differs'
+    else if (message === 'Invalid reply reminder provenance') reason = 'invalid-reminder-provenance'
     else if (/^Item \d+ has no valid message-(received|delivered) timestamp$/.test(message)) reason = message.includes('message-delivered') ? 'missing-delivery-log' : 'missing-receive-log'
     else if (/^Item \d+ has no fixed parts$/.test(message)) reason = 'missing-fixed-parts'
     else if (/^Item \d+ part \d+ has no exact transcript receipt$/.test(message)) reason = 'missing-exact-receipt'
@@ -309,7 +322,8 @@ export function deliveryFailureEvidence(options: AuditOptions, entries: readonly
   try { ownEntries = personaTranscripts(options.key, journal, readFileSync(join(options.stateDir, 'server.log'), 'utf8').split('\n'), entries) } catch { sessionEvidenceReadable = false }
   const attempts = head ? journal.filter(r => r.kind === 'sent' && r.seq === head.seq) : []
   const screen = pane !== undefined && screenReader ? screenReader('claude', pane, own) : undefined
-  return { reason, journalReadable, accepted: accepted.length, expected: numeric(options.expectedCount), open: open.length,
+  return { reason, journalReadable, accepted: accepted.filter(r => r.reminder_for === undefined).length,
+    reminders: accepted.filter(r => r.reminder_for !== undefined).length, expected: numeric(options.expectedCount), open: open.length,
     head: head ? { seq: numeric(head.seq), parts: fixed.length, part, attempts: attempts.length,
       recentAttempts: attempts.slice(-8).map(r => ({ attempt: numeric(r.attempt), part: numeric(r.part), at: numeric(r.at),
         kind: ['text', 'enter', 'retype'].includes(r.send_kind) ? r.send_kind : 'unknown', unknownOutcome: r.unknown_outcome === true,
@@ -379,7 +393,7 @@ if (import.meta.main) {
     const entries = readTranscripts(transcripts, adapters)
     const result = auditReceipts({ stateDir, key, shimLog, transcripts, expectedCount: command !== 'latency' && count ? Number(count) : undefined, noRetype: mode === 'no-retype' }, entries, adapters)
     if (command !== 'ready') {
-      console.log(`recorded: receipts ${JSON.stringify({ items: result.items, transcripts: transcripts.length, timings: result.timings })}`)
+      console.log(`recorded: receipts ${JSON.stringify({ items: result.items, reminders: result.reminders, transcripts: transcripts.length, timings: result.timings })}`)
       if (command === 'latency') {
         const n = Number(count)
         if (!Number.isSafeInteger(n) || n <= 0 || result.timings.length < n) throw new Error('Insufficient latency samples')
