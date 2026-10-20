@@ -485,21 +485,31 @@ try {
     expectControl('first-launch other AD session',()=>invoke('first-launch','0'),'sends do not match AD waiting session')
 
     const resetRecords=[records[0],records[1],...[
-      [2000,'session-control'],[12000,'session-control'],[43000,'session-control'],
-      [50000,'session-control'],[60000,'session-control'],
-    ].map(([at,session_id],i)=>({...records[2],at,session_id,attempt:i+1}))]
-    const writeReset=(patch:{waitingAt?:number;launch?:boolean;session?:string;late?:boolean}={})=>{
-      write(resetRecords.map(r=>patch.late&&r.kind==='sent'&&r.at===60000?{...r,at:110000}:r))
-      writeFileSync(log,patch.launch===false?'':`call\t49\t1\t1\tbun\tresume --instance-id cscb_control\n`)
-      writeFileSync(join(dir,'server.log'),[1000,patch.waitingAt??50000].map(at=>'[slack] delivery-launch-first-waiting: '+JSON.stringify({key:'control',session_id:patch.session??'session-control',at})).join('\n')+'\n')
+      [2000,'text'],[22500,'retype'],[83000,'retype'],
+      [101000,'enter'],[111000,'retype'],[141500,'enter'],[171500,'retype'],
+    ].map(([at,send_kind],i)=>({...records[2],at,send_kind,attempt:i+1})),{...records[3],at:173000}]
+    const writeReset=(patch:{waitingAt?:number;initialKey?:boolean;session?:string;late?:boolean;missingRetype?:boolean}={})=>{
+      // Move all later evidence together so the late control fails on backoff,
+      // while the baseline proves 10s, 30s and 30s with a 500ms guarded Enter.
+      const at=(time:number)=>time+(patch.late&&time>=111000?20000:0)
+      const lines=[diagnostic('message-received',0,1000),diagnostic('message-delivered',0,at(174000)),
+        ...[1000,patch.waitingAt??100000].map(time=>'[slack] delivery-launch-first-waiting: '+JSON.stringify({key:'control',session_id:patch.session??'session-control',at:time}))]
+      write(resetRecords.filter(r=>!(patch.missingRetype&&r.kind==='sent'&&r.at===171500)).map(r=>r.at===undefined?r:{...r,at:at(r.at)}),
+        [{...originalTakes[0]!,timestamp:new Date(at(172500)).toISOString()}],undefined,lines)
+      writeFileSync(log,[textCall(2000),call(2500,'--key Enter'),textCall(22500),call(23000,'--key Enter'),
+        textCall(83000),call(83500,'--key Enter'),`call\t99\t1\t1\tbun\tresume --instance-id cscb_control\n`,
+        patch.initialKey===false?'':call(101000,'--key Enter'),textCall(at(111000)),
+        `fault\t${at(111000)/1000}\t1\t1\tbun\tsend-keys no_enter swallow 1\n`,
+        call(at(111500),'--key Enter'),call(at(141500),'--key Enter'),textCall(at(171500)),call(at(172000),'--key Enter')].join(''))
     }
     writeReset()
     expectControl('same-session AD waiting resets unconfirmed retry spacing',()=>invoke('reset-spacing','1'))
     for(const [name,patch,reason] of [
-      ['no new waiting',{waitingAt:1000},'head was not retried across an AD first-waiting'],
-      ['no native relaunch',{launch:false},'head retry has no native relaunch'],
-      ['foreign AD session',{session:'other-session'},'does not match AD waiting session'],
-      ['old retry backoff',{late:true},'restart retained later backoff'],
+      ['no new waiting',{waitingAt:1000},'durable Enter/text/Enter/text recovery sequence'],
+      ['no initial recovery key',{initialKey:false},'reset stages lack actual persona key calls'],
+      ['foreign AD session',{session:'other-session'},'reset lacks an AD first-waiting observation'],
+      ['old retry backoff',{late:true},'reset retained or skipped a backoff stage: 0'],
+      ['missing retype',{missingRetype:true},'durable Enter/text/Enter/text recovery sequence'],
     ] as const) {
       writeReset(patch)
       expectControl('reset-spacing '+name,()=>invoke('reset-spacing','1'),reason)
