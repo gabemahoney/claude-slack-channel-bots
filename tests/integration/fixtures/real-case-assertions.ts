@@ -3,13 +3,46 @@ import { existsSync, readFileSync, mkdirSync, writeFileSync, rmSync } from 'node
 import { join, resolve } from 'node:path'
 import { auditReceipts, captureReceiptJournal, jsonLines, packedReceiptAdapters, personaTranscripts, readTranscripts, receiptJournal, shimWords, transcriptFiles } from './transcript-receipts.ts'
 import { assertBusyProof, emitBusyProofFailure, pollBusyProof, type BusyProofSnapshot } from './busy-proof.ts'
-const [command, state, key, shim, root, arg = '', arg2 = '', arg3 = ''] = process.argv.slice(2)
 function check(value: unknown, reason: string): asserts value { if (!value) throw new Error(reason) }
+type KeyCall = { at: number; words: string[] }
+function recoveryKey(call: KeyCall, instance: string) {
+  return call.words.includes('send-keys') && call.words.includes(instance)
+    && (call.words.includes('--no-enter') || (call.words.includes('--key') && call.words.includes('Enter')))
+}
+
+/** Unknown text can be completed by Enter; the first actual recovery key owns the backoff. */
+export function assertUnknownKeyRecovery(calls: KeyCall[], fault: KeyCall, instance: string) {
+  const after = calls.filter(call => call.at > fault.at)
+  const next = after.find(call => recoveryKey(call, instance))
+  check(next && next.at - fault.at >= 10000, 'unknown send recovered without the existing backoff')
+  check(!after.some(call => call.words.includes('read-pane')), 'unknown recovery read native pane text')
+}
+
+/** A missed Enter needs a durable Enter attempt and its actual guarded key call. */
+export function assertSwallowedEnterRecovery(journal: any[], calls: KeyCall[], faults: KeyCall[], seq: number, instance: string) {
+  const sent = journal.filter(record => record.kind === 'sent' && record.seq === seq)
+  const text = sent.filter(record => record.send_kind !== 'enter')
+  const enter = sent.filter(record => record.send_kind === 'enter')
+  check(enter.some(retry => text.some(typed => typed.part === retry.part && typed.launch_id === retry.launch_id
+    && typed.at <= retry.at && faults.some(fault => fault.at >= typed.at && fault.at < retry.at
+      && fault.words[1] === 'key=Enter' && fault.words[2] === 'swallow'
+      && (calls.find(call => call.at > fault.at && recoveryKey(call, instance))?.at ?? -Infinity) - fault.at >= 10000
+      && calls.some(call => call.at >= retry.at && recoveryKey(call, instance)
+        && call.words.includes('--key') && call.words.includes('Enter'))))),
+    'swallowed Enter has no observed durable Enter-only recovery under the existing backoff')
+}
+
+async function main() {
+const [command, state, key, shim, root, arg = '', arg2 = '', arg3 = ''] = process.argv.slice(2)
 function journal() { return jsonLines(join(state!, 'queue', `${key}.jsonl`)) }
 function cumulativeJournal() { return receiptJournal(state!, key!) }
 function calls() { return readFileSync(shim!, 'utf8').split('\n').filter(l => l.startsWith('call\t')).map(l => { const f=l.split('\t'); return { at:Number(f[1])*1000, words:shimWords(f[5]!) } }) }
 function blocks(e:any):any[] { return e.value?.type==='assistant'&&Array.isArray(e.value?.message?.content)?e.value.message.content:[] }
 async function entries() { return readTranscripts(transcriptFiles(root!), await packedReceiptAdapters()) }
+async function confirmReceipts() {
+  const adapters = await packedReceiptAdapters(), transcripts = transcriptFiles(root!)
+  auditReceipts({ stateDir: state!, key: key!, shimLog: shim!, transcripts }, readTranscripts(transcripts, adapters), adapters)
+}
 try {
   check(existsSync('/etc/cscb-ci-image'), 'scenario assertions require the CI image')
   if (command === 'accepted' || command === 'delivered') {
@@ -62,10 +95,9 @@ try {
   } else if(command==='unknown-proof') {
     const faults=readFileSync(shim!,'utf8').split('\n').filter(l=>l.startsWith('fault\t')).map(l=>{const f=l.split('\t');return {at:Number(f[1])*1000,words:shimWords(f[5]!)}})
     const f=faults.find(f=>f.words[2]===arg);check(f,'unknown fault was not applied')
-    const after=calls().filter(c=>c.at>f.at), next=after.find(c=>c.words.includes('send-keys')&&c.words.includes('--no-enter'))
-    check(next && next.at-f.at>=10000,'unknown send retyped without the existing backoff')
-    check(!after.some(c=>c.words.includes('read-pane')),'unknown recovery read native pane text')
-    console.log('recorded: unknown outcome retried under AD state/backoff '+arg)
+    assertUnknownKeyRecovery(calls(),f,'cscb_'+key)
+    await confirmReceipts()
+    console.log('recorded: unknown outcome confirmed by exact receipt after guarded recovery '+arg)
   } else if(command==='reset-spacing') {
     const s=cumulativeJournal().filter(r=>r.kind==='sent'&&r.seq===Number(arg)&&r.send_kind!=='enter')
     const launches=[...new Set(s.map(r=>r.launch_id))];check(launches.length>=2,'head was not retried across a real launch')
@@ -74,13 +106,18 @@ try {
     console.log('recorded: restart reset spacing '+JSON.stringify(newer.map(r=>r.at)))
   } else if(command==='key-proof') {
     const j=cumulativeJournal(), s=j.filter(r=>r.kind==='sent'&&r.seq===Number(arg))
-    const text=s.filter(r=>r.send_kind!=='enter'), enter=s.filter(r=>r.send_kind==='enter')
+    const text=s.filter(r=>r.send_kind!=='enter')
+    if(arg2==='enter') {
+      const faults=readFileSync(shim!,'utf8').split('\n').filter(l=>l.startsWith('fault\t')).map(l=>{const f=l.split('\t');return {at:Number(f[1])*1000,words:shimWords(f[5]!)}})
+      assertSwallowedEnterRecovery(j,calls(),faults,Number(arg),'cscb_'+key)
+    }
     if(arg2==='retype') check(text.length>=2, 'missed text was not retyped')
     if(arg2==='spacing') {
       check(text.length>=4, 'three swallowed texts did not produce three retypes')
       for(let i=1;i<4;i++) check(text[i].at-text[i-1].at >= [10000,30000,60000][i-1]!, 'retype spacing below growing backoff')
       check(j.filter(r=>r.kind==='noticed'&&r.seq===Number(arg)).length===1, 'not-taken-in notice not once')
     }
+    await confirmReceipts()
     console.log('recorded: key proof '+JSON.stringify({seq:Number(arg),sends:s.map(r=>({kind:r.send_kind,at:r.at}))}))
   } else if(command==='cron') {
     const a=cumulativeJournal().filter(r=>r.kind==='accepted'&&r.source==='cron'&&!r.compact)
@@ -545,3 +582,6 @@ try {
     rmSync(dir,{recursive:true,force:true})
   } else throw new Error('unknown lane-1 assertion')
 } catch(error) { console.error('real-case-assertions: '+(error instanceof Error?error.message:'unknown'));process.exit(1) }
+
+}
+if (import.meta.main) await main()
