@@ -13,7 +13,7 @@ with synthetic input, journal and reply bodies. Untimed metadata is recorded
 in the fixture but omitted from this replay; separate controls exercise its
 exact informational shapes. This regression proves the checker accepts the
 captured ancestry, not that the paid trial's original answer was correct.
-Ordinary and AC15 controls cover all six allowed attachment types, an earlier
+Ordinary and AC15 controls cover all eight allowed setup attachment types, an earlier
 turn (both a wrong parent and a timestamp at/before its last finite timestamp),
 no receipt link, untimed prior bookkeeping, stale offsets, and unchanged exact
 clocks for other records. Existing controls cover duplicate UUIDs, cycles, foreign sessions,
@@ -29,11 +29,52 @@ stamped 1 ms earlier. Shutdown `cost-state`, `last-prompt` and
 finite timestamp belongs to `turn_duration` at offset 76861. Both ordinary
 read-back and AC15 controls replay this shape with synthetic input, journal,
 and reply text, and reject a floor at/after the attachment or a parent from
-the earlier turn. All six setup types also retain their floor and ancestry
+the earlier turn. All eight setup types also retain their floor and ancestry
 controls with untimed bookkeeping interposed. This proves the amended checker
 behavior; the original paid resume reply's correctness remains unverified.
 Current-exchange validation still rejects untimed records outside the existing
 five exact informational shapes; the amendment changes only floor selection.
+
+`claude-304-deferred-tools.json` retains the receipt-to-completion chain from
+Claude 2.1.304, AC11 trial 1, run `real-1792509656324-1284261` (source:
+`/tmp/rel1-gate-304/matrix/real-agent-failures.jsonl`). The assistant at offset
+124302 is stamped 1792515606863; its `deferred_tools_record` parent is stamped
+1792515606864. Both `deferred_tools_delta` and `deferred_tools_record` belong
+to the setup family. Setup records must prove membership, but do not anchor
+child timestamps: the nearest non-setup ancestor and receipt set the exact
+floor. Controls replay this ancestry for ordinary read-back, AC11 and AC15,
+reject backward assistant/tool-result clocks and extra real tool calls, and
+also accept a larger setup lead without introducing a fixed tolerance.
+
+`claude-304-api-request-blob.json` records the observed field shape from that
+run's AC11 trial 1, offset 117952: an untimed blob containing an assistant
+`ToolSearch` tool-use block. Hash, session, ID and arguments are synthetic.
+The kind can carry actions, so it remains outside the blanket informational
+allowlist. AC11 still rejects it. AC15 now validates request echoes separately,
+as described below, and rejects every embedded forbidden action.
+
+`claude-304-ac15-request-echoes.json` inventories all nine retained blobs from
+run `real-1792519134421-3860158`. Each trial contains four user text blocks,
+a system string, and a user tool-result/text pair. The last repeats the exact
+ID of the earlier native `ToolSearch` result; none of these nine contains a
+`tool_use`. Bodies and nested result content used in tests are synthetic.
+
+The checksum-matched native 2.1.304 binary (SHA-256 recorded in the fixture)
+confirms the interpretation: `Kvt` builds `blobCandidates` from outgoing
+`params.messages` (or its privacy-cut subset), hashes canonical messages, and
+removes `cache_control` from the saved copies. `appendRequestReplayRecords`
+writes candidates missing from the transcript hash index, followed by an
+`api-request` whose tail references their hashes. These are request-replay
+context records, not separate executions. The builder and writer are at byte
+offsets 245545319 and 245713043 in that exact binary.
+
+AC15 requires the four-field native blob envelope, an untimed non-transcript
+record, a hex digest, a recognized message role and understood content shapes.
+It recursively checks all embedded `tool_use`/`server_tool_use` objects before
+exempting the echo from time ordering. Only reply and native `ToolSearch`
+tool uses pass. Tool references inside results are definitions, not calls.
+Malformed/unknown content, extra envelope fields and forbidden actions still
+fail; an echo supplies neither receipt nor readback/completion evidence.
 
 ## Timestamp sweep
 

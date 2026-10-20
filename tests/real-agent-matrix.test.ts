@@ -445,10 +445,10 @@ describe('heavy execution with fake children', () => {
   const run = (planOnly = false, codexOnly = false, keepGoing = false) => runMatrix({ repo, output, planOnly, codexOnly, keepGoing })
   const jobsRun = () => calls.filter(c => c.argv[1] === 'run' && !c.argv.includes('id') && !c.argv.includes('/opt/cscb-ci/real-agent-codex-job.sh'))
   const codexRuns = () => calls.filter(c => c.argv.includes('/opt/cscb-ci/real-agent-codex-job.sh'))
-  test.each([false, true])('explicit Claude execution skips Codex login and latest lookup, failed=%s', failed => {
+  test.each([[false, false, undefined], [true, false, undefined], [false, true, undefined], [true, true, undefined], [false, true, [15]], [true, true, [15]]] as [boolean, boolean, number[] | undefined][])('explicit Claude execution skips Codex login and latest lookup, failed=%s, aiOnly=%s, criteria=%j', (failed, aiOnly, aiCriteria) => {
     return (async () => {
       const versions = ['2.1.304', MIN_CLAUDE_CODE_VERSION]
-      const jobs = selectedClaudePlan(versions, gates(), heavyNames())
+      const jobs = selectedClaudePlan(versions, gates(), heavyNames(), aiOnly, aiCriteria)
       process.env.CODEX_HOME = join(root, 'absent-login')
       latestResponse = async () => { throw new Error('unexpected latest lookup') }
       response = argv => {
@@ -458,15 +458,20 @@ describe('heavy execution with fake children', () => {
         if (failed && job.version === versions[0]) results[0]!.exit = 1
         return { code: results.some(r => r.exit) ? 1 : 0, text: results.map(resultLine).join('\n') + '\n' }
       }
-      expect(await runMatrix({ repo, output, planOnly: false, keepGoing: true, claudeVersions: versions })).toBe(!failed)
+      expect(await runMatrix({ repo, output, planOnly: false, keepGoing: true, claudeVersions: versions, aiOnly, aiCriteria })).toBe(!failed)
+      if (aiOnly) for (const job of jobs) {
+        expect(job.invocations).toEqual(AI_CRITERIA.filter(ac => !aiCriteria || aiCriteria.includes(ac)).flatMap(ac => [1, 2, 3].map(trial => ({
+          script: `real-agent/test-${100 + ac}-fmk-real-ai-ac${ac}.sh`, trial, model: 'opus',
+        }))))
+      }
       expect(jobsRun()).toHaveLength(2)
       expect(codexRuns()).toHaveLength(0)
       expect(calls.some(c => c.argv.includes(CODEX_LOGIN_TARGET))).toBe(false)
       expect(existsSync(join(root, 'absent-login'))).toBe(false)
       expect(JSON.parse(readFileSync(join(output, 'plan.json'), 'utf8'))).toMatchObject({
-        selection: 'claude-only', totalInvocations: 120, codexModel: null, localAgents: [], jobs,
+        selection: aiCriteria ? 'claude-ai-selected' : aiOnly ? 'claude-ai-only' : 'claude-only', totalInvocations: aiCriteria ? 6 : aiOnly ? 42 : 120, codexModel: null, localAgents: [], jobs,
       })
-      expect(stdout.join('')).toContain(`REAL-AGENT-CLAUDE-VERDICT ${failed ? 'FAIL' : 'PASS'}`)
+      expect(stdout.join('')).toContain(`REAL-AGENT-CLAUDE${aiCriteria ? '-AI-SELECTED' : aiOnly ? '-AI' : ''}-VERDICT ${failed ? 'FAIL' : 'PASS'}`)
       expect(calls.at(-1)!.argv.slice(0, 3)).toEqual(['docker', 'image', 'rm'])
     })()
   })
@@ -479,6 +484,25 @@ describe('heavy execution with fake children', () => {
     expect(matrixOptions(['--claude-versions', `2.1.304,${MIN_CLAUDE_CODE_VERSION}`, '--output', output], repo))
       .toEqual({ repo, output, planOnly: false, claudeVersions: ['2.1.304', MIN_CLAUDE_CODE_VERSION] })
     expect(() => matrixOptions(['--codex-only', '--claude-versions', '2.1.304'], repo)).toThrow('Usage')
+    expect(matrixOptions(['--claude-versions', '2.1.304', '--ai-only', '--output', output], repo))
+      .toEqual({ repo, output, planOnly: false, claudeVersions: ['2.1.304'], aiOnly: true })
+    for (const args of [['--ai-only'], ['--codex-only', '--ai-only']]) {
+      expect(() => matrixOptions(args, repo)).toThrow('Usage')
+    }
+  })
+  test.each(['', '14', '15,15', '15,', '015', '15.0', '15\n'])('rejects invalid AI criterion selection %j', criteria => {
+    expect(() => matrixOptions(['--claude-versions', '2.1.304', '--ai-only', '--ai-criteria', criteria], repo)).toThrow('Usage')
+  })
+  test('selected AI criteria require explicit Claude AI mode and retain three trials each', async () => {
+    expect(matrixOptions(['--claude-versions', '2.1.304', '--ai-only', '--ai-criteria', '15,23', '--output', output], repo))
+      .toEqual({ repo, output, planOnly: false, claudeVersions: ['2.1.304'], aiOnly: true, aiCriteria: [15, 23] })
+    expect(() => matrixOptions(['--claude-versions', '2.1.304', '--ai-criteria', '15'], repo)).toThrow('Usage')
+    for (const aiCriteria of [[], [14], [15, 15]]) {
+      await expect(runMatrix({ repo, output, planOnly: true, claudeVersions: ['2.1.304'], aiOnly: true, aiCriteria })).rejects.toThrow('Invalid AI criteria selection')
+    }
+    await expect(runMatrix({ repo, output, planOnly: true, claudeVersions: ['2.1.304'], aiCriteria: [15] })).rejects.toThrow('Invalid AI criteria selection')
+    const [job] = selectedClaudePlan(['2.1.304'], gates(), heavyNames(), true, [23, 15])
+    expect(job!.invocations.map(i => [i.script, i.trial])).toEqual([15, 23].flatMap(ac => [1, 2, 3].map(trial => [`real-agent/test-${100 + ac}-fmk-real-ai-ac${ac}.sh`, trial])))
   })
   const interruptMatrix = (before: ReturnType<typeof process.listeners>) => {
     // Invoke only this run's handler: emitting a process signal also reaches

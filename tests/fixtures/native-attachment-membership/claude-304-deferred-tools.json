@@ -1,0 +1,167 @@
+{
+  "run": "real-1792509656324-1284261",
+  "scenario": "test-111-fmk-real-ai-ac11",
+  "trial": 1,
+  "version": "2.1.304",
+  "records": [
+    {
+      "offset": 507,
+      "at": 1792515597105,
+      "type": "user",
+      "sessionId": "2bad18b0-47b8-4a96-ad43-78b36d52a432",
+      "uuid": "f408732d-a7eb-456f-bb5f-3a78da4bf1e9",
+      "parentUuid": null
+    },
+    {
+      "offset": 1308,
+      "at": 1792515597104,
+      "type": "attachment",
+      "sessionId": "2bad18b0-47b8-4a96-ad43-78b36d52a432",
+      "uuid": "4e8901a2-e93c-49ea-965c-921af61b3231",
+      "parentUuid": "f408732d-a7eb-456f-bb5f-3a78da4bf1e9",
+      "attachmentType": "environment"
+    },
+    {
+      "offset": 2756,
+      "at": 1792515597104,
+      "type": "attachment",
+      "sessionId": "2bad18b0-47b8-4a96-ad43-78b36d52a432",
+      "uuid": "930a4621-cf45-4974-b044-fd019699491d",
+      "parentUuid": "4e8901a2-e93c-49ea-965c-921af61b3231",
+      "attachmentType": "model"
+    },
+    {
+      "offset": 3459,
+      "at": 1792515597104,
+      "type": "attachment",
+      "sessionId": "2bad18b0-47b8-4a96-ad43-78b36d52a432",
+      "uuid": "f04ee843-b1f1-4b3a-be4b-b1286ccffa24",
+      "parentUuid": "930a4621-cf45-4974-b044-fd019699491d",
+      "attachmentType": "deferred_tools_delta"
+    },
+    {
+      "offset": 5805,
+      "at": 1792515597104,
+      "type": "attachment",
+      "sessionId": "2bad18b0-47b8-4a96-ad43-78b36d52a432",
+      "uuid": "dd72cb0d-63da-43bb-a87b-3fefc3c1818b",
+      "parentUuid": "f04ee843-b1f1-4b3a-be4b-b1286ccffa24",
+      "attachmentType": "agent_listing_delta"
+    },
+    {
+      "offset": 11883,
+      "at": 1792515597104,
+      "type": "attachment",
+      "sessionId": "2bad18b0-47b8-4a96-ad43-78b36d52a432",
+      "uuid": "670be98b-3e24-4515-8eca-016154de9e4f",
+      "parentUuid": "dd72cb0d-63da-43bb-a87b-3fefc3c1818b",
+      "attachmentType": "mcp_instructions_delta"
+    },
+    {
+      "offset": 15965,
+      "at": 1792515597104,
+      "type": "attachment",
+      "sessionId": "2bad18b0-47b8-4a96-ad43-78b36d52a432",
+      "uuid": "f9a9176e-4067-45ce-b170-424e179051e1",
+      "parentUuid": "670be98b-3e24-4515-8eca-016154de9e4f",
+      "attachmentType": "skill_listing"
+    },
+    {
+      "offset": 29693,
+      "at": 1792515597138,
+      "type": "attachment",
+      "sessionId": "2bad18b0-47b8-4a96-ad43-78b36d52a432",
+      "uuid": "549ed2d0-6c0a-48c0-ab12-ac5f17390c52",
+      "parentUuid": "f9a9176e-4067-45ce-b170-424e179051e1",
+      "attachmentType": "instructions"
+    },
+    {
+      "offset": 31619,
+      "at": 1792515597138,
+      "type": "attachment",
+      "sessionId": "2bad18b0-47b8-4a96-ad43-78b36d52a432",
+      "uuid": "5e795349-e10b-4978-9e02-0b51e1c38e9d",
+      "parentUuid": "549ed2d0-6c0a-48c0-ab12-ac5f17390c52",
+      "attachmentType": "session_context"
+    },
+    {
+      "offset": 33009,
+      "at": 1792515597138,
+      "type": "attachment",
+      "sessionId": "2bad18b0-47b8-4a96-ad43-78b36d52a432",
+      "uuid": "ff6edc73-fa63-43d3-8e6a-b1c7d80e0231",
+      "parentUuid": "5e795349-e10b-4978-9e02-0b51e1c38e9d",
+      "attachmentType": "date"
+    },
+    {
+      "offset": 33598,
+      "at": 1792515597140,
+      "type": "attachment",
+      "sessionId": "2bad18b0-47b8-4a96-ad43-78b36d52a432",
+      "uuid": "71892440-9014-448e-bfed-d8ad95de8b18",
+      "parentUuid": "ff6edc73-fa63-43d3-8e6a-b1c7d80e0231",
+      "attachmentType": "remote_session_change"
+    },
+    {
+      "offset": 120612,
+      "at": 1792515599702,
+      "type": "assistant",
+      "sessionId": "2bad18b0-47b8-4a96-ad43-78b36d52a432",
+      "uuid": "5bca07e0-ef34-4ecd-ac77-c97d96be7e91",
+      "parentUuid": "71892440-9014-448e-bfed-d8ad95de8b18",
+      "stopReason": "tool_use"
+    },
+    {
+      "offset": 122070,
+      "at": 1792515599735,
+      "type": "user",
+      "sessionId": "2bad18b0-47b8-4a96-ad43-78b36d52a432",
+      "uuid": "56a5ec95-e7a6-4d56-b319-40aaad4ee885",
+      "parentUuid": "5bca07e0-ef34-4ecd-ac77-c97d96be7e91"
+    },
+    {
+      "offset": 122995,
+      "at": 1792515606864,
+      "type": "attachment",
+      "sessionId": "2bad18b0-47b8-4a96-ad43-78b36d52a432",
+      "uuid": "979fb514-8606-4fb1-8298-c033098dcb1e",
+      "parentUuid": "56a5ec95-e7a6-4d56-b319-40aaad4ee885",
+      "attachmentType": "deferred_tools_record"
+    },
+    {
+      "offset": 124302,
+      "at": 1792515606863,
+      "type": "assistant",
+      "sessionId": "2bad18b0-47b8-4a96-ad43-78b36d52a432",
+      "uuid": "f5df5da5-fc1c-4f1b-a325-2845c641cdb3",
+      "parentUuid": "979fb514-8606-4fb1-8298-c033098dcb1e",
+      "stopReason": "tool_use"
+    },
+    {
+      "offset": 126393,
+      "at": 1792515606867,
+      "type": "assistant",
+      "sessionId": "2bad18b0-47b8-4a96-ad43-78b36d52a432",
+      "uuid": "978e554e-7112-4985-8aba-23c2fc7b948f",
+      "parentUuid": "f5df5da5-fc1c-4f1b-a325-2845c641cdb3",
+      "stopReason": "tool_use"
+    },
+    {
+      "offset": 127606,
+      "at": 1792515606905,
+      "type": "user",
+      "sessionId": "2bad18b0-47b8-4a96-ad43-78b36d52a432",
+      "uuid": "1c141b37-6cd7-4598-b61e-39a9dafb206b",
+      "parentUuid": "f5df5da5-fc1c-4f1b-a325-2845c641cdb3"
+    },
+    {
+      "offset": 129920,
+      "at": 1792515610437,
+      "type": "assistant",
+      "sessionId": "2bad18b0-47b8-4a96-ad43-78b36d52a432",
+      "uuid": "ab901543-c8eb-44f5-9a31-bb4edf3618d0",
+      "parentUuid": "1c141b37-6cd7-4598-b61e-39a9dafb206b",
+      "stopReason": "end_turn"
+    }
+  ]
+}
