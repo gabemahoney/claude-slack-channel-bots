@@ -49,8 +49,7 @@
  * applies the change as step 4 would). Within a step every
  * persona's operation runs at once and the step settles once all of them
  * settled; one persona's rejection is reported and never stops the others.
- * A persona with only next-launch changes (`claude_config_dir`,
- * `stop_hook_bootstrap`, own or inherited) is in no step: step 1's swap
+ * A persona with only next-launch changes (`claude_config_dir`, own or inherited) is in no step: step 1's swap
  * already makes its next launch read the new values, and its running
  * instance keeps what it launched with.
  *

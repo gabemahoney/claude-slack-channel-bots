@@ -935,7 +935,9 @@ function routingHolder(
   expect(engineReads).toHaveLength(query === 'isOpen' ? 1 : 0)
   const reportingReads = named.filter(at => withinCall([at], onlyCallOf('createDeliveryReporting')) === 1)
   expect(reportingReads).toHaveLength(query === 'isOpen' ? 1 : 0)
-  expect(named).toHaveLength(3 + checkReaders.length + alsoIn.length + engineReads.length + reportingReads.length)
+  const reminderReads = named.filter(at => withinCall([at], onlyCallOf('createReplyReminders')) === 1)
+  expect(reminderReads).toHaveLength(query === 'isOpen' ? 1 : 0)
+  expect(named).toHaveLength(3 + checkReaders.length + alsoIn.length + engineReads.length + reportingReads.length + reminderReads.length)
   return { holder, at, end: at + assigned[0]![0].length }
 }
 
@@ -1484,7 +1486,7 @@ describe('main() installs the runtime agent-director version re-check right afte
   // timer is armed before the PID check). shutdown() stops what it finds, so
   // main() must not start the HTTP server, the start bring-up, the health
   // check or the detection tick once a shutdown has begun; nor the start
-  // sweep or a bootstrap pass after it (trust, JSONL safeguard, Stop hook),
+  // sweep or a bootstrap pass after it (trust, JSONL safeguard, legacy cleanup),
   // so a version re-check's stop changes no agent-director row (b.jg5
   // SRJ-205, SRJ-714). main() can only observe that after it resumes from an
   // await, so each of those calls needs an `if (shuttingDown) return` between
@@ -1499,7 +1501,7 @@ describe('main() installs the runtime agent-director version re-check right afte
     ['the start sweep (reconcileOrphans)', () => /(?<![\w.$])reconcileOrphans\s*\(/g],
     ['the trust bootstrap (trustBootstrap)', () => /(?<![\w.$])trustBootstrap\s*\(/g],
     ['the JSONL-persistence safeguard (runJsonlPersistenceSafeguard)', () => /(?<![\w.$])runJsonlPersistenceSafeguard\s*\(/g],
-    ['the Stop-hook bootstrap (stopHookBootstrap)', () => /(?<![\w.$])stopHookBootstrap\s*\(/g],
+    ['the legacy hook cleanup', () => /(?<![\w.$])removeLegacyReplyHooks\s*\(personaConfig\.personas/g],
   ])('main() starts %s only if no shutdown has begun: an `if (shuttingDown) return` in main()\'s own statement list after the last await before the call', (_what, callPattern) => {
     const [start, end] = mainBody(SERVER_CODE)
     const calls = indicesOf(callPattern(startResolution(SERVER_CODE).controller), SERVER_CODE)
@@ -3890,7 +3892,8 @@ describe('main() builds the one per-persona latch, in server memory only, before
     // queries' forms are pinned in the describe below; the holder's in the
     // persona routing's describe.
     const named = indicesOf(new RegExp(`\\b${latch}\\b`, 'g'), SERVER_CODE)
-    expect(named).toHaveLength(15)
+    expect(named).toHaveLength(16)
+    expect(withinCall(named, onlyCallOf('createReplyReminders'))).toBe(1)
     expect(withinCall(named, onlyCallOf('createDeliveryReporting'))).toBe(1)
     const decl = SERVER_CODE.match(new RegExp(`\\bconst\\s+${latch}\\b`))!
     expect(named[0]).toBe(decl.index! + decl[0].length - latch.length)
@@ -4086,7 +4089,8 @@ describe('main() binds the latch\'s holds before its CONFLICT notice, installs t
     expect(inCheck(outside)).toBe(1)
     expect(within(outside, SERVER_CODE.search(/\bfunction\s+reconnectLatchedAt\s*\(/))).toBe(1)
     const queries = indicesOf(new RegExp(`\\.\\s*${IS_LATCHED}\\s*\\(`, 'g'), SERVER_CODE)
-    expect(queries).toHaveLength(10)
+    expect(queries).toHaveLength(11)
+    expect(withinCall(queries, onlyCallOf('createReplyReminders'))).toBe(1)
     expect(withinCall(queries, onlyCallOf('createDeliveryReporting'))).toBe(1)
     expect(['createFullModeRetryAction', 'initRestart', 'initHealthCheck', 'createPersonaRouting'].map((call) => within(queries, onlyCallOf(call)))).toEqual([0, 2, 1, 1])
     expect(withinRetryRunGate(queries)).toBe(1)
@@ -4600,7 +4604,8 @@ describe('main() builds the one ErrInvalidFlags hold before the start pass, inst
     expect(['createFullModeRetryAction', 'initRestart', 'initHealthCheck'].map((call) => withinCall(members, onlyCallOf(call)))).toEqual([0, 1, 1])
     expect(withinRetryRunGate(members)).toBe(1)
     const queries = indicesOf(new RegExp(`\\.\\s*${IS_HELD}\\s*\\(`, 'g'), SERVER_CODE)
-    expect(queries).toHaveLength(6)
+    expect(queries).toHaveLength(7)
+    expect(withinCall(queries, onlyCallOf('createReplyReminders'))).toBe(1)
     expect(withinCall(queries, onlyCallOf('createDeliveryReporting'))).toBe(1)
     expect(['createFullModeRetryAction', 'initRestart', 'initHealthCheck', 'createPersonaRouting'].map((call) => withinCall(queries, onlyCallOf(call)))).toEqual([0, 1, 1, 1])
     expect(withinRetryRunGate(queries)).toBe(1)
@@ -4622,7 +4627,8 @@ describe('main() builds the one ErrInvalidFlags hold before the start pass, inst
     expect(indicesOf(new RegExp(`\\b${holderName()}\\s*[?!]?\\.\\s*${SET}\\s*\\(`, 'g'), SERVER_CODE)).toEqual([])
 
     const named = indicesOf(new RegExp(`\\b${hold}\\b`, 'g'), SERVER_CODE)
-    expect(named).toHaveLength(11)
+    expect(named).toHaveLength(12)
+    expect(withinCall(named, onlyCallOf('createReplyReminders'))).toBe(1)
     expect(withinCall(named, onlyCallOf('createDeliveryReporting'))).toBe(1)
     const decl = SERVER_CODE.match(new RegExp(`\\bconst\\s+${hold}\\b`))!
     expect(named[0]).toBe(decl.index! + decl[0].length - hold.length)
@@ -4747,7 +4753,8 @@ describe('server.ts binds the persona routing\'s lost-message state inputs to th
     expect(importSource(SERVER_CODE, KILL_FAILED_HOLD)).toBe('./session-manager.ts')
     // Named in server.ts only at its import and this member.
     const named = indicesOf(new RegExp(`\\b${KILL_FAILED_HOLD}\\b`, 'g'), SERVER_CODE)
-    expect(named).toHaveLength(4)
+    expect(named).toHaveLength(5)
+    expect(withinCall(named, onlyCallOf('createReplyReminders'))).toBe(1)
     expect(withinCall(named, onlyCallOf('createDeliveryReporting'))).toBe(1)
     expect(withinCall(named, onlyCallOf('createPersonaRouting'))).toBe(1)
     expect(withinCall(named, onlyCallOf('createDeliveryEngines'))).toBe(1)
@@ -5287,7 +5294,8 @@ describe('main() binds what a hold refuses: the held-directory query into the MC
     importedOnly(HELD_QUERY, './session-manager.ts')
     // Named only at its import and this member: never called with a captured set, never wrapped.
     const named = indicesOf(new RegExp(`\\b${HELD_QUERY}\\b`, 'g'), SERVER_CODE)
-    expect(named).toHaveLength(3)
+    expect(named).toHaveLength(4)
+    expect(withinCall(named, onlyCallOf('createReplyReminders'))).toBe(1)
     expect(withinCall(named, onlyCallOf('createDeliveryReporting'))).toBe(1)
     expect(withinCall(named, onlyCallOf('decideSessionAdmission'))).toBe(1)
   })
@@ -5442,9 +5450,10 @@ describe('server.ts refuses service to a persona that is not up (b.av2 SR-6.3, S
     expect(outcomes.get('isUp')).toMatch(/^\((\w+)\) => bringUps\?\.isUp\(\1\) \?\? false$/)
     expect(outcomes.get('isApplied')).toMatch(/^\((\w+)\) => bringUps\?\.isApplied\(\1\) \?\? false$/)
     // Never called directly, and no serving check copied in.
-    expect(callsOf('isPersonaUp')).toHaveLength(2)
+    expect(callsOf('isPersonaUp')).toHaveLength(3)
     expect(withinCall(callsOf('isPersonaUp'), onlyCallOf('createDeliveryReporting'))).toBe(1)
     expect(withinCall(callsOf('isPersonaUp'), onlyCallOf('createDeliveryEngines'))).toBe(1)
+    expect(withinCall(callsOf('isPersonaUp'), onlyCallOf('createReplyReminders'))).toBe(1)
     expect(indicesOf(/\bisPersonaClientServing\b/g, SERVER_CODE)).toEqual([])
   })
 
@@ -6116,13 +6125,14 @@ describe('delivery ownership wiring', () => {
     expect(engine.get('isLatched')).toBe('key => conflictLatch.isLatched(key)')
     expect(engine.get('isHeld')).toContain('invalidFlagsHold.isHeld(key)')
     for (const [hook, handler] of [
-      ['onRow', 'applyDeliveryOwnRowRead'],
       ['onKeyError', 'handleDeliveryKeyError'],
       ['onReadError', 'handleDeliveryReadError'],
     ]) {
       expect(engine.get(hook!)).toBe(handler)
       expect(importSource(SERVER_CODE, handler!)).toBe('./session-manager.ts')
     }
+    expect(engine.get('onRow')).toBe('(key, row) => { const held = applyDeliveryOwnRowRead(key, row) if (!held) void replyReminders?.observe(key, row) return held }')
+    expect(importSource(SERVER_CODE, 'applyDeliveryOwnRowRead')).toBe('./session-manager.ts')
     expect(engine.get('prepare')).toContain('deliveryPreparation!.owns(key, item.accepted.seq)')
     const [shutdownStart, shutdownEnd] = shutdownBody(SERVER_CODE)
     const stopping = SERVER_CODE.slice(shutdownStart, shutdownEnd)
@@ -6138,6 +6148,42 @@ describe('delivery ownership wiring', () => {
     const reconnect = onlyCallProps('createDeliveryEngines').get('reconnect')!
     expect(reconnect).toContain('deliveryScope.run(key, client as Client, beforeCall, async () =>')
     expect(reconnect).toContain('await deferredReconnect(key)')
+  })
+})
+
+describe('reply reminders use authoritative rows and the durable delivery path (b.js7)', () => {
+  test('independent polling starts unconditionally before the start bring-up, including when health checks are disabled', () => {
+    const starts = indicesOf(/\breplyReminders\.start\s*\(/g, SERVER_CODE)
+    expect(starts).toHaveLength(1)
+    expect(atMainTopLevel(SERVER_CODE, starts[0]!)).toBe(true)
+    expect(callArguments(SERVER_CODE, starts[0]!)).toBe('')
+    expect(starts[0]).toBeGreaterThan(onlyCallOf('createReplyReminders'))
+    expect(starts[0]).toBeLessThan(startResolution(SERVER_CODE).bringUpAt)
+  })
+
+  test('the poller reads through the persona client and gates on the live up/configured/connected state', () => {
+    expect(importSource(SERVER_CODE, 'createReplyReminders')).toBe('./reply-reminder.ts')
+    const deps = onlyCallProps('createReplyReminders')
+    expect([...deps.keys()].sort()).toEqual(['queue', 'getRow', 'ready', 'enabled', 'prepare', 'onError'].sort())
+    expect(deps.get('queue')).toBe(onlyCallProps('createDeliveryEngines').get('queue'))
+    const getRow = deps.get('getRow')!
+    expect(getRow).toBe("async (key, current) => { try { const client = await deliveryClients!.clientFor(key) if (!current()) return undefined const row = await withOutageDetection(key, undefined, 'get', c => c.get({ instance_id: personaInstanceId(key) }), { client: client as Client, armsNothing: { personaConfigured: () => !!getAppliedPersona(key) } }) if (!current()) return undefined return applyDeliveryOwnRowRead(key, row) ? undefined : row } catch (error) { if (!current()) return undefined await handleDeliveryReadError(key, error, 'get') throw error } }")
+    expect(importSource(SERVER_CODE, 'applyDeliveryOwnRowRead')).toBe('./session-manager.ts')
+    expect(importSource(SERVER_CODE, 'handleDeliveryReadError')).toBe('./session-manager.ts')
+    expect(deps.get('ready')).toBe('key => !shuttingDown && deliveryLifecycle?.active(key) === true && !!getAppliedPersona(key) && isPersonaUp(key) && getSessionByPersona(key)?.connected === true && !isDryRun() && !isRestartPendingOrActive(key) && !conflictLatch.isLatched(key) && !invalidFlagsHold.isHeld(key) && personaKillFailureAlerts?.isOpen(key) !== true && !waitsOnKillFailedHold(key) && !isOwnRowOldLifeHeld(key) && !oldLifeHeldDirectory(getAppliedPersona(key)!.working_directory)')
+    expect(deps.get('enabled')).toBe('key => getAppliedPersona(key)?.stop_hook_bootstrap !== false')
+    expect(deps.get('prepare')).toBe('(key, item) => deliveryPreparation!.prepare(key, item)')
+  })
+
+  test('reply calls reach the reminder tracker and shutdown stops it before clients and the journal close', () => {
+    const tools = objectProperties(spreadConstObject('sessionToolDeps'))
+    expect(tools.get('onReplyCall')).toBe('key => replyReminders?.noteReplyCall(key)')
+    const [start, end] = shutdownBody(SERVER_CODE)
+    const stopping = SERVER_CODE.slice(start, end)
+    expect(stopping).toContain('const remindersStopping = replyReminders?.stop()')
+    expect(stopping.indexOf('await remindersStopping')).toBeGreaterThan(stopping.indexOf('replyReminders?.stop()'))
+    expect(stopping.indexOf('await remindersStopping')).toBeLessThan(stopping.indexOf('await deliveryClients?.close()'))
+    expect(stopping.indexOf('await remindersStopping')).toBeLessThan(stopping.indexOf('await deliveryQueue?.stop()'))
   })
 })
 

@@ -980,16 +980,6 @@ const RAW_ERROR_ALLOWED: { file: string; anchor: string; reason: string }[] = [
     reason: "the server entry point's last-resort catch-all for an unexpected throw from main()",
   },
   {
-    file: 'src/stop-hook-bootstrap.ts',
-    anchor: "'stop-hook-bootstrap-init'",
-    reason: "a file-system error resolving the reply-guard hook script; no Slack or agent-director call",
-  },
-  {
-    file: 'src/stop-hook-bootstrap.ts',
-    anchor: 'unexpected top-level error in stopHookBootstrap',
-    reason: "the settings.json hook patch's catch-all (file system and JSON only)",
-  },
-  {
     file: 'src/trust-bootstrap.ts',
     anchor: 'unexpected error for',
     reason: "the .claude.json trust patch's catch-all (file system and JSON only), recorded at start and logged per launch",

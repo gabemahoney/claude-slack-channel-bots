@@ -134,7 +134,7 @@ The server applies it without a restart. Lines that start `DESTRUCTIVE:` name pe
 | [Channel modes](docs/channel-modes.md) | Choose declarative or fungible mode, and see who can reach a persona in fungible mode |
 | [Reload](docs/reload.md) | Change the configuration of a running server and read its preview |
 | [CLI Reference](docs/cli.md) | Look up a command's behaviour, output and exit codes |
-| [What a bot can do](docs/bots.md) | Learn the bots' tools, how messages reach them, `/interject`, the permission relay and the Slack Reply Guard |
+| [What a bot can do](docs/bots.md) | Learn the bots' tools, how messages reach them, `/interject`, the permission relay and Slack reply reminders |
 | [Scheduled Prompts](docs/scheduled-prompts.md) | Send prompts to bots on a schedule |
 | [agent-director](docs/agent-director.md) | Check the agent-director install and size CSCB's agent-director timeout |
 | [Troubleshooting](docs/troubleshooting.md) | Fix a persona that is silent or down, a notice, or a startup error |

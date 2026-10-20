@@ -124,7 +124,6 @@ import {
   _resetNotConnectedEpisodes,
   notifyRestartCapReached,
   setSessionNotifier,
-  _resetPreLaunchReplyGuard,
   _setConfigDirFs,
   _resetConfigDirFs,
   checkLaunchConfigDir,
@@ -216,9 +215,7 @@ import { createPersonaBringUpController, type PersonaBringUpController } from '.
 import { PERSONA_CONFIG_DIR_UNRESOLVABLE } from '../src/persona-diagnostics.ts'
 import { makeConnectionHarness, type ConnectionHarness } from './test-helpers/persona-connection-harness.ts'
 import { APP_TOKEN_PREFIX, LEAK_SENTINEL, REDACTED_SENTINEL_TAIL, assertNoLeak, fakeToken, sentinelInMessage } from './test-helpers/credentials.ts'
-import { _resetLaunchedWithDirs, getLaunchedWithDir } from '../src/stop-hook-bootstrap.ts'
-import { makeReplyGuardRecordDir, type ReplyGuardRecordDir } from './test-helpers/reply-guard-record.ts'
-import { installRecordingReplyGuard, observeLaunchCalls, type LaunchCall } from './test-helpers/reply-guard-launch.ts'
+import { observeLaunchCalls } from './test-helpers/launch-calls.ts'
 import {
   setClientForTests,
   resetClientForTests,
@@ -608,14 +605,6 @@ function ownStubCalls(log: StubCallLog, instanceId: string): Record<string, numb
 beforeEach(() => {
   _resetRestartState()
   _resetBackoffState()
-})
-
-// No test outside the reply-guard block installs the pre-launch reply guard,
-// so no other launch here writes a record; reset it (and the launched-with
-// dirs) after every test all the same.
-afterEach(() => {
-  _resetPreLaunchReplyGuard()
-  _resetLaunchedWithDirs()
 })
 
 // ---------------------------------------------------------------------------
@@ -4701,39 +4690,26 @@ describe('restart: one in-flight launch per persona (b.av2 SR-6.3, SR-6.6)', () 
 })
 
 // ---------------------------------------------------------------------------
-// Restart-triggered relaunch: the reply-guard record precedes the launch
-// (b.av2 SR-6.2, SR-9.4). `RestartDeps.launchSession` is the session
-// manager's REAL launch adapter, and the REAL `preLaunchReplyGuard` is
-// installed with `setPreLaunchReplyGuard` over a `mkdtempSync` state
-// directory (`makeReplyGuardRecordDir`), removed in afterEach with every
-// persona path. The persona has its own temp claude_config_dir, so the
-// launch-time hook pass writes only there. At each spawn or resume the stub
-// snapshots the persona's record and launched-with dir; the installed step
-// and its undo log to the same order log (`installRecordingReplyGuard` and
-// `observeLaunchCalls`, tests/test-helpers/reply-guard-launch.ts).
+// Restart-triggered relaunches use the session manager's real launch adapter
+// over isolated working/config directories and a recording AD stub.
 // ---------------------------------------------------------------------------
 
-describe('restart: the reply-guard record holds the effective value before the relaunch reaches agent-director (b.av2 SR-6.2, SR-9.4)', () => {
+describe('restart: the real launch adapter uses the applied configuration', () => {
   let dir: string
-  let rg: ReplyGuardRecordDir
   let configDir: string
   let errLines: string[]
   let origConsoleError: typeof console.error
-  /** The installed step ('guard'), its undo ('undo') and the stub's 'spawn' / 'resume', in order. */
+  /** The stub's spawn and resume calls, in order. */
   let events: string[]
-  /** The record text (null when absent) and launched-with dir at each spawn or resume. */
-  let seen: Array<{ call: LaunchCall; record: string | null; launchedWith: string | undefined }>
   let spawnCalls: SpawnParams[]
   let resumeCalls: ResumeParams[]
   let sendKeysCalls: SendKeysParams[]
 
   beforeEach(() => {
-    dir = mkdtempSync(join(tmpdir(), 'restart-reply-guard-'))
-    rg = makeReplyGuardRecordDir()
+    dir = mkdtempSync(join(tmpdir(), 'restart-launch-'))
     configDir = join(dir, 'claude-config')
     mkdirSync(configDir)
     events = []
-    seen = []
     spawnCalls = []
     resumeCalls = []
     sendKeysCalls = []
@@ -4755,14 +4731,12 @@ describe('restart: the reply-guard record holds the effective value before the r
     setSessionNotifier(undefined)
     _resetSpawnHomeDir()
     _resetDialogReadyTimeoutMs()
-    rg.cleanup()
     rmSync(dir, { recursive: true, force: true })
   })
 
   /**
    * One persona, `Alpha Desk` (a hashed key), with the given effective
-   * stop_hook_bootstrap and its own claude_config_dir; the real reply guard
-   * installed over it; and a stub AD client whose row is gone (`row: 'gone'`,
+   * stop_hook_bootstrap and its own claude_config_dir, and a stub AD client whose row is gone (`row: 'gone'`,
    * the spawn succeeds) or `ended` (the spawn collides and the row resumes).
    */
   function setup(stopHookBootstrap: boolean, row: 'gone' | 'ended' | 'waiting'): { config: PersonaConfig; a: Persona } {
@@ -4773,7 +4747,6 @@ describe('restart: the reply-guard record holds the effective value before the r
     )
     const [a] = config.personas as [Persona]
     mkdirSync(a.working_directory, { recursive: true })
-    installRecordingReplyGuard(config.personas, rg.stateDir, events)
     const stub = observeLaunchCalls(makeStubClient({
       statusFn: () => ({ state: 'waiting' }),
       spawnCalls,
@@ -4783,7 +4756,6 @@ describe('restart: the reply-guard record holds the effective value before the r
       getResult: cannedGetResult({ state: row === 'waiting' ? 'waiting' : 'ended' }, a, dir),
     }), (call) => {
       events.push(call)
-      seen.push({ call, record: rg.readRecord(a.key), launchedWith: getLaunchedWithDir(a.key) })
     })
     _resetOutageState()
     initOutageState({ notify: () => {}, getClient: () => stub as unknown as Client })
@@ -4797,9 +4769,9 @@ describe('restart: the reply-guard record holds the effective value before the r
     while (!cond() && Date.now() < deadline) await Bun.sleep(5)
   }
 
-  // One relaunch through the real adapter; every launch path and both values
-  // are covered against the ladder in session-manager.test.ts.
-  test('dead session, ended row, stop_hook_bootstrap false: the record reads false before each relaunch call (the optimistic spawn is undone, then resume)', async () => {
+  // Relaunch through the real adapter; the ladder matrices are covered in
+  // session-manager.test.ts.
+  test('dead session, ended row: the optimistic spawn collides, then the row resumes', async () => {
     const { config, a } = setup(false, 'ended')
     const results: LaunchSessionResult[] = []
     const deps = makeDeps({
@@ -4821,15 +4793,12 @@ describe('restart: the reply-guard record holds the effective value before the r
     expect(deps.launchSessionCalls.map((c) => c.key)).toEqual([a.key])
     // b.4q8: a resume answers resumed-unreported; its row reads waiting, so no failure is counted for it.
     expect(results).toEqual([LAUNCH_RESUMED_UNREPORTED])
-    expect(events).toEqual(['guard', 'spawn', 'undo', 'guard', 'resume'])
-    expect(seen.map((s) => s.call)).toEqual(['spawn', 'resume'])
-    for (const snap of seen) expect(snap).toEqual({ call: snap.call, record: 'false', launchedWith: configDir })
+    expect(events).toEqual(['spawn', 'resume'])
     expect(resumeCalls).toHaveLength(1)
-    expect(rg.readRecord(a.key)).toBe('false')
     expect(getFailureCount(a.key)).toBe(0)
   })
 
-  test('live session: the restart reconnects through the real adapter — no launch, no reply-guard step, no record', async () => {
+  test('live session: the restart reconnects through the real adapter without launching', async () => {
     const { a } = setup(true, 'waiting')
     const deps = makeDeps({ isSessionAliveResult: LIVENESS_READING_LIVE })
     deps.reconnectSession = _buildReconnectSessionAdapter()
@@ -4843,15 +4812,13 @@ describe('restart: the reply-guard record holds the effective value before the r
     expect(deps.launchSessionCalls).toEqual([])
     expect(events).toEqual([])
     expect(spawnCalls).toEqual([])
-    expect(rg.readRecord(a.key)).toBeNull()
-    expect(getLaunchedWithDir(a.key)).toBeUndefined()
   })
 
   // b.av2 SR-8.6 next-launch rows (AC 59): restart.ts keeps no persona
   // values; each relaunch goes through the launch adapter, handed the applied
   // set at that moment (the server's `personaConfig`, which a confirmed
-  // apply's step 1 swaps), and the reply guard reads the live applied set.
-  test('claude_config_dir and stop_hook_bootstrap changed between two restarts: the first relaunch uses the old values; the second gives the old-label row a reuse spawn of the same id with the new CLAUDE_CONFIG_DIR (not created yet), deletes nothing and writes the new record', async () => {
+  // apply's step 1 swaps).
+  test('claude_config_dir changed between two restarts: the first relaunch uses the old values; the second gives the old-label row a reuse spawn of the same id with the new CLAUDE_CONFIG_DIR (not created yet), and deletes nothing', async () => {
     const newDir = join(dir, 'claude-config-new')
     const configFor = (claude_config_dir: string, stop_hook_bootstrap: boolean) =>
       makeMultiPersonaConfig([{ name: 'Alpha Desk', claude_config_dir, stop_hook_bootstrap }], dir, { agent_director_poll_interval_ms: 1 })
@@ -4859,7 +4826,6 @@ describe('restart: the reply-guard record holds the effective value before the r
     let applied = before
     const [a] = before.personas as [Persona]
     mkdirSync(a.working_directory, { recursive: true })
-    installRecordingReplyGuard(() => applied.personas, rg.stateDir, events)
     // The row the first relaunch leaves behind, labelled for the old directory.
     const oldRow = cannedGetResult({ state: 'ended' }, a, dir)
     const deleteCalls: StubDeleteParams[] = []
@@ -4894,7 +4860,6 @@ describe('restart: the reply-guard record holds the effective value before the r
     expect(spawnCalls).toHaveLength(1)
     expect(spawnCalls[0]!.extra_env?.['CLAUDE_CONFIG_DIR']).toBe(configDir)
     expect(spawnCalls[0]!.label).toContain(`config_dir=${oldRow.labels['config_dir']}`)
-    expect(rg.readRecord(a.key)).toBe('true')
 
     // Step 1 of a confirmed apply: the applied set now holds the new values.
     applied = configFor(newDir, false)
@@ -4919,7 +4884,6 @@ describe('restart: the reply-guard record holds the effective value before the r
       `persona=${a.key}`,
       `config_dir=${configDirLabelValue(join(realpathSync(dir), 'claude-config-new'))}`,
     ])
-    expect(rg.readRecord(a.key)).toBe('false')
     expect(getFailureCount(a.key)).toBe(0)
     expect(errLines.filter((l) => l.includes(PERSONA_CONFIG_DIR_UNRESOLVABLE))).toEqual([])
   })

@@ -260,8 +260,8 @@ tests/
     test-10-credentials-change.sh  # E13 (SR-8.3; SR-8.6 as amended by b.deo SRI-805), live against the Slack stub: a credentials change reconnects one persona on confirmation; handshake failure and refused change; leak counts
     test-12-bot-hook-absoluteness.sh
                                    # b.cnu SR-8.2, b.2qu, live against the Slack stub: every hook `command` path of an agent-director-launched persona is an absolute path to an existing executable
-                                   # (agent-director's exec-form `command` read verbatim, CSCB's shell-form Stop hook by its first word); agent-director's run the user's agent-director install,
-                                   # the reply guard runs the installed package's script
+                                   # (agent-director's exec-form `command` read verbatim), running the user's agent-director install; startup removes a seeded retired CSCB Stop hook,
+                                   # preserves an unrelated user hook, and uses the normal real-launch path
     test-0-fmk-harness-self-check.sh
                                    # SRJ-1306 (as amended by b.deo SRI-1402 to SRI-1404), fmk mode: the harness's self-check, run once, after Test 4 in canonical order, in the one shard that holds it. Its legs show the scenario's own HOME,
                                    # TMUX_TMPDIR and PATH (no agent-director on it, the stub as `claude`, bun kept); the release behind the shim at the standard path, and its agent-director-admin behind the shim at the admin path;

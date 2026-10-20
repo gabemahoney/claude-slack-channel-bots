@@ -158,7 +158,6 @@ import {
   createOldLifeWaitUnclassifiedErrors,
   type OldLifeWaitUnclassifiedErrors,
   waitsOnKillFailedHold,
-  setPreLaunchReplyGuard,
   setPreLaunchTrustPatcher,
   setSystemPromptPreparer,
   setRetiredKeyStore,
@@ -227,7 +226,8 @@ import { createSlowRecoveryTracker } from './slow-recovery.ts'
 import { createDeliveryReporting } from './delivery-notices.ts'
 import { buildDeliveryDiagnostic, buildQueuedMessageRetryLine, SYSTEM_PROMPT_UNWRITABLE, queueErrorCode } from './persona-diagnostics.ts'
 import { createPersonaRouting } from './persona-routing.ts'
-import { createDeliveryQueue, type DeliveryQueue, type QueueEvent } from './delivery-queue.ts'
+import { createDeliveryQueue, type ReplyReminderQueue, type QueueEvent } from './delivery-queue.ts'
+import { createReplyReminders, type ReplyReminders } from './reply-reminder.ts'
 import { createDeliveryPreparation, type DeliveryPreparation } from './delivery-intake.ts'
 import {
   createPersonaConnectionManager,
@@ -297,13 +297,7 @@ import {
 import { getClient, closeClient } from './agent-director-client.ts'
 import { trustBootstrap, trustPatchPersona } from './trust-bootstrap.ts'
 import { runJsonlPersistenceSafeguard, runPersonaStorageCheck } from './jsonl-persistence-check.ts'
-import {
-  getLaunchedWithDir,
-  preLaunchReplyGuard,
-  stopHookBootstrap,
-  stopHookLaunchPass,
-  teardownPersonaReplyGuard,
-} from './stop-hook-bootstrap.ts'
+import { removeLegacyReplyHooks } from './legacy-reply-hook-cleanup.ts'
 import { forgetPersonaPrompts, startPermissionPoller, stopPermissionPoller, hasNativePromptWarning } from './permission-poller.ts'
 import {
   initRestart,
@@ -755,6 +749,7 @@ const sessionToolDeps: SessionToolDeps = {
   inboxDir: INBOX_DIR,
   resolveUserName: resolvePersonaUserName,
   consumeAck,
+  onReplyCall: key => replyReminders?.noteReplyCall(key),
   serverPort: 0, // updated to actual port in main() before Bun.serve
   // The channel mode of the configuration in effect, read at each tool call
   // (b.deo SRI-201, SRI-601).
@@ -1180,7 +1175,8 @@ async function handleInitialized(
  * receiver.
  */
 // Holders are populated in main(), after the duplicate-server guard and before admission.
-let deliveryQueue: DeliveryQueue | undefined
+let deliveryQueue: ReplyReminderQueue | undefined
+let replyReminders: ReplyReminders | undefined
 let deliveryPreparation: DeliveryPreparation | undefined
 let deliveryEngines: DeliveryEngines | undefined
 let deliveryLifecycle: DeliveryLifecycle | undefined
@@ -1192,7 +1188,7 @@ export function _setDeliveryLifecycle(value: DeliveryLifecycle | undefined): voi
 let deliveryReporting: ReturnType<typeof createDeliveryReporting> | undefined
 const bufferedQueueEvents: QueueEvent[] = []
 let deliveryClients: ReturnType<typeof createDeliveryClientFactory> | undefined
-export const deliveryEngineEvents = { emit: (event: DeliveryEngineEvent): void => { deliveryReporting?.engineEvent(event) } }
+export const deliveryEngineEvents = { emit: (event: DeliveryEngineEvent): void => { deliveryReporting?.engineEvent(event); if (event.type === 'item-delivered') replyReminders?.wake(event.key) } }
 /** E5 binds event handling here; E2 supplies facts without notices or wording. */
 export const deliveryQueueEvents = { emit: (event: QueueEvent): void => { if (deliveryReporting) deliveryReporting.queueEvent(event); else bufferedQueueEvents.push(event) } }
 /** E3's engine binds this hook after startup; until then queued work waits. */
@@ -1509,9 +1505,11 @@ async function shutdown(reason: string, exitCode = 0): Promise<void> {
 
   // b.omv SR-3.3: finish fixation and drain the shared writers after every
   // synchronous stop above, before closing the transports and clients.
+  const remindersStopping = replyReminders?.stop()
   const deliveryStopping = deliveryEngines?.stop()
   await deliveryPreparation?.stop()
   await deliveryStopping
+  await remindersStopping
   await deliveryClients?.close()
   await deliveryQueue?.stop()
 
@@ -3529,7 +3527,13 @@ export async function main(): Promise<void> {
     // b.jg5 SRJ-808, SRJ-404: apply step 1 stops the dialog approver of each
     // key it records, right after the record and before the last-applied
     // rewrite and the teardown's kill; no pending-row rule run follows.
-    stopApprover: async (key) => { const stopping = deliveryEngines?.forget(key); deliveryLifecycle?.forget(key); await stopDialogApprover(key, APPROVER_STOP_RETIRED_KEY); await stopping },
+    stopApprover: async (key) => {
+      const stopping = deliveryEngines?.forget(key)
+      deliveryLifecycle?.forget(key)
+      const remindersStopping = replyReminders?.forget(key)
+      const approverStopping = stopDialogApprover(key, APPROVER_STOP_RETIRED_KEY)
+      await Promise.all([stopping, remindersStopping, approverStopping])
+    },
     // b.av2 SR-8.6 as amended by b.jg5 SRJ-1511, beside b.deo SRI-406,
     // SRI-408 and SRI-502: a confirmed apply's step 1 writes the unwritten
     // drops of a key it brings up, drops the retired keys' stored choices and
@@ -3581,7 +3585,7 @@ export async function main(): Promise<void> {
     // server-wide setting keeps its start-time value (the next start applies
     // it). Everything that reads the applied set or the channel mode reads
     // `personaConfig` at call time: the bring-up controller's applied set,
-    // the reply-guard step, routing, the destination resolver, the notifier,
+    // reply reminders, routing, the destination resolver, the notifier,
     // /interject, cron, the health work list and MCP admission.
     // An apply before the start resolved is never expected (detection is
     // armed only after the start bring-up); it throws rather than build a
@@ -3609,7 +3613,10 @@ export async function main(): Promise<void> {
   // the persona config is set — before the Slack connections, Bun.serve and
   // initRestart — so no launch path (start, restart or a human trigger) can
   // run unpatched.
-  setPreLaunchTrustPatcher(trustPatchPersona)
+  setPreLaunchTrustPatcher(persona => {
+    removeLegacyReplyHooks([persona.claude_config_dir])
+    trustPatchPersona(persona)
+  })
   // b.omv SR-7.2: startup failure is local; every launch retries the write and fails closed.
   const prepareSystemPrompt = (key: string): void => {
     try {
@@ -3624,14 +3631,6 @@ export async function main(): Promise<void> {
   setSystemPromptPreparer(prepareSystemPrompt)
   try { prepareSystemPrompt('server-start') } catch { /* persona launches retry independently */ }
 
-  // b.av2 SR-9.4: the reply-guard steps (record, launched-with dir, hook
-  // install) run immediately before each spawn or resume. The step gets a
-  // getter for the applied persona set (read at the launch and again by its
-  // undo, never a snapshot) and the server's own state directory. With no
-  // persona config the installed step does nothing: no record, no patch.
-  setPreLaunchReplyGuard((persona) =>
-    personaConfig === null ? undefined : preLaunchReplyGuard(persona, () => personaConfig?.personas, STATE_DIR),
-  )
   console.error(`[slack] Loaded persona config: ${personaConfig.personas.length} persona(s)`)
   // The start-time applied config (declared before the reload controller).
   appliedConfig = personaConfig
@@ -4266,7 +4265,11 @@ export async function main(): Promise<void> {
     // is still acknowledging it. Only post-ack intake/recovery may start
     // name lookups; an unfixed head waits for that owner's durable wake.
     prepare: (key, item) => deliveryPreparation!.owns(key, item.accepted.seq) ? deliveryPreparation!.prepare(key, item) : Promise.resolve(),
-    onRow: applyDeliveryOwnRowRead,
+    onRow: (key, row) => {
+      const held = applyDeliveryOwnRowRead(key, row)
+      if (!held) void replyReminders?.observe(key, row)
+      return held
+    },
     inspectUpgrade: (key, _row, client, beforeCall) => deliveryScope.run(key, client as Client, beforeCall, async () => { await inspectPersonaUpgrade(key, getAppliedPersona(key)) }),
     onKeyError: handleDeliveryKeyError,
     onReadError: handleDeliveryReadError,
@@ -4281,6 +4284,31 @@ export async function main(): Promise<void> {
       }
     }),
   })
+  replyReminders = createReplyReminders({
+    queue: deliveryQueue!,
+    getRow: async (key, current) => {
+      try {
+        const client = await deliveryClients!.clientFor(key)
+        if (!current()) return undefined
+        const row = await withOutageDetection(key, undefined, 'get', c => c.get({ instance_id: personaInstanceId(key) }), { client: client as Client, armsNothing: { personaConfigured: () => !!getAppliedPersona(key) } })
+        if (!current()) return undefined
+        return applyDeliveryOwnRowRead(key, row) ? undefined : row
+      } catch (error) {
+        if (!current()) return undefined
+        await handleDeliveryReadError(key, error, 'get')
+        throw error
+      }
+    },
+    ready: key => !shuttingDown && deliveryLifecycle?.active(key) === true && !!getAppliedPersona(key) && isPersonaUp(key) && getSessionByPersona(key)?.connected === true && !isDryRun() && !isRestartPendingOrActive(key)
+      && !conflictLatch.isLatched(key) && !invalidFlagsHold.isHeld(key) && personaKillFailureAlerts?.isOpen(key) !== true && !waitsOnKillFailedHold(key) && !isOwnRowOldLifeHeld(key)
+      && !oldLifeHeldDirectory(getAppliedPersona(key)!.working_directory),
+    // Legacy configuration remains accepted as the reminder opt-out. It no
+    // longer patches settings or installs a Claude-only hook.
+    enabled: key => getAppliedPersona(key)?.stop_hook_bootstrap !== false,
+    prepare: (key, item) => deliveryPreparation!.prepare(key, item),
+    onError: key => console.error(`[slack] reply-reminder persona=${key}: observation or journal update failed; retrying`),
+  })
+  replyReminders.start()
   deliveryQueueWake.wake = key => deliveryEngines?.wake(key)
   // Retained in-flight items need recovery before launch reconnects; an
   // accepted-only head has no keys to recover and is fixed after bring-up.
@@ -4382,7 +4410,13 @@ export async function main(): Promise<void> {
     whenLaunchSettled,
     // b.jg5 SRJ-404, SRJ-715: a teardown stops the key's dialog approver
     // first, and the one its launch in flight would start.
-    stopApprover: async (key) => { const stopping = deliveryEngines?.forget(key); deliveryLifecycle?.forget(key); await stopDialogApprover(key, APPROVER_STOP_TEARDOWN); await stopping },
+    stopApprover: async (key) => {
+      const stopping = deliveryEngines?.forget(key)
+      deliveryLifecycle?.forget(key)
+      const remindersStopping = replyReminders?.forget(key)
+      const approverStopping = stopDialogApprover(key, APPROVER_STOP_TEARDOWN)
+      await Promise.all([stopping, remindersStopping, approverStopping])
+    },
     // b.jg5 SRJ-706, SRJ-715: right after the approver, the key's live-row
     // sequence, before the wait for its launch in flight; the teardown waits
     // for the sequence's call in flight to return.
@@ -4437,11 +4471,7 @@ export async function main(): Promise<void> {
     // so a standing non-success whose outage onset the window wrote raises
     // no second notice.
     outageFlags: getOutageFlags,
-    replyGuard: {
-      launchedWithDir: getLaunchedWithDir,
-      teardown: (key) => teardownPersonaReplyGuard(STATE_DIR, key),
-      launchPass: (dirs, personas) => stopHookLaunchPass(dirs, personas, STATE_DIR),
-    },
+    forgetReplyReminders: key => replyReminders?.forget(key) ?? Promise.resolve(),
     storageCheck: (persona) => runPersonaStorageCheck(persona, personaNotifier.notify),
     launch: (persona) => spawnForPersona(persona, personaConfig ?? appliedConfig, false),
     // Step 5 keeps the server-wide arguments the boot install wrote.
@@ -4822,15 +4852,10 @@ export async function main(): Promise<void> {
     console.error(`[slack] Warning: jsonl-persistence safeguard failed — continuing: ${describeThrownValue(err)}`)
   }
 
-  // b.osj / b.av2 SR-9.4: install (or remove) the CSCB-managed Stop hook in
-  // each applied persona's effective claude_config_dir settings.json before
-  // any spawn fires; its command names this server's reply-guard record
-  // directory. Runs for both real and dry-run modes (config-file patch, not a
-  // session operation). Never throws — per-dir failures are recorded via
-  // recordStartupError.
-  // No bootstrap pass starts once a shutdown has begun (b.jg5 SRJ-205).
+  // Migration only: remove old managed entries before starting bots. Each
+  // launch also retries cleanup, including config directories added by reload.
   if (shuttingDown) return
-  stopHookBootstrap(personaConfig, STATE_DIR)
+  removeLegacyReplyHooks(personaConfig.personas.map(persona => persona.claude_config_dir))
 
   // b.av2 SR-6.1: bring each applied persona up — one persona-start line,
   // the local credentials check (skipped in dry run), the working-directory

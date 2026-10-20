@@ -591,7 +591,7 @@ export interface ReloadControllerDeps {
    * reassigns the server's `personaConfig` to `configInEffect`: the new
    * persona set and its `allow_invited_channels` switch, with every other
    * server-wide value kept from start time; the bring-up controller's applied
-   * set, the reply-guard step and every consumer of the channel mode read it
+   * set, the reply reminder and every consumer of the channel mode read it
    * from there. A throw is logged; the apply goes on.
    */
   onApplied?: (config: PersonaConfig) => void
@@ -635,8 +635,8 @@ export interface ReloadControllerDeps {
  * always matches the mode `applied`'s personas were resolved in. The
  * top-level `claude_config_dir` and `stop_hook_bootstrap` are not held back
  * by this either: they act only as inherited defaults, already resolved into
- * each of `applied`'s personas, so an inheriting persona's next launch uses
- * the new value. The one place the server derives what it runs from an
+ * each of `applied`'s personas. The config directory applies at the next
+ * launch; the legacy reminder opt-out applies immediately. The one place the server derives what it runs from an
  * applied configuration: after an apply (the `onApplied` of `main()` in
  * `server.ts`), and for the start bring-up pass (its `startBringUp`), whose
  * `startTime` is the server's start-time configuration. Pure: neither input

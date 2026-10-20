@@ -1,3 +1,4 @@
+import { REPLY_REMINDER_TEXT } from '../src/reply-reminder.ts'
 /**
  * shipped-docs.test.ts — the shipped-description audit (b.av2 SR-13.5): what
  * the package ships to the operator and to bot instances describes personas
@@ -869,7 +870,6 @@ describe('README.md', () => {
     /** SR-8.6: each next-launch setting keeps the instance, `claude_config_dir` only until the next launch. */
     const NEXT_LAUNCH_SESSION: Record<NextLaunchSetting, string> = {
       claude_config_dir: 'Kept until the next launch',
-      stop_hook_bootstrap: 'Kept',
     }
 
     /**
@@ -916,7 +916,8 @@ describe('README.md', () => {
       Expected[]
     > = {
       inPlace: [
-        { label: IN_PLACE_SETTINGS.join(', '), find: naming(...IN_PLACE_SETTINGS), session: 'Kept', destructive: false },
+        { label: IN_PLACE_SETTINGS.filter(s => s !== 'stop_hook_bootstrap').join(', '), find: naming(...IN_PLACE_SETTINGS.filter(s => s !== 'stop_hook_bootstrap')), session: 'Kept', destructive: false },
+        { label: 'stop_hook_bootstrap', find: naming('stop_hook_bootstrap'), session: 'Kept', destructive: false },
       ],
       credentials: [
         {
@@ -986,7 +987,8 @@ describe('README.md', () => {
       return [
         ...(/\bnext server start\b/.test(row.confirmed) ? [] : ['Once confirmed names no next server start']),
         ...(codeSpans(row.confirmed).includes(MODE_SWITCH_SETTING) ? [] : [`Once confirmed names no \`${MODE_SWITCH_SETTING}\``]),
-        ...(/\bexception\b/i.test(row.confirmed) ? [] : ['Once confirmed names no exception']),
+        ...(codeSpans(row.confirmed).includes('stop_hook_bootstrap') ? [] : ['Once confirmed names no `stop_hook_bootstrap`']),
+        ...(/apply in place at once/i.test(row.confirmed) ? [] : ['Once confirmed names no immediate application']),
       ]
     }
 
@@ -1051,7 +1053,8 @@ describe('README.md', () => {
       test.each([
         [`\`${MODE_SWITCH_SETTING}\``, (line: string) => line.replaceAll(`\`${MODE_SWITCH_SETTING}\``, 'the switch'), `Once confirmed names no \`${MODE_SWITCH_SETTING}\``],
         ['"next server start"', (line: string) => line.replaceAll('next server start', 'next start'), 'Once confirmed names no next server start'],
-        ['"exception"', (line: string) => line.replace(/\bexception\b/gi, 'difference'), 'Once confirmed names no exception'],
+        ['`stop_hook_bootstrap`', (line: string) => line.replaceAll('`stop_hook_bootstrap`', 'the reminder setting'), 'Once confirmed names no `stop_hook_bootstrap`'],
+        ['"apply in place at once"', (line: string) => line.replaceAll('apply in place at once', 'apply later'), 'Once confirmed names no immediate application'],
       ] as const)('the server-wide row with %s cut fails the exception case on that leg alone', (_cut, edit, problem) => {
         const edited = withRowEdited(reloadDoc, SERVER_WIDE_ROW, edit)
         expect(edited).not.toBe(reloadDoc)
@@ -1195,7 +1198,7 @@ describe('README.md', () => {
         ['the moved server-wide settings', ({ raw }) => {
           expect(MOVED_SERVER_SETTINGS.filter((key) => !(key in raw))).toEqual([])
         }],
-        // SR-9.4: the reply guard refuses ~/.claude, so no config dir in the example, top-level or persona, may be it.
+        // Examples keep each config directory isolated from the temp home's default Claude directory.
         ['no claude_config_dir is <home>/.claude (SR-9.4)', ({ home, config }) => {
           const dirs = [['top level', config.claude_config_dir], ...config.personas.map((p) => [p.name, p.claude_config_dir])]
           expect(dirs.filter(([, configDir]) => configDir === join(home, '.claude'))).toEqual([])
@@ -1314,26 +1317,11 @@ function mcpInstructionsText(): string {
 /** The name the MCP instructions go by in the audit's failures and case titles. */
 const MCP_INSTRUCTIONS_NAME = 'MCP instructions (src/registry.ts MCP_INSTRUCTIONS)'
 
-/** The Slack Reply Guard, whose reminder text reaches every persona's instance. */
-const REPLY_GUARD_FILE = 'stop-hooks/slack-reply-guard.sh'
-
-/**
- * The Slack Reply Guard's reminder text: every `PROVENANCE="…"` wording and
- * the `REMINDER_TAIL="…"` the hook prints to the instance, one per line, read
- * as the literal strings the script assigns (not its comments or code; an
- * assignment that expands a variable is skipped). Throws when either is
- * missing, so the audit never passes on nothing.
- */
-function replyGuardReminderText(): string {
-  const script = readRepoFile(REPLY_GUARD_FILE)
-  const literals = (name: string) =>
-    [...script.matchAll(new RegExp(`^\\s*${name}="([^"$]*)"\\s*$`, 'gm'))].map((m) => m[1])
-  const provenances = literals('PROVENANCE')
-  const tails = literals('REMINDER_TAIL')
-  if (provenances.length === 0 || tails.length !== 1) {
-    throw new Error(`${REPLY_GUARD_FILE}: expected PROVENANCE wordings and one REMINDER_TAIL, found ${provenances.length} and ${tails.length}`)
-  }
-  return [...provenances, ...tails].join('\n')
+/** The reminder text sent through the delivery queue to a persona. */
+const REPLY_REMINDER_FILE = 'src/reply-reminder.ts'
+function replyReminderText(): string {
+  if (REPLY_REMINDER_TEXT.trim() === '') throw new Error('empty reply reminder')
+  return REPLY_REMINDER_TEXT
 }
 
 /** The crontable header the server writes for a new crontable, as src/cron-bootstrap.ts exports it. */
@@ -1424,7 +1412,7 @@ const SHIPPED_TEXTS: [name: string, read: () => string][] = [
   ['slack-app-manifest.yml', () => readRepoFile('slack-app-manifest.yml')],
   [CREDENTIALS_SCRIPT, () => readRepoFile(CREDENTIALS_SCRIPT)],
   [MCP_INSTRUCTIONS_NAME, mcpInstructionsText],
-  [`${REPLY_GUARD_FILE} (reminder text)`, replyGuardReminderText],
+  [`${REPLY_REMINDER_FILE} (reminder text)`, replyReminderText],
   ['CRONTABLE_TEMPLATE_HEADER (src/cron-bootstrap.ts)', crontableHeaderText],
   ...SET_CHANNEL_DELIVERY_TEXTS.map(toolTextEntry),
 ]
@@ -2284,7 +2272,7 @@ describe('AC 74: the MCP instructions carry no reload wording (SR-8.8)', () => {
 describe('AC 47: the MCP instructions and the Reply Guard reminder do not name clear-latch (SRJ-511)', () => {
   const BOT_FACING_TEXTS: [name: string, read: () => string][] = [
     [MCP_INSTRUCTIONS_NAME, mcpInstructionsText],
-    [`${REPLY_GUARD_FILE} (reminder text)`, replyGuardReminderText],
+    [`${REPLY_REMINDER_FILE} (reminder text)`, replyReminderText],
   ]
 
   test.each(BOT_FACING_TEXTS.flatMap(([name, read]) => CLEAR_LATCH_TERMS.map((term) => [name, term, read] as const)))(
@@ -7829,9 +7817,10 @@ const README_DEO_ROWS: readonly DocRow[] = [
   ]],
 
   // SRI-1101, the configuration sections T1's cases do not read (T20 S3).
-  [`Server-wide settings: the opening paragraph names ${MODE_SWITCH_SETTING} as the one setting a confirmation applies in place`, unitOf(USER_DOCS_NAME, '## Server-wide settings', 'These top-level fields apply'), [
-    ci('A confirmed change to one takes effect at the next server start'),
-    ci(`${SWITCH} is the one setting a confirmation applies in place, at once`),
+  [`Server-wide settings: the opening paragraph names ${MODE_SWITCH_SETTING} and the reminder default as applying immediately`, unitOf(USER_DOCS_NAME, '## Server-wide settings', 'These top-level fields apply'), [
+    ci('Confirmed changes take effect at the next server start, with exceptions'),
+    ci(`${SWITCH} applies in place at once`),
+    ci('`stop_hook_bootstrap` applies immediately to each inheriting persona'),
   ]],
   [`Persona fields: ${CHANNELS_KEY} is a declarative-mode field`, tableRowOf('### Persona fields', `${code(CHANNELS_KEY)} |`), [
     ci('in declarative mode, yes unless'),
@@ -8025,7 +8014,8 @@ const README_DEO_ROWS: readonly DocRow[] = [
     () => `| ${code(switchLineQuote('fungible'))} |`,
     () => `| ${code(switchLineQuote('declarative'))} |`,
     () => ci(`ends ${code(switchLineNoPersonaEnding())} when there is none`),
-    ci('Unlike other server-wide settings, it applies at once, with no restart, and every session is kept'),
+    ci('It applies at once, with no restart, and every session is kept'),
+    ci('The inherited `stop_hook_bootstrap` default also applies immediately to reminder checks'),
   ]],
   ['Reading the preview: the recorded lines, as recordedLine renders them for each section, and their row', readmeSection('## Reading the preview'), [
     () => code(recordedLineQuote('declarative')),
@@ -8035,7 +8025,7 @@ const README_DEO_ROWS: readonly DocRow[] = [
     ci(`A change made only of recorded changes previews as ${code(NO_EFFECTIVE_CHANGE)}, followed by its recorded lines`),
   ]],
   [`Confirming a change: the switch is the exception to "recorded and take effect later"`, readmeSection('## Confirming a change'), [
-    ci(`next-launch and server-wide settings are recorded and take effect later, except the switch ${SWITCH}, which applies in place at once`),
+    ci(`Next-launch and most server-wide settings are recorded and take effect later; the switch ${SWITCH} and reminder setting ` + code('stop_hook_bootstrap') + ` (own or inherited) apply in place at once`),
   ]],
   [`Confirming a change: ${RELOAD_NOOP} covers a confirmation of recorded changes only`, tableRowOf('## Confirming a change', `\`[slack] ${RELOAD_NOOP}:`), [
     ci('as for a confirmation whose only changes are recorded ones (changes to the section not in force)'),
@@ -8046,7 +8036,7 @@ const README_DEO_ROWS: readonly DocRow[] = [
     ci("when it can't, nothing is applied, the retired-key record is not written, and the change stays pending"),
   ]],
   ['When next-launch and server-wide changes take effect: the switch takes effect once confirmed, with no restart', readmeSection('## When next-launch and server-wide changes take effect'), [
-    ci(`Server-wide settings take effect at the next server start, except the switch ${SWITCH}: it takes effect when the change is confirmed, and needs no ${code(CLI_COMMAND_CLEAN_RESTART)}`),
+    ci(`Server-wide settings take effect at the next server start, except ${SWITCH} and the inherited ` + code('stop_hook_bootstrap') + ` reminder setting: both take effect when the change is confirmed, and need no ${code(CLI_COMMAND_CLEAN_RESTART)}`),
   ]],
 
   // SRI-1105, troubleshooting and downgrade (T20 S8).
@@ -8687,8 +8677,8 @@ describe('released agent-director 0.12 migration instructions (b.m2o)', () => {
 })
 
 // b.omv SR-7.1/2/4/6: maintained release notes describe this breaking upgrade.
-test('Unreleased records fresh conversations, retained memory and the typed launch contract', () => {
-  const unreleased = readFileSync(join(REPO_ROOT, 'CHANGELOG.md'), 'utf-8').split(/^## \[Unreleased\]|^## Unreleased/m)[1]?.split('\n## ')[0] ?? ''
+test('0.17.0 records fresh conversations, retained memory and the typed launch contract', () => {
+  const unreleased = markdownSection(readFileSync(join(REPO_ROOT, 'CHANGELOG.md'), 'utf-8'), '## 0.17.0 (2026-10-19)')
   for (const term of ['fresh conversation', 'memory', 'tag_prompt', 'bot-system-prompt.md']) expect(unreleased.toLowerCase()).toContain(term)
 })
 
@@ -8728,9 +8718,10 @@ const QUEUED_DOC_ROWS: readonly (readonly [file: string, heading: HeadingMatch |
     /200/, /(?:durable storage|durably stored)/i, /(?:not delivery|not a delivery)/i,
     /\| 500 \|/, 'Message not stored', /\| 404 \|[^\n]*applied configuration/,
   ], 'After durable storage, 200 acknowledges storage, not delivery.\n| 500 | Message not stored |\n| 404 | No persona in the applied configuration |'],
-  [BOTS_DOC, '## Slack Reply Guard (Stop hook)', 'guard recognises CSCB tags, mid-turn input and pasted forms', [
-    /CSCB[^.]*typ/i, /mid.turn/i, /past\w*/i,
-  ], 'CSCB types the tag. The guard recognises mid-turn input and pasted forms.'],
+  [BOTS_DOC, '## Slack reply reminders', 'reminders use AD state and own reply calls for both agents, at most once per Slack delivery', [
+    /agent-director row/i, /working[^.]*waiting/i, /no [`]?reply[`]? tool call since that delivery/i,
+    /at most one reminder per delivered Slack message/i, /Claude and Codex/i, 'stop_hook_bootstrap',
+  ], 'The agent-director row goes working to waiting, with no reply tool call since that delivery. There is at most one reminder per delivered Slack message. Claude and Codex use stop_hook_bootstrap.'],
   [SERVER_SETTINGS_DOC, '## Server-wide settings', 'bind keeps clear-latch loopback and scheduled queueing independent of HTTP', [
     /`bind`[^|\n]*\|[^\n]*clear-latch/, /clear-latch[^.]*loopback/i,
     /(?:scheduled|cron)[^.]*(?:directly|in.process)[^.]*queue/i,
@@ -8802,7 +8793,7 @@ const QUEUED_DOC_ROWS: readonly (readonly [file: string, heading: HeadingMatch |
   [RUNBOOK_DOC, '### Upgrading to personas', 'upgrade permits removing the Claude Code pin', [
     /(?:remove|drop)[^.]*Claude Code[^.]*pin/i,
   ], 'After upgrading, remove the Claude Code version pin.'],
-  [CHANGELOG_FILE, '## Unreleased', 'remaining breaking changes, durable delivery and downgrade instructions are released together', [
+  [CHANGELOG_FILE, '## 0.17.0 (2026-10-19)', 'remaining breaking changes, durable delivery and downgrade instructions are released together', [
     '/interject', /agent-director[^.]*0\.12\.0/, /channels[^.]*flag/i,
     /durable/i, /(?:strict[^.]*order|ordered|FIFO)/i, /at.least.once/i,
     /scheduled[^.]*queue/i, 'queued', 'queue-failed', 'queued=N failed=M', '`bind`',

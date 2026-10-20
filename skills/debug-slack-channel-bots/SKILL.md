@@ -3491,7 +3491,7 @@ When the change is applied, its key is recorded as retired and the server
 stops answering its instance's startup prompts at once. The teardown then
 stops everything else the server runs for it first (its retries, its
 replacement of an old instance, its hold and its notices), closes its Slack
-connection, drops its MCP session and its reply-guard record, and ends its
+connection, drops its MCP session and cancels its pending reply reminders, and ends its
 instance `cscb_<key>` with the result checked: a kill agent-director can't
 carry out right now is tried up to 3 times, 2 s apart. Its agent-director
 row is kept until agent-director's `expire` removes it, whatever the kill's
@@ -3960,162 +3960,29 @@ registers again with its history. If the new token is refused too, a new
 
 ## A persona isn't reminded to reply, or is reminded after opting out
 
-- **Symptom:** a persona ends a turn that started from a Slack message without
-  replying, and gets no reminder to reply (the Slack Reply Guard's Stop-hook
-  message), although its `stop_hook_bootstrap` should be `true`. Or the
-  reverse: a persona set to `stop_hook_bootstrap: false` is still reminded.
-- **How it works:** before each launch of a persona (spawn, resume or
-  restart) the server writes the persona's effective `stop_hook_bootstrap` to
-  its record, `reply-guard/<key>` in the state directory, as `true` or
-  `false`. The reminder comes from the CSCB-managed Stop hook in the
-  persona's `claude_config_dir`/`settings.json`, and the hook reminds only
-  when the persona's own record reads `true`. Personas sharing one
-  `claude_config_dir` share the hook, but each follows its own record.
-- **Confirm,** read only (replace `ops_bot` with the key; `$STATE` as in
-  [The server log](#the-server-log)):
+- **Symptom:** a persona finishes responding to a delivered Slack message without a `reply` tool call and no reminder arrives, or a persona with reminders disabled still receives one.
+- **Rule:** CSCB must observe the persona's agent-director row go `working` → `waiting` in the same running session after delivery. It queues at most one reminder per Slack delivery, through the normal queue. Claude and Codex use the same rule, independently of `claude_config_dir` and `jq`.
+- **Confirm:** check the persona's own and top-level `stop_hook_bootstrap` booleans in `config.json`, and confirm that the change was applied (see [Confirming a pending change](#confirming-a-pending-change)). An own value overrides the top-level default, which is `true`. A confirmed change applies immediately and keeps the session.
+- **Check only authoritative state and CSCB facts:** use `agent-director get --instance-id cscb_<key>` for the row state, and inspect `server.log` for the content-free `reply-reminder persona=<key>: observation or journal update failed; retrying` line. Check state-directory permissions and free space if it repeats. Do not inspect transcripts or panes to reconstruct a turn or reply.
 
-  ```sh
-  cat "$STATE/reply-guard/ops_bot"; echo
-  grep -h -E 'stop-hook-bootstrap|reply-guard' "$STATE"/startup-errors.log "$STATE"/server.log 2>/dev/null | tail -n 40
-  jq '.hooks.Stop' "<the persona's claude_config_dir>/settings.json"
-  ```
+| Cause | What to do |
+|---|---|
+| The row was first observed at `waiting`, so no `working` transition was observed. | No reminder is owed from that read alone. Verify with a subsequent delivered Slack message and observed AD transition. |
+| The persona invoked its own `reply` tool after the delivery, even if the post failed or targeted another conversation. | The call suppresses that delivery's reminder. Diagnose any posting failure separately. |
+| The input was a scheduled prompt, `/interject` or a reminder. | These inputs never arm reminders. |
+| The persona's session changed, its row finished or disappeared, or it was torn down. | Pending reminder checks for the previous running life are cancelled. |
+| The persona answers through another service or only with `edit_message` or `react`. | Set its `stop_hook_bootstrap` to `false` and confirm the change to avoid unnecessary reminders. |
+| A reminder was queued before opt-out was confirmed. | Already accepted queue items follow normal delivery; disabling reminders affects subsequent checks. |
 
-  The server rewrites the record at every launch. Never edit or delete it by
-  hand; change `config.json` and apply the edit.
-- **Causes and fixes:**
+### Reply-hook cleanup messages
 
-  | Cause | How to confirm | Fix |
-  |---|---|---|
-  | The effective value isn't what you expect. A persona without its own `stop_hook_bootstrap` inherits the top-level one (default `true`). | The persona's entry and the top level of `config.json`. | With the operator's say-so, set `stop_hook_bootstrap` on the persona's entry (it overrides the top level), then confirm the edit. It applies at the persona's next launch; to apply it now, relaunch the bots with `clean_restart` (see [Next-launch and server-wide settings](#next-launch-and-server-wide-settings)). |
-  | The value changed after the persona's instance launched. A running instance keeps the value it launched with; a change applies at the persona's next launch. A plain server restart reconnects to an instance that is still running, which is not a launch. | The record holds the old value. | With the operator's say-so, run `claude-slack-channel-bots clean_restart`. It relaunches every persona (resume or fresh spawn), cutting off their current turns, and each launch rewrites the persona's record. |
-  | No `claude_config_dir` is configured for the persona (nor at the top level). No hook is installed for it, so it gets no reminder. | `server.log` has `[slack] stop-hook-bootstrap: "<name>" (key=<key>) has no claude_config_dir — skipping`. | Give the persona (or the top level) a `claude_config_dir` of its own, then confirm the edit and relaunch the bots with `clean_restart` (see [Next-launch and server-wide settings](#next-launch-and-server-wide-settings)). The new directory must exist (else `stop-hook-bootstrap-dir-missing`) and be logged in to a Claude account, and the bot comes back without its conversation history. |
-  | Its `claude_config_dir` resolves to the operator's own `~/.claude`. The server never installs the hook there, so the persona gets no reminder. | `startup-errors.log` has a `stop-hook-bootstrap-refuse-home` entry (recorded once per server start, naming the directory and the personas); `server.log` has `refusing to touch operator's own ~/.claude` at each launch. | Point the persona at a different `claude_config_dir`, then confirm the edit and relaunch the bots with `clean_restart` (see [Next-launch and server-wide settings](#next-launch-and-server-wide-settings)). The new directory must exist (else `stop-hook-bootstrap-dir-missing`) and be logged in to a Claude account, and the bot comes back without its conversation history. |
-  | `jq` is not on the host's `PATH`. The hook is installed but can't read the transcript, so it never reminds. | `startup-errors.log` has a `stop-hook-bootstrap-jq-missing` entry. | Install `jq`. No restart is needed; the next turn is checked. |
-  | The hook couldn't be installed: the directory is missing, or its `settings.json` is unreadable or not valid JSON (left untouched). | `startup-errors.log` (at start) or `server.log` (at a launch) has `stop-hook-bootstrap-dir-missing`, `stop-hook-bootstrap-not-a-dir` or `stop-hook-bootstrap-settings-…`; the `jq` command above shows no `slack-reply-guard.sh` entry. | Create the directory or fix the file, then `clean_restart`. |
-  | The record couldn't be written at launch. The stale record is removed, so the persona gets no reminder until its next launch. | No record file; `server.log` has `[slack] reply-guard: could not write the record for "<name>" (key=<key>) at <path>`. | Fix the state directory's permissions or free space, then `clean_restart`. |
-  | Reminded after opting out: the instance launched while the value was `true`. | The record reads `true`. | `clean_restart` (second row). |
-  | No reminder after a confirmed `claude_config_dir` change and a plain server restart. The server keeps each instance's launched-with directory in memory only, so after the restart it no longer counts the still-running instance toward its old directory. When every persona the server still counts toward the old directory has the reminder off, the next hook pass there (the restart's own start pass, or a launch of such a neighbour) removes the managed hook. Only the reply reminder is lost, until that instance's next launch. | The `jq` command above, run on the old directory, shows no `slack-reply-guard.sh` entry. | `clean_restart`, with the operator's say-so. |
+At startup and before launches, CSCB removes recognized retired CSCB hook commands from configured bot directories and preserves other settings. It never installs a reminder hook. These lines belong to `server.log` and do not prevent launch:
 
-- **Not a fault:** the hook reminds at most once per turn, only for a turn
-  that started from a Slack message the persona received, and only when it
-  hasn't replied with the `reply` tool. A persona that replies, or a turn
-  started by a scheduled prompt or `/interject`, gets no reminder.
-
-### How the guard is installed and what it reads
-
-- **The hook.** The server patches `<claude_config_dir>/settings.json` in
-  each applied persona's effective `claude_config_dir` (the persona's own
-  value, else the top-level value). Where the hook is installed, the file
-  holds exactly one managed Stop-hook group of this shape:
-
-  ```jsonc
-  {
-    "hooks": {
-      "Stop": [
-        { "hooks": [ { "type": "command", "command": "'<absolute path>/stop-hooks/slack-reply-guard.sh' '<state dir>/reply-guard'" } ] }
-      ]
-    }
-  }
-  ```
-
-  The command is the absolute path of the script inside CSCB's installed
-  package, then the record directory, each in single quotes. There is no
-  `matcher` field: Stop is not a tool-scoped event. The operator's other Stop
-  hooks, and every other key in `settings.json`, are preserved. Writes are
-  atomic (`.tmp` + `rename`). A missing `settings.json` is created with just
-  this group; a malformed one is left untouched and an error is recorded.
-- **Recognition rule.** Any Stop-hook `command` containing
-  `slack-reply-guard.sh` counts as CSCB-managed. Only the exact current
-  command is kept: duplicates collapse to one group, and an entry with an
-  older script path, no record directory or another record directory is
-  replaced. This is how the hook heals itself across upgrades.
-- **The record.** `reply-guard/<persona key>` in the state directory holds
-  `true` or `false`, the persona's effective `stop_hook_bootstrap`. The
-  server writes it atomically immediately before it spawns or resumes the
-  persona's instance; reconnecting to an instance that is still running
-  leaves it as it was.
-- **What the guard reads.** Every persona's instance runs with its key in
-  `CSCB_PERSONA`. The guard reads `<record directory>/<CSCB_PERSONA>` and
-  reminds only when it reads exactly `true`. A missing argument, an unset
-  `CSCB_PERSONA` or a missing record means no reminder.
-- **Shared directories.** Personas that share one `claude_config_dir` each
-  follow their own record. The managed hook stays installed in a directory
-  while any persona counting toward it has an effective `stop_hook_bootstrap`
-  of `true` or a record reading `true`. A persona counts toward its effective
-  directory and toward the directory its running instance launched with.
-  When no such persona is left, the server removes the hook from that
-  directory.
-- **Timing.** At server start the server patches the hook for every applied
-  persona before any launch. Immediately before each spawn or resume (a
-  restart included), it writes the persona's record and patches the hook in
-  the persona's new effective directory and, if it differs, the directory it
-  last launched with. A running instance keeps the value it launched with,
-  since the guard reads its own record. The hook itself may appear in or
-  vanish from a shared directory while an instance runs, for example when a
-  neighbour launches; Claude Code normally picks such edits up without a
-  restart, but the instance's own record still decides.
-- **No directory, or `~/.claude`.** A persona with no effective
-  `claude_config_dir` (an empty or whitespace-only value counts as none)
-  gets no reminder; this is a server-log line only, never a startup error.
-  The server never installs the hook in the operator's own `~/.claude` and
-  never edits `~/.claude/settings.json`: a persona whose directory resolves
-  there (symlinks followed) gets no reminder, recorded once per start as
-  `stop-hook-bootstrap-refuse-home` and as a server-log line at a later
-  launch.
-- **Fail-open.** When anything is missing or goes wrong, the guard exits `0`
-  and the turn ends normally: besides the cases above, when `jq` is missing
-  (the hook is installed anyway, so installing `jq` later is enough), when
-  the record could not be written before a launch (the stale record is
-  removed, one line is logged and the launch goes on), and when the
-  transcript is missing or unreadable or the message's opening `<channel>`
-  tag is not in the shape the guard expects (below).
-
-### Checking the guard after an upgrade
-
-The guard reads the `<channel …>` tag at the very start of each message that
-started the turn. It treats the tag as Slack's when its `source` starts with
-`slack`, and reads its `via` and `chat_id`; a tag quoted later in a
-message's text is ignored. CSCB sends only the message content and its
-attributes over MCP: the Claude Code harness renders the tag when it writes
-the message into the transcript, `source` being the MCP server name
-(`slack-channel-router`). The tag is an external, harness-owned contract: a
-Claude Code release can rename or restructure it, and the guard would
-silently stop reminding. The guard also relies on the harness escaping
-attribute values: `via` comes after the free-form `user` attribute, so if the
-harness stopped escaping `>`, a display name containing `>` would cut the
-tag short before `via` and the reminder would be silently skipped.
-
-After every CSCB or Claude Code upgrade, verify the guard end to end:
-
-1. Send a persona that has the reminder on a Slack message that needs a
-   reply.
-2. Confirm the reply lands in Slack.
-3. Inspect the persona's most recently modified transcript, in
-   `<claude_config_dir>/projects/<project_folder>/`, where
-   `<claude_config_dir>` is the persona's effective `claude_config_dir` (a
-   persona the guard covers always has one, never `~/.claude`). Claude Code
-   names `<project_folder>` after the absolute `working_directory`, every
-   character other than a letter, a digit or `-` replaced by `-`:
-   `/home/me/projects/alpha` becomes `-home-me-projects-alpha`. Other
-   personas sharing the config dir have their own folders, so use this one,
-   not `projects/*`. Replace both placeholders:
-
-   ```sh
-   f=$(ls -t <claude_config_dir>/projects/<project_folder>/*.jsonl | head -n 1)
-   grep -o '<channel source=\\"slack[^>]*>' "$f" | tail -n 1
-   grep -n '<channel source=\\"slack' "$f" | tail -n 1 | cut -d: -f1
-   grep -n '"name":"mcp__slack-channel-router__reply"' "$f" | tail -n 1 | cut -d: -f1
-   ```
-
-   The transcript stores the tag's quotes escaped (`\"`), hence the `\\"` in
-   the patterns. The first `grep` prints the last Slack tag, which must carry
-   both `via` and `chat_id`. The next two print the line numbers of the last
-   Slack tag and of the last `mcp__slack-channel-router__reply` `tool_use`.
-   The reply's line number must be greater than the tag's; no reply line, or
-   a smaller number, means the reply was not recorded after the message.
-
-If the tag, `via` or `chat_id` no longer appears, the guard is dark or
-misreading messages: report it to the operator to file an issue.
+| Line | Meaning and action |
+|---|---|
+| `[slack] reply-reminder: removed the legacy Stop hook` | Cleanup completed. No action needed. |
+| `[slack] reply-reminder: legacy hook cleanup failed; retrying on the next launch` | The configured directory's settings could not be read, parsed or written. Check its JSON syntax, permissions and free space without displaying credentials. Cleanup retries on the next launch. |
+| `[slack] reply-reminder: refusing to clean legacy hooks in the operator config directory` | The directory resolves to your own `~/.claude`; CSCB leaves it untouched. The operator must review any retired CSCB hook there. |
 
 ---
 
@@ -6004,9 +5871,9 @@ line among them.
 | `DESTRUCTIVE: persona "<name>" (key=<key>) working_directory changed to "<path>": the persona will be retired and brought up fresh: its session stopped and never resumed.` | Its `credentials_file` or `working_directory` (compared by real path) changed, or its `name` changed without changing its key (`name changed`). Several are joined by ` and `, e.g. `credentials_file changed to "<path>" and working_directory changed to "<path>"`. At the confirmation the persona is retired (its session stopped and never resumed) and brought up fresh: the instance is replaced and loses its session history. |
 | `persona "<name>" (key=<key>) is added: it will be brought up and launched.` | A new persona. |
 | `persona "<name>" (key=<key>) is added but cannot come up: <cause>; <cause>.` | A new persona whose bring-up would fail now. The causes, in this order, are the credentials and working-directory cause texts under [Persona diagnostic classes](#persona-diagnostic-classes) (for example `credentials file does not exist`, `credentials file is invalid: …`, `working directory does not exist`), then `claude_config_dir cannot be resolved to a real path (<errno>)`, or `(<errno>: a symlink on its path points to nothing)` for a dangling symlink (see [`persona-config-dir-unresolvable`](#persona-config-dir-unresolvable)). Every check runs, so one cause never hides another. A `claude_config_dir` not created yet under an existing parent is not listed. Fix them before the change is applied. |
-| `persona "<name>" (key=<key>): <settings> changed: applied in place immediately, instance kept.` | `<settings>` lists one or more of the in-place settings of the mode the edit's own `allow_invited_channels` picks. Declarative mode: `channels` (a channel added or removed), `delivery` (a kept channel's mode), `permission_prompts`. Fungible mode: `invited.permission_prompts` (an absent value and `"dm"` count as the same). Both modes: `dm.enabled`, `dm.contact`. Reordering channels isn't a change. When the same edit turns the switch on or off, the newly selected section counts as changed wherever its JSON differs from before. |
-| `…: stop_hook_bootstrap changed: takes effect at its next launch, instance kept.` | The persona's own `stop_hook_bootstrap` changed. The running instance doesn't see it until it is launched again. |
-| `…: claude_config_dir changed: takes effect at its next launch, which starts fresh (the conversation is not resumed), instance kept until then.` | The persona's own `claude_config_dir` changed (by real path). The running instance is kept; its next launch uses the new directory and starts a new conversation. With both settings changed, the line reads `claude_config_dir, stop_hook_bootstrap changed:` with this effect. |
+| `persona "<name>" (key=<key>): <settings> changed: applied in place immediately, instance kept.` | `<settings>` lists one or more of the in-place settings of the mode the edit's own `allow_invited_channels` picks. Declarative mode: `channels` (a channel added or removed), `delivery` (a kept channel's mode), `permission_prompts`. Fungible mode: `invited.permission_prompts` (an absent value and `"dm"` count as the same). Both modes: `dm.enabled`, `dm.contact`, `stop_hook_bootstrap`. Reordering channels isn't a change. When the same edit turns the switch on or off, the newly selected section counts as changed wherever its JSON differs from before. |
+| `…: stop_hook_bootstrap changed: applied in place immediately, instance kept.` | The persona's own reminder setting changed. Subsequent checks use the confirmed value, keeping its running session. |
+| `…: claude_config_dir changed: takes effect at its next launch, which starts fresh (the conversation is not resumed), instance kept until then.` | The persona's own `claude_config_dir` changed (by real path). The running instance is kept; its next launch uses the new directory and starts a new conversation. A reminder-setting change alongside it has its own immediate in-place effect. |
 | `…: claude_config_dir changed: …, instance kept until then; but at that launch it cannot come up: claude_config_dir cannot be resolved to a real path (<errno>).` | A warning: the new directory can't be resolved now, with the same check and wording as an added persona's (`(<errno>: a symlink on its path points to nothing)` for a dangling symlink). It is not a refusal: confirming applies the change, and at the persona's next launch it is held as [`persona-config-dir-unresolvable`](#persona-config-dir-unresolvable) (its Slack connection closed, its launch waiting) until the directory resolves. The same warning ends a changed top-level `claude_config_dir` line, naming the inheriting personas it stops (`; but at that launch "<name>" (key=<key>), … cannot come up: …`), and a `DESTRUCTIVE:` line whose persona's `claude_config_dir` changed too (`; but it cannot come up: …`; that persona is held when it is brought up at the confirmation). Fix the directory, or the setting, before confirming. If the check itself failed, the line ends `; whether it can come up at that launch could not be checked` (see the `cannot check` line below). |
 | `…: credentials file "<path>" changed: a new connection opens, then the old one closes, instance kept.` | The credentials file's content changed at the same path, and the persona is up. The line names the persona and the path, never a token. |
 | `…: credentials file "<path>" changed: it has no connection yet, so it retries with the new content, instance kept.` | The same, for a persona still retrying its bring-up (Slack unreachable, its working directory unusable, or held for its `claude_config_dir`, see [`persona-config-dir-unresolvable`](#persona-config-dir-unresolvable)). |
@@ -6021,7 +5888,7 @@ line among them.
 | `server-wide setting <name> changed: once applied, it is recorded and takes effect at the next server start after that.` | A top-level setting such as `port` or `bind`. |
 | `server-wide setting <name> changed: once applied, it is recorded, and the CLI takes it from the record from then on (the running server does not use it).` | `stop_timeout` or `exit_timeout`, which only the CLI uses. |
 | `server-wide setting <name> changed: once applied, it is recorded, the CLI takes it from the record from then on, and the running server uses it from its next start.` | `agent_director_call_timeout_ms`, which both the CLI and the server use. |
-| `server-wide setting <name> changed: inherited by "<name>" (key=<key>), …; takes effect at each one's next launch, instance kept.` | The top-level `stop_hook_bootstrap` changed; the listed personas take the default and are affected. |
+| `server-wide setting stop_hook_bootstrap changed: inherited by "<name>" (key=<key>), …; applied in place immediately, instance kept.` | The listed personas inherit the changed reminder default; subsequent checks use it. |
 | `server-wide setting claude_config_dir changed: inherited by "<name>" (key=<key>), …; takes effect at each one's next launch, which starts fresh (the conversation is not resumed), instance kept until then.` | The top-level `claude_config_dir` changed; each listed persona's next launch starts a new conversation. |
 | `server-wide setting <name> changed: once applied, it is recorded; no persona inherits it, so no instance is affected.` | The top-level `claude_config_dir` or `stop_hook_bootstrap` changed, but every persona sets its own value. |
 
@@ -6199,7 +6066,7 @@ for a server start.
 
 | Preview line | After the confirmation | To carry it out sooner |
 |---|---|---|
-| `stop_hook_bootstrap changed` or `claude_config_dir changed` (`takes effect at its next launch`, or a top-level setting `inherited by …`) | Recorded. It reaches each persona at its next launch: when the bot dies (a crash or a failed health check), at a `clean_restart`, at `stop --stop-bots` then `start`, or after a host reboot. A changed `claude_config_dir` makes that launch start a new conversation on the same instance; nothing is deleted, and the old conversation stays in the old directory. | Relaunch the bots: `claude-slack-channel-bots clean_restart`, or `stop --stop-bots` then `start`. Both cut off the bots' current turns. A plain restart reconnects running bots, which is not a launch. |
+| `claude_config_dir changed` (`takes effect at its next launch`, or a top-level setting `inherited by …`) | Recorded. It reaches each persona at its next launch: when the bot dies (a crash or a failed health check), at a `clean_restart`, at `stop --stop-bots` then `start`, or after a host reboot. A changed `claude_config_dir` makes that launch start a new conversation on the same instance; nothing is deleted, and the old conversation stays in the old directory. | Relaunch the bots: `claude-slack-channel-bots clean_restart`, or `stop --stop-bots` then `start`. Both cut off the bots' current turns. A plain restart reconnects running bots, which is not a launch. |
 | `server-wide setting <name> changed: once applied, it is recorded and takes effect at the next server start after that.` | Recorded. The running server keeps the value it started with. | Restart. |
 | `server-wide setting <name> changed: once applied, it is recorded, and the CLI takes it from the record from then on (the running server does not use it).` | `stop_timeout` or `exit_timeout`. The next `stop` or `clean_restart` uses it. | Nothing. |
 | `server-wide setting <name> changed: once applied, it is recorded, the CLI takes it from the record from then on, and the running server uses it from its next start.` | `agent_director_call_timeout_ms`. The next `stop --stop-bots` or `clean_restart` uses it; the running server keeps the value it started with. | Restart, or `clean_restart`. |
@@ -6281,8 +6148,7 @@ applied. Compared with a confirmation:
   up fresh in the new directory.
 - A changed `credentials_file` only reconnects the persona to Slack with the
   new app; its instance keeps running.
-- A setting that takes effect at a bot's launch (`stop_hook_bootstrap`, a
-  changed `claude_config_dir`) doesn't reach a bot that kept running. If the
+- A setting that takes effect at a bot's launch (a changed `claude_config_dir`) doesn't reach a bot that kept running. If the
   server is still running, stop it with `stop --stop-bots` instead of `stop`.
 
 With the operator's say-so, stop the server if it is still running:
@@ -6599,8 +6465,8 @@ or a filesystem that doesn't support syncing a directory).
     `invited.permission_prompts` in fungible mode, and `dm.*` in both;
   - a change to the section the mode doesn't read is only written into the
     record, with no effect until the switch selects that section;
-  - a kept persona's `stop_hook_bootstrap` or `claude_config_dir` change
-    takes effect at its next launch (a relaunch after the bot dies, a
+  - a kept persona's `stop_hook_bootstrap` change applies immediately;
+  - a kept persona's `claude_config_dir` change takes effect at its next launch (a relaunch after the bot dies, a
     `clean_restart`, `stop --stop-bots` then `start`, or a host reboot; a
     plain `stop` and `start` only reconnects), which launches the new
     declaration; until then its instance runs as launched;
@@ -7163,7 +7029,7 @@ Every class `startup-errors.log` can record, what it means and where its detail 
 
 CSCB writes startup errors to `~/.config/claude-slack-channel-bots/startup-errors.log` (override the directory with `SLACK_STATE_DIR`) in addition to stderr. Each entry is a single timestamped line. The file is append-only and never rotated by CSCB — copy `docs/logrotate-startup-errors.conf` into `/etc/logrotate.d/` if you want host-level rotation.
 
-The classes in the first list are fatal: the process exits non-zero. Two of them can also be written while the server runs (see "Found while the server was running" after the list). The later groups (Slack Reply Guard setup, persona launch and conversation memory) are non-fatal: they are recorded, and the start continues. Four non-fatal classes, `persona-unclassified-error`, `persona-kill-failed`, `persona-teardown-notice` and `persona-kill-survivor`, are written while the server runs; of them only `persona-kill-survivor` can also be written at start (see "Written while the server runs" below). `stop --stop-bots` and `clean_restart` write `cli-teardown-failed`, `persona-kill-failed` and `persona-kill-survivor` entries while the server is stopped, and `clean_restart` also `clean-restart-not-restarted` (see "Written by `stop --stop-bots` and `clean_restart`" below).
+The classes in the first list are fatal: the process exits non-zero. Two of them can also be written while the server runs (see "Found while the server was running" after the list). The later groups (persona launch and conversation memory) are non-fatal: they are recorded, and the start continues. Four non-fatal classes, `persona-unclassified-error`, `persona-kill-failed`, `persona-teardown-notice` and `persona-kill-survivor`, are written while the server runs; of them only `persona-kill-survivor` can also be written at start (see "Written while the server runs" below). `stop --stop-bots` and `clean_restart` write `cli-teardown-failed`, `persona-kill-failed` and `persona-kill-survivor` entries while the server is stopped, and `clean_restart` also `clean-restart-not-restarted` (see "Written by `stop --stop-bots` and `clean_restart`" below).
 
 Fatal classes you may see:
 
@@ -7185,18 +7051,7 @@ Fatal classes you may see:
 
 **Found while the server was running.** `ad-system-install-too-old` and `ad-below-phase1-floor` can also be written by the runtime re-check of the agent-director binary, which then stops the server. This stop is not a switch-over case: see [Found while the server was running](#found-while-the-server-was-running).
 
-The following classes are **non-fatal**: the Slack Reply Guard's setup pass at server start (see [Slack Reply Guard (Stop hook)](../../docs/bots.md#slack-reply-guard-stop-hook)). The guard stays fail-open, so an affected persona gets no reminder, and every other persona and the rest of the start are unaffected. Directory and file failures at a later launch are server-log lines only, never records here.
-
-- `stop-hook-bootstrap-refuse-home` — a persona's effective `claude_config_dir` resolves to `~/.claude`, which the server never writes. See the causes table under [A persona isn't reminded to reply, or is reminded after opting out](#a-persona-isnt-reminded-to-reply-or-is-reminded-after-opting-out).
-- `stop-hook-bootstrap-jq-missing` — `jq` is not on `PATH`. See the same causes table.
-- `stop-hook-bootstrap-dir-missing` — a `claude_config_dir` that should get the hook doesn't exist, so it is skipped. Create the directory (for example with `claude auth login`, see [Next-launch settings](../../docs/configuration.md#next-launch-settings)); the persona's next launch installs the hook.
-- `stop-hook-bootstrap-not-a-dir` — a `claude_config_dir` exists but isn't a directory, so it is skipped. Fix the path.
-- `stop-hook-bootstrap-settings-read` — `<claude_config_dir>/settings.json` exists but can't be read (for example, permissions). The file is left untouched.
-- `stop-hook-bootstrap-settings-parse` — `settings.json` isn't valid JSON. The file is left untouched; fix its syntax.
-- `stop-hook-bootstrap-settings-shape` — the top level of `settings.json` isn't a JSON object. The file is left untouched.
-- `stop-hook-bootstrap-init` — the server couldn't resolve the path of its own `slack-reply-guard.sh`, so no directory is processed. Reinstall the package.
-- `stop-hook-bootstrap-dir` — an unexpected error while processing one directory; the line names the directory and the personas. Other directories are still processed.
-- `stop-hook-bootstrap` — an unexpected error in the setup pass itself. Report it as a bug.
+Reply reminder observation and migration-cleanup failures are server-log lines only. See [A persona isn't reminded to reply, or is reminded after opting out](#a-persona-isnt-reminded-to-reply-or-is-reminded-after-opting-out).
 
 The following classes are **non-fatal** failures while preparing or launching personas at server start. A line for a failed agent-director call ends with agent-director's error name and, when it gives one, its description as `message="…"`, on one line, with token-like text redacted and long text cut short. At a later launch, the same failures are `server.log` lines only; the persona classes written while the server runs are listed under "Written while the server runs" below.
 

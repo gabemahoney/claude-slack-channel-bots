@@ -482,7 +482,7 @@ import { createDeliveryPreparation } from '../../src/delivery-intake.ts'
  * The real launch path (`opts.realLaunch`, implies `opts.realLifecycle`; see
  * the option): every launch (start pass, bring-up retry, apply bring-up,
  * `run.relaunch`) runs `spawnForPersona` over `run.serverConfig()`, with the
- * trust patch, the reply-guard steps over `h.stateDir` and the collision
+ * trust patch and the collision
  * ladder, against the composition's agent-director stub and the harness's
  * row table (`AgentDirectorRow`, shared by every run as agent-director's
  * store outlives a server restart): a plain spawn creates a `waiting` row
@@ -508,8 +508,7 @@ import { createDeliveryPreparation } from '../../src/delivery-intake.ts'
  * it); `run.relaunch(name)` is the persona's next launch through the
  * restart path (the relaunch gate, then `launchSession`, in its serializer
  * turn), with no apply. `h.stateDir` is the temp state directory, and
- * `h.replyGuardDir` its record directory (the guard's argument);
- * `h.readReplyGuardRecord(name)` reads a record. `h.configDir(name)` makes
+ * `h.configDir(name)` makes
  * a temp `claude_config_dir`; with `makeReloadHarness({ personaConfigDirs:
  * true })` every `h.persona` gets its own. A persona with none resolves to
  * the temp home's `.claude`, never the operator's. Session-manager notices
@@ -598,7 +597,7 @@ import { createDeliveryPreparation } from '../../src/delivery-intake.ts'
  * realLaunch run also installs the session manager's module seams (the
  * process's agent-director client — through it the startup-dialog approver
  * reads and types; the prompt-row checks only read —, the approver's 200 ms
- * cap, the spawn home, the trust patcher, the reply guard, the claude_config_dir hook, the
+ * cap, the spawn home, the trust patcher, the claude_config_dir hook, the
  * session notifier, the latch, the `ErrInvalidFlags` hold, the configured-persona query, the
  * retired-key store and the old-life hold set) and captures
  * `console.error`; `h.cleanup()` first stops every dialog approver a launch
@@ -758,7 +757,6 @@ import {
   _resetLiveRowSequenceRegistry,
   _resetOldLifeHolds,
   _resetOldLifeWaitBindings,
-  _resetPreLaunchReplyGuard,
   _resetPreLaunchTrustPatcher,
   _resetRetiredKeyStore,
   _resetSpawnHomeDir,
@@ -783,7 +781,6 @@ import {
   setLiveRowSequenceRegistry,
   setOldLifeHolds,
   setOldLifeWaitBindings,
-  setPreLaunchReplyGuard,
   setPreLaunchTrustPatcher,
   setRetiredKeyStore,
   setSessionNotifier,
@@ -795,13 +792,6 @@ import {
   whenLaunchSettled,
   type SpawnPersonaResult,
 } from '../../src/session-manager.ts'
-import {
-  _resetLaunchedWithDirs,
-  getLaunchedWithDir,
-  preLaunchReplyGuard,
-  stopHookLaunchPass,
-  teardownPersonaReplyGuard,
-} from '../../src/stop-hook-bootstrap.ts'
 import { trustPatchPersona } from '../../src/trust-bootstrap.ts'
 import type { ApplyBringUpOptions, ApplyStepSlots, InPlaceApplyInput } from '../../src/reload-apply.ts'
 import { composePendingFile, parsePendingFingerprint } from '../../src/reload-fingerprint.ts'
@@ -858,7 +848,6 @@ import { makePersona } from './persona-config.ts'
 import { makeConnectionHarness, type ConnectionHarness } from './persona-connection-harness.ts'
 import { makeNotifierStack } from './persona-notifier.ts'
 import { makeSessionServer, makeTransport, type ChannelNotification } from './persona-routing-harness.ts'
-import { REPLY_GUARD_DIR_NAME } from './reply-guard-record.ts'
 import {
   INITIAL_CREDENTIALS,
   type EnvelopeOverrides,
@@ -1172,8 +1161,7 @@ export interface RealLifecycleComposition {
    * `'forgetOldLifeWaits'` (with the real launch path only),
    * `'dropSession'`, `'resetOutageState'`, `'killInstance'`,
    * `'raiseKillFailureAlert'`, `'forgetFailures'`, `'forgetDisconnectedStreak'`,
-   * `'forgetConflictLatch'`, `'forgetInvalidFlagsHold'`, `'forgetNoticeEpisodes'`, `'replyGuard.launchedWithDir'`, `'replyGuard.teardown'`,
-   * `'replyGuard.launchPass'`, `'storageCheck'`, `'bringUps.bringUp'`,
+   * `'forgetConflictLatch'`, `'forgetInvalidFlagsHold'`, `'forgetNoticeEpisodes'`, `'forgetReplyReminders'`, `'storageCheck'`, `'bringUps.bringUp'`,
    * `'bringUps.changeCredentials'`, `'connections.reconnectCredentials'`,
    * `'connections.replaceRetryTokens'`, `'launch'`) plus `'outage-notice'`
    * for a notice the outage state raised. The one query, `bringUps.state`
@@ -1699,13 +1687,12 @@ export interface ReloadRunOptions {
    * The real persona launch path (implies `realLifecycle`): every launch (the
    * start pass's, a bring-up retry's, an apply bring-up's and
    * `run.relaunch`'s) runs `spawnForPersona` (the pre-launch
-   * claude_config_dir check, the collision ladder, the trust patch and the
-   * reply-guard steps) over the composition's agent-director stub and the
+   * claude_config_dir check, the collision ladder and the trust patch) over the composition's agent-director stub and the
    * harness's row table, with the configuration the server runs
    * (`run.serverConfig()`), never as a startup launch (no
    * `startup-errors.log`). The run installs, as `server.ts` does, the stub
    * as the process's agent-director client, `trustPatchPersona`, the
-   * reply-guard steps over `h.stateDir` and the applied set, the bring-up
+   * bring-up
    * controller's claude_config_dir hold and re-check, and a session notifier
    * that records each notice (`run.sessionNotices`) and raises it through
    * the run's notifier, the run's latch (`run.latch`), the run's
@@ -1715,12 +1702,11 @@ export interface ReloadRunOptions {
    * launch call (b.jg5 SRJ-401), which reads and types through the stub only,
    * its laps `DIALOG_POLL_INTERVAL_MS` apart on the approver's clock with a
    * 200 ms cap; a prompt row (`ask_user`, `check_permission`) a launch meets is read
-   * through the stub's `read-pane` (b.jg5 SRJ-607); the spawn home is `h.home`. The composition's reply-guard members are the
-   * real ones over `h.stateDir`. Every `console.error` line (the session
-   * manager's, the reply guard's) goes to `run.logs` while the run is the
+   * through the stub's `read-pane` (b.jg5 SRJ-607); the spawn home is `h.home`. Every session-manager `console.error` line
+   * goes to `run.logs` while the run is the
    * latest live one. The start-time bootstraps (the sweep, the trust and
-   * Stop-hook bootstraps, the template install) are not run. A new run
-   * forgets the launched-with directories and in-flight launches, as a new
+   * legacy-hook cleanup, the template install) are not run. A new run
+   * forgets in-flight launches, as a new
    * server process would; the row table and the record files persist.
    */
   realLaunch?: boolean
@@ -2187,12 +2173,8 @@ export interface ReloadHarness {
   readonly dir: string
   /** The temp home handed to the controller for `~` expansion, and the spawn home of a real launch (nothing is created in it). */
   readonly home: string
-  /** The temp state directory the reply-guard steps get (`server.ts`'s `STATE_DIR`), under the root. */
+  /** The temp server state directory (`server.ts`'s `STATE_DIR`), under the root. */
   readonly stateDir: string
-  /** The reply-guard record directory, `<stateDir>/reply-guard`: the guard's argument; records are `<replyGuardDir>/<key>`. */
-  readonly replyGuardDir: string
-  /** The persona's reply-guard record's exact text, or undefined when there is none. */
-  readReplyGuardRecord(name: string): string | undefined
   /** A temp `claude_config_dir` under the root named `name` (`<root>/claude-config/<name>`), created; returns its path. */
   configDir(name: string): string
   /**
@@ -2271,7 +2253,7 @@ export interface ReloadHarness {
    * a hand-edited record), as a `writtenFile` keyed by its root-relative
    * path, for `assertNoLeak`, which checks both the key (the file's name)
    * and the content. That is what the server wrote anywhere under the root
-   * (the pending file, the record, a leftover confirmation, reply-guard
+   * (the pending file, the record, a leftover confirmation, queue
    * records, anything under the state directory or the home). Symlinks are
    * not followed and FIFOs are skipped: the server writes only regular
    * files, so a symlink or FIFO under the root is a test fixture (a
@@ -2497,7 +2479,6 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
   mkdirSync(dir)
   mkdirSync(home)
   const stateDir = join(root, 'state')
-  const replyGuardDir = join(stateDir, REPLY_GUARD_DIR_NAME)
   mkdirSync(stateDir)
   const paths = reloadFilePaths(join(dir, 'config.json'))
 
@@ -3123,18 +3104,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
           calls.push(['raiseKillFailureAlert', key])
           return killFailureAlerts.raise({ key, decision, latched: false, context: KILL_FAILURE_CONTEXT_PERSONA_TEARDOWN })
         },
-        // With the real launch path, the real reply-guard members over the
-        // harness's state directory, as server.ts binds them; else recorders.
-        replyGuard: {
-          launchedWithDir: rec<string | undefined>('replyGuard.launchedWithDir', (key) =>
-            realLaunch ? getLaunchedWithDir(key) : undefined,
-          ),
-          teardown: rec('replyGuard.teardown', (key) => (realLaunch ? teardownPersonaReplyGuard(stateDir, key) : undefined)),
-          launchPass: (dirs, personas) => {
-            calls.push(['replyGuard.launchPass', personas.map((p) => p.key).join(',')])
-            if (realLaunch) stopHookLaunchPass(dirs, personas, stateDir)
-          },
-        },
+        forgetReplyReminders: rec('forgetReplyReminders', async () => undefined),
         storageCheck: (persona) => void calls.push(['storageCheck', persona.key]),
         launch: async (persona) => {
           calls.push(['launch', persona.key])
@@ -3963,15 +3933,10 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       else _setApproverClock(runOpts.approverClock)
       _setSpawnHomeDir(home)
       // A new server process: nothing in flight (no launch, no dialog
-      // approver), no launched-with dir known.
+      // approver).
       _resetInFlightLaunches()
-      _resetLaunchedWithDirs()
       _resetFindMissingMemo()
       setPreLaunchTrustPatcher(trustPatchPersona)
-      setPreLaunchReplyGuard((persona) => {
-        const config = serverConfig()
-        return config === undefined ? undefined : preLaunchReplyGuard(persona, () => serverConfig()?.personas, stateDir)
-      })
       setConfigDirUnresolvableHook((persona, failure) => bringUps.holdForConfigDir(persona, failure))
       setSessionNotifier((key, text, options) => {
         sessionNotices.push({ key, text })
@@ -4062,11 +4027,6 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     dir,
     home,
     stateDir,
-    replyGuardDir,
-    readReplyGuardRecord(name) {
-      const path = join(replyGuardDir, personaKey(name))
-      return existsSync(path) ? readFileSync(path, 'utf-8') : undefined
-    },
     configDir(name) {
       const path = inside(join('claude-config', name))
       mkdirSync(path, { recursive: true })
@@ -4368,10 +4328,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
           _resetDialogReadyTimeoutMs()
           _resetApproverClock()
           _resetSpawnHomeDir()
-          _resetLaunchedWithDirs()
           _resetFindMissingMemo()
           _resetPreLaunchTrustPatcher()
-          _resetPreLaunchReplyGuard()
           setConfigDirUnresolvableHook(undefined)
           setSessionNotifier(undefined)
           setConflictLatch(undefined)

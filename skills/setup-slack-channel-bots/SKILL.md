@@ -389,8 +389,9 @@ Offer these only if the operator wants to override the top-level defaults
   (`--console` for a Console account.) If a persona doesn't come up because
   its `claude_config_dir` can't be resolved, point to the debugging skill's
   `persona-config-dir-unresolvable` entry.
-- **`stop_hook_bootstrap`**: `false` turns the Slack Reply Guard reminder off
-  for this persona.
+- **`stop_hook_bootstrap`**: boolean compatibility setting; `false` turns Slack
+  reply reminders off for this persona. Confirmed changes apply immediately
+  and keep its running session. See [Slack reply reminders](../../docs/bots.md#slack-reply-reminders).
 
 #### 5.9 Declare the persona
 

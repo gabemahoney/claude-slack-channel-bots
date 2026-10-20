@@ -223,6 +223,7 @@ export const IN_PLACE_SETTINGS = [
   'invited.permission_prompts',
   'dm.enabled',
   'dm.contact',
+  'stop_hook_bootstrap',
 ] as const
 
 /** A setting applied in place. `channels`: the set of channel IDs; `delivery`: a kept channel's mode. */
@@ -243,7 +244,7 @@ export type RecordedSectionKey = (typeof RECORDED_SECTION_KEYS)[number]
 export const MODE_SWITCH_SETTING = 'allow_invited_channels'
 
 /** The settings that take effect at the persona's next launch (b.av2 SR-8.6), in the order they are reported. */
-export const NEXT_LAUNCH_SETTINGS = ['claude_config_dir', 'stop_hook_bootstrap'] as const
+export const NEXT_LAUNCH_SETTINGS = ['claude_config_dir'] as const
 
 /** A setting that takes effect at the persona's next launch, set on the persona or inherited. */
 export type NextLaunchSetting = (typeof NEXT_LAUNCH_SETTINGS)[number]
@@ -359,7 +360,7 @@ export interface ServerSettingChange {
   /** The top-level key. */
   name: string
   /**
-   * For an inherited default (`claude_config_dir`, `stop_hook_bootstrap`):
+   * For inherited defaults (`claude_config_dir`, `stop_hook_bootstrap`):
    * the personas, present in both configurations and not destructively
    * modified, whose value changes through it, in candidate order. Absent for
    * any other setting.
@@ -518,6 +519,7 @@ function personaSectionChanges(
     'invited.permission_prompts': false,
     'dm.enabled': before.dm.enabled !== after.dm.enabled,
     'dm.contact': before.dm.contact !== after.dm.contact,
+    stop_hook_bootstrap: before.stop_hook_bootstrap !== after.stop_hook_bootstrap,
   }
   let recorded: RecordedSectionKey[]
   if (mode === 'declarative') {
@@ -641,7 +643,7 @@ function configDirsDiffer(applied: PersonaConfig, candidate: PersonaConfig, home
  * - credentials changed: same `credentials_file` by real path, and the
  *   current digest or marker differs from the held one (never in dry run or
  *   with nothing held). May come with in-place changes;
- * - next launch: `claude_config_dir` (by real path) or `stop_hook_bootstrap`
+ * - next launch: `claude_config_dir` (by real path)
  *   changed, marked own or inherited (see `nextLaunchChanges`);
  * - otherwise unchanged.
  *
@@ -653,7 +655,7 @@ function configDirsDiffer(applied: PersonaConfig, candidate: PersonaConfig, home
  * is still applied as previewed.
  *
  * Server-wide settings are compared by resolved value, paths by real path. A
- * changed `claude_config_dir` or `stop_hook_bootstrap` lists the personas
+ * changed `claude_config_dir` lists the personas
  * that inherit the change. A changed `allow_invited_channels` (absent and
  * `false` are the same value) carries the mode it turns on and every persona
  * present in both configurations (b.deo SRI-803). `noEffectiveChange` holds
@@ -760,6 +762,16 @@ export function buildChangePlan(applied: PersonaConfig, candidate: ChangePlanCan
       // present in both configurations.
       const personas = next.personas.filter((p) => appliedByKey.has(p.key)).map(refOf)
       plan.settings.push({ name, mode, personas })
+      continue
+    }
+    if (name === 'stop_hook_bootstrap') {
+      const inheritedBy = next.personas.filter(persona => {
+        const before = appliedByKey.get(persona.key)
+        return before && before.stop_hook_bootstrap === applied.stop_hook_bootstrap
+          && persona.stop_hook_bootstrap === next.stop_hook_bootstrap
+          && before.stop_hook_bootstrap !== persona.stop_hook_bootstrap
+      }).map(refOf)
+      plan.settings.push({ name, inheritedBy })
       continue
     }
     if (!INHERITED_DEFAULTS.has(name)) {
@@ -1050,6 +1062,11 @@ function settingLine(s: ServerSettingChange): string {
   if (s.name === MODE_SWITCH_SETTING && s.mode !== undefined) return modeSwitchLine(s.mode, s.personas ?? [])
   const prefix = `server-wide setting ${s.name} changed:`
   const recorded = 'once applied, it is recorded'
+  if (s.name === 'stop_hook_bootstrap') {
+    if (!s.inheritedBy?.length) return `${prefix} ${recorded}; no persona inherits the change, so no reply reminder is affected.`
+    const who = s.inheritedBy.map(p => renderPersonaRef(p.name, p.key)).join(', ')
+    return `${prefix} inherited by ${who}; once applied, reply reminders use it immediately.`
+  }
   if (CLI_RECORD_SETTINGS.has(s.name)) {
     return `${prefix} ${recorded}, and the CLI takes it from the record from then on (the running server does not use it).`
   }

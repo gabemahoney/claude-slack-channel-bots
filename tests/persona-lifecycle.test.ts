@@ -428,13 +428,13 @@ type DepName =
   | 'routing.forget' | 'forgetAcks' | 'destinations.forget' | 'destinationHold.cancel' | 'notifier.forget' | 'forgetPersonaPrompts'
   | 'notifier.notify' | 'notifier.submitTeardown' | 'notifier.settleTeardown' | 'notifier.openTeardownWindow' | 'notifier.closeTeardownWindow'
   | 'dropSession' | 'resetOutageState' | 'killInstance' | 'raiseKillFailureAlert' | 'forgetFailures'
-  | 'forgetDisconnectedStreak' | 'forgetNotConnectedEpisode' | 'forgetConflictLatch' | 'forgetInvalidFlagsHold' | 'forgetNoticeEpisodes' | 'replyGuard.launchedWithDir' | 'replyGuard.teardown' | 'replyGuard.launchPass'
+  | 'forgetDisconnectedStreak' | 'forgetNotConnectedEpisode' | 'forgetConflictLatch' | 'forgetInvalidFlagsHold' | 'forgetNoticeEpisodes' | 'forgetReplyReminders'
   | 'storageCheck' | 'launch' | 'connections.reconnectCredentials' | 'connections.replaceRetryTokens'
 
 /** Dependencies whose production form returns a promise: their failure is a rejection, the others' a throw. */
 const ASYNC_DEPS = new Set<DepName>([
   'bringUps.bringUp', 'bringUps.changeCredentials', 'stopApprover', 'stopLiveRowSequence', 'whenLaunchSettled', 'connections.stop', 'connections.reconnectCredentials',
-  'dropSession', 'killInstance', 'launch', 'notifier.notify',
+  'dropSession', 'killInstance', 'launch', 'notifier.notify', 'forgetReplyReminders',
 ])
 
 /** A thrown value whose message carries a fake token: the log line must not show it. */
@@ -448,8 +448,6 @@ interface FixtureOptions {
   fail?: readonly DepName[]
   /** With `fail`: every failing dependency returns a rejected promise, a synchronous one included (a step run without awaiting). */
   rejectFailures?: boolean
-  /** What the recording `launchedWithDir` returns. */
-  launchedWith?: string
   /** What the recording `whenLaunchSettled` returns for a key (default: resolved). */
   launchInFlight?: (key: string) => Promise<void>
   /** What the recording `bringUps.bringUp` resolves with. */
@@ -589,16 +587,7 @@ function makeFixture(opts: FixtureOptions = {}): Fixture {
     dropSession: rec('dropSession', byKey, async () => false),
     killInstance: rec('killInstance', byKey, async (): Promise<PersonaTeardownKillResult> => opts.killResult ?? KILL_RESULT_SUCCEEDED),
     raiseKillFailureAlert: rec('raiseKillFailureAlert', (key: string, decision: KillRetryAlert) => `${key}:${decision.kind}`, () => undefined),
-    replyGuard: {
-      launchedWithDir: rec('replyGuard.launchedWithDir', byKey, () => opts.launchedWith),
-      teardown: rec('replyGuard.teardown', byKey, () => undefined),
-      launchPass: rec(
-        'replyGuard.launchPass',
-        (dirs: readonly (string | undefined)[], personas: readonly Persona[]) =>
-          `${JSON.stringify(dirs)}:[${personas.map((p) => p.key).join(',')}]`,
-        () => undefined,
-      ),
-    },
+    forgetReplyReminders: rec('forgetReplyReminders', byKey, async () => undefined),
     storageCheck: rec('storageCheck', byPersona, () => undefined),
     launch: rec('launch', byPersona, async () => ({ key: 'x', action: 'spawned' })),
     templateRefresh: {
@@ -690,12 +679,12 @@ function turnEnd(p: Persona): string[] {
  * made (no delete: the row is kept) and, after it, the retry timer stopped
  * once more (the kill arms none, b.jg5 SRJ-110), the failure count, health
  * streak and not-connected episode forgotten and the latch forgotten once
- * more; then the reply guard; then the window closed and the submit ended
+ * more; then reply reminders are forgotten; then the window closed and the submit ended
  * (`turnEnd`). The outage state is not forgotten after the kill, and no
  * notice is dropped after it (b.jg5 SRJ-1002, SRJ-1003). No alert is raised
  * for the fixture's default kill (its decision is `none`).
  */
-function teardownTurnTrail(p: Persona, launchPass: string): string[] {
+function teardownTurnTrail(p: Persona): string[] {
   const k = p.key
   return [
     ...turnStart(p),
@@ -707,7 +696,7 @@ function teardownTurnTrail(p: Persona, launchPass: string): string[] {
     `notifier.forget:${k}`, `forgetPersonaPrompts:${k}`, `dropSession:${k}`,
     `killInstance:${k}`, `stopRetryTimer:${k}`,
     `forgetFailures:${k}`, `forgetDisconnectedStreak:${k}`, `forgetNotConnectedEpisode:${k}`, `forgetConflictLatch:${k}`,
-    `replyGuard.launchedWithDir:${k}`, `replyGuard.teardown:${k}`, `replyGuard.launchPass:${launchPass}`,
+    `forgetReplyReminders:${k}`,
     ...turnEnd(p),
   ]
 }
@@ -727,8 +716,8 @@ function submitCancels(p: Persona): string[] {
  * The full teardown trail for `p`, a key no longer applied: its submit-time
  * cancels (every teardown), then its turn.
  */
-function fullTeardownTrail(p: Persona, launchPass: string): string[] {
-  return [...submitCancels(p), ...teardownTurnTrail(p, launchPass)]
+function fullTeardownTrail(p: Persona): string[] {
+  return [...submitCancels(p), ...teardownTurnTrail(p)]
 }
 
 /**
@@ -740,21 +729,16 @@ function fullTeardownTrail(p: Persona, launchPass: string): string[] {
  * with the connection drops, and never again after the kill (b.jg5
  * SRJ-1003: a notice raised in the window is written, never held).
  */
-function stillAppliedTeardownTrail(p: Persona, launchPass: string): string[] {
+function stillAppliedTeardownTrail(p: Persona): string[] {
   return [
     ...submitCancels(p), `bringUps.cancel:${p.key}`, `cancelRestartTimer:${p.key}`, `stopRetryTimer:${p.key}`,
-    ...teardownTurnTrail(p, launchPass),
+    ...teardownTurnTrail(p),
   ]
 }
 
 /** `trail` up to and including the teardown's wait for `p`'s launch in flight. */
 function untilLaunchSettled(trail: string[], p: Persona): string[] {
   return trail.slice(0, trail.indexOf(`whenLaunchSettled:${p.key}`) + 1)
-}
-
-/** The launch-pass record for B's config dir and `launchedWith`, against the applied set [A]. */
-function launchPassOf(f: Fixture, launchedWith: string | undefined): string {
-  return `${JSON.stringify([f.b.claude_config_dir, launchedWith])}:[${f.a.key}]`
 }
 
 /** The real bring-up controller over the real connection manager, and a lifecycle over them. */
@@ -838,13 +822,12 @@ function makeControllerStack(opts: {
 // ---------------------------------------------------------------------------
 
 describe('persona teardown (SR-6.5): every step for the removed key only, in order', () => {
-  test('AC 57: tearing B down runs every step for B alone, in the documented order, then the launch pass with B\'s config and launched-with dirs against the personas still applied; starting and complete lines only', async () => {
-    const launchedWith = join(dir, 'beta-launched-with')
-    const f = makeFixture({ launchedWith })
+  test('AC 57: tearing B down runs every step for B alone, in the documented order, starting and complete lines only', async () => {
+    const f = makeFixture()
 
     await f.lifecycle.teardown(f.b)
 
-    expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, launchedWith)))
+    expect(f.trail).toEqual(fullTeardownTrail(f.b))
     expect(f.lines).toEqual(cleanTeardownLines(f.b))
     expect(f.trail.join('\n')).not.toContain(f.a.key + ':')
     expect(f.submitted).toEqual([f.b.key])
@@ -868,7 +851,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     const k = f.b.key
     const want: string[] = []
     let timerStops = 0
-    for (const step of fullTeardownTrail(f.b, launchPassOf(f, undefined))) {
+    for (const step of fullTeardownTrail(f.b)) {
       want.push(step)
       if (step === `stopRetryTimer:${k}` && ++timerStops <= 2) want.push(`forgetOldLifeWaits:${k}`)
     }
@@ -891,7 +874,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
 
     await expect(f.lifecycle.teardown(f.b)).resolves.toBeUndefined()
 
-    expect(f.trail.filter((c) => c.startsWith('killInstance:') || c.startsWith('replyGuard.launchPass:'))).toHaveLength(2)
+    expect(f.trail.filter((c) => c.startsWith('killInstance:') || c.startsWith('forgetReplyReminders:'))).toHaveLength(2)
     expect(f.lines).toEqual([
       `${teardownPrefix(f.b)}: starting`,
       expect.stringMatching(new RegExp(`^${RegExp.escape(`${teardownPrefix(f.b)}: ${OLD_LIFE_WAITS_STEP} failed: Error`)}( |$)`)),
@@ -900,20 +883,6 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
       `${teardownPrefix(f.b)}: complete, with 2 failed step(s)`,
     ])
     assertNoLeak({ lines: f.lines })
-  })
-
-  test('the launch pass reads the applied set when it runs, not when the teardown started', async () => {
-    let applied: Persona[] = []
-    const f = makeFixture({
-      launchInFlight: async () => {
-        applied.length = 0 // the applied set changes while the teardown runs
-      },
-    })
-    applied = f.applied
-
-    await f.lifecycle.teardown(f.b)
-
-    expect(f.trail.filter((c) => c.startsWith('replyGuard.launchPass:'))).toEqual([`replyGuard.launchPass:${JSON.stringify([f.b.claude_config_dir, undefined])}:[]`])
   })
 
   test('b.f2b: a launch in flight that settles only once its wait for a working row is cancelled (up to 10 minutes otherwise) does not hold the teardown: the wait is cancelled at submit, before the teardown waits for the launch', async () => {
@@ -931,7 +900,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
 
     await f.lifecycle.teardown(f.b)
 
-    expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, undefined)))
+    expect(f.trail).toEqual(fullTeardownTrail(f.b))
     expect(f.lines).toEqual(cleanTeardownLines(f.b))
   })
 
@@ -951,7 +920,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
         },
       },
     })
-    const full = fullTeardownTrail(f.b, launchPassOf(f, undefined))
+    const full = fullTeardownTrail(f.b)
 
     const done = f.lifecycle.teardown(f.b)
     await flush()
@@ -991,7 +960,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
 
     await expect(f.lifecycle.teardown(f.b)).resolves.toBeUndefined()
 
-    expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, undefined)))
+    expect(f.trail).toEqual(fullTeardownTrail(f.b))
     expect(f.lines).toEqual([
       `${teardownPrefix(f.b)}: starting`,
       expect.stringMatching(new RegExp(`^${RegExp.escape(`${teardownPrefix(f.b)}: stopping its dialog approver failed: Error`)}( |$)`)),
@@ -1006,7 +975,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
 
     await expect(f.lifecycle.teardown(f.b)).resolves.toBeUndefined()
 
-    expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, undefined)).filter((c) => !c.startsWith('stopApprover:')))
+    expect(f.trail).toEqual(fullTeardownTrail(f.b).filter((c) => !c.startsWith('stopApprover:')))
     expect(f.lines).toEqual(cleanTeardownLines(f.b))
   })
 
@@ -1027,7 +996,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
         },
       },
     })
-    const full = fullTeardownTrail(f.b, launchPassOf(f, undefined))
+    const full = fullTeardownTrail(f.b)
 
     const done = f.lifecycle.teardown(f.b)
     await flush()
@@ -1066,7 +1035,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
         },
       },
     })
-    const full = fullTeardownTrail(f.b, launchPassOf(f, undefined))
+    const full = fullTeardownTrail(f.b)
 
     const done = f.lifecycle.teardown(f.b)
     await flush()
@@ -1108,7 +1077,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
 
     await expect(f.lifecycle.teardown(f.b)).resolves.toBeUndefined()
 
-    expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, undefined)))
+    expect(f.trail).toEqual(fullTeardownTrail(f.b))
     expect(f.lines).toEqual([
       `${teardownPrefix(f.b)}: starting`,
       expect.stringMatching(new RegExp(`^${RegExp.escape(`${teardownPrefix(f.b)}: ${phrase} failed: Error`)}( |$)`)),
@@ -1123,7 +1092,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
 
     await expect(f.lifecycle.teardown(f.b)).resolves.toBeUndefined()
 
-    expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, undefined)).filter((c) => !c.startsWith('stopLiveRowSequence:')))
+    expect(f.trail).toEqual(fullTeardownTrail(f.b).filter((c) => !c.startsWith('stopLiveRowSequence:')))
     expect(f.lines).toEqual(cleanTeardownLines(f.b))
   })
 
@@ -1358,18 +1327,13 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     ['forgetConflictLatch', ['forgetting its latch', 'forgetting its latch again, after its launch in flight settled', 'forgetting its latch once more, after the kill']],
     ['forgetInvalidFlagsHold', ['forgetting its ErrInvalidFlags hold', 'forgetting its ErrInvalidFlags hold again, after its launch in flight settled']],
     ['forgetNoticeEpisodes', ['forgetting its notice episodes', 'forgetting its notice episodes again, after its launch in flight settled']],
-    ['replyGuard.launchedWithDir', ['reading its launched-with directory']],
-    ['replyGuard.teardown', ['deleting its reply-guard record']],
-    ['replyGuard.launchPass', ['re-evaluating the Stop hook in its config directories']],
+    ['forgetReplyReminders', ['forgetting its reply reminders']],
   ])('%s failing: its step is logged token-safely, every other step still runs, and the completion line counts the failed steps', async (dep, phrases) => {
-    const launchedWith = join(dir, 'beta-launched-with')
-    const f = makeFixture({ fail: [dep], launchedWith })
+    const f = makeFixture({ fail: [dep] })
 
     await expect(f.lifecycle.teardown(f.b)).resolves.toBeUndefined()
 
-    // A failed launched-with read leaves the launch pass without that dir.
-    const expectedWith = dep === 'replyGuard.launchedWithDir' ? undefined : launchedWith
-    expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, expectedWith)))
+    expect(f.trail).toEqual(fullTeardownTrail(f.b))
     const failedLine = (phrase: string) =>
       expect.stringMatching(new RegExp(`^${RegExp.escape(`${teardownPrefix(f.b)}: ${phrase.replace('cscb_<key>', personaInstanceId(f.b.key))} failed: Error`)}( |$)`))
     expect(f.lines[0]).toBe(`${teardownPrefix(f.b)}: starting`)
@@ -1385,12 +1349,11 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
   // step fails, nothing is raised and the row is kept (there is no delete);
   // every other step still runs.
   test('b.jg5 SRJ-715: killInstance failing (it throws): its step is logged token-safely, no alert is raised, every other step still runs, and the completion line counts one failed step', async () => {
-    const launchedWith = join(dir, 'beta-launched-with')
-    const f = makeFixture({ fail: ['killInstance'], launchedWith })
+    const f = makeFixture({ fail: ['killInstance'] })
 
     await expect(f.lifecycle.teardown(f.b)).resolves.toBeUndefined()
 
-    expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, launchedWith)))
+    expect(f.trail).toEqual(fullTeardownTrail(f.b))
     expect(f.lines).toEqual([
       `${teardownPrefix(f.b)}: starting`,
       expect.stringMatching(new RegExp(`^${RegExp.escape(`${teardownPrefix(f.b)}: agent-director kill of ${personaInstanceId(f.b.key)} failed: Error`)}( |$)`)),
@@ -1404,7 +1367,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
 
     await f.lifecycle.teardown(f.b)
 
-    expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, undefined)))
+    expect(f.trail).toEqual(fullTeardownTrail(f.b))
     expect(f.lines).toEqual([
       `${teardownPrefix(f.b)}: starting`,
       `${teardownPrefix(f.b)}: agent-director kill of ${personaInstanceId(f.b.key)} failed: it answered no kill outcome — the row is kept (b.jg5 SRJ-715)`,
@@ -1448,7 +1411,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
 
       await f.lifecycle.teardown(f.b)
 
-      const expected = fullTeardownTrail(f.b, launchPassOf(f, undefined))
+      const expected = fullTeardownTrail(f.b)
       const afterKill = expected.indexOf(`killInstance:${k}`) + 1
       expect(f.trail).toEqual([...expected.slice(0, afterKill), `raiseKillFailureAlert:${k}:${killResult.alert.kind}`, ...expected.slice(afterKill)])
       const failedSteps = (succeeded ? 0 : 1) + (raiseFails ? 1 : 0)
@@ -1479,7 +1442,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
 
     await expect(f.lifecycle.teardown(f.b)).resolves.toBeUndefined()
 
-    expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, undefined)))
+    expect(f.trail).toEqual(fullTeardownTrail(f.b))
     expect(f.trail.filter((c) => c.startsWith('raiseKillFailureAlert:'))).toEqual([])
     expect(f.lines).toEqual([
       `${teardownPrefix(f.b)}: starting`,
@@ -1496,7 +1459,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
 
     await expect(f.lifecycle.teardown(f.b)).resolves.toBeUndefined()
 
-    expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, undefined)))
+    expect(f.trail).toEqual(fullTeardownTrail(f.b))
     expect(f.lines).toEqual([
       `${teardownPrefix(f.b)}: starting`,
       malformedAlertLine(f.b),
@@ -1523,7 +1486,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
 
     await expect(f.lifecycle.teardown(f.b)).resolves.toBeUndefined()
 
-    const expected = fullTeardownTrail(f.b, launchPassOf(f, undefined))
+    const expected = fullTeardownTrail(f.b)
     const afterKill = expected.indexOf(`killInstance:${k}`) + 1
     const notice = teardownKillNotSucceededNoticeText(personaInstanceId(k), outcome as KillFailure, KILL_RETRY_TRIES)
     expect(f.trail).toEqual([...expected.slice(0, afterKill), `notifier.notify:${k}:${notice}`, ...expected.slice(afterKill)])
@@ -1647,11 +1610,11 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
 
     await expect(f.lifecycle.teardown(f.b)).resolves.toBeUndefined()
 
-    // Every later step still ran: the timer stop after the kill, the forgets and the reply guard.
+    // Every later step still ran: the timer stop after the kill, the forgets and reminder cancellation.
     const afterKill = f.trail.slice(f.trail.indexOf(`killInstance:${k}`) + 1).filter((c) => !c.startsWith('notifier.'))
     expect(afterKill).toEqual([
       `stopRetryTimer:${k}`, `forgetFailures:${k}`, `forgetDisconnectedStreak:${k}`, `forgetNotConnectedEpisode:${k}`, `forgetConflictLatch:${k}`,
-      `replyGuard.launchedWithDir:${k}`, `replyGuard.teardown:${k}`, `replyGuard.launchPass:${launchPassOf(f, undefined)}`,
+      `forgetReplyReminders:${k}`,
     ])
     expect(f.lines).toEqual([
       `${teardownPrefix(f.b)}: starting`,
@@ -1673,7 +1636,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
 
     await f.lifecycle.teardown(f.b)
 
-    expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, undefined)))
+    expect(f.trail).toEqual(fullTeardownTrail(f.b))
     expect(f.lines).toEqual(cleanTeardownLines(f.b))
   })
 
@@ -1682,18 +1645,18 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
       'stopApprover', 'stopLiveRowSequence', 'bringUps.cancel', 'cancelRestartTimer', 'stopRetryTimer', 'cancelLaunchWait', 'whenLaunchSettled', 'connections.stop', 'routing.forget',
       'forgetAcks', 'destinations.forget', 'destinationHold.cancel', 'notifier.forget', 'forgetPersonaPrompts', 'dropSession',
       'resetOutageState', 'killInstance', 'forgetFailures', 'forgetDisconnectedStreak', 'forgetNotConnectedEpisode',
-      'forgetConflictLatch', 'forgetInvalidFlagsHold', 'forgetNoticeEpisodes', 'replyGuard.launchedWithDir', 'replyGuard.teardown', 'replyGuard.launchPass',
+      'forgetConflictLatch', 'forgetInvalidFlagsHold', 'forgetNoticeEpisodes', 'forgetReplyReminders',
       'notifier.openTeardownWindow', 'notifier.closeTeardownWindow',
     ]
     const f = makeFixture({ fail: all })
 
     await f.lifecycle.teardown(f.b)
 
-    const turn = teardownTurnTrail(f.b, launchPassOf(f, undefined))
-    expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, undefined)))
+    const turn = teardownTurnTrail(f.b)
+    expect(f.trail).toEqual(fullTeardownTrail(f.b))
     // Every step of the turn failed once (the repeated stops, forgets and hold cancels each count), the window's open
-    // and close included: 36; the submit's end, the turn's last call, is no step (its own case below).
-    expect(turn).toHaveLength(37)
+    // and close included: 34; the submit's end, the turn's last call, is no step (its own case below).
+    expect(turn).toHaveLength(35)
     expect(turn.at(-1)).toBe(`notifier.settleTeardown:${f.b.key}`)
     expect(f.lines.at(-1)).toBe(`${teardownPrefix(f.b)}: complete, with ${turn.length - 1} failed step(s)`)
     expect(f.lines.filter((line) => line.includes(' delete '))).toEqual([])
@@ -1701,8 +1664,8 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
   })
 
   // b.jg5 SRJ-1003: the window opens at the turn's start and closes after its last step, whatever a step throws.
-  test('b.jg5 SRJ-1003: the notice window opens right after the outage reset, before the turn\'s first step, and closes after its last step, then the submit ends; a throwing step and a throwing launch pass still leave it closed', async () => {
-    const f = makeFixture({ fail: ['connections.stop', 'killInstance', 'replyGuard.launchPass'] })
+  test('b.jg5 SRJ-1003: the notice window opens right after the outage reset, before the turn\'s first step, and closes after its last step, then the submit ends; a throwing step and failing reminder cancellation still leave it closed', async () => {
+    const f = makeFixture({ fail: ['connections.stop', 'killInstance', 'forgetReplyReminders'] })
     const k = f.b.key
 
     await f.lifecycle.teardown(f.b)
@@ -1711,7 +1674,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     expect(f.trail.slice(opened - 1, opened + 3)).toEqual([
       `resetOutageState:${k}`, `notifier.openTeardownWindow:${k}`, `destinationHold.cancel:${k}`, `stopApprover:${k}`,
     ])
-    expect(f.trail.slice(-3)).toEqual([expect.stringMatching(/^replyGuard\.launchPass:/), ...turnEnd(f.b)])
+    expect(f.trail.slice(-3)).toEqual([`forgetReplyReminders:${k}`, ...turnEnd(f.b)])
     expect(f.trail.filter((c) => c.startsWith('notifier.') && c !== `notifier.forget:${k}`)).toEqual([
       `notifier.submitTeardown:${k}`, `notifier.openTeardownWindow:${k}`, `notifier.closeTeardownWindow:${k}`, `notifier.settleTeardown:${k}`,
     ])
@@ -1731,7 +1694,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     await expect(f.lifecycle.teardown(f.b)).resolves.toBeUndefined()
 
     // A failed registration leaves no submit to end.
-    const full = fullTeardownTrail(f.b, launchPassOf(f, undefined))
+    const full = fullTeardownTrail(f.b)
     expect(f.trail).toEqual(dep === 'notifier.submitTeardown' ? full.filter((c) => c !== `notifier.settleTeardown:${k}`) : full)
     const failedLine = expect.stringMatching(new RegExp(`^${RegExp.escape(`${teardownPrefix(f.b)}: ${phrase} failed: Error`)}( |$)`))
     const [starting, killLine, complete] = cleanTeardownLines(f.b)
@@ -1755,7 +1718,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
 
     await expect(f.lifecycle.teardown(f.b)).resolves.toBeUndefined()
 
-    expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, undefined)))
+    expect(f.trail).toEqual(fullTeardownTrail(f.b))
     const failedLine = expect.stringMatching(new RegExp(`^${RegExp.escape(`${teardownPrefix(f.b)}: ${phrase} failed: Error`)}( |$)`))
     const [starting, killLine] = cleanTeardownLines(f.b)
     expect(f.lines).toEqual([
@@ -1783,7 +1746,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     await f.lifecycle.teardown(f.b)
 
     const k = f.b.key
-    const full = fullTeardownTrail(f.b, launchPassOf(f, undefined))
+    const full = fullTeardownTrail(f.b)
     expect(f.trail).toEqual(full.filter((c) => c !== `killInstance:${k}`))
     expect(f.lines).toEqual([
       `${teardownPrefix(f.b)}: starting`,
@@ -1796,7 +1759,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     const f = makeFixture({ overrides: { log: () => { throw new Error('log sink exploded') } } })
 
     await expect(f.lifecycle.teardown(f.b)).resolves.toBeUndefined()
-    expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, undefined)))
+    expect(f.trail).toEqual(fullTeardownTrail(f.b))
   })
 
   test('over the real ack tracker: tearing B down drops every ack-reaction entry of B\'s, so B added again starts clean, and leaves A\'s entries, even on the same message, untouched', async () => {
@@ -1810,7 +1773,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     await f.lifecycle.teardown(f.b)
 
     // Every other step still ran, in order (the real forget records no trail entry).
-    expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, undefined)).filter((c) => c !== `forgetAcks:${b}`))
+    expect(f.trail).toEqual(fullTeardownTrail(f.b).filter((c) => c !== `forgetAcks:${b}`))
     expect(f.lines).toEqual(cleanTeardownLines(f.b))
     expect(consumeAck(b, 'C0SHARED01', '1700000000.000100')).toBe(false)
     expect(consumeAck(b, 'D0BETADM01', '1700000000.000200')).toBe(false)
@@ -1842,7 +1805,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
 
     await expect(f.lifecycle.teardown(f.b)).resolves.toBeUndefined()
 
-    expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, undefined)))
+    expect(f.trail).toEqual(fullTeardownTrail(f.b))
     const failedLine = (step: string) => expect.stringMatching(new RegExp(`^${RegExp.escape(`${teardownPrefix(f.b)}: ${step} failed: Error`)}( |$)`))
     const beforeKill = [failedLine(phrase), failedLine(`${phrase} again, after its launch in flight settled`)]
     const afterKill = dep === 'forgetConflictLatch' ? [failedLine(`${phrase} once more, after the kill`)] : []
@@ -1879,7 +1842,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     await flush()
 
     // Every other step still ran, in order (the real forget records no trail entry).
-    expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, undefined)).filter((c) => c !== `forgetNoticeEpisodes:${b}`))
+    expect(f.trail).toEqual(fullTeardownTrail(f.b).filter((c) => c !== `forgetNoticeEpisodes:${b}`))
     expect(f.lines).toEqual(cleanTeardownLines(f.b))
     expect(posts.length).toBe(postsBefore)
     expect(episodeLogs).toEqual([])
@@ -1914,7 +1877,7 @@ describe('persona teardown (SR-6.5): every step for the removed key only, in ord
     await f.lifecycle.teardown(f.b)
 
     // Every other step still ran, in order (the real forget records no trail entry).
-    expect(f.trail).toEqual(fullTeardownTrail(f.b, launchPassOf(f, undefined)).filter((c) => c !== `routing.forget:${b}`))
+    expect(f.trail).toEqual(fullTeardownTrail(f.b).filter((c) => c !== `routing.forget:${b}`))
     expect(f.lines).toEqual(cleanTeardownLines(f.b))
     expect(h.heardChannels(b)).toEqual(new Set())
     expect(h.heardChannels(a)).toEqual(new Set([x, y]))
@@ -2152,18 +2115,18 @@ describe('persona teardown end to end over the recovery harness (b.jg5 SRJ-715):
 describe('persona teardown of a key still applied (the old half of a destructive modify, SR-8.6)', () => {
   // Rows: whether B is still applied when its teardown is submitted, what ran
   // at submit while B's turn was held, and the whole trail once it ran.
-  test.each<[string, boolean, (f: Fixture) => string[], (f: Fixture, launchPass: string) => string[]]>([
+  test.each<[string, boolean, (f: Fixture) => string[], (f: Fixture) => string[]]>([
     [
       'B still applied (a destructive modify\'s old half): its submit registered and its dialog approver stopped first, then its launch\'s wait, bring-up retries and restart timer are cancelled and its UNAVAILABLE retry timer stopped at submit, before its turn; its turn is a removed key\'s, its held notices dropped once and never again after the kill',
       true,
       (f) => [...submitCancels(f.b), `bringUps.cancel:${f.b.key}`, `cancelRestartTimer:${f.b.key}`, `stopRetryTimer:${f.b.key}`],
-      (f, launchPass) => stillAppliedTeardownTrail(f.b, launchPass),
+      (f) => stillAppliedTeardownTrail(f.b),
     ],
     [
       'B removed (it left the applied set at step 1): only its submit is registered, its dialog approver and live-row sequence stopped and its launch\'s wait for a working row cancelled before its turn, and its notices are dropped once',
       false,
       (f) => submitCancels(f.b),
-      (f, launchPass) => fullTeardownTrail(f.b, launchPass),
+      (f) => fullTeardownTrail(f.b),
     ],
   ])('%s', async (_label, stillApplied, atSubmit, whole) => {
     const f = makeFixture()
@@ -2179,8 +2142,7 @@ describe('persona teardown of a key still applied (the old half of a destructive
     blocker.resolve()
     await held
     await done
-    const launchPass = `${JSON.stringify([f.b.claude_config_dir, undefined])}:[${f.applied.map((p) => p.key).join(',')}]`
-    expect(f.trail).toEqual(whole(f, launchPass))
+    expect(f.trail).toEqual(whole(f))
     expect(f.lines).toEqual(cleanTeardownLines(f.b))
     expect(f.trail.join('\n')).not.toContain(f.a.key + ':')
     expect(f.submitted).toEqual([f.b.key])
@@ -2193,8 +2155,7 @@ describe('persona teardown of a key still applied (the old half of a destructive
     await f.lifecycle.teardown(f.b)
 
     const k = f.b.key
-    const launchPass = `${JSON.stringify([f.b.claude_config_dir, undefined])}:[${f.a.key},${k}]`
-    expect(f.trail).toEqual(stillAppliedTeardownTrail(f.b, launchPass).filter((c) => c !== `killInstance:${k}`))
+    expect(f.trail).toEqual(stillAppliedTeardownTrail(f.b).filter((c) => c !== `killInstance:${k}`))
   })
 
   // Rows: the early cancel that fails, its step phrase, and whether it throws or returns a rejected promise.
@@ -2235,8 +2196,7 @@ describe('persona teardown of a key still applied (the old half of a destructive
     await expect(f.lifecycle.teardown(f.b)).resolves.toBeUndefined()
     await flush()
 
-    const launchPass = `${JSON.stringify([f.b.claude_config_dir, undefined])}:[${f.a.key},${f.b.key}]`
-    expect(f.trail).toEqual(stillAppliedTeardownTrail(f.b, launchPass))
+    expect(f.trail).toEqual(stillAppliedTeardownTrail(f.b))
     const beforeTurn = f.lines.filter((l) => l.includes(' before its turn failed: '))
     expect(beforeTurn).toHaveLength(1)
     expect(beforeTurn[0]).toMatch(new RegExp(`^${RegExp.escape(`${teardownPrefix(f.b)}: ${phrase} before its turn failed: Error`)}( |$)`))
@@ -2273,8 +2233,7 @@ describe('persona teardown of a key still applied (the old half of a destructive
 
     await f.lifecycle.teardown(f.b)
 
-    const launchPass = `${JSON.stringify([f.b.claude_config_dir, undefined])}:[${f.a.key},${f.b.key}]`
-    expect(f.trail).toEqual(stillAppliedTeardownTrail(f.b, launchPass))
+    expect(f.trail).toEqual(stillAppliedTeardownTrail(f.b))
     expect(f.trail.filter((c) => c.startsWith('notifier.forget:'))).toEqual([`notifier.forget:${f.b.key}`])
     expect(f.lines.slice(1, -1)).toEqual([
       expect.stringMatching(new RegExp(`^${RegExp.escape(`${teardownPrefix(f.b)}: dropping its held notices failed: Error`)}( |$)`)),
@@ -2284,16 +2243,15 @@ describe('persona teardown of a key still applied (the old half of a destructive
     assertNoLeak({ lines: f.lines })
   })
 
-  test('the applied set cannot be read: B counts as not applied (none of the still-applied cancels at submit), and the launch pass\'s failed read is its one failed step', async () => {
+  test('the applied set cannot be read: B counts as not applied and its teardown still completes', async () => {
     const f = makeFixture({ overrides: { appliedPersonas: () => { throw failure() } } })
 
     await expect(f.lifecycle.teardown(f.b)).resolves.toBeUndefined()
 
-    expect(f.trail).toEqual(fullTeardownTrail(f.b, '').filter((c) => !c.startsWith('replyGuard.launchPass:')))
+    expect(f.trail).toEqual(fullTeardownTrail(f.b))
     expect(f.lines.slice(1)).toEqual([
       killOutcomeLine(f.b),
-      expect.stringMatching(new RegExp(`^${RegExp.escape(`${teardownPrefix(f.b)}: re-evaluating the Stop hook in its config directories failed: Error`)}( |$)`)),
-      `${teardownPrefix(f.b)}: complete, with 1 failed step(s)`,
+      `${teardownPrefix(f.b)}: complete`,
     ])
     assertNoLeak({ lines: f.lines })
   })
@@ -2413,7 +2371,7 @@ describe('persona teardown over the real latch (b.jg5 SRJ-504, SRJ-1002): the ke
     await r.f.lifecycle.teardown(r.f.b)
     await flush()
 
-    expect(r.f.trail).toEqual(fullTeardownTrail(r.f.b, launchPassOf(r.f, undefined)))
+    expect(r.f.trail).toEqual(fullTeardownTrail(r.f.b))
     expect(r.f.lines).toEqual(cleanTeardownLines(r.f.b))
     expect(r.latch.isLatched(b)).toBe(false)
     expect(r.latch.record(b)).toBeUndefined()
@@ -2456,7 +2414,7 @@ describe('persona teardown over the real latch (b.jg5 SRJ-504, SRJ-1002): the ke
     await flush()
     expect(h.posts(a)).toEqual([{ channel: r.f.a.permission_prompts!, text: formatPersonaNotice(r.f.a, aText) }])
     // The real notifier records no trail entry.
-    const full = fullTeardownTrail(r.f.b, launchPassOf(r.f, undefined)).filter((c) => !c.startsWith('notifier.'))
+    const full = fullTeardownTrail(r.f.b).filter((c) => !c.startsWith('notifier.'))
 
     const done = r.f.lifecycle.teardown(r.f.b)
     await flush()
@@ -2664,8 +2622,7 @@ describe('persona teardown over the real latch (b.jg5 SRJ-504, SRJ-1002): the ke
     await r.f.lifecycle.teardown(b)
     await flush()
 
-    const launchPass = `${JSON.stringify([b.claude_config_dir, undefined])}:[${r.f.a.key},${b.key}]`
-    expect(r.f.trail).toEqual(stillAppliedTeardownTrail(b, launchPass))
+    expect(r.f.trail).toEqual(stillAppliedTeardownTrail(b))
     expect(r.latch.isLatched(b.key)).toBe(false)
     expect(r.episodes.isOpen(b.key, PERSONA_EPISODE_KIND_CONFLICT)).toBe(false)
     expect(r.posts).toHaveLength(postsBefore)
@@ -2784,7 +2741,7 @@ describe('persona teardown over the real ErrInvalidFlags hold (b.jg5 SRJ-207, SR
     await r.f.lifecycle.teardown(r.f.b)
     await flush()
 
-    expect(r.f.trail).toEqual(fullTeardownTrail(r.f.b, launchPassOf(r.f, undefined)))
+    expect(r.f.trail).toEqual(fullTeardownTrail(r.f.b))
     expect(r.f.lines).toEqual(cleanTeardownLines(r.f.b))
     expect(r.hold.isHeld(b)).toBe(false)
     expect(r.hold.heldKeys()).toEqual([a])
@@ -2817,7 +2774,7 @@ describe('persona teardown over the real ErrInvalidFlags hold (b.jg5 SRJ-207, SR
         }),
     })
     const b = r.f.b.key
-    const full = fullTeardownTrail(r.f.b, launchPassOf(r.f, undefined))
+    const full = fullTeardownTrail(r.f.b)
 
     const done = r.f.lifecycle.teardown(r.f.b)
     await flush()
@@ -2864,7 +2821,7 @@ describe('persona teardown over the real ErrInvalidFlags hold (b.jg5 SRJ-207, SR
     const b = r.f.b
     // A destructive modify: B's key stays applied, its new half sending notices to another channel.
     const newHalf = applyNewHalfOf(h, r.f.applied, b)
-    const full = stillAppliedTeardownTrail(b, `${JSON.stringify([b.claude_config_dir, undefined])}:[${r.f.a.key},${b.key}]`)
+    const full = stillAppliedTeardownTrail(b)
       .filter((c) => !c.startsWith('notifier.'))
 
     const done = r.f.lifecycle.teardown(b)
@@ -3099,7 +3056,7 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
     const k = p.key
     return [
       `stopRetryTimer:${k}`, `forgetFailures:${k}`, `forgetDisconnectedStreak:${k}`, `forgetNotConnectedEpisode:${k}`, `forgetConflictLatch:${k}`,
-      `replyGuard.launchedWithDir:${k}`, `replyGuard.teardown:${k}`, `replyGuard.launchPass:${launchPassOf(f, undefined)}`,
+      `forgetReplyReminders:${k}`,
     ]
   }
 
@@ -3189,7 +3146,7 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
 
     const id = personaInstanceId(r.f.b.key)
     expect(r.adOrder).toEqual(killsAndReads(id, triesFor(unreachable)))
-    expect(r.f.trail.slice(-8)).toEqual(stepsAfterKill(r.f, r.f.b))
+    expect(r.f.trail.slice(-6)).toEqual(stepsAfterKill(r.f, r.f.b))
     expect(r.f.lines.slice(1)).toEqual([
       killFailedLine(r.f.b, killOutcomeOf({ thrown: unreachable }), triesFor(unreachable)),
       `${teardownPrefix(r.f.b)}: complete, with 1 failed step(s)`,
@@ -3290,7 +3247,7 @@ describe('persona teardown (b.jg5 SRJ-715, SR-6.5) over the real bounded-retry k
     expect(r.adOrder).toEqual(killsAndReads(id, tries))
     expect(stubCallCount(r.calls)).toBe(2 * tries - 1)
     expect(r.killWaits).toEqual(Array.from({ length: tries - 1 }, () => KILL_RETRY_SPACING_MS))
-    expect(r.f.trail.slice(-8)).toEqual(stepsAfterKill(r.f, r.f.b))
+    expect(r.f.trail.slice(-6)).toEqual(stepsAfterKill(r.f, r.f.b))
     expect(r.f.lines.slice(1)).toEqual([
       killFailedLine(r.f.b, killOutcomeOf({ thrown: err }), tries),
       `${teardownPrefix(r.f.b)}: complete, with 1 failed step(s)`,
@@ -4836,13 +4793,14 @@ describe('in-place update (SR-8.6, AC 58): forget the cached DM when its destina
   test.each<[InPlaceSetting[], boolean]>([
     [['channels'], false],
     [['delivery'], false],
+    [['stop_hook_bootstrap'], false],
     [['channels', 'delivery'], false],
     [['permission_prompts'], true],
     [['dm.enabled'], true],
     [['dm.contact'], true],
     [['delivery', 'dm.contact'], true],
     [['channels', 'delivery', 'permission_prompts', 'dm.enabled', 'dm.contact'], true],
-  ])('AC 58: %j changed: forgets B\'s cached DM only when a DM destination setting changed, logs one line, and touches no other state of B (no bring-up, retry, restart, connection, session, prompts, held notice or reply guard), live and in dry run alike', async (settings, forgets) => {
+  ])('AC 58: %j changed: forgets B\'s cached DM only when a DM destination setting changed, logs one line, and touches no other state of B (no bring-up, retry, restart, connection, session, prompts, held notice or reply reminder), live and in dry run alike', async (settings, forgets) => {
     for (const dryRun of [false, true]) {
       const f = makeInPlaceFixture({ dryRun })
 
@@ -5010,7 +4968,7 @@ describe('persona teardown serialization (SR-6.6)', () => {
 
     const forB = f.lifecycle.teardown(f.b)
     await flush()
-    expect(f.trail).toEqual(untilLaunchSettled(fullTeardownTrail(f.b, ''), f.b))
+    expect(f.trail).toEqual(untilLaunchSettled(fullTeardownTrail(f.b), f.b))
 
     // B's turn is held: a bring-up for B submitted now waits. A is independent.
     const bringUpB = f.lifecycle.bringUp(f.b, applied)
@@ -5018,7 +4976,7 @@ describe('persona teardown serialization (SR-6.6)', () => {
     await f.lifecycle.bringUp(f.a, applied)
     expect(await settled(forB)).toBe(false)
     expect(await settled(bringUpB)).toBe(false)
-    expect(f.trail.filter((c) => c.endsWith(`:${f.b.key}`))).toEqual(untilLaunchSettled(fullTeardownTrail(f.b, ''), f.b))
+    expect(f.trail.filter((c) => c.endsWith(`:${f.b.key}`))).toEqual(untilLaunchSettled(fullTeardownTrail(f.b), f.b))
     expect(f.lines.filter((l) => l.startsWith(teardownPrefix(f.a)))).toEqual([
       ...cleanTeardownLines(f.a),
     ])
@@ -5026,13 +4984,13 @@ describe('persona teardown serialization (SR-6.6)', () => {
     launchInFlight.resolve()
     await forB
     await bringUpB
-    const bTeardown = fullTeardownTrail(f.b, launchPassOf(f, undefined))
+    const bTeardown = fullTeardownTrail(f.b)
     const bUntilLaunch = untilLaunchSettled(bTeardown, f.b)
     const bringUpOf = (p: Persona) => [`storageCheck:${p.key}`, `bringUps.bringUp:${p.key}:[${f.a.key},${f.b.key}]`, `launch:${p.key}`]
     expect(f.trail).toEqual([
       ...bUntilLaunch,
       // A is still applied (the old half of a destructive modify): its early cancels at submit.
-      ...stillAppliedTeardownTrail(f.a, `${JSON.stringify([f.a.claude_config_dir, undefined])}:[${f.a.key}]`),
+      ...stillAppliedTeardownTrail(f.a),
       ...bringUpOf(f.a),
       ...bTeardown.slice(bUntilLaunch.length),
       ...bringUpOf(f.b),
@@ -5116,7 +5074,7 @@ describe('persona teardown serialization (SR-6.6)', () => {
     const teardownOnly = (f: Fixture) => f.trail.filter((c) => !c.startsWith('restart.'))
     /** The full teardown trail without the recorder for `cancelRestartTimer` (the real one runs here). */
     const expectedTeardown = (f: Fixture) =>
-      fullTeardownTrail(f.b, launchPassOf(f, undefined)).filter((c) => !c.startsWith('cancelRestartTimer:'))
+      fullTeardownTrail(f.b).filter((c) => !c.startsWith('cancelRestartTimer:'))
     const restartOnly = (f: Fixture) => f.trail.filter((c) => c.startsWith('restart.'))
 
     test('a teardown for B submitted while B\'s restart work is running (its launch in progress) starts only once that work settled', async () => {
@@ -5182,7 +5140,7 @@ describe('persona teardown serialization (SR-6.6)', () => {
       const afterArm = [...turnStart(f.b), `stopApprover:${k}`, `stopLiveRowSequence:${k}`, `stopRetryTimer:${k}`]
       expect(f.trail.slice(armed + 1, armed + 1 + afterArm.length)).toEqual(afterArm)
       expect(teardownOnly(f)).toEqual(
-        stillAppliedTeardownTrail(f.b, `${JSON.stringify([f.b.claude_config_dir, undefined])}:[${f.a.key},${k}]`)
+        stillAppliedTeardownTrail(f.b)
           .filter((c) => !c.startsWith('cancelRestartTimer:')),
       )
       expect(f.lines.at(-1)).toBe(`${teardownPrefix(f.b)}: complete`)

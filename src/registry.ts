@@ -648,6 +648,8 @@ export function resolveTransportForRequest(
  * its client are looked up through these on every tool call, never cached.
  */
 export interface SessionToolDeps {
+  /** Records an attempted reply using CSCB records, before any scope or Slack outcome. */
+  onReplyCall?(key: string): void | Promise<void>
   /** File exfiltration guard — throws when the file must not be sent */
   assertSendable: (filePath: string) => void
   /**
@@ -1776,6 +1778,7 @@ export function createSessionServer(
     if (!key) return toolError(sessionNotMatchedRefusal(name))
     const persona = getPersona(key)
     if (!persona) return toolError(personaNotAppliedRefusal(name, key))
+    if (name === 'reply') await deps.onReplyCall?.(key)
     // The channel mode, read now with the persona (b.deo SRI-201, SRI-601).
     const mode: ChannelMode = deps.getChannelMode?.() ?? 'declarative'
 

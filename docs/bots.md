@@ -1,6 +1,6 @@
 # What a bot can do
 
-Tools, receiving messages, injecting a message, permission prompts and the Slack Reply Guard. See also [Scheduled Prompts](scheduled-prompts.md).
+Tools, receiving messages, injecting a message, permission prompts and Slack reply reminders. See also [Scheduled Prompts](scheduled-prompts.md).
 
 ## Tools
 
@@ -32,7 +32,7 @@ On a host whose Claude Code permission settings don't allow the server's tools a
 
 ## Interject
 
-POST to `/interject` to store a message for a configured persona from localhost. The message is queued only for the named persona, including while it is down. Each request is an independent queued item, even with identical sender and text; requests are never merged or deduplicated. Only requests from `127.0.0.1` or `::1` are accepted — external callers are rejected with 403. The bot sees it as described in [How a persona receives messages](#how-a-persona-receives-messages); the Slack Reply Guard does not remind it to reply.
+POST to `/interject` to store a message for a configured persona from localhost. The message is queued only for the named persona, including while it is down. Each request is an independent queued item, even with identical sender and text; requests are never merged or deduplicated. Only requests from `127.0.0.1` or `::1` are accepted — external callers are rejected with 403. The bot sees it as described in [How a persona receives messages](#how-a-persona-receives-messages); this input never arms a Slack reply reminder.
 
 An injected message carries no Slack conversation; say in its text where to post any Slack reply.
 
@@ -137,15 +137,15 @@ Each way a message reaches a persona:
 
 | Kind | How it reaches the persona | Tag attributes | `via` | Reminder |
 |---|---|---|---|---|
-| Direct message | A DM to the persona's own Slack app, when its `dm.enabled` is `true`, whatever the text mentions. With `dm.enabled` `false` the server drops it and logs one `persona-dm-dropped` line. A group DM is never delivered. | Slack attributes; `chat_id` is the DM conversation ID | `dm` | Yes, direct-message wording |
-| Direct @mention | A message that @mentions the persona. In declarative mode: in a channel listed in its `channels`, with `delivery: mentions` or `delivery: all`. In fungible mode: in a public or private channel its app is in that is not externally shared, at either channel delivery. | Slack attributes | `mention` | Yes, direct-mention wording |
-| `@here` / `@channel` broadcast | A message that uses `@here` or `@channel`. In declarative mode: in a channel listed in the persona's `channels`, with either `delivery`. In fungible mode: in a public or private channel its app is in that is not externally shared, at either channel delivery. `@everyone` and user-group mentions are not broadcasts. | Slack attributes | `broadcast` | Yes, broadcast wording |
-| Every message, shared channel | A message that neither @mentions the persona nor broadcasts. In declarative mode: in a channel listed in its `channels` with `delivery: all`, when at least one other persona in the applied configuration also has `delivery: all` for that channel, whether or not that persona is up. In fungible mode: in a public or private channel its app is in that is not externally shared, where its channel delivery is `all` (a stored choice, after the loop guard; see [Channel delivery in fungible mode](channel-modes.md#channel-delivery-in-fungible-mode)), when at least one other persona in the applied configuration has a channel delivery of `all` for that channel by the same rule, whether or not that persona's app remains in the channel. | Slack attributes | `receive_all_shared` | Yes, shared-channel wording |
-| Every message, this persona alone | A message that neither @mentions the persona nor broadcasts. In declarative mode: in a channel listed in its `channels` with `delivery: all`, when no other persona in the applied configuration has `delivery: all` for that channel. In fungible mode: in a public or private channel its app is in that is not externally shared, where its channel delivery is `all`, when no other persona in the applied configuration has a channel delivery of `all` for that channel. | Slack attributes | `receive_all` | Yes, only-you wording |
+| Direct message | A DM to the persona's own Slack app, when its `dm.enabled` is `true`, whatever the text mentions. With `dm.enabled` `false` the server drops it and logs one `persona-dm-dropped` line. A group DM is never delivered. | Slack attributes; `chat_id` is the DM conversation ID | `dm` | Yes |
+| Direct @mention | A message that @mentions the persona. In declarative mode: in a channel listed in its `channels`, with `delivery: mentions` or `delivery: all`. In fungible mode: in a public or private channel its app is in that is not externally shared, at either channel delivery. | Slack attributes | `mention` | Yes |
+| `@here` / `@channel` broadcast | A message that uses `@here` or `@channel`. In declarative mode: in a channel listed in the persona's `channels`, with either `delivery`. In fungible mode: in a public or private channel its app is in that is not externally shared, at either channel delivery. `@everyone` and user-group mentions are not broadcasts. | Slack attributes | `broadcast` | Yes |
+| Every message, shared channel | A message that neither @mentions the persona nor broadcasts. In declarative mode: in a channel listed in its `channels` with `delivery: all`, when at least one other persona in the applied configuration also has `delivery: all` for that channel, whether or not that persona is up. In fungible mode: in a public or private channel its app is in that is not externally shared, where its channel delivery is `all` (a stored choice, after the loop guard; see [Channel delivery in fungible mode](channel-modes.md#channel-delivery-in-fungible-mode)), when at least one other persona in the applied configuration has a channel delivery of `all` for that channel by the same rule, whether or not that persona's app remains in the channel. | Slack attributes | `receive_all_shared` | Yes |
+| Every message, this persona alone | A message that neither @mentions the persona nor broadcasts. In declarative mode: in a channel listed in its `channels` with `delivery: all`, when no other persona in the applied configuration has `delivery: all` for that channel. In fungible mode: in a public or private channel its app is in that is not externally shared, where its channel delivery is `all`, when no other persona in the applied configuration has a channel delivery of `all` for that channel. | Slack attributes | `receive_all` | Yes |
 | Scheduled prompt | A crontable line naming the persona fires, and the scheduler queues it for that persona only (see [Scheduled Prompts](scheduled-prompts.md#scheduled-prompts-cscb_cron)). | Only `user` = `cscb-cron:<prompt file name without its extension>` (`cscb-cron:standup` for `standup.md`) and `ts` = the fire time in seconds, with six decimals. No `chat_id`, `message_id` or `via`. | none | Never |
 | `/interject` message | A localhost POST to `/interject` addressed by `persona` (see [Interject](#interject)); it reaches only that persona. | Only `user` = the request's `sender` (default `interject`) and `ts`, as for a scheduled prompt. No `chat_id`, `message_id` or `via`. | none | Never |
 
-A "Yes" in the Reminder column means the [Slack Reply Guard](#slack-reply-guard-stop-hook) reminds the persona once if it ends its turn without replying, wherever the reminder is on for that persona. Each `via` has its own reminder wording, stating how the message arrived; that section lists them.
+A "Yes" in the Reminder column means [Slack reply reminders](#slack-reply-reminders) are eligible for that delivery when enabled for the persona.
 
 - **The first applicable `via` wins,** in the order `dm`, `mention`, `broadcast`, `receive_all_shared`, `receive_all`. A message that @mentions the persona in a channel it receives in full arrives as `mention`.
 - **The persona's own @mention is removed from the text.** Mentions of other personas and `@here` / `@channel` stay.
@@ -155,43 +155,28 @@ A "Yes" in the Reminder column means the [Slack Reply Guard](#slack-reply-guard-
 - **Slack redeliveries add no second queue item, including across server restarts.** Each accepted Slack message keeps its key for at least 24 hours after intake; the paired channel @mention adds no second item.
 - **In fungible mode, an @mention is delivered from its `message` event.** Of the two events Slack sends for a channel @mention, the `app_mention` event decides nothing and the `message` event carrying the same mention decides, so each @mention is delivered once, whichever event arrives first. An edit that adds a mention to an earlier message sends no new `message` event, so in fungible mode it is not delivered.
 - **A message without `via` is an injected prompt.** Its `user` label is free-form, so an `/interject` sender label, even one starting with `cscb-cron:`, cannot make it look like a Slack message.
-- **When the reminder is off.** A persona gets no reminder when its effective `stop_hook_bootstrap` was `false` at its last launch, when it has no `claude_config_dir` (its own or the top-level one), when that directory resolves to `~/.claude`, or when `jq` is not installed. See [Slack Reply Guard](#slack-reply-guard-stop-hook).
+- **When the reminder is off.** No new reminder is queued when the persona's effective `stop_hook_bootstrap` is `false`. See [Slack reply reminders](#slack-reply-reminders).
 
-## Slack Reply Guard (Stop hook)
+## Slack reply reminders
 
-CSCB ships a Claude Code Stop hook that gives a persona a **one-time, declinable reminder** to answer in Slack. It is on for every persona whose effective `stop_hook_bootstrap` is `true` (the default), except a persona with no `claude_config_dir`, one whose directory resolves to `~/.claude`, or any persona when `jq` is missing (see [When it stays silent](#when-it-stays-silent)). When the messages that started the turn include a message from Slack and the persona ends its turn without calling the `mcp__slack-channel-router__reply` tool, the hook exits `2` and Claude Code shows the persona a reminder. The message's `via` picks the wording:
-
-| `via` | Reminder |
-|---|---|
-| `dm` | `This turn started from a Slack direct message (conversation <chat_id>) and you haven't replied. If you meant to answer in Slack, do it now with the mcp__slack-channel-router__reply tool. If no reply is needed, just end your turn.` |
-| `mention` | `This turn started from a Slack message that @mentioned you directly (channel <chat_id>) and you haven't replied. If you meant to answer in Slack, do it now with the mcp__slack-channel-router__reply tool. If no reply is needed, just end your turn.` |
-| `broadcast` | `This turn started from an @here or @channel broadcast in a Slack channel (channel <chat_id>) and you haven't replied. If you meant to answer in Slack, do it now with the mcp__slack-channel-router__reply tool. If no reply is needed, just end your turn.` |
-| `receive_all_shared` | `This turn started from a message in a Slack channel where you and other personas receive every message (channel <chat_id>) and you haven't replied. If you meant to answer in Slack, do it now with the mcp__slack-channel-router__reply tool. If no reply is needed, just end your turn.` |
-| `receive_all` | `This turn started from a message in a Slack channel where only you receive every message (channel <chat_id>) and you haven't replied. If you meant to answer in Slack, do it now with the mcp__slack-channel-router__reply tool. If no reply is needed, just end your turn.` |
-| any other value, empty included | `This turn started from a Slack channel message (channel <chat_id>) and you haven't replied. If you meant to answer in Slack, do it now with the mcp__slack-channel-router__reply tool. If no reply is needed, just end your turn.` |
-
-`<chat_id>` is the message's `chat_id`. When `chat_id` is absent or is not a Slack ID (capital letters and digits only), the reminder omits the parenthesis, for example:
+After CSCB delivers a Slack message, it watches the persona's agent-director row. When it observes `working` followed by `waiting` in the same running session, and the persona has made no `reply` tool call since that delivery, CSCB queues one reminder through normal message delivery:
 
 ```text
-This turn started from a Slack direct message and you haven't replied. If you meant to answer in Slack, do it now with the mcp__slack-channel-router__reply tool. If no reply is needed, just end your turn.
+You received a Slack message and you haven't replied. If you meant to answer in Slack, do it now with the reply tool. If no reply is needed, just end your turn.
 ```
 
-When several Slack messages started the turn, the last one picks the wording. A `reply` call after the earliest of them counts as a reply. The persona then continues once: it can reply, or end the turn without replying. That continuation carries `stop_hook_active=true`, which the guard always lets through, so the reminder appears at most once per turn and never loops.
+The persona can reply or end its turn. There is at most one reminder per delivered Slack message, including across server restarts. Both Claude and Codex personas are covered, regardless of `claude_config_dir`; no `jq` installation is needed.
 
-CSCB types the tag, including when a message arrives mid-turn or is pasted into the composer. The guard recognises these forms in the transcript.
-
-**Only messages from Slack trigger it.** The guard recognises a message from Slack by its `via` attribute; any `via` value counts. Injected prompts (scheduled prompts and `/interject` messages) carry no `via`, so they never trigger the reminder: no Slack conversation is waiting on them. An injected message that arrives right after a Slack message does not cancel the reminder for the Slack message. [How a persona receives messages](#how-a-persona-receives-messages) lists every kind of message and its `via`.
+Only Slack deliveries arm reminders. Scheduled prompts, `/interject` messages and reminders themselves do not. A `reply` call by that persona suppresses the reminder even if posting fails or the call targets another conversation. Replies through another tool or service can therefore be followed by one harmless reminder.
 
 ### Turning it on or off
 
-Set `stop_hook_bootstrap` in `config.json`: at the top level for every persona, or on a persona to override the top-level value for that persona alone. It defaults to `true`. Setting `stop_hook_bootstrap: false` on the persona, or inheriting `false` from the top level, is all an opt-out needs, even when the persona shares its `claude_config_dir` with other personas. See [Next-launch settings](configuration.md#next-launch-settings) and [Server-wide settings](server-settings.md#server-wide-settings).
-
-A change reaches a persona at its first launch after the change is applied (see [Reload](reload.md#reload)): a running instance keeps the value it launched with, and a plain server restart reconnects to it without a launch.
+Set `stop_hook_bootstrap` in `config.json`: at the top level for every persona, or on a persona to override that default. This compatibility setting defaults to `true`; `false` disables reminders for that persona. A confirmed [reload](reload.md#reload) applies the change immediately and keeps the running session. The setting applies independently to personas sharing a config directory. A reminder already queued before confirmation still follows normal delivery.
 
 ### Personas that answer without `reply` — opt them out
 
-The guard only recognises a reply made with `mcp__slack-channel-router__reply`. A persona whose only Slack surface is `edit_message` or `react` ends its turn without that call, so the guard reminds it after every Slack message, costing one useless continuation each time. Set `stop_hook_bootstrap: false` on that persona.
+A persona that answers only with `edit_message`, `react` or another service can receive a reminder after each Slack delivery. Set `stop_hook_bootstrap: false` on that persona and confirm the change.
 
 ### When it stays silent
 
-The guard is fail-open: when anything is missing or goes wrong, the turn ends normally with no reminder. Besides the opt-out, it stays silent for a persona with no `claude_config_dir`, one whose directory resolves to your own `~/.claude` (the server never edits `~/.claude/settings.json`), any persona while `jq` is not installed (installing it later is enough), and when the message's `<channel>` tag, which CSCB types, isn't in the shape the guard expects. After every CSCB or Claude Code upgrade, check the guard end to end with the steps in the debugging skill's ["Checking the guard after an upgrade"](../skills/debug-slack-channel-bots/SKILL.md#checking-the-guard-after-an-upgrade). How the server installs the hook and the per-persona record it reads are in ["How the guard is installed and what it reads"](../skills/debug-slack-channel-bots/SKILL.md#how-the-guard-is-installed-and-what-it-reads).
+A reminder requires an observed `working` → `waiting` transition after delivery in the same session. A first observation of `waiting` alone is insufficient; CSCB does not infer a missed transition. A changed session, a finished or missing row, or persona teardown cancels pending reminder checks. For diagnosis, see [A persona isn't reminded to reply, or is reminded after opting out](../skills/debug-slack-channel-bots/SKILL.md#a-persona-isnt-reminded-to-reply-or-is-reminded-after-opting-out).

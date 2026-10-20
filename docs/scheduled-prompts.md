@@ -91,7 +91,7 @@ The prompt-file path resolves as follows:
 
 ## How fires appear
 
-The server directly queues a scheduled fire only for the target persona, as an injected message with no Slack conversation attached. Its `sender` label is `cscb-cron:<prompt-file-basename>` — for a prompt file `standup.md` the sender is `cscb-cron:standup`. This distinguishes a cron tick from a human and from peer-bot traffic. The [Slack Reply Guard](bots.md#slack-reply-guard-stop-hook) never reminds a bot to reply to a scheduled prompt: like every injected message, a fire carries no `via`. Because a fire carries no channel, a prompt file that wants a Slack reply must say where to post it. Each schedule queues its own message independently, so when several schedules match the same minute for the same persona each one is its own queued item.
+The server directly queues a scheduled fire only for the target persona, as an injected message with no Slack conversation attached. Its `sender` label is `cscb-cron:<prompt-file-basename>` — for a prompt file `standup.md` the sender is `cscb-cron:standup`. This distinguishes a cron tick from a human and from peer-bot traffic. Scheduled fires never arm [Slack reply reminders](bots.md#slack-reply-reminders); like every injected message, a fire carries no `via`. Because a fire carries no channel, a prompt file that wants a Slack reply must say where to post it. Each schedule queues its own message independently, so when several schedules match the same minute for the same persona each one is its own queued item.
 
 ## The cron log
 

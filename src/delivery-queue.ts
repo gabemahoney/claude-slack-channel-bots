@@ -1,4 +1,5 @@
 /** Durable per-persona FIFO journals. No import-time I/O (b.omv SR-3). */
+import type { GetResult } from 'agent-director'
 import * as nodeFs from 'node:fs'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
@@ -28,6 +29,8 @@ export interface AcceptedInput {
   bot_profile_name?: string
   files?: QueueFile[]
   via?: string
+  /** Internal link for an injected reply reminder; never accepted from Slack intake. */
+  reminder_for?: number
 }
 interface BaseRecord { v: 1; seq: number }
 export interface AcceptedRecord extends BaseRecord, AcceptedInput {
@@ -54,8 +57,18 @@ export interface DeliveredRecord extends BaseRecord {
   kind: 'delivered'; part: number; at: number; receipt: { path: string; uuid?: string; offset?: number }
 }
 export interface RefusedRecord extends BaseRecord { kind: 'refused'; attempt: number; at: number }
+export interface ReplyReminderRecord extends BaseRecord {
+  kind: 'reply-reminder'; at: number
+  state: 'observed' | 'replied' | 'nudged' | 'cancelled'
+  row_state?: string; session_id?: string; launch_started_at?: string | null
+  /** A pre-receipt reply covers only these attempts, while they remain unrefused. */
+  reply_attempts?: number[]
+  /** Non-content send facts retained when compaction removes the delivered item. */
+  delivery_attempts?: number[]
+}
+export interface ReplyCallTarget { seq: number; attempts?: number[] }
 export interface NoticedRecord extends BaseRecord { kind: 'noticed'; at: number }
-export type QueueRecord = AcceptedRecord | QueueKeyRecord | QueueAllocationRecord | FixedRecord | SentRecord | UnknownSentRecord | DeliveredRecord | RefusedRecord | NoticedRecord
+export type QueueRecord = AcceptedRecord | QueueKeyRecord | QueueAllocationRecord | FixedRecord | SentRecord | UnknownSentRecord | DeliveredRecord | RefusedRecord | NoticedRecord | ReplyReminderRecord
 export type ItemRecord = AcceptedRecord | FixedRecord | SentRecord | UnknownSentRecord | DeliveredRecord | RefusedRecord | NoticedRecord
 export interface QueueItem {
   accepted: AcceptedRecord; fixed?: FixedRecord; records: ItemRecord[]; delivered: boolean
@@ -87,6 +100,15 @@ export interface DeliveryQueue {
   retained(key: string): void
   startupFindings(): QueueEvent[]
 }
+export type ReplyReminderRow = Pick<GetResult, 'state' | 'session_id' | 'launch_started_at'>
+/** Server-owned journal operations; ordinary delivery adapters need only DeliveryQueue. */
+export interface ReplyReminderQueue extends DeliveryQueue {
+  replyReminderItems(key: string): ReplyReminderRecord[]
+  replyCallTargets(key: string): ReplyCallTarget[]
+  recordReplyCall(key: string, targets: readonly ReplyCallTarget[]): Promise<void>
+  observeReplyReminders(key: string, row: ReplyReminderRow, text: string, enabled: boolean, current: () => boolean): Promise<QueueItem[]>
+  cancelReplyReminders(key: string): Promise<void>
+}
 export interface DeliveryQueueOptions {
   stateDir: string
   now?: () => number
@@ -113,6 +135,7 @@ export function isQueueRecord(value: unknown): value is QueueRecord {
       if (r.compact === 'allocation') return (r.injected_ts === undefined || timestamp(r.injected_ts)) && Object.keys(r).every(k => ['v', 'kind', 'seq', 'compact', 'injected_ts'].includes(k))
       if (r.compact === 'key') return isSlackKey(r.key) && number(r.received_at) && number(r.delivered_at) && Object.keys(r).every(k => ['v', 'kind', 'seq', 'compact', 'key', 'received_at', 'delivered_at'].includes(k))
       if (r.compact !== undefined || !['slack', 'interject', 'cron'].includes(String(r.source)) || !str(r.text) || !str(r.ts) || !number(r.received_at)) return false
+      if (r.reminder_for !== undefined && (!positive(r.reminder_for) || r.source !== 'interject')) return false
       if (r.attempt_high_watermark !== undefined && !integer(r.attempt_high_watermark)) return false
       for (const k of ['sender', 'channel', 'channel_type', 'thread_ts', 'edited_ts', 'user', 'bot_id', 'username', 'bot_profile_name', 'via']) if (r[k] !== undefined && !str(r[k])) return false
       if (r.files !== undefined && (!Array.isArray(r.files) || !r.files.every(f => object(f) && str(f.name) && (f.mimetype === undefined || str(f.mimetype)) && (f.size === undefined || number(f.size))))) return false
@@ -124,6 +147,7 @@ export function isQueueRecord(value: unknown): value is QueueRecord {
       return positive(r.part) && ['text', 'enter', 'retype'].includes(String(r.send_kind)) && str(r.launch_id) && str(r.session_id) && str(r.transcript_path) && integer(r.transcript_size)
     case 'delivered': return positive(r.part) && number(r.at) && object(r.receipt) && str(r.receipt.path) && (str(r.receipt.uuid) || integer(r.receipt.offset))
     case 'refused': return positive(r.attempt) && number(r.at)
+    case 'reply-reminder': return number(r.at) && ['observed', 'replied', 'nudged', 'cancelled'].includes(String(r.state)) && (r.row_state === undefined || str(r.row_state)) && (r.session_id === undefined || str(r.session_id)) && (r.launch_started_at === undefined || r.launch_started_at === null || str(r.launch_started_at)) && (r.reply_attempts === undefined || (r.state === 'replied' && Array.isArray(r.reply_attempts) && r.reply_attempts.length > 0 && r.reply_attempts.every(positive))) && (r.delivery_attempts === undefined || (Array.isArray(r.delivery_attempts) && r.delivery_attempts.length > 0 && r.delivery_attempts.every(positive)))
     case 'noticed': return number(r.at)
     default: return false
   }
@@ -138,11 +162,11 @@ function formatMicros(us: bigint): string { return `${us / 1000000n}.${String(us
 interface AppendRollback { pendingRollback?: number }
 interface Journal extends AppendRollback {
   records: QueueRecord[]; nextSeq: number; lastInjected?: bigint; loaded: boolean; quarantineRollback?: AppendRollback
-  items: Map<number, QueueItem>; slackKeys: Map<string, AcceptedRecord | QueueKeyRecord>; openCount: number
+  reminders: Map<number, ReplyReminderRecord>; items: Map<number, QueueItem>; slackKeys: Map<string, AcceptedRecord | QueueKeyRecord>; openCount: number
 }
-function emptyJournal(): Journal { return { records: [], nextSeq: 1, loaded: false, items: new Map(), slackKeys: new Map(), openCount: 0 } }
+function emptyJournal(): Journal { return { records: [], nextSeq: 1, loaded: false, reminders: new Map(), items: new Map(), slackKeys: new Map(), openCount: 0 } }
 /** All file access is explicit; construction allocates only memory (SR-13.1). */
-export function createDeliveryQueue(options: DeliveryQueueOptions): DeliveryQueue {
+export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminderQueue {
   const fs = options.fs ?? nodeFs
   const now = options.now ?? Date.now
   const dir = join(options.stateDir, 'queue')
@@ -236,6 +260,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): DeliveryQueu
     return item
   }
   function indexRecord(j: Journal, record: QueueRecord): void {
+    if (record.kind === 'reply-reminder') { j.reminders.set(record.seq, record); return }
     if (record.kind === 'accepted') {
       if ('key' in record && record.key) {
         const encoded = slackKeyString(record.key)
@@ -248,19 +273,21 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): DeliveryQueu
     if (!previous) return
     const item = summarize(previous.accepted, [...previous.records, record])
     j.items.set(record.seq, item)
+    ensureReminder(j, item)
     j.openCount += Number(previous.delivered) - Number(item.delivered)
   }
   function rebuild(j: Journal): void {
-    j.items = new Map(); j.slackKeys = new Map(); j.openCount = 0
+    j.items = new Map(); j.slackKeys = new Map(); j.reminders = new Map(); j.openCount = 0
     // Replay groups records once, rather than repeatedly copying a long
     // history of retypes for the same item.
     for (const record of j.records) {
-      if (record.kind === 'accepted') indexRecord(j, record)
+      if (record.kind === 'accepted' || record.kind === 'reply-reminder') indexRecord(j, record)
       else j.items.get(record.seq)?.records.push(record)
     }
     for (const [seq, previous] of j.items) {
       const item = summarize(previous.accepted, previous.records)
       j.items.set(seq, item)
+      ensureReminder(j, item)
       if (item.delivered) j.openCount--
     }
   }
@@ -303,7 +330,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): DeliveryQueu
     const seenAccept = new Set<number>()
     for (const l of lines) {
       const r = l.record
-      const orphan = r && r.kind !== 'accepted' && !accepted.has(r.seq)
+      const orphan = r && r.kind !== 'accepted' && r.kind !== 'reply-reminder' && !accepted.has(r.seq)
       const duplicate = r && isAccepted(r) && seenAccept.has(r.seq)
       if (!r || orphan || duplicate) { damaged.push(l); continue }
       if (isAccepted(r)) seenAccept.add(r.seq)
@@ -326,7 +353,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): DeliveryQueu
         event({ type: 'record-unreadable', key, line: l.line, quarantinePath, alert: l.line !== lines.length && !(integer(seq) && accepted.has(seq)) && (raw?.kind === 'accepted' || !['fixed', 'sent', 'delivered', 'refused', 'noticed'].includes(String(raw?.kind))) })
       }
     }
-    stored.records = j.records; stored.nextSeq = j.nextSeq; stored.lastInjected = j.lastInjected; stored.items = j.items; stored.slackKeys = j.slackKeys; stored.openCount = j.openCount; stored.loaded = true
+    stored.records = j.records; stored.nextSeq = j.nextSeq; stored.lastInjected = j.lastInjected; stored.items = j.items; stored.reminders = j.reminders; stored.slackKeys = j.slackKeys; stored.openCount = j.openCount; stored.loaded = true
   }
   function rewrite(key: string, records: QueueRecord[]): void {
     const path = pathFor(key), temp = `${path}.${randomUUID()}.tmp`
@@ -337,6 +364,50 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): DeliveryQueu
       fs.renameSync(temp, path); syncDir(dir)
     } finally { try { fs.unlinkSync(temp) } catch { /* rename consumed temp */ } }
   }
+  function lastSend(item: QueueItem): SentRecord | undefined {
+    const refused = new Set(item.records.flatMap(r => r.kind === 'refused' ? [r.attempt] : []))
+    for (let i = item.records.length - 1; i >= 0; i--) {
+      const record = item.records[i]!
+      if (record.kind === 'sent' && !('unknown_outcome' in record) && !refused.has(record.attempt)) return record
+    }
+    return undefined
+  }
+  function unrefusedAttempts(item: QueueItem): number[] {
+    const refused = new Set(item.records.flatMap(r => r.kind === 'refused' ? [r.attempt] : []))
+    return item.records.flatMap(r => r.kind === 'sent' && !refused.has(r.attempt) ? [r.attempt] : [])
+  }
+  function reminderResolved(j: Journal, item: QueueItem): boolean {
+    const record = j.reminders.get(item.accepted.seq)
+    if (!record) return false
+    if (record.state !== 'replied' || record.reply_attempts === undefined) return true
+    const attempts = unrefusedAttempts(item)
+    return record.reply_attempts.some(attempt => attempts.includes(attempt))
+  }
+  /** Derive missing initial facts from CSCB's delivery records, including a torn append. */
+  function ensureReminder(j: Journal, item: QueueItem): void {
+    if (!item.delivered || item.accepted.source !== 'slack' || reminderResolved(j, item)) return
+    const sent = lastSend(item)
+    if (!sent) return
+    j.reminders.set(item.accepted.seq, { v: 1, kind: 'reply-reminder', seq: item.accepted.seq, at: Math.max(...item.records.flatMap(r => r.kind === 'delivered' ? [r.at] : [])), state: 'observed', session_id: sent.session_id, delivery_attempts: unrefusedAttempts(item) })
+  }
+  function replyCandidates(j: Journal): ReplyReminderRecord[] {
+    return [...j.reminders.values()].filter(record => record.state === 'observed')
+  }
+  function replySequences(j: Journal): number[] {
+    return replyTargets(j).map(target => target.seq)
+  }
+  function replyTargets(j: Journal): ReplyCallTarget[] {
+    const targets = new Map(replyCandidates(j).map(record => [record.seq, { seq: record.seq } as ReplyCallTarget]))
+    for (const item of materialize(j)) {
+      if (item.accepted.source !== 'slack') continue
+      const attempts = unrefusedAttempts(item)
+      const previous = j.reminders.get(item.accepted.seq)
+      if (attempts.length && (!previous || previous.state === 'replied')) {
+        targets.set(item.accepted.seq, { seq: item.accepted.seq, ...(item.delivered ? {} : { attempts }) })
+      }
+    }
+    return [...targets.values()]
+  }
   function compactOne(key: string): void {
     load(key)
     const j = journal(key)
@@ -345,6 +416,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): DeliveryQueu
       try { fs.ftruncateSync(fd, j.pendingRollback); fs.fsyncSync(fd); delete j.pendingRollback } finally { fs.closeSync(fd) }
     }
     const at = now(), retained: QueueRecord[] = []
+    const queuedReminders = new Set(materialize(j).flatMap(item => item.accepted.reminder_for === undefined ? [] : [item.accepted.reminder_for]))
     for (const r of j.records) if (r.kind === 'accepted' && 'compact' in r && r.compact === 'key' && at - r.received_at < QUEUE_KEY_KEEP_MS) retained.push(r)
     for (const item of materialize(j)) {
       if (item.delivered) {
@@ -355,6 +427,13 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): DeliveryQueu
         retained.push({ ...item.accepted, attempt_high_watermark: item.nextAttempt - 1 })
         retained.push(...item.records.filter(r => r.kind !== 'accepted' && !((r.kind === 'sent' || r.kind === 'refused') && removable.has(r.attempt))))
       }
+    }
+    // Pending reminder facts contain no delivered body, fixed text, or receipt
+    // path. A terminal fact for an unfinished item prevents re-arming when
+    // its delivery is confirmed later. Completed facts can then disappear.
+    for (const record of j.reminders.values()) {
+      if (queuedReminders.has(record.seq)) continue
+      if (record.state === 'observed' || (j.items.has(record.seq) && !j.items.get(record.seq)!.delivered)) retained.push(record)
     }
     // Preserve both sequence allocation and the injected microsecond watermark forever.
     retained.push({ v: 1, kind: 'accepted', seq: j.nextSeq - 1, compact: 'allocation', ...(j.lastInjected === undefined ? {} : { injected_ts: formatMicros(j.lastInjected) }) })
@@ -371,7 +450,78 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): DeliveryQueu
   async function compact(key?: string): Promise<void> {
     await Promise.all((key ? [key] : [...journals.keys()]).map(k => serial(k, () => { try { compactOne(k) } catch (error) { event({ type: 'compaction-failed', key: k, error }); throw error } })))
   }
-  const api: DeliveryQueue = {
+  /** One append/fsync boundary for reminder facts and their injected delivery. */
+  function appendReminderRecords(key: string, records: QueueRecord[]): void {
+    if (!started || stopped) throw new Error('Queue is not writable')
+    if (!records.length) return
+    const j = journal(key)
+    durableAppend(pathFor(key), Buffer.from(records.map(r => JSON.stringify(r) + '\n').join('')), j)
+    for (const r of records) update(j, r)
+  }
+  const api: ReplyReminderQueue = {
+    replyReminderItems: key => replyCandidates(journal(key)).map(record => structuredClone(record)),
+    replyCallTargets: key => replyTargets(journal(key)),
+    async recordReplyCall(key, targets) {
+      targets = structuredClone(targets)
+      await serial(key, () => {
+        load(key)
+        const j = journal(key), records: ReplyReminderRecord[] = []
+        for (const target of targets) {
+          const previous = j.reminders.get(target.seq)
+          if (previous?.state === 'nudged' || previous?.state === 'cancelled') continue
+          let attempts = target.attempts
+          if (attempts !== undefined) {
+            const item = j.items.get(target.seq)
+            const unrefused = item ? unrefusedAttempts(item) : previous?.delivery_attempts ?? []
+            attempts = attempts.filter(attempt => unrefused.includes(attempt))
+            if (!attempts.length) continue
+            // Concurrent replies can settle in either order; retain the union
+            // of their exact attempts rather than suppressing a later retry.
+            if (previous?.state === 'replied') {
+              if (previous.reply_attempts === undefined) continue
+              attempts = [...new Set([...previous.reply_attempts, ...attempts])]
+            }
+          }
+          records.push({ v: 1, kind: 'reply-reminder', seq: target.seq, at: now(), state: 'replied', ...(attempts === undefined ? {} : { reply_attempts: attempts }) })
+        }
+        appendReminderRecords(key, records)
+      })
+    },
+    async cancelReplyReminders(key) {
+      await serial(key, () => {
+        load(key)
+        appendReminderRecords(key, replySequences(journal(key)).map(seq => ({ v: 1, kind: 'reply-reminder', seq, at: now(), state: 'cancelled' })))
+      })
+    },
+    async observeReplyReminders(key, row, text, enabled, current) {
+      return serial(key, () => {
+        load(key)
+        if (!current()) return []
+        const j = journal(key), records: QueueRecord[] = [], injected: number[] = []
+        let seq = j.nextSeq
+        let injectedAt = j.lastInjected
+        const items = materialize(j)
+        for (const previous of replyCandidates(j)) {
+          const originalSeq = previous.seq
+          const alreadyQueued = items.some(other => other.accepted.reminder_for === originalSeq)
+          const sameLife = previous.session_id === row.session_id && (previous.row_state === undefined || previous.launch_started_at === row.launch_started_at)
+          const cancelled = !enabled || !sameLife || ['pending', 'ended', 'missing', 'error'].includes(row.state)
+          const nudge = !cancelled && previous.row_state === 'working' && row.state === 'waiting'
+          if (!alreadyQueued && !cancelled && !nudge && previous.row_state === row.state && sameLife) continue
+          if (nudge && !alreadyQueued) {
+            const at = now(), candidate = BigInt(Math.trunc(at * 1000))
+            injectedAt = injectedAt === undefined || candidate > injectedAt ? candidate : injectedAt + 1n
+            // Acceptance precedes resolution: a torn append can replay it and
+            // recover the missing resolution without accepting a duplicate.
+            const accepted: AcceptedRecord = { v: 1, kind: 'accepted', seq: seq++, source: 'interject', sender: 'reply-reminder', text, received_at: at, ts: formatMicros(injectedAt), reminder_for: originalSeq }
+            records.push(accepted); injected.push(accepted.seq)
+          }
+          records.push({ v: 1, kind: 'reply-reminder', seq: originalSeq, at: now(), state: cancelled ? 'cancelled' : alreadyQueued || nudge ? 'nudged' : 'observed', row_state: row.state, session_id: row.session_id, launch_started_at: row.launch_started_at, ...(previous.delivery_attempts === undefined ? {} : { delivery_attempts: previous.delivery_attempts }) })
+        }
+        appendReminderRecords(key, records)
+        return injected.map(seq => structuredClone(j.items.get(seq)!))
+      })
+    },
     async start() {
       if (started) return
       ensureDir()
@@ -404,7 +554,7 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): DeliveryQueu
         record = structuredClone(record)
         await serial(key, () => {
           load(key); const j = journal(key)
-          if (!isQueueRecord(record) || record.kind === 'accepted') throw new Error('Invalid append record')
+          if (!isQueueRecord(record) || record.kind === 'accepted' || record.kind === 'reply-reminder') throw new Error('Invalid append record')
           const item = j.items.get(record.seq)
           if (!item) throw new Error('Append has no accepted item')
           // Immutable fixation and stable attempt identifiers allow safe retry after failures.
@@ -418,7 +568,14 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): DeliveryQueu
             if (!item.records.some(r => r.kind === 'sent' && !('unknown_outcome' in r) && r.attempt === attempt)) throw new Error('Refusal has no sent attempt')
           }
           if (record.kind === 'delivered' && (!item.fixed || record.part > item.fixed.parts.length)) throw new Error('Receipt has no fixed part')
-          durableAppend(pathFor(key), Buffer.from(JSON.stringify(record) + '\n'), j); update(j, record)
+          const records: QueueRecord[] = [record]
+          if (record.kind === 'delivered') {
+            const deliveredItem = summarize(item.accepted, [...item.records, record])
+            const sent = lastSend(deliveredItem)
+            if (deliveredItem.delivered && item.accepted.source === 'slack' && sent && !reminderResolved(j, deliveredItem)) records.push({ v: 1, kind: 'reply-reminder', seq: record.seq, at: record.at, state: 'observed', session_id: sent.session_id, delivery_attempts: unrefusedAttempts(deliveredItem) })
+          }
+          durableAppend(pathFor(key), Buffer.from(records.map(r => JSON.stringify(r) + '\n').join('')), j)
+          for (const next of records) update(j, next)
         })
         if (appendBlocked.delete(key)) event({ type: 'writable', key })
       } catch (error) { appendBlocked.add(key); event({ type: 'append-failed', key, path: pathFor(key), seq: record.seq, error }); throw error }
