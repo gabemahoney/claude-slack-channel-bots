@@ -316,7 +316,7 @@ EOF
 
 # Simulate an upgraded installation while preserving an independent user hook.
 write_file "${CLAUDE_SETTINGS}" << 'EOF'
-{"permissions":{"allow":["Read"]},"hooks":{"Stop":[{"hooks":[{"type":"command","command":"/obsolete/slack-reply-guard.sh /obsolete/records"},{"type":"command","command":"/bin/true"}]}]}}
+{"permissions":{"allow":["Read"]},"hooks":{"Stop":[{"hooks":[{"type":"command","command":"/obsolete/slack-reply-guard.sh /obsolete/reply-guard"},{"type":"command","command":"/bin/true"}]}]}}
 EOF
 
 start_server --live
