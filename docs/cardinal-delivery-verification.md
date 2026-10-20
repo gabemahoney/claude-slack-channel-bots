@@ -12,7 +12,7 @@ Receipt-window fix `7e80d089` keeps reconciliation blocked after an AD read fail
 
 Reconnect records input intent before text. Partial or uncertain input resumes with Enter alone; definite text refusal clears intent. Pending control input blocks delivery keys and retains lifecycle retry ownership even after MCP connects. Launch/session change, terminal/absent rows, teardown and shutdown cancel intent and delayed keys.
 
-Documentation follow-up removes working/waiting pane checks, stale screen-duration notices, native final-pane/composer diagnostics, startup approver/trust Enter instructions and the obsolete `working-tmux-gone`/`waiting-row-pane-gone` evidence rows. Outcome-only prompt-row, latch and teardown probes remain. The verified local model, trace, conformance and unit results are recorded below; full `/ci` belongs to the separate runner.
+Documentation follow-up removes working/waiting pane checks, stale screen-duration notices, native final-pane/composer diagnostics, startup approver/trust Enter instructions and the obsolete `working-tmux-gone`/`waiting-row-pane-gone` evidence rows. Outcome-only prompt-row, latch and teardown probes remain. The prior local model, trace, conformance and unit results are recorded below. External CI failed at `712013d9`; the repair and its pending external rerun are recorded separately below.
 
 ## Audit disposition
 
@@ -273,7 +273,7 @@ The isolated targeted run of `tests/delivery-model-conformance.test.ts` and `tes
 
 An independent final validator review checked all 107 input hashes, 266 fixtures, 84 raw logs and the actual 302-file inventory, including refusal of tampered evidence; it returned no findings. This checks evidence integrity and runtime conformance within the recorded scopes, without extending the model to adapter behavior.
 
-### Source/test reviews and full units
+### Source/test reviews and full units before the CI repair
 
 Apiary 3.0.6 was installed after work began. The owner requested fresh whole-branch `$code-review` and `$test-review` with the engineering guide's cardinal rules taking precedence over every spec. Blocking findings were fixed and follow-up reviews returned no findings: receipt-window guard `7e80d089`, integration/test repairs `5ad238f7` and `c282c98f`, model/trace evidence `ea90dab5`, and final assertion correction `0d680462`. The sole ignored documentation review item is the unrelated pre-existing `docs/bots.md` error-conditions table relocation, outside this bug's scope.
 
@@ -281,13 +281,55 @@ Test work retains all four conflict-latch matrices, Claude/Codex prior-session r
 
 The final isolated full unit run passed **30,928 tests, skipped 21 and failed zero**, with 194,924 assertions: 30,949 tests across 181 files in **182.02 s**. Its retained local log is `/tmp/acu-full-units-final306-green.log`. The first full attempt passed 30,927 tests with one stale reconnect expectation; `0d680462` corrects it to assert the exact Enter-only retry after an uncertain reconnect text outcome. That file then passed 577 tests, and the complete final rerun produced the green result above. Final `bun run typecheck` (`tsc --noEmit`) and `git diff --check` also passed, as recorded by the calling agent.
 
-### External CI handoff
+### External CI at `712013d9`: FAIL
 
-Full `/ci` was **NOT RUN HERE**. Per the owner's `/tmp/ci_note.md`, a separate runner owns full branch CI because this worker has no CI credentials. No CI run ID or verdict is available here; the result remains pending with that runner. This is neither a CI pass nor a waiver recorded as PASS. The owner explicitly permits completing local fixes, full isolated units and branch commits before that runner returns its result. No merge or push is performed.
+The external runner tested `712013d984cfa601517f5cb4491e53374b508bb7`. Across the full run and two selective diagnostics, **41 scripts were attempted: 30 passed and 11 failed**. The full gate remains **FAIL**. The selective runs complete coverage and are not independent gate passes. The owner's `/tmp/acu_ci_fix.md` records these results; retained runner artifacts are under `/run/openclaw/horde/cscb-ci-<run id>`.
+
+| Run ID | Scope | Result |
+|---|---|---|
+| `20261020t065929z-5eb1zv8p` | Full CI | FAIL: tests 0, 17, 18, 19, 26 and 41 failed; 20 scripts were initially unexecuted. |
+| `20261020t073737z-a6vejbcb` | Selective diagnostic | FAIL: tests 15, 22 and 35 failed; five newly selected scripts passed, 12 remained unexecuted. |
+| `20261020t080358z-vyxrh33a` | Selective diagnostic | FAIL: source recovery in tests 32 and 33 failed; ten newly selected scripts passed, completing coverage. |
+
+The runner classified tests 32/33 as source recovery stalls: after a worker kill, recovery Enter returned AD `GONE`, but restart delay zero or a stale `waiting` row prevented recovery and left durable work blocked for 180 seconds. The other nine failures were test/fixture mismatches. Its initial test-26 diagnosis was provisional, and test 41's sanitized refusal was class `other`; the exact native refusal reason remains unknown.
+
+### Current CI repair
+
+The delivery engine now preserves a key's actual AD `GONE` evidence for its launch, bars further keys, releases the lifecycle lease and hands recovery to `recoverDeliveryGone` in `session-manager.ts`. That adapter starts the existing checked AD live-row recovery sequence detached from the engine tick; it does not await a sequence that can join launch/reconnect or teardown. Recovery therefore continues with restart delay zero and a stale `waiting` row, while existing applied/up, latch, hold, outage, cap and launch-identity guards remain.
+
+The engine retains a delayed handoff; normal retry ownership may retry a refused sequence. A source-review P1 found that a hold could outlive the original AD session and let retained `GONE` evidence target its replacement. The rework forces a fresh AD `get` before delayed/retried handoff, discards evidence on lifecycle-launch, session or launch-timestamp change, retains work on refused reads and rechecks local guards after the await. Reconnect retries use the same serialized engine tick. An active sequence holds delivery and suppresses deferred reconnect re-arming until it can complete.
+
+A subsequent source-review P2 found that fresh `ErrSpawnNotFound` could leave retained `GONE` blocking the durable queue. The engine now calls the server’s `recoverAbsent` adapter, which transfers recovery through the existing retry controller’s `runNow` even with restart delay zero; only `RAN` or `ARMED` clears retained evidence. `RUNNING` or `CLOSED` retains ownership because an overlapping retry can stop on an older row. The controller re-reads AD before acting and preserves guards and refusal backoff, so a replacement appearing after transfer receives no stale kill or launch.
+
+This repairs adapter ownership without changing the pure delivery policy, lifecycle module or model. No fresh TLC result or adapter-level TLC coverage is claimed. All prior model inputs, evidence, trace inventory and 57 audit dispositions remain intact.
+
+| Failed test | Repair and behavior rationale |
+|---|---|
+| 0 — harness self-check | Initialize/iterate the supported `at-once` reporting fixture so every `REFIRE_PID` lookup exists under `nounset`; retired UI modes cannot leave phantom re-fire entries. |
+| 15 — prefix neighbour | Expect the `at-once` neighbour's own SessionStart and `waiting` row, then require unchanged hook and session identity to prove CSCB left it untouched. |
+| 17 — launch pending | Permit scheduled/deferred recovery diagnostics while pending; structured call/post checks still prohibit launch, pane reads and keys during the hold. |
+| 18 — wedged | Align both audit streams from the originating uncertain text through the first successful Enter, including intervening refusals after the unwedge mark, with matching AD waiting/outcome records and unchanged identity; retained input must not be retyped after an uncertain outcome. |
+| 19 — reuse | Give the fixture an explicit bounded two-second report delay so the authoritative sampler can observe the pending hold. |
+| 22 — wrong server | Require zero automatic startup key calls; the reporting fixture starts itself, and remaining startup dialogs await a human. |
+| 26 — timing settings | Release the persistent lost-create fault only after the first exact timeout/pending-get proof, allowing a healthy next launch; AD transition records and checked recovery govern progress rather than sampler timing. |
+| 35 — real restarts | Require AD to report a new native session before replacement assertions, so the old live row and historical MCP log cannot satisfy the wait. |
+| 41 — real Codex | Stop all observation owners and verify AD retirement before spawning the gate in the shared workdir; the original native refusal's exact reason remains unknown. |
+
+The retained baseline experiment ran the new production recovery regression against `712013d9`'s three source files with an additive export solely for import compatibility: **one pass, five failures** (`/tmp/acu-gone-ci-baseline.log`). With the fixed source, the same six cases passed (`/tmp/acu-gone-ci-fixed.log`). The three focused source suites passed **2,663 tests, zero failures** (`/tmp/acu-gone-three-suites.log`). The Test Writer handoff additionally reports **1,411 passing stub tests**, a subsequent **764-test** final stub run, and real/control checks of **206 and 357 passing tests**. These local checks do not establish a native integration gate result.
+
+The test-review P2 concerned test 18 selecting calls and outcomes at different unwedge boundaries. Its rework uses the same first successful Enter for both streams; seven controls exercise the actual selector, including post-mark refusals and rejected launch/caller/guard changes. The source P1 rework adds 11 regressions covering fresh reads, unannounced session/timestamp replacements, absent/refused reads, guards changed during reads, serialized reconnect retries and eventual recovery. Exhausted-kill coverage uses `KILL_RETRY_TRIES`. That rework's focused Test Writer run passed **885 tests across two files, zero failures**.
+
+The absent-row P2 rework adds seven cases using the real retry controller: permanent `get`/`status` absence with delay zero through tick and reconnect, exact-receipt FIFO drain, replacement before the controller acts, rejected transfer, changed up/launch guards and AD status refusal/backoff. Its initial run passed **127 delivery-engine tests** and typecheck. Nine subsequent ownership regressions exercise the actual extracted server callback, all four `runNow` outcomes, stale-launch rejection, real pending-only retry overlap through tick/reconnect and exact-receipt FIFO drain. The old callback fails three negative-control cases; the final focused run passed **1,069 tests**.
+
+Closing source and test reviews returned no findings, including the complete three-file source repair, the final nine ownership regressions and the startup-wiring assertion correction. The documentation review covered the entire changed repair diff and surrounding contracts and returned no findings; it did not review the complete unchanged architecture and testing guides. No substantive current review finding was ignored; the unrelated historical documentation item above remains recorded.
+
+The final isolated full unit rerun passed **31,014 tests, skipped 21 and failed zero** across **181 files in 180.81 s**. Retained evidence: `/tmp/acu-ci-repair-full-units-green.log` and JUnit `/tmp/acu-ci-repair-full-units-green.xml`. The preceding full attempt passed 31,013 tests, skipped 21 and failed one in 182.10 s: a stale global guard-count assertion in `tests/server-startup-wiring.test.ts`. The correction checks all four guard calls while retaining the restart gate; its focused run passed **282 tests**, fresh review found no findings, and the complete rerun produced the green result above.
+
+The **29 conformance/verdict tests** passed. Final typecheck (`/tmp/acu-ci-repair-green-typecheck.log`) and whitespace checks passed. The earlier 30,928-pass full-unit result belongs to the pre-repair branch; no new TLC run or proof claim is made. Per `/tmp/ci_note.md` and `/tmp/acu_ci_fix.md`, the separate credentialed runner owns the repair's CI rerun. **No post-repair CI pass is claimed.** No merge or push is performed.
 
 ### Branch commits
 
-These are all commits after audited revision `a01d092d` through current source/test HEAD `0d680462`, grouped by bug and shared milestones. The calling agent will commit this final documentation update afterward; no future commit hash is asserted here.
+These are the historical source/test commits after audited revision `a01d092d` through `0d680462`, grouped by bug and shared milestones. Documentation handoff commit `712013d9` followed them and was the external CI target above. The completed repair commits are listed separately below; no future documentation commit hash is asserted here.
 
 | Group | Commit | Change |
 |---|---|---|
@@ -310,11 +352,22 @@ These are all commits after audited revision `a01d092d` through current source/t
 | shared | `fcb93897` | WIP b.acu b.aqj: model AD-only readiness and durable Enter recovery |
 | shared | `eee87067` | WIP b.acu b.aqj: document AD-owned delivery and remove obsolete screen rules |
 
-### Documentation verification
+| CI repair group | Commit | Change |
+|---|---|---|
+| b.aqj | `a8d802a8` | Recover GONE delivery attempts through checked AD recovery; preserve absent-row ownership and audit uncertain reconnect input. |
+| b.acu | `be4e9dbf` | Align CI fixtures with AD-owned launch and retirement state. |
 
-The final targeted documentation run, `bun test tests/shipped-docs.test.ts`, used an isolated scratch launch HOME/state and the host-safety preload. It passed **2,456 tests, zero failures and 3,549 assertions in 10.01 s**; retained local log: `/tmp/acu-docs-final-evidence-shipped.log`. The final documentation diff passes `git diff --check`. All 57 audit rows and their original references remain, every changed tracked `spec/tla` path has a one-line reason, and all 302 actual trace/coverage changes are linked. No unresolved report placeholders remain beyond the explicitly pending external CI result.
+### Documentation verification before the CI repair
+
+The pre-repair targeted documentation run, `bun test tests/shipped-docs.test.ts`, used an isolated scratch launch HOME/state and the host-safety preload. It passed **2,456 tests, zero failures and 3,549 assertions in 10.01 s**; retained local log: `/tmp/acu-docs-final-evidence-shipped.log`. Its documentation diff passed `git diff --check`. All 57 audit rows and their original references remain, every changed tracked `spec/tla` path has a one-line reason, and all 302 actual trace/coverage changes are linked. Current repair validation and external CI status are recorded above.
 
 The earlier stale-reference audit across README, CONTRIBUTING, `docs/*.md`, `tests/README.md` and tracked skills found no removed readiness/approver symbols or screen-based contract; explicit removal rationale in this report and excluded CI-live collection contracts remain. Outcome-only prompt-row/latch/teardown probes and human diagnostic commands are retained. Review of the customer-facing pages found no additional operator changes needed after the existing AD-owned guidance and release notes.
+
+### Current repair documentation verification
+
+The documentation-only diff passes `git diff --check`. A structural comparison against `712013d9` confirms all 57 audit rows and the prior model/helper/config/trace inventory and canonical evidence sections are unchanged, with all three failed CI run IDs and nine repair rationales present. Architecture and testing guidance now describe the GONE/absent-row handoffs, retry ownership and authoritative fixture boundaries; customer-facing guidance needs no additional operator action for this repair.
+
+After final evidence completion, the scoped `bun test tests/shipped-docs.test.ts` run passed **2,456 tests, zero failures and 3,549 assertions in 9.71 s**, using a scratch launch HOME/state, stripped token/persona/Claude config environment and the host-safety preload (`/tmp/acu-docs-ci-final-shipped.log`). No pending local validation placeholders remain; the external CI rerun is still pending.
 
 ## Documentation boundary
 
