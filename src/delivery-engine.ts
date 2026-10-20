@@ -51,6 +51,10 @@ export interface DeliveryEngineDeps {
   onKeyError?(key: string, error: unknown, row: GetResult): Promise<void>
   isRestartPendingOrActive(key: string): boolean
   scheduleRestart(key: string, cwd: string): void
+  /** Hand actual AD GONE evidence to checked recovery; true transfers ownership. */
+  recoverGone?(key: string, row: GetResult, launch: string): boolean
+  /** A fresh get found no row after GONE; true transfers to ordinary recovery. */
+  recoverAbsent?(key: string, launch: string): boolean
   reconnect(key: string, client: DeliveryClient, beforeCall: () => void): Promise<void>
   receiptReader?(): DeliveryReceiptReader
   clock?: DeliveryClock
@@ -91,7 +95,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     reader: DeliveryReceiptReader; receiptTarget?: DeliveryPair; receiptAttempt?: number; deadlines: Partial<Record<DeliveryTimer, number>>; budget: () => void
     rowAt: number; waitingAt?: number; notNowStep: number; retryStep: number; appendRetryStep: number; lastSeq?: number; lastPart?: number
     pending?: { record: QueueRecord; complete(): void }; lease?: () => void; timer?: unknown; busy?: Promise<void>; stopped: boolean
-    restarted?: string; receiptWorking: boolean; pollAfter: number; snapshot?: DeliveryPolicyKnowledge; lastRetypeEvent?: number; dialogHold: boolean; dialogMaybeOpen: boolean; recoveringReconnect?: boolean
+    restarted?: string; gone?: { row: GetResult; launch: string; handedOff?: boolean }; receiptWorking: boolean; pollAfter: number; snapshot?: DeliveryPolicyKnowledge; lastRetypeEvent?: number; dialogHold: boolean; dialogMaybeOpen: boolean; recoveringReconnect?: boolean
   }
   const states = new Map<string, State>(), budgets = new Map<string, () => void>()
   // Empty queues retire their engine, not the already observed launch. Keep
@@ -168,16 +172,58 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
       if (error instanceof DeliveryBudgetWait) throw error
       await deps.onReadError?.(key, error, 'get')
       deps.onError?.(key, error)
-      if (isAdErrorInstance(error, ErrSpawnNotFound)) { life.clearDeferred(key); restart(key, s); wait(key, s, 'state') }
+      if (isAdErrorInstance(error, ErrSpawnNotFound)) {
+        life.clearDeferred(key)
+        const gone = s.gone
+        if (gone && deps.recoverAbsent) {
+          // Absence supersedes the old live-row evidence. Transfer to the
+          // ordinary retry owner, which reads AD again before any launch;
+          // never kill a replacement using this retained row.
+          if (gone.launch === life.launchId(key) && canHandoffGone(key, s) && deps.recoverAbsent(key, gone.launch)) s.gone = undefined
+        } else restart(key, s)
+        wait(key, s, 'state')
+      }
       return false
     }
   }
-  function restart(key: string, s: State): void {
+  function canHandoffGone(key: string, s: State): boolean {
+    return !stopped && !s.stopped && life.active(key) && deps.isUp(key) && !deps.isLatched(key) && !deps.isHeld(key) && life.owner(key) === 'free'
+  }
+  function handoffGone(key: string, s: State, retry = false): void {
+    const gone = s.gone
+    if (!gone) return
+    if (gone.launch !== life.launchId(key)) { s.gone = undefined; return }
+    if (gone.handedOff && !retry) return
+    if (!canHandoffGone(key, s)) return
+    // The sequence runs detached. Awaiting it here could join this engine
+    // again at its launch/reconnect or while teardown waits for this tick.
+    if (deps.recoverGone?.(key, gone.row, gone.launch)) { gone.handedOff = true; life.clearDeferred(key) }
+  }
+  async function refreshGone(key: string, s: State, retry = false): Promise<void> {
+    const gone = s.gone
+    if (!gone) return
+    if (gone.launch !== life.launchId(key)) { s.gone = undefined; return }
+    if ((gone.handedOff && !retry) || !canHandoffGone(key, s)) return
+    // A hold or refused sequence can outlive this AD life. Re-read even
+    // inside the row cache window before using its old GONE evidence.
+    const fresh = await readRow(key, s, true), row = s.row
+    if (s.gone !== gone) return
+    if (gone.launch !== life.launchId(key) || (row && (row.session_id !== gone.row.session_id || row.launch_started_at !== gone.row.launch_started_at))) {
+      s.gone = undefined; return
+    }
+    if (fresh && row) { gone.row = row; handoffGone(key, s, retry) }
+  }
+  function restart(key: string, s: State, goneRow?: GetResult): void {
     const id = life.launchId(key), p = deps.persona(key)
     if (!p || s.restarted === id) return
     // GONE bars every further key in this launch, including when someone
     // else already scheduled its restart (SR-5.6).
     s.restarted = id; release(s)
+    if (goneRow && deps.recoverGone) {
+      s.gone = { row: goneRow, launch: id }
+      handoffGone(key, s)
+      return
+    }
     if (!deps.isRestartPendingOrActive(key)) deps.scheduleRestart(key, p.cwd)
   }
   function build(key: string, s: State): DeliveryPolicyKnowledge {
@@ -249,14 +295,14 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
   }
   async function keyError(key: string, s: State, error: unknown, textCall: boolean): Promise<void> {
     if (error instanceof DeliveryBudgetWait) throw error
-    const row = s.row!
+    const row = s.row!, launch = s.e.launchSeen
     await deps.onKeyError?.(key, error, row)
     if (isAdErrorInstance(error, ErrInvalidFlags) && !deps.onKeyError) await classifyWithInvalidFlagsRecheck(error)
     if (isAdErrorInstance(error, ErrSpawnNotInteractive) || isAdErrorInstance(error, ErrSpawnNotFound)) {
       if (await readRow(key, s, true)) {
         if (s.row?.state === 'ended' || s.row?.state === 'missing') restart(key, s)
       }
-    } else if (classifyAdError(error).errorClass === 'GONE') restart(key, s)
+    } else if (classifyAdError(error).errorClass === 'GONE' && life.launchId(key) === launch) restart(key, s, row)
     s.dialogMaybeOpen = isAdErrorInstance(error, ErrDialogMaybeOpen)
     if (s.dialogMaybeOpen) {
       const fresh = await readRow(key, s, true)
@@ -274,6 +320,9 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     let nextDelay = DELIVERY_ROW_POLL_MS
     let observedPair: DeliveryPair | undefined, readyObserved = false
     try {
+      // A concurrent local hold may have delayed the GONE handoff. This
+      // engine retains it only for the launch whose key call failed.
+      await refreshGone(key, s, s.recoveringReconnect)
       // Finish our own append/call continuations without replacing the key
       // reading. Every new operation obtains a fresh row and gate grant.
       for (let turns = 0; turns < 40 && !stopped && !s.stopped; turns++) {
@@ -479,6 +528,9 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
       api.wake(key)
       const s = states.get(key)!
       const reconciled = (): boolean => {
+        // Retained GONE must be freshly reconciled by the serialized tick
+        // before reconnect may type or retry the checked sequence.
+        if (s.gone?.launch === life.launchId(key)) return false
         const k = build(key, s), pair = selectDeliveryTarget(k)
         if (pair[0] === 0) return true
         const attempt = latestDeliveryAttempt(k, pair)

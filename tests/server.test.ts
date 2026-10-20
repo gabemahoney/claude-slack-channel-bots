@@ -1,5 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
+import { createDeliveryLifecycle } from '../src/delivery-lifecycle.ts'
+import { _setDeliveryLifecycle } from '../src/server.ts'
+import { recoverDeliveryGone, setDeliveryPersonaLookup } from '../src/session-manager.ts'
 
 import type { Client, ClientOptions, FindMissingParams, FindMissingResult, GetParams, KillParams, ReadPaneParams, ReadPaneResult, ResumeParams, SendKeysParams, SendKeysResult, SpawnParams, StatusParams, StatusResult } from 'agent-director'
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
@@ -4756,5 +4759,54 @@ describe('_runCallTimeoutStartStep (b.jg5 SRJ-213)', () => {
 
     expect(logs).toEqual([expectedLine!])
     expectPersonaClientInstalled(DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS)
+  })
+})
+
+describe('b.acu: reconnect adapter respects the checked delivery GONE recovery owner', () => {
+  test.each([false, true])('delivery recovery starts a sequence=%s: only an unowned wait arms deferred reconnect', async startSequence => {
+    const h = makeRecoveryHarness({ harnessNow: true })
+    const key = h.keys[0]!
+    const life = createDeliveryLifecycle({ startId: 'gone-adapter', clock: h.clock })
+    _setDeliveryLifecycle(life)
+    setDeliveryPersonaLookup(appliedLookupOf(h))
+    let row = personaRow(h, key, { state: 'waiting' })
+    h.script({ getFn: () => row, killFn: () => { row = { ...row, state: 'missing' }; return {} } })
+    const hold = holdFindMissing(h.stub.client)
+    const handedOff: boolean[] = []
+    life.setRecovery(async () => {
+      if (startSequence) handedOff.push(recoverDeliveryGone(key, row, life.launchId(key)))
+      return false
+    })
+    try {
+      const reconnect = _buildReconnectSessionAdapter(undefined, k => h.latch.isLatched(k), appliedLookupOf(h))
+      expect(await reconnect(key)).toBe('transient')
+      if (startSequence) {
+        await h.driveSequence(hold.entered(1))
+        expect(handedOff).toEqual([true])
+        expect(h.sequenceRunning(key)).toBe(true)
+        expect(life.deferred(key)).toBeUndefined()
+        // An overlapping reconnect sees the sequence during upgrade
+        // inspection and must still leave it as the only recovery owner.
+        expect(await reconnect(key)).toBe('transient')
+        expect(life.deferred(key)).toBeUndefined()
+        expect(h.stub.calls.killCalls).toHaveLength(1)
+      } else {
+        expect(life.deferred(key)).toEqual({ due: false })
+        expect(h.stub.calls.killCalls).toEqual([])
+      }
+      expect(h.stub.calls.sendKeysCalls).toEqual([])
+      expect(h.stub.calls.readPaneCalls).toEqual([])
+      expect(h.stub.calls.resumeCalls).toEqual([])
+      expect(h.stub.calls.deleteCalls).toEqual([])
+      assertNoLeak(h.captured())
+    } finally {
+      h.shutdown()
+      hold.releaseAll()
+      await h.driveSequence(h.sequenceSettled(key))
+      await life.stop()
+      _setDeliveryLifecycle(undefined)
+      setDeliveryPersonaLookup(() => undefined)
+      h.cleanup()
+    }
   })
 })

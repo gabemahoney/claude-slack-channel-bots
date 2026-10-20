@@ -1661,6 +1661,90 @@ printf '%s' "$GRACE_S"`, ['awk', 'mkdir'])
     expect(output).toBe(expected!)
   })
   const selfCheck = readFileSync(join(import.meta.dir, 'integration/test-0-fmk-harness-self-check.sh'), 'utf8')
+  test.each([
+    'complete', 'one-enter', 'no-results', 'missing-origin', 'duplicate-text', 'foreign-parent', 'changed-instance',
+    'early-enter', 'pane-read', 'bypass', 'changed-launch', 'missing-result', 'premature-ok',
+    'failed-final', 'wrong-row', 'wrong-caller', 'wrong-result-instance',
+  ])('uncertain reconnect recovery keeps originating intent and AD evidence: %s', (mode) => {
+    const text = '--instance-id cscb_control --text /mcp\\ reconnect\\ slack-channel-router --no-enter'
+    const enter = '--instance-id cscb_control --key Enter'
+    const rows = [
+      ['1', '1.000000', '42', 'send-keys', 'cscb_control', text],
+      ['2', '2.000000', '42', 'send-keys', 'cscb_control', enter],
+      ['3', '3.000000', '42', 'send-keys', 'cscb_control', enter],
+    ]
+    const records = rows.map((_, i) => ({ event: 'ad.send_keys.called', instance_id: 'cscb_control', caller_pid: 42,
+      row_state: 'waiting', allow_pending: false, outcome: i === 2 ? 'ok' : 'ErrTmuxUnresponsive' }))
+    if (mode === 'one-enter') { rows.splice(1, 1); records.splice(1, 1) }
+    if (mode === 'no-results') { rows.splice(1, 1); records.splice(0) }
+    if (mode === 'missing-origin') { rows.shift(); records.shift() }
+    if (mode === 'duplicate-text') rows[1]![5] = text
+    if (mode === 'foreign-parent') rows[1]![2] = '43'
+    if (mode === 'changed-instance') rows[1]![4] = 'cscb_other'
+    if (mode === 'early-enter') rows[1]![1] = '1.999999'
+    if (mode === 'pane-read') rows.splice(1, 0, ['2', '1.500000', '42', 'read-pane', 'cscb_control', '--n-lines 1'])
+    if (mode === 'bypass') rows[1]![5] += ' --allow-pending'
+    if (mode === 'changed-launch') rows.splice(1, 0, ['2', '1.500000', '42', 'resume', 'cscb_control', '--instance-id cscb_control'])
+    if (mode === 'missing-result') records.pop()
+    if (mode === 'premature-ok') records[0]!.outcome = 'ok'
+    if (mode === 'failed-final') records[2]!.outcome = 'ErrTmuxUnresponsive'
+    if (mode === 'wrong-row') records[1]!.row_state = 'working'
+    if (mode === 'wrong-caller') records[1]!.caller_pid = 43
+    if (mode === 'wrong-result-instance') records[1]!.instance_id = 'cscb_other'
+    writeFileSync(join(home, 'rows'), rows.map(row => row.join('\t')).join('\n'))
+    writeFileSync(join(home, 'outcomes'), records.map(record => JSON.stringify(record)).join('\n'))
+    const output = shell(`${['_scenario_eval_words', '_scenario_to_us', '_scenario_assert_reconnect_rows'].map(name => helper(name)).join('\n')}
+fail() { printf 'REFUSED: %s\\n' "$*"; exit 1; }
+(_scenario_assert_reconnect_rows fixture 42 1000 "$(cat "$HOME/rows")" "$(cat "$HOME/outcomes")")
+printf 'RESULT=%s' "$?"`, ['cat', 'jq'])
+    expect(output).toContain(mode === 'complete' || mode === 'one-enter' ? 'RESULT=0' : 'RESULT=1')
+  })
+  test.each([
+    'complete', 'changed-launch-during-refusal', 'foreign-parent-during-refusal',
+    'guard-bypass-during-refusal', 'missing-origin', 'missing-success', 'success-before-mark',
+  ])('test-18 actual selector keeps post-mark refusals through the successful Enter: %s', mode => {
+    const source = readFileSync(join(import.meta.dir, 'integration/test-18-fmk-wedged.sh'), 'utf8')
+    // Extract the selector the scenario actually calls, not a second copy of
+    // its awk/jq. A refused Enter after mark=2 precedes the successful one.
+    expect(source).toContain('t18_reconnect_window "${step}: ${p}" "${SERVER_PID}" "${unwedge_mark}" "${calls}" "${outcomes}"')
+    expect(source).toContain('"${T18_RECONNECT_CALLS}" "${T18_RECONNECT_OUTCOMES}"')
+    const text = '--instance-id cscb_control --text /mcp\\ reconnect\\ slack-channel-router --no-enter'
+    const enter = '--instance-id cscb_control --key Enter'
+    const rows = [
+      ['1', '1.000000', '42', 'send-keys', 'cscb_control', text],
+      ['2', '2.000000', '42', 'send-keys', 'cscb_control', enter],
+      ['3', '2.500000', '42', 'get', 'cscb_control', '--instance-id cscb_control'],
+      ['4', '3.000000', '42', 'send-keys', 'cscb_control', enter],
+      ['5', '3.500000', '42', 'get', 'cscb_control', '--instance-id cscb_control'],
+      ['6', '4.000000', '42', 'send-keys', 'cscb_control', enter],
+      // Later activity must not leak into either selected stream.
+      ['7', '4.500000', '42', 'read-pane', 'cscb_control', '--n-lines 1'],
+      ['8', '5.000000', '42', 'send-keys', 'cscb_control', text],
+    ]
+    const records = [1, 2, 3, 4, 5].map((second, i) => ({ event: 'ad.send_keys.called',
+      ts: `1970-01-01T00:00:0${second}.000Z`, instance_id: 'cscb_control', caller_pid: 42,
+      row_state: 'waiting', allow_pending: false, outcome: i >= 3 ? 'ok' : 'ErrTmuxUnresponsive' }))
+    if (mode === 'changed-launch-during-refusal') rows[4]![3] = 'resume'
+    if (mode === 'foreign-parent-during-refusal') rows[3]![2] = '43'
+    if (mode === 'guard-bypass-during-refusal') rows[3]![5] += ' --allow-pending'
+    if (mode === 'missing-origin') rows.shift()
+    if (mode === 'missing-success') records.splice(3)
+    writeFileSync(join(home, 'rows'), rows.map(row => row.join('\t')).join('\n'))
+    writeFileSync(join(home, 'outcomes'), records.map(record => JSON.stringify(record)).join('\n'))
+    const output = shell(`${helper('t18_reconnect_window', source)}
+${['_scenario_eval_words', '_scenario_to_us', '_scenario_assert_reconnect_rows'].map(name => helper(name)).join('\n')}
+fail() { printf 'REFUSED: %s\\n' "$*"; exit 1; }
+(
+t18_reconnect_window fixture 42 ${mode === 'success-before-mark' ? 6 : 2} "$(cat "$HOME/rows")" "$(cat "$HOME/outcomes")"
+_scenario_assert_reconnect_rows fixture 42 1000 "$T18_RECONNECT_CALLS" "$T18_RECONNECT_OUTCOMES"
+printf 'KEYS=%s OUTCOMES=%s LAST=%s\\n' \
+    "$(awk -F '\\t' '$4 == "send-keys" { n++ } END { print n }' <<< "$T18_RECONNECT_CALLS")" \
+    "$(jq -s length <<< "$T18_RECONNECT_OUTCOMES")" \
+    "$(awk -F '\\t' 'END { print $1 }' <<< "$T18_RECONNECT_CALLS")"
+)
+printf 'RESULT=%s' "$?"`, ['cat', 'jq', 'awk'])
+    expect(output).toContain(mode === 'complete' ? 'KEYS=4 OUTCOMES=4 LAST=6\nRESULT=0' : 'RESULT=1')
+  })
   const shimHelpers = ['_scenario_ad_contract', '_scenario_is_shim', '_scenario_check_shim_at', 'check_ad_shim'].map((name) => helper(name)).join('\n')
   const fixturePrelude = `${shimHelpers}
 ${helper('expect_fails_in_home', selfCheck)}

@@ -61,7 +61,7 @@ import type { Client } from 'agent-director'
 import { createDeliveryEngines, createDeliveryLifecycle, type DeliveryEngines, type DeliveryLifecycle, type DeliveryEngineEvent } from './delivery-engine.ts'
 import { createDeliveryAdScope } from './delivery-ad-scope.ts'
 import { parseLaunchStart } from './pending-row.ts'
-import { setDeliveryLifecycle, setDeliveryPersonaLookup, inspectPersonaUpgrade, isTagUpgradePending, hasNotConnectedEpisode, applyDeliveryOwnRowRead, handleDeliveryKeyError, handleDeliveryReadError } from './session-manager.ts'
+import { setDeliveryLifecycle, setDeliveryPersonaLookup, inspectPersonaUpgrade, isTagUpgradePending, hasNotConnectedEpisode, applyDeliveryOwnRowRead, handleDeliveryKeyError, handleDeliveryReadError, recoverDeliveryGone } from './session-manager.ts'
 import type { WebClient } from '@slack/web-api'
 import { join, resolve } from 'path'
 import { fileURLToPath } from 'url'
@@ -102,6 +102,7 @@ import {
   forgetNotConnectedEpisode,
   holdLaunchIfConfigDirUnresolvable,
   isLaunchInFlight,
+  isLiveRowSequenceRunning,
   createOldLifeHoldEndRetry,
   forgetOldLifeWaits,
   isOwnRowOldLifeHeld,
@@ -310,6 +311,8 @@ import {
   UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD,
   UNAVAILABLE_RETRY_CAUSE_READ_ERROR,
   UNAVAILABLE_RETRY_RUN_NOW_HOLD_ENDED,
+  UNAVAILABLE_RETRY_RUN_NOW_RAN,
+  UNAVAILABLE_RETRY_RUN_NOW_ARMED,
   UNAVAILABLE_RETRY_CONDITION_TMUX_UNAVAILABLE,
   UNAVAILABLE_RETRY_CONDITION_TMUX_UNRESPONSIVE,
   UNAVAILABLE_RETRY_STOP_CAPPED,
@@ -1901,10 +1904,10 @@ export function _buildReconnectSessionAdapter(
   // `key` is the persona key.
   const run: (key: string) => Promise<'success' | ReconnectEscalateDead | 'transient' | 'pending'> = async (key: string) => {
     const upgrade = await inspectPersonaUpgrade(key, getPersona?.(key) ?? appliedPersona(key))
-    if (upgrade !== 'current') { deliveryLifecycle?.defer(key); return 'transient' }
+    if (upgrade !== 'current') { if (!isLiveRowSequenceRunning(key)) deliveryLifecycle?.defer(key); return 'transient' }
     if (getSessionByPersona(key)?.connected === true && !deliveryLifecycle?.reconnectInput(key)) { deliveryLifecycle?.clearDeferred(key); return 'success' }
     if (deliveryLifecycle?.owner(key) !== undefined && deliveryLifecycle.owner(key) !== 'free') { deliveryLifecycle.defer(key); return 'transient' }
-    if (deliveryLifecycle && !await deliveryLifecycle.recoverBeforeReconnect(key)) { deliveryLifecycle.defer(key); return 'transient' }
+    if (deliveryLifecycle && !await deliveryLifecycle.recoverBeforeReconnect(key)) { if (!isLiveRowSequenceRunning(key)) deliveryLifecycle.defer(key); return 'transient' }
     let state: string
     // b.jg5 SRJ-115: a `pending` row's raw launch start, for `deferPendingRow`.
     let launchStartedAt: string | undefined
@@ -2041,7 +2044,7 @@ export function _buildReconnectSessionAdapter(
     if (deliveryLifecycle?.deferred(key)) deliveryLifecycle.defer(key)
     const result = await run(key)
     if (result === 'transient' || result === 'pending') {
-      if (!deliveryLifecycle?.deferred(key)) deliveryLifecycle?.defer(key)
+      if (!isLiveRowSequenceRunning(key) && !deliveryLifecycle?.deferred(key)) deliveryLifecycle?.defer(key)
     } else deliveryLifecycle?.clearDeferred(key)
     return result
   }
@@ -3537,7 +3540,7 @@ export async function main(): Promise<void> {
     persona: key => { const p = getAppliedPersona(key); return p ? { cwd: p.working_directory, configDir: resolveClaudeConfigDir(p.claude_config_dir) } : undefined },
     isUp: key => !shuttingDown && isPersonaUp(key),
     isLatched: key => conflictLatch.isLatched(key),
-    isHeld: key => invalidFlagsHold.isHeld(key) || personaKillFailureAlerts?.isOpen(key) === true || waitsOnKillFailedHold(key) || isOwnRowOldLifeHeld(key),
+    isHeld: key => invalidFlagsHold.isHeld(key) || personaKillFailureAlerts?.isOpen(key) === true || waitsOnKillFailedHold(key) || isOwnRowOldLifeHeld(key) || isLiveRowSequenceRunning(key),
     isConnected: key => getSessionByPersona(key)?.connected === true,
     // The engine can notice a newly accepted head while its Slack handler
     // is still acknowledging it. Only post-ack intake/recovery may start
@@ -3548,6 +3551,14 @@ export async function main(): Promise<void> {
     onKeyError: handleDeliveryKeyError,
     onReadError: handleDeliveryReadError,
     isRestartPendingOrActive, scheduleRestart,
+    recoverGone: recoverDeliveryGone,
+    recoverAbsent: (key, launch) => {
+      if (deliveryLifecycle?.launchId(key) !== launch) return false
+      const result = retryTimers.runNow(key, { kind: 'delivery-row-absent' }, 'delivery-row-absent')
+      // An already running retry may stop on a row read from before the
+      // absence. Keep the engine's GONE evidence unless a new pass started.
+      return result === UNAVAILABLE_RETRY_RUN_NOW_RAN || result === UNAVAILABLE_RETRY_RUN_NOW_ARMED
+    },
     onEvent: event => deliveryEngineEvents.emit(event),
     onError: (key, error) => console.error(`[slack] delivery persona=${key}: ${describeThrownValue(error)}`),
     reconnect: (key, client, beforeCall) => deliveryScope.run(key, client as Client, beforeCall, async () => {

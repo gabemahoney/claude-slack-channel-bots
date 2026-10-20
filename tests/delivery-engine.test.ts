@@ -4,9 +4,18 @@ import { MCP_SERVER_NAME } from '../src/config.ts'
  * own suite. Every timestamp and retry is driven by the injected fake clock. */
 import { afterEach, describe, expect, test } from 'bun:test'
 import { readFileSync, statSync } from 'node:fs'
-import { createDeliveryCallBudget, DELIVERY_MAX_AD_CALLS_PER_S, DELIVERY_ROW_POLL_MS, DeliveryBudgetWait, deliveryTextWasRefused, ENTER_DELAY_MS, LAUNCH_SETTLE_MS, NOT_NOW_RETRY_MS, RECEIPT_WAIT_MS, RETYPE_BACKOFF_MS } from '../src/delivery-engine.ts'
-import { cannedPermissionRequest, errCallTimeout, errConfigMalformed, errDialogMaybeOpen, errInternal, errInvalidFlags, errPaneChanged, errRelayFallenBack, errSendKeysWhileRelayed, errSpawnNotFound, errSpawnNotInteractive, errSystemInstallDisappeared, errTmuxNotAvailable, errTmuxSendKeys, errTmuxSessionConflict, errTmuxUnresponsive, errUnusableName } from './test-helpers/agent-director-stub.ts'
+import { join } from 'node:path'
+import { createDeliveryCallBudget, createDeliveryEngines, createDeliveryLifecycle, DELIVERY_MAX_AD_CALLS_PER_S, DELIVERY_ROW_POLL_MS, DeliveryBudgetWait, deliveryTextWasRefused, ENTER_DELAY_MS, LAUNCH_SETTLE_MS, NOT_NOW_RETRY_MS, RECEIPT_WAIT_MS, RETYPE_BACKOFF_MS } from '../src/delivery-engine.ts'
+import { applyDeliveryOwnRowRead, handleDeliveryKeyError, recoverDeliveryGone, setDeliveryLifecycle, setDeliveryPersonaLookup } from '../src/session-manager.ts'
+import { LIVE_ROW_LAUNCH_REASON_KEEPS_CONVERSATION, LIVE_ROW_LAUNCH_RESUME, LIVE_ROW_OUTCOME_LAUNCHED } from '../src/live-row-sequence.ts'
+import { KILL_RETRY_TRIES } from '../src/kill-retry.ts'
+import { UNAVAILABLE_RETRY_MODE_PENDING_ONLY, UNAVAILABLE_RETRY_RUN_NOW_ARMED, UNAVAILABLE_RETRY_RUN_NOW_CLOSED, UNAVAILABLE_RETRY_RUN_NOW_RAN, UNAVAILABLE_RETRY_RUN_NOW_RUNNING, UNAVAILABLE_RETRY_STOP_ROW_LIVE, type UnavailableRetryController, type UnavailableRetryRunNowResult } from '../src/unavailable-retry.ts'
+import { cannedPermissionRequest, errCallTimeout, errConfigMalformed, errDialogMaybeOpen, errInstanceIdCollision, errInternal, errInvalidFlags, errPaneChanged, errRelayFallenBack, errSendKeysWhileRelayed, errSpawnNotFound, errSpawnNotInteractive, errSystemInstallDisappeared, errTmuxNotAvailable, errTmuxSendKeys, errTmuxSessionConflict, errTmuxUnresponsive, errUnusableName } from './test-helpers/agent-director-stub.ts'
 import { makeEngineHarness, type EngineHarness } from './test-helpers/delivery-engine.ts'
+import { injectedInput, makeQueue, readQueue } from './test-helpers/delivery-queue.ts'
+import { assertNoLeak } from './test-helpers/credentials.ts'
+import { makeRecoveryHarness, personaOf, personaRow, retryNow } from './test-helpers/recovery-harness.ts'
+import { balancedAfter, onlyCallArguments, stripComments } from './test-helpers/source-audit.ts'
 import { appendTranscript, codexPromptEntry, endedTurn, promptEntry, queueOperationEntry, replyEntry, writeTranscript } from './test-helpers/working-row-panes.ts'
 
 const harnesses: EngineHarness[] = []
@@ -22,6 +31,651 @@ async function drainTimers(h: EngineHarness) {
   expect(h.queue.openCount('alpha')).toBe(0)
   expect(h.engine.running('alpha')).toBe(false)
 }
+
+// Run main()'s actual callback without starting the server. A copied callback
+// would miss a regression in the production ownership handoff.
+const engineWiring = onlyCallArguments(
+  stripComments(readFileSync(new URL('../src/server.ts', import.meta.url), 'utf8')), 'createDeliveryEngines',
+)
+const absentRecoveryProperty = engineWiring.match(/\brecoverAbsent\s*:/g)
+if (absentRecoveryProperty?.length !== 1) throw new Error('server delivery engine must have one recoverAbsent callback')
+const absentRecoveryStart = engineWiring.indexOf(absentRecoveryProperty[0]!) + absentRecoveryProperty[0]!.length
+const absentRecoveryExpression = engineWiring.slice(absentRecoveryStart, balancedAfter(engineWiring, absentRecoveryStart, '{', '}')[1] + 1)
+const bindAbsentRecovery = new Function(
+  'deliveryLifecycle', 'retryTimers', 'UNAVAILABLE_RETRY_RUN_NOW_RAN', 'UNAVAILABLE_RETRY_RUN_NOW_ARMED',
+  'UNAVAILABLE_RETRY_RUN_NOW_RUNNING', 'UNAVAILABLE_RETRY_RUN_NOW_CLOSED',
+  `return (${absentRecoveryExpression})`,
+) as (
+  lifecycle: Pick<ReturnType<typeof createDeliveryLifecycle>, 'launchId'>,
+  retryTimers: Pick<UnavailableRetryController, 'runNow'>,
+  ...results: UnavailableRetryRunNowResult[]
+) => (key: string, launch: string) => boolean
+function productionAbsentRecovery(
+  lifecycle: Pick<ReturnType<typeof createDeliveryLifecycle>, 'launchId'>,
+  retryTimers: Pick<UnavailableRetryController, 'runNow'>,
+) {
+  return bindAbsentRecovery(lifecycle, retryTimers, UNAVAILABLE_RETRY_RUN_NOW_RAN, UNAVAILABLE_RETRY_RUN_NOW_ARMED,
+    UNAVAILABLE_RETRY_RUN_NOW_RUNNING, UNAVAILABLE_RETRY_RUN_NOW_CLOSED)
+}
+
+/** Restart with an unconfirmed text attempt and a stale AD waiting row.
+ * Only AD's Enter outcome establishes that the old session is gone. */
+async function goneRecovery(options: {
+  delay?: number; pending?: boolean; holdKill?: boolean; refusedKills?: number; keyError?: () => Error; recoverAbsent?: boolean
+} = {}) {
+  const h = makeRecoveryHarness({ personas: [{}], sessionRestartDelay: options.delay ?? 0, harnessNow: true })
+  const key = h.keys[0]!, persona = personaOf(h, key)
+  const lifecycle = createDeliveryLifecycle({ startId: 'gone-recovery', clock: h.clock })
+  setDeliveryLifecycle(lifecycle)
+  setDeliveryPersonaLookup(k => k === key ? persona : undefined)
+  let queue = await makeQueue(h.stateDir, { now: h.clock.now })
+  let path = join(h.stateDir, 'old-session.jsonl')
+  writeTranscript(path, [])
+  let row = personaRow(h, key, { state: 'waiting', session_id: 'old-session', jsonl_path: path })
+  let resumed = false, draft = '', failed = false, restartAsks = 0, handoffs = 0, killAttempts = 0, up = true
+  let readError: Error | undefined, statusError: Error | undefined, beforeGet: (() => Promise<void>) | undefined
+  let afterKeyError: (() => void) | undefined
+  let absent = false, acceptAbsent = true, absentHandoffs = 0
+  let releaseKill!: () => void, enteredKill!: () => void
+  const heldKill = new Promise<void>(resolve => { releaseKill = resolve })
+  const killEntered = new Promise<void>(resolve => { enteredKill = resolve })
+  const keys: string[] = [], owners: string[] = [], errors: unknown[] = [], recoveryCalls: string[] = []
+  const absentResults: UnavailableRetryRunNowResult[] = []
+  const recoverAbsent = productionAbsentRecovery(lifecycle, {
+    runNow(...args) {
+      const result = h.controller.runNow(...args)
+      absentResults.push(result)
+      return result
+    },
+  })
+  h.script({
+    spawnFn: () => {
+      if (!absent) return errInstanceIdCollision()
+      absent = false; resumed = true
+      path = join(h.stateDir, 'spawned-session.jsonl')
+      writeTranscript(path, [])
+      row = { ...row, state: 'waiting', session_id: 'spawned-session', jsonl_path: path, launch_started_at: new Date(h.clock.now()).toISOString() }
+      return { instance_id: row.instance_id }
+    },
+    getFn: () => readError ?? (absent ? errSpawnNotFound() : { ...row }),
+    statusFn: () => statusError ?? (absent ? errSpawnNotFound() : { state: row.state }),
+    sendKeysFn(params) {
+      keys.push(params.key ?? params.text ?? '')
+      if (!resumed) { failed = true; return options.keyError?.() ?? errTmuxSendKeys() }
+      if (params.no_enter) draft = params.text!
+      else if (draft) { appendTranscript(path, [promptEntry(draft)]); draft = '' }
+      return {}
+    },
+    async killFn() {
+      enteredKill()
+      if (options.holdKill) await heldKill
+      if (killAttempts++ < (options.refusedKills ?? 0)) return errCallTimeout('kill')
+      row = { ...row, state: 'missing' }
+      return {}
+    },
+    resumeFn() {
+      resumed = true
+      row = { ...row, state: 'waiting', launch_started_at: new Date(h.clock.now()).toISOString() }
+      return { instance_id: row.instance_id }
+    },
+  })
+  for (let n = 0; n < 3; n++) {
+    const accepted = await queue.accept(key, injectedInput({ text: `message ${n}` }))
+    if (accepted.status === 'failed') throw new Error('fixture acceptance failed')
+    await queue.append(key, { v: 1, kind: 'fixed', seq: accepted.seq, parts: [`message ${n}`] })
+    if (n === 0) await queue.append(key, {
+      v: 1, kind: 'sent', seq: accepted.seq, part: 1, attempt: 1, send_kind: 'text', at: 0,
+      launch_id: 'previous-process', session_id: row.session_id, transcript_path: path, transcript_size: 0,
+    })
+  }
+  // Reopen the actual on-disk journal as a new server process would.
+  await queue.stop()
+  queue = await makeQueue(h.stateDir, { now: h.clock.now })
+  const engine = createDeliveryEngines({
+    queue, lifecycle, clock: h.clock,
+    constants: { LAUNCH_SETTLE_MS: 1, ENTER_DELAY_MS: 1, RECEIPT_WAIT_MS: 10, RETYPE_BACKOFF_MS: [10], NOT_NOW_RETRY_MS: [1] },
+    clientFor: async () => h.stub.client, instanceId: () => row.instance_id,
+    call: async (_key, verb, client, run) => {
+      if (verb === 'get') { recoveryCalls.push('get'); await beforeGet?.() }
+      return run(client)
+    },
+    persona: () => ({ cwd: persona.working_directory }), isUp: () => up,
+    isLatched: () => h.latch.isLatched(key), isHeld: () => h.sequenceRunning(key), isConnected: () => resumed,
+    prepare: async () => {}, onRow: applyDeliveryOwnRowRead,
+    onKeyError: async (...args) => { await handleDeliveryKeyError(...args); afterKeyError?.() },
+    isRestartPendingOrActive: () => options.pending ?? false, scheduleRestart: () => { restartAsks++ },
+    recoverGone: (...args) => { recoveryCalls.push('handoff'); handoffs++; owners.push(lifecycle.owner(key)); return recoverDeliveryGone(...args) },
+    recoverAbsent: options.recoverAbsent ? (key, launch) => {
+      recoveryCalls.push('absent-handoff'); absentHandoffs++
+      return acceptAbsent && recoverAbsent(key, launch)
+    } : undefined,
+    reconnect: async () => {}, onError: (_key, error) => errors.push(error),
+  })
+  return {
+    h, key, queue, engine, lifecycle, keys, owners, errors, recoveryCalls, absentResults, killEntered, releaseKill,
+    failed: () => failed, resumed: () => resumed, restarts: () => restartAsks, handoffs: () => handoffs,
+    absentHandoffs: () => absentHandoffs,
+    setAbsent(value: boolean) { absent = value },
+    acceptAbsent(value: boolean) { acceptAbsent = value },
+    replaceWithHealthyRow() {
+      absent = false; resumed = true
+      path = join(h.stateDir, 'replacement-session.jsonl')
+      writeTranscript(path, [])
+      row = { ...row, session_id: 'replacement-session', jsonl_path: path, launch_started_at: new Date(h.clock.now() + 1).toISOString() }
+      h.setConnected(key, true)
+    },
+    afterKeyError: (hook: () => void) => { afterKeyError = hook },
+    setUp(value: boolean) { up = value; h.setUp(key, value) },
+    changeRow(patch: Partial<typeof row>) { row = { ...row, ...patch } },
+    failReads(error?: Error) { readError = error },
+    failStatusReads(error?: Error) { statusError = error },
+    beforeGet(hook?: () => Promise<void>) { beforeGet = hook },
+    async advance() { await h.clock.advance(1000); await engine.tick(key) },
+    async failRecoveryEnter() {
+      expect((await h.launch(key)).action).toBe('retrying')
+      for (let n = 0; n < 100 && !failed; n++) await this.advance()
+      expect(failed).toBe(true)
+      expect(keys[0]).toBe('Enter')
+    },
+    async cleanup() {
+      h.shutdown()
+      releaseKill()
+      await engine.stop()
+      await h.driveSequence(h.sequenceSettled(key))
+      await queue.stop()
+      await lifecycle.stop()
+      setDeliveryLifecycle(undefined)
+      setDeliveryPersonaLookup(() => undefined)
+      try { assertNoLeak(h.captured()); expect(h.clock.pending()).toEqual([]) } finally { h.cleanup() }
+    },
+  }
+}
+
+describe('b.acu: AD GONE during durable startup recovery', () => {
+  test.each([0, 60].flatMap(delay => [false, true].map(pending => [delay, pending] as const)))(
+    'delay=%s, ordinary restart pending=%s: checked recovery resumes the conversation and drains FIFO', async (delay, pending) => {
+      const f = await goneRecovery({ delay, pending })
+      try {
+        expect(f.queue.openCount(f.key)).toBe(3)
+        await f.failRecoveryEnter()
+        expect(await f.h.driveSequence(f.h.sequenceSettled(f.key))).toMatchObject({
+          kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_RESUME, reason: LIVE_ROW_LAUNCH_REASON_KEEPS_CONVERSATION,
+        })
+        expect(f.resumed()).toBe(true)
+        expect(f.handoffs()).toBe(1)
+        expect(f.owners).toEqual(['free'])
+        expect(f.restarts()).toBe(0)
+        expect(f.h.stub.calls.killCalls).toHaveLength(1)
+        expect(f.h.stub.calls.findMissingCalls).toHaveLength(1)
+        expect(f.h.stub.calls.resumeCalls).toHaveLength(1)
+        expect(f.h.stub.calls.resumeCalls[0]!.instance_id).toBe(f.h.stub.calls.killCalls[0]!.instance_id)
+        expect(f.h.stub.calls.deleteCalls).toEqual([])
+        expect(f.h.stub.calls.readPaneCalls).toEqual([])
+        for (let n = 0; n < 200 && f.queue.openCount(f.key); n++) await f.advance()
+        expect(f.queue.openCount(f.key)).toBe(0)
+        // The resumed conversation checks the retained draft with Enter
+        // before receipt expiry permits retyping the head.
+        expect(f.keys).toEqual(['Enter', 'Enter', 'message 0', 'Enter', 'message 1', 'Enter', 'message 2', 'Enter'])
+        expect(readQueue(f.h.stateDir, f.key).filter(r => r.kind === 'delivered').map(r => r.seq)).toEqual([1, 2, 3])
+        expect(f.errors).toEqual([])
+      } finally { await f.cleanup() }
+    },
+  )
+
+  test('shutdown with a checked kill in flight stops the engine without waiting on its detached sequence', async () => {
+    const f = await goneRecovery({ holdKill: true })
+    try {
+      await f.failRecoveryEnter()
+      await f.h.driveSequence(f.killEntered)
+      expect(f.h.sequenceRunning(f.key)).toBe(true)
+      f.h.shutdown()
+      await f.engine.stop()
+      const count = f.keys.length
+      f.releaseKill()
+      await f.h.driveSequence(f.h.sequenceSettled(f.key))
+      expect(f.keys).toHaveLength(count)
+      expect(f.h.stub.calls.resumeCalls).toEqual([])
+      expect(f.queue.openCount(f.key)).toBe(3)
+    } finally { await f.cleanup() }
+  })
+
+  test('a not-up guard retains GONE without keys until bring-up allows checked recovery', async () => {
+    const f = await goneRecovery()
+    try {
+      f.afterKeyError(() => f.setUp(false))
+      await f.failRecoveryEnter()
+      const count = f.keys.length
+      for (let n = 0; n < 5; n++) await f.advance()
+      expect(f.h.stub.calls.killCalls).toEqual([])
+      expect(f.keys).toHaveLength(count)
+      f.setUp(true)
+      await f.advance()
+      await f.h.driveSequence(f.h.sequenceSettled(f.key))
+      expect(f.h.stub.calls.killCalls).toHaveLength(1)
+      expect(f.h.stub.calls.resumeCalls).toHaveLength(1)
+      expect(f.restarts()).toBe(0)
+    } finally { await f.cleanup() }
+  })
+
+  test('a launch changed during GONE classification receives none of the old launch handoff', async () => {
+    const f = await goneRecovery()
+    try {
+      f.afterKeyError(() => f.lifecycle.beforeLaunch(f.key))
+      await f.failRecoveryEnter()
+      expect(f.handoffs()).toBe(0)
+      expect(f.h.stub.calls.killCalls).toEqual([])
+      expect(f.h.stub.calls.resumeCalls).toEqual([])
+      expect(f.restarts()).toBe(0)
+    } finally { await f.cleanup() }
+  })
+
+  const retryGone = (f: Awaited<ReturnType<typeof goneRecovery>>, via: 'tick' | 'reconnect') =>
+    via === 'tick' ? f.engine.tick(f.key) : f.engine.recoverBeforeReconnect(f.key)
+
+  async function retainGoneThenRemoveRow(f: Awaited<ReturnType<typeof goneRecovery>>) {
+    f.afterKeyError(() => f.setUp(false))
+    await f.failRecoveryEnter()
+    f.setAbsent(true)
+    f.setUp(true)
+    f.recoveryCalls.length = 0
+  }
+
+  async function expectExactFifoAfterAbsentRecovery(f: Awaited<ReturnType<typeof goneRecovery>>) {
+    for (let n = 0; n < 200 && f.queue.openCount(f.key); n++) await f.advance()
+    expect(f.queue.openCount(f.key)).toBe(0)
+    expect(f.keys.filter(k => k !== 'Enter')).toEqual(['message 0', 'message 1', 'message 2'])
+    expect(readQueue(f.h.stateDir, f.key).filter(r => r.kind === 'delivered').map(r => [r.seq, r.part])).toEqual([[1, 1], [2, 1], [3, 1]])
+    // Further wakes cannot repeat a persisted receipt or a delivered part.
+    const keys = [...f.keys]
+    for (let n = 0; n < 3; n++) await f.advance()
+    expect(f.keys).toEqual(keys)
+    expect(readQueue(f.h.stateDir, f.key).filter(r => r.kind === 'delivered')).toHaveLength(3)
+  }
+
+  test.each([
+    [UNAVAILABLE_RETRY_RUN_NOW_RAN, true],
+    [UNAVAILABLE_RETRY_RUN_NOW_ARMED, true],
+    [UNAVAILABLE_RETRY_RUN_NOW_RUNNING, false],
+    [UNAVAILABLE_RETRY_RUN_NOW_CLOSED, false],
+  ] as const)('server absent callback reports ownership correctly for %s', (result, accepted) => {
+    const calls: unknown[][] = []
+    const recover = productionAbsentRecovery({ launchId: () => 'current' }, {
+      runNow: (...args) => { calls.push(args); return result },
+    })
+    expect(recover('alpha', 'current')).toBe(accepted)
+    expect(calls).toEqual([['alpha', { kind: 'delivery-row-absent' }, 'delivery-row-absent']])
+  })
+
+  test('server absent callback rejects a stale launch without asking the retry controller', () => {
+    const calls: unknown[][] = []
+    const recover = productionAbsentRecovery({ launchId: () => 'replacement' }, {
+      runNow: (...args) => { calls.push(args); return UNAVAILABLE_RETRY_RUN_NOW_ARMED },
+    })
+    expect(recover('alpha', 'old-launch')).toBe(false)
+    expect(calls).toEqual([])
+  })
+
+  test.each(['tick', 'reconnect'] as const)('%s retains GONE when an overlapping pending-only retry stops on an older waiting result', async via => {
+    const f = await goneRecovery({ recoverAbsent: true })
+    let release!: () => void, entered!: () => void
+    const held = new Promise<void>(resolve => { release = resolve })
+    const observedWaiting = new Promise<void>(resolve => { entered = resolve })
+    try {
+      await retainGoneThenRemoveRow(f)
+      f.setAbsent(false)
+      // Let the real pending-only action observe AD waiting, then delay its
+      // result reaching the controller until the engine has observed absence.
+      f.h.setAction(async (key, attempt) => {
+        const outcome = await f.h.fullModeAction(key, attempt)
+        expect(attempt.mode).toBe(UNAVAILABLE_RETRY_MODE_PENDING_ONLY)
+        expect(outcome).toEqual({ kind: 'stop', reason: UNAVAILABLE_RETRY_STOP_ROW_LIVE, row: 'waiting', yieldsToFullMode: true })
+        entered()
+        await held
+        return outcome
+      })
+      f.h.controller.armPendingOnly(f.key)
+      expect(f.h.controller.runNow(f.key, { kind: 'pending-row' }, 'pending-row')).toBe(UNAVAILABLE_RETRY_RUN_NOW_RAN)
+      await observedWaiting
+      f.setAbsent(true)
+      await retryGone(f, via)
+      expect(f.absentResults).toEqual([UNAVAILABLE_RETRY_RUN_NOW_RUNNING])
+      expect(f.queue.openCount(f.key)).toBe(3)
+      expect(f.keys).toEqual(['Enter'])
+      release()
+      await f.h.settle()
+      expect(f.h.controller.view(f.key)).toBeUndefined()
+      expect(f.resumed()).toBe(false)
+      expect(f.h.stub.calls.spawnCalls).toHaveLength(1)
+      f.h.setAction(undefined)
+      // No clock advance: retained GONE must force the next fresh absence
+      // handoff even while the engine's ordinary row cache would still apply.
+      await f.engine.tick(f.key)
+      await f.h.settle()
+      expect(f.absentResults).toEqual([UNAVAILABLE_RETRY_RUN_NOW_RUNNING, UNAVAILABLE_RETRY_RUN_NOW_ARMED])
+      expect(f.resumed()).toBe(true)
+      expect(f.h.stub.calls.killCalls).toEqual([])
+      expect(f.h.stub.calls.resumeCalls).toEqual([])
+      expect(f.h.stub.calls.readPaneCalls).toEqual([])
+      expect(f.restarts()).toBe(0)
+      await expectExactFifoAfterAbsentRecovery(f)
+    } finally { release(); await f.cleanup() }
+  })
+
+  test('an already armed retry accepts absent GONE ownership and drains exact FIFO receipts', async () => {
+    const f = await goneRecovery({ recoverAbsent: true })
+    try {
+      await retainGoneThenRemoveRow(f)
+      f.h.controller.arm(f.key, { kind: 'read-error' })
+      await f.engine.tick(f.key)
+      await f.h.settle()
+      expect(f.absentResults).toEqual([UNAVAILABLE_RETRY_RUN_NOW_RAN])
+      expect(f.resumed()).toBe(true)
+      await expectExactFifoAfterAbsentRecovery(f)
+      expect(f.absentHandoffs()).toBe(1)
+    } finally { await f.cleanup() }
+  })
+
+  test('a closed retry controller leaves absent GONE retryable without keys or queue loss', async () => {
+    const f = await goneRecovery({ recoverAbsent: true })
+    try {
+      await retainGoneThenRemoveRow(f)
+      f.h.controller.close('test shutdown')
+      await f.engine.tick(f.key)
+      await f.engine.tick(f.key)
+      expect(f.absentResults).toEqual([UNAVAILABLE_RETRY_RUN_NOW_CLOSED, UNAVAILABLE_RETRY_RUN_NOW_CLOSED])
+      expect(f.h.attempts).toEqual([])
+      expect(f.h.stub.calls.spawnCalls).toHaveLength(1)
+      expect(f.h.stub.calls.killCalls).toEqual([])
+      expect(f.keys).toEqual(['Enter'])
+      expect(f.queue.openCount(f.key)).toBe(3)
+      expect(readQueue(f.h.stateDir, f.key).filter(r => r.kind === 'delivered')).toEqual([])
+    } finally { await f.cleanup() }
+  })
+
+  test.each(['tick', 'reconnect'] as const)('%s transfers permanently absent GONE to real retry recovery with delay=0 and drains exact FIFO receipts', async via => {
+    const f = await goneRecovery({ delay: 0, recoverAbsent: true })
+    try {
+      await retainGoneThenRemoveRow(f)
+      await retryGone(f, via)
+      await f.h.settle()
+      expect(f.recoveryCalls.slice(0, 2)).toEqual(['get', 'absent-handoff'])
+      expect(f.absentHandoffs()).toBe(1)
+      expect(f.handoffs()).toBe(0)
+      expect(f.h.attempts.some(a => a.causes.includes('delivery-row-absent'))).toBe(true)
+      expect(f.resumed()).toBe(true)
+      expect(f.h.stub.calls.spawnCalls).toHaveLength(2) // original collision, then absent-row spawn
+      expect(f.h.stub.calls.killCalls).toEqual([])
+      expect(f.h.stub.calls.resumeCalls).toEqual([])
+      expect(f.h.stub.calls.deleteCalls).toEqual([])
+      expect(f.h.stub.calls.readPaneCalls).toEqual([])
+      expect(f.restarts()).toBe(0)
+      await expectExactFifoAfterAbsentRecovery(f)
+      expect(f.absentHandoffs()).toBe(1)
+    } finally { await f.cleanup() }
+  })
+
+  test('a healthy replacement appearing after absent transfer is re-read by the retry owner without a stale kill', async () => {
+    const f = await goneRecovery({ recoverAbsent: true })
+    let release!: () => void
+    const held = new Promise<void>(resolve => { release = resolve })
+    try {
+      await retainGoneThenRemoveRow(f)
+      f.h.setAction(async (key, attempt) => { await held; return f.h.fullModeAction(key, attempt) })
+      await f.engine.tick(f.key)
+      expect(f.absentHandoffs()).toBe(1)
+      expect(f.queue.openCount(f.key)).toBe(3)
+      expect(f.keys).toEqual(['Enter'])
+      f.replaceWithHealthyRow()
+      release()
+      await f.h.settle()
+      expect(f.h.stub.calls.killCalls).toEqual([])
+      expect(f.h.stub.calls.spawnCalls).toHaveLength(1)
+      expect(f.h.stub.calls.resumeCalls).toEqual([])
+      await expectExactFifoAfterAbsentRecovery(f)
+    } finally { release(); await f.cleanup() }
+  })
+
+  test('a rejected absent transfer keeps GONE retryable without queue loss or keys', async () => {
+    const f = await goneRecovery({ recoverAbsent: true })
+    try {
+      await retainGoneThenRemoveRow(f)
+      f.acceptAbsent(false)
+      await f.engine.tick(f.key)
+      expect(f.absentHandoffs()).toBe(1)
+      expect(f.h.attempts).toEqual([])
+      expect(f.h.stub.calls.killCalls).toEqual([])
+      expect(f.keys).toEqual(['Enter'])
+      expect(f.queue.openCount(f.key)).toBe(3)
+      expect(readQueue(f.h.stateDir, f.key).filter(r => r.kind === 'delivered')).toEqual([])
+      f.acceptAbsent(true)
+      await f.engine.tick(f.key) // same clock: force a fresh absence read
+      await f.h.settle()
+      expect(f.absentHandoffs()).toBe(2)
+      expect(f.resumed()).toBe(true)
+      await expectExactFifoAfterAbsentRecovery(f)
+    } finally { await f.cleanup() }
+  })
+
+  test('accepted absent recovery preserves the real retry backoff after an AD status refusal', async () => {
+    const f = await goneRecovery({ recoverAbsent: true })
+    try {
+      await retainGoneThenRemoveRow(f)
+      f.failStatusReads(errCallTimeout('status'))
+      await f.engine.tick(f.key)
+      await f.h.settle()
+      expect(f.absentHandoffs()).toBe(1)
+      expect(f.h.attempts).toHaveLength(1)
+      const retry = f.h.controller.view(f.key)!
+      expect(retry.dueAt).toBeGreaterThan(f.h.clock.now())
+      expect(f.h.stub.calls.spawnCalls).toHaveLength(1)
+      expect(f.keys).toEqual(['Enter'])
+      expect(f.queue.openCount(f.key)).toBe(3)
+      for (let n = 0; n < 3; n++) await f.engine.tick(f.key)
+      expect(f.h.controller.view(f.key)).toEqual(retry)
+      expect(f.h.attempts).toHaveLength(1)
+      expect(f.absentHandoffs()).toBe(1)
+      f.failStatusReads()
+      expect(await retryNow(f.h, f.key)).toBe(retry.dueAt!)
+      expect(f.resumed()).toBe(true)
+      expect(f.h.stub.calls.killCalls).toEqual([])
+      expect(f.h.stub.calls.resumeCalls).toEqual([])
+      await expectExactFifoAfterAbsentRecovery(f)
+    } finally { await f.cleanup() }
+  })
+
+  test.each(['not up', 'new launch'] as const)('absence read rechecks %s before transferring retained GONE', async guard => {
+    const f = await goneRecovery({ recoverAbsent: true })
+    try {
+      await retainGoneThenRemoveRow(f)
+      f.beforeGet(async () => {
+        if (guard === 'not up') f.setUp(false)
+        else f.lifecycle.beforeLaunch(f.key)
+      })
+      await f.engine.tick(f.key)
+      expect(f.absentHandoffs()).toBe(0)
+      expect(f.h.attempts).toEqual([])
+      expect(f.h.stub.calls.killCalls).toEqual([])
+      expect(f.h.stub.calls.spawnCalls).toHaveLength(1)
+      expect(f.keys).toEqual(['Enter'])
+      expect(f.queue.openCount(f.key)).toBe(3)
+      expect(readQueue(f.h.stateDir, f.key).filter(r => r.kind === 'delivered')).toEqual([])
+      if (guard === 'not up') {
+        f.beforeGet()
+        f.setUp(true)
+        await f.engine.tick(f.key)
+        await f.h.settle()
+        expect(f.absentHandoffs()).toBe(1)
+        await expectExactFifoAfterAbsentRecovery(f)
+      }
+    } finally { await f.cleanup() }
+  })
+
+  test.each((['tick', 'reconnect'] as const).flatMap(via =>
+    (['session', 'launch timestamp'] as const).map(identity => [via, identity] as const),
+  ))('%s freshly rejects retained GONE after an unannounced AD %s change', async (via, identity) => {
+    const f = await goneRecovery()
+    try {
+      f.afterKeyError(() => f.setUp(false))
+      await f.failRecoveryEnter()
+      expect(f.handoffs()).toBe(0)
+      const launch = f.lifecycle.launchId(f.key), keys = f.keys.length
+      // No lifecycle notification: the next get is the only way to learn
+      // that another process replaced the launch while bring-up held it.
+      f.changeRow(identity === 'session' ? { session_id: 'replacement-session' }
+        : { launch_started_at: new Date(f.h.clock.now() + 1).toISOString() })
+      expect(f.lifecycle.launchId(f.key)).toBe(launch)
+      f.setUp(true)
+      f.recoveryCalls.length = 0
+      await retryGone(f, via)
+      expect(f.recoveryCalls[0]).toBe('get')
+      expect(f.lifecycle.launchId(f.key)).not.toBe(launch)
+      expect(f.handoffs()).toBe(0)
+      expect(f.h.stub.calls.killCalls).toEqual([])
+      expect(f.h.stub.calls.resumeCalls).toEqual([])
+      expect(f.keys).toHaveLength(keys)
+      expect(f.queue.openCount(f.key)).toBe(3)
+      expect(readQueue(f.h.stateDir, f.key).filter(r => r.kind === 'delivered')).toEqual([])
+    } finally { await f.cleanup() }
+  })
+
+  test.each((['tick', 'reconnect'] as const).flatMap(via => [
+    [via, 'unreadable', () => errCallTimeout('get')],
+    [via, 'absent', () => errSpawnNotFound()],
+  ] as const))('%s retains GONE and queued work while the fresh AD row is %s', async (via, _label, makeError) => {
+    const f = await goneRecovery()
+    try {
+      f.afterKeyError(() => f.setUp(false))
+      await f.failRecoveryEnter()
+      const keys = f.keys.length, error = makeError()
+      f.failReads(error)
+      f.setUp(true)
+      f.recoveryCalls.length = 0
+      await retryGone(f, via)
+      expect(f.recoveryCalls[0]).toBe('get')
+      expect(f.handoffs()).toBe(0)
+      expect(f.h.stub.calls.killCalls).toEqual([])
+      expect(f.h.stub.calls.resumeCalls).toEqual([])
+      expect(f.keys).toHaveLength(keys)
+      expect(f.queue.openCount(f.key)).toBe(3)
+      expect(readQueue(f.h.stateDir, f.key).filter(r => r.kind === 'delivered')).toEqual([])
+      expect(f.errors.length).toBeGreaterThan(0)
+      expect(f.errors.every(e => e === error)).toBe(true)
+      // Retry without advancing the clock: retained GONE must bypass the
+      // row cache, and the unchanged life must eventually resume normally.
+      f.failReads()
+      f.recoveryCalls.length = 0
+      await retryGone(f, via)
+      expect(f.recoveryCalls.slice(0, 2)).toEqual(['get', 'handoff'])
+      await f.h.driveSequence(f.h.sequenceSettled(f.key))
+      expect(f.handoffs()).toBe(1)
+      expect(f.resumed()).toBe(true)
+      expect(f.h.stub.calls.killCalls).toHaveLength(1)
+      expect(f.h.stub.calls.resumeCalls).toHaveLength(1)
+      for (let n = 0; n < 200 && f.queue.openCount(f.key); n++) await f.advance()
+      expect(f.queue.openCount(f.key)).toBe(0)
+    } finally { await f.cleanup() }
+  })
+
+  test.each(['tick', 'reconnect'] as const)('%s rechecks a not-up guard changed during the fresh GONE get', async via => {
+    const f = await goneRecovery()
+    let release!: () => void
+    const held = new Promise<void>(resolve => { release = resolve })
+    let entered!: () => void
+    const reading = new Promise<void>(resolve => { entered = resolve })
+    try {
+      f.afterKeyError(() => f.setUp(false))
+      await f.failRecoveryEnter()
+      f.setUp(true)
+      f.beforeGet(() => { entered(); return held })
+      f.recoveryCalls.length = 0
+      const retry = retryGone(f, via)
+      await reading
+      f.setUp(false)
+      release()
+      await retry
+      expect(f.recoveryCalls).toEqual(['get'])
+      expect(f.handoffs()).toBe(0)
+      expect(f.h.stub.calls.killCalls).toEqual([])
+      expect(f.keys).toEqual(['Enter'])
+      expect(f.queue.openCount(f.key)).toBe(3)
+      f.beforeGet()
+      f.setUp(true)
+      f.recoveryCalls.length = 0
+      await retryGone(f, via)
+      expect(f.recoveryCalls.slice(0, 2)).toEqual(['get', 'handoff'])
+      await f.h.driveSequence(f.h.sequenceSettled(f.key))
+      expect(f.resumed()).toBe(true)
+    } finally { release(); await f.cleanup() }
+  })
+
+  test('reconnect defers to an in-flight GONE refresh without another read or handoff', async () => {
+    const f = await goneRecovery()
+    let release!: () => void
+    const held = new Promise<void>(resolve => { release = resolve })
+    let entered!: () => void
+    const reading = new Promise<void>(resolve => { entered = resolve })
+    try {
+      f.afterKeyError(() => f.setUp(false))
+      await f.failRecoveryEnter()
+      f.setUp(true)
+      f.beforeGet(() => { entered(); return held })
+      f.recoveryCalls.length = 0
+      const tick = f.engine.tick(f.key)
+      await reading
+      expect(await f.engine.recoverBeforeReconnect(f.key)).toBe(false)
+      expect(f.recoveryCalls).toEqual(['get'])
+      expect(f.handoffs()).toBe(0)
+      release()
+      await tick
+      expect(f.recoveryCalls.slice(0, 2)).toEqual(['get', 'handoff'])
+      await f.h.driveSequence(f.h.sequenceSettled(f.key))
+      expect(f.handoffs()).toBe(1)
+      expect(f.h.stub.calls.killCalls).toHaveLength(1)
+      expect(f.resumed()).toBe(true)
+    } finally { release(); await f.cleanup() }
+  })
+
+  test('exhausted checked kills retain the ordinary retry owner, whose later retry resumes recovery', async () => {
+    const f = await goneRecovery({ refusedKills: KILL_RETRY_TRIES })
+    try {
+      await f.failRecoveryEnter()
+      await f.h.driveSequence(f.h.sequenceSettled(f.key))
+      expect(f.resumed()).toBe(false)
+      expect(f.h.stub.calls.killCalls).toHaveLength(KILL_RETRY_TRIES)
+      expect(f.h.controller.isArmed(f.key)).toBe(true)
+      expect(f.lifecycle.deferred(f.key)).toBeUndefined()
+      const count = f.keys.length
+      for (let n = 0; n < 5; n++) await f.advance()
+      expect(f.keys).toHaveLength(count)
+      expect(f.handoffs()).toBe(1)
+      await retryNow(f.h, f.key)
+      await f.h.driveSequence(f.h.sequenceSettled(f.key))
+      expect(f.resumed()).toBe(true)
+      expect(f.handoffs()).toBe(2)
+      expect(f.h.stub.calls.killCalls).toHaveLength(KILL_RETRY_TRIES + 1)
+      expect(f.h.stub.calls.resumeCalls).toHaveLength(1)
+      expect(f.restarts()).toBe(0)
+    } finally { await f.cleanup() }
+  })
+
+  test.each([
+    ['UNAVAILABLE', () => errCallTimeout('send-keys')],
+    ['dialog refusal', () => errDialogMaybeOpen()],
+    ['relay refusal', () => errSendKeysWhileRelayed()],
+  ] as const)('%s during recovery Enter retains the queue without a death handoff', async (_label, keyError) => {
+    const f = await goneRecovery({ keyError })
+    try {
+      await f.failRecoveryEnter()
+      for (let n = 0; n < 5; n++) await f.advance()
+      expect(f.handoffs()).toBe(0)
+      expect(f.h.stub.calls.killCalls).toEqual([])
+      expect(f.h.stub.calls.resumeCalls).toEqual([])
+      expect(f.restarts()).toBe(0)
+      expect(f.queue.openCount(f.key)).toBe(3)
+      expect(readQueue(f.h.stateDir, f.key).filter(r => r.kind === 'delivered')).toEqual([])
+    } finally { await f.cleanup() }
+  })
+})
 
 describe('durable FIFO and send sequence', () => {
   test.each([

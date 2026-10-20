@@ -2132,7 +2132,7 @@ describe('main() builds the one live-row sequence registry and installs it befor
   // b.jg5 SRJ-811: the bare running query would refuse a restart over an
   // old-life wait on the persona's own row without arming its retry timer,
   // so nothing would retry it once the wait is over.
-  test('the restart work\'s running query is the session manager\'s gate (liveRowSequenceGate) for the key it is given and a site of its own, which also arms a persona whose own row carries an old-life wait; server.ts asks the bare running query nowhere', () => {
+  test('the restart work uses liveRowSequenceGate to arm old-life retries; the bare running query only guards reconnect deferral and delivery holds', () => {
     const query = onlyCallProps('initRestart').get(RESTART_QUERY)
     expect(query).toMatch(new RegExp(`^\\(?(\\w+)\\)? => ${RESTART_GATE}\\(\\1, '[^']+'\\)$`))
     expect(importSource(SERVER_CODE, RESTART_GATE)).toBe('./session-manager.ts')
@@ -2140,11 +2140,19 @@ describe('main() builds the one live-row sequence registry and installs it befor
     const gates = indicesOf(new RegExp(`\\b${RESTART_GATE}\\b`, 'g'), SERVER_CODE)
     expect(gates).toHaveLength(2)
     expect(withinCall(gates, onlyCallOf('initRestart'))).toBe(1)
-    // The bare query is neither imported nor called: its name appears only as
-    // the restart deps' member.
-    expect(importSource(SERVER_CODE, SEQUENCE_RUNNING)).toBeUndefined()
-    expect(callsOf(SEQUENCE_RUNNING)).toEqual([])
-    expect(indicesOf(new RegExp(`\\b${SEQUENCE_RUNNING}\\b`, 'g'), SERVER_CODE)).toHaveLength(1)
+    // GONE recovery must keep a running sequence from rearming reconnect
+    // deferral or allowing delivery keys, without replacing the restart gate.
+    expect(importSource(SERVER_CODE, SEQUENCE_RUNNING)).toBe('./session-manager.ts')
+    const calls = callsOf(SEQUENCE_RUNNING)
+    expect(calls).toHaveLength(4)
+    expect(withinCall(calls, onlyCallOf('initRestart'))).toBe(0)
+    const [start, end] = exportedFunctionBody('_buildReconnectSessionAdapter')
+    expect(calls.filter(at => at > start && at < end)).toHaveLength(3)
+    expect(withinCall(calls, onlyCallOf('createDeliveryEngines'))).toBe(1)
+    expect(onlyCallProps('createDeliveryEngines').get('isHeld')).toMatch(new RegExp(`\\|\\| ${SEQUENCE_RUNNING}\\(key\\)$`))
+    for (const at of calls) expect(callArguments(SERVER_CODE, at).trim()).toBe('key')
+    // One import, four calls and the restart dependency's member name.
+    expect(indicesOf(new RegExp(`\\b${SEQUENCE_RUNNING}\\b`, 'g'), SERVER_CODE)).toHaveLength(6)
   })
 
   test('shutdown() closes the registry exactly once, through its holder, after the shutting-down flag, before the retry controller closes, before it first yields and before closeClient(); nothing else closes or stops every sequence', () => {

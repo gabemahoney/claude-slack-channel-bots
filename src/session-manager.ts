@@ -2862,6 +2862,23 @@ export async function handleDeliveryKeyError(key: string, error: unknown, row: G
   await reconnectAnswerTo(key, latchRowStateRead(row.state), keyRef(key), error)
 }
 
+/** Continue a delivery key's GONE through the checked live-row sequence,
+ * even when the launch's reconnect deferred before that key completed.
+ * The engine retains ownership on false; no restart-delay policy applies
+ * to completing this recovery of the existing launch. */
+export function recoverDeliveryGone(key: string, row: GetResult, launch: string): boolean {
+  const life = deliveryLifecycle, persona = configuredPersonaForDelivery(key)
+  if (!persona || !life?.active(key) || life.launchId(key) !== launch || life.owner(key) !== 'free' ||
+      row.instance_id !== personaInstanceId(key) || isKnownUnapplied(key) || !personaUpNow(key) ||
+      personaLatchedNow(key) || heldGateReadingOf(key) !== undefined || waitsOnKillFailedHold(key) ||
+      isOwnRowOldLifeHeld(key) || isLaunchInFlight(key) || isAtCap(key, RESTART_FAILURE_CAP)) return false
+  const flags = getOutageFlags(key)
+  if (flags.has('tmux-unavailable') || flags.has('ad-config-malformed')) return false
+  if (holdLaunchIfConfigDirUnresolvable(persona) || oldLifeHoldStep(persona, 'delivery recovery', personaRef(persona))) return false
+  const { startAnswer } = startRecoverySequence({ persona, ref: personaRef(persona) }, latchRowStateRead(row.state), true, false)
+  return startAnswer === LIVE_ROW_START_STARTED || startAnswer === LIVE_ROW_START_ALREADY_RUNNING
+}
+
 export async function readPersonaOwnRow(key: string, at: OwnRowReadSite): Promise<OwnRowRead> {
   const launchWindow = launchCallWindowOf(key)
   let row: GetResult
@@ -3684,7 +3701,7 @@ export async function reconnectMcpWithCause(
   const getInput = () => life ? life.reconnectInput(key) : standaloneReconnectInputs.get(key)
   const clearInput = () => { if (life) life.clearReconnectInput(key); else standaloneReconnectInputs.delete(key) }
   if (life?.deferred(key)) life.defer(key)
-  const defer = (): ReconnectResult => { life?.defer(key); return { outcome: 'transient' } }
+  const defer = (): ReconnectResult => { if (!isLiveRowSequenceRunning(key)) life?.defer(key); return { outcome: 'transient' } }
   if (personaLatchedNow(key)) {
     console.error(reconnectLatchedLine(ref))
     life?.defer(key)

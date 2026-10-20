@@ -360,8 +360,18 @@ t18_note_posts() {
 # Setup: every persona launched in `log` and reported in
 # ---------------------------------------------------------------------------
 
+t18_reconnect_identity() {
+    local session pane
+    t18_row_get "$1" "$2"
+    session="$(jq -r '.tmux_session_name' "${AD_OUT}")"
+    pane="$(tmux_session_value "${session}" '#{session_id} #{pane_id} #{pane_pid}')" || fail "$2: cannot read the fixture's pane identity"
+    jq -ce --arg pane "${pane}" '[.session_id, .tmux_session_name, .tmux_socket, .jsonl_path, $pane] |
+        select(all(.[]; type == "string" and length > 0))' "${AD_OUT}" \
+        || fail "$2: the reported fixture has incomplete identity"
+}
+
 t18_setup() {
-    local step="setup" m before p id_var
+    local step="setup" m before p id_var identity
     tmux_shim_mode log
     t18_write_config "${KEPT[@]}" "${ABSENT[@]}"
     m="$(completion_match 5)" || exit 1
@@ -371,6 +381,8 @@ t18_setup() {
     for p in "${KEPT[@]}" "${ABSENT[@]}"; do
         id_var="${p}_ID"
         wait_until "${ROW_WAIT_S}" "${step}: ${!id_var} never reported in (waiting)" t18_row_is "${!id_var}" waiting
+        identity="$(t18_reconnect_identity "${!id_var}" "${step}")" || exit 1
+        printf -v "${p}_IDENTITY" '%s' "${identity}"
     done
 
     # The operator: a plain stop (every worker keeps running and every row
@@ -516,14 +528,43 @@ t18_texts() {
 }
 
 t18_reconnect_submitted() {
-    local n
-    n="$(cscb_ad_count_between "$2" - send-keys "--instance-id $1" "--key Enter")" || return 1
-    (( n >= 1 ))
+    local events
+    events="$(ad_trail_events ad.send_keys.called "$1")" || return 1
+    jq -e -s --argjson server "${SERVER_PID}" --argjson since "$2" '
+        any(.[]; .caller_pid == $server and .outcome == "ok" and
+            ((.ts | (.[0:19] + "Z" | fromdateiso8601) + (("0." + .[20:23]) | tonumber)) + 0.001 >= $since))
+    ' <<< "${events}" > /dev/null
+}
+
+# Select both audit streams through the same successful Enter. The mark is
+# taken before clearing the fault, so post-mark Enters can still be refused.
+t18_reconnect_window() {
+    local step="$1" server="$2" mark="$3" calls="$4" outcomes="$5" first_key selected count
+    first_key="$(awk -F '\t' '$4 == "send-keys" { print $2; exit }' <<< "${calls}")"
+    [[ -n "${first_key}" ]] || fail "${step}: reconnect has no originating key"
+    selected="$(jq -c -s --argjson since "${first_key}" --argjson server "${server}" '
+        map(select(.caller_pid == $server and
+            ((.ts | (.[0:19] + "Z" | fromdateiso8601) + (("0." + .[20:23]) | tonumber)) + 0.001 >= $since))) |
+        (map(.outcome == "ok") | index(true)) as $ok |
+        if $ok == null then [] else .[0:($ok + 1)] end
+    ' <<< "${outcomes}")" || fail "${step}: cannot decode AD reconnect outcomes"
+    count="$(jq 'length' <<< "${selected}")"
+    (( count >= 2 )) || fail "${step}: reconnect has no successful Enter after its originating text"
+    T18_RECONNECT_CALLS="$(awk -F '\t' -v count="${count}" '
+        $4 == "send-keys" { started = 1; sends++ }
+        started { print }
+        sends == count { exit }
+    ' <<< "${calls}")"
+    awk -F '\t' -v mark="${mark}" '
+        $4 == "send-keys" { pos = $1; args = $6 }
+        END { exit !(pos > mark && args ~ /--key Enter/) }
+    ' <<< "${T18_RECONNECT_CALLS}" || fail "${step}: successful reconnect Enter is not after the unwedge mark"
+    T18_RECONNECT_OUTCOMES="$(jq -c '.[]' <<< "${selected}")"
 }
 
 t18_condition_section() {
     local step="wedged condition" p head n deadline_s wait_s alert_t unwedge_t times t onset_n
-    local id_var key_var ch_var at_var alert_var onset_var rec_var verb calls unwedge_mark
+    local id_var key_var ch_var at_var alert_var onset_var rec_var verb calls unwedge_mark outcomes identity_var
 
     # Each persona's first refusal: its condition's started line.
     for p in "${KEPT[@]}"; do
@@ -579,26 +620,18 @@ t18_condition_section() {
         # An outage all-clear precedes the reconnect's Enter. Wait for both
         # key calls before inspecting their order, provenance and delay.
         wait_until "${RECOVERY_SLACK_S}" "${step}: ${p}'s reconnect never submitted" \
-            t18_reconnect_submitted "${!id_var}" "${unwedge_mark}"
-        # The unwedge may land between an in-flight attempt's pane reads
-        # and its successful text/Enter. Include that complete attempt:
-        # from the preceding send through the first post-unwedge Enter,
-        # excluding the preceding send itself. Earlier refused attempts
-        # must not count as another text/Enter pair in this audit.
+            t18_reconnect_submitted "${!id_var}" "${unwedge_t}"
+        # Retain the originating uncertain text, every refused Enter, and
+        # the successful post-unwedge Enter. A suffix of two Enters loses
+        # the intent which makes those retries safe.
         calls="$(ad_cscb_calls "${!id_var}" - -)" || exit 1
-        calls="$(awk -F '\t' -v mark="${unwedge_mark}" '
-            { rows[NR] = $0 }
-            $4 == "send-keys" {
-                sends[++n] = NR
-                if ($1 > mark && $6 ~ /--key Enter/) {
-                    first = n > 2 ? sends[n - 2] + 1 : 1
-                    for (i = first; i <= NR; i++) print rows[i]
-                    exit
-                }
-            }
-        ' <<< "${calls}")"
+        outcomes="$(ad_trail_events ad.send_keys.called "${!id_var}")" || exit 1
+        t18_reconnect_window "${step}: ${p}" "${SERVER_PID}" "${unwedge_mark}" "${calls}" "${outcomes}"
         _scenario_assert_reconnect_rows "${step}: ${p}" "${SERVER_PID}" "${ENTER_DELAY_MS}" \
-            "${calls}"
+            "${T18_RECONNECT_CALLS}" "${T18_RECONNECT_OUTCOMES}"
+        identity_var="${p}_IDENTITY"
+        [[ "$(t18_reconnect_identity "${!id_var}" "${step}")" == "${!identity_var}" ]] \
+            || fail "${step}: ${p}'s reconnect changed its launch/session/pane identity"
 
         # Exactly one alert and one recovery, the recovery after the unwedge.
         n="$(t18_count_posts "" "${!alert_var}")"

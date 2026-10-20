@@ -1,5 +1,6 @@
 import { errDialogMaybeOpen } from './test-helpers/agent-director-stub.ts'
 import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
+import { recoverDeliveryGone, setDeliveryPersonaLookup } from '../src/session-manager.ts'
 
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'fs'
@@ -26047,6 +26048,49 @@ describe('reconnect continuation preserves partial command input', () => {
       expect(input).toBe('')
       expect(life.reconnectInput(p)).toBeUndefined()
       expect(h.stub.calls.readPaneCalls).toEqual([])
+    },
+  )
+})
+
+describe('b.acu: delivery GONE handoff preserves recovery guards', () => {
+  test.each(['not-up', 'unapplied', 'wrong-instance', 'stale-launch', 'typing-owned', 'forgotten'] as const)(
+    '%s refuses the affected persona without probing, while an eligible sibling enters checked recovery', async guard => {
+      const h = makeRecoveryHarness({ harnessNow: true })
+      const [p, q] = h.keys as [string, string]
+      const life = createDeliveryLifecycle({ startId: 'gone-guards', clock: h.clock })
+      setDeliveryLifecycle(life)
+      setDeliveryPersonaLookup(key => h.config.personas.find(persona => persona.key === key))
+      const starts = recordSequenceStarts()
+      let release: (() => void) | undefined
+      try {
+        const row = personaRow(h.config, p, { state: 'waiting' })
+        const launch = life.observeRow(p, row)
+        if (guard === 'not-up') h.setUp(p, false)
+        if (guard === 'unapplied') h.remove(p)
+        if (guard === 'wrong-instance') row.instance_id = personaInstanceId(q)
+        if (guard === 'stale-launch') life.beforeLaunch(p)
+        if (guard === 'typing-owned') release = life.acquire(p, 'reconnect')
+        if (guard === 'forgotten') life.forget(p)
+
+        expect(recoverDeliveryGone(p, row, launch)).toBe(false)
+        expect(starts).toEqual([])
+        expect(stubCallCount(h.stub.calls)).toBe(0)
+        const sibling = personaRow(h.config, q, { state: 'waiting' })
+        expect(recoverDeliveryGone(q, sibling, life.observeRow(q, sibling))).toBe(true)
+        expect(starts).toHaveLength(1)
+        expect(starts[0]).toMatchObject({
+          key: q, instanceId: personaInstanceId(q), lastReadState: 'waiting', keepsConversation: true, launches: true,
+        })
+        expect(stubCallCount(h.stub.calls)).toBe(0)
+        expect(h.triggers).toEqual([])
+        assertNoLeak(h.captured())
+      } finally {
+        release?.()
+        await life.stop()
+        setDeliveryLifecycle(undefined)
+        setDeliveryPersonaLookup(() => undefined)
+        h.cleanup()
+      }
     },
   )
 })

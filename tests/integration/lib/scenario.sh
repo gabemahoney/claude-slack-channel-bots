@@ -4994,15 +4994,23 @@ ad_cscb_calls() {
 
 # _scenario_assert_reconnect_rows <step> <server-pid> <delay-ms> <rows>:
 # inspect an already-filtered ad_cscb_calls table for one persona/window.
-# AD row guards, text with no_enter, and delayed Enter. Automatic reconnects
+# AD row guards, text with no_enter, and delayed Enter. Optional fifth arg:
+# AD send_keys.called records for the complete uncertain recovery attempt.
+# Every retry must have its own waiting/server/id/outcome record; only the
+# final Enter may succeed. Automatic reconnects
 # must never inspect screen contents or send an expected pane hash.
 _scenario_assert_reconnect_rows() {
-    local step="$1" server="$2" delay="$3" rows="$4"
-    local pos time parent verb id args words=() i text key no_enter sends=0 typed_at=0
+    local step="$1" server="$2" delay="$3" rows="$4" outcomes="${5:-}" recovery="${5+x}"
+    local pos time parent verb id args words=() i text key no_enter sends=0 typed_at=0 instance=""
     while IFS=$'\t' read -r pos time parent verb id args; do
         [[ -n "${pos}" ]] || continue
+        if (( sends > 0 )) && [[ "${verb}" == spawn || "${verb}" == resume || "${verb}" == kill ]]; then
+            fail "${step}: reconnect recovery changed the launch"
+        fi
         [[ "${verb}" == read-pane || "${verb}" == send-keys ]] || continue
         [[ "${parent}" == "${server}" ]] || fail "${step}: ${verb} has parent ${parent}, not server ${server}"
+        instance="${instance:-${id}}"
+        [[ -n "${id}" && "${id}" == "${instance}" ]] || fail "${step}: reconnect recovery changed the instance"
         _scenario_eval_words words "${args}" || fail "${step}: cannot decode ${verb} arguments"
         text=""
         key=""
@@ -5026,7 +5034,7 @@ _scenario_assert_reconnect_rows() {
             [[ "${text}" == '/mcp reconnect '?* && -z "${key}" && "${no_enter}" == 1 ]] \
                 || fail "${step}: first reconnect key is not no_enter text: ${args}"
             typed_at="${_SCENARIO_US}"
-        elif (( sends == 2 )); then
+        elif (( sends == 2 )) || [[ -n "${recovery}" ]]; then
             [[ "${key}" == Enter && -z "${text}" && "${no_enter}" == 0 ]] \
                 || fail "${step}: second reconnect key is not Enter alone: ${args}"
             (( _SCENARIO_US - typed_at >= delay * 1000 )) \
@@ -5035,7 +5043,19 @@ _scenario_assert_reconnect_rows() {
             fail "${step}: more than one reconnect text/Enter pair in the window"
         fi
     done <<< "${rows}"
-    (( sends == 2 )) || fail "${step}: reconnect has ${sends} key calls, not text then Enter"
+    if [[ -z "${recovery}" ]]; then
+        (( sends == 2 )) || fail "${step}: reconnect has ${sends} key calls, not text then Enter"
+    else
+        (( sends >= 2 )) || fail "${step}: recovery has no originating text and Enter"
+        jq -e -s --arg id "${instance}" --argjson server "${server}" --argjson n "${sends}" '
+            length == $n and
+            all(.[]; .event == "ad.send_keys.called" and .instance_id == $id and
+                .caller_pid == $server and .row_state == "waiting" and .allow_pending == false) and
+            (.[-1].outcome == "ok") and
+            all(.[0:-1][]; .outcome == "ErrTmuxUnresponsive")
+        ' <<< "${outcomes}" > /dev/null \
+            || fail "${step}: recovery lacks matching waiting/instance/server/outcome evidence"
+    fi
 }
 
 # True when `ad_cscb_calls <instance-id>` holds at least <min> rows of <verb>;
