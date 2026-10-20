@@ -859,6 +859,56 @@ plus_s() {
     awk -v t="$1" -v d="$2" 'BEGIN { printf "%.3f\n", t + d }'
 }
 
+# Check the first CSCB row read in the retry that observes waiting, regardless
+# of when the harness polls. Never substitute a later read to satisfy the
+# deadline; the persona's own waiting log and condition end corroborate it.
+lt_expect_recovery_ended() {
+    local table="$1" srv="$2" id="$3" key="$4" log0="$5" step="$6"
+    local first read_at read_verb retry_at next_retry waiting_at="" waiting_verb="" candidate verb ended n end_at
+    local retry_times=()
+    for verb in status get; do
+        candidate="$(log_hits "${log0}" "${verb} for persona=${key}: this launch's row left pending for waiting after its launch timeout" \
+            'the tmux-unresponsive condition ends if it holds' | head -n 1 | cut -f2)"
+        if [[ -n "${candidate}" ]] && { [[ -z "${waiting_at}" ]] || awk -v t="${candidate}" -v w="${waiting_at}" 'BEGIN { exit !(t < w) }'; }; then
+            waiting_at="${candidate}" waiting_verb="${verb}"
+        fi
+    done
+    [[ -n "${waiting_at}" ]] || fail "${step}: no CSCB waiting observation for ${key}"
+    mapfile -t retry_times < <(retry_hits "${log0}" "${RT_RETRY_HEAD[${key}]}" "${RT_RETRY_FULL[${key}]}" "${RT_RETRY_PENDING[${key}]}" | cut -f2)
+    retry_at="" next_retry=""
+    for n in "${retry_times[@]}"; do
+        if awk -v t="${n}" -v w="${waiting_at}" 'BEGIN { exit !(t + 0 <= w + 0) }'; then
+            retry_at="${n}"
+        else
+            next_retry="${n}"
+            break
+        fi
+    done
+    [[ -n "${retry_at}" ]] || fail "${step}: no persona retry before CSCB's waiting observation"
+    first="$(calls "${table}" "${srv}" "${id}" - - - \
+        | awk -F'\t' -v r="${retry_at}" -v nxt="${next_retry:-0}" \
+            '$1 + 0 >= r + 0 && (nxt == 0 || $1 + 0 < nxt + 0) && ($3 == "status" || $3 == "get") { print; exit }')"
+    [[ -n "${first}" ]] || fail "${step}: no CSCB recovery status or get of ${id} in the waiting retry"
+    read_at="$(cut -f1 <<< "${first}")"
+    read_verb="$(cut -f3 <<< "${first}")"
+    [[ "${read_verb}" == "${waiting_verb}" ]] || fail "${step}: the first CSCB recovery read is ${read_verb}, but the waiting observation names ${waiting_verb}"
+    # Retry timestamps are millisecond log timestamps; compare the invocation
+    # at that same precision, without changing the five-second allowance.
+    read_at="$(awk -v t="${read_at}" 'BEGIN { printf "%.3f\n", int(t * 1000) / 1000 }')"
+    awk -v t="${retry_at:-0}" -v r="${read_at}" -v b="${LT_RETRY_READ_S}" \
+        'BEGIN { exit !(t > 0 && r >= t && r - t <= b) }' \
+        || fail "${step}: the first CSCB recovery read at ${read_at} is not within ${LT_RETRY_READ_S}s of its persona's retry"
+    ended="$(fmk_text tmuxUnresponsiveEndedLines "${key}")" || fail "${step}: fmk-texts.ts could not print tmuxUnresponsiveEndedLines"
+    n="$(grep -nF -f <(printf '%s\n' "${ended}") "${SLACK_STATE_DIR}/server.log" | awk -F: -v s="${log0}" '$1 + 0 > s + 0 { print $1; exit }' || true)"
+    [[ -n "${n}" ]] || fail "${step}: no tmux-unresponsive ended line for ${key}"
+    end_at="$(log_hits "$(( n - 1 ))" "" | head -n 1 | cut -f2)"
+    for n in "${waiting_at}" "${end_at}"; do
+        awk -v t="${n:-0}" -v r="${read_at}" -v b="${LT_RETRY_READ_S}" -v nxt="${next_retry:-0}" \
+            'BEGIN { exit !(t > 0 && t >= r && t - r <= b && (nxt == 0 || t < nxt)) }' \
+            || fail "${step}: waiting observation (${waiting_at:-missing}) and condition end (${end_at:-missing}) must follow the first CSCB recovery read (${read_at}) within ${LT_RETRY_READ_S}s in the same retry"
+    done
+}
+
 # timeout_get_lines_seen <from-line>: true once each launch-timeout persona
 # has its post-timeout get line after server.log line <from-line>.
 timeout_get_lines_seen() {
@@ -915,7 +965,7 @@ leg_launch_timeouts() {
     local step="launch timeouts" creds="${SCENARIO_ROOT}/credentials-lt" role id ref key verb
     local log0 lt_start reset_at="" deadline left reads="${SCENARIO_ROOT}/lt-reads.tsv" table="${SCENARIO_ROOT}/lt-calls.tsv"
     local -A sid=() out_at=() out_state=() out_sid=() launch_at=() get_at=() send_at=() pane_at=()
-    local lines=() hits=() posts=() n t connected_at ended pend srv
+    local lines=() hits=() posts=() n t connected_at pend srv
 
     # Step 1: the reuse and resume personas are brought up, then their workers end.
     new_state_dir bringup
@@ -1082,14 +1132,7 @@ leg_launch_timeouts() {
         pend="$(awk -F'\t' -v r="${role}" -v a="${get_at[${role}]}" '$1 == r && $3 == "pending" && $2 + 0 > a + 0 { n++ } END { print n + 0 }' "${reads}")"
         (( pend > 0 )) || fail "${step}: ${role}: no harness read of ${id} after the bot server's get read pending"
 
-        # The tmux-unresponsive condition's ended line, no later than the
-        # first harness read out of pending.
-        ended="$(fmk_text tmuxUnresponsiveEndedLines "${key}")" || fail "${step}: fmk-texts.ts could not print tmuxUnresponsiveEndedLines"
-        n="$(grep -nF -f <(printf '%s\n' "${ended}") "${SLACK_STATE_DIR}/server.log" | awk -F: -v s="${log0}" '$1 + 0 > s + 0 { print $1; exit }' || true)"
-        [[ -n "${n}" ]] || fail "${step}: ${role}: no tmux-unresponsive ended line for ${key}"
-        t="$(log_hits "$(( n - 1 ))" "" | head -n 1 | cut -f2)"
-        awk -v e="${t:-0}" -v o="${out_at[${role}]}" 'BEGIN { exit !(e + 0 > 0 && e + 0 <= o + 0) }' \
-            || fail "${step}: ${role}: the tmux-unresponsive ended line (${t:-no time}) came after the first harness read out of pending (${out_at[${role}]})"
+        lt_expect_recovery_ended "${table}" "${srv}" "${id}" "${key}" "${log0}" "${step}: ${role}"
         echo "${TEST_NAME}: ${step}: ${role}: its tmux-unresponsive condition (recorded): $(log_hits "${log0}" "${TU_HEAD[${key}]}" | cut -f3 | cut -c1-200 | tr '\n' '|')"
 
         # Every retry (its retry line exactly, never the re-armed line) reads

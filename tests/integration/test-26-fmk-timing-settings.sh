@@ -1278,6 +1278,7 @@ GRACE_CT_S="$(printed pendingGraceMinimumSeconds "${CREATE_RAISED_MS}" "${DEFAUL
 # table.
 TABLE_CT=("${KEY_GRACE}=${GRACE_CT_S}" "${KEY_STOPPING}=${STOPPING_S}" "${KEY_STARTING}=${STARTING_S}" "${KEY_CREATE}=${CREATE_RAISED_MS}")
 VALUES_LINE_CT="$(printed buildAdSettingsValuesLine "${AD_SETTINGS_FILE}" "${TABLE_CT[@]}")" || exit 1
+B_CT_MS="$(printed adLaunchBoundMs "${TABLE_CT[@]}" "dialog_ready_timeout_ms=${OVR_DIALOG_READY_MS}")" || exit 1
 NEED_TEXT="$(printed adCallTimeoutNeed "${TABLE_CT[@]}")" || exit 1
 read -r NEED_MS NEED_VERB <<< "${NEED_TEXT}"
 WARN_LOW="$(printed buildAdCallTimeoutWarningLine "${CALL_TIMEOUT_LOW_MS}" "${TABLE_CT[@]}")" || exit 1
@@ -1360,9 +1361,131 @@ launch_answer_at() {
     T_END="$(log_time "${ANSWER_LINE}")" || exit 1
 }
 
+# The retry timer starts when the failed launch completes, not when it starts.
+# Find its first scheduled retry at/after B using the effective retry settings.
+# Allow bounded phases after that retry: row checks, a new launch, SessionStart;
+# the low leg additionally waits for the following retry to stop its timer.
+# The estimate is diagnostic only. Actual retry records bound each recovery phase.
+# Sets CT_ELIGIBLE_RETRY, CT_ELIGIBLE_AT and the absolute CT_DEADLINE.
+call_timeout_observation_deadline() {
+    local launch="$1" completed="$2" timer_stop_s="${3:-0}" due_s bound
+    bound="$(awk -v t="${launch}" -v ms="${B_CT_MS}" 'BEGIN { printf "%.6f\n", t + ms / 1000 }')"
+    CT_BOUND_AT="${bound}"
+    CT_NEXT_RETRY=1
+    CT_RECOVERY_RETRY=""
+    CT_ELIGIBLE_RETRY=1
+    while :; do
+        due_s="$(printed unavailableRetryDueS "${CT_ELIGIBLE_RETRY}" \
+            "unavailable_retry_base_s=${OVR_RETRY_BASE_S}" "unavailable_retry_ceiling_s=${OVR_RETRY_CEILING_S}")" || exit 1
+        CT_ELIGIBLE_AT="$(time_plus "${completed}" "${due_s}")"
+        time_before "${CT_ELIGIBLE_AT}" "${bound}" || break
+        CT_ELIGIBLE_RETRY=$(( CT_ELIGIBLE_RETRY + 1 ))
+    done
+    CT_DEADLINE="$(time_plus "${CT_ELIGIBLE_AT}" "$(( LOG_WAIT_S + LAUNCH_WAIT_S + REPORT_WAIT_S + timer_stop_s ))")"
+    CT_EXPECTED_RETRY_AT="$(time_plus "${completed}" "${OVR_RETRY_BASE_S}")"
+    CT_PHASE_DEADLINE="$(time_plus "${CT_EXPECTED_RETRY_AT}" "${LOG_WAIT_S}")"
+}
+
+# Poll actual retry starts/ends and CSCB's own AD calls. A retry may start
+# before B and cross B while reading AD; its post-B get or kill makes that
+# retry eligible too. Never infer eligibility from the harness poll time.
+call_timeout_recovery_started() {
+    local step="$1" x="$2" n="${CT_NEXT_RETRY}" start_line start end_line end head line read_at kill_at due prior
+    head="$(printed unavailableRetryRetryLine "${KEY[${x}]}" "${n}" full)" || exit 1
+    start_line="$(log_lines "${head}")"
+    if [[ -n "${start_line}" ]]; then
+        [[ "$(printf '%s\n' "${start_line}" | wc -l)" == 1 ]] || fail "${step}: duplicate retry ${n}"
+        start="$(log_time "${start_line}")" || exit 1
+        time_before "$(time_plus "${CT_EXPECTED_RETRY_AT}" "${LOG_WAIT_S}")" "${start}" && fail "${step}: retry ${n} started after its bounded timer phase"
+        CT_PHASE_DEADLINE="$(time_plus "${start}" "${LOG_WAIT_S}")"
+        head="$(printed unavailableRetryReArmedLine "${KEY[${x}]}" "${n}" full "${REFUSED_MARKER}" 0)" || exit 1
+        head="${head%%"${REFUSED_MARKER}"*}"
+        end_line="$(log_lines "${head}")"
+        end=""
+        [[ -z "${end_line}" ]] || end="$(log_time "${end_line}")"
+        # server.log has millisecond precision; shim calls have microseconds.
+        # Include the re-arm's last millisecond when correlating its AD calls.
+        [[ -z "${end}" ]] || end="$(time_plus "${end}" 0.001)"
+        # The start of the next retry is an additional hard ownership boundary.
+        head="$(printed unavailableRetryRetryLine "${KEY[${x}]}" "$(( n + 1 ))" full)" || exit 1
+        line="$(log_lines "${head}")"
+        if [[ -n "${line}" && -z "${end}" ]]; then end="$(log_time "${line}")"; fi
+        line="$(first_cscb_call_at_or_after "${start}" kill --instance-id "${ID[${x}]}")"
+        kill_at=""
+        if [[ -n "${line}" ]]; then
+            call_fields "${step}" "${line}"
+            if [[ -z "${end}" ]] || time_before "${CALL_T}" "${end}"; then kill_at="${CALL_T}"; fi
+        fi
+        if [[ -n "${kill_at}" ]]; then
+            time_before "${kill_at}" "${CT_BOUND_AT}" && fail "${step}: CSCB kill before B"
+            time_before "${CT_PHASE_DEADLINE}" "${kill_at}" && fail "${step}: retry ${n} kill exceeded its bounded recovery phase"
+            CT_RECOVERY_RETRY="${n}"
+            CT_RECOVERY_AT="${kill_at}"
+            CT_RECOVERY_START="${start}"
+            CT_RECOVERY_END="${end}"
+            return 0
+        fi
+        # A fresh AD get that starts at/after B necessarily evaluates at/after
+        # B. A call starting before B can return across it; accept recovery in
+        # that same retry rather than forcing it into the next nominal slot.
+        read_at="$(cscb_ad_calls get --instance-id "${ID[${x}]}" | awk -F'\t' -v a="${start}" -v b="${end}" '$2 >= a && (b == "" || $2 < b) { t=$2 } END { print t }')"
+        if [[ -n "${end}" ]]; then
+            if ! time_before "${start}" "${CT_BOUND_AT}" ||
+                { [[ -n "${read_at}" ]] && ! time_before "${read_at}" "${CT_BOUND_AT}"; }; then
+                fail "${step}: first eligible retry ${n} ended without a CSCB checked kill"
+            fi
+            if ! time_before "${end}" "${CT_BOUND_AT}"; then
+                # AD calls begun before B may finish across it. The production
+                # rule's own before-B answer resolves that boundary ambiguity.
+                head="$(printed pendingRowRuleRoundLineHead "${REF[${x}]}" PENDING_ROW_RULE_ORIGIN_RETRY)" || exit 1
+                log_lines_from "${start}" "${end}" "${head}" | grep -q -F 'before B: nothing more this round' \
+                    || fail "${step}: retry ${n} crossed B without recovery or a production before-B answer"
+            fi
+            CT_NEXT_RETRY=$(( n + 1 ))
+            due="$(printed unavailableRetryDueS "${CT_NEXT_RETRY}" "unavailable_retry_base_s=${OVR_RETRY_BASE_S}" "unavailable_retry_ceiling_s=${OVR_RETRY_CEILING_S}")" || exit 1
+            prior="$(printed unavailableRetryDueS "${n}" "unavailable_retry_base_s=${OVR_RETRY_BASE_S}" "unavailable_retry_ceiling_s=${OVR_RETRY_CEILING_S}")" || exit 1
+            CT_EXPECTED_RETRY_AT="$(time_plus "${end}" "$(( due - prior ))")"
+            CT_PHASE_DEADLINE="$(time_plus "${CT_EXPECTED_RETRY_AT}" "${LOG_WAIT_S}")"
+            return 1
+        fi
+    fi
+    time_before "$(now_s)" "${CT_PHASE_DEADLINE}" || fail "${step}: retry ${n} exceeded its bounded recovery phase"
+    return 1
+}
+
+# Only after proving that the first eligible retry actually began recovery do
+# we allow the separate checked-kill/log, fresh-launch and SessionStart waits.
+await_call_timeout_recovery() {
+    local step="$1" x="$2" line head
+    until call_timeout_recovery_started "${step}" "${x}"; do sleep 1; done
+    head="$(printed stuckLaunchAbortKillSucceededHead "${KEY[${x}]}")" || exit 1
+    wait_until "${LOG_WAIT_S}" "${step}: no successful checked-kill outcome" _scenario_log_has "${head}"
+    line="$(log_lines "${head}")"
+    # The checked result belongs to the retry that made the kill, before its
+    # re-arm; the following live-row sequence can outlive that retry.
+    local outcome_at end_line end
+    outcome_at="$(log_time "${line}")" || exit 1
+    head="$(printed unavailableRetryReArmedLine "${KEY[${x}]}" "${CT_RECOVERY_RETRY}" full "${REFUSED_MARKER}" 0)" || exit 1
+    end_line="$(log_lines "${head%%"${REFUSED_MARKER}"*}")"
+    if [[ -n "${end_line}" ]]; then
+        end="$(log_time "${end_line}")" || exit 1
+        time_before "${end}" "${outcome_at}" && fail "${step}: checked kill belongs to a later retry"
+    fi
+    wait_until "${LAUNCH_WAIT_S}" "${step}: no fresh launch after the first eligible retry's kill" call_timeout_fresh_launch "${step}" "${x}"
+    echo "${TEST_NAME}: ${step}: actual retry ${CT_RECOVERY_RETRY} began checked recovery at ${CT_RECOVERY_AT}; fresh launch at ${CT_FRESH_LAUNCH_AT}; AD launch bound ${CT_BOUND_AT}"
+}
+
+call_timeout_fresh_launch() {
+    local step="$1" x="$2" line
+    line="$({ cscb_ad_calls spawn --instance-id "${ID[${x}]}"; cscb_ad_calls resume --instance-id "${ID[${x}]}"; } | awk -F'\t' -v t="${CT_RECOVERY_AT}" '$2 >= t' | sort -t $'\t' -k2,2n | head -n 1)"
+    [[ -n "${line}" ]] || return 1
+    call_fields "${step}" "${line}"
+    CT_FRESH_LAUNCH_AT="${CALL_T}"
+}
+
 hooks_brought_up() {
-    local step="$1" x="$2" n session events
-    wait_until "${REPORT_WAIT_S}" "${step}: ${SCENARIO_TAG}_${x} never reported in after its launch timeout" row_state_is "${ID[${x}]}" waiting
+    local step="$1" x="$2" n session events report_wait="${REPORT_WAIT_S}"
+    wait_until "${report_wait}" "${step}: ${SCENARIO_TAG}_${x} never reported in after its launch timeout" row_state_is "${ID[${x}]}" waiting
     ad_capture get --instance-id "${ID[${x}]}"
     (( AD_RC == 0 )) || fail "${step}: cannot read the recovered row"
     session="$(jq -er '.session_id | select(type == "string" and length > 0)' "${AD_OUT}")" \
@@ -1409,9 +1532,23 @@ expect_finished_before_launch() {
     (( reads >= 1 )) || fail "${step}: a CSCB launch of ${id} with no CSCB read of its row before it"
 }
 
+# This slow-create fixture loses its pane identity: recovery must actually
+# checked-kill that launch, then observe AD's terminal row before launching.
+expect_checked_kill_before_launch() {
+    local step="$1" x="$2" previous="$3" launch="$4" n head not_before
+    not_before="$(awk -v t="${CT_LAUNCH_AT}" -v ms="${B_CT_MS}" 'BEGIN { printf "%.6f\n", t + ms / 1000 }')"
+    n="$(cscb_calls_between "${previous}" "${not_before}" kill --instance-id "${ID[${x}]}")"
+    (( n == 0 )) || fail "${step}: CSCB kill before B"
+    n="$(cscb_calls_between "${previous}" "${launch}" kill --instance-id "${ID[${x}]}")"
+    (( n == 1 )) || fail "${step}: expected one CSCB checked kill before the fresh launch, got ${n}"
+    head="$(printed stuckLaunchAbortKillSucceededHead "${KEY[${x}]}")" || exit 1
+    n="$(count_log_from "${previous}" "${launch}" "${head}")"
+    (( n == 1 )) || fail "${step}: no unique successful checked-kill outcome before the fresh launch"
+}
+
 leg_call_timeout_low() {
-    local step="call-timeout-30000" x=t1 line warn_t elapsed get_line t_get readings state start_raw stopped_m deadline
-    local t prev n_pending n_live first_waiting first_launch_start="" released=0
+    local step="call-timeout-30000" x=t1 line warn_t elapsed get_line t_get readings state start_raw stopped_m
+    local t prev n_pending n_live first_waiting first_launch_start="" released=0 recovered_launches=0
     leg "${step}"
     readings="${SCENARIO_ROOT}/${x}-row-readings.tsv"
     start_call_timeout_leg "${step}" "${x}" "${CALL_TIMEOUT_LOW_MS}"
@@ -1435,7 +1572,7 @@ leg_call_timeout_low() {
     # finds T1 connected, nothing left to recover (the printer's stop line).
     stopped_m="$(printed unavailableRetryStoppedLine "${KEY[${x}]}" full none "${STOP_RECOVERED}")" || exit 1
     : > "${readings}"
-    deadline=$(( SECONDS + CALL_TIMEOUT_LOW_MS / 1000 + REPORT_WAIT_S + RETRY_CEILING_S + LOG_WAIT_S ))
+    CT_DEADLINE="$(time_plus "${T_CALL}" "$(( CALL_TIMEOUT_LOW_MS / 1000 + LOG_WAIT_S ))")"
     while :; do
         ad_capture get --instance-id "${ID[${x}]}"
         state=""
@@ -1451,10 +1588,17 @@ leg_call_timeout_low() {
         if (( ! released )) && [[ -n "${first_launch_start}" ]] &&
             _scenario_log_has "$(launch_answer_line "${x}" ErrCallTimeout)"; then
             release_timed_out_launch_fixture "${step}" "${x}" "${first_launch_start}"
+            launch_answer_at "${step}" "${x}" ErrCallTimeout "${LOG_WAIT_S}"
+            CT_LAUNCH_AT="$(epoch_of "${step}" "${first_launch_start}")" || exit 1
+            call_timeout_observation_deadline "${CT_LAUNCH_AT}" "${T_END}" "${RETRY_CEILING_S}"
+            await_call_timeout_recovery "${step}" "${x}"
+            hooks_brought_up "${step}" "${x}" "${T_END}"
+            wait_until "$(( RETRY_CEILING_S + LOG_WAIT_S ))" "${step}: retry timer did not stop after recovery" _scenario_log_has "${stopped_m}"
+            CT_DEADLINE="$(time_plus "$(now_s)" "${LOG_WAIT_S}")"
             released=1
         fi
         [[ "${state}" == waiting ]] && _scenario_log_has "${stopped_m}" && break
-        (( SECONDS < deadline )) || fail "${step}: T1 was not up with its retry timer stopped by the leg's bound (last read '${state}')"
+        time_before "$(now_s)" "${CT_DEADLINE}" || fail "${step}: T1 was not up with its retry timer stopped by the leg's bound (last read '${state}')"
         sleep 1
     done
 
@@ -1489,8 +1633,11 @@ leg_call_timeout_low() {
         t="${CALL_T}"
         time_before "${T_CALL}" "${t}" || continue
         expect_finished_before_launch "${step}: ${CALL_VERB} at +$(seconds_between "${T_CALL}" "${t}")s" "${ID[${x}]}" "${prev}" "${t}"
+        expect_checked_kill_before_launch "${step}" "${x}" "${prev}" "${t}"
+        recovered_launches=$(( recovered_launches + 1 ))
         prev="${t}"
     done < <({ cscb_ad_calls spawn --instance-id "${ID[${x}]}"; cscb_ad_calls resume --instance-id "${ID[${x}]}"; } | sort -t $'\t' -k2,2n)
+    (( recovered_launches >= 1 )) || fail "${step}: no fresh launch after checked recovery"
     n_pending="$(awk -F'\t' '$2 == "pending"' "${readings}" | wc -l | tr -d ' ')"
     n_live="$(awk -F'\t' '$2 != "pending" && $2 != "ended" && $2 != "missing" && $2 != "none"' "${readings}" | wc -l | tr -d ' ')"
     first_waiting="$(awk -F'\t' '$2 == "waiting" { print $1; exit }' "${readings}")"
@@ -1500,7 +1647,7 @@ leg_call_timeout_low() {
 }
 
 leg_call_timeout_high() {
-    local step="call-timeout-61000" x=t2 elapsed get_line t_get n start_raw
+    local step="call-timeout-61000" x=t2 elapsed get_line t_get n start_raw line t prev recovered_launches=0
     leg "${step}"
     start_call_timeout_leg "${step}" "${x}" "${CALL_TIMEOUT_HIGH_MS}"
     # The check runs before the start pass, so by T2's spawn any warning of
@@ -1522,12 +1669,17 @@ leg_call_timeout_high() {
     fi
     time_before "${elapsed}" "${CALL_HIGH_S}" || fail "${step}: T2's spawn ended ${elapsed}s after its call, not before the call timeout (${CALL_HIGH_S}s)"
 
+    CT_LAUNCH_AT="$(epoch_of "${step}" "${start_raw}")" || exit 1
+    call_timeout_observation_deadline "${CT_LAUNCH_AT}" "${T_END}"
+    echo "${TEST_NAME}: ${step}: nominal first eligible retry ${CT_ELIGIBLE_RETRY} at +$(seconds_between "${T_CALL}" "${CT_ELIGIBLE_AT}")s; diagnostic phase estimate +$(seconds_between "${T_CALL}" "${CT_DEADLINE}")s"
+
     expect_get_after_timeout_line "${step}" "${x}" ErrTmuxUnresponsive "${start_raw}"
     release_timed_out_launch_fixture "${step}" "${x}" "${start_raw}" ErrTmuxUnresponsive
     get_line="$(first_cscb_call_at_or_after "${T_CALL}" get --instance-id "${ID[${x}]}")"
     [[ -n "${get_line}" ]] || fail "${step}: no CSCB get of T2 after its launch timeout"
     call_fields "${step}" "${get_line}"
     t_get="${CALL_T}"
+    await_call_timeout_recovery "${step}" "${x}"
     hooks_brought_up "${step}" "${x}" "${t_get}"
 
     # No ErrCallTimeout for T2, and still no warning.
@@ -1537,6 +1689,18 @@ leg_call_timeout_high() {
     [[ "${n}" == 0 ]] || fail "${step}: ${n} server.log line(s) for T2 name ErrCallTimeout"
     [[ "$(count_log "${WARN_STEM}")" == "${WARN_BEFORE}" ]] || fail "${step}: a call-timeout warning after the start with ${CALL_TIMEOUT_HIGH_MS}"
     echo "${TEST_NAME}: ${step}: no warning; T2's get at +$(seconds_between "${T_CALL}" "${t_get}")s read this launch's pending row; T2 up (waiting) at +$(seconds_between "${T_CALL}" "$(now_s)")s with no ErrCallTimeout"
+    prev="${T_CALL}"
+    while IFS= read -r line; do
+        call_fields "${step}" "${line}"
+        t="${CALL_T}"
+        time_before "${T_CALL}" "${t}" || continue
+        expect_finished_before_launch "${step}" "${ID[${x}]}" "${prev}" "${t}"
+        expect_checked_kill_before_launch "${step}" "${x}" "${prev}" "${t}"
+        recovered_launches=$(( recovered_launches + 1 ))
+        prev="${t}"
+    done < <({ cscb_ad_calls spawn --instance-id "${ID[${x}]}"; cscb_ad_calls resume --instance-id "${ID[${x}]}"; } | sort -t $'\t' -k2,2n)
+    (( recovered_launches >= 1 )) || fail "${step}: no fresh launch after checked recovery"
+
     tmux_shim_mode log
 }
 

@@ -1,3 +1,4 @@
+import { makePendingRowModel, PENDING_ROW_MODEL_NO_ROW, judgeNotJudged } from './test-helpers/pending-row-model.ts'
 import { errDialogMaybeOpen } from './test-helpers/agent-director-stub.ts'
 import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
 import { recoverDeliveryGone, setDeliveryPersonaLookup } from '../src/session-manager.ts'
@@ -68,7 +69,7 @@ import {
   type LaunchTimeoutForm
 } from '../src/ad-error-class.ts'
 import type { PreTrust } from '../src/ad-phase1-types.ts'
-import { adLaunchBoundMsInEffect } from '../src/ad-settings.ts'
+import { adGraceMsInEffect, adLaunchBoundMsInEffect, installLaunchBoundFloorMs } from '../src/ad-settings.ts'
 import {
   AD_VERSION_RECHECK_INTERVAL_MS,
   AD_VERSION_RECHECK_STOP_EXIT_CODE,
@@ -223,7 +224,7 @@ import {
   STUCK_LAUNCH_ABORT_KILL_TRY_LATER,
   STUCK_LAUNCH_ABORT_SEQUENCE_NOT_STARTED,
   STUCK_LAUNCH_ABORT_SEQUENCE_STARTED, STUCK_LAUNCH_POSTED, stuckLaunchAbortKillUsesAbort, stuckLaunchEndRowLiveReason,
-  stuckLaunchEpisodeEndedLine, stuckLaunchHeldText, type PendingRowRuleAnswer, type StuckLaunchAbortKillAnswer, type StuckLaunchPosterDeps
+  stuckLaunchAbortKillLine, stuckLaunchEpisodeEndedLine, stuckLaunchHeldText, type PendingRowRuleAnswer, type StuckLaunchAbortKillAnswer, type StuckLaunchPosterDeps
 } from '../src/pending-row.ts'
 import { _resetPollerState, stopPermissionPoller, type PollerDeps } from '../src/permission-poller.ts'
 import {
@@ -524,6 +525,8 @@ import {
   killFailureStoppedEntryLine,
   launchThroughSequence,
   makeRecoveryHarness,
+  launchOwnPending,
+  scriptModelLaunch,
   ordinaryAlertContent,
   ownRowsLiveThenMissing,
   pastSampleGrace,
@@ -26093,4 +26096,77 @@ describe('b.acu: delivery GONE handoff preserves recovery guards', () => {
       }
     },
   )
+})
+
+// The real test-26 slow-create failures arm retries after the error returns.
+// AD outcomes below are modeled, while the retry/launch/checked-kill paths
+// run their production code. Native hook application belongs to Docker CI.
+describe('b.acu CI round 3: create-timeout recovery uses the first retry past B', () => {
+  test.each([
+    [30_000, LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT],
+    [40_059, LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE],
+  ] as const)('%s ms %s keeps the pending row until the fifth retry, then checked-kills before a fresh launch', async (duration, form) => {
+    const h = makeRecoveryHarness({
+      harnessNow: true,
+      adSettings: { tmux: { create_timeout_ms: 40_000n, pending_grace_seconds: 61n, stopping_window_seconds: 30n, starting_session_seconds: 120n } },
+    })
+    installLaunchBoundFloorMs(120_000)
+    const key = h.keys[0]!
+    const retry = createUnavailableRetryController({ clock: h.clock, baseS: 5, ceilingS: 60, log: () => {}, action: h.fullModeAction })
+    initOutageState({ notify: () => {}, getClient, triggerSink: retry })
+    try {
+      const row = makePendingRowModel(h, key, { state: PENDING_ROW_MODEL_NO_ROW, judgment: judgeNotJudged })
+      scriptModelLaunch(h, row, { takesMs: duration, end: form })
+      await launchOwnPending(h, row)
+      expect([adGraceMsInEffect(), adLaunchBoundMsInEffect()]).toEqual([61_000, 121_000])
+      const retryTimes: number[] = []
+      for (let attempt = 0; attempt < 4; attempt++) {
+        const due = retry.view(key)!.dueAt!
+        await h.advance(due - h.clock.now())
+        await h.drive(retry.whenRunSettled(key))
+        await h.driveSequence(h.sequenceSettled(key))
+        retryTimes.push(due)
+        expect(row.callTimes('kill')).toEqual([])
+        expect(row.callTimes('spawn')).toEqual([0])
+        expect(row.callTimes('resume')).toEqual([])
+      }
+      // Both retries past G but before B freshly read the still-pending row.
+      for (const at of retryTimes.slice(2)) {
+        expect(row.calls.filter(call => call.at === at).map(call => [call.verb, call.state])).toEqual([
+          ['status', 'pending'], ['get', 'pending'], ['find-missing', 'pending'], ['get', 'pending'],
+        ])
+      }
+      await h.advance(121_000 - 1 - h.clock.now())
+      expect(row.callTimes('kill')).toEqual([])
+      await h.advance(2)
+      expect(row.callTimes('kill')).toEqual([])
+      expect(row.callTimes('spawn')).toEqual([0])
+      const eligible = retry.view(key)!.dueAt!
+      expect(eligible).toBeGreaterThan(121_000)
+      // The old high-leg deadline is earlier than this eligible retry.
+      if (form === LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE) expect(duration + 120_000).toBeLessThan(eligible)
+      await h.advance(eligible - h.clock.now())
+      await h.drive(retry.whenRunSettled(key))
+      await h.driveSequence(h.sequenceSettled(key))
+      retryTimes.push(eligible)
+      expect(retryTimes).toEqual([5_000, 15_000, 35_000, 75_000, 135_000].map(delay => duration + delay))
+      expect(row.callTimes('kill')).toEqual([eligible])
+      const checkedSuccess = stuckLaunchAbortKillLine(key, {
+        kind: STUCK_LAUNCH_ABORT_KILL_SUCCEEDED, killSent: true,
+        description: describeKillOutcome({ kind: KILL_OUTCOME_KILLED, killSent: true }),
+      }, '').split(' — ')[0]!
+      expect(h.errors.filter(line => line.startsWith(checkedSuccess))).toHaveLength(1)
+      expect(row.calls.filter(call => call.at >= eligible).map(call => [call.verb, call.state])).toEqual([
+        ['status', 'pending'], ['get', 'pending'], ['find-missing', 'pending'], ['get', 'pending'],
+        ['kill', 'pending'], ['get', 'ended'], ['find-missing', 'ended'], ['get', 'ended'], ['spawn', 'ended'],
+      ])
+      expect(row.calls.filter(call => call.verb === 'kill').map(call => call.params)).toEqual([{ instance_id: row.instanceId }])
+      expect([h.stub.calls.readPaneCalls, h.stub.calls.sendKeysCalls, h.stub.calls.deleteCalls]).toEqual([[], [], []])
+      expect(getFailureCount(key)).toBe(0)
+      assertNoLeak(h.captured())
+    } finally {
+      retry.close('create-timeout regression complete')
+      h.cleanup()
+    }
+  })
 })
