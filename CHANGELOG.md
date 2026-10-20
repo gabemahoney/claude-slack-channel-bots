@@ -10,6 +10,8 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 Slack reply reminders now work for Claude and Codex. After a delivered Slack message, an observed agent-director `working` → `waiting` transition with no subsequent call to CSCB's own `reply` tool queues at most one reminder per delivery. Scheduled prompts and `/interject` do not arm reminders. CSCB no longer reads native transcripts or panes to decide whether to remind.
 
+New Claude launches pre-allow the Slack `reply` tool, and template refreshes retain that permission. Older Claude conversations without the launch's `reply_tool_preallowed=1` label receive no new reminders, including after resume, so reminders cannot prompt those conversations to use an unapproved tool. Other tool permissions still use the existing relay.
+
 The transcript-reading `stop-hooks/slack-reply-guard.sh` and per-persona `reply-guard/<key>` records are retired. At server start and before launches, CSCB removes matching CSCB-managed Stop-hook commands from configured bot directories, preserves unrelated settings, and never installs a hook or edits the operator's `~/.claude`. Missing or invalid settings are left untouched; a failed cleanup is retried at the next launch. Remove any remaining retired CSCB hook from a custom directory before using that directory with this release.
 
 `stop_hook_bootstrap` remains a validated boolean compatibility setting: `false` opts a persona out. A confirmed reload now applies it immediately, including an inherited top-level default, without relaunching bots. Reminders require neither a configured Claude directory nor `jq`. A reply through another service may receive one harmless reminder. See [Slack reply reminders](docs/bots.md#slack-reply-reminders).

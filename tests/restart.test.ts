@@ -1,3 +1,4 @@
+import { REPLY_TOOL_PREALLOWED_LABEL } from '../src/reply-reminder.ts'
 import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
 import { IDLE_PANE } from './test-helpers/working-row-panes.ts'
 import { useImmediateTypingLifecycle } from './test-helpers/legacy-typing.ts'
@@ -4881,6 +4882,7 @@ describe('restart: the real launch adapter uses the applied configuration', () =
     expect(spawnCalls[2]!.label).toEqual([
       'service=cscb',
       'tag_prompt=1',
+      REPLY_TOOL_PREALLOWED_LABEL,
       `persona=${a.key}`,
       `config_dir=${configDirLabelValue(join(realpathSync(dir), 'claude-config-new'))}`,
     ])

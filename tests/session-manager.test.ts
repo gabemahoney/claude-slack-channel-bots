@@ -1,3 +1,4 @@
+import { REPLY_TOOL_PREALLOWED_LABEL } from '../src/reply-reminder.ts'
 import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
 /**
  * session-manager.test.ts — Library-backed session-manager tests.
@@ -2155,7 +2156,7 @@ describe('spawnForPersona: SR-1.1 / SR-2.2 fresh spawn parameters', () => {
     expect(params.instance_id).toBe(`cscb_${key}`)
     expect(params.tmux_session_name).toBe(`slack_bot_${key}`)
     expect(params.relay_mode).toBe('on')
-    expect(params.label).toEqual(['service=cscb', 'tag_prompt=1', `persona=${key}`, configDirLabelFor(configDir)])
+    expect(params.label).toEqual(['service=cscb', 'tag_prompt=1', REPLY_TOOL_PREALLOWED_LABEL, `persona=${key}`, configDirLabelFor(configDir)])
     // The interim `channel=<key>` label is no longer written (E3 Task 6).
     expect(params.label!.some((l) => l.startsWith('channel='))).toBe(false)
     expect(params.extra_env).toEqual({
@@ -2191,7 +2192,7 @@ describe('spawnForPersona: SR-1.1 / SR-2.2 fresh spawn parameters', () => {
     expect('CLAUDE_CONFIG_DIR' in env).toBe(false)
     expect(spawnCalls[0].label).toEqual([
       'service=cscb',
-      'tag_prompt=1',
+      'tag_prompt=1', REPLY_TOOL_PREALLOWED_LABEL,
       'persona=C',
       `config_dir=${personaConfigDirLabelValue(undefined, home)}`,
     ])
@@ -2430,7 +2431,7 @@ describe('spawnForPersona: persona identity (SR-2.2)', () => {
     expect(params.cwd).toBe('/repo/general')
     expect(params.label).toEqual([
       'service=cscb',
-      'tag_prompt=1',
+      'tag_prompt=1', REPLY_TOOL_PREALLOWED_LABEL,
       'persona=C0AMDDZEHCY',
       configDirLabelFor(topLevel),
     ])
@@ -2597,7 +2598,7 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
     expect(spawnCalls).toHaveLength(2)
     // fresh spawn carries the original params (same persona labels / id)
     expect(spawnCalls[1].instance_id).toBe('cscb_C')
-    expect(spawnCalls[1].label).toEqual(['service=cscb', 'tag_prompt=1', 'persona=C', `config_dir=${personaConfigDirLabelValue(undefined, home)}`])
+    expect(spawnCalls[1].label).toEqual(['service=cscb', 'tag_prompt=1', REPLY_TOOL_PREALLOWED_LABEL, 'persona=C', `config_dir=${personaConfigDirLabelValue(undefined, home)}`])
     // row was already gone — no kill and no delete of a missing row
     expect(killCalls).toHaveLength(0)
     expect(deleteCalls).toHaveLength(0)
@@ -3244,7 +3245,7 @@ describe('collision ladder: config_dir guard before resume (b.av2 SR-6.2, AC 48)
     } else {
       expect(result).toEqual({ key: 'C', action: 'spawned' })
       expect(calls.spawnCalls.map((call) => call.reuse_finished)).toEqual([undefined, true])
-      expect(calls.spawnCalls[1].label).toEqual(['service=cscb', 'tag_prompt=1', 'persona=C', `config_dir=${expectedLabel}`])
+      expect(calls.spawnCalls[1].label).toEqual(['service=cscb', 'tag_prompt=1', REPLY_TOOL_PREALLOWED_LABEL, 'persona=C', `config_dir=${expectedLabel}`])
       expect(calls.spawnCalls[1].extra_env?.['CLAUDE_CONFIG_DIR']).toBe(configDir)
     }
     // A fresh spawn, not amnesia: no transcript diagnosis, record or notice.
@@ -3394,7 +3395,7 @@ describe('collision ladder: config_dir guard before resume (b.av2 SR-6.2, AC 48)
     expect(deleteCalls).toEqual([])
     expect(spawnCalls.map((call) => [call.instance_id, call.reuse_finished])).toEqual([['cscb_C', undefined], ['cscb_C', true]])
     expect(spawnCalls[1].extra_env?.['CLAUDE_CONFIG_DIR']).toBe(later)
-    expect(spawnCalls[1].label).toEqual(['service=cscb', 'tag_prompt=1', 'persona=C', configDirLabelFor(later)])
+    expect(spawnCalls[1].label).toEqual(['service=cscb', 'tag_prompt=1', REPLY_TOOL_PREALLOWED_LABEL, 'persona=C', configDirLabelFor(later)])
     expect(spawnCalls[1].label).not.toContain(configDirLabelFor(earlier))
   })
 })
@@ -4012,7 +4013,7 @@ describe('next launch: the applied values at launch time (b.av2 SR-8.6 next-laun
     expect(second.spawnCalls[1]!.extra_env?.['CLAUDE_CONFIG_DIR']).toBe(newDir)
     expect(second.spawnCalls[1]!.label).toEqual([
       'service=cscb',
-      'tag_prompt=1',
+      'tag_prompt=1', REPLY_TOOL_PREALLOWED_LABEL,
       `persona=${GUARD_KEY}`,
       `config_dir=${configDirLabelValue(join(realpathSync(realParent), 'claude-config-new'))}`,
     ])
@@ -7021,7 +7022,7 @@ describe('b.g57: an unresolvable claude_config_dir keeps the row and skips the l
       expect(await spawnForPersona(personaOf(cfg, 'C'), cfg)).toEqual({ key: 'C', action: 'spawned' })
     })
 
-    expect(first.spawnCalls[0]!.label).toEqual(['service=cscb', 'tag_prompt=1', 'persona=C', `config_dir=${expected}`])
+    expect(first.spawnCalls[0]!.label).toEqual(['service=cscb', 'tag_prompt=1', REPLY_TOOL_PREALLOWED_LABEL, 'persona=C', `config_dir=${expected}`])
     expect(first.spawnCalls[0]!.extra_env?.['CLAUDE_CONFIG_DIR']).toBe(configDir)
     expect(configDirLines(errLog)).toEqual([])
 
@@ -7207,9 +7208,9 @@ describe('startupSessionManager', () => {
     // Each spawn carries its own persona's working directory and persona label.
     const byId = new Map(spawnCalls.map((p) => [p.instance_id, p]))
     expect(byId.get('cscb_alpha')!.cwd).toBe('/x/alpha')
-    expect(byId.get('cscb_alpha')!.label).toEqual(['service=cscb', 'tag_prompt=1', 'persona=alpha', expect.stringMatching(/^config_dir=/)])
+    expect(byId.get('cscb_alpha')!.label).toEqual(['service=cscb', 'tag_prompt=1', REPLY_TOOL_PREALLOWED_LABEL, 'persona=alpha', expect.stringMatching(/^config_dir=/)])
     expect(byId.get('cscb_beta')!.cwd).toBe('/x/beta')
-    expect(byId.get('cscb_beta')!.label).toEqual(['service=cscb', 'tag_prompt=1', 'persona=beta', expect.stringMatching(/^config_dir=/)])
+    expect(byId.get('cscb_beta')!.label).toEqual(['service=cscb', 'tag_prompt=1', REPLY_TOOL_PREALLOWED_LABEL, 'persona=beta', expect.stringMatching(/^config_dir=/)])
     // Result counts are per persona.
     expect(result.succeeded).toBe(2)
     expect(result.freshSpawned).toBe(2)

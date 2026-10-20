@@ -5,6 +5,8 @@ import { systemDeliveryClock, type DeliveryClock } from './delivery-lifecycle.ts
 
 export const REPLY_REMINDER_TEXT = "You received a Slack message and you haven't replied. If you meant to answer in Slack, do it now with the reply tool. If no reply is needed, just end your turn."
 export const REPLY_REMINDER_POLL_MS = 1000
+/** Set only on launches using CSCB's reply-preallowing template; AD keeps it on resume. */
+export const REPLY_TOOL_PREALLOWED_LABEL = 'reply_tool_preallowed=1'
 export interface ReplyReminders {
   wake(key: string): void
   /** Called synchronously when CSCB sees the bot invoke reply, including a failed call. */
@@ -50,8 +52,11 @@ export function createReplyReminders(deps: {
   }
   async function observe(key: string, row: GetResult, s: State, generation: number): Promise<void> {
     await flush(key, s)
-    const enabled = deps.enabled(key)
-    const current = () => deps.enabled(key) === enabled && !stopped && !s.disabled && s.generation === generation && s.replies === undefined && !s.cancel && deps.ready(key)
+    const configured = deps.enabled(key)
+    // Older Claude rows resume their saved permissions, not the current
+    // template. Do not prompt those conversations to call an unapproved tool.
+    const enabled = configured && (row.agent !== 'claude' || row.labels.reply_tool_preallowed === '1')
+    const current = () => deps.enabled(key) === configured && !stopped && !s.disabled && s.generation === generation && s.replies === undefined && !s.cancel && deps.ready(key)
     if (!current()) return
     const items = await deps.queue.observeReplyReminders(key, row, REPLY_REMINDER_TEXT, enabled, current)
     // Accepted work belongs to normal preparation/recovery even if teardown

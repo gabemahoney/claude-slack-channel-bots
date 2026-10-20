@@ -108,6 +108,8 @@ Each persona's Slack app must have **interactivity enabled** with **Socket Mode*
 
 The `AskUserQuestion` tool is denied for every CSCB-spawned bot via the agent-director template (`deny: ['AskUserQuestion']`). Bots respond to operator questions via the Slack `reply` MCP tool instead. There is no `ask-relay.sh` hook and no `/ask` HTTP endpoint.
 
+The template pre-allows `mcp__slack-channel-router__reply`, so a newly spawned Claude persona can answer a reply reminder without human approval. This grants only the reply tool; other tool approvals still follow the permission relay. Template refreshes preserve this rule.
+
 ### Memory-directory reads
 
 The template also pre-allows each bot to read its own persistent-memory directory, so those reads don't surface a permission prompt to a human. One `Read(//<config-dir>/projects/*/memory/**)` rule is derived per distinct Claude config directory across your personas (a persona's own `claude_config_dir`, the top-level `claude_config_dir`, or the `~/.claude` default). The rules follow the applied personas: when a confirmed change alters the set of config directories, the server rewrites them. If that rewrite fails, `server.log` shows a `template refresh: … failed` line. Until the directories change again or the server restarts, a persona using a new directory then asks for permission each time it reads its memory notes. The rule is scoped to `projects/*/memory/**` only — never the config-dir root, which holds live credentials — so it never pre-authorizes credential reads.
@@ -166,6 +168,8 @@ You received a Slack message and you haven't replied. If you meant to answer in 
 ```
 
 The persona can reply or end its turn. There is at most one reminder per delivered Slack message, including across server restarts. Both Claude and Codex personas are covered, regardless of `claude_config_dir`; no `jq` installation is needed.
+
+Claude conversations launched before the reply permission was added receive no new reminders. Resuming a conversation preserves its saved permissions, so a server restart or resume alone does not enable reminders for those older conversations. New Claude launches carry the reply permission and a `reply_tool_preallowed=1` agent-director label; reminders require that label. Existing conversations continue receiving ordinary messages.
 
 Only Slack deliveries arm reminders. Scheduled prompts, `/interject` messages and reminders themselves do not. A `reply` call by that persona suppresses the reminder even if posting fails or the call targets another conversation. Replies through another tool or service can therefore be followed by one harmless reminder.
 

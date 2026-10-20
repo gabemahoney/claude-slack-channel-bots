@@ -1,3 +1,4 @@
+import { REPLY_TOOL_ALLOW_RULE } from '../src/agent-director-template.ts'
 import { queuePath, readQueue } from './test-helpers/delivery-queue.ts'
 import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
 import { IDLE_PANE } from './test-helpers/working-row-panes.ts'
@@ -3359,9 +3360,9 @@ function configDirLink(name: string, target: string): string {
   return path
 }
 
-/** The memory-read rules the template holds for `dirs`: one per distinct directory, sorted, scoped to project memory (b.av2 SR-11). */
-function memoryRules(...dirs: string[]): string[] {
-  return [...new Set(dirs)].sort().map((dir) => `Read(/${dir}/projects/*/memory/**)`)
+/** Reply plus one memory-read rule per distinct directory, sorted and scoped to project memory. */
+function templateAllowRules(...dirs: string[]): string[] {
+  return [REPLY_TOOL_ALLOW_RULE, ...[...new Set(dirs)].sort().map((dir) => `Read(/${dir}/projects/*/memory/**)`)]
 }
 
 /** The agent-director calls made from `from` (an `agentDirectorCalls` length taken earlier) on. */
@@ -5360,14 +5361,14 @@ describe('step 5: the agent-director template refresh (b.av2 SR-8.6 step 5, SR-1
   test.each(REFRESH_ROWS)('step 5: $label changes the set of effective config directories, so the apply refreshes the template exactly once, its allow rules covering exactly the new set and every other field as installed (real composition)', async ({ next, dirs, noop }) => {
     const { run, personas } = await running(['alpha', 'bravo', ['charlie', { claude_config_dir: undefined }]], { realLifecycle: true, top: DEFAULT_TOP() })
     const installed = run.composition!.installedTemplate!
-    expect(installed.allow).toEqual(memoryRules(ownConfigDir('alpha'), ownConfigDir('bravo'), h.configDir('default')))
+    expect(installed.allow).toEqual(templateAllowRules(ownConfigDir('alpha'), ownConfigDir('bravo'), h.configDir('default')))
     const candidate = next(personas, DEFAULT_TOP())
     const cp = run.checkpoint()
 
     await applyConfig(run, candidate.personas, candidate.top)
 
     expect(run.lifecycle.of('template-refresh')).toEqual([refreshRecord('refreshed')])
-    expect(templateCalls(run)).toEqual([{ ...installed, allow: memoryRules(...dirs()), overwrite: true }])
+    expect(templateCalls(run)).toEqual([{ ...installed, allow: templateAllowRules(...dirs()), overwrite: true }])
     expect(run.logs.filter((l) => l.startsWith('[slack] template refresh: '))).toHaveLength(1)
     if (noop) {
       expect(run.since(cp).lifecycle).toEqual([refreshRecord('refreshed')])
@@ -5423,7 +5424,7 @@ describe('step 5: the agent-director template refresh (b.av2 SR-8.6 step 5, SR-1
     await applyConfig(run, withDelta(personas), { mcp_config_path: join(h.root, 'mcp-next.json'), system_prompt_mode: 'none' })
 
     expect(templateCalls(run)).toEqual([
-      { ...installed, allow: memoryRules(ownConfigDir('alpha'), ownConfigDir('bravo'), ownConfigDir('delta')), overwrite: true },
+      { ...installed, allow: templateAllowRules(ownConfigDir('alpha'), ownConfigDir('bravo'), ownConfigDir('delta')), overwrite: true },
     ])
     expect(run.serverConfig()!.mcp_config_path).toBe(startTop.mcp_config_path!)
     expect(run.serverConfig()!.system_prompt_mode).toBe('append')

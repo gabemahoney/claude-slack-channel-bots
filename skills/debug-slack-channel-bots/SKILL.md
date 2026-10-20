@@ -3967,6 +3967,7 @@ registers again with its history. If the new token is refused too, a new
 
 | Cause | What to do |
 |---|---|
+| A Claude row lacks `reply_tool_preallowed=1` in its labels. | This older conversation has no recorded reply pre-approval, so CSCB sends no new reminders. Resume retains its saved permissions. Leave the label unchanged; new CSCB spawns receive the permission and label together. Ordinary message delivery continues. |
 | The row was first observed at `waiting`, so no `working` transition was observed. | No reminder is owed from that read alone. Verify with a subsequent delivered Slack message and observed AD transition. |
 | The persona invoked its own `reply` tool after the delivery, even if the post failed or targeted another conversation. | The call suppresses that delivery's reminder. Diagnose any posting failure separately. |
 | The input was a scheduled prompt, `/interject` or a reminder. | These inputs never arm reminders. |

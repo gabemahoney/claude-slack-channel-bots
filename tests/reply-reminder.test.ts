@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import type { GetResult } from 'agent-director'
 import { createDeliveryQueue, REPLY_REMINDER_KEEP_MS, type AcceptedInput, type ReplyReminderQueue, type QueueItem } from '../src/delivery-queue.ts'
-import { createReplyReminders, REPLY_REMINDER_TEXT, REPLY_REMINDER_POLL_MS, type ReplyReminders } from '../src/reply-reminder.ts'
+import { createReplyReminders, REPLY_REMINDER_TEXT, REPLY_REMINDER_POLL_MS, REPLY_TOOL_PREALLOWED_LABEL, type ReplyReminders } from '../src/reply-reminder.ts'
 import { cannedGetResult } from './test-helpers/agent-director-stub.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
@@ -26,7 +26,10 @@ async function open(options: Omit<Parameters<typeof createDeliveryQueue>[0], 'st
 function harness(queue: ReplyReminderQueue, options: { prepare?: (key: string, item: QueueItem) => Promise<void> } = {}) {
   const clock = createFakeClock()
   const persona = makeMultiPersonaConfig([{ name: 'alpha' }, { name: 'beta' }], dir).personas[0]!
-  const row = (state: GetResult['state'], overrides: Partial<GetResult> = {}) => cannedGetResult({ state, session_id: 'session', ...overrides }, persona, dir)
+  const row = (state: GetResult['state'], overrides: Partial<GetResult> = {}) => {
+    const result = cannedGetResult({ state, session_id: 'session' }, persona, dir)
+    return { ...result, labels: { ...result.labels, ...Object.fromEntries([REPLY_TOOL_PREALLOWED_LABEL.split('=')]) }, ...overrides }
+  }
   let next: (current: () => boolean) => Promise<GetResult | undefined> = async () => row('working')
   let ready = true, enabled = true, reads = 0
   const readyFor = new Map<string, boolean>(), readKeys: string[] = []
@@ -49,22 +52,43 @@ async function send(queue: ReplyReminderQueue, key = 'alpha', input: AcceptedInp
 const nudges = (q: ReplyReminderQueue, key = 'alpha') => q.items(key).filter(item => item.accepted.reminder_for !== undefined)
 
 describe('AD row reply reminders (b.js7)', () => {
+  test.each([undefined, '0'])('a legacy Claude row with reply preallow marker %s gets no reminder, including after resume', async marker => {
+    const q = await open(), h = harness(q)
+    const labels = { ...h.row('working').labels }
+    delete labels.reply_tool_preallowed
+    if (marker !== undefined) labels.reply_tool_preallowed = marker
+    await send(q)
+    await h.monitor.observe('alpha', h.row('working', { labels }))
+    await h.monitor.observe('alpha', h.row('waiting', { labels }))
+    expect(nudges(q)).toEqual([])
+    expect(q.replyReminderItems('alpha')).toEqual([])
+    await h.monitor.observe('alpha', h.row('pending', { labels }))
+    await send(q, 'alpha', slackInput({ key: { chat_id: 'C0TEST001', ts: '1700000000.000002' } }))
+    await h.monitor.observe('alpha', h.row('working', { labels }))
+    await h.monitor.observe('alpha', h.row('waiting', { labels }))
+    expect(nudges(q)).toEqual([])
+    expect(h.prepared).toEqual([])
+    expect(h.errors).toEqual([])
+  })
+
   test.each(['claude', 'codex'] as const)('%s: working → waiting queues exactly one normal injected reminder for each delivered Slack message', async agent => {
     const q = await open(), h = harness(q)
+    // The Claude launch permission marker has no role in Codex's own policy.
+    const agentRow = { agent, ...(agent === 'codex' ? { labels: {} } : {}) }
     const first = await send(q)
-    await h.monitor.observe('alpha', h.row('waiting', { agent }))
+    await h.monitor.observe('alpha', h.row('waiting', agentRow))
     expect(nudges(q)).toEqual([])
-    await h.monitor.observe('alpha', h.row('working', { agent }))
-    await Promise.all([h.monitor.observe('alpha', h.row('waiting', { agent })), h.monitor.observe('alpha', h.row('waiting', { agent }))])
+    await h.monitor.observe('alpha', h.row('working', agentRow))
+    await Promise.all([h.monitor.observe('alpha', h.row('waiting', agentRow)), h.monitor.observe('alpha', h.row('waiting', agentRow))])
     expect(h.errors).toEqual([])
     expect(nudges(q).map(item => item.accepted)).toEqual([expect.objectContaining({ source: 'interject', sender: 'reply-reminder', text: REPLY_REMINDER_TEXT, reminder_for: first })])
     expect(h.prepared.map(p => [p.key, p.item.accepted.seq])).toEqual([['alpha', nudges(q)[0]!.accepted.seq]])
-    await h.monitor.observe('alpha', h.row('working', { agent }))
-    await h.monitor.observe('alpha', h.row('waiting', { agent }))
+    await h.monitor.observe('alpha', h.row('working', agentRow))
+    await h.monitor.observe('alpha', h.row('waiting', agentRow))
     expect(nudges(q)).toHaveLength(1)
     const second = await send(q, 'alpha', slackInput({ key: { chat_id: 'C0TEST001', ts: '1700000000.000002' } }))
-    await h.monitor.observe('alpha', h.row('working', { agent }))
-    await h.monitor.observe('alpha', h.row('waiting', { agent }))
+    await h.monitor.observe('alpha', h.row('working', agentRow))
+    await h.monitor.observe('alpha', h.row('waiting', agentRow))
     expect(nudges(q).map(item => item.accepted.reminder_for)).toEqual([first, second])
     expect(nudges(q, 'beta')).toEqual([])
   })

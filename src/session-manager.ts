@@ -440,6 +440,7 @@
  */
 
 import { ENTER_DELAY_MS } from './delivery-constants.ts'
+import { REPLY_TOOL_PREALLOWED_LABEL } from './reply-reminder.ts'
 import type { DeliveryLifecycle } from './delivery-lifecycle.ts'
 import { readDeliveryScreen } from './delivery-screen.ts'
 import { decideGate, createDeliveryPolicyState, type DeliveryReading } from './delivery-policy.ts'
@@ -9327,6 +9328,7 @@ function buildSpawnParams(persona: Persona, config: PersonaConfig, configDirLabe
     label: [
       SERVICE_LABEL,
       'tag_prompt=1', // b.omv SR-7.6: every plain and reuse spawn.
+      REPLY_TOOL_PREALLOWED_LABEL,
       `${PERSONA_LABEL_PREFIX}${key}`,
       `${CONFIG_DIR_LABEL_PREFIX}${configDirLabel}`,
     ],

@@ -39,6 +39,7 @@ import { AgentDirectorError, ErrTemplateMalformed, type MakeTemplateParams } fro
 
 import {
   buildTemplateParams,
+  REPLY_TOOL_ALLOW_RULE,
   deriveMemoryReadAllowRules,
   installSlackChannelBotTemplate,
   refreshSlackChannelBotTemplate,
@@ -103,11 +104,12 @@ describe('buildTemplateParams (SR-3.1)', () => {
   // else top-level, else Claude's default `~/.claude`), one memory-scoped Read
   // rule per dir, sorted by dir + deduped. NEVER the config-dir root (holds
   // live creds). os.homedir() is read only to compute an expected string.
-  test('allow: default — no config dirs set → exactly the ~/.claude rule from os.homedir() (b.fae F5)', () => {
+  test('allow: reply needs no human approval, alongside the default memory rule', () => {
     const cfg = makePersonaConfig({ mcp_config_path: '/abs/mcp.json', system_prompt_mode: 'none' }, baseDir)
     const params = buildTemplateParams(cfg)
     // Built from os.homedir(), NOT a hardcoded /home/horde.
-    expect(params.allow).toEqual([memoryRule(join(os.homedir(), '.claude'))])
+    expect(REPLY_TOOL_ALLOW_RULE).toBe('mcp__slack-channel-router__reply')
+    expect(params.allow).toEqual([REPLY_TOOL_ALLOW_RULE, memoryRule(join(os.homedir(), '.claude'))])
     // deny surface is unchanged by F5.
     expect(params.deny).toEqual(['AskUserQuestion'])
   })
@@ -123,12 +125,11 @@ describe('buildTemplateParams (SR-3.1)', () => {
     // The rejected-in-triage broad glob and any bare-root variant must be absent.
     expect(allow).not.toContain(`Read(/${infhub}/**)`)
     expect(allow).not.toContain(`Read(/${join(os.homedir(), '.claude')}/**)`)
-    // Belt-and-suspenders: every rule must reach into projects/*/memory, so no
-    // rule can resolve to the config-dir root, settings.json, or .claude.json.
-    expect(allow.length).toBe(2)
-    for (const rule of allow) {
-      expect(rule.endsWith('/projects/*/memory/**)')).toBe(true)
-    }
+    // Exact allowlist: reply plus memory only; no other tool or credential read.
+    expect(allow).toEqual([
+      REPLY_TOOL_ALLOW_RULE,
+      ...[join(os.homedir(), '.claude'), infhub].sort().map(memoryRule),
+    ])
   })
 })
 
@@ -448,11 +449,11 @@ describe('refreshSlackChannelBotTemplate (b.av2 SR-8.6 step 5)', () => {
 
     const { result, calls, logs } = await refresh(appliedCfg, installed)
 
-    const allow = [memoryRule(join(home, '.claude')), memoryRule(infhub)]
+    const allow = [REPLY_TOOL_ALLOW_RULE, memoryRule(join(home, '.claude')), memoryRule(infhub)]
     expect(calls).toEqual([{ ...installed, allow, overwrite: true }])
     expect(calls[0]!.agent_args).toEqual(expectedArgs(baseDir))
     // Scope (b.av2 SR-11): every refreshed rule reaches into projects/*/memory, never a config-dir root.
-    for (const rule of calls[0]!.allow ?? []) expect(rule).toMatch(/\/projects\/\*\/memory\/\*\*\)$/)
+    for (const rule of calls[0]!.allow?.slice(1) ?? []) expect(rule).toMatch(/\/projects\/\*\/memory\/\*\*\)$/)
     expect(calls[0]!.allow).not.toContain(`Read(/${infhub}/**)`)
     expect(result).toEqual({ kind: 'refreshed', path: REFRESHED_PATH })
     expect(logs).toEqual([refreshedLine(2)])
@@ -468,11 +469,11 @@ describe('refreshSlackChannelBotTemplate (b.av2 SR-8.6 step 5)', () => {
     const [a, b] = [join(baseDir, 'cfg-a'), join(baseDir, 'cfg-b')]
     const serverWide = { mcp_config_path: '/abs/mcp.json', system_prompt_mode: 'none' as const }
     const installed = await bootInstall(makeMultiPersonaConfig([{ name: 'A Bot' }, { name: 'B Bot', claude_config_dir: a }], baseDir, serverWide))
-    expect(installed.allow).toHaveLength(2)
+    expect(installed.allow).toHaveLength(3)
 
     const { result, calls, logs } = await refresh(makeMultiPersonaConfig([{ name: 'B Bot', claude_config_dir: b }], baseDir, serverWide), installed)
 
-    expect(calls).toEqual([{ ...installed, allow: [memoryRule(b)], overwrite: true }])
+    expect(calls).toEqual([{ ...installed, allow: [REPLY_TOOL_ALLOW_RULE, memoryRule(b)], overwrite: true }])
     expect(result).toEqual({ kind: 'refreshed', path: REFRESHED_PATH })
     expect(logs).toEqual([refreshedLine(1)])
   })
@@ -486,7 +487,7 @@ describe('refreshSlackChannelBotTemplate (b.av2 SR-8.6 step 5)', () => {
       log: () => { /* not asserted here */ },
     })
     // os.homedir() is read only to compute the expected string.
-    expect(calls.map((p) => p.allow)).toEqual([[memoryRule(join(os.homedir(), '.claude'))]])
+    expect(calls.map((p) => p.allow)).toEqual([[REPLY_TOOL_ALLOW_RULE, memoryRule(join(os.homedir(), '.claude'))]])
   })
 
   describe('a rejected refresh is logged, not fatal, and not retried (E13 decision 3)', () => {

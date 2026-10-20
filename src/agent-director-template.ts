@@ -29,7 +29,7 @@
 
 import * as fs from 'node:fs'
 import { botSystemPromptPath } from './bot-system-prompt.ts'
-import { resolveServerStateDir } from './config.ts'
+import { MCP_SERVER_NAME, resolveServerStateDir } from './config.ts'
 import { homedir } from 'node:os'
 import { posix as pathPosix } from 'node:path'
 import type { MakeTemplateParams, MakeTemplateResult } from 'agent-director'
@@ -125,6 +125,9 @@ export function deriveMemoryReadAllowRules(personaConfig: PersonaConfig, home: s
 // SR-3.1 params builder
 // ---------------------------------------------------------------------------
 
+/** Reply reminders must not need a human to approve the Slack reply they request. */
+export const REPLY_TOOL_ALLOW_RULE = `mcp__${MCP_SERVER_NAME}__reply`
+
 /**
  * Build the `MakeTemplateParams` for the slack-channel-bot template per
  * SR-3.1. Exported for direct testing.
@@ -195,7 +198,7 @@ export function buildTemplateParams(
     // notes" into "agent reads the API key with no prompt." Every derived rule
     // is therefore scoped to the `projects/*/memory/**` subdirectory — which
     // holds innocuous markdown notes — and NEVER the config-dir root.
-    allow: deriveMemoryReadAllowRules(personaConfig),
+    allow: [REPLY_TOOL_ALLOW_RULE, ...deriveMemoryReadAllowRules(personaConfig)],
     agent: 'claude',
     agent_args,
     overwrite: true,
@@ -311,7 +314,8 @@ export type TemplateRefreshResult =
  * change (b.av2 SR-8.6 step 5): `installed` with its memory-read `allow`
  * rules derived afresh from `applied`'s personas (`deriveMemoryReadAllowRules`,
  * the boot install's derivation, so the rule shape and its per-project
- * memory scope are the same, never a config-dir root). Every other field is
+ * memory scope are the same, never a config-dir root). The reply-tool allow
+ * rule is kept alongside them. Every other field is
  * `installed`'s: `agent_args` keeps the start-time MCP config and
  * system-prompt flags (the append file is not probed again), and `name`,
  * `label`, `deny` and `relay_mode` are unchanged. `applied`'s server-wide
@@ -336,8 +340,8 @@ export async function refreshSlackChannelBotTemplate(
   installed: MakeTemplateParams,
   deps: TemplateRefreshDeps,
 ): Promise<TemplateRefreshResult> {
-  const allow = deriveMemoryReadAllowRules(applied, deps.home)
-  const params: MakeTemplateParams = { ...installed, allow, overwrite: true }
+  const memoryRules = deriveMemoryReadAllowRules(applied, deps.home)
+  const params: MakeTemplateParams = { ...installed, allow: [REPLY_TOOL_ALLOW_RULE, ...memoryRules], overwrite: true }
   const log = (line: string): void => {
     try {
       deps.log(line)
@@ -350,7 +354,7 @@ export async function refreshSlackChannelBotTemplate(
     const result = await client.makeTemplate(params)
     log(
       `[slack] template refresh: rewrote the agent-director template '${params.name}' with the memory-read rules ` +
-        `of the applied config directories (${allow.length} rule(s)); its other arguments are the start's`,
+        `of the applied config directories (${memoryRules.length} rule(s)); its other arguments are the start's`,
     )
     return { kind: 'refreshed', path: result.path }
   } catch (err) {
