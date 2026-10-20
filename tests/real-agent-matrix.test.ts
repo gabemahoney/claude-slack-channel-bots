@@ -212,6 +212,37 @@ describe('heavy planning and result validation', () => {
   })
 })
 
+test.each(['installed', 'missing', 'wrong version', 'installer failure'])('Claude entrypoint exact version setup: %s', mode => {
+  const root = mkdtempSync(join(tmpdir(), 'claude-job-setup-'))
+  try {
+    const entrypoint = readFileSync(join(import.meta.dir, '..', 'docker/real-agent-job.sh'), 'utf8')
+    const setup = entrypoint.slice(entrypoint.indexOf('[[ "$version" =~'), entrypoint.indexOf('export REAL_AGENT_CLAUDE_VERSION'))
+      .replaceAll('/opt/claude-code/$version/claude', '$fake')
+    expect(setup.startsWith('[[ "$version" =~')).toBe(true)
+    const fake = join(root, 'claude')
+    writeFileSync(fake, `#!/bin/bash\nprintf '%s\\n' '${mode === 'wrong version' ? '2.1.999' : '2.1.304'} (Claude Code)'\n`, { mode: mode === 'installed' ? 0o700 : 0o600 })
+    const program = `set -euo pipefail
+version=2.1.304
+latest=0
+fake="$1"
+mode="$2"
+bash() {
+  [[ "$1" == /opt/cscb-ci/install-real-agents.sh && "$2" == "$version" ]] || exit 9
+  printf 'installer-called\\n'
+  [[ "$mode" != 'installer failure' ]] || return 8
+  chmod +x "$fake"
+}
+${setup}`
+    const child = spawnSync('bash', ['-c', program, 'job-setup', fake, mode], {
+      env: hostSafeChildEnv(root, { tools: ['bash', 'chmod'] }), encoding: 'utf8', timeout: 5000,
+    })
+    expect(child.error).toBeUndefined()
+    expect(child.status).toBe(mode === 'installer failure' ? 8 : mode === 'wrong version' ? 1 : 0)
+    expect(child.stdout.includes('installer-called')).toBe(mode !== 'installed')
+    expect(child.stdout.includes('recorded: matrix native Claude 2.1.304')).toBe(['installed', 'missing'].includes(mode))
+  } finally { rmSync(root, { recursive: true, force: true }) }
+})
+
 test.each([false, true].flatMap(keepGoing => ['exit', 'missing report'].map(failure => [keepGoing, failure] as const)))('Claude entrypoint keep-going=%s handles %s and preserves failure status', (keepGoing, failure) => {
   const root = mkdtempSync(join(tmpdir(), 'claude-job-loop-'))
   try {
