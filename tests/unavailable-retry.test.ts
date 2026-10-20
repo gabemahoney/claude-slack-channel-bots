@@ -18,7 +18,7 @@ import { PHASE1_FLOOR_VERSION } from '../src/ad-version-gate.ts'
 import { ERR_SCHEMA_MISMATCH_NAME, ErrCwdNotFound } from '../src/agent-director-errors.ts'
 import { _resetBackoffState, getFailureCount, isAtCap, recordFailure } from '../src/backoff.ts'
 import { KILL_OUTCOME_NOT_KILLED } from '../src/checked-kill.ts'
-import type { Persona } from '../src/config.ts'
+import { MCP_SERVER_NAME, type Persona } from '../src/config.ts'
 import {
   CONFLICT_LATCH_SET_LATCHED,
   LATCH_CASE_LEFTOVER,
@@ -3942,7 +3942,7 @@ describe('unavailable retry: the tmux-unresponsive condition’s ends and the re
     expect(h.clock.pending().map((t) => t.dueAt)).toEqual([before.dueAt!])
   })
 
-  test('with both settings 0, a retry whose reconnect read-pane succeeds (the end is deferred) and whose send-keys is then refused UNAVAILABLE leaves the condition holding and the timer re-armed at the next wait; the next retry fires at that due time', async () => {
+  test('with both settings 0, an uncertain UNAVAILABLE reconnect text call keeps the condition holding and the timer re-armed; the next retry sends Enter alone at its due time', async () => {
     const h = (harness = makeRecoveryHarness(RETRY_TIMER_ONLY))
     expect([h.config.session_restart_delay, h.config.health_check_interval]).toEqual([0, 0])
     const [key] = h.keys as [string]
@@ -3954,10 +3954,12 @@ describe('unavailable retry: the tmux-unresponsive condition’s ends and the re
 
     await retryNow(h, key)
 
-    // The reconnect's read-pane ends the condition while the retry runs (the
-    // end is deferred); its send-keys is refused and starts it again, arming
-    // the timer in the same run, which cancels the deferred end.
+    // The reconnect's text call has an uncertain result and keeps its input
+    // intent while the unavailable condition and retry timer stay armed.
     expect(callsSince(h, before)).toEqual({ statusCalls: 2, getCalls: 3, sendKeysCalls: 1 })
+    expect(h.stub.calls.sendKeysCalls).toEqual([
+      { instance_id: personaInstanceId(key), text: `/mcp reconnect ${MCP_SERVER_NAME}`, no_enter: true },
+    ])
     expect(h.conditionEnds).toEqual([])
     expect(h.triggers).toEqual([{ key, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }, { key, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }])
     const lines = conditionLines(h, key)
@@ -3970,14 +3972,18 @@ describe('unavailable retry: the tmux-unresponsive condition’s ends and the re
     expect(view).toMatchObject({ phase: 'waiting', dueAt: h.clock.now() + waitMs(1), waitMs: waitMs(1), refusals: 1, mode: UNAVAILABLE_RETRY_MODE_FULL })
     expect(h.clock.pending().map((t) => t.dueAt)).toEqual([view.dueAt!])
 
-    // The re-armed timer really fires: the send-keys answers now, the
-    // reconnect succeeds and the retry stops the timer.
+    // The re-armed timer really fires: finish the uncertain text call with
+    // Enter alone, then stop the timer once the reconnect succeeds.
     h.script({ sendKeysError: undefined })
     const beforeSecond = callCounts(h)
     await h.advance(waitMs(1) - 1)
     expect(callsSince(h, beforeSecond)).toEqual({})
     await retryNow(h, key)
-    expect(callsSince(h, beforeSecond)).toEqual({ statusCalls: 2, getCalls: 4, sendKeysCalls: 2 })
+    expect(callsSince(h, beforeSecond)).toEqual({ statusCalls: 2, getCalls: 4, sendKeysCalls: 1 })
+    expect(h.stub.calls.sendKeysCalls).toEqual([
+      { instance_id: personaInstanceId(key), text: `/mcp reconnect ${MCP_SERVER_NAME}`, no_enter: true },
+      { instance_id: personaInstanceId(key), key: 'Enter' },
+    ])
     expect(h.tmuxUnresponsive.holds(key)).toBe(false)
     expect(retryLinesOf(h, key).at(-1)).toBe(stoppedLine(key, UNAVAILABLE_RETRY_STOP_RECOVERED))
     expectStopped(h, key)
