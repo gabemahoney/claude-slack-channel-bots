@@ -2236,13 +2236,11 @@ describe('server.ts gates every relaunch on the persona\'s connection (SR-6.1) a
     expect([...options.keys()].sort()).toEqual(['canLaunch', 'deadEvidence'])
   })
 
-  // Bug b.g57: the adapter's persona lookup is optional; without it a restart
-  // of a persona whose claude_config_dir no longer resolves would kill its
-  // instance ahead of a launch that cannot be made.
-  test('bug b.g57, b.jg5 SRJ-702: the restart module\'s kill is the kill adapter over the live applied persona lookup, getAppliedPersona, and the production kill-retry clock', () => {
-    expect(onlyCallProps('initRestart').get('killSession')).toBe(`_buildKillSessionAdapter(getAppliedPersona, ${KILL_RETRY_PRODUCTION_CLOCK})`)
-    // The only adapter built (its declaration aside): no other kill path without the lookup.
-    expect(indicesOf(/(?<![\w.$]|function\s+)_buildKillSessionAdapter\s*\(/g, SERVER_CODE)).toHaveLength(1)
+  // b.jpf: restart recovery is never authorized by installation discovery.
+  test('b.jpf: restart production wiring has no kill dependency', () => {
+    expect(onlyCallProps('initRestart').has('killSession')).toBe(false)
+    // The compatibility factory is declared but never built for production.
+    expect(indicesOf(/(?<![\w.$]|function\s+)_buildKillSessionAdapter\s*\(/g, SERVER_CODE)).toHaveLength(0)
     // getAppliedPersona reads the holder at call time (pinned in tests/reload-wiring.test.ts).
     expect(indicesOf(/\bfunction\s+getAppliedPersona\s*\(/g, SERVER_CODE)).toHaveLength(1)
   })

@@ -195,8 +195,11 @@ export function livenessReadingForState(state: unknown): LivenessReading {
 export function livenessKindOf(reading: unknown): LivenessKind {
   try {
     if (typeof reading !== 'object' || reading === null) return LIVENESS_UNKNOWN
-    if (isInstallGoneDeadReading(reading)) return LIVENESS_UNKNOWN
     const kind = (reading as { readonly kind?: unknown }).kind
+    if (kind === LIVENESS_DEAD &&
+        (reading as { readonly source?: unknown }).source === LIVENESS_DEAD_SOURCE_INSTALL_GONE) {
+      return LIVENESS_UNKNOWN
+    }
     return KINDS.has(kind) ? (kind as LivenessKind) : LIVENESS_UNKNOWN
   } catch {
     return LIVENESS_UNKNOWN

@@ -8686,10 +8686,11 @@ describe('released agent-director 0.12 migration instructions (b.m2o)', () => {
   })
 })
 
-// b.omv SR-7.1/2/4/6: maintained release notes describe this breaking upgrade.
-test('Unreleased records fresh conversations, retained memory and the typed launch contract', () => {
-  const unreleased = readFileSync(join(REPO_ROOT, 'CHANGELOG.md'), 'utf-8').split(/^## \[Unreleased\]|^## Unreleased/m)[1]?.split('\n## ')[0] ?? ''
-  for (const term of ['fresh conversation', 'memory', 'tag_prompt', 'bot-system-prompt.md']) expect(unreleased.toLowerCase()).toContain(term)
+// b.omv SR-7.1/2/4/6 shipped in 0.17.0; Unreleased holds later changes.
+const QUEUED_DELIVERY_RELEASE_HEADING = '## 0.17.0 (2026-10-19)'
+test('0.17.0 records fresh conversations, retained memory and the typed launch contract', () => {
+  const released = requiredSection(operatorText(CHANGELOG_FILE), QUEUED_DELIVERY_RELEASE_HEADING, CHANGELOG_FILE)
+  for (const term of ['fresh conversation', 'memory', 'tag_prompt', 'bot-system-prompt.md']) expect(released.toLowerCase()).toContain(term)
 })
 
 const OBSOLETE_SLACK_REDELIVERY = /(?:deduplicat\w*|redeliver\w*|key)[^.]*(?:10|ten)[ -]minutes?|(?:deduplicat\w*|redeliver\w*|key)[^.]*(?:clear\w*|reset\w*|forgotten|forget\w*)[^.]*restart/i
@@ -8802,7 +8803,7 @@ const QUEUED_DOC_ROWS: readonly (readonly [file: string, heading: HeadingMatch |
   [RUNBOOK_DOC, '### Upgrading to personas', 'upgrade permits removing the Claude Code pin', [
     /(?:remove|drop)[^.]*Claude Code[^.]*pin/i,
   ], 'After upgrading, remove the Claude Code version pin.'],
-  [CHANGELOG_FILE, '## Unreleased', 'remaining breaking changes, durable delivery and downgrade instructions are released together', [
+  [CHANGELOG_FILE, QUEUED_DELIVERY_RELEASE_HEADING, 'remaining breaking changes, durable delivery and downgrade instructions are released together', [
     '/interject', /agent-director[^.]*0\.12\.0/, /channels[^.]*flag/i,
     /durable/i, /(?:strict[^.]*order|ordered|FIFO)/i, /at.least.once/i,
     /scheduled[^.]*queue/i, 'queued', 'queue-failed', 'queued=N failed=M', '`bind`',

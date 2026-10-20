@@ -67,6 +67,8 @@ import {
   AGENT_DIRECTOR_PENDING_STATE,
   LIVENESS_LIVE,
   LIVENESS_READING_DEAD,
+  LIVENESS_READING_DEAD_INSTALL_GONE,
+  LIVENESS_DEAD_SOURCE_INSTALL_GONE,
   LIVENESS_READING_LIVE,
   LIVENESS_READING_PENDING,
   LIVENESS_READING_UNKNOWN,
@@ -3178,7 +3180,6 @@ describe('E4 guard: health liveness with upgrade inspection installed', () => {
     ['absent row', errSpawnNotFound()],
     ['ended row', cannedStatusResult({ state: 'ended' })],
     ['missing row', cannedStatusResult({ state: 'missing' })],
-    ['dead without a row read (install gone)', errSystemInstallDisappeared('status')],
   ] as const)('%s bypasses inspection and schedules normal recovery immediately', async (_label, answer) => {
     const config = makeMultiPersonaConfig([{ name: KEY }], baseDir)
     const statusCalls: string[] = []
@@ -3209,5 +3210,55 @@ describe('E4 guard: health liveness with upgrade inspection installed', () => {
     expect(deps.scheduleRestartCalls).toEqual([])
     expect(deps.isSessionConnectedCalls).toEqual([])
     expect(lines.filter(line => line.includes('liveness unknown'))).toHaveLength(inspected ? 0 : 1)
+  })
+})
+
+describe('b.jpf: install discovery failure supplies no health recovery evidence', () => {
+  afterEach(resetClientForTests)
+
+  test('repeated install failures retain ad-unreachable without scheduling or resetting health; a fresh missing row permits recovery', async () => {
+    const config = makeMultiPersonaConfig([{ name: KEY }], baseDir)
+    let authoritative = false
+    const statusCalls: string[] = []
+    setClientForTests(makeStubClient({ statusFn: params => {
+      statusCalls.push(params.instance_id!)
+      return authoritative ? cannedStatusResult({ state: 'missing' }) : errSystemInstallDisappeared('status')
+    } }) as unknown as Client)
+    const deps = makeDeps({ personas: buildPersonaWorkList(config), recordRetryArms: true })
+    deps.isSessionAlive = _buildIsSessionAliveAdapter(() => config)
+    const healthy: string[] = []
+    const ended: string[] = []
+    deps.resetSlowRecoveryCount = key => { healthy.push(key) }
+    deps.endNotConnectedEpisode = key => { ended.push(key) }
+    deps.endTmuxUnresponsive = key => { ended.push(key) }
+    initHealthCheck(deps)
+
+    await capturingErrors(() => driveTicks(3))
+
+    expect(statusCalls).toEqual(Array(3).fill(personaInstanceId(KEY)))
+    expect([...getOutageFlags(KEY)]).toEqual(['ad-unreachable'])
+    expect(notices).toHaveLength(1)
+    expect(notices[0]!.text).toContain('agent-director unreachable')
+    expect([deps.scheduleRestartCalls, deps.isSessionConnectedCalls, deps.armRetryTimerCalls, healthy, ended]).toEqual([[], [], [], [], []])
+
+    authoritative = true
+    await driveTicks(1)
+    expect(deps.scheduleRestartCalls).toEqual([{ key: KEY, cwd: config.personas[0]!.working_directory }])
+    expect([...getOutageFlags(KEY)]).toEqual([])
+    expect([healthy, ended]).toEqual([[], []])
+  })
+
+  test.each([
+    ['legacy export', LIVENESS_READING_DEAD_INSTALL_GONE],
+    ['legacy dead shape', { kind: LIVENESS_READING_DEAD.kind, source: LIVENESS_DEAD_SOURCE_INSTALL_GONE }],
+    ['dead shape with throwing source', Object.defineProperty({ kind: LIVENESS_READING_DEAD.kind }, 'source', { get() { throw new Error('unreadable source') } })],
+  ] as const)('%s is skipped without health restart or slow-count reset', async (_label, reading) => {
+    const deps = makeDeps({ isSessionAliveResult: reading, recordRetryArms: true })
+    const healthy: string[] = []
+    deps.resetSlowRecoveryCount = key => { healthy.push(key) }
+    initHealthCheck(deps)
+    await capturingErrors(() => driveTicks(2))
+    expect(deps.isSessionAliveCalls).toEqual([KEY, KEY])
+    expect([deps.scheduleRestartCalls, deps.isSessionConnectedCalls, deps.armRetryTimerCalls, healthy]).toEqual([[], [], [], []])
   })
 })

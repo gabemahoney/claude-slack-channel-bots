@@ -17888,11 +17888,9 @@ describe('b.jg5 SRJ-704, SRJ-1007, SRJ-702: the kill-failure alert at the live-r
     await h.runApproverToStop(p)
 
     const err = errTmuxKillFailed(undefined, 'no-session-no-kill')
-    // Only a dead reading that read no row (ErrSystemInstallDisappeared) leads
-    // the restart path to a kill (b.jg5 SRJ-314, SRJ-110: none for a row just
-    // read ended or missing).
-    h.script({ statusQueue: [], statusError: errSystemInstallDisappeared('status'), killQueue: [], killError: err })
-    expect(await runRestartRetry(p, harnessPersona(h, p).working_directory, isLaunchInFlight)).toBe(RESTART_OUTCOME_REFUSED)
+    // An authoritative live-row replacement still performs its own checked kill.
+    scriptLiveRowElsewhere(h, p, { killQueue: [], killError: err, statusQueue: [], statusError: undefined })
+    await launchThroughSequence(h, p)
 
     expect(h.episodeNotices).toEqual([killFailureNotice(p, survivorAlertContent(p, survivor)), killFailureNotice(p, ordinaryAlertContent(p, { last: err }))])
     expect(h.killFailureOpen(p)).toBe(true)
