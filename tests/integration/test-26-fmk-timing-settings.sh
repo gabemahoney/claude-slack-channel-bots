@@ -1386,10 +1386,32 @@ release_timed_out_launch_fixture() {
     stub_report_delay "${WORK[${x}]}" 0
 }
 
+# expect_finished_before_launch <step> <id> <previous-launch> <launch>:
+# AD's latest state change in this launch interval must be terminal. A sweep
+# marks missing through ad.find_missing.tick, not ad.spawn.state_transition;
+# note-only sweep ticks have null states and do not change the row's state.
+# These events carry the instance id, not a conversation id. SessionStart is
+# checked separately against the recovered row's exact session in hooks_brought_up.
+expect_finished_before_launch() {
+    local step="$1" id="$2" previous="$3" launch="$4" transitions last reads
+    transitions="$(ad_trail_events ad.spawn.state_transition "${id}")" || exit 1
+    transitions+=$'\n'"$(ad_trail_events ad.find_missing.tick "${id}")" || exit 1
+    last="$(jq -ers --arg id "${id}" --argjson after "${previous}" --argjson before "${launch}" '
+        map(select(.instance_id == $id and .new_state != null)
+            | (.ts | capture("^(?<s>[^.Z]+)(\\.(?<f>[0-9]+))?Z$")) as $ts
+            | . + {epoch: (($ts.s + "Z" | fromdateiso8601) + ("0." + ($ts.f // "0") | tonumber))}
+            | select(.epoch > $after and .epoch < $before))
+        | sort_by(.epoch) | last | .new_state // "none"' <<< "${transitions}")" \
+        || fail "${step}: cannot read AD state changes for ${id}"
+    [[ "${last}" == ended || "${last}" == missing ]] \
+        || fail "${step}: a CSCB launch of ${id} without AD ended/missing evidence after its previous launch (last transition '${last}')"
+    reads=$(( $(cscb_calls_between "${previous}" "${launch}" get --instance-id "${id}") + $(cscb_calls_between "${previous}" "${launch}" status --instance-id "${id}") ))
+    (( reads >= 1 )) || fail "${step}: a CSCB launch of ${id} with no CSCB read of its row before it"
+}
+
 leg_call_timeout_low() {
     local step="call-timeout-30000" x=t1 line warn_t elapsed get_line t_get readings state start_raw stopped_m deadline
-    local t prev last reads n_pending n_live first_waiting first_launch_start="" released=0
-    local event_time event_state event_t transitions
+    local t prev n_pending n_live first_waiting first_launch_start="" released=0
     leg "${step}"
     readings="${SCENARIO_ROOT}/${x}-row-readings.tsv"
     start_call_timeout_leg "${step}" "${x}" "${CALL_TIMEOUT_LOW_MS}"
@@ -1458,29 +1480,15 @@ leg_call_timeout_low() {
     echo "${TEST_NAME}: ${step}: T1's get at +$(seconds_between "${T_CALL}" "${t_get}")s read this launch's pending row; SessionStart brought T1 up"
 
     # No launch over the row: every CSCB launch call of T1 after its spawn
-    # follows a harness reading of ended or missing (its latest reading
-    # before the call) and a CSCB read of the row (a get or status) since
-    # the call before it.
+    # follows AD's ended/missing evidence and a CSCB read of the row (a get
+    # or status) since the call before it. AD's trail preserves a finished
+    # interval even when it falls between the harness's one-second samples.
     prev="${T_CALL}"
     while IFS= read -r line; do
         call_fields "${step}" "${line}"
         t="${CALL_T}"
         time_before "${T_CALL}" "${t}" || continue
-        # AD's transition trail preserves a finished interval even when it
-        # falls between the harness's one-second samples.
-        transitions="$(ad_trail_events ad.spawn.state_transition "${ID[${x}]}")" || exit 1
-        last=""
-        while IFS=$'\t' read -r event_time event_state; do
-            [[ -n "${event_time}" ]] || continue
-            event_t="$(date -u -d "${event_time}" +%s.%6N)" || fail "${step}: invalid AD transition timestamp"
-            if time_before "${prev}" "${event_t}" && time_before "${event_t}" "${t}"; then
-                last="${event_state}"
-            fi
-        done < <(jq -r '[.ts, .new_state] | @tsv' <<< "${transitions}")
-        [[ "${last}" == ended || "${last}" == missing ]] \
-            || fail "${step}: a CSCB ${CALL_VERB} of T1 at +$(seconds_between "${T_CALL}" "${t}")s without AD ended/missing evidence after its previous launch (last transition '${last:-none}')"
-        reads=$(( $(cscb_calls_between "${prev}" "${t}" get --instance-id "${ID[${x}]}") + $(cscb_calls_between "${prev}" "${t}" status --instance-id "${ID[${x}]}") ))
-        (( reads >= 1 )) || fail "${step}: a CSCB ${CALL_VERB} of T1 at +$(seconds_between "${T_CALL}" "${t}")s with no CSCB read of its row before it"
+        expect_finished_before_launch "${step}: ${CALL_VERB} at +$(seconds_between "${T_CALL}" "${t}")s" "${ID[${x}]}" "${prev}" "${t}"
         prev="${t}"
     done < <({ cscb_ad_calls spawn --instance-id "${ID[${x}]}"; cscb_ad_calls resume --instance-id "${ID[${x}]}"; } | sort -t $'\t' -k2,2n)
     n_pending="$(awk -F'\t' '$2 == "pending"' "${readings}" | wc -l | tr -d ' ')"

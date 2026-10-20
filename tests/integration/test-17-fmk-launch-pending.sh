@@ -67,9 +67,8 @@ Q_CHANNEL="C0T17RST1"
 Q_SUFFIX=t17q
 
 # The launch-timeout legs (seconds).
-CREATE_DELAY_MARGIN_S=10  # the slow-create delay past agent-director's create timeout
 LT_HOLD_SLACK_S=8         # the report-in delay past the last launch call's end
-LT_REPORT_WAIT_S=60       # after the launch calls ended: every row out of pending
+LT_REPORT_WAIT_S=60       # reporting allowance in the fixed combined leg deadline below
 LT_RETRY_READ_S=5         # after a retry line: that retry's read of the row
 LT_RETRY_SLACK_S=30       # past the retry timer's first wait: each persona's timer stopped
 
@@ -493,17 +492,13 @@ FORM_UNAVAILABLE_HEAD="$(fmk_text launchUnavailableFormText none)" || fail "setu
 [[ "${RETRY_BASE_S}" =~ ^[1-9][0-9]*$ && "${RETRY_CEILING_S}" =~ ^[1-9][0-9]*$ ]] \
     || fail "setup: the retry base '${RETRY_BASE_S}' or ceiling '${RETRY_CEILING_S}' is not a whole number of seconds"
 [[ -n "${TIMEOUT_PHRASE}" && -n "${OUTCOME_PENDING}" ]] || fail "setup: fmk-texts.ts printed an empty value"
-# The slow-create delay: above agent-director's create timeout, below CSCB's call timeout.
-CREATE_DELAY_S=$(( (CREATE_TIMEOUT_MS + 999) / 1000 + CREATE_DELAY_MARGIN_S ))
-(( CREATE_DELAY_S * 1000 > CREATE_TIMEOUT_MS && CREATE_DELAY_S * 1000 < CALL_TIMEOUT_MS )) \
-    || fail "setup: the slow-create delay ${CREATE_DELAY_S}s is not between the create timeout ${CREATE_TIMEOUT_MS}ms and the call timeout ${CALL_TIMEOUT_MS}ms"
 # The start pass's launch calls end within CSCB's call timeout; then each one's get.
 LAUNCH_END_WAIT_S=$(( CALL_TIMEOUT_MS / 1000 + 30 ))
 # The launch-timeout legs' report-in delay: agent-director makes one launch's
 # session-creating call at a time, so the last launch call ends about one
-# create timeout per persona after the first launch start, and each get
-# follows; the delay outlasts that by LT_HOLD_SLACK_S, so a harness read after
-# each get still finds the row pending at its starting screen.
+# create timeout per persona after the first launch start at worst. Keep
+# the existing 23-second delay: losing the response after AD records the
+# successful launch leaves time for each recovery get to observe pending.
 LT_REPORT_DELAY_S=$(( ${#LT_ROLES[@]} * ((CREATE_TIMEOUT_MS + 999) / 1000) + LT_HOLD_SLACK_S ))
 (( LT_REPORT_DELAY_S < G_S )) || fail "setup: the launch-timeout legs' report-in delay ${LT_REPORT_DELAY_S}s is not shorter than G ${G_S}s"
 # Each persona's retry timer, armed at its launch timeout, has run its first retry or stopped.
@@ -512,7 +507,7 @@ LT_RETRY_WAIT_S=$(( RETRY_BASE_S + LT_RETRY_SLACK_S ))
     || fail "setup: the restart leg's report-in delay ${RESTART_REPORT_DELAY_S}s is not shorter than G ${G_S}s"
 # The restart leg's wait: from the launch start, G and one longest retry wait, then the lap and the report-in.
 RESTART_CLEAR_BOUND_S=$(( G_S + RETRY_CEILING_S + RESTART_LAP_SLACK_S ))
-echo "${TEST_NAME}: slow-create delay ${CREATE_DELAY_S}s (create timeout ${CREATE_TIMEOUT_MS}ms, call timeout ${CALL_TIMEOUT_MS}ms); retry base ${RETRY_BASE_S}s, ceiling ${RETRY_CEILING_S}s; restart leg: report-in delay ${RESTART_REPORT_DELAY_S}s, clear bound ${RESTART_CLEAR_BOUND_S}s"
+echo "${TEST_NAME}: successful launch response loss (report-in delay ${LT_REPORT_DELAY_S}s, call timeout ${CALL_TIMEOUT_MS}ms); retry base ${RETRY_BASE_S}s, ceiling ${RETRY_CEILING_S}s; restart leg: report-in delay ${RESTART_REPORT_DELAY_S}s, clear bound ${RESTART_CLEAR_BOUND_S}s"
 
 MARKED_MISSING="$(fmk_text PENDING_ROW_RUN_MARKED_MISSING)" || fail "setup: fmk-texts.ts could not print PENDING_ROW_RUN_MARKED_MISSING"
 SPAWN_FAILURE_HEAD="$(fmk_text spawnFailureNoticeHead "${SESSION_CREATE_ERR}")" \
@@ -897,8 +892,24 @@ end_worker() {
 }
 
 # ---------------------------------------------------------------------------
-# The launch-timeout legs: a plain spawn, a reuse and a resume (slow-create)
+# The launch-timeout legs: a plain spawn, a reuse and a resume (response loss)
 # ---------------------------------------------------------------------------
+
+lt_launch_reply_faults() {
+    require_ci_image 'launch response faults'
+    require_scenario_home 'launch response faults'
+    local file="${SCENARIO_AD_SHIM_LOG%.log}.faults" role verb
+    # Preserve collisions and all failed launches. Each rule is consumed
+    # only when this persona's real launch succeeds with its identity saved.
+    {
+        flock -x 8 || fail 'launch response faults: cannot lock rules'
+        for role in "${LT_ROLES[@]}"; do
+            verb=spawn
+            [[ "${role}" != resume ]] || verb=resume
+            printf '%s instance=%s launch-reply-timeout 1\n' "${verb}" "${LT_ID[${role}]}"
+        done > "${file}"
+    } 8> "${file}.lock"
+}
 
 leg_launch_timeouts() {
     local step="launch timeouts" creds="${SCENARIO_ROOT}/credentials-lt" role id ref key verb
@@ -955,23 +966,24 @@ leg_launch_timeouts() {
         "$(persona_json "${LT_NAME[reuse]}" "${creds}/reuse.json" "${LT_WORK[reuse]}" "${LT_CHANNEL[reuse]}")" \
         "$(persona_json "${LT_NAME[resume]}" "${creds}/resume.json" "${LT_WORK[resume]}" "${LT_CHANNEL[resume]}")"
 
-    # Step 3: slow-create, then the start.
-    tmux_shim_mode slow-create "${CREATE_DELAY_S}"
+    # Step 3: lose successful launch responses, then start. A slow-create
+    # timeout returns before AD saves pane identity on 0.12, so SessionStart
+    # cannot report in; that is a different contract from this success leg.
+    lt_launch_reply_faults
     log0="$(line_count "${SLACK_STATE_DIR}/server.log")"
     lt_start="$(now_s)"
     start_server --live
     srv="${SERVER_PID}"
 
     # Steps 4 and 5 [harness]: read the three rows until each has left
-    # pending; once every launch call has ended in its get, the shim goes back
-    # to `log`.
+    # pending. The unchanged deadline is LAUNCH_END_WAIT_S + LT_REPORT_WAIT_S
+    # from this polling phase's start, not a fresh 60 seconds after the gets.
     : > "${reads}"
     deadline=$(( $(_scenario_now_ms) + (LAUNCH_END_WAIT_S + LT_REPORT_WAIT_S) * 1000 ))
     while :; do
         if [[ -z "${reset_at}" ]] && timeout_get_lines_seen "${log0}"; then
-            tmux_shim_mode log
             reset_at="$(now_s)"
-            echo "${TEST_NAME}: ${step}: every launch call ended in its get by $(seconds_between "${lt_start}" "${reset_at}")s after the start; the tmux shim is back in log mode"
+            echo "${TEST_NAME}: ${step}: every launch call ended in its get by $(seconds_between "${lt_start}" "${reset_at}")s after the start"
         fi
         left=0
         for role in "${LT_ROLES[@]}"; do
@@ -988,8 +1000,8 @@ leg_launch_timeouts() {
         done
         (( left )) || break
         if (( $(_scenario_now_ms) >= deadline )); then
-            [[ -n "${reset_at}" ]] || fail "${step}: the three launch calls had not all ended in their get within ${LAUNCH_END_WAIT_S}s"
-            fail "${step}: not every row left pending within ${LT_REPORT_WAIT_S}s of the launch calls' end"
+            [[ -n "${reset_at}" ]] || fail "${step}: the three launch calls had not all ended in their get within the combined $((LAUNCH_END_WAIT_S + LT_REPORT_WAIT_S))s polling bound"
+            fail "${step}: not every row left pending within the combined $((LAUNCH_END_WAIT_S + LT_REPORT_WAIT_S))s polling bound (${LT_REPORT_WAIT_S}s reporting allowance)"
         fi
         sleep "${SCENARIO_POLL_S}"
     done
@@ -1035,6 +1047,11 @@ leg_launch_timeouts() {
                 (( n == 0 )) || fail "${step}: ${role}: the bot server made ${n} reuse spawn(s) of ${id}" ;;
         esac
         [[ -n "${launch_at[${role}]}" ]] || fail "${step}: ${role}: the bot server made no launch of its kind for ${id}"
+        verb=spawn
+        [[ "${role}" != resume ]] || verb=resume
+        n="$(awk -F'\t' -v p="${srv}" -v w="${verb} instance=${id} launch-reply-timeout 1" \
+            '$1 == "fault" && $4 == p && $6 == w { n++ } END { print n + 0 }' "${SCENARIO_AD_SHIM_LOG}")"
+        (( n == 1 )) || fail "${step}: ${role}: ${n} successful launch responses lost, not one"
         if [[ "${role}" != spawn ]]; then
             echo "${TEST_NAME}: ${step}: ${role}: its plain spawn's collision (recorded): $(log_hits "${log0}" "[slack] spawnForPersona: collision resolved, state=" "for ${ref}" | cut -f3 | tr '\n' '|')"
         fi

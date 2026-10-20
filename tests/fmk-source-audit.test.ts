@@ -108,7 +108,10 @@ import ts from 'typescript'
 import { assertNoLeak, writtenFile } from './test-helpers/credentials.ts'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
 
-import { AD_ERROR_CLASS_CONFIG, AD_ERROR_CLASS_CONFLICT, AD_ERROR_CLASS_UNAVAILABLE, AD_ERROR_CLASS_UNCLASSIFIED, AD_ERROR_CLASS_UNUSABLE_NAME, classifyAdError } from '../src/ad-error-class.ts'
+import { AD_ERROR_CLASS_CONFIG, AD_ERROR_CLASS_CONFLICT, AD_ERROR_CLASS_UNAVAILABLE, AD_ERROR_CLASS_UNCLASSIFIED, AD_ERROR_CLASS_UNUSABLE_NAME, classifyAdError, LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE, launchTimeoutFormOf } from '../src/ad-error-class.ts'
+import { LAUNCH_TIMEOUT_PHRASE } from '../src/ad-description-phrases.ts'
+import { LAUNCH_CALL_END_LAUNCH_TIMEOUT, launchCallWindowOf, thisLaunchRowOf } from '../src/session-manager.ts'
+import { collided, makeRecoveryHarness, personaRow } from './test-helpers/recovery-harness.ts'
 import { adConfigMalformedOnset } from '../src/outage-state.ts'
 import { PANE_READ_GONE, paneReadFailureOf } from '../src/pane-read.ts'
 
@@ -1745,6 +1748,93 @@ printf 'KEYS=%s OUTCOMES=%s LAST=%s\\n' \
 printf 'RESULT=%s' "$?"`, ['cat', 'jq', 'awk'])
     expect(output).toContain(mode === 'complete' ? 'KEYS=4 OUTCOMES=4 LAST=6\nRESULT=0' : 'RESULT=1')
   })
+  test.each(['complete', 'missing-session', 'missing-pane', 'tmux-failure', 'undefined-helper'])('test-18 executes its fixture identity reader: %s', mode => {
+    const source = readFileSync(join(import.meta.dir, 'integration/test-18-fmk-wedged.sh'), 'utf8')
+    writeFileSync(join(home, 'row.json'), JSON.stringify({ session_id: 'conversation', tmux_session_name: mode === 'missing-session' ? null : 'fixture', tmux_socket: '/fixture/socket', jsonl_path: '/fixture/transcript' }))
+    const reader = helper('t18_reconnect_identity', source)
+    const output = shell(`${['_scenario_tmux_check', '_scenario_tmux', '_scenario_session_target'].map(name => helper(name)).join('\n')}
+${helper('t18_row_get', source)}
+${mode === 'undefined-helper' ? reader.replace('_scenario_tmux display-message', 'tmux_session_value display-message') : reader}
+SCENARIO_ROOT="$HOME"
+SCENARIO_FMK=1
+TMUX_TMPDIR="$HOME/tmux"
+SCENARIO_REAL_TMUX=fixture_tmux
+AD_OUT="$HOME/row.json"
+fail() { printf 'REFUSED: %s\\n' "$*"; exit 1; }
+ad_capture() { [[ "$*" == 'get --instance-id cscb_fixture' ]] || exit 9; AD_RC=0; }
+fixture_tmux() {
+    [[ "$*" == 'display-message -p -t =fixture: #{session_id} #{pane_id} #{pane_pid}' ]] || exit 9
+    ${mode === 'tmux-failure' ? 'return 1' : `printf '%s\\n' '${mode === 'missing-pane' ? '$4 %3' : '$4 %3 123'}'`}
+}
+(t18_reconnect_identity cscb_fixture fixture) 2>&1
+printf 'RESULT=%s' "$?"`, ['jq'])
+    expect(output).toContain(mode === 'complete' ? '["conversation","fixture","/fixture/socket","/fixture/transcript","$4 %3 123"]\nRESULT=0' : 'RESULT=1')
+    if (mode === 'undefined-helper') expect(output).toContain('command not found')
+  })
+
+  test.each([
+    'sweep-missing', 'hook-ended', 'null-note-after-missing', 'out-of-order-events',
+    'wrong-id', 'before-previous-launch', 'after-next-launch', 'at-previous-launch', 'at-next-launch',
+    'note-only', 'still-pending', 'live-after-missing', 'no-cscb-read', 'status-read', 'missing-sweep-reader',
+  ])('test-26 requires terminal AD evidence and a CSCB read between launches: %s', mode => {
+    const source = readFileSync(join(import.meta.dir, 'integration/test-26-fmk-timing-settings.sh'), 'utf8')
+    expect(helper('leg_call_timeout_low', source)).toContain('expect_finished_before_launch "${step}: ${CALL_VERB} at +$(seconds_between "${T_CALL}" "${t}")s" "${ID[${x}]}" "${prev}" "${t}"')
+    const tick = { event: 'ad.find_missing.tick', instance_id: 'cscb_fixture', ts: '1970-01-01T00:00:15.123456789Z', prior_state: 'pending', new_state: 'missing' as string | null }
+    const events = [tick]
+    if (mode === 'hook-ended') { tick.event = 'ad.spawn.state_transition'; tick.new_state = 'ended' }
+    if (mode === 'wrong-id') tick.instance_id = 'cscb_other'
+    if (mode === 'before-previous-launch') tick.ts = '1970-01-01T00:00:09Z'
+    if (mode === 'after-next-launch') tick.ts = '1970-01-01T00:00:21Z'
+    if (mode === 'at-previous-launch') tick.ts = '1970-01-01T00:00:10Z'
+    if (mode === 'at-next-launch') tick.ts = '1970-01-01T00:00:20Z'
+    if (mode === 'note-only') tick.new_state = null
+    if (mode === 'still-pending') tick.new_state = 'pending'
+    if (mode === 'null-note-after-missing') events.push({ ...tick, ts: '1970-01-01T00:00:16Z', new_state: null })
+    // Concatenating the two event streams without chronological sorting
+    // would incorrectly let this older sweep hide the later live hook.
+    if (mode === 'live-after-missing') events.push({ ...tick, event: 'ad.spawn.state_transition', ts: '1970-01-01T00:00:16Z', new_state: 'waiting' })
+    if (mode === 'out-of-order-events') events.unshift({ ...tick, event: 'ad.spawn.state_transition', ts: '1970-01-01T00:00:14Z', new_state: 'pending' })
+    writeFileSync(join(home, 'ad-trail.jsonl'), events.map(event => JSON.stringify(event)).join('\n'))
+    const reader = helper('expect_finished_before_launch', source)
+    const output = shell(`${helper('ad_trail_events')}
+${mode === 'missing-sweep-reader' ? reader.replace(/^.*transitions\+=.*ad\.find_missing\.tick.*\n/m, '') : reader}
+SCENARIO_AD_ROOT="$HOME"
+require_ci_image() { :; }
+require_scenario_home() { :; }
+fail() { printf 'REFUSED: %s\\n' "$*"; exit 1; }
+cscb_calls_between() {
+    [[ "$1 $2 $4 $5" == '10 20 --instance-id cscb_fixture' ]] || exit 9
+    [[ "$3" == ${mode === 'status-read' ? 'status' : 'get'} ]] && echo ${mode === 'no-cscb-read' ? '0' : '1'} || echo 0
+}
+(expect_finished_before_launch fixture cscb_fixture 10 20)
+printf 'RESULT=%s' "$?"`, ['jq'])
+    const accepted = ['sweep-missing', 'hook-ended', 'null-note-after-missing', 'out-of-order-events', 'status-read'].includes(mode)
+    expect(output).toContain(accepted ? 'RESULT=0' : 'RESULT=1')
+    if (mode === 'no-cscb-read') expect(output).toContain('no CSCB read')
+  })
+
+  test.each(['matching-session', 'wrong-session', 'wrong-id', 'unapplied-hook', 'automatic-keys'])('test-26 recovery requires the applied SessionStart of its recovered session: %s', mode => {
+    const source = readFileSync(join(import.meta.dir, 'integration/test-26-fmk-timing-settings.sh'), 'utf8')
+    writeFileSync(join(home, 'row.json'), JSON.stringify({ state: 'waiting', session_id: 'recovered-session' }))
+    writeFileSync(join(home, 'ad-trail.jsonl'), JSON.stringify({ event: 'ad.hook.fired', instance_id: mode === 'wrong-id' ? 'cscb_other' : 'cscb_fixture', event_name: 'SessionStart', session_id: mode === 'wrong-session' ? 'earlier-session' : 'recovered-session', upsert_outcome: mode === 'unapplied-hook' ? 'no_change' : 'updated' }))
+    const output = shell(`${helper('ad_trail_events')}
+${helper('hooks_brought_up', source)}
+SCENARIO_AD_ROOT="$HOME"
+SCENARIO_TAG=fixture
+REPORT_WAIT_S=1
+AD_OUT="$HOME/row.json"
+declare -A ID=([t1]=cscb_fixture)
+require_ci_image() { :; }
+require_scenario_home() { :; }
+fail() { printf 'REFUSED: %s\\n' "$*"; exit 1; }
+wait_until() { [[ "$3 $4 $5" == 'row_state_is cscb_fixture waiting' ]] || exit 9; }
+ad_capture() { [[ "$*" == 'get --instance-id cscb_fixture' ]] || exit 9; AD_RC=0; }
+now_s() { echo 20; }
+cscb_calls_between() { [[ "$*" == '10 20 send-keys --instance-id cscb_fixture' ]] || exit 9; echo ${mode === 'automatic-keys' ? 1 : 0}; }
+(hooks_brought_up fixture t1 10)
+printf 'RESULT=%s' "$?"`, ['jq'])
+    expect(output).toContain(mode === 'matching-session' ? 'RESULT=0' : 'RESULT=1')
+  })
   const shimHelpers = ['_scenario_ad_contract', '_scenario_is_shim', '_scenario_check_shim_at', 'check_ad_shim'].map((name) => helper(name)).join('\n')
   const fixturePrelude = `${shimHelpers}
 ${helper('expect_fails_in_home', selfCheck)}
@@ -2364,5 +2454,193 @@ describe('b.m2o: old-name audit exempts only deliberate old-release contracts', 
     expect(legacyIntegrationFindings('fixtures/stub-claude.sh', planted)).toContain('fixtures/stub-claude.sh: read_grace has 2 legacy lines, expected 1')
     const outside = `${source}\ncat "$HOME/.agent-director/config.toml"\n`
     expect(legacyIntegrationFindings('fixtures/stub-claude.sh', outside)).toEqual([`fixtures/stub-claude.sh:${source.split('\n').length + 1}: legacy token outside an old-release contract`])
+  })
+})
+
+describe('test-17 loses only a successful, targeted AD launch response', () => {
+  const fixtureDir = join(import.meta.dir, 'integration/fixtures')
+  const shim = readFileSync(join(fixtureDir, 'agent-director-shim.sh'), 'utf8')
+  const scenario = readFileSync(join(import.meta.dir, 'integration/test-17-fmk-launch-pending.sh'), 'utf8')
+  const declaration = (name: string) => scenario.match(new RegExp(`^${name}\\(\\) \\{[\\s\\S]*?^\\}`, 'm'))![0]
+  const leg = declaration('leg_launch_timeouts')
+  const selectionStart = leg.indexOf('    # Step 3:')
+  const selection = leg.slice(selectionStart, leg.indexOf('    log0=', selectionStart))
+  // Execute the complete shim against an inert binary replacement. No AD,
+  // tmux, native agent or scenario is run.
+  const envelope = readFileSync(join(fixtureDir, 'agent-director-unresponsive.json'), 'utf8')
+  let root: string, real: string, log: string, faults: string
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'pending-launch-response-'))
+    real = join(root, 'agent-director.real'); log = join(root, 'agent-director-shim.log'); faults = join(root, 'agent-director-shim.faults')
+    writeFileSync(join(root, 'inert-shim'), shim, { mode: 0o755 })
+    writeFileSync(join(root, 'agent-director-unresponsive.json'), envelope)
+    writeFileSync(`${real}.status`, '0\n')
+    writeFileSync(real, '#!/bin/bash\nprintf "%s\\n" "$*" >> "$0.calls"\nprintf "real-stdout\\n"\nprintf "real-stderr\\n" >&2\nread -r rc < "$0.status"\nexit "$rc"\n', { mode: 0o755 })
+  })
+  afterEach(() => { rmSync(root, { recursive: true, force: true }) })
+  function configure(useSlowCreate = false) {
+    const script = [
+      'set -euo pipefail', 'SCENARIO_AD_SHIM_LOG="$1"', 'LT_ROLES=(spawn reuse resume)',
+      'declare -A LT_ID=([spawn]=fixture_spawn [reuse]=fixture_reuse [resume]=fixture_resume)',
+      'require_ci_image() { :; }', 'require_scenario_home() { :; }', 'fail() { exit 97; }',
+      'tmux_shim_mode() { :; }', declaration('lt_launch_reply_faults'),
+      useSlowCreate ? selection.replace('    lt_launch_reply_faults', '    tmux_shim_mode slow-create 15') : selection,
+    ].join('\n')
+    const result = spawnSync('bash', ['-c', script, 'inert-selection', log], {
+      env: hostSafeChildEnv(root, { tools: ['bash', 'flock'] }), encoding: 'utf8', timeout: 5000,
+    })
+    expect(result.error).toBeUndefined(); expect(result.status).toBe(0)
+    assertNoLeak({ stdout: result.stdout, stderr: result.stderr })
+  }
+  function invoke(args: string[], rc = 0) {
+    writeFileSync(`${real}.status`, `${rc}\n`)
+    const result = spawnSync('bash', ['-p', join(root, 'inert-shim'), ...args], {
+      env: hostSafeChildEnv(root, { tools: ['bash'] }), encoding: 'utf8', timeout: 5000,
+    })
+    expect(result.error).toBeUndefined(); expect(result.signal).toBeNull()
+    assertNoLeak({ stdout: result.stdout, stderr: result.stderr })
+    return { status: result.status, stdout: result.stdout, stderr: result.stderr }
+  }
+  function actualFaults() { return existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n').filter(line => line.startsWith('fault\t')) : [] }
+  function decodedReply(reply: ReturnType<typeof invoke>, verb: 'spawn' | 'resume') {
+    expect(reply.status).toBe(1)
+    expect(reply.stdout).toBe('')
+    const parsed = JSON.parse(reply.stderr)
+    return agentDirectorClient.errorFromEnvelope(verb, parsed.err_name, parsed.err_description)
+  }
+  function expectLaunchTimeout(reply: ReturnType<typeof invoke>, verb: 'spawn' | 'resume') {
+    const error = decodedReply(reply, verb)
+    expect(classifyAdError(error).errorClass).toBe(AD_ERROR_CLASS_UNAVAILABLE)
+    expect(launchTimeoutFormOf(error, verb)).toBe(LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE)
+    expect(error.errDescription).toContain(LAUNCH_TIMEOUT_PHRASE)
+    expect(error.errDescription).not.toContain('the keys may have been delivered')
+    return error
+  }
+
+  test.each([
+    ['plain spawn', ['spawn', '--instance-id', 'fixture_spawn']],
+    ['reuse spawn', ['spawn', '--instance-id', 'fixture_reuse', '--reuse-finished']],
+    ['resume', ['resume', '--instance-id', 'fixture_resume']],
+    ['client global arguments', ['--store-path', '/inert/store', 'spawn', '--instance-id', 'fixture_spawn']],
+    ['equals global and instance arguments', ['--store-path=/inert/store', 'spawn', '--instance-id=fixture_spawn']],
+  ])('%s executes the launch once, replaces only its successful reply, then exhausts the fault', (_name, args) => {
+    configure()
+    expectLaunchTimeout(invoke(args as string[]), args.includes('resume') ? 'resume' : 'spawn')
+    expect(actualFaults()).toHaveLength(1)
+    const words = args as string[]
+    const id = words.find(word => word.startsWith('--instance-id='))?.split('=')[1]
+      ?? words[words.indexOf('--instance-id') + 1]
+    expect(actualFaults()[0]!.split('\t')[5]).toBe(`${words.includes('resume') ? 'resume' : 'spawn'} instance=${id} launch-reply-timeout 1`)
+    expect(readFileSync(`${real}.calls`, 'utf8').trim().split('\n')).toEqual([(args as string[]).join(' ')])
+    expect(invoke(args as string[])).toEqual({ status: 0, stdout: 'real-stdout\n', stderr: 'real-stderr\n' })
+    expect(actualFaults()).toHaveLength(1)
+    expect(readdirSync(root).filter(name => name.includes('.reply.'))).toEqual([])
+  })
+
+  test.each([
+    ['reuse collision', 'spawn', 'fixture_reuse', 23],
+    ['resume error', 'resume', 'fixture_resume', 24],
+    ['plain launch error', 'spawn', 'fixture_spawn', 25],
+  ])('%s preserves both streams and status, reserving the timeout for the next successful launch', (_name, verb, id, rc) => {
+    configure()
+    const args = [verb as string, '--instance-id', id as string]
+    const rulesBefore = readFileSync(faults, 'utf8')
+    expect(invoke(args, rc as number)).toEqual({ status: rc, stdout: 'real-stdout\n', stderr: 'real-stderr\n' })
+    expect(actualFaults()).toEqual([])
+    expect(readFileSync(faults, 'utf8')).toBe(rulesBefore)
+    expectLaunchTimeout(invoke(args), verb as 'spawn' | 'resume')
+    expect(actualFaults()).toHaveLength(1)
+  })
+
+  test.each([
+    ['other persona', ['spawn', '--instance-id', 'fixture_other']],
+    ['prefix-only persona', ['spawn', '--instance-id', 'fixture_spawn_extra']],
+    ['target only in a label', ['spawn', '--instance-id', 'fixture_other', '--label', 'fixture_spawn']],
+    ['other verb', ['get', '--instance-id', 'fixture_spawn']],
+    ['wrong launch kind', ['resume', '--instance-id', 'fixture_spawn']],
+    ['resume persona’s initial plain spawn', ['spawn', '--instance-id', 'fixture_resume']],
+  ])('%s passes through without consuming another persona’s fault', (_name, args) => {
+    configure()
+    const rulesBefore = readFileSync(faults, 'utf8')
+    expect(invoke(args as string[])).toEqual({ status: 0, stdout: 'real-stdout\n', stderr: 'real-stderr\n' })
+    expect(actualFaults()).toEqual([])
+    expect(readFileSync(faults, 'utf8')).toBe(rulesBefore)
+  })
+
+  test('the actual leg configures all three scoped launch faults and retains the report delay and fixed deadline', () => {
+    configure()
+    expect(readFileSync(faults, 'utf8')).toBe('spawn instance=fixture_spawn launch-reply-timeout 1\nspawn instance=fixture_reuse launch-reply-timeout 1\nresume instance=fixture_resume launch-reply-timeout 1\n')
+    // Mutating the actual leg back to slow-create loses the timeout oracle.
+    rmSync(faults)
+    configure(true)
+    expect(invoke(['spawn', '--instance-id', 'fixture_spawn'])).toEqual({ status: 0, stdout: 'real-stdout\n', stderr: 'real-stderr\n' })
+    expect(scenario).toContain('LT_REPORT_WAIT_S=60')
+    expect(scenario).toContain('LT_REPORT_DELAY_S=$(( ${#LT_ROLES[@]} * ((CREATE_TIMEOUT_MS + 999) / 1000) + LT_HOLD_SLACK_S ))')
+    expect(leg).toContain('deadline=$(( $(_scenario_now_ms) + (LAUNCH_END_WAIT_S + LT_REPORT_WAIT_S) * 1000 ))')
+  })
+
+  test('the older unknown-typed action fails the collision pass-through control', () => {
+    configure()
+    writeFileSync(faults, readFileSync(faults, 'utf8').replaceAll('launch-reply-timeout', 'unknown-typed'))
+    expect(invoke(['spawn', '--instance-id', 'fixture_reuse'], 23)).toEqual({ status: 1, stdout: '', stderr: envelope })
+    expect(actualFaults()).toHaveLength(1)
+  })
+
+  test.each(['spawn', 'reuse', 'resume'] as const)('%s reply ends the production launch window and owns its pending row', async role => {
+    configure()
+    const verb = role === 'resume' ? 'resume' : 'spawn'
+    const error = expectLaunchTimeout(invoke([verb, '--instance-id', `fixture_${role}`]), verb)
+    const h = makeRecoveryHarness({ harnessNow: true })
+    const persona = h.config.personas[0]!, key = persona.key
+    const startMs = Date.parse('2026-01-01T00:00:00Z'), takesMs = 3_000
+    let launched = false
+    try {
+      await h.clock.advanceTo(startMs)
+      if (role !== 'spawn') h.script(collided(h, persona, {
+        state: 'ended', session_id: 'saved-session',
+        ...(role === 'reuse' ? { cwd: h.home } : {}),
+      }))
+      const timedCall = async () => {
+        launched = true
+        await h.clock.advance(takesMs)
+        return error
+      }
+      h.script({
+        ...(verb === 'resume' ? { resumeFn: timedCall } : { spawnFn: params => {
+          if (role === 'reuse' && !params.reuse_finished) return undefined
+          return timedCall()
+        } }),
+        getFn: () => launched ? personaRow(h, key, { state: 'pending', launch_started_at: new Date(startMs + 1).toISOString() }) : undefined,
+      })
+      expect(await h.launch(key)).toEqual({ key, action: 'retrying' })
+      expect(launchCallWindowOf(key)).toEqual({ verb, startMs, endMs: startMs + takesMs, end: LAUNCH_CALL_END_LAUNCH_TIMEOUT })
+      expect(thisLaunchRowOf(key)).toEqual({ launchStartMs: startMs + 1, window: { verb, startMs, endMs: startMs + takesMs, end: LAUNCH_CALL_END_LAUNCH_TIMEOUT } })
+      expect(h.stub.calls.readPaneCalls).toEqual([])
+      expect(h.stub.calls.sendKeysCalls).toEqual([])
+      expect(h.stub.calls.killCalls).toEqual([])
+      expect(h.stub.calls.deleteCalls).toEqual([])
+      assertNoLeak(h.captured())
+    } finally {
+      h.cleanup()
+    }
+  })
+
+  test('the old send-keys envelope fails the launch-timeout oracle on the executable shim', () => {
+    configure()
+    const broken = shim.replace(/            printf '\{"err_name":"ErrTmuxUnresponsive"[^\n]+/, '            /usr/bin/cat "${log%/*}/agent-director-unresponsive.json" >&2 || exit 70')
+    expect(broken).not.toBe(shim)
+    writeFileSync(join(root, 'inert-shim'), broken)
+    const reply = invoke(['spawn', '--instance-id', 'fixture_spawn'])
+    const error = decodedReply(reply, 'spawn')
+    expect(classifyAdError(error).errorClass).toBe(AD_ERROR_CLASS_UNAVAILABLE)
+    expect(launchTimeoutFormOf(error, 'spawn')).toBeUndefined()
+    expect(() => expectLaunchTimeout(reply, 'spawn')).toThrow()
+  })
+
+  test.each(['send-keys instance=fixture_spawn', 'spawn *'])('launch timeout fault refuses an unsafe scope: %s', rule => {
+    writeFileSync(faults, `${rule} launch-reply-timeout 1\n`)
+    expect(invoke(['spawn', '--instance-id', 'fixture_spawn']).status).toBe(70)
+    expect(existsSync(`${real}.calls`)).toBe(false)
+    expect(actualFaults()).toEqual([])
   })
 })

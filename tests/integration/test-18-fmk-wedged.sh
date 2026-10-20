@@ -363,8 +363,13 @@ t18_note_posts() {
 t18_reconnect_identity() {
     local session pane
     t18_row_get "$1" "$2"
-    session="$(jq -r '.tmux_session_name' "${AD_OUT}")"
-    pane="$(tmux_session_value "${session}" '#{session_id} #{pane_id} #{pane_pid}')" || fail "$2: cannot read the fixture's pane identity"
+    session="$(jq -er '.tmux_session_name | select(type == "string" and length > 0)' "${AD_OUT}")" \
+        || fail "$2: the reported fixture has no tmux session name"
+    _scenario_tmux_check "$2: fixture identity"
+    pane="$(_scenario_tmux display-message -p -t "$(_scenario_session_target "${session}"):" '#{session_id} #{pane_id} #{pane_pid}')" \
+        || fail "$2: cannot read the fixture's pane identity"
+    [[ "${pane}" =~ ^\$[0-9]+\ %[0-9]+\ [1-9][0-9]*$ ]] \
+        || fail "$2: the fixture has incomplete pane identity"
     jq -ce --arg pane "${pane}" '[.session_id, .tmux_session_name, .tmux_socket, .jsonl_path, $pane] |
         select(all(.[]; type == "string" and length > 0))' "${AD_OUT}" \
         || fail "$2: the reported fixture has incomplete identity"

@@ -130,6 +130,17 @@ while (( verb_index < ${#argv[@]} )); do
     esac
 done
 call_verb="${argv[verb_index]:-}"
+# Launch-response loss consumes a rule only after a successful real launch.
+# Keep its lock through that call so a collision cannot steal the fault
+# intended for the following reuse/resume, or race a concurrent invocation.
+consume_fault() {
+    rules[i]="${verb} ${match} ${candidate} $((10#${count} - 1))"
+    printf '%s\n' "${rules[@]}" > "${faults}.$$" || exit 70
+    /usr/bin/mv -f "${faults}.$$" "${faults}" || exit 70
+    printf -v fault_words '%q %q %q %q' "${verb}" "${match}" "${candidate}" "${count}"
+    printf -v fault_line 'fault\t%s\t%s\t%s\t%s\t%s' "${EPOCHREALTIME/,/.}" "$$" "${PPID}" "${parent}" "${fault_words}"
+    { /usr/bin/flock -x 9 && printf '%s\n' "${fault_line}" >&9; } 9>> "${log}" || exit 70
+}
 if [[ -f "${faults}" ]]; then
     exec 8> "${faults}.lock" || exit 70
     /usr/bin/flock -x 8 || exit 70
@@ -143,10 +154,13 @@ if [[ -f "${faults}" ]]; then
             exit 70
         fi
         case "${candidate}" in
-            swallow|unknown-typed|unknown-untyped) ;;
+            swallow|unknown-typed|unknown-untyped|launch-reply-timeout) ;;
             delay=*) [[ "${candidate#delay=}" =~ ^[0-9]{1,6}$ ]] || exit 70 ;;
             *) exit 70 ;;
         esac
+        if [[ "${candidate}" == launch-reply-timeout ]]; then
+            [[ "${verb}" == spawn || "${verb}" == resume ]] && [[ "${match}" == instance=?* ]] || exit 70
+        fi
         [[ "${verb}" == "${call_verb}" && "${count}" -gt 0 ]] || continue
         matches=0
         case "${match}" in
@@ -156,22 +170,42 @@ if [[ -f "${faults}" ]]; then
                 [[ "${previous}" == --key && "${arg}" == "${match#key=}" ]] && matches=1
                 previous="${arg}"
             done ;;
+            instance=*) previous=''; for arg in "$@"; do
+                if [[ "${previous}" == --instance-id && "${arg}" == "${match#instance=}" \
+                    || "${arg}" == "--instance-id=${match#instance=}" ]]; then matches=1; fi
+                previous="${arg}"
+            done ;;
             *) printf 'agent-director-shim: invalid fault matcher\n' >&2; exit 70 ;;
         esac
         (( matches )) || continue
         action="${candidate}"
-        rules[i]="${verb} ${match} ${candidate} $((10#${count} - 1))"
-        printf '%s\n' "${rules[@]}" > "${faults}.$$" || exit 70
-        /usr/bin/mv -f "${faults}.$$" "${faults}" || exit 70
-        printf -v fault_words '%q %q %q %q' "${verb}" "${match}" "${candidate}" "${count}"
-        printf -v fault_line 'fault\t%s\t%s\t%s\t%s\t%s' "${EPOCHREALTIME/,/.}" "$$" "${PPID}" "${parent}" "${fault_words}"
-        { /usr/bin/flock -x 9 && printf '%s\n' "${fault_line}" >&9; } 9>> "${log}" || exit 70
+        [[ "${action}" == launch-reply-timeout ]] || consume_fault
         break
     done
-    /usr/bin/flock -u 8
-    exec 8>&-
+    if [[ "${action}" != launch-reply-timeout ]]; then
+        /usr/bin/flock -u 8
+        exec 8>&-
+    fi
 fi
 case "${action}" in
+    launch-reply-timeout)
+        reply="${faults}.reply.$$"
+        rc=0
+        "${real}" "$@" 8>&- > "${reply}.out" 2> "${reply}.err" || rc=$?
+        if (( rc == 0 )); then consume_fault; fi
+        /usr/bin/flock -u 8
+        exec 8>&-
+        if (( rc == 0 )); then
+            # LaunchTimeoutError's envelope (internal/spawn/launch_errors.go),
+            # distinct from the send-keys uncertainty used by unknown-typed.
+            printf '{"err_name":"ErrTmuxUnresponsive","err_description":"tmux: unresponsive: %s of instance launch-reply-timeout: tmux session creation failed: no answer within 5 s; the session may have been created; the row stays pending; do not retry until get shows the row ended or missing"}\n' "${call_verb}" >&2 || exit 70
+            rc=1
+        else
+            /usr/bin/cat "${reply}.out" || exit 70
+            /usr/bin/cat "${reply}.err" >&2 || exit 70
+        fi
+        /usr/bin/rm -f "${reply}.out" "${reply}.err" || exit 70
+        exit "${rc}" ;;
     swallow) printf '{}\n'; exit 0 ;;
     delay=*) ms="${action#delay=}"; printf -v seconds '%d.%03d' "$((10#${ms}/1000))" "$((10#${ms}%1000))"; /usr/bin/sleep "${seconds}" ;;
     unknown-typed) "${real}" "$@" >/dev/null 2>/dev/null || true ;;
