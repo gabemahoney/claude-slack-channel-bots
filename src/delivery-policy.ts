@@ -2,14 +2,14 @@
 /** The production engine and gate's I/O-free choices (b.omv SR-1.2/15.6).
  * Observations are values: receipt records and saved key readings are never
  * replaced with a newer environment while an owned operation completes. */
-export const ENGINE_ACTIONS = ['expireTimers', 'commitAppend', 'observeLaunch', 'readReceipt', 'fixText', 'recordSend', 'typeText', 'pressEnter', 'recordRefusal', 'releaseAttempt', 'requestGate', 'deferReconnect', 'recordNotice', 'stopAbsent', 'compactQueueRename', 'compactQueueFinish', 'ignoreDuplicate'] as const
+export const ENGINE_ACTIONS = ['expireTimers', 'commitAppend', 'observeLaunch', 'readReceipt', 'fixText', 'recordSend', 'recordRecoveryEnter', 'typeText', 'pressEnter', 'recordRefusal', 'releaseAttempt', 'requestGate', 'deferReconnect', 'recordNotice', 'stopAbsent', 'compactQueueRename', 'compactQueueFinish', 'ignoreDuplicate'] as const
 export type EngineAction = typeof ENGINE_ACTIONS[number] | 'wait'
 export type GateAction = 'grantDelivery' | 'cancelRequest' | 'release' | 'runReconnect' | 'wait'
 export type DeliveryPair = readonly [number, number]
 export const NO_DELIVERY_PAIR: DeliveryPair = [0, 0]
 export type DeliveryTimer = 'settle' | 'receipt' | 'backoff' | 'enterDelay' | 'notNow' | 'reconnect'
 export type PolicyTimers = Record<DeliveryTimer, number>
-export interface PolicySend { item: number; part: number; offset: number; how?: string }
+export interface PolicySend { item: number; part: number; offset: number; how?: string; attempt?: number }
 export interface PolicyRecord { kind: string; text: unknown }
 export interface DeliveryReading {
   row: string; relay: boolean; marker: boolean; mcp: boolean
@@ -22,6 +22,8 @@ export interface DeliveryPolicyEngine {
   retypes: Record<number, number>; timers: PolicyTimers
   restartCheck: boolean; appendBlocked: boolean; noticed: readonly number[]; request: string
   keyReading: DeliveryReading
+  /** Durable recovery Enter attempt completed in this engine; forgotten on restart. */
+  recoveryAttempt?: number
 }
 export interface DeliveryPolicyKnowledge {
   p: { accepted: readonly number[]; fixed: readonly number[]; sent: readonly PolicySend[]; refused: readonly number[]; delivered: readonly DeliveryPair[] }
@@ -58,11 +60,17 @@ export function firstSendGate(r: DeliveryReading, e: DeliveryPolicyEngine): bool
 export function retypeGate(r: DeliveryReading, e: DeliveryPolicyEngine): boolean {
   return firstSendGate(r, e) && r.receipts.length === 0 && e.timers.backoff === 0
 }
+/** Attempt identity for the latest durable, non-refused send of this part. */
+export function latestDeliveryAttempt(k: DeliveryPolicyKnowledge, pair: DeliveryPair): number | undefined {
+  const last = made(k, pair).at(-1)
+  return last === undefined ? undefined : k.p.sent[last]!.attempt ?? last + 1
+}
 export function reconnectGate(r: DeliveryReading): boolean {
   return r.up && !r.latched && !r.held && r.relay && r.marker && r.row === 'waiting'
 }
 export function decideEngine(k: DeliveryPolicyKnowledge): EngineAction {
   const ip = selectDeliveryTarget(k), e = k.e, r = k.r, hasTarget = ip[0] !== 0, retype = hasTarget && made(k, ip).length > 0
+  const recoverEnter = retype && e.recoveryAttempt !== latestDeliveryAttempt(k, ip)
   if (k.compact === 'prepared') return 'compactQueueRename'
   if (k.writer.kind === 'accepted' && k.writer.how === 'slack-redelivery') return 'ignoreDuplicate'
   if (k.compact === 'renamed') return 'compactQueueFinish'
@@ -73,22 +81,26 @@ export function decideEngine(k: DeliveryPolicyKnowledge): EngineAction {
   if (e.phase === 'enter' && e.timers.enterDelay === 0) return r.gate === 'delivery' ? 'pressEnter' : r.gate === 'free' ? 'requestGate' : 'wait'
   if (e.phase === 'refused') return 'recordRefusal'
   if (hasTarget && policyReceipt(k, ip) !== undefined) return 'readReceipt'
+  if (e.phase === 'recovery-enter') return r.gate === 'delivery' ? 'pressEnter' : r.gate === 'free' ? 'requestGate' : 'wait'
   if (e.phase === 'receipt' && e.timers.receipt === 0) return 'releaseAttempt'
   if (hasTarget && !k.p.fixed.includes(ip[0])) return 'fixText'
   if (k.g.deferred && !r.mcp && k.g.due && r.gate === 'free') return 'deferReconnect'
-  if (hasTarget && e.phase === 'ready' && e.timers.notNow === 0 && (retype ? retypeGate(r, e) : firstSendGate(r, e)) && (!retype || (e.retypes[ip[0]] ?? 0) < (k.MaxRetypes ?? Infinity))) return r.gate === 'delivery' ? 'recordSend' : 'requestGate'
+  if (hasTarget && e.phase === 'ready' && e.timers.notNow === 0 && (retype ? retypeGate(r, e) : firstSendGate(r, e)) && (!retype || recoverEnter || (e.retypes[ip[0]] ?? 0) < (k.MaxRetypes ?? Infinity))) {
+    if (r.gate !== 'delivery') return 'requestGate'
+    return recoverEnter ? 'recordRecoveryEnter' : 'recordSend'
+  }
   if (hasTarget && retype && (e.retypes[ip[0]] ?? 0) >= 1 && !e.noticed.includes(ip[0])) return 'recordNotice'
   if (Object.values(e.timers).some(t => t > 0)) return 'expireTimers'
   return 'wait'
 }
 export function decideGate(k: DeliveryPolicyKnowledge): GateAction {
-  const needed = k.e.request === 'granted' || ['text', 'enter', 'receipt'].includes(k.e.phase) || k.writer.kind === 'sent'
+  const needed = k.e.request === 'granted' || ['text', 'enter', 'recovery-enter', 'receipt'].includes(k.e.phase) || k.writer.kind === 'sent'
   const blocked = k.e.appendBlocked || !k.r.up || k.r.latched || k.r.held
   if (k.g.owner === 'delivery' && blocked) return 'release'
   if (k.g.owner === 'delivery' && !needed) return 'release'
   if (k.g.owner === 'free' && k.e.request === 'delivery') {
     const operation = decideEngine({ ...k, r: { ...k.r, gate: 'delivery' } })
-    return (needed || operation === 'recordSend') && !blocked ? 'grantDelivery' : 'cancelRequest'
+    return (needed || operation === 'recordSend' || operation === 'recordRecoveryEnter') && !blocked ? 'grantDelivery' : 'cancelRequest'
   }
   if (k.g.owner === 'reconnect' && k.g.stage === 'done') return 'release'
   if (k.g.owner === 'free' && k.g.deferred && k.g.due && !k.r.mcp && reconnectGate(k.r)) return 'runReconnect'

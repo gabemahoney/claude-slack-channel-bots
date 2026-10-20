@@ -1428,7 +1428,10 @@ export type SessionConflictLatch = Pick<ConflictLatch, 'isLatched' | 'record' | 
  */
 let conflictLatch: SessionConflictLatch | undefined
 
-export function setConflictLatch(latch: SessionConflictLatch | undefined): void { conflictLatch = latch }
+export function setConflictLatch(latch: SessionConflictLatch | undefined): void {
+  conflictLatch = latch
+  syncSequenceLatchObserver()
+}
 
 const LATCH_CASE_UNKNOWN = 'unknown'
 

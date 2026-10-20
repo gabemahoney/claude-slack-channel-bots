@@ -197,7 +197,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
           // The frozen observation predates any newly appended send.
           // Receipts for earlier sends of this part remain eligible.
           const offset = s.receiptTarget?.[0] === item.accepted.seq && s.receiptTarget[1] === part && r.attempt > (s.receiptAttempt ?? 0) ? s.reading.records.length : 0
-          sends.push({ item: item.accepted.seq, part, offset, how: 'send_kind' in r ? r.send_kind : 'unknown' })
+          sends.push({ item: item.accepted.seq, part, offset, how: 'send_kind' in r ? r.send_kind : 'unknown', attempt: r.attempt })
           if (noKeys.has(r.attempt)) refused.push(sends.length)
         } else if (r.kind === 'delivered') delivered.push([r.seq, r.part])
       }
@@ -292,6 +292,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
           // Retype spacing belongs to the FIFO item, spanning its parts.
           if (s.lastSeq !== head.accepted.seq) s.retryStep = 0
           s.lastSeq = head.accepted.seq; s.lastPart = part; s.lastRetypeEvent = undefined; s.e.target = pair; s.notNowStep = 0
+          s.e.recoveryAttempt = undefined
           s.recover = effectiveSends(head, part).length > 0 || head.unknownSend
         }
         if (!s.pending && observedItem && (s.e.phase === 'ready' || s.e.phase === 'receipt' || !s.row)
@@ -320,6 +321,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
         }
         if (action === 'observeLaunch') {
           release(s); s.e.phase = 'ready'; s.e.launchSeen = k.r.launch; s.e.sessionSeen = k.r.session
+          s.e.recoveryAttempt = undefined
           s.e.retypes = {}; s.dialogHold = false; s.dialogMaybeOpen = false; s.retryStep = 0; s.notNowStep = 0; s.recover = true
           s.deadlines.backoff = 0; s.deadlines.notNow = 0; s.deadlines.enterDelay = 0
           const previous = launches.get(key), launchId = life.launchId(key), sessionId = s.row!.session_id
@@ -363,7 +365,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
             const sent = effectiveSends(head!, part).at(-1)
             const safe = sent?.send_kind === 'retype' ? retypeGate(gateKnowledge.r, gateKnowledge.e) : firstSendGate(gateKnowledge.r, gateKnowledge.e)
             if (!safe) { s.e.phase = 'ready'; s.e.request = 'none'; s.recover = true; release(s); break }
-          } else if (s.e.phase === 'enter' && !firstSendGate(gateKnowledge.r, gateKnowledge.e)) {
+          } else if (['enter', 'recovery-enter'].includes(s.e.phase) && !firstSendGate(gateKnowledge.r, gateKnowledge.e)) {
             s.e.phase = 'receipt'; s.e.request = 'none'; s.deadlines.receipt = clock.now() + ms('RECEIPT_WAIT_MS', RECEIPT_WAIT_MS); release(s); break
           }
           if (choice === 'grantDelivery') {
@@ -372,13 +374,13 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
           }
           s.e.request = 'none'; break
         }
-        if (action === 'recordSend') {
+        if (action === 'recordSend' || action === 'recordRecoveryEnter') {
           const retype = (effectiveSends(head!, part).length > 0 || head!.unknownSend)
-          const kind = retype ? 'retype' : 'text'
+          const kind = action === 'recordRecoveryEnter' ? 'enter' : retype ? 'retype' : 'text'
           const sent: SentRecord = { v: 1, kind: 'sent', seq: pair[0], part, attempt: head!.nextAttempt, send_kind: kind, at: clock.now(), launch_id: life.launchId(key), session_id: s.row!.session_id, transcript_path: s.receipt?.path ?? '', transcript_size: s.receipt?.size ?? 0 }
           s.e.target = pair; s.e.attempt = sent.attempt
           queueWrite(s, sent, () => {
-            s.e.phase = 'text'; s.e.request = 'none'
+            s.e.phase = kind === 'enter' ? 'recovery-enter' : 'text'; s.e.request = 'none'
             if (kind === 'retype') { s.e.retypes[pair[0]] = (s.e.retypes[pair[0]] ?? 0) + 1; s.retryStep++ }
           }); continue
         }
@@ -396,7 +398,13 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
         }
         if (action === 'pressEnter') {
           if (!await revalidateKeys(key, s)) break
-          try { await ad(key, s, 'send-keys', client => client.sendKeys({ instance_id: deps.instanceId(key), key: 'Enter' })) }
+          const recovery = s.e.phase === 'recovery-enter'
+          try {
+            await ad(key, s, 'send-keys', client => client.sendKeys({ instance_id: deps.instanceId(key), key: 'Enter' }))
+            // The durable intent precedes keys. A restart or any refused or
+            // uncertain recovery retries Enter before it can append text.
+            if (recovery) s.e.recoveryAttempt = s.e.attempt
+          }
           catch (error) { await keyError(key, s, error, false) }
           const sentItem = deps.queue.items(key).find(i => i.accepted.seq === s.e.target[0]) ?? head!
           const sent = effectiveSends(sentItem, s.e.target[1]).at(-1)
