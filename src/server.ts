@@ -246,7 +246,6 @@ import { createPersonaSerializer } from './persona-serializer.ts'
 import { createPersonaLifecycle, type PersonaLifecycle } from './persona-lifecycle.ts'
 import { describeKillOutcome, killOutcomeStopsServer } from './checked-kill.ts'
 import { KILL_RETRY_SEED_NOT_LIVE_VALUE, KILL_RETRY_SYSTEM_CLOCK, killRetryStopped, type KillRetryWait } from './kill-retry.ts'
-import { cleanSession, getCozempicAvailable } from './cozempic.ts'
 import { resolveSystemBinary } from 'agent-director'
 import {
   ErrSpawnNotFound,
@@ -1110,8 +1109,6 @@ async function handleInitialized(
   // Promote pending → registered (removes from pendingSessionMap internally;
   // the pending stub becomes the registered entry).
   registerSession(realCwd, persona.key, pendingId)
-  // b.f2b: connected again, so its not-connected episode (if any) is over:
-  // its notice latch and the restart path's idle evidence are forgotten.
   forgetNotConnectedEpisode(persona.key)
 
   // Register MCP session ID for future HTTP request routing
@@ -1171,19 +1168,9 @@ const personaRouting = createPersonaRouting({
   getChannelDelivery: () => channelDeliveryStore,
   // A lost message for a persona that is not up restarts nothing (b.av2 SR-6.4).
   isPersonaUp,
-  // b.jg5 SRJ-1011: the lost-message state inputs, each read at call time.
-  // The latch and the tmux-unresponsive conditions are built in main(), so
-  // before then no persona is latched and no condition holds. State 6's
-  // launch-or-approver member: a launch call, or the dialog approver that
-  // runs after it returned, in its own registry (SRJ-401). This is not the
-  // "in flight for P" predicate below: a live-row sequence or an old-life
-  // wait step reports `restarting` instead (the sequence/wait member below).
   isLatched: (key) => personaLatch?.isLatched(key) ?? false,
   isTmuxUnresponsive: (key) => personaTmuxUnresponsive?.holds(key) ?? false,
   isLaunchRunning: (key) => isLaunchInFlight(key),
-  // b.jg5 SRJ-1011: the lost-message read gate's "in flight for P" is the
-  // health tick's (isPersonaWorkInFlight: a running approver and a running
-  // live-row sequence included), so in-flight work reaches the gate through it.
   isWorkInFlight: isPersonaWorkInFlight,
   // b.jg5 SRJ-706, SRJ-811, SRJ-812, SRJ-1011: while P's live-row sequence,
   // or an old-life wait step for a hold P waits on, runs, a lost message
@@ -1390,11 +1377,6 @@ async function shutdown(reason: string, exitCode = 0): Promise<void> {
     cronScheduler.stop()
     cronScheduler = null
   }
-  // b.jg5 SRJ-706: every running live-row sequence stops (its stop signal set
-  // now, so none makes a call after the one in progress returns, and none
-  // holds a timer), and no sequence starts after this; a call in progress is
-  // not waited for, as for the dialog approvers below. Before the retry
-  // controller closes and before the client is released.
   void liveRowSequences?.close().catch((err: unknown) => {
     console.error(`[slack] stopping the live-row sequences on shutdown failed: ${describeThrownValue(err)}`)
   })
@@ -1426,9 +1408,6 @@ async function shutdown(reason: string, exitCode = 0): Promise<void> {
   // persona whose held notices are dropped unposted.
   personaDestinationHold.cancelAll()
   stopAllKeepAliveTimers()
-  // b.jg5 SRJ-404: every running dialog approver is stopped (marked and woken
-  // now, so none makes a call after the one in progress returns) and none
-  // starts after this; a call in progress is not waited for.
 
 
   console.error(`[slack] Shutting down: ${reason}`)
@@ -1870,12 +1849,6 @@ export function _buildKillSessionAdapter(
 ): (key: string, lastRead: DeadLivenessReading) => Promise<KillSessionResult> {
   // `key` is the persona key; `lastRead` the restart run's `dead` reading.
   return async (key: string, lastRead: DeadLivenessReading) => {
-    // The launch call only, not a running dialog approver (b.jg5 SRJ-401):
-    // this kill can run while an approver still runs for the persona (an
-    // approver reads the row again only at its next lap, or once its call in
-    // progress returns). That approver then meets GONE, or is superseded by
-    // a newer launch's, and stops. So the kill checks `isLaunchInFlight` only, as do the
-    // reconnect verdicts (`promptRowReconnectVerdict`, `workingReconnectVerdict`).
     if (isLaunchInFlight(key)) {
       console.error(`[slack] killSession (restart adapter): launch already in flight for persona=${key} — not killing`)
       return KILL_SESSION_NOT_KILLED_GUARD
@@ -1944,7 +1917,7 @@ export function _buildReconnectSessionAdapter(
       // latched the persona types nothing. b.jg5 SRJ-809: the same step ends
       // an old-life hold on cscb_<key> when the row reads `ended` or
       // `missing`; a live reading, `pending` included, keeps it.
-      if (applyOwnRowStatusStep(key, { result: st }, RECONNECT_STATUS_SITE)) return reconnectLatchedByRead(key)
+      if (applyOwnRowStatusStep(key, { result: st }, RECONNECT_STATUS_SITE)) return reconnectLatchedByRead()
       state = st.state
       launchStartedAt = pendingLaunchStartOf(st)
     } catch (err) {
@@ -1952,7 +1925,7 @@ export function _buildReconnectSessionAdapter(
       // (the own-row `status` step); nothing is typed. b.jg5 SRJ-809: the
       // same step ends an old-life hold on cscb_<key> on `ErrSpawnNotFound`
       // (no row); any other error keeps it.
-      if (applyOwnRowStatusStep(key, { thrown: err }, RECONNECT_STATUS_SITE)) return reconnectLatchedByRead(key)
+      if (applyOwnRowStatusStep(key, { thrown: err }, RECONNECT_STATUS_SITE)) return reconnectLatchedByRead()
       // b.f2b: nothing is known about the session, so nothing is typed.
       console.error(reconnectStatusCheckFailedLine(key, describeAdFailureForLog(err)))
       return 'transient'
@@ -1967,12 +1940,6 @@ export function _buildReconnectSessionAdapter(
     // reports 'transient'.
     const oldLife = ownRowOldLifeOf(key, state)
     if (oldLife !== undefined) return replaceOwnRowOldLife(key, state, oldLife)
-    // b.f2b: the evidence for a `working` row spans consecutive attempts that
-    // read the row `working`; any other reading ends it, and the run of
-    // deferrals on the row with it.
-    if (state !== 'working') {
-    }
-    // b.jdc: likewise the run of deferrals on a row waiting on a prompt.
     if (!PROMPT_ROW_STATES.has(state)) endPromptRowDeferral(key)
     if (state === 'working' && isLaunchInFlight(key)) return 'transient'
     if (PROMPT_ROW_STATES.has(state)) {
@@ -2036,7 +2003,7 @@ export function _buildReconnectSessionAdapter(
     const oldLifeNow = ownRowOldLifeOf(key, state)
     if (oldLifeNow !== undefined) return replaceOwnRowOldLife(key, state, oldLifeNow)
     // b.jg5 SRJ-118, SRJ-501: the reconnect's last read is this adapter's
-    // `status` read (`waiting`, or a stale `working` row).
+    // `status` read; the fresh waiting row still decides before keys.
     const result = await reconnectMcpWithCause(key, latchRowStateRead(state))
     if (result.outcome === 'ok') return 'success'
     if (result.outcome === 'dead-session') {
@@ -2197,12 +2164,12 @@ export function reconnectHeldOwnRowLine(key: string, state: string, startAnswer:
 
 /**
  * The reconnect adapter's answer for a state read that latched the persona
- * (b.jg5 SRJ-115, SRJ-502, SRJ-512): its `working`-row evidence is
- * forgotten, nothing is typed (the step logged the one line), and the
+ * (b.jg5 SRJ-115, SRJ-502, SRJ-512): nothing is typed (the step logged
+ * the one line), and the
  * adapter answers 'transient', which restart.ts neither counts nor escalates
  * to a kill.
  */
-function reconnectLatchedByRead(key: string): 'transient' {
+function reconnectLatchedByRead(): 'transient' {
   return 'transient'
 }
 
@@ -2905,9 +2872,6 @@ export async function main(): Promise<void> {
     // b.jg5 SRJ-809: apply step 1 begins its old-life holds in the one hold
     // set, once the last-applied rewrite has succeeded.
     oldLifeHolds,
-    // b.jg5 SRJ-808, SRJ-404: apply step 1 stops the dialog approver of each
-    // key it records, right after the record and before the last-applied
-    // rewrite and the teardown's kill; no pending-row rule run follows.
     stopDelivery: async (key) => { const stopping = deliveryEngines?.forget(key); deliveryLifecycle?.forget(key); await stopping },
     // b.av2 SR-8.6 as amended by b.jg5 SRJ-1511, beside b.deo SRI-406,
     // SRI-408 and SRI-502: a confirmed apply's step 1 writes the unwritten
@@ -3363,42 +3327,6 @@ export async function main(): Promise<void> {
     log: (line) => console.error(line),
   })
 
-  // b.jg5 SRJ-301, SRJ-303, SRJ-305: one UNAVAILABLE retry controller, on the
-  // system clock, installed below as the outage state's trigger sink before
-  // the start pass (whose launches are the first attempts that can arm it).
-  // A full-mode retry reruns the restart path's decision through the restart
-  // module's retry entry, and so through the one per-persona serializer
-  // initRestart gets; a pending-only retry reads the persona's row with the
-  // session manager's row read. Either stops on shutdown, a persona no longer
-  // applied, latched, held on ErrInvalidFlags, not up (the relaunch gate) or
-  // at the restart cap. The gate is built further down and
-  // initRestart runs later still: no statement in between awaits, and no
-  // retry falls due before 30 s. Dry run arms nothing, since it makes no
-  // agent-director call. b.jg5 SRJ-310: a retry that finds the persona's row
-  // live out of `pending` with its session connected with its stream ends
-  // its tmux-unresponsive condition (built just below; no retry runs before
-  // it exists). b.jg5 SRJ-308: every retry, one skipped for work in flight
-  // included, is the condition's onset check with the health check off.
-  // b.jg5 SRJ-309: every stop of a persona's timer, whatever its reason (a
-  // teardown and shutdown included), cancels the condition's alert check
-  // not yet posted while it holds, since the alert says CSCB keeps retrying;
-  // b.jg5 SRJ-305, SRJ-308: the same call holds the condition's onset back
-  // until a later refusal (never again after a terminal stop).
-  // b.jg5 SRJ-311, SRJ-312: the same healthy-row observation (a live row out
-  // of `pending`, connected with its stream) also clears the persona's
-  // `tmux-unavailable` outage, with that reading, which the cleared-flag
-  // observer below passes on to the timer's condition-end entry.
-  // b.jg5 SRJ-313: the same stop observer then tells the unclassified-error
-  // episodes, which end the persona's episode only when the stop's reason is
-  // that a retry found nothing left to recover, that a pending-only retry
-  // read the row live out of `pending` or ended or gone, or that the
-  // `tmux-unavailable` condition cleared or the `tmux-unresponsive`
-  // condition ended. Each consumer is isolated, so one that throws does not
-  // skip the other.
-  // b.jg5 SRJ-303, SRJ-305, SRJ-404: the retry action's gate before any call
-  // (applied, latched, held on ErrInvalidFlags, up, the cap, shutdown), one
-  // object for the retry action and the pending-row rule's run at a dialog
-  // approver's stop, so that run is gated as a retry's is.
   const retryRunGate: RetryRunGateDeps = {
     appliedPersona: getAppliedPersona,
     canRelaunch: (key) => canRelaunch(key),
@@ -3430,9 +3358,6 @@ export async function main(): Promise<void> {
     action: createFullModeRetryAction({
       retry: runRestartRetry,
       ...retryRunGate,
-      // b.jg5 SRJ-303: only work that blocks a retry skips it; a running
-      // dialog approver alone never does (SRJ-401). The skip's again-reason
-      // and the restart retry's skip line name what blocks it.
       isInFlight: isPersonaRetryBlocked,
       retryBlockCause: personaRetryBlockCause,
       readRow: readPersonaRowState,
@@ -3441,28 +3366,11 @@ export async function main(): Promise<void> {
         tmuxUnresponsive.end(key, TMUX_UNRESPONSIVE_END_RETRY, reading)
         clearOutageFlag(key, 'tmux-unavailable', reading)
       },
-      // b.jg5 SRJ-409, SRJ-411: a pending-only retry whose row read shows
-      // `pending` reads the applied persona's row once more with `get` and
-      // decides whether it is covered: a covered or undecided row is armed
-      // pending-only and kept; one that is not covered goes through the
-      // live-row sequence, with no launch or approver of the retry's own.
       stepPendingRow: (key) => retryPendingRowStep(key, getAppliedPersona(key)),
     }),
   })
   unavailableRetry = retryTimers
 
-  // b.jg5 SRJ-705, SRJ-706: the one live-row sequence registry, on the system
-  // clock, its sequences composed by the session manager's one builder over
-  // the kill-failure alerts installed above (the builder's default), the
-  // retry controller's arm and the applied configuration read at each call;
-  // each sequence runs in its own recovery
-  // attempt for its persona, detached from its starter's. Installed in the
-  // session manager before the start pass and before any path that can start
-  // a sequence; the latch installed above gets its set observer here, so a
-  // latch of a persona stops its sequence. Its running query is in "blocks a
-  // retry" (and so in "in flight for P"), the lost-message routing's
-  // sequence/wait member and the restart work's gate; a teardown stops a
-  // persona's sequence right after its approver, and shutdown() closes it.
   const sequences = createLiveRowSequenceRegistry({
     deps: buildLiveRowSequenceDeps({
       retryArm: retryTimers,
@@ -3477,14 +3385,6 @@ export async function main(): Promise<void> {
   liveRowSequences = sequences
   setLiveRowSequenceRegistry(sequences)
 
-  // b.jg5 SRJ-410, SRJ-404: the one pending-row rule, built through its
-  // factory over the session manager's one dependency builder (the notice
-  // episodes above for its held post) and installed beside the sequence
-  // registry, before the start pass. It runs only at a retry of a persona's
-  // timer (the pending-only step, the restart path's deferral, the ladder's
-  // `pending` step) and once at a dialog approver's stop, which takes the
-  // persona's turn in the lifecycle serializer and is dropped when the retry
-  // action's gate would stop a retry then; every other origin only arms.
   setPendingRowRule({
     rule: createPendingRowRule(
       buildPendingRowRuleDeps({
@@ -3732,18 +3632,6 @@ export async function main(): Promise<void> {
   // launches it.
   setConfigDirUnresolvableHook(personaBringUps.holdForConfigDir)
 
-  // b.av2 SR-6.5 / SR-6.1 / SR-8.6 / SR-6.6 / SR-6.4: the apply's persona
-  // teardown, in-place update, credentials change and bring-up (recovery
-  // included), each through the per-persona serializer, and its template
-  // refresh. The teardown (b.jg5 SRJ-715, SRJ-1507) stops the key's
-  // approver, live-row sequence and retry timer first, kills its row with
-  // the bounded retry and keeps the row: nothing here deletes one. b.jg5
-  // SRJ-1003: the one notifier also carries the teardown's window: its submit
-  // mutes the key's notice episodes, and from the start of its turn until it
-  // completes every notice for the key, a CONFLICT or UNUSABLE NAME its kill
-  // meets included, is written to the server log and startup-errors.log,
-  // never posted. This supplies only the production dependencies; the
-  // operations live in persona-lifecycle.ts.
   personaLifecycleOps = createPersonaLifecycle({
     serialize: personaLifecycle.run,
     bringUps: personaBringUps,
@@ -3757,12 +3645,7 @@ export async function main(): Promise<void> {
     isShuttingDown: () => shuttingDown,
     log: (line) => console.error(line),
     whenLaunchSettled,
-    // b.jg5 SRJ-404, SRJ-715: a teardown stops the key's dialog approver
-    // first, and the one its launch in flight would start.
     stopDelivery: async (key) => { const stopping = deliveryEngines?.forget(key); deliveryLifecycle?.forget(key); await stopping },
-    // b.jg5 SRJ-706, SRJ-715: right after the approver, the key's live-row
-    // sequence, before the wait for its launch in flight; the teardown waits
-    // for the sequence's call in flight to return.
     stopLiveRowSequence: (key) => stopLiveRowSequence(key, LIVE_ROW_STOP_TEARDOWN),
     // b.f2b: a teardown cancels a launch's wait for a `working` row rather
     // than wait it out (up to 10 min).
@@ -4248,10 +4131,6 @@ export async function main(): Promise<void> {
       return session?.connected === true
     },
     isRestartPendingOrActive,
-    // b.f2b, b.jg5 SRJ-315: "in flight for P", a running dialog approver
-    // included (SRJ-401). Work in flight owns the session (a start launch
-    // may still be waiting in the background for a `working` row), so the
-    // tick still reads the persona but makes no attempt for it.
     isLaunchInFlight: isPersonaWorkInFlight,
     // b.jg5 SRJ-315, SRJ-502: a latched persona is still read, but the tick
     // makes no attempt for it.
@@ -4290,9 +4169,6 @@ export async function main(): Promise<void> {
     // (the one the first refusal's time comes from).
     now: () => noticeEpisodes.clock.now(),
     onTickEnd: (tickStartedAt) => tmuxUnresponsive.onsetAtTick(tickStartedAt),
-    // b.f2b: while the reconnect adapter holds an idle run for a persona's
-    // `working` row, the next attempt (which can find the row stale and
-    // reconnect it) is scheduled on the first undeliverable tick.
     isAtCap: (key) => backoffIsAtCap(key, RESTART_FAILURE_CAP),
     statRoute: _buildStatRouteImpl(),
     scheduleRestart,

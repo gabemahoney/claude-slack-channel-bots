@@ -474,7 +474,7 @@ export interface CliDeps {
    * ErrSpawnNotFound included, for the precheck to classify. Latches,
    * records and logs nothing.
    */
-  directorReadPane: (instanceId: string, nLines: number) => Promise<string>
+  directorReadPane: (instanceId: string, nLines: number) => Promise<void>
   /**
    * Query the agent-director state of a persona's instance, addressed by its
    * instance ID (`cscb_<key>`). Returns null only when the row is absent
@@ -1066,7 +1066,8 @@ export function createCli(deps: CliDeps): CliHandlers {
     if (got.kind !== PRECHECK_VERDICT_PASS) return { errorClass: got.errorClass, description: got.description }
     const read = await precheckTries(async (): Promise<PrecheckAnswer> => {
       try {
-        return { call: PRECHECK_CALL_READ_PANE, pane: await deps.directorReadPane(id, PROBE_PANE_READ_LINES) }
+        await deps.directorReadPane(id, PROBE_PANE_READ_LINES)
+        return { call: PRECHECK_CALL_READ_PANE }
       } catch (error) {
         return { call: PRECHECK_CALL_READ_PANE, error }
       }
@@ -1814,8 +1815,7 @@ export function createDirectorOps(getClient: () => DirectorClient): DirectorOps 
       }
     },
     directorReadPane: async (id, nLines) => {
-      const r = await getClient().readPane({ instance_id: id, n_lines: nLines })
-      return r.pane
+      await getClient().readPane({ instance_id: id, n_lines: nLines })
     },
     directorStatus: async (id) => {
       try {

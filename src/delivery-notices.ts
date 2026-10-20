@@ -67,7 +67,7 @@ export function buildQueueRecordUnreadableNotice(persona: string, count: number,
 function stuckReason(reason: DeliveryReason, status: DeliveryStatus): DeliveryStuckReason | undefined {
   if (reason === 'transcript-unreadable') return 'transcript'
   if (reason === 'not-now') return 'refused'
-  if ((reason === 'receipt' || reason === 'idle-evidence') && status.retypeCount > 0) return 'not-taken-in'
+  if ((reason === 'receipt' || reason === 'backoff') && status.retypeCount > 0) return 'not-taken-in'
   return ['relay-off', 'mcp', 'queue-unwritable', 'dialog-hold'].includes(reason) ? reason as DeliveryStuckReason : undefined
 }
 export interface DeliveryReportingDeps {

@@ -11,9 +11,7 @@
  * probe that threw) skips the persona for the tick, with nothing scheduled or
  * posted, and arms no retry timer. With auto-restart disabled,
  * an alive persona it would reconnect is reported through the not-connected
- * notice instead of being left down silently (b.f2b). A persona whose
- * `working` row the reconnect adapter is gathering idle evidence for is
- * scheduled on its first undeliverable tick (b.f2b). The work list, the
+ * notice instead of being left down silently (b.f2b). The work list, the
  * disconnected streaks, every guard call and the `cwd-unreachable` flag are
  * keyed by persona key (b.av2 SR-6.3); log lines name it as `persona=<key>`.
  * The healthy branch (`live`, connected, stream present) is the tick's only
@@ -87,19 +85,9 @@ export interface HealthCheckDeps {
   isReconnectDeferred?(key: string): boolean
   isRestartPendingOrActive(key: string): boolean
   /**
-   * True while anything is in flight for the persona (b.f2b, b.jg5 SRJ-315;
-   * production: the server's "in flight for P" predicate, built from the
-   * retry timer's "blocks a retry" one; work that holds back the retry timer
-   * counts here too, but not the reverse: a running dialog approver counts
-   * here and never blocks a retry, SRJ-303, SRJ-401). Today that is a launch
-   * call (a start launch still waiting in the background for a `working` row
-   * to settle, a bring-up retry's launch or a restart's), or the dialog
-   * approver that runs after a launch call returned. The work in flight owns the persona's
-   * session, so it is a no-attempt reason: the tick still runs the
-   * working-directory check and reads the persona's liveness, connection and
-   * stream, and a healthy one takes the healthy branch, but it never calls
-   * `scheduleRestart` or `notifyNotConnected` for it. A throw ends the persona's work for the
-   * tick (logged), before any read. Absent: nothing is in flight.
+   * True while lifecycle work owns the persona (a launch, live-row sequence
+   * or old-life wait). Health reads still run, but recovery and notices wait
+   * for that work. Absent: nothing is in flight.
    */
   isLaunchInFlight?(key: string): boolean
   /**
@@ -213,17 +201,6 @@ export interface HealthCheckDeps {
    */
   now?(): number
   /**
-   * b.f2b: true while the restart path's reconnect adapter holds an idle run
-   * for the persona's `working` row that one more attempt can conclude
-   * (production: the session manager's `hasPendingWorkingRowEvidence`). The
-   * row may be stale, and each attempt reads its evidence only once, so the tick
-   * schedules the next attempt the first time it finds the persona
-   * undeliverable instead of after two consecutive ticks. HAZARD 1 does not
-   * apply: the evidence exists only for a session already read idle with its
-   * row `working`, and is forgotten as soon as any launch for the persona
-   * starts, so a booting session never has it. Absent: false.
-   */
-  /**
    * Returns true when the persona has reached the consecutive-failure cap.
    * Capped personas are skipped on every tick (SR-25.3/25.4) — the tick
    * must not schedule more restarts once a cap has been signalled.
@@ -290,10 +267,6 @@ let skippedTicks = 0
  * ticks (chosen over a post-launch grace window because it needs no launch
  * timestamp plumbed in from restart.ts, and resets cleanly through the seams
  * below) means a booting session that connects between ticks is never poked.
- * b.f2b: the one exception is a persona whose `working` row the reconnect
- * adapter is gathering idle evidence for (`hasPendingWorkingRowEvidence`),
- * scheduled on its first undeliverable tick; a launch forgets that evidence,
- * so it never applies to a booting session.
  *
  * This map leaks nothing across contexts because it is cleared:
  *   - the moment a persona is observed connected (streak reset inline below),
@@ -616,12 +589,6 @@ async function runHealthCheckTick(): Promise<void> {
         } else if (!deliverable || pending) {
           // b.omv SR-9: disconnected and pending rows share the existing
           // two-consecutive-tick debounce. A pending row is never healthy.
-          // b.f2b: a reconnect deferred on a `working` row returns
-          // 'transient', and restart.ts never re-enters on it; this tick is
-          // the retry driver. While the adapter holds an idle run for the
-          // row (`hasPendingWorkingRowEvidence`), the next attempt, which
-          // can find the row stale and reconnect it, is scheduled on this
-          // first undeliverable tick rather than after a second.
           const streak = (disconnectedStreak.get(key) ?? 0) + 1
           if (streak >= 2) {
             disconnectedStreak.delete(key)

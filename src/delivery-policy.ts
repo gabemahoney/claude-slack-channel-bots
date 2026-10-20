@@ -2,24 +2,24 @@
 /** The production engine and gate's I/O-free choices (b.omv SR-1.2/15.6).
  * Observations are values: receipt records and saved key readings are never
  * replaced with a newer environment while an owned operation completes. */
-export const ENGINE_ACTIONS = ['expireTimers', 'commitAppend', 'observeLaunch', 'observeCompaction', 'readReceipt', 'fixText', 'recordSend', 'typeText', 'pressEnter', 'recordRefusal', 'releaseAttempt', 'requestGate', 'deferReconnect', 'recordNotice', 'stopAbsent', 'compactQueueRename', 'compactQueueFinish', 'ignoreDuplicate'] as const
+export const ENGINE_ACTIONS = ['expireTimers', 'commitAppend', 'observeLaunch', 'readReceipt', 'fixText', 'recordSend', 'typeText', 'pressEnter', 'recordRefusal', 'releaseAttempt', 'requestGate', 'deferReconnect', 'recordNotice', 'stopAbsent', 'compactQueueRename', 'compactQueueFinish', 'ignoreDuplicate'] as const
 export type EngineAction = typeof ENGINE_ACTIONS[number] | 'wait'
 export type GateAction = 'grantDelivery' | 'cancelRequest' | 'release' | 'runReconnect' | 'wait'
 export type DeliveryPair = readonly [number, number]
 export const NO_DELIVERY_PAIR: DeliveryPair = [0, 0]
-export type DeliveryTimer = 'settle' | 'receipt' | 'backoff' | 'idleEvidence' | 'enterDelay' | 'notNow' | 'reconnect'
+export type DeliveryTimer = 'settle' | 'receipt' | 'backoff' | 'enterDelay' | 'notNow' | 'reconnect'
 export type PolicyTimers = Record<DeliveryTimer, number>
 export interface PolicySend { item: number; part: number; offset: number; how?: string }
 export interface PolicyRecord { kind: string; text: unknown }
 export interface DeliveryReading {
   row: string; relay: boolean; marker: boolean; mcp: boolean
   up: boolean; latched: boolean; held: boolean; readable: boolean; receipts: readonly number[]
-  idleEvidence: boolean; launch: string | number; session: string | number; compactions: string | number
+  launch: string | number; session: string | number
   gate: string; offset: number; records: readonly PolicyRecord[]
 }
 export interface DeliveryPolicyEngine {
   phase: string; target: DeliveryPair; attempt: number; launchSeen: string | number; sessionSeen: string | number
-  compactionSeen: string | number; retypes: Record<number, number>; timers: PolicyTimers
+  retypes: Record<number, number>; timers: PolicyTimers
   restartCheck: boolean; appendBlocked: boolean; noticed: readonly number[]; request: string
   keyReading: DeliveryReading
 }
@@ -47,25 +47,19 @@ const textOf = (k: DeliveryPolicyKnowledge, pair: DeliveryPair): unknown => k.te
 function made(k: DeliveryPolicyKnowledge, pair: DeliveryPair): number[] {
   return k.p.sent.flatMap((s, index) => s.item === pair[0] && s.part === pair[1] && !k.p.refused.includes(index + 1) ? [index] : [])
 }
-export function policyNotTakenIn(k: DeliveryPolicyKnowledge, pair: DeliveryPair): boolean {
-  const sends = made(k, pair), last = sends.at(-1)
-  if (last === undefined) return false
-  const offset = k.p.sent[last]!.offset
-  return k.r.records.some((r, n) => n + 1 > offset && sameDeliveryText(r.text, textOf(k, pair)) && ['queue-operation:remove:dropped_by_hook', 'queue-operation:remove:cleared_on_cancel', 'queue-operation:remove:not_carried_to_background', 'queue-operation:remove:agent_stopped', 'queue-operation:remove:resume_failed', 'queue-operation:popAll', 'queue-operation:popOne'].includes(r.kind))
-}
 export function policyReceipt(k: DeliveryPolicyKnowledge, pair: DeliveryPair): number | undefined {
   const first = made(k, pair)[0]
   if (first === undefined) return undefined
   return k.r.receipts.find(n => n > k.p.sent[first]!.offset && k.r.records[n - 1]?.kind === 'take-in' && sameDeliveryText(k.r.records[n - 1]?.text, textOf(k, pair)))
 }
 export function firstSendGate(r: DeliveryReading, e: DeliveryPolicyEngine): boolean {
-  return r.up && !r.latched && !r.held && r.marker && r.relay && r.mcp && ['waiting', 'working'].includes(r.row) && e.timers.settle === 0
+  return r.up && !r.latched && !r.held && r.marker && r.relay && r.mcp && r.row === 'waiting' && e.timers.settle === 0
 }
 export function retypeGate(r: DeliveryReading, e: DeliveryPolicyEngine): boolean {
-  return firstSendGate(r, e) && r.row === 'waiting' && r.receipts.length === 0 && e.timers.backoff === 0 && (r.idleEvidence || e.timers.idleEvidence === 0)
+  return firstSendGate(r, e) && r.receipts.length === 0 && e.timers.backoff === 0
 }
 export function reconnectGate(r: DeliveryReading): boolean {
-  return r.up && !r.latched && !r.held && r.relay && r.marker && ['waiting', 'working'].includes(r.row)
+  return r.up && !r.latched && !r.held && r.relay && r.marker && r.row === 'waiting'
 }
 export function decideEngine(k: DeliveryPolicyKnowledge): EngineAction {
   const ip = selectDeliveryTarget(k), e = k.e, r = k.r, hasTarget = ip[0] !== 0, retype = hasTarget && made(k, ip).length > 0
@@ -75,9 +69,7 @@ export function decideEngine(k: DeliveryPolicyKnowledge): EngineAction {
   if (k.writer.kind !== 'none') return !e.appendBlocked || e.timers.backoff === 0 ? 'commitAppend' : 'expireTimers'
   if (!r.up) return 'stopAbsent'
   if (r.launch !== e.launchSeen || r.session !== e.sessionSeen) return 'observeLaunch'
-  if (r.compactions !== e.compactionSeen) return 'observeCompaction'
   if (e.phase === 'text') return r.gate === 'delivery' ? 'typeText' : r.gate === 'free' ? 'requestGate' : 'wait'
-  if (e.phase === 'enter' && policyNotTakenIn(k, e.target)) return 'releaseAttempt'
   if (e.phase === 'enter' && e.timers.enterDelay === 0) return r.gate === 'delivery' ? 'pressEnter' : r.gate === 'free' ? 'requestGate' : 'wait'
   if (e.phase === 'refused') return 'recordRefusal'
   if (hasTarget && policyReceipt(k, ip) !== undefined) return 'readReceipt'
@@ -96,12 +88,12 @@ export function decideGate(k: DeliveryPolicyKnowledge): GateAction {
   if (k.g.owner === 'delivery' && !needed) return 'release'
   if (k.g.owner === 'free' && k.e.request === 'delivery') {
     const operation = decideEngine({ ...k, r: { ...k.r, gate: 'delivery' } })
-    return (needed || ['recordSend', 'recordEnterRetry'].includes(operation)) && !blocked ? 'grantDelivery' : 'cancelRequest'
+    return (needed || operation === 'recordSend') && !blocked ? 'grantDelivery' : 'cancelRequest'
   }
   if (k.g.owner === 'reconnect' && k.g.stage === 'done') return 'release'
   if (k.g.owner === 'free' && k.g.deferred && k.g.due && !k.r.mcp && reconnectGate(k.r)) return 'runReconnect'
   return 'wait'
 }
 
-export function createDeliveryReading(): DeliveryReading { return { row: 'missing', relay: false, marker: false, mcp: false, up: false, latched: false, held: false, readable: true, receipts: [], idleEvidence: false, launch: '', session: '', compactions: '', gate: 'free', offset: 0, records: [] } }
-export function createDeliveryPolicyState(): DeliveryPolicyEngine { return { phase: 'ready', target: NO_DELIVERY_PAIR, attempt: 0, launchSeen: '', sessionSeen: '', compactionSeen: '', retypes: {}, timers: { settle: 0, receipt: 0, backoff: 0, idleEvidence: 0, enterDelay: 0, notNow: 0, reconnect: 0 }, restartCheck: true, appendBlocked: false, noticed: [], request: 'none', keyReading: createDeliveryReading() } }
+export function createDeliveryReading(): DeliveryReading { return { row: 'missing', relay: false, marker: false, mcp: false, up: false, latched: false, held: false, readable: true, receipts: [], launch: '', session: '', gate: 'free', offset: 0, records: [] } }
+export function createDeliveryPolicyState(): DeliveryPolicyEngine { return { phase: 'ready', target: NO_DELIVERY_PAIR, attempt: 0, launchSeen: '', sessionSeen: '', retypes: {}, timers: { settle: 0, receipt: 0, backoff: 0, enterDelay: 0, notNow: 0, reconnect: 0 }, restartCheck: true, appendBlocked: false, noticed: [], request: 'none', keyReading: createDeliveryReading() } }

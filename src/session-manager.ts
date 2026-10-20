@@ -43,9 +43,7 @@
  *      b.jg5 SRJ-1503). Otherwise branch on the observed state (ended/missing
  *      → resume, or the replacement when `resume_enabled` is false; waiting
  *      → /mcp reconnect via sendKeys; working →
- *      wait for waiting (or, b.f2b, for positive evidence that the row is
- *      stale and the session idle: the same idle pane and the same transcript,
- *      ended with a completed turn, across a window) then reconnect;
+ *      wait for agent-director to report waiting, then reconnect;
  *      check_permission/ask_user → one one-line `read-pane` of the row:
  *      no-op on a pane or a read that could not answer, and a findMissing
  *      sweep, then resume or spawn once its row reads dead, when
@@ -171,8 +169,8 @@
  * Own-row reads (b.jg5 SRJ-114, SRJ-115, SRJ-116): every `get` of a
  * persona's own row at SRJ-114's sites goes through `readPersonaOwnRow`, whose
  * act step (`actOnOwnRowRead`) the start sweep applies to each row of its
- * `list`, and every own-row `status` the session manager makes, the dialog
- * approver's included, through `readPersonaOwnRowStatus`, which applies the
+ * `list`, and every own-row `status` the session manager makes through
+ * `readPersonaOwnRowStatus`, which applies the
  * own-row `status` step (`applyOwnRowStatusStep`; the liveness and reconnect
  * adapters in `src/server.ts` apply it after their own calls). Both apply
  * the row-read rule (`decideOwnRowRead`, `src/row-read-rules.ts`) to every
@@ -208,39 +206,14 @@
  * outcome ends a hold. The start sweep begins holds, and a teardown or sweep
  * kill whose tries decided the ordinary kill-failure alert marks its hold
  * kill-failed (SRJ-812). Every
- * `read-pane` of a persona's own row outside the dialog approver goes
- * through the shared read-pane (`readPersonaOwnPane`, b.jg5 SRJ-117; the
- * outcome and its class in `src/pane-read.ts`). Its uses (the launch wait's
- * evidence read and the restart path's `waiting`-row check through
- * `readWorkingPane`, the `working`-row verdict in `src/server.ts`, whose
- * pane `checkWorkingRowPane` folds, and b.jdc's one-line reads of an
- * `ask_user` or `check_permission` row: the prompt-row verdict
- * `promptRowReconnectVerdict` in `src/server.ts` and the ladder's
- * `launchOnPromptRow`; and the pending-row rule's lap,
- * `readPendingRowLapPane`, the only read made with `allow_pending`) latch on
- * a CONFLICT answer,
- * with the refused operation "P's next check or recovery", and on an
- * UNUSABLE NAME answer, each with the state its caller last read; a latched
- * persona is not read, and its caller ends with nothing typed. A pane that
- * any of them reads, or the dialog approver reads, may be a single
- * leftover's (b.jg5 SRJ-613), so none acts on a pane alone: the `send-keys`
- * that follows is the backstop (the reconnect's CONFLICT "not this launch's
- * session" latches P with nothing typed; the approver's and the pending-row
- * lap's Enter answering `ErrSpawnNotInteractive` on a `pending` row types
- * nothing, stops the approver with no kill, and ends the lap with no
- * further lap on that launch; see `src/pane-read.ts`).
+ * outcome-only `read-pane` probes of a persona's own row go through
+ * `readPersonaOwnPane`. Only AD success and error classes are consumed;
+ * pane text is discarded. CONFLICT and UNUSABLE NAME latch the persona.
  *
  * Both row checks go through `compareRowToPersona`. At most one launch per
  * persona is in flight (b.av2 SR-6.3): a concurrent call for the same key
- * joins the running ladder. A launch that returned success starts the
- * persona's dialog approver after its launch call, outside the launch and
- * its attempt, in a registry holding at most one approver per persona
- * (`startDialogApprover`, b.jg5 SRJ-401); a teardown or shutdown stops it
- * (`stopDialogApprover`, `stopAllDialogApprovers`, SRJ-404), and so does a
- * latch of the persona set by any site (the set observer the latch installer
- * registers, `setConflictLatch`, SRJ-502). The approver paces its laps
- * (SRJ-403), stops at B from the launch start with no post (SRJ-404,
- * SRJ-405) and classifies every answer by class (SRJ-117, SRJ-118). Every launch
+ * joins the running ladder. AD pre-trust handles folder trust; other
+ * startup dialogs await a human. Every launch
  * first resolves the persona's claude_config_dir to a real path with no
  * lexical fallback (bug b.g57,
  * `checkLaunchConfigDir`); when it cannot be resolved the launch makes no
@@ -3271,12 +3244,12 @@ export async function readPersonaOwnPane(key: string, request: PersonaPaneReadRe
   let failure: PaneReadFailure
   try {
     const instance_id = personaInstanceId(key)
-    const result = await withOutageDetection(key, undefined, 'read-pane', (client) =>
+    await withOutageDetection(key, undefined, 'read-pane', (client) =>
       client.readPane(
         { instance_id, n_lines: request.nLines },
       ),
     )
-    return { kind: PANE_READ_PANE, pane: result.pane }
+    return { kind: PANE_READ_PANE }
   } catch (err) {
     failure = isInvalidFlagsError(err) ? await paneReadInvalidFlagsFailure(key, request, err) : paneReadFailureOf(err)
   }
@@ -3345,7 +3318,7 @@ function logPaneReadLatch(
 }
 
 // ---------------------------------------------------------------------------
-// The pending-row rule's lap: its read-pane and its Enter (b.jg5 SRJ-410)
+// The pending-row rule's own-row read (b.jg5 SRJ-410)
 // ---------------------------------------------------------------------------
 
 /** The site label of the pending-row rule's own calls and lines. */
@@ -3380,12 +3353,6 @@ export type NotConnectedNotice =
   | { reason: 'auto-restart-disabled'; cause: string }
 
 /**
- * Why the health check finds an alive persona undeliverable (b.f2b): its MCP
- * session is not connected (b.omv SR-9).
- */
-export type UndeliverableCause = 'disconnected'
-
-/**
  * Personas whose not-connected notice was raised in the current episode
  * (b.f2b). The episode ends when the persona's MCP session registers again,
  * when the health check finds it deliverable again, or when the persona is
@@ -3412,9 +3379,9 @@ export function notifyPersonaNotConnected(key: string, notice: NotConnectedNotic
  * The health check's report for an alive persona it would reconnect while
  * auto-restart is disabled (b.f2b): the `auto-restart-disabled` notice, once
  * per episode (`notifyPersonaNotConnected`), worded for why it is
- * undeliverable: its MCP connection is down (`disconnected`, the default).
+ * undeliverable: its MCP connection is down.
  */
-export function notifyDisconnectedWithAutoRestartDisabled(key: string, cause: UndeliverableCause = 'disconnected'): void {
+export function notifyDisconnectedWithAutoRestartDisabled(key: string): void {
   if (deliveryLifecycle?.deferred(key)) return
   notifyPersonaNotConnected(key, { reason: 'auto-restart-disabled', cause: 'its connection has been down on two health checks in a row' })
 }
@@ -3428,7 +3395,7 @@ export function forgetNotConnectedEpisode(key: string): void {
   nonLatchingNoteLogged.delete(key)
 }
 
-/** Test-only seam: end every persona's not-connected episode (notice latches, idle evidence, deferral runs and logged liveness notes). */
+/** Test-only seam: end every persona's not-connected episode (notice latches, deferral runs and logged liveness notes). */
 export function _resetNotConnectedEpisodes(): void {
   notConnectedNoticeRaised.clear()
   promptRowDeferredSince.clear()
@@ -3686,7 +3653,7 @@ export type ReconnectResult =
  * Send `/mcp reconnect <MCP_SERVER_NAME>` to persona `key`'s row and answer
  * its outcome alone (`reconnectMcpWithCause`). `lastRead` is the row state
  * the caller last read (b.jg5 SRJ-501), `waiting` when not given: every
- * reconnect is made on a row read `waiting`, or a stale `working` row.
+ * reconnect is made only after a fresh row reads `waiting`.
  *
  * @param key  Persona key: addresses `cscb_<key>` and keys outage flags and notices.
  * @param lastRead  The row state the caller last read, for a latch the reconnect sets.
@@ -3735,8 +3702,8 @@ export async function reconnectMcpWithCause(
   }
   if (life && !await life.recoverBeforeReconnect(key)) return defer()
   if (AGENT_DIRECTOR_DEAD_STATES.has(row.state)) { life?.clearDeferred(key); return { outcome: 'dead-session', deadCause: DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE } }
-  if (!['waiting', 'working'].includes(row.state) || row.relay_mode !== 'on') return defer()
-  const reading: DeliveryReading = { row: row.state, relay: true, marker: row.labels?.tag_prompt === '1', mcp: false, up: true, latched: personaLatchedNow(key), held: isOwnRowOldLifeHeld(key) || heldGateReadingOf(key) !== undefined || waitsOnKillFailedHold(key), readable: true, receipts: [], idleEvidence: false, launch: '', session: row.session_id, compactions: '', gate: life?.owner(key) ?? 'free', offset: 0, records: [] }
+  if (row.state !== 'waiting' || row.relay_mode !== 'on') return defer()
+  const reading: DeliveryReading = { row: row.state, relay: true, marker: row.labels?.tag_prompt === '1', mcp: false, up: true, latched: personaLatchedNow(key), held: isOwnRowOldLifeHeld(key) || heldGateReadingOf(key) !== undefined || waitsOnKillFailedHold(key), readable: true, receipts: [], launch: '', session: row.session_id, gate: life?.owner(key) ?? 'free', offset: 0, records: [] }
   const gateChoice = decideGate({ p: { accepted: [], fixed: [], sent: [], refused: [], delivered: [] }, e: createDeliveryPolicyState(), r: reading, g: { owner: life?.owner(key) ?? 'free', stage: 'none', deferred: true, due: true }, writer: { kind: 'none' }, compact: 'none' })
   if (gateChoice !== 'runReconnect') return defer()
   const release = life?.acquire(key, 'reconnect')
@@ -3745,7 +3712,7 @@ export async function reconnectMcpWithCause(
     const textRow = await readPersonaOwnRow(key, { site: 'reconnect', what: 'before text' })
     if (textRow.kind !== OWN_ROW_READ_ROW || textRow.latched || textRow.row.labels?.tag_prompt !== '1' || textRow.row.relay_mode !== 'on' ||
         textRow.row.session_id !== row.session_id || textRow.row.launch_started_at !== row.launch_started_at ||
-        !['waiting', 'working'].includes(textRow.row.state) || personaLatchedNow(key) ||
+        textRow.row.state !== 'waiting' || personaLatchedNow(key) ||
         isOwnRowOldLifeHeld(key) || heldGateReadingOf(key) !== undefined || waitsOnKillFailedHold(key) ||
         (life && (!life.active(key) || life.owner(key) !== 'reconnect'))) return defer()
     console.error(reconnectStartLine(ref))
@@ -3759,7 +3726,7 @@ export async function reconnectMcpWithCause(
     // concurrent latch/hold during it must still prevent the control key.
     if (enterRow.kind !== OWN_ROW_READ_ROW || enterRow.latched || enterRow.row.labels?.tag_prompt !== '1' || enterRow.row.relay_mode !== 'on' ||
         enterRow.row.session_id !== row.session_id || enterRow.row.launch_started_at !== row.launch_started_at ||
-        !['waiting', 'working'].includes(enterRow.row.state) || personaLatchedNow(key) ||
+        enterRow.row.state !== 'waiting' || personaLatchedNow(key) ||
         isOwnRowOldLifeHeld(key) || heldGateReadingOf(key) !== undefined || waitsOnKillFailedHold(key) ||
         (life && (!life.active(key) || life.owner(key) !== 'reconnect'))) return defer()
     await withOutageDetection(key, undefined, 'send-keys', client => client.sendKeys({ instance_id: personaInstanceId(key), key: 'Enter' }))
@@ -5566,8 +5533,7 @@ const promptRowDeferredSince = new Map<string, number>()
 
 /**
  * Start persona `key`'s run in `runs` at its first deferral, and return how
- * long the run has lasted (ms, on `_now`). Shared by the `working`-row and
- * prompt-row deferral runs.
+ * long the prompt-row deferral run has lasted (ms, on `_now`).
  */
 function noteDeferralRun(runs: Map<string, number>, key: string): number {
   const now = _now()
@@ -6000,8 +5966,8 @@ export async function waitForWaitingAndReconnectWithCause(
 
 /**
  * The wait's reconnect (b.jg5 SRJ-118): `reconnectMcpWithCause` with
- * `lastRead`, the row state the wait read just before (`waiting`, or
- * `working` for a stale row), answering its outcome unchanged, a
+ * `lastRead`, the waiting row state the wait read just before, answering
+ * its outcome unchanged, a
  * `dead-session` with the reconnect's cause (b.jg5 SRJ-611), and noting on
  * `wait` a `transient` one's latch or stop.
  */
@@ -6119,8 +6085,6 @@ async function waitForWorkingRow(
       await sleepUnlessCancelled(wait, pollIntervalMs)
       continue
     }
-    // b.f2b: a run of deferrals on the `working` row ends with any other state.
-
     if (state === 'waiting') {
       return reconnectInWait(key, ref, wait, latchRowStateRead(state))
     }
@@ -6216,9 +6180,6 @@ async function waitForWorkingRow(
   }
   // b.f2b: the row settled at the deadline — reconnect, as the loop would have.
   if (timeoutState === 'waiting') return reconnectInWait(key, ref, wait, latchRowStateRead(timeoutState))
-  // b.f2b: a `working` row given up on is one more deferral: a run that has
-  // lasted UNPROVEN_IDLE_NOTICE_AFTER_MS raises the unproven-idle notice, at
-  // any restart delay.
 
   return reportWaitEndedDisconnected(
     key,
@@ -7516,7 +7477,7 @@ export async function plainSpawnOutcomeAt<R>(site: PlainSpawnSite<R>): Promise<S
   console.error(site.spawnedLine(launched))
   // b.jg5 SRJ-506: a latch re-check's retry that was not refused clears the
   clearLatchBeforeOutcome(key)
-  afterLaunchSucceeded(key, isStartup, ref, LAUNCH_VERB_SPAWN, launched)
+  afterLaunchSucceeded(key, ref, LAUNCH_VERB_SPAWN, launched)
   return { key, action: 'spawned' }
 }
 
@@ -8982,7 +8943,7 @@ async function resumeAtSite<R>(site: ResumeSite<R>): Promise<SpawnPersonaResult 
     // A resumed bot faces the same startup dialogs as a fresh one. Its row
     // reads `pending` from the resume until its session reports in (HO C5),
     // spawn (b.jg5 SRJ-402).
-    afterLaunchSucceeded(key, isStartup, ref, LAUNCH_VERB_RESUME, launched)
+    afterLaunchSucceeded(key, ref, LAUNCH_VERB_RESUME, launched)
     return { key, action: 'resumed' }
   } catch (err) {
     const promptFailure = promptFailureResult(key, err)
@@ -10197,9 +10158,9 @@ export function buildPendingRowRuleDeps(input: PendingRowRuleDepsInput): Pending
 export interface PendingRowRuleInstall {
   /** The rule, built through `createPendingRowRule` over `buildPendingRowRuleDeps`. */
   readonly rule: PendingRowRule
-  
+
   readonly serialize?: PersonaSerialize
-  
+
   readonly gate?: RetryRunGateDeps
 }
 
@@ -10579,7 +10540,7 @@ export function launchUnavailableGetLine(
 /** What a launch call whose UNAVAILABLE outcome the step follows was. */
 interface LaunchUnavailableSite {
   readonly persona: Persona
-  
+
   readonly isStartup: boolean
   readonly ref: string
   /** The call's declared verb: `spawn` (plain or reuse) or `resume`. */
@@ -11269,7 +11230,6 @@ function renderPreTrustValue(value: unknown): string {
 
 function afterLaunchSucceeded(
   key: string,
-  isStartup: boolean,
   ref: string,
   verb: LaunchVerb,
   launched: SpawnResult | ResumeResult,
@@ -11277,7 +11237,6 @@ function afterLaunchSucceeded(
   noteLaunchForResumeCount(key, verb)
   console.error(preTrustLogLine(ref, verb, launched?.pre_trust))
   armPendingRowWatch(key, ref)
-
 }
 
 
@@ -11353,11 +11312,6 @@ export async function spawnForPersona(
   }
 
   const configDirLabel = configDirLabelValue(configDir.realPath, spawnHomeDir())
-  // b.f2b: the restart path's idle evidence for an earlier `working` row says
-  // nothing about the session this launch brings up (and must not let the
-  // health check skip its two-tick guard while it boots), and the launch's own
-  // wait, if any, starts its own run of deferrals on the row. b.jdc: nor does
-  // its run of deferrals on a row waiting on a prompt.
   endPromptRowDeferral(key)
   // b.jg5 SRJ-301, SRJ-1015: the ladder is a launch attempt; joiners get its result, `retrying` included.
   const launch = runInAttempt(key, 'launch', async (attempt) =>
@@ -12003,7 +11957,7 @@ export async function reuseSpawnForPersona(
   )
   // b.jg5 SRJ-806: for a retired key the new life has begun; its mark is set.
   const action = reuseSuccessAction(key, ref, retiredAtStart)
-  afterLaunchSucceeded(key, options.isStartup, ref, LAUNCH_VERB_REUSE_SPAWN, launched)
+  afterLaunchSucceeded(key, ref, LAUNCH_VERB_REUSE_SPAWN, launched)
   return { key, action }
 }
 
@@ -17254,8 +17208,6 @@ async function latchRecheckLaunch(
     return 'config-dir-unresolvable'
   }
   const params = buildSpawnParams(persona, config, configDirLabelValue(configDir.realPath, spawnHomeDir()))
-  // b.f2b, b.jdc: as at any launch, the earlier row's idle evidence and
-  // deferrals say nothing about the session this launch brings up.
   endPromptRowDeferral(key)
   const launch = runInAttempt(key, 'launch', () => latchRecheckLaunchCall(call, found, ref, params, lastRead, deps.latch))
   inFlightLaunches.set(key, launch)
@@ -18249,8 +18201,7 @@ function forcedLaunchCollided(key: string, ref: string, what: string): SpawnPers
  * launch already in flight for the persona in this process is joined, with
  * no call (`called` false, its result); a `claude_config_dir` that does not
  * resolve goes to the deferral hook and answers `deferred`, and a dry run
- * answers `no-op`, each with no call. Otherwise the earlier row's idle
- * evidence and deferrals are forgotten, as at any launch, one line is logged,
+ * answers `no-op`, each with no call. Otherwise the earlier row's deferrals are forgotten, as at any launch, one line is logged,
  * and the call runs as a launch attempt (`runInAttempt`, `retrying` in place
  * of `failed` when the attempt armed the retry timer), registered as the
  * persona's launch in flight, and its result is counted as a launch outside
@@ -18287,8 +18238,6 @@ async function runForcedLaunch(
     return { called: false, result: skipped, counted: false, latched: latchedAfter(skipped) }
   }
   const configDirLabel = configDirLabelValue(configDir.realPath, spawnHomeDir())
-  // b.f2b, b.jdc: as at any launch, the earlier row's idle evidence and
-  // deferrals say nothing about the session this launch brings up.
   endPromptRowDeferral(key)
   const seen: { settled?: ForcedLaunchSettled } = {}
   const observer = (settled: ForcedLaunchSettled): void => {
