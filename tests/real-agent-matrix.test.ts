@@ -9,7 +9,7 @@ import { spawnSync } from 'node:child_process'
 import {
   AI_CRITERIA, GATE_SLUGS, HEAVY_SCRIPTS, MATRIX_CPUS, MATRIX_MEMORY, MATRIX_TIMEOUT_MS,
   MATRIX_VERSIONS, SCHEDULER_JOB_CONTRACT, assertJobComplete, discoverGateScripts,
-  matrixDockerArgs, matrixOptions, matrixPlan, safeModel, parseResultLine, runMatrix,
+  matrixDockerArgs, matrixOptions, matrixPlan, selectedClaudePlan, safeModel, parseResultLine, runMatrix,
   CODEX_AI_CRITERIA, localCodexExtension, assertCodexJobComplete, codexMatrixDockerArgs,
   type MatrixJob, type MatrixResult,
 } from '../scripts/real-agent-matrix.ts'
@@ -50,6 +50,21 @@ function jobForArgv(argv: string[]): MatrixJob {
 }
 
 describe('heavy planning and result validation', () => {
+  test('explicit Claude versions require all twenty scenarios at three trials per version', () => {
+    const jobs = selectedClaudePlan(['2.1.304', MIN_CLAUDE_CODE_VERSION], gates(), heavyNames())
+    expect(jobs.map(j => j.version)).toEqual(['2.1.304', MIN_CLAUDE_CODE_VERSION])
+    for (const job of jobs) {
+      expect(job.runtimeLatest).toBe(false)
+      expect(job.invocations).toHaveLength(60)
+      for (const script of [...gates(), ...heavyNames().map(n => `real-agent/${n}`)]) {
+        expect(job.invocations.filter(i => i.script === script).map(i => i.trial)).toEqual([1, 2, 3])
+      }
+      const results = resultsFor(job)
+      expect(() => assertJobComplete(job, results, model, model)).not.toThrow()
+      expect(() => assertJobComplete(job, results.slice(1), model, model)).toThrow()
+    }
+  })
+
   test('pins the two native versions, resolves a separate runtime-latest job, and requires all gate and heavy cases', () => {
     expect(MATRIX_VERSIONS).toEqual([MIN_CLAUDE_CODE_VERSION, LIVE_CLAUDE_CODE_VERSION])
     expect(AI_CRITERIA).toEqual([11, 12, 15, 20, 23, 91, 106])
@@ -399,6 +414,41 @@ describe('heavy execution with fake children', () => {
   const run = (planOnly = false, codexOnly = false, keepGoing = false) => runMatrix({ repo, output, planOnly, codexOnly, keepGoing })
   const jobsRun = () => calls.filter(c => c.argv[1] === 'run' && !c.argv.includes('id') && !c.argv.includes('/opt/cscb-ci/real-agent-codex-job.sh'))
   const codexRuns = () => calls.filter(c => c.argv.includes('/opt/cscb-ci/real-agent-codex-job.sh'))
+  test.each([false, true])('explicit Claude execution skips Codex login and latest lookup, failed=%s', failed => {
+    return (async () => {
+      const versions = ['2.1.304', MIN_CLAUDE_CODE_VERSION]
+      const jobs = selectedClaudePlan(versions, gates(), heavyNames())
+      process.env.CODEX_HOME = join(root, 'absent-login')
+      latestResponse = async () => { throw new Error('unexpected latest lookup') }
+      response = argv => {
+        if (argv[0] !== 'docker' || argv[1] !== 'run') return {}
+        const job = jobs.find(j => argv.includes(j.version))!
+        const results = resultsFor(job)
+        if (failed && job.version === versions[0]) results[0]!.exit = 1
+        return { code: results.some(r => r.exit) ? 1 : 0, text: results.map(resultLine).join('\n') + '\n' }
+      }
+      expect(await runMatrix({ repo, output, planOnly: false, keepGoing: true, claudeVersions: versions })).toBe(!failed)
+      expect(jobsRun()).toHaveLength(2)
+      expect(codexRuns()).toHaveLength(0)
+      expect(calls.some(c => c.argv.includes(CODEX_LOGIN_TARGET))).toBe(false)
+      expect(existsSync(join(root, 'absent-login'))).toBe(false)
+      expect(JSON.parse(readFileSync(join(output, 'plan.json'), 'utf8'))).toMatchObject({
+        selection: 'claude-only', totalInvocations: 120, codexModel: null, localAgents: [], jobs,
+      })
+      expect(stdout.join('')).toContain(`REAL-AGENT-CLAUDE-VERDICT ${failed ? 'FAIL' : 'PASS'}`)
+      expect(calls.at(-1)!.argv.slice(0, 3)).toEqual(['docker', 'image', 'rm'])
+    })()
+  })
+
+  test.each(['', 'latest', '2.1.304,', '2.1.304,2.1.304', '2.1.304\n'])('rejects invalid Claude selection %j', versions => {
+    expect(() => matrixOptions(['--claude-versions', versions], repo)).toThrow('Usage')
+  })
+
+  test('Claude selection is exclusive with Codex and parsed without changing defaults', () => {
+    expect(matrixOptions(['--claude-versions', `2.1.304,${MIN_CLAUDE_CODE_VERSION}`, '--output', output], repo))
+      .toEqual({ repo, output, planOnly: false, claudeVersions: ['2.1.304', MIN_CLAUDE_CODE_VERSION] })
+    expect(() => matrixOptions(['--codex-only', '--claude-versions', '2.1.304'], repo)).toThrow('Usage')
+  })
   const interruptMatrix = (before: ReturnType<typeof process.listeners>) => {
     // Invoke only this run's handler: emitting a process signal also reaches
     // unrelated listeners installed by other suites in a combined Bun run.

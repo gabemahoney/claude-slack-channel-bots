@@ -415,6 +415,15 @@ Before launch and after retirement, revalidate valid JSON, device/inode identity
 
 The explicit coordinator option `--codex-only` selects those 15 local trials, skipping Claude jobs, runtime-latest fetching and Claude credential admission. It keeps the same Codex lease, UID/inspection, mount, token-scan, cleanup and interruption checks, including lease preservation when retirement is unresolved. Plan/results record `selection: codex-only`, empty Claude jobs and null Claude models/scheduler; its `REAL-AGENT-CODEX-VERDICT` and `REAL-AGENT-CODEX-PLAN` prefixes distinguish it from the default 73-invocation full selection. `--plan` accesses no Codex auth/config and establishes no acceptance.
 
+For a Claude-only compatibility gate, use `--claude-versions 2.1.304,2.1.280`.
+It runs all nine gates, four heavy scenarios and seven AI criteria three times
+per exact version (60 invocations each). It skips runtime-latest lookup and all
+Codex login/config access, and cannot be combined with `--codex-only`.
+Plan/results record `selection: claude-only`, no local Codex jobs and a null
+Codex model. Its `REAL-AGENT-CLAUDE-VERDICT` certifies only those Claude trials.
+Use `--keep-going` to retain failures and execute the remaining trials; any
+failure still fails the selection.
+
 Use the established `CI_ANTHROPIC_*` prefix on the `/ci` runner and **every** `ci-verdict.ts` wait/stop/report/recovery call, as the current CI skill describes. The heavy coordinator reads those CI names directly. Never put credential values in arguments or diagnostic output.
 
 Final E7 acceptance passed: default full `/ci` `20261018t042311z-fik3tlbb` (no selection arguments, reader exit 0) passed all 46 executions in 2,521.526 s, including the 17-item native Codex fault/recovery/fidelity gate. Focused local heavy `real-1792299930887-3167396` ended `REAL-AGENT-CODEX-VERDICT PASS`: 15 unique completed native trials, AC11/12/15/20/106 each 3 of 3, in 1,726.57 s, on Codex 0.159.2 / `gpt-6-astra`.
