@@ -364,7 +364,7 @@ function escalateDeadWith(verdict: DeadEvidenceSource): ReconnectEscalateDead {
  * `missing` or gone voids it: no kill, a relaunch carrying none (b.jg5
  * SRJ-611, dead evidence covers one life).
  */
-const ESCALATE_DEAD_WORKING_GONE = escalateDeadWith('working-tmux-gone')
+const ESCALATE_DEAD_WORKING_GONE = escalateDeadWith('prompt-row-tmux-gone')
 
 function makeDeps(opts: DepsOpts = {}): RestartDeps & {
   isSessionAliveCalls: string[]
@@ -3415,7 +3415,7 @@ describe('b.jg5 SRJ-611, SRJ-710: the restart path\'s relaunch after each escala
 
   /**
    * AC 58 through the restart path (b.jg5 SRJ-611, SRJ-710): P's `working`
-   * row's `read-pane` answers GONE once (verdict `working-tmux-gone`, dead
+   * row's `read-pane` answers GONE once (verdict `prompt-row-tmux-gone`, dead
    * evidence) and the re-probe after the sweep reads
    * `ErrSystemInstallDisappeared`, so the checked kill is made and the
    * relaunch carries the verdict; its collision `get` reads the row
@@ -3681,7 +3681,7 @@ describe('b.jg5 SRJ-118, SRJ-609: the reconnect\'s transient and latching answer
 // after the re-probe, since it is an async agent-director call. Each run tells
 // a recording slow-recovery observer what it read (b.jg5 SRJ-610). The deps
 // are `makeDeps` fakes: the first probe reads `live` and the reconnect answers
-// escalate-dead carrying b.d61's GONE-based verdict (`working-tmux-gone`)
+// escalate-dead carrying b.d61's GONE-based verdict (`prompt-row-tmux-gone`)
 // unless a case gives another answer. b.jg5 SRJ-110, SRJ-314, SRJ-611
 // (`killBeforeRelaunch`'s decision): only a GONE-based verdict, dead
 // evidence, with a re-probe of `ErrSystemInstallDisappeared` (no row read) is
@@ -3721,7 +3721,7 @@ describe('b.d61: after an escalate-dead reconnect, the restart run probes livene
   /**
    * makeDeps whose first liveness probe reads `live`, whose reconnect answers
    * `answer` (default: escalate-dead carrying the GONE-based
-   * `working-tmux-gone`), and whose re-probe runs `reprobe`.
+   * `prompt-row-tmux-gone`), and whose re-probe runs `reprobe`.
    */
   function makeEscalateDeps(
     reprobe: () => Promise<LivenessReading>,
@@ -3969,13 +3969,13 @@ describe('b.d61: after an escalate-dead reconnect, the restart run probes livene
       `[slack] No kill before the launch for persona=${KEY} — its liveness read found the row ended: no kill is sent for a row just read finished or gone, which proves nothing about a worker, and a launch that started since that read is not the one it saw; the launch carries no verdict (b.jg5 SRJ-110, SRJ-314)`,
     )
     expect(relaunchWithoutKillLine(KEY, verdict, RELAUNCH_NO_KILL_VERDICT_VOIDED, LIVENESS_READING_DEAD_NO_ROW)).toBe(
-      `[slack] No kill before the relaunch for persona=${KEY} — its escalate-dead verdict (verdict=working-tmux-gone) is dead evidence, but the re-probe found no row (ErrSpawnNotFound), which voids it (dead evidence covers one life): the relaunch carries no verdict (b.jg5 SRJ-110, SRJ-314, SRJ-611)`,
+      `[slack] No kill before the relaunch for persona=${KEY} — its escalate-dead verdict (verdict=prompt-row-tmux-gone) is dead evidence, but the re-probe found no row (ErrSpawnNotFound), which voids it (dead evidence covers one life): the relaunch carries no verdict (b.jg5 SRJ-110, SRJ-314, SRJ-611)`,
     )
     expect(killVoidsVerdictLine(KEY, verdict)).toBe(
-      `[slack] The kill before the relaunch for persona=${KEY} answered ErrSpawnNotFound (the row is gone), which voids its escalate-dead verdict (verdict=working-tmux-gone; dead evidence covers one life): the relaunch carries no verdict (b.jg5 SRJ-611)`,
+      `[slack] The kill before the relaunch for persona=${KEY} answered ErrSpawnNotFound (the row is gone), which voids its escalate-dead verdict (verdict=prompt-row-tmux-gone; dead evidence covers one life): the relaunch carries no verdict (b.jg5 SRJ-611)`,
     )
     expect(killVoidsVerdictLine(KEY, verdict, KILL_ROW_FINISHED_MISSING)).toBe(
-      `[slack] The kill before the relaunch for persona=${KEY} ended its tries at a status read that found the row missing, which voids its escalate-dead verdict (verdict=working-tmux-gone; dead evidence covers one life): the relaunch carries no verdict (b.jg5 SRJ-611, SRJ-702)`,
+      `[slack] The kill before the relaunch for persona=${KEY} ended its tries at a status read that found the row missing, which voids its escalate-dead verdict (verdict=prompt-row-tmux-gone; dead evidence covers one life): the relaunch carries no verdict (b.jg5 SRJ-611, SRJ-702)`,
     )
   })
 
@@ -6648,7 +6648,7 @@ describe('b.jg5 SRJ-115: a pending reading goes to the pending deferral whatever
 // `recovery`), its one line naming the reason. The restart run answers
 // `pending-deferred`, counts nothing and makes no kill, launch or keystroke
 // of its own. The re-probe is reached by P's `working` row's `read-pane`
-// answering GONE (verdict `working-tmux-gone`); the row reads `pending` once
+// answering GONE (verdict `prompt-row-tmux-gone`); the row reads `pending` once
 // the escalate-dead sweep has run. One failure is on record first, so a
 // recorded success or failure shows. The uncovered cases hold the
 // sequence at its first bypassing run, then let it end in its reuse.
@@ -9744,6 +9744,7 @@ describe('b.4q8: a resumed launch counts once its row reports in, and resumes th
   })
 
   const N = UNREPORTED_RESUME_FALLBACK_AFTER
+  const RUN = Array.from({ length: N }, (_, i) => i + 1)
   const MISSING = LIVENESS_DEAD_ROW_MISSING
 
   /** What a persona's row reads after its nth `resume`: a state, or an error every read of it answers. */
@@ -9812,10 +9813,93 @@ describe('b.4q8: a resumed launch counts once its row reports in, and resumes th
   async function restartRun(loop: ResumeLoop, key: string): Promise<RestartRetryOutcome> {
     const outcome = await runRestartRetry(key, loop.cwdOf(key), isLaunchInFlight)
     await loop.h.settle()
+    if (outcome === RESTART_OUTCOME_LAUNCHED) await readPersonaOwnRow(key, { site: 'restart.test', what: 'observe resumed row', ref: loop.refOf(key) })
     return outcome
   }
 
   // The regression (the silent loop): the resumes went on, about every 90 s at default timings.
+
+  /** How P is launched in a loop case: its launch, settled, and what each launch answers (a resume first, then the fallback). */
+  interface LoopEntry {
+    readonly launch: (loop: ResumeLoop) => Promise<unknown>
+    readonly answers: (p: string) => readonly unknown[]
+    /** P's failure count after each launch. */
+    readonly counts: readonly number[]
+    /** How many counted lines (`resumedLaunchFailedLine`) P's launches log in all. */
+    readonly countedLines: number
+  }
+
+  const LOOP_ENTRIES: ReadonlyArray<readonly [string, LoopEntry]> = [
+    ['the restart path (runRestartRetry), which counts each such resume as one launch failure, with its counted line, the reuse spawn\'s success resetting the count', {
+      launch: (loop) => restartRun(loop, loop.p),
+      answers: () => [...RUN, 0].map(() => RESTART_OUTCOME_LAUNCHED),
+      counts: [...RUN, 0],
+      countedLines: N,
+    }],
+    ['the start pass (spawnForPersona), whose resumes count toward the fallback but never as launch failures, with no counted line', {
+      launch: async (loop) => {
+        const result = await loop.h.launch(loop.p)
+        await loop.h.settle()
+        await readPersonaOwnRow(loop.p, { site: 'restart.test', what: 'observe resumed row', ref: loop.refOf(loop.p) })
+        return result
+      },
+      answers: (p) => [...RUN.map(() => ({ key: p, action: 'resumed' })), { key: p, action: 'spawned' }],
+      counts: [...RUN, 0].map(() => 0),
+      countedLines: 0,
+    }],
+  ]
+
+  // The regression (the silent loop): the resumes went on, about every 90 s at default timings.
+  test.each(LOOP_ENTRIES)('the silent resume loop ends, through %s: after UNREPORTED_RESUME_FALLBACK_AFTER resumes whose row went missing before reporting in, the next launch is one reuse spawn of the same id, never a resume, with one fallback line; each such resume logs one line with its run\'s count; nothing deleted or posted, Q untouched', async (_label, entry) => {
+    const loop = buildResumeLoop(() => MISSING)
+    const { h, p, q } = loop
+    const ref = loop.refOf(p)
+    const answers: unknown[] = []
+    const counts: number[] = []
+
+    for (let launch = 0; launch <= N; launch++) {
+      answers.push(await entry.launch(loop))
+      counts.push(getFailureCount(p))
+    }
+
+    expect(answers).toEqual([...entry.answers(p)])
+    expect(counts).toEqual([...entry.counts])
+    expect(countedLinesOf(h.errors, p)).toHaveLength(entry.countedLines)
+    expect(h.stub.calls.resumeCalls).toEqual(RUN.map(() => ({ instance_id: personaInstanceId(p) })))
+    expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p)])
+    expect(resumeEndedLinesOf(h.errors, ref)).toEqual(RUN.map((n) => resumeEndedUnreportedLine({ site: 'restart.test', what: 'observe resumed row' }, ref, MISSING, n)))
+    expect(resumeFallbackLinesOf(h.errors, ref)).toEqual([unreportedResumeFallbackLine(ref, N)])
+    expect([h.notices, h.episodeNotices, h.capReached]).toEqual([[], [], []])
+    expect(personaCallCounts(h, q)).toEqual({})
+  })
+
+  test('a resume whose row reports in between counts as a success and ends the run: a resume that ends before reporting in after it is the first of a new run, so the next launch still resumes, and the fallback comes only after UNREPORTED_RESUME_FALLBACK_AFTER in a row', async () => {
+    // Resume 2's session reports in, then exits later (a crash after reporting in).
+    let crashedAfterReportingIn = false
+    const loop = buildResumeLoop((n) => (n === 2 && !crashedAfterReportingIn ? 'waiting' : MISSING))
+    const { h, p } = loop
+    const ref = loop.refOf(p)
+    const counts: number[] = []
+    const run = async (): Promise<void> => {
+      expect(await restartRun(loop, p)).toBe(RESTART_OUTCOME_LAUNCHED)
+      counts.push(getFailureCount(p))
+    }
+
+    await run()
+    await run()
+    crashedAfterReportingIn = true
+    for (let i = 0; i < N; i++) await run()
+    expect(h.reuseSpawns()).toEqual([])
+    await run()
+
+    expect(counts).toEqual([1, 0, ...RUN, 0])
+    // One counted line per resume that ended before reporting in; none for the one that reported in.
+    expect(countedLinesOf(h.errors, p)).toHaveLength(1 + N)
+    expect(h.stub.calls.resumeCalls).toHaveLength(2 + N)
+    expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p)])
+    expect(resumeEndedLinesOf(h.errors, ref)).toEqual([1, ...RUN].map((n) => resumeEndedUnreportedLine({ site: 'restart.test', what: 'observe resumed row' }, ref, MISSING, n)))
+    expect(resumeFallbackLinesOf(h.errors, ref)).toEqual([unreportedResumeFallbackLine(ref, N)])
+  })
 
   /** A fallback reuse spawn that does not succeed: its answers, the run's outcome, P's count after it, and whether P's timer is armed with the collision cause. */
   const FAILED_REUSES: ReadonlyArray<readonly [string, readonly Error[], RestartRetryOutcome, number, boolean]> = [
@@ -9860,6 +9944,34 @@ describe('b.4q8: a resumed launch counts once its row reports in, and resumes th
     expect([getFailureCount(p), getFailureCount(q)]).toEqual([0, 1])
     expect(resumeEndedLinesOf(h.errors, loop.refOf(p))).toEqual([])
     expect(resumeEndedLinesOf(h.errors, loop.refOf(q))).toHaveLength(1)
+  })
+
+  test('a resume that ends before reporting in with P one failure below the cap is counted to the cap: the cap notice fires once, and a later read of its ended row counts nothing more', async () => {
+    const loop = buildResumeLoop(() => MISSING)
+    const { h, p } = loop
+    const ref = loop.refOf(p)
+    for (let i = 1; i < RESTART_FAILURE_CAP; i++) recordFailure(p)
+
+    expect(await restartRun(loop, p)).toBe(RESTART_OUTCOME_LAUNCHED)
+
+    expect([getFailureCount(p), h.capReached]).toEqual([RESTART_FAILURE_CAP, [p]])
+    await readPersonaOwnRow(p, { site: 'restart.test', what: 'a later read', ref })
+    expect([getFailureCount(p), h.capReached]).toEqual([RESTART_FAILURE_CAP, [p]])
+    expect(resumeEndedLinesOf(h.errors, ref)).toEqual([resumeEndedUnreportedLine({ site: 'restart.test', what: 'observe resumed row' }, ref, MISSING, 1)])
+    expect(countedLinesOf(h.errors, p)).toHaveLength(1)
+  })
+
+  test('a pending resumed row reports waiting later: the authoritative own-row read resets the earlier failure exactly once', async () => {
+    let reported = false
+    const loop = buildResumeLoop(() => reported ? 'waiting' : AGENT_DIRECTOR_PENDING_STATE)
+    recordFailure(loop.p)
+    expect(await restartRun(loop, loop.p)).toBe(RESTART_OUTCOME_LAUNCHED)
+    expect(getFailureCount(loop.p)).toBe(1)
+    reported = true
+    for (let n = 0; n < 2; n++) await readPersonaOwnRow(loop.p, { site: 'restart.test', what: 'later reported row', ref: loop.refOf(loop.p) })
+    expect(getFailureCount(loop.p)).toBe(0)
+    expect(resumeEndedLinesOf(loop.h.errors, loop.refOf(loop.p))).toEqual([])
+    expect(loop.h.capReached).toEqual([])
   })
 
   async function handedOverPending(failures: number): Promise<{ readonly loop: ResumeLoop; readonly setRow: (row: StatusResult['state'] | Error) => void }> {

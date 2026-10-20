@@ -143,7 +143,7 @@ import { KILL_FAILURE_END_ROW_FINISHED } from '../src/persona-episodes.ts'
 import { CONFIG_DIR_LABEL_PREFIX, personaInstanceId, personaTmuxSessionName, renderPersonaRef } from '../src/persona-identity.ts'
 import { MAX_TIMER_DELAY_MS } from '../src/persona-retry-schedule.ts'
 import { OLD_LIFE_HOLD_CAUSE_START_SWEEP_KILL } from '../src/retired-keys.ts'
-import { _resetFindMissingMemo, _resetNow, _setNow, ESCALATE_DEAD_WAITING_ROW_PANE_GONE, isLaunchInFlight, launchSession, noteOldLifeRowRead, OLD_LIFE_ROW_READ_STATE, readPersonaRowState, ROW_REREAD_FINISHED, ROW_REREAD_LATCHED, ROW_REREAD_LIVE, ROW_REREAD_PENDING, ROW_REREAD_REFUSED, SEQUENCE_NOT_RESUMABLE_LATCHED_OUTCOME, SEQUENCE_NOT_RESUMABLE_LOST_RACE_OUTCOME, SEQUENCE_NOT_RESUMABLE_PENDING_OUTCOME, SPAWN_ACTION_FRESH_RETIRED, SPAWN_ACTION_RETRYING, spawnNotResumableLine, startLiveRowSequence, sweepDeadTmuxChannel, type PersonaRowReread, type SpawnPersonaResult } from '../src/session-manager.ts'
+import { _resetFindMissingMemo, _resetNow, _setNow,  isLaunchInFlight, launchSession, noteOldLifeRowRead, OLD_LIFE_ROW_READ_STATE, readPersonaRowState, ROW_REREAD_FINISHED, ROW_REREAD_LATCHED, ROW_REREAD_LIVE, ROW_REREAD_PENDING, ROW_REREAD_REFUSED, SEQUENCE_NOT_RESUMABLE_LATCHED_OUTCOME, SEQUENCE_NOT_RESUMABLE_LOST_RACE_OUTCOME, SEQUENCE_NOT_RESUMABLE_PENDING_OUTCOME, SPAWN_ACTION_FRESH_RETIRED, SPAWN_ACTION_RETRYING, spawnNotResumableLine, startLiveRowSequence, sweepDeadTmuxChannel, type PersonaRowReread, type SpawnPersonaResult } from '../src/session-manager.ts'
 import {
   isInsideAttempt,
   runInAttempt,
@@ -460,10 +460,10 @@ describe('pacing and limits: one kill, three runs spaced apart, a second kill, t
     const { h, p } = build()
     _setNow(h.clock.now)
     h.script({ getResult: personaRow(h, p) })
-    await sweepDeadTmuxChannel(p, ESCALATE_DEAD_WAITING_ROW_PANE_GONE)
+    await sweepDeadTmuxChannel(p, 'prompt-row-tmux-gone')
     expect(h.stub.calls.findMissingCalls).toHaveLength(1)
     // An ordinary run now reuses the memo: no new call.
-    await sweepDeadTmuxChannel(p, ESCALATE_DEAD_WAITING_ROW_PANE_GONE)
+    await sweepDeadTmuxChannel(p, 'prompt-row-tmux-gone')
     expect(h.stub.calls.findMissingCalls).toHaveLength(1)
 
     await h.runSequence(p, { lastReadState: LIVE })

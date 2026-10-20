@@ -21,7 +21,7 @@ import {
   DEAD_SESSION_CAUSE_ROW_READ_FINISHED,
   DEAD_SESSION_CAUSE_TMUX_GONE,
   ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ,
-  ESCALATE_DEAD_WAITING_ROW_PANE_GONE,
+
   type DeadEvidenceSource,
 } from '../../src/session-manager.ts'
 
@@ -33,8 +33,6 @@ export const DEAD_EVIDENCE_OF: Readonly<Record<DeadEvidenceSource, boolean>> = {
   [DEAD_SESSION_CAUSE_ROW_ABSENT]: false,
   [DEAD_SESSION_CAUSE_ROW_READ_FINISHED]: false,
   'dead-session': true,
-  'working-tmux-gone': true,
-  [ESCALATE_DEAD_WAITING_ROW_PANE_GONE]: true,
-  [ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ]: false,
   'prompt-row-tmux-gone': true,
+  [ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ]: false,
 }

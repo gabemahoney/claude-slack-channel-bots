@@ -1,3 +1,6 @@
+import { thisLaunchRowOf, timedOutReuseNewLifeLine } from '../src/session-manager.ts'
+import { recordSequenceStarts } from './test-helpers/recovery-harness.ts'
+import { errInstanceIdCollision } from './test-helpers/agent-director-stub.ts'
 
 
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
@@ -1588,12 +1591,58 @@ describe('a recorded key\'s reuse that timed out but launched sets its mark, kep
     return loaded.store
   }
 
+  /** A stand-in for what the mark's write did, to cut the new-life line's fixed words from its builder. */
+  const MARK_PROBE = '<mark>'
+
+  /** The new-life lines of a timed-out reuse among `h.errors` for `ref` (`timedOutReuseNewLifeLine`, whatever its mark's write did). */
+  function newLifeLinesIn(h: RecoveryHarness, ref: string): string[] {
+    const probe = timedOutReuseNewLifeLine(ref, MARK_PROBE)
+    const head = probe.slice(0, probe.indexOf(MARK_PROBE))
+    const tail = probe.slice(probe.indexOf(MARK_PROBE) + MARK_PROBE.length)
+    return h.errors.filter((line) => line.startsWith(head) && line.endsWith(tail))
+  }
+
   /** P's own calls the stub recorded, by verb (a replacement would be a `spawn`, a `resume` or a `kill`). */
   function replacementsOf(h: RecoveryHarness, p: string): { spawns: number; resumes: number; kills: number } {
     const id = personaInstanceId(p)
     const on = (calls: readonly { instance_id?: unknown }[]): number => calls.filter((params) => params.instance_id === id).length
     return { spawns: on(h.stub.calls.spawnCalls), resumes: on(h.stub.calls.resumeCalls), kills: on(h.stub.calls.killCalls) }
   }
+
+  test.each(FORMS.flatMap((form) => (['at-start', 'at-end'] as const).map((launchStart) => [form, launchStart] as const)))(
+    'a timed-out reuse (%s, launch start %s) marks this new life once; its pending retry keeps the record and replaces nothing',
+    async (form, launchStart) => {
+      const { h, p, q, ref } = await recordedP()
+      const before = readRetiredKeysRecord(h.stateDir)!
+      const sequences = recordSequenceStarts()
+      const t = timedReuse(h, p, { end: form, launchStart })
+
+      expect(await h.launch(p)).toStrictEqual({ key: p, action: SPAWN_ACTION_RETRYING })
+
+      // One reuse spawn, then the one get; this launch's row recorded.
+      expect(h.stub.calls.spawnCalls).toEqual([reuseSpawnOf(h, p)])
+      expect(h.stub.calls.getCalls.map((params) => params.instance_id)).toEqual([personaInstanceId(p)])
+      expect(thisLaunchRowOf(p)?.launchStartMs).toBe(Date.parse(t.launchStartedAt()!))
+      // The mark: written once, in the file, P's entry otherwise as it was; Q's untouched.
+      const marked = readRetiredKeysRecord(h.stateDir)!
+      expect(marked.get(p)).toEqual({ ...before.get(p)!, newLifeBegunAt: expect.stringMatching(RFC3339_UTC) })
+      expect(marked.get(q)).toEqual(before.get(q))
+      expect(h.retiredKeyWrites.slice(-1)).toEqual([{ path: h.retiredKeys.path, ok: true }])
+      expect([restartedStore(h.stateDir).isMarked(p), restartedStore(h.stateDir).entry(p)]).toEqual([true, marked.get(p)])
+      expect(newLifeLinesIn(h, ref)).toHaveLength(1)
+      // The mark came before the cover decision: P's row is its covered new life, never the old life's sequence.
+      expect(sequences).toEqual([])
+
+      expect(readRetiredKeysRecord(h.stateDir)).toEqual(marked)
+      // The retry the launch's outcome armed reads the row (its read and its pending step's get) and launches nothing over it.
+      const order = recordCallOrder(h)
+      await retryNow(h, p)
+      expect(order).toEqual(['status', 'get'])
+      expect(readRetiredKeysRecord(h.stateDir)).toEqual(marked)
+      expect(replacementsOf(h, p)).toEqual({ spawns: 1, resumes: 0, kills: 0 })
+      expect(newLifeLinesIn(h, ref)).toHaveLength(1)
+    },
+  )
 
   test.each([...FORMS])(
     'AC 52 (%s): across a restart the record a timed-out reuse marked is still in place while the new life reads pending, a pending-only retry over it replaces nothing, and its first read live other than pending removes the entry, in the file and for the next start',
@@ -1647,4 +1696,29 @@ describe('a recorded key\'s reuse that timed out but launched sets its mark, kep
   // life, still `pending` with this launch's start; the ladder handles the row
   // as any live row of P, and nothing replaces it.
 
+  test('a timed-out reuse whose mark write failed: P\'s next launch decision writes the held mark once, in the file and for the next start; the reuse collides with the pending new life, which is not replaced, killed or sequenced', async () => {
+    const { h, p, q } = await recordedP()
+    const before = readRetiredKeysRecord(h.stateDir)!
+    const sequences = recordSequenceStarts()
+    timedReuse(h, p, {})
+    h.failRetiredKeyWrites()
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: SPAWN_ACTION_RETRYING })
+    expect([h.retiredEntry(p).marked, restartedStore(h.stateDir).isMarked(p)]).toEqual([true, false])
+    const writes = h.retiredKeyWrites.length
+    const storeLines = retiredKeyLinesIn(h.errors).length
+
+    h.script({ spawnError: errInstanceIdCollision() })
+    expect(await h.launch(p)).toStrictEqual({ key: p, action: 'no-op' })
+
+    expect(h.retiredKeyWrites.slice(writes)).toEqual([{ path: h.retiredKeys.path, ok: true }])
+    expect(retiredKeyLinesIn(h.errors).slice(storeLines)).toHaveLength(1)
+    const written = readRetiredKeysRecord(h.stateDir)!
+    expect(written.get(p)).toEqual({ ...before.get(p)!, newLifeBegunAt: expect.stringMatching(RFC3339_UTC) })
+    expect(written.get(q)).toEqual(before.get(q))
+    expect([restartedStore(h.stateDir).isMarked(p), restartedStore(h.stateDir).entry(p)]).toEqual([true, written.get(p)])
+    expect(sequences).toEqual([])
+    expect(replacementsOf(h, p)).toEqual({ spawns: 2, resumes: 0, kills: 0 })
+    expect(h.stub.calls.spawnCalls.at(-1)).toEqual(reuseSpawnOf(h, p))
+    h.controller.stop(p, 'the case is over')
+  })
 })

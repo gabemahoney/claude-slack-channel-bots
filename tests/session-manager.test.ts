@@ -1,3 +1,4 @@
+import { errDialogMaybeOpen } from './test-helpers/agent-director-stub.ts'
 import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
 
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
@@ -43,7 +44,7 @@ import {
   type RetiredKeyAttemptStart,
 } from '../src/live-row-sequence.ts'
 import { _buildReconnectSessionAdapter, _setDeliveryLifecycle as setDeliveryLifecycle } from '../src/server.ts'
-import { _resetConfigDirFs, _resetConfiguredPersonaQuery, _resetFindMissingMemo, _resetInFlightLaunches, _resetLiveRowSequenceRegistry, _resetNotConnectedEpisodes, _resetNow, _resetPreLaunchReplyGuard, _resetPreLaunchTrustPatcher, _resetSpawnHomeDir, _resetWaitForWaitingTimeoutMs, _setConfigDirFs, _setFindMissingMemoTtlMs, _setNow, _setSpawnHomeDir, _setWaitForWaitingTimeoutMs, AGENT_DIRECTOR_LIVE_STATES, buildLiveRowSequenceDeps, bypassingFindMissingSweep, cancelWorkingRowWait, CARRIED_DEAD_EVIDENCE_NONE, carriedDeadEvidenceOf, checkLaunchConfigDir, checkPromptRowDeferral, compareRowToPersona, ConfigDirUnresolvableError, DEAD_EVIDENCE_NONE, DEAD_EVIDENCE_READ_BY_COLLISION_GET, DEAD_EVIDENCE_READ_BY_PATH, DEAD_EVIDENCE_READ_BY_POST_SWEEP_GET, DEAD_EVIDENCE_READ_BY_PROMPT_ROW_REREAD, DEAD_EVIDENCE_VOIDED_BY_RESUME_NOT_FOUND, DEAD_EVIDENCE_VOIDED_BY_RETIRED_KEY_FIRST_LAUNCH, DEAD_EVIDENCE_VOIDED_BY_REUSE_COLLISION_RERUN, DEAD_EVIDENCE_VOIDED_BY_ROW_NOT_INTERACTIVE, DEAD_SESSION_CAUSE_PROMPT_ROW_LADDER_GONE, DEAD_SESSION_CAUSE_ROW_ABSENT, DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE, DEAD_SESSION_CAUSE_ROW_READ_FINISHED, DEAD_SESSION_CAUSE_TMUX_GONE, DEAD_SESSION_CAUSES, deadEvidenceReadByCause, deadEvidenceVoidedLine, deadEvidenceVoidingRead, deadSessionRouteLine, decideNotResumable, describeDeadEvidence, describePersonaRowReread, ESCALATE_DEAD_EVIDENCE, ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ, ESCALATE_DEAD_VERDICTS, ESCALATE_DEAD_WAITING_ROW_PANE_GONE, escalateDeadSweepLine, escalateDeadVerdictOfCause, FIND_MISSING_LATCHED, FIND_MISSING_MEMO_TTL_MS, FIND_MISSING_REFUSED, FIND_MISSING_ROW_JUDGED_ALIVE, FIND_MISSING_ROW_LEFT_LIVE, FIND_MISSING_ROW_MARKED_MISSING, FIND_MISSING_ROW_NOT_JUDGED, findMissingRunReadName, forgetNotConnectedEpisode, handleDeliveryKeyError, handleDeliveryReadError, isDeadEvidence, isLaunchInFlight, isLiveRowSequenceRunning, joinedLaunchDropsDeadEvidenceLine, JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS, JSONL_DIAGNOSIS_REUSE_WORDING, JSONL_TRANSCRIPT_LOST_ENTRY_CLASS, KILL_CONTEXT_TEARDOWN, killPersonaInstance, killPersonaInstanceForTeardown, LAUNCH_VERB_RESUME, LAUNCH_VERB_REUSE_SPAWN, LAUNCH_VERB_SPAWN, launchForLiveRowSequence, launchSession, LIVE_ROW_START_NOT_INSTALLED, lostRaceOutcome, NOT_RESUMABLE_LATCHED, NOT_RESUMABLE_LOST_RACE, NOT_RESUMABLE_PENDING, NOT_RESUMABLE_PENDING_OUTCOME, NOT_RESUMABLE_SEQUENCE, notifyDisconnectedWithAutoRestartDisabled, notifyPersonaNotConnected, notifyRestartCapReached, notifySpawnFailure, notResumableSequenceOutcome, ORPHAN_CLEANUP_LIST_FAILED_LABEL, OWN_ROW_READ_ABSENT, OWN_ROW_READ_ROW, OWN_ROW_STATUS_ABSENT, OWN_ROW_STATUS_LATCHED, OWN_ROW_STATUS_REFUSED, OWN_ROW_STATUS_STATE, personaConfigDirLabelValue, plainSpawnCollisionLine, PRE_TRUST_LOG_PREFIX, preTrustLogLine, PROMPT_ROW_STATES, PROMPT_ROW_SWEEP_AFTER_MS, promptRowLadderAfterSweepLine, promptRowLadderLatchedLine, promptRowLadderNoActionLine, promptRowLadderNoPaneLine, promptRowLadderStoppingLine, readFindMissingRow, readPersonaOwnRow, readPersonaOwnRowStatus, readPersonaRowState, reconcileOrphans, RECONNECT_NOT_THIS_LAUNCH_NOTE, reconnectConflictLine, reconnectGoneLine, reconnectInvalidFlagsLine, reconnectLatchedLine, reconnectMcp, reconnectMcpWithCause, reconnectNotInteractiveLine, reconnectRowAbsentLine, reconnectStartLine, reconnectTransientLine, reconnectUnusableNameLine, REPLACE_REREAD_FINISHED_OUTCOME, REPLACE_REREAD_PENDING_OUTCOME, REPLACE_REREAD_REFUSED_OUTCOME, replaceRereadLine, resumeNotFoundSpawnLine, ROW_REREAD_FINISHED, ROW_REREAD_LATCHED, ROW_REREAD_LIVE, ROW_REREAD_PENDING, ROW_REREAD_REFUSED, ROW_REREAD_UNKNOWN, SEQUENCE_NOT_RESUMABLE_LOST_RACE_OUTCOME, sequenceLaunchAtCapLine, setConfigDirUnresolvableHook, setConfiguredPersonaQuery, setConflictLatch, setKillFailureAlerts, setPreLaunchReplyGuard, setPreLaunchTrustPatcher, setSessionNotifier, SPAWN_CAP_REACHED_REMEDIATION, SPAWN_FAILURE_DEFAULT_REMEDIATION, SPAWN_NOT_FOUND_REMEDIATION, spawnFailureNoticeText, spawnForPersona, spawnNotResumableLine, startLiveRowSequence, STARTUP_ERROR_SPAWN_FAILED, startupSessionManager, stopLiveRowSequence, sweepDeadTmuxChannel, transientReconnectLine, WAIT_OUTCOME_LATCHED, waitEndedDisconnectedLine, waitEndedOnStateReport, waitForWaitingAndReconnect, waitForWaitingAndReconnectWithCause, waitPollStatusErrorLine, waitRowAbsentLine, waitRowFinishedLine, waitTimedOutUnreadReport, whenLaunchSettled, type CarriedDeadEvidence, type ConfigDirUnresolvableHook, type DeadEvidenceSource, type DeadSessionCause, type FindMissingRowReading, type LaunchVerb, type NotConnectedNotice, type OwnRowReadSite, type PersonaRowReread, type PersonaTeardownKillResult, type ReconnectResult, type SessionConflictLatch, type SpawnPersonaResult, type StartupPersonaOutcome } from '../src/session-manager.ts'
+import { _resetConfigDirFs, _resetConfiguredPersonaQuery, _resetFindMissingMemo, _resetInFlightLaunches, _resetLiveRowSequenceRegistry, _resetNotConnectedEpisodes, _resetNow, _resetPreLaunchReplyGuard, _resetPreLaunchTrustPatcher, _resetSpawnHomeDir, _resetWaitForWaitingTimeoutMs, _setConfigDirFs, _setFindMissingMemoTtlMs, _setNow, _setSpawnHomeDir, _setWaitForWaitingTimeoutMs, AGENT_DIRECTOR_LIVE_STATES, buildLiveRowSequenceDeps, bypassingFindMissingSweep, cancelWorkingRowWait, CARRIED_DEAD_EVIDENCE_NONE, carriedDeadEvidenceOf, checkLaunchConfigDir, checkPromptRowDeferral, compareRowToPersona, ConfigDirUnresolvableError, DEAD_EVIDENCE_NONE, DEAD_EVIDENCE_READ_BY_COLLISION_GET, DEAD_EVIDENCE_READ_BY_PATH, DEAD_EVIDENCE_READ_BY_POST_SWEEP_GET, DEAD_EVIDENCE_READ_BY_PROMPT_ROW_REREAD, DEAD_EVIDENCE_VOIDED_BY_RESUME_NOT_FOUND, DEAD_EVIDENCE_VOIDED_BY_RETIRED_KEY_FIRST_LAUNCH, DEAD_EVIDENCE_VOIDED_BY_REUSE_COLLISION_RERUN, DEAD_EVIDENCE_VOIDED_BY_ROW_NOT_INTERACTIVE, DEAD_SESSION_CAUSE_PROMPT_ROW_LADDER_GONE, DEAD_SESSION_CAUSE_ROW_ABSENT, DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE, DEAD_SESSION_CAUSE_ROW_READ_FINISHED, DEAD_SESSION_CAUSE_TMUX_GONE, DEAD_SESSION_CAUSES, deadEvidenceReadByCause, deadEvidenceVoidedLine, deadEvidenceVoidingRead, deadSessionRouteLine, decideNotResumable, describeDeadEvidence, describePersonaRowReread, ESCALATE_DEAD_EVIDENCE, ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ, ESCALATE_DEAD_VERDICTS,  escalateDeadSweepLine, escalateDeadVerdictOfCause, FIND_MISSING_LATCHED, FIND_MISSING_MEMO_TTL_MS, FIND_MISSING_REFUSED, FIND_MISSING_ROW_JUDGED_ALIVE, FIND_MISSING_ROW_LEFT_LIVE, FIND_MISSING_ROW_MARKED_MISSING, FIND_MISSING_ROW_NOT_JUDGED, findMissingRunReadName, forgetNotConnectedEpisode, handleDeliveryKeyError, handleDeliveryReadError, isDeadEvidence, isLaunchInFlight, isLiveRowSequenceRunning, joinedLaunchDropsDeadEvidenceLine, JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS, JSONL_DIAGNOSIS_REUSE_WORDING, JSONL_TRANSCRIPT_LOST_ENTRY_CLASS, KILL_CONTEXT_TEARDOWN, killPersonaInstance, killPersonaInstanceForTeardown, LAUNCH_VERB_RESUME, LAUNCH_VERB_REUSE_SPAWN, LAUNCH_VERB_SPAWN, launchForLiveRowSequence, launchSession, LIVE_ROW_START_NOT_INSTALLED, lostRaceOutcome, NOT_RESUMABLE_LATCHED, NOT_RESUMABLE_LOST_RACE, NOT_RESUMABLE_PENDING, NOT_RESUMABLE_PENDING_OUTCOME, NOT_RESUMABLE_SEQUENCE, notifyDisconnectedWithAutoRestartDisabled, notifyPersonaNotConnected, notifyRestartCapReached, notifySpawnFailure, notResumableSequenceOutcome, ORPHAN_CLEANUP_LIST_FAILED_LABEL, OWN_ROW_READ_ABSENT, OWN_ROW_READ_ROW, OWN_ROW_STATUS_ABSENT, OWN_ROW_STATUS_LATCHED, OWN_ROW_STATUS_REFUSED, OWN_ROW_STATUS_STATE, personaConfigDirLabelValue, plainSpawnCollisionLine, PRE_TRUST_LOG_PREFIX, preTrustLogLine, PROMPT_ROW_STATES, PROMPT_ROW_SWEEP_AFTER_MS, promptRowLadderAfterSweepLine, promptRowLadderLatchedLine, promptRowLadderNoActionLine, promptRowLadderNoPaneLine, promptRowLadderStoppingLine, readFindMissingRow, readPersonaOwnRow, readPersonaOwnRowStatus, readPersonaRowState, reconcileOrphans, RECONNECT_NOT_THIS_LAUNCH_NOTE, reconnectConflictLine, reconnectGoneLine, reconnectInvalidFlagsLine, reconnectLatchedLine, reconnectMcp, reconnectMcpWithCause, reconnectNotInteractiveLine, reconnectRowAbsentLine, reconnectStartLine, reconnectTransientLine, reconnectUnusableNameLine, REPLACE_REREAD_FINISHED_OUTCOME, REPLACE_REREAD_PENDING_OUTCOME, REPLACE_REREAD_REFUSED_OUTCOME, replaceRereadLine, resumeNotFoundSpawnLine, ROW_REREAD_FINISHED, ROW_REREAD_LATCHED, ROW_REREAD_LIVE, ROW_REREAD_PENDING, ROW_REREAD_REFUSED, ROW_REREAD_UNKNOWN, SEQUENCE_NOT_RESUMABLE_LOST_RACE_OUTCOME, sequenceLaunchAtCapLine, setConfigDirUnresolvableHook, setConfiguredPersonaQuery, setConflictLatch, setKillFailureAlerts, setPreLaunchReplyGuard, setPreLaunchTrustPatcher, setSessionNotifier, SPAWN_CAP_REACHED_REMEDIATION, SPAWN_FAILURE_DEFAULT_REMEDIATION, SPAWN_NOT_FOUND_REMEDIATION, spawnFailureNoticeText, spawnForPersona, spawnNotResumableLine, startLiveRowSequence, STARTUP_ERROR_SPAWN_FAILED, startupSessionManager, stopLiveRowSequence, sweepDeadTmuxChannel, transientReconnectLine, WAIT_OUTCOME_LATCHED, waitEndedDisconnectedLine, waitEndedOnStateReport, waitForWaitingAndReconnect, waitForWaitingAndReconnectWithCause, waitPollStatusErrorLine, waitRowAbsentLine, waitRowFinishedLine, waitTimedOutUnreadReport, whenLaunchSettled, type CarriedDeadEvidence, type ConfigDirUnresolvableHook, type DeadEvidenceSource, type DeadSessionCause, type FindMissingRowReading, type LaunchVerb, type NotConnectedNotice, type OwnRowReadSite, type PersonaRowReread, type PersonaTeardownKillResult, type ReconnectResult, type SessionConflictLatch, type SpawnPersonaResult, type StartupPersonaOutcome } from '../src/session-manager.ts'
 import { useImmediateTypingLifecycle } from './test-helpers/legacy-typing.ts'
 useImmediateTypingLifecycle()
 
@@ -18670,7 +18671,7 @@ describe('b.jg5 SRJ-611: dead evidence, the launch wait\'s dead-session cause an
 
   // The builders' literal pins; every other case compares with the builders.
   test('describeDeadEvidence: a GONE-based cause, a row read, none carried, and a hand-built value claiming evidence its cause does not prove', () => {
-    expect(describeDeadEvidence(carriedDeadEvidenceOf('working-tmux-gone'))).toBe('cause=working-tmux-gone: dead evidence (GONE-based)')
+    expect(describeDeadEvidence(carriedDeadEvidenceOf('prompt-row-tmux-gone'))).toBe('cause=prompt-row-tmux-gone: dead evidence (GONE-based)')
     expect(describeDeadEvidence(carriedDeadEvidenceOf(DEAD_SESSION_CAUSE_ROW_ABSENT))).toBe('cause=row-absent: not dead evidence')
     expect(describeDeadEvidence(CARRIED_DEAD_EVIDENCE_NONE)).toBe('no cause carried: not dead evidence')
     expect(describeDeadEvidence(handBuilt(DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE, true))).toBe('cause=row-not-interactive: not dead evidence')
@@ -18681,15 +18682,15 @@ describe('b.jg5 SRJ-611: dead evidence, the launch wait\'s dead-session cause an
     expect(deadSessionRouteLine(ref, 'waiting', carriedDeadEvidenceOf(DEAD_SESSION_CAUSE_TMUX_GONE), CARRIED_DEAD_EVIDENCE_NONE)).toBe(
       `[slack] spawnForPersona: dead session for ${ref} (state=waiting) — cause=tmux-gone: dead evidence (GONE-based); the path holds dead evidence; recovering via resume/fresh-spawn (b.jg5 SRJ-611)`,
     )
-    expect(deadSessionRouteLine(ref, 'working', carriedDeadEvidenceOf(DEAD_SESSION_CAUSE_ROW_ABSENT), carriedDeadEvidenceOf('working-tmux-gone'))).toBe(
-      `[slack] spawnForPersona: dead session for ${ref} (state=working) — cause=row-absent: not dead evidence; the restart path carried in cause=working-tmux-gone: dead evidence (GONE-based); the path holds dead evidence; recovering via resume/fresh-spawn (b.jg5 SRJ-611)`,
+    expect(deadSessionRouteLine(ref, 'working', carriedDeadEvidenceOf(DEAD_SESSION_CAUSE_ROW_ABSENT), carriedDeadEvidenceOf('prompt-row-tmux-gone'))).toBe(
+      `[slack] spawnForPersona: dead session for ${ref} (state=working) — cause=row-absent: not dead evidence; the restart path carried in cause=prompt-row-tmux-gone: dead evidence (GONE-based); the path holds dead evidence; recovering via resume/fresh-spawn (b.jg5 SRJ-611)`,
     )
     expect(deadSessionRouteLine(ref, 'ended', CARRIED_DEAD_EVIDENCE_NONE, carriedDeadEvidenceOf(DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE))).toBe(
       `[slack] spawnForPersona: dead session for ${ref} (state=ended) — no cause carried: not dead evidence; the restart path carried in cause=row-not-interactive: not dead evidence; the path holds no dead evidence; recovering via resume/fresh-spawn (b.jg5 SRJ-611)`,
     )
     // Dead evidence covers one life: the read or answer that voids it is named.
-    expect(deadSessionRouteLine(ref, 'ended', CARRIED_DEAD_EVIDENCE_NONE, carriedDeadEvidenceOf('working-tmux-gone'), 'the collision get read the row ended')).toBe(
-      `[slack] spawnForPersona: dead session for ${ref} (state=ended) — no cause carried: not dead evidence; the restart path carried in cause=working-tmux-gone: dead evidence (GONE-based); the path holds no dead evidence: the collision get read the row ended, which voids it; recovering via resume/fresh-spawn (b.jg5 SRJ-611)`,
+    expect(deadSessionRouteLine(ref, 'ended', CARRIED_DEAD_EVIDENCE_NONE, carriedDeadEvidenceOf('prompt-row-tmux-gone'), 'the collision get read the row ended')).toBe(
+      `[slack] spawnForPersona: dead session for ${ref} (state=ended) — no cause carried: not dead evidence; the restart path carried in cause=prompt-row-tmux-gone: dead evidence (GONE-based); the path holds no dead evidence: the collision get read the row ended, which voids it; recovering via resume/fresh-spawn (b.jg5 SRJ-611)`,
     )
     // With no dead evidence to void, the words are not used.
     expect(deadSessionRouteLine(ref, 'waiting', carriedDeadEvidenceOf(DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE), CARRIED_DEAD_EVIDENCE_NONE, 'unused')).toBe(
@@ -18705,8 +18706,8 @@ describe('b.jg5 SRJ-611: dead evidence, the launch wait\'s dead-session cause an
     expect(deadEvidenceVoidingRead(DEAD_EVIDENCE_READ_BY_PATH, latchRowStateRead(LIVENESS_DEAD_ROW_MISSING))).toBe("the path's last read read the row missing")
     expect(deadEvidenceVoidingRead(DEAD_EVIDENCE_READ_BY_PROMPT_ROW_REREAD, latchRowStateRead(LIVENESS_DEAD_ROW_ENDED))).toBe("the prompt-row ladder action's re-read after its find-missing run read the row ended")
     expect(deadEvidenceReadByCause(DEAD_SESSION_CAUSE_ROW_READ_FINISHED)).toBe('the read behind its dead-session cause (cause=row-read-finished)')
-    expect(deadEvidenceVoidedLine(ref, carriedDeadEvidenceOf('working-tmux-gone'), 'the collision get read the row ended')).toBe(
-      `[slack] spawnForPersona: ${ref}'s dead evidence (cause=working-tmux-gone: dead evidence (GONE-based)) is void for the rest of this attempt — the collision get read the row ended; a later live reading of the row is a launch that evidence never saw, handled as on a path with no dead evidence (b.jg5 SRJ-611)`,
+    expect(deadEvidenceVoidedLine(ref, carriedDeadEvidenceOf('prompt-row-tmux-gone'), 'the collision get read the row ended')).toBe(
+      `[slack] spawnForPersona: ${ref}'s dead evidence (cause=prompt-row-tmux-gone: dead evidence (GONE-based)) is void for the rest of this attempt — the collision get read the row ended; a later live reading of the row is a launch that evidence never saw, handled as on a path with no dead evidence (b.jg5 SRJ-611)`,
     )
     expect(DEAD_EVIDENCE_VOIDED_BY_ROW_NOT_INTERACTIVE).toBe("the reconnect's send-keys answered ErrSpawnNotInteractive (row-not-interactive): the row is finished, or pending under a launch the verdict never saw")
     expect(DEAD_EVIDENCE_VOIDED_BY_RESUME_NOT_FOUND).toBe('resume answered ErrSpawnNotFound: the row is gone')
@@ -18779,7 +18780,7 @@ describe('b.jg5 SRJ-611: dead evidence, the launch wait\'s dead-session cause an
   const waitingRow = (err: Error) => (h: RecoveryHarness, p: string): RecoveryStubScript => ({ ...collided(h, harnessPersona(h, p), { state: 'waiting' }), sendKeysError: err })
   const finishedRow = (state: string) => (h: RecoveryHarness, p: string): RecoveryStubScript => collided(h, harnessPersona(h, p), { state })
 
-  const GONE_VERDICT = carriedDeadEvidenceOf('working-tmux-gone')
+  const GONE_VERDICT = carriedDeadEvidenceOf('prompt-row-tmux-gone')
   const NOT_INTERACTIVE = carriedDeadEvidenceOf(DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE)
   const OWN_GONE = carriedDeadEvidenceOf(DEAD_SESSION_CAUSE_TMUX_GONE)
 
@@ -19583,7 +19584,7 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
     _setNow(h.clock.now)
     const id = personaInstanceId(p)
     h.script({ findMissingResult: cannedFindMissing({ rows: { [id]: 'unverified_ids', [personaInstanceId(b)]: 'unverified_ids' } }) })
-    await sweepDeadTmuxChannel(b, ESCALATE_DEAD_WAITING_ROW_PANE_GONE)
+    await sweepDeadTmuxChannel(b, 'prompt-row-tmux-gone')
     const getsBefore = h.stub.calls.getCalls.length
 
     expect(await h.sequenceDeps.runFindMissing(p, id, cannedStatusResult().state)).toBe(LIVE_ROW_RUN_LEFT_LIVE)
@@ -20275,7 +20276,7 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
   // A GONE-based verdict the restart path carried in changes nothing here:
   // the reconnect's row-not-interactive voids it (b.jg5 SRJ-611, AC 59 as
   // amended), with one line.
-  const CARRIED_GONE = carriedDeadEvidenceOf('working-tmux-gone')
+  const CARRIED_GONE = carriedDeadEvidenceOf('prompt-row-tmux-gone')
   const NOT_EVIDENCE_REREADS = DEAD_SESSION_REPLACEMENT_ROUTES.flatMap((route) =>
     [undefined, CARRIED_GONE].flatMap((carried) =>
       [LIVENESS_DEAD_ROW_ENDED, LIVE, AGENT_DIRECTOR_PENDING_STATE, ...UNKNOWN_STATES].map((reread) => [`${route.name}${carried === undefined ? '' : ', carrying a GONE-based verdict'}`, reread, route, carried] as const),
@@ -21218,7 +21219,7 @@ describe('b.jg5 SRJ-611, SRJ-710 (AC 58, AC 59): an ErrSpawnNotResumable on a ro
   }
 
   /** A GONE-based escalate-dead verdict, as the restart path carries it into the relaunch. */
-  const CARRIED_GONE = carriedDeadEvidenceOf('working-tmux-gone')
+  const CARRIED_GONE = carriedDeadEvidenceOf('prompt-row-tmux-gone')
 
   /** The reconnect's answers that make a dead-session verdict, with their cause. */
   const RECONNECT_DEAD_ANSWERS: ReadonlyArray<readonly [string, () => Error, DeadSessionCause]> = [
@@ -25994,4 +25995,58 @@ describe('production delivery error effects', () => {
     expect(h.triggers).toEqual([])
     expect([getFailureCount(p), getFailureCount(b)]).toEqual([0, 0])
   })
+})
+
+
+describe('reconnect continuation preserves partial command input', () => {
+  let life: DeliveryLifecycle | undefined
+  afterEach(async () => { await life?.stop(); setDeliveryLifecycle(undefined); srj105AfterEach() })
+
+  test.each(['working-before-enter', 'unknown-text', 'refused-text', 'unknown-enter', 'refused-enter'] as const)(
+    '%s: retry submits one complete reconnect command without appending or duplicating text', async fault => {
+      const { h, p } = srj105Build()
+      const clock = createFakeClock()
+      life = createDeliveryLifecycle({ startId: fault, clock })
+      setDeliveryLifecycle(life)
+      const row = harnessRow(h, harnessPersona(h, p), { state: 'waiting' })
+      let reads = 0, input = '', textCalls = 0, enters = 0
+      const submitted: string[] = []
+      h.script({
+        getFn: () => ({ ...row, state: fault === 'working-before-enter' && ++reads === 3 ? 'working' : 'waiting' }),
+        sendKeysFn: params => {
+          if (params.no_enter) {
+            textCalls++
+            if (fault === 'refused-text' && textCalls === 1) return errDialogMaybeOpen()
+            input += params.text
+            if (fault === 'unknown-text' && textCalls === 1) return errCallTimeout('send-keys')
+          } else if (params.key === 'Enter') {
+            enters++
+            if (fault === 'unknown-enter' && enters === 1) return errCallTimeout('send-keys')
+            if (fault === 'refused-enter' && enters === 1) return errDialogMaybeOpen()
+            submitted.push(input)
+            input = ''
+          }
+          return {}
+        },
+      })
+      const run = async () => {
+        const work = reconnectMcpWithCause(p, WAITING_READ)
+        await clock.flush()
+        await clock.advance(ENTER_DELAY_MS)
+        return work
+      }
+      expect((await run()).outcome).toBe('transient')
+      expect(submitted).toEqual([])
+      expect(input).toBe(fault === 'refused-text' ? '' : RECONNECT_TEXT)
+      const deliveryLease = life.acquire(p, 'delivery')
+      expect(deliveryLease === undefined).toBe(fault !== 'refused-text')
+      deliveryLease?.()
+      expect((await run()).outcome).toBe('ok')
+      expect(submitted).toEqual([RECONNECT_TEXT])
+      expect(textCalls).toBe(fault === 'refused-text' ? 2 : 1)
+      expect(input).toBe('')
+      expect(life.reconnectInput(p)).toBeUndefined()
+      expect(h.stub.calls.readPaneCalls).toEqual([])
+    },
+  )
 })
