@@ -647,7 +647,38 @@ NotConcrete == ~(Fairness''' + assumption + " /\\ []RestartStateConstraint /\\ ~
                     "CONSTRAINT RestartStateConstraint\nALIAS TraceView\nPOSTCONDITION EmitTrace\n")
 
 
+def observation_replacement_candidate_inputs(cfg_text):
+    """Exercise replacement of a waiting read before the engine consumes it.
+
+    This only guides the search through original Next actions. Exact replay,
+    raw action fairness and the same-schedule correct contrast still decide
+    whether the exported candidate establishes the mutation's sensitivity.
+    """
+    spec, target, bug, constants = cfg_context(cfg_text)
+    require(bug == "replace_observation", "unsupported observation candidate")
+    assumption = " /\\ TypableHeadTakeInAssumption" if spec == "Spec" else ""
+    module = r'''---------------- MODULE ConcreteCandidate ----------------
+EXTENDS PersonaDelivery
+TargetedMutationWitnessGuide ==
+ CASE st.w.kind # "none" -> EngineStep
+ [] st.h.accepted = {} /\ st.observation = "none" -> Accept
+ [] st.observation = "ready" /\ st.knowledge.r.row = "waiting" /\
+    st.a.row = "waiting" /\ EngineChoice(StepKnowledge) = "requestGate" -> AgentOwnTurnStart
+ [] st.observation = "ready" /\ st.knowledge.r.row = "waiting" /\
+    st.a.row = "working" -> EngineObserve
+ [] st.observation = "ready" \/ InternalContinuation -> EngineStep
+ [] st.a.actual # "idle" -> AgentTurnEnd
+ [] OTHER -> EngineObserve
+CandidateNext == Next /\ TargetedMutationWitnessGuide
+CandidateSpec == Init /\ [][CandidateNext]_vars
+NotConcrete == ~(Fairness''' + assumption + " /\\ []RestartStateConstraint /\\ ~" + target + " )\n" + "=" * 56 + "\n"
+    return module, ("SPECIFICATION CandidateSpec\n" + constants + "PROPERTY NotConcrete\n"
+                    "CONSTRAINT RestartStateConstraint\nALIAS TraceView\nPOSTCONDITION EmitTrace\n")
+
+
 def candidate_search_inputs(cfg_text, raw):
+    if cfg_context(cfg_text)[2] == "replace_observation":
+        return "independent-targeted-guide", observation_replacement_candidate_inputs(cfg_text)
     if cfg_context(cfg_text)[2] in {"park_retype", "unreadable_park", "hold_gate_mcp"}:
         return "independent-targeted-guide", targeted_candidate_inputs(cfg_text)
     return "view-label-search", candidate_inputs(cfg_text, raw)
