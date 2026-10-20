@@ -515,6 +515,11 @@ resumed session, plus an MCP connection logged after the stop.
 AD exposes `launch_started_at` only while pending; an old connection line
 cannot satisfy the check.
 
+The busy scenario pre-allows Slack replies, edits and reactions in its disposable
+Claude HOME so acknowledgement choices cannot open extra permission dialogs.
+Its two deliberate Bash probes still ask for permission. Recovery start and
+completion markers distinguish earlier failures from the kill/resume phase.
+
 Every real-agent failure retains metadata for all main and subagent transcript
 records from its isolated HOME, plus structured AD row and exact-receipt
 evidence captured before retirement. Message text, tool arguments/results and native terminal text are

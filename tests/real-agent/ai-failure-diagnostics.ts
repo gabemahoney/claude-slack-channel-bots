@@ -92,7 +92,7 @@ export function projectCodexFailure(entry: TranscriptEntry) {
 export function projectFailureState(row: unknown) {
   if (!row || typeof row !== 'object' || Array.isArray(row)) return { unavailable: true }
   const value = row as Record<string, unknown>
-  const state = ['pending', 'waiting', 'working', 'ended', 'paused'].includes(String(value.state)) ? value.state : 'unreadable'
+  const state = ['pending', 'waiting', 'working', 'ask_user', 'check_permission', 'ended', 'missing', 'paused'].includes(String(value.state)) ? value.state : 'unreadable'
   return { state, ...fields(value, ['family_state', 'transcript_status']) }
 }
 /** Reads only JSONL below the scenario's isolated transcript directory. No
