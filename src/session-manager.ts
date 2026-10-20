@@ -2858,6 +2858,7 @@ export async function handleDeliveryKeyError(key: string, error: unknown, row: G
 }
 
 export async function readPersonaOwnRow(key: string, at: OwnRowReadSite): Promise<OwnRowRead> {
+  const launchWindow = launchCallWindowOf(key)
   let row: GetResult
   try {
     row = await withOutageDetection(key, undefined, 'get', (client) =>
@@ -2903,6 +2904,7 @@ export async function readPersonaOwnRow(key: string, at: OwnRowReadSite): Promis
   const latched = actOnOwnRowRead(key, row, at, true) !== undefined
   // b.jg5 SRJ-310 rule 3, SRJ-407: this launch's row read live other than `pending` ends the condition.
   checkThisLaunchRowOnRead(key, { state: row.state, launchStartedAt: row.launch_started_at }, latched, at)
+  if (!latched) recordReturnedOwnLaunchOnRead(key, row, launchWindow)
   return { kind: OWN_ROW_READ_ROW, row, latched }
 }
 
@@ -10968,6 +10970,14 @@ function recordOwnLaunch(
   } catch {
     return false
   }
+}
+
+/** Record a successful launch from AD's own pending row, before pending-row recovery decides ownership. */
+function recordReturnedOwnLaunchOnRead(key: string, row: GetResult, window: LaunchCallWindowRecord | undefined): void {
+  if (row.instance_id !== personaInstanceId(key) || row.state !== AGENT_DIRECTOR_PENDING_STATE) return
+  // Keep the window captured before the read: a later launch or teardown
+  // must prevent this read from restoring the earlier launch's record.
+  recordOwnLaunch(key, window, LAUNCH_CALL_END_RETURNED, row.launch_started_at)
 }
 
 /**
