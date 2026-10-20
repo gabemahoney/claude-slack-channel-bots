@@ -145,7 +145,7 @@ export interface PersonaRoutingDeps {
    * or `isDialogApproverRunning`, b.jg5 SRJ-401): a message lost then reports
    * `session-starting`, unless an earlier state applies.
    */
-  isLaunchOrApproverRunning?(key: string): boolean
+  isLaunchRunning?(key: string): boolean
   /** Whether persona P is held on `ErrInvalidFlags`: reports `cannot-launch`. */
   isHeldOnInvalidFlags?(key: string): boolean
   /**
@@ -432,7 +432,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
     const state = decideLostMessageState({
       ...early,
       isSequenceOrWaitRunning: () => deps.isSequenceOrWaitRunning?.(key) === true,
-      isRowPending: () => rowReadPending || deps.isLaunchOrApproverRunning?.(key) === true,
+      isRowPending: () => rowReadPending || deps.isLaunchRunning?.(key) === true,
       isRestartPending: () => isRestartPendingOrActive(key),
       isAutoRestartDisabled: () => config.session_restart_delay === 0,
       isAtRestartLimit: () => isAtCap(key, RESTART_FAILURE_CAP),
@@ -493,7 +493,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
   function shouldReadRow(key: string, early: EarlyLostMessageQueries): boolean {
     if (deps.readRowLiveness === undefined) return false
     if (decideEarlyLostMessageState(early) !== undefined) return false
-    if (deps.isLaunchOrApproverRunning?.(key) === true) return false
+    if (deps.isLaunchRunning?.(key) === true) return false
     if (deps.isSequenceOrWaitRunning?.(key) === true) return false
     return deps.isWorkInFlight?.(key) !== true
   }

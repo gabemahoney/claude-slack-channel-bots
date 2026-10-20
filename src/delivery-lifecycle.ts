@@ -1,7 +1,8 @@
 /** Shared ownership of every automatic keystroke (b.omv SR-5.5/6.6). */
 import { NOT_NOW_RETRY_MS } from './delivery-constants.ts'
 import { parseLaunchStart } from './pending-row.ts'
-export { NOT_NOW_RETRY_MS, RECONNECT_BLOCKED_NOTICE_MS } from './delivery-constants.ts'
+
+export { NOT_NOW_RETRY_MS } from './delivery-constants.ts'
 export interface DeliveryClock {
   now(): number
   setTimeout(callback: () => void, ms: number): unknown
@@ -10,7 +11,7 @@ export interface DeliveryClock {
 export const systemDeliveryClock: DeliveryClock = {
   now: Date.now, setTimeout: (cb, ms) => setTimeout(cb, ms), clearTimeout: id => clearTimeout(id as ReturnType<typeof setTimeout>),
 }
-export type TypingOwner = 'delivery' | 'reconnect' | 'startup'
+export type TypingOwner = 'delivery' | 'reconnect'
 export interface DeliveryLifecycle {
   active(key?: string): boolean
   pause(ms: number): Promise<void>
@@ -20,8 +21,8 @@ export interface DeliveryLifecycle {
   hasWaited(key: string): boolean
   owner(key: string): TypingOwner | 'free'
   acquire(key: string, owner: TypingOwner): (() => void) | undefined
-  deferred(key: string): { due: boolean; screen?: 'input' | 'menu'; blockedMs: number } | undefined
-  defer(key: string, screen?: 'input' | 'menu'): void
+  deferred(key: string): { due: boolean } | undefined
+  defer(key: string): void
   clearDeferred(key: string): void
   engineRunning(key: string, running: boolean): void
   setReconnect(callback: (key: string) => Promise<void>): void
@@ -33,11 +34,10 @@ export interface DeliveryLifecycle {
 }
 export function createDeliveryLifecycle(options: {
   startId: string; clock?: DeliveryClock; parseLaunchStart?: (value: unknown) => number | undefined
-  onReconnectScreen?: (key: string, screen: 'input' | 'menu', blockedMs: number) => void
   onError?: (error: unknown) => void
 }): DeliveryLifecycle {
   const clock = options.clock ?? systemDeliveryClock
-  interface State { n: number; state?: string; session?: string; stamps: Set<number>; waited: boolean; owner: TypingOwner | 'free'; lease?: object; running: boolean; disabled?: boolean; deferred?: { dueAt: number; screen?: 'input' | 'menu'; lastAt: number; blockedMs: number }; timer?: unknown; reconnecting?: Promise<void> }
+  interface State { n: number; state?: string; session?: string; stamps: Set<number>; waited: boolean; owner: TypingOwner | 'free'; lease?: object; running: boolean; disabled?: boolean; deferred?: { dueAt: number }; timer?: unknown; reconnecting?: Promise<void> }
   const states = new Map<string, State>()
   let stopped = false, reconnect: ((key: string) => Promise<void>) | undefined, recovery: ((key: string) => Promise<boolean>) | undefined
   const pauses = new Map<unknown, () => void>()
@@ -71,13 +71,11 @@ export function createDeliveryLifecycle(options: {
       const lease = {}; s.owner = owner; s.lease = lease
       return () => { if (s.lease === lease) { s.owner = 'free'; s.lease = undefined } }
     },
-    deferred(key) { const d = state(key).deferred; return d ? { due: clock.now() >= d.dueAt, screen: d.screen, blockedMs: d.blockedMs + (d.screen ? clock.now() - d.lastAt : 0) } : undefined },
-    defer(key, screen) {
+    deferred(key) { const d = state(key).deferred; return d ? { due: clock.now() >= d.dueAt } : undefined },
+    defer(key) {
       if (stopped || state(key).disabled) return
-      const s = state(key), old = s.deferred, now = clock.now()
-      const blockedMs = (old?.blockedMs ?? 0) + (old?.screen ? now - old.lastAt : 0)
-      s.deferred = { dueAt: now + NOT_NOW_RETRY_MS[0], screen, lastAt: now, blockedMs }
-      if (screen) { try { options.onReconnectScreen?.(key, screen, blockedMs) } catch {} }
+      const s = state(key)
+      s.deferred = { dueAt: clock.now() + NOT_NOW_RETRY_MS[0] }
       arm(key, s)
     },
     clearDeferred(key) { const s = state(key); cancel(s); s.deferred = undefined },

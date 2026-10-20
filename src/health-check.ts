@@ -223,7 +223,6 @@ export interface HealthCheckDeps {
    * row `working`, and is forgotten as soon as any launch for the persona
    * starts, so a booting session never has it. Absent: false.
    */
-  hasPendingWorkingRowEvidence?(key: string): boolean
   /**
    * Returns true when the persona has reached the consecutive-failure cap.
    * Capped personas are skipped on every tick (SR-25.3/25.4) — the tick
@@ -624,7 +623,7 @@ async function runHealthCheckTick(): Promise<void> {
           // can find the row stale and reconnect it, is scheduled on this
           // first undeliverable tick rather than after a second.
           const streak = (disconnectedStreak.get(key) ?? 0) + 1
-          if (streak >= 2 || deps.hasPendingWorkingRowEvidence?.(key) === true) {
+          if (streak >= 2) {
             disconnectedStreak.delete(key)
             deps.scheduleRestart(key, cwd)
             // b.f2b: with auto-restart disabled scheduleRestart only logs and

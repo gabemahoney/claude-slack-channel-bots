@@ -446,7 +446,6 @@
 
 import { ENTER_DELAY_MS } from './delivery-constants.ts'
 import type { DeliveryLifecycle } from './delivery-lifecycle.ts'
-import { readDeliveryScreen } from './delivery-screen.ts'
 import { decideGate, createDeliveryPolicyState, type DeliveryReading } from './delivery-policy.ts'
 import type {
   Client,
@@ -458,9 +457,7 @@ import type {
   SpawnResult,
   StatusResult,
 } from 'agent-director'
-
 import type { PreTrust } from './ad-phase1-types.ts'
-
 import { checkCozempicAvailable, resolveJsonlPath } from './cozempic.ts'
 import {
   type Persona,
@@ -624,7 +621,6 @@ import {
   type KillRetryWait,
 } from './kill-retry.ts'
 import {
-  FULL_PANE_READ_LINES,
   PANE_READ_ABSENT,
   PANE_READ_CONFIG,
   PANE_READ_CONFLICT,
@@ -770,11 +766,9 @@ import {
   isInsideLatchRecheck,
   isInsideTimerRetry,
   latchRecheckScopeOf,
-  runDetachedRecoveryAttempt,
   runInAttempt,
   runInLatchRecheck,
   runOutsideAttempts,
-  retryRunGateStop,
   unavailableRetryCauseFor,
   UNAVAILABLE_RETRY_CAUSE_LOST_RACE,
   UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD,
@@ -868,16 +862,7 @@ import {
   type OldLifeWaitRefusalAt,
 } from './old-life-wait.ts'
 import { recordStartupError } from './startup-errors.ts'
-// Type only: the held-directory answer session admission takes; nothing of
-// the registry is loaded here.
 import type { SessionHeldDirectory } from './registry.ts'
-import {
-  locateTranscript,
-  readTranscriptTurnState,
-  sameTranscriptSnapshot,
-  type TranscriptReading,
-  type TranscriptSnapshot,
-} from './session-transcript.ts'
 import type { ReplyGuardUndo } from './stop-hook-bootstrap.ts'
 import {
   PERSONA_TEARDOWN_NOTICE_DURING_WAIT,
@@ -930,12 +915,6 @@ import {
   PENDING_ROW_GET_LATCHED,
   PENDING_ROW_GET_REFUSED,
   PENDING_ROW_GET_ROW,
-  PENDING_ROW_LAP_ENTER_CONFLICT,
-  PENDING_ROW_LAP_ENTER_LATCHED,
-  PENDING_ROW_LAP_ENTER_NOT_SENT_LATCHED,
-  PENDING_ROW_LAP_ENTER_SENT,
-  PENDING_ROW_LAP_ENTER_UNCLASSIFIED,
-  PENDING_ROW_LAP_ENTER_UNUSABLE_NAME,
   PENDING_ROW_RELAUNCH_KEPT,
   PENDING_ROW_RELAUNCH_LATCHED,
   PENDING_ROW_RELAUNCH_SEQUENCE_STARTED,
@@ -943,7 +922,6 @@ import {
   PENDING_ROW_RULE_HELD,
   PENDING_ROW_RULE_LATCHED,
   PENDING_ROW_RULE_LIVE,
-  PENDING_ROW_RULE_ORIGIN_APPROVER_STOP,
   PENDING_ROW_RULE_ORIGIN_RETRY,
   PENDING_ROW_RULE_READ_REFUSED,
   PENDING_ROW_RULE_REFUSAL,
@@ -965,17 +943,11 @@ import {
   STUCK_LAUNCH_POST_FAILED,
   createStuckLaunchAbort,
   describePendingRowRuleAnswer,
-  pendingRowLapEnterFailureOf,
-  pendingRowRuleFailedLine,
   postStuckLaunchHeld,
   postStuckLaunchRelaunching,
   type StuckLaunchAbortEpisodes,
   type StuckLaunchAbortKillAnswer,
   type StuckLaunchAbortSequenceStart,
-  type PendingRowLapEnterFailure,
-  type PendingRowLapEnterLatching,
-  type PendingRowLapEnterOutcome,
-  type PendingRowLapEnterUnclassified,
   type PendingRowRule,
   type PendingRowRuleAnswer,
   type PendingRowRuleDeps,
@@ -992,13 +964,10 @@ import {
   PENDING_ROW_REASON_CWD_UNRESOLVED,
   PENDING_ROW_REASON_RETIRED_OLD_LIFE,
   PENDING_ROW_UNDECIDED,
-  PENDING_ROW_WAIT_NOT_ARMED,
-  armPendingRowWait,
   decidePendingRowCover,
   describeLaunchStartForLog,
   endStuckLaunchEpisode,
   isLaunchStartInWindow,
-  isPendingRowAged,
   isStuckLaunchEpisodeEndState,
   launchStartInstantOf,
   parseLaunchStart,
@@ -1015,11 +984,8 @@ import {
   DIALOG_READY_TIMEOUT_MS,
   adGraceMsInEffect,
   adLaunchBoundMsInEffect,
-  armNeverEarlyWait,
   type NeverEarlyWaitClock,
-  type NeverEarlyWaitLength,
 } from './ad-settings.ts'
-// Import cycle with jsonl-persistence-check.ts: use these imports only inside functions, never at module top level.
 import {
   makeDefaultArchiveCount,
   personaArchiveEvidenceScope,
@@ -1030,6 +996,60 @@ import { startupSummaryEnding, type StartupSummaryEndingCounts } from './startup
 import { realpathSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { resolve as resolvePath } from 'node:path'
+
+export const STARTUP_ERROR_SPAWN_FAILED = 'spawn-failed'
+export const ESCALATE_DEAD_REPROBE_DECIDES = "sweeping and escalating (escalate-dead); the restart path's re-probe decides"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// Type only: the held-directory answer session admission takes; nothing of
+// the registry is loaded here.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// Import cycle with jsonl-persistence-check.ts: use these imports only inside functions, never at module top level.
+
+
+
+
+
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -1042,7 +1062,7 @@ import { resolve as resolvePath } from 'node:path'
  */
 export { AGENT_DIRECTOR_LIVE_STATES }
 
-/** B's floor (`src/ad-settings.ts`, b.jg5 SRJ-210), re-exported for the approver's readers. */
+
 export { DIALOG_READY_TIMEOUT_MS }
 
 /** The CSCB-shipped template name (mirrors agent-director-client). */
@@ -1415,16 +1435,7 @@ function logRefusal(site: string, what: string, ref: string, described: string):
 // The latch (b.jg5 SRJ-501, SRJ-502)
 // ---------------------------------------------------------------------------
 
-/**
- * What the session manager uses of the server's one latch
- * (`src/conflict-latch.ts`): `set` for a latching own-row read
- * (`readPersonaOwnRow`, `applyOwnRowStatusStep`; a launch start not recorded
- * with `launchStartNotRecordedSetInput`'s input) and for an UNUSABLE NAME
- * answer (with `unusableNameSetInput`'s input, `latchOnUnusableName`),
- * `setFromConflict` for a CONFLICT answer; and, when the latch has it,
- * `addSetObserver`, through which the installer stops a latched persona's
- * running dialog approver (`setConflictLatch`, b.jg5 SRJ-502).
- */
+
 export type SessionConflictLatch = Pick<ConflictLatch, 'isLatched' | 'record' | 'set' | 'setFromConflict'> &
   Partial<Pick<ConflictLatch, 'addSetObserver'>>
 
@@ -1444,48 +1455,8 @@ export type SessionConflictLatch = Pick<ConflictLatch, 'isLatched' | 'record' | 
  */
 let conflictLatch: SessionConflictLatch | undefined
 
-/** Removes the approver-stop set observer from the installed latch; undefined while none is registered. */
-let removeApproverLatchObserver: (() => void) | undefined
+export function setConflictLatch(latch: SessionConflictLatch | undefined): void { conflictLatch = latch }
 
-/**
- * Install the server's latch (production: `main()`; the recovery harness
- * installs its own the same way), or remove it with undefined. The installer
- * registers one set observer on a latch that has `addSetObserver`
- * (`stopApproverOnLatch`, b.jg5 SRJ-502): every set of a persona, a relatch
- * and a same-case set included, stops that persona's running dialog approver
- * with the reason `latched`. The observer registered on a latch installed
- * before is removed first, so exactly one is registered, on the installed
- * latch only. When a live-row sequence registry is installed too
- * (`setLiveRowSequenceRegistry`), a second set observer stops the persona's
- * running live-row sequence with the latch reason (`stopSequenceOnLatch`,
- * SRJ-502, SRJ-706), registered once on the installed latch, whichever of
- * the two is installed second.
- */
-export function setConflictLatch(latch: SessionConflictLatch | undefined): void {
-  removeApproverLatchObserver?.()
-  removeApproverLatchObserver = undefined
-  conflictLatch = latch
-  if (latch?.addSetObserver !== undefined) removeApproverLatchObserver = latch.addSetObserver(stopApproverOnLatch)
-  syncSequenceLatchObserver()
-}
-
-/**
- * The latch's set observer the installer registers (`setConflictLatch`,
- * b.jg5 SRJ-502): stops persona `event.key`'s running dialog approver with
- * the reason `latched` through the stop entry (`stopDialogApprover`). The
- * approver is marked stopped synchronously, inside this call, so no approver
- * call for the persona starts after the latch's `set` returns, whatever order
- * the observers run in; a call already in progress returns first, and the
- * approver makes none after it. Does nothing when no approver runs for the
- * persona, and nothing more when its approver was already stopping (its own
- * CONFLICT or UNUSABLE NAME answer marks it before it latches). Returns
- * nothing to await; never throws.
- */
-function stopApproverOnLatch(event: ConflictLatchSetEvent): void {
-  void stopDialogApprover(event.key, APPROVER_STOP_LATCHED)
-}
-
-/** The case the latched gate logs when it cannot read the persona's latch record. */
 const LATCH_CASE_UNKNOWN = 'unknown'
 
 /**
@@ -3179,64 +3150,7 @@ export type OwnRowStatusAnswer =
   | { readonly result: StatusResult }
   | { readonly thrown: unknown }
 
-/**
- * The own-row `status` step (b.jg5 SRJ-105, SRJ-115, SRJ-512): the own-row
- * rules applied to one `status` answer from persona `key`'s own row
- * (`cscb_<key>`), whoever made the call (the shared own-row `status` read,
- * or an adapter's own call in `src/server.ts`). Answers whether it latched
- * the persona; never throws.
- *
- *   - A returned result: the row-read rule (`decideOwnRowRead`,
- *     `src/row-read-rules.ts`) over the result, as the persona's own row,
- *     with the installed configured-persona query (with none installed no
- *     decision latches). A latch decision latches the persona with the
- *     decision's case, refused operation and row state (`latchFromRowRead`)
- *     and logs one line. A configured persona's own row that reads
- *     `pending` with no launch start latches it with "launch start not
- *     recorded" and the state `pending` (b.jg5 SRJ-513; SRJ-1020 is posted
- *     once per episode), relatching a persona latched with another case. A
- *     `status` result carries no liveness note, so the note decision never
- *     latches here; every decision the rule gains applies here unchanged.
- *   - A thrown value: an UNUSABLE NAME answer (`isUnusableNameError`, by
- *     name) latches the persona with the state unreadable
- *     (`latchOnUnusableNameRead`: one line, no further read). Any other
- *     value, `ErrSpawnNotFound` included, is left to the caller.
- *   - A returned result reading `waiting`, `working`, `ask_user` or
- *     `check_permission` while the installed retired-key store has the key
- *     recorded with its mark set clears the key's entry, durably, whether or
- *     not the key is configured and beside any latch the same result decides
- *     (`clearRetiredEntryOnRead`; b.jg5 SRJ-807). A `pending` result never
- *     clears. What the step answers is the same whatever the clear did; a
- *     clear whose write fails leaves the entry for the next qualifying read.
- *     The liveness and reconnect adapters get the clear through this step.
- *   - Either way, first: a result reading `ended` or `missing`, or an
- *     `ErrSpawnNotFound` answer (the row is gone), ends the persona's
- *     kill-failure episode silently (`endKillFailureEpisodeOnRead`; b.jg5
- *     SRJ-704, SRJ-1016), and ends an old-life hold on `cscb_<key>`, with
- *     its one end line (`noteOldLifeRowRead`; b.jg5 SRJ-809); any other
- *     state keeps it. So every own-row `status` the server makes ends the
- *     hold this way: the shared own-row `status` read, a persona kill
- *     retry's between-try read, and the liveness and reconnect adapters.
- *   - A returned result reading `waiting`, `working`, `ask_user` or
- *     `check_permission` ends the persona's stuck-launch episode silently
- *     (`endStuckLaunchEpisodeOnRead`; b.jg5 SRJ-1016), whoever made the
- *     call, the liveness and reconnect adapters included; `pending`,
- *     `ended`, `missing`, `ErrSpawnNotFound` and a failed read do not.
- *   - The same live states settle the persona's resumed launch as reported
- *     in, and `ended`, `missing` or `ErrSpawnNotFound` as ended before it
- *     (`settleResumeOnRead`, b.4q8), whoever made the call.
- *   - While the persona holds a "this launch's row" record (b.jg5 SRJ-407),
- *     the answer applies SRJ-310's third end rule to it
- *     (`checkThisLaunchRowOnRead`), so every own-row `status` the server
- *     makes, an approver's lap and a health tick's included, can end the
- *     condition by it.
- *
- * With no latch installed a latching answer still answers true, with
- * nothing latched, as at the CONFLICT row. Log lines:
- *
- *   [slack] <site>: <what> for <ref>: its row read latches the persona (case=<case>, state=<state>) — <outcome>; nothing more is called for it (b.jg5 SRJ-115, SRJ-501)
- *   [slack] <site>: <what> for <ref>: <failure> — UNUSABLE NAME: <outcome>; nothing more is called for it (b.jg5 SRJ-105, SRJ-512)
- */
+
 export function applyOwnRowStatusStep(key: string, answer: OwnRowStatusAnswer, at: OwnRowReadSite): boolean {
   try {
     if (!('thrown' in answer)) deliveryLifecycle?.observeRow(key, answer.result)
@@ -3303,30 +3217,7 @@ export type OwnRowStatusRead =
   /** `rowState`: what the read gave, as a latch records it (unreadable for a thrown answer). */
   | { readonly kind: typeof OWN_ROW_STATUS_LATCHED; readonly rowState: LatchRowState }
 
-/**
- * The shared own-row `status` read (b.jg5 SRJ-115): one `status` of persona
- * `key`'s own row (`cscb_<key>`) through `withOutageDetection` (so a
- * failure raises its outage flags and, inside a launch or recovery attempt,
- * arms the persona's retry timer), then the own-row `status` step
- * (`applyOwnRowStatusStep`). Answers:
- *
- *   - `latched` when the step latched the persona (an UNUSABLE NAME answer,
- *     recorded unreadable, or a latch decision of the row-read rule: the
- *     persona's own row reading `pending` with no launch start, recorded
- *     `pending`, b.jg5 SRJ-513), with the state as a latch records it; the
- *     caller calls nothing more for the persona (b.jg5 SRJ-502);
- *   - `state`, with the raw launch start a `pending` result shows
- *     (`pendingLaunchStartOf`; absent when not shown);
- *   - `absent` for `ErrSpawnNotFound` (recognised by class);
- *   - `refused` for any other error, carried unchanged for the site's own
- *     handling (`refusalAt`, b.jg5 SRJ-105, or its own rule).
- *
- * The session manager's own-row `status` sites read through it: the launch
- * wait's poll and timeout reads, the prompt rows' re-read after a sweep
- * (`reconcileAndReadRowState`), the retry timer's row read
- * (`readPersonaRowState`), the latch-time read (`latchTimeRowState`) and
- * the dialog approver's lap (`approvePreSessionDialogs`). Never throws.
- */
+
 export async function readPersonaOwnRowStatus(key: string, at: OwnRowReadSite): Promise<OwnRowStatusRead> {
   // The result whole, so the step reads its launch start (b.jg5 SRJ-513).
   let result: StatusResult
@@ -3355,7 +3246,7 @@ export async function readPersonaOwnRowStatus(key: string, at: OwnRowReadSite): 
 
 /** What `readPersonaOwnPane` is asked to read, and for whom. */
 export interface PersonaPaneReadRequest {
-  /** Trailing pane lines to read (`FULL_PANE_READ_LINES` at a full read). */
+  /** Trailing pane lines to read for an outcome-only probe. */
   readonly nLines: number
   /**
    * The row state the calling path last read (b.jg5 SRJ-501), which a latch
@@ -3364,13 +3255,7 @@ export interface PersonaPaneReadRequest {
   readonly lastRead: LatchRowState
   /** A short site label, the head of the reader's latch line. */
   readonly site: string
-  /**
-   * Read a `pending` row's pane (`allow_pending: true` on the call, b.jg5
-   * SRJ-117, SRJ-402). Only the pending-row rule's lap sets it
-   * (`readPendingRowLapPane`); every other site leaves it unset, and its call
-   * carries no `allow_pending`.
-   */
-  readonly allowPending?: boolean
+
 }
 
 /**
@@ -3380,62 +3265,7 @@ export interface PersonaPaneReadRequest {
  */
 export type OwnPaneReadOutcome = Exclude<PaneReadOutcome, PaneReadConflict | PaneReadUnusableName>
 
-/**
- * The shared read-pane of persona `key`'s own row (`cscb_<key>`, b.jg5
- * SRJ-117): one `readPane` through `withOutageDetection`, declaring the
- * `read-pane` verb (tmux-touching: inside an attempt an UNAVAILABLE starts
- * `tmux-unresponsive` and a pane or GONE ends it, and ENVIRONMENT and CONFIG
- * raise their outages, all in the wrapper), with `instance_id` and
- * `n_lines` only, and `allow_pending: true` when `request.allowPending` is
- * set (the pending-row rule's lap, b.jg5 SRJ-410). Answers the read's
- * outcome (`src/pane-read.ts`):
- *
- *   - a persona already latched (`personaLatchedNow`, b.jg5 SRJ-502) gets no
- *     call and answers latched with no cause;
- *   - a CONFLICT latches the persona through the latch's CONFLICT entry
- *     (`setFromConflict`) with the refused operation "P's next check or
- *     recovery" and `request.lastRead` (b.jg5 SRJ-501), and answers latched
- *     with the CONFLICT as its cause;
- *   - an UNUSABLE NAME latches it through the unusable-name entry
- *     (`latchOnUnusableName`: refused operation "none", `request.lastRead`,
- *     b.jg5 SRJ-512), and answers latched with it as its cause;
- *   - an `ErrInvalidFlags`, to which `read-pane` gives no meaning, gets
- *     exactly one immediate version re-check (`classifyWithInvalidFlagsRecheck`,
- *     b.jg5 SRJ-104, SRJ-204) and then answers UNCLASSIFIED
- *     (`paneReadInvalidFlagsFailure`), carrying the stop mark
- *     `stopping: true` when the re-check decided that the server stops
- *     (b.jg5 SRJ-205; the caller then types nothing and calls nothing more
- *     for the persona);
- *   - every other outcome (a pane, GONE, absent, CONFIG, ENVIRONMENT,
- *     UNAVAILABLE, UNCLASSIFIED) is returned unchanged for the caller to
- *     handle.
- *
- * A pane it answers may be a single leftover's: with no session of the
- * row's current launch there and exactly one leftover of the persona,
- * agent-director answers the leftover's pane (b.jg5 SRJ-117, SRJ-613). The
- * reader treats it as no proof that the worker's own session is there, and
- * no caller acts on it alone: a pane leads at most to a deferral, no action,
- * a positive-idle fold, the reconnect, or the pending-row lap's Enter. The
- * backstop is the `send-keys` that follows: the reconnect's
- * (`reconnectMcpWithCause`), which on a live row that is not `pending`
- * answers CONFLICT "not this launch's session": CSCB then latches P (b.jg5
- * SRJ-501) with nothing typed and never retries the refused `send-keys`
- * (SRJ-118, SRJ-505); and the lap's Enter (`sendPendingRowLapEnter`), which
- * on a `pending` row whose session is not this launch's answers
- * `ErrSpawnNotInteractive` with nothing typed, after which no further lap is
- * made on the row's launch (b.jg5 SRJ-410, SRJ-613).
- *
- * With no latch installed a CONFLICT or UNUSABLE NAME still answers latched
- * with nothing latched, as the latch's entries do elsewhere (`conflictAt`,
- * `unusableNameAt`). The reader posts nothing and counts nothing, and makes
- * no further call after a latch. One line per latch it sets (no token: the
- * answer through the redacting describer):
- *
- *   [slack] <site>: pane read refused for persona=<key>: <failure> — CONFLICT: <outcome>; nothing is typed and nothing more is called for it (b.jg5 SRJ-105, SRJ-501)
- *   [slack] <site>: pane read refused for persona=<key>: <failure> — UNUSABLE NAME: <outcome>; nothing is typed and nothing more is called for it (b.jg5 SRJ-105, SRJ-512)
- *
- * Never throws.
- */
+
 export async function readPersonaOwnPane(key: string, request: PersonaPaneReadRequest): Promise<OwnPaneReadOutcome> {
   if (personaLatchedNow(key)) return PANE_READ_NOT_READ_LATCHED
   let failure: PaneReadFailure
@@ -3443,9 +3273,7 @@ export async function readPersonaOwnPane(key: string, request: PersonaPaneReadRe
     const instance_id = personaInstanceId(key)
     const result = await withOutageDetection(key, undefined, 'read-pane', (client) =>
       client.readPane(
-        request.allowPending === true
-          ? { instance_id, n_lines: request.nLines, allow_pending: true }
-          : { instance_id, n_lines: request.nLines },
+        { instance_id, n_lines: request.nLines },
       ),
     )
     return { kind: PANE_READ_PANE, pane: result.pane }
@@ -3527,130 +3355,6 @@ export const PENDING_ROW_RULE_SITE = 'pendingRowRule'
 export const PENDING_ROW_RULE_GET_SITE: OwnRowReadSite = Object.freeze({ site: PENDING_ROW_RULE_SITE, what: 'pending-row rule get' })
 
 /**
- * Whether `pane` shows a startup dialog the dialog approver recognises: one
- * of its needles (`PRE_SESSION_DIALOG_NEEDLES`: folder trust; b.omv SR-7.5). The approver's laps and the
- * pending-row rule's lap (b.jg5 SRJ-410) both read a pane through it. A pane
- * may be a single leftover's (b.jg5 SRJ-613), so a dialog on it leads at
- * most to Enter through `send-keys`, the backstop. Pure; never throws.
- */
-export function paneShowsStartupDialog(pane: string): boolean {
-  return typeof pane === 'string' &&
-    readDeliveryScreen('claude', pane).kind === 'menu' &&
-    paneShowsDialog(paneLines(pane).slice(-40)) &&
-    PRE_SESSION_DIALOG_NEEDLES.some((needle) => pane.includes(needle))
-}
-
-/**
- * The pending-row rule's lap `read-pane` of persona `key`'s own row (b.jg5
- * SRJ-410, SRJ-117's pending-row lap column): the shared reader
- * (`readPersonaOwnPane`) with 40 lines (`FULL_PANE_READ_LINES`) and
- * `allow_pending`, the row last read `pending`. The reader latches on
- * CONFLICT (refused operation "P's next check or recovery") and UNUSABLE
- * NAME, reads nothing for a latched persona, and answers every other
- * outcome by class. Its pane may be a single leftover's (b.jg5 SRJ-613): the
- * lap acts on it at most by Enter (`sendPendingRowLapEnter`), the backstop.
- * Never throws.
- */
-export function readPendingRowLapPane(key: string, ref: string = keyRef(key)): Promise<OwnPaneReadOutcome> {
-  return readPersonaOwnPane(key, {
-    nLines: FULL_PANE_READ_LINES,
-    lastRead: latchRowStateRead(AGENT_DIRECTOR_PENDING_STATE),
-    site: `${PENDING_ROW_RULE_SITE} ${ref} lap`,
-    allowPending: true,
-  })
-}
-
-/**
- * The pending-row rule's lap Enter on persona `key`'s own row (b.jg5
- * SRJ-410, SRJ-118's approver-and-lap row): one `send-keys` with an empty
- * text and `allow_pending: true`, which presses Enter, through
- * `withOutageDetection` declaring the `send-keys` verb (tmux-touching:
- * inside an attempt an UNAVAILABLE starts `tmux-unresponsive`, an
- * UNCLASSIFIED opens the persona's unclassified-error episode, and
- * ENVIRONMENT and CONFIG raise their outages, all in the wrapper). Answers
- * the outcome (`PendingRowLapEnterOutcome`, `src/pending-row.ts`), by class
- * and name through `src/ad-error-class.ts`, never by testing the value
- * against an error class:
- *
- *   - a persona already latched (b.jg5 SRJ-502) gets no call: latched;
- *   - success: sent;
- *   - CONFLICT: the persona latches through the latch's CONFLICT entry
- *     (`setFromConflict`) with the refused operation "P's next check or
- *     recovery" and the recorded state `pending` (b.jg5 SRJ-501): latched,
- *     with one line;
- *   - UNUSABLE NAME: the persona latches through the unusable-name entry
- *     (b.jg5 SRJ-512), recorded `pending`: latched, with one line;
- *   - `ErrInvalidFlags`, to which `send-keys` gives no meaning: one immediate
- *     version re-check, then UNCLASSIFIED (carrying the stop mark when the
- *     re-check decided that the server stops; otherwise reported through
- *     the outage state's UNCLASSIFIED site entry), with one line;
- *   - every other answer returned by class: GONE, `ErrSpawnNotFound`,
- *     `ErrSpawnNotInteractive` (nothing was typed: the session holding the
- *     name is not this launch's, b.jg5 SRJ-613), UNAVAILABLE, CONFIG,
- *     ENVIRONMENT, UNCLASSIFIED (`ErrSendKeysWhileRelayed` included).
- *
- * It types nothing but on success, posts nothing and counts nothing. Never
- * throws.
- */
-export async function sendPendingRowLapEnter(key: string, ref: string = keyRef(key)): Promise<PendingRowLapEnterOutcome> {
-  if (personaLatchedNow(key)) return PENDING_ROW_LAP_ENTER_NOT_SENT_LATCHED
-  let failure: PendingRowLapEnterFailure
-  try {
-    const sent = await withStartupTyping(key, () => withOutageDetection(key, undefined, 'send-keys', (client) =>
-      client.sendKeys({ instance_id: personaInstanceId(key), text: '', allow_pending: true }),
-    ).then(() => {}))
-    if (!sent) return { kind: 'unclassified', errorClass: AD_ERROR_CLASS_UNCLASSIFIED, description: 'Startup answer deferred by typing gate or fresh prompt check' }
-    return { kind: PENDING_ROW_LAP_ENTER_SENT }
-  } catch (err) {
-    if (isInvalidFlagsError(err)) return lapEnterInvalidFlagsOutcome(key, ref, err)
-    failure = pendingRowLapEnterFailureOf(err)
-  }
-  const lastRead = latchRowStateRead(AGENT_DIRECTOR_PENDING_STATE)
-  if (failure.kind === PENDING_ROW_LAP_ENTER_CONFLICT) {
-    logLapEnterLatch(ref, failure, latchOnConflict(key, failure.error, REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY, lastRead))
-    return { kind: PENDING_ROW_LAP_ENTER_LATCHED, cause: failure }
-  }
-  if (failure.kind === PENDING_ROW_LAP_ENTER_UNUSABLE_NAME) {
-    logLapEnterLatch(ref, failure, latchOnUnusableName(key, failure.error, lastRead))
-    return { kind: PENDING_ROW_LAP_ENTER_LATCHED, cause: failure }
-  }
-  return failure
-}
-
-/**
- * `sendPendingRowLapEnter`'s answer to an `ErrInvalidFlags`: one immediate
- * version re-check (`classifyWithInvalidFlagsRecheck`, b.jg5 SRJ-204), then
- * UNCLASSIFIED, marked `stopping` when the re-check decided that the server
- * stops (b.jg5 SRJ-205), in which case nothing is reported; otherwise it
- * takes SRJ-105's UNCLASSIFIED row through the outage state's site entry
- * (`reportUnclassifiedAtSite`), since the wrapper took the value as STATE.
- * One line. Never throws.
- */
-async function lapEnterInvalidFlagsOutcome(key: string, ref: string, err: InvalidFlagsError): Promise<PendingRowLapEnterUnclassified> {
-  const step = await classifyWithInvalidFlagsRecheck(err)
-  const stopping = step.recheck.kind === RECHECK_OUTCOME_STOP
-  if (!stopping) reportUnclassifiedAtSite(key, err, 'send-keys', step.classification)
-  console.error(
-    `[slack] ${PENDING_ROW_RULE_SITE}: lap Enter for ${ref} answered ${describeAdErrorClassification(step.classification)} — UNCLASSIFIED after one immediate agent-director version re-check: ${step.recheck.kind}; nothing typed (b.jg5 SRJ-104, SRJ-204)`,
-  )
-  const outcome: PendingRowLapEnterUnclassified = {
-    kind: PENDING_ROW_LAP_ENTER_UNCLASSIFIED,
-    errorClass: step.classification.errorClass,
-    description: describeAgentDirectorFailure(err),
-  }
-  return stopping ? { ...outcome, stopping: true } : outcome
-}
-
-/** `sendPendingRowLapEnter`'s one line for a latch it set (`outcome`: what became of the latch). */
-function logLapEnterLatch(ref: string, cause: PendingRowLapEnterLatching, outcome: string): void {
-  const [label, srj] = cause.kind === PENDING_ROW_LAP_ENTER_CONFLICT ? ['CONFLICT', 'SRJ-501'] : ['UNUSABLE NAME', 'SRJ-512']
-  console.error(
-    `[slack] ${PENDING_ROW_RULE_SITE}: lap Enter refused for ${ref}: ${cause.description} — ${label}: ${outcome}; ` +
-      `nothing is typed and nothing more is called for it (b.jg5 SRJ-105, ${srj})`,
-  )
-}
-
-/**
  * Latch persona `key` on the thrown CONFLICT `err` through the installed
  * latch's CONFLICT entry (`setFromConflict`, b.jg5 SRJ-501) with `operation`
  * and `rowState`. Answers the latch line's outcome text: the set's outcome,
@@ -3670,30 +3374,10 @@ function latchOnConflict(key: string, err: unknown, operation: RefusedOperation,
   }
 }
 
-/**
- * Why a persona is reported not connected (b.f2b), and what the notice says:
- * - `blocked-on-prompt`: its session shows a prompt or dialog that no one
- *   answered, and CSCB never types into one, so it won't reconnect the
- *   persona while the prompt is up: its `working` row's pane has shown one
- *   for `STALE_WORKING_WINDOW_MS`, its `waiting` row's pane shows one, or its
- *   row reads `ask_user` or `check_permission` (the restart path, or a launch
- *   wait that ended there). With `autoRestartDisabled` the notice also says
- *   nothing will reconnect it once the prompt is answered.
- * - `auto-restart-disabled`: its session runs but messages can't reach it
- *   (`cause`, fixed token-free text): its MCP connection is down. With
- *   `session_restart_delay` 0 nothing will reconnect it.
- * - `unproven-idle`: its row reads `working` and CSCB has held back from it,
- *   typing nothing, for `heldMs` (at least `UNPROVEN_IDLE_NOTICE_AFTER_MS`,
- *   `noteWorkingRowDeferral`, or a launch wait that gave up on the row at
- *   `session_restart_delay` 0), because it can't prove the session idle. With
- *   `autoRestartDisabled` the notice says nothing will reconnect it on its
- *   own; otherwise that CSCB reconnects it once it can tell it is idle.
- */
+
 export type NotConnectedNotice =
   | { reason: 'blocked-on-prompt'; autoRestartDisabled: boolean }
   | { reason: 'auto-restart-disabled'; cause: string }
-  | { reason: 'reconnect-blocked'; rule: 'menu' | 'input' }
-  | { reason: 'unproven-idle'; autoRestartDisabled: boolean; heldMs: number }
 
 /**
  * Why the health check finds an alive persona undeliverable (b.f2b): its MCP
@@ -3735,23 +3419,11 @@ export function notifyDisconnectedWithAutoRestartDisabled(key: string, cause: Un
   notifyPersonaNotConnected(key, { reason: 'auto-restart-disabled', cause: 'its connection has been down on two health checks in a row' })
 }
 
-/**
- * End persona `key`'s not-connected episode (b.f2b): its MCP session
- * registered again, the health check found it deliverable again, or it was
- * torn down. Its notice latch is cleared, so a later episode is reported
- * again, and so are the idle evidence the restart path gathered for its
- * `working` row (`checkWorkingRowPane`), its run of deferrals on that row
- * (`noteWorkingRowDeferral`), its run of deferrals on a row waiting on a
- * prompt (`checkPromptRowDeferral`, b.jdc) and the last non-latching
- * liveness note logged for its own row (`nonLatchingNoteLogged`, b.jg5
- * SRJ-114). Silent; other personas are untouched.
- */
+
 export function hasNotConnectedEpisode(key: string): boolean { return notConnectedNoticeRaised.has(key) }
 
 export function forgetNotConnectedEpisode(key: string): void {
   notConnectedNoticeRaised.delete(key)
-  workingRowPaneRuns.delete(key)
-  workingRowDeferredSince.delete(key)
   promptRowDeferredSince.delete(key)
   nonLatchingNoteLogged.delete(key)
 }
@@ -3759,8 +3431,6 @@ export function forgetNotConnectedEpisode(key: string): void {
 /** Test-only seam: end every persona's not-connected episode (notice latches, idle evidence, deferral runs and logged liveness notes). */
 export function _resetNotConnectedEpisodes(): void {
   notConnectedNoticeRaised.clear()
-  workingRowPaneRuns.clear()
-  workingRowDeferredSince.clear()
   promptRowDeferredSince.clear()
   nonLatchingNoteLogged.clear()
 }
@@ -3779,28 +3449,13 @@ export function _resetNotConnectedEpisodes(): void {
 export function buildNotConnectedNotice(key: string, notice: NotConnectedNotice): string {
   const attach = `\`tmux attach -t ${tmuxExactSessionTarget(personaTmuxSessionName(key))}\``
   const reconnect = `\`/mcp reconnect ${MCP_SERVER_NAME}\``
-  if (notice.reason === 'reconnect-blocked') {
-    const screen = notice.rule === 'menu'
-      ? `A menu, overlay or dialog is open in its terminal, so CSCB can't type \`/mcp reconnect\` into it. Attach with ${attach} and close it.`
-      : `Text is left in its input box, so CSCB can't type \`/mcp reconnect\` into it. Attach with ${attach} and submit or clear it.`
-    return `:warning: *Waiting on a prompt* — ${screen} CSCB keeps trying the reconnect. This persona can't reply or use its Slack tools until it is connected again. Messages sent to it are kept and delivered once it is. Delivery waits until it is closed or cleared. ${CONFLICT_NOTICE_HUMAN_ONLY_LINE}`
-  }
   if (notice.reason === 'blocked-on-prompt') {
     const after = notice.autoRestartDisabled
       ? `Automatic restarts are disabled (\`session_restart_delay\` is 0): if it is still not connected once its turn ends, type ${reconnect} there or restart the server.`
-      : `Once it is answered, CSCB reconnects it when it can tell the session is idle again (its row reads waiting, or its screen and transcript prove it idle); if it stays disconnected, type ${reconnect} there.`
+      : `Once it is answered, CSCB reconnects it when it can tell the session is idle again (agent-director reports it waiting); if it stays disconnected, type ${reconnect} there.`
     return (
       `:warning: *Waiting on a prompt* — this persona is not connected to this server, and its session shows a prompt or dialog in its terminal that no one has answered. CSCB never types into a prompt, so it won't reconnect the persona while the prompt is up; this persona can't reply or use its Slack tools until it is connected again. Messages sent to it are kept and delivered once it is.\n` +
       `Attach with ${attach} and answer it. Delivery waits until the prompt is answered. ${after} ${CONFLICT_NOTICE_HUMAN_ONLY_LINE}`
-    )
-  }
-  if (notice.reason === 'unproven-idle') {
-    const after = notice.autoRestartDisabled
-      ? `Automatic restarts are disabled (\`session_restart_delay\` is 0), so nothing will reconnect it on its own; if it stays disconnected, restart the server.`
-      : `Otherwise CSCB keeps checking it and reconnects it once its row reads waiting or its screen and transcript prove it idle.`
-    return (
-      `:warning: *Not connected* — this persona is not connected to this server: its session reads working but CSCB can't prove it's idle, so it won't type into it, and has held back for ${describeWaitSpan(notice.heldMs)}. This persona can't reply or use its Slack tools until it is connected again. Messages sent to it are kept and delivered once it is.\n` +
-      `Check it with ${attach}: let a running turn finish and answer anything on screen; if it sits idle at its prompt, type ${reconnect} there. ${after} ${CONFLICT_NOTICE_HUMAN_ONLY_LINE}`
     )
   }
   return (
@@ -4045,101 +3700,15 @@ export async function reconnectMcp(
   return (await reconnectMcpWithCause(key, lastRead, ref)).outcome
 }
 
-/**
- * Send `/mcp reconnect <MCP_SERVER_NAME>` to persona `key`'s row after fresh
- * recovery, own-row and screen guards establish an empty, idle input and
- * the persona's typing gate is acquired (b.omv SR-5.5). Send the text with
- * `no_enter: true`, wait `ENTER_DELAY_MS`, recheck lifecycle ownership,
- * latch and old-life hold, then send `key: 'Enter'`. Both `sendKeys` calls
- * go through `withOutageDetection`, declaring the `send-keys` verb
- * (tmux-touching). A failed key is never retried inline; blocked or
- * transient runs are deferred for the active delivery engine or the
- * lifecycle timer to retry under fresh guards. It never starts a tmux
- * server and makes no tmux call of its own (b.jg5 SRJ-609, HO C20).
- * Each answer is decided by class through `src/ad-error-class.ts`
- * (`classifyAdError`, `isAdErrorInstance`), never by an error's name (b.jg5
- * SRJ-118's reconnect row):
- *
- *   - a persona already latched (`personaLatchedNow`, b.jg5 SRJ-502): no
- *     `send-keys`; `transient` (latched);
- *   - a persona whose own `cscb_<key>` is held for an old life
- *     (`isOwnRowOldLifeHeld`, b.jg5 SRJ-810: CSCB types no `/mcp reconnect`
- *     into the old life's session): no `send-keys`; the persona recorded as
- *     waiting on that hold (`recordOwnRowWaiting`), its retry timer armed
- *     with the held-for-an-old-life cause (`armOldLifeHoldTimer`), one line
- *     (`reconnectHeldLine`) naming the persona and the held instance id;
- *     `transient`. This guards every caller: the ladder's `waiting` branch,
- *     the launch's working-row wait and the restart path's reconnect
- *     adapter, which itself starts the persona's live-row sequence for such
- *     a row before it would get here;
- *   - success: `ok`;
- *   - GONE (`ErrTmuxSendKeys`): `dead-session` with cause `tmux-gone`, at once;
- *   - `ErrSpawnNotInteractive`: `dead-session` with cause
- *     `row-not-interactive`, a route into the restart path's decision only;
- *     it claims nothing about the worker's process;
- *   - `ErrSpawnNotFound`: `dead-session` with cause `row-absent` (a row read,
- *     not a GONE);
- *   - CONFLICT: the persona latches through the latch's CONFLICT entry
- *     (`setFromConflict`) with the refused operation "P's next check or
- *     recovery" and `lastRead` (b.jg5 SRJ-501); `transient` (latched). On a
- *     live row that is not `pending`, "not this launch's session" means a
- *     leftover of an earlier launch holds the persona's session (SRJ-613),
- *     and its line says so. The refused `send-keys` is never retried
- *     (SRJ-505);
- *
- *     This CONFLICT is the backstop for every pane read that leads here
- *     (b.jg5 SRJ-613). A pane may be a single leftover's, so the waiting-row
- *     check's pane (`checkWaitingRowPane`), the working-row verdict's fold
- *     (`workingReconnectVerdict`, `checkWorkingRowPane`) and the launch
- *     wait's evidence read (`staleWorkingRowIsIdle`) never prove that the
- *     worker's own session is there; this `send-keys` is answered by the
- *     row's current launch, and when a leftover holds the persona's session
- *     it types nothing and P latches (its CONFLICT notice posted once,
- *     SRJ-508), held for a human (SRJ-502);
- *   - UNUSABLE NAME: the persona latches through the unusable-name entry
- *     (`latchOnUnusableName`: refused operation "none", `lastRead`, b.jg5
- *     SRJ-512); `transient` (latched);
- *   - `ErrInvalidFlags`, to which `send-keys` gives no meaning: one immediate
- *     version re-check, then UNCLASSIFIED (b.jg5 SRJ-104, SRJ-204):
- *     `transient`, carrying `stopping` when the re-check decided the stop;
- *   - UNAVAILABLE (timeouts included), ENVIRONMENT, CONFIG and UNCLASSIFIED
- *     (`ErrSendKeysWhileRelayed` and `ErrSystemInstallDisappeared`
- *     included), and any STATE, LAUNCH FAILURE or DIRECTORY name SRJ-118
- *     gives no column: `transient`. The wrapper has already done what their
- *     class asks (b.jg5 SRJ-105, SRJ-301, SRJ-311, SRJ-313, SRJ-316): it
- *     raised the `tmux-unavailable`, `ad-config-malformed` or
- *     `ad-unreachable` outage, armed the persona's retry timer inside an
- *     attempt and reported an UNCLASSIFIED answer to the persona's
- *     unclassified-error episode; a CONFIG answer is otherwise taken as the
- *     UNAVAILABLE column.
- *
- * No path posts a spawn-failure notice, records a `spawn-failed` entry or
- * counts anything. A failure or deferral after the text call can leave text
- * without Enter. Guard deferrals can return before the start line; typing
- * logs use exported builders (`reconnectStartLine`, then one of
- * `reconnectLatchedLine`, `reconnectGoneLine`, `reconnectNotInteractiveLine`,
- * `reconnectRowAbsentLine`, `reconnectConflictLine`,
- * `reconnectUnusableNameLine`, `reconnectInvalidFlagsLine` and
- * `reconnectTransientLine` for a failure). Never throws.
- *
- * @param key  Persona key: addresses `cscb_<key>` and keys outage flags and notices.
- * @param lastRead  The row state the caller last read (b.jg5 SRJ-501): the
- *   ladder's `waiting` branch `waiting`; the launch wait `waiting`, or
- *   `working` for a stale `working` row; the restart adapter the state its
- *   `status` read gave.
- * @param ref  Log reference; defaults to the key alone.
- */
+
 export async function reconnectMcpWithCause(
   key: string,
   lastRead: LatchRowState,
   ref: string = keyRef(key),
-  options: { workingChecked?: { launchId: string | undefined } } = {},
 ): Promise<ReconnectResult> {
   const life = deliveryLifecycle
-  // Direct launch callers share the adapter's screen-time accounting: only
-  // a finding in this run may resume the previously accumulated screen wait.
   if (life?.deferred(key)) life.defer(key)
-  const defer = (screen?: 'input' | 'menu'): ReconnectResult => { life?.defer(key, screen); return { outcome: 'transient' } }
+  const defer = (): ReconnectResult => { life?.defer(key); return { outcome: 'transient' } }
   if (personaLatchedNow(key)) {
     console.error(reconnectLatchedLine(ref))
     life?.defer(key)
@@ -4167,39 +3736,14 @@ export async function reconnectMcpWithCause(
   if (life && !await life.recoverBeforeReconnect(key)) return defer()
   if (AGENT_DIRECTOR_DEAD_STATES.has(row.state)) { life?.clearDeferred(key); return { outcome: 'dead-session', deadCause: DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE } }
   if (!['waiting', 'working'].includes(row.state) || row.relay_mode !== 'on') return defer()
-  // Every caller receives the existing positive-idle/prompt guard. Only the
-  // restart adapter's outer run may raise its existing prompt notices.
-  if (row.state === 'waiting') {
-    const checked = await checkWaitingRowPane(key, () => personaLatchedNow(key), { noNotice: true })
-    if (checked === WAITING_ROW_PANE_GONE || checked === WAITING_ROW_PANE_ABSENT) { life?.clearDeferred(key); return { outcome: 'dead-session', deadCause: checked === WAITING_ROW_PANE_GONE ? DEAD_SESSION_CAUSE_TMUX_GONE : DEAD_SESSION_CAUSE_ROW_ABSENT } }
-    if (checked === 'defer') {
-      // A prompt finding has already recorded its reason and elapsed time.
-      if (!life?.deferred(key)) life?.defer(key)
-      return { outcome: 'transient' }
-    }
-  }
-  let pane: string
-  try {
-    pane = (await withOutageDetection(key, undefined, 'read-pane', client => client.readPane({ instance_id: personaInstanceId(key), n_lines: 40 }))).pane
-  } catch (err) {
-    const deliveryPaneFailureOutcome = await reconnectAnswerTo(key, lastRead, ref, err)
-    if (deliveryPaneFailureOutcome.outcome === 'dead-session') life?.clearDeferred(key)
-    else life?.defer(key) // a failed read is never screen-blocked time
-    return deliveryPaneFailureOutcome
-  }
-  const screen = readDeliveryScreen(row.agent === 'codex' ? 'codex' : 'claude', pane)
-  if (screen.kind !== 'empty') return defer(screen.kind === 'input' || screen.kind === 'own' ? 'input' : 'menu')
-  if (screen.running || classifyWorkingPane(pane) === 'busy') return defer()
-  const workingChecked = options.workingChecked !== undefined && options.workingChecked.launchId === life?.launchId(key)
-  if (row.state === 'working' && !workingChecked && await checkWorkingRowPane(key, pane, { noNotice: true, persona: configuredPersonaForDelivery(key), latchedNow: () => personaLatchedNow(key) }) !== 'reconnect') return defer()
-  const reading: DeliveryReading = { row: row.state, screen: 'empty', box: '', relay: true, marker: row.labels?.tag_prompt === '1', mcp: false, up: true, latched: personaLatchedNow(key), held: isOwnRowOldLifeHeld(key) || heldGateReadingOf(key) !== undefined || waitsOnKillFailedHold(key), readable: true, receipts: [], idleEvidence: row.state === 'working', launch: '', session: row.session_id, compactions: '', gate: life?.owner(key) ?? 'free', offset: 0, records: [] }
+  const reading: DeliveryReading = { row: row.state, relay: true, marker: row.labels?.tag_prompt === '1', mcp: false, up: true, latched: personaLatchedNow(key), held: isOwnRowOldLifeHeld(key) || heldGateReadingOf(key) !== undefined || waitsOnKillFailedHold(key), readable: true, receipts: [], idleEvidence: false, launch: '', session: row.session_id, compactions: '', gate: life?.owner(key) ?? 'free', offset: 0, records: [] }
   const gateChoice = decideGate({ p: { accepted: [], fixed: [], sent: [], refused: [], delivered: [] }, e: createDeliveryPolicyState(), r: reading, g: { owner: life?.owner(key) ?? 'free', stage: 'none', deferred: true, due: true }, writer: { kind: 'none' }, compact: 'none' })
   if (gateChoice !== 'runReconnect') return defer()
   const release = life?.acquire(key, 'reconnect')
   if (life && !release) return defer()
   try {
     const textRow = await readPersonaOwnRow(key, { site: 'reconnect', what: 'before text' })
-    if (textRow.kind !== OWN_ROW_READ_ROW || textRow.latched || textRow.row.labels?.tag_prompt !== '1' ||
+    if (textRow.kind !== OWN_ROW_READ_ROW || textRow.latched || textRow.row.labels?.tag_prompt !== '1' || textRow.row.relay_mode !== 'on' ||
         textRow.row.session_id !== row.session_id || textRow.row.launch_started_at !== row.launch_started_at ||
         !['waiting', 'working'].includes(textRow.row.state) || personaLatchedNow(key) ||
         isOwnRowOldLifeHeld(key) || heldGateReadingOf(key) !== undefined || waitsOnKillFailedHold(key) ||
@@ -4213,7 +3757,7 @@ export async function reconnectMcpWithCause(
     const enterRow = await readPersonaOwnRow(key, { site: 'reconnect', what: 'before Enter' })
     // b.omv SR-5.5/7.6: the final read is awaited; a teardown, shutdown or
     // concurrent latch/hold during it must still prevent the control key.
-    if (enterRow.kind !== OWN_ROW_READ_ROW || enterRow.latched || enterRow.row.labels?.tag_prompt !== '1' ||
+    if (enterRow.kind !== OWN_ROW_READ_ROW || enterRow.latched || enterRow.row.labels?.tag_prompt !== '1' || enterRow.row.relay_mode !== 'on' ||
         enterRow.row.session_id !== row.session_id || enterRow.row.launch_started_at !== row.launch_started_at ||
         !['waiting', 'working'].includes(enterRow.row.state) || personaLatchedNow(key) ||
         isOwnRowOldLifeHeld(key) || heldGateReadingOf(key) !== undefined || waitsOnKillFailedHold(key) ||
@@ -4226,32 +3770,6 @@ export async function reconnectMcpWithCause(
     if (deliveryKeyFailureOutcome.outcome === 'dead-session') life?.clearDeferred(key)
     else life?.defer(key)
     return deliveryKeyFailureOutcome
-  } finally { release?.() }
-}
-
-/** The server supplies the applied persona for the existing working guard. */
-let configuredPersonaForDelivery: (key: string) => Persona | undefined = () => undefined
-export function setDeliveryPersonaLookup(lookup: (key: string) => Persona | undefined): void { configuredPersonaForDelivery = lookup }
-
-/** Fresh startup-prompt proof under the same gate as delivery/reconnect. */
-async function withStartupTyping(key: string, work: () => Promise<void>): Promise<boolean> {
-  const life = deliveryLifecycle
-  if (life?.hasWaited(key)) return false
-  const release = life?.acquire(key, 'startup')
-  if (life && !release) return false
-  try {
-    const status = await readPersonaOwnRow(key, { site: 'startup answer', what: 'fresh get' })
-    if (status.kind !== OWN_ROW_READ_ROW || status.latched || status.row.labels?.tag_prompt !== '1' || status.row.state !== 'pending' || life?.hasWaited(key) || (life && !life.active(key))) return false
-    const pane = await readPendingRowLapPane(key)
-    if (pane.kind !== PANE_READ_PANE || !paneShowsStartupDialog(pane.pane)) return false
-    if (personaLatchedNow(key) || life?.hasWaited(key) || (life && !life.active(key))) return false
-    const final = await readPersonaOwnRow(key, { site: 'startup answer', what: 'before Enter' })
-    if (final.kind !== OWN_ROW_READ_ROW || final.latched || final.row.labels?.tag_prompt !== '1' || final.row.state !== 'pending' ||
-        final.row.launch_started_at !== status.row.launch_started_at || personaLatchedNow(key) ||
-        isOwnRowOldLifeHeld(key) || heldGateReadingOf(key) !== undefined || waitsOnKillFailedHold(key) ||
-        life?.hasWaited(key) || (life && (!life.active(key) || life.owner(key) !== 'startup'))) return false
-    await work()
-    return true
   } finally { release?.() }
 }
 
@@ -4318,12 +3836,7 @@ async function reconnectInvalidFlagsAnswer(key: string, ref: string, err: Invali
   return stopping ? { outcome: 'transient', stopping: true } : { outcome: 'transient' }
 }
 
-/**
- * One reconnect line to the server log; `line` comes from one of the
- * reconnect's exported builders. The two latching lines go through it, as
- * `logApproverLine` and `logPaneReadLatch` do, because their arguments hand
- * the thrown value to the latch call, which a direct log call may not.
- */
+
 function logReconnectLine(line: string): void {
   console.error(line)
 }
@@ -4445,1113 +3958,6 @@ export function reconnectTransientLine(ref: string, failure: string, errorClass:
 }
 
 // ---------------------------------------------------------------------------
-// approvePreSessionDialogs — auto-approve pre-SessionStart dialogs on spawn
-// ---------------------------------------------------------------------------
-
-/**
- * Verified against Claude Code 2.1.120 (2026-05-27). If this stops matching,
- * the dev-channels dialog has drifted — see b.yy6. Match the option label
- * (semantic, stable) rather than the header (cosmetic, drifts).
- */
-export const DEV_CHANNELS_DIALOG_NEEDLE = 'I am using this for local development'
-
-/**
- * Verified against Claude Code 2.1.120 (2026-06-02). If this stops matching,
- * the folder-trust dialog has drifted — see b.k54 / b.uhv. Match the option
- * label (semantic, stable) rather than the header (cosmetic, drifts).
- */
-export const TRUST_DIALOG_NEEDLE = 'Yes, I trust this folder'
-
-/**
- * The approver's pace (b.jg5 SRJ-403): at most one pane read a second. The
- * lap after one that read the pane starts at least this long after that
- * `read-pane` call, on the approver's clock (`_setApproverClock`), so two
- * `read-pane` calls are never closer than the pace in effect, however long
- * either lap's `status` read takes. The lap after one that read no pane
- * starts at least this long after that lap's start.
- */
-export const DIALOG_POLL_INTERVAL_MS = 1_000
-
-/**
- * The approver's slow pace (b.jg5 SRJ-403, SRJ-404): at most one pane read
- * every 5 s, measured as `DIALOG_POLL_INTERVAL_MS` is. The next lap waits it
- * once G (`adGraceMsInEffect`, read at the lap)
- * has passed since the launch start the lap's `status` read carried, and
- * after a lap that met an UNAVAILABLE or CONFIG answer (backing off).
- */
-export const DIALOG_SLOW_POLL_INTERVAL_MS = 5_000
-
-/**
- * The approver's test cap (b.jg5 SRJ-404, SRJ-1303): unset by default. While
- * it is set, the approver stops that many milliseconds after its own start,
- * on the approver's clock, in place of B; no other wait reads it.
- */
-let _dialogReadyTimeoutMs: number | undefined
-
-/** Test-only seam: cap the approver at `ms` from its own start, in place of B. */
-export function _setDialogReadyTimeoutMs(ms: number): void {
-  _dialogReadyTimeoutMs = ms
-}
-
-/** Test-only seam: unset the cap, so the approver stops at B. */
-export function _resetDialogReadyTimeoutMs(): void {
-  _dialogReadyTimeoutMs = undefined
-}
-
-/**
- * The time to wait from one lap's pane read (or, for a lap that read no
- * pane, its start) to the next lap's start (b.jg5 SRJ-403, SRJ-404):
- * `DIALOG_SLOW_POLL_INTERVAL_MS` after a lap that backed off (an
- * UNAVAILABLE or CONFIG answer), or once `graceMs` (G: the accessor itself,
- * read at this call) has passed at `nowMs` since the launch start
- * `launchStartedAt` names, the raw launch start the lap's `status` read
- * carried (`isPendingRowAged`, `src/pending-row.ts`; b.jg5 SRJ-406, never
- * `started_at`); otherwise `DIALOG_POLL_INTERVAL_MS`. A lap with no launch
- * start (never aged, SRJ-408), and a G of `AD_WAIT_NEVER_ENDS`, keep the 1 s
- * pace. Pure.
- */
-export function approverPaceMs(
-  backOff: boolean,
-  launchStartedAt: unknown,
-  nowMs: number,
-  graceMs: NeverEarlyWaitLength,
-): number {
-  if (backOff) return DIALOG_SLOW_POLL_INTERVAL_MS
-  if (isPendingRowAged(launchStartedAt, graceMs, nowMs)) return DIALOG_SLOW_POLL_INTERVAL_MS
-  return DIALOG_POLL_INTERVAL_MS
-}
-
-// ---------------------------------------------------------------------------
-// The approver's clock, stop reasons, startup-errors labels and log lines
-// ---------------------------------------------------------------------------
-
-/**
- * The approver's clock and timers: the timer subset of the persona clock type
- * (`NeverEarlyWaitClock`, `src/ad-settings.ts`). The approver's B (or cap)
- * timer and its sleeps between laps run on this clock only, so a suite drives
- * them all with `createFakeClock` and never waits on real time.
- */
-export type ApproverClock = NeverEarlyWaitClock
-
-/** The real clock, the approver's default. */
-const SYSTEM_APPROVER_CLOCK: ApproverClock = Object.freeze({
-  now: (): number => Date.now(),
-  setTimeout: (callback: () => void, delayMs: number): unknown => setTimeout(callback, delayMs),
-  clearTimeout: (handle: unknown): void => clearTimeout(handle as ReturnType<typeof setTimeout>),
-})
-
-let _approverClock: ApproverClock = SYSTEM_APPROVER_CLOCK
-
-/** Test-only seam: run the approver's B (or cap) timer and sleeps on `clock` (a suite passes `createFakeClock()`). */
-export function _setApproverClock(clock: ApproverClock): void {
-  _approverClock = clock
-}
-
-/** Test-only seam: restore the real clock for the approver. */
-export function _resetApproverClock(): void {
-  _approverClock = SYSTEM_APPROVER_CLOCK
-}
-
-/** The approver stopped because the row left `pending` for a live state: the dialog is gone. */
-export const APPROVER_STOP_LIVE = 'live'
-/** The approver stopped because the row read `ended` or `missing`: the launch is over (b.jg5 SRJ-402). */
-export const APPROVER_STOP_FINISHED = 'finished'
-/** The approver stopped because `status` answered `ErrSpawnNotFound`: the row is absent. */
-export const APPROVER_STOP_ABSENT = 'absent'
-/**
- * The approver stopped because the persona latched (b.jg5 SRJ-502, SRJ-512,
- * SRJ-513): its `status` read latched it (the own-row `status` step), its
- * own CONFLICT or UNUSABLE NAME answer latched it, it was latched before a
- * lap or while a call was awaited, or a latch set by any other site stopped
- * it (the latch's set observer, `setConflictLatch`).
- */
-export const APPROVER_STOP_LATCHED = 'latched'
-/**
- * The approver stopped because the row read `pending` with no launch start
- * and the read latched nothing (b.jg5 SRJ-401, SRJ-513). For a configured
- * persona the own-row `status` step (`applyOwnRowStatusStep`) latches such a
- * row with "launch start not recorded", answering latched even with no latch
- * installed, so the approver stops `latched` instead. This stop is reached
- * only when no configured-persona query is installed, or the query does not
- * answer that `key` is a configured persona's (it answers otherwise or
- * throws; e.g. a persona removed while its launch's approver runs).
- */
-export const APPROVER_STOP_NO_LAUNCH_START = 'no-launch-start'
-/**
- * The approver stopped at B (`adLaunchBoundMsInEffect`, b.jg5 SRJ-210,
- * SRJ-404), measured from the launch start its first `pending` lap kept, or
- * from its own start while no lap had read one.
- */
-export const APPROVER_STOP_BOUND = 'bound'
-/** The approver stopped at its test cap (`_setDialogReadyTimeoutMs`, measured from its own start), set in place of B. */
-export const APPROVER_STOP_CAP = 'cap'
-/**
- * The approver stopped on GONE (`ErrTmuxCaptureFailed`, `ErrTmuxSendKeys`)
- * from any of its calls, or on `ErrSpawnNotFound` from `read-pane` or
- * `send-keys` (b.jg5 SRJ-117, SRJ-118, SRJ-404).
- */
-export const APPROVER_STOP_GONE = 'gone'
-/**
- * The approver stopped on `ErrSpawnNotInteractive` with nothing typed (b.jg5
- * SRJ-118, SRJ-404): the session holding the name is not this launch's, by
- * its label's token, or the row has no launch start.
- */
-export const APPROVER_STOP_NOT_INTERACTIVE = 'not-interactive'
-/**
- * The approver stopped on ENVIRONMENT (`ErrTmuxNotAvailable`, b.jg5 SRJ-311,
- * SRJ-404); the wrapper raised the persona's `tmux-unavailable` outage, and
- * nothing is counted.
- */
-export const APPROVER_STOP_TMUX_UNAVAILABLE = 'tmux-unavailable'
-/**
- * The approver was stopped by the one-approver rule (b.jg5 SRJ-401; hatch
- * A2): a later launch of the persona started its own approver
- * (`startDialogApprover`), or a lap read a launch start other than the one
- * the approver kept. Either way the row belongs to a newer launch.
- */
-export const APPROVER_STOP_SUPERSEDED = 'superseded'
-/** The persona's teardown stopped the approver (b.jg5 SRJ-404, SRJ-715). */
-export const APPROVER_STOP_TEARDOWN = 'teardown'
-/**
- * The persona's key was recorded as retired (b.jg5 SRJ-808, SRJ-404): apply
- * step 1 stopped the approver right after its record, before the
- * last-applied rewrite and before the teardown's kill. No pending-row rule
- * run follows this stop.
- */
-export const APPROVER_STOP_RETIRED_KEY = 'retired-key'
-/** Shutdown stopped the approver (b.jg5 SRJ-404). */
-export const APPROVER_STOP_SHUTDOWN = 'shutdown'
-/**
- * The abort of the persona's own stuck launch began (b.jg5 SRJ-412, SRJ-404;
- * hatch A3): the pending-row rule stopped the approver before the abort's
- * kill (`stopApproverForStuckLaunchAbort`). No pending-row rule run follows
- * this stop, and it arms nothing (`APPROVER_STOPS_THAT_ARM`).
- */
-export const APPROVER_STOP_STUCK_LAUNCH_ABORT = 'stuck-launch-abort'
-/** The approver's loop threw (not reached: every step is guarded); the throw was logged and nothing more was called. */
-export const APPROVER_STOP_FAILED = 'failed'
-
-/**
- * Why the approver stopped: what `approvePreSessionDialogs` resolves with,
- * and the reason in an {@link ApproverOutcome}. Each kind of stop has its own
- * member, so a reader of the outcome tells which stops leave a `pending` row
- * to the pending-row rule (b.jg5 SRJ-404: B or the cap, GONE, not
- * interactive, tmux unavailable, superseded) from those that do not
- * (shutdown, latched, teardown, retired key, the stuck-launch abort).
- */
-export type ApproverStopReason =
-  | typeof APPROVER_STOP_LIVE
-  | typeof APPROVER_STOP_FINISHED
-  | typeof APPROVER_STOP_ABSENT
-  | typeof APPROVER_STOP_LATCHED
-  | typeof APPROVER_STOP_NO_LAUNCH_START
-  | typeof APPROVER_STOP_BOUND
-  | typeof APPROVER_STOP_CAP
-  | typeof APPROVER_STOP_GONE
-  | typeof APPROVER_STOP_NOT_INTERACTIVE
-  | typeof APPROVER_STOP_TMUX_UNAVAILABLE
-  | typeof APPROVER_STOP_SUPERSEDED
-  | typeof APPROVER_STOP_TEARDOWN
-  | typeof APPROVER_STOP_RETIRED_KEY
-  | typeof APPROVER_STOP_SHUTDOWN
-  | typeof APPROVER_STOP_STUCK_LAUNCH_ABORT
-  | typeof APPROVER_STOP_FAILED
-
-/**
- * The reasons a caller stops a persona's approver with (`stopDialogApprover`):
- * each is also the stopped approver's {@link ApproverStopReason}. One member
- * per kind of stop (the abort of the persona's own stuck launch included,
- * `APPROVER_STOP_STUCK_LAUNCH_ABORT`), so a reader of the outcome tells
- * which stops leave the row to the pending-row rule: none of these but
- * `superseded` does (b.jg5 SRJ-404).
- */
-export type ApproverStopRequestReason =
-  | typeof APPROVER_STOP_SUPERSEDED
-  | typeof APPROVER_STOP_TEARDOWN
-  | typeof APPROVER_STOP_RETIRED_KEY
-  | typeof APPROVER_STOP_SHUTDOWN
-  | typeof APPROVER_STOP_LATCHED
-  | typeof APPROVER_STOP_STUCK_LAUNCH_ABORT
-
-/** The approver's two time limits: B, or the test cap set in place of it. */
-type ApproverLimitReason = typeof APPROVER_STOP_BOUND | typeof APPROVER_STOP_CAP
-
-/** How one approver ended: why, and the launch start it kept (absent when no lap read the row `pending` with a launch start). */
-export interface ApproverOutcome {
-  readonly reason: ApproverStopReason
-  /** Epoch ms of the launch start the approver's first lap whose `status` read the row `pending` with a launch start read. */
-  readonly launchStartMs: number | undefined
-}
-
-/** The startup-errors class a start-pass launch that failed writes, beside its spawn-failure notice. */
-export const STARTUP_ERROR_SPAWN_FAILED = 'spawn-failed'
-/** The startup-errors class the approver writes, during a start-pass launch, when the row reads `ended` or `missing` (b.jg5 SRJ-402, SRJ-1013). */
-export const STARTUP_ERROR_APPROVE_SPAWN_DIED = 'dev-channels-approve-spawn-died'
-/** The startup-errors class the approver writes, during a start-pass launch, at B or its cap (b.jg5 SRJ-405). */
-export const STARTUP_ERROR_APPROVE_NOT_READY = 'dev-channels-approve-not-ready'
-
-/** The approver's site name, in its own log lines and in the own-row `status` read's lines. */
-export const APPROVER_LOG_SITE = 'approvePreSessionDialogs'
-/** What the approver's own-row `status` read is called in that read's lines (`OwnRowReadSite.what`). */
-export const APPROVER_STATUS_READ_WHAT = 'readiness status read'
-/** The head of every log line the approver writes itself. */
-export const APPROVER_LOG_PREFIX = `[slack] ${APPROVER_LOG_SITE}: `
-/** The pane lines one approver `read-pane` asks for (b.jg5 SRJ-402). */
-export const APPROVER_PANE_LINES = 40
-
-/** The agent-director verbs the approver calls. */
-export type ApproverVerb = 'status' | 'read-pane' | 'send-keys'
-
-/** B was measured from the launch start a lap kept. */
-export const APPROVER_BOUND_FROM_LAUNCH_START = 'the launch start'
-/** B was measured from the approver's own start: no lap had read a launch start. */
-export const APPROVER_BOUND_FROM_APPROVER_START = "the approver's start"
-
-/** Where B was measured from, in the at-B line ({@link approverBoundMessage}). */
-export type ApproverBoundFrom = typeof APPROVER_BOUND_FROM_LAUNCH_START | typeof APPROVER_BOUND_FROM_APPROVER_START
-
-/** One approver log line: {@link APPROVER_LOG_PREFIX} and `message`. */
-export function approverLogLine(message: string): string {
-  return `${APPROVER_LOG_PREFIX}${message}`
-}
-
-/** The message (log line and start-pass entry) for a row that read `ended` or `missing`. */
-export function approverFinishedMessage(ref: string, state: string): string {
-  return `${ref} reads ${renderLogMessageText(state)}: the launch is over, so the approver stops with no pane read and the restart path decides (b.jg5 SRJ-402)`
-}
-
-/** The message for an absent row (`ErrSpawnNotFound`); no startup-errors entry is written for it. */
-export function approverAbsentMessage(ref: string): string {
-  return `${ref} has no row (ErrSpawnNotFound): the approver stops; nothing is read or typed (b.jg5 SRJ-402)`
-}
-
-/** The message for a `pending` row with no launch start that latched nothing. */
-export function approverNoLaunchStartMessage(ref: string): string {
-  return `${ref} reads pending with no launch start: the approver stops; nothing is read or typed (b.jg5 SRJ-401, SRJ-513)`
-}
-
-/** The message for a state that is neither `pending`, live nor finished: nothing is read or typed this lap. */
-export function approverUnknownStateMessage(ref: string, state: string): string {
-  return `${ref} reads the state ${JSON.stringify(renderLogMessageText(state))}, which is neither pending, live nor finished — nothing read or typed; polling on within the bound`
-}
-
-/**
- * The message for a refused `status` whose class keeps the approver polling
- * (UNAVAILABLE, CONFIG, UNCLASSIFIED or a STATE name the approver gives no
- * meaning; b.jg5 SRJ-404). `failure` is the error already described by the
- * caller through `describeAgentDirectorFailure` (redacted); the builder never
- * sees the raw error.
- */
-export function approverStatusRefusedMessage(ref: string, failure: string): string {
-  return `status of ${ref} failed: ${failure} — polling on within the bound`
-}
-
-/**
- * The message for a failed `read-pane` or `send-keys` whose class keeps the
- * approver polling (UNAVAILABLE, CONFIG, UNCLASSIFIED, `ErrSendKeysWhileRelayed`
- * included, or a STATE name the approver gives no meaning; b.jg5 SRJ-117,
- * SRJ-118). `failure` is the error already described by the caller through
- * `describeAgentDirectorFailure` (redacted); the builder never sees the raw
- * error.
- */
-export function approverPaneCallFailedMessage(ref: string, verb: 'read-pane' | 'send-keys', failure: string): string {
-  return `${verb} of ${ref} failed: ${failure} — polling on within the bound`
-}
-
-/** The message for a GONE answer, or `ErrSpawnNotFound` from a pane verb: the approver stops. `failure` is already described (redacted). */
-export function approverGoneMessage(ref: string, verb: ApproverVerb, failure: string): string {
-  return `${verb} of ${ref} answered that the session is gone: ${failure} — the approver stops; nothing typed (b.jg5 SRJ-117, SRJ-118, SRJ-404)`
-}
-
-/**
- * The one line for `ErrSpawnNotInteractive` (b.jg5 SRJ-118, SRJ-404), naming
- * both possible causes. `failure` is already described (redacted).
- */
-export function approverNotInteractiveMessage(ref: string, verb: ApproverVerb, failure: string): string {
-  return (
-    `${verb} of ${ref} answered that the row is not interactive: ${failure} — the session holding the name is not this ` +
-    `launch's (by its label's token), or the row has no launch start; the approver stops with nothing typed and nothing killed (b.jg5 SRJ-118, SRJ-404)`
-  )
-}
-
-/** The message for ENVIRONMENT (`ErrTmuxNotAvailable`): the approver stops. `failure` is already described (redacted). */
-export function approverTmuxUnavailableMessage(ref: string, verb: ApproverVerb, failure: string): string {
-  return `${verb} of ${ref} answered that tmux is not available: ${failure} — the approver stops; the tmux-unavailable outage is raised and nothing is counted (b.jg5 SRJ-311, SRJ-404)`
-}
-
-/**
- * The message for a CONFLICT answer: the persona latched (refused operation
- * "P's next check or recovery") and the approver stops. `failure` is already
- * described (redacted); `outcome` says what became of the latch.
- */
-export function approverConflictMessage(ref: string, verb: ApproverVerb, failure: string, outcome: string): string {
-  return `${verb} of ${ref} refused: ${failure} — CONFLICT: ${outcome}; the approver stops; nothing typed (b.jg5 SRJ-404, SRJ-501)`
-}
-
-/**
- * The message for an UNUSABLE NAME answer: the persona latched (refused
- * operation none) and the approver stops. `failure` is already described
- * (redacted); `outcome` says what became of the latch.
- */
-export function approverUnusableNameMessage(ref: string, verb: ApproverVerb, failure: string, outcome: string): string {
-  return `${verb} of ${ref} refused: ${failure} — UNUSABLE NAME: ${outcome}; the approver stops; nothing typed (b.jg5 SRJ-404, SRJ-512)`
-}
-
-/** The message for a persona found latched before a lap or after an awaited call: the approver stops with no further call. */
-export function approverLatchedMessage(ref: string): string {
-  return `${ref} is latched — the approver stops; nothing more is read or typed (b.jg5 SRJ-502)`
-}
-
-/** The message (log line and start-pass entry) at B: nothing is posted (b.jg5 SRJ-405). */
-export function approverBoundMessage(ref: string, boundMs: number, measuredFrom: ApproverBoundFrom): string {
-  return (
-    `spawn never reached a live state within B (${boundMs}ms from ${measuredFrom}) for ${ref} — dialog unrecognized or session hung ` +
-    `(dev-needle='${DEV_CHANNELS_DIALOG_NEEDLE}'); the approver stops and nothing is posted (b.jg5 SRJ-404, SRJ-405)`
-  )
-}
-
-/** The message (log line and start-pass entry) at the test cap: nothing is posted (b.jg5 SRJ-405). */
-export function approverCapMessage(ref: string, capMs: number): string {
-  return (
-    `spawn never reached a live state within ${capMs}ms for ${ref} — dialog unrecognized or session hung ` +
-    `(dev-needle='${DEV_CHANNELS_DIALOG_NEEDLE}'); the approver stops at its cap and nothing is posted (b.jg5 SRJ-404, SRJ-405)`
-  )
-}
-
-/** The message for a lap that read a launch start other than the one the approver kept: it stops with nothing typed. */
-export function approverLaunchStartChangedMessage(ref: string): string {
-  return `${ref} reads pending with a launch start other than the one this approver kept: the row belongs to a newer launch, whose own approver works on it — this approver stops; nothing read or typed (b.jg5 SRJ-401)`
-}
-
-/**
- * Why each requested stop happened, in {@link approverStopRequestedMessage}'s
- * line. Keyed by every {@link ApproverStopRequestReason}, so a new reason does
- * not compile without its text.
- */
-const APPROVER_STOP_REQUEST_WHY: Readonly<Record<ApproverStopRequestReason, string>> = {
-  [APPROVER_STOP_SUPERSEDED]: 'a later launch started its own approver',
-  [APPROVER_STOP_TEARDOWN]: 'its teardown began',
-  [APPROVER_STOP_RETIRED_KEY]: 'its key was recorded as retired',
-  [APPROVER_STOP_SHUTDOWN]: 'the server is shutting down',
-  [APPROVER_STOP_LATCHED]: 'the persona latched',
-  [APPROVER_STOP_STUCK_LAUNCH_ABORT]: "CSCB is aborting the persona's own stuck launch, and its kill follows; no pending-row run follows this stop",
-}
-
-/** The message for a stop of a running approver (`stopDialogApprover`, `startDialogApprover` superseding one, the latch's set observer). */
-export function approverStopRequestedMessage(ref: string, reason: ApproverStopRequestReason): string {
-  return `stopping the approver for ${ref} (${reason}): ${APPROVER_STOP_REQUEST_WHY[reason]}; it makes no further call (b.jg5 SRJ-401, SRJ-404)`
-}
-
-/** The message for an approver not started because its persona was stopped while its launch was in flight, or after shutdown. */
-export function approverNotStartedMessage(ref: string, reason: ApproverStopRequestReason): string {
-  return `not starting the approver for ${ref} (${reason}): it was stopped before its launch returned; nothing read or typed (b.jg5 SRJ-404)`
-}
-
-/** The message for an approver whose loop threw. `failure` is already described (`describeThrownValue`). */
-export function approverFailedMessage(ref: string, failure: string): string {
-  return `the approver for ${ref} failed: ${failure} — it stops; nothing more is called`
-}
-
-/** An approver started because a launch call of the persona returned success (`afterLaunchSucceeded`; b.jg5 SRJ-401). */
-export const APPROVER_ORIGIN_AFTER_LAUNCH = 'after-launch'
-/**
- * An approver started after a launch call of the persona ended in a launch
- * timeout and the one `get` that followed read a covered `pending` row
- * (`afterLaunchUnavailable`; b.jg5 SRJ-401, SRJ-407).
- */
-export const APPROVER_ORIGIN_LAUNCH_TIMEOUT = 'launch-timeout'
-
-/** Why an approver is started (`startDialogApprover`). */
-export type ApproverOrigin = typeof APPROVER_ORIGIN_AFTER_LAUNCH | typeof APPROVER_ORIGIN_LAUNCH_TIMEOUT
-
-/**
- * What the start entry (`startDialogApprover`) is told about why it starts
- * an approver: after a launch that returned, with nothing more; or after a
- * launch timeout, with the decision the pending-row step made on the row the
- * `get` read (`cover`, `decidePendingRowCover`) and that row's raw launch
- * start (`launchStartedAt`), which the entry checks before it starts one.
- */
-export type ApproverStart =
-  | { readonly origin: typeof APPROVER_ORIGIN_AFTER_LAUNCH }
-  | {
-      readonly origin: typeof APPROVER_ORIGIN_LAUNCH_TIMEOUT
-      readonly cover: PendingRowCover
-      readonly launchStartedAt: unknown
-    }
-
-/** The start entry's default: an approver after a launch that returned. */
-export const APPROVER_START_AFTER_LAUNCH: ApproverStart = Object.freeze({ origin: APPROVER_ORIGIN_AFTER_LAUNCH })
-
-/** The message for an approver started after a launch timeout (b.jg5 SRJ-401, SRJ-407). */
-export function approverStartedAfterLaunchTimeoutMessage(ref: string): string {
-  return `starting the approver for ${ref} (${APPROVER_ORIGIN_LAUNCH_TIMEOUT}): its launch call timed out and the get after it read its pending row covered — the approver runs after the launch call returned, under the same stop rules as after a returned launch (b.jg5 SRJ-401, SRJ-404, SRJ-407)`
-}
-
-/**
- * The message for an approver the start entry refuses after a launch timeout
- * because the row the `get` read is not covered, is undecided or has no
- * launch start (b.jg5 SRJ-401, SRJ-407); `why` says which.
- */
-export function approverRefusedRowMessage(ref: string, why: string): string {
-  return `not starting the approver for ${ref} (${APPROVER_ORIGIN_LAUNCH_TIMEOUT}): its pending row ${why} — no status, read-pane or send-keys (b.jg5 SRJ-401, SRJ-407)`
-}
-
-/**
- * Why the start entry refuses an approver after a launch timeout, in
- * `approverRefusedRowMessage`'s words, or `undefined` when it may start one:
- * the decision is covered and the row's launch start parses. Pure.
- */
-function approverRowRefusal(start: ApproverStart): string | undefined {
-  if (start.origin !== APPROVER_ORIGIN_LAUNCH_TIMEOUT) return undefined
-  const { cover } = start
-  switch (cover.answer) {
-    case PENDING_ROW_NO_LAUNCH_START:
-      return 'has no launch start'
-    case PENDING_ROW_NOT_COVERED:
-      return `is not covered (${cover.reason})`
-    case PENDING_ROW_UNDECIDED:
-      return `is undecided (${cover.reason})`
-    case PENDING_ROW_COVERED:
-      return parseLaunchStart(start.launchStartedAt) === undefined ? 'has no launch start' : undefined
-  }
-}
-
-/** b.omv SR-7.5: only folder trust is answered; it may follow skipped/failed pre-trust. */
-const PRE_SESSION_DIALOG_NEEDLES = [TRUST_DIALOG_NEEDLE]
-
-/**
- * One armed time limit of an approver (B, or the cap): its reason, where B
- * was measured from, the plain check of whether it has passed at a given now
- * (against the wait in effect then: B's accessor itself, so a value raised
- * while armed never ends it early), and the cancel of its never-early timer.
- */
-interface ApproverLimit {
-  readonly reason: ApproverLimitReason
-  readonly measuredFrom: ApproverBoundFrom
-  readonly passed: (nowMs: number) => boolean
-  readonly cancel: () => void
-}
-
-/**
- * One approver's state, shared by its loop and its stops. The registry
- * (`startDialogApprover`) keeps one per running approver; a direct
- * `approvePreSessionDialogs` call makes its own.
- */
-interface ApproverRun {
-  /**
-   * Set by the first stop asked of this approver (`stopDialogApprover`, a
-   * later start, the latch's set observer, the reset seam): its reason. The
-   * approver sets `latched` itself right before it latches the persona on
-   * its own CONFLICT or UNUSABLE NAME answer, so the set observer finds it
-   * already stopping.
-   */
-  stopRequested: ApproverStopRequestReason | undefined
-  /** Set when B (or the cap) has passed: the approver stops before its next call. */
-  limitReached: ApproverLimitReason | undefined
-  /** The armed limit, while the loop runs. */
-  limit: ApproverLimit | undefined
-  /** Wakes the approver's sleep between laps, while it sleeps. */
-  wake: (() => void) | undefined
-  /**
-   * The launch start (epoch ms) the first lap whose `status` read the row
-   * `pending` with a launch start read (b.jg5 SRJ-401; hatch A2). A lap whose
-   * `status` failed sets nothing.
-   */
-  launchStartMs: number | undefined
-  /**
-   * The row state the approver's latest own-row `status` read gave, if any
-   * read answered a row (b.jg5 SRJ-404): at its stop, a row last read
-   * `pending`, or none read, is armed for (`armAfterApproverStop`).
-   */
-  lastStateRead: string | undefined
-  /**
-   * The raw launch start the approver's latest own-row `status` read carried
-   * (`undefined` for a read that showed none, or a state other than
-   * `pending`): with `lastStateRead`, the row read the pending-row rule's one
-   * run at the approver's stop runs on (b.jg5 SRJ-404, SRJ-410).
-   */
-  lastLaunchStartedAt: unknown
-  /**
-   * The window of the launch call that started this approver
-   * (`launchCallWindowOf` when the registry started it; b.jg5 SRJ-407,
-   * SRJ-412), or `undefined` for an approver run directly
-   * (`approvePreSessionDialogs`), which takes the persona's latest window at
-   * its first lap. The first lap that keeps a launch start records CSCB's own
-   * launch only while this is still the persona's latest window.
-   */
-  readonly launchWindow: LaunchCallWindowRecord | undefined
-}
-
-/** A fresh approver state: no stop asked, no limit armed, no launch start kept; `launchWindow` the window of the launch call that started it, if known. */
-function newApproverRun(launchWindow?: LaunchCallWindowRecord): ApproverRun {
-  return {
-    stopRequested: undefined,
-    limitReached: undefined,
-    limit: undefined,
-    wake: undefined,
-    launchStartMs: undefined,
-    lastStateRead: undefined,
-    lastLaunchStartedAt: undefined,
-    launchWindow,
-  }
-}
-
-/** What one approver loop works with: the persona, its run and the clock it took at its start. */
-interface ApproverContext {
-  readonly key: string
-  readonly isStartup: boolean
-  readonly ref: string
-  readonly at: OwnRowReadSite
-  readonly run: ApproverRun
-  readonly clock: ApproverClock
-}
-
-/**
- * Arm `run`'s time limit (`reason`) from the approver's own start `fromMs`
- * (a time on `clock`, never a row's launch start) with `waitMs`, through
- * `armNeverEarlyWait` on `clock`, replacing (and cancelling) any limit armed
- * before. The timer marks the limit reached and wakes any sleep. The limit's
- * check compares the time since `fromMs` with the wait in effect (a wait
- * that cannot be read is not reached).
- */
-function armApproverLimit(
-  clock: ApproverClock,
-  run: ApproverRun,
-  reason: ApproverLimitReason,
-  fromMs: number,
-  waitMs: () => number,
-): void {
-  run.limit?.cancel()
-  const cancel = armNeverEarlyWait(clock, fromMs, waitMs, () => markApproverLimit(run, reason))
-  const passed = (nowMs: number): boolean => {
-    let currentWaitMs: number
-    try {
-      currentWaitMs = waitMs()
-    } catch {
-      return false
-    }
-    return nowMs - fromMs >= currentWaitMs
-  }
-  run.limit = { reason, measuredFrom: APPROVER_BOUND_FROM_APPROVER_START, passed, cancel }
-}
-
-/**
- * Re-arm `run`'s B from the launch start `launchStartedAt` names (raw, as
- * the lap's `status` read carried it), through `armPendingRowWait`
- * (`src/pending-row.ts`) with `adLaunchBoundMsInEffect` itself, replacing
- * (and cancelling) the limit armed before; its check is `isPendingRowAged`
- * against B in effect (b.jg5 SRJ-406: measured from the launch start, never
- * `started_at`). A launch start that is absent or does not parse arms
- * nothing and keeps the limit armed before (SRJ-408: never aged).
- */
-function armApproverBoundFromLaunchStart(clock: ApproverClock, run: ApproverRun, launchStartedAt: unknown): void {
-  const armed = armPendingRowWait(clock, launchStartedAt, adLaunchBoundMsInEffect, () =>
-    markApproverLimit(run, APPROVER_STOP_BOUND),
-  )
-  if (armed === PENDING_ROW_WAIT_NOT_ARMED) return
-  run.limit?.cancel()
-  const passed = (nowMs: number): boolean => isPendingRowAged(launchStartedAt, adLaunchBoundMsInEffect, nowMs)
-  run.limit = { reason: APPROVER_STOP_BOUND, measuredFrom: APPROVER_BOUND_FROM_LAUNCH_START, passed, cancel: armed.cancel }
-}
-
-/** Mark `run`'s limit reached (the first mark is kept) and wake its sleep. */
-function markApproverLimit(run: ApproverRun, reason: ApproverLimitReason): void {
-  if (run.limitReached !== undefined) return
-  run.limitReached = reason
-  run.wake?.()
-}
-
-/**
- * Why the approver must stop now, before its next call, or `undefined`: a
- * stop asked of it first, then its limit, checked with the timer's mark and
- * by a plain `elapsed >= wait` comparison against the wait in effect now (a
- * wait that cannot be read is not reached).
- */
-function approverStopMark(ctx: ApproverContext): ApproverStopReason | undefined {
-  const { run } = ctx
-  if (run.stopRequested !== undefined) return run.stopRequested
-  const limit = run.limit
-  if (run.limitReached === undefined && limit !== undefined && limit.passed(ctx.clock.now())) {
-    markApproverLimit(run, limit.reason)
-  }
-  return run.limitReached
-}
-
-/**
- * The stop mark (`approverStopMark`), else `latched` when the persona is
- * latched now (`personaLatchedNow`), after one line: a persona latched
- * before a lap, or while a call was awaited, gets no further call (b.jg5
- * SRJ-502). `undefined` to go on.
- */
-function approverStopOrLatched(ctx: ApproverContext): ApproverStopReason | undefined {
-  const mark = approverStopMark(ctx)
-  if (mark !== undefined) return mark
-  if (!personaLatchedNow(ctx.key)) return undefined
-  console.error(approverLogLine(approverLatchedMessage(ctx.ref)))
-  return APPROVER_STOP_LATCHED
-}
-
-/**
- * Drive a launched bot past its pre-SessionStart dialogs (folder-trust and
- * dev-channels) through agent-director only (b.jg5 SRJ-402). A launch,
- * fresh or resumed, reads `pending` until its session reports in (HO C5),
- * so every lap works on the `pending` row:
- *
- *   - before the lap, a persona already latched stops it with no call
- *     (`latched`, b.jg5 SRJ-502);
- *   - one own-row `status` read (`readPersonaOwnRowStatus`, which applies
- *     the own-row `status` step): a read that latched the persona stops the
- *     approver with nothing read or typed (`latched`); `ErrSpawnNotFound`
- *     stops it with one line and no startup-errors entry (`absent`); any
- *     other refusal takes the class rules below;
- *   - a live state other than `pending` stops it (`live`);
- *   - `ended` or `missing` stops it at once with no pane read and one line,
- *     and a start-pass launch writes `dev-channels-approve-spawn-died`
- *     (`finished`); the restart path decides what follows;
- *   - `pending` with no launch start (`isPendingWithNoLaunchStart`) that the
- *     read did not latch stops it with one line and nothing read or typed
- *     (`no-launch-start`); a configured persona's such row is latched by the
- *     read (`latched`), so this stop is reached only with no configured-persona
- *     query installed or one that does not answer `key` as configured;
- *   - `pending` with a launch start: the first such lap keeps that launch
- *     start, and B is re-armed from it; a later lap that reads another one
- *     stops the approver with one line and nothing read or typed
- *     (`superseded`, b.jg5 SRJ-401; hatch A2: the row belongs to a newer
- *     launch). Otherwise one `read-pane` (40 lines, `allow_pending`), and
- *     when the pane shows a needle of `PRE_SESSION_DIALOG_NEEDLES`, one
- *     `send-keys` with an empty text and `allow_pending`, which presses
- *     Enter.
- *
- * Each refused call is classified by class through
- * `src/ad-error-class.ts` (b.jg5 SRJ-117, SRJ-118, SRJ-404), with one line:
- *
- *   - GONE, or `ErrSpawnNotFound` from `read-pane` or `send-keys`: stop
- *     (`gone`);
- *   - `ErrSpawnNotInteractive`: stop with nothing typed and nothing killed
- *     (`not-interactive`); from `send-keys` only, the launch start the first
- *     lap kept is also recorded as a launch that met it
- *     (`recordSendKeysNotInteractive`; b.jg5 SRJ-118, SRJ-412, SRJ-1017),
- *     even when a stop asked during that call decides the stop's reason; a
- *     `read-pane` answer of that name records nothing;
- *   - CONFLICT: the persona latches through the latch's CONFLICT entry
- *     (`setFromConflict`) with the refused operation "P's next check or
- *     recovery" and the recorded state `pending` (unreadable for a `status`
- *     answer, which read none); stop (`latched`);
- *   - UNUSABLE NAME: the persona latches with the case "unusable recorded
- *     name" and the refused operation none (`latchOnUnusableName`), recorded
- *     `pending`; stop with nothing typed (`latched`);
- *   - ENVIRONMENT (`ErrTmuxNotAvailable`): stop (`tmux-unavailable`); the
- *     wrapper raised the outage, and nothing is counted;
- *   - UNAVAILABLE and CONFIG: poll on within B, the next lap at the slow
- *     pace (backing off; the wrapper raised `ad-config-malformed` for
- *     CONFIG and armed the persona's retry timer as from any verb);
- *   - anything else (UNCLASSIFIED, `ErrSendKeysWhileRelayed` included, or a
- *     STATE name the approver gives no meaning): poll on within B at the pace
- *     in effect.
- *
- * Every call names only the persona's `instance_id`, and the server
- * runs no tmux command here; agent-director answers each call by the row's
- * current launch (HO rev 17). The pane a lap reads may be a single
- * leftover's: with no session of this launch there and exactly one leftover
- * of the persona, `read-pane` answers the leftover's pane (b.jg5 SRJ-117,
- * SRJ-613), so a needle on it is no proof that this launch's session shows
- * the dialog. The lap acts on it only through its Enter `send-keys`, which is
- * the backstop: on a `pending` row whose session is not this launch's (by its
- * label's token), it answers `ErrSpawnNotInteractive`, and the approver stops
- * with nothing typed, no kill and one log line (`not-interactive`, b.jg5
- * SRJ-404); a CONFLICT there latches the persona and stops it.
- *
- * Pace (b.jg5 SRJ-403): each lap starts at least `DIALOG_POLL_INTERVAL_MS`
- * after the previous lap's `read-pane` call (or, when the previous lap read
- * no pane, after its start), and `DIALOG_SLOW_POLL_INTERVAL_MS` after it
- * once G has passed since the launch start that lap's `status` read carried,
- * or after a lap that backed off (`approverPaceMs`). Two `read-pane` calls
- * are so never closer than the pace in effect, whatever the `status` reads
- * between them take.
- *
- * B (b.jg5 SRJ-210, SRJ-404): armed never-early (`armNeverEarlyWait` with
- * `adLaunchBoundMsInEffect` itself) from the approver's own start until a
- * lap keeps a launch start, then re-armed from that launch start through
- * `armPendingRowWait` (`src/pending-row.ts`; SRJ-406: never from
- * `started_at`); also checked by a plain comparison before each call
- * (`isPendingRowAged` once measured from the launch start). While the test cap
- * (`_setDialogReadyTimeoutMs`) is set, the cap is armed from the approver's
- * own start in place of B. All of it runs on the approver's clock
- * (`_setApproverClock`). At B or the cap it logs one line and, for a
- * start-pass launch, writes `dev-channels-approve-not-ready`; nothing is
- * posted to any notifier (b.jg5 SRJ-405). Resolves with why it stopped;
- * never rejects.
- *
- * Production starts an approver only through the registry
- * (`startDialogApprover`), which runs it outside every launch or recovery
- * attempt and stops it on request; direct calls are for tests. A direct
- * call runs one approver outside the registry, so nothing can stop it but
- * its own rules, and outside every launch or recovery attempt
- * (`runOutsideAttempts`), whatever attempt the caller runs in.
- */
-export async function approvePreSessionDialogs(
-  key: string,
-  isStartup: boolean,
-  ref: string = keyRef(key),
-): Promise<ApproverStopReason> {
-  return runOutsideAttempts(() => runApproverLoop(key, isStartup, ref, newApproverRun()))
-}
-
-/**
- * The approver's loop (`approvePreSessionDialogs`) over `run`: a stop asked
- * of `run`, or its limit, wakes its sleep at once and is checked before each
- * agent-director call, so no call follows a stop; the approver then resolves
- * with the stop's reason. Never rejects.
- */
-async function runApproverLoop(key: string, isStartup: boolean, ref: string, run: ApproverRun): Promise<ApproverStopReason> {
-  const clock = _approverClock
-  const capMs = _dialogReadyTimeoutMs
-  const ctx: ApproverContext = {
-    key,
-    isStartup,
-    ref,
-    at: { site: APPROVER_LOG_SITE, what: APPROVER_STATUS_READ_WHAT, ref },
-    run,
-    clock,
-  }
-  const startMs = clock.now()
-  if (capMs !== undefined) {
-    armApproverLimit(clock, run, APPROVER_STOP_CAP, startMs, () => capMs)
-  } else {
-    // b.jg5 SRJ-404, SRJ-406: before any launch start is read, B runs from the approver's own start.
-    armApproverLimit(clock, run, APPROVER_STOP_BOUND, startMs, adLaunchBoundMsInEffect)
-  }
-  let reason: ApproverStopReason
-  try {
-    for (;;) {
-      const lapStartMs = clock.now()
-      const lap = await approverLap(ctx)
-      if (typeof lap === 'string') {
-        reason = lap
-        break
-      }
-      const mark = approverStopMark(ctx)
-      if (mark !== undefined) {
-        reason = mark
-        break
-      }
-      const paceMs = approverPaceMs(lap.backOff, lap.launchStartedAt, clock.now(), adGraceMsInEffect)
-      // b.jg5 SRJ-403: the pace runs from the lap's pane read, so the next
-      // read (after the next lap's `status` read) is never closer than it.
-      const paceFromMs = lap.paneReadAtMs ?? lapStartMs
-      if (clock.now() - paceFromMs < paceMs) await sleepUntilNextLap(ctx, paceFromMs, paceMs)
-    }
-  } finally {
-    run.wake = undefined
-    run.limit?.cancel()
-  }
-  if (reason === APPROVER_STOP_BOUND || reason === APPROVER_STOP_CAP) approverLimitReached(ctx, reason, capMs)
-  return reason
-}
-
-/**
- * Sleep from `fromMs` (the lap's pane read, or its start when it read no
- * pane) until `paceMs` has passed on the approver's clock (never early:
- * `armNeverEarlyWait`), or until a stop or the limit wakes it.
- */
-function sleepUntilNextLap(ctx: ApproverContext, fromMs: number, paceMs: number): Promise<void> {
-  const { run, clock } = ctx
-  return new Promise<void>((resolve) => {
-    const done = (): void => {
-      run.wake = undefined
-      resolve()
-    }
-    const cancel = armNeverEarlyWait(clock, fromMs, paceMs, done)
-    run.wake = () => {
-      cancel()
-      done()
-    }
-  })
-}
-
-/**
- * At B or the cap (b.jg5 SRJ-405): one server-log line and, for a start-pass
- * launch, the `dev-channels-approve-not-ready` entry. Nothing is posted to
- * Slack.
- */
-function approverLimitReached(ctx: ApproverContext, reason: ApproverLimitReason, capMs: number | undefined): void {
-  const msg =
-    reason === APPROVER_STOP_CAP && capMs !== undefined
-      ? approverCapMessage(ctx.ref, capMs)
-      : approverBoundMessage(
-          ctx.ref,
-          adLaunchBoundMsInEffect(),
-          ctx.run.limit?.measuredFrom ?? APPROVER_BOUND_FROM_APPROVER_START,
-        )
-  console.error(approverLogLine(msg))
-  if (ctx.isStartup) recordStartupError(STARTUP_ERROR_APPROVE_NOT_READY, msg)
-}
-
-/**
- * Keep `launchStartMs`, the first launch start a lap read (b.jg5 SRJ-401),
- * and re-arm B from it (b.jg5 SRJ-404, SRJ-406: B runs from the approver's own
- * start only until a lap reads a launch start). The approver's start is
- * never earlier than the launch start, so the bound armed first was never
- * early. With the test cap set nothing is re-armed. `launchStartedAt` is
- * the raw launch start the lap read and `launchStartMs` its instant
- * (`parseLaunchStart`); B is re-armed from the raw value through
- * `armApproverBoundFromLaunchStart`, which arms nothing for one that does
- * not parse.
- *
- * b.jg5 SRJ-412, SRJ-407: when the launch call that started the approver
- * (`run.launchWindow`, or, for an approver run directly, the persona's
- * latest window) is still the persona's latest, returned success
- * (`LAUNCH_CALL_END_RETURNED`) and the kept launch start lies inside its
- * window, the launch is recorded as CSCB's own (`recordOwnLaunch`); the
- * record outlives the approver, for the pending-row rule's step 3. A launch
- * start outside the window, a window with no end or a launch-timeout window
- * (recorded by `afterLaunchUnavailable` instead) records nothing here.
- */
-function keepApproverLaunchStart(ctx: ApproverContext, launchStartedAt: unknown, launchStartMs: number): void {
-  const { run } = ctx
-  run.launchStartMs = launchStartMs
-  recordOwnLaunch(ctx.key, run.launchWindow ?? launchCallWindowOf(ctx.key), LAUNCH_CALL_END_RETURNED, launchStartedAt)
-  if (run.limit === undefined || run.limit.reason !== APPROVER_STOP_BOUND) return
-  armApproverBoundFromLaunchStart(ctx.clock, run, launchStartedAt)
-}
-
-/**
- * How a lap that stops nothing ended: whether it backed off, the raw launch
- * start its `status` read carried (`undefined` when it read none), and when
- * (on the approver's clock) it made its `read-pane` call, `undefined` when
- * it made none (b.jg5 SRJ-403: the pace runs from it).
- */
-interface ApproverLapGoesOn {
-  readonly backOff: boolean
-  readonly launchStartedAt: unknown
-  readonly paneReadAtMs: number | undefined
-}
-
-/** What the approver does with one refused call: stop with a reason, or poll on (backing off or not). */
-type ApproverAnswer = { readonly stop: ApproverStopReason } | { readonly backOff: boolean }
-
-/**
- * One approver lap (`approvePreSessionDialogs`): answers the stop reason, or
- * how the lap ended to poll on. A stop asked of the approver during a call
- * is answered as soon as that call returns, before anything else, except
- * that a pane call's CONFLICT or UNUSABLE NAME answer still latches the
- * persona first (`approverStoppedDuringCall`). Never throws.
- */
-async function approverLap(ctx: ApproverContext): Promise<ApproverStopReason | ApproverLapGoesOn> {
-  const { key, isStartup, ref, at, run } = ctx
-  const before = approverStopOrLatched(ctx)
-  if (before !== undefined) return before
-
-  const read = await readPersonaOwnRowStatus(key, at)
-  if (run.stopRequested !== undefined) return run.stopRequested
-  if (read.kind === OWN_ROW_STATUS_LATCHED) return APPROVER_STOP_LATCHED // the step logged its line
-  if (personaLatchedNow(key)) {
-    console.error(approverLogLine(approverLatchedMessage(ref)))
-    return APPROVER_STOP_LATCHED
-  }
-  if (read.kind === OWN_ROW_STATUS_ABSENT) {
-    console.error(approverLogLine(approverAbsentMessage(ref)))
-    return APPROVER_STOP_ABSENT
-  }
-  if (read.kind === OWN_ROW_STATUS_REFUSED) {
-    // A failed read keeps no launch start (b.jg5 SRJ-401; hatch A2).
-    const answer = approverAnswerTo(ctx, 'status', read.error)
-    return 'stop' in answer ? answer.stop : { backOff: answer.backOff, launchStartedAt: undefined, paneReadAtMs: undefined }
-  }
-
-  const state = read.state
-  run.lastStateRead = state
-  run.lastLaunchStartedAt = read.launchStartedAt
-  if (AGENT_DIRECTOR_DEAD_STATES.has(state)) {
-    const msg = approverFinishedMessage(ref, state)
-    console.error(approverLogLine(msg))
-    if (isStartup) recordStartupError(STARTUP_ERROR_APPROVE_SPAWN_DIED, msg)
-    return APPROVER_STOP_FINISHED
-  }
-  if (state !== AGENT_DIRECTOR_PENDING_STATE) {
-    if (AGENT_DIRECTOR_LIVE_STATES.has(state)) return APPROVER_STOP_LIVE
-    console.error(approverLogLine(approverUnknownStateMessage(ref, state)))
-    return { backOff: false, launchStartedAt: undefined, paneReadAtMs: undefined }
-  }
-  const launchStartedAt = read.launchStartedAt
-  const launchStartMs = parseLaunchStart(launchStartedAt)
-  if (launchStartMs === undefined) {
-    // `pending` with no launch start, or one that does not parse (as `isPendingWithNoLaunchStart` reads it).
-    console.error(approverLogLine(approverNoLaunchStartMessage(ref)))
-    return APPROVER_STOP_NO_LAUNCH_START
-  }
-  // b.jg5 SRJ-401 (hatch A2): the first lap that reads a launch start keeps
-  // it; a later one that reads another belongs to a newer launch.
-  if (run.launchStartMs === undefined) {
-    keepApproverLaunchStart(ctx, launchStartedAt, launchStartMs)
-  } else if (run.launchStartMs !== launchStartMs) {
-    console.error(approverLogLine(approverLaunchStartChangedMessage(ref)))
-    return APPROVER_STOP_SUPERSEDED
-  }
-  const beforePane = approverStopMark(ctx)
-  if (beforePane !== undefined) return beforePane
-
-  const instance_id = personaInstanceId(key)
-  // b.jg5 SRJ-403: the next lap is paced from this pane read.
-  const goesOn: ApproverLapGoesOn = { backOff: false, launchStartedAt, paneReadAtMs: ctx.clock.now() }
-  let pane: string
-  try {
-    const result = await withOutageDetection(key, undefined, 'read-pane', (client) =>
-      client.readPane({ instance_id, n_lines: APPROVER_PANE_LINES, allow_pending: true }),
-    )
-    pane = result.pane
-  } catch (err) {
-    if (run.stopRequested !== undefined) return approverStoppedDuringCall(ctx, 'read-pane', err, run.stopRequested)
-    const answer = approverAnswerTo(ctx, 'read-pane', err)
-    return 'stop' in answer ? answer.stop : { ...goesOn, backOff: answer.backOff }
-  }
-  const afterPane = approverStopOrLatched(ctx)
-  if (afterPane !== undefined) return afterPane
-  if (!paneShowsStartupDialog(pane)) return goesOn
-  try {
-    // An empty text presses Enter. The pane may be a single leftover's
-    // (b.jg5 SRJ-613): this `send-keys` is the backstop, and its
-    // `ErrSpawnNotInteractive` stops the approver with nothing typed and no
-    // kill (SRJ-404).
-    await withStartupTyping(key, () => withOutageDetection(key, undefined, 'send-keys', (client) =>
-      client.sendKeys({ instance_id, text: '', allow_pending: true }),
-    ).then(() => {}))
-  } catch (err) {
-    // b.jg5 SRJ-118, SRJ-412, SRJ-1017: a `send-keys` that answered
-    // `ErrSpawnNotInteractive` makes this launch (the launch start the first
-    // lap kept) no longer CSCB's own, whatever stops the approver.
-    if (isAdErrorInstance(err, ErrSpawnNotInteractive)) recordSendKeysNotInteractive(key, run.launchStartMs)
-    if (run.stopRequested !== undefined) return approverStoppedDuringCall(ctx, 'send-keys', err, run.stopRequested)
-    const answer = approverAnswerTo(ctx, 'send-keys', err)
-    return 'stop' in answer ? answer.stop : { ...goesOn, backOff: answer.backOff }
-  }
-  if (run.stopRequested !== undefined) return run.stopRequested
-  return goesOn
-}
-
-/**
- * The approver's one classification of a refused call (b.jg5 SRJ-117,
- * SRJ-118, SRJ-404), by class through `src/ad-error-class.ts` (never by an
- * error's name), with one line from an exported builder carrying the
- * persona reference and the redacted description: see
- * `approvePreSessionDialogs` for the table. A `status` read's
- * `ErrSpawnNotFound` and UNUSABLE NAME answers never reach here (the shared
- * read answers absent and latched). Never throws.
- */
-function approverAnswerTo(ctx: ApproverContext, verb: ApproverVerb, err: unknown): ApproverAnswer {
-  const { ref } = ctx
-  const { errorClass } = classifyAdError(err)
-  // The reported name, as the launch sites' refusal lines give it (b.jg5 SRJ-104).
-  const failure = describeAdFailureForLog(err)
-  if (errorClass === AD_ERROR_CLASS_GONE || (verb !== 'status' && isAdErrorInstance(err, ErrSpawnNotFound))) {
-    console.error(approverLogLine(approverGoneMessage(ref, verb, failure)))
-    return { stop: APPROVER_STOP_GONE }
-  }
-  if (isAdErrorInstance(err, ErrSpawnNotInteractive)) {
-    console.error(approverLogLine(approverNotInteractiveMessage(ref, verb, failure)))
-    return { stop: APPROVER_STOP_NOT_INTERACTIVE }
-  }
-  if (approverLatchOn(ctx, verb, err, errorClass, failure)) return { stop: APPROVER_STOP_LATCHED }
-  if (errorClass === AD_ERROR_CLASS_ENVIRONMENT) {
-    console.error(approverLogLine(approverTmuxUnavailableMessage(ref, verb, failure)))
-    return { stop: APPROVER_STOP_TMUX_UNAVAILABLE }
-  }
-  const message =
-    verb === 'status' ? approverStatusRefusedMessage(ref, failure) : approverPaneCallFailedMessage(ref, verb, failure)
-  console.error(approverLogLine(message))
-  // CONFIG is taken as the UNAVAILABLE column (b.jg5 SRJ-117, SRJ-118): both back off.
-  return { backOff: errorClass === AD_ERROR_CLASS_UNAVAILABLE || errorClass === AD_ERROR_CLASS_CONFIG }
-}
-
-/**
- * The two classes that latch at the approver (b.jg5 SRJ-117, SRJ-118):
- * for a CONFLICT or UNUSABLE NAME answer `err` to `verb` (`errorClass`, with
- * `failure` its redacted description), latch the persona through the
- * installed latch's entry for the class and log one line carrying what
- * became of the latch. The approver is marked stopping (`latched`) first
- * unless a stop was already asked, so the latch's set observer finds it
- * stopping. Answers whether `err` was of either class; for any other class
- * it does nothing. Never throws.
- */
-function approverLatchOn(
-  ctx: ApproverContext,
-  verb: ApproverVerb,
-  err: unknown,
-  errorClass: AdErrorClass,
-  failure: string,
-): boolean {
-  const { ref } = ctx
-  if (errorClass === AD_ERROR_CLASS_CONFLICT) {
-    // The latch is set first; its line then carries what became of it.
-    logApproverLine(approverConflictMessage(ref, verb, failure, approverLatchOnConflict(ctx, verb, err)))
-    return true
-  }
-  if (errorClass === AD_ERROR_CLASS_UNUSABLE_NAME) {
-    ctx.run.stopRequested ??= APPROVER_STOP_LATCHED // the latch's set observer then finds it stopping
-    logApproverLine(approverUnusableNameMessage(ref, verb, failure, latchOnUnusableName(ctx.key, err, approverLatchRowState(verb))))
-    return true
-  }
-  return false
-}
-
-/**
- * A pane call (`verb`) refused with `err` after a stop was asked of the
- * approver (`requested`: superseded, latched, teardown or shutdown) while
- * the call was in progress. A CONFLICT or UNUSABLE NAME answer still latches
- * the persona with its one line (`approverLatchOn`; a persona already
- * latched answers as the latch's entry does for a same-case set); every
- * other answer is dropped with no line. Either way the approver honours the
- * stop already asked, answering its reason, and types nothing more. Never
- * throws.
- */
-function approverStoppedDuringCall(
-  ctx: ApproverContext,
-  verb: ApproverVerb,
-  err: unknown,
-  requested: ApproverStopRequestReason,
-): ApproverStopReason {
-  const { errorClass } = classifyAdError(err)
-  if (errorClass === AD_ERROR_CLASS_CONFLICT || errorClass === AD_ERROR_CLASS_UNUSABLE_NAME) {
-    approverLatchOn(ctx, verb, err, errorClass, describeAdFailureForLog(err))
-  }
-  return requested
-}
-
-/** One approver line (`approverLogLine`) to the server log; `message` comes from an exported builder. */
-function logApproverLine(message: string): void {
-  console.error(approverLogLine(message))
-}
-
-/** The latch line's outcome text for what `setFromConflict` answered (`undefined`: the value was not CONFLICT, so nothing latched). */
-function conflictSetOutcomeText(outcome: ConflictLatchSetOutcome | undefined): string {
-  return outcome === undefined ? 'nothing is latched (the answer is not CONFLICT)' : LATCH_SET_OUTCOME_TEXT[outcome]
-}
-
-/**
- * The row state a latch records for the approver's answer to `verb` (b.jg5
- * SRJ-501): `pending`, which the lap's `status` read before a pane verb;
- * unreadable for a `status` answer, which read no state.
- */
-function approverLatchRowState(verb: ApproverVerb): LatchRowState {
-  return verb === 'status' ? LATCH_ROW_STATE_UNREADABLE : latchRowStateRead(AGENT_DIRECTOR_PENDING_STATE)
-}
-
-/**
- * Latch the persona on the approver's CONFLICT answer `err` to `verb`
- * (b.jg5 SRJ-501): the installed latch's CONFLICT entry (`setFromConflict`)
- * with the refused operation "P's next check or recovery" and the recorded
- * state (`approverLatchRowState`). The approver is marked stopping
- * (`latched`) first, so the latch's set observer finds it already stopping.
- * Answers the latch line's outcome text: the set's outcome, that no latch is
- * installed, or that latching failed and what it threw. Logs nothing; never
- * throws.
- */
-function approverLatchOnConflict(ctx: ApproverContext, verb: ApproverVerb, err: unknown): string {
-  ctx.run.stopRequested ??= APPROVER_STOP_LATCHED
-  return latchOnConflict(ctx.key, err, REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY, approverLatchRowState(verb))
-}
-
-// ---------------------------------------------------------------------------
 // waitForWaitingAndReconnect — used when a colliding spawn is in `working`
 // ---------------------------------------------------------------------------
 
@@ -5570,16 +3976,7 @@ export function _resetWaitForWaitingTimeoutMs(): void {
   _waitForWaitingTimeoutMs = WAIT_FOR_WAITING_TIMEOUT_MS
 }
 
-/**
- * The clock of the `working`-row wait and evidence (b.f2b):
- * `waitForWaitingAndReconnect`'s deadline and loop, the launch wait's
- * evidence reads (`staleWorkingRowIsIdle`) and the restart path's fold
- * (`checkWorkingRowPane`), pane and transcript alike, and the findMissing
- * memo's window (`sharedFindMissingSweep`, `FIND_MISSING_MEMO_TTL_MS`),
- * and each launch call's window (`launchCallWithWindow`, b.jg5 SRJ-407),
- * whose times are wall-clock instants compared with a row's
- * `launch_started_at`. Test-only override below.
- */
+
 let _now: () => number = () => Date.now()
 
 /** Test-only seam: override the clock of the `working`-row wait and evidence, of the findMissing memo and of each launch call's window (a suite passes `createFakeClock().now`). */
@@ -5592,316 +3989,10 @@ export function _resetNow(): void {
   _now = () => Date.now()
 }
 
-// ---------------------------------------------------------------------------
-// Stale `working` rows (b.f2b) — evidence from the persona's pane and transcript
-// ---------------------------------------------------------------------------
-
-/**
- * How long a `working` row's idle evidence must hold, or its pane keep showing
- * a prompt, before `waitForWaitingAndReconnect` at a launch, or the restart
- * path's reconnect adapter across its attempts (`checkWorkingRowPane`), acts
- * on it (b.f2b): it reconnects the stale row, or reports the prompt. Idle
- * evidence is the positive-idle rule of `foldWorkingPaneRun`: at every read
- * across the window, the pane shows the same idle screen AND the session's
- * transcript ends with a completed turn, unchanged. Test-only override below.
- */
-export const STALE_WORKING_WINDOW_MS = 60_000
-
-let _staleWorkingWindowMs = STALE_WORKING_WINDOW_MS
-
-/** Test-only seam: override the stale-`working` evidence window. */
-export function _setStaleWorkingWindowMs(ms: number): void {
-  _staleWorkingWindowMs = ms
+function conflictSetOutcomeText(outcome: ConflictLatchSetOutcome | undefined): string {
+  return outcome === undefined ? 'nothing is latched (the answer is not CONFLICT)' : LATCH_SET_OUTCOME_TEXT[outcome]
 }
 
-/** Test-only seam: restore the default stale-`working` evidence window. */
-export function _resetStaleWorkingWindowMs(): void {
-  _staleWorkingWindowMs = STALE_WORKING_WINDOW_MS
-}
-
-/**
- * How often the launch wait reads a `working` row's evidence (b.f2b): its
- * pane and, when that shows an idle screen, its agent-director row and
- * transcript. Every agent-director call goes through its one queue, shared by
- * every persona, so the wait reads at this cadence rather than on each status
- * poll. Test-only override below.
- */
-export const WORKING_ROW_READ_INTERVAL_MS = 5_000
-
-let _workingRowReadIntervalMs = WORKING_ROW_READ_INTERVAL_MS
-
-/** Test-only seam: override how often the launch wait reads a `working` row's evidence. */
-export function _setWorkingRowReadIntervalMs(ms: number): void {
-  _workingRowReadIntervalMs = ms
-}
-
-/** Test-only seam: restore the default evidence read interval. */
-export function _resetWorkingRowReadIntervalMs(): void {
-  _workingRowReadIntervalMs = WORKING_ROW_READ_INTERVAL_MS
-}
-
-/**
- * How long CSCB holds back from a persona whose row reads `working`, typing
- * nothing because it can't prove the session idle, before it reports the
- * persona through the `unproven-idle` not-connected notice (b.f2b), whatever
- * `session_restart_delay` is: measured from the first deferral of the run
- * (`noteWorkingRowDeferral`). Without it, a row whose idleness can't be proven
- * (an unreadable transcript, a compaction summary, a screen that keeps
- * changing) would be held back from for good, silently. Test-only override
- * below.
- */
-export const UNPROVEN_IDLE_NOTICE_AFTER_MS = 10 * 60 * 1000
-
-let _unprovenIdleNoticeAfterMs = UNPROVEN_IDLE_NOTICE_AFTER_MS
-
-/** Test-only seam: override how long deferrals on a `working` row run before the `unproven-idle` notice. */
-export function _setUnprovenIdleNoticeAfterMs(ms: number): void {
-  _unprovenIdleNoticeAfterMs = ms
-}
-
-/** Test-only seam: restore the default. */
-export function _resetUnprovenIdleNoticeAfterMs(): void {
-  _unprovenIdleNoticeAfterMs = UNPROVEN_IDLE_NOTICE_AFTER_MS
-}
-
-/** The pane's last lines with text: Claude Code's prompt box, footer and any dialog are drawn there. */
-const WORKING_PANE_BOTTOM_LINES = 12
-
-/**
- * Claude Code's spinner line while a turn runs (2.1.280), matched only in its
- * own shape: at column 0 a spinner glyph, a space, the spinner's message, an
- * ellipsis, then the end of the line or ` (` and the turn's status (elapsed
- * time, tokens, thinking), e.g. `✳ Harmonizing… (2m 42s · ↓ 10.1k tokens)`.
- * The message holds no ellipsis and is short: a verb from Claude Code's list
- * (`Harmonizing`, `Fiddle-faddling`), a custom one from the `spinnerVerbs`
- * setting, which can be several words (`🐝 Buzzing about the hive`), or the
- * current task's `activeForm`. The status is left out at first, and in
- * screen-reader mode. The animated glyphs (`·` `✢` `✳` `✶` `✻` `✽`, and `*`
- * on some terminals) start no other line with an ellipsis: a finished turn's
- * line (`✻ Baked for 4m 11s`) has none, and text quoted in a reply is
- * indented.
- * `●` (U+25CF) is the glyph with prefersReducedMotion, but on Linux Claude
- * Code also draws it at column 0 before every reply and tool call (macOS draws
- * `⏺` there), and those lines can hold an ellipsis. So a `●` line counts only
- * as a single word and an ellipsis ending the line, or as any message whose
- * ellipsis is followed by ` (` and a status that starts with an elapsed time,
- * a token arrow or `thinking`/`thought for`; `● Let me check the logs…`,
- * `● Checked the build… (see the thread)` and `● Bash(ls …)` do not. Verified
- * (2026-09-26) against the 2.1.280 binary and live panes, which show custom
- * verbs of an emoji and three words with their status, and `●` reply and tool
- * lines. 2.1.280 no longer prints "esc to interrupt" while a turn runs.
- */
-const BUSY_SPINNER_LINE_RE =
-  /^(?:[·✢✳✶✻✽*] [^\s…][^…\n]{0,79}…(?: \(.*)?|● [\p{L}\p{M}'’-]{1,40}…|● [^\s…][^…\n]{0,79}… \((?:\d+(?:\.\d+)?[smhd]\b|[↓↑] |thinking|thought for ).*)$/mu
-
-/**
- * Busy hints in the pane's bottom lines, matched case-insensitively: the
- * "esc to interrupt" hint of earlier Claude Code versions and of the
- * capacity-retry line ("to interrupt" also covers a rebound key), and a turn
- * paused on a usage limit ("continuing automatically at … · esc to cancel").
- */
-const BUSY_PANE_NEEDLES = ['to interrupt', 'esc to cancel']
-
-/**
- * The static rows Claude Code 2.1.280 draws instead of the spinner while a
- * turn waits on the API, with no glyph, no timer and no interrupt hint,
- * matched case-insensitively in the pane's bottom lines (b.f2b): "No response
- * from the API after 2m · retrying, waiting up to 5m · attempt 2/10" and its
- * fixed second line "A proxy or gateway that buffers…", "Rate limit reached ·
- * Retrying in 7m (resets …) · attempt n/m" (the countdown shows whole minutes
- * from 5 m up, so the row can stay the same for a minute or more), and
- * "Waiting for API response · will retry in …". Each is anchored on Claude
- * Code's own `·` separator or fixed wording, so a reply that mentions a retry
- * does not read busy.
- */
-const BUSY_API_RETRY_ROWS: readonly RegExp[] = [
-  /no response from the api after [^\n]*·\s*retrying/i,
-  /a proxy or gateway that buffers/i,
-  /rate limit reached\s*·\s*retrying in/i,
-  /waiting for api response\s*·\s*will retry in/i,
-  /·\s*attempt \d+\/\d+/i,
-]
-
-/**
- * A numbered option line of a Claude Code dialog (2.1.280), its box side
- * (`│`) dropped: an optional `❯` selection cursor, the option's number, a
- * period and its label, e.g. `❯ 1. Yes` or `2. No, and tell Claude what to do
- * differently (esc)`. Group 2 is the number.
- */
-const DIALOG_OPTION_LINE_RE = /^(❯\s*)?(\d+)\.\s+\S/
-
-/**
- * Option labels and footers that mark a Claude Code dialog (2.1.280), matched
- * case-insensitively on its option list and the lines below it: the deny
- * option of every tool-permission dialog, the select-menu footers
- * (AskUserQuestion and other pickers) and the pre-session dialogs' options.
- */
-const DIALOG_NEEDLES = [
-  'tell Claude what to do differently',
-  'Enter to select',
-  'Enter to confirm',
-  ...PRE_SESSION_DIALOG_NEEDLES,
-  DEV_CHANNELS_DIALOG_NEEDLE, // b.omv SR-7.5: detect, never approve.
-].map((needle) => needle.toLowerCase())
-
-/** What a pane read from a `working` row shows (b.f2b). */
-export type WorkingPaneReading = 'prompt' | 'busy' | 'idle' | 'blank'
-
-/** The pane's lines without trailing spaces, and without the blank lines after its last text. */
-function paneLines(pane: string): string[] {
-  const lines = pane.split('\n').map((line) => line.trimEnd())
-  while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop()
-  return lines
-}
-
-/** A pane line's text with a dialog box's sides (`│`) dropped, and whether it had a left side. */
-function dialogRow(line: string): { text: string; boxed: boolean } {
-  const trimmed = line.trim()
-  const boxed = trimmed.startsWith('│')
-  const text = (boxed ? trimmed.slice(1) : trimmed).replace(/│$/, '').trim()
-  return { text, boxed }
-}
-
-/**
- * Whether the pane's bottom lines show a Claude Code dialog (b.f2b), anchored
- * to its layout, so an idle screen whose last reply merely quotes a dialog's
- * wording does not count: a numbered option list (an option `1.` and, below
- * it, an option `2.`; description lines may sit between them) with the `❯`
- * selection cursor on one of its options, and, to anchor it, a question line
- * (ending in `?`) above the list, a dialog option or footer
- * (`DIALOG_NEEDLES`) on or below it, or its options drawn inside the dialog's
- * box (`│`).
- */
-function paneShowsDialog(bottom: readonly string[]): boolean {
-  const rows = bottom.map(dialogRow)
-  const optionNumber = (text: string): string | undefined => DIALOG_OPTION_LINE_RE.exec(text)?.[2]
-  const first = rows.findIndex((row) => optionNumber(row.text) === '1')
-  if (first < 0) return false
-  const below = rows.slice(first)
-  const options = below.filter((row) => optionNumber(row.text) !== undefined)
-  if (!options.some((row) => optionNumber(row.text) === '2')) return false
-  if (!options.some((row) => row.text.startsWith('❯'))) return false
-  return (
-    rows.slice(0, first).some((row) => row.text.endsWith('?')) ||
-    below.some((row) => DIALOG_NEEDLES.some((needle) => row.text.toLowerCase().includes(needle))) ||
-    options.some((row) => row.boxed)
-  )
-}
-
-/**
- * Classify a pane read from a `working` (or `waiting`) row (b.f2b): `prompt`
- * when its bottom lines show a dialog (`paneShowsDialog`); else `busy` when it
- * shows Claude Code's spinner line anywhere, or a busy hint or an API retry
- * row in its bottom lines; `blank` when it holds no text; otherwise `idle`. A
- * prompt wins over a busy sign, since a dialog may sit under a running turn's
- * spinner: either way nothing is typed. `idle` is no proof the session is
- * idle: the stale-row rule also needs the transcript (`foldWorkingPaneRun`).
- * Pure.
- */
-export function classifyWorkingPane(pane: string): WorkingPaneReading {
-  const lines = paneLines(pane)
-  if (lines.length === 0) return 'blank'
-  const bottomLines = lines.slice(-WORKING_PANE_BOTTOM_LINES)
-  // An actual bottom composer makes earlier quoted options/history inert
-  // (b.omv SR-5.3). A dialog has replaced that composer.
-  if (readDeliveryScreen('claude', pane).kind === 'menu' && paneShowsDialog(bottomLines)) return 'prompt'
-  if (BUSY_SPINNER_LINE_RE.test(lines.join('\n'))) return 'busy'
-  const bottom = bottomLines.join('\n').toLowerCase()
-  if (BUSY_PANE_NEEDLES.some((needle) => bottom.includes(needle))) return 'busy'
-  if (BUSY_API_RETRY_ROWS.some((row) => row.test(bottom))) return 'busy'
-  return 'idle'
-}
-
-/** A run of consecutive evidence reads of a `working` row that agree (b.f2b). */
-export interface WorkingPaneRun {
-  /**
-   * `idle`: every read showed the same idle screen and the same, unchanged
-   * transcript ending with a completed turn; `prompt`: every read showed a
-   * prompt or dialog.
-   */
-  reading: 'idle' | 'prompt'
-  /** The run's first screen (its lines, trailing spaces dropped): an idle run lasts only while it is unchanged. */
-  screen: string
-  /** An idle run's transcript as its first read saw it: the run lasts only while every read sees it unchanged. */
-  transcript?: TranscriptSnapshot
-  /** When the run started (epoch ms, the session manager's clock `_now`). */
-  since: number
-}
-
-/**
- * Fold one evidence read into the current run (b.f2b). This is the
- * positive-idle rule: a pane alone is never idle evidence.
- * - `pane` undefined (the read failed), a `busy` or a `blank` pane ends the
- *   run: no evidence.
- * - A `prompt` pane continues a prompt run, or starts one at `now`; the
- *   transcript plays no part (nothing is typed into a prompt either way).
- * - An `idle` pane is evidence only together with `transcript`, the session's
- *   transcript read with it, ending with a completed turn (`ended`, see
- *   `transcriptTailTurnState`). A transcript that doesn't, can't be located or
- *   read, or wasn't read ends the run. An idle run continues only while both
- *   the screen and the transcript's snapshot (path, device, inode, size,
- *   mtime) are unchanged; otherwise a new idle run starts at `now`.
- * So a row is stale only once the same idle screen and the same ended,
- * unchanged transcript were read at every read across the window. A live
- * turn, an API retry included, never ends its transcript with a completed
- * turn, so it never gives idle evidence, however still its screen. Pure.
- */
-export function foldWorkingPaneRun(
-  run: WorkingPaneRun | undefined,
-  pane: string | undefined,
-  now: number,
-  transcript?: TranscriptReading,
-): WorkingPaneRun | undefined {
-  if (pane === undefined) return undefined
-  const reading = classifyWorkingPane(pane)
-  const screen = paneLines(pane).join('\n')
-  if (reading === 'prompt') return run?.reading === 'prompt' ? run : { reading, screen, since: now }
-  if (reading !== 'idle' || transcript === undefined || transcript.kind !== 'ended') return undefined
-  const unchanged =
-    run?.reading === 'idle' &&
-    run.screen === screen &&
-    run.transcript !== undefined &&
-    sameTranscriptSnapshot(run.transcript, transcript.snapshot)
-  return unchanged ? run : { reading, screen, transcript: transcript.snapshot, since: now }
-}
-
-/** One evidence read of a `working` row (b.f2b). */
-interface WorkingRowRead {
-  /** The pane; undefined when the read failed, or when the persona latched. */
-  pane: string | undefined
-  /**
-   * The pane read's failure outcome (`src/pane-read.ts`: its class and its
-   * token-safe description); set only when the read failed and latched
-   * nothing. An UNCLASSIFIED here carries the reader's stop mark
-   * (`stopping`) when its version re-check decided that the server stops.
-   */
-  paneFailure?: PaneReadFailure
-  /** The session's transcript, read only when the pane shows an idle screen. */
-  transcript?: TranscriptReading
-  /**
-   * b.jg5 SRJ-501: the row state the transcript `get` read (no row for
-   * `ErrSpawnNotFound`, unreadable for an UNUSABLE NAME answer), when it was
-   * made and gave one: the path's last read of the row from then on.
-   */
-  rowRead?: LatchRowState
-  /**
-   * b.jg5 SRJ-502: the persona is latched after one of the read's
-   * agent-director calls (its pane read or its transcript `get` latched it,
-   * or it was latched elsewhere). No evidence: the caller calls nothing more
-   * and types nothing.
-   */
-  latched?: true
-}
-
-/** The evidence read of a persona that is latched (`WorkingRowRead.latched`). */
-const WORKING_ROW_READ_LATCHED: WorkingRowRead = Object.freeze({ pane: undefined, latched: true })
-
-/**
- * True when persona `key` is latched now, by the installed latch (b.jg5
- * SRJ-502): a latched query that throws, or a latched persona whose record
- * cannot be read, counts as latched (`latchGateReadingOf`). False with no
- * latch installed. Logs nothing; never throws.
- */
 function personaLatchedNow(key: string): boolean {
   return latchGateReadingOf(key) !== undefined
 }
@@ -5920,668 +4011,6 @@ function latchedAfterOwnRowRead(key: string, site: string, what: string, ref: st
   if (!personaLatchedNow(key)) return false
   console.error(`[slack] ${site}: ${ref} is latched after its ${what} — nothing more is called for it (b.jg5 SRJ-502)`)
   return true
-}
-
-/**
- * Read persona `key`'s pane (`readWorkingPane`, whose CONFLICT or UNUSABLE
- * NAME answer latches the persona with `lastRead`, the row state the calling
- * path last read) and, only when it shows an idle screen, its transcript
- * (`readIdlePaneTranscript`), for one evidence read of the launch wait
- * (b.f2b). After the pane read it asks whether the persona is latched
- * (`personaLatchedNow`, or a read that latched it), and then answers
- * `WORKING_ROW_READ_LATCHED` with nothing more read (b.jg5 SRJ-502). A
- * failed pane read that latched nothing is carried as its outcome
- * (`paneFailure`). Never throws.
- */
-async function readWorkingRowEvidence(
-  key: string,
-  configDir: string | undefined,
-  lastRead: LatchRowState,
-): Promise<WorkingRowRead> {
-  const read = await readWorkingPane(key, lastRead)
-  if (read.kind === PANE_READ_LATCHED || personaLatchedNow(key)) return WORKING_ROW_READ_LATCHED
-  if (read.kind !== PANE_READ_PANE) return { pane: undefined, paneFailure: read }
-  return readIdlePaneTranscript(key, read.pane, configDir)
-}
-
-/**
- * The rest of one evidence read of persona `key`'s `working` row once its
- * `pane` has been read (b.f2b): the transcript (`readPersonaTranscript`, one
- * `get` of its own row) only when the pane shows an idle screen. After the
- * transcript `get` it asks whether the persona is latched (the `get` latched
- * it, or `personaLatchedNow`), and then answers `WORKING_ROW_READ_LATCHED`
- * (b.jg5 SRJ-502), carrying the state the `get` read when it gave one.
- * Never throws.
- */
-async function readIdlePaneTranscript(key: string, pane: string, configDir: string | undefined): Promise<WorkingRowRead> {
-  if (classifyWorkingPane(pane) !== 'idle') return { pane }
-  const { transcript, rowRead } = await readPersonaTranscript(key, configDir)
-  const tracked = rowRead === undefined ? {} : { rowRead }
-  if (transcript.kind === PERSONA_TRANSCRIPT_LATCHED || personaLatchedNow(key)) {
-    return { ...WORKING_ROW_READ_LATCHED, ...tracked }
-  }
-  return { pane, transcript, ...tracked }
-}
-
-/**
- * Read the last `FULL_PANE_READ_LINES` lines of persona `key`'s pane (b.f2b)
- * through the shared read-pane of its own row (`readPersonaOwnPane`, b.jg5
- * SRJ-117), answering its outcome. A CONFLICT or UNUSABLE NAME answer
- * latches the persona with `lastRead`, the row state the calling path last
- * read (the launch wait's last read, or the `waiting` state the restart
- * path's check was called for), and a persona already latched is not read:
- * either way the outcome is latched, and the caller ends what it was doing
- * with nothing typed (b.jg5 SRJ-501, SRJ-502, SRJ-512). A pane it answers
- * may be a single leftover's (b.jg5 SRJ-613): its callers (the launch wait's
- * evidence read and `checkWaitingRowPane`) act on it only through the
- * reconnect, whose `send-keys` is the backstop (`reconnectMcpWithCause`).
- * Never throws.
- */
-async function readWorkingPane(key: string, lastRead: LatchRowState): Promise<OwnPaneReadOutcome> {
-  return readPersonaOwnPane(key, { nLines: FULL_PANE_READ_LINES, lastRead, site: 'readWorkingPane' })
-}
-
-/**
- * The effective claude_config_dir of `persona`, absolute (`<home>/.claude`
- * when none is set), for composing its transcript's path (b.f2b); undefined
- * when the persona isn't known, and then only the row's persisted path is
- * used (`locateTranscript`).
- */
-function transcriptConfigDir(persona: Pick<Persona, 'claude_config_dir'> | undefined): string | undefined {
-  return persona === undefined ? undefined : resolveClaudeConfigDir(persona.claude_config_dir, spawnHomeDir())
-}
-
-/** `readPersonaTranscript`'s answer when its `get` latched the persona (b.jg5 SRJ-114, SRJ-512). */
-const PERSONA_TRANSCRIPT_LATCHED = 'latched'
-
-/** A transcript reading, or that its `get` latched the persona. */
-type PersonaTranscriptReading = TranscriptReading | { kind: typeof PERSONA_TRANSCRIPT_LATCHED }
-
-/**
- * What `readPersonaTranscript` answers: the reading, and the row state its
- * `get` read (b.jg5 SRJ-501), when it gave one.
- */
-interface PersonaTranscriptRead {
-  readonly transcript: PersonaTranscriptReading
-  readonly rowRead?: LatchRowState
-}
-
-/**
- * Read persona `key`'s transcript for idle evidence (b.f2b): fetch its
- * agent-director row through the shared own-row read (`readPersonaOwnRow`,
- * one `get`, b.jg5 SRJ-114), locate the transcript of the row's session
- * (`locateTranscript`: the persisted `jsonl_path`, else the path composed
- * under `configDir`) and read its turn state (`readTranscriptTurnState`). A
- * `get` that latched the persona (its own row reading `pending` with no
- * launch start, b.jg5 SRJ-513, a latching note, or an UNUSABLE NAME
- * answer, b.jg5 SRJ-512) answers `latched`, and nothing more is read: no
- * evidence. An absent row (`ErrSpawnNotFound`), a failed `get`, a row that
- * names no transcript, or a file that can't be read is `unreadable`, with a
- * token-safe reason: no evidence. Beside the reading it answers the row
- * state the `get` read (`rowRead`, b.jg5 SRJ-501: the state of a row, no row
- * for an absent one, unreadable for an UNUSABLE NAME answer; none for a
- * failed `get`), so the caller tracks it as the path's last read. Never
- * throws.
- */
-async function readPersonaTranscript(key: string, configDir: string | undefined): Promise<PersonaTranscriptRead> {
-  const read = await readPersonaOwnRow(key, { site: 'readPersonaTranscript', what: 'transcript get' })
-  if (read.kind === OWN_ROW_READ_LATCHED) {
-    return { transcript: { kind: PERSONA_TRANSCRIPT_LATCHED }, rowRead: LATCH_ROW_STATE_UNREADABLE }
-  }
-  if (read.kind === OWN_ROW_READ_ABSENT) {
-    return {
-      transcript: { kind: 'unreadable', reason: 'its agent-director row is absent (ErrSpawnNotFound)' },
-      rowRead: LATCH_ROW_STATE_NO_ROW,
-    }
-  }
-  if (read.kind === OWN_ROW_READ_REFUSED) {
-    return {
-      transcript: { kind: 'unreadable', reason: `reading its agent-director row failed: ${describeAgentDirectorFailure(read.error)}` },
-    }
-  }
-  const { row } = read
-  const rowRead = latchRowStateRead(row.state)
-  if (read.latched) return { transcript: { kind: PERSONA_TRANSCRIPT_LATCHED }, rowRead }
-  const path = locateTranscript(row, configDir)
-  if (path === undefined) {
-    return { transcript: { kind: 'unreadable', reason: 'its agent-director row names no transcript for its session' }, rowRead }
-  }
-  const reading = readTranscriptTurnState(path)
-  return {
-    transcript: reading.kind === 'unreadable' ? { kind: 'unreadable', reason: `"${path}": ${reading.reason}` } : reading,
-    rowRead,
-  }
-}
-
-/**
- * Why a transcript read with an idle pane gives no idle evidence (b.f2b), for
- * a log line; undefined when it was not read or ends with a completed turn.
- */
-function transcriptNoEvidence(transcript: TranscriptReading | undefined): string | undefined {
-  if (transcript === undefined) return undefined
-  if (transcript.kind === 'unreadable') return `its transcript can't be read: ${transcript.reason}`
-  return transcript.kind === 'open' ? `its transcript "${transcript.snapshot.path}" does not end with a completed turn` : undefined
-}
-
-/**
- * `staleWorkingRowIsIdle`'s answer when its pane read's version re-check
- * decided that the server stops (b.jg5 SRJ-205).
- */
-const WORKING_EVIDENCE_STOPPING = 'stopping'
-
-/** One launch wait's evidence for a `working` row (b.f2b). */
-interface WorkingPaneWatch {
-  run: WorkingPaneRun | undefined
-  /** When the wait last read the evidence (`_now`); undefined before its first read. */
-  lastReadAt: number | undefined
-  /** The first failed pane read was logged (later ones are not, for the rest of the wait). */
-  readFailureLogged: boolean
-  /** The last reason an idle pane's transcript gave no evidence, as logged: a changed reason is logged again. */
-  transcriptNote: string | undefined
-  /** A prompt run reached the window: logged and reported once for the wait. */
-  promptReported: boolean
-}
-
-/**
- * The launch wait's evidence check for persona `key`'s `working` row (b.f2b),
- * called on every status poll. It reads the evidence only once
- * `WORKING_ROW_READ_INTERVAL_MS` has passed since its last read (the first
- * poll reads at once), and folds it into the wait's run (`foldWorkingPaneRun`).
- * True once the idle evidence has held for the whole window: the pane has
- * shown the same idle screen and the transcript has ended with a completed
- * turn, unchanged, at every read. The row is stale and the caller reconnects
- * it. A prompt shown for the window is logged and reported (once per wait,
- * through the not-connected notice) and the wait goes on; nothing is typed
- * into it. A failed pane read or an idle pane whose transcript gives no
- * evidence ends the run; the wait's first pane failure and each new
- * transcript reason are logged, and the wait goes on as before.
- * `latched` when the persona is latched after the read's pane or transcript
- * read (b.jg5 SRJ-502, `WorkingRowRead.latched`; a pane read's CONFLICT or
- * UNUSABLE NAME answer latches it with the wait's last read, b.jg5 SRJ-117,
- * SRJ-501, SRJ-512, SRJ-608, and a latched persona's pane is not read):
- * nothing is logged, folded or reported, and the wait ends with nothing
- * typed. `stopping` (`WORKING_EVIDENCE_STOPPING`) when the pane read's
- * UNCLASSIFIED carries the stop mark (b.jg5 SRJ-205: the shared reader's
- * `ErrInvalidFlags` re-check decided that the server stops): one line,
- * nothing folded or reported, and the wait ends with nothing typed. Every
- * other failed pane read (GONE, an absent row, UNAVAILABLE, ENVIRONMENT,
- * CONFIG, UNCLASSIFIED) is no evidence (b.jg5 SRJ-117, SRJ-608). The state
- * the transcript `get` read, when it was made, becomes the wait's last read
- * (`wait.lastRead`, b.jg5 SRJ-501).
- *
- * The pane may be a single leftover's (b.jg5 SRJ-117, SRJ-613: with no
- * session of the row's current launch there and exactly one leftover of the
- * persona, agent-director answers the leftover's pane), so it is no proof
- * that the worker's own session is there: a pane only feeds the fold, which
- * also needs the transcript. When the fold shows the row stale, the wait's
- * reconnect (`reconnectInWait`, `reconnectMcpWithCause` with the row state
- * `working`) is the backstop: its `send-keys` answers CONFLICT "not this
- * launch's session" on a live row that is not `pending` when a leftover
- * holds the persona's session, and then nothing is typed, P latches (b.jg5
- * SRJ-501) with its CONFLICT notice posted once, the refused `send-keys` is
- * never retried, and the wait answers `transient` noted as latched, so the
- * ladder answers `latched`.
- */
-async function staleWorkingRowIsIdle(
-  key: string,
-  ref: string,
-  config: PersonaConfig,
-  watch: WorkingPaneWatch,
-  wait: WorkingRowWait,
-): Promise<boolean | typeof WAIT_OUTCOME_LATCHED | typeof WORKING_EVIDENCE_STOPPING> {
-  const due = _now()
-  if (watch.lastReadAt !== undefined && due - watch.lastReadAt < _workingRowReadIntervalMs) return false
-  watch.lastReadAt = due
-  const read = await readWorkingRowEvidence(
-    key,
-    transcriptConfigDir(config.personas.find((p) => p.key === key)),
-    // The poll that called this has just read the row `working`.
-    wait.lastRead ?? latchRowStateRead('working'),
-  )
-  if (read.rowRead !== undefined) wait.lastRead = read.rowRead
-  // b.jg5 SRJ-608: a CONFLICT (or UNUSABLE NAME) at the pane read latched P;
-  // the wait ends `latched` with no further call and nothing typed.
-  if (read.latched) return WAIT_OUTCOME_LATCHED
-  // b.jg5 SRJ-205: the pane read's version re-check decided that the server
-  // stops; the wait ends with no further call and nothing typed.
-  if (read.paneFailure?.kind === PANE_READ_UNCLASSIFIED && read.paneFailure.stopping === true) {
-    console.error(
-      `[slack] waitForWaitingAndReconnect: reading the pane of ${ref} failed: ${read.paneFailure.description} — the agent-director version re-check decided that the server stops; the wait ends, nothing more is called and nothing is typed (${paneReadClassNote(read.paneFailure)}; b.jg5 SRJ-204, SRJ-205)`,
-    )
-    return WORKING_EVIDENCE_STOPPING
-  }
-  if (read.paneFailure !== undefined && !watch.readFailureLogged) {
-    watch.readFailureLogged = true
-    console.error(
-      `[slack] waitForWaitingAndReconnect: reading the pane of ${ref} failed: ${read.paneFailure.description} — no idle evidence from it; still waiting for its working row (${paneReadClassNote(read.paneFailure)}; b.f2b)`,
-    )
-  }
-  const note = transcriptNoEvidence(read.transcript)
-  if (note !== undefined && note !== watch.transcriptNote) {
-    watch.transcriptNote = note
-    console.error(
-      `[slack] waitForWaitingAndReconnect: ${ref} reads working and its pane shows an idle screen, but ${note} — no idle evidence; still waiting for its working row (b.f2b)`,
-    )
-  }
-  const now = _now()
-  watch.run = foldWorkingPaneRun(watch.run, read.pane, now, read.transcript)
-  const run = watch.run
-  if (run === undefined || now - run.since < _staleWorkingWindowMs) return false
-  const seconds = Math.round((now - run.since) / 1000)
-  if (run.reading === 'idle') {
-    console.error(
-      `[slack] waitForWaitingAndReconnect: ${ref} reads working, but its pane has shown the same idle screen (no busy indicator, no prompt) and its transcript has ended with a completed turn, both unchanged, for ${seconds}s — treating the row as stale and reconnecting (b.f2b)`,
-    )
-    return true
-  }
-  if (!watch.promptReported) {
-    watch.promptReported = true
-    console.error(
-      `[slack] waitForWaitingAndReconnect: ${ref} reads working and its pane has shown a prompt or dialog for ${seconds}s — blocked on it; not typing into it, still waiting (answer it in tmux session "${personaTmuxSessionName(key)}") (b.f2b)`,
-    )
-    notifyPersonaNotConnected(key, { reason: 'blocked-on-prompt', autoRestartDisabled: config.session_restart_delay === 0 })
-  }
-  return false
-}
-
-/**
- * The restart path's evidence for each persona whose row reads `working`
- * (b.f2b): one run per persona, kept across its reconnect attempts, which are
- * minutes apart (`checkWorkingRowPane`). Forgotten when an attempt finds the
- * row in another state or can't read it (`forgetWorkingRowEvidence`), when a
- * read gives no evidence and ends the run, when an idle run concludes and the
- * reconnect is typed, when any launch for the persona starts
- * (`spawnForPersona`), and with the persona's not-connected episode
- * (`forgetNotConnectedEpisode`: it reconnected, became deliverable again, or
- * was torn down).
- */
-const workingRowPaneRuns = new Map<string, WorkingPaneRun>()
-
-/**
- * When each persona's current run of deferrals on its `working` row began
- * (b.f2b, on the session manager's clock `_now`): the first time a launch
- * wait or the restart path held back from the row, typing nothing, because it
- * could not prove the session idle (`noteWorkingRowDeferral`). A run goes on
- * across reads and attempts that find no proof, whatever the reason: a busy,
- * changing or blank pane, a transcript that doesn't end with a completed
- * turn or can't be read, idle evidence not yet held for the window, a
- * prompt, a pane read agent-director could not answer (UNAVAILABLE or
- * CONFIG, b.jg5 SRJ-603). A failed status call, and a pane read that met
- * ENVIRONMENT, UNCLASSIFIED or a latch, neither extend nor end it. It ends
- * (`endWorkingRowDeferral`) when the row reads another state, when a
- * reconnect is typed into it, when any launch for the persona starts (the
- * launch's own wait starts a new run), and with the persona's not-connected
- * episode (`forgetNotConnectedEpisode`).
- */
-const workingRowDeferredSince = new Map<string, number>()
-
-/**
- * b.f2b: note that CSCB held back from persona `key`'s `working` row once
- * more, typing nothing, because it could not prove the session idle. The
- * first deferral of a run starts it (`workingRowDeferredSince`); once the run
- * has lasted `UNPROVEN_IDLE_NOTICE_AFTER_MS`, the `unproven-idle`
- * not-connected notice is raised, at any `session_restart_delay`, through the
- * shared latch: once per episode, and not at all when another not-connected
- * notice was raised in the episode. `autoRestartDisabled` (`session_restart_delay`
- * is 0) words what happens next; the restart path runs only with auto-restart
- * on. Returns whether it raised the notice; `notifyPersonaNotConnected` logs
- * the line.
- */
-export function noteWorkingRowDeferral(key: string, autoRestartDisabled: boolean): boolean {
-  const heldMs = noteDeferralRun(workingRowDeferredSince, key)
-  if (heldMs < _unprovenIdleNoticeAfterMs) return false
-  return notifyPersonaNotConnected(key, { reason: 'unproven-idle', autoRestartDisabled, heldMs })
-}
-
-/**
- * b.f2b: end persona `key`'s run of deferrals on its `working` row (it read
- * another state, a reconnect was typed into it, or a launch for it started),
- * so a later deferral starts a new run. Silent; other personas are untouched.
- */
-export function endWorkingRowDeferral(key: string): void {
-  workingRowDeferredSince.delete(key)
-}
-
-/** What `checkWorkingRowPane` tells the restart path's reconnect adapter (b.f2b). */
-export type WorkingRowPaneVerdict = 'reconnect' | 'defer'
-
-/** `checkWaitingRowPane`'s answer when the row's `read-pane` answered GONE (b.jg5 SRJ-117, SRJ-604). */
-export const WAITING_ROW_PANE_GONE = 'gone'
-
-/** `checkWaitingRowPane`'s answer when the row was absent (`ErrSpawnNotFound`) at its `read-pane` (b.jg5 SRJ-117). */
-export const WAITING_ROW_PANE_ABSENT = 'absent'
-
-/**
- * What `checkWaitingRowPane` tells the restart path's reconnect adapter
- * (b.f2b, b.jg5 SRJ-604): `reconnect`, `defer`, or that the row's
- * `read-pane` answered GONE (`gone`) or found the row absent (`absent`), on
- * either of which the adapter sweeps and escalates with nothing typed.
- */
-export type WaitingRowPaneVerdict = WorkingRowPaneVerdict | typeof WAITING_ROW_PANE_GONE | typeof WAITING_ROW_PANE_ABSENT
-
-/**
- * What a reconnect line says it does on a row it escalates as dead before the
- * restart path's re-probe (b.jg5 SRJ-610): the sweep and the 'escalate-dead'
- * answer, and no outcome, since a swept row may stay live for further ticks.
- */
-export const ESCALATE_DEAD_REPROBE_DECIDES = "sweeping and escalating (escalate-dead); the restart path's re-probe decides"
-
-/**
- * `checkWaitingRowPane`'s line when the `waiting` row's `read-pane` answered
- * GONE (b.jg5 SRJ-604); `read` is that failure.
- */
-export function waitingRowPaneGoneLine(key: string, read: PaneReadFailure): string {
-  return `[slack] reconnectSession: ${keyRef(key)} is waiting but agent-director's read-pane found no pane of its launch: ${read.description} — not typing /mcp reconnect; ${ESCALATE_DEAD_REPROBE_DECIDES} (${paneReadClassNote(read)}; b.jg5 SRJ-604)`
-}
-
-/**
- * `checkWaitingRowPane`'s line when the `waiting` row was absent
- * (`ErrSpawnNotFound`) at its `read-pane` (b.jg5 SRJ-117); `read` is that
- * failure.
- */
-export function waitingRowAbsentAtPaneReadLine(key: string, read: PaneReadFailure): string {
-  return `[slack] reconnectSession: ${keyRef(key)} is waiting but its agent-director row was absent at the pane read: ${read.description} — not typing /mcp reconnect; ${ESCALATE_DEAD_REPROBE_DECIDES} (${paneReadClassNote(read)}; b.jg5 SRJ-117)`
-}
-
-/** What `checkWorkingRowPane` is given beside the persona's key and pane. */
-export interface WorkingRowPaneCheckOptions {
-  readonly noNotice?: boolean
-  /**
-   * The persona, for locating its transcript under its claude_config_dir;
-   * absent, only the row's persisted transcript path is read.
-   */
-  readonly persona?: Pick<Persona, 'claude_config_dir'>
-  /**
-   * The caller's latched gate (b.jg5 SRJ-502; production: the reconnect
-   * adapter's `reconnectLatchedAt` for the persona, which logs the latched
-   * line), asked right before a deferral is noted and right before the
-   * `blocked-on-prompt` notice: a persona that latched meanwhile (a launch
-   * outside the restart serializer can latch it during the check's awaits)
-   * answers `defer` with its run forgotten, no deferral noted and no notice.
-   * Absent: never asked.
-   */
-  readonly latchedNow?: () => boolean
-}
-
-/**
- * b.f2b, b.jg5 SRJ-603 — the restart path's positive-idle fold for a persona
- * whose row reads `working`, on the `pane` its caller read: the reconnect
- * adapter's one `read-pane` of the row (`workingReconnectVerdict` in
- * `server.ts`). It makes no `read-pane` of its own. It reads the transcript
- * (one `get` of the row; located with `options.persona`'s
- * claude_config_dir, and without it only the row's persisted transcript path
- * is used) only when the pane shows an idle screen, and folds the evidence
- * into the persona's run, kept across reconnect attempts
- * (`workingRowPaneRuns`):
- * - `reconnect` once the idle evidence has held across reads spanning
- *   `STALE_WORKING_WINDOW_MS`: the same idle screen (no busy indicator, no
- *   prompt) and the same transcript, ended with a completed turn and
- *   unchanged, at every read. The row is stale, and the caller types
- *   `/mcp reconnect`. The run is forgotten.
- * - `defer` otherwise: a busy or blank pane, or an idle pane whose transcript
- *   does not end with a completed turn or can't be located or read (the run
- *   ends: no evidence); idle evidence not yet held for the window; or a
- *   prompt or dialog. A prompt shown across reads spanning the window also
- *   raises the `blocked-on-prompt` not-connected notice (once per episode);
- *   nothing is ever typed into a prompt.
- * Each `defer` is one more deferral in the persona's run on its `working` row
- * (`noteWorkingRowDeferral`): once the run has lasted
- * `UNPROVEN_IDLE_NOTICE_AFTER_MS`, the `unproven-idle` notice is raised (once
- * per episode), so a row whose idleness can never be proven is not held back
- * from silently. `reconnect` ends the run. A live turn never ends its
- * transcript with a completed turn, so it is never taken for idle (b.rmy).
- *
- * The pane comes from the caller's one read and may be a single leftover's
- * (b.jg5 SRJ-117, SRJ-613: with no session of the row's current launch there
- * and exactly one leftover of the persona, agent-director answers the
- * leftover's pane), so a pane alone is never proof that the worker's own
- * session is there: the fold also needs the transcript, and `reconnect` only
- * lets the caller type `/mcp reconnect`. That reconnect's `send-keys`
- * (`reconnectMcpWithCause`) is the backstop: on a live row that is not
- * `pending` it answers CONFLICT "not this launch's session" when a leftover
- * holds the persona's session, and then nothing is typed, P latches (b.jg5
- * SRJ-501) with its CONFLICT notice posted once, and the refused `send-keys`
- * is never retried (SRJ-118).
- *
- * A persona latched during the transcript `get` (it read a
- * `provenance_conflict` note or answered UNUSABLE NAME, b.jg5 SRJ-114,
- * SRJ-512, or it was latched elsewhere), or one `options.latchedNow` finds
- * latched right before a deferral is noted or the notice is raised, answers
- * `defer` with its run forgotten, no deferral noted, no not-connected notice
- * and nothing typed (b.jg5 SRJ-502).
- * Logs one line per call; never throws.
- */
-export async function checkWorkingRowPane(
-  key: string,
-  pane: string,
-  options: WorkingRowPaneCheckOptions = {},
-): Promise<WorkingRowPaneVerdict> {
-  const verdict = await workingRowPaneVerdict(key, pane, options)
-  // b.jg5 SRJ-502: a persona latched during the check is deferred with no
-  // deferral noted, so no not-connected notice is raised for it.
-  if (verdict === WAIT_OUTCOME_LATCHED) return 'defer'
-  if (verdict === 'reconnect') {
-    endWorkingRowDeferral(key)
-    return 'reconnect'
-  }
-  // b.jg5 SRJ-502: asked right before the deferral that may raise the
-  // `unproven-idle` notice.
-  if (options.latchedNow?.() === true) {
-    workingRowPaneRuns.delete(key)
-    return 'defer'
-  }
-  // The restart path runs only with auto-restart on.
-  if (!options.noNotice) noteWorkingRowDeferral(key, false)
-  return 'defer'
-}
-
-/**
- * `checkWorkingRowPane`'s transcript read and verdict on the caller's `pane`,
- * before its deferral is noted (b.f2b); `latched` for a persona latched
- * during the transcript `get`, or found latched right before the
- * `blocked-on-prompt` notice (b.jg5 SRJ-502): its run is forgotten.
- */
-async function workingRowPaneVerdict(
-  key: string,
-  pane: string,
-  options: WorkingRowPaneCheckOptions,
-): Promise<WorkingRowPaneVerdict | typeof WAIT_OUTCOME_LATCHED> {
-  const ref = keyRef(key)
-  const read = await readIdlePaneTranscript(key, pane, transcriptConfigDir(options.persona))
-  if (read.latched) {
-    workingRowPaneRuns.delete(key)
-    console.error(
-      `[slack] reconnectSession: ${ref} is working and is latched — deferring; no deferral noted, nothing typed (b.jg5 SRJ-502)`,
-    )
-    return WAIT_OUTCOME_LATCHED
-  }
-  const now = _now()
-  const run = foldWorkingPaneRun(workingRowPaneRuns.get(key), pane, now, read.transcript)
-  if (run === undefined) {
-    workingRowPaneRuns.delete(key)
-    logNoWorkingRowEvidence(ref, classifyWorkingPane(pane), read.transcript)
-    return 'defer'
-  }
-  workingRowPaneRuns.set(key, run)
-  const span = now - run.since
-  const seconds = Math.round(span / 1000)
-  if (run.reading === 'idle') {
-    if (span < _staleWorkingWindowMs) {
-      console.error(
-        `[slack] reconnectSession: ${ref} is working; its pane shows an idle screen (no busy indicator, no prompt) and its transcript ends with a completed turn, both unchanged for ${seconds}s of the ${Math.round(_staleWorkingWindowMs / 1000)}s needed — deferring /mcp reconnect to a later tick, which reads them again (b.f2b)`,
-      )
-      return 'defer'
-    }
-    workingRowPaneRuns.delete(key)
-    console.error(
-      `[slack] reconnectSession: ${ref} reads working, but its pane has shown the same idle screen (no busy indicator, no prompt) and its transcript has ended with a completed turn, both unchanged, for ${seconds}s — treating the row as stale and reconnecting (b.f2b)`,
-    )
-    return 'reconnect'
-  }
-  if (span < _staleWorkingWindowMs) {
-    console.error(`[slack] reconnectSession: ${ref} is working and its pane shows a prompt or dialog — not typing into it; deferring /mcp reconnect to a later tick (b.f2b/b.rmy)`)
-    return 'defer'
-  }
-  // b.jg5 SRJ-502: asked right before the notice; the gate logs its line.
-  if (options.latchedNow?.() === true) {
-    workingRowPaneRuns.delete(key)
-    return WAIT_OUTCOME_LATCHED
-  }
-  console.error(
-    `[slack] reconnectSession: ${ref} reads working and its pane has shown a prompt or dialog for ${seconds}s — blocked on it; not typing into it, deferring /mcp reconnect to a later tick (answer it in tmux session "${personaTmuxSessionName(key)}") (b.f2b)`,
-  )
-  // The restart path runs only with auto-restart on: `scheduleRestart` arms
-  // nothing while `session_restart_delay` is 0.
-  if (!options.noNotice) notifyPersonaNotConnected(key, { reason: 'blocked-on-prompt', autoRestartDisabled: false })
-  return 'defer'
-}
-
-/** `checkWorkingRowPane`'s line for a read that gave no evidence and ended the run (b.f2b). */
-function logNoWorkingRowEvidence(ref: string, reading: WorkingPaneReading, transcript: TranscriptReading | undefined): void {
-  if (reading === 'busy') {
-    console.error(`[slack] reconnectSession: ${ref} is working — deferring /mcp reconnect to a later tick (b.9a7/b.rmy)`)
-  } else if (reading === 'blank') {
-    console.error(`[slack] reconnectSession: ${ref} is working and its pane is blank — no idle evidence; deferring /mcp reconnect to a later tick (b.f2b)`)
-  } else {
-    console.error(
-      `[slack] reconnectSession: ${ref} is working and its pane shows an idle screen, but ${transcriptNoEvidence(transcript) ?? 'its transcript was not read'} — no idle evidence; deferring /mcp reconnect to a later tick (b.f2b/b.rmy)`,
-    )
-  }
-}
-
-/**
- * b.f2b, b.jg5 SRJ-604 — the restart path's check of a persona whose row
- * reads `waiting`, before the reconnect adapter types `/mcp reconnect`: one
- * `read-pane` of the row through the shared reader (`readWorkingPane`, the
- * full read, the row state `waiting`), answered by b.jg5 SRJ-117's
- * waiting-row column:
- * - a pane: a running turn (`busy`) defers; so does a prompt or dialog, which
- *   is never typed into and raises the `blocked-on-prompt` not-connected
- *   notice (once per episode); otherwise `reconnect`. The pane may be a
- *   single leftover's (b.jg5 SRJ-117, SRJ-613), so it is no proof the
- *   worker's own session is there: the reconnect's own `send-keys`
- *   (`reconnectMcpWithCause`) is the backstop. On a live row that is not
- *   `pending` it answers CONFLICT "not this launch's session" when a
- *   leftover holds the persona's session; then nothing is typed, P latches
- *   (b.jg5 SRJ-501) with its CONFLICT notice posted once, the refused
- *   `send-keys` is never retried (SRJ-118) and the adapter answers
- *   'transient';
- * - GONE (`ErrTmuxCaptureFailed`): `gone`; the adapter sweeps and escalates,
- *   typing nothing;
- * - the row absent (`ErrSpawnNotFound`): `absent`, which the adapter
- *   handles as GONE without dead evidence (b.jg5 SRJ-117);
- * - CONFLICT or UNUSABLE NAME (the reader latched the persona with the row
- *   state `waiting`, b.jg5 SRJ-501, SRJ-512), or a persona already latched,
- *   which the reader does not read: `defer`, with no notice, so nothing is
- *   typed (b.jg5 SRJ-502);
- * - ENVIRONMENT (`ErrTmuxNotAvailable`; the wrapper raised the
- *   `tmux-unavailable` outage, b.jg5 SRJ-311): `defer`, nothing typed;
- * - an UNCLASSIFIED carrying the stop mark (`stopping`: the reader's
- *   `ErrInvalidFlags` re-check decided that the server stops, b.jg5
- *   SRJ-205): `defer`, nothing typed and nothing more called;
- * - UNAVAILABLE (timeouts included), CONFIG (the wrapper raised the
- *   `ad-config-malformed` outage, b.jg5 SRJ-316) and any other
- *   UNCLASSIFIED: `reconnect` on the `waiting` row alone, agent-director's
- *   own idle signal, with one line naming the class.
- * `latchedNow` (the adapter's latched gate, b.jg5 SRJ-502) is asked right
- * before the `blocked-on-prompt` notice: a persona that latched meanwhile
- * gets no notice and `defer`. Logs one line for each answer but a plain
- * `reconnect`; never throws.
- */
-export async function checkWaitingRowPane(key: string, latchedNow?: () => boolean, options: { noNotice?: boolean } = {}): Promise<WaitingRowPaneVerdict> {
-  const ref = keyRef(key)
-  // The adapter called this for a row it has just read `waiting`.
-  const read = await readWorkingPane(key, latchRowStateRead('waiting'))
-  switch (read.kind) {
-    case PANE_READ_PANE:
-      return waitingRowPaneJudgement(key, ref, read.pane, latchedNow, options.noNotice)
-    case PANE_READ_LATCHED:
-      console.error(`[slack] reconnectSession: ${ref} is waiting and is latched — deferring; nothing typed (b.jg5 SRJ-502)`)
-      return 'defer'
-    case PANE_READ_GONE:
-      console.error(waitingRowPaneGoneLine(key, read))
-      return WAITING_ROW_PANE_GONE
-    case PANE_READ_ABSENT:
-      console.error(waitingRowAbsentAtPaneReadLine(key, read))
-      return WAITING_ROW_PANE_ABSENT
-    case PANE_READ_ENVIRONMENT:
-      console.error(
-        `[slack] reconnectSession: ${ref} is waiting and reading its pane failed: ${read.description} — tmux is not available; not typing /mcp reconnect, deferring to a later tick (${paneReadClassNote(read)}; b.jg5 SRJ-117, SRJ-311)`,
-      )
-      return 'defer'
-    case PANE_READ_UNCLASSIFIED:
-      if (read.stopping === true) {
-        console.error(
-          `[slack] reconnectSession: ${ref} is waiting and reading its pane failed: ${read.description} — the agent-director version re-check decided that the server stops; not typing /mcp reconnect, nothing more is called for it (${paneReadClassNote(read)}; b.jg5 SRJ-204, SRJ-205)`,
-        )
-        return 'defer'
-      }
-      return reconnectOnWaitingRowAlone(ref, read)
-    case PANE_READ_UNAVAILABLE:
-    case PANE_READ_CONFIG:
-      return reconnectOnWaitingRowAlone(ref, read)
-  }
-}
-
-/** `checkWaitingRowPane`'s `reconnect` on the `waiting` row alone after a failed pane read, with its one line (b.f2b, b.jg5 SRJ-604). */
-function reconnectOnWaitingRowAlone(ref: string, read: PaneReadFailure): 'reconnect' {
-  console.error(
-    `[slack] reconnectSession: ${ref} is waiting and reading its pane failed: ${read.description} — reconnecting on the waiting row alone (${paneReadClassNote(read)}; b.f2b, b.jg5 SRJ-604)`,
-  )
-  return 'reconnect'
-}
-
-/**
- * `checkWaitingRowPane`'s judgement of the `pane` it read (b.f2b): a running
- * turn defers; a prompt or dialog defers and raises the `blocked-on-prompt`
- * notice, unless `latchedNow` finds the persona latched right before it
- * (b.jg5 SRJ-502: no notice); anything else is `reconnect`.
- */
-function waitingRowPaneJudgement(
-  key: string,
-  ref: string,
-  pane: string,
-  latchedNow: (() => boolean) | undefined,
-  noNotice = false,
-): WorkingRowPaneVerdict {
-  const reading = classifyWorkingPane(pane)
-  if (reading === 'busy') {
-    console.error(`[slack] reconnectSession: ${ref} is waiting but its pane shows a running turn — deferring /mcp reconnect to a later tick (b.f2b/b.rmy)`)
-    return 'defer'
-  }
-  if (reading === 'prompt') {
-    deliveryLifecycle?.defer(key, 'menu')
-    // b.jg5 SRJ-502: asked right before the notice; the gate logs its line.
-    if (latchedNow?.() === true) return 'defer'
-    console.error(
-      `[slack] reconnectSession: ${ref} is waiting but its pane shows a prompt or dialog — not typing into it; deferring /mcp reconnect to a later tick (answer it in tmux session "${personaTmuxSessionName(key)}") (b.f2b/b.rmy)`,
-    )
-    if (!noNotice) notifyPersonaNotConnected(key, { reason: 'blocked-on-prompt', autoRestartDisabled: false })
-    return 'defer'
-  }
-  return 'reconnect'
-}
-
-/**
- * b.f2b: true while the restart path holds an idle run for persona `key`'s
- * `working` row that has not yet concluded: one more reconnect attempt can
- * find the row stale and reconnect it. The health check then schedules that
- * attempt the first tick it finds the persona undeliverable, rather than
- * after two. A prompt run does not count: CSCB cannot recover that persona
- * until someone answers the prompt.
- */
-export function hasPendingWorkingRowEvidence(key: string): boolean {
-  return workingRowPaneRuns.get(key)?.reading === 'idle'
-}
-
-/**
- * b.f2b: forget the restart path's evidence for persona `key`'s `working` row
- * (a reconnect attempt found the row in another state or couldn't read it, so
- * the next `working` reading starts afresh). Silent; other personas are
- * untouched.
- */
-export function forgetWorkingRowEvidence(key: string): void {
-  workingRowPaneRuns.delete(key)
 }
 
 // ---------------------------------------------------------------------------
@@ -6710,13 +4139,7 @@ function describeWaitSpan(ms: number): string {
  */
 export const PROMPT_ROW_STATES: ReadonlySet<string> = new Set(['ask_user', 'check_permission'])
 
-/**
- * The not-connected notice for a wait that ended with its session alive and
- * its row in `state` while auto-restart is disabled (b.f2b):
- * `blocked-on-prompt` for `ask_user` or `check_permission` (a prompt is why
- * nothing reconnects it), else `auto-restart-disabled` with `cause`. (The
- * timeout words a `working` row's as `unproven-idle` itself.)
- */
+
 function waitEndedNotice(state: string, cause: string): NotConnectedNotice {
   return PROMPT_ROW_STATES.has(state)
     ? { reason: 'blocked-on-prompt', autoRestartDisabled: true }
@@ -6749,30 +4172,16 @@ export function waitEndedOnStateReport(ref: string, state: string): WaitEndedRep
   }
 }
 
-/**
- * The report of a wait whose timeout read found the row in `state`, a live
- * state other than `waiting` (b.f2b), `timeoutMs` after it started; the
- * health check's `working`-row report comes after `unprovenIdleAfterMs` of
- * holding back. A `working` row's notice is `unproven-idle`, held for
- * `heldMs` (required for it); any other state's is `waitEndedNotice`'s.
- */
+
 export function waitTimedOutLiveReport(
   ref: string,
   timeoutMs: number,
-  unprovenIdleAfterMs: number,
   state: string,
-  heldMs?: number,
 ): WaitEndedReport {
   return {
-    logHead: `[slack] reconnect: gave up waiting for ${ref} after ${timeoutMs}ms — claude process state=${state} (alive)`,
-    enabledFollowUp: `the health check schedules a reconnect once it has seen the persona disconnected on two ticks; for a working row it types /mcp reconnect only once its pane has shown the same idle screen and its transcript has ended with a completed turn, both unchanged, across attempts, and never into a prompt, and it reports the persona once CSCB has held back from the row for ${describeWaitSpan(unprovenIdleAfterMs)} (b.9a7/b.rmy/b.f2b)`,
-    notice:
-      state === 'working'
-        ? { reason: 'unproven-idle', autoRestartDisabled: true, heldMs: heldMs ?? 0 }
-        : waitEndedNotice(
-            state,
-            `its agent-director row still read ${state} ${describeWaitSpan(timeoutMs)} after launch, and CSCB found no proof it was idle`,
-          ),
+    logHead: `[slack] reconnect: gave up waiting for ${ref} after ${timeoutMs}ms — agent-director state=${state} (alive)`,
+    enabledFollowUp: 'the health check schedules a reconnect after two disconnected ticks; AD row state and key refusals decide when it proceeds',
+    notice: waitEndedNotice(state, `its agent-director row still read ${state} ${describeWaitSpan(timeoutMs)} after launch`),
   }
 }
 
@@ -8551,131 +5960,7 @@ export function promptRowLadderLatchedLine(ref: string, state: string): string {
   return `[slack] spawnForPersona: ${ref} reads ${state} and is latched — no action; nothing typed and nothing more is called for it (b.jg5 SRJ-502)`
 }
 
-/**
- * Poll `status({instance_id})` until the spawn transitions to
- * `waiting`, then call reconnectMcp. Transitions to live transient states
- * (ask_user, check_permission, pending) return 'not-reconnected' (b.f2b;
- * 'ok' before); recovery is then the health-check tick's job — post-b.9a7 the
- * tick observes the row as alive && !connected and routes it through
- * scheduleRestart -> reconnect. 'ok' now always means `/mcp reconnect` was
- * typed.
- *
- * b.f2b — a stale `working` row. agent-director can leave a row `working`
- * after the turn ended, so while the row reads `working` the wait also reads
- * its evidence, every `WORKING_ROW_READ_INTERVAL_MS` (`staleWorkingRowIsIdle`):
- * the persona's pane and, when that shows an idle screen, the session's
- * transcript. The row is stale only on the positive-idle rule
- * (`foldWorkingPaneRun`): for the whole `STALE_WORKING_WINDOW_MS`, every read
- * showed the same idle screen (no spinner, busy hint, API retry row, prompt
- * or dialog) AND the same transcript, unchanged, ending with a completed turn.
- * Then it reconnects, as the `waiting` branch does. A live turn never ends its
- * transcript with a completed turn, an API retry or stall included (which can
- * hide the spinner and hold the screen still), so it is never taken for idle
- * and never typed into (the b.rmy invariant). A transcript that can't be
- * located or read is no evidence. A pane that shows a prompt or dialog for
- * the window is never typed into either: the wait goes on, and the prompt is
- * logged and reported through the not-connected notice, once. The reconnect
- * is part of the launch, not an auto-restart, so it runs whatever
- * `session_restart_delay` is, like the `waiting` branch's. Each poll that
- * reads the row `working` and doesn't reconnect it is one more deferral in
- * the persona's run on the row (`noteWorkingRowDeferral`), and so is the
- * timeout on a `working` row: once the run has lasted
- * `UNPROVEN_IDLE_NOTICE_AFTER_MS`, the `unproven-idle` notice is raised, at
- * any restart delay (once per episode). Any other state ends the run.
- *
- * b.f2b — every wait that ends without reconnecting a live session (a live
- * transient state at the poll; at the timeout, a live row or a failed
- * `status` read) returns 'not-reconnected' and says what happens next for
- * the restart delay in effect: with `session_restart_delay` 0 nothing will
- * reconnect the persona, so the not-connected notice is raised (once per
- * episode) instead of claiming the health check will
- * (`reportWaitEndedDisconnected`, its line and notice built by
- * `waitEndedOnStateReport`, `waitTimedOutLiveReport` and
- * `waitTimedOutUnreadReport`): the `blocked-on-prompt` notice when the row
- * ended at `ask_user` or `check_permission`, `unproven-idle` when the timeout
- * finds it `working`, the `auto-restart-disabled` one otherwise.
- *
- * b.f2b — a teardown cancels the wait (`cancelWorkingRowWait`). The wait
- * checks after each agent-director call and wakes from its poll sleep at
- * once, types nothing once cancelled, and returns 'cancelled'.
- *
- * b.jg5 SRJ-502 — the wait asks whether its persona is latched at the same
- * points, after each agent-director call it makes (its `find-missing` runs,
- * `status` polls, pane reads and transcript `get`s): a latch its transcript
- * `get` set (a `provenance_conflict` note, b.jg5 SRJ-114), one a `find-missing`
- * run's post-run `get` set (b.jg5 SRJ-120), or one set elsewhere ends it
- * with 'latched', one line, no further call, nothing typed and no
- * not-connected notice. A cancelled wait still answers 'cancelled'.
- *
- * b.ecw, b.jg5 SRJ-605 — every terminal branch keys on agent-director's row
- * for the claude process; the wait makes no tmux probe. Where it answers
- * 'dead-session', the recovery's resume or spawn (`resumeOrFreshSpawn`)
- * decides what holds the persona's name: agent-director classifies any
- * leftover session, and a CONFLICT there latches the persona (b.jg5
- * SRJ-501). Each 'dead-session' end carries one cause
- * (`waitForWaitingAndReconnectWithCause`, `WaitDeadSession`, b.jg5
- * SRJ-611): only the reconnect's `tmux-gone` is dead evidence; a
- * 'dead-session' from a row read or from a refusal as not interactive is
- * not.
- *   - ended/missing branch: `ended` means SessionEnd fired; `missing` after
- *     the up-front sweep is agent-director's sweep verdict on the row. One
- *     line (`waitRowFinishedLine`), then 'dead-session' directly, cause
- *     `row-read-finished` with the state read.
- *   - timeout branch: a FRESH findMissing sweep (the 10s memo has long
- *     expired at the 10-minute deadline) + one status call. A `waiting` row
- *     is reconnected (b.f2b); a process mid-long-turn is left alive,
- *     'not-reconnected' (the b.rmy/b.3ce long-turn guard); only a row that
- *     reads `ended` or `missing` (cause `row-read-finished`), or is absent,
- *     returns 'dead-session'.
- *   - an absent row (`ErrSpawnNotFound`), at the poll or the timeout
- *     `status`: one line (`waitRowAbsentLine`), then 'dead-session', cause
- *     `row-absent`.
- *   - any other `status` error (UNAVAILABLE, a timeout, ENVIRONMENT, CONFIG,
- *     UNCLASSIFIED, `ErrSystemInstallDisappeared` included; b.jg5 SRJ-605):
- *     never 'dead-session', 'transient' or a refusal. At the poll the wait goes
- *     on to its next poll with no post, logging its first failed read and
- *     again only when the class changes; at the timeout it ends
- *     'not-reconnected' through `reportWaitEndedDisconnected`. The wrapper
- *     raised the error's outage (`ad-unreachable`, `tmux-unavailable`,
- *     `ad-config-malformed`), armed the persona's retry timer and reported
- *     an UNCLASSIFIED answer to its episode, as at any row read in a launch
- *     attempt (b.jg5 SRJ-105, SRJ-301), so the launch's result follows the
- *     wait's outcome.
- *   - an UNUSABLE NAME answer (b.jg5 SRJ-105, SRJ-512), or the persona's own
- *     row reading `pending` with no launch start (b.jg5 SRJ-513), at the
- *     poll or the timeout `status` (both through `readPersonaOwnRowStatus`),
- *     or an UNUSABLE NAME at a pane read or transcript `get` of the evidence
- *     read: the persona latches and the wait ends 'latched', with nothing
- *     typed, no not-connected notice and never 'dead-session'. A `status`
- *     answer records what it read (`wait.lastRead`); a pane read records the
- *     wait's last read; a transcript `get` that read a row, or no row,
- *     becomes the wait's last read (b.jg5 SRJ-501).
- *   - a CONFLICT at the evidence read's pane read (b.jg5 SRJ-608): the
- *     shared reader latches the persona with the refused operation "P's next
- *     check or recovery" and the wait's last read, and the wait ends
- *     'latched' at once, with no further call and nothing typed. Every other
- *     failed pane read (GONE, an absent row, UNAVAILABLE, ENVIRONMENT, CONFIG,
- *     UNCLASSIFIED) is no evidence and the wait goes on.
- *   - an UNCLASSIFIED at the evidence read's pane read carrying the stop mark
- *     (`stopping`: the shared reader's `ErrInvalidFlags` re-check decided
- *     that the server stops, b.jg5 SRJ-205): one line, then 'transient' with
- *     the stop noted on the wait, no further call and nothing typed; the
- *     ladder answers a `failed` result marked `stopping`, as for a resume's
- *     re-check stop.
- *   - a refused findMissing sweep (b.jg5 SRJ-105), up front or at the
- *     timeout: its refusal line, then 'transient' with no status read.
- *   - the reconnect (`reconnectMcpWithCause`, made on a row read `waiting`,
- *     at the poll or the timeout, or on a stale `working` row, with that row
- *     state as its last read): its outcome is the wait's, unchanged (b.jg5
- *     SRJ-118), a 'dead-session' with the reconnect's cause (`tmux-gone`,
- *     `row-not-interactive` or `row-absent`). A `transient` reconnect that
- *     latched the persona, or found it latched, is noted on the wait so the
- *     ladder answers `latched`; one
- *     whose `ErrInvalidFlags` re-check decided the stop is noted as a stop.
- *     It is never retried.
- * Outcome only: it answers a bare 'dead-session' with no cause; a caller
- * that needs the cause uses `waitForWaitingAndReconnectWithCause`.
- */
+
 export async function waitForWaitingAndReconnect(
   key: string,
   config: PersonaConfig,
@@ -8720,8 +6005,8 @@ export async function waitForWaitingAndReconnectWithCause(
  * `dead-session` with the reconnect's cause (b.jg5 SRJ-611), and noting on
  * `wait` a `transient` one's latch or stop.
  */
-async function reconnectInWait(key: string, ref: string, wait: WorkingRowWait, lastRead: LatchRowState, workingChecked?: { launchId: string | undefined }): Promise<WaitEnd> {
-  const result = await reconnectMcpWithCause(key, lastRead, ref, { workingChecked })
+async function reconnectInWait(key: string, ref: string, wait: WorkingRowWait, lastRead: LatchRowState): Promise<WaitEnd> {
+  const result = await reconnectMcpWithCause(key, lastRead, ref)
   if (result.outcome === 'dead-session') return { outcome: 'dead-session', deadCause: result.deadCause }
   if (result.outcome === 'transient') {
     if (result.latched) wait.latched = true
@@ -8758,13 +6043,7 @@ async function waitForWorkingRow(
   const deadline = waitStartedAt + _waitForWaitingTimeoutMs
   /** The class of the poll's last logged `status` error (b.jg5 SRJ-605); undefined before the first. */
   let loggedStatusErrorClass: AdErrorClass | undefined
-  const paneWatch: WorkingPaneWatch = {
-    run: undefined,
-    lastReadAt: undefined,
-    readFailureLogged: false,
-    transcriptNote: undefined,
-    promptReported: false,
-  }
+
 
   // b.m4r: a bot killed mid-turn never fires SessionEnd, so its AD row freezes
   // at `working`. Without a reconcile, the poll below spins on `status` for the
@@ -8841,38 +6120,12 @@ async function waitForWorkingRow(
       continue
     }
     // b.f2b: a run of deferrals on the `working` row ends with any other state.
-    if (state !== 'working') endWorkingRowDeferral(key)
 
     if (state === 'waiting') {
       return reconnectInWait(key, ref, wait, latchRowStateRead(state))
     }
 
     if (state === 'working') {
-      // b.f2b: a stale row — the positive-idle rule held for the whole window
-      // (the same idle screen and the same ended, unchanged transcript) — is
-      // reconnected like a `waiting` one.
-      const workingChecked = { launchId: deliveryLifecycle?.launchId(key) }
-      const stale = await staleWorkingRowIsIdle(key, ref, config, paneWatch, wait)
-      // b.jg5 SRJ-608: the evidence read latched P (a pane read's CONFLICT
-      // or UNUSABLE NAME): `latched` at once, nothing more called or typed.
-      if (stale === WAIT_OUTCOME_LATCHED) return endWait(ref, wait)
-      // b.jg5 SRJ-205: the pane read's version re-check decided the stop.
-      if (stale === WORKING_EVIDENCE_STOPPING) {
-        wait.stopping = true
-        return 'transient'
-      }
-      // b.jg5 SRJ-502: the after-call check — a latch set elsewhere, or a
-      // cancel, ends the wait.
-      if (waitMustEnd(key, wait)) return endWait(ref, wait)
-      if (stale) {
-        endWorkingRowDeferral(key)
-        // Reuse this wait's completed idle window only for the same launch.
-        // The reconnect still reads its own fresh row and delivery screen.
-        return reconnectInWait(key, ref, wait, latchRowStateRead(state), workingChecked)
-      }
-      // b.f2b: held back again; a run that has lasted
-      // UNPROVEN_IDLE_NOTICE_AFTER_MS raises the unproven-idle notice.
-      noteWorkingRowDeferral(key, config.session_restart_delay === 0)
       await sleepUnlessCancelled(wait, pollIntervalMs)
       continue
     }
@@ -8957,7 +6210,6 @@ async function waitForWorkingRow(
   wait.lastRead = latchRowStateRead(timeoutState)
   if (waitMustEnd(key, wait)) return endWait(ref, wait)
 
-  if (timeoutState !== 'working') endWorkingRowDeferral(key)
   if (timeoutState === 'ended' || timeoutState === 'missing') {
     console.error(waitRowFinishedLine(ref, timeoutState, _waitForWaitingTimeoutMs))
     return { outcome: 'dead-session', deadCause: DEAD_SESSION_CAUSE_ROW_READ_FINISHED, finishedState: timeoutState }
@@ -8967,22 +6219,11 @@ async function waitForWorkingRow(
   // b.f2b: a `working` row given up on is one more deferral: a run that has
   // lasted UNPROVEN_IDLE_NOTICE_AFTER_MS raises the unproven-idle notice, at
   // any restart delay.
-  let heldMs: number | undefined
-  if (timeoutState === 'working') {
-    heldMs = _now() - (workingRowDeferredSince.get(key) ?? waitStartedAt)
-    noteWorkingRowDeferral(key, config.session_restart_delay === 0)
-  }
-  // b.f2b: say what actually happens next for the restart delay in effect.
-  // With auto-restart on, the health check schedules the reconnect, whose
-  // adapter types `/mcp reconnect` into a `working` row only on the
-  // positive-idle rule across attempts, and never into a prompt
-  // (b.9a7/b.rmy); with `session_restart_delay` 0 nothing reconnects it, so
-  // the not-connected notice is raised (once per episode: not again after a
-  // prompt or unproven-idle report).
+
   return reportWaitEndedDisconnected(
     key,
     config,
-    waitTimedOutLiveReport(ref, _waitForWaitingTimeoutMs, _unprovenIdleNoticeAfterMs, timeoutState, heldMs),
+    waitTimedOutLiveReport(ref, _waitForWaitingTimeoutMs, timeoutState),
   )
 }
 
@@ -8990,17 +6231,7 @@ async function waitForWorkingRow(
 // spawnForPersona — SR-1.4 collision-then-act dispatcher
 // ---------------------------------------------------------------------------
 
-/**
- * The launch result action of a reuse spawn that succeeded for a key the
- * installed retired-key store has recorded (b.jg5 SRJ-806, SRJ-112's success
- * row): the "new life has begun" mark is set, and the persona is up on a new
- * life that resumed nothing. A success like `spawned`: every consumer that
- * reads `spawned` as a launched new life reads it the same
- * (`launchSession` maps it to true, the live-row sequence's launch counts it
- * as a success, the after-launch step has started the dialog approver). The
- * start summary counts it in `succeeded` and in its own `freshRetired`
- * count, never in `freshSpawned` (b.jg5 SRJ-1015).
- */
+
 export const SPAWN_ACTION_FRESH_RETIRED = 'fresh-retired'
 
 /**
@@ -10259,48 +7490,7 @@ export interface PlainSpawnSite<R> {
   readonly collided: (err: unknown) => Promise<R>
 }
 
-/**
- * The one plain-spawn outcome handler (b.jg5 SRJ-111): one plain spawn of
- * persona `site.persona`'s `cscb_<key>` from `site.params`, its outcome
- * decided by class (`src/ad-error-class.ts`), never by an error's name.
- * Used at every plain-spawn site: the collision ladder's first spawn, its
- * retry spawn after the collision `get` answered `ErrSpawnNotFound`, and the
- * spawn after `resume`'s `ErrSpawnNotFound` at both `resume` sites
- * (`resumeOrFreshSpawn` and the live-row sequence's launch entry, through
- * `plainSpawnAfterResumeNotFound`). agent-director's pre-spawn scan runs
- * inside the spawn and writes nothing when it refuses (HO rev 15): no row
- * exists afterwards. A spawn whose session-creating call meets "duplicate
- * session" ends its new row (`ended`), which a leftover's hooks never
- * revive, unless agent-director's end write was not applied, which leaves it
- * `pending` (HO rev 15, rev 17). A fresh spawn whose launch failed otherwise
- * (`ErrTmuxSessionCreate`) leaves a `pending` row that is never CSCB's own
- * launch, waited out by the pending-row rule, never killed (b.jg5 SRJ-713,
- * SRJ-410). A row whose create reply was lost and whose worker then exited
- * is counted gone by agent-director's `find-missing` once no pane carries
- * its launch's per-pane label, and is marked `missing` past G (HO rev 18).
- *
- * The installed reply-guard steps run immediately before the call (b.av2
- * SR-9.4), and the call records its window (`launchCallWithWindow`, b.jg5
- * SRJ-407). Then:
- *   - success: the site's line, the after-launch step
- *     (`afterLaunchSucceeded`: the dialog approver on the persona's `pending`
- *     row, the pending-only arm of its retry timer, the `pre_trust` line;
- *     SRJ-401, SRJ-301, SRJ-413), and `spawned`;
- *   - `ErrInstanceIdCollision` (by class): nothing was launched, so the
- *     reply-guard steps are undone (restored while still the step's own),
- *     and the site's collision row (`site.collided`) answers: nothing is
- *     counted, and no spawn-failure notice is posted (SRJ-713);
- *   - any other value: the plain spawn's failure by class
- *     (`plainSpawnFailedAt`): CONFLICT and UNUSABLE NAME latch, a launch
- *     timeout and every other UNAVAILABLE outcome are followed by the one
- *     `get`, ENVIRONMENT, CONFIG and UNCLASSIFIED are refusals,
- *     `ErrTmuxSessionCreate` is one counted launch failure with no kill,
- *     DIRECTORY answers `failed` (marked `countedClass` where the site asks,
- *     `site.marksDirectoryCounted`), and `ErrInvalidFlags` gets one
- *     immediate version re-check, then UNCLASSIFIED.
- * The handler makes one launch call and never a second one after a refusal;
- * nothing here deletes, kills or sets `include_finished`. Never throws.
- */
+
 export async function plainSpawnOutcomeAt<R>(site: PlainSpawnSite<R>): Promise<SpawnPersonaResult | R> {
   const { persona, isStartup, ref, params } = site
   const { key } = persona
@@ -10325,7 +7515,6 @@ export async function plainSpawnOutcomeAt<R>(site: PlainSpawnSite<R>): Promise<S
   }
   console.error(site.spawnedLine(launched))
   // b.jg5 SRJ-506: a latch re-check's retry that was not refused clears the
-  // latch before the after-launch step, so its approver runs unlatched.
   clearLatchBeforeOutcome(key)
   afterLaunchSucceeded(key, isStartup, ref, LAUNCH_VERB_SPAWN, launched)
   return { key, action: 'spawned' }
@@ -11779,43 +8968,7 @@ interface ResumeSite<R> {
   readonly plainSpawnCollided: (err: unknown) => Promise<R>
 }
 
-/**
- * The one `resume` outcome handler (b.jg5 SRJ-113), used by both `resume`
- * sites: `resumeOrFreshSpawn` and the live-row sequence's launch entry's
- * `resume` leg (`launchForLiveRowSequence`). One `resume` of persona
- * `site.persona`'s `cscb_<key>` through the ladder's launch helper
- * (`launchWithReplyGuard`: the reply guard, spawn detection, arming by
- * class), its outcome decided by class, never by an error's name:
- *   - success: one line, the after-launch step (`afterLaunchSucceeded`: the
- *     `pre_trust` line and the dialog approver on the row, which reads
- *     `pending` until its session reports in, b.jg5 SRJ-402, and the record
- *     of the resumed launch, counted once its row reports in or ends before
- *     it does, b.4q8), `resumed`;
- *   - `ErrNoSessionId`, `ErrJsonlNeverWritten`, `ErrJsonlMissing`: the
- *     site's no-transcript row (`site.noTranscript`, SRJ-707, SRJ-712);
- *   - `ErrSpawnNotResumable`: the site's not-resumable step
- *     (`site.notResumable`, SRJ-710);
- *   - `ErrSpawnNotFound`: the site told (`site.resumeNotFound`), then one
- *     plain spawn of the same id
- *     (`plainSpawnAfterResumeNotFound`, SRJ-111) through the one plain-spawn
- *     outcome handler, with no spawn-failure notice for the
- *     `ErrSpawnNotFound` itself; its collision takes the site's row
- *     (`site.plainSpawnCollided`);
- *   - any other outcome: `resumeFailedAt` (CONFLICT latches with the refused
- *     operation "resume" and `site.lastRead`, never a kill; UNAVAILABLE,
- *     ENVIRONMENT, CONFIG and UNCLASSIFIED take the refusal rows, an
- *     UNAVAILABLE one followed by the one `get` and its decision
- *     (`afterLaunchUnavailable`, b.jg5 SRJ-407); UNUSABLE
- *     NAME latches; `ErrTmuxSessionCreate` is one counted launch failure
- *     that arms the retry timer at once in pending-only mode; the DIRECTORY
- *     errors give `cwd-unreachable`, counted; `ErrInvalidFlags` takes the
- *     version re-check, then UNCLASSIFIED; an `ErrInstanceIdCollision`,
- *     which agent-director's `resume` does not answer, arms the collision
- *     cause and answers `retrying`, never the spawn-failure notice,
- *     `resumeCollisionAt`). Nothing assumes the row was
- *     restored after a failed `resume` (HO rev 28): a later read decides.
- * Nothing here deletes, kills or sets `include_finished`. Never throws.
- */
+
 async function resumeAtSite<R>(site: ResumeSite<R>): Promise<SpawnPersonaResult | R> {
   const { persona, isStartup, ref, lastRead, head } = site
   const { key } = persona
@@ -11825,11 +8978,9 @@ async function resumeAtSite<R>(site: ResumeSite<R>): Promise<SpawnPersonaResult 
     )
     console.error(`${head} resumed ${ref}`)
     // b.jg5 SRJ-506: a latch re-check's retry that was not refused clears the
-    // latch before the after-launch step, so its approver runs unlatched.
     clearLatchBeforeOutcome(key)
     // A resumed bot faces the same startup dialogs as a fresh one. Its row
     // reads `pending` from the resume until its session reports in (HO C5),
-    // so the approver clears the dialog through agent-director, as after a
     // spawn (b.jg5 SRJ-402).
     afterLaunchSucceeded(key, isStartup, ref, LAUNCH_VERB_RESUME, launched)
     return { key, action: 'resumed' }
@@ -11929,30 +9080,7 @@ function noteLaunchForResumeCount(key: string, verb: LaunchVerb): void {
   resumesEndedUnreported.delete(key)
 }
 
-/**
- * Run `kill`, one of CSCB's own kills of persona `key`'s row (its bounded
- * retry: the restart path's, the stuck-launch abort's and the live-row
- * sequence's, `retryPersonaKill`; an old-life wait's of a persona's own
- * `cscb_<key>` row), with the persona's resumed launch held out of the
- * resumed-launch rule (b.4q8). Such a kill ends the launch, which is not a
- * failed resume, as the teardown's kill does not fail one
- * (`forgetLaunchCalls`):
- *   - a record not settled yet is held while the kill runs, so no read in the
- *     meantime (a read between the kill's tries, the health tick's, an
- *     approver's lap) settles it as ended; a read of the row reported in
- *     still settles it so;
- *   - once the kill ended the launch (a success form, `killLetsNextStepRun`),
- *     a record still held and still unsettled is forgotten with nothing
- *     counted, so the reads after the kill (the live-row sequence's) settle
- *     nothing either;
- *   - a kill that did not end it (try-later, stopped, `ErrTmuxKillFailed`,
- *     latched) leaves the record as it was, so the launch is still counted
- *     when a later read settles it.
- * A record settled before the kill, and a record a new launch set during it,
- * are left alone. The persona's run of resumes that ended before reporting in
- * is neither reset nor grown by the kill. Answers `kill`'s answer; never
- * throws more than `kill` does.
- */
+
 async function withResumeHeldForOwnKill<R extends { readonly outcome: unknown }>(key: string, kill: () => Promise<R>): Promise<R> {
   const held = unreportedResumes.get(key)
   if (held === undefined || held.reportedIn !== undefined) return kill()
@@ -12041,29 +9169,7 @@ export function resumeEndedUnreportedLine(at: OwnRowReadSite, ref: string, state
   )
 }
 
-/**
- * The resumed-launch rule (b.4q8), applied by the shared own-row reads
- * (`readPersonaOwnRow`'s `get`, and the own-row `status` step,
- * `applyOwnRowStatusStep`, which every own-row `status` goes through: the
- * approver's laps, the retry's row read, the liveness and reconnect
- * adapters, the live-row sequence's reads) to persona `key`'s row. On the
- * read's answer:
- *   - a live state other than `pending`: the row reported in, so the
- *     persona's run of resumes that ended before reporting in is forgotten,
- *     and its resumed launch waiting on the row settles as reported in;
- *   - `ended`, `missing` or no row (`ErrSpawnNotFound`): its resumed launch
- *     waiting on the row settles as ended before reporting in, the run grows
- *     by one, and one line is logged (`resumeEndedUnreportedLine`);
- *   - `pending`, a state CSCB does not know and any other failed read:
- *     nothing.
- * While CSCB's own kill of the row runs (`withResumeHeldForOwnKill`), a
- * finished row or no row settles nothing: the run is not grown and no line
- * is logged.
- * A record handed over already is counted at once (`countSettledResume`);
- * any other is kept, settled, for its hand-over (`countResumeWhenSettled`).
- * A record settled already is left as it is. What the read answers never
- * changes. Never throws.
- */
+
 function settleResumeOnRead(key: string, answer: { readonly state: unknown } | { readonly thrown: unknown }, at: OwnRowReadSite): void {
   try {
     let state: string
@@ -12498,27 +9604,12 @@ const PENDING_ROW_UNDECIDED_WHY: Readonly<Record<PendingRowUndecidedReason, stri
   [PENDING_ROW_REASON_CONFIG_DIR_UNRESOLVED]: 'its claude_config_dir cannot be resolved now',
 }
 
-/**
- * The one line for a `pending` row that is not covered, sent to the live-row
- * sequence (b.jg5 SRJ-411), naming the persona reference `ref` and the
- * reason:
- *
- *   [slack] pending-row: <ref>'s pending row is not covered (<reason>: <why>) — it goes through the live-row sequence, the conversation not kept (alert context recovery); no approver, nothing typed (b.jg5 SRJ-411)
- *
- * Pure.
- */
+
 export function uncoveredPendingRowLine(ref: string, reason: PendingRowNotCoveredReason): string {
   return `${PENDING_ROW_STEP_LOG_PREFIX} ${ref}'s pending row is not covered (${reason}: ${pendingRowNotCoveredWhy(reason)}) — it goes through the live-row sequence, the conversation not kept (alert context ${KILL_FAILURE_CONTEXT_RECOVERY}); no approver, nothing typed (b.jg5 SRJ-411)`
 }
 
-/**
- * The one line for a `pending` row whose cover is undecided (b.jg5 SRJ-409;
- * b.av2 SR-6.4, b.g57), with whether its timer was asked to arm:
- *
- *   [slack] pending-row: <ref>'s pending row is undecided (<reason>: <why>) — no approver, no sequence; its retry timer is armed in pending-only mode, and the next read decides again (b.jg5 SRJ-409)
- *
- * Pure.
- */
+
 export function undecidedPendingRowLine(ref: string, reason: PendingRowUndecidedReason, armed: boolean): string {
   const timer = armed ? 'its retry timer is armed in pending-only mode' : 'its retry timer could not be armed'
   return `${PENDING_ROW_STEP_LOG_PREFIX} ${ref}'s pending row is undecided (${reason}: ${PENDING_ROW_UNDECIDED_WHY[reason]}) — no approver, no sequence; ${timer}, and the next read decides again (b.jg5 SRJ-409)`
@@ -12614,22 +9705,7 @@ export function pendingRowComparisonFor(comparison: RowPersonaComparison): RowPe
   return { ...comparison, cwdMatches: false, cwdCheckDeferred: true }
 }
 
-/**
- * The one pending-row step (b.jg5 SRJ-409, SRJ-411, SRJ-408, SRJ-513) over
- * persona `persona`'s own row `row`, read `pending`: decides whether it is
- * covered (`pendingRowCoverOf`) and acts on every answer but "not covered":
- *   - no launch start: nothing (the read that found it latched the persona;
- *     one line);
- *   - covered: the persona's retry timer is armed in pending-only mode
- *     (`armPendingRowWatch`); no kill, no launch, no approver;
- *   - undecided: armed the same, with one line; no approver, no sequence;
- *   - not covered: one line (`uncoveredPendingRowLine`); its caller starts
- *     the live-row sequence (the collision ladder through its replace step,
- *     the read-and-step entry through the start entry).
- * The step never starts an approver, kills or launches. `statusOnlySite`
- * is passed to `pendingRowCoverOf`. Answers the decision and whether the
- * timer was asked to arm. Never throws.
- */
+
 function pendingRowStep(
   persona: Persona,
   ref: string,
@@ -12756,33 +9832,7 @@ export function ladderRuleRetryingLine(ref: string, answer: string): string {
   return `[slack] spawnForPersona: the pending-row rule for ${ref} answered ${answer} — nothing launched in this attempt; answering ${SPAWN_ACTION_RETRYING}, its retry timer owns it and its next retry reads the row (b.jg5 SRJ-410, SRJ-1015)`
 }
 
-/**
- * The read-and-step entry (b.jg5 SRJ-409, SRJ-411) for persona `persona`, for
- * a caller that holds only a `status` read showing its row `pending` (the
- * restart path's deferral, `deferPendingRow` in `src/server.ts`, and the
- * pending-only retry, `retryPendingRowStep`): one `get` of its own row
- * through the shared own-row read (`readPersonaOwnRow` at
- * `PENDING_ROW_STEP_GET_SITE`, so its note latch, its launch-start latch,
- * its retired-entry clear and its old-life read entry apply), then:
- *   - the read latched the persona (or found it latched after the read):
- *     `latched`, nothing more;
- *   - `ErrSpawnNotFound`: `no-row`; any other refused read: `refused`, with
- *     the error (an UNAVAILABLE armed its cause inside an attempt);
- *   - a state other than `pending`: `not-pending`, with the state read;
- *   - `pending`: the one pending-row step (`pendingRowStep`): covered or
- *     undecided, the timer armed in pending-only mode (a covered answer
- *     carries the row the `get` read, for the pending-row rule's run at a
- *     retry, `runPendingRowRuleAtRetry`); not covered, one
- *     start of the live-row sequence through the start entry
- *     (`startRecoverySequence`: seeded `pending`, entry at step 1, the
- *     conversation not kept, the retired-key flag set for a retired key's
- *     old life and by the start entry for any recorded key, ending in a
- *     launch, alert context `recovery`), answering the start entry's
- *     answer; no launch call of its own. A sequence it starts meets the
- *     old-life hold gate at its step-6 launch.
- * Never starts an approver, kills or launches; no new `getClient()` site.
- * Never throws.
- */
+
 export async function readAndStepPendingRow(persona: Persona): Promise<PendingRowStepAnswer> {
   const { key } = persona
   const ref = personaRef(persona)
@@ -12952,7 +10002,6 @@ export function pendingRowRuleNoEpisodesRelaunchingLine(key: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// The abort of CSCB's own stuck launch: its kill, its approver stop and its
 // sequence (b.jg5 SRJ-412)
 // ---------------------------------------------------------------------------
 
@@ -13059,21 +10108,6 @@ export async function abortKillOwnStuckLaunch(
 }
 
 /**
- * Stop persona `key`'s running dialog approver for the abort of its own
- * stuck launch (b.jg5 SRJ-404, SRJ-412; hatch A3), before the abort's kill:
- * with `APPROVER_STOP_STUCK_LAUNCH_ABORT`, a stop outside the stops the
- * pending-row rule runs after and that arm the retry timer
- * (`APPROVER_STOPS_THAT_ARM`), so no rule run follows it. Only a running
- * approver is stopped (`isDialogApproverRunning`): no coming approver of a
- * launch in flight is cancelled. Resolves once it has stopped, true when one
- * ran. Never rejects.
- */
-export async function stopApproverForStuckLaunchAbort(key: string): Promise<boolean> {
-  if (!isDialogApproverRunning(key)) return false
-  return stopDialogApprover(key, APPROVER_STOP_STUCK_LAUNCH_ABORT)
-}
-
-/**
  * Start persona `key`'s live-row sequence after the abort's own kill (b.jg5
  * SRJ-412, SRJ-705, SRJ-706) through the start entry
  * (`startLiveRowSequence`): entry at step 2 (`LIVE_ROW_SEQUENCE_ENTRY_GET`),
@@ -13106,42 +10140,7 @@ export function startStuckLaunchAbortSequence(key: string, ref: string): StuckLa
   }
 }
 
-/**
- * The pending-row rule's production dependencies (b.jg5 SRJ-410), bound to
- * the shared entries, so `main()` and the recovery harness compose the rule
- * identically:
- *   - the session manager's injected clock (`_setNow`) and the log;
- *   - the latch's latched query (`personaLatchedNow`), the "blocks a retry"
- *     causes (`personaRetryBlockCause`, P's own launch left out from its
- *     ladder) and the old-life hold gate (`isOwnRowOldLifeHeld`,
- *     `oldLifeHoldStep`);
- *   - the dialog approver's running query (`isDialogApproverRunning`) and
- *     its startup-dialog recognition (`paneShowsStartupDialog`);
- *   - the record of a launch whose `send-keys` met `ErrSpawnNotInteractive`
- *     (`launchMetSendKeysNotInteractive`, `recordSendKeysNotInteractive`);
- *   - the lap's `read-pane` (`readPendingRowLapPane`, the shared reader with
- *     `allow_pending`) and Enter (`sendPendingRowLapEnter`);
- *   - the bypassing `find-missing` run (`bypassingFindMissingSweep`, P's key
- *     as its next-step `get`, read with `readFindMissingRow`) and the shared
- *     own-row `get` (`readPersonaOwnRow`);
- *   - the outage flags (`getOutageFlags`: `tmux-unavailable`,
- *     `ad-config-malformed`);
- *   - the held text's poster (`postStuckLaunchHeld`) over the one episodes
- *     instance;
- *   - step 3's own-launch slot (b.jg5 SRJ-412): one abort instance
- *     (`createStuckLaunchAbort`, holding the per-episode abort state) over
- *     the own-launch query (`isCscbOwnLaunch`), the latched query and the
- *     outage flags, the relaunching text's poster
- *     (`postStuckLaunchRelaunching`, B in effect at the post) and the
- *     stuck-launch episode's close hook over the same episodes instance, the
- *     approver's stop (`stopApproverForStuckLaunchAbort`), the abort kill
- *     (`abortKillOwnStuckLaunch`, on `input.killRetryWait` with
- *     `input.killFailureAlerts`) and the sequence's start at step 2
- *     (`startStuckLaunchAbortSequence`).
- * Every agent-director call goes through `withOutageDetection` inside those
- * entries; there is no new `getClient()` site. The builder reads nothing and
- * starts nothing when called.
- */
+
 export function buildPendingRowRuleDeps(input: PendingRowRuleDepsInput): PendingRowRuleDeps {
   const log = input.log ?? ((line: string): void => console.error(line))
   const tmuxUnavailableRaised = (key: string): boolean => getOutageFlags(key).has('tmux-unavailable')
@@ -13164,7 +10163,6 @@ export function buildPendingRowRuleDeps(input: PendingRowRuleDepsInput): Pending
     episodes: {
       whenClosed: (key, kind, dispose) => episodesNow()?.whenClosed(key, kind, dispose) === true,
     },
-    stopApprover: (key) => stopApproverForStuckLaunchAbort(key),
     abortKill: (key, ref) =>
       abortKillOwnStuckLaunch(key, ref, {
         clock: input.killRetryWait ?? KILL_RETRY_SYSTEM_CLOCK,
@@ -13178,12 +10176,7 @@ export function buildPendingRowRuleDeps(input: PendingRowRuleDepsInput): Pending
     isLatched: (key) => personaLatchedNow(key),
     retryBlockedBy: (key, withinOwnLaunch) => retryBlockCauseOf(key, withinOwnLaunch),
     isHeldForOldLife: (key) => pendingRowRuleHeldForOldLife(key, input.appliedPersona),
-    isApproverRunning: (key) => isDialogApproverRunning(key),
     launchMetNotInteractive: (key, launchStart) => launchMetSendKeysNotInteractive(key, launchStart),
-    recordNotInteractive: (key, launchStart) => recordSendKeysNotInteractive(key, launchStart),
-    readLapPane: (key, ref) => readPendingRowLapPane(key, ref),
-    paneShowsStartupDialog: (pane) => paneShowsStartupDialog(pane),
-    sendLapEnter: (key, ref) => sendPendingRowLapEnter(key, ref),
     runFindMissing: (key) => runPendingRowRuleFindMissing(key),
     readRow: (key, ref) => readPendingRowRuleRow(key, ref),
     isTmuxUnavailableRaised: tmuxUnavailableRaised,
@@ -13204,32 +10197,13 @@ export function buildPendingRowRuleDeps(input: PendingRowRuleDepsInput): Pending
 export interface PendingRowRuleInstall {
   /** The rule, built through `createPendingRowRule` over `buildPendingRowRuleDeps`. */
   readonly rule: PendingRowRule
-  /**
-   * P's lifecycle serializer (production: `main()`'s `personaLifecycle.run`):
-   * the rule's one run at the dialog approver's stop takes P's turn there.
-   * Absent: that run starts at once, on its own.
-   */
+  
   readonly serialize?: PersonaSerialize
-  /**
-   * The retry action's gate before any call (`retryRunGateStop`,
-   * `src/unavailable-retry.ts`; production: the same dependencies `main()`
-   * gives the retry action): asked when the rule's run at a dialog
-   * approver's stop starts, after its turn in P's serializer, so a run that
-   * waited behind P's teardown, or finds P latched, held on
-   * `ErrInvalidFlags`, not up or at the restart cap, is dropped with no call
-   * (b.jg5 SRJ-404, SRJ-410, SRJ-411, SRJ-305; b.av2 SR-8.6). Absent: only
-   * the shutdown drop applies there.
-   */
+  
   readonly gate?: RetryRunGateDeps
 }
 
-/**
- * The installed pending-row rule (b.jg5 SRJ-410). Production installs it in
- * `main()` beside the live-row sequence registry, before the start pass.
- * With none installed (unit tests that install none) no rule run is made:
- * the retries and the approver's stop keep the pending-only arm only, with
- * one line where a run would have been made.
- */
+
 let pendingRowRule: PendingRowRuleInstall | undefined
 
 /** Install the pending-row rule (production: `main()`), or remove it with undefined (b.jg5 SRJ-410). */
@@ -13330,134 +10304,6 @@ export function pendingStepOfRuleAnswer(answer: PendingRowRuleAnswer): Unavailab
           return { kind: UNAVAILABLE_RETRY_PENDING_STEP_KEPT }
       }
   }
-}
-
-/**
- * The line of the pending-row rule's one run at persona `ref`'s dialog
- * approver's stop (b.jg5 SRJ-404, SRJ-410): the stop's reason and the
- * rule's answer:
- *
- *   [slack] pending-row: <ref> rule (approver-stop): its dialog approver stopped (<reason>) with the row pending — the run answered <answer> (b.jg5 SRJ-404, SRJ-410)
- *
- * Pure.
- */
-export function pendingRowRuleApproverStopLine(ref: string, reason: ApproverStopReason, answer: PendingRowRuleAnswer): string {
-  return `[slack] pending-row: ${ref} rule (${PENDING_ROW_RULE_ORIGIN_APPROVER_STOP}): its dialog approver stopped (${reason}) with the row pending — the run answered ${describePendingRowRuleAnswer(answer)} (b.jg5 SRJ-404, SRJ-410)`
-}
-
-/** The line for a queued approver-stop run dropped because the server is shutting down: no call. */
-export function pendingRowRuleApproverStopDroppedLine(ref: string): string {
-  return `[slack] pending-row: ${ref} rule (${PENDING_ROW_RULE_ORIGIN_APPROVER_STOP}): dropped — the server is shutting down; no call (b.jg5 SRJ-404)`
-}
-
-/**
- * The line for a queued approver-stop run dropped at its start by the retry
- * action's gate (`retryRunGateStop`): `why` is the gate's stop reason (P not
- * in the applied configuration, latched, held on `ErrInvalidFlags`, not up,
- * at the restart cap, the server shutting down) or the gate's failure. No
- * call:
- *
- *   [slack] pending-row: <ref> rule (approver-stop): dropped — <why>; no call (b.jg5 SRJ-404, SRJ-410, SRJ-305)
- */
-export function pendingRowRuleApproverStopGatedLine(ref: string, why: string): string {
-  return `[slack] pending-row: ${ref} rule (${PENDING_ROW_RULE_ORIGIN_APPROVER_STOP}): dropped — ${why}; no call (b.jg5 SRJ-404, SRJ-410, SRJ-305)`
-}
-
-/** The `why` of `pendingRowRuleApproverStopGatedLine` when the gate itself threw: taken as stopped (fail safe). */
-export function pendingRowRuleApproverStopGateFailedWhy(described: string): string {
-  return `its gate failed (${described}), taken as stopped`
-}
-
-/** The line for an approver stop that would run the rule with none installed: the pending-only arm only. */
-export function pendingRowRuleApproverStopNotInstalledLine(ref: string, reason: ApproverStopReason): string {
-  return `[slack] pending-row: ${ref}: its dialog approver stopped (${reason}) with the row pending, and no pending-row rule is installed — the pending-only arm only; no lap, run or post (b.jg5 SRJ-404, SRJ-410)`
-}
-
-/**
- * At the stop of persona `key`'s registered approver (after it has left the
- * registry and its pending-only arm, `armAfterApproverStop`), with `reason` and the
- * approver's state `run` (b.jg5 SRJ-404, SRJ-410; a loop that threw,
- * `failed`, is in the set too): when the reason is one after which the rule runs
- * (`approverStopArmsPendingRow`, `APPROVER_STOPS_THAT_ARM`: B or the test
- * cap, GONE, not interactive, tmux unavailable, superseded, failed; never
- * shutdown, a latch, the key's retired-key recording, a teardown or the
- * stuck-launch abort) and the
- * approver's last `status` read gave the row `pending` with a launch start,
- * one rule run for P is queued in P's lifecycle serializer turn
- * (`PendingRowRuleInstall.serialize`), not awaited by the approver. It runs
- * as a recovery attempt of its own (`runDetachedRecoveryAttempt`; hatch A2:
- * its UNAVAILABLE arms, a tmux-touching call's UNAVAILABLE starts
- * `tmux-unresponsive`, its UNCLASSIFIED opens an episode), on that last
- * read, exempt from the retry timer's cadence. When it starts, a run after
- * shutdown began, or one the retry action's gate stops
- * (`PendingRowRuleInstall.gate`: P not applied, latched, held on
- * `ErrInvalidFlags`, not up, at the cap), is dropped with one line and no
- * call; then the rule's own gates apply. Its answer is logged in one line; a gone row is left to the timer
- * the stop's arm armed. No run for any other reason, for a last read in another
- * state, with none, or with no launch start. With no rule installed, one
- * line and nothing more. Never throws.
- */
-function queueApproverStopRuleRun(key: string, ref: string, reason: ApproverStopReason, run: ApproverRun): void {
-  try {
-    if (!approverStopArmsPendingRow(reason)) return
-    if (run.lastStateRead !== AGENT_DIRECTOR_PENDING_STATE) return
-    const launchStartedAt = run.lastLaunchStartedAt
-    if (parseLaunchStart(launchStartedAt) === undefined) return
-    const installed = pendingRowRule
-    if (installed === undefined) {
-      console.error(pendingRowRuleApproverStopNotInstalledLine(ref, reason))
-      return
-    }
-    const row: PendingRowRuleRow = { state: AGENT_DIRECTOR_PENDING_STATE, launchStartedAt }
-    const operation = (): Promise<void> => approverStopRuleRun(key, ref, reason, row, installed)
-    const queued = installed.serialize === undefined ? operation() : installed.serialize(key, operation)
-    void queued.catch((err: unknown) => {
-      console.error(pendingRowRuleFailedLine(ref, PENDING_ROW_RULE_ORIGIN_APPROVER_STOP, describeThrownValue(err)))
-    })
-  } catch {
-    /* a queued run never changes how the approver ended */
-  }
-}
-
-/**
- * The queued approver-stop run itself (`queueApproverStopRuleRun`), when its
- * turn starts: dropped with one line after shutdown began
- * (`pendingRowRuleApproverStopDroppedLine`), or when the installed gate
- * (`PendingRowRuleInstall.gate`, through `retryRunGateStop`) answers a stop
- * reason or throws (`pendingRowRuleApproverStopGatedLine`): no `read-pane`,
- * Enter, `find-missing`, `get`, post or kill for a persona removed, latched,
- * held, not up or at the cap. Else one rule run as a recovery attempt, and
- * its line.
- */
-async function approverStopRuleRun(
-  key: string,
-  ref: string,
-  reason: ApproverStopReason,
-  row: PendingRowRuleRow,
-  installed: PendingRowRuleInstall,
-): Promise<void> {
-  if (approversClosed) {
-    console.error(pendingRowRuleApproverStopDroppedLine(ref))
-    return
-  }
-  const gate = installed.gate
-  if (gate !== undefined) {
-    let why: string | undefined
-    try {
-      why = retryRunGateStop(gate, key)
-    } catch (err) {
-      why = pendingRowRuleApproverStopGateFailedWhy(describeThrownValue(err))
-    }
-    if (why !== undefined) {
-      console.error(pendingRowRuleApproverStopGatedLine(ref, why))
-      return
-    }
-  }
-  const { rule } = installed
-  const ruled = await runDetachedRecoveryAttempt(key, () =>
-    rule.run({ key, ref, row, origin: PENDING_ROW_RULE_ORIGIN_APPROVER_STOP }),
-  )
-  console.error(pendingRowRuleApproverStopLine(ref, reason, ruled))
 }
 
 // ---------------------------------------------------------------------------
@@ -13672,10 +10518,8 @@ export const LAUNCH_UNAVAILABLE_OUTCOME_LIVE =
   "another live state: no launch over it; the retry the outcome armed runs the restart path, whose reconnect adapter handles the row"
 /** The step's outcome: the row reads a state CSCB does not know. */
 export const LAUNCH_UNAVAILABLE_OUTCOME_UNKNOWN = 'a state CSCB does not know: nothing more in this attempt'
-/** The step's outcome: a covered `pending` row after a launch timeout, the approver started. */
-export const LAUNCH_UNAVAILABLE_OUTCOME_APPROVER = 'covered: the approver starts once the launch call has returned; the retry timer watches the row'
-/** The step's outcome: a covered `pending` row after a launch timeout whose approver the start entry did not start. */
-export const LAUNCH_UNAVAILABLE_OUTCOME_APPROVER_NOT_STARTED = 'covered, but the approver was not started; the retry timer watches the row'
+
+
 /** The step's outcome: a covered `pending` row after an UNAVAILABLE outcome that was no launch timeout. */
 export const LAUNCH_UNAVAILABLE_OUTCOME_COVERED_NO_APPROVER =
   'covered: no approver after this outcome; the retry timer watches the row'
@@ -13735,7 +10579,7 @@ export function launchUnavailableGetLine(
 /** What a launch call whose UNAVAILABLE outcome the step follows was. */
 interface LaunchUnavailableSite {
   readonly persona: Persona
-  /** Whether the launch is part of the start pass (passed to the approver). */
+  
   readonly isStartup: boolean
   readonly ref: string
   /** The call's declared verb: `spawn` (plain or reuse) or `resume`. */
@@ -13760,56 +10604,7 @@ function launchUnavailableReadText(state: unknown): string {
   return isSafeIdentifier(state) ? state : 'unknown'
 }
 
-/**
- * The one post-UNAVAILABLE step (b.jg5 SRJ-407), run inside the launch
- * attempt right after a launch call of `site.persona` (a plain spawn at any
- * of its sites, a reuse spawn at any of its sites, the live-row sequence's
- * final one included, or a `resume` at either site) ended in an UNAVAILABLE
- * outcome (`err`, by class) and the refusal handling answered `refused` and
- * armed the persona's retry timer. No launch call follows in this attempt,
- * whatever the read shows. One `get` of the persona's own row through the
- * shared own-row read (`readPersonaOwnRow` at `LAUNCH_UNAVAILABLE_GET_SITE`,
- * so its note latch, its no-launch-start latch, its retired-entry clear and
- * its old-life read entry apply; SRJ-114, SRJ-513, SRJ-807, SRJ-809), then:
- *   - the read latched the persona, or it was latched meanwhile: `latched`;
- *   - `ErrSpawnNotFound`: nothing more; the retry the outcome armed brings
- *     the persona up, never a launch in this attempt;
- *   - a refused read: the shared read's own error rows (`refusalAt`: one
- *     line; inside the attempt its UNAVAILABLE arms its read-error cause);
- *   - `ended` or `missing`: nothing more; launched again at the next retry;
- *   - another live state, or one CSCB does not know: nothing more; the retry
- *     the outcome armed runs the restart path, whose reconnect adapter
- *     handles the row; never a launch over it;
- *   - `pending` after a launch timeout (`launchTimeoutFormOf`, either form):
- *     first, when its launch start lies inside the call's window
- *     (`isLaunchStartInWindow` over `launchCallWindowOf`, both ends
- *     included), the row is this launch's: the persona's "this launch's row"
- *     record is set (`thisLaunchRows`: its launch start and the window, for
- *     SRJ-310's rule 3, `checkThisLaunchRowOnRead`), so is the record of
- *     CSCB's own launch (`ownLaunches`, b.jg5 SRJ-412), and for a reuse spawn
- *     of a recorded key the "new life has begun" mark is set and the key's
- *     old-life hold ended (`markNewLifeAfterTimedOutReuse`, SRJ-806,
- *     SRJ-809), before the cover decision, so the reuse's own row is covered
- *     as the new life; then the one pending-row step (`pendingRowStep`)
- *     decides and arms; a covered row gets the dialog approver through the
- *     start entry with the launch-timeout origin (`startDialogApprover`,
- *     `APPROVER_ORIGIN_LAUNCH_TIMEOUT`; not awaited, its first call after the
- *     launch call returned), never through the after-launch step;
- *   - `pending` after any other UNAVAILABLE outcome: the pending-row step
- *     only: never this launch's row, no mark and no approver;
- *   - a `pending` row that is not covered (a retired key's old life, a `cwd`
- *     or `config_dir` mismatch): the live-row sequence through the start
- *     entry (`startRecoverySequence`: seeded `pending`, the conversation not
- *     kept, alert context `recovery`), no approver, answering
- *     `sequence-waiting` (`held` for a persona held on `ErrInvalidFlags`);
- *   - a configured persona's own `pending` row with no launch start:
- *     `latched` (its read latched it).
- * Any other answer is the launch's refusal result (b.jg5 SRJ-1015): `retrying` when the
- * attempt's error before or during the step armed the persona's timer
- * (`currentAttemptLastError`), else `refused` as it came. One line per
- * decision (`launchUnavailableGetLine`). Nothing here kills, deletes,
- * launches or counts. Never throws.
- */
+
 async function afterLaunchUnavailable(
   site: LaunchUnavailableSite,
   err: unknown,
@@ -13903,12 +10698,7 @@ async function afterLaunchUnavailable(
       }
       // b.jg5 SRJ-401, SRJ-407: started outside the launch call; its first
       // call waits until this launch has settled.
-      const started = startDialogApprover(key, site.isStartup, ref, {
-        origin: APPROVER_ORIGIN_LAUNCH_TIMEOUT,
-        cover,
-        launchStartedAt: row.launch_started_at,
-      })
-      log(readText, thisLaunchRow, started ? LAUNCH_UNAVAILABLE_OUTCOME_APPROVER : LAUNCH_UNAVAILABLE_OUTCOME_APPROVER_NOT_STARTED)
+      log(readText, thisLaunchRow, LAUNCH_UNAVAILABLE_OUTCOME_COVERED_NO_APPROVER)
       return notLaunched()
     }
     case PENDING_ROW_NOT_COVERED: {
@@ -13936,6 +10726,9 @@ function noteTagPromptReading(key: string, row: Pick<GetResult, 'labels'>): bool
   else tagUpgradeCandidates.delete(key)
   return missing
 }
+let configuredPersonaForDelivery: (key: string) => Persona | undefined = () => undefined
+export function setDeliveryPersonaLookup(lookup: (key: string) => Persona | undefined): void { configuredPersonaForDelivery = lookup }
+
 export type TagUpgradeInspection = 'current' | 'deferred' | 'replacing' | 'unreadable'
 /** Shared reader for health/restart and E5. It always re-reads provenance before replacement. */
 export function inspectPersonaUpgrade(
@@ -14155,30 +10948,10 @@ export function forgetLaunchCalls(key: string): void {
   resumesEndedUnreported.delete(key)
 }
 
-/**
- * Each persona's latest launch whose `send-keys` answered
- * `ErrSpawnNotInteractive` (b.jg5 SRJ-118, SRJ-412, SRJ-1017): the launch
- * start of that launch (epoch ms), kept beside the launch-in-flight state,
- * in memory only (a server restart forgets it). Set by
- * `recordSendKeysNotInteractive` (the dialog approver's `send-keys`; the
- * pending-row lap's), a later record replacing it; read by
- * `launchMetSendKeysNotInteractive`. Forgotten at the persona's teardown's
- * kill (`forgetLaunchCalls`) and by `_resetInFlightLaunches`. A new launch
- * call keeps it: the record names its launch by its launch start, so a new
- * launch, with a new launch start, reads no.
- */
+
 const notInteractiveLaunches = new Map<string, number>()
 
-/**
- * Record that a `send-keys` on persona `key`'s row answered
- * `ErrSpawnNotInteractive` during the launch whose launch start is
- * `launchStart` (b.jg5 SRJ-118, SRJ-412, SRJ-1017), raw or parsed
- * (`launchStartInstantOf`): the session holding the name is not that
- * launch's. Replaces the persona's earlier record. A launch start that is
- * absent or does not parse records nothing (an approver that never read
- * one). Only a `send-keys` answer counts: a `read-pane` or `status` answer
- * of that name is never recorded (SRJ-412, SRJ-1017). Silent; never throws.
- */
+
 export function recordSendKeysNotInteractive(key: string, launchStart: unknown): void {
   const launchStartMs = launchStartInstantOf(launchStart)
   if (launchStartMs === undefined) return
@@ -14204,36 +10977,13 @@ export function launchMetSendKeysNotInteractive(key: string, launchStart: unknow
 // CSCB's own launch (b.jg5 SRJ-412)
 // ---------------------------------------------------------------------------
 
-/**
- * Persona P's record of CSCB's own launch (b.jg5 SRJ-412, SRJ-407): the
- * launch start (epoch ms, as `parseLaunchStart` reads it) of the row a launch
- * call this server made left, and that call's window. Set only when the
- * launch start lies inside the window (`isLaunchStartInWindow`, both ends
- * included): after a call that returned success, as the dialog approver's
- * first lap read it (`keepApproverLaunchStart`); after a call that ended in a
- * launch timeout, as the one `get` that followed read it
- * (`afterLaunchUnavailable`).
- */
+
 export interface OwnLaunchRecord {
   readonly launchStartMs: number
   readonly window: LaunchCallWindowRecord
 }
 
-/**
- * Each persona's record of CSCB's own launch (`OwnLaunchRecord`; b.jg5
- * SRJ-412), kept beside the launch-in-flight state and the launch-call
- * windows, in memory only (a server restart forgets it). It outlives the
- * dialog approver that set it, so the pending-row rule's step 3 reads it
- * after the approver has stopped. Unlike "this launch's row"
- * (`thisLaunchRows`), no read forgets it: a read only compares the launch
- * start it carries (`isCscbOwnLaunch`). Forgotten at a new launch call for
- * the persona (`launchCallWithWindow`; put back after a call that answered
- * `ErrInstanceIdCollision`, `restoreLaunchRecords`), at its teardown's kill
- * (`forgetLaunchCalls`) and by `_resetInFlightLaunches`. A launch call that
- * failed in any other way (no window end), another process's or a human's
- * launch, a row with no launch start and a launch start outside the window
- * are never recorded.
- */
+
 const ownLaunches = new Map<string, OwnLaunchRecord>()
 
 /** Persona `key`'s record of CSCB's own launch, or `undefined` when none is kept (b.jg5 SRJ-412). Read-only. */
@@ -14241,14 +10991,7 @@ export function ownLaunchRecordOf(key: string): OwnLaunchRecord | undefined {
   return ownLaunches.get(key)
 }
 
-/**
- * Record persona `key`'s own launch (b.jg5 SRJ-412) when `launchStartedAt`,
- * the raw launch start a read gave, lies inside `window`, which must still be
- * the persona's latest launch call's window and have ended `end`
- * (`LAUNCH_CALL_END_RETURNED` for the approver's first lap,
- * `LAUNCH_CALL_END_LAUNCH_TIMEOUT` for the get after a launch timeout).
- * Answers whether it recorded. Silent; never throws.
- */
+
 function recordOwnLaunch(
   key: string,
   window: LaunchCallWindowRecord | undefined,
@@ -14423,32 +11166,7 @@ export function thisLaunchRowLiveLine(at: OwnRowReadSite, ref: string, state: st
   return `[slack] ${at.site}: ${at.what} for ${ref}: this launch's row left pending for ${isSafeIdentifier(state) ? state : 'unknown'} after its launch timeout — ${ended} (SRJ-310 rule 3; b.jg5 SRJ-407)`
 }
 
-/**
- * SRJ-310's third end rule (b.jg5 SRJ-310, SRJ-303, SRJ-407), applied by the
- * shared own-row reads (`readPersonaOwnRow`'s `get`, and the own-row `status`
- * step, `applyOwnRowStatusStep`, which every own-row `status` goes through:
- * the retry's row read, the liveness and reconnect adapters, the approver's
- * laps, the live-row sequence's reads) to persona `key`'s "this launch's row"
- * record, if any. The rule applies only once this launch's row was
- * established: after a launch timeout, by a `pending` read whose launch
- * start lay inside the call's window (`afterLaunchUnavailable`); a first read
- * already live other than `pending` sets no record and is left to rules 1
- * and 2. On the read's answer (`reading`):
- *   - a live state other than `pending` (`AGENT_DIRECTOR_LIVE_STATES`): the
- *     record is forgotten, then, unless the same read latched the persona
- *     (`latched`: the latch's own silent end applies), the condition is
- *     ended once through the outage state's end entry
- *     (`endTmuxUnresponsiveForLaunchRow`) with that state as its reading,
- *     with one line (`thisLaunchRowLiveLine`); the condition's own rules
- *     decide the recovery post, and its condition-end hook stops the retry
- *     timer unless another cause holds (SRJ-306). Whichever read sees it
- *     first ends it, and no later read ends it again;
- *   - `ended`, `missing`, no row, or `pending` with a launch start other than
- *     the record's (none included): the record is forgotten, with no end;
- *   - `pending` with the record's launch start, or a state CSCB does not
- *     know: the record is kept.
- * Never throws.
- */
+
 function checkThisLaunchRowOnRead(key: string, reading: ThisLaunchRowReading, latched: boolean, at: OwnRowReadSite): void {
   try {
     const record = thisLaunchRows.get(key)
@@ -14482,27 +11200,10 @@ function endLaunchCallWindow(key: string, started: LaunchCallWindowRecord, end: 
   launchCallWindows.set(key, { ...started, endMs: _now(), end })
 }
 
-/**
- * In-flight launches by persona key (b.av2 SR-6.3): at most one ladder per
- * persona runs at a time. Holds only unsettled launches; an entry is removed
- * when its launch settles, whatever the outcome. A launch's dialog approver
- * is not part of it: it runs after the launch call returned, in the approver
- * registry below (b.jg5 SRJ-401).
- */
+
 const inFlightLaunches = new Map<string, Promise<SpawnPersonaResult>>()
 
-/**
- * Test-only seam: forget every in-flight launch (and, b.f2b, every cancel of
- * a wait one had not started), every launch call's window, every "this
- * launch's row" record (b.jg5 SRJ-407), every record of a launch whose
- * `send-keys` answered `ErrSpawnNotInteractive`, every record of CSCB's
- * own launch (b.jg5 SRJ-412), and every resumed launch's record and run of
- * resumes that ended before reporting in (b.4q8); cancel, wake and forget every running wait for
- * a `working` row, as `cancelWorkingRowWait` does but without its log line, so
- * the wait types nothing more and returns `cancelled` instead of polling on
- * to its deadline; and stop and forget every dialog approver
- * (`_resetDialogApprovers`); so none outlives a test.
- */
+
 export function _resetInFlightLaunches(): void {
   inFlightLaunches.clear()
   tagUpgradeCandidates.clear()
@@ -14519,309 +11220,11 @@ export function _resetInFlightLaunches(): void {
     wait.wake()
   }
   workingRowWaits.clear()
-  _resetDialogApprovers()
 }
 
-/**
- * True while a launch call (collision ladder) for persona `key` is in flight
- * (b.av2 SR-6.6). The restart module's kill adapter consults this so a restart
- * that is about to join a running launch does not first kill the session that
- * launch is bringing up. The health check skips such a persona (b.f2b): a
- * start launch still waiting in the background for a `working` row owns its
- * session until it settles. The launch's dialog approver is not part of the
- * launch in flight: this answers false while only the approver runs
- * (b.jg5 SRJ-401; `isDialogApproverRunning` answers for it).
- */
+
 export function isLaunchInFlight(key: string): boolean {
   return inFlightLaunches.has(key)
-}
-
-// ---------------------------------------------------------------------------
-// The dialog approver registry (b.jg5 SRJ-401, SRJ-404)
-// ---------------------------------------------------------------------------
-
-/** One running approver in the registry: its state and the promise its stop resolves. */
-interface RegisteredApprover {
-  readonly run: ApproverRun
-  readonly ref: string
-  /** Resolves once the approver has stopped (after any call in progress returned); never rejects. */
-  readonly stopped: Promise<ApproverOutcome>
-}
-
-/**
- * The running dialog approvers by persona key (b.jg5 SRJ-401; hatch A2): at
- * most one per persona. An approver's entry is removed when it stops; an
- * approver a later start superseded has already left the map then, and the
- * later one waits for its stop before its first call.
- */
-const runningApprovers = new Map<string, RegisteredApprover>()
-
-/**
- * Keys whose launch in flight has not started its approver yet and whose
- * approver was stopped meanwhile (`stopDialogApprover`), with the stop's
- * reason: that launch's approver does not start. Forgotten when the launch
- * settles, as `cancelledLaunchWaits` is.
- */
-const cancelledComingApprovers = new Map<string, ApproverStopRequestReason>()
-
-/** Set by `stopAllDialogApprovers` (shutdown): no approver starts after it. Cleared only by the reset seam. */
-let approversClosed = false
-
-/**
- * How each persona's latest stopped approver ended; one entry per key.
- * Read by the await seam `_whenDialogApproverStopped`, which answers from it
- * once no approver runs for the key.
- */
-const lastApproverOutcomes = new Map<string, ApproverOutcome>()
-
-/**
- * Ask `entry`'s approver to stop with `reason`: marks it (the first reason
- * asked is kept) and wakes its sleep at once; a call in progress returns
- * first, and the loop makes no further call. Logs one line when this ask
- * is the first. Answers whether it was.
- */
-function requestApproverStop(entry: RegisteredApprover, reason: ApproverStopRequestReason, log: boolean): boolean {
-  if (entry.run.stopRequested !== undefined) return false
-  entry.run.stopRequested = reason
-  if (log) console.error(approverLogLine(approverStopRequestedMessage(entry.ref, reason)))
-  entry.run.wake?.()
-  return true
-}
-
-/**
- * Start persona `key`'s dialog approver on its own (b.jg5 SRJ-401): the
- * approver's loop (`approvePreSessionDialogs`' rules) runs without being
- * awaited, outside every launch or recovery attempt (`runOutsideAttempts`),
- * so this returns at once, and the caller's launch call returns while the
- * approver runs. Its UNAVAILABLE answers then arm no retry timer and start
- * no `tmux-unresponsive` condition, its UNCLASSIFIED answers open no
- * unclassified-error episode and arm nothing, and its ENVIRONMENT and CONFIG
- * answers raise their outages and arm the persona's retry timer as from any
- * verb (SRJ-301, SRJ-307, SRJ-311, SRJ-313, SRJ-316).
- *
- * The approver makes its first call only once the launch in flight for
- * `key` when it starts (the launch whose success started it), if any, has
- * settled, so it never runs while `isLaunchInFlight` answers for that
- * launch. The registry holds at most one approver per persona (hatch A2): an
- * approver still running for `key` is stopped first (`superseded`, one line),
- * and the new one makes its first call only once that stop has completed.
- * No approver starts when `key` was stopped while this launch was in flight
- * (`stopDialogApprover`), or after `stopAllDialogApprovers`: one line, and
- * the answer false. Otherwise answers true. A failure inside the loop is
- * logged and the approver stops (`failed`); it never becomes an unhandled
- * rejection. The entry is removed when the approver stops. Never throws.
- *
- * `start` says why it starts (b.jg5 SRJ-401, SRJ-407): after a launch that
- * returned (`APPROVER_START_AFTER_LAUNCH`, the default; `afterLaunchSucceeded`),
- * or after a launch timeout whose `get` read the persona's row `pending`
- * (`APPROVER_ORIGIN_LAUNCH_TIMEOUT`; `afterLaunchUnavailable`). For the
- * launch-timeout origin the entry first checks the pending-row step's
- * decision on that row, as a guard beside its caller's: a row that is not
- * covered, undecided, or with no launch start (by the decision, or a launch
- * start that does not parse) gets no approver, with one line
- * (`approverRefusedRowMessage`), and the answer false. An approver it starts
- * logs one line naming the origin (`approverStartedAfterLaunchTimeoutMessage`)
- * and then runs exactly as one started after a returned launch: the same
- * loop, stop rules, pace, B from the launch start its first lap keeps, and
- * the one-approver rule (SRJ-404).
- */
-export function startDialogApprover(
-  key: string,
-  isStartup: boolean,
-  ref: string = keyRef(key),
-  start: ApproverStart = APPROVER_START_AFTER_LAUNCH,
-): boolean {
-  const rowRefusal = approverRowRefusal(start)
-  if (rowRefusal !== undefined) {
-    console.error(approverLogLine(approverRefusedRowMessage(ref, rowRefusal)))
-    return false
-  }
-  const refusal = approversClosed ? APPROVER_STOP_SHUTDOWN : cancelledComingApprovers.get(key)
-  if (refusal !== undefined) {
-    console.error(approverLogLine(approverNotStartedMessage(ref, refusal)))
-    return false
-  }
-  if (start.origin === APPROVER_ORIGIN_LAUNCH_TIMEOUT) console.error(approverLogLine(approverStartedAfterLaunchTimeoutMessage(ref)))
-  const previous = runningApprovers.get(key)
-  if (previous !== undefined) requestApproverStop(previous, APPROVER_STOP_SUPERSEDED, true)
-  // b.jg5 SRJ-412: the window of the launch call that starts this approver, for its first lap's own-launch record.
-  const run = newApproverRun(launchCallWindowOf(key))
-  let resolveStopped!: (outcome: ApproverOutcome) => void
-  const stopped = new Promise<ApproverOutcome>((resolve) => {
-    resolveStopped = resolve
-  })
-  const entry: RegisteredApprover = { run, ref, stopped }
-  runningApprovers.set(key, entry)
-  const launch = inFlightLaunches.get(key)
-  runOutsideAttempts(() => {
-    void runRegisteredApprover(key, isStartup, entry, launch, previous).then(resolveStopped)
-  })
-  return true
-}
-
-/**
- * The registered approver's run: waits for `launch` to settle and
- * `previous` to stop, runs the loop unless a stop came meanwhile, and
- * removes its entry. Never rejects.
- */
-async function runRegisteredApprover(
-  key: string,
-  isStartup: boolean,
-  entry: RegisteredApprover,
-  launch: Promise<unknown> | undefined,
-  previous: RegisteredApprover | undefined,
-): Promise<ApproverOutcome> {
-  let reason: ApproverStopReason
-  try {
-    // Always awaited, so the first call comes after the start entry returned.
-    await (launch ?? Promise.resolve()).then(
-      () => undefined,
-      () => undefined, // the launch's own caller handles its outcome
-    )
-    if (previous !== undefined) await previous.stopped
-    reason = entry.run.stopRequested ?? (await runApproverLoop(key, isStartup, entry.ref, entry.run))
-  } catch (err) {
-    console.error(approverLogLine(approverFailedMessage(entry.ref, describeThrownValue(err))))
-    reason = APPROVER_STOP_FAILED
-  }
-  const outcome: ApproverOutcome = { reason, launchStartMs: entry.run.launchStartMs }
-  if (runningApprovers.get(key) === entry) {
-    runningApprovers.delete(key)
-    lastApproverOutcomes.set(key, outcome)
-  }
-  // b.jg5 SRJ-409, SRJ-404: the row an approver leaves `pending` when it stops is watched.
-  armAfterApproverStop(key, entry.ref, reason, entry.run.lastStateRead)
-  // b.jg5 SRJ-404, SRJ-410: and gets the pending-row rule's one run, queued, not awaited.
-  queueApproverStopRuleRun(key, entry.ref, reason, entry.run)
-  return outcome
-}
-
-/**
- * The approver stops after which the row it leaves `pending` arms the
- * persona's retry timer in pending-only mode (b.jg5 SRJ-409, SRJ-404): B or
- * the test cap, GONE, not interactive, tmux unavailable, the one-approver
- * rule (`superseded`), and a loop that threw (`failed`, so a `pending` row
- * is never left unwatched). Never after shutdown, a latch, the key's
- * retired-key recording, a teardown or the abort of the persona's own stuck
- * launch (`stuck-launch-abort`: its kill and sequence follow, b.jg5
- * SRJ-412); `live`, `finished`, `absent` and
- * `no-launch-start` leave no covered `pending` row. The same set is the one
- * after which the pending-row rule runs once for P (b.jg5 SRJ-404, SRJ-410;
- * `queueApproverStopRuleRun`), for a last read of `pending` with a launch
- * start; there is no second list.
- */
-const APPROVER_STOPS_THAT_ARM: ReadonlySet<ApproverStopReason> = new Set<ApproverStopReason>([
-  APPROVER_STOP_BOUND,
-  APPROVER_STOP_CAP,
-  APPROVER_STOP_GONE,
-  APPROVER_STOP_NOT_INTERACTIVE,
-  APPROVER_STOP_TMUX_UNAVAILABLE,
-  APPROVER_STOP_SUPERSEDED,
-  APPROVER_STOP_FAILED,
-])
-
-/** Whether an approver stopped with `reason` arms the persona's retry timer for the row it leaves `pending` (`APPROVER_STOPS_THAT_ARM`). Pure. */
-export function approverStopArmsPendingRow(reason: ApproverStopReason): boolean {
-  return APPROVER_STOPS_THAT_ARM.has(reason)
-}
-
-/**
- * At the stop of persona `key`'s registered approver (after it has left the
- * registry), with `reason` and `lastState`, the state its latest `status`
- * read gave (b.jg5 SRJ-409, SRJ-404): for a stop that arms
- * (`approverStopArmsPendingRow`) whose last read was `pending`, or that read
- * no row, the persona's retry timer is armed in pending-only mode
- * (`armPendingRowWatch`: never for a latched persona), outside every
- * attempt; the controller's armed line is its line. Nothing for any other
- * stop. Never throws.
- */
-function armAfterApproverStop(key: string, ref: string, reason: ApproverStopReason, lastState: string | undefined): void {
-  try {
-    if (!approverStopArmsPendingRow(reason)) return
-    if (lastState !== undefined && lastState !== AGENT_DIRECTOR_PENDING_STATE) return
-    armPendingRowWatch(key, ref)
-  } catch {
-    /* an arm never changes how the approver ended */
-  }
-}
-
-/**
- * Stop persona `key`'s dialog approver with `reason` (b.jg5 SRJ-404), as
- * `cancelWorkingRowWait` cancels a launch's wait. A running approver is
- * marked and its sleep woken at once; it makes no call after the one in
- * progress, if any, returns (no `send-keys` follows a stop), and resolves
- * true once it has stopped, with one line logged when this stop was the
- * first asked of it. While a launch for `key` is in flight, the approver that
- * launch would start is cancelled too, from its start: it makes no call.
- * Resolves false, silently, when no approver ran. Never rejects.
- */
-export async function stopDialogApprover(key: string, reason: ApproverStopRequestReason): Promise<boolean> {
-  if (inFlightLaunches.has(key) && !cancelledComingApprovers.has(key)) cancelledComingApprovers.set(key, reason)
-  const entry = runningApprovers.get(key)
-  if (entry === undefined) return false
-  requestApproverStop(entry, reason, true)
-  await entry.stopped
-  return true
-}
-
-/**
- * Stop every running dialog approver (`shutdown`, b.jg5 SRJ-404), and let no
- * approver start after it. Every approver is marked and woken before this
- * returns its promise, so none makes a further call once the call in
- * progress returns; the promise resolves once all have stopped. Never rejects.
- */
-export async function stopAllDialogApprovers(): Promise<void> {
-  approversClosed = true
-  const entries = [...runningApprovers.values()]
-  for (const entry of entries) requestApproverStop(entry, APPROVER_STOP_SHUTDOWN, true)
-  await Promise.all(entries.map((entry) => entry.stopped))
-}
-
-/**
- * True while a dialog approver runs for persona `key` (b.jg5 SRJ-401): from
- * its start until it has stopped, a stop asked but not yet completed
- * included. Such an approver is in flight for the persona for the health
- * tick and the lost-message routing, and never blocks a retry (SRJ-303).
- */
-export function isDialogApproverRunning(key: string): boolean {
-  return runningApprovers.has(key)
-}
-
-/**
- * The launch start (epoch ms) that persona `key`'s running approver kept:
- * the one its first lap whose `status` read the row `pending` with a launch
- * start read (b.jg5 SRJ-401, SRJ-412). Undefined when no approver runs or
- * none has kept one yet. Read-only. The first lap that keeps it also sets
- * the record of CSCB's own launch for a launch that returned success
- * (`keepApproverLaunchStart`, `ownLaunchRecordOf`; b.jg5 SRJ-412), which
- * outlives the approver.
- */
-export function dialogApproverLaunchStart(key: string): number | undefined {
-  return runningApprovers.get(key)?.run.launchStartMs
-}
-
-/**
- * Test-only seam: resolves with how persona `key`'s latest approver ended:
- * the running one's, once it has stopped; otherwise at once the last one's
- * that stopped while it was the persona's latest (a superseded approver's
- * outcome is not kept); `undefined` when there is none. Starts and stops
- * nothing.
- */
-export function _whenDialogApproverStopped(key: string): Promise<ApproverOutcome | undefined> {
-  return runningApprovers.get(key)?.stopped ?? Promise.resolve(lastApproverOutcomes.get(key))
-}
-
-/**
- * Test-only seam: stop every running approver (marked and woken, silently;
- * each makes no further call once its call in progress returns) and forget
- * them all, with every cancel of a coming approver and the shutdown mark.
- */
-export function _resetDialogApprovers(): void {
-  for (const entry of runningApprovers.values()) requestApproverStop(entry, APPROVER_STOP_SHUTDOWN, false)
-  runningApprovers.clear()
-  cancelledComingApprovers.clear()
-  lastApproverOutcomes.clear()
-  approversClosed = false
 }
 
 /** The launches whose success runs the after-launch step, as the `pre_trust` line names them. */
@@ -14836,15 +11239,7 @@ export const LAUNCH_VERB_REUSE_SPAWN = 'reuse spawn'
 /** The head of every `pre_trust` line. */
 export const PRE_TRUST_LOG_PREFIX = '[slack] spawnForPersona: '
 
-/**
- * The one log line a successful launch writes about its `pre_trust` (b.jg5
- * SRJ-413): the persona reference `ref`, the launch verb (a plain spawn, a
- * `resume` or a reuse spawn, `LaunchVerb`) and the value the result carried, shown as it arrived (rendered for the log, never checked
- * against a list); for a result without the field (`preTrust` undefined), that
- * the result came from an agent-director older than Phase 1. The line is
- * information only: no value changes what CSCB does, and a folder-trust prompt
- * that follows is the dialog approver's. Pure; never throws.
- */
+
 export function preTrustLogLine(ref: string, verb: LaunchVerb, preTrust: PreTrust | undefined): string {
   if (preTrust === undefined) {
     return (
@@ -14871,33 +11266,7 @@ function renderPreTrustValue(value: unknown): string {
   return rendered === '' ? '<unreadable>' : rendered
 }
 
-/**
- * The one step after a launch call that returned success (b.jg5 SRJ-401):
- * the plain spawn, the retry spawn after the collision
- * `get`'s `ErrSpawnNotFound`, the `resume`, the plain spawn after
- * `resume`'s `ErrSpawnNotFound` (`plainSpawnAfterResumeNotFound`), and the reuse spawn
- * (`reuseSpawnForPersona`), including the reuse spawn of the same id after
- * `resume`'s no-transcript answer (b.jg5 SRJ-707, SRJ-712). `verb` names the launch and `launched` is the
- * call's whole result. The step writes the launch's one
- * `pre_trust` line (`preTrustLogLine`, b.jg5 SRJ-413), then arms the
- * persona's retry timer in pending-only mode with the `pending-row` cause
- * (`armPendingRowWatch`; b.jg5 SRJ-301, SRJ-409: the row a launch that
- * returned leaves reads `pending` until its session reports in, and is the
- * persona's own current life, built from its own spawn parameters; a
- * latched persona is not armed), then starts the persona's dialog approver
- * (`startDialogApprover`) without awaiting it, so the ladder's result is
- * returned as soon as the launch call returned. Every success site calls
- * it, so the arm covers each of them: the live-row sequence's final launch,
- * a `fresh-retired` reuse, and the launch the pending-only retry's hand-off
- * run makes. A full-mode retry whose launch succeeds still switches to
- * pending-only mode (`armPendingOnly` is no full-mode cause).
- * The client returns the parsed reply as is, so a `null` or missing result
- * is read as one with no `pre_trust` field. Nothing here or after it reads
- * the `pre_trust` value. First of all, before the approver's first read, the
- * launch is noted for the resumed-launch rule (`noteLaunchForResumeCount`,
- * b.4q8): a `resume`'s result waits on its row; a spawn's starts a fresh
- * life. Never throws.
- */
+
 function afterLaunchSucceeded(
   key: string,
   isStartup: boolean,
@@ -14908,24 +11277,10 @@ function afterLaunchSucceeded(
   noteLaunchForResumeCount(key, verb)
   console.error(preTrustLogLine(ref, verb, launched?.pre_trust))
   armPendingRowWatch(key, ref)
-  try {
-    startDialogApprover(key, isStartup, ref)
-  } catch (err) {
-    // Not reached: the start entry never throws.
-    console.error(approverLogLine(approverFailedMessage(ref, describeThrownValue(err))))
-  }
+
 }
 
-/**
- * Resolves once the launch in flight for persona `key` (if any) has settled,
- * whatever its outcome; at once when none is. Never rejects and starts
- * nothing. For a teardown (b.av2 SR-6.6), which must not kill the row while
- * a launch is still bringing it up; launches that run outside the
- * lifecycle serializer (the start pass) are covered too. The launch's dialog
- * approver is not waited for: a launch settles as its launch call returns,
- * and the teardown stops the approver first (`stopDialogApprover`, b.jg5
- * SRJ-404, SRJ-715).
- */
+
 export async function whenLaunchSettled(key: string): Promise<void> {
   const inFlight = inFlightLaunches.get(key)
   if (inFlight === undefined) return
@@ -14936,255 +11291,7 @@ export async function whenLaunchSettled(key: string): Promise<void> {
   }
 }
 
-/**
- * Core per-persona spawn dispatcher (SR-1.4), addressing `cscb_<key>`:
- *
- * 00. The held gate (b.jg5 SRJ-207): a persona the installed hold
- *    (`setInvalidFlagsHold`) holds on `ErrInvalidFlags`, and that is not
- *    latched, answers `held` before any other step, joining no launch in
- *    flight, with one line: no agent-director call, no trust patch, no
- *    reply-guard step, no record written, nothing armed or counted. A held
- *    query that throws counts as held. A latched persona goes on to the
- *    latched gate.
- * 0. The live-row sequence gate (b.jg5 SRJ-706): while a live-row sequence
- *    runs for the persona (`isLiveRowSequenceRunning`) and it is not
- *    latched, the call answers `sequence-waiting` before any other step,
- *    joining no launch in flight (the sequence's own step-6 launch
- *    included), with one log line: no agent-director call, no trust patch,
- *    no reply-guard step, no record written, nothing armed. The sequence's
- *    own launch (`launchForLiveRowSequence`) does not come through here and
- *    is exempt. A latched persona goes on to the latched gate.
- * 0a. The old-life gate (b.jg5 SRJ-810 bullet 3; b.av2 SR-6.1 as amended by
- *    b.jg5 SRJ-1502: "(4) launch, which waits while an old life that may
- *    still be running holds the persona's working directory (b.jg5 SRJ-809,
- *    SRJ-810); the persona is retried on its UNAVAILABLE retry timer (b.jg5
- *    SRJ-301) until that wait ends"): while a hold whose instance id is not
- *    the persona's own `cscb_<key>` is on its working directory, by real
- *    path, and it is not latched, the hold step (`oldLifeHoldStep`) records
- *    the persona as waiting on each such hold, starts each hold's wait when
- *    it is not running (`ensureOldLifeWait`; one wait per held instance id),
- *    arms its retry timer with the held-for-an-old-life cause and logs one
- *    line (`oldLifeHoldLaunchLine`), and the call answers `sequence-waiting`
- *    (`sequenceWaitingCause` `old-life-hold`) before any other step, joining
- *    no launch in flight: no agent-director call, no trust patch, no
- *    reply-guard step, no record written. `launchSession` answers it with
- *    the uncounted `'refused'`, so the timer stays armed, and the start
- *    summary counts it under "waiting on a live-row sequence" (b.jg5
- *    SRJ-1015). A hold on the persona's own row does not hold it here: a
- *    destructive modify's same-key new half waits by the retired-key rule
- *    through its live-row sequence (step 4a; SRJ-805), and a held own row of
- *    a key that is not recorded is replaced through the live-row sequence by
- *    the ladder's `cwd` replace step or the restart path's reconnect adapter.
- *    Once no such hold is left, the launch takes the ladder unchanged; a
- *    renamed persona's new key then gets its plain first spawn (b.jg5
- *    SRJ-711). A latched persona goes on to the latched gate.
- * 1. One in-flight launch per persona (b.av2 SR-6.3): while a launch for the
- *    key is in flight, a second call joins it and receives its result instead
- *    of starting a second ladder. The start's worker pool and the restart
- *    module's `launchSession` both come through here. Keys are independent.
- * 1a. The latched gate (b.jg5 SRJ-502): a persona the installed latch
- *    (`setConflictLatch`) holds latched answers `latched` before any other
- *    step, with one log line naming its case, and nothing else runs. A call
- *    joining a launch already in flight still gets that launch's result.
- *    Only the latch re-check's own run of the restart path's decision
- *    passes it, while its permit holds (`holdsLatchRecheckPermit`, b.jg5
- *    SRJ-505).
- * 2. Pre-launch claude_config_dir check (bug b.g57, `checkLaunchConfigDir`),
- *    dry run included: when the directory cannot be resolved to a real path,
- *    nothing else runs (no trust patch, no reply-guard step, no
- *    agent-director call, no record written); the failure goes to the
- *    installed hook (the bring-up controller holds the persona `retrying`)
- *    and the result is `deferred`. Otherwise its real path gives the spawn's
- *    `config_dir` label.
- * 3. Dry-run: skip the rest, return synthetic success.
- * 4. Run the installed pre-launch trust patcher for the persona (b.av2
- *    SR-6.2) once, before any spawn or resume the ladder makes.
- *    Then attempt `client.spawn(...)`: a plain first spawn from
- *    `buildSpawnParams`, with no reuse flag (b.jg5 SRJ-711), so a key whose
- *    row is already there collides and step 5's `get` and `resume` keep its
- *    conversation; only the reuse launch adds the flag, and the only first
- *    launch that is a reuse is a retired key's (step 4a). On success → done. Every spawn and
- *    resume below is immediately preceded by the installed pre-launch reply
- *    guard (b.av2 SR-9.4); the optimistic spawn undoes its reply-guard steps
- *    on `ErrInstanceIdCollision`: the record and launched-with dir are
- *    restored while still its own, and the hook is re-evaluated.
- * 4a. The retired-key rule (b.jg5 SRJ-805, SRJ-806): while the installed
- *    retired-key store has the key recorded (`retiredKeyReadingOf`), marked
- *    or not, no plain spawn and no `resume` is made for it on any path, and
- *    each launch decision for it writes again a mark held only in memory
- *    after its write failed (`retiredLaunchReadingOf`). Its first launch is
- *    one reuse spawn of `cscb_<key>` in place of the plain spawn
- *    (`retiredKeyFirstLaunch`), whatever row there is: with no row an
- *    ordinary fresh spawn, which makes agent-director's pre-spawn scan (HO
- *    rev 15); on a finished row a reset to a new life. Its success answers
- *    `fresh-retired` and sets the "new life has begun" mark
- *    (`reuseSuccessAction`). A live row (`pending` included) makes it
- *    collide; the reply-guard steps are undone and step 5's collision `get`
- *    decides by the rule (`retiredKeyAtCollision`), after the `cwd` guard,
- *    as the one re-run that reuse collision gives (SRJ-112), so a reuse
- *    there that collides too is the second collision:
- *    a finished row or no row gets the replace step's reuse; with no mark a
- *    live row is the old life, and the replace step starts the live-row
- *    sequence with the retired-key flag (conversation not kept, context
- *    `recovery`) and answers `sequence-waiting`; with the mark set a live
- *    row is the new life and takes step 5's live branches as any live row,
- *    never replaced by this rule. `resumeOrFreshSpawn`, reached from those
- *    branches, makes a reuse in place of every `resume`, and the live-row
- *    sequence's start entry sets the retired-key flag, so no sequence for
- *    the key ends in a `resume`. A key that is not recorded takes steps 4
- *    to 8 as written below (SRJ-711).
- * 5. `ErrInstanceIdCollision` → `client.get(...)`, the shared own-row read
- *    (`readPersonaOwnRow`, b.jg5 SRJ-114), then:
- *    - the note check comes first, before the guards and the state branches:
- *      a read that latched the persona (its own row carries the
- *      `provenance_conflict` note and it is configured) answers `latched` at
- *      once, whatever the row's state, `cwd` or `config_dir` label: no wait,
- *      sweep, reconnect, sequence or launch, no notice, nothing counted
- *      (b.jg5 SRJ-501, SRJ-502). Any other note, or none, goes on below.
- *      `ErrSpawnNotFound` retries the plain spawn once, through the one
- *      plain-spawn outcome handler (`plainSpawnOutcomeAt`, b.jg5 SRJ-111),
- *      whose collision re-runs this step once (`plainSpawnCollisionAtLadder`;
- *      a plain spawn's collision in that re-run answers `retrying` with the
- *      retry timer armed); any other error takes the refusal row (`refusalAt`);
- *    - the row's `cwd` differs from the persona's working_directory by real
- *      path (`compareRowToPersona`) → the replace step, whatever the state
- *      and resume_enabled (b.av2 SR-6.2 as amended, b.jg5 SRJ-1503: "An
- *      existing row whose `cwd` differs from the persona's working
- *      directory, by real path, is replaced on every ladder path with no row
- *      deleted: a live row goes through the live-row sequence (b.jg5
- *      SRJ-705), then a reuse spawn; a finished row gets a reuse spawn (b.jg5
- *      SRJ-707)."). When the working directory
- *      cannot be resolved to a real path at that moment and the row's `cwd`
- *      has none either (`cwdCheckDeferred`), the row is kept instead: no
- *      replacement, `cwd-unreachable` raised and `failed` returned
- *      (b.av2 SR-6.4). Otherwise branch on state:
- *    - ended/missing + resume_enabled → resume; on ErrNoSessionId/
- *      ErrJsonlMissing/ErrJsonlNeverWritten → the no-transcript step: after
- *      ErrJsonlMissing the lost-transcript diagnosis, then one reuse spawn
- *      of the same id through the replace step's finished-row branch;
- *      nothing is deleted (`noTranscriptReuse`, `reuseFinishedRow`); on
- *      ErrSpawnNotResumable → the not-resumable step (b.jg5 SRJ-710): one
- *      re-read of the row; `pending` → the ladder's `pending` step, nothing
- *      counted or posted; another live state → the live-row sequence with
- *      the conversation kept only when the path holds dead evidence
- *      (SRJ-611); otherwise a lost race: nothing killed, deleted or
- *      launched, the retry timer armed with the lost-race cause,
- *      `retrying`; on ErrSpawnNotFound → one plain spawn through the one
- *      plain-spawn outcome handler, whose collision re-runs this step once
- *      (SRJ-113, SRJ-111). An escalate-dead verdict the restart path carried
- *      in (`deadEvidence`) is named in one line, and is void: the collision
- *      `get`'s finished read voids it for the rest of the attempt (b.jg5
- *      SRJ-611, dead evidence covers one life).
- *    - ended/missing + !resume_enabled → the replace step: a reuse spawn of
- *      the same id.
- *    - waiting → the reconnect (`reconnectMcpWithCause`, one `send-keys`,
- *      b.jg5 SRJ-118); 'dead-session', whatever its cause → the find-missing
- *      run, then resume/fresh-spawn (b.3ce), whose resume or spawn decides
- *      what holds the persona's name. The route's one line names its cause
- *      and hands it on (`deadSessionRoute`, b.jg5 SRJ-611): only a
- *      GONE-based cause (`tmux-gone`) is dead evidence, never
- *      `row-not-interactive` or `row-absent`, and the find-missing run is
- *      made for every cause; `row-not-interactive` voids a verdict the
- *      restart path carried in, and `row-absent` voids all the path holds
- *      (dead evidence covers one life); 'transient' → `latched` for a latched
- *      persona, otherwise `retrying` (b.jg5 SRJ-1015): no spawn-failure
- *      notice, no `spawn-failed` entry, nothing counted.
- *    - working → waitForWaitingAndReconnect; its outcome is mapped as the
- *      `waiting` branch maps the reconnect's ('dead-session', with the
- *      wait's cause: the reconnect's, `row-absent` or `row-read-finished`,
- *      of which only `tmux-gone` is dead evidence, and 'transient');
- *      'not-reconnected' or 'cancelled' (its teardown cancelled
- *      the wait) → `not-reconnected` (b.f2b: nothing was typed;
- *      `reconnected` only when `/mcp reconnect` was). `hooks.onWorkingRowWait`
- *      is called as the wait starts (b.f2b).
- *    - check_permission/ask_user → never typed into; one one-line
- *      `read-pane` of the persona's own row through the shared reader first
- *      (b.jdc, b.jg5 SRJ-607, `launchOnPromptRow`), with no tmux call: a
- *      pane, UNAVAILABLE, CONFIG, UNCLASSIFIED or ENVIRONMENT → no-op; GONE
- *      or the row absent (`ErrSpawnNotFound`) → findMissing sweep and a
- *      re-read, and a row now `ended` or `missing` → resume/fresh-spawn,
- *      naming `prompt-row-ladder-gone` (dead evidence) after a GONE and
- *      `row-absent` (not dead evidence) after an absent row, both void once
- *      the re-read found the row finished (b.jg5 SRJ-611)
- *      (otherwise no-op); CONFLICT or UNUSABLE NAME (the reader latched the
- *      persona) → `latched`.
- *    - pending → the ladder's `pending` step (`ladderPendingRowStep`):
- *      no-op when its `cwd` and `config_dir` label match, the persona's
- *      retry timer armed in pending-only mode (b.jg5 SRJ-409); a label
- *      missing or different (b.jg5 SRJ-411, SRJ-707) means the row is not
- *      covered, and the replace step sends it through the live-row sequence.
- *    Every resume first checks the row's `config_dir` label; a missing or
- *    different label means the replacement instead (resumeOrFreshSpawn;
- *    b.av2 SR-6.2 as amended, b.jg5 SRJ-1504). A replacement there whose
- *    path last read the row live but holds no dead evidence reads the row
- *    again first and never starts the sequence itself (`replaceAtResumeSite`,
- *    b.jg5 SRJ-609, SRJ-611).
- *    A directory that stopped resolving since step 2 keeps the row and
- *    returns `deferred` instead.
- *    The replace step (`replacePersonaRow`, b.jg5 SRJ-707) decides on the
- *    row state the path last read: `ended`, `missing` or no row → one reuse
- *    spawn of the same id (`reuseSpawnForPersona`); its collision re-runs
- *    this step 5 once, and a second collision arms the collision
- *    cause and answers `retrying`; any live state,
- *    `pending` included → the live-row sequence is started (SRJ-705,
- *    SRJ-706) and the launch answers `sequence-waiting` with no other call.
- *    Nothing in step 5 deletes or kills a row.
- * 6. A CONFLICT at any spawn or resume above latches the persona and
- *    answers `latched` (b.jg5 SRJ-501, `conflictAt`); other errors → surface
- *    to Slack + (when isStartup) startup-errors.log, except a refusal and,
- *    at a plain spawn, any error but a LAUNCH FAILURE (SRJ-111: a collision
- *    is get-then-act, and `ErrInvalidFlags` and the names a plain spawn
- *    gives no meaning are UNCLASSIFIED). An
- *    `ErrTmuxSessionCreate` (LAUNCH FAILURE, by class) at any of them is one
- *    counted launch failure (b.jg5 SRJ-602; `plainSpawnFailedAt`,
- *    `resumeFailedAt`): the notice, a `spawn-failed` entry at start, and
- *    `failed` marked `countedClass`; nothing is killed because of it, no
- *    spawn is made in its place, and the persona's retry timer is armed at
- *    once in pending-only mode (`launchFailureResult`; SRJ-301, SRJ-409).
- *    An UNAVAILABLE outcome of any spawn or resume above (a launch timeout,
- *    either form, included) is a refusal followed by one `get` of the
- *    persona's row and no launch in the attempt (`afterLaunchUnavailable`,
- *    b.jg5 SRJ-407): a covered `pending` row after a launch timeout gets the
- *    dialog approver, a row that is not covered the live-row sequence, and
- *    the launch answers `retrying`, `latched` or `sequence-waiting`.
- * 7. Steps 4 to 6 run as a launch attempt for the key (b.jg5 SRJ-301,
- *    `runInAttempt`): an agent-director error there that the arming predicate
- *    answers a cause for arms the persona's retry timer through the installed
- *    trigger sink, and a `failed` result (not `stopping`) whose attempt's
- *    last agent-director error armed it is answered as `retrying`
- *    (`retryingWhenArmed`, b.jg5 SRJ-1015). A joining call,
- *    the held and latched gates, the claude_config_dir deferral and dry run
- *    are no attempt.
- * 8. Every spawn or resume above that returns success is followed by one
- *    after-launch step (`afterLaunchSucceeded`), which arms the persona's
- *    retry timer in pending-only mode for the launch's `pending` row (b.jg5
- *    SRJ-301, SRJ-409; never for a latched persona) and starts the persona's
- *    dialog approver in its own registry (`startDialogApprover`, b.jg5
- *    SRJ-401) without awaiting it: the result is returned as soon as the
- *    launch call returns, and the launch is no longer in flight
- *    (`isLaunchInFlight`) while the approver runs. The approver runs outside
- *    the launch attempt. Besides it, only the step after a launch timeout
- *    whose `get` read a covered `pending` row starts one, through the same
- *    start entry with the launch-timeout origin (`afterLaunchUnavailable`,
- *    b.jg5 SRJ-407); no other branch, result or dry run starts one.
- *
- * `hooks` belong to the ladder this call starts; a call that joins a launch
- * already in flight gets none of them.
- *
- * `deadEvidence` is the escalate-dead verdict the restart path carries into
- * its relaunch (b.jg5 SRJ-611; absent, none): the ladder keeps it for the
- * run (decided again from its cause or verdict, `carriedDeadEvidenceOf`),
- * and every `resumeOrFreshSpawn` call it makes holds dead evidence when that
- * verdict is dead evidence or the path's own cause is, until a read of the
- * row as `ended`, `missing` or gone, or a reconnect's `row-not-interactive`
- * answer, voids it for the rest of the attempt (dead evidence covers one
- * life, `voidDeadEvidence`). A call that joins a
- * launch already in flight gets that launch's result, and its verdict is
- * dropped with one line. The held, `sequence-waiting` and old-life gates run
- * before the join check, so they answer either way; the latched gate runs after it, so
- * it answers only a call that starts a ladder (a joining call gets the
- * in-flight launch's result).
- */
+
 export async function spawnForPersona(
   persona: Persona,
   config: PersonaConfig,
@@ -15251,8 +11358,6 @@ export async function spawnForPersona(
   // health check skip its two-tick guard while it boots), and the launch's own
   // wait, if any, starts its own run of deferrals on the row. b.jdc: nor does
   // its run of deferrals on a row waiting on a prompt.
-  forgetWorkingRowEvidence(key)
-  endWorkingRowDeferral(key)
   endPromptRowDeferral(key)
   // b.jg5 SRJ-301, SRJ-1015: the ladder is a launch attempt; joiners get its result, `retrying` included.
   const launch = runInAttempt(key, 'launch', async (attempt) =>
@@ -15265,9 +11370,7 @@ export async function spawnForPersona(
     if (inFlightLaunches.get(key) === launch) {
       inFlightLaunches.delete(key)
       // b.f2b: a teardown's cancel of this launch's wait ends with it, and
-      // (b.jg5 SRJ-404) so does a stop of the approver it had not started.
       cancelledLaunchWaits.delete(key)
-      cancelledComingApprovers.delete(key)
     }
   }
 }
@@ -15843,56 +11946,7 @@ export interface ReuseSpawnOptions {
   readonly retiredAtStart?: RetiredKeyAttemptStart
 }
 
-/**
- * The reuse spawn of persona `persona`'s `cscb_<key>` (b.jg5 SRJ-112,
- * SRJ-708): agent-director's `spawn` of the same fixed id with the reuse
- * flag, which brings the persona up with a fresh conversation on its own id
- * and retains its Claude row's AD life and prior sessions. One launch, called
- * by every reuse site; it runs inside its
- * caller's launch or recovery attempt and opens none of its own, and its
- * caller registers the launch in flight.
- *   - The launch path's `claude_config_dir` check comes first (bug b.g57):
- *     a directory that does not resolve goes to the installed deferral hook
- *     and the answer is `deferred`, with no agent-director call.
- *   - Its parameters are `buildSpawnParams`'s, with only `reuse_finished:
- *     true` added (SRJ-708): the same template, `cwd`, labels and `extra_env`
- *     as any launch of the persona, prompt suggestions off included. No
- *     `no_pre_trust` is ever set (SRJ-413).
- *   - The pre-launch trust patch runs once before the call unless the caller
- *     ran it in this attempt (`options.trustPatchRan`), and the call is made
- *     as `launchWithReplyGuard` makes it (the reply guard immediately before
- *     it, then spawn detection, which reports an error by class).
- *   - A success logs one line naming the reuse spawn and the persona (and,
- *     when `options.lastRead` is no row, that no prior sessions are kept: an
- *     ordinary fresh spawn, SRJ-112; when it is nothing read, a retired
- *     key's first launch or, with `options.forcedWhat`, the forced launch
- *     through its test seam, that any finished Claude row retains its AD life
- *     and prior sessions),
- *     then, for a key the installed retired-key store had recorded when the
- *     launch attempt started (`options.retiredAtStart`; when the call was
- *     made, for a reuse with no attempt context) and still has recorded,
- *     with its record generation unchanged since (no recording named it
- *     during the attempt), sets its "new life has begun" mark through the
- *     store's `mark` unless it is already set, with one line
- *     (`reuseSuccessAction`; SRJ-806, SRJ-112's success row), then runs
- *     the after-launch step (`afterLaunchSucceeded`: the `pre_trust` line
- *     naming the reuse spawn, SRJ-413, and the dialog approver on the
- *     persona's row, SRJ-401), and answers `fresh-retired` for that key
- *     (`SPAWN_ACTION_FRESH_RETIRED`) and `spawned` for any other. A key
- *     recorded while the attempt was in flight (first recorded then, or
- *     recorded again, whether that cleared its mark or wrote nothing) gets no
- *     mark and answers `spawned`, with one line: the launch was decided
- *     before that recording, so its life is the old life. Every reuse site (the collision ladder's
- *     first launch of a retired key, the replace step, the no-transcript
- *     step, the live-row sequence's final launch) gets the mark from here.
- *   - With `options.firstLaunch` (a retired key's first launch, SRJ-805) a
- *     collision undoes the reply-guard steps, as the plain first spawn's
- *     does (b.av2 SR-9.4): the row is live, so that launch was no launch.
- *   - Every failure is handled by SRJ-112's outcome table
- *     (`reuseSpawnFailedAt`).
- * Nothing here calls `delete` or `kill`, sets `include_finished`, makes a
- * second launch or says that a row was deleted. Never throws.
- */
+
 export async function reuseSpawnForPersona(
   persona: Persona,
   config: PersonaConfig,
@@ -15934,7 +11988,6 @@ export async function reuseSpawnForPersona(
     return reuseSpawnFailedAt(persona, err, options.isStartup, ref, options.lastRead, retiredAtStart)
   }
   // b.jg5 SRJ-506: a latch re-check's retry that was not refused clears the
-  // latch before the after-launch step, so its approver runs unlatched.
   clearLatchBeforeOutcome(key)
   // b.jg5 SRJ-112: a reuse of an id with no row is an ordinary fresh spawn; no prior sessions are kept.
   const retainedHistory =
@@ -16774,116 +12827,7 @@ export interface LiveRowSequenceNotLaunched {
 /** What the sequence-launch entry answers: the launch's result, or that no launch was made. */
 export type LiveRowSequenceLaunchEntryResult = SpawnPersonaResult | LiveRowSequenceNotLaunched
 
-/**
- * The live-row sequence's final launch (b.jg5 SRJ-705 step 6) of persona
- * `persona`'s `cscb_<key>`, of `request.kind`. It is a launch call:
- *   - it waits for any launch still in flight for the persona to settle
- *     (never joining or overlapping it), then registers in the in-flight
- *     map `spawnForPersona` uses, so `isLaunchInFlight` is true and
- *     `whenLaunchSettled` waits for it while it runs (a teardown's wait
- *     covers it, SRJ-715); a call that joins it gets its launch result, a
- *     not-launched answer or any failure that is not stopping reading as
- *     `retrying` (b.jg5 SRJ-1015), so a failure is counted only here, once
- *     and by class;
- *   - once the sequence's stop signal (`request.stop`) is set, it stops
- *     waiting and makes no call (b.jg5 SRJ-706): one line, nothing
- *     registered, and a not-launched answer (`stopped`);
- *   - it is exempt from the `sequence-waiting` gate on the persona's launch
- *     paths (`spawnForPersona`): it is the sequence's own launch, made from
- *     inside it, and never passes through that gate;
- *   - the latched gate, the held gate (b.jg5 SRJ-207: a persona held on
- *     `ErrInvalidFlags` answers `held` with no call), the restart cap (b.4q8:
- *     a persona below the cap when its sequence started
- *     (`request.belowCapAtStart`) and at it now gets no call, one line,
- *     `sequenceLaunchAtCapLine`, and the not-launched answer `capped`, so
- *     the sequence ends without its launch with nothing counted or armed: a
- *     read of its row, the sequence's own included, counted its resumed
- *     launch as failed and reached the cap; a persona already at the cap
- *     when its sequence started, a restart's re-attempt at the cap, is
- *     launched, as `skipIfCapReachedDuringWork` lets that restart's own
- *     launch run), the old-life gate
- *     (b.jg5 SRJ-810, SRJ-1502: a hold other than one on the persona's own
- *     row on its working directory answers `sequence-waiting` with no call,
- *     through the hold step `oldLifeHoldStep`, so the sequence ends without
- *     its launch), the pre-launch
- *     `claude_config_dir` check and dry run come first, as in
- *     `spawnForPersona`; then the launch runs as a launch attempt for the
- *     persona (SRJ-301), the trust patch once before it;
- *   - `resume`: SRJ-113's table through the one `resume` outcome handler
- *     the collision ladder's `resume` uses too (`resumeAtSite`), so every
- *     row matches `resumeOrFreshSpawn`'s but the not-resumable one: one
- *     `resume` of the id through the ladder's launch helper
- *     (`launchWithReplyGuard`: the reply guard, spawn detection, arming by
- *     class). `ErrNoSessionId`, `ErrJsonlMissing` and `ErrJsonlNeverWritten`
- *     (by class) go on to the no-transcript step (`noTranscriptReuse`,
- *     SRJ-707, SRJ-712): after `ErrJsonlMissing` the lost-transcript
- *     diagnosis first (a latched or refused diagnosis read ends the launch
- *     with no reuse), then the reuse spawn once with the row state last read
- *     (the diagnosis's read when it made one); its success answers
- *     `fresh-after-amnesia` or `fresh-after-inconclusive-amnesia` after
- *     `ErrJsonlMissing` and `spawned` otherwise, and its collision answers
- *     not launched as the `reuse` kind's does. `ErrSpawnNotResumable` takes
- *     the not-resumable step with the sequence barred
- *     (`sequenceNotResumable`, SRJ-710: one re-read, never a second
- *     sequence) and answers not launched: `not-resumable-latched` when the
- *     re-read latched the persona, `not-resumable-pending` for a `pending`
- *     row, `not-resumable` (a lost race) otherwise. `ErrSpawnNotFound` makes
- *     one plain spawn of the same id from `buildSpawnParams` (no reuse flag;
- *     agent-director's pre-spawn scan runs inside it, SRJ-111), with no
- *     spawn-failure notice for the `ErrSpawnNotFound` itself; that spawn
- *     takes SRJ-111's table through the one plain-spawn outcome handler
- *     (`plainSpawnOutcomeAt`): its collision answers not launched
- *     (`spawn-collision`, `sequenceSpawnCollision`): no further launch,
- *     nothing counted, no notice; the sequence ends without its launch and
- *     arms the persona's retry timer with the collision cause, whose run is
- *     the get-then-act; its failure takes the plain spawn's handling
- *     (`plainSpawnFailedAt`). An
- *     `ErrTmuxSessionCreate` (by class) is a counted launch failure that also
- *     arms the persona's retry timer at once in pending-only mode, through
- *     the shared `resumeFailedAt` (SRJ-113, SRJ-409), and a DIRECTORY error
- *     is a counted launch failure; any other non-success ends by class
- *     (`resumeFailedAt`: a CONFLICT or UNUSABLE NAME latches with
- *     `request.lastRead`; `ErrInvalidFlags` gets the version re-check, then
- *     UNCLASSIFIED) with no further call: no delete, no kill and no further
- *     launch;
- *   - `reuse`: the reuse spawn (`reuseSpawnForPersona`) with
- *     `request.lastRead`, its outcomes SRJ-112's (its `ErrInvalidFlags` holds
- *     the persona and answers `held`, SRJ-207). Its collision answers not
- *     launched (`reuse-collision`): no further launch, nothing counted, no
- *     notice; the sequence ends without its launch and arms the persona's
- *     retry timer with the collision cause (SRJ-112, SRJ-705, SRJ-706);
- *   - a success runs the after-launch step (`afterLaunchSucceeded`: the
- *     `pre_trust` line and the dialog approver); any other result ends the
- *     sequence without its launch (`runLiveRowSequence` arms by its rule,
- *     SRJ-301).
- * The launch's result is counted once here, as the restart path counts a
- * launch's result (`recordLaunchResultOutsideRestartWork`, b.jg5 SRJ-112,
- * SRJ-113, SRJ-602), by class: a success resets the persona's failure
- * count, and a `failed` result that is not stopping and
- * whose class is LAUNCH FAILURE (`ErrTmuxSessionCreate`) or DIRECTORY
- * (`ErrCwdNotFound`, `ErrCwdNotADirectory`), marked `countedClass` where
- * that class is handled, is one counted launch failure; any other `failed`
- * result and a retrying, stopping, latched, held, deferred or not-launched answer
- * record nothing.
- * The launch is never part of the start pass, whichever path started the
- * sequence (a start-pass collision ladder's replacement site or
- * not-resumable step included, and the abort of the persona's own stuck
- * launch, made only at a retry of its timer or at its dialog approver's
- * stop, after the stuck launch's call returned; b.jg5 SRJ-412): the
- * sequence runs detached, after its starter has answered (`sequence-waiting`
- * or "sequence started") and the start pass has counted that (b.jg5
- * SRJ-706, SRJ-1015), so every call here passes the start flag false, the
- * `resume` a recovery holding dead evidence ends in and the `resume` that
- * keeps an aborted resumed launch's conversation included.
- * No `spawn-failed`, `jsonl-transcript-lost-on-resume` or
- * `jsonl-diagnosis-inconclusive` startup-errors entry is written for it, as
- * for every launch outside the start pass (the restart path's `resume`
- * included); the lost-transcript diagnosis after its `resume`'s
- * `ErrJsonlMissing` still runs before the reuse spawn, with its log lines,
- * its persona notice and its `fresh-after-amnesia` or
- * `fresh-after-inconclusive-amnesia` result (b.jg5 SRJ-712).
- * Never calls `delete` and never sets `include_finished`. Never throws.
- */
+
 export async function launchForLiveRowSequence(
   persona: Persona,
   config: PersonaConfig,
@@ -16920,7 +12864,6 @@ export async function launchForLiveRowSequence(
     if (inFlightLaunches.get(key) === asLaunch) {
       inFlightLaunches.delete(key)
       cancelledLaunchWaits.delete(key)
-      cancelledComingApprovers.delete(key)
     }
   }
 }
@@ -17013,8 +12956,6 @@ async function sequenceLaunchAttempt(
   }
   // The plain spawn's parameters, for the spawn after `resume`'s `ErrSpawnNotFound` (b.jg5 SRJ-113, SRJ-111).
   const params = buildSpawnParams(persona, config, configDirLabelValue(configDir.realPath, spawnHomeDir()))
-  forgetWorkingRowEvidence(key)
-  endWorkingRowDeferral(key)
   endPromptRowDeferral(key)
   // b.jg5 SRJ-301: the launch is a launch attempt for the persona.
   const result = await runInAttempt(key, 'launch', async (attempt) => {
@@ -19523,29 +15464,7 @@ function absentPersonaKeysOf(rows: readonly ListRow[], personasByKey: ReadonlyMa
   return [...keys]
 }
 
-/**
- * The start sweep's one batch record (b.jg5 SRJ-714, SRJ-803): `keys`, each
- * with the cause `absent-at-start` (`RETIRED_KEY_CAUSE_ABSENT_AT_START`),
- * through the installed store's `record`, one call per sweep, made after the
- * latch pass and before the first kill. The store's rules apply: a new key
- * gets its entry, a marked key has its mark cleared, an unmarked recorded key
- * writes nothing unless it is held only in memory, and a batch that changes
- * nothing writes nothing. The store logs its write and its failure; a failed
- * write is that one line and leaves the file as it was, while the store holds
- * the keys as retired in memory for this server's life, and the sweep goes on
- * to its kills, with no `orphan-cleanup` entry; the next start's sweep
- * records them again (hatch A3). No approver needs stopping: none runs before
- * the bring-up (SRJ-808).
- *
- * Answers the keys recorded: all of `keys` once `record` returned, whatever
- * it wrote; 0 for no keys (no call), with no store installed, and when
- * `record` throws, each of the last two with one line:
- *
- *   [slack] reconcileOrphans: no retired-key store is installed, so the keys of absent personas' rows are not recorded as retired: <keys> (b.jg5 SRJ-714, SRJ-803)
- *   [slack] reconcileOrphans: recording the keys of absent personas' rows as retired failed: <error>; nothing is recorded (b.jg5 SRJ-714, SRJ-803)
- *
- * Never throws.
- */
+
 function recordAbsentPersonaKeys(keys: readonly string[]): number {
   if (keys.length === 0) return 0
   const store = retiredKeyStore
@@ -20622,18 +16541,7 @@ function latchRecheckRoundScopeOf(key: string): LatchRecheckRoundScope | undefin
   return scope !== undefined && 'clear' in scope && 'lastRead' in scope ? (scope as LatchRecheckRoundScope) : undefined
 }
 
-/**
- * The clear hook of the three launch handlers (`plainSpawnOutcomeAt`,
- * `resumeAtSite`, `reuseSpawnForPersona`) and the live-row sequence's start
- * entry (b.jg5 SRJ-506; hatch A3): inside a latch re-check of persona `key`
- * that is still latched, an answer that clears the latch (a launch that was
- * not refused, a definite failure, a run of the restart path's decision
- * that reached a sequence) hands the clear off now, before the after-launch
- * step (the dialog approver, the pending-only arm), before a definite
- * failure's class handling, and before a sequence begins: each of those
- * stops for, or arms nothing for, a latched persona. Does nothing anywhere
- * else. Never throws.
- */
+
 function clearLatchBeforeOutcome(key: string): void {
   if (!isInsideLatchRecheck(key)) return
   latchRecheckRoundScopeOf(key)?.clear()
@@ -21348,8 +17256,6 @@ async function latchRecheckLaunch(
   const params = buildSpawnParams(persona, config, configDirLabelValue(configDir.realPath, spawnHomeDir()))
   // b.f2b, b.jdc: as at any launch, the earlier row's idle evidence and
   // deferrals say nothing about the session this launch brings up.
-  forgetWorkingRowEvidence(key)
-  endWorkingRowDeferral(key)
   endPromptRowDeferral(key)
   const launch = runInAttempt(key, 'launch', () => latchRecheckLaunchCall(call, found, ref, params, lastRead, deps.latch))
   inFlightLaunches.set(key, launch)
@@ -21363,7 +17269,6 @@ async function latchRecheckLaunch(
     if (inFlightLaunches.get(key) === launch) {
       inFlightLaunches.delete(key)
       cancelledLaunchWaits.delete(key)
-      cancelledComingApprovers.delete(key)
     }
   }
 }
@@ -21787,7 +17692,6 @@ function clearForSequence(key: string, reason: LatchRecoveryReason, deps: LatchC
  * answered, unstarted. Synchronous.
  */
 function holdForSequence(key: string, deps: LatchClearSequenceDeps, findMissingFirst: boolean): LatchClearRun {
-  forgetWorkingRowEvidence(key)
   const release = holdRestartActive(key)
   let ran: Promise<LatchClearSequenceOutcome> | undefined
   return {
@@ -22385,8 +18289,6 @@ async function runForcedLaunch(
   const configDirLabel = configDirLabelValue(configDir.realPath, spawnHomeDir())
   // b.f2b, b.jdc: as at any launch, the earlier row's idle evidence and
   // deferrals say nothing about the session this launch brings up.
-  forgetWorkingRowEvidence(key)
-  endWorkingRowDeferral(key)
   endPromptRowDeferral(key)
   const seen: { settled?: ForcedLaunchSettled } = {}
   const observer = (settled: ForcedLaunchSettled): void => {
@@ -22407,7 +18309,6 @@ async function runForcedLaunch(
     if (inFlightLaunches.get(key) === launch) {
       inFlightLaunches.delete(key)
       cancelledLaunchWaits.delete(key)
-      cancelledComingApprovers.delete(key)
     }
   }
   const { settled } = seen

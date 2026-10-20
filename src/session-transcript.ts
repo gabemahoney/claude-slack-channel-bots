@@ -33,10 +33,8 @@
  * SPDX-License-Identifier: MIT
  */
 
-import { closeSync, constants, fstatSync, openSync, readSync } from 'node:fs'
 import { basename } from 'node:path'
 import { resolveJsonlPath } from './cozempic.ts'
-import { isSafeIdentifier } from './persona-connection-errors.ts'
 
 /** How much of the transcript's end is read: the last entries of a turn are small, a whole transcript can be many MB. */
 export const TRANSCRIPT_TAIL_BYTES = 256 * 1024
@@ -74,27 +72,8 @@ export function locateTranscript(row: TranscriptRowFields, configDir: string | u
   return resolveJsonlPath(row.cwd, sessionId, configDir)
 }
 
-/** The identity of a transcript file at one read. Two reads with equal snapshots saw the file unchanged. */
-export interface TranscriptSnapshot {
-  path: string
-  dev: number
-  ino: number
-  size: number
-  mtimeMs: number
-}
-
-/** Whether two reads saw the same, unchanged transcript file (path, device, inode, size and mtime). */
-export function sameTranscriptSnapshot(a: TranscriptSnapshot, b: TranscriptSnapshot): boolean {
-  return a.path === b.path && a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeMs === b.mtimeMs
-}
-
 /** Whether a transcript's last conversation entry is a completed turn (`ended`) or not (`open`). */
 export type TranscriptTurnState = 'ended' | 'open'
-
-/** One read of a transcript: its snapshot and turn state, or why it could not be read (fixed, token-free text). */
-export type TranscriptReading =
-  | { kind: TranscriptTurnState; snapshot: TranscriptSnapshot }
-  | { kind: 'unreadable'; reason: string }
 
 /**
  * The text Claude Code 2.1.280 writes, as a `user` entry's only content block,
@@ -230,46 +209,3 @@ export function transcriptTailTurnState(tail: string, fromStart: boolean): Trans
   return 'open'
 }
 
-/** A file-system failure as a fixed reason: its `code` when it is a short identifier. */
-function fsFailureReason(step: string, failure: unknown): string {
-  const code = typeof failure === 'object' && failure !== null ? (failure as { code?: unknown }).code : undefined
-  return `${step} failed (${isSafeIdentifier(code) ? code : 'unknown error'})`
-}
-
-/**
- * Read the transcript at `path` stat-first and return its snapshot and the
- * turn state of its last `TRANSCRIPT_TAIL_BYTES`; `unreadable` (with a fixed
- * reason) when it can't be opened, isn't a regular file, is empty or can't be
- * read. Never throws.
- */
-export function readTranscriptTurnState(path: string): TranscriptReading {
-  let fd: number
-  try {
-    fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK)
-  } catch (failure) {
-    return { kind: 'unreadable', reason: fsFailureReason('opening it', failure) }
-  }
-  try {
-    const st = fstatSync(fd)
-    if (!st.isFile()) return { kind: 'unreadable', reason: 'it is not a regular file' }
-    if (st.size === 0) return { kind: 'unreadable', reason: 'it is empty' }
-    const start = Math.max(0, st.size - TRANSCRIPT_TAIL_BYTES)
-    const buffer = Buffer.alloc(st.size - start)
-    let read = 0
-    while (read < buffer.length) {
-      const n = readSync(fd, buffer, read, buffer.length - read, start + read)
-      if (n === 0) break
-      read += n
-    }
-    const snapshot: TranscriptSnapshot = { path, dev: st.dev, ino: st.ino, size: st.size, mtimeMs: st.mtimeMs }
-    return { kind: transcriptTailTurnState(buffer.subarray(0, read).toString('utf8'), start === 0), snapshot }
-  } catch (failure) {
-    return { kind: 'unreadable', reason: fsFailureReason('reading it', failure) }
-  } finally {
-    try {
-      closeSync(fd)
-    } catch {
-      /* ignore */
-    }
-  }
-}

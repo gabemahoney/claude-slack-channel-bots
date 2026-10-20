@@ -114,13 +114,6 @@ import {
 import { ErrSpawnNotFound } from './agent-director-errors.ts'
 
 /**
- * Trailing pane lines a full read asks for (b.jg5 SRJ-117's `n_lines` at the
- * working-row verdict, the waiting-row check and the launch wait's evidence
- * read).
- */
-export const FULL_PANE_READ_LINES = 40
-
-/**
  * Trailing pane lines a one-line probe asks for (b.jg5 SRJ-117's `n_lines`
  * at b.jdc's reconnect verdict, `promptRowReconnectVerdict` in
  * `src/server.ts`, and b.jdc's ladder action, `launchOnPromptRow`; SRJ-606,

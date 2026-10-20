@@ -98,7 +98,6 @@
 
 import { createHash } from 'node:crypto'
 import { dirname, resolve } from 'node:path'
-
 import {
   durableUnlinkSync,
   DurableUnlinkUnsyncedError,
@@ -514,7 +513,7 @@ export interface ReloadControllerDeps {
    */
   channelDelivery: () => ChannelDeliveryStore
   /**
-   * Stop the dialog approver running for a key apply step 1 recorded as
+   * Stop delivery running for a key apply step 1 recorded as
    * retired (b.jg5 SRJ-808, SRJ-404: production `stopDialogApprover` with
    * the retired-key reason, which logs the stop and its reason and also
    * cancels the approver a launch in flight would start; no pending-row rule
@@ -525,7 +524,7 @@ export interface ReloadControllerDeps {
    * throw or rejection is logged. A failed step-1 write stops nothing, and a
    * failed rewrite restarts no approver.
    */
-  stopApprover: (key: string) => unknown
+  stopDelivery: (key: string) => unknown
   /**
    * The server's old-life hold set (`createOldLifeHoldSet`,
    * `src/retired-keys.ts`; b.jg5 SRJ-809): production passes the one set
@@ -1613,17 +1612,17 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
   }
 
   /**
-   * Stop the dialog approver of `key`, which step 1 recorded as retired
-   * (b.jg5 SRJ-808): `deps.stopApprover`, not awaited; a throw or a
+   * Stop delivery of `key`, which step 1 recorded as retired
+   * (b.jg5 SRJ-808): `deps.stopDelivery`, not awaited; a throw or a
    * rejection is logged, never raised:
    *
-   *   [slack] reload: stopping the dialog approver of key=<key>, recorded as retired, failed: <thrown value>
+   *   [slack] reload: stopping delivery of key=<key>, recorded as retired, failed: <thrown value>
    */
-  function stopApproverOf(key: string): void {
+  function stopDeliveryOf(key: string): void {
     const failed = (err: unknown): void =>
-      deps.log(`[slack] reload: stopping the dialog approver of key=${key}, recorded as retired, failed: ${describeThrownValue(err)}`)
+      deps.log(`[slack] reload: stopping delivery of key=${key}, recorded as retired, failed: ${describeThrownValue(err)}`)
     try {
-      void Promise.resolve(deps.stopApprover(key)).catch(failed)
+      void Promise.resolve(deps.stopDelivery(key)).catch(failed)
     } catch (err) {
       failed(err)
     }
@@ -1739,7 +1738,7 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
    *      rewritten and the change stays pending (SRJ-804). Once the record
    *      did not fail (written, or nothing to write for keys already
    *      recorded with no mark), the dialog approver of each key of the
-   *      batch is stopped (`stopApprover`, SRJ-808), before the rewrite and
+   *      batch is stopped (`stopDelivery`, SRJ-808), before the rewrite and
    *      before any teardown's kill;
    *   2. rewrite the last-applied record. When that fails, the retired-key
    *      record, if step 1 wrote it, is restored to what it held before the
@@ -1813,7 +1812,7 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
     // b.jg5 SRJ-808: each recorded key's approver stops now, before the
     // rewrite and the teardown's kill; nothing awaited, so step 1 stays one
     // synchronous stretch.
-    for (const { key } of batch) stopApproverOf(key)
+    for (const { key } of batch) stopDeliveryOf(key)
     const rewriteFailed = writeRecord(bytes, current.bytes)
     if (rewriteFailed !== undefined) {
       const restored =

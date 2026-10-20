@@ -1,8 +1,10 @@
 /** Transcript I/O and schemas are private to this adapter (b.omv SR-6). */
 import * as nodeFs from 'node:fs'
 import { locateTranscript, transcriptTailTurnState, TRANSCRIPT_TAIL_BYTES } from './session-transcript.ts'
-import type { DeliveryAgent } from './delivery-screen.ts'
 import type { QueueItem, SentRecord, DeliveredRecord } from './delivery-queue.ts'
+
+export type DeliveryAgent = 'claude' | 'codex'
+
 export interface DeliveryTranscriptRow {
   jsonl_path?: string; session_id?: string; cwd?: string; transcript_status?: string
   prior_sessions?: readonly { jsonl_path?: string; session_id?: string; cwd?: string }[]

@@ -3,24 +3,25 @@
 import type { Client, GetResult, SendKeysParams } from 'agent-director'
 import type { DeliveryQueue, QueueItem, QueueRecord, SentRecord } from './delivery-queue.ts'
 import { createDeliveryReceiptReader, effectiveSends, type DeliveryReceiptReader, type ReceiptObservation } from './delivery-receipt.ts'
-import { readDeliveryScreen, FULL_PANE_READ_LINES, type DeliveryAgent, type DeliveryScreen } from './delivery-screen.ts'
 import { type DeliveryLifecycle, type DeliveryClock, systemDeliveryClock, NOT_NOW_RETRY_MS } from './delivery-lifecycle.ts'
 import { decideEngine, decideGate, firstSendGate, retypeGate, selectDeliveryTarget, NO_DELIVERY_PAIR, createDeliveryReading, createDeliveryPolicyState, type DeliveryPair, type DeliveryPolicyEngine, type DeliveryPolicyKnowledge, type DeliveryReading, type DeliveryTimer } from './delivery-policy.ts'
 import { classifyAdError, isAdErrorInstance, classifyWithInvalidFlagsRecheck, type AdCall } from './ad-error-class.ts'
 import { ErrInvalidFlags, ErrSpawnNotFound, ErrSpawnNotInteractive, ErrSendKeysWhileRelayed, ErrRelayFallenBack, ErrDialogMaybeOpen, ErrPaneChanged, ErrSystemInstallDisappeared } from './agent-director-errors.ts'
-export * from './delivery-policy.ts'
-export { createDeliveryLifecycle, NOT_NOW_RETRY_MS, RECONNECT_BLOCKED_NOTICE_MS } from './delivery-lifecycle.ts'
-export type { DeliveryLifecycle, DeliveryClock } from './delivery-lifecycle.ts'
 import { LAUNCH_SETTLE_MS, ENTER_DELAY_MS, ENTER_ONLY_RETRY_MS, RECEIPT_WAIT_MS, RETYPE_BACKOFF_MS, IDLE_EVIDENCE_MAX_WAIT_MS, DELIVERY_MAX_AD_CALLS_PER_S, DELIVERY_ROW_POLL_MS } from './delivery-constants.ts'
+import type { DeliveryAgent } from './delivery-receipt.ts'
+
+export * from './delivery-policy.ts'
+export { createDeliveryLifecycle, NOT_NOW_RETRY_MS } from './delivery-lifecycle.ts'
+export type { DeliveryLifecycle, DeliveryClock } from './delivery-lifecycle.ts'
+
 export * from './delivery-constants.ts'
-export type DeliveryReason = 'state' | 'marker' | 'mcp' | 'launch-settle' | 'menu' | 'input' | 'relay-off' | 'held' | 'dialog-hold' | 'transcript-unreadable' | 'queue-unwritable' | 'not-now' | 'receipt' | 'idle-evidence'
+export type DeliveryReason = 'state' | 'marker' | 'mcp' | 'launch-settle' | 'relay-off' | 'held' | 'dialog-hold' | 'transcript-unreadable' | 'queue-unwritable' | 'not-now' | 'receipt' | 'idle-evidence'
 /** Safe operational facts; never composer or message body text (b.omv SR-8). */
 export interface DeliveryStatus {
   key: string; seq: number; count: number; ageMs: number; retypeCount: number
   row?: string; marker: boolean; relay: boolean; connected: boolean; up: boolean
   latched: boolean; held: boolean; receiptWorking: boolean; dialogMaybeOpen: boolean
   reconnectDeferred: boolean
-  reconnectScreen?: 'input' | 'menu'
 }
 export type DeliveryEngineEvent =
   | { type: 'launch-observed'; key: string; launchId: string; sessionId: string; at: number }
@@ -31,8 +32,7 @@ export type DeliveryEngineEvent =
   | { type: 'retyped' | 'first-unconfirmed-retype'; key: string; seq: number; part: number; count: number }
   | { type: 'waiting'; key: string; seq: number; reason: DeliveryReason; ageMs: number; status?: DeliveryStatus }
   | { type: 'marker-missing'; key: string }
-  | { type: 'reconnect-screen'; key: string; reason: 'input' | 'menu'; blockedMs: number }
-export type DeliveryClient = Pick<Client, 'get' | 'readPane' | 'sendKeys'>
+export type DeliveryClient = Pick<Client, 'get' | 'sendKeys'>
 export interface DeliveryEngineDeps {
   queue: DeliveryQueue; lifecycle: DeliveryLifecycle
   clientFor(key: string): Promise<DeliveryClient>
@@ -45,7 +45,7 @@ export interface DeliveryEngineDeps {
   onRow?(key: string, row: GetResult): boolean
   /** E4's shared replacement when a fresh own-row marker is unproved, under the engine's client and call budget. */
   inspectUpgrade?(key: string, row: GetResult, client: DeliveryClient, beforeCall: () => void): Promise<void>
-  onReadError?(key: string, error: unknown, verb: 'get' | 'read-pane'): Promise<void>
+  onReadError?(key: string, error: unknown, verb: 'get'): Promise<void>
   onError?(key: string, error: unknown): void
   onEvent?(event: DeliveryEngineEvent): void
   onKeyError?(key: string, error: unknown, row: GetResult): Promise<void>
@@ -55,7 +55,7 @@ export interface DeliveryEngineDeps {
   receiptReader?(): DeliveryReceiptReader
   clock?: DeliveryClock
   /** Optional bounded replay constants. Production never caps retypes. */
-  constants?: Partial<{ LAUNCH_SETTLE_MS: number; ENTER_DELAY_MS: number; RECEIPT_WAIT_MS: number; ENTER_ONLY_RETRY_MS: number; IDLE_EVIDENCE_MAX_WAIT_MS: number; RETYPE_BACKOFF_MS: readonly number[]; NOT_NOW_RETRY_MS: readonly number[]; MaxRetypes: number; EnterRetries: number }>
+  constants?: Partial<{ LAUNCH_SETTLE_MS: number; ENTER_DELAY_MS: number; RECEIPT_WAIT_MS: number; ENTER_ONLY_RETRY_MS: number; IDLE_EVIDENCE_MAX_WAIT_MS: number; RETYPE_BACKOFF_MS: readonly number[]; NOT_NOW_RETRY_MS: readonly number[]; MaxRetypes: number }>
 }
 export interface DeliveryEngines {
   wake(key: string): void
@@ -87,13 +87,13 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
   const clock = deps.clock ?? systemDeliveryClock, life = deps.lifecycle, constants = deps.constants
   const ms = (name: 'LAUNCH_SETTLE_MS' | 'ENTER_DELAY_MS' | 'RECEIPT_WAIT_MS' | 'ENTER_ONLY_RETRY_MS' | 'IDLE_EVIDENCE_MAX_WAIT_MS', fallback: number): number => constants?.[name] ?? fallback
   interface State {
-    e: DeliveryPolicyEngine; reading: DeliveryReading; row?: GetResult; screen?: DeliveryScreen; receipt?: ReceiptObservation
+    e: DeliveryPolicyEngine; reading: DeliveryReading; row?: GetResult; receipt?: ReceiptObservation
     reader: DeliveryReceiptReader; receiptTarget?: DeliveryPair; receiptAttempt?: number; deadlines: Partial<Record<DeliveryTimer, number>>; budget: () => void
     rowAt: number; waitingAt?: number; notNowStep: number; retryStep: number; appendRetryStep: number; lastSeq?: number; lastPart?: number
     pending?: { record: QueueRecord; complete(): void }; lease?: () => void; timer?: unknown; busy?: Promise<void>; stopped: boolean
-    recover: boolean; restarted?: string; receiptWorking: boolean; pollAfter: number; snapshot?: DeliveryPolicyKnowledge; lastRetypeEvent?: number; dialogHold: boolean; lastBox?: string; cleanup: boolean; dialogMaybeOpen: boolean
+    recover: boolean; restarted?: string; receiptWorking: boolean; pollAfter: number; snapshot?: DeliveryPolicyKnowledge; lastRetypeEvent?: number; dialogHold: boolean; dialogMaybeOpen: boolean
   }
-  const states = new Map<string, State>(), budgets = new Map<string, () => void>(), lastDelivered = new Map<string, { pair: DeliveryPair; text: string }>()
+  const states = new Map<string, State>(), budgets = new Map<string, () => void>()
   // Empty queues retire their engine, not the already observed launch. Keep
   // its first waiting read without polling an otherwise idle persona.
   const launches = new Map<string, { launchId: string; sessionId: string; waitingAt?: number }>()
@@ -102,8 +102,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
   function emit(event: DeliveryEngineEvent): void { try { void Promise.resolve(deps.onEvent?.(event)).catch(() => {}) } catch {} }
   function budget(key: string): () => void { let b = budgets.get(key); if (!b) { b = createDeliveryCallBudget(clock.now); budgets.set(key, b) }; return b }
   function create(key: string): State {
-    const s: State = { e: createDeliveryPolicyState(), reading: createDeliveryReading(), reader: deps.receiptReader?.() ?? createDeliveryReceiptReader(), deadlines: {}, budget: budget(key), rowAt: -Infinity, notNowStep: 0, retryStep: 0, appendRetryStep: 0, stopped: false, recover: true, receiptWorking: false, pollAfter: 0, dialogHold: false, cleanup: false, dialogMaybeOpen: false }
-    s.e.lastDelivered = lastDelivered.get(key)?.pair ?? NO_DELIVERY_PAIR
+    const s: State = { e: createDeliveryPolicyState(), reading: createDeliveryReading(), reader: deps.receiptReader?.() ?? createDeliveryReceiptReader(), deadlines: {}, budget: budget(key), rowAt: -Infinity, notNowStep: 0, retryStep: 0, appendRetryStep: 0, stopped: false, recover: true, receiptWorking: false, pollAfter: 0, dialogHold: false, dialogMaybeOpen: false }
     states.set(key, s); life.engineRunning(key, true); return s
   }
   function release(s: State): void { s.lease?.(); s.lease = undefined; s.e.request = 'none' }
@@ -114,7 +113,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     const deferred = life.deferred(key)
     return { key, seq: head.accepted.seq, count: items.length, ageMs: Math.max(0, clock.now() - head.accepted.received_at), retypeCount: head.retypeCount,
       row: s.restarted === life.launchId(key) ? (s.row?.state === 'ended' || s.row?.state === 'missing' ? s.row.state : 'absent') : s.row?.state, marker: s.row?.labels?.tag_prompt === '1', relay: s.row?.relay_mode === 'on', connected: deps.isConnected(key), up: deps.isUp(key),
-      latched: deps.isLatched(key), held: deps.isHeld(key), receiptWorking: s.receiptWorking, dialogMaybeOpen: s.dialogMaybeOpen, reconnectDeferred: !!deferred, reconnectScreen: deferred?.screen }
+      latched: deps.isLatched(key), held: deps.isHeld(key), receiptWorking: s.receiptWorking, dialogMaybeOpen: s.dialogMaybeOpen, reconnectDeferred: !!deferred }
   }
   function wait(key: string, s: State, reason: DeliveryReason): void { const facts = status(key, s); if (facts) emit({ type: 'waiting', key, seq: facts.seq, reason, ageMs: facts.ageMs, status: facts }) }
   function schedule(key: string, s: State, delay = DELIVERY_ROW_POLL_MS): void {
@@ -207,43 +206,39 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     if (deps.isConnected(key)) life.clearDeferred(key)
     const deferred = life.deferred(key)
     s.reading = { ...s.reading, gate: life.owner(key), up: deps.isUp(key) && !!deps.persona(key), latched: deps.isLatched(key), held: deps.isHeld(key) || s.restarted === life.launchId(key), mcp: deps.isConnected(key) }
-    const k: DeliveryPolicyKnowledge = { p: { accepted: items.map(i => i.accepted.seq), fixed: items.filter(i => i.fixed).map(i => i.accepted.seq), sent: sends, refused, delivered }, e: s.e, r: s.reading, g: { owner: life.owner(key), stage: 'none', deferred: !!deferred, due: deferred?.due ?? false }, writer: { kind: s.pending?.record.kind ?? 'none' }, compact: 'none', parts, EnterRetries: constants?.EnterRetries ?? Math.ceil(Buffer.byteLength(items.find(i => i.accepted.seq === s.e.target[0])?.fixed?.parts[(s.e.target[1] || 1) - 1] ?? '') / 1000) + 2, MaxRetypes: constants?.MaxRetypes, textFor: pair => items.find(i => i.accepted.seq === pair[0])?.fixed?.parts[pair[1] - 1] ?? (lastDelivered.get(key)?.pair[0] === pair[0] && lastDelivered.get(key)?.pair[1] === pair[1] ? lastDelivered.get(key)!.text : pair) }
+    const k: DeliveryPolicyKnowledge = { p: { accepted: items.map(i => i.accepted.seq), fixed: items.filter(i => i.fixed).map(i => i.accepted.seq), sent: sends, refused, delivered }, e: s.e, r: s.reading, g: { owner: life.owner(key), stage: 'none', deferred: !!deferred, due: deferred?.due ?? false }, writer: { kind: s.pending?.record.kind ?? 'none' }, compact: 'none', parts, MaxRetypes: constants?.MaxRetypes, textFor: pair => items.find(i => i.accepted.seq === pair[0])?.fixed?.parts[pair[1] - 1] ?? pair }
     s.snapshot = k; return k
   }
-  async function observe(key: string, s: State, head: QueueItem, part: number, screen = true, force = false): Promise<boolean> {
+  async function observe(key: string, s: State, head: QueueItem, part: number, force = false): Promise<boolean> {
     if (!await readRow(key, s, force) || !s.row) return false
     const row = s.row, persona = deps.persona(key), agent: DeliveryAgent = row.agent === 'codex' ? 'codex' : persona?.agent ?? 'claude'
     const receipt = s.reader.read(agent, row, head, part, deps.queue.items(key), persona?.configDir)
     s.receipt = receipt
     s.receiptTarget = [head.accepted.seq, part]; s.receiptAttempt = effectiveSends(head, part).at(-1)?.attempt ?? 0
     const text = head.fixed?.parts[part - 1]
-    let observed = s.screen, leftoverLoss: string | undefined
-    if ((screen || receipt.receipt) && ['waiting', 'working'].includes(row.state)) {
-      try {
-        const p = await ad(key, s, 'read-pane', client => client.readPane({ instance_id: deps.instanceId(key), n_lines: FULL_PANE_READ_LINES }))
-        observed = readDeliveryScreen(agent, p.pane, text)
-        let own = text
-        if (observed.kind === 'input' && s.e.lastDelivered[0] !== 0) {
-          const previousItem = deps.queue.items(key).find(i => i.accepted.seq === s.e.lastDelivered[0])
-          const previous = previousItem?.fixed?.parts[s.e.lastDelivered[1] - 1] ?? lastDelivered.get(key)?.text
-          const leftover = readDeliveryScreen(agent, p.pane, previous)
-          if (leftover.kind === 'own') { observed = leftover; own = previous; if (previousItem && s.reader.read(agent, row, previousItem, s.e.lastDelivered[1], deps.queue.items(key), persona?.configDir).notTakenIn) leftoverLoss = previous }
-        }
-        if (s.lastBox !== observed.text) s.e.enterRetries = 0
-        s.lastBox = observed.text; s.screen = observed
-        s.reading.box = observed.kind === 'own' ? own : observed.text
-      }
-      catch (error) { if (error instanceof DeliveryBudgetWait) throw error; await deps.onReadError?.(key, error, 'read-pane'); deps.onError?.(key, error); if (classifyAdError(error).errorClass === 'GONE' || isAdErrorInstance(error, ErrSpawnNotFound)) { life.clearDeferred(key); restart(key, s) }; observed = undefined; s.screen = undefined }
-    }
     const records = [
-      ...(leftoverLoss ? [{ kind: 'queue-operation:popOne', text: leftoverLoss }] : []),
       ...(receipt.notTakenIn ? [{ kind: 'queue-operation:popOne', text }] : []),
       ...(receipt.receipt ? [{ kind: 'take-in', text }] : []),
     ]
-    s.reading = { row: row.state, screen: observed?.kind === 'own' ? 'item' : observed?.kind === 'empty' ? observed.running ? 'running' : 'empty' : observed?.kind === 'input' ? 'other' : 'overlay', box: observed?.kind === 'own' ? s.reading.box : observed?.text, relay: row.relay_mode === 'on', marker: row.labels?.tag_prompt === '1', mcp: deps.isConnected(key), up: deps.isUp(key), latched: deps.isLatched(key), held: deps.isHeld(key), readable: receipt.availability !== 'unreadable', receipts: receipt.receipt ? [records.length] : [], idleEvidence: receipt.idleEvidence, launch: life.launchId(key), session: row.session_id, compactions: receipt.compaction, gate: life.owner(key), offset: 0, records }
+    s.reading = { row: row.state, relay: row.relay_mode === 'on', marker: row.labels?.tag_prompt === '1', mcp: deps.isConnected(key), up: deps.isUp(key), latched: deps.isLatched(key), held: deps.isHeld(key), readable: receipt.availability !== 'unreadable', receipts: receipt.receipt ? [records.length] : [], idleEvidence: receipt.idleEvidence, launch: life.launchId(key), session: row.session_id, compactions: receipt.compaction, gate: life.owner(key), offset: 0, records }
     if (life.launchId(key) === s.e.launchSeen && s.waitingAt !== undefined) s.deadlines.settle = s.waitingAt + ms('LAUNCH_SETTLE_MS', LAUNCH_SETTLE_MS)
     if (s.restarted === life.launchId(key)) s.reading.held = true
     return true
+  }
+  // A durable append or the text-to-Enter pause may outlive its gate read.
+  // Revalidate AD's row and CSCB's lifecycle guards before each unused key.
+  async function revalidateKeys(key: string, s: State): Promise<boolean> {
+    const fresh = await readRow(key, s, true), row = s.row
+    const allowed = fresh && row && life.owner(key) === 'delivery' &&
+      life.launchId(key) === s.e.launchSeen && row.session_id === s.e.sessionSeen &&
+      firstSendGate({ ...s.reading, row: row.state, marker: row.labels?.tag_prompt === '1',
+        relay: row.relay_mode === 'on', up: deps.isUp(key), mcp: deps.isConnected(key),
+        held: deps.isHeld(key), latched: deps.isLatched(key) }, s.e)
+    if (allowed) return true
+    s.e.phase = 'receipt'; s.e.request = 'none'; s.recover = true
+    s.deadlines.receipt = clock.now() + ms('RECEIPT_WAIT_MS', RECEIPT_WAIT_MS)
+    release(s)
+    return false
   }
   function queueWrite(s: State, record: QueueRecord, complete: () => void): void { s.pending = { record, complete } }
   function afterSend(s: State, key: string, sent: SentRecord): void {
@@ -285,36 +280,30 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     let observedPair: DeliveryPair | undefined, readyObserved = false
     try {
       // Finish our own append/call continuations without replacing the key
-      // reading. Every new operation obtains a new screen and gate grant.
+      // reading. Every new operation obtains a fresh row and gate grant.
       for (let turns = 0; turns < 40 && !stopped && !s.stopped; turns++) {
         const items = deps.queue.items(key), head = items.find(i => !i.delivered)
         if (!head && !s.pending) {
-          // Finish only a freshly observed leftover of the part just
-          // confirmed. An otherwise empty queue makes no delivery calls.
-          if (s.cleanup && s.e.phase === 'receipt' && (s.deadlines.receipt ?? 0) > clock.now()) { nextDelay = s.deadlines.receipt! - clock.now(); break }
-          const last = lastDelivered.get(key)
-          const leftover = !s.cleanup && last && s.e.lastDelivered[0] !== 0 && s.reading.screen === 'item' && s.reading.box === last.text
-          if (!leftover && !(s.cleanup && s.e.phase === 'retry')) { release(s); states.delete(key); life.engineRunning(key, false); return }
+          release(s); states.delete(key); life.engineRunning(key, false); return
         }
         if (!s.pending && (!deps.isUp(key) || deps.isLatched(key) || deps.isHeld(key))) { release(s); wait(key, s, 'held'); break }
         if (!s.pending && deps.queue.isWritable?.(key) === false) { release(s); wait(key, s, 'queue-unwritable'); nextDelay = RETYPE_BACKOFF_MS[0]; break }
         let k = build(key, s), pair = selectDeliveryTarget(k), part = pair[1]
-        const observedItem = head ?? items.find(i => i.accepted.seq === (s.e.lastDelivered[0] || s.e.target[0]))
-        const observedPart = head ? part : s.e.lastDelivered[1] || s.e.target[1]
+        const observedItem = head
+        const observedPart = part
         if (head && (s.lastSeq !== head.accepted.seq || s.lastPart !== part)) {
           // Retype spacing belongs to the FIFO item, spanning its parts.
           if (s.lastSeq !== head.accepted.seq) s.retryStep = 0
-          s.lastSeq = head.accepted.seq; s.lastPart = part; s.e.enterRetries = 0; s.lastRetypeEvent = undefined; s.e.target = pair; s.notNowStep = 0
+          s.lastSeq = head.accepted.seq; s.lastPart = part; s.lastRetypeEvent = undefined; s.e.target = pair; s.notNowStep = 0
           s.recover = effectiveSends(head, part).length > 0 || head.unknownSend
         }
         if (!s.pending && observedItem && (s.e.phase === 'ready' || s.e.phase === 'receipt' || !s.row)
           && (!observedPair || observedPair[0] !== observedItem.accepted.seq || observedPair[1] !== observedPart || (s.e.phase === 'ready' && !readyObserved))) {
-          const needScreen = s.e.phase === 'ready'
-          if (!await observe(key, s, observedItem, observedPart, needScreen)) { release(s); break }
+          if (!await observe(key, s, observedItem, observedPart)) { release(s); break }
           // Pure transitions and durable appends consume this tick's reading.
           // The gate still obtains its own fresh observation below; do not
           // replace the engine reading again after that independent grant.
-          observedPair = [observedItem.accepted.seq, observedPart]; readyObserved = needScreen
+          observedPair = [observedItem.accepted.seq, observedPart]; readyObserved = true
           k = build(key, s)
         }
         const action = decideEngine(k)
@@ -334,7 +323,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
         }
         if (action === 'observeLaunch') {
           release(s); s.e.phase = 'ready'; s.e.launchSeen = k.r.launch; s.e.sessionSeen = k.r.session; s.e.compactionSeen = k.r.compactions
-          s.e.retypes = {}; s.dialogHold = false; s.dialogMaybeOpen = false; s.e.enterRetries = 0; s.retryStep = 0; s.notNowStep = 0; s.recover = true
+          s.e.retypes = {}; s.dialogHold = false; s.dialogMaybeOpen = false; s.retryStep = 0; s.notNowStep = 0; s.recover = true
           s.deadlines.backoff = 0; s.deadlines.notNow = 0; s.deadlines.enterDelay = 0; s.deadlines.idleEvidence = clock.now() + ms('IDLE_EVIDENCE_MAX_WAIT_MS', IDLE_EVIDENCE_MAX_WAIT_MS)
           const previous = launches.get(key), launchId = life.launchId(key), sessionId = s.row!.session_id
           const sameLaunch = previous?.launchId === launchId && previous.sessionId === sessionId
@@ -352,7 +341,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
           const receipt = s.receipt?.receipt
           if (!receipt) break
           queueWrite(s, { v: 1, kind: 'delivered', seq: pair[0], part, at: clock.now(), receipt: { path: receipt.path, uuid: receipt.uuid, offset: receipt.offset } }, () => {
-            s.e.lastDelivered = pair; lastDelivered.set(key, { pair, text: head!.fixed!.parts[part - 1]! }); s.e.phase = 'ready'; s.e.target = NO_DELIVERY_PAIR; s.recover = false; release(s)
+            s.e.phase = 'ready'; s.e.target = NO_DELIVERY_PAIR; s.recover = false; release(s)
             emit({ type: 'delivered', key, seq: pair[0], part })
             const item = deps.queue.items(key).find(i => i.accepted.seq === pair[0])
             if (item?.delivered) emit({ type: 'item-delivered', key, seq: pair[0], at: clock.now(), waitMs: Math.max(0, clock.now() - item.accepted.received_at) })
@@ -368,7 +357,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
           // Revalidate every unused request against a fresh independent gate
           // observation. The engine's prior external reading stays frozen.
           const saved = s.reading
-          if (!await observe(key, s, observedItem!, observedPart, true, true)) { s.e.request = 'none'; s.reading = saved; break }
+          if (!await observe(key, s, observedItem!, observedPart, true)) { s.e.request = 'none'; s.reading = saved; break }
           const gateKnowledge = build(key, s), choice = decideGate(gateKnowledge)
           // A writer failure may have released an already-recorded attempt's
           // lease for a long time. Recover that durable unknown attempt if
@@ -378,7 +367,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
             const sent = effectiveSends(head!, part).at(-1)
             const safe = sent?.send_kind === 'retype' ? retypeGate(gateKnowledge.r, gateKnowledge.e) : firstSendGate(gateKnowledge.r, gateKnowledge.e)
             if (!safe) { s.e.phase = 'ready'; s.e.request = 'none'; s.recover = true; release(s); break }
-          } else if (['enter', 'retry'].includes(s.e.phase) && s.screen?.kind !== 'own') {
+          } else if (s.e.phase === 'enter' && !firstSendGate(gateKnowledge.r, gateKnowledge.e)) {
             s.e.phase = 'receipt'; s.e.request = 'none'; s.deadlines.receipt = clock.now() + ms('RECEIPT_WAIT_MS', RECEIPT_WAIT_MS); release(s); break
           }
           if (choice === 'grantDelivery') {
@@ -387,37 +376,36 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
           }
           s.e.request = 'none'; break
         }
-        if (action === 'recordSend' || action === 'recordEnterRetry') {
-          const retype = action === 'recordSend' && (effectiveSends(head!, part).length > 0 || head!.unknownSend)
-          const kind = action === 'recordEnterRetry' ? 'enter' : retype ? 'retype' : 'text'
+        if (action === 'recordSend') {
+          const retype = (effectiveSends(head!, part).length > 0 || head!.unknownSend)
+          const kind = retype ? 'retype' : 'text'
           const sent: SentRecord = { v: 1, kind: 'sent', seq: pair[0], part, attempt: head!.nextAttempt, send_kind: kind, at: clock.now(), launch_id: life.launchId(key), session_id: s.row!.session_id, transcript_path: s.receipt?.path ?? '', transcript_size: s.receipt?.size ?? 0 }
           s.e.target = pair; s.e.attempt = sent.attempt
           queueWrite(s, sent, () => {
-            s.e.phase = kind === 'enter' ? 'retry' : 'text'; s.e.request = 'none'
-            if (kind === 'enter') s.e.enterRetries++
+            s.e.phase = 'text'; s.e.request = 'none'
             if (kind === 'retype') { s.e.retypes[pair[0]] = (s.e.retypes[pair[0]] ?? 0) + 1; s.retryStep++ }
           }); continue
         }
         if (action === 'typeText') {
+          if (!await revalidateKeys(key, s)) break
           try {
             const params: SendKeysParams = { instance_id: deps.instanceId(key), text: head!.fixed!.parts[part - 1], no_enter: true }
             await ad(key, s, 'send-keys', client => client.sendKeys(params))
             if (part === 1 && effectiveSends(head!, part).at(-1)?.send_kind === 'text' && !typed.has(`${key}:${pair[0]}`)) { typed.add(`${key}:${pair[0]}`); emit({ type: 'first-typed', key, seq: pair[0], part }) }
             s.dialogMaybeOpen = false
-            s.notNowStep = 0; s.e.enterRetries = 0; s.deadlines.notNow = 0; s.e.phase = 'enter'; s.deadlines.enterDelay = clock.now() + ms('ENTER_DELAY_MS', ENTER_DELAY_MS)
+            s.notNowStep = 0; s.deadlines.notNow = 0; s.e.phase = 'enter'; s.deadlines.enterDelay = clock.now() + ms('ENTER_DELAY_MS', ENTER_DELAY_MS)
           } catch (error) { await keyError(key, s, error, true) }
           if (s.e.phase === 'enter') { nextDelay = ms('ENTER_DELAY_MS', ENTER_DELAY_MS); break }
           continue
         }
-        if (action === 'leftoverEnter') { s.cleanup = true; s.e.target = s.e.lastDelivered; s.e.lastDelivered = NO_DELIVERY_PAIR; s.e.phase = 'retry'; s.e.request = 'none'; continue }
-        if (action === 'pressEnter' || action === 'retryEnter') {
+        if (action === 'pressEnter') {
+          if (!await revalidateKeys(key, s)) break
           try { await ad(key, s, 'send-keys', client => client.sendKeys({ instance_id: deps.instanceId(key), key: 'Enter' })) }
           catch (error) { await keyError(key, s, error, false) }
           const sentItem = deps.queue.items(key).find(i => i.accepted.seq === s.e.target[0]) ?? head!
           const sent = effectiveSends(sentItem, s.e.target[1]).at(-1)
           if (sent) afterSend(s, key, sent)
           else { s.e.phase = 'receipt'; s.deadlines.receipt = clock.now() + ms('RECEIPT_WAIT_MS', RECEIPT_WAIT_MS) }
-          s.reading = { ...s.reading, screen: 'overlay' }; s.screen = undefined
           break
         }
         if (action === 'recordRefusal') {
@@ -428,7 +416,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
           }); continue
         }
         if (action === 'releaseAttempt') {
-          release(s); s.cleanup = false; s.e.phase = 'ready'; s.recover = false
+          release(s); s.e.phase = 'ready'; s.recover = false
           // Do not poll a working row with its gate held. Its ten-second
           // receipt deadline restarts when it leaves working.
           if (s.receiptWorking) break
@@ -445,7 +433,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
           await life.retryReconnect(key); break
         }
         if (action === 'stopAbsent') { release(s); wait(key, s, 'state'); break }
-        if (s.e.phase === 'enter' || s.e.phase === 'retry') {
+        if (s.e.phase === 'enter') {
           // A wake can run between a text and its delayed Enter. Keep the
           // key sequence's lease until the Enter (including retry delays).
         } else if (s.e.phase === 'receipt' || s.receiptWorking) {
@@ -454,7 +442,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
         } else {
           release(s); s.recover = false
           const r = s.reading
-          const reason: DeliveryReason = s.dialogHold ? 'dialog-hold' : r.held || r.latched ? 'held' : !r.marker ? 'marker' : !r.relay ? 'relay-off' : !['waiting', 'working'].includes(r.row) ? 'state' : s.screen?.kind === 'input' || s.screen?.kind === 'own' ? 'input' : !s.screen ? 'not-now' : s.screen.kind !== 'empty' ? 'menu' : !r.mcp ? 'mcp' : s.e.timers.settle > 0 ? 'launch-settle' : s.receipt?.availability === 'unreadable' ? 'transcript-unreadable' : 'idle-evidence'
+          const reason: DeliveryReason = s.dialogHold ? 'dialog-hold' : r.held || r.latched ? 'held' : !r.marker ? 'marker' : !r.relay ? 'relay-off' : !['waiting', 'working'].includes(r.row) ? 'state' : !r.mcp ? 'mcp' : s.e.timers.settle > 0 ? 'launch-settle' : s.receipt?.availability === 'unreadable' ? 'transcript-unreadable' : 'idle-evidence'
           wait(key, s, reason); if (reason === 'marker') emit({ type: 'marker-missing', key })
         }
         const due = Object.values(s.deadlines).filter(t => Number.isFinite(t) && t > clock.now()).map(t => t - clock.now())
@@ -492,8 +480,8 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
       await api.tick(key)
       return !s.recover && life.owner(key) !== 'delivery'
     },
-    async forget(key) { lastDelivered.delete(key); launches.delete(key); const s = states.get(key); if (!s) { life.forget(key); return }; s.stopped = true; if (s.timer !== undefined) clock.clearTimeout(s.timer); release(s); await s.busy; states.delete(key); life.engineRunning(key, false); life.forget(key) },
-    async stop() { stopped = true; const stoppingLife = life.stop(); for (const [key, s] of states) { s.stopped = true; if (s.timer !== undefined) clock.clearTimeout(s.timer); release(s); life.engineRunning(key, false) }; await Promise.allSettled([...states.values()].flatMap(s => s.busy ? [s.busy] : [])); await stoppingLife; states.clear(); lastDelivered.clear(); launches.clear() },
+    async forget(key) { launches.delete(key); const s = states.get(key); if (!s) { life.forget(key); return }; s.stopped = true; if (s.timer !== undefined) clock.clearTimeout(s.timer); release(s); await s.busy; states.delete(key); life.engineRunning(key, false); life.forget(key) },
+    async stop() { stopped = true; const stoppingLife = life.stop(); for (const [key, s] of states) { s.stopped = true; if (s.timer !== undefined) clock.clearTimeout(s.timer); release(s); life.engineRunning(key, false) }; await Promise.allSettled([...states.values()].flatMap(s => s.busy ? [s.busy] : [])); await stoppingLife; states.clear(); launches.clear() },
     running: key => states.has(key),
     snapshot: key => states.get(key)?.snapshot,
     status: key => { const s = states.get(key); return s ? status(key, s) : undefined },
@@ -503,7 +491,7 @@ export function createDeliveryEngines(deps: DeliveryEngineDeps): DeliveryEngines
     if (stopped || !deps.persona(key) || deps.isConnected(key)) { life.clearDeferred(key); return }
     // b.omv SR-5.5, b.jg5 SRJ-502: only the latch re-check may call
     // agent-director while latched. Keep the reconnect for after the clear,
-    // pausing screen-only time, and recheck after client creation awaits.
+    // and recheck after client creation awaits.
     if (deps.isLatched(key)) { life.defer(key); return }
     const client = await deps.clientFor(key)
     if (stopped || !life.active(key)) return
