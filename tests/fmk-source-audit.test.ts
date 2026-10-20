@@ -1667,16 +1667,19 @@ printf '%s' "$GRACE_S"`, ['awk', 'mkdir'])
   test.each([
     'complete', 'one-enter', 'no-results', 'missing-origin', 'duplicate-text', 'foreign-parent', 'changed-instance',
     'early-enter', 'pane-read', 'bypass', 'changed-launch', 'missing-result', 'premature-ok',
-    'failed-final', 'wrong-row', 'wrong-caller', 'wrong-result-instance',
+    'failed-final', 'wrong-row', 'wrong-caller', 'wrong-result-instance', 'wrong-event',
+    'server-as-caller', 'reordered-results', 'duplicate-result', 'before-invocation', 'after-next-invocation',
+    'wrong-invocation', 'allow-pending-result', 'wrong-refusal', 'missing-invocation', 'millisecond-rounding',
   ])('uncertain reconnect recovery keeps originating intent and AD evidence: %s', (mode) => {
     const text = '--instance-id cscb_control --text /mcp\\ reconnect\\ slack-channel-router --no-enter'
     const enter = '--instance-id cscb_control --key Enter'
     const rows = [
-      ['1', '1.000000', '42', 'send-keys', 'cscb_control', text],
-      ['2', '2.000000', '42', 'send-keys', 'cscb_control', enter],
-      ['3', '3.000000', '42', 'send-keys', 'cscb_control', enter],
+      ['1', '1.000000', '42', 'send-keys', 'cscb_control', text, '101'],
+      ['2', '2.000000', '42', 'send-keys', 'cscb_control', enter, '102'],
+      ['3', '3.000000', '42', 'send-keys', 'cscb_control', enter, '103'],
     ]
-    const records = rows.map((_, i) => ({ event: 'ad.send_keys.called', instance_id: 'cscb_control', caller_pid: 42,
+    const records = rows.map((row, i) => ({ event: 'ad.send_keys.called', instance_id: 'cscb_control', caller_pid: Number(row[6]),
+      ts: `1970-01-01T00:00:0${i + 1}.010Z`, source: 'ad_send_keys', caller_process: 'agent-director',
       row_state: 'waiting', allow_pending: false, outcome: i === 2 ? 'ok' : 'ErrTmuxUnresponsive' }))
     if (mode === 'one-enter') { rows.splice(1, 1); records.splice(1, 1) }
     if (mode === 'no-results') { rows.splice(1, 1); records.splice(0) }
@@ -1694,13 +1697,25 @@ printf '%s' "$GRACE_S"`, ['awk', 'mkdir'])
     if (mode === 'wrong-row') records[1]!.row_state = 'working'
     if (mode === 'wrong-caller') records[1]!.caller_pid = 43
     if (mode === 'wrong-result-instance') records[1]!.instance_id = 'cscb_other'
+    if (mode === 'wrong-event') records[1]!.event = 'ad.pause.called'
+    if (mode === 'server-as-caller') records[1]!.caller_pid = 42
+    if (mode === 'reordered-results') records.reverse()
+    if (mode === 'duplicate-result') records.splice(1, 0, { ...records[1]! })
+    if (mode === 'before-invocation') records[1]!.ts = '1970-01-01T00:00:01.999Z'
+    if (mode === 'after-next-invocation') records[1]!.ts = '1970-01-01T00:00:03.001Z'
+    if (mode === 'wrong-invocation') records[1]!.caller_pid = 103
+    if (mode === 'allow-pending-result') records[1]!.allow_pending = true
+    if (mode === 'wrong-refusal') records[1]!.outcome = 'ErrDialogMaybeOpen'
+    if (mode === 'missing-invocation') rows[1]!.pop()
+    // AD truncates its event clock to milliseconds; the shim records microseconds.
+    if (mode === 'millisecond-rounding') { rows[1]![1] = '2.000999'; records[1]!.ts = '1970-01-01T00:00:02.000Z' }
     writeFileSync(join(home, 'rows'), rows.map(row => row.join('\t')).join('\n'))
     writeFileSync(join(home, 'outcomes'), records.map(record => JSON.stringify(record)).join('\n'))
-    const output = shell(`${['_scenario_eval_words', '_scenario_to_us', '_scenario_assert_reconnect_rows'].map(name => helper(name)).join('\n')}
+    const output = shell(`${['_scenario_eval_words', '_scenario_to_us', '_scenario_reconnect_outcomes', '_scenario_assert_reconnect_rows'].map(name => helper(name)).join('\n')}
 fail() { printf 'REFUSED: %s\\n' "$*"; exit 1; }
 (_scenario_assert_reconnect_rows fixture 42 1000 "$(cat "$HOME/rows")" "$(cat "$HOME/outcomes")")
 printf 'RESULT=%s' "$?"`, ['cat', 'jq'])
-    expect(output).toContain(mode === 'complete' || mode === 'one-enter' ? 'RESULT=0' : 'RESULT=1')
+    expect(output).toContain(['complete', 'one-enter', 'millisecond-rounding'].includes(mode) ? 'RESULT=0' : 'RESULT=1')
   })
   test.each([
     'complete', 'changed-launch-during-refusal', 'foreign-parent-during-refusal',
@@ -1714,18 +1729,18 @@ printf 'RESULT=%s' "$?"`, ['cat', 'jq'])
     const text = '--instance-id cscb_control --text /mcp\\ reconnect\\ slack-channel-router --no-enter'
     const enter = '--instance-id cscb_control --key Enter'
     const rows = [
-      ['1', '1.000000', '42', 'send-keys', 'cscb_control', text],
-      ['2', '2.000000', '42', 'send-keys', 'cscb_control', enter],
-      ['3', '2.500000', '42', 'get', 'cscb_control', '--instance-id cscb_control'],
-      ['4', '3.000000', '42', 'send-keys', 'cscb_control', enter],
-      ['5', '3.500000', '42', 'get', 'cscb_control', '--instance-id cscb_control'],
-      ['6', '4.000000', '42', 'send-keys', 'cscb_control', enter],
+      ['1', '1.000000', '42', 'send-keys', 'cscb_control', text, '101'],
+      ['2', '2.000000', '42', 'send-keys', 'cscb_control', enter, '102'],
+      ['3', '2.500000', '42', 'get', 'cscb_control', '--instance-id cscb_control', '103'],
+      ['4', '3.000000', '42', 'send-keys', 'cscb_control', enter, '104'],
+      ['5', '3.500000', '42', 'get', 'cscb_control', '--instance-id cscb_control', '105'],
+      ['6', '4.000000', '42', 'send-keys', 'cscb_control', enter, '106'],
       // Later activity must not leak into either selected stream.
-      ['7', '4.500000', '42', 'read-pane', 'cscb_control', '--n-lines 1'],
-      ['8', '5.000000', '42', 'send-keys', 'cscb_control', text],
+      ['7', '4.500000', '42', 'read-pane', 'cscb_control', '--n-lines 1', '107'],
+      ['8', '5.000000', '42', 'send-keys', 'cscb_control', text, '108'],
     ]
     const records = [1, 2, 3, 4, 5].map((second, i) => ({ event: 'ad.send_keys.called',
-      ts: `1970-01-01T00:00:0${second}.000Z`, instance_id: 'cscb_control', caller_pid: 42,
+      ts: `1970-01-01T00:00:0${second}.010Z`, instance_id: 'cscb_control', caller_pid: [101, 102, 104, 106, 108][i],
       row_state: 'waiting', allow_pending: false, outcome: i >= 3 ? 'ok' : 'ErrTmuxUnresponsive' }))
     if (mode === 'changed-launch-during-refusal') rows[4]![3] = 'resume'
     if (mode === 'foreign-parent-during-refusal') rows[3]![2] = '43'
@@ -1735,7 +1750,7 @@ printf 'RESULT=%s' "$?"`, ['cat', 'jq'])
     writeFileSync(join(home, 'rows'), rows.map(row => row.join('\t')).join('\n'))
     writeFileSync(join(home, 'outcomes'), records.map(record => JSON.stringify(record)).join('\n'))
     const output = shell(`${helper('t18_reconnect_window', source)}
-${['_scenario_eval_words', '_scenario_to_us', '_scenario_assert_reconnect_rows'].map(name => helper(name)).join('\n')}
+${['_scenario_eval_words', '_scenario_to_us', '_scenario_reconnect_outcomes', '_scenario_assert_reconnect_rows'].map(name => helper(name)).join('\n')}
 fail() { printf 'REFUSED: %s\\n' "$*"; exit 1; }
 (
 t18_reconnect_window fixture 42 ${mode === 'success-before-mark' ? 6 : 2} "$(cat "$HOME/rows")" "$(cat "$HOME/outcomes")"
@@ -1748,6 +1763,75 @@ printf 'KEYS=%s OUTCOMES=%s LAST=%s\\n' \
 printf 'RESULT=%s' "$?"`, ['cat', 'jq', 'awk'])
     expect(output).toContain(mode === 'complete' ? 'KEYS=4 OUTCOMES=4 LAST=6\nRESULT=0' : 'RESULT=1')
   })
+  test.each([
+    'complete', 'unrelated-child-noise', 'wrong-parent', 'other-instance', 'unrelated-child',
+    'wrong-operation', 'reordered-results', 'wrong-outcome', 'missing-result', 'old-caller-filter',
+  ])('test-18 polls and verifies exact CLI invocations from shim/trail records: %s', mode => {
+    const source = readFileSync(join(import.meta.dir, 'integration/test-18-fmk-wedged.sh'), 'utf8')
+    const text = '--instance-id cscb_control --text /mcp\\ reconnect\\ slack-channel-router --no-enter'
+    const enter = '--instance-id cscb_control --key Enter'
+    // Real shim columns: kind, epoch, CLI PID, parent PID, parent argv, CLI argv.
+    // The shared client's get overlaps the persona client's refused key, so
+    // unrelated reads cannot be used as an upper time bound for key results.
+    const log = [
+      ['call', '1.000005', '101', '42', 'bun server.ts', `--store-path /fixture/state send-keys ${text}`],
+      ['call', '2.000005', '102', '42', 'bun server.ts', `--store-path /fixture/state send-keys ${enter}`],
+      ['call', '2.500005', '109', '42', 'bun server.ts', 'get --instance-id cscb_control'],
+      ['call', '3.000005', '103', mode === 'wrong-parent' ? '43' : '42', 'bun server.ts', `send-keys ${enter}`],
+    ]
+    const records = [101, 102, 103].map((pid, i) => ({
+      event: 'ad.send_keys.called', instance_id: 'cscb_control', caller_pid: pid,
+      caller_process: 'agent-director', source: 'ad_send_keys',
+      ts: `1970-01-01T00:00:0${i + 1}.${i === 1 ? '800' : '010'}Z`,
+      row_state: 'waiting', allow_pending: false, guard_evaluation: 'not-applicable',
+      outcome: i === 2 ? 'ok' : 'ErrTmuxUnresponsive',
+    }))
+    if (mode === 'other-instance') records[2]!.instance_id = 'cscb_other'
+    if (mode === 'unrelated-child') records[2]!.caller_pid = 109
+    if (mode === 'wrong-operation') log[3]![5] = 'get --instance-id cscb_control'
+    if (mode === 'reordered-results') records.reverse()
+    if (mode === 'wrong-outcome') records[1]!.outcome = 'ErrDialogMaybeOpen'
+    if (mode === 'missing-result') records.splice(1, 1)
+    if (mode === 'unrelated-child-noise') records.splice(1, 0, { ...records[2]!, caller_pid: 109, ts: '1970-01-01T00:00:02.600Z' })
+    writeFileSync(join(home, 'shim.log'), log.map(row => row.join('\t')).join('\n'))
+    writeFileSync(join(home, 'ad-trail.jsonl'), records.map(record => JSON.stringify(record)).join('\n'))
+    writeFileSync(join(home, 'processes'), 'proc\tserver\t42\t1\t0.000000\tbun server.ts\n')
+    const correlate = helper('_scenario_reconnect_outcomes')
+    const oldFilter = correlate.replace('.value.caller_pid == ($call[6] | tonumber)', '.value.caller_pid == ($server | tonumber)')
+    expect(oldFilter).not.toBe(correlate)
+    const declarations = [
+      '_scenario_record_load', '_scenario_role_at', '_scenario_query_prep', '_scenario_read_log',
+      '_scenario_to_us', '_scenario_us_text', '_scenario_split_line', '_scenario_eval_words',
+      '_scenario_decode_words', '_scenario_ad_verb', '_scenario_ad_id', '_scenario_in_window',
+      '_scenario_check_mark', '_scenario_cscb_ad_rows', 'ad_cscb_calls', 'ad_trail_events',
+      '_scenario_assert_reconnect_rows',
+    ].map(name => helper(name)).join('\n')
+    const output = shell(`${declarations}
+${mode === 'old-caller-filter' ? oldFilter : correlate}
+${helper('t18_reconnect_submitted', source)}
+${helper('t18_reconnect_window', source)}
+require_ci_image() { :; }
+require_scenario_home() { :; }
+fail() { printf 'REFUSED: %s\\n' "$*"; exit 1; }
+SCENARIO_FMK=1
+SCENARIO_CSCB_RECORD="$HOME/processes"
+_SCENARIO_REAL_CSCB_RECORD="$HOME/unused"
+SCENARIO_AD_SHIM_LOG="$HOME/shim.log"
+SCENARIO_AD_ROOT="$HOME"
+SERVER_PID=42
+(
+t18_reconnect_submitted cscb_control 2.9 || exit 1
+calls="$(ad_cscb_calls cscb_control - - with-pid)"
+# All default consumers keep the original six-column record contract.
+[[ "$(ad_cscb_calls cscb_control | awk -F '\\t' 'NF != 6 { bad++ } END { print bad+0 }')" == 0 ]] || exit 2
+t18_reconnect_window fixture 42 2 "$calls" "$(ad_trail_events ad.send_keys.called cscb_control)"
+_scenario_assert_reconnect_rows fixture 42 1000 "$T18_RECONNECT_CALLS" "$T18_RECONNECT_OUTCOMES"
+printf 'PIDS=%s\\n' "$(jq -sr 'map(.caller_pid | tostring) | join(",")' <<< "$T18_RECONNECT_OUTCOMES")"
+)
+printf 'RESULT=%s' "$?"`, ['jq', 'awk'])
+    expect(output).toContain(['complete', 'unrelated-child-noise'].includes(mode) ? 'PIDS=101,102,103\nRESULT=0' : 'RESULT=1')
+  })
+
   test.each(['complete', 'missing-session', 'missing-pane', 'tmux-failure', 'undefined-helper'])('test-18 executes its fixture identity reader: %s', mode => {
     const source = readFileSync(join(import.meta.dir, 'integration/test-18-fmk-wedged.sh'), 'utf8')
     writeFileSync(join(home, 'row.json'), JSON.stringify({ session_id: 'conversation', tmux_session_name: mode === 'missing-session' ? null : 'fixture', tmux_socket: '/fixture/socket', jsonl_path: '/fixture/transcript' }))

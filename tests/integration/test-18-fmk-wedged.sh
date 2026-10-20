@@ -533,26 +533,22 @@ t18_texts() {
 }
 
 t18_reconnect_submitted() {
-    local events
+    local events calls selected
     events="$(ad_trail_events ad.send_keys.called "$1")" || return 1
-    jq -e -s --argjson server "${SERVER_PID}" --argjson since "$2" '
-        any(.[]; .caller_pid == $server and .outcome == "ok" and
+    calls="$(ad_cscb_calls "$1" - - with-pid)" || return 1
+    selected="$(_scenario_reconnect_outcomes "${SERVER_PID}" "${calls}" "${events}")" || return 1
+    jq -e --argjson since "$2" '
+        length >= 2 and (.[-1] | .outcome == "ok" and
             ((.ts | (.[0:19] + "Z" | fromdateiso8601) + (("0." + .[20:23]) | tonumber)) + 0.001 >= $since))
-    ' <<< "${events}" > /dev/null
+    ' <<< "${selected}" > /dev/null
 }
 
 # Select both audit streams through the same successful Enter. The mark is
 # taken before clearing the fault, so post-mark Enters can still be refused.
 t18_reconnect_window() {
-    local step="$1" server="$2" mark="$3" calls="$4" outcomes="$5" first_key selected count
-    first_key="$(awk -F '\t' '$4 == "send-keys" { print $2; exit }' <<< "${calls}")"
-    [[ -n "${first_key}" ]] || fail "${step}: reconnect has no originating key"
-    selected="$(jq -c -s --argjson since "${first_key}" --argjson server "${server}" '
-        map(select(.caller_pid == $server and
-            ((.ts | (.[0:19] + "Z" | fromdateiso8601) + (("0." + .[20:23]) | tonumber)) + 0.001 >= $since))) |
-        (map(.outcome == "ok") | index(true)) as $ok |
-        if $ok == null then [] else .[0:($ok + 1)] end
-    ' <<< "${outcomes}")" || fail "${step}: cannot decode AD reconnect outcomes"
+    local step="$1" server="$2" mark="$3" calls="$4" outcomes="$5" selected count
+    selected="$(_scenario_reconnect_outcomes "${server}" "${calls}" "${outcomes}")" \
+        || fail "${step}: cannot correlate AD reconnect outcomes to server invocations"
     count="$(jq 'length' <<< "${selected}")"
     (( count >= 2 )) || fail "${step}: reconnect has no successful Enter after its originating text"
     T18_RECONNECT_CALLS="$(awk -F '\t' -v count="${count}" '
@@ -629,7 +625,7 @@ t18_condition_section() {
         # Retain the originating uncertain text, every refused Enter, and
         # the successful post-unwedge Enter. A suffix of two Enters loses
         # the intent which makes those retries safe.
-        calls="$(ad_cscb_calls "${!id_var}" - -)" || exit 1
+        calls="$(ad_cscb_calls "${!id_var}" - - with-pid)" || exit 1
         outcomes="$(ad_trail_events ad.send_keys.called "${!id_var}")" || exit 1
         t18_reconnect_window "${step}: ${p}" "${SERVER_PID}" "${unwedge_mark}" "${calls}" "${outcomes}"
         _scenario_assert_reconnect_rows "${step}: ${p}" "${SERVER_PID}" "${ENTER_DELAY_MS}" \

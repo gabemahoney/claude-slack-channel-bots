@@ -888,11 +888,12 @@
 #   single spaces.
 #   ad_shim_mark                       print the agent-director shim log's position now
 #   tmux_shim_mark                     print the tmux shim log's position now
-#   ad_cscb_calls <instance-id|*> [<from-mark> [<to-mark>]]
+#   ad_cscb_calls <instance-id|*> [<from-mark> [<to-mark> [with-pid]]]
 #                                      print the rows of the CSCB-parented calls whose instance id is
 #                                      exactly <instance-id> (never one it is a prefix of), or, for
 #                                      `*`, of every CSCB-parented call that carries an instance id,
-#                                      in log order
+#                                      in log order; with-pid appends the invocation PID as field 7
+#                                      for exact AD trail correlation (the default six fields stay fixed)
 #   wait_for_ad_cscb_call <instance-id> <verb> <min-count> <timeout-s> [<step>]
 #                                      wait until `ad_cscb_calls <instance-id>` holds at least
 #                                      <min-count> rows of <verb> (a count over the whole log); fail,
@@ -4979,30 +4980,74 @@ _scenario_cscb_ad_rows() {
             printf -v args '%q ' "${_L_ARGS[@]}"
             args="${args% }"
         fi
-        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(( i + 1 ))" "$(_scenario_us_text "${_L_US}")" "${_L_PPID}" \
+        printf '%s\t%s\t%s\t%s\t%s\t%s' "$(( i + 1 ))" "$(_scenario_us_text "${_L_US}")" "${_L_PPID}" \
             "${_L_VERB}" "${_L_ID:--}" "${args}"
+        [[ "${6:-}" != with-pid ]] || printf '\t%s' "${_L_PID}"
+        printf '\n'
     done
 }
 
 ad_cscb_calls() {
-    local id="${1:-}" from="${2:--}" to="${3:--}"
+    local id="${1:-}" from="${2:--}" to="${3:--}" pid="${4:-}"
+    [[ -z "${pid}" || "${pid}" == with-pid ]] || fail "ad_cscb_calls: unknown projection ${pid}"
     [[ -n "${id}" ]] || fail "ad_cscb_calls: no instance id given (or * for every call carrying one)"
     _scenario_check_mark ad_cscb_calls "<from-mark>" "${from}"
     _scenario_check_mark ad_cscb_calls "<to-mark>" "${to}"
-    _scenario_cscb_ad_rows ad_cscb_calls "${id}" "" "${from}" "${to}"
+    _scenario_cscb_ad_rows ad_cscb_calls "${id}" "" "${from}" "${to}" "${pid}"
+}
+
+# Match each key to the exact shim invocation, through the first success.
+# AD caller_pid is os.Getpid() inside its CLI, not the CSCB server PID.
+# Rows must carry with-pid field 7; its parent still has to be the server.
+# The millisecond trail timestamp represents [ts, ts + 1 ms), so compare
+# that interval with the invocation and the next key under its lifecycle lease.
+# Other clients can read the same persona concurrently; those reads do not
+# bound a key result.
+# Keep event write order, reject duplicates/missing results, and never match
+# a different operation, instance or merely some child of the server.
+_scenario_reconnect_outcomes() {
+    jq -e -c -s --arg rows "$2" --arg server "$1" '
+        def stamp: .ts | capture("^(?<whole>[^.]+)\\.(?<fraction>[0-9]+)Z$") |
+            ((.whole + "Z" | fromdateiso8601) + (("0." + .fraction) | tonumber));
+        . as $events |
+        ($rows | split("\n") | map(select(length > 0) | split("\t")) |
+            map(select(.[3] == "send-keys"))) as $calls |
+        def keys($i; $last; $found):
+            if $i >= ($calls | length) then error("no successful key")
+            else $calls[$i] as $call |
+                if ($call | length) != 7 or $call[2] != $server or
+                    ($call[6] | test("^[0-9]+$") | not) then error("unproven invocation") else
+                ($events | to_entries | map(select(
+                    .value.event == "ad.send_keys.called" and
+                    .value.instance_id == $call[4] and
+                    .value.caller_pid == ($call[6] | tonumber) and
+                    ((.value | stamp) + 0.001 > ($call[1] | tonumber)) and
+                    (if $i + 1 < ($calls | length) then
+                        (.value | stamp) <= ($calls[$i + 1][1] | tonumber)
+                     else true end)))) as $matches |
+                if ($matches | length) != 1 or $matches[0].key <= $last then
+                    error("missing, duplicate or reordered key result")
+                else $matches[0] as $match |
+                    ($found + [$match.value]) as $next |
+                    if $match.value.outcome == "ok" then $next
+                    else keys($i + 1; $match.key; $next) end
+                end end
+            end;
+        keys(0; -1; [])
+    ' <<< "$3" 2>/dev/null
 }
 
 # _scenario_assert_reconnect_rows <step> <server-pid> <delay-ms> <rows>:
 # inspect an already-filtered ad_cscb_calls table for one persona/window.
 # AD row guards, text with no_enter, and delayed Enter. Optional fifth arg:
 # AD send_keys.called records for the complete uncertain recovery attempt.
-# Every retry must have its own waiting/server/id/outcome record; only the
+# Every retry must have its own waiting/invocation/id/outcome record; only the
 # final Enter may succeed. Automatic reconnects
 # must never inspect screen contents or send an expected pane hash.
 _scenario_assert_reconnect_rows() {
     local step="$1" server="$2" delay="$3" rows="$4" outcomes="${5:-}" recovery="${5+x}"
-    local pos time parent verb id args words=() i text key no_enter sends=0 typed_at=0 instance=""
-    while IFS=$'\t' read -r pos time parent verb id args; do
+    local pos time parent verb id args invocation words=() i text key no_enter sends=0 typed_at=0 instance="" last_key_at=0
+    while IFS=$'\t' read -r pos time parent verb id args invocation; do
         [[ -n "${pos}" ]] || continue
         if (( sends > 0 )) && [[ "${verb}" == spawn || "${verb}" == resume || "${verb}" == kill ]]; then
             fail "${step}: reconnect recovery changed the launch"
@@ -5029,6 +5074,8 @@ _scenario_assert_reconnect_rows() {
             fail "${step}: automatic reconnect read a pane"
         fi
         _scenario_to_us "${time}" || fail "${step}: invalid key timestamp ${time}"
+        (( _SCENARIO_US >= last_key_at )) || fail "${step}: reconnect keys are out of order"
+        last_key_at="${_SCENARIO_US}"
         sends=$(( sends + 1 ))
         if (( sends == 1 )); then
             [[ "${text}" == '/mcp reconnect '?* && -z "${key}" && "${no_enter}" == 1 ]] \
@@ -5047,14 +5094,17 @@ _scenario_assert_reconnect_rows() {
         (( sends == 2 )) || fail "${step}: reconnect has ${sends} key calls, not text then Enter"
     else
         (( sends >= 2 )) || fail "${step}: recovery has no originating text and Enter"
-        jq -e -s --arg id "${instance}" --argjson server "${server}" --argjson n "${sends}" '
+        local matched
+        matched="$(_scenario_reconnect_outcomes "${server}" "${rows}" "${outcomes}")" \
+            || fail "${step}: recovery lacks exact AD invocation/outcome evidence"
+        jq -e --arg id "${instance}" --argjson n "${sends}" '
             length == $n and
             all(.[]; .event == "ad.send_keys.called" and .instance_id == $id and
-                .caller_pid == $server and .row_state == "waiting" and .allow_pending == false) and
+                .row_state == "waiting" and .allow_pending == false) and
             (.[-1].outcome == "ok") and
             all(.[0:-1][]; .outcome == "ErrTmuxUnresponsive")
-        ' <<< "${outcomes}" > /dev/null \
-            || fail "${step}: recovery lacks matching waiting/instance/server/outcome evidence"
+        ' <<< "${matched}" > /dev/null \
+            || fail "${step}: recovery lacks matching waiting/instance/invocation/outcome evidence"
     fi
 }
 
