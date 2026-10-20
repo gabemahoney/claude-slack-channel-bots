@@ -21,7 +21,7 @@ function nativeTakeIn(entry: TranscriptEntry, adapters: ReceiptAdapters): boolea
 
 // Native session metadata has no temporal or ancestry identity. Only the five
 // observed three-field shapes are informational; added evidence stays checked.
-function nativeInformation(entry: TranscriptEntry, adapters: ReceiptAdapters): boolean {
+export function nativeInformation(entry: TranscriptEntry, adapters: ReceiptAdapters): boolean {
   const value = entry.value, field = new Map([
     ['mode', 'mode'], ['permission-mode', 'permissionMode'], ['atis-latch', 'atis'],
     ['last-prompt', 'leafUuid'], ['ai-title', 'aiTitle'],
@@ -56,14 +56,14 @@ function nativeChain(session: TranscriptEntry[], entry: TranscriptEntry, target:
   return undefined
 }
 
-function nativeTime(session: TranscriptEntry[], entry: TranscriptEntry, receipt: TranscriptEntry, adapters: ReceiptAdapters): boolean {
+export function nativeTime(session: TranscriptEntry[], entry: TranscriptEntry, receipt: TranscriptEntry, adapters: ReceiptAdapters): boolean {
   if (!Number.isFinite(entry.at)) return false
   // Decision 24: setup is prepared before the user record is timestamped.
   // Membership is ancestry/file order, with the previous turn as a time floor;
-  // no guessed millisecond allowance applies to these six native types.
+  // no guessed millisecond allowance applies to these native setup types.
   const setup = entry.value?.type === 'attachment'
     && ['environment', 'model', 'agent_listing_delta', 'mcp_instructions_delta', 'skill_listing',
-      'total_tokens_reminder'].includes(entry.value.attachment?.type)
+      'total_tokens_reminder', 'deferred_tools_delta'].includes(entry.value.attachment?.type)
   if (setup) {
     const preceding = session.filter(e => e.offset < receipt.offset)
     const predecessor = preceding.at(-1)
@@ -119,8 +119,10 @@ function assertAC15Exchange(parts: string[], acceptedAt: number, seq: number, jo
         check(Array.isArray(e.value.message?.content), 'AC15 has malformed native assistant content')
         for (const block of e.value.message.content) {
           check(block && typeof block === 'object' && typeof block.type === 'string', 'AC15 has malformed native response block')
+          // Claude's native ToolSearch discovers deferred tool definitions; it
+          // does not execute them. Check every subsequent action independently.
           if (block.type === 'tool_use' || block.type === 'server_tool_use') check(block.type === 'tool_use'
-            && block.name === 'mcp__slack-channel-router__reply', 'AC15 non-reply tool action observed')
+            && ['mcp__slack-channel-router__reply', 'ToolSearch'].includes(block.name), 'AC15 non-reply tool action observed')
         }
       }
     }

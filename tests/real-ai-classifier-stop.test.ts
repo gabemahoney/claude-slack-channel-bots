@@ -47,6 +47,27 @@ function ordinaryEvidence() {
   return { ...e, seq: 3, reply }
 }
 
+test.each(['valid', 'wrong setup parent', 'untimed action', 'real tool after discovery', 'server tool'])(
+  'AC11 handles 2.1.304 setup, discovery and post-reply metadata: %s', mode => {
+    const e = ordinaryEvidence()
+    const setup = e.entry(21, { type: 'attachment', uuid: 'setup', parentUuid: mode === 'wrong setup parent' ? 'missing' : 'case3',
+      attachment: { type: 'deferred_tools_delta' } })
+    setup.at = e.take.at - 1
+    const search = assistant(e, [{ type: mode === 'server tool' ? 'server_tool_use' : 'tool_use', name: 'ToolSearch',
+      id: 'discover', input: { query: 'select:mcp__slack-channel-router__reply' } }], 22, { parentUuid: 'setup' })
+    search.value.message.stop_reason = 'tool_use'
+    e.reply.value.parentUuid = search.value.uuid
+    const information = [['last-prompt', 'leafUuid'], ['ai-title', 'aiTitle']].map(([type, field], i) => {
+      const value = { type, sessionId: 'session', [field!]: 'informational' }
+      return { path: e.take.path, offset: 30 + i, at: NaN, value, ...parseDeliveryTranscriptRecord('claude', value) }
+    })
+    e.own = [e.take, setup, search, e.reply, ...information]
+    if (mode === 'untimed action') information[0]!.value.uuid = 'hidden-action'
+    if (mode === 'real tool after discovery') e.reply.value.message.content.push({ type: 'tool_use', name: 'Write', input: { file_path: 'spoof.txt', content: 'KIWI' } })
+    if (mode === 'valid') expect(spoofTurn(e)).toBeNull()
+    else expect(() => spoofTurn(e)).toThrow()
+  })
+
 function queuedTakeIn(entry: TranscriptEntry, explicitHuman = true) {
   const prompt = entry.text!
   delete entry.value.message
@@ -131,7 +152,7 @@ for (const criterion of ['ordinary', 'AC15'] as const) {
     expect(() => completedAIReadback(e)).toThrow()
   })
 
-  test.each(['environment', 'model', 'agent_listing_delta', 'mcp_instructions_delta', 'skill_listing', 'total_tokens_reminder'])(
+  test.each(['environment', 'model', 'agent_listing_delta', 'mcp_instructions_delta', 'skill_listing', 'total_tokens_reminder', 'deferred_tools_delta'])(
     `${criterion} setup %s must follow the previous turn and link to this receipt`, type => {
       const e = capturedSetup(criterion), setup = e.own[1]!, receipt = e.own[0]!
       setup.value.attachment.type = type
@@ -651,9 +672,20 @@ test.each([
   expect(() => readAC15(e)).toThrow(/^AC15 non-reply tool action observed$/)
 })
 
-test.each(['Bash', 'Read', 'Write', 'Agent', 'mcp__other__reply', 'reply'])('AC15 rejects %s despite exact final JSON', name => {
+test.each(['Bash', 'Read', 'Write', 'Agent', 'mcp__other__reply', 'reply', 'mcp__other__ToolSearch', 'toolsearch'])('AC15 rejects %s despite exact final JSON', name => {
   const e = multipartAC15(); e.own.push(forbiddenAC15Action(e, 26, 'reply25', name))
   expect(() => readAC15(e)).toThrow('AC15 non-reply tool action')
+})
+
+test.each(['discovery only', 'retrieval after discovery', 'server tool lookalike'])('AC15 native ToolSearch: %s', mode => {
+  const e = multipartAC15()
+  const search = forbiddenAC15Action(e, 26, 'reply25', 'ToolSearch')
+  search.value.message.content[0].input = { query: 'select:mcp__slack-channel-router__reply', max_results: 1 }
+  if (mode === 'server tool lookalike') search.value.message.content[0].type = 'server_tool_use'
+  e.own.push(search)
+  if (mode === 'retrieval after discovery') e.own.push(forbiddenAC15Action(e, 27, search.value.uuid))
+  if (mode === 'discovery only') expect(readAC15(e).receipt_uuid).toBe('part-3')
+  else expect(() => readAC15(e)).toThrow('AC15 non-reply tool action')
 })
 
 test.each([NaN, 24])('AC15 rejects late linked history retrieval with invalid/backdated time %s', at => {
