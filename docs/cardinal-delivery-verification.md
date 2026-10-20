@@ -8,9 +8,11 @@ Only fresh agent-director `waiting` authorizes delivery, recovery Enter and reco
 
 Unconfirmed durable own sends receive a persisted `send_kind: enter` recovery attempt under AD waiting/local guards/backoff, including with MCP disconnected, then a receipt window. `recoverBeforeReconnect` prevents reconnect text from overtaking durable attempts or a successful recovery Enter awaiting its receipt window. Only absent confirmation permits later full retype. Durable accepted work, strict FIFO, one in flight and at-least-once behavior remain; duplicates are possible.
 
+Receipt-window fix `7e80d089` keeps reconciliation blocked after an AD read failure releases the lease: an unconfirmed current attempt requires phase `ready`, no `receiptWorking` extension and matching launch/session/recovery-attempt identity. AD `working` extends recovery through a fresh full receipt wait after `waiting`; an exact receipt permits early reconnect only after its `delivered` append is durable. Four production engine regressions check timeout/lease release, durable receipt completion, failed recovery-intent append/backoff and working-to-waiting extension. `ModelReconnectStep` abstracts reconciliation and does not verify this adapter-level receipt-window guard.
+
 Reconnect records input intent before text. Partial or uncertain input resumes with Enter alone; definite text refusal clears intent. Pending control input blocks delivery keys and retains lifecycle retry ownership even after MCP connects. Launch/session change, terminal/absent rows, teardown and shutdown cancel intent and delayed keys.
 
-Documentation follow-up removes working/waiting pane checks, stale screen-duration notices, native final-pane/composer diagnostics, startup approver/trust Enter instructions and the obsolete `working-tmux-gone`/`waiting-row-pane-gone` evidence rows. Outcome-only prompt-row, latch and teardown probes remain. Final trace/TLC/unit/CI evidence below stays pending.
+Documentation follow-up removes working/waiting pane checks, stale screen-duration notices, native final-pane/composer diagnostics, startup approver/trust Enter instructions and the obsolete `working-tmux-gone`/`waiting-row-pane-gone` evidence rows. Outcome-only prompt-row, latch and teardown probes remain. The verified local model, trace, conformance and unit results are recorded below; full `/ci` belongs to the separate runner.
 
 ## Audit disposition
 
@@ -74,7 +76,7 @@ Original references below are from `cardinal-audit-report.md` at audited revisio
 | AT06 | `tests/integration/fixtures/real-case-assertions.ts:99`, `:396` | Spinner plus Compacting regex and marker controls asserted active native compaction. | Removed compaction marker assertions/fixtures; Test 104 instead injects an uncertain AD text outcome and verifies three ordered exact receipts without capability skips. |
 | AT07 | `tests/real-agent/ai-failure-diagnostics.ts:93`, `:166`; `tests/real-agent/codex-delivery.ts:635` | Failure projector parsed borders, residue, footer and prompt glyphs to retain selected pane rows. | Removed native pane content from failure evidence; safe structured transcript/error metadata remains. |
 | AT08 | `tests/integration/fixtures/transcript-receipts.ts:311`, `:368`, `:374` | Delivery failure evidence invoked the production classifier to report own/input/running. | Removed screen classifications from failure projections; retain AD outcomes, queue facts and safe exact receipt evidence. |
-| AT09 | `tests/test-helpers/delivery-model-replay.ts:42` | Model replay parsed native pane fixtures with the production classifier. | Replay now consumes AD observations/refusals and exact receipts; final regenerated trace/conformance evidence remains pending below. |
+| AT09 | `tests/test-helpers/delivery-model-replay.ts:42` | Model replay parsed native pane fixtures with the production classifier. | Replay now consumes AD observations/refusals and exact receipts; all 266 regenerated traces and 40,778 states replay successfully, as recorded below. |
 
 ## Remaining outcome-only `readPane` calls
 
@@ -90,7 +92,9 @@ The owner explicitly permits these outcome/error-class probes for this scope. Th
 
 | Path | One-line reason |
 |---|---|
-| `spec/tla/PersonaDelivery.tla` | Remove screen/idle/compaction-derived readiness; add durable recovery Enter intent and volatile completion identity under waiting-only guards. |
+| `spec/tla/PROVENANCE.txt` | Refresh 49 stale input hashes and add the `ci/check_cardinal.py` pin; all 107 current/frozen inputs match, while historical provenance remains explicitly historical. |
+| `spec/tla/README.md` | Describe AD-owned readiness, durable Enter recovery, current local evidence and its exhaustive/sampled and certification limits. |
+| `spec/tla/PersonaDelivery.tla` | Remove screen/idle/compaction-derived readiness; add durable recovery Enter intent and volatile completion identity under waiting-only guards; `727c6e64` models recovery Enter before disconnected reconnect. |
 | `spec/tla/PersonaDelivery.tla:RestartStateConstraint` | Expand explicit per-part durable-send prefix from two to four so text/recovery Enter/retype/recovery Enter remain reachable; keep all invariants. |
 | `spec/tla/ci/fairness-probe/PermissionFairness.tla` | Use AD waiting/live refusals and model recovery Enter while retaining the original seven fairness obligations and first-text-refusal diagnostic. |
 | `spec/tla/ci/check_cardinal.py` | Freeze actual model/runner/config hashes, retain raw logs and independent proofs, and include all 76 delivery rows plus 8 auxiliary checks in a detached local run. |
@@ -98,7 +102,7 @@ The owner explicitly permits these outcome/error-class probes for this scope. Th
 | `spec/tla/ci/profile_restart.py` | Retain recoveryAttempt, durable attempt IDs and recovery-enter readings in the projection/dataflow audit. |
 | `spec/tla/ci/runner.py` | Declare current AD typing invariant/mutants and four-send reduction metadata. |
 | `spec/tla/ci/trace_contract.py` | Validate recovery action divergence and four-send companion counterexamples. |
-| `spec/tla/ci/temporal_sensitivity.py` | Keep independent temporal proof guides within current screen-free model and current four-send scope. |
+| `spec/tla/ci/temporal_sensitivity.py` | Keep independent temporal proof guides within current screen-free model and four-send scope; `727c6e64` adapts recovery scheduling, and `a30bf265` targets the causal observation-replacement search while preserving original-action replay, fairness and the exact-environment contrast. |
 | `spec/tla/ci/suite.tsv` | Retain all 76 checks/modes/seeds and describe AD guard targets and expanded recovery prefix. |
 | `spec/tla/ci/fairness-probe/job.py` | Validate first-text refusal lassos from AD live guard races without any screen premise. |
 
@@ -149,15 +153,168 @@ The owner explicitly permits these outcome/error-class probes for this scope. Th
 
 ## Final trace change inventory
 
-**PLACEHOLDER — fill from the final exporter inventory after export.** List every actual added/rewritten/deleted trace file and one-line reason, including metadata/provenance/coverage changes. The 76 manifest-row plan is not a substitute for the actual-file inventory. Screen-marker-only cases must not remain as readiness evidence. Keep all non-screen no-loss/FIFO/durable-work controls and duplicate witness semantics.
+The tracked [actual-file inventory](../tests/test-helpers/cardinal-trace-changes.json) contains **302 paths**, each with its change kind and one-line reason: 266 rewritten, 35 deleted and one added. The rewritten paths are 265 canonical trace files plus `coverage.json`; the added path is `supplemental_pullback-001.json`. All 302 paths match the actual fixture diff from audited revision `a01d092d`; this inventory is separate from the 76 manifest rows.
+
+Canonical traces were regenerated from the waiting-only AD model with independent proof bundles. Deleted samples have no corresponding trace in the actual current TLC output. `coverage.json` binds model/input hashes, raw logs, per-row proof/auxiliary evidence, the supplemental witness and executed coverage. Screen-marker-only observations supply no readiness evidence; non-screen no-loss/FIFO/durable-work controls and the expected duplicate witness remain.
 
 ## Verification results
 
-**PLACEHOLDER — final canonical 84-row run (76 manifest + eight auxiliary), run ID/path, frozen input identity, every per-config result and expected-control target, exhaustive versus sampled scope, trace export counts and conformance replay results.** Verification is pending; no current PASS is claimed here.
+### Canonical local evidence and scope
 
-**PLACEHOLDER — full isolated unit-suite outcome; separate runner's full `/ci` run ID and verdict; final commit list.** Per the owner handoff in `/tmp/ci_note.md`, a separate CI runner owns full `/ci` after the branch fix, full isolated units and commits; a local credential-related NOT RUN is not a blocker. The documentation worker runs only targeted documentation checks and makes no commit/merge/push. The calling agent records the unit/commit evidence and the separate runner's CI verdict when available.
+The retained canonical local run is [cardinal-final-causal-proof-20261020T054736Z/report.json](../spec/tla/ci/.runs/cardinal-final-causal-proof-20261020T054736Z/report.json). All **76 delivery rows plus eight auxiliary rows (84 total)** match their expected results, with zero unexpected checker errors, timeouts or proof errors. Expected counterexamples are successful negative controls, not product failures. The report records `partial: false`, `inputsUnchanged: true` and **`certification: false`**; this is local TLC/replay evidence and establishes no scheduler certificate.
 
-Targeted documentation verification: `bun test tests/shipped-docs.test.ts` with scratch launch HOME/state and the host-safety preload passed 2,456 tests, 3,549 assertions, 0 failures in 10.04 s; local log: `/tmp/acu-final-shipped-docs.log`. The owned documentation diff passes `git diff --check`. A stale-reference audit across README, CONTRIBUTING, `docs/*.md`, `tests/README.md` and tracked skills finds no removed readiness/approver symbols or screen-based contract; explicit removal rationale in this report and excluded CI-live collection contracts remain. Outcome-only prompt-row/latch/teardown probes and human diagnostic commands are retained.
+All **107 inputs** match current files, frozen source bytes, report hashes and provenance pins. The earlier pin refresh replaced 49 stale hashes and added the missing `ci/check_cardinal.py` pin. The model SHA-256 is `a4a3d8784998a853337c64f3c98016a2ccac71669d13d908f07887c35290266d`; the temporal-helper SHA-256 is `ddfe487624d5465b8daab0b0e605bfa33271fda75b19e672e1461be099c904d5`. All 84 retained compressed raw logs also match their recorded hashes. Pruned diagnostic directories are not current evidence.
+
+The delivery manifest has eight passing exhaustive checks, 40 expected counterexamples and 28 sampled simulations. The eight exhaustive positives are `core_head_taken_in`, five `restart_order*` checks, `safety_plain` and `safety_agent_input`; their guarantees apply only within each checked config's bounds, constraints and reductions. `core_head_taken_in` verifies `HeadTakenIn` in its small constrained, unprojected scope under the original seven fairness rules and explicit environment assumptions. Restart safety uses `RestartSafetyView`/`RestartStateConstraint`, including the four-send durable prefix; that prefix is a model bound, never a production retry cap.
+
+The 28 delivery simulations retain eight samples each, depth 256 and their exact seeds. The `live_*` simulations leave temporal properties **UNVERIFIED**; sampled safety does not prove liveness. Auxiliary evidence adds one passing bounded exhaustive permission-safety check, six expected safety/temporal/reachability counterexamples, and two depth-five proof-parser simulation samples. Independent original-action replay, accepted-work and temporal contrast bundles are retained where required. The row tables below preserve each config's actual mode, selected target, exit and expected outcome.
+
+### Delivery row results
+
+| Config | Actual scope / sample | Selected checks or expected target | Matched result / exit |
+|---|---|---|---|
+| `core_head_taken_in` | bounded exhaustive | `TypeOK`, `DurableAccept`, `NoDrop`, `ReceiptBacked`, `InOrder`, `TranscriptFIFO`, `OneInFlight`, `TypingGuards`, `NoRetypeWhileWorking`, `GateExclusive`, `NoDuplicateKey`, `HeadTakenIn` | expected pass; 0 |
+| `restart_control_next_item` | finite counterexample | `OneInFlight` | expected violation; 12 |
+| `restart_control_next_part` | finite counterexample | `OneInFlight` | expected violation; 12 |
+| `restart_control_send_is_delivery` | finite counterexample | `ReceiptBacked` | expected violation; 12 |
+| `restart_control_queue_is_receipt` | finite counterexample | `TranscriptFIFO` | expected violation; 12 |
+| `restart_control_start_drop` | finite counterexample | `NoDrop` | expected violation; 12 |
+| `restart_control_compact_open` | finite counterexample | `NoDrop` | expected violation; 12 |
+| `restart_control_early_ack` | finite counterexample | `DurableAccept` | expected violation; 12 |
+| `restart_control_skip_refused` | finite counterexample | `InOrder` | expected violation; 12 |
+| `restart_control_start_unsent_head` | finite counterexample | `InOrder` | expected violation; 12 |
+| `restart_control_retype_into_text` | finite counterexample | `TypingGuards` | expected violation; 12 |
+| `restart_control_retype_working` | finite counterexample | `NoRetypeWhileWorking` | expected violation; 12 |
+| `restart_control_reconnect_keys` | finite counterexample | `GateExclusive` | expected violation; 12 |
+| `restart_control_reconnect_running` | finite counterexample | `TypingGuards` | expected violation; 12 |
+| `restart_control_duplicate_key` | finite counterexample | `NoDuplicateKey` | expected violation; 12 |
+| `restart_order` | bounded exhaustive | `TypeOK`, `DurableAccept`, `NoDrop`, `ReceiptBacked`, `InOrder`, `TranscriptFIFO`, `OneInFlight`, `TypingGuards`, `NoRetypeWhileWorking`, `GateExclusive`, `NoDuplicateKey` | expected pass; 0 |
+| `restart_order_across` | bounded exhaustive | `TypeOK`, `DurableAccept`, `NoDrop`, `ReceiptBacked`, `InOrder`, `TranscriptFIFO`, `OneInFlight`, `TypingGuards`, `NoRetypeWhileWorking`, `GateExclusive`, `NoDuplicateKey` | expected pass; 0 |
+| `restart_order_bot` | bounded exhaustive | `TypeOK`, `DurableAccept`, `NoDrop`, `ReceiptBacked`, `InOrder`, `TranscriptFIFO`, `OneInFlight`, `TypingGuards`, `NoRetypeWhileWorking`, `GateExclusive`, `NoDuplicateKey` | expected pass; 0 |
+| `restart_order_enter` | bounded exhaustive | `TypeOK`, `DurableAccept`, `NoDrop`, `ReceiptBacked`, `InOrder`, `TranscriptFIFO`, `OneInFlight`, `TypingGuards`, `NoRetypeWhileWorking`, `GateExclusive`, `NoDuplicateKey` | expected pass; 0 |
+| `restart_order_busy` | bounded exhaustive | `TypeOK`, `DurableAccept`, `NoDrop`, `ReceiptBacked`, `InOrder`, `TranscriptFIFO`, `OneInFlight`, `TypingGuards`, `NoRetypeWhileWorking`, `GateExclusive`, `NoDuplicateKey` | expected pass; 0 |
+| `restart_order_simulation` | sampled: 8 × depth 256, seed 111792 | sampled safety; no temporal claim | expected pass; 0 |
+| `safety_plain` | bounded exhaustive | `TypeOK`, `DurableAccept`, `NoDrop`, `ReceiptBacked`, `InOrder`, `TranscriptFIFO`, `OneInFlight`, `TypingGuards`, `NoRetypeWhileWorking`, `GateExclusive`, `NoDuplicateKey` | expected pass; 0 |
+| `safety_calls` | sampled: 8 × depth 256, seed 112801 | sampled safety; no temporal claim | expected pass; 0 |
+| `safety_enter_unknown` | sampled: 8 × depth 256, seed 113810 | sampled safety; no temporal claim | expected pass; 0 |
+| `safety_agent_input` | bounded exhaustive | `TypeOK`, `DurableAccept`, `NoDrop`, `ReceiptBacked`, `InOrder`, `TranscriptFIFO`, `OneInFlight`, `TypingGuards`, `NoRetypeWhileWorking`, `GateExclusive`, `NoDuplicateKey` | expected pass; 0 |
+| `safety_bot_resume` | sampled: 8 × depth 256, seed 114819 | sampled safety; no temporal claim | expected pass; 0 |
+| `safety_bot_sessions` | sampled: 8 × depth 256, seed 115828 | sampled safety; no temporal claim | expected pass; 0 |
+| `safety_storage` | sampled: 8 × depth 256, seed 116837 | sampled safety; no temporal claim | expected pass; 0 |
+| `safety_screen` | sampled: 8 × depth 256, seed 117846 | sampled safety; no temporal claim | expected pass; 0 |
+| `safety_connection` | sampled: 8 × depth 256, seed 118855 | sampled safety; no temporal claim | expected pass; 0 |
+| `safety_persona` | sampled: 8 × depth 256, seed 119864 | sampled safety; no temporal claim | expected pass; 0 |
+| `safety_identical` | sampled: 8 × depth 256, seed 120873 | sampled safety; no temporal claim | expected pass; 0 |
+| `live_plain` | sampled: 8 × depth 256, seed 121882 | sampled safety; `EventuallyDelivered` UNVERIFIED, `HeadTakenIn` UNVERIFIED, `ReconnectNotBlocked` UNVERIFIED, `GateFreeInfinitelyOften` UNVERIFIED | expected pass; 0 |
+| `live_calls` | sampled: 8 × depth 256, seed 122891 | sampled safety; `EventuallyDelivered` UNVERIFIED, `HeadTakenIn` UNVERIFIED, `ReconnectNotBlocked` UNVERIFIED, `GateFreeInfinitelyOften` UNVERIFIED | expected pass; 0 |
+| `live_enter_unknown` | sampled: 8 × depth 256, seed 123900 | sampled safety; `EventuallyDelivered` UNVERIFIED, `HeadTakenIn` UNVERIFIED, `ReconnectNotBlocked` UNVERIFIED, `GateFreeInfinitelyOften` UNVERIFIED | expected pass; 0 |
+| `live_agent_input` | sampled: 8 × depth 256, seed 124909 | sampled safety; `EventuallyDelivered` UNVERIFIED, `HeadTakenIn` UNVERIFIED, `ReconnectNotBlocked` UNVERIFIED, `GateFreeInfinitelyOften` UNVERIFIED | expected pass; 0 |
+| `live_bot_resume` | sampled: 8 × depth 256, seed 125918 | sampled safety; `EventuallyDelivered` UNVERIFIED, `HeadTakenIn` UNVERIFIED, `ReconnectNotBlocked` UNVERIFIED, `GateFreeInfinitelyOften` UNVERIFIED | expected pass; 0 |
+| `live_bot_sessions` | sampled: 8 × depth 256, seed 126927 | sampled safety; `EventuallyDelivered` UNVERIFIED, `HeadTakenIn` UNVERIFIED, `ReconnectNotBlocked` UNVERIFIED, `GateFreeInfinitelyOften` UNVERIFIED | expected pass; 0 |
+| `live_storage` | sampled: 8 × depth 256, seed 127936 | sampled safety; `EventuallyDelivered` UNVERIFIED, `HeadTakenIn` UNVERIFIED, `ReconnectNotBlocked` UNVERIFIED, `GateFreeInfinitelyOften` UNVERIFIED | expected pass; 0 |
+| `live_screen` | sampled: 8 × depth 256, seed 128945 | sampled safety; `EventuallyDelivered` UNVERIFIED, `HeadTakenIn` UNVERIFIED, `ReconnectNotBlocked` UNVERIFIED, `GateFreeInfinitelyOften` UNVERIFIED | expected pass; 0 |
+| `live_connection` | sampled: 8 × depth 256, seed 129954 | sampled safety; `EventuallyDelivered` UNVERIFIED, `HeadTakenIn` UNVERIFIED, `ReconnectNotBlocked` UNVERIFIED, `GateFreeInfinitelyOften` UNVERIFIED | expected pass; 0 |
+| `live_persona` | sampled: 8 × depth 256, seed 130963 | sampled safety; `EventuallyDelivered` UNVERIFIED, `HeadTakenIn` UNVERIFIED, `ReconnectNotBlocked` UNVERIFIED, `GateFreeInfinitelyOften` UNVERIFIED | expected pass; 0 |
+| `live_empty_reconnect` | sampled: 8 × depth 256, seed 131972 | sampled safety; `EventuallyDelivered` UNVERIFIED, `HeadTakenIn` UNVERIFIED, `ReconnectNotBlocked` UNVERIFIED, `GateFreeInfinitelyOften` UNVERIFIED | expected pass; 0 |
+| `control_next_item` | finite counterexample | `OneInFlight` | expected violation; 12 |
+| `control_next_part` | finite counterexample | `OneInFlight` | expected violation; 12 |
+| `control_send_is_delivery` | finite counterexample | `ReceiptBacked` | expected violation; 12 |
+| `control_queue_is_receipt` | finite counterexample | `TranscriptFIFO` | expected violation; 12 |
+| `control_start_drop` | finite counterexample | `NoDrop` | expected violation; 12 |
+| `control_compact_open` | finite counterexample | `NoDrop` | expected violation; 12 |
+| `control_early_ack` | finite counterexample | `DurableAccept` | expected violation; 12 |
+| `control_skip_refused` | finite counterexample | `InOrder` | expected violation; 12 |
+| `control_start_unsent_head` | finite counterexample | `InOrder` | expected violation; 12 |
+| `control_retype_into_text` | finite counterexample | `TypingGuards` | expected violation; 12 |
+| `control_retype_working` | finite counterexample | `NoRetypeWhileWorking` | expected violation; 12 |
+| `control_reconnect_keys` | finite counterexample | `GateExclusive` | expected violation; 12 |
+| `control_keep_gate` | temporal counterexample | `GateFreeInfinitelyOften` | expected violation; 13 |
+| `control_hold_gate_mcp_reconnect` | temporal counterexample | `ReconnectNotBlocked` | expected violation; 13 |
+| `control_hold_gate_mcp_delivery` | temporal counterexample | `EventuallyDelivered` | expected violation; 13 |
+| `control_no_deferred` | temporal counterexample | `ReconnectNotBlocked` | expected violation; 13 |
+| `control_reconnect_running` | finite counterexample | `TypingGuards` | expected violation; 12 |
+| `control_deferred_only_open` | temporal counterexample | `ReconnectNotBlocked` | expected violation; 13 |
+| `control_park_retype` | temporal counterexample | `EventuallyDelivered` | expected violation; 13 |
+| `control_unreadable_park` | temporal counterexample | `HeadTakenIn` | expected violation; 13 |
+| `control_weak_observe` | temporal counterexample | `EventuallyDelivered` | expected violation; 13 |
+| `control_replace_observation` | temporal counterexample | `EventuallyDelivered` | expected violation; 13 |
+| `control_duplicate_key` | finite counterexample | `NoDuplicateKey` | expected violation; 12 |
+| `control_no_head_takein_assumption` | temporal counterexample | `HeadTakenIn` | expected violation; 13 |
+| `witness_duplicates` | finite counterexample | `AtMostOnce` | expected violation; 12 |
+| `probe_premise` | temporal counterexample | `NotPremise` | expected violation; 13 |
+| `trace_calls` | sampled: 8 × depth 256, seed 104729 | sampled safety; no temporal claim | expected pass; 0 |
+| `trace_agent` | sampled: 8 × depth 256, seed 105738 | sampled safety; no temporal claim | expected pass; 0 |
+| `trace_lifecycle` | sampled: 8 × depth 256, seed 106747 | sampled safety; no temporal claim | expected pass; 0 |
+| `trace_storage` | sampled: 8 × depth 256, seed 107756 | sampled safety; no temporal claim | expected pass; 0 |
+| `trace_screen` | sampled: 8 × depth 256, seed 108765 | sampled safety; no temporal claim | expected pass; 0 |
+| `trace_flapping` | sampled: 8 × depth 256, seed 109774 | sampled safety; no temporal claim | expected pass; 0 |
+| `trace_identical` | sampled: 8 × depth 256, seed 110783 | sampled safety; no temporal claim | expected pass; 0 |
+
+### Auxiliary row results
+
+| Config | Actual scope / sample | Selected checks or expected target | Matched result / exit |
+|---|---|---|---|
+| `proof_simulation` | sampled: 2 × depth 5, seed 104729 | proof trace parser; `EmitSimulationTrace`; no temporal claim | expected pass; 0 |
+| `proof_safety` | finite counterexample | `SafetyProbe` | expected violation; 12 |
+| `proof_temporal` | temporal counterexample | `TemporalProbe` | expected violation; 13 |
+| `permission_safety` | bounded exhaustive | `TypeOK`, `SafetySanity` | expected pass; 0 |
+| `permission_delivery_reachable` | finite counterexample | `NotDelivered` | expected violation; 12 |
+| `permission_premise_reachable` | temporal counterexample | `NotPremise` | expected violation; 13 |
+| `permission_eventually_delivered` | temporal counterexample | `EventuallyDelivered` | expected violation; 13 |
+| `permission_head_taken_in` | temporal counterexample | `HeadTakenIn` | expected violation; 13 |
+
+### Supplemental witness and runtime conformance
+
+The separately retained [pullback evidence](../spec/tla/ci/.runs/cardinal-final-causal-proof-20261020T054736Z/supplemental/pullback/evidence.json) proves an existential finite prefix of **21 states and 20 original-action edges**, including a genuine `PullBack` fault absent from the fixed-seed manifest samples. Its search and exact replay use the same frozen model, input config and unchanged safety invariants; exact replay exits 0. It is outside the canonical 84 rows and makes **no liveness claim**.
+
+The [coverage inventory](../tests/fixtures/delivery-traces/coverage.json) binds **266 traces and 40,778 states**: 265 canonical traces/40,757 states plus the supplemental 21-state trace. Replay covers 38 executed controls, all 18 engine actions, 26 faults and four flapping actions. Legacy fault/config identifiers such as `botCompact` and `*_screen` are retained inventory names; they do not authorize native compaction or terminal-derived state.
+
+The isolated targeted run of `tests/delivery-model-conformance.test.ts` and `tests/delivery-model-verdict.test.ts` passed **29 tests, zero failures, 54 assertions in 80.42 s**, including 23 scheduler-boundary cases. Conformance replays every frozen state through production AD/receipt decisions, checks independent/saved observations and expired timers, exercises recovery with disconnected MCP, and detects an isolated FIFO policy mutation. The boundary cases use injected evidence and do not run a scheduler. Both files also pass in the retained final full-unit log.
+
+An independent final validator review checked all 107 input hashes, 266 fixtures, 84 raw logs and the actual 302-file inventory, including refusal of tampered evidence; it returned no findings. This checks evidence integrity and runtime conformance within the recorded scopes, without extending the model to adapter behavior.
+
+### Source/test reviews and full units
+
+Apiary 3.0.6 was installed after work began. The owner requested fresh whole-branch `$code-review` and `$test-review` with the engineering guide's cardinal rules taking precedence over every spec. Blocking findings were fixed and follow-up reviews returned no findings: receipt-window guard `7e80d089`, integration/test repairs `5ad238f7` and `c282c98f`, model/trace evidence `ea90dab5`, and final assertion correction `0d680462`. The sole ignored documentation review item is the unrelated pre-existing `docs/bots.md` error-conditions table relocation, outside this bug's scope.
+
+Test work retains all four conflict-latch matrices, Claude/Codex prior-session receipt-window and cached-unreadable-file controls, and structured AD/hook/journal integration evidence. `real-key-recovery-proof.test.ts` checks durable recovery and persona-scoped shim/backoff controls; scenario commands additionally require the shared exact-receipt audit. The adapter receipt-window guard is **not directly TLC-verified**: `ModelReconnectStep` abstracts it, and the four production engine regressions described above cover lease release, durable receipt completion, recovery-intent append/backoff and working-to-waiting extension.
+
+The final isolated full unit run passed **30,928 tests, skipped 21 and failed zero**, with 194,924 assertions: 30,949 tests across 181 files in **182.02 s**. Its retained local log is `/tmp/acu-full-units-final306-green.log`. The first full attempt passed 30,927 tests with one stale reconnect expectation; `0d680462` corrects it to assert the exact Enter-only retry after an uncertain reconnect text outcome. That file then passed 577 tests, and the complete final rerun produced the green result above. Final `bun run typecheck` (`tsc --noEmit`) and `git diff --check` also passed, as recorded by the calling agent.
+
+### External CI handoff
+
+Full `/ci` was **NOT RUN HERE**. Per the owner's `/tmp/ci_note.md`, a separate runner owns full branch CI because this worker has no CI credentials. No CI run ID or verdict is available here; the result remains pending with that runner. This is neither a CI pass nor a waiver recorded as PASS. The owner explicitly permits completing local fixes, full isolated units and branch commits before that runner returns its result. No merge or push is performed.
+
+### Branch commits
+
+These are all commits after audited revision `a01d092d` through current source/test HEAD `0d680462`, grouped by bug and shared milestones. The calling agent will commit this final documentation update afterward; no future commit hash is asserted here.
+
+| Group | Commit | Change |
+|---|---|---|
+| b.acu | `bc3d70d9` | WIP b.acu: remove pane-based typing and startup answers |
+| b.acu | `5ef71567` | b.acu: retain own-launch bookkeeping from AD row reads |
+| b.acu | `1377d6b0` | WIP b.acu: replace native screen fixtures with AD contract tests |
+| b.acu | `f99c6d38` | b.acu: preserve non-screen recovery and lifecycle coverage |
+| b.acu | `399148e8` | b.acu: document every audit removal and AD-owned readiness |
+| b.acu | `a30bf265` | b.acu: target the observation replacement temporal control |
+| b.acu | `c282c98f` | b.acu: replace remaining agent-pane tests and restore latch matrices |
+| b.acu | `ea90dab5` | b.acu: regenerate AD-state conformance traces with verified evidence |
+| b.aqj | `5f2f62d4` | WIP b.aqj: gate typing on AD waiting and retain receipt-only confirmation |
+| b.aqj | `e54e638e` | b.aqj: recover unconfirmed sends through recorded Enter attempts |
+| b.aqj | `e37ee853` | b.aqj: reconcile pending input before reconnecting |
+| b.aqj | `10486a91` | b.aqj: prevent reconnect recovery from awaiting itself |
+| b.aqj | `727c6e64` | b.aqj: model recovery Enter before disconnected reconnect |
+| b.aqj | `7e80d089` | b.aqj: preserve recovery receipt windows after lease release |
+| b.aqj | `5ad238f7` | b.aqj: verify durable Enter recovery without requiring a retype |
+| b.aqj | `0d680462` | b.aqj: assert Enter-only retry after uncertain reconnect text |
+| shared | `fcb93897` | WIP b.acu b.aqj: model AD-only readiness and durable Enter recovery |
+| shared | `eee87067` | WIP b.acu b.aqj: document AD-owned delivery and remove obsolete screen rules |
+
+### Documentation verification
+
+The final targeted documentation run, `bun test tests/shipped-docs.test.ts`, used an isolated scratch launch HOME/state and the host-safety preload. It passed **2,456 tests, zero failures and 3,549 assertions in 10.01 s**; retained local log: `/tmp/acu-docs-final-evidence-shipped.log`. The final documentation diff passes `git diff --check`. All 57 audit rows and their original references remain, every changed tracked `spec/tla` path has a one-line reason, and all 302 actual trace/coverage changes are linked. No unresolved report placeholders remain beyond the explicitly pending external CI result.
+
+The earlier stale-reference audit across README, CONTRIBUTING, `docs/*.md`, `tests/README.md` and tracked skills found no removed readiness/approver symbols or screen-based contract; explicit removal rationale in this report and excluded CI-live collection contracts remain. Outcome-only prompt-row/latch/teardown probes and human diagnostic commands are retained. Review of the customer-facing pages found no additional operator changes needed after the existing AD-owned guidance and release notes.
 
 ## Documentation boundary
 

@@ -292,7 +292,9 @@ The first effective non-refused send defines the receipt window. Its own path us
 
 Per-item spacing spans parts: 10, 30, 60, 120, 300, then 900 s indefinitely; server start or a new launch resets spacing. Append failure releases the lease, retains the continuation and blocks more keys until durability returns. Resumed keys revalidate AD/lifecycle guards. Open work never expires; at-least-once delivery permits duplicates.
 
-**Reconnect and lifecycle.** Reconnect first asks `recoverBeforeReconnect` to reconcile durable delivery attempts and the receipt window after successful recovery Enter. It shares the persona lease with delivery and revalidates AD `waiting`, marker, relay, launch/session identity and local holds before each key. Before text it records a lifecycle-scoped reconnect input intent; a partial or uncertain command resumes with Enter alone. A definite text refusal clears the intent; launch/session change, terminal/absent rows, teardown and shutdown cancel it. Pending reconnect input blocks delivery keys and keeps the lifecycle retry timer active even after MCP connects. Without pending input, active engines own deferred reconnect retries; otherwise the lifecycle timer owns them, including with health checks disabled. `transient` does not establish that no key landed.
+**Reconnect and lifecycle.** Reconnect first asks `recoverBeforeReconnect` to reconcile durable delivery attempts and the receipt window after successful recovery Enter. A released lease alone cannot finish reconciliation: an unconfirmed current attempt needs engine phase `ready`, no `receiptWorking` extension, and matching launch/session/recovery-attempt identity. An AD read failure preserves the receipt wait; AD `working` extends it until a fresh full receipt wait after `waiting`, while an exact receipt permits early progress only after its `delivered` append is durable.
+
+Reconnect shares the persona lease with delivery and revalidates AD `waiting`, marker, relay, launch/session identity and local holds before each key. Before text it records a lifecycle-scoped reconnect input intent; a partial or uncertain command resumes with Enter alone. A definite text refusal clears the intent; launch/session change, terminal/absent rows, teardown and shutdown cancel it. Pending reconnect input blocks delivery keys and keeps the lifecycle retry timer active even after MCP connects. Without pending input, active engines own deferred reconnect retries; otherwise the lifecycle timer owns them, including with health checks disabled. `transient` does not establish that no key landed.
 
 Launch IDs track server-start identity and authoritative observed launch/session changes. Native compaction causes no lifecycle transition. `forget` cancels persona execution/leases/timers while retaining the journal; `stop` cancels key pauses and awaits running work before client close and queue drain. Calls retain the per-persona sliding budget; empty queues make no delivery calls except independently deferred reconnects.
 
@@ -332,7 +334,7 @@ Final `item-delivered` calls the delivery reaction callback. Slack items alone u
 
 ### Delivery model code map (b.omv SR-15.6)
 
-[spec/tla/README.md](../spec/tla/README.md) describes the current model boundary and verification status. The b.acu/b.aqj model removes screen, transcript-idle and native-compaction state, using fresh AD `waiting` plus non-screen guards. Final certificates, trace inventory and conformance results are pending; earlier evidence does not certify this revision. See [the verification report](cardinal-delivery-verification.md).
+[spec/tla/README.md](../spec/tla/README.md) describes the current model boundary and verification status. The b.acu/b.aqj model removes screen, transcript-idle and native-compaction state, using fresh AD `waiting` plus non-screen guards. The final local run matches all 84 expected row results on 107 unchanged inputs; all 266 traces and 40,778 states replay through production policy. The report distinguishes bounded exhaustive checks, sampled simulations and the supplemental finite pullback witness; local `certification: false` establishes no scheduler certificate. Full `/ci` remains with the separate runner. See [the verification report](cardinal-delivery-verification.md).
 
 `DeliveryPolicyKnowledge.p` projects durable queue facts; `e` is volatile engine state; `r` is an AD/receipt observation separate from hidden agent state. The gate gets an independent reading; an owned key operation retains its saved reading until completion. Replay uses production policy and exact receipt inputs without a native screen renderer.
 
@@ -346,6 +348,8 @@ Final `item-delivered` calls the delivery reaction callback. Slack items alone u
 | Reconnect | Persona lease, fresh AD guards and engine/timer retry ownership. |
 | Queue compaction | Durable journal rename/finish remains independent of native agent compaction. |
 | At-least-once | Exact receipts prevent false delivery confirmation; duplicate delivery remains allowed. |
+
+`ModelReconnectStep` abstracts delivery reconciliation before reconnect; it does not verify the adapter's receipt-window guard. Four `delivery-engine.test.ts` regressions exercise lease release during an AD read timeout, durable receipt completion, failed recovery-intent append/backoff, and the AD working-to-waiting receipt extension.
 
 Report bounded exhaustive safety/temporal checks separately from sampled simulations. Pending runs establish no new guarantee.
 

@@ -2,7 +2,7 @@
 
 The b.acu/b.aqj revision models agent-director as the authority for typing readiness. Delivery, recovery Enter and reconnect require AD `waiting` plus existing non-screen guards. Pane text, native transcript idle/turn ordering and compaction markers are not model observations.
 
-**Verification pending.** The final canonical local run contains 84 rows: 76 delivery-manifest rows and eight auxiliary checks. Results, source hashes, exhaustive/sampled coverage and the regenerated trace inventory must be filled into [the change and verification report](../../docs/cardinal-delivery-verification.md) after export. Earlier `ci/verdicts.txt` and frozen fixture evidence do not certify the edited model. Do not report pending work as a pass.
+**Local verification complete.** The retained `cardinal-final-causal-proof-20261020T054736Z` report has all 76 delivery-manifest rows and eight auxiliary checks matching their expected results, with 107 unchanged frozen input hashes. The regenerated runtime corpus has 266 traces and 40,778 states, including a separately replayed 21-state finite pullback witness with no liveness claim. [The change and verification report](../../docs/cardinal-delivery-verification.md) records every row, expected-control target, exhaustive/sampled scope, model/helper hash, actual-file inventory and runtime replay result. This is local evidence with `certification: false`; it establishes no scheduler certificate. Full `/ci` remains with the separate runner and has no verdict here.
 
 ## Files and evidence
 
@@ -38,10 +38,10 @@ At-most-once is not a guarantee: the expected duplicate witness must continue to
 
 Bounded exhaustive results apply only within each config's stated bounds/reductions. Sampled simulation safety does not prove temporal properties. The restart durable-send prefix now admits four sends per part so text, recovery Enter, retype and recovery Enter remain reachable; this is a bounded exploration limit, not a production retry cap.
 
-Config filenames such as `*_screen`, `control_retype_into_text` and `control_reconnect_running` remain stable inventory identifiers. Their current faults/targets cover AD row/refusal and local guards, not native presentation. [The verification report](../../docs/cardinal-delivery-verification.md) lists each changed model/helper/config with a reason and reserves the final per-trace inventory.
+Config filenames such as `*_screen`, `control_retype_into_text` and `control_reconnect_running` remain stable inventory identifiers. Their current faults/targets cover AD row/refusal and local guards, not native presentation. [The verification report](../../docs/cardinal-delivery-verification.md) lists each changed model/helper/config with a reason and links the complete 302-path trace change inventory.
 
 ## Reproducing verification
 
 Use the checked-in runner's help and manifest for supported invocation, resources and output. Freeze the model/config/helper inputs before starting a run and preserve the raw logs, exit codes, source hashes, expected-control targets and independent proof artifacts. Do not edit a running snapshot or reuse an earlier certificate for changed inputs.
 
-`runner.py`'s `input_paths` excludes Markdown. Documentation updates do not change the frozen proof input hashes; edits to model/config/helper code do. Final export, conformance and full-suite results are recorded separately in the linked report.
+`runner.py`'s `input_paths` excludes Markdown. Documentation updates do not change the frozen proof input hashes; edits to model/config/helper code do. Completed export, conformance and full-unit results, plus the pending external CI handoff, are recorded separately in the linked report.
