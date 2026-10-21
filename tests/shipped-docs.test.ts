@@ -5776,7 +5776,7 @@ describe('E36 T3: the architecture doc and the engineering guide match the build
       ['the kill unchecked', 'A pre-persona row (b.1ix) is killed when live, and kept.', ['lacks /\\bchecked\\b/']],
     ] as const)("the Start Sweep's pre-persona-row rule with %s is reported", (_label, sentence, expected) => {
       const text = guide()
-      const edited = text.replace(/A pre-persona row \(b\.1ix\) is killed when live[^.]*\./, sentence)
+      const edited = text.replace(/A pre-persona row is killed when live[^.]*\./, sentence)
       expect(edited).not.toBe(text)
       expect(prePersonaRuleProblems(edited).map((problem) => problem.split(': ')[0])).toEqual([...expected])
     })

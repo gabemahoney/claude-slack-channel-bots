@@ -6080,7 +6080,7 @@ async function waitForWorkingRow(
   // by the evidence-based sweep and keeps today's polling behavior (b.rmy
   // long-turn guard preserved). Agent-director's findMissing verb is the
   // reconcile, and CSCB starts no tmux process (b.jg5 SRJ-601;
-  // docs/engineering-guide.md, "Avoiding Duplicated Effort"), mirroring
+  // docs/engineering-guide.md, "Layering: agent-director Owns tmux"), mirroring
   // resumeOrFreshSpawn's reconcileMissingFirst branch. On a findMissing
   // error, log and fall through to the existing poll loop (today's
   // behavior), except a refused sweep (b.jg5 SRJ-105): nothing more is
@@ -8753,7 +8753,7 @@ async function resumeOrFreshSpawn(
   // resume anyway (an ErrSpawnNotResumable then takes the not-resumable
   // step). Agent-director's findMissing verb is the reconcile, and CSCB
   // starts no tmux process (b.jg5 SRJ-601; docs/engineering-guide.md,
-  // "Avoiding Duplicated Effort").
+  // "Layering: agent-director Owns tmux").
   if (opts.reconcileMissingFirst) {
     const postSweep: { ownRowRead?: LatchRowState } = {}
     const sweep = await reconcileMissingSweep(key, 'spawnForPersona: before resume', ref, {

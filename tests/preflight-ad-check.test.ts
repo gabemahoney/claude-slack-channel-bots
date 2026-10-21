@@ -11,7 +11,7 @@
  *   (comment lines dropped for the code checks); no test runs them.
  * - `.claude/skills/publish/SKILL.md` and `.claude/skills/publish-prepare/SKILL.md`
  *   are read with the markdown helpers, and so is the SR-2.5 row of the
- *   failure-mode table in `docs/engineering-guide.md`'s release section.
+ *   failure-mode table in `CONTRIBUTING.md`'s release section.
  *
  * No line the check writes, no SR-2.5 line of the scripts and no SR-2.5 line
  * of either skill advises upgrading or re-installing agent-director or names
@@ -79,8 +79,8 @@ const PREFLIGHT = 'scripts/preflight.sh'
 const PUBLISH_PREPARE_SCRIPT = 'scripts/publish-prepare.sh'
 const SKILLS = ['.claude/skills/publish/SKILL.md', '.claude/skills/publish-prepare/SKILL.md'] as const
 const EXIT_TABLE_HEADING = '## Exit code → operator recovery'
-const ENGINEERING_GUIDE = 'docs/engineering-guide.md'
-const RELEASE_HEADING = '## Releasing CSCB'
+const CONTRIBUTING = 'CONTRIBUTING.md'
+const RELEASE_HEADING = '## Release process'
 
 /** The bump kind every run's rerun hint names. */
 const BUMP = 'minor'
@@ -355,8 +355,8 @@ describe('SR-2.5 in the scripts and the publish skills', () => {
     expect(skillFindings(readRepo(file), file)).toEqual([])
   })
 
-  test("the engineering guide's release-section SR-2.5 row names the runbook section, with no upgrade form and no package.json", () => {
-    const rows = requiredSection(readRepo(ENGINEERING_GUIDE), RELEASE_HEADING, ENGINEERING_GUIDE)
+  test("the contributing guide's release-section SR-2.5 row names the runbook section, with no upgrade form and no package.json", () => {
+    const rows = requiredSection(readRepo(CONTRIBUTING), RELEASE_HEADING, CONTRIBUTING)
       .split('\n')
       .filter((line) => line.startsWith('|') && line.includes(`\`${SR25_PREFIX}\``))
     expect(rows).toHaveLength(1)
