@@ -1,3 +1,4 @@
+import { KILL_RETRY_TRIES } from '../src/kill-retry.ts'
 import { livenessReadingForStatus } from '../src/liveness-reading.ts'
 import type { Persona } from '../src/config.ts'
 import type { LostMessageState } from '../src/lost-message.ts'
@@ -96,7 +97,6 @@ import {
   expectPendingOnlyWatch,
   holdSequenceReuse,
   holdThroughReuse,
-  installGoneRestartProbe,
   launchThroughSequence,
   makeRecoveryHarness,
   ownRowsLiveThenMissing,
@@ -308,7 +308,7 @@ describe('b.jg5 SRJ-1011 through the recovery harness: the read is the liveness 
     expectNothingRaisedOrArmed(h, key)
   })
 
-  test('SRJ-1011, SRJ-115, hatch A2: a read answering ErrSystemInstallDisappeared raises ad-unreachable and reads dead, not pending: state 6 is left out, nothing is armed and no episode opens', async () => {
+  test('SRJ-1011, SRJ-115, hatch A2: a read answering ErrSystemInstallDisappeared raises ad-unreachable and reads unknown: state 6 is left out, nothing is armed and no episode opens', async () => {
     const h = makeRecovery()
     const [key] = h.keys as [string]
     h.script({ statusError: errSystemInstallDisappeared('status') })
@@ -501,31 +501,14 @@ describe('b.jg5 SRJ-409, SRJ-411: an item accepted for P whose restart reads P\'
   })
 })
 
-// ===========================================================================
-// b.jg5 SRJ-1011 state 4, SRJ-704 (E20 T3): an item accepted while P's
-// kill-failure episode is open reports `kill-failed`
-//
-// Through the recovery harness's lost-message driver, whose `isKillFailed` is
-// bound to the harness's kill-failure alerts' episode as main() binds it. The
-// restart path's kill is one try (its `dead` seed), so an `ErrTmuxKillFailed`
-// there stands at once; that kill follows only an `ErrSystemInstallDisappeared`
-// reading (b.jg5 SRJ-110, SRJ-314; `installGoneRestartProbe`). The multi-try
-// legs run at the step-1 kill of the
-// live-row sequence P's launch starts at a collision ladder replacement site
-// over a row read live (`scriptLiveRowElsewhere`, `launchThroughSequence`, on
-// the sequence clock; the ladder makes no kill, b.jg5 SRJ-707). States
-// and wordings come from src/lost-message.ts (`expectLostMessageReports`).
-// ===========================================================================
 
-/** A recovery harness (`makeRecovery`) whose restart run's kill answers `ErrTmuxKillFailed` once, after `installGoneRestartProbe`'s reading; P's row reads `ended` until its spawn. Answers P's key and `readRow`. */
-async function afterRestartKillFailed(options: RecoveryHarnessOptions = {}): Promise<{ h: RecoveryHarness; key: string; readRow(): void }> {
-  const probe = installGoneRestartProbe(() => h.config)
-  const h: RecoveryHarness = makeRecovery({ ...options, restartDeps: { isSessionAlive: probe.isSessionAlive } })
+/** A live-row replacement whose sequence's checked kill fails opens the alert episode. */
+async function afterSequenceKillFailed(options: RecoveryHarnessOptions = {}): Promise<{ h: RecoveryHarness; key: string; readRow(): void }> {
+  const h = makeRecovery(options)
   const [key] = h.keys as [string]
-  rowReadsUntilSpawn(h, 'ended')
-  h.script({ killError: errTmuxKillFailed() })
-  await runRestartRetry(key, personaOf(h, key).working_directory, isLaunchInFlight)
-  return { h, key, readRow: probe.readRow }
+  scriptLiveRowElsewhere(h, key, { killError: errTmuxKillFailed() })
+  await launchThroughSequence(h, key)
+  return { h, key, readRow: () => { rowReadsUntilSpawn(h, 'ended'); h.script({ killError: undefined }) } }
 }
 
 describe('b.jg5 SRJ-1011 state 4: an item accepted after the kill-failure alert reports kill failed, through the real routing', () => {
@@ -535,14 +518,14 @@ describe('b.jg5 SRJ-1011 state 4: an item accepted after the kill-failure alert 
     await launchThroughSequence(h, key)
   }
 
-  test('ErrTmuxKillFailed that stands at the restart path\'s kill: after the ordinary alert, a queued Slack item reports kill failed with its wording; no human-triggered restart fires, with the delay above 0', async () => {
-    const { h, key } = await afterRestartKillFailed({ sessionRestartDelay: FAST_DELAY_S })
+  test('ErrTmuxKillFailed that stands at a live-row replacement sequence\'s kill: after the ordinary alert, a queued Slack item reports kill failed with its wording; no human-triggered restart fires, with the delay above 0', async () => {
+    const { h, key } = await afterSequenceKillFailed({ sessionRestartDelay: FAST_DELAY_S })
     expect(h.episodeNotices).toHaveLength(1)
 
     await expectLostMessageReports(h, key, 'kill-failed')
 
     expect(isRestartPendingOrActive(key)).toBe(false)
-    expect(h.stub.calls.spawnCalls).toEqual([])
+    expect(h.stub.calls.spawnCalls).toHaveLength(1)
   })
 
   test('a survivor-naming failure, then ErrTmuxUnresponsive twice, at the live-row sequence\'s kill of a row read live, started at a replacement site: the ordinary alert, then a queued Slack item reports kill failed', async () => {
@@ -581,7 +564,7 @@ describe('b.jg5 SRJ-1011 state 4: an item accepted after the kill-failure alert 
   })
 
   test('after the episode ends (a later restart run\'s liveness read of ended, which launches P with no kill), a queued Slack item no longer reports kill failed', async () => {
-    const { h, key, readRow } = await afterRestartKillFailed()
+    const { h, key, readRow } = await afterSequenceKillFailed()
     expect(h.killFailureOpen(key)).toBe(true)
 
     // The retry's liveness read is the real adapter's: P's row reads `ended`,
@@ -590,7 +573,7 @@ describe('b.jg5 SRJ-1011 state 4: an item accepted after the kill-failure alert 
     await retryNow(h, key)
 
     expect(h.killFailureOpen(key)).toBe(false)
-    expect(h.stub.calls.killCalls).toHaveLength(1)
+    expect(h.stub.calls.killCalls).toHaveLength(KILL_RETRY_TRIES)
     expect(h.episodeNotices).toHaveLength(1)
     await expectLostMessageReports(h, key, 'auto-restart-disabled')
   })
@@ -627,7 +610,7 @@ describe('b.jg5 SRJ-1011 state 3, SRJ-207: an item accepted while P is held on E
   })
 
   test('P held with its kill-failure episode open: cannot launch is reported, not kill failed', async () => {
-    const { h, key } = await afterRestartKillFailed({ sessionRestartDelay: FAST_DELAY_S })
+    const { h, key } = await afterSequenceKillFailed({ sessionRestartDelay: FAST_DELAY_S })
     expect(h.killFailureOpen(key)).toBe(true)
     // The sequence-launch entry's reuse (no row read first, which would end the episode) holds P.
     h.script({ killError: undefined, spawnError: errInvalidFlags('spawn') })

@@ -9,21 +9,16 @@
  *
  *   live     a live state other than `pending`
  *   pending  the row reads `pending`: its session has not started
- *   dead     `ended` or `missing`; also `ErrSpawnNotFound`, and
- *            `ErrSystemInstallDisappeared` with its `ad-unreachable` outage
- *            (the adapter decides those errors); the last reads no row, so
- *            its reading carries the source `install-gone`
- *            (`isInstallGoneDeadReading`), which the slow-recovery count
- *            tells apart from a row read (b.jg5 SRJ-610); a row read's
- *            reading carries what it read (`rowRead`: `ended`, `missing`
- *            or `no-row`, `deadRowReadOf`), so the restart path's kill can
- *            record the state its path last read in a latch (b.jg5 SRJ-501)
- *   unknown  any other `status` error, and any state string that is none of
+ *   dead     `ended`, `missing` or `ErrSpawnNotFound`; the reading carries
+ *            what agent-director read (`rowRead`: `ended`, `missing` or
+ *            `no-row`, `deadRowReadOf`)
+ *   unknown  any other `status` error, including
+ *            `ErrSystemInstallDisappeared`, and any state string that is none of
  *            the above: agent-director could not report on the persona
  *
- * Only `dead` leads to a launch, and only its `ErrSystemInstallDisappeared`
- * form, which reads no row, to a kill before it (b.jg5 SRJ-110, SRJ-314):
- * no kill is sent for a row just read `ended`, `missing` or gone. A reading is an object whose
+ * Only `dead` leads to a launch; no kill is sent for a row just read
+ * `ended`, `missing` or gone. Installation failure supplies no agent-state
+ * observation and cannot authorize recovery (b.jpf). A reading is an object whose
  * `kind` names it; consumers decide on `livenessKindOf(reading)`. A `pending`
  * reading also carries the row's launch start (`launchStartedAt`) when the
  * `status` result showed one (b.jg5 SRJ-115, SRJ-406): read raw, as
@@ -76,7 +71,7 @@ export const AGENT_DIRECTOR_DEAD_STATES: ReadonlySet<string> = new Set(['ended',
 export const LIVENESS_LIVE = 'live'
 /** `pending`: the row reads `pending`; its session has not started. */
 export const LIVENESS_PENDING = 'pending'
-/** `dead`: `ended`, `missing`, `ErrSpawnNotFound` or `ErrSystemInstallDisappeared`. The only reading that leads to a launch; only its `ErrSystemInstallDisappeared` form leads to a kill before it (b.jg5 SRJ-314). */
+/** `dead`: `ended`, `missing` or `ErrSpawnNotFound`. The only reading that leads to a launch. */
 export const LIVENESS_DEAD = 'dead'
 /** `unknown`: agent-director could not report on the persona. Never read as dead. */
 export const LIVENESS_UNKNOWN = 'unknown'
@@ -103,10 +98,9 @@ export interface PendingLivenessReading {
 }
 
 /**
- * The `dead` reading's source when it came from `ErrSystemInstallDisappeared`
- * (b.jg5 SRJ-314), which reads no row: the reading is `dead` all the same,
- * but it is not a row read of `ended`, `missing` or no row, so it ends no
- * slow-recovery episode (SRJ-610, SRJ-1016; hatch A2).
+ * Legacy source retained to recognize obsolete dead-shaped readings from
+ * `ErrSystemInstallDisappeared`. `livenessKindOf` rejects these as unknown
+ * because no agent state was observed (b.jpf).
  */
 export const LIVENESS_DEAD_SOURCE_INSTALL_GONE = 'install-gone'
 
@@ -121,12 +115,11 @@ export const LIVENESS_DEAD_ROW_NO_ROW = 'no-row'
 export type DeadRowRead = typeof LIVENESS_DEAD_ROW_ENDED | typeof LIVENESS_DEAD_ROW_MISSING | typeof LIVENESS_DEAD_ROW_NO_ROW
 
 /**
- * The `dead` reading. `source` is `LIVENESS_DEAD_SOURCE_INSTALL_GONE` when the
- * reading came from `ErrSystemInstallDisappeared`; absent for a row read
- * (`ended`, `missing`, `ErrSpawnNotFound`). `rowRead` is what a row read
- * found (`ended`, `missing`, or `no-row` for `ErrSpawnNotFound`); absent when
- * no row was read (`ErrSystemInstallDisappeared`, or a reading made with no
- * `status` call).
+ * The `dead` reading. `rowRead` is what agent-director found (`ended`,
+ * `missing`, or `no-row` for `ErrSpawnNotFound`); absent for caller lifecycle
+ * bookkeeping made without a `status` call. The optional `source` accepts
+ * the legacy shape for compatibility only: its kind is normalized to
+ * `unknown`, so it cannot authorize recovery (b.jpf).
  */
 export interface DeadLivenessReading {
   readonly kind: typeof LIVENESS_DEAD
@@ -167,13 +160,10 @@ export const LIVENESS_READING_DEAD_NO_ROW: DeadLivenessReading = Object.freeze({
   kind: LIVENESS_DEAD,
   rowRead: LIVENESS_DEAD_ROW_NO_ROW,
 })
-/** The `dead` reading from `ErrSystemInstallDisappeared`, which reads no row, as a value. */
-export const LIVENESS_READING_DEAD_INSTALL_GONE: DeadLivenessReading = Object.freeze({
-  kind: LIVENESS_DEAD,
-  source: LIVENESS_DEAD_SOURCE_INSTALL_GONE,
-})
 /** The `unknown` reading, as a value. */
 export const LIVENESS_READING_UNKNOWN: UnknownLivenessReading = Object.freeze({ kind: LIVENESS_UNKNOWN })
+/** @deprecated Legacy name; installation failure is unknown, never dead (b.jpf). */
+export const LIVENESS_READING_DEAD_INSTALL_GONE: UnknownLivenessReading = LIVENESS_READING_UNKNOWN
 
 const KINDS: ReadonlySet<unknown> = new Set<unknown>(LIVENESS_KINDS)
 
@@ -206,6 +196,10 @@ export function livenessKindOf(reading: unknown): LivenessKind {
   try {
     if (typeof reading !== 'object' || reading === null) return LIVENESS_UNKNOWN
     const kind = (reading as { readonly kind?: unknown }).kind
+    if (kind === LIVENESS_DEAD &&
+        (reading as { readonly source?: unknown }).source === LIVENESS_DEAD_SOURCE_INSTALL_GONE) {
+      return LIVENESS_UNKNOWN
+    }
     return KINDS.has(kind) ? (kind as LivenessKind) : LIVENESS_UNKNOWN
   } catch {
     return LIVENESS_UNKNOWN
@@ -213,15 +207,15 @@ export function livenessKindOf(reading: unknown): LivenessKind {
 }
 
 /**
- * Whether a probe's answer is the `dead` reading from
- * `ErrSystemInstallDisappeared` (its `source` is
- * `LIVENESS_DEAD_SOURCE_INSTALL_GONE`); false for every other answer, a row
- * read's `dead` included. Never throws.
+ * Whether an answer has the obsolete install-gone dead shape. Retained for
+ * compatibility and rejection by `livenessKindOf`; it is never evidence of
+ * agent death. The legacy constant now answers unknown. Never throws.
  */
 export function isInstallGoneDeadReading(reading: unknown): boolean {
   try {
-    if (livenessKindOf(reading) !== LIVENESS_DEAD) return false
-    return (reading as { readonly source?: unknown }).source === LIVENESS_DEAD_SOURCE_INSTALL_GONE
+    if (typeof reading !== 'object' || reading === null) return false
+    const legacy = reading as { readonly kind?: unknown; readonly source?: unknown }
+    return legacy.kind === LIVENESS_DEAD && legacy.source === LIVENESS_DEAD_SOURCE_INSTALL_GONE
   } catch {
     return false
   }

@@ -268,7 +268,6 @@ import {
   LIVENESS_LIVE,
   LIVENESS_READING_DEAD,
   LIVENESS_READING_DEAD_NO_ROW,
-  LIVENESS_READING_DEAD_INSTALL_GONE,
   LIVENESS_READING_UNKNOWN,
   LIVENESS_UNKNOWN,
   livenessReadingForStatus,
@@ -1552,10 +1551,9 @@ export async function _runCallTimeoutStartStep(
  *   - `ErrSpawnNotFound` → `dead`, carrying no row as what it read
  *     (`LIVENESS_READING_DEAD_NO_ROW`); clears `ad-unreachable` and
  *     `ad-config-malformed`, as a state answer does;
- *   - `ErrSystemInstallDisappeared` → `dead`, marked as read from no row
- *     (`LIVENESS_READING_DEAD_INSTALL_GONE`: the slow-recovery count resets
- *     on it without ending its episode, b.jg5 SRJ-610); raises
- *     `ad-unreachable` with its binary path;
+ *   - `ErrSystemInstallDisappeared` → `unknown`: no agent state was read;
+ *     raises `ad-unreachable` with its binary path, and recovery waits for
+ *     an authoritative agent-director observation (b.jpf);
  *   - `ErrTmuxNotAvailable` (ENVIRONMENT) → `unknown`; raises
  *     `tmux-unavailable` through `raiseTmuxUnavailable` with the error, which
  *     posts SRJ-1021's onset for the re-bound-socket form;
@@ -1597,8 +1595,9 @@ export async function _runCallTimeoutStartStep(
  * (b.jg5 SRJ-311, SRJ-316). Inside a restart run an UNCLASSIFIED answer (an
  * `ErrInternal`, a store-open name, a name CSCB gives no handling) is also
  * reported to the persona's unclassified-error episode (b.jg5 SRJ-313), but
- * `ErrSystemInstallDisappeared` is not: it keeps its `dead` reading (SRJ-105,
- * SRJ-314). From the health tick nothing is reported.
+ * `ErrSystemInstallDisappeared` is not: its `ad-unreachable` outage reports
+ * the failure, and its reading is `unknown`. From the health tick nothing
+ * is reported.
  *
  * The same instance is the persona routing's lost-message row read (b.jg5
  * SRJ-115, SRJ-1011), made from the Slack event path, outside any launch or
@@ -1609,7 +1608,7 @@ export async function _runCallTimeoutStartStep(
  * `status` not being tmux-touching, no answer starts a `tmux-unresponsive`
  * condition; an ENVIRONMENT or CONFIG answer raises its outage and arms the
  * retry timer, and `ErrSystemInstallDisappeared` raises `ad-unreachable` and
- * reads `dead` (SRJ-105, SRJ-1501).
+ * reads `unknown` (b.jpf).
  *
  * @internal
  */
@@ -1643,7 +1642,7 @@ export function _buildIsSessionAliveAdapter(
       // error arms the persona's retry timer, whatever the reading below.
       // b.jg5 SRJ-313: an UNCLASSIFIED status there is reported to the
       // persona's unclassified-error episode, except ErrSystemInstallDisappeared,
-      // which keeps its `dead` reading (SRJ-105, SRJ-314).
+      // whose ad-unreachable outage already reports the failure (b.jpf).
       reportAgentDirectorError(key, err, 'status', {
         reportUnclassified: !isAdErrorInstance(err, ErrSystemInstallDisappeared),
       })
@@ -1674,8 +1673,8 @@ function livenessLatchedReading(): LivenessReading {
 /**
  * The liveness adapter's reading for a `status` error (b.jg5 SRJ-314), with
  * its outage flags; see `_buildIsSessionAliveAdapter`. Decided by class
- * through `src/ad-error-class.ts`. Only `ErrSpawnNotFound` and
- * `ErrSystemInstallDisappeared` read `dead`.
+ * through `src/ad-error-class.ts`. Only `ErrSpawnNotFound` reads `dead`:
+ * an installation failure supplies no observation of the agent (b.jpf).
  */
 function statusErrorReading(key: string, err: unknown): LivenessReading {
   if (isAdErrorInstance(err, ErrSpawnNotFound)) {
@@ -1687,9 +1686,9 @@ function statusErrorReading(key: string, err: unknown): LivenessReading {
   }
   if (isAdErrorInstance(err, ErrSystemInstallDisappeared)) {
     setOutageFlag(key, 'ad-unreachable', binaryPathOf(err))
-    // b.jg5 SRJ-610: `dead` all the same, marked as read from no row, so the
-    // slow-recovery count resets without ending its episode (hatch A2).
-    return LIVENESS_READING_DEAD_INSTALL_GONE
+    // The executable disappearing says nothing about its agents. Keep the
+    // outage and wait for an authoritative status answer before recovery.
+    return LIVENESS_READING_UNKNOWN
   }
   if (classifyAdError(err).errorClass === AD_ERROR_CLASS_ENVIRONMENT) {
     // b.jg5 SRJ-1021: the raising error picks the onset.
@@ -1768,89 +1767,27 @@ export function _buildStatRouteImpl(deps?: {
 const KILL_SESSION_ADAPTER_SITE = 'killSession (restart adapter)'
 
 /**
- * _buildKillSessionAdapter — test-only factory for the restart module's
- * killSession dependency. Production code wires this via main()'s initRestart
- * call; tests call it directly.
+ * Legacy checked-kill adapter retained for compatibility with direct callers.
+ * Restart work no longer calls it: installation failure is unknown and
+ * supplies no agent observation that can authorize recovery (b.jpf).
  *
- * b.av2 SR-6.6 (per-persona lifecycle ops in sequence): restart.ts kills the
- * persona's session and then calls launchSession, which joins a launch already
- * in flight for the key. While a launch is in flight (a collision ladder
- * between its `resume` or reuse spawn and the row's next state, or the
- * live-row sequence's final launch) the row can read dead, so an unguarded
- * kill here would take down the process the running launch is bringing up.
- * While a launch for the key is in flight the adapter therefore skips the
- * kill; the in-flight launch owns the session's lifecycle. A running
- * live-row sequence is asked by the restart work itself, right before it
- * calls this adapter (b.jg5 SRJ-706).
+ * Guards refuse a kill while a launch is in flight or the persona's config
+ * directory cannot be resolved. Otherwise `retryPersonaKill` decides the
+ * checked-kill outcome, which is logged and handled by class: CONFLICT and
+ * UNUSABLE NAME latch the persona, retryable failures arm its retry timer,
+ * and the retry's kill-failure alert decision is raised. `lastRead` supplies
+ * the latch's row state; absent a state, latching reads status once.
+ * This factory does not launch or count a launch outcome.
  *
- * Bug b.g57: with `getPersona`, a persona whose claude_config_dir cannot be
- * resolved to a real path is not killed either. The kill precedes a launch
- * that could not be made, so the instance and its row are left as they are
- * and the persona is handed to the bring-up controller's hold, as the launch
- * would (`holdLaunchIfConfigDirUnresolvable`); the launch that follows is then
- * refused by the relaunch gate (`'skipped'`), counting no failure.
- *
- * b.jg5 SRJ-110, SRJ-701, SRJ-702: both guards make no call and answer
- * `KILL_SESSION_NOT_KILLED_GUARD`, after which the restart work goes on as it
- * always has (the launch joins the launch in flight, or the relaunch gate
- * refuses it). Otherwise the adapter's kill runs through the bounded retry
- * (`retryPersonaKill`, inside the restart work's recovery attempt, on
- * `clock`), seeded with the run's `dead` reading: the restart path kills
- * only after one, and only after its `ErrSystemInstallDisappeared` form,
- * which reads no row (`killBeforeRelaunch` in `src/restart.ts`; b.jg5
- * SRJ-314, SRJ-611: no kill is sent for a row just read `ended`, `missing`
- * or gone), so its kill is not of a row read live (not tmux-touching) and is
- * one try, its outcome standing at once. The adapter logs the outcome that stands with
- * `kill_sent` (`describeKillOutcome`), does its class's handling below,
- * raises the retry's kill-failure alert decision
- * (`raisePersonaKillFailureAlert`, context `recovery`; b.jg5 SRJ-704) and
- * answers the outcome: an `ErrTmuxKillFailed` that stands raises the
- * ordinary version (P's destination once per kill-failure episode, or a log
- * line and a `persona-kill-failed` entry for a persona no longer in the
- * applied configuration), and starts no `tmux-unresponsive` condition. A
- * stop of the tries (a read between tries that latched the persona, or the
- * keep-going check) answers the last outcome with no class handling, and the
- * restart work answers `latched` when the persona is latched. Every answer
- * is classified by error class through `src/ad-error-class.ts`. The restart work
- * launches only after a success (any `kill_sent`, `ErrSpawnNotFound`,
- * GONE, or a read that found the row finished). By class:
- *   - CONFLICT: the persona latches through the latch's CONFLICT entry with
- *     the refused operation "P's next check or recovery"
- *     (`latchOnRestartKillOutcome`; b.jg5 SRJ-501, SRJ-505; a "not this
- *     launch's session" answer on a live row is SRJ-613's kill backstop), and
- *     the work answers `latched`;
- *   - UNUSABLE NAME: the persona latches through the unusable-name entry
- *     (b.jg5 SRJ-512), and the work answers `latched`;
- *   - either latch records `lastRead`'s row state, the state the restart run
- *     last read (`ended`, `missing` or no row), with no further `status`
- *     read; only a reading that carries none (`ErrSystemInstallDisappeared`)
- *     leads to one latch-time `status` read, its lines prefixed
- *     `killSession (restart adapter)` (b.jg5 SRJ-501);
- *   - `ErrInvalidFlags`: one immediate version re-check (b.jg5 SRJ-104,
- *     SRJ-204); when it decides that the server stops, the outcome is
- *     answered with nothing more done and the work answers `shutting-down`
- *     (b.jg5 SRJ-205); otherwise it is UNCLASSIFIED, as below;
- *   - UNAVAILABLE (`ErrTmuxKillFailed` included), ENVIRONMENT (the wrapper
- *     raises `tmux-unavailable`), CONFIG (the wrapper raises
- *     `ad-config-malformed`) and UNCLASSIFIED (`ErrSystemInstallDisappeared`
- *     included, whose wrapper raises `ad-unreachable`; and a class the kill
- *     has no row for, which `killPersonaInstance` reports as UNCLASSIFIED):
- *     the persona's retry timer is armed, an UNCLASSIFIED outcome feeds its
- *     unclassified-error episode, and the work answers `refused`.
- * No non-success launches anything or counts anything, and the kill is never
- * repeated.
- *
- * @param getPersona  The applied persona with a key (production:
- *   `getAppliedPersona`); without it the directory is not checked here.
- * @param clock  The wait between the kill's tries (a clock with
- *   `setTimeout`, or a sleep function); the production clock by default.
+ * @param getPersona The applied persona; without it the directory is not checked.
+ * @param clock The wait between the kill's tries; the production clock by default.
  * @internal
  */
 export function _buildKillSessionAdapter(
   getPersona?: (key: string) => Persona | undefined,
   clock: KillRetryWait = KILL_RETRY_SYSTEM_CLOCK,
 ): (key: string, lastRead: DeadLivenessReading) => Promise<KillSessionResult> {
-  // `key` is the persona key; `lastRead` the restart run's `dead` reading.
+  // `key` is the persona key; `lastRead` is the caller's `dead` reading.
   return async (key: string, lastRead: DeadLivenessReading) => {
     if (isLaunchInFlight(key)) {
       console.error(`[slack] killSession (restart adapter): launch already in flight for persona=${key} — not killing`)
@@ -1967,12 +1904,9 @@ export function _buildReconnectSessionAdapter(
     // (b.sv7), CSCB recovers ITSELF: we fire the internal
     // sweep wrapper here, which may reconcile the frozen `working` row to
     // `missing`, and restart.ts probes liveness again in the same restart run
-    // (b.d61): a re-probe that reads `dead` relaunches at once, with its
-    // checked kill first only after a verdict that is dead evidence and a
-    // re-probe of `ErrSystemInstallDisappeared` (the relaunch alone after
-    // `row-not-interactive` or `row-absent-at-pane-read`, and after a
-    // re-probe that read the row, which voids the verdict, b.jg5 SRJ-609,
-    // SRJ-611). `pending` or
+    // (b.d61): a re-probe that reads `dead` relaunches at once, with no kill.
+    // A row read voids GONE-based evidence for an older life (b.jg5 SRJ-611).
+    // Installation failure reads unknown (b.jpf). `pending` or
     // `unknown` leaves the relaunch undone
     // (`unknown` arms the retry timer). The sweep may leave the row live (in
     // `unverified_ids`, or, when `pending`, not judged at all, b.jg5
@@ -3923,10 +3857,9 @@ export async function main(): Promise<void> {
   // Shared adapter: probes agent-director for the spawn's current state per
   // SR-11 Event 6a and answers one of four readings (b.jg5 SRJ-314): `pending`,
   // with the row's raw launch start when shown (SRJ-115); `live` for another
-  // live state; `dead` for a terminal state (ended, missing), ErrSpawnNotFound
-  // or ErrSystemInstallDisappeared; `unknown` for every other status error and
-  // any state CSCB does not know. Only `dead` leads to a launch, with a kill
-  // before it only for ErrSystemInstallDisappeared (b.jg5 SRJ-314);
+  // live state; `dead` for a terminal state (ended, missing) or ErrSpawnNotFound;
+  // `unknown` for every other status error, installation failure included,
+  // and any state CSCB does not know. Only `dead` leads to a launch, with no kill;
   // the restart path hands `pending` to `deferPendingRow` and arms the
   // persona's retry timer on `unknown`; the health tick never counts
   // `pending` healthy and skips an `unknown` persona that tick. A configured
@@ -3950,7 +3883,6 @@ export async function main(): Promise<void> {
     },
     // b.f2b: the persona locates a `working` row's transcript (its
     reconnectSession: _buildReconnectSessionAdapter(getAppliedPersona, (key) => conflictLatch.isLatched(key)),
-    killSession: _buildKillSessionAdapter(getAppliedPersona, KILL_RETRY_SYSTEM_CLOCK),
     launchSession: async (key, _cwd, _sessionId, deadEvidence) => {
       if (!personaConfig) return false
       // Launches the applied persona with this key; false when there is none.

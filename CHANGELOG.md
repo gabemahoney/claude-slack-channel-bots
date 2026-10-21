@@ -6,6 +6,10 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 ## Unreleased
 
+### Recovery waits for agent-director state
+
+If agent-director reports `ErrSystemInstallDisappeared`, CSCB keeps the `ad-unreachable` outage and waits for a fresh agent-director observation before recovery. The error no longer triggers an agent-death relaunch or a preceding kill. Restart failure counts and the slow-recovery count and notice episode stay unchanged while the agent state is unknown.
+
 - Live acceptance checks route agent input and restart faults through agent-director, with bounded state polling and confirmed kill results (b.ou8).
 - Release audits and finished-ticket sweeps follow Apiary 4.0.3 acceptance rules (b.vrx).
 

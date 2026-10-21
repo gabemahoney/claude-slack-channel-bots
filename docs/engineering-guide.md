@@ -85,6 +85,8 @@ Preserve the [intake](architecture.md#durable-intake-queue-bomv-sr-2sr-3), [engi
 
 ## Session recovery
 
+An agent-director installation disappearance leaves agent state unknown. Keep the outage, restart failure count and slow-recovery episode unchanged; wait for a fresh authoritative AD observation before recovery. Never kill or relaunch because the installation is unavailable (b.jpf).
+
 The detailed [lifecycle contracts](architecture.md#session-lifecycle) define outcome tables and ordering. Reuse their entries rather than adding a parallel recovery path.
 
 - Replace live rows, including `pending`, only through `startLiveRowSequence` and the server's one registry; final launches use its session-manager entry. Never call `runLiveRowSequence` directly in production or kill-then-launch inline. Reuse rows read `ended`/`missing` through `reuseSpawnForPersona`, preserving their history; delete none.

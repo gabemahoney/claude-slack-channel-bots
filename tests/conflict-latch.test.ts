@@ -2893,52 +2893,11 @@ describe('SRJ-118, SRJ-505: a CONFLICT or UNUSABLE NAME at the reconnect\'s send
   })
 })
 
-// ---------------------------------------------------------------------------
-// b.jg5 SRJ-110, SRJ-505 (AC 9), SRJ-501, SRJ-502, SRJ-512, SRJ-613: a kill is
-// a latch site (E20; the E13, E16 and E19 hatch notes). P's restart run kills
-// after its liveness read answers ErrSystemInstallDisappeared (the one `dead`
-// reading that reads no row, and so the only one its kill follows: SRJ-110,
-// SRJ-314), or the live-row sequence P's launch starts at a collision
-// ladder replacement site (a row of P's read `waiting` in another directory;
-// b.jg5 SRJ-707) kills it at its step 1, and the
-// kill answers CONFLICT
-// "not this launch's session"; or the restart run's kill answers UNUSABLE
-// NAME. P latches once with one post, P's retry timer (armed before) stops
-// latched, and no path that could retry the kill (a new launch, the retry
-// entry, a scheduled and a human-triggered restart, the retry timer, the
-// health tick) makes a `kill`, `delete`, `spawn`, `resume` or any other
-// tmux-touching call for P: the stub records exactly one `kill` of P. Q's
-// paths go on.
-// ---------------------------------------------------------------------------
-
-/**
- * The restart run's checked kill for P: P's next liveness read answers
- * ErrSystemInstallDisappeared, the only `dead` reading the restart path kills
- * after (a row read `ended` launches with no kill), and the kill answers `err`.
- */
-async function restartRunKillAnswering({ h, failStatusOnce }: AutomatedPathsRun, key: string, err: Error): Promise<void> {
-  failStatusOnce(key, errSystemInstallDisappeared('status'))
-  h.script({ killError: err })
-  expect(await runRestartRetry(key, personaOf(h, key).working_directory, isLaunchInFlight)).toBe(RESTART_OUTCOME_LATCHED)
-}
 
 /** How P's kill latches: [label, P's expected record, P's one post, the latching call (P's retry timer armed before it)]. */
 const KILL_LATCH_WAYS: ReadonlyArray<
   readonly [string, (key: string) => ConflictLatchRecord, (key: string) => string, (run: AutomatedPathsRun, key: string) => Promise<void>]
 > = [
-  ...RESTART_KILL_CONFLICT_CASE_ROWS.filter((row) => row.latchCase === LATCH_CASE_NOT_THIS_LAUNCH).map((row) => [
-    `the restart run's kill: CONFLICT (${row.name})`,
-    (key: string) =>
-      expectedLatchRecord(key, {
-        latchCase: row.latchCase,
-        refusedOperation: REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY,
-        rowState: row.rowState,
-        sessionName: row.sessionName,
-        description: row.build().errDescription,
-      }),
-    () => row.notice.text,
-    (run: AutomatedPathsRun, key: string) => restartRunKillAnswering(run, key, row.build()),
-  ] as const),
   ...sequenceKillConflictRowsAt(SEQUENCE_STEP1_KILL_SITE, 'waiting').filter((row) => row.latchCase === LATCH_CASE_NOT_THIS_LAUNCH).map((row) => [
     `the step-1 kill of the live-row sequence P's launch starts over a row read waiting in another directory: CONFLICT (${row.name})`,
     (key: string) =>
@@ -2958,12 +2917,7 @@ const KILL_LATCH_WAYS: ReadonlyArray<
       expect([h.stub.calls.sendKeysCalls, h.stub.calls.deleteCalls, h.stub.calls.spawnCalls.length]).toEqual([[], [], 1])
     },
   ] as const),
-  ...RESTART_KILL_UNUSABLE_NAME_CASE_ROWS.slice(0, 1).map((row) => [
-    `the restart run's kill: UNUSABLE NAME (${row.name})`,
-    (key: string) => row.record(key),
-    (key: string) => row.notice(key),
-    (run: AutomatedPathsRun, key: string) => restartRunKillAnswering(run, key, row.build()),
-  ] as const),
+
 ]
 
 describe('SRJ-110, SRJ-505 (AC 9): a CONFLICT or UNUSABLE NAME at P\'s kill holds P, and no automated path sends the kill again (recovery harness)', () => {

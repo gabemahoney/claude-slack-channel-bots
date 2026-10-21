@@ -117,6 +117,7 @@ import {
   LIVENESS_READING_DEAD,
   LIVENESS_READING_DEAD_ENDED,
   LIVENESS_READING_DEAD_INSTALL_GONE,
+  LIVENESS_DEAD_SOURCE_INSTALL_GONE,
   LIVENESS_READING_DEAD_MISSING,
   LIVENESS_READING_DEAD_NO_ROW,
   LIVENESS_READING_LIVE,
@@ -592,7 +593,7 @@ describe('sanitizeFilename', () => {
 // ---------------------------------------------------------------------------
 // _buildIsSessionAliveAdapter (SRD § Liveness probe, Epic 2 Task 1; b.jg5
 // SRJ-314: four readings, and a `status` error never reads dead unless it is
-// ErrSpawnNotFound or ErrSystemInstallDisappeared)
+// ErrSpawnNotFound)
 // ---------------------------------------------------------------------------
 
 /** The live states other than `pending`: each reads `live`. */
@@ -732,7 +733,7 @@ describe("liveness-reading: the dead reading's row read (b.jg5 SRJ-501)", () => 
   })
 
   test.each<[string, unknown]>([
-    ['the install-gone dead reading (it reads no row)', LIVENESS_READING_DEAD_INSTALL_GONE],
+    ['the legacy install-gone alias (unknown)', LIVENESS_READING_DEAD_INSTALL_GONE],
     ['a live reading carrying a row read', { ...LIVENESS_READING_LIVE, rowRead: LIVENESS_DEAD_ROW_ENDED }],
     ['an unknown reading carrying a row read', { ...LIVENESS_READING_UNKNOWN, rowRead: LIVENESS_DEAD_ROW_MISSING }],
     ['a dead reading carrying a row read CSCB does not know', { ...LIVENESS_READING_DEAD, rowRead: 'a-later-state' }],
@@ -746,11 +747,20 @@ describe("liveness-reading: the dead reading's row read (b.jg5 SRJ-501)", () => 
 })
 
 describe("liveness-reading: the dead reading's install-gone source", () => {
-  test('LIVENESS_READING_DEAD_INSTALL_GONE is a frozen dead reading, told apart from the row read\'s dead', () => {
+  test('b.jpf: the legacy install-gone export aliases frozen unknown', () => {
     expect(Object.isFrozen(LIVENESS_READING_DEAD_INSTALL_GONE)).toBe(true)
-    expect(livenessKindOf(LIVENESS_READING_DEAD_INSTALL_GONE)).toBe(livenessKindOf(LIVENESS_READING_DEAD))
+    expect(LIVENESS_READING_DEAD_INSTALL_GONE).toBe(LIVENESS_READING_UNKNOWN)
     expect(LIVENESS_READING_DEAD_INSTALL_GONE).not.toEqual(LIVENESS_READING_DEAD)
-    expect(isInstallGoneDeadReading(LIVENESS_READING_DEAD_INSTALL_GONE)).toBe(true)
+    expect(isInstallGoneDeadReading(LIVENESS_READING_DEAD_INSTALL_GONE)).toBe(false)
+  })
+
+  test.each([
+    ['legacy dead shape', { kind: LIVENESS_READING_DEAD.kind, source: LIVENESS_DEAD_SOURCE_INSTALL_GONE }],
+    ['legacy shape carrying a stale terminal row', { ...LIVENESS_READING_DEAD_ENDED, source: LIVENESS_DEAD_SOURCE_INSTALL_GONE }],
+    ['dead shape whose source getter throws', Object.defineProperty({ kind: LIVENESS_READING_DEAD.kind }, 'source', { get() { throw new Error('unreadable source') } })],
+  ])('b.jpf: %s normalizes to unknown and supplies no dead-row evidence', (_label, reading) => {
+    expect(livenessKindOf(reading)).toBe(livenessKindOf(LIVENESS_READING_UNKNOWN))
+    expect(deadRowReadOf(reading)).toBeUndefined()
   })
 
   test('isInstallGoneDeadReading → false for every other reading, a row read\'s dead included, for a non-dead reading carrying the source, and for a value that is not a reading; never throws', () => {
@@ -758,7 +768,7 @@ describe("liveness-reading: the dead reading's install-gone source", () => {
       expect(isInstallGoneDeadReading(other)).toBe(false)
     }
     for (const other of [LIVENESS_READING_LIVE, LIVENESS_READING_PENDING, LIVENESS_READING_UNKNOWN]) {
-      expect(isInstallGoneDeadReading({ ...other, source: LIVENESS_READING_DEAD_INSTALL_GONE.source })).toBe(false)
+      expect(isInstallGoneDeadReading({ ...other, source: LIVENESS_DEAD_SOURCE_INSTALL_GONE })).toBe(false)
     }
     expect(isInstallGoneDeadReading({ ...LIVENESS_READING_DEAD, source: 'another-source' })).toBe(false)
     const throwingSource = Object.defineProperty({ kind: LIVENESS_READING_DEAD.kind }, 'source', {
@@ -767,7 +777,7 @@ describe("liveness-reading: the dead reading's install-gone source", () => {
       },
     })
     expect(isInstallGoneDeadReading(throwingSource)).toBe(false)
-    for (const notAReading of [null, undefined, LIVENESS_READING_DEAD.kind, LIVENESS_READING_DEAD_INSTALL_GONE.source]) {
+    for (const notAReading of [null, undefined, LIVENESS_READING_DEAD.kind, LIVENESS_DEAD_SOURCE_INSTALL_GONE]) {
       expect(isInstallGoneDeadReading(notAReading)).toBe(false)
     }
   })
@@ -1015,17 +1025,16 @@ describe('_buildIsSessionAliveAdapter', () => {
     expect(emissions.slice(before)).toEqual([{ key: 'C1', text: adUnreachableAllClear('/bin/ad') }])
   })
 
-  // b.jg5 SRJ-610, SRJ-1016: the reading is `dead`, from no row read, so it
-  // carries the install-gone source (a slow-recovery episode stays open).
-  test('3. ErrSystemInstallDisappeared: status throws → sets ad-unreachable with binaryPath as detail; reads dead, from the install-gone source', async () => {
+  // b.jpf: executable discovery supplies no observation of the agent.
+  test('3. ErrSystemInstallDisappeared: status throws → sets ad-unreachable with binaryPath as detail; reads unknown without an agent observation', async () => {
     const binaryPath = '/home/horde/.config/agent-director/bin/agent-director'
     const { emissions, statusCalls, adapter } = makeHarness(errSystemInstallDisappeared('status', binaryPath))
 
     const result = await adapter('C1')
 
-    expect(result).toEqual(LIVENESS_READING_DEAD_INSTALL_GONE)
-    expect(livenessKindOf(result)).toBe(livenessKindOf(LIVENESS_READING_DEAD))
-    expect(isInstallGoneDeadReading(result)).toBe(true)
+    expect(result).toBe(LIVENESS_READING_UNKNOWN)
+    expect(livenessKindOf(result)).toBe(livenessKindOf(LIVENESS_READING_UNKNOWN))
+    expect(isInstallGoneDeadReading(result)).toBe(false)
     expect(statusCalls.map((c) => c.instance_id)).toEqual(['cscb_C1'])
     expect(getOutageFlags('C1').has('ad-unreachable')).toBe(true)
     expect(getOutageFlags('C1').has('tmux-unavailable')).toBe(false)
@@ -1191,7 +1200,7 @@ describe('_buildIsSessionAliveAdapter', () => {
   /** The binary path the ErrSystemInstallDisappeared row names (its `ad-unreachable` onset carries it). */
   const disappearedBinaryPath = '/home/horde/.config/agent-director/bin/agent-director'
   test.each([
-    ['ErrSystemInstallDisappeared', () => errSystemInstallDisappeared('status', disappearedBinaryPath), LIVENESS_READING_DEAD_INSTALL_GONE, [ONSET_TEMPLATES['ad-unreachable'](disappearedBinaryPath)]],
+    ['ErrSystemInstallDisappeared', () => errSystemInstallDisappeared('status', disappearedBinaryPath), LIVENESS_READING_UNKNOWN, [ONSET_TEMPLATES['ad-unreachable'](disappearedBinaryPath)]],
     ['ErrTmuxNotAvailable (ENVIRONMENT)', () => errTmuxNotAvailable(undefined, 'status'), LIVENESS_READING_UNKNOWN, [ONSET_TEMPLATES['tmux-unavailable']()]],
     ...unavailableForms('ErrCallTimeout', 'ErrTmuxUnresponsive', 'ErrUnknownErrorName').map(
       ([label, build]) => [`${label} (UNAVAILABLE)`, () => build('status'), LIVENESS_READING_UNKNOWN, []] as const,
@@ -1282,23 +1291,22 @@ describe('_buildIsSessionAliveAdapter', () => {
   })
 
   // b.jg5 SRJ-105, SRJ-314 (Task ruling): `ErrSystemInstallDisappeared` is
-  // UNCLASSIFIED, but at the liveness adapter it keeps its `dead` reading
-  // (from the install-gone source, b.jg5 SRJ-610) and
+  // UNCLASSIFIED, but the liveness adapter reports unknown and preserves
   // its `ad-unreachable` raise, and is never reported to the unclassified
   // sink, inside a restart run for the persona or outside one. Its arming is
   // unchanged (a read's error inside the attempt: the read-error cause).
   test.each([
     ['inside a restart run for the persona', true],
     ['outside any attempt', false],
-  ] as const)('b.jg5 SRJ-313: status throws ErrSystemInstallDisappeared %s → reads dead, from the install-gone source; ad-unreachable raised; not reported to the unclassified sink', async (_label, inside) => {
+  ] as const)('b.jg5 SRJ-313: status throws ErrSystemInstallDisappeared %s → reads unknown without an agent observation; ad-unreachable raised; not reported to the unclassified sink', async (_label, inside) => {
     const { triggers, unclassified, adapter } = makeHarness(errSystemInstallDisappeared('status'))
 
     const { result, errArgs } = inside
       ? await runInAttempt('C1', 'recovery', () => probeCapturingErrors(adapter, 'C1'))
       : await probeCapturingErrors(adapter, 'C1')
 
-    expect(result).toEqual(LIVENESS_READING_DEAD_INSTALL_GONE)
-    expect(isInstallGoneDeadReading(result)).toBe(true)
+    expect(result).toBe(LIVENESS_READING_UNKNOWN)
+    expect(isInstallGoneDeadReading(result)).toBe(false)
     expect(getOutageFlags('C1').has('ad-unreachable')).toBe(true)
     expect(unclassified).toEqual([])
     expect(triggers).toEqual(inside ? [{ key: 'C1', kind: UNAVAILABLE_RETRY_CAUSE_READ_ERROR, inside: true }] : [])
@@ -4591,7 +4599,7 @@ describe('_buildKillSessionAdapter: the checked kill\'s outcome (b.jg5 SRJ-110, 
       const err = conflictRow!.build()
       install(err)
 
-      await killInAttempt('C1', undefined, LIVENESS_READING_DEAD_INSTALL_GONE)
+      await killInAttempt('C1', undefined, { kind: LIVENESS_READING_DEAD.kind, source: LIVENESS_DEAD_SOURCE_INSTALL_GONE })
 
       expect(statusCalls.map((c) => c.instance_id)).toEqual([personaInstanceId('C1')])
       expect(latch.record('C1')?.rowState).toEqual(latchRowStateRead(LIVENESS_DEAD_ROW_ENDED))
@@ -4601,7 +4609,7 @@ describe('_buildKillSessionAdapter: the checked kill\'s outcome (b.jg5 SRJ-110, 
       const readErr = unusableRow!.build()
       install(conflictRow!.build(), cannedKillResult(true), readErr)
 
-      const { errArgs } = await killInAttempt('C1', undefined, LIVENESS_READING_DEAD_INSTALL_GONE)
+      const { errArgs } = await killInAttempt('C1', undefined, { kind: LIVENESS_READING_DEAD.kind, source: LIVENESS_DEAD_SOURCE_INSTALL_GONE })
 
       expect(statusCalls).toHaveLength(1)
       expect(latch.record('C1')).toStrictEqual({ ...unusableRow!.record('C1'), rowState: LATCH_ROW_STATE_UNREADABLE })
