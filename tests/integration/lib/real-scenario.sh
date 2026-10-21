@@ -7,6 +7,9 @@ require_scenario_home real-scenario
 source "${BASH_SOURCE[0]%/*}/real-failure.sh"
 [[ "${TEST_NAME}" == *-fmk-real-* ]] || fail 'real-scenario requires a -fmk-real- script'
 REAL_DELIVERY_WAIT_S=180
+# Functional watchdogs: no exact workload receipt progress for 180s, or a
+# bounded 30-minute batch overall. AC76 uses its separate unchanged audit.
+REAL_DELIVERY_MAX_WAIT_S=1800
 REAL_LAUNCH_WAIT_S=300
 REAL_COMPACT_WAIT_S=120
 REAL_IDLE_WAIT_S=2700
@@ -159,7 +162,7 @@ real_wait_launch() {
     # Persona names need not equal their derived key: match by key alone.
     # A replacement also needs AD to report a new native session. A still-live
     # old row and a historical MCP connection do not finish its live-row sequence.
-    wait_until "${REAL_LAUNCH_WAIT_S}" "real persona $1 never launched/connected" _real_connected "$1" "${2:-}"
+    wait_until "${REAL_LAUNCH_WAIT_S}" "real persona $1 never launched/connected" _real_connected "$1" "${2:-}" "${3:-0}"
     real_wait_idle "$1" "${REAL_LAUNCH_WAIT_S}"
 }
 _real_waiting() {
@@ -174,6 +177,18 @@ real_wait_idle() {
     real_ad status --instance-id "$(real_instance "$1")" > "${status}" 2>/dev/null || printf '{}\n' > "${status}"
     bun "${SCENARIO_FIXTURES}/real-observations.ts" "${status}" || echo 'recorded: AD state diagnostic unavailable'
     fail "real persona $1 never reached AD waiting (not within ${timeout}s)"
+}
+_real_latency_admission() {
+    bun "${REAL_RECEIPTS%/*}/ac76-admission.ts" admission "${SLACK_STATE_DIR}" "$1" \
+        "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" "$2" "${SCENARIO_ROOT}" \
+        "${SCENARIO_AD_ROOT}/bin/agent-director.real" "${SCENARIO_ROOT}/relaunch-$1.json" "${REAL_CONNECTION_LINE_BASE}"
+}
+real_wait_latency_admission() {
+    # Test32 only: unresolved prior candidates remain closed even when AD is
+    # waiting. Poll evidence under a watchdog; elapsed time never grants entry.
+    _scenario_check_timeout "${REAL_DELIVERY_WAIT_S}" real_wait_latency_admission
+    if _scenario_poll_until "${REAL_DELIVERY_WAIT_S}" _real_latency_admission "$1" "$2"; then return 0; fi
+    fail 'AC76 pre-sample admission timed out (see reason codes and counts)'
 }
 real_record_state() {
     local status="${SCENARIO_ROOT}/real-status.json"
@@ -192,16 +207,33 @@ _real_connected() {
              and .labels.tag_prompt == "1" and (.session_id | type == "string" and length > 0)
              and .session_id != $old_session' <<< "${row}" >/dev/null || return 1
     fi
-    grep -F 'Session connected: persona ' "${SLACK_STATE_DIR}/server.log" | grep -qF "(key=$1)"
+    # A resumed conversation keeps its session ID. Its new MCP connection
+    # must still occur after the caller's post-stop log cursor.
+    tail -n "+$((${3:-0}+1))" "${SLACK_STATE_DIR}/server.log" \
+        | grep -F 'Session connected: persona ' | grep -qF "(key=$1)"
 }
 real_wait_delivery() {
     _scenario_check_timeout "${REAL_DELIVERY_WAIT_S}" real_wait_delivery
-    if _scenario_poll_until "${REAL_DELIVERY_WAIT_S}" \
-        bun "${REAL_RECEIPTS}" ready "${SLACK_STATE_DIR}" "$1" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" "${2:-}" "${3:-}"; then return 0; fi
-    # Capture while the live row, composer and receipt files still exist.
-    # Diagnostics cannot turn the expired wait into success or replace FAIL.
+    _scenario_check_timeout "${REAL_DELIVERY_MAX_WAIT_S}" real_wait_delivery
+    local started last_progress now progress most=0 reason
+    started="$(_scenario_now_ms)"
+    last_progress="${started}"
+    while :; do
+        # Progress never substitutes for the complete receipt/FIFO audit.
+        if bun "${REAL_RECEIPTS}" ready "${SLACK_STATE_DIR}" "$1" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" "${2:-}" "${3:-}"; then return 0; fi
+        now="$(_scenario_now_ms)"
+        if (( now - started >= REAL_DELIVERY_MAX_WAIT_S * 1000 )); then reason=overall; break; fi
+        progress="$(bun "${REAL_RECEIPTS}" progress "${SLACK_STATE_DIR}" "$1" "${SCENARIO_AD_SHIM_LOG}" "${HOME}/.claude/projects" "${2:-}" "${3:-}")" || progress=''
+        if [[ "${progress}" =~ ^[0-9]+$ ]] && (( progress > most )); then
+            most="${progress}"
+            last_progress="${now}"
+        fi
+        if (( now - last_progress >= REAL_DELIVERY_WAIT_S * 1000 )); then reason=no-progress; break; fi
+        sleep "${SCENARIO_POLL_S}"
+    done
+    # Capture only structured state/receipt diagnostics before cleanup.
     _real_delivery_diagnostic "$@" || echo 'recorded: delivery diagnostic unavailable'
-    fail "real persona $1 has open/unconfirmed deliveries (not within ${REAL_DELIVERY_WAIT_S}s)"
+    fail "real persona $1 has open/unconfirmed deliveries (${reason} watchdog; receipts=${most}; idle bound=${REAL_DELIVERY_WAIT_S}s; overall bound=${REAL_DELIVERY_MAX_WAIT_S}s)"
 }
 _real_delivery_diagnostic() {
     local status="${SCENARIO_ROOT}/real-delivery-status.json"

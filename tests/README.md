@@ -187,7 +187,7 @@ why:
   built-ins and loads the installed package only after the check.
 - `lib/real-scenario.sh`: checks the image and scenario HOME at source time,
   then requires a `-fmk-real-` test name. `transcript-receipts.ts`,
-  `real-observations.ts`, `real-case-assertions.ts` and
+  `ac76-admission.ts`, `real-observations.ts`, `real-case-assertions.ts` and
   the real-agent fixture drivers guard their executable entry points;
   their importable helpers perform no launch.
 - `fixtures/agent-director-list-refusing.sh`: its first step. It prints one
@@ -473,9 +473,10 @@ tests/
     session-leader.test.ts         # bun test, not run by runner.sh
   ci-durations.tsv                 # the duration table: each script's expected seconds, by number form; balances the shards and sets their limits
                                    # (see The duration table)
-  runner.sh                        # the per-shard in-container runner: takes the shard number, the canary, the `--fail` pairs and the assigned scripts,
-                                   # runs only those, writes the in-shard files and no verdict, then waits after its end marker until the host runner
+  runner.sh                        # takes the shard number, canary, optional `--keep-going`, `--fail` pairs and assigned scripts;
+                                   # writes in-shard evidence and no verdict; `done` requires verified final cleanup, then it waits until the host runner
                                    # kills its container (see The in-container runner and the in-shard files)
+  runner-keep-going-controls.py     # contained synthetic controls of the actual runner, dependencies, cleanup and performance locks
   README.md
 docker/
   Dockerfile.test.base             # source-independent base image (see docker/README.md)
@@ -574,22 +575,34 @@ after package installation. Its four R55 phases match the maintained
 install/store and tmux server, with onboarding completed, the run's key
 approved and only its required permission allow rules; no bypass mode.
 
-Only the run's API key, base URL and model are used (`ANTHROPIC_API_KEY`,
-`ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL`); supply the CI credentials through
-`/ci`'s existing `CI_ANTHROPIC_*` route. Every full `/ci` run and release makes real model calls. They clear inherited subscription/OAuth
+Supply the run's API key, base URL and model directly as host
+`CI_ANTHROPIC_*` inputs to `/ci` and its verdict reader. Only the disposable
+container entrypoint translates them to native `ANTHROPIC_*`; no host
+remapping or native credential assignment is needed. Every full `/ci` run
+and release makes real model calls. They clear inherited subscription/OAuth
 credentials. No key goes into an image, repository, log or result file.
 No real bot, agent-director or tmux runs on the host.
 
 `lib/real-scenario.sh` provides native version checks, persona/Slack stub
 setup, fault installation, MCP drop, waiting/launch helpers and exact receipt
-assertions. Its delivery wait is 180 s, launch wait 300 s and compact wait
-120 s. Test 34 starts its boundary wait after queueing messages, then uses a
-separate 180 s delivery wait. Heavy Test 104 has a 45-minute start-observation
+assertions. Its functional delivery watchdog allows 180 s without exact
+receipt progress and 1800 s overall; launch wait is 300 s and compact wait
+120 s. Test 34 starts its boundary wait after queueing messages, then uses
+a separate delivery watchdog. Heavy Test 104 has a 45-minute start-observation
 bound, then shares one 120 s deadline for the boundary and queued deliveries
 from observed compaction start. A timeout fails the scenario;
 no script or coordinator automatically reruns a failed case. Product delivery
 retries within a scenario remain part
 of the behavior under test.
+
+Only an increased count of distinct original-workload parts with matching
+durable receipts and exact own-session take-ins renews the watchdog.
+Reminders, attempts, duplicates, foreign sessions and stale/nonmatching
+take-ins do not. Progress never establishes success: the complete receipt,
+FIFO and no-open-work audit must pass. Failure diagnostics precede cleanup.
+Test 35 also requires a new own-persona connection after its post-stop log
+cursor in all four modes; fresh/upgrade retain changed-session checks and
+resume retains its same-session check.
 
 Real-agent actions wait on AD `waiting` and typed refusals. Explicit `/compact` trials verify later exact receipts and durable queue progress; no pane or native compaction marker establishes lifecycle state. Diagnostics omit pane text.
 
@@ -634,11 +647,63 @@ HOME/transcripts. Usage includes launch and subagent work and deduplicates
 streamed assistant message IDs. An incomplete/damaged report is a failure,
 not zero usage. Nothing is written under `/test-results/`.
 
-The gate latency step sends 20 DMs only with a connected, waiting bot,
-fresh AD waiting row and nothing in flight. It measures `message-received` to the
-shim's first send and `message-delivered`: p95 typing start ≤2 s and delivery
-≤10 s. The separate stub-only 3 s Slack Socket Mode acknowledgement check
+Test 32's persona instructions request a genuine Slack reply with text `OK`
+for every relayed Slack message, using its `chat_id`, `message_id` and, when
+present, `thread_ts`. Actual calls follow normal production reply resolution,
+allowing eligible prior reminder candidates to resolve through reply-call
+facts and establish the measured workload's ready-state preconditions.
+
+Immediately after `real_wait_relaunch`, Test 32's `reply-permission-resume`
+assertion compares `REAL_KILLED_ROW` with the retained
+`relaunch-${REAL_KEY}.json`. Both must identify the expected AD instance and
+the same nonempty native `session_id`; the resumed row must save exactly one
+`--allowedTools` flag immediately followed by `REPLY_TOOL_ALLOW_RULE`, loaded
+from the installed package. A fallback reuse into another conversation or a
+preallowed label without that argument pair cannot satisfy the assertion.
+It prints a fixed confirmation only, never row or argument payloads.
+
+The check establishes conversation identity and retained arguments. Native
+permission evidence additionally requires subsequent real replies and drain
+without a permission decision on the pinned Claude version; the existing
+AD waiting, connection, receipt and admission checks remain necessary.
+`real-key-recovery-proof.test.ts` exercises the assertion with production-built
+arguments and canned AD rows, including label-only, identity and malformed
+argument controls; `agent-director-template.test.ts` covers exact build,
+install and refresh arguments, overlay scope and snapshot ordering. Neither
+unit suite establishes effective native permissions after resume.
+
+Test 32 calls `real_wait_latency_admission` before each of its 20 latency DMs,
+with exactly `33+n-1` prior original inputs for sample `n` (1–20).
+`fixtures/ac76-admission.ts` replays and compacts the production queue in a
+private journal copy, requiring zero unresolved reply-reminder candidates and
+zero open items, then the complete reminder-inclusive receipt/FIFO audit.
+Receipt history supplies delivery proof, never candidate state; the live queue
+is not changed by this check.
+
+Admission reads AD before replay and freshly after the audit. Both rows must
+match the retained relaunch's instance, session, row-start and launch identity
+with `tag_prompt=1`; the final row must be `waiting`.
+The latest own CSCB connection diagnostic after the post-stop cursor must be
+connected and unchanged across the checks; journal bytes must still match
+after replay/stop and after the final AD read.
+
+Closed attempts print `recorded: AC76 admission` with `ready`, a fixed `reason`
+code and `candidates`/`open` counts (null until available), never raw journal,
+AD or error payloads. The helper polls under a 180 s watchdog and fails without
+sending the next DM if admission stays closed, including for a candidate with
+no observed working transition; elapsed time alone cannot admit a sample.
+The import-safe fixture uses installed-package queue/receipt adapters in its
+guarded CLI and bounds each AD read to 10 s.
+
+Latency measures `message-received` to the shim's first send and
+`message-delivered`: nearest-rank p95 typing start ≤2000 ms and delivery
+≤10000 ms across exactly 20 samples. Reminders remain enabled, and no slow
+sample is filtered, discarded or retried. The separate stub-only 3 s Slack
+Socket Mode acknowledgement check
 measures intake/ACK, not those receipt-confirmed latency limits.
+Test-32 runs under the exclusive [performance guard](../docker/README.md#performance-measurement-guard).
+Functional receipt progress cannot waive either latency limit or reduce the
+20 native samples. Synthetic admission, watchdog and lock controls prove no native result.
 
 #### Counted key faults
 
@@ -1174,7 +1239,7 @@ Test 41 and the five exact heavy entrypoints above must call `assert_codex_d1_sa
 
 The host login is only the existing single read-write mounted file; the private scratch Codex home keeps its exact auth symlink. The harness creates/copies no Codex config, requires absence before the first spawn, and checks durable native-spawn provenance tied to that private home's inode before later recovery can admit native-written metadata. Amended decision 22 permits only fixed `tui.screen_reader_detection_done` and genuine parent tables with exclusively allowed descendants, even when their names overlap the host. All other host keys and every model/reasoning/profile/provider/auth/unknown key reject it. Native metadata host values are never decoded or copied; only key names and unknown-key counts are recorded. Native CLI `tui.show_tooltips=false` avoids an optional counter without adding a file allowlist key.
 
-Use [the runner's full admission and retirement contract](../docker/README.md#codex-admission-login-and-scratch-lifecycle): selected top-level host model, bounded plain `CODEX_HOST_CONFIG_KEYS`, UID/owner-0600 checks, dedicated test-1/Codex shard, shared 30-minute login lease, survivor refusal, core dumps disabled, additional 2 GiB memory and before/after token scans. Codex always runs in local disposable containers, never a scheduler job. Keep the `CI_ANTHROPIC_*` prefix on the `/ci` runner and every verdict-reader call; `/ci-live` stays in its own container and test workspace. Never export scratch homes or access actual credentials from host tests.
+Use [the runner's full admission and retirement contract](../docker/README.md#codex-admission-login-and-scratch-lifecycle): selected top-level host model, bounded plain `CODEX_HOST_CONFIG_KEYS`, UID/owner-0600 checks, dedicated test-1/Codex shard, shared 30-minute login lease, survivor refusal, core dumps disabled, additional 2 GiB memory and before/after token scans. Codex always runs in local disposable containers, never a scheduler job. Supply the same `CI_ANTHROPIC_*` environment directly to the `/ci` runner and every verdict-reader call; `/ci-live` stays in its own container and test workspace. Never export scratch homes or access actual credentials from host tests.
 
 The four synthetic Codex suites are `codex-config-keys.test.ts`, `codex-delivery-controls.test.ts`, `codex-ai-controls.test.ts` and `codex-gate-controls.test.ts`. They cover strict bounded child checkpoints, atomic markers, both durable pair IDs, marker-first consistent reads, diagnostics before kill, completed AC15 acknowledgements and compaction-preserved FIFO evidence. Actual SIGKILL stays between successful text return and Enter.
 
@@ -1398,20 +1463,16 @@ server's calls are its shim lines after the restart:
   reads `pending` with a launch start until one reads `waiting`, within B_R;
 - the same from agent-director's trail (`ad-trail.jsonl` in the scenario
   HOME's `~/.config/agent-director/`, the records after the length noted before
-  `clean_restart`). For each row, the script takes, in trail order, the
-  first SessionStart `pending`-to-`waiting` state transition and the last
-  `ad.resume.moved_to_pending` before it; and, by `ts`, the row's
-  SessionStart `ad.hook.fired` record nearest the transition: the latest at
-  or before it, else the first after it, whatever the records' order in the
-  trail. It orders them against the bot server's last
-  resume call and the harness's reads. Both the move to `pending` and the
-  SessionStart hook come after that resume, and the hook comes no later than
-  the end of the first read of `waiting`. No read between that resume and
-  the transition reads `waiting`, and each such read that starts after the
-  move to `pending` reads `pending` with a launch start;
-- the dialog is cleared through agent-director: `read-pane` and `send-keys`
-  naming the row, by the bot server, after its last resume and before the row
-  read `waiting`;
+  `clean_restart`). After the last resume call, the script waits for the
+  matching `ad.resume.moved_to_pending`, SessionStart `pending`-to-`waiting`
+  transition and applied (`upsert_outcome: updated`) `ad.hook.fired` for
+  the same instance and saved conversation. Missing, foreign, stale or
+  unapplied evidence and ambiguous multiple pending/waiting transitions fail. Trail
+  publication may follow the harness's waiting read; no cross-observer
+  timestamp ordering is required. Any sampled pending row still needs a
+  launch start;
+- SessionStart completes without automatic startup `read-pane` or
+  `send-keys` calls after the last resume and before the waiting observation;
 - the conversation is kept: the row keeps the `session_id` read
   before, and the worker in its session's pane was started with
   `--resume <id>`;
@@ -1535,8 +1596,11 @@ resolves (`ad-client-check.sh --package`, then
 a shard, as one scheduling unit (Test 3's `# ci-requires: test-2`), and use
 that daemon; Test 4 uses the shard's installed package.
 
-The runner stops its shard at the shard's first failing script and runs
-nothing after it there. The other shards run on to their own ends.
+By default the runner stops its shard at the first failing script; other
+shards run on. Explicit `--keep-going` continues independent assigned
+scripts after verified cleanup. Failed or skipped prerequisites and unsafe
+cleanup produce explicit `notrun` reasons, as the in-container contract below
+defines; every failure remains part of the combined result.
 
 Test 0 and Tests 5 onwards depend only on Test 1's install. Each runs any
 server it starts in its own state dir on its own port, and stops it before it
@@ -1588,26 +1652,32 @@ per Codex script plus an ordinary shard when ordinary units are selected
   with no prerequisite beyond test-1; its shard runs exactly test-1 and it.
   The current full run needs at least 2 shards; a Codex-only selective run may
   use one. Only dedicated shards get the login mount.
+- **Independent tracks.** Ordinary shards form Track A; dedicated login
+  shards form Track B (test-41 today). Shared preparation reserves the whole
+  workload, then A starts while B waits for login. B releases its lease
+  after protected retirement/postcheck/scans while A can continue. Neither
+  track alone is a full gate. See [Codex lifecycle](../docker/README.md#codex-admission-login-and-scratch-lifecycle).
 - **Per-shard limits.** Each shard has its own wall-time limit (see The
   duration table), and its container its own memory cap, PID limit and CPU
   limit (see `docker/README.md`'s `### Shard containers` and
   `### The per-shard memory cap and out-of-memory kills`).
-- **Nothing shared.** A shard sees only its own results subdirectory,
+- **Private state.** A shard sees its own results subdirectory,
   `shard-<k>` of the run directory, mounted at `/test-results`, and the
-  run's tarball, read-only. A dedicated Codex shard also has the validated
+  run's tarball, read-only, plus the read-only shared performance-lock file.
+  A dedicated Codex shard also has the validated
   single read-write login-file mount at `/run/codex-login/auth.json`.
   It shares no HOME, agent-director store, tmux
   server or daemon with another shard, and writes no file another shard
   sees.
-- **Failures stay in their shard.** A shard stops at its own first failing
-  script; one shard's failure, limit or out-of-memory kill never stops
+- **Failures stay in their shard.** Default fail-fast or explicit keep-going
+  applies within each shard; one shard's failure, limit or out-of-memory kill never stops
   another. Only a run-level stop (an interrupt, the run deadline or the
   memory watchdog), or an internal error of the host runner, stops every
   shard.
 - **One merged verdict.** When every shard has ended, the host runner reads
   each shard's files, runs the integrity checks and writes one verdict for
   the run (see Verdict file format). A selection permitted to use
-  `--shards 1` keeps serial order and stops at its first failure.
+  `--shards 1` keeps serial order and uses the selected failure mode.
 
 ### The in-container runner and the in-shard files
 
@@ -1616,13 +1686,14 @@ per Codex script plus an ordinary shard when ordinary units are selected
 check (see Image marker). It then takes its arguments, in this order:
 
 ```text
-tests/runner.sh <shard number> <canary> [--fail <file name>]... <file name>...
+tests/runner.sh <shard number> <canary> [--keep-going] [--fail <file name>]... <file name>...
 ```
 
 | Argument | Form |
 |---|---|
 | `<shard number>` | k, a whole number of at least 1, with no leading zero |
 | `<canary>` | 32 lowercase hexadecimal characters, drawn at random for each shard by the host runner |
+| `--keep-going` | optional flag, once before the `--fail` pairs; continue independent scripts after verified cleanup |
 | `--fail <file name>` | zero or more pairs: an assigned script to record failed without running it (the `fail:` fault; see Fault injection) |
 | `<file name>...` | the assigned scripts' file names, `test-<n>-<slug>.sh`, in run order, test-1 first, each once |
 
@@ -1641,7 +1712,7 @@ mounted at `/test-results`, it writes these files and nothing else:
 | `canary.txt` | the canary and one LF | before any script runs |
 | `package.sha256` | the SHA-256 of `/tmp/package.tgz`, 64 lowercase hexadecimal characters and one LF | before any script runs |
 | `result.txt` | one line per event, below | each line flushed whole as it is written |
-| `<file name>.log` | the script's combined stdout and stderr | as the script runs, for each script with a result other than `notrun` |
+| `<file name>.log` | the script's combined stdout/stderr and cleanup diagnostics | for each attempted script; a pre-measurement cleanup refusal can also leave a log for a `notrun` script |
 | `dependency-fingerprint.txt` | the SHA-256, 64 lowercase hexadecimal characters and one LF, of one `<name>@<version>` line per installed package directory under `/test-repo/node_modules`, sorted bytewise with repeats removed | after test-1 passes |
 
 `result.txt`'s lines, each ending in an LF, fields separated by single
@@ -1651,21 +1722,48 @@ spaces:
 start <file name>
 end <file name> pass <s.mmm>
 end <file name> fail <s.mmm>
-notrun <file name>
+notrun <file name> <reason>
 done
 ```
 
 `start` comes before each script and `end` after it, with the script's wall
 time in seconds: digits with no leading zero but a lone `0`, a point, and
 exactly three digits. `notrun` is written for each assigned script not
-reached, and the end marker `done` comes last.
+executed. The parser also accepts older reasonless `notrun <file name>`
+records; malformed reasons fail closed.
+
+| Reason | Meaning |
+|---|---|
+| `unsafe-cleanup` | Cleanup could not establish quiescence; no subsequent script runs |
+| `fail-fast` | An earlier script failed and keep-going was not selected |
+| `dependency:<file name>` | The named earlier prerequisite failed or was skipped; test-1 is implicit for every later script |
+
+Reasons use that precedence. A skipped prerequisite blocks its own
+dependents transitively. The runner reads only assigned scripts' validated
+header prerequisites; it never discovers or runs additional scripts.
+`results.json` version 1 preserves a supplied reason as the optional script
+field `notrunReason`, and `summary.txt` appends `; <reason>` to that script's
+line. An unrecorded/legacy reason stays absent; the host does not invent one.
 
 A script named by `--fail` is not run. Its lines are `start <file name>` and
-`end <file name> fail 0.000`, and its log holds only
-`FAIL: <file name>: injected failure`.
+`end <file name> fail 0.000`, and its log begins with
+`FAIL: <file name>: injected failure`; normal cleanup diagnostics can follow.
 
-At its first failing script the runner runs nothing more: it writes the
-`notrun` lines, then `done`. It never writes `verdict.txt`; the host runner
+After each script's traps finish, the runner verifies process cleanup inside
+the disposable PID namespace, comparing PID/start-time identities without
+reading arguments, environment or panes. It preserves initial infrastructure
+and the known test-1/test-3 daemon for ordinary scripts; other survivors get
+TERM, then KILL, and must disappear. A failed check fails that script and
+blocks later ones. This process check does not restore arbitrary package or
+filesystem state: scripts must retain their setup/teardown and prerequisites.
+
+Final cleanup also retires the intentional daemon. Only successful cleanup
+unlocks the performance guard and writes `done`. On uncertainty, even after
+all script ENDs passed, the runner prints `FAIL: runner.sh: unsafe-cleanup`
+to the container log, keeps the guard and idles without `done`. The host's
+existing shard wall-time limit or run stop then retires the container and
+fails the shard; this path does not report immediate completion. Earlier
+script results stay intact. It never writes `verdict.txt`; the host runner
 writes the verdict at the end of the run.
 
 After `done` the runner stays running, idle, and ignores SIGTERM until the
@@ -1702,6 +1800,47 @@ every run, and its failure still fails that run.
 | Script | Symptom |
 |---|---|
 | test-4 (`test-4-resume-dialog.sh`) | Seen once in five serial runs. The driver's `resume` meets agent-director's "still stopping" refusal within its stopping window, while the first life's worker is still exiting, and the script fails with `phase2 spawnForPersona returned failed`. A re-run passed |
+
+### Contained runner controls
+
+`tests/runner-keep-going-controls.py` runs the real shell runner with harmless
+synthetic scripts in a marked CI image. It covers fail-fast and keep-going,
+transitive dependency skips, bootstrap failure, orphan removal, unremovable
+survivors, injected failures, shared/exclusive measurement ownership and
+cancellation. The late-final-cleanup control adds a synchronization barrier
+to a scratch runner copy so a root-owned survivor appears after all passing
+END records; production cleanup/result/lock logic remains intact.
+
+These controls launch no native agent, integration scenario, AD process,
+tmux server or network request. They establish process/lock behavior, not
+arbitrary filesystem restoration or native AC76 acceptance. From the repo
+root, with the existing base image available (no pull/build):
+
+```sh
+(
+  CI_CONTROL_LOCK="$(mktemp /tmp/cscb-runner-control-lock.XXXXXX)"
+  trap 'rm -f -- "$CI_CONTROL_LOCK"' EXIT
+  chmod 0644 "$CI_CONTROL_LOCK"
+  docker run --rm --pull never --user 0 --network none --read-only --cap-drop ALL \
+    --cap-add CHOWN --cap-add SETUID --cap-add SETGID --cap-add KILL \
+    --cap-add FOWNER --cap-add DAC_OVERRIDE --security-opt no-new-privileges \
+    --pids-limit 128 --memory 256m --cpus 1 \
+    --tmpfs /tmp:rw,nosuid,nodev,mode=1777 \
+    --tmpfs /test-results:rw,nosuid,nodev,mode=1777 \
+    --tmpfs /test-repo:rw,nosuid,nodev,mode=1777 \
+    --mount "type=bind,src=$PWD/tests/runner.sh,dst=/source/runner.sh,readonly" \
+    --mount "type=bind,src=$PWD/tests/runner-keep-going-controls.py,dst=/controls.py,readonly" \
+    --mount "type=bind,src=$CI_CONTROL_LOCK,dst=/run/cscb-ci-performance.lock,readonly" \
+    --entrypoint /usr/bin/python3 cscb-ci-base:v8 /controls.py
+)
+```
+
+The root driver drops the runner to testuser/nobody. Extra capabilities let
+the driver create and retire a survivor that the runner cannot kill; mutable
+fixtures stay in container tmpfs. The only host mounts are the two read-only
+source files and a fresh non-secret scratch lock. Never mount a host home,
+socket or credential, reuse the real performance lock, or fabricate the image
+marker. Inspect images/containers only through the safe inspection wrapper.
 
 ### Script names, prerequisites and canonical order
 
@@ -1795,7 +1934,7 @@ follows as one detail line. Within a stage the failures come in this order:
 - header refusals: the declaring script's canonical order, then the header
   refusal table's order; a cycle counts as declared by its first script in
   canonical order
-- credentials: `ANTHROPIC_API_KEY` before `GH_TOKEN`
+- credentials: the selected API key (`CI_ANTHROPIC_API_KEY` for the host CI route) before `GH_TOKEN`
 
 ### Selective runs
 
@@ -2520,7 +2659,7 @@ script's header comment is its full specification.
 | 2 (b.jg5 SRJ-1403; AC 24, AC 64) | `test-14-fmk-kill-fails.sh` | The start sweep (a persona removed while its worker runs); a `config_dir` mismatch, met at the collision ladder's `pending` branch (SRJ-411) by a start; a `cwd` mismatch, met by a running server's first pending-only retry. `resume_enabled=false` is not driven here: SRJ-1403 leaves it, with `ErrSpawnNotResumable` with dead evidence, to SRJ-110's unit test (dead evidence means the session is gone, so agent-director's kill sends no kill for the shim to fail) | Every kill try answers `ErrTmuxKillFailed`, `KILL_RETRY_TRIES` tries; no CSCB delete or launch (spawn or resume) of the leg's id follows; the row is kept (read afterwards, present). One alert is routed per SRJ-704: at the start sweep, one `orphan-cleanup` startup-errors entry and one server-log line, nothing to Slack; at a `config_dir` or `cwd` mismatch, one ordinary alert at the persona's destination, quoting agent-director's description, and no second alert through one further retry (no post of any text at the destination for a hold of at least 5 s and at least twice the first alert's latency plus 5 s, and the same count just before the leg's stop). No `tmux-unresponsive` post and no `tmux-unresponsive` started line (for the start sweep, for any persona) (SRJ-307) | tmux-shim `fail-kill` for the kills checked (`log` while a leg launches); stub modes `startup-trust` (reporting, the start sweep's persona) and `silent` (the mismatch personas, whose rows stay `pending`); the mismatch made by re-pointing a symlinked directory (`repoint_symlink`); agent-director's default settings, no `config.toml`, so `kill_exit_wait_ms` is its default, 5000 ms, measured (slowest exit 603 ms), and the retry makes 3 tries 2 s apart; `health_check_interval` 0; starts on 0.10.0 (`SCENARIO_AD_START=0.10.0`), with scenario 16's seeding quiesced before `install_ad_release` and its live fixtures rebuilt afterwards, so legs 1 to 3 run on the release; values from `fixtures/fmk-texts.ts`; posts from the Slack stub's record |
 | 15 (b.jg5 SRJ-1417, SRJ-715; AC 1, AC 64) | `test-14-fmk-kill-fails.sh` (leg 4, after scenario 2's legs) | A persona removal's teardown: persona R (a Slack destination, its worker reporting in) is up and its row `waiting`; the operator removes R from `config.json` and confirms the apply by renaming the pending file to the apply file (README "Reload") | R's teardown kill: each of its `KILL_RETRY_TRIES` tries answers `ErrTmuxKillFailed`, its tries ending exhausted; exactly one `persona-teardown-notice` startup-errors entry naming R, carrying the alert's ordinary version with the log-only closing sentence, and one server-log line of it; no CSCB delete; R's row present; R's key in the retired-key record with cause `removed`; nothing about R in the Slack stub's record after the edit, no `tmux-unresponsive` post and no `tmux-unresponsive` started line for R's key | tmux-shim `fail-kill` limited to R's session name, session id and pane id (`tmux_shim_mode fail-kill --targets`), `log` at the leg's end; stub mode `startup-trust`; agent-director's default settings; `health_check_interval` 0; values from `fixtures/fmk-texts.ts`; posts from the Slack stub's record |
 | 6 (b.jg5 SRJ-1408, SRJ-702; AC 1, AC 56) | `test-18-fmk-wedged.sh` | Personas A and B (kept) and X1, X2 and X3, each with its own key, credentials, channel (its Slack destination) and directories, launched in `log` until each row reads `waiting`. The harness plays the operator: a plain `stop` (every worker keeps running and every row stays live), X1 to X3 removed from `config.json`, the last-applied record moved aside (so the next start applies `config.json` as it stands), `wedge`, then a live start. Section 1 is that start's sweep (`reconcileOrphans`): the release's `list` is a store read with no tmux call, so it lists all five rows and reaches the kills of X1 to X3's live rows. Section 2 is A's and B's condition: their rows are kept, the start pass's plain spawns collide and route to `get`, and the start pass and each retry run the reconnect (fresh AD row/local guards, then separate reconnect text and Enter), whose tmux verbs are refused; the first refusal starts the persona's `tmux-unresponsive` condition and arms its retry timer, whose retries fall at 30, 90, 210, 450 and 750 s after it. The onset falls due at the first retry at least `TMUX_UNRESPONSIVE_ONSET_FLOOR_MS` after the first refusal and the alert once the threshold has passed; `wedge` is kept until both alerts have posted, so the retry at 450 s is the first after the unwedge | Section 1: the sweep's summary line reads 5 listed, none killed, 5 kept with 3 kills failed, 3 keys recorded as retired and none left for a latch; the first swept row gets exactly `KILL_RETRY_TRIES` (3) CSCB `kill` calls, its per-try lines (`killRetryTryLine`) ending `KILL_RETRY_NEXT_AGAIN` and then, on the last, `KILL_RETRY_NEXT_EXHAUSTED`, and each later row exactly 1, its one per-try line ending `KILL_RETRY_NEXT_BUDGET_SPENT` (the pass's retries are spent); the sweep's duration, from its CSCB `list` carrying the `service` label (read from the agent-director shim's log, as the sweep logs no start line) to its summary line, is at most (3 + the later rows) × CSCB's agent-director call timeout + 2 × `KILL_RETRY_SPACING_MS`, 304 s at the defaults (the measured duration is logged); CSCB makes no `delete`, and every X row is present (harness `get`). Section 2, for each of A and B: exactly one `tmux-unresponsive` started line; at most one onset post and none after its alert; exactly one alert, posted more than the alert threshold (360 s at agent-director's defaults) after the first refusal, and exactly one recovery, posted after the unwedge, each at the persona's destination as the persona notifier's prefix and then the printer's body; no restart-cap notice, cap-reached line, retry entry's cap-skip line or retry timer stopped at the cap (SRJ-305); CSCB calls naming its id continue after its alert; no CSCB `kill`, `delete`, `resume` or reuse spawn naming its id, and the start pass's one plain spawn is the only `spawn` naming it (no relaunch); its row is present. Logged as `NOTE:` lines, not asserted: each persona's CSCB calls by verb, whether its onset posted, every post at its destination (readiness and notices use AD state and refusals only) and the status reads between the first swept row's tries. Ends with the three closing assertions | tmux-shim `log` while the personas launch, `wedge` (its default 60 s delay, longer than every tmux call timeout at agent-director's defaults) from just before the wedged start until both alerts have posted, then `log`; stub mode `startup-trust`; agent-director's default settings, no `config.toml` (alert threshold `adAlertThresholdMs` of the defaults); CSCB's agent-director call timeout at its default (`DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS`); `health_check_interval` 0 in `config.json`, so no health tick runs; the release start (`SCENARIO_AD_START` unset); live starts against the Slack stub; values from `fixtures/fmk-texts.ts`; posts from the Slack stub's record |
-| 7 (b.jg5 SRJ-1409, SRJ-707, SRJ-708, SRJ-711, SRJ-712, SRJ-413, SRJ-716; AC 1) | `test-19-fmk-reuse.sh` | First a harness check of the two harness additions on a stub the harness starts itself (`seed_unlabelled`, no agent-director and no CSCB process): in `transcript-on-first-message` no transcript exists at its dialog, nor after Enter reports it in, nor for 2 s after a typed `/exit`; one exists once a line is typed, the typed exit sentinel ends it, and `stub_type_line` aimed at a missing pane fails. Then two legs, each with its own persona: E with `resume_enabled=false`, and F with a missing transcript (`resume_enabled` true). Each persona's first life comes up (`waiting`); the harness types the exit sentinel, so the row reads `ended`; in leg F the harness unlinks the transcript file, the path under `SCENARIO_ROOT` that the row's `jsonl_path` names. The persona's directory is switched to `transcript-on-first-message`, then a plain `stop` and a start: CSCB's spawn collides with the finished row and, in E, reuses it with no `resume`; in F, CSCB's `resume` meets `ErrJsonlMissing`, the lost-transcript diagnosis runs, then the reuse spawn | A background harness `get`, started before the start, reads `pending` with a `launch_started_at`, then `waiting`, and no `waiting` before it. Exactly one CSCB-parented `spawn` of the persona's id carrying `--reuse-finished` (the agent-director shim's argv) after the leg's mark. E: no CSCB `resume`. F: a CSCB `resume`, and exactly one lost-transcript diagnosis line for the id, logged no later than the reuse spawn's call. A harness `get`'s `prior_sessions` does not hold the first life's session id. Exactly one server-log `pre_trust` line for the reuse spawn, with value `ok`. CSCB makes no `delete`, and the row is present. Then, with the server stopped by a plain `stop` and the new life ended by the exit sentinel before any message, the harness's own `resume` of the id (`ad_capture`) exits non-zero answering `ErrJsonlNeverWritten`, and the row is present. Logged as `NOTE:` lines, not asserted: each leg's CSCB calls of its id by verb, the new life's session id and `transcript_status`, the diagnosis's verdict (its startup-errors entries) and how many reads saw `pending`. Scenario 12's legs follow (next row), then scenario 18's, then the three closing assertions | Stub modes `startup-trust` (each first life) and `transcript-on-first-message` (each new life; a harness addition); `stub_type_line` with `STUB_EXIT_SENTINEL` (harness additions); each persona's `claude_config_dir` holding a `.claude.json` of `{}`, so agent-director's pre-trust answers `ok`; agent-director's default settings, no `config.toml`; `health_check_interval` 0 and `session_restart_delay` 0 in `config.json`; between legs `config.json` rewritten and the last-applied record moved aside while the server is stopped; the release start (`SCENARIO_AD_START` unset); live starts against the Slack stub; values from `fixtures/fmk-texts.ts` |
+| 7 (b.jg5 SRJ-1409, SRJ-707, SRJ-708, SRJ-711, SRJ-712, SRJ-413, SRJ-716; AC 1) | `test-19-fmk-reuse.sh` | First a harness check of the two harness additions on a stub the harness starts itself (`seed_unlabelled`, no agent-director and no CSCB process): in `transcript-on-first-message` no transcript exists at its dialog, nor after Enter reports it in, nor for 2 s after a typed `/exit`; one exists once a line is typed, the typed exit sentinel ends it, and `stub_type_line` aimed at a missing pane fails. Then two legs, each with its own persona: E with `resume_enabled=false`, and F with a missing transcript (`resume_enabled` true). Each persona's first life comes up (`waiting`); the harness types the exit sentinel, so the row reads `ended`; in leg F the harness unlinks the transcript file, the path under `SCENARIO_ROOT` that the row's `jsonl_path` names. The persona's directory is switched to `transcript-on-first-message`, then a plain `stop` and a start: CSCB's spawn collides with the finished row and, in E, reuses it with no `resume`; in F, CSCB's `resume` meets `ErrJsonlMissing`, the lost-transcript diagnosis runs, then the reuse spawn | A background harness `get`, started before the start, observes `waiting` with a session after the leg mark. The AD trail must also contain the same instance's pending-to-waiting SessionStart transition and an applied SessionStart hook for that observed session after the mark; publication is awaited separately. Catching the transient pending window is not required and no fixed report-in delay is inserted. Exactly one CSCB-parented `spawn` of the persona's id carrying `--reuse-finished` (the agent-director shim's argv) after the leg's mark. E: no CSCB `resume`. F: a CSCB `resume`, and exactly one lost-transcript diagnosis line for the id, logged no later than the reuse spawn's call. A harness `get`'s `prior_sessions` does not hold the first life's session id. Exactly one server-log `pre_trust` line for the reuse spawn, with value `ok`. CSCB makes no `delete`, and the row is present. Then, with the server stopped by a plain `stop` and the new life ended by the exit sentinel before any message, the harness's own `resume` of the id (`ad_capture`) exits non-zero answering `ErrJsonlNeverWritten`, and the row is present. Logged as `NOTE:` lines, not asserted: each leg's CSCB calls of its id by verb, the new life's session id and `transcript_status`, the diagnosis's verdict (its startup-errors entries) and how many reads saw `pending`. Scenario 12's legs follow (next row), then scenario 18's, then the three closing assertions | Stub modes `startup-trust` (each first life) and `transcript-on-first-message` (each new life; a harness addition); `stub_type_line` with `STUB_EXIT_SENTINEL` (harness additions); each persona's `claude_config_dir` holding a `.claude.json` of `{}`, so agent-director's pre-trust answers `ok`; agent-director's default settings, no `config.toml`; `health_check_interval` 0 and `session_restart_delay` 0 in `config.json`; between legs `config.json` rewritten and the last-applied record moved aside while the server is stopped; the release start (`SCENARIO_AD_START` unset); live starts against the Slack stub; values from `fixtures/fmk-texts.ts` |
 | 12 (b.jg5 SRJ-1414, SRJ-707, SRJ-709, SRJ-410, SRJ-501, SRJ-505, SRJ-716, SRJ-1401, SRJ-1418; AC 1) | `test-19-fmk-reuse.sh` (legs G and H, after scenario 7's legs) | Two legs, each with its own persona and a background harness `get` of its row until it reads `waiting` again. G, a `missing` row with no session id beside a leftover holding its name: G launches with the `silent` stub, so its row reads `pending` with a launch start and no `session_id`; before G (agent-director's pending grace) has passed from the launch start, the harness types the exit sentinel into G's pane (no hook fires, and the session closes with the stub), seeds a leftover (`seed_leftover`) named G's session name, labelled as an earlier launch of G's id with the store's own id (`ad_store_id`, `ad_owner_label`) and its pane carrying `ad_pane_label`'s label, running the `silent` stub, and switches G's directory to `startup-trust`. CSCB's own pending-row runs mark the row `missing` past G; its `resume` answers `ErrNoSessionId`, and the reuse spawn follows, refused while the leftover runs; after at least two refusals the harness ends the leftover by its session id (`end_session`). H, an `ended` row with a stale `config_dir` label beside its remaining session: H comes up (`waiting`); the harness sets `remain-on-exit` on its session and types the exit sentinel, so the row reads `ended` and the session stays with its pane dead; `repoint_symlink` re-points H's `claude_config_dir` symlink, then a plain `stop` and a start: CSCB's collision `get` reads the row `ended` with a `config_dir` label that is not the persona's, so it makes a reuse spawn and no `resume`, refused while the session remains; after at least two refusals the harness ends that session by its session id | G: a background read of `missing`, with a CSCB-parented `find-missing` after the leg's mark no later than it, and no `find-missing` from any other process; at least one CSCB `resume` of G's id, and a server-log line naming `ErrNoSessionId` on a resume of G no later than the first CSCB reuse spawn. H: no CSCB `resume` of its id; every CSCB-parented `spawn` of its id without `--reuse-finished` is the collision ladder's first spawn of an attempt (SRJ-111), with its `ErrInstanceIdCollision` line. Each leg: every CSCB reuse spawn made before the harness began ending the session (at least two) has its refusal line before then, each UNAVAILABLE or CONFLICT (the class `classifyAdError` gives the error name the line names), apart from at most one in flight across that time, accepted either way; none succeeded before then; exactly one reuse spawn succeeded once the harness had ended the session; the row reads `waiting` with a session id (H's other than its first life's); CSCB makes no `delete`; at least one background read answered and none answered `ErrSpawnNotFound`, so the row was present throughout. Logged as `NOTE:` lines, not asserted: each refusal's error name and description (G's leftover met as CONFLICT, the retry at the latch re-check; H's session met as UNAVAILABLE while still stopping, the retry at the retry timer), the background reads' states in order, the posts at the persona's channel (for G, the held and cleared notices), the reuse's `pre_trust` value, each leg's CSCB calls of its id by verb, and agent-director's trail records naming G's id. Each leg ends with a plain `stop` and the harness ending the new life; scenario 18's legs follow (next row), then the three closing assertions | Stub modes `silent` (G's first life and its leftover) and `startup-trust` (G's new life, H's lives); `stub_type_line` with `STUB_EXIT_SENTINEL`; `seed_leftover`, `ad_store_id`, `ad_owner_label`, `ad_pane_label`, `set_remain_on_exit`, `repoint_symlink` and `end_session`; H's `claude_config_dir` a symlink under `SCENARIO_ROOT` to one of two directories, each holding a `.claude.json` of `{}`; agent-director's default settings, no `config.toml` (G from `adGraceMs` of the defaults); `health_check_interval` 0, `session_restart_delay` 0 and `resume_enabled` true in `config.json`, rewritten with the last-applied record moved aside before each leg; the release start (`SCENARIO_AD_START` unset); live starts against the Slack stub; the harness runs no `find-missing`; values from `fixtures/fmk-texts.ts` |
 | 18 (b.jg5 SRJ-1419; b.jg5 SRJ-803 as amended by b.deo SRI-408; b.jg5 SRJ-805; b.jg5 SRJ-806 as amended by b.deo SRI-407; b.jg5 SRJ-807, SRJ-715, SRJ-711, SRJ-1401, SRJ-1418; AC 1, AC 49) | `test-19-fmk-reuse.sh` (legs J and K, after scenario 12's legs) | Two legs, each with its own persona, whose first life comes up (`waiting`) and is messaged: the harness reads the life's session id and `cwd` (`get`), checks that no transcript is at the path agent-director's `resume` looks for that session under the persona's `claude_config_dir` (`<CLAUDE_CONFIG_DIR>/projects/<slug of the cwd>/<session id>.jsonl`), types a first message (`stub_type_line`) and waits for the transcript there, so the old session would be resumable if CSCB resumed it. J, removed and re-added: the operator removes J from `config.json` (no persona left) and confirms the apply by renaming the pending file to the apply file (README "Reload"), checked to be absent before the edit; then a plain `stop`, a start with no persona, and the operator adds J back with the same key, working directory and `claude_config_dir` and confirms the apply. K, `credentials_file` changed: the operator points K's `credentials_file` at a second credentials file and confirms the apply, a destructive modify | Each apply's `reload-applied` line after the leg's mark, for its counts (J's removal 1 removed, J's re-add 1 added, K's change 1 destructively modified). J after the removal: J's session ended (the teardown's kill, the tmux shim in `log`), the retired-key record gives J's key the cause `removed`, and J's row is present. K after the change: the retired-key record's cause for K's key, when it still has an entry, is `destructive-modify` (by then the new life may have begun and the entry been cleared, SRJ-806 as amended by b.deo SRI-407; SRJ-807). Each leg: the row reads `waiting` with a session other than the old one; the first CSCB-parented `spawn` of the persona's id after the re-add's or change's mark carries `--reuse-finished`; a harness `get` shows the old session neither as current nor in `prior_sessions` (an array); from the removal's or change's mark on, no CSCB `resume` of the id, and CSCB makes no `delete`. Logged as `NOTE:` lines, not asserted: the messaged row's `jsonl_path` and `transcript_status`, the persona's CSCB spawns after the mark (how many carry `--reuse-finished`), its CSCB calls by verb, the new life's `transcript_status` and `prior_sessions`, and a destructive modify's retired-key entry already cleared. Each leg ends with a plain `stop` and the harness ending the new life with the exit sentinel; the three closing assertions follow | Stub mode `transcript-on-first-message` for every life of J and K; `stub_type_line` (the message, and `STUB_EXIT_SENTINEL`); tmux-shim `log`, so a teardown's kill succeeds; J's and K's `claude_config_dir` the scenario HOME's `.claude`, the directory the stub writes every transcript under, holding a `.claude.json` of `{}` (agent-director records no `jsonl_path` for a transcript written after SessionStart, and its `resume` then looks under `<CLAUDE_CONFIG_DIR>/projects`); K's second credentials file written at run time with its own fake token pair under its own label, which the Slack stub answers ok; agent-director's default settings, no `config.toml`; `health_check_interval` 0, `session_restart_delay` 0 and `resume_enabled` true in `config.json`, the first life's config written with the last-applied record moved aside while the server is stopped, later edits made on the running server and confirmed by the apply file; the release start (`SCENARIO_AD_START` unset); live starts against the Slack stub; values from `fixtures/fmk-texts.ts` (the pending and apply files' suffixes, `reloadAppliedLogLine`, `retiredKeysPath`, `RETIRED_KEY_CAUSE_REMOVED`, `RETIRED_KEY_CAUSE_DESTRUCTIVE_MODIFY`) |
 | 9 (b.jg5 SRJ-1411, SRJ-901, SRJ-903 to SRJ-907, SRJ-909; AC 1, AC 4, AC 73, AC 75) | `test-21-fmk-teardown.sh` | `clean_restart` and `stop --stop-bots`, each run as a CLI command through `cscb_run` (so its calls count as CSCB's), every leg with its own personas, put in `config.json` while the server is stopped with the last-applied record moved aside. Precheck legs: A and B up (`waiting`); the harness respawns A's worker pane with a `sleep` (`respawn_worker_pane`), so the release's one-line `read-pane` of A answers CONFLICT ("the agent's pane was not found") while A's row stays live and B is untouched. Changing A's `launch_token` is not used: it makes `read-pane` read a leftover's pane, so the precheck would pass. Teardown-failure legs: C and E up; tmux-shim `fail-kill` (no target list) set just before the command; the stub ignores `pause`'s `/exit`, so each pause times out (30 s) and escalates to the kill, whose `KILL_RETRY_TRIES` tries each answer `ErrTmuxKillFailed`. Not-restarted leg: F and G up; the list-refusing stand-in swapped in behind the shim; `fail-kill`; `clean_restart`, whose answer check's `list` tries are refused. Pending-persona leg: D under `unrecognised-dialog`, its row `pending` with a launch start at a dialog CSCB never answers; `stop --stop-bots` (run before G has passed since D's launch start; the script fails otherwise); then D's directory switched to `startup-trust` and a start | Precheck legs, for each command: it exits non-zero; its output holds one precheck failure line naming A, its key, its session and CONFLICT, the description holding `CONFLICT_PANE_NOT_FOUND_PHRASE`, no such line for B, and "nothing was stopped" once, as its last line; A's failure line in neither `server.log` nor `startup-errors.log`; the bot server's PID unchanged and running; at least one CLI-parented `read-pane` of A and no CLI-parented `pause` or `kill`. A's and B's rows are unchanged (a harness `get` before and after). Then the harness ends A's session by its session id (`end_session`), and a harness `read-pane` of A answers `ErrTmuxCaptureFailed` (GONE). Teardown-failure legs, for each of C and E under each command: each kill try's per-try line answers `ErrTmuxKillFailed`, with exactly `KILL_RETRY_TRIES` CLI-parented kills of its id; its failure line printed once, followed by the ordinary alert for the CLI-teardown route, each appended once to `server.log` (and, under `clean_restart`, to `clean_restart.log`), and one `persona-kill-failed` entry holding both; two such entries per command; the last line counting 2; exit non-zero; no CSCB `delete`, both rows present and both sessions still there. After `clean_restart` the bot server runs with a new PID; after `stop --stop-bots` it is gone, with no `server.pid` and no server started after the command's mark. Not-restarted leg: a harness `list` is refused and a harness `version` and `get` answer through the stand-in; no precheck line; F's and G's UNAVAILABLE teardown failure lines; exactly 3 CLI-parented `list` calls carrying the `service` label, with one failed answer-check line per try in `clean_restart.log`; no bot server running and none started after the mark; exactly one not-restarted alert naming F and G, in the command's output, once in `clean_restart.log` and once in `server.log`, recorded as one `clean-restart-not-restarted` entry with the same text; the last line counting 2; exit non-zero; no CSCB `delete`; both rows present. Pending-persona leg: `stop --stop-bots` exits 0, its output holding one escalation line for D carrying `ErrSpawnNotPausable`, with one CLI-parented `pause` and one `kill` of D; the server and D's session are gone. After the next start D's row reads `waiting` within G + `UNAVAILABLE_RETRY_CEILING_S` + 120 s (at least 300 s); no CSCB `kill` of D after that start; no harness `find-missing` in the whole run; exactly one `ad.find_missing.tick` in agent-director's trail marking D's row `missing` from `pending`, with a CSCB `find-missing` at or before it; exactly one launch record for D after the start's mark (`ad.spawn.reused` or `ad.resume.moved_to_pending`), not before that tick. Logged as `NOTE:` lines, not asserted: each leg's CSCB calls of its ids by verb, D's row state after the kill and the restarted server's PID. Ends with the three closing assertions | tmux-shim `log` while personas launch, `fail-kill` (no target list) for the teardown-failure and not-restarted legs' commands, `log` again before the pending-persona leg; stub modes `startup-trust` (A, B, C, E, F, G, and D's recovery) and `unrecognised-dialog` (D); `respawn_worker_pane` and `end_session`; the list-refusing stand-in (`swap_ad_binary <path>`, then `swap_ad_binary release`); agent-director's default settings, no `config.toml` (`[pause] timeout_seconds` 30; G from `adGraceMs` of the defaults); `health_check_interval` 0, `session_restart_delay` 0 and `exit_timeout` 5 in `config.json`; the release start (`SCENARIO_AD_START` unset); live starts against the Slack stub, and the CLI commands with `SLACK_DRY_RUN` unset; values from `fixtures/fmk-texts.ts`; agent-director's trail (`ad-trail.jsonl`) for its marks and launch records |
@@ -3672,8 +3811,9 @@ selective or injected invocation.
 A full run without `--inject` writes exactly `PASS` or a line beginning
 `FAIL: `. When that line is a failing script's, it is still the script's first
 `FAIL:` line or the fallback line below. With one shard (N = 1) the run
-keeps the serial order, stops at its first failure and writes the verdict a
-serial run writes.
+keeps the serial order and selected failure mode. A full keep-going run is
+gate-eligible only with complete passing coverage and no integrity/cleanup
+failure; selective and injected runs retain their wrappers and non-gate exits.
 
 #### Script lines
 
@@ -3683,8 +3823,11 @@ serial run writes.
   `FAIL: <file name>: exited non-zero without explicit FAIL line`.
 - A failing prerequisite is charged to itself; its dependents in that shard
   are `notrun` and add no line of their own. The run fails.
-- A shard stops at its own first failing script; the other shards run on. A
-  script a shard did not reach is `notrun`, never passed, and fails the run.
+- Default fail-fast stops at a shard's first failing script. Keep-going
+  retains every failure and runs independent scripts after verified cleanup;
+  the other shards run on. A skipped script is `notrun`, never passed, and
+  fails the run. Its optional `notrunReason` explains the skip without
+  adding a separate script failure line.
 
 #### Shard end lines
 

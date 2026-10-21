@@ -23,11 +23,12 @@ Run every command below from the worktree root, the directory that holds
 ## Interface
 
 ```text
-/ci [--shards N] [--shard-timeout MINUTES] [--inject FAULT]... [SCRIPT]...
+/ci [--keep-going] [--shards N] [--shard-timeout MINUTES] [--inject FAULT]... [SCRIPT]...
 ```
 
 | Argument | Meaning |
 |---|---|
+| `--keep-going` | Continue independent scripts after verified cleanup, retaining every failure. Default: fail-fast within each shard |
 | `--shards N` | Run exactly the effective N shards (see [How N is chosen](#how-n-is-chosen)), or be refused. N is a whole number from 1 to 6 |
 | `--shard-timeout MINUTES` | Every shard's wall-time limit, in place of the computed one. A whole number from 1 to 720 |
 | `--inject FAULT` | Turn on one fault (see [Fault injection](#fault-injection)). May be repeated; an identical fault given twice counts once |
@@ -37,12 +38,12 @@ Argument rules:
 
 - Arguments may come in any order, options and SCRIPT names mixed. The order
   changes nothing but the order of faults in the `INJECTED (<faults>)` wrapper.
-- Each option takes the next argument as its value (`--shards 3`).
+- Except `--keep-going`, each option takes the next argument as its value (`--shards 3`).
   `--shards=3`, an option given last with no value, an unknown option and any
   other argument beginning `-` are bad arguments.
 - A whole number is decimal digits with no sign, no decimal point and no
   leading zero.
-- `--shards` and `--shard-timeout` may each appear once. A second appearance
+- `--keep-going`, `--shards` and `--shard-timeout` may each appear once. A second appearance
   is a bad argument, even with the same value.
 - A number form matches only the script with exactly that number, so `test-2`
   never matches `test-20`. A script named more than once, in either form,
@@ -56,7 +57,9 @@ Run kinds:
   shards as admission allows up to 6, default limits, no faults. It is what
   `/publish` and `/publish-prepare` run.
 - A full run (no SCRIPT) without `--inject` is gate-eligible, with or without
-  `--shards` or `--shard-timeout`, whatever N admission picks.
+  `--keep-going`, `--shards` or `--shard-timeout`, whatever N admission picks.
+  Keep-going passes only with zero failures, complete coverage from both
+  tracks, and all integrity and cleanup checks passing.
 - A selective run (any SCRIPT) or an injected run (any `--inject`) is never a
   gate result.
 
@@ -110,8 +113,8 @@ integrity failures) and which one wins are in
 The procedure has exactly four kinds of Bash call: the launch, a wait, a stop
 and a report. Shell variables do not survive from one Bash call to the next,
 so carry the printed RUN_ID and PID into each later command as literal text.
-When the CI credentials are kept under `CI_ANTHROPIC_*`, the launch's runner
-line and every reader call carry the prefix [Credentials](#credentials) gives.
+The runner and every reader call inherit the same `CI_ANTHROPIC_*`
+environment directly; see [Credentials](#credentials). No host remapping is needed.
 
 ### 1. Launch
 
@@ -361,6 +364,12 @@ shard container.
 
 ## The parallel run
 
+- **Independent tracks.** Track A contains ordinary scripts and takes no
+  Codex login lease. Track B contains only login-bearing scripts (test-41
+  today), each with test-1 in its dedicated shard. After shared packing,
+  admission and image preparation, A starts while B waits for login. B
+  releases the lease after its containers retire and its postchecks and
+  scans run, even while A continues. Neither track alone is a full gate.
 - **Shards.** Up to 6 shard containers run at once from the one test image
   the run builds and pins by image ID. Every shard starts with test-1.
   Each Codex login script gets its own shard containing exactly test-1
@@ -384,10 +393,23 @@ shard container.
   limit plus 15 min. Codex runs initially reserve the full 30-minute
   login-wait allowance; after login admission it becomes the actual
   elapsed wait. Use the deadline the reader reports.
-- **Failures.** Each shard stops at its first failing script; other
-  shards run on. A permitted one-shard selection keeps serial order and
-  stops at its first failure. A full run containing both ordinary and
-  Codex scripts cannot use `--shards 1`.
+- **Failures.** By default each shard stops at its first failing script;
+  other shards run on. With `--keep-going`, independent scripts continue
+  only after verified process cleanup. Failed or skipped prerequisites
+  block dependents; test-1 is every script's prerequisite. Skips record
+  `fail-fast`, `dependency:<file name>` or `unsafe-cleanup`. No failure is
+  retried or waived. A permitted one-shard selection keeps serial order;
+  a mixed full run cannot use `--shards 1`.
+- **Measurement guard.** Packing/builds and shard work outside test-32 share an
+  account-local performance lock. Test-32 first clears its baseline daemon
+  and verifies cleanup, then takes the lock exclusively for its native
+  AC76 measurement script. This coordinates participating `/ci` runs;
+  resource admission, deadlines and the 20-sample 2 s/10 s p95 limits remain.
+- **Final cleanup.** Uncertain final cleanup emits no `done`, even if all
+  script END records passed. The container retains its performance lock
+  until the host retires it at the existing shard limit or run stop. The
+  retained Docker log says `FAIL: runner.sh: unsafe-cleanup`; the reader
+  reports the resulting shard/run failure through the normal procedure.
 
 Detail: [`tests/README.md`'s Script names, prerequisites and canonical order](../../../tests/README.md#script-names-prerequisites-and-canonical-order),
 [The duration table](../../../tests/README.md#the-duration-table) and
@@ -500,6 +522,8 @@ disk watchdog.
 The Codex shard still counts as one shard and reserves 2 CPUs. Its
 extra memory is included both when choosing N and when writing the
 reservation; reducing ordinary shards does not remove that extra cost.
+The full reservation stays held while Track B waits and after either track
+finishes; early login release does not release or overbook reserved capacity.
 
 Detail: [`docker/README.md`'s Admission: memory, disk and CPU](../../../docker/README.md#admission-memory-disk-and-cpu)
 and [The admission lock, reservations and the sweep](../../../docker/README.md#the-admission-lock-reservations-and-the-sweep).
@@ -508,11 +532,11 @@ and [The admission lock, reservations and the sweep](../../../docker/README.md#t
 
 A refused run is not runnable: exit 2, `NOT RUN: <reason>`, then its
 detail lines. The runner validates arguments, scripts, isolation shard
-count and Claude credentials first. For a Codex selection it then
-validates the host model, takes the login lock, validates the login and
-checks for surviving login containers before the Docker/build/admission
-sequence. Image read-back and the image testuser UID check occur after
-the build and before shards start. Relay the reader's actual outcome;
+count and Claude credentials first, then performs Docker/build/admission
+checks and image read-back. Track B acquires and validates its login/model,
+checks survivors and checks the image testuser UID before its own shards
+start; Track A can already be running. A Track B admission error is then a
+run failure, not an early `NOT RUN`. Relay the reader's actual outcome;
 runtime postcheck and cleanup failures are failures too.
 
 | Refusal | What to do |
@@ -564,18 +588,17 @@ The runner reads credentials from its own environment, which the launch
 passes on unchanged.
 
 - Every full `/ci` run and every release makes real model calls for both
-  Claude Code and Codex. `ANTHROPIC_API_KEY` must be set and not empty
-  for the Claude real-agent scripts; supply it through the existing
-  `CI_ANTHROPIC_*` command prefix below. Other scripts use stub `claude`;
+  Claude Code and Codex. `CI_ANTHROPIC_API_KEY` must be set and not empty
+  for the Claude real-agent scripts. Other scripts use stub `claude`;
   the bots do not use Claude Code OAuth. Codex uses the existing host
   login described below, without an additional API credential.
 - A key that does not begin `sk-ant-` is a gateway credential, not a raw
-  Anthropic key, and needs `ANTHROPIC_BASE_URL` (and `ANTHROPIC_MODEL`) set
-  too. An empty `ANTHROPIC_BASE_URL` counts as unset.
+  Anthropic key, and needs `CI_ANTHROPIC_BASE_URL` set too; provide
+  `CI_ANTHROPIC_MODEL` to select the test model. An empty base URL counts as unset.
 - Every secret credential that is set and not empty must be at least 8
-  characters long. The secret credentials are `ANTHROPIC_API_KEY`,
+  characters long. The secret credentials include `CI_ANTHROPIC_API_KEY`,
   `GH_TOKEN` when set, and the base-build token (`gh auth token`) when the
-  base image must be built. `ANTHROPIC_BASE_URL` and `ANTHROPIC_MODEL` are not
+  base image must be built. `CI_ANTHROPIC_BASE_URL` and `CI_ANTHROPIC_MODEL` are not
   secret.
 - No secret value is written to any file of the run; the reader prints
   `<redacted>` in its place.
@@ -586,7 +609,7 @@ requires the existing host Codex login and model. It uses non-empty
 `CODEX_HOME`, otherwise `$HOME/.codex`, and reads the top-level `model`
 from that directory's `config.toml`. The model must be a non-empty string
 matching `[A-Za-z0-9._:/-]+`; a missing, unreadable, malformed or invalid
-model refuses the run before a shard starts. The runner supplies this
+model fails Track B before a login-bearing shard starts. The runner supplies this
 value as `CODEX_TEST_MODEL`; it is a plain, non-secret shard variable,
 not an independent model override. `results.json` records `codexModel`
 (null when no Codex login was admitted), and `summary.txt` records
@@ -616,8 +639,8 @@ Recheck native save semantics before changing the Codex version.
 
 Only the dedicated Codex shard gets one additional read-write bind
 mount: the validated host login file at `/run/codex-login/auth.json`.
-Its other mounts remain the read-only package tarball and that shard's
-own results directory. Ordinary shards get no login mount. The scratch
+Its other mounts are the read-only package tarball and performance guard,
+and that shard's own results directory. Ordinary shards get no login mount. The scratch
 Codex home uses an `auth.json` symlink to that exact mounted path;
 replacing the symlink fails the scenario. Its home is private mode 0700.
 The harness creates no Codex `config.toml`, copies no host settings and
@@ -636,7 +659,8 @@ in disposable local CI containers; never send the login or the Codex leg to a jo
 The runner and local heavy coordinator share the exclusive
 `codex-login.lock` in the selected host Codex directory. They wait at
 most 30 minutes for it, separately from the ordinary admission lock's
-30-second wait. A surviving container labelled `cscb.codex-login=true`,
+30-second wait. Track A takes no login lease and proceeds during that wait.
+A surviving container labelled `cscb.codex-login=true`,
 including a stopped container, refuses another login-bearing run;
 failure to verify retirement also refuses admission. If retirement
 cannot be confirmed, the runner holds the login lease until it exits,
@@ -651,6 +675,12 @@ in memory for redaction and secret scanning, including refreshed
 tokens. Relay a postcheck or secret-scan failure as a failure; do not
 print credentials or environment values while diagnosing it.
 
+Once all login containers are verified retired, Track B completes its login
+postcheck and scans its retired evidence and runner log before releasing
+the lease. Failures remain run failures. The runner keeps original and
+refreshed token values in memory to mask and scan late Track A output at
+the whole-run end; it never rereads a released login.
+
 Test 41 now implements native observations and the final receipt-only
 D1 gate, including fault/FIFO/fidelity and actual child SIGKILL/recovery
 checks. Gate delivery assertions do not require model prose or completed
@@ -664,58 +694,24 @@ are not final gate, full CI or heavy acceptance.
 
 The heavy leg's AI criteria run on the model set by CI_ANTHROPIC_AI_MODEL (azure/openai/gpt-6-astra for release runs); gate and other scripts use CI_ANTHROPIC_MODEL.
 
-To find a raw key, read Claude Code's own stored key:
+Provision `CI_ANTHROPIC_API_KEY`, optional `CI_ANTHROPIC_BASE_URL` and
+`CI_ANTHROPIC_MODEL` in the runner and reader environment through the existing
+credential provisioning route. Keep those names on the host, including when
+finishing a run by hand. Never extract a personal key, put credential values
+in command arguments, or assign/export host `ANTHROPIC_*` for CI.
 
-```sh
-export ANTHROPIC_API_KEY="$(jq -r .primaryApiKey ~/.claude.json)"
-```
+The runner validates and forwards the CI family directly by bare environment
+name. Setting any CI-family input selects that whole family, even if empty;
+an incomplete CI configuration never borrows a personal key or base URL.
+Unused native credential variables are omitted from the Docker child's
+environment. Only `docker/entrypoint.sh` inside the disposable container
+translates the CI family to the native names its tools require.
 
-If `primaryApiKey` is null or absent and no gateway credential is exported,
-no API key has been provisioned; provision one before re-running `/ci`.
-
-A worker spawned through agent-director does not inherit the orchestrator's
-environment. Pass the credentials on the spawn command:
-
-```sh
---extra-env ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY}"
-```
-
-For a gateway credential, add
-`--extra-env ANTHROPIC_BASE_URL="${ANTHROPIC_BASE_URL}" --extra-env ANTHROPIC_MODEL="${ANTHROPIC_MODEL}"`.
-
-These are the names the worker's own Claude Code reads too. Passed this way,
-they move the worker's own session onto the CI key, and for a gateway
-credential onto its gateway and model as well. Use this route only when that
-is wanted.
-
-To keep the worker's own session on its own credentials, pass the CI
-credentials under other names instead: `CI_ANTHROPIC_API_KEY`, and for a
-gateway credential `CI_ANTHROPIC_BASE_URL` and `CI_ANTHROPIC_MODEL`
-(`--extra-env CI_ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY}"`, and so on). The
-runner and the reader read only the `ANTHROPIC_*` names, so set those from
-the `CI_ANTHROPIC_*` values on each command, never by exporting them in the
-worker's shell. Prefix the launch's runner line and every reader call: each
-wait, each stop and the report. The reader needs the values as well as the
-runner: the report replaces each secret value of its own environment with
-`<redacted>`, so it can mask only the key it was given. The wait and the stop
-read no credential; they take the prefix too so that every reader call has
-the same form. The prefix is:
-
-```sh
-ANTHROPIC_API_KEY="${CI_ANTHROPIC_API_KEY}" ANTHROPIC_BASE_URL="${CI_ANTHROPIC_BASE_URL}" ANTHROPIC_MODEL="${CI_ANTHROPIC_MODEL}"
-```
-
-- **The launch.** Put the prefix, then a space, at the start of the line that
-  begins `setsid bun scripts/ci-run.ts`. The other lines of the launch are
-  unchanged.
-- **Each reader call.** Put the prefix, then a space, before
-  `bun scripts/ci-verdict.ts` in every wait, every stop and the report. The
-  `; echo` after the call is unchanged.
-- **A raw key.** Leave out the `ANTHROPIC_BASE_URL` and `ANTHROPIC_MODEL`
-  assignments.
-- **By hand.** Finishing a run by hand (see
-  [Finishing a run by hand](#finishing-a-run-by-hand)) takes the same prefix on
-  each reader call.
+The reader also recognizes CI secrets directly. Give it the same environment
+as the runner so its report can redact them; wait and stop read no credential.
+The launch/wait/stop/report commands above need no credential prefix or
+remapping. Legacy native-family callers remain source-compatible when no CI
+input is set; this project's host invocation uses the CI family.
 
 ### The base image
 
@@ -780,7 +776,7 @@ cap from measured anon peak: <peak> GiB in shard-<k> (page cache <f> GiB) + 1 Gi
   peak complete; `; source after out-of-memory kill in <shards>` for a default
   full run with any kill; otherwise `; not a valid cap source: <reasons>`,
   each reason that applies, in this order: `not a default run` (a `--shards`,
-  `--shard-timeout` or `--inject` full run), `run did not pass`,
+  `--shard-timeout`, `--keep-going` or `--inject` full run), `run did not pass`,
   `partial anon peak (<shards>)` and `unknown anon peak (<shards>)`. A line
   with that suffix is never a reason to change the cap.
 - After a kill, `(page cache <f> GiB)` reads

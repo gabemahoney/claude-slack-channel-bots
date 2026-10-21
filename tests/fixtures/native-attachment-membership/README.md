@@ -97,8 +97,10 @@ Other numeric timing matches are not native timestamp allowances:
 - `codex-delivery.ts`'s >=1000 ms unsubmitted-text observation is a measured
   no-turn research interval, not timestamp skew or an SRD latency pass bound.
   It cannot turn missing evidence into receipt/completion evidence.
-- `real-scenario.sh` defines delivery/launch/compaction waits of 180/300/120 s
-  (SR-14.6), and native idle-compaction observation up to 2700 s (decision 16).
+- `real-scenario.sh` defines delivery watchdogs of 180 s without increased
+  exact original-workload receipt progress and 1800 s overall; launch and
+  compaction waits are 300 s and 120 s (SR-14.6). Native idle-compaction
+  observation is bounded at 2700 s (decision 16).
   `codex-delivery.ts` and `codex-crash-barrier.ts` also bound operational waits
   at 180000 ms. These deadlines do not adjust native timestamps.
 - `ac20-diagnostics.ts`'s 60000 ms post-retry/post-late-completion grace,

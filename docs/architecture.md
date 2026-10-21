@@ -425,7 +425,9 @@ The choice applies from the next event in that channel (Inbound step 4). It live
 
 `src/reply-reminder.ts` observes only authoritative agent-director `get` rows and CSCB's own durable delivery and `reply` call facts. A fully delivered Slack item becomes a reminder candidate; cron and `/interject` items never do. Only an observed `working` → `waiting` transition in the same `session_id` and `launch_started_at` can queue a reminder; an initial `waiting` read does not infer a missed working state.
 
-- The boot template and its refresh pre-allow exactly `mcp__slack-channel-router__reply` alongside the memory-read rules. Every plain/reuse Claude spawn carries `reply_tool_preallowed=1`; AD preserves the label and permissions on resume. The observer cancels candidates for older Claude rows without that label, since installing a template does not change their saved permissions. The permission relay requires a human decision and is not the approval mechanism for reminders.
+- `src/agent-director-template.ts` retains the exact reply and scoped memory-read allow overlay, and also puts `--allowedTools`, `REPLY_TOOL_ALLOW_RULE` (exactly `mcp__slack-channel-router__reply`) in `agent_args`, before the optional final `--system-prompt-snapshot off` pair. AD v0.12.0 saves those arguments and restores them on resume; it deliberately does not retain the template permission overlay. Only the exact reply rule is also carried in saved arguments; existing overlay scope and deny rules remain unchanged, and deny rules and managed restrictions still take priority.
+- Every plain/reuse Claude spawn carries `reply_tool_preallowed=1`, which AD also retains on resume. The observer still cancels candidates for Claude rows without that label; a label alone on an older row does not prove retained reply permission when its saved arguments lack the pair. Template updates do not retrofit existing rows or replace their conversations: resume keeps their saved arguments, while ordinary fresh/reuse launches obtain the current template arguments.
+- The permission relay requires a human decision and is not the approval mechanism for reminders.
 - `createReplyReminders` serializes observations per persona, accepts delivery-engine observations and polls candidates independently. It reads the current applied persona's `stop_hook_bootstrap` on each check. Both Claude and Codex use this path; it depends on neither a Claude config directory nor a hook, transcript or pane parser.
 - `SessionToolDeps.onReplyCall` records the persona's own `reply` invocation before its handler proceeds, even if posting fails or targets another channel. It synchronously captures pending delivered candidates and the non-refused send attempts of unfinished Slack items, so a call made while delivery is in flight still counts. Suppression for an unfinished item covers only those attempts: a later refusal removes their coverage, and a later successful retry can become a reminder candidate. An older call cannot suppress a later send; other personas' calls do not count.
 - `src/delivery-queue.ts` persists non-content `reply-reminder` records (`observed`, `replied`, `nudged`, `cancelled`) in the existing per-persona queue journal. Observation facts include session and launch identity and the last row state; reply facts for unfinished deliveries include the covered attempt numbers. These facts survive restart and compaction without retaining delivered text or receipt paths.
@@ -4212,6 +4214,45 @@ Clears one persona's latch by hand on the running server (b.jg5 SRJ-510, SRJ-506
 AD 0.12 compatibility: `recogniseConflictCase` maps the native “this id's own abandoned launch” description to the existing own-id case. Classification still depends on the native error class: an `ErrTmuxUnresponsive` before the starting bound remains unavailable; only `ErrTmuxSessionConflict` latches. Malformed configuration uses native `ErrConfigMalformed` with legacy unknown-name envelope compatibility. Same-agent reuse retains inspectable `prior_sessions` while launching a fresh current conversation.
 ## Sharded CI resource gate
 
+`scripts/ci-run.ts` prepares one pinned image and reserves the entire selected
+workload before starting two independent tracks. Track A starts ordinary
+shards without a Codex lease; Track B acquires the existing login lease,
+checks the login/model, survivors and image UID, then starts dedicated
+test-1/login-script shards. A Track B error fails the combined run even if
+ordinary work has already completed. `scripts/ci-verdict.ts` owns the report
+and exit mapping; selective and injected work never becomes a full gate.
+
+`finishCodexTrack` verifies retirement and runs the login postcheck and
+retired-evidence/log scans before early lease release. Unverified retirement
+keeps the lease until runner exit, with survivor refusal protecting later
+runs. Original and refreshed secrets remain in memory for the final scan of
+late ordinary artifacts; the released login is never reread. Reservation
+capacity stays held until whole-run cleanup, including queued Track B.
+
+An account-local `performance.lock` shares the admission directory but has
+separate ownership: packing/builds and ordinary scripts hold shared locks;
+test-32 verifies quiescence, including its baseline daemon, then holds an
+exclusive lock for AC76. Each shard mounts the same regular inode read-only
+at `/run/cscb-ci-performance.lock`; integrity checks require the exact mount.
+This coordinates participating `/ci` workloads, preserves the native sample
+count/thresholds and keeps existing deadlines on waits.
+
+`tests/runner.sh` defaults to per-shard fail-fast. Explicit `--keep-going`
+continues only independent assigned scripts after process cleanup using
+PID/start-time identity inside the container. Validated header dependencies
+plus implicit test-1 produce transitive skips; the optional `notrunReason`
+field preserves `fail-fast`, `dependency:<file name>` or `unsafe-cleanup`
+through results and summary. Process quiescence does not restore arbitrary
+shared filesystem state. Final cleanup uncertainty retains the lock, logs
+`FAIL: runner.sh: unsafe-cleanup` and withholds `done`; host limit/stop
+retirement fails the shard even if every script END passed.
+
+Host credentials use `CI_ANTHROPIC_*` directly for validation, forwarding and
+reader redaction. An explicit CI input selects the whole family; the Docker
+child omits unused native credentials. Native-name translation occurs only
+inside the disposable container's entrypoint. See [the runner contract](../tests/README.md#the-in-container-runner-and-the-in-shard-files)
+and [container/lease details](../docker/README.md#ci-the-sharded-run).
+
 The host runner `scripts/ci-run.ts` reads the cgroup-namespace root under its
 shared admission lock. Admission and the 30 s memory watchdog both use
 `nonReclaimableMemoryBytes`: the larger of `anon + shmem` and
@@ -4227,7 +4268,7 @@ values so older diagnostics remain readable.
 
 Working set (`memory.current`
 minus `inactive_file`, floored at zero) stays diagnostic; `results.json`
-version 1 retains its existing fields and schema.
+version 1 retains its memory fields and accepts optional script `notrunReason`.
 
 The ceiling remains 85% of the pod limit, rounded down, lowered to at most
 40 GiB while `/ci-live` is active. Admission adds existing run commitments,

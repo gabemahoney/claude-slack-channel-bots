@@ -4,7 +4,9 @@
  * Covers:
  *   - buildTemplateParams() produces the SR-3.1 shape (relay_mode='on',
  *     label=['service=cscb'], deny=['AskUserQuestion'], overwrite: true,
- *     agent_args with the four required CLI flags).
+ *     agent_args with MCP/prompt flags and the exact durable reply preallow).
+ *   - The reply rule is in agent_args independently of the ephemeral allow
+ *     overlay, which agent-director does not retain on resume (b.pb8).
  *   - deriveMemoryReadAllowRules() emits one memory-subdir Read rule per
  *     distinct effective config dir across the personas (b.fae F5,
  *     b.av2 SR-6.2), never a config-dir root.
@@ -44,7 +46,7 @@ import {
   installSlackChannelBotTemplate,
   refreshSlackChannelBotTemplate,
 } from '../src/agent-director-template.ts'
-import { resolveServerStateDir, type PersonaConfig } from '../src/config.ts'
+import { parsePersonaConfigBytes, resolveServerStateDir, type PersonaConfig } from '../src/config.ts'
 import { botSystemPromptPath } from '../src/bot-system-prompt.ts'
 import {
   cannedMakeTemplate,
@@ -53,7 +55,7 @@ import {
   makeStubClient,
 } from './test-helpers/agent-director-stub.ts'
 import { BOT_TOKEN_PREFIX, REDACTED_SENTINEL_TAIL, assertNoLeak, fakeToken, sentinelInMessage } from './test-helpers/credentials.ts'
-import { makeMultiPersonaConfig, makePersonaConfig, type PersonaSpec } from './test-helpers/persona-config.ts'
+import { makeMultiPersonaConfig, makePersonaConfig, makePersonaConfigInput, type PersonaSpec } from './test-helpers/persona-config.ts'
 
 /**
  * Fixture base dir for persona paths, fresh per test. The code under test only
@@ -93,6 +95,7 @@ describe('buildTemplateParams (SR-3.1)', () => {
       '--mcp-config',
       '/abs/mcp.json',
       '--append-system-prompt-file', botSystemPromptPath(resolveServerStateDir()),
+      '--allowedTools', REPLY_TOOL_ALLOW_RULE,
     ])
     // CSCB_CRONTABLE_PATH is spawn-time-only env (buildSpawnParams' extra_env),
     // never template env — the template omits env entirely by design.
@@ -104,14 +107,23 @@ describe('buildTemplateParams (SR-3.1)', () => {
   // else top-level, else Claude's default `~/.claude`), one memory-scoped Read
   // rule per dir, sorted by dir + deduped. NEVER the config-dir root (holds
   // live creds). os.homedir() is read only to compute an expected string.
-  test('allow: reply needs no human approval, alongside the default memory rule', () => {
-    const cfg = makePersonaConfig({ mcp_config_path: '/abs/mcp.json', system_prompt_mode: 'none' }, baseDir)
+  test('reply preallow is in durable agent_args independently of the allow overlay (b.pb8)', () => {
+    const cfg = parsePersonaConfigBytes(
+      JSON.stringify(makePersonaConfigInput({ mcp_config_path: join(baseDir, 'mcp.json'), system_prompt_mode: 'none' }, baseDir)),
+      join(baseDir, 'config.json'), baseDir, { home: baseDir },
+    )
     const params = buildTemplateParams(cfg)
     // Built from os.homedir(), NOT a hardcoded /home/horde.
     expect(REPLY_TOOL_ALLOW_RULE).toBe('mcp__slack-channel-router__reply')
     expect(params.allow).toEqual([REPLY_TOOL_ALLOW_RULE, memoryRule(join(os.homedir(), '.claude'))])
     // deny surface is unchanged by F5.
     expect(params.deny).toEqual(['AskUserQuestion'])
+    // AD saves agent_args, but drops the template's allow overlay on resume.
+    // Inspect the production builder's durable input; no simulated AD resume.
+    const args = params.agent_args!
+    expect(args).toContain('--allowedTools')
+    expect(args.slice(args.indexOf('--allowedTools'), args.indexOf('--allowedTools') + 2))
+      .toEqual(['--allowedTools', REPLY_TOOL_ALLOW_RULE])
   })
 
   test('no allow rule covers a config-dir root (credentials guard, b.fae F5)', () => {
@@ -206,7 +218,7 @@ describe('buildTemplateParams: --system-prompt-snapshot off (b.b1j SR-2)', () =>
   ] as const
 
   test.each(rows.flatMap(([label, overrides]) => settings.map(([setting, value, pair]) => [label, setting, value, pair, overrides] as const)))(
-    '%s, fresh_system_prompt %s: one generated append flag and optional snapshot pair last',
+    '%s, fresh_system_prompt %s: exact reply preallow, one generated append flag and optional snapshot pair last',
     (_label, _setting, value, pair, overrides) => {
       const cfg = makePersonaConfig({ mcp_config_path: '/abs/mcp.json', ...overrides }, baseDir)
       if (value === undefined) delete (cfg as Partial<PersonaConfig>).fresh_system_prompt
@@ -215,7 +227,7 @@ describe('buildTemplateParams: --system-prompt-snapshot off (b.b1j SR-2)', () =>
         accessSync: () => { throw new Error('operator reads belong to composition') },
         stderrWrite: () => { throw new Error('composition owns warnings') },
       })
-      const args = ['--mcp-config', '/abs/mcp.json', '--append-system-prompt-file', botSystemPromptPath(resolveServerStateDir())]
+      const args = ['--mcp-config', '/abs/mcp.json', '--append-system-prompt-file', botSystemPromptPath(resolveServerStateDir()), '--allowedTools', REPLY_TOOL_ALLOW_RULE]
       expect(params.agent_args).toEqual(pair ? [...args, ...PAIR] : args)
       expect(params.agent_args!.filter(a => a === '--append-system-prompt-file')).toHaveLength(1)
       expect(params.agent_args).not.toContain('--dangerously-load-development-channels')
@@ -258,6 +270,7 @@ describe('installSlackChannelBotTemplate (SR-3.2)', () => {
       '--mcp-config',
       '/abs/mcp.json',
       '--append-system-prompt-file', botSystemPromptPath(resolveServerStateDir()),
+      '--allowedTools', REPLY_TOOL_ALLOW_RULE,
     ])
   })
 
@@ -282,6 +295,7 @@ describe('installSlackChannelBotTemplate (SR-3.2)', () => {
       '/abs/mcp.json',
       '--append-system-prompt-file',
       botSystemPromptPath(resolveServerStateDir()),
+      '--allowedTools', REPLY_TOOL_ALLOW_RULE,
       '--system-prompt-snapshot',
       'off',
     ])
@@ -422,17 +436,20 @@ describe('refreshSlackChannelBotTemplate (b.av2 SR-8.6 step 5)', () => {
       (b) => [{ mcp_config_path: join(b, 'boot-mcp.json'), system_prompt_mode: 'append', append_system_prompt_file: join(b, 'boot-append.md'), fresh_system_prompt: false }, true],
       (b) => ({ mcp_config_path: join(b, 'applied-mcp.json'), system_prompt_mode: 'none', append_system_prompt_file: join(b, 'applied-append.md') }),
       (b) => ['--mcp-config', join(b, 'boot-mcp.json'),
-        '--append-system-prompt-file', botSystemPromptPath(resolveServerStateDir())]],
+        '--append-system-prompt-file', botSystemPromptPath(resolveServerStateDir()),
+        '--allowedTools', REPLY_TOOL_ALLOW_RULE]],
     ['start omitted an unreadable append file; the applied config names a readable one (not probed again)',
       (b) => [{ mcp_config_path: join(b, 'boot-mcp.json'), system_prompt_mode: 'append', append_system_prompt_file: join(b, 'boot-append.md'), fresh_system_prompt: false }, false],
       (b) => ({ mcp_config_path: join(b, 'applied-mcp.json'), system_prompt_mode: 'append', append_system_prompt_file: join(b, 'applied-append.md') }),
-      (b) => ['--mcp-config', join(b, 'boot-mcp.json'), '--append-system-prompt-file', botSystemPromptPath(resolveServerStateDir())]],
+      (b) => ['--mcp-config', join(b, 'boot-mcp.json'), '--append-system-prompt-file', botSystemPromptPath(resolveServerStateDir()),
+        '--allowedTools', REPLY_TOOL_ALLOW_RULE]],
     // b.b1j SR-2.3: fresh_system_prompt is start-time-only; the pair the start installed survives the applied config turning it off.
     ['start installed the snapshot pair; the applied config turns fresh_system_prompt off (the pair is kept)',
       (b) => [{ mcp_config_path: join(b, 'boot-mcp.json'), system_prompt_mode: 'none', fresh_system_prompt: true }, true],
       (b) => ({ mcp_config_path: join(b, 'applied-mcp.json'), system_prompt_mode: 'none', fresh_system_prompt: false }),
       (b) => ['--mcp-config', join(b, 'boot-mcp.json'),
         '--append-system-prompt-file', botSystemPromptPath(resolveServerStateDir()),
+        '--allowedTools', REPLY_TOOL_ALLOW_RULE,
         '--system-prompt-snapshot', 'off']],
   ]
 

@@ -729,8 +729,8 @@ describe('E9: shard containers (b.t6s E9 T5; b.uqm SR-10.1 to SR-10.5)', () => {
     ANTHROPIC_MODEL: MODEL,
     GH_TOKEN: SECRETS.ghToken,
   }
-  /** The shard variables a shard's list names by bare name (b.uqm SR-10.4). */
-  const SHARD_VARIABLES = ['ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL', 'CODEX_TEST_MODEL', 'CODEX_HOST_CONFIG_KEYS']
+  /** The allowlisted variables a shard's list may name, only when defined (b.uqm SR-10.4). */
+  const SHARD_VARIABLES = ['CI_ANTHROPIC_API_KEY', 'CI_ANTHROPIC_BASE_URL', 'CI_ANTHROPIC_MODEL', 'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL', 'CODEX_TEST_MODEL', 'CODEX_HOST_CONFIG_KEYS']
   /** Test data: the run's start on the fake clock, and its tarball's file name in `package/` (never read: it need not exist). */
   const START_MS = Date.UTC(2026, 9, 8, 12, 0, 0)
   const TARBALL_FILE_NAME = 'claude-slack-channel-bots-e9.tgz'
@@ -962,7 +962,7 @@ describe('E9: shard containers (b.t6s E9 T5; b.uqm SR-10.1 to SR-10.5)', () => {
           bindMount(rig.tarballPath, e9.INTEGRITY_TARBALL_MOUNT_TARGET, true),
           '--mount',
           bindMount(rig.shardDir(1), e9.INTEGRITY_RESULTS_MOUNT_TARGET, false),
-          ...SHARD_VARIABLES.flatMap((name) => ['--env', name]),
+          ...['ANTHROPIC_API_KEY', 'CODEX_TEST_MODEL', 'CODEX_HOST_CONFIG_KEYS'].flatMap((name) => ['--env', name]),
           PINNED_IMAGE_ID,
           '1',
           result.start.canary,
@@ -1105,15 +1105,43 @@ describe('E9: shard containers (b.t6s E9 T5; b.uqm SR-10.1 to SR-10.5)', () => {
   // --- T5.S2: credentials by bare name and the argument-list check (SR-10.4, SR-15.1) ---
 
   describe('credentials by bare name and the argument-list check (SR-10.4, SR-15.1)', () => {
-    test('each list names exactly the shard credentials, model and host-key projection by bare name, no other variable and no env file; GH_TOKEN is never named though it is set', async () => {
+    test.each(['CI family', 'native family'] as const)('b.pb8: %s forwards only defined child environment names, preserving explicit empty values', async family => {
+      const ci = family === 'CI family'
+      const env = ci
+        ? { ...GATEWAY_ENV, CI_ANTHROPIC_API_KEY: SECRETS.key, CI_ANTHROPIC_BASE_URL: '' }
+        : RAW_KEY_ENV
+      const rig = e9Rig({ env })
+      expect((await rig.start(1)).start.kind).toBe('started')
+      const [spawn] = runSpawns(rig)
+      const names = valuesOf(spawn!.argv, '--env')
+      const expected = ci
+        ? ['CI_ANTHROPIC_API_KEY', 'CI_ANTHROPIC_BASE_URL', 'CODEX_TEST_MODEL', 'CODEX_HOST_CONFIG_KEYS']
+        : ['ANTHROPIC_API_KEY', 'CODEX_TEST_MODEL', 'CODEX_HOST_CONFIG_KEYS']
+
+      // Docker preserves an absent --env NAME as bare NAME in Config.Env.
+      // The inspection wrapper deliberately requires NAME=value; avoid creating
+      // those entries, while keeping an explicitly empty value distinguishable.
+      expect(names.filter(name => spawn!.env[name] === undefined)).toEqual([])
+      expect(names).toEqual(expected)
+      if (ci) {
+        expect(spawn!.env.CI_ANTHROPIC_BASE_URL === '').toBe(true)
+        expect(['ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL']
+          .every(name => spawn!.env[name] === undefined)).toBe(true)
+      }
+      expect(spawn!.env[ci ? 'CI_ANTHROPIC_API_KEY' : 'ANTHROPIC_API_KEY'] === SECRETS.key).toBe(true)
+      e9Credentials.assertNoLeak({ argv: spawn!.argv, logged: rig.logged })
+    })
+
+    test('each list names exactly the defined shard credentials, model and host-key projection by bare name, no other variable and no env file; GH_TOKEN is never named though it is set', async () => {
       const rig = e9Rig({ env: GATEWAY_ENV })
       await startAll(rig, [1, 2, 3])
 
       expect(rig.env.GH_TOKEN).toBe(SECRETS.ghToken)
       expect(rig.runs()).toHaveLength(3)
+      const defined = ['ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL', 'CODEX_TEST_MODEL', 'CODEX_HOST_CONFIG_KEYS']
       for (const argv of rig.runs()) {
-        expect(valuesOf(argv, '--env')).toEqual(SHARD_VARIABLES)
-        expect(argv.filter((arg) => /^(?:-e|--env)/.test(arg))).toEqual(SHARD_VARIABLES.map(() => '--env'))
+        expect(valuesOf(argv, '--env')).toEqual(defined)
+        expect(argv.filter((arg) => /^(?:-e|--env)/.test(arg))).toEqual(defined.map(() => '--env'))
         expect(argv.filter((arg) => arg.includes('GH_TOKEN'))).toEqual([])
         expect(argv.filter((arg) => SHARD_VARIABLES.some((name) => arg.includes(`${name}=`)))).toEqual([])
       }
@@ -1146,7 +1174,7 @@ describe('E9: shard containers (b.t6s E9 T5; b.uqm SR-10.1 to SR-10.5)', () => {
         expect(result.start.kind).toBe('started')
         const [spawn] = runSpawns(rig)
         expect(spawn!.env.CODEX_HOST_CONFIG_KEYS).toBe(projection)
-        expect(valuesOf(spawn!.argv, '--env')).toEqual(SHARD_VARIABLES)
+        expect(valuesOf(spawn!.argv, '--env')).toEqual(['ANTHROPIC_API_KEY', 'CODEX_TEST_MODEL', 'CODEX_HOST_CONFIG_KEYS'])
         expect(spawn!.argv.some(arg => arg.includes(projection) || arg.includes('inherited-untrusted-projection'))).toBe(false)
         expect(rig.logged.some(entry => entry.line.includes(projection))).toBe(false)
       } else {
@@ -1180,6 +1208,7 @@ describe('E9: shard containers (b.t6s E9 T5; b.uqm SR-10.1 to SR-10.5)', () => {
     function checkedList(): { argv: string[]; secretValues: ReadonlySet<string> } {
       const runDir = join(root, 'e9-check-run')
       const plan = e9.shardRunPlan({
+        env: RAW_KEY_ENV,
         owner: OWNER,
         runDir,
         shard: 1,
@@ -4321,6 +4350,7 @@ const E13_EXPORT_NAMES = [
   'USAGE_PREFIX',
   'USAGE_EXIT_STATUS',
   'RUNNER_FAIL_OPTION',
+  'PERFORMANCE_LOCK_TARGET',
   'CANARY_LENGTH',
   'SHA256_HEX_LENGTH',
   'SCRIPT_FILE_NAME_PATTERN',
@@ -4535,7 +4565,6 @@ function e13BodyText(lines: readonly E13Line[], name: string): string {
 }
 
 const E13_OPENER = /^(?:if|for|while|until)\b/
-const E13_CLOSER = /^(?:fi|done)\b/
 
 /** `lines[at]` (an `if`, `for` or `while` line) through its closing `fi` or `done`. */
 function e13Block(lines: readonly E13Line[], at: number): E13Line[] {
@@ -4543,7 +4572,7 @@ function e13Block(lines: readonly E13Line[], at: number): E13Line[] {
   for (let i = at; i < lines.length; i++) {
     const masked = (lines[i] as E13Line).masked
     if (E13_OPENER.test(masked)) depth++
-    if (E13_CLOSER.test(masked)) depth--
+    if (/(?:^|;\s*)(?:fi|done)\b/.test(masked)) depth--
     if (depth === 0) return lines.slice(at, i + 1)
   }
   throw new Error(`e13Block: line ${lines[at]?.no} is never closed`)
@@ -4554,8 +4583,8 @@ function e13Enclosing(lines: readonly E13Line[], at: number): E13Line | undefine
   let depth = 0
   for (let i = at - 1; i >= 0; i--) {
     const masked = (lines[i] as E13Line).masked
-    if (E13_CLOSER.test(masked)) depth++
-    else if (E13_OPENER.test(masked)) {
+    if (/(?:^|;\s*)(?:fi|done)\b/.test(masked)) depth++
+    if (E13_OPENER.test(masked)) {
       if (depth === 0) return lines[i]
       depth--
     }
@@ -4649,6 +4678,7 @@ function e13AssignedNames(lines: readonly E13Line[]): { line: E13Line; name: str
   for (const { line, args } of e13Calls(lines, 'read')) {
     for (let i = 0; i < args.length; i++) {
       const word = args[i] as string
+      if (/^(?:[<>]|[;&|])/.test(word)) break
       if (!word.startsWith('-')) out.push({ line, name: word })
       else if (/[adinNptu]$/.test(word)) {
         i++
@@ -4667,6 +4697,11 @@ const E13_PARSE = [
   '[[ $2 =~ ${CANARY_PATTERN} ]] || usage ',
   'canary=$2',
   'shift 2',
+  'keep_going=0',
+  'if (( $# >= 1 )) && [[ $1 == --keep-going ]]; then',
+  'keep_going=1',
+  'shift',
+  'fi',
   'fail_names=()',
   `while (( $# >= 1 )) && [[ $1 == "${e13Ref('RUNNER_FAIL_OPTION')}" ]]; do`,
   '(( $# >= 2 )) || usage ',
@@ -4730,6 +4765,7 @@ function e13RunnerProblems(source: string): string[] {
     `write_file > "${results}/$1"`,
     `write_result_line >> "${results}/${e13Ref('RESULT_FILE_NAME')}"`,
     `top > "${results}/\${name}${e13Ref('SCRIPT_LOG_SUFFIX')}"`,
+    `top >> "${results}/\${name}${e13Ref('SCRIPT_LOG_SUFFIX')}"`,
   ])
   for (const w of e13Redirects(lines)) {
     if (w.target !== '/dev/null' && !allowedRedirects.has(`${w.line.fn ?? 'top'} ${w.op} ${w.target}`)) problems.push(`writes ${w.target} by ${w.op}, not an in-shard file through its exported name: ${w.line.code}`)
@@ -4790,11 +4826,20 @@ function e13RunnerProblems(source: string): string[] {
   }
 
   // Only the assigned scripts run, in order, each through bash (SR-11.1, SR-11.4).
-  const runs = lines.filter((l) => e13Runs(l, E13_RUN_COMMANDS))
+  // A descriptor-only exec opens the guard; every exec with a command is still a script run.
+  const runs = lines.filter((l) => e13Runs(l, E13_RUN_COMMANDS) && !/^exec \d+< "[^"]+"(?: \|\| exit \d+)?$/.test(l.code))
   for (const l of runs) if (!l.code.startsWith(`${E13_RUN} `) && l.code !== E13_RUN) problems.push(`runs a script other than as ${E13_RUN}: ${l.code}`)
   if (runs.length !== 1) problems.push(`has ${runs.length} script runs, not one`)
+  // Dependency inspection must read only each explicitly assigned file, never discover more scripts.
+  const dependencyBody = e13Body(lines, 'read_dependencies')
+  const dependencyReads = new Set(dependencyBody.filter(l =>
+    l.code === '[[ -f ${tests_dir}/integration/${script} && ! -L ${tests_dir}/integration/${script} ]] || usage \'assigned script missing or not regular\'' ||
+    l.code === 'done < "${tests_dir}/integration/${script}"'))
+  if (dependencyReads.size !== 2 || !dependencyBody.some(l => l.code === 'for script in "${assigned[@]}"; do')) {
+    problems.push('dependency inspection does not read only assigned regular scripts')
+  }
   for (const l of lines) {
-    if (!runs.includes(l) && /\bintegration\b|\$\{?tests_dir\b/.test(l.code)) problems.push(`looks for scripts instead of running only the assigned ones: ${l.code}`)
+    if (!runs.includes(l) && !dependencyReads.has(l) && /\bintegration\b|\$\{?tests_dir\b/.test(l.code)) problems.push(`looks for scripts instead of running only the assigned ones: ${l.code}`)
   }
   const assigned = top.filter((l) => /^assigned(?:\[[^\]]*\])?\+?=/.test(l.code)).map((l) => l.code)
   if (assigned.join('\n') !== 'assigned=("$@")') problems.push(`the assigned scripts are not the arguments after the ${e13Ref('RUNNER_FAIL_OPTION')} pairs: ${assigned.join('; ')}`)
@@ -4806,12 +4851,17 @@ function e13RunnerProblems(source: string): string[] {
     if (loop[0]?.code !== 'for (( index = 0; index < ${#assigned[@]}; index++ )); do' || loop[1]?.code !== 'name=${assigned[index]}') {
       problems.push('the run loop does not walk the assigned scripts in order')
     }
-    if (top[top.indexOf(loop[0] as E13Line) - 1]?.code !== 'failed=0') problems.push('the run loop is not just after failed=0')
-    const notrun = ['if (( failed )); then', `write_result_line "${e13Ref('RESULT_WORD_NOTRUN')} \${name}"`, 'continue', 'fi']
-    if (loop.slice(2, 6).map((l) => l.code).join('\n') !== notrun.join('\n')) problems.push('the run loop does not write a notrun line for each script after the first failure')
+    if (top[top.indexOf(loop[0] as E13Line) - 2]?.code !== 'failed=0') problems.push('the run loop is not just after failed=0')
+    const codes = loop.map(l => l.code)
+    const skip = codes.indexOf('if [[ -n ${reason} ]]; then')
+    const notrun = ['if [[ -n ${reason} ]]; then', 'outcomes[${name}]=notrun', `write_result_line "${e13Ref('RESULT_WORD_NOTRUN')} \${name} \${reason}"`, 'continue', 'fi']
+    if (!codes.includes('elif (( failed && ! keep_going )); then') || !codes.includes('reason=fail-fast') ||
+        skip < 0 || codes.slice(skip, skip + notrun.length).join('\n') !== notrun.join('\n')) {
+      problems.push('the run loop does not write a notrun line for each script after the first failure')
+    }
     loop.forEach((l, i) => {
       const line = e13Unquote(e13ArgOn(l, 'write_result_line'))
-      if (line?.startsWith(`${e13Ref('RESULT_WORD_END')} `) && line.includes(` ${e13Ref('RESULT_WORD_FAIL')} `) && (loop[i + 1]?.code !== 'failed=1' || loop[i + 2]?.code !== 'continue')) {
+      if (line?.startsWith(`${e13Ref('RESULT_WORD_END')} `) && line.includes(` ${e13Ref('RESULT_WORD_FAIL')} `) && loop[i + 1]?.code !== 'failed=1') {
         problems.push(`a failed script does not stop the run: ${l.code}`)
       }
     })
@@ -4897,7 +4947,7 @@ function e13RunnerWriteProblems(source: string): string[] {
 
   // Result lines: each of a known form, read back by the runner's own parser.
   const script = e13Helpers.realScriptFileName(1)
-  const values = { ...e13ShellValues(top), name: script, seconds: e13.formatResultSeconds(1) }
+  const values = { ...e13ShellValues(top), name: script, seconds: e13.formatResultSeconds(1), reason: 'fail-fast' }
   const kinds = new Set<string>()
   // Each result word through its exported name, never typed (SR-11.5).
   const word = (...names: E13ExportName[]): string => `\\$\\{(?:${names.join('|')})\\}`
@@ -4911,7 +4961,7 @@ function e13RunnerWriteProblems(source: string): string[] {
     if (event === null) problems.push(`writes a result line of no known form: ${line.code}`)
     else {
       kinds.add(event.kind === e13.RESULT_WORD_END ? `${event.kind} … ${event.result}` : event.kind)
-      if (!spelled.test(args[0] as string)) problems.push(`types a result line's words instead of their exported names: ${line.code}`)
+      if (!spelled.test(args[0] as string) && ![`"${e13Ref('RESULT_WORD_NOTRUN')} \${name} \${reason}"`, `"${e13Ref('RESULT_WORD_NOTRUN')} \${name} unsafe-cleanup"`].includes(args[0] as string)) problems.push(`types a result line's words instead of their exported names: ${line.code}`)
     }
   }
   for (const kind of [
@@ -4936,21 +4986,26 @@ function e13RunnerWriteProblems(source: string): string[] {
   // Each run script's log: its stdout and stderr together, as it runs.
   const log = `"${results}/\${name}${e13Ref('SCRIPT_LOG_SUFFIX')}"`
   const logged = lines.filter((l) => l.code.includes(E13_RUN))
-  if (logged.length !== 1 || logged[0]?.code !== `${E13_RUN} > ${log} 2>&1`) problems.push(`a script's log does not take its standard output and standard error as it runs: ${logged.map((l) => l.code).join('; ')}`)
+  if (logged.length !== 1 || logged[0]?.code !== `${E13_RUN} >> ${log} 2>&1`) problems.push(`a script's log does not take its standard output and standard error as it runs: ${logged.map((l) => l.code).join('; ')}`)
 
   // A --fail script: start, then end … fail 0.000, and a log of only the injected FAIL line; it is not run.
   const failIf = at('if is_in "${name}" "${fail_names[@]}"; then')
   if (failIf < 0) problems.push(`no ${fail} script is recorded failed without running`)
   else {
     const block = e13Block(loop, failIf)
-    if (block.some((l) => e13Runs(l, E13_RUN_COMMANDS) || l.code.includes('${tests_dir}')) || (run >= 0 && run < failIf + block.length)) problems.push(`a ${fail} script is run`)
-    const logs = e13Calls(block, 'write_file')
+    const otherwise = block.findIndex(l => l.code === 'else')
+    const injected = block.slice(1, otherwise)
+    if (otherwise < 0 || injected.some(l => e13Runs(l, E13_RUN_COMMANDS) || l.code.includes('${tests_dir}')) || run <= failIf + otherwise || run >= failIf + block.length) problems.push(`a ${fail} script is run`)
+    const logs = e13Calls(injected, 'write_file')
     const text = logs.length === 1 && logs[0]?.args[0] === `"\${name}${e13Ref('SCRIPT_LOG_SUFFIX')}"` ? e13Unquote(logs[0].args[1]) : null
     if (text === null || e13Expand(text, values) !== e13.injectedFailureLine(script)) problems.push(`a ${fail} script's log is not only the injected FAIL line`)
-    const ends = e13Calls(block, 'write_result_line')
-    const end = ends.length === 1 ? e13Unquote(ends[0]?.args[0]) : null
+    const zeroAt = at('is_in "${name}" "${fail_names[@]}" && seconds=0.000')
+    const failedAt = at('if (( script_status != 0 )); then')
+    const failedBlock = failedAt < 0 ? [] : e13Block(loop, failedAt)
+    const failure = e13Calls(failedBlock.slice(0, failedBlock.findIndex(l => l.code === 'else')), 'write_result_line')[0]
+    const end = failure ? e13Unquote(failure.args[0]) : null
     const expected = { kind: e13.RESULT_WORD_END, fileName: script, result: e13.RESULT_WORD_FAIL, seconds: 0 }
-    if (end === null || JSON.stringify(e13.parseResultLine(e13Expand(end, values))) !== JSON.stringify(expected)) {
+    if (!injected.some(l => l.code === 'script_status=1') || zeroAt < timed[3]! || zeroAt > failedAt || end === null || JSON.stringify(e13.parseResultLine(e13Expand(end, { ...values, seconds: '0.000' }))) !== JSON.stringify(expected)) {
       problems.push(`a ${fail} script's end line is not ${e13.RESULT_WORD_END} <file name> ${e13.RESULT_WORD_FAIL} ${e13.formatResultSeconds(0)}`)
     }
     const start = loop.findIndex((l) => e13ArgOn(l, 'write_result_line') === `"${e13Ref('RESULT_WORD_START')} \${name}"`)
@@ -4966,7 +5021,9 @@ function e13RunnerWriteProblems(source: string): string[] {
     taken.length !== 1 ||
     fingerprint < 0 ||
     status < 0 ||
-    pass < status + e13Block(loop, status).length ||
+    pass <= status ||
+    pass >= status + e13Block(loop, status).length ||
+    loop[pass - 2]?.code !== 'else' ||
     fingerprint < pass ||
     e13Enclosing(loop, fingerprint)?.code !== 'if (( index == 0 )); then' ||
     loop[fingerprint + 1]?.code !== `write_file "${e13Ref('DEPENDENCY_FINGERPRINT_FILE_NAME')}" "\${fingerprint}"`
@@ -5107,14 +5164,18 @@ describe('E13: tests/runner.sh and docker/entrypoint.sh source audit (b.t6s E13 
       (t) => e13Planted(t, `>&2\n    exit ${e13.MARKER_REFUSAL_EXIT_STATUS}\n`, '>&2\n    exit 1\n'),
       'the marker refusal does not exit MARKER_REFUSAL_EXIT_STATUS: exit 1',
     ],
-    ['a script run with source, not bash', (t) => e13Planted(t, E13_RUN, 'source "${tests_dir}/integration/${name}"'), `runs a script other than as ${E13_RUN}: source "\${tests_dir}/integration/\${name}" > "${e13Ref('INTEGRITY_RESULTS_MOUNT_TARGET')}/\${name}${e13Ref('SCRIPT_LOG_SUFFIX')}" 2>&1`],
+    ['a script run with source, not bash', (t) => e13Planted(t, E13_RUN, 'source "${tests_dir}/integration/${name}"'), `runs a script other than as ${E13_RUN}: source "\${tests_dir}/integration/\${name}" >> "${e13Ref('INTEGRITY_RESULTS_MOUNT_TARGET')}/\${name}${e13Ref('SCRIPT_LOG_SUFFIX')}" 2>&1`],
+    ['a descriptor exec that also runs a command', (t) => e13Planted(t, 'exec 9< "${PERFORMANCE_LOCK_TARGET}" || exit 2', 'exec 9< "${PERFORMANCE_LOCK_TARGET}" bash foreign.sh'), `runs a script other than as ${E13_RUN}: exec 9< "\${PERFORMANCE_LOCK_TARGET}" bash foreign.sh`],
+    ['dependency inspection over unassigned scripts', (t) => e13Planted(t, 'for script in "${assigned[@]}"; do', 'for script in *.sh; do'), 'dependency inspection does not read only assigned regular scripts'],
+    ['keep-going enabled by default', (t) => e13Planted(t, 'keep_going=0', 'keep_going=1'), `the argument parse's line 7 is not "keep_going=0": keep_going=1`],
+    ['fail-fast applied during keep-going', (t) => e13Planted(t, 'elif (( failed && ! keep_going )); then', 'elif (( failed )); then'), 'the run loop does not write a notrun line for each script after the first failure'],
     ['scripts found in tests/integration', (t) => e13Planted(t, 'assigned=("$@")', 'assigned=("${tests_dir}"/integration/test-*.sh)'), 'looks for scripts instead of running only the assigned ones: assigned=("${tests_dir}"/integration/test-*.sh)'],
     [
       'no stop at the first failure',
       (t) => e13Planted(t, `${e13Ref('RESULT_WORD_FAIL')} \${seconds}"\n        failed=1\n`, `${e13Ref('RESULT_WORD_FAIL')} \${seconds}"\n`),
       `a failed script does not stop the run: write_result_line "${e13Ref('RESULT_WORD_END')} \${name} ${e13Ref('RESULT_WORD_FAIL')} \${seconds}"`,
     ],
-    ['no notrun lines after the first failure', (t) => e13Planted(t, `write_result_line "${e13Ref('RESULT_WORD_NOTRUN')} \${name}"\n`, ':\n'), 'the run loop does not write a notrun line for each script after the first failure'],
+    ['no notrun lines after the first failure', (t) => e13Planted(t, `write_result_line "${e13Ref('RESULT_WORD_NOTRUN')} \${name} \${reason}"\n`, ':\n'), 'the run loop does not write a notrun line for each script after the first failure'],
     ['no end marker', (t) => e13Planted(t, `${done}\n`, ''), 'does not write the end marker once, last, after the run loop'],
     ['an exit after the end marker', (t) => e13Planted(t, /while :; do\n\s*sleep \d+\ndone\n/, 'exit 0\n'), 'ends after the end marker: exit 0'],
     ['a SIGTERM handler that exits', (t) => e13Planted(t, "trap '' TERM", "trap 'exit 0' TERM"), "a trap runs a handler: trap 'exit 0' TERM"],
@@ -5123,16 +5184,16 @@ describe('E13: tests/runner.sh and docker/entrypoint.sh source audit (b.t6s E13 
     [
       "the canary in a script's environment",
       (t) => e13Planted(t, `    ${E13_RUN}`, `    CSCB_CANARY="\${canary}" ${E13_RUN}`),
-      `uses the canary outside its write to ${e13.CANARY_FILE_NAME}: CSCB_CANARY="\${canary}" ${E13_RUN} > "${e13Ref('INTEGRITY_RESULTS_MOUNT_TARGET')}/\${name}${e13Ref('SCRIPT_LOG_SUFFIX')}" 2>&1`,
+      `uses the canary outside its write to ${e13.CANARY_FILE_NAME}: CSCB_CANARY="\${canary}" ${E13_RUN} >> "${e13Ref('INTEGRITY_RESULTS_MOUNT_TARGET')}/\${name}${e13Ref('SCRIPT_LOG_SUFFIX')}" 2>&1`,
     ],
     ['no failed=0 before the run loop', (t) => e13Planted(t, 'failed=0\n', ''), 'the run loop is not just after failed=0'],
     // The argument parse (SR-11.2).
-    ['no shift after the canary', (t) => e13Planted(t, 'canary=$2\nshift 2\n', 'canary=$2\n'), `the argument parse's line 6 is not "shift 2": fail_names=()`],
-    ['a --fail pair read from the option word', (t) => e13Planted(t, 'fail_names+=("$2")', 'fail_names+=("$1")'), `the argument parse's line 10 is not ${JSON.stringify('fail_names+=("$2")')}: fail_names+=("$1")`],
-    ['a --fail loop that shifts one word', (t) => e13Planted(t, 'fail_names+=("$2")\n    shift 2\n', 'fail_names+=("$2")\n    shift 1\n'), `the argument parse's line 11 is not "shift 2": shift 1`],
+    ['no shift after the canary', (t) => e13Planted(t, 'canary=$2\nshift 2\n', 'canary=$2\n'), `the argument parse's line 6 is not "shift 2": keep_going=0`],
+    ['a --fail pair read from the option word', (t) => e13Planted(t, 'fail_names+=("$2")', 'fail_names+=("$1")'), `the argument parse's line 15 is not ${JSON.stringify('fail_names+=("$2")')}: fail_names+=("$1")`],
+    ['a --fail loop that shifts one word', (t) => e13Planted(t, 'fail_names+=("$2")\n    shift 2\n', 'fail_names+=("$2")\n    shift 1\n'), `the argument parse's line 16 is not "shift 2": shift 1`],
     ['no shard-number check', (t) => e13Planted(t, /\n\[\[ \$1 =~ \$\{SHARD_NUMBER_PATTERN\} \]\] \|\| usage [^\n]*\n/, '\n'), `the argument parse's line 2 is not ${JSON.stringify(`${E13_PARSE[1]}…`)}: ${parseLine('(( $# >= 2 ))')}`],
     ['no missing-canary check', (t) => e13Planted(t, /\n\(\( \$# >= 2 \)\) \|\| usage [^\n]*\n(?=\[\[ \$2)/, '\n'), `the argument parse's line 3 is not ${JSON.stringify(`${E13_PARSE[2]}…`)}: ${parseLine('[[ $2 =~')}`],
-    ['no missing-script check', (t) => e13Planted(t, /\n\(\( \$# >= 1 \)\) \|\| usage [^\n]*\n(?=assigned=)/, '\n'), `the argument parse's line 13 is not ${JSON.stringify(`${E13_PARSE[12]}…`)}: assigned=("$@")`],
+    ['no missing-script check', (t) => e13Planted(t, /\n\(\( \$# >= 1 \)\) \|\| usage [^\n]*\n(?=assigned=)/, '\n'), `the argument parse's line 18 is not ${JSON.stringify(`${E13_PARSE[17]}…`)}: assigned=("$@")`],
     ['a shard number of 0 taken', (t) => e13Planted(t, "SHARD_NUMBER_PATTERN='^[1-9][0-9]*$'", "SHARD_NUMBER_PATTERN='^[0-9]+$'"), 'SHARD_NUMBER_PATTERN is not a whole number of at least 1 with no leading zero'],
     ['no duplicate-script check', (t) => e13Planted(t, /\n *is_in "\$\{name\}" "\$\{assigned\[@\]:0:index\}" && usage [^\n]*\n/, '\n'), 'the argument check does not check each assigned name once'],
     [
@@ -5208,9 +5269,9 @@ describe('E13: what tests/runner.sh writes (b.t6s E13 T6; b.uqm SR-11.3)', () =>
   const runner = (): string => readFileSync(E13_RUNNER_SH, 'utf-8')
   const done = `write_result_line "${e13Ref('RESULT_WORD_DONE')}"`
   const packageWrite = `write_file "${e13Ref('PACKAGE_SHA256_FILE_NAME')}" "\${package_sha256}"`
-  const fingerprintBlock = /\n( *if \(\( index == 0 \)\); then\n[\s\S]*?\n {4}fi\n)/
+  const fingerprintBlock = /\n( *if \(\( index == 0 \)\); then\n[\s\S]*?\n {8}fi\n)/
   const failLog = `        write_file "\${name}${e13Ref('SCRIPT_LOG_SUFFIX')}" "${e13Ref('FAIL_PREFIX')}`
-  const logOpen = `    : > "${e13Ref('INTEGRITY_RESULTS_MOUNT_TARGET')}/\${name}${e13Ref('SCRIPT_LOG_SUFFIX')}" || exit 1`
+  const logPath = `"${e13Ref('INTEGRITY_RESULTS_MOUNT_TARGET')}/\${name}${e13Ref('SCRIPT_LOG_SUFFIX')}"`
 
   test('the current tests/runner.sh writes each in-shard file in its exact form, at its time', () => {
     expect(e13RunnerWriteProblems(runner())).toEqual([])
@@ -5231,26 +5292,26 @@ describe('E13: what tests/runner.sh writes (b.t6s E13 T6; b.uqm SR-11.3)', () =>
     ],
     [
       'a result word typed',
-      (t) => e13Planted(t, `write_result_line "${e13Ref('RESULT_WORD_NOTRUN')} \${name}"`, `write_result_line "${e13.RESULT_WORD_NOTRUN} \${name}"`),
-      `types a result line's words instead of their exported names: write_result_line "${e13.RESULT_WORD_NOTRUN} \${name}"`,
+      (t) => e13Planted(t, `write_result_line "${e13Ref('RESULT_WORD_NOTRUN')} \${name} \${reason}"`, `write_result_line "${e13.RESULT_WORD_NOTRUN} \${name} \${reason}"`),
+      `types a result line's words instead of their exported names: write_result_line "${e13.RESULT_WORD_NOTRUN} \${name} \${reason}"`,
     ],
     ['result lines overwritten, not appended', (t) => e13Planted(t, `"$1" >> "`, `"$1" > "`), `write_result_line does not append its line and one LF to ${e13.RESULT_FILE_NAME} in one write`],
     ['seconds with two decimals', (t) => e13Planted(t, "'%d.%03d\\n'", "'%d.%02d\\n'"), 'script_seconds does not print whole seconds with no leading zero, a point and exactly three digits'],
     ['seconds with a leading zero', (t) => e13Planted(t, "'%d.%03d\\n'", "'%02d.%03d\\n'"), 'script_seconds does not print whole seconds with no leading zero, a point and exactly three digits'],
     ['a negative time kept', (t) => e13Planted(t, '(( elapsed_ms >= 0 )) || elapsed_ms=0', ':'), 'script_seconds does not give a negative time as 0'],
     ['seconds taken before the run', (t) => e13Moved(t, '    started_us=$(now_us)', '    ended_us=$(now_us)'), "an end line's seconds are not the script's timed run"],
-    ["a log without the script's stderr", (t) => e13Planted(t, '${SCRIPT_LOG_SUFFIX}" 2>&1\n', '${SCRIPT_LOG_SUFFIX}"\n'), `a script's log does not take its standard output and standard error as it runs: ${E13_RUN} > "${e13Ref('INTEGRITY_RESULTS_MOUNT_TARGET')}/\${name}${e13Ref('SCRIPT_LOG_SUFFIX')}"`],
-    ['a log written after the run', (t) => e13Planted(t, /^ {4}bash .*$/m, `    output=$(${E13_RUN} 2>&1)`), `a script's log does not take its standard output and standard error as it runs: output=$(${E13_RUN} 2>&1)`],
+    ["a log without the script's stderr", (t) => e13Planted(t, `${E13_RUN} >> ${logPath} 2>&1`, `${E13_RUN} >> ${logPath}`), `a script's log does not take its standard output and standard error as it runs: ${E13_RUN} >> "${e13Ref('INTEGRITY_RESULTS_MOUNT_TARGET')}/\${name}${e13Ref('SCRIPT_LOG_SUFFIX')}"`],
+    ['a log written after the run', (t) => e13Planted(t, /^ {8}bash .*$/m, `    output=$(${E13_RUN} 2>&1)`), `a script's log does not take its standard output and standard error as it runs: output=$(${E13_RUN} 2>&1)`],
     ['a --fail script run', (t) => e13Planted(t, failLog, `        ${E13_RUN}\n${failLog}`), `a ${e13Ref('RUNNER_FAIL_OPTION')} script is run`],
     ["a --fail script's log text changed", (t) => e13Planted(t, `\${name}: ${e13Ref('INJECTED_FAILURE_TEXT')}`, `\${name} ${e13Ref('INJECTED_FAILURE_TEXT')}`), `a ${e13Ref('RUNNER_FAIL_OPTION')} script's log is not only the injected FAIL line`],
     [
       "a --fail script's end with other seconds",
-      (t) => e13Planted(t, `${e13Ref('RESULT_WORD_FAIL')} ${e13.formatResultSeconds(0)}"`, `${e13Ref('RESULT_WORD_FAIL')} ${e13.formatResultSeconds(0.001)}"`),
+      (t) => e13Planted(t, '&& seconds=0.000', '&& seconds=0.001'),
       `a ${e13Ref('RUNNER_FAIL_OPTION')} script's end line is not ${e13.RESULT_WORD_END} <file name> ${e13.RESULT_WORD_FAIL} ${e13.formatResultSeconds(0)}`,
     ],
     [
       'a --fail script without its start line',
-      (t) => e13Moved(t, `    write_result_line "${e13Ref('RESULT_WORD_START')} \${name}"`, logOpen),
+      (t) => e13Moved(t, `    write_result_line "${e13Ref('RESULT_WORD_START')} \${name}"`, '    ended_us=$(now_us)'),
       `a ${e13Ref('RUNNER_FAIL_OPTION')} script gets no start line before its end line`,
     ],
     ['a fingerprint after any passing script', (t) => e13Planted(t, 'if (( index == 0 )); then', 'if (( index >= 0 )); then'), `${e13.DEPENDENCY_FINGERPRINT_FILE_NAME} is not written only after test-1 passes`],

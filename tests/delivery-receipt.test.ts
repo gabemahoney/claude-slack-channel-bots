@@ -126,7 +126,7 @@ describe('real delivery timeout evidence (synthetic, no native launch)', () => {
         'real_ad() { case "$*" in "status --instance-id own-row") echo \'{"state":"waiting"}\';; "get --instance-id own-row") printf "%s\\n" "$ROW";; *) exit 9;; esac; }',
         connected, '_real_connected alpha old-session'].join('\n')
       const path = join(root, 'control.sh'); fs.writeFileSync(path, script)
-      const child = spawnSync('bash', [path], { env: hostSafeChildEnv(root, { tools: ['bash', 'jq', 'grep'], extras: { ROW: JSON.stringify(row) } }), encoding: 'utf8', timeout: 5000 })
+      const child = spawnSync('bash', [path], { env: hostSafeChildEnv(root, { tools: ['bash', 'jq', 'grep', 'tail'], extras: { ROW: JSON.stringify(row) } }), encoding: 'utf8', timeout: 5000 })
       expect(child.error).toBeUndefined(); expect(child.signal).toBeNull()
       expect(child.stderr).toBe(''); expect(child.stdout).toBe('')
       expect(child.status).toBe(ready ? 0 : 1)
@@ -142,11 +142,11 @@ describe('real delivery timeout evidence (synthetic, no native launch)', () => {
       const script = ['set -euo pipefail', 'SLACK_STATE_DIR="$HOME"', 'REAL_LAUNCH_WAIT_S=300', 'real_instance() { echo own-row; }',
         'real_ad() { case "$*" in "status --instance-id own-row") printf \'{"state":"%s"}\\n\' "$ROW_STATE";; "get --instance-id own-row") printf \'{"instance_id":"own-row","state":"%s","session_id":"%s","labels":{"tag_prompt":"1"}}\\n\' "$ROW_STATE" "$ROW_SESSION";; *) exit 9;; esac; }',
         // No time passes: each explicit AD answer advances the actual predicate.
-        'wait_until() { [[ "$1" == 300 ]]; shift 2; [[ "$*" == "_real_connected alpha old-session" ]]; ROW_STATE=waiting; ROW_SESSION=old-session; if "$@"; then exit 10; fi; echo old-rejected; ROW_STATE=pending; ROW_SESSION=""; if "$@"; then exit 11; fi; echo pending-rejected; ROW_STATE=waiting; ROW_SESSION=new-session; "$@"; echo new-bound; }',
+        'wait_until() { [[ "$1" == 300 ]]; shift 2; [[ "$*" == "_real_connected alpha old-session 0" ]]; ROW_STATE=waiting; ROW_SESSION=old-session; if "$@"; then exit 10; fi; echo old-rejected; ROW_STATE=pending; ROW_SESSION=""; if "$@"; then exit 11; fi; echo pending-rejected; ROW_STATE=waiting; ROW_SESSION=new-session; "$@"; echo new-bound; }',
         'real_wait_idle() { [[ "$*" == "alpha 300" ]]; echo ad-waiting; }', extract('_real_connected'), extract('real_wait_launch'),
         'real_wait_launch alpha old-session'].join('\n')
       const path = join(root, 'control.sh'); fs.writeFileSync(path, script)
-      const child = spawnSync('bash', [path], { env: hostSafeChildEnv(root, { tools: ['bash', 'jq', 'grep'] }), encoding: 'utf8', timeout: 5000 })
+      const child = spawnSync('bash', [path], { env: hostSafeChildEnv(root, { tools: ['bash', 'jq', 'grep', 'tail'] }), encoding: 'utf8', timeout: 5000 })
       expect(child.error).toBeUndefined(); expect(child.signal).toBeNull(); expect(child.status).toBe(0)
       expect(child.stderr).toBe(''); expect(child.stdout).toBe('old-rejected\npending-rejected\nnew-bound\nad-waiting\n')
       assertNoLeak({ stdout: child.stdout, stderr: child.stderr })
@@ -157,21 +157,21 @@ describe('real delivery timeout evidence (synthetic, no native launch)', () => {
     try {
       const source = fs.readFileSync(join(import.meta.dir, 'integration/lib/real-scenario.sh'), 'utf8')
       const wait = source.match(/^real_wait_delivery\(\) \{[\s\S]*?^\}/m)![0]
-      const script = ['set -euo pipefail', 'REAL_DELIVERY_WAIT_S=180', 'REAL_RECEIPTS=receipts', 'SLACK_STATE_DIR=state', 'SCENARIO_AD_SHIM_LOG=shim',
-        'fail() { echo "FAIL: $*"; exit 17; }', '_scenario_check_timeout() { [[ "$1" == 180 ]]; }',
-        '_scenario_poll_until() { printf "poll:%s:%s:%s:%s:%s:%s:%s:%s:%s\\n" "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$9" "${10}"; [[ "$MODE" == success ]]; }',
+      const script = ['set -euo pipefail', 'REAL_DELIVERY_WAIT_S=180', 'REAL_DELIVERY_MAX_WAIT_S=1800', 'CLOCK_MS=0', 'SCENARIO_POLL_S=1', '_scenario_now_ms() { echo "$CLOCK_MS"; }', 'sleep() { CLOCK_MS=$((CLOCK_MS+180000)); }', 'REAL_RECEIPTS=receipts', 'SLACK_STATE_DIR=state', 'SCENARIO_AD_SHIM_LOG=shim',
+        'fail() { echo "FAIL: $*"; exit 17; }', '_scenario_check_timeout() { [[ "$1" == 180 || "$1" == 1800 ]]; }',
+        'bun() { if [[ "$2" == progress ]]; then echo 0; return; fi; if ((CLOCK_MS == 0)); then printf "poll:%s:%s:%s:%s:%s:%s:%s\\n" "$1" "$2" "$3" "$4" "$5" "$7" "$8"; fi; [[ "$MODE" == success ]]; }',
         '_real_delivery_diagnostic() { echo "evidence-before-cleanup:$*"; [[ "$MODE" != diagnostic-failure ]]; }',
         'trap \'echo cleanup\' EXIT', wait, 'real_wait_delivery alpha 13 no-retype', 'echo success'].join('\n')
       const path = join(root, 'control.sh'); fs.writeFileSync(path, script)
       const child = spawnSync('bash', [path], { env: hostSafeChildEnv(root, { tools: ['bash'], extras: { MODE: mode } }), encoding: 'utf8', timeout: 5000 })
       expect(child.error).toBeUndefined(); expect(child.signal).toBeNull(); expect(child.stderr).toBe('')
       const lines = child.stdout.trim().split('\n')
-      expect(lines[0]).toBe('poll:180:bun:receipts:ready:state:alpha:shim:13:no-retype')
+      expect(lines[0]).toBe('poll:receipts:ready:state:alpha:shim:13:no-retype')
       if (mode === 'success') { expect(child.status).toBe(0); expect(lines.slice(1)).toEqual(['success', 'cleanup']) }
       else {
         expect(child.status).toBe(17)
         expect(lines[1]).toBe('evidence-before-cleanup:alpha 13 no-retype')
-        expect(lines.slice(-2)).toEqual(['FAIL: real persona alpha has open/unconfirmed deliveries (not within 180s)', 'cleanup'])
+        expect(lines.slice(-2)).toEqual(['FAIL: real persona alpha has open/unconfirmed deliveries (no-progress watchdog; receipts=0; idle bound=180s; overall bound=1800s)', 'cleanup'])
         expect(lines.includes('recorded: delivery diagnostic unavailable')).toBe(mode === 'diagnostic-failure')
       }
     } finally { fs.rmSync(root, { recursive: true, force: true }) }
@@ -181,10 +181,10 @@ describe('real delivery timeout evidence (synthetic, no native launch)', () => {
     try {
       const source = fs.readFileSync(join(import.meta.dir, 'integration/lib/real-scenario.sh'), 'utf8')
       const declarations = ['real_wait_delivery', '_real_delivery_diagnostic'].map(name => source.match(new RegExp(`^${name}\\(\\) \\{[\\s\\S]*?^\\}`, 'm'))![0]).join('\n')
-      const script = ['set -euo pipefail', 'SCENARIO_ROOT="$1"', 'REAL_DELIVERY_WAIT_S=180', 'REAL_RECEIPTS=receipts', 'SLACK_STATE_DIR=state', 'SCENARIO_AD_SHIM_LOG=shim', 'SCENARIO_FIXTURES=fixtures',
-        'fail() { echo "FAIL: $*"; exit 17; }', '_scenario_check_timeout() { :; }', '_scenario_poll_until() { return 1; }',
+      const script = ['set -euo pipefail', 'SCENARIO_ROOT="$1"', 'REAL_DELIVERY_WAIT_S=180', 'REAL_DELIVERY_MAX_WAIT_S=1800', 'CLOCK_MS=0', 'SCENARIO_POLL_S=1', '_scenario_now_ms() { echo "$CLOCK_MS"; }', 'sleep() { CLOCK_MS=$((CLOCK_MS+180000)); }', 'REAL_RECEIPTS=receipts', 'SLACK_STATE_DIR=state', 'SCENARIO_AD_SHIM_LOG=shim', 'SCENARIO_FIXTURES=fixtures',
+        'fail() { echo "FAIL: $*"; exit 17; }', '_scenario_check_timeout() { :; }',
         'real_instance() { echo own-row; }', 'real_ad() { [[ "$*" == "status --instance-id own-row" ]] || return 8; [[ "$MODE" != unreadable ]] || return 1; echo \'{"state":"working","private":"withheld"}\'; }',
-        'bun() { [[ -s "$SCENARIO_ROOT/real-delivery-status.json" ]] || return 9; printf "capture:%s:%s\\n" "$1" "$2"; [[ "$MODE" != formatter-failure ]]; }',
+        'bun() { if [[ "$2" == ready ]]; then return 1; fi; if [[ "$2" == progress ]]; then echo 0; return; fi; [[ -s "$SCENARIO_ROOT/real-delivery-status.json" ]] || return 9; printf "capture:%s:%s\\n" "$1" "$2"; [[ "$MODE" != formatter-failure ]]; }',
         'trap \'echo cleanup\' EXIT', declarations, 'real_wait_delivery alpha 13 no-retype'].join('\n')
       const path = join(root, 'control.sh'); fs.writeFileSync(path, script)
       const child = spawnSync('bash', [path, root], { env: hostSafeChildEnv(root, { tools: ['bash'], extras: { MODE: mode } }), encoding: 'utf8', timeout: 5000 })
@@ -192,7 +192,7 @@ describe('real delivery timeout evidence (synthetic, no native launch)', () => {
       const lines = child.stdout.trim().split('\n')
       expect(lines.indexOf('capture:receipts:diagnostic')).toBe(0)
       expect(lines.some(line => line.startsWith('capture:fixtures/real-observations.ts:'))).toBe(true)
-      expect(lines.slice(-2)).toEqual(['FAIL: real persona alpha has open/unconfirmed deliveries (not within 180s)', 'cleanup'])
+      expect(lines.slice(-2)).toEqual(['FAIL: real persona alpha has open/unconfirmed deliveries (no-progress watchdog; receipts=0; idle bound=180s; overall bound=1800s)', 'cleanup'])
       expect(child.stdout.includes('private')).toBe(false)
       expect(JSON.parse(fs.readFileSync(join(root, 'real-delivery-status.json'), 'utf8'))).toEqual(mode === 'unreadable' ? {} : { state: 'working', private: 'withheld' })
     } finally { fs.rmSync(root, { recursive: true, force: true }) }

@@ -2840,11 +2840,11 @@ function codexPureValue(value: ts.Expression, names: Set<string>): boolean {
 }
 
 /** Inspect the complete pinned import graph without importing any module.
- * Only two existing dual-use helpers may have an exact import.meta.main block;
+ * Only the named dual-use helpers may have an exact import.meta.main block;
  * their CLI bodies are unreachable when imported, without an else branch. */
-function codexHelperFindings(file: string, source: string): string[] {
+function codexHelperFindings(file: string, source: string, expected = CODEX_IMPORT_GRAPH[file] ?? []): string[] {
   const sf = parse(source, file), findings: string[] = [], names = new Set<string>()
-  const expected = CODEX_IMPORT_GRAPH[file] ?? [], actual: string[] = []
+  const actual: string[] = []
   for (const statement of sf.statements) {
     const specifier = staticLoadOf(statement)
     if (specifier !== undefined) {
@@ -2861,7 +2861,7 @@ function codexHelperFindings(file: string, source: string): string[] {
         names.add(declaration.name.text)
         return true
       })) continue
-    if (['tests/real-agent/ai-fixture-audit.ts', 'tests/integration/fixtures/transcript-receipts.ts'].includes(file)
+    if (['tests/real-agent/ai-fixture-audit.ts', 'tests/integration/fixtures/transcript-receipts.ts', 'tests/integration/fixtures/ac76-admission.ts'].includes(file)
       && ts.isIfStatement(statement) && statement.expression.getText(sf) === 'import.meta.main'
       && ts.isBlock(statement.thenStatement) && !statement.elseStatement) continue
     findings.push(`${file}:${finding(sf, statement, 'codex-helper-import: executable statement at import time')}`)
@@ -2979,6 +2979,29 @@ function codexCrashProtocolFindings(source: string): string[] {
 }
 
 describe('E7 Codex executable inventory and import safety', () => {
+  test('AC76 dual-use admission fixture has only its reviewed receipt edge and erased queue types', () => {
+    const file = 'tests/integration/fixtures/ac76-admission.ts'
+    const source = readFileSync(join(REPO_ROOT, file), 'utf8')
+    const edges = ['../../../src/delivery-queue.ts', './transcript-receipts.ts']
+    const audit = (text: string) => {
+      const findings = codexHelperFindings(file, text, edges)
+      const queueImport = parse(text).statements.filter(ts.isImportDeclaration)
+        .find(s => stringText(s.moduleSpecifier) === edges[0])
+      if (!queueImport?.importClause?.isTypeOnly) findings.push('queue must be a type-only edge')
+      return findings
+    }
+    expect(audit(source)).toEqual([])
+    // The sole runtime edge is already checked transitively above.
+    expect(CODEX_IMPORT_GRAPH['tests/integration/fixtures/transcript-receipts.ts']).toEqual([])
+    for (const changed of [source.replace('import type', 'import'),
+      source.replace('if (import.meta.main)', 'if (true)'),
+      source.replace('if (import.meta.main)', 'if (!import.meta.main)'),
+      source + '\ncheckAc76Admission();', source + '\nimport "./unreviewed.ts";',
+    ]) {
+      expect(changed).not.toBe(source)
+      expect(audit(changed).length).toBeGreaterThan(0)
+    }
+  })
   test('all current Codex harness modules have an explicit execution contract', () => {
     const actual = filesUnder(join(TESTS_DIR, 'real-agent'), path => /\/codex-[^/]+\.ts$/.test(path)).sort()
     expect(actual).toEqual([CODEX_DELIVERY_PATH, ...CODEX_IMPORT_ONLY_PATHS].sort())

@@ -121,6 +121,17 @@ process.exitCode = answer.code
     expect(JSON.parse(readFileSync(argvFile, 'utf8'))).toEqual(['inspect', '--type', 'container', '--size', 'safe-name'])
   })
 
+  test.each(['unset', 'empty'] as const)('b.pb8: %s Config.Env entry retains the strict inspection boundary', kind => {
+    answer.stdout = JSON.stringify([{ Id: id, Config: {
+      Env: [kind === 'unset' ? 'CSCB_INSPECT_PROBE' : 'CSCB_INSPECT_PROBE='],
+    } }])
+    answer.stderr = ''
+    const captured = run(['docker', 'container', 'inspect', 'safe-name'])
+    expect(captured).toEqual(kind === 'unset'
+      ? { code: 65, stdout: '', stderr: '' }
+      : { code: 0, stdout: JSON.stringify([{ Id: id, Config: {} }], null, 2) + '\n', stderr: '' })
+  })
+
   test('masks inherited ANTHROPIC values even when Docker copies them only outside Env', () => {
     answer.stdout = JSON.stringify([{ Id: id, Config: { Env: [] },
       Labels: Object.fromEntries(Object.values(secrets).map((value, i) => [`copy-${i}-${value}`, JSON.stringify({ value })])),

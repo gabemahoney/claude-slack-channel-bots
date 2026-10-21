@@ -234,6 +234,23 @@ Validate `allow_invited_channels` in `validatePersonaServerSettings` before pars
 - No declared error-class recognition by names/constants/collections, stand-in classes or parallel client types. Keep `SANCTIONED_BY_NAME` closed and named re-exports intact.
 - Preserve planted violations, comment/string controls, per-source appended violations and parser checks. Audits must detect the forbidden construct without treating harmless text as code.
 
+## CI runner boundaries
+
+Keep ordinary shards independent of the Codex login wait, with full resource
+admission and the shared/exclusive measurement guard intact. Release a login
+lease only after its protected retirement/postcheck/scan sequence; preserve
+observed token values for late output scans without rereading a released
+login. Host CI inputs stay under `CI_ANTHROPIC_*`; only the disposable
+entrypoint translates native credential names.
+
+Keep fail-fast as the default. Continue independent scripts only after
+verified cleanup, preserve dependency/cleanup skip reasons, and never emit
+normal `done` after uncertain final cleanup. Keep the performance guard
+until retirement on that path. Require both tracks and all integrity checks
+for a full gate; synthetic controls establish no native AC76 acceptance.
+See [the architecture contract](architecture.md#sharded-ci-resource-gate)
+and [test evidence rules](testing-guide.md#asynchronous-ad-recovery-assertions).
+
 ## Review Prioritization
 
 Prioritize security, logic, missing tests, architecture, touched code quality, then style. Fix security/logic immediately, add missing tests before merge, address architecture within scope when feasible and let tooling handle style. Don't hunt unrelated cleanup; record out-of-scope work for the Managing Intelligence.

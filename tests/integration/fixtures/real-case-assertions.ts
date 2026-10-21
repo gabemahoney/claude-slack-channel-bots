@@ -1,6 +1,7 @@
 /** Lane-1 scenario assertions, not transport or production matching (b.omv SR-14). */
 import { existsSync, readFileSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { join, resolve } from 'node:path'
+import type { GetResult } from 'agent-director'
 import { auditReceipts, captureReceiptJournal, jsonLines, packedReceiptAdapters, personaTranscripts, readTranscripts, receiptJournal, shimWords, transcriptFiles, workloadItem, workloadItems } from './transcript-receipts.ts'
 import { assertBusyProof, emitBusyProofFailure, pollBusyProof, type BusyProofSnapshot } from './busy-proof.ts'
 function check(value: unknown, reason: string): asserts value { if (!value) throw new Error(reason) }
@@ -44,6 +45,23 @@ export function assertSwallowedEnterRecovery(journal: any[], calls: KeyCall[], f
 }
 
 type LaunchObservation = { key: string; session_id: string; at: number }
+
+/** The retained AD rows must prove resume, not a fresh/reused conversation. */
+export function assertSameConversationReplyPermission(
+  before: Pick<GetResult, 'instance_id' | 'session_id'>,
+  after: Pick<GetResult, 'instance_id' | 'session_id' | 'agent_args'>,
+  instance: string,
+  replyRule: string,
+) {
+  check(before?.instance_id === instance && after?.instance_id === instance,
+    'reply permission resume has the wrong AD instance')
+  check(typeof before.session_id === 'string' && before.session_id.trim().length > 0
+    && after.session_id === before.session_id, 'reply permission proof requires the same native session')
+  const args = after.agent_args
+  check(Array.isArray(args) && args.filter(arg => arg === '--allowedTools').length === 1
+    && args[args.indexOf('--allowedTools') + 1] === replyRule,
+    'resumed AD row lacks the exact reply permission pair')
+}
 
 /** Bind first-waiting evidence to this persona and its durable AD session. */
 export function assertFirstLaunchWaiting(waiting: LaunchObservation[], sent: { session_id?: string }[], key: string, start: number, textAt: number): LaunchObservation {
@@ -280,6 +298,14 @@ try {
     const j=cumulativeJournal(), a=j.filter(r=>r.kind==='accepted'&&!r.compact), m=a.find(r=>r.text.includes('<!here>'))
     check(m,'mention not stored');const f=j.find(r=>r.kind==='fixed'&&r.seq===m.seq)
     check(f?.parts.join('').includes(`<@${arg}> <!here> &lt;b&gt; <https://example.com|link>`),'mention body lost another mention, here or markup')
+  } else if(command==='reply-permission-resume') {
+    const { REPLY_TOOL_ALLOW_RULE } = await import(join(resolve(process.env.CSCB_PKG_DIR??'/test-repo/node_modules/claude-slack-channel-bots'),'src/agent-director-template.ts'))
+    const [before,after] = [arg,arg2].map(path => {
+      try { return JSON.parse(readFileSync(path,'utf8')) }
+      catch { throw new Error('reply permission resume AD rows could not be read') }
+    })
+    assertSameConversationReplyPermission(before,after,'cscb_'+key,REPLY_TOOL_ALLOW_RULE)
+    console.log('recorded: same native session resumed with exact reply permission pair')
   } else if(command==='launches') {
     const launch=calls().filter(c=>c.words.includes('spawn')||c.words.includes('resume'))
     check(launch.some(c=>c.words.includes('spawn')), 'no fresh launch')
