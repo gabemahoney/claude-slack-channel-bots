@@ -535,20 +535,45 @@ describe('chunkText', () => {
     expect(result).toEqual(['aaaa', 'aaaa', 'aa'])
   })
 
-  test('chunks at newlines (paragraph-aware)', () => {
-    const text = 'line1\nline2\nline3\nline4'
-    const result = chunkText(text, 12, 'newline')
-    expect(result.length).toBeGreaterThan(1)
-    // Each chunk should be <= 12 chars
-    for (const chunk of result) {
-      expect(chunk.length).toBeLessThanOrEqual(12)
+  test.each<[string, string, number, string[]]>([
+    ['fitting lines', 'short\nshort\nshort', 100, ['short\nshort\nshort']],
+    ['split delimiters', 'line1\nline2\nline3\nline4', 12, ['line1\nline2\n', 'line3\nline4']],
+    ['a newline at the limit', 'abc\ndef', 4, ['abc\n', 'def']],
+    ['a newline just after the limit', 'abcd\nef', 4, ['abcd', '\nef']],
+    ['an oversized line', 'abcdefgh\nend', 4, ['abcd', 'efgh', '\nend']],
+    ['a leading blank line and trailing newlines', '\nabc\n\n', 4, ['\n', 'abc\n', '\n']],
+  ])('newline mode retains %s', (_label, text, limit, expected) => {
+    expect(chunkText(text, limit, 'newline')).toEqual(expected)
+  })
+
+  test.each([
+    ['empty input', ''],
+    ['whitespace and blank lines', ' \t\r\n\n  \n\r\n '],
+    ['an oversized line and trailing spaces', 'a'.repeat(23) + '  '],
+    ['CRLF line endings', 'alpha\r\nbeta\r\n'],
+    ['surrogate pairs at chunk boundaries', 'a😀b🦊c😀'],
+    ['only supplementary characters', '😀🦊🌊🚀'],
+    ['combining marks and joined emoji', 'e\u0301👩\u200d💻 z'],
+    ['lone surrogates', '\ud800a\udc00\n😀'],
+  ])('both modes reconstruct %s exactly within the code point limit', (_label, text) => {
+    for (const mode of ['length', 'newline'] as const) {
+      for (const limit of [1, 2, 5, 12]) {
+        const chunks = chunkText(text, limit, mode)
+        expect(chunks.join('')).toBe(text)
+        expect(chunks.length).toBeGreaterThan(0)
+        if (text === '') expect(chunks).toEqual([''])
+        else expect(chunks.every(chunk => chunk !== '')).toBe(true)
+        for (const chunk of chunks) expect(Array.from(chunk).length).toBeLessThanOrEqual(limit)
+        // Exact code-point reconstruction also catches splitting a surrogate pair.
+        expect(chunks.flatMap(chunk => Array.from(chunk))).toEqual(Array.from(text))
+      }
     }
   })
 
-  test('newline mode keeps lines together when possible', () => {
-    const text = 'short\nshort\nshort'
-    const result = chunkText(text, 100, 'newline')
-    expect(result).toEqual(['short\nshort\nshort'])
+  test.each([0, -1, 1.5, NaN, Infinity, -Infinity])('rejects invalid limit %p even for empty input', limit => {
+    for (const mode of ['length', 'newline'] as const) {
+      for (const text of ['', 'hello']) expect(() => chunkText(text, limit, mode)).toThrow(RangeError)
+    }
   })
 })
 

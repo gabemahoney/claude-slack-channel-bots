@@ -9,7 +9,6 @@ import {
 import type { SlackBotIdentity } from './persona-slack-validation.ts'
 import {
   decideDelivery,
-  stripPersonaMention,
   type DeliveryDecision,
   type DropDecision,
   type FungibleDecisionInputs,
@@ -306,7 +305,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
             channel_type: stringField('channel_type'), thread_ts: stringField('thread_ts'), edited_ts: slackKey.edited_ts,
             user: stringField('user'), bot_id: stringField('bot_id'), username: stringField('username'),
             bot_profile_name: typeof profile === 'object' && profile !== null && 'name' in profile && typeof profile.name === 'string' ? profile.name : undefined,
-            text: stripPersonaMention(stringField('text') || '', identity?.botUserId), files, via: decision.via, received_at: (deps.now ?? Date.now)(),
+            text: stringField('text') ?? '', files, via: decision.via, received_at: (deps.now ?? Date.now)(),
           }
           try {
             const result = await deps.queue.accept(key, input)

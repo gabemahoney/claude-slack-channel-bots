@@ -6,6 +6,11 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 ## Unreleased
 
+### Message text preservation
+
+- **Inbound messages retain every own @mention and its following whitespace,** including quoted, repeated and mention-only text. Accepted text is stored as received before terminal tag formatting.
+- **Replies split without losing whitespace.** Both `reply_chunk_mode` values preserve all supplied text, including blank lines and CRLF line endings; concatenating the posted texts in order reproduces the input exactly. `newline` keeps the split newline in the preceding message and now hard-splits oversized lines. `reply_chunk_limit` counts Unicode code points, so chunks stay within the limit without splitting surrogate pairs.
+
 ### Recovery waits for agent-director state
 
 If agent-director reports `ErrSystemInstallDisappeared`, CSCB keeps the `ad-unreachable` outage and waits for a fresh agent-director observation before recovery. The error no longer triggers an agent-death relaunch or a preceding kill. Restart failure counts and the slow-recovery count and notice episode stay unchanged while the agent state is unknown.

@@ -1,7 +1,7 @@
 /**
  * delivery-decision.test.ts — The pure inbound delivery decision (b.av2
  * SR-4.2 steps in order, SR-4.3 direct messages and group DMs, SR-4.4 `via`
- * precedence) and `stripPersonaMention`.
+ * precedence).
  *
  * Imports the module directly: no server, no `mock.module`, no I/O. Events
  * come from the Slack stub's event factories; P and the applied view are
@@ -20,7 +20,6 @@ import {
   type DeliveryPersona,
   type Via,
   decideDelivery,
-  stripPersonaMention,
 } from '../src/delivery-decision.ts'
 import {
   broadcastText,
@@ -404,40 +403,5 @@ describe('no arbitration', () => {
       results.push(decideDelivery(event, toP ? P : Q, applied))
     }
     expect(results).toEqual(Array.from({ length: 20 }, () => deliver('mention')))
-  })
-})
-
-// ---------------------------------------------------------------------------
-// stripPersonaMention
-// ---------------------------------------------------------------------------
-
-describe('stripPersonaMention', () => {
-  test.each<[string, string, string]>([
-    ['a leading mention', `${mentionText(P_USER)} hello`, 'hello'],
-    ['a leading labelled mention', `${mentionText(P_USER, 'p-bot')} hello`, 'hello'],
-    ['a mid-text mention', `hi ${mentionText(P_USER)} there`, 'hi there'],
-    ['every form, repeated', `${mentionText(P_USER)}  ${mentionText(P_USER, 'x')}   hello`, 'hello'],
-    ['a mention followed by a body with a trailing space', `${mentionText(P_USER)} hello `, 'hello '],
-    ['leading spaces before a mention and its body', `  ${mentionText(P_USER)} hello`, '  hello'],
-    ['a mention followed by a body with a trailing newline', `${mentionText(P_USER)} hello\n`, 'hello\n'],
-    ['all whitespace immediately after a mention', `${mentionText(P_USER)} \t\r\n hello \t\n`, 'hello \t\n'],
-    ['only whitespace after a mention', `${mentionText(P_USER)} \t\r\n`, ''],
-    ['only whitespace surrounding repeated mention forms', ` \t${mentionText(P_USER)} \n${mentionText(P_USER, 'x')}\r\n `, ''],
-    ['every own mention while keeping whitespace before each token', `  first ${mentionText(P_USER)}\tsecond ${mentionText(P_USER, 'x')}\nthird \n`, '  first second third \n'],
-    ["another persona's mentions and surrounding whitespace", ` \t${mentionText(Q_USER)}  ${mentionText(Q_USER, 'q')}\n `, ` \t${mentionText(Q_USER)}  ${mentionText(Q_USER, 'q')}\n `],
-    ['plain text and its surrounding whitespace', ' \tplain body \n', ' \tplain body \n'],
-    ['whitespace without an own mention', ' \t\r\n ', ' \t\r\n '],
-    ['surrounding whitespace', `  ${mentionText(P_USER)}  `, ''],
-    ["P's mention, keeping another persona's", `${mentionText(P_USER)} ${mentionText(Q_USER, 'q')} hi`, `${mentionText(Q_USER, 'q')} hi`],
-    ["P's mention, keeping a broadcast", `${broadcastText('here')} ${mentionText(P_USER)} hi`, `${broadcastText('here')} hi`],
-    ['nothing when P is not mentioned', `${mentionText(Q_USER)} hi`, `${mentionText(Q_USER)} hi`],
-    ["nothing for an ID that starts with P's", `${mentionText(`${P_USER}X`)} hi`, `${mentionText(`${P_USER}X`)} hi`],
-  ])('strips %s', (_label, text, expected) => {
-    expect(stripPersonaMention(text, P_USER)).toBe(expected)
-  })
-
-  test.each(['', undefined])('an unknown bot user ID %p leaves the text unchanged', (botUserId) => {
-    const text = `${mentionText('')} ${mentionText(P_USER)} hi`
-    expect(stripPersonaMention(text, botUserId)).toBe(text)
   })
 })

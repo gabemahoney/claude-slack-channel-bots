@@ -53,6 +53,8 @@ Use strict TypeScript, Bun for runtime and tests, ES2022, ESNext modules with bu
 
 ## Delivery ownership and adapters
 
+Store accepted Slack text exactly as received, including mentions and whitespace. Apply terminal formatting only through `tag-wrapper.ts`. Outbound `chunkText` splits preserve exact reconstruction, retain newline delimiters, keep surrogate pairs together and bound each chunk by the positive integer limit in Unicode code points (b.iiz).
+
 Preserve the [intake](architecture.md#durable-intake-queue-bomv-sr-2sr-3), [engine](architecture.md#per-persona-delivery-engine-bomv-sr-5sr-6) and [reporting](architecture.md#delivery-reporting-and-reactions-bomv-sr-8) contracts.
 
 - Keep `decideDelivery`, `decideEngine`, `decideGate` and head selection pure. Pass observations, durable facts and constants explicitly; inject clients, receipts, queues, clocks and timers. Engines/adapters start no I/O or timers on import, so decisions can be tested independently of execution.
