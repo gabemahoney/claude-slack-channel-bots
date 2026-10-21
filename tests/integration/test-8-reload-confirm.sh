@@ -6,7 +6,7 @@
 #    is previewed: config.json.pending appears holding a preview that names
 #    that persona, each of its preview lines is logged as a `reload-preview`
 #    line, and for a full tick interval nothing is applied
-#    (config.json.last-applied keeps the start's bytes). Renaming the pending
+#    (config.json.last-applied keeps the start's authority). Renaming the pending
 #    file to config.json.apply confirms it: the server deletes .apply, logs
 #    `reload-applied`, the record now holds the configuration file's bytes,
 #    and the pending file is removed.
@@ -193,7 +193,7 @@ cp -- "${CONFIG}" "${V0_COPY}"
 # shellcheck disable=SC2119 # dry-run start: no --live
 start_server
 wait_for_file "${LAST}" "${TICK_WAIT_S}" "start never wrote config.json.last-applied"
-configuration_record_matches "${CONFIG}" "${LAST}" || fail "start: config.json.last-applied does not hold config.json's bytes"
+configuration_record_matches "${CONFIG}" "${LAST}" applied || fail "start: config.json.last-applied does not hold config.json's bytes"
 [[ ! -e "${PENDING}" ]] || fail "start: config.json.pending exists with no edit made"
 
 AUTHORITY_V0="${SCENARIO_ROOT}/authority.v0.json"
@@ -219,7 +219,7 @@ mv -f -- "${PENDING}" "${APPLY}"
 
 wait_for_log "${APPLIED_1}" "${TICK_WAIT_S}" "confirm 1: reload-applied not logged"
 [[ ! -e "${APPLY}" ]] || fail "confirm 1: config.json.apply still present after the apply"
-configuration_record_matches "${CONFIG}" "${LAST}" || fail "confirm 1: config.json.last-applied does not hold the confirmed config.json"
+configuration_record_matches "${CONFIG}" "${LAST}" applied || fail "confirm 1: config.json.last-applied does not hold the confirmed config.json"
 wait_for_log "${ALPHA_UPDATED_CHANNELS}" 10 "confirm 1: persona ${ALPHA} not updated in place"
 # The same pass removes the pending file (nothing is pending any more) and,
 # having applied, logs no reload-nothing-pending line.
@@ -277,7 +277,7 @@ mv -f -- "${PENDING}" "${APPLY}"
 
 wait_for_log "${APPLIED_2}" "${TICK_WAIT_S}" "confirm 3: reload-applied not logged"
 [[ ! -e "${APPLY}" ]] || fail "confirm 3: config.json.apply still present after the apply"
-configuration_record_matches "${CONFIG}" "${LAST}" || fail "confirm 3: config.json.last-applied does not hold the confirmed config.json"
+configuration_record_matches "${CONFIG}" "${LAST}" applied || fail "confirm 3: config.json.last-applied does not hold the confirmed config.json"
 wait_for_log "${ALPHA_UPDATED_DELIVERY}" 10 "confirm 3: persona ${ALPHA} not updated in place"
 wait_for_log "${BRAVO_UPDATED_DELIVERY}" 10 "confirm 3: persona ${BRAVO} not updated in place"
 wait_until 10 "confirm 3: config.json.pending not removed after the apply" test ! -e "${PENDING}"

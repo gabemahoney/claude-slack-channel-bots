@@ -557,7 +557,7 @@ for dir in "${ALPHA_TRANSCRIPTS}" "${BRAVO_TRANSCRIPTS}"; do
 done
 
 [[ -f "${LAST}" ]] || fail "start: config.json.last-applied was not written"
-cmp -s "${CONFIG}" "${LAST}" || fail "start: config.json.last-applied does not hold config.json's bytes"
+configuration_record_matches "${CONFIG}" "${LAST}" applied || fail "start: reviewed bytes or applied configuration differ from config.json"
 [[ ! -e "${PENDING}" ]] || fail "start: config.json.pending exists with no change made"
 check_no_leak "start"
 
@@ -608,7 +608,7 @@ expect_count "[slack] persona-credentials-change-failed:" 0 "alpha rotation: per
 
 [[ "$(inode_of "${LAST}")" != "${last_inode}" ]] \
     || fail "alpha rotation: config.json.last-applied was not rewritten by the apply"
-cmp -s "${CONFIG}" "${LAST}" || fail "alpha rotation: config.json.last-applied does not hold config.json's bytes"
+configuration_record_matches "${CONFIG}" "${LAST}" applied || fail "alpha rotation: reviewed bytes or applied configuration differ from config.json"
 [[ ! -e "${APPLY}" ]] || fail "alpha rotation: config.json.apply was not removed"
 [[ ! -e "${PENDING}" ]] || fail "alpha rotation: config.json.pending is still there after the apply"
 check_no_leak "alpha rotation applied"

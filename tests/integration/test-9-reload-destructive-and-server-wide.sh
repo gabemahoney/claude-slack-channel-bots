@@ -195,7 +195,7 @@ confirm_pending() {
 }
 
 record_port() {
-    python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["applied"]["port"])' "${LAST}" 2> /dev/null || true
+    configuration_applied_value "${CONFIG}" "${LAST}" port
 }
 
 expect_no_reload_errors() {
@@ -213,7 +213,7 @@ wait_for_log "${LISTENING_OLD}" "${START_LINE_WAIT_S}" \
 wait_for_log "${STARTUP_COMPLETE}" "${START_LINE_WAIT_S}" \
     "start: startupSessionManager never completed for 2 personas"
 port_listening "${OLD_PORT}" || fail "start: nothing answers on port ${OLD_PORT}"
-configuration_record_matches "${CONFIG}" "${LAST}" || fail "start: ${LAST} does not hold config.json's bytes"
+configuration_record_matches "${CONFIG}" "${LAST}" applied || fail "start: ${LAST} does not hold config.json's bytes"
 expect_count "${ALPHA_START}" 1 "start: persona-start lines for ${ALPHA}"
 expect_count "${ALPHA_SKIP_OLD}" 1 "start: dry-run spawn skip lines for ${ALPHA} in ${ALPHA_OLD_DIR}"
 expect_count "${BRAVO_SKIP}" 1 "start: dry-run spawn skip lines for ${BRAVO}"
@@ -277,7 +277,7 @@ got="$(count_log "(key=${BRAVO_KEY})")"
 
 [[ ! -e "${APPLY}" ]] || fail "destructive: ${APPLY} still present after the apply"
 wait_until "${SETTLE_WAIT_S}" "destructive: ${PENDING} still present after the apply" pending_gone
-configuration_record_matches "${CONFIG}" "${LAST}" || fail "destructive: ${LAST} does not hold config.json's bytes after the apply"
+configuration_record_matches "${CONFIG}" "${LAST}" applied || fail "destructive: ${LAST} does not hold config.json's bytes after the apply"
 expect_no_reload_errors destructive
 
 # --- 2. Server-wide change: port ------------------------------------------
@@ -309,7 +309,7 @@ expect_log "${APPLIED_PORT}" "port: reload-applied line lacks '$(counts settings
 
 got="$(record_port)"
 [[ "${got}" == "${NEW_PORT}" ]] || fail "port: ${LAST} holds port '${got}', expected ${NEW_PORT}"
-configuration_record_matches "${CONFIG}" "${LAST}" || fail "port: ${LAST} does not hold config.json's bytes after the apply"
+configuration_record_matches "${CONFIG}" "${LAST}" applied || fail "port: ${LAST} does not hold config.json's bytes after the apply"
 [[ ! -e "${APPLY}" ]] || fail "port: ${APPLY} still present after the apply"
 wait_until "${SETTLE_WAIT_S}" "port: ${PENDING} still present after the apply" pending_gone
 

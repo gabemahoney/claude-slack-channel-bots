@@ -24,7 +24,7 @@
 #   MCP sessions registered; a push to an unknown label is refused
 #   (`no-open-socket`) with its `push-refused` record line.
 # - A, a 0.11.x configuration (the upgrade path): neither key of this
-#   work; config.json equals its copy and the last-applied record; no
+#   work; config.json equals its copy and the authority's reviewed input; no
 #   stored-choice file; no server.log line names the switch's key, fungible
 #   mode or a class this work adds. alpha A1 plain is delivered `receive_all`
 #   (the first-delivery control); U1, unlisted, one mention as both its
@@ -859,7 +859,7 @@ check_upgrade_log() {
 
 cmp -s -- "${CONFIG}" "${CONFIG_A_COPY}" || fail "phase A: config.json is not its copy, byte for byte"
 [[ -f "${LAST}" ]] || fail "phase A: config.json.last-applied was not written"
-configuration_record_matches "${CONFIG}" "${LAST}" || fail "phase A: config.json.last-applied does not hold config.json's bytes"
+configuration_record_matches "${CONFIG}" "${LAST}" applied || fail "phase A: reviewed bytes or applied configuration differ from config.json"
 [[ ! -e "${SLACK_STATE_DIR}/channel-delivery.json" ]] || fail "phase A: a legacy store was created"
 check_upgrade_log "phase A after the start"
 
@@ -911,7 +911,8 @@ check_upgrade_log "phase A after its last control"
 # persona's registration and launch lines (launch_counts), write the
 # configuration of that shape, wait for the pending file to carry the
 # switch's line, confirm it and wait for its applied line; config.json's
-# last-applied record then holds its bytes.
+# authority then preserves its reviewed bytes; automatic channel choices may
+# differ in the applied view, independently validated by the production parser.
 confirm_switch() {
     local shape="$1" line="$2" step="$3" applied_before
     ALPHA_LAUNCHES="$(launch_counts "${ALPHA_REF}" "${ALPHA_START}" "${ALPHA_RELAUNCH}")"
@@ -926,7 +927,7 @@ confirm_switch() {
     cmp -s -- "${authority_before}" "${LAST}" || fail "${step}: authority envelope changed before confirmation"
     mv -f -- "${PENDING}" "${APPLY}"
     wait_for_count "${APPLIED_CLASS}" $(( applied_before + 1 )) "${APPLY_WAIT_S}" "${step}: the confirmation was never applied"
-    configuration_record_matches "${CONFIG}" "${LAST}" || fail "${step}: config.json.last-applied does not hold config.json's bytes"
+    configuration_record_matches "${CONFIG}" "${LAST}" reviewed || fail "${step}: authority does not preserve the reviewed config.json bytes"
 }
 
 # expect_sessions_kept <step> <alpha-channel> <alpha-ts> <bravo-channel> <bravo-ts>:

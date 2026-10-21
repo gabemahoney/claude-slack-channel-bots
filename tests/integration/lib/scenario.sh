@@ -5675,18 +5675,23 @@ queue_accepted() {
         || fail "queue_accepted: could not read accepted queue records"
 }
 
-# Compare submitted configuration with the source retained by the production authority.
-# Successful application retains the exact reviewed bytes, including formatting.
+# Production-validated authority and byte-exact reviewed input. The optional
+# applied comparison also requires the resolved applied settings to match;
+# reviewed permits valid automatic channel changes independent of the input.
 configuration_record_matches() {
-    python3 - "$1" "$2" <<'PY_RECORD'
-import base64, json, sys
-with open(sys.argv[1], "rb") as f:
-    expected = f.read()
-with open(sys.argv[2]) as f:
-    authority = json.load(f)
-assert authority['format'] == 'cscb-shared-channels-v1'
-assert isinstance(authority['revision'], int) and authority['revision'] >= 1
-assert base64.b64decode(authority['sourceBytesBase64'], validate=True) == expected
-assert authority['source'] == json.loads(expected)
-PY_RECORD
+    require_ci_image "configuration_record_matches"
+    bun "${SCENARIO_FIXTURES}/fmk-texts.ts" sharedConfigurationMatches "$1" "$2" "${3:-reviewed}"
+}
+
+# Safe applied-setting projection; neither reads pending config.json bytes.
+configuration_applied_value() {
+    require_ci_image "configuration_applied_value"
+    bun "${SCENARIO_FIXTURES}/fmk-texts.ts" sharedConfigurationValue "$1" "$2" "$3"
+}
+
+configuration_applied_is() {
+    require_ci_image "configuration_applied_is"
+    local value
+    value="$(configuration_applied_value "$1" "$2" "$3")" || return 1
+    [[ "${value}" == "$4" ]]
 }

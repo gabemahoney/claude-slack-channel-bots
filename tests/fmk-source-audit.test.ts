@@ -105,8 +105,11 @@ import { existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, readlink
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import ts from 'typescript'
+import type { PersonaConfigInput } from '../src/config.ts'
+import { createSharedChannelAuthority } from '../src/shared-channels.ts'
 import { assertNoLeak, writtenFile } from './test-helpers/credentials.ts'
 import { hostSafeChildEnv } from './test-helpers/host-safe-env.ts'
+import { configBytes, makeSharedAuthority, readSharedState } from './test-helpers/shared-channels.ts'
 
 import { AD_ERROR_CLASS_CONFIG, AD_ERROR_CLASS_CONFLICT, AD_ERROR_CLASS_UNAVAILABLE, AD_ERROR_CLASS_UNCLASSIFIED, AD_ERROR_CLASS_UNUSABLE_NAME, classifyAdError, LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE, launchTimeoutFormOf } from '../src/ad-error-class.ts'
 import { LAUNCH_TIMEOUT_PHRASE } from '../src/ad-description-phrases.ts'
@@ -2193,6 +2196,67 @@ printf 'RESULT=%s' "$?"`, ['jq', 'grep'])
     expect(classifyAdError(err)).toEqual({ errorClass: AD_ERROR_CLASS_CONFIG, reportedName: 'ErrConfigMalformed', message: 'invalid timer' })
     expect(adConfigMalformedOnset(err)).toContain('invalid timer')
     await expect(decode('adConfigMalformedOnset', 'bad', { importAgentDirectorClient: async () => ({}) })).rejects.toThrow('native malformed-config')
+  })
+  test.each([
+    ['J', 't19_leg_removed_readded', 'the re-add'],
+    ['K', 't19_leg_credentials_changed', 'the change'],
+  ] as const)('test-19 %s reviews a fresh channel choice at the identity reset', (prefix, legName, step) => {
+    const source = readFileSync(join(import.meta.dir, 'integration/test-19-fmk-reuse.sh'), 'utf8')
+    const leg = helper(legName, source)
+    // The config function contains a JSON heredoc with its own closing brace.
+    const configBuilder = source.match(/^t19_config\(\) \{\n[\s\S]*?^EOF\n\}/m)
+    expect(configBuilder).not.toBeNull()
+    const apply = leg.indexOf(`    t19_apply_config "\${step}: ${step}"`)
+    const editStart = leg.lastIndexOf('    t19_mark\n', apply)
+    expect(apply).toBeGreaterThan(-1)
+    expect(editStart).toBeGreaterThan(-1)
+    // Run only the config builders and the actual operator-edit fragment.
+    // No harness sourcing, lifecycle function, AD/tmux or server is run.
+    const configs = shell(`set -eu
+${helper('t19_persona_json', source)}
+${configBuilder![0]}
+${prefix}_NAME=fixture
+${prefix}_CREDS="$HOME/first.json"
+${prefix}_CREDS_TWO="$HOME/second.json"
+${prefix}_WORK="$HOME/work"
+${prefix}_CFG="$HOME/claude"
+${prefix}_CHANNEL=C0TEST001
+SCENARIO_PORT=12345
+step=fixture
+write_config() { jq -c .; }
+t19_mark() { MARK_TIME=0; }
+t19_apply_config() { shift 4; t19_config true "$@"; }
+t19_config true ${prefix}
+${prefix === 'J' ? 't19_config true' : ''}
+${leg.slice(editStart, leg.indexOf('\n', apply))}`, ['jq'])
+      .split('\n').map(line => JSON.parse(line) as PersonaConfigInput)
+    expect(configs).toHaveLength(prefix === 'J' ? 3 : 2)
+    let authority = makeSharedAuthority(home, configs[0]!)
+    const original = authority.config().personas[0]!
+    const oldLife = authority.incarnation(original.key)
+    expect(original.channels).toEqual([{ id: 'C0TEST001', delivery: 'all' }])
+    expect(original.dm.enabled).toBe(false)
+    if (prefix === 'J') {
+      expect(authority.applyReviewed(configBytes(configs[1]), authority.revision).kind).toBe('applied')
+      authority = createSharedChannelAuthority(authority.path, readSharedState(home)!)
+      expect(authority.config().personas).toEqual([])
+    }
+    const edited = configs.at(-1)!
+    const copied = structuredClone(edited)
+    copied.personas[0]!.channels = structuredClone(configs[0]!.personas[0]!.channels)
+    expect(() => authority.previewReviewed(configBytes(copied))).toThrow('no channels')
+    const bytes = configBytes(edited)
+    const preview = authority.previewReviewed(bytes).personas[0]!
+    expect(preview.channels).toEqual([{ id: 'C0TEST001', delivery: 'mentions' }])
+    expect(preview.dm.enabled).toBe(false)
+    expect(preview.permission_prompts).toBe(original.permission_prompts)
+    expect(preview.working_directory).toBe(original.working_directory)
+    expect(preview.credentials_file).toBe(join(home, prefix === 'J' ? 'first.json' : 'second.json'))
+    expect(authority.applyReviewed(bytes, authority.revision).kind).toBe('applied')
+    expect(authority.incarnation(original.key)).not.toBe(oldLife)
+    expect(authority.config().personas).toEqual([preview])
+    expect(authority.sourceBytes()).toEqual(bytes)
+    assertNoLeak(authority.snapshot())
   })
   test.each([
     ['valid', { session_id: 'new', prior_sessions: [{ session_id: 'old', jsonl_path: '/archived' }] }, true],

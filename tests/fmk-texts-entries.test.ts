@@ -77,10 +77,12 @@ import * as personaIdentity from '../src/persona-identity.ts'
 import * as personaNotifier from '../src/persona-notifier.ts'
 import * as registry from '../src/registry.ts'
 import * as reloadApply from '../src/reload-apply.ts'
+import * as reload from '../src/reload.ts'
 import * as reloadPlan from '../src/reload-plan.ts'
 import * as restart from '../src/restart.ts'
 import * as rowReadRules from '../src/row-read-rules.ts'
 import * as sessionManager from '../src/session-manager.ts'
+import * as sharedChannels from '../src/shared-channels.ts'
 import * as testTimerOverrides from '../src/test-timer-overrides.ts'
 import * as unavailableRetry from '../src/unavailable-retry.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
@@ -117,10 +119,12 @@ const MODULES: Readonly<Record<string, Readonly<Record<string, unknown>>>> = {
   'persona-notifier.ts': personaNotifier,
   'registry.ts': registry,
   'reload-apply.ts': reloadApply,
+  'reload.ts': reload,
   'reload-plan.ts': reloadPlan,
   'restart.ts': restart,
   'row-read-rules.ts': rowReadRules,
   'session-manager.ts': sessionManager,
+  'shared-channels.ts': sharedChannels,
   'test-timer-overrides.ts': testTimerOverrides,
   'unavailable-retry.ts': unavailableRetry,
 }
@@ -431,6 +435,15 @@ describe("the printer's references (tests/integration/fixtures/fmk-texts.ts)", (
   // Scenario 20's references (test-23), each `<file>:<export>:<kind>`, with
   // what the scenario reads of the value beyond its kind, when it reads more.
   const named = new Set(reading.refs.map((r) => `${r.file}:${r.name}:${r.kind}`))
+  test.each([
+    'config.ts:readPersonaConfigBytes:function',
+    'config.ts:parsePersonaConfigBytes:function',
+    'shared-channels.ts:parseSharedChannelState:function',
+    'shared-channels.ts:sharedAppliedConfig:function',
+    'reload.ts:reloadSharedAuthorityStartLine:function',
+  ])('shared-authority assertions use the production export %s', ref => {
+    expect(named.has(ref)).toBe(true)
+  })
   const scenario20Values: Readonly<Record<string, () => void>> = {
     // test-23 prints `AD_SETTING_MINIMUMS` for the two keys it writes at their
     // minimums, `starting_session_seconds` and `stopping_window_seconds`, and

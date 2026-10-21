@@ -17,7 +17,9 @@ real_write_config '{"resume_enabled":false}'
 jq 'del(.test_mcp_drop_endpoint)' "${SLACK_STATE_DIR}/config.json" | write_config
 wait_for_file "${SLACK_STATE_DIR}/config.json.pending" 30 'resume=false preview absent'
 mv "${SLACK_STATE_DIR}/config.json.pending" "${SLACK_STATE_DIR}/config.json.apply"
-wait_until 30 'resume=false was not confirmed' jq -e '.resume_enabled == false' "${SLACK_STATE_DIR}/config.json.last-applied"
+wait_until 30 'resume=false was not confirmed' configuration_applied_is "${SLACK_STATE_DIR}/config.json" "${SLACK_STATE_DIR}/config.json.last-applied" resume_enabled false
+configuration_record_matches "${SLACK_STATE_DIR}/config.json" "${SLACK_STATE_DIR}/config.json.last-applied" applied \
+    || fail 'disable-resume confirmation did not preserve reviewed bytes and applied configuration'
 echo 'recorded: R55 step 2 resume_enabled=false confirmed'
 stop_server --stop-bots
 PREVIOUS="/opt/claude-slack-channel-bots-0.16.1/claude-slack-channel-bots-0.16.1.tgz"
@@ -44,6 +46,7 @@ echo 'recorded: R55 step 4 prior release started fresh with channels'
 jq '.resume_enabled = true' "${SLACK_STATE_DIR}/config.json" | write_config
 wait_for_file "${SLACK_STATE_DIR}/config.json.pending" 30 'resume=true preview absent'
 mv "${SLACK_STATE_DIR}/config.json.pending" "${SLACK_STATE_DIR}/config.json.apply"
+# This assertion runs against the installed previous release's raw baseline.
 wait_until 30 'resume=true was not confirmed' jq -e '.resume_enabled == true' "${SLACK_STATE_DIR}/config.json.last-applied"
 echo 'recorded: R55 resume_enabled=true confirmed'
 # The shared EXIT hook reports launch usage once, after bot teardown.

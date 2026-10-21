@@ -56,6 +56,13 @@
  *
  * ENTRIES (each named after its `src/` export)
  * -------
+ *   sharedConfigurationMatches <config-path> <record-path> <reviewed|applied>
+ *       Validate the whole shared authority and exact reviewed input; applied
+ *       also compares resolved applied configuration with that input.
+ *   sharedConfigurationValue <config-path> <record-path> <port|resume_enabled>
+ *       Print only the named safe applied setting, never pending input.
+ *   reloadSharedAuthorityStartLine <config-path> <record-path>
+ *       Build the production startup line using the validated record revision.
  *   PHASE1_FLOOR_VERSION                         src/ad-version-gate.ts, the Phase 1 floor
  *   AD_BELOW_PHASE1_FLOOR                        src/install-check-labels.ts, sentinel guard class
  *   AD_SYSTEM_INSTALL_TOO_OLD                   src/install-check-labels.ts, native minimum class
@@ -1120,7 +1127,8 @@
  * opens no socket, reads no token and writes no file.
  */
 import { existsSync } from 'node:fs'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
+import { isDeepStrictEqual } from 'node:util'
 
 if (!existsSync('/etc/cscb-ci-image')) {
   console.error('FAIL: fmk-texts: refused: /etc/cscb-ci-image is absent; this printer runs only in a cscb-ci image (/ci)')
@@ -3959,8 +3967,82 @@ const deliverySetResult: Entry = {
   },
 }
 
+/** Read and validate the entire authority with the installed production reader.
+ * These entries print only a boolean/number or a production diagnostic, never
+ * submitted configuration, credentials, parser errors or arbitrary fields.
+ */
+async function readSharedConfiguration(context: EntryContext, configPath: string, recordPath: string) {
+  const read = await packageFunction<(path: string) => Uint8Array>(context, 'config.ts', 'readPersonaConfigBytes')
+  const parse = await packageFunction<(bytes: Uint8Array, path: string, deps: { sourcePath: string }) =>
+    { sourceBytesBase64: string; revision: number } | undefined>(context, 'shared-channels.ts', 'parseSharedChannelState')
+  const applied = await packageFunction<(state: object, path: string) => { port: number; resume_enabled: boolean }>(
+    context, 'shared-channels.ts', 'sharedAppliedConfig')
+  try {
+    const state = parse(read(recordPath), recordPath, { sourcePath: configPath })
+    if (!state) throw new Error()
+    return { state, applied: applied(state, configPath), read }
+  } catch {
+    throw new PrinterFailure('shared configuration authority could not be read or validated', PRINTER_FAIL_EXIT)
+  }
+}
+
+// sharedConfigurationMatches <config-path> <record-path> <reviewed|applied>:
+// both require byte-exact reviewed input; applied additionally requires the
+// resolved applied configuration to equal that input. Reviewed-only callers
+// may have legitimate automatic channel changes, which the parser validates.
+const sharedConfigurationMatches: Entry = {
+  synopsis: '<config-path> <record-path> <reviewed|applied>',
+  async print(args, context) {
+    expectArguments('sharedConfigurationMatches', args, ['config-path', 'record-path', 'comparison'])
+    const [configPath, recordPath, comparison] = args
+    if (comparison !== 'reviewed' && comparison !== 'applied') usageFail('comparison must be reviewed or applied')
+    const { state, applied, read } = await readSharedConfiguration(context, configPath, recordPath)
+    const parse = await packageFunction<(bytes: Uint8Array, path: string, dir: string) => unknown>(
+      context, 'config.ts', 'parsePersonaConfigBytes')
+    try {
+      const expected = read(configPath)
+      if (!Buffer.from(state.sourceBytesBase64, 'base64').equals(expected)) throw new Error()
+      if (comparison === 'applied' && !isDeepStrictEqual(applied, parse(expected, configPath, dirname(configPath)))) throw new Error()
+    } catch {
+      throw new PrinterFailure('shared configuration does not preserve the expected reviewed input or applied configuration', PRINTER_FAIL_EXIT)
+    }
+    return ''
+  },
+}
+
+// sharedConfigurationValue <config-path> <record-path> <port|resume_enabled>:
+// the applied view only, never the pending input or an arbitrary JSON path.
+const sharedConfigurationValue: Entry = {
+  synopsis: '<config-path> <record-path> <port|resume_enabled>',
+  async print(args, context) {
+    expectArguments('sharedConfigurationValue', args, ['config-path', 'record-path', 'setting'])
+    const [configPath, recordPath, setting] = args
+    if (setting !== 'port' && setting !== 'resume_enabled') usageFail('setting must be port or resume_enabled')
+    const { applied } = await readSharedConfiguration(context, configPath, recordPath)
+    const value = applied[setting]
+    if (setting === 'port' ? !Number.isSafeInteger(value) : typeof value !== 'boolean') {
+      throw new PrinterFailure('shared configuration setting has an unexpected type', PRINTER_FAIL_EXIT)
+    }
+    return String(value)
+  },
+}
+
+const sharedAuthorityStartLine: Entry = {
+  synopsis: '<config-path> <record-path>',
+  async print(args, context) {
+    expectArguments('reloadSharedAuthorityStartLine', args, ['config-path', 'record-path'])
+    const [configPath, recordPath] = args
+    const { state } = await readSharedConfiguration(context, configPath, recordPath)
+    const build = await packageFunction<(path: string, revision: number) => string>(context, 'reload.ts', 'reloadSharedAuthorityStartLine')
+    return build(recordPath, state.revision)
+  },
+}
+
 /** The printer's entries, by the name a script passes. Later scenarios add entries here. */
 const ENTRIES: Readonly<Record<string, Entry>> = joinEntryTables({
+  sharedConfigurationMatches,
+  sharedConfigurationValue,
+  reloadSharedAuthorityStartLine: sharedAuthorityStartLine,
   // Scenario 8 (test-20-fmk-old-binary.sh).
   PHASE1_FLOOR_VERSION: constantEntry('ad-version-gate.ts', 'PHASE1_FLOOR_VERSION'),
   AD_BELOW_PHASE1_FLOOR: constantEntry('install-check-labels.ts', 'AD_BELOW_PHASE1_FLOOR'),

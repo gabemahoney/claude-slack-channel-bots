@@ -193,11 +193,12 @@ printf '{"bot_token": "%s", "app_token": "%s"}\n' \
 
 # t19_persona_json <prefix>: one persona entry: its credentials file, working
 # directory, claude_config_dir and one channel, which also takes its
-# permission prompts (its destination).
+# permission prompts (its destination). A leg can explicitly review a new
+# channel choice with <prefix>_DELIVERY; other legs keep all.
 t19_persona_json() {
-    local n="$1_NAME" cr="$1_CREDS" w="$1_WORK" c="$1_CFG" ch="$1_CHANNEL"
-    printf '{"name": "%s", "credentials_file": "%s", "working_directory": "%s", "claude_config_dir": "%s", "channels": [{"id": "%s", "delivery": "all"}], "permission_prompts": "%s"}' \
-        "${!n}" "${!cr}" "${!w}" "${!c}" "${!ch}" "${!ch}"
+    local n="$1_NAME" cr="$1_CREDS" w="$1_WORK" c="$1_CFG" ch="$1_CHANNEL" delivery="$1_DELIVERY"
+    printf '{"name": "%s", "credentials_file": "%s", "working_directory": "%s", "claude_config_dir": "%s", "channels": [{"id": "%s", "delivery": "%s"}], "permission_prompts": "%s"}' \
+        "${!n}" "${!cr}" "${!w}" "${!c}" "${!ch}" "${!delivery:-all}" "${!ch}"
 }
 
 T19_RECORD_ASIDE=0
@@ -1288,8 +1289,10 @@ t19_leg_removed_readded() {
     t19_start_and_wait 0
 
     # 4. The operator adds J back, with the same key, working directory and
-    #    claude_config_dir, and confirms the apply; J reports in.
+    #    claude_config_dir, and confirms the apply; J reports in. Deliberately
+    #    change all to mentions: a copied old choice resets with the identity.
     t19_mark
+    J_DELIVERY=mentions
     t19_apply_config "${step}: the re-add" 1 0 0 J
     wait_until "${ROW_WAIT_S}" "${step}: ${id} never read waiting with a new session after the re-add" t19_row_waiting_new "${id}" "${old_sid}"
 
@@ -1327,10 +1330,12 @@ t19_leg_credentials_changed() {
 
     # 2. The operator points K's credentials_file at the second file and
     #    confirms the apply: a destructive modify, whose old half's teardown
-    #    ends K's session and whose new half brings K up.
+    #    ends K's session and whose new half brings K up. Review mentions for
+    #    the new identity instead of inheriting its copied old all choice.
     t19_mark
     change_t="${MARK_TIME}"
     K_CREDS="${K_CREDS_TWO}"
+    K_DELIVERY=mentions
     t19_apply_config "${step}: the change" 0 0 1 K
     wait_until "${ROW_WAIT_S}" "${step}: ${id} never read waiting with a new session after the change" t19_row_waiting_new "${id}" "${old_sid}"
     # Working default: by now the new life may have begun and its entry been

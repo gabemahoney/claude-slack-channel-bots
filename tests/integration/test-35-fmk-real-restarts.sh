@@ -23,7 +23,9 @@ for mode in restart resume fresh upgrade; do
         real_write_config "{\"resume_enabled\":${RESUME},\"session_restart_delay\":0}"
         wait_for_file "${SLACK_STATE_DIR}/config.json.pending" 30 'resume setting not previewed'
         mv "${SLACK_STATE_DIR}/config.json.pending" "${SLACK_STATE_DIR}/config.json.apply"
-        wait_until 30 'resume setting not applied' jq -e --argjson resume "${RESUME}" '.resume_enabled == $resume' "${SLACK_STATE_DIR}/config.json.last-applied"
+        wait_until 30 'resume setting not applied' configuration_applied_is "${SLACK_STATE_DIR}/config.json" "${SLACK_STATE_DIR}/config.json.last-applied" resume_enabled "${RESUME}"
+        configuration_record_matches "${SLACK_STATE_DIR}/config.json" "${SLACK_STATE_DIR}/config.json.last-applied" applied \
+            || fail 'resume confirmation did not preserve reviewed bytes and applied configuration'
     fi
     # Block a pending head so the lifecycle transition really is mid-queue.
     real_fault send-keys no_enter swallow 1
