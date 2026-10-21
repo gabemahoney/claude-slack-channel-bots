@@ -330,7 +330,7 @@ export interface ServerSettingsInput {
    */
   resume_enabled?: boolean
   /**
-   * Stop-hook bootstrap guard opt-out (SR-4.1–SR-4.5). Defaults to true when
+   * Legacy name for the AD-state reply reminder opt-out. Defaults to true when
    * absent at the top level. A persona entry may override it; a persona that
    * does not inherits this value (`Persona.stop_hook_bootstrap`).
    */
@@ -405,7 +405,7 @@ export interface ServerSettings {
   /** When false, --resume is skipped on startup and bots always launch fresh. Defaults to true. */
   resume_enabled: boolean
   /**
-   * Resolved Stop-hook bootstrap guard flag (SR-4.1–SR-4.5). Defaults to true
+   * Resolved reply reminder flag (the legacy setting name is retained). Defaults to true
    * when absent at the top level. The effective value for a persona is
    * `Persona.stop_hook_bootstrap`: its own value, else this one.
    */
@@ -499,7 +499,7 @@ export interface PersonaInput {
   invited?: PersonaInvitedInput
   /** Per-persona Claude config dir: absolute, `~` or `~/…`. Defaults to the top-level value. */
   claude_config_dir?: string
-  /** Per-persona Stop-hook bootstrap flag. Defaults to the top-level value. */
+  /** Per-persona reply reminder flag (legacy setting name). Defaults to the top-level value. */
   stop_hook_bootstrap?: boolean
 }
 
@@ -572,7 +572,7 @@ export interface Persona {
    * value, else absent (Claude's own default applies). Absolute.
    */
   claude_config_dir?: string
-  /** Effective Stop-hook bootstrap flag: the per-persona value, else the top-level value. */
+  /** Effective reply reminder flag: the per-persona value, else the top-level value. */
   stop_hook_bootstrap: boolean
 }
 

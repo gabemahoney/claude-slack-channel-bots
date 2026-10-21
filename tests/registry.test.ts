@@ -1341,6 +1341,55 @@ describe('tool posting scope (through the MCP server)', () => {
 // DM targets, gated by the persona's DMs switch (b.av2 SR-5.1)
 // ---------------------------------------------------------------------------
 
+describe('reply reminder tool facts (b.js7)', () => {
+  test.each(['success', 'Slack failure', 'target refusal', 'dry run'] as const)('%s: reply records its own persona before scope validation or Slack outcome', async outcome => {
+    const keys: string[] = []
+    const deps = { ...h.deps, onReplyCall: async (key: string) => {
+      expect(totalSlackCalls()).toBe(0)
+      keys.push(key)
+    } }
+    if (outcome === 'Slack failure') stubOf(h.alpha).script.post.push({ kind: 'platform', error: 'not_in_channel' })
+    if (outcome === 'dry run') process.env['SLACK_DRY_RUN'] = '1'
+    const entry = registerSession(h.alpha.working_directory, h.alpha.key, makeTransport(), makeServer())
+    const session = await openSession(entry, deps)
+    const result = await session.call('reply', TOOL_ARGS.reply(outcome === 'target refusal' ? B_CHANNEL : A_ALL))
+    expect(keys).toEqual([h.alpha.key])
+    expect(result.isError === true).toBe(outcome === 'Slack failure' || outcome === 'target refusal')
+    expect(slackCallCount(stubOf(h.beta))).toBe(0)
+    if (outcome === 'target refusal' || outcome === 'dry run') expectNoSlackCall()
+  })
+
+  test('a reply waits for its durable fact before posting, while other tools create no reply fact', async () => {
+    let release!: () => void
+    let entered!: () => void
+    const started = new Promise<void>(resolve => { entered = resolve })
+    const durable = new Promise<void>(resolve => { release = resolve })
+    const keys: string[] = []
+    const entry = registerSession(h.alpha.working_directory, h.alpha.key, makeTransport(), makeServer())
+    const session = await openSession(entry, { ...h.deps, onReplyCall: async key => { keys.push(key); entered(); await durable } })
+    const replying = session.call('reply', TOOL_ARGS.reply(A_ALL))
+    await started
+    expectNoSlackCall()
+    release()
+    expect((await replying).isError).toBeUndefined()
+    expect(stubOf(h.alpha).calls.postMessage).toHaveLength(1)
+    await session.call('react', TOOL_ARGS.react(A_ALL))
+    expect(keys).toEqual([h.alpha.key])
+  })
+
+  test('an unmatched or removed persona creates no reply fact', async () => {
+    const keys: string[] = [], deps = { ...h.deps, onReplyCall: (key: string) => { keys.push(key) } }
+    const pending = await openSession(makePendingStub(), deps)
+    expect((await pending.call('reply', TOOL_ARGS.reply(A_ALL))).isError).toBe(true)
+    const entry = registerSession(h.alpha.working_directory, h.alpha.key, makeTransport(), makeServer())
+    const session = await openSession(entry, deps)
+    h.personas.delete(h.alpha.key)
+    expect((await session.call('reply', TOOL_ARGS.reply(A_ALL))).isError).toBe(true)
+    expect(keys).toEqual([])
+    expectNoSlackCall()
+  })
+})
+
 describe('DM targets (through the MCP server)', () => {
   const D = 'D0DIRECT1'
   const U = 'U0USER001'

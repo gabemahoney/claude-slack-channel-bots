@@ -441,7 +441,7 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
     // Functions and objects with a parameter name of the source's choosing.
     // (`templateRefresh` is pinned in the test after this one.)
     const shaped = [
-      'log', 'replyGuard', 'storageCheck', 'launch', 'templateRefresh',  'stopDelivery', 'stopLiveRowSequence', 'stopRetryTimer',
+      'log', 'forgetReplyReminders', 'storageCheck', 'launch', 'templateRefresh',  'stopDelivery', 'stopLiveRowSequence', 'stopRetryTimer',
       'forgetConflictLatch', 'forgetInvalidFlagsHold', 'forgetNoticeEpisodes', 'killInstance', 'raiseKillFailureAlert',
     ]
     expect([...props.keys()].sort()).toEqual([...expected.keys(), ...shaped].sort())
@@ -468,9 +468,6 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
       getOutageFlags: './outage-state.ts',
       forgetPersonaPrompts: './permission-poller.ts',
       forgetPersonaAcks: './ack-tracker.ts',
-      getLaunchedWithDir: './stop-hook-bootstrap.ts',
-      teardownPersonaReplyGuard: './stop-hook-bootstrap.ts',
-      stopHookLaunchPass: './stop-hook-bootstrap.ts',
       runPersonaStorageCheck: './jsonl-persistence-check.ts',
       createUnavailableRetryController: './unavailable-retry.ts',
       UNAVAILABLE_RETRY_STOP_TORN_DOWN: './unavailable-retry.ts',
@@ -500,28 +497,14 @@ describe('server.ts binds the confirmed apply\'s teardown, in-place update, cred
     // The log is the server log.
     expect(props.get('log')).toMatch(/^\(?\s*(\w+)\s*\)?\s*=>\s*console\s*\.\s*error\s*\(\s*\1\s*\)$/)
 
-    // The reply guard's teardown and launch pass use the server's state dir,
-    // the one the start's stop-hook bootstrap writes.
-    const stateDir = splitTopLevel(onlyCallArguments(SERVER_CODE, 'stopHookBootstrap'))[1]
-    expect(stateDir).toMatch(/^\w+$/)
-    const guard = objectProperties(props.get('replyGuard') ?? '')
-    expect([...guard.keys()].sort()).toEqual(['launchPass', 'launchedWithDir', 'teardown'])
-    expect(guard.get('launchedWithDir')).toBe('getLaunchedWithDir')
-    const teardown = (guard.get('teardown') ?? '').match(new RegExp(`^\\(?(\\w+)\\)? => teardownPersonaReplyGuard\\(${stateDir}, (\\w+)\\)$`))
-    expect(teardown).not.toBeNull()
-    expect(teardown![2]).toBe(teardown![1])
-    const launchPass = (guard.get('launchPass') ?? '').match(
-      new RegExp(`^\\((\\w+), (\\w+)\\) => stopHookLaunchPass\\((\\w+), (\\w+), ${stateDir}\\)$`),
-    )
-    expect(launchPass).not.toBeNull()
-    expect([launchPass![3], launchPass![4]]).toEqual([launchPass![1], launchPass![2]])
+    expect(props.get('forgetReplyReminders')).toMatch(/^\(?key\)? => replyReminders\?\.forget\(key\) \?\? Promise\.resolve\(\)$/)
 
     // Teardown stops delivery and forgets its lifecycle for this key.
     const stopBody = props.get('stopDelivery') ?? ''
     const stopDelivery = stopBody.match(/^async \(?(\w+)\)? => \{ const (\w+) = /)
     expect(stopDelivery).not.toBeNull()
     const [, stopKey, stoppingDelivery] = stopDelivery!
-    expect(stopBody).toBe(`async (${stopKey}) => { const ${stoppingDelivery} = deliveryEngines?.forget(${stopKey}); deliveryLifecycle?.forget(${stopKey}); await ${stoppingDelivery} }`)
+    expect(stopBody).toBe(`async (${stopKey}) => { const ${stoppingDelivery} = deliveryEngines?.forget(${stopKey}); deliveryLifecycle?.forget(${stopKey}); const remindersStopping = replyReminders?.forget(${stopKey}); await Promise.all([${stoppingDelivery}, remindersStopping]) }`)
 
     // b.jg5 SRJ-706, SRJ-715: optional in the deps, so only this pin makes
     // sure a production teardown stops the key's live-row sequence (right

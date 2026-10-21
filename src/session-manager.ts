@@ -223,11 +223,6 @@
  * calls the installed pre-launch trust patcher (`setPreLaunchTrustPatcher`,
  * b.av2 SR-6.2), so the persona's `.claude.json` trust flags are set before
  * any spawn or resume.
- * Immediately before each `client.spawn` / `client.resume` it calls the
- * installed pre-launch reply guard (`setPreLaunchReplyGuard`, b.av2 SR-9.4):
- * the persona's reply-guard record, launched-with dir and managed Stop hook.
- * A path that only reconnects to a live instance or does nothing runs no
- * reply-guard step (the optimistic spawn's steps are undone on a collision).
  *
  * The start sweep (`reconcileOrphans`, b.av2 SR-6.3, b.jg5 SRJ-116,
  * SRJ-714) makes one `list` of every `service=cscb` row in every state; a
@@ -418,6 +413,7 @@
  */
 
 import { ENTER_DELAY_MS } from './delivery-constants.ts'
+import { REPLY_TOOL_PREALLOWED_LABEL } from './reply-reminder.ts'
 import type { DeliveryLifecycle, ReconnectInput } from './delivery-lifecycle.ts'
 import { deliveryTextWasRefused } from './delivery-engine.ts'
 import { decideGate, createDeliveryPolicyState, type DeliveryReading } from './delivery-policy.ts'
@@ -838,7 +834,6 @@ import {
 } from './old-life-wait.ts'
 import { recordStartupError } from './startup-errors.ts'
 import type { SessionHeldDirectory } from './registry.ts'
-import type { ReplyGuardUndo } from './stop-hook-bootstrap.ts'
 import {
   PERSONA_TEARDOWN_NOTICE_DURING_WAIT,
   PERSONA_TEARDOWN_NOTICE_LABEL,
@@ -1553,7 +1548,7 @@ function heldGateReadingOf(key: string): { readonly failure?: string } | undefin
  * held on `ErrInvalidFlags` (a held query that throws counts as held) and is
  * not latched (the latched gate answers for a latched one), log one line
  * (`invalidFlagsHeldNoLaunchLine`) and answer the `held` result: no
- * agent-director call, no trust patch, no reply-guard step, no record
+ * agent-director call, no trust patch, no record
  * written, nothing armed and nothing counted. Otherwise undefined.
  */
 function heldResult(key: string, ref: string, site: string): SpawnPersonaResult | undefined {
@@ -6326,7 +6321,7 @@ export interface SpawnPersonaResult {
     /**
      * b.jg5 SRJ-706: a live-row sequence runs for the persona
      * (`isLiveRowSequenceRunning`), so no other launch for it starts: no
-     * agent-director call, no trust patch, no reply-guard step, no record
+     * agent-director call, no trust patch, no record
      * written, and nothing armed. Not a failure: `launchSession` maps it to
      * the uncounted `'refused'` (SRJ-1015), so a retry that meets it re-arms
      * the persona's retry timer (SRJ-302), and the start pass counts it
@@ -6448,7 +6443,7 @@ export function checkLaunchConfigDir(persona: Persona): ConfigDirCheckResult {
 export type ConfigDirUnresolvableHook = (persona: Persona, failure: PersonaCheckFailure) => boolean
 
 /**
- * The one hook, installed like the pre-launch reply guard. With none installed
+ * The one hook installed by the server. With none installed
  * (unit tests, the integration driver), or when it does not hold the persona,
  * the failure line is logged here, on every attempt.
  */
@@ -6582,6 +6577,7 @@ function buildSpawnParams(persona: Persona, config: PersonaConfig, configDirLabe
     label: [
       SERVICE_LABEL,
       'tag_prompt=1', // b.omv SR-7.6: every plain and reuse spawn.
+      REPLY_TOOL_PREALLOWED_LABEL,
       `${PERSONA_LABEL_PREFIX}${key}`,
       `${CONFIG_DIR_LABEL_PREFIX}${configDirLabel}`,
     ],
@@ -7512,17 +7508,13 @@ export interface PlainSpawnSite<R> {
 export async function plainSpawnOutcomeAt<R>(site: PlainSpawnSite<R>): Promise<SpawnPersonaResult | R> {
   const { persona, isStartup, ref, params } = site
   const { key } = persona
-  const replyGuardUndo = runPreLaunchReplyGuard(persona, ref)
   let launched: SpawnResult
   try {
     launched = await launchCallWithWindow(key, persona.working_directory, 'spawn', (client) => client.spawn(params))
   } catch (err) {
     const promptFailure = promptFailureResult(key, err)
-    if (promptFailure) { undoPreLaunchReplyGuard(replyGuardUndo, ref); return promptFailure }
+    if (promptFailure) return promptFailure
     if (isAdErrorInstance(err, ErrInstanceIdCollision)) {
-      // b.av2 SR-9.4: a collision means an instance already exists, so this
-      // spawn's reply-guard steps are undone; any later launch runs them again.
-      undoPreLaunchReplyGuard(replyGuardUndo, ref)
       return site.collided(err)
     }
     // b.jg5 SRJ-506: a latch re-check's retry whose answer is definite clears
@@ -8991,7 +8983,7 @@ async function resumeAtSite<R>(site: ResumeSite<R>): Promise<SpawnPersonaResult 
   const { persona, isStartup, ref, lastRead, head } = site
   const { key } = persona
   try {
-    const launched: ResumeResult = await launchWithReplyGuard(persona, ref, 'resume', (client) =>
+    const launched: ResumeResult = await launchPrepared(persona, ref, 'resume', (client) =>
       client.resume({ instance_id: personaInstanceId(key) }),
     )
     console.error(`${head} resumed ${ref}`)
@@ -10827,83 +10819,14 @@ function runPreLaunchTrustPatch(persona: Persona, ref: string): void {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Pre-launch reply guard (b.av2 SR-9.4, SR-6.2)
-// ---------------------------------------------------------------------------
-
-/**
- * Runs the reply-guard steps before one persona's launch (record write,
- * launched-with update, launch-time hook pass) and may return an undo for a
- * launch that turns out not to be one.
- */
-export type PreLaunchReplyGuard = (persona: Persona) => ReplyGuardUndo | void
-
-/**
- * The one pre-launch reply guard. Production installs `preLaunchReplyGuard`
- * from `src/stop-hook-bootstrap.ts`, closed over the server's state directory
- * and a getter for the applied persona set. With none installed (unit tests,
- * the integration driver) no record is written and no settings are patched;
- * nothing here resolves a state directory.
- */
-let preLaunchReplyGuard: PreLaunchReplyGuard | undefined
-
-/** Install the pre-launch reply guard (production: `server.ts`). */
-export function setPreLaunchReplyGuard(guard: PreLaunchReplyGuard): void {
-  preLaunchReplyGuard = guard
-}
-
-/** Test-only seam: remove any installed pre-launch reply guard. */
-export function _resetPreLaunchReplyGuard(): void {
-  preLaunchReplyGuard = undefined
-}
-
-/**
- * Run the installed pre-launch reply guard for `persona`, immediately before
- * an agent-director spawn or resume. A throw is logged with the persona
- * reference and never reaches the ladder. Returns the guard's undo, if any.
- */
-function runPreLaunchReplyGuard(persona: Persona, ref: string): ReplyGuardUndo | undefined {
-  if (!preLaunchReplyGuard) return undefined
-  try {
-    return preLaunchReplyGuard(persona) ?? undefined
-  } catch (err) {
-    console.error(`[slack] spawnForPersona: pre-launch reply guard failed for ${ref} — launching anyway: ${describeThrownValue(err)}`)
-    return undefined
-  }
-}
-
-/** Run a reply-guard undo; a throw is logged and never reaches the ladder. */
-function undoPreLaunchReplyGuard(undo: ReplyGuardUndo | undefined, ref: string): void {
-  if (!undo) return
-  try {
-    undo()
-  } catch (err) {
-    console.error(`[slack] spawnForPersona: undoing the pre-launch reply guard failed for ${ref}: ${describeThrownValue(err)}`)
-  }
-}
-
-/**
- * An agent-director call that starts the persona's instance (`client.spawn`
- * or `client.resume`, declared as `verb`), preceded immediately by the
- * reply-guard steps. Every
- * `resume` goes through here; every plain spawn goes through the one
- * plain-spawn outcome handler (`plainSpawnOutcomeAt`), which also undoes the
- * steps when it meets a live instance, and the reuse spawn
- * (`reuseSpawnForPersona`) makes the same two steps itself so that a retired
- * key's first launch can undo them the same way (b.jg5 SRJ-805). The call
- * records its window (`launchCallWithWindow`, b.jg5 SRJ-407).
- */
-function launchWithReplyGuard<T>(
+/** Launch through the common preparation and call-window path. */
+function launchPrepared<T>(
   persona: Persona,
-  ref: string,
+  _ref: string,
   verb: 'spawn' | 'resume',
   call: (client: Client) => Promise<T>,
 ): Promise<T> {
-  const undo = runPreLaunchReplyGuard(persona, ref)
-  return launchCallWithWindow(persona.key, persona.working_directory, verb, call).catch(err => {
-    if (err instanceof SystemPromptPreparationError) undoPreLaunchReplyGuard(undo, ref)
-    throw err
-  })
+  return launchCallWithWindow(persona.key, persona.working_directory, verb, call)
 }
 
 // ---------------------------------------------------------------------------
@@ -11077,7 +11000,7 @@ export function isCscbOwnLaunch(key: string, launchStart: unknown): boolean {
  * settled (`tellForcedLaunchObserver`; none is set outside those seams). The
  * call's answer or error is passed on unchanged. Every launch call goes
  * through here: every plain spawn (`plainSpawnOutcomeAt`) and a reuse spawn
- * directly, and every `resume` through `launchWithReplyGuard`.
+ * directly, and every `resume` through `launchPrepared`.
  */
 async function launchCallWithWindow<T>(
   key: string,
@@ -11327,19 +11250,19 @@ export async function spawnForPersona(
   const ref = personaRef(persona)
   // b.jg5 SRJ-207: a persona held on ErrInvalidFlags is not launched, whoever
   // asks, and joins no launch in flight: no agent-director call, no trust
-  // patch, no reply-guard step, no record. A latched persona still gets the
+  // patch, no record. A latched persona still gets the
   // latched gate's answer.
   const held = heldResult(key, ref, 'spawnForPersona')
   if (held !== undefined) return held
   // b.jg5 SRJ-706: while P's live-row sequence runs (its own step-6 launch in
   // flight included), no other launch for P starts or joins one: no
-  // agent-director call, no trust patch, no reply-guard step, no record.
+  // agent-director call, no trust patch, no record.
   // A latched persona still gets the latched gate's answer.
   const sequenceWaiting = sequenceWaitingResult(key, ref, 'spawnForPersona')
   if (sequenceWaiting !== undefined) return sequenceWaiting
   // b.jg5 SRJ-810, SRJ-1502: while an old life may still run in P's working
   // directory, P is not brought up: no agent-director call, no trust patch,
-  // no reply-guard step, no record. P is recorded as waiting, the hold's wait
+  // no record. P is recorded as waiting, the hold's wait
   // is started and P's retry timer armed. A hold on P's own row is not this
   // gate's (SRJ-805's retired-key rule). A latched persona still gets the
   // latched gate's answer.
@@ -11357,7 +11280,7 @@ export async function spawnForPersona(
 
   // b.jg5 SRJ-502: a latched persona is not launched, whoever asks (the start
   // pass, the bring-up controller, an apply's bring-up, a restart, a retry):
-  // no trust patch, no reply-guard step, no config-dir hold and no
+  // no trust patch, no config-dir hold and no
   // agent-director call. A latch that cannot be read counts as latched.
   const latched = latchGateReadingOf(key)
   if (latched !== undefined) {
@@ -11520,13 +11443,6 @@ function runPersonaLadder(
   // collision `get` and `resume` below, which keep the conversation. Only the
   // reuse launch adds the flag; the only first launch that is a reuse is a
   // retired key's (SRJ-805, above).
-  // b.av2 SR-9.4: the reply-guard steps run immediately before every spawn or
-  // resume, never on a path that only reconnects to a live instance or does
-  // nothing. This optimistic spawn is a launch only when no row exists; a
-  // collision means an instance already exists, so the handler undoes its
-  // steps (the record and launched-with dir restored while still this step's
-  // own, and the hook re-evaluated against the persona's current config) and
-  // any later spawn or resume below runs them again.
   // b.jg5 SRJ-111: SRJ-111's table through the one plain-spawn outcome
   // handler. A CONFLICT latches the persona with the refused operation
   // "plain spawn": the pre-spawn scan's refusal wrote no row, and one after
@@ -11581,8 +11497,7 @@ function describeRetiredMark(retired: RetiredKeyReading): string {
  * NAME takes the one latch-time `status` read (SRJ-501). Its success answers
  * `fresh-retired` and sets the mark (SRJ-806); every other outcome but a
  * collision is SRJ-112's. A collision (the row is live, `pending` included)
- * undoes the reply-guard steps, as the plain first spawn's does, and goes on
- * to get-then-act (`ladderGetThenAct`), whose collision `get` reads the row
+ * goes on to get-then-act (`ladderGetThenAct`), whose collision `get` reads the row
  * and whose retired-key rule decides on it: an old life goes through the
  * live-row sequence, so each live old life costs one refused reuse. That
  * collision is the attempt's one reuse collision (SRJ-112), so this
@@ -11939,9 +11854,7 @@ export interface ReuseSpawnOptions {
    */
   readonly trustPatchRan?: boolean
   /**
-   * True for a retired key's first launch (b.jg5 SRJ-805): its collision
-   * undoes the reply-guard steps it ran (b.av2 SR-9.4), as the plain first
-   * spawn's collision does.
+   * Identifies a retired key's first launch for callers (b.jg5 SRJ-805).
    */
   readonly firstLaunch?: boolean
   /**
@@ -11988,9 +11901,6 @@ export async function reuseSpawnForPersona(
   // b.av2 SR-6.2: the trust patch precedes every launch, once per attempt.
   if (options.trustPatchRan !== true) runPreLaunchTrustPatch(persona, ref)
   let launched: SpawnResult
-  // b.av2 SR-9.4: the reply guard immediately before the call; a retired
-  // key's first launch undoes it on a collision, as the plain first spawn does.
-  const replyGuardUndo = runPreLaunchReplyGuard(persona, ref)
   // b.jg5 SRJ-806: the reading and record generation the launch attempt
   // started under (read now when the caller gave none); a key recorded since
   // gets no mark at the reuse's success (`reuseSuccessAction`).
@@ -11999,8 +11909,7 @@ export async function reuseSpawnForPersona(
     launched = await launchCallWithWindow(key, persona.working_directory, 'spawn', (client) => client.spawn(params))
   } catch (err) {
     const promptFailure = promptFailureResult(key, err)
-    if (promptFailure) { undoPreLaunchReplyGuard(replyGuardUndo, ref); return promptFailure }
-    if (options.firstLaunch === true && isAdErrorInstance(err, ErrInstanceIdCollision)) undoPreLaunchReplyGuard(replyGuardUndo, ref)
+    if (promptFailure) return promptFailure
     // b.jg5 SRJ-506: a latch re-check's retry whose answer is definite clears
     // the latch before the answer's class handling.
     if (isDefiniteLaunchAnswer(err, 'spawn')) clearLatchBeforeOutcome(key)
@@ -12440,7 +12349,7 @@ function launchHoldsOn(persona: OldLifeHoldPersona): OldLifeHold[] {
  *     with what was done for its wait, and the timer
  *     (`oldLifeHoldLaunchLine`);
  * and it answers true. Otherwise it answers false with nothing done. Makes
- * no agent-director call: no trust patch, no reply-guard step and no record
+ * no agent-director call: no trust patch, no record
  * write precede or follow it. Never throws.
  *
  * With `options.latchRecheck`, asked by a latch re-check's own launch of the
@@ -18340,8 +18249,8 @@ async function runForcedLaunch(
  * It runs as `runForcedLaunch` runs a launch, through the production
  * `resume` path: the pre-launch trust patch, then the one `resume` outcome
  * handler (`resumeAtSite`, b.jg5 SRJ-113) with the plain spawn's parameters
- * (`buildSpawnParams`), which makes the call through `launchWithReplyGuard`
- * (the reply guard, the launch-call window, spawn detection with its outage
+ * (`buildSpawnParams`), which makes the call through `launchPrepared`
+ * (the launch-call window, spawn detection with its outage
  * reports by class) and handles every answer by class as at any `resume`
  * site, with nothing read before it (`NOTHING_READ`: a CONFLICT or UNUSABLE
  * NAME latches after the one latch-time `status` read). Its site's own rows:
@@ -18414,7 +18323,7 @@ export function _forceResumeForPersona(persona: Persona, config: PersonaConfig):
  * It runs as `runForcedLaunch` runs a launch, through the one reuse launch
  * (`reuseSpawnForPersona`, b.jg5 SRJ-112, SRJ-708): its `claude_config_dir`
  * check, the parameters `buildSpawnParams` gives with only `reuse_finished`
- * added, the pre-launch trust patch and reply guard, the call through the
+ * added, the pre-launch trust patch, the call through the
  * launch-call window and spawn detection, and SRJ-112's outcome table by
  * class (`reuseSpawnFailedAt`: `ErrInvalidFlags` takes the version re-check
  * and the hold decision; a CONFLICT or UNUSABLE NAME latches after the one

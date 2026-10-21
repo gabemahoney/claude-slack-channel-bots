@@ -122,10 +122,7 @@
  *      its notice latch and the restart path's idle evidence) are forgotten,
  *      and its latch once more, silently (b.jg5 SRJ-715). No recovery
  *      notice is posted, no clear is logged, and nothing is retried;
- *   10. its reply-guard record is deleted and its launched-with directory
- *      forgotten (read first), then the Stop-hook launch pass re-evaluates
- *      the persona's configured and launched-with directories against the
- *      personas still applied.
+ *   10. outstanding reply reminder candidates for its running life are cancelled.
  *   A removed persona has already left the applied set (apply step 1), so
  *   every launch, restart and retry path refuses it; a notice raised for it
  *   between apply step 1 and the teardown's turn is dropped by the
@@ -207,7 +204,7 @@
  *   persona whose `channels`, `delivery`, `permission_prompts` (declarative
  *   mode), `invited.permission_prompts` (fungible mode) or `dm.*` changed
  *   keeps its instance, Slack connection, Web API client, MCP session, restart,
- *   backoff, health, outage and retry state, reply-guard record, tracked
+ *   backoff, health, outage and retry state, reply reminders, tracked
  *   prompts and held notices. The new values already took effect at apply
  *   step 1: every consumer (tool scope, delivery decision, destination, DM
  *   switch, archive evidence) reads the persona's entry from the applied
@@ -235,11 +232,10 @@
  * operation (the re-entrancy rule in `persona-serializer.ts`). None touches
  * another persona.
  *
- * A persona with only next-launch changes (`claude_config_dir`,
- * `stop_hook_bootstrap`, own or inherited) gets no operation: step 1's swap
+ * A persona with only next-launch changes (`claude_config_dir`, own or inherited) gets no operation: step 1's swap
  * of the applied set is what its next launch reads (the spawn environment and
  * `config_dir` label, the SR-6.2 label check before a resume, the trust patch,
- * the reply-guard record and hook install, the transcript diagnosis), and its
+ * the transcript diagnosis), and its
  * running instance keeps what it launched with.
  *
  * Logging: plain `[slack]` lines through the injected logger, token-free; a
@@ -343,16 +339,6 @@ import type { PersonaTeardownKillRefusal, PersonaTeardownKillResult } from './se
 // Types
 // ---------------------------------------------------------------------------
 
-/** The reply-guard helpers of `stop-hook-bootstrap.ts`, with the server's state directory bound. */
-export interface PersonaTeardownReplyGuard {
-  /** The directory the persona's running instance launched with (`getLaunchedWithDir`). */
-  launchedWithDir(key: string): string | undefined
-  /** Delete the persona's record and forget its launched-with dir (`teardownPersonaReplyGuard`). Never throws. */
-  teardown(key: string): void
-  /** Re-evaluate the managed Stop hook in `dirs` against `personas` (`stopHookLaunchPass`). Never throws. */
-  launchPass(dirs: readonly (string | undefined)[], personas: readonly Persona[]): void
-}
-
 /** Dependencies of `createPersonaLifecycle`. */
 export interface PersonaLifecycleDeps {
   /** The per-persona lifecycle serializer's `run` (the server's one shared instance). */
@@ -397,7 +383,7 @@ export interface PersonaLifecycleDeps {
     Partial<Pick<PersonaNotifier, 'notify' | 'submitTeardown' | 'settleTeardown' | 'openTeardownWindow' | 'closeTeardownWindow'>>
   /**
    * The persona set applied now (the server's `personaConfig`), read at each
-   * use: the teardown's Stop-hook pass, whether a teardown's key is still
+   * use: whether a teardown's key is still
    * applied (the old half of a destructive modify), and whether an in-place
    * update's key is still applied.
    */
@@ -571,8 +557,8 @@ export interface PersonaLifecycleDeps {
    * `ErrSystemInstallDisappeared` always. A throw counts as none raised.
    */
   outageFlags?: (key: string) => ReadonlySet<string>
-  /** The reply-guard helpers, the state directory bound. */
-  replyGuard: PersonaTeardownReplyGuard
+  /** Cancel durable reminder candidates for the retired running life. */
+  forgetReplyReminders?(key: string): Promise<void>
 
   // --- apply bring-up ---
   /**
@@ -1114,15 +1100,7 @@ export function createPersonaLifecycle(deps: PersonaLifecycleDeps): PersonaLifec
     // b.jg5 SRJ-715, SRJ-504: its latch once more, silently, after the kill.
     await step('forgetting its latch once more, after the kill', () => deps.forgetConflictLatch(key))
 
-    // Read the launched-with dir before the teardown forgets it.
-    let launchedWith: string | undefined
-    await step('reading its launched-with directory', () => {
-      launchedWith = deps.replyGuard.launchedWithDir(key)
-    })
-    await step('deleting its reply-guard record', () => deps.replyGuard.teardown(key))
-    await step('re-evaluating the Stop hook in its config directories', () =>
-      deps.replyGuard.launchPass([persona.claude_config_dir, launchedWith], deps.appliedPersonas()),
-    )
+    await step('forgetting its reply reminders', () => deps.forgetReplyReminders?.(key))
   }
 
   // -------------------------------------------------------------------------

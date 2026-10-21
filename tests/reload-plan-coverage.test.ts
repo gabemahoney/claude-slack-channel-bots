@@ -162,13 +162,13 @@ describe('every persona field the loader accepts is classified', () => {
 describe('every top-level key the loader accepts is compared', () => {
   // A top-level key is a persona default when a persona entry accepts it too:
   // the persona inherits it when its entry omits it. When this fails, a key
-  // both levels accept is missing from NEXT_LAUNCH_SETTINGS (whose members
-  // the plan treats as inherited defaults), or a next-launch setting lost its
-  // top-level form: fix the loader's lists or the class.
-  test('the persona defaults are exactly the next-launch settings, and each is a top-level key', () => {
+  // both levels accept needs an inherited-default rule, with either an
+  // immediate reminder update or a next-launch directory change.
+  test('the persona defaults are the next-launch directory and immediate reminder settings', () => {
     const entryKeys = new Set<string>(PERSONA_ENTRY_KEYS)
     const defaults = PERSONA_TOP_LEVEL_KEYS.filter((key) => entryKeys.has(key))
-    expect([...defaults].sort()).toEqual([...NEXT_LAUNCH_SETTINGS].sort())
+    expect([...defaults].sort()).toEqual([...NEXT_LAUNCH_SETTINGS, 'stop_hook_bootstrap'].sort())
+    expect(IN_PLACE_SETTINGS).toContain('stop_hook_bootstrap')
   })
 
   function plan(top: Record<string, unknown>): ValidChangePlan {
@@ -224,7 +224,7 @@ describe('every top-level key the loader accepts is compared', () => {
    * on and every persona present in both configurations (b.deo SRI-803).
    */
   function expectedSetting(key: string): ServerSettingChange {
-    if ((NEXT_LAUNCH_SETTINGS as readonly string[]).includes(key)) return { name: key, inheritedBy: [ALPHA_REF] }
+    if ((NEXT_LAUNCH_SETTINGS as readonly string[]).includes(key) || key === 'stop_hook_bootstrap') return { name: key, inheritedBy: [ALPHA_REF] }
     if (key === MODE_SWITCH_SETTING) {
       // The mode the candidate's switch picks.
       const mode = channelModeOf(parse(input({ [key]: CHANGED_VALUES()[key] })))
@@ -353,7 +353,7 @@ describe('a persona change is classified by the section in force when both confi
       'dm.contact',
     ],
     ['fungible: a working_directory change', FUNGIBLE_TOP, {}, { working_directory: '~/moved-work' }, 'destructive', 'working_directory'],
-    ['fungible: a stop_hook_bootstrap change', FUNGIBLE_TOP, {}, { stop_hook_bootstrap: false }, 'nextLaunch', 'stop_hook_bootstrap'],
+    ['fungible: a stop_hook_bootstrap change', FUNGIBLE_TOP, {}, { stop_hook_bootstrap: false }, 'inPlace', 'stop_hook_bootstrap'],
   ])('%s lands in its class', (_label, top, before, after, cls, setting) => {
     expect(PLAN_CLASSES[cls] as readonly string[]).toContain(setting)
     expect(channelModeOf(parse(input(top, after)))).toBe(channelModeOf(parse(input(top, before))))

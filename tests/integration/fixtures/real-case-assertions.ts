@@ -1,7 +1,7 @@
 /** Lane-1 scenario assertions, not transport or production matching (b.omv SR-14). */
 import { existsSync, readFileSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { join, resolve } from 'node:path'
-import { auditReceipts, captureReceiptJournal, jsonLines, packedReceiptAdapters, personaTranscripts, readTranscripts, receiptJournal, shimWords, transcriptFiles } from './transcript-receipts.ts'
+import { auditReceipts, captureReceiptJournal, jsonLines, packedReceiptAdapters, personaTranscripts, readTranscripts, receiptJournal, shimWords, transcriptFiles, workloadItem, workloadItems } from './transcript-receipts.ts'
 import { assertBusyProof, emitBusyProofFailure, pollBusyProof, type BusyProofSnapshot } from './busy-proof.ts'
 function check(value: unknown, reason: string): asserts value { if (!value) throw new Error(reason) }
 type KeyCall = { at: number; words: string[]; pid?: string }
@@ -90,7 +90,7 @@ async function confirmReceipts() {
 try {
   check(existsSync('/etc/cscb-ci-image'), 'scenario assertions require the CI image')
   if (command === 'accepted' || command === 'delivered') {
-    const j=cumulativeJournal(), a=j.filter(r=>r.kind==='accepted'&&!r.compact)
+    const j=cumulativeJournal(), a=workloadItems(j)
     check(a.length>=Number(arg), 'not enough accepted items')
     if(command==='delivered') for(const i of a.slice(0,Number(arg))) {
       const f=j.find(r=>r.kind==='fixed'&&r.seq===i.seq)
@@ -101,7 +101,7 @@ try {
     for(const row of [before,after]) check(row.instance_id==='cscb_'+key&&row.state==='ended','DOWN interval has a live or wrong native row')
     check(before.session_id&&before.ended_at,'DOWN interval lacks the paused native session')
     for(const field of ['session_id','started_at','ended_at','launch_started_at']) check(before[field]===after[field],'native launch changed during DOWN interval')
-    const j=cumulativeJournal(), accepted=j.filter(r=>r.kind==='accepted'&&!r.compact)
+    const j=cumulativeJournal(), accepted=workloadItems(j)
     check(accepted.length===Number(arg3),'DOWN interval acceptance count differs')
     for(const [source,count] of [['slack',10],['interject',2],['cron',1]] as const) check(accepted.filter(r=>r.source===source).length===count,'DOWN interval source count differs: '+source)
     check(!j.some(r=>r.kind==='sent'),'send recorded during DOWN interval')
@@ -124,7 +124,7 @@ try {
   } else if(command==='no-send') {
     check(!calls().some(c=>c.at>=Number(arg)&&c.words.includes('send-keys')), 'keys typed during a hold')
   } else if(command==='open') {
-    const j=journal(),seq=Number(arg),f=j.find(r=>r.seq===seq&&r.kind==='fixed')
+    const j=cumulativeJournal(),seq=workloadItem(j,Number(arg)).seq,f=j.find(r=>r.seq===seq&&r.kind==='fixed')
     check(f?.parts?.some((_:unknown,n:number)=>!j.some(r=>r.seq===seq&&r.kind==='delivered'&&r.part===n+1)),'expected head is already complete')
   } else if(command==='no-enter-fault') {
     check(readFileSync(shim!,'utf8').split('\n').filter(l=>l.startsWith('fault\t')&&shimWords(l.split('\t')[5]!)[1]==='no_enter').length>=Number(arg),'text fault not yet applied')
@@ -133,7 +133,8 @@ try {
   } else if(command==='fault') {
     check(readFileSync(shim!,'utf8').split('\n').filter(l=>l.startsWith('fault\t')&&shimWords(l.split('\t')[5]!)[2]===arg).length>=Number(arg2||1), 'fault not yet consumed')
   } else if(command==='fidelity-shapes') {
-    const j=cumulativeJournal();for(const [seq,bytes] of [[9,850],[10,1400],[11,1900]]) {
+    const j=cumulativeJournal();for(const [ordinal,bytes] of [[9,850],[10,1400],[11,1900]] as const) {
+      const seq=workloadItem(j,ordinal).seq
       const f=j.find(r=>r.kind==='fixed'&&r.seq===seq);check(f?.parts?.length===1&&Buffer.byteLength(f.parts[0])===bytes,'single-part native fidelity size differs')
     }
   } else if(command==='unknown-proof') {
@@ -148,24 +149,25 @@ try {
       const marker='delivery-launch-first-waiting: ', index=line.indexOf(marker)
       return index < 0 ? [] : [JSON.parse(line.slice(index+marker.length))]
     })
-    const proof=assertResetKeyRecovery(cumulativeJournal(),calls(),faults,waiting,Number(arg),'cscb_'+key)
+    const j=cumulativeJournal(), seq=workloadItem(j,Number(arg)).seq
+    const proof=assertResetKeyRecovery(j,calls(),faults,waiting,seq,'cscb_'+key)
     await confirmReceipts()
     console.log('recorded: restart reset guarded recovery '+JSON.stringify(proof))
   } else if(command==='key-proof') {
-    const j=cumulativeJournal(), s=j.filter(r=>r.kind==='sent'&&r.seq===Number(arg))
+    const j=cumulativeJournal(), seq=workloadItem(j,Number(arg)).seq, s=j.filter(r=>r.kind==='sent'&&r.seq===seq)
     const text=s.filter(r=>r.send_kind!=='enter')
     if(arg2==='enter') {
       const faults=readFileSync(shim!,'utf8').split('\n').filter(l=>l.startsWith('fault\t')).map(l=>{const f=l.split('\t');return {at:Number(f[1])*1000,words:shimWords(f[5]!)}})
-      assertSwallowedEnterRecovery(j,calls(),faults,Number(arg),'cscb_'+key)
+      assertSwallowedEnterRecovery(j,calls(),faults,seq,'cscb_'+key)
     }
     if(arg2==='retype') check(text.length>=2, 'missed text was not retyped')
     if(arg2==='spacing') {
       check(text.length>=4, 'three swallowed texts did not produce three retypes')
       for(let i=1;i<4;i++) check(text[i].at-text[i-1].at >= [10000,30000,60000][i-1]!, 'retype spacing below growing backoff')
-      check(j.filter(r=>r.kind==='noticed'&&r.seq===Number(arg)).length===1, 'not-taken-in notice not once')
+      check(j.filter(r=>r.kind==='noticed'&&r.seq===seq).length===1, 'not-taken-in notice not once')
     }
     await confirmReceipts()
-    console.log('recorded: key proof '+JSON.stringify({seq:Number(arg),sends:s.map(r=>({kind:r.send_kind,at:r.at}))}))
+    console.log('recorded: key proof '+JSON.stringify({ordinal:Number(arg),seq,sends:s.map(r=>({kind:r.send_kind,at:r.at}))}))
   } else if(command==='cron') {
     const a=cumulativeJournal().filter(r=>r.kind==='accepted'&&r.source==='cron'&&!r.compact)
     check(a.length===Number(arg), 'cron fire count differs')
@@ -174,7 +176,8 @@ try {
   } else if(command==='fault-at') {
     const f=readFileSync(shim!,'utf8').split('\n').filter(l=>l.startsWith('fault\t')&&shimWords(l.split('\t')[5]!)[2]===arg).at(-1);check(f,'fault not found');console.log(Number(f.split('\t')[1])*1000)
   } else if(command==='reconnect-proof') {
-    const j=cumulativeJournal(),fixed=j.find(r=>r.kind==='fixed'&&r.seq===Number(arg));check(fixed,'reconnect target not fixed')
+    const j=cumulativeJournal(),target=workloadItem(j,Number(arg))
+    const fixed=j.find(r=>r.kind==='fixed'&&r.seq===target?.seq);check(fixed,'reconnect target not fixed')
     const c=calls(), sent=c.find(c=>c.words.includes('--text')&&c.words[c.words.indexOf('--text')+1]===fixed.parts[0]);check(sent,'delivery was not typed')
     const reconnect=c.filter(c=>c.at>=Number(arg2)&&c.at<sent.at&&c.words.includes('send-keys')&&c.words.some(w=>w.startsWith('/mcp reconnect')))
     check(reconnect.length>=1,'delivery preceded its reconnect or reconnect violated the hold interval')
@@ -587,7 +590,9 @@ try {
     await queue.stop()
     queue=createDeliveryQueue({stateDir:compactDir,now:()=>50000});await queue.start()
     try {
-      check(jsonLines(compactQueue).every(r=>r.compact),'real restart retained a completed full item')
+      // Pending reminder metadata survives restart; completed message bodies must not.
+      const reminderFields=['v','kind','seq','at','delivered_at','state','row_state','session_id','launch_started_at','delivery_attempts']
+      check(jsonLines(compactQueue).every(r=>r.compact||(r.kind==='reply-reminder'&&r.state==='observed'&&Object.keys(r).every(k=>reminderFields.includes(k)))),'real restart retained a completed full item')
       check(auditCompact().items===5,'real queue compaction lost original five-item count')
       expectControl('cumulative delivered prefix after actual restart',()=>invokeCompact('delivered','5'))
       const compactBytes=readFileSync(compactQueue,'utf8'), historyBytes=readFileSync(historyPath,'utf8')

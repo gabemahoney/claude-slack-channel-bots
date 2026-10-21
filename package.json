@@ -24,8 +24,7 @@
     "docs/server-settings.md",
     "docs/troubleshooting.md",
     "docs/migration.md",
-    "skills/",
-    "stop-hooks/"
+    "skills/"
   ],
   "engines": {
     "bun": ">=1.0.21"

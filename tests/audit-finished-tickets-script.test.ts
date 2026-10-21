@@ -22,7 +22,7 @@
  *   and audits the scratch git history. We invoke it as
  *   `bash <copied-script> <repo>` so REPO_ROOT points at the fixture repo.
  *
- * Follows repo conventions (see tests/stop-hook-bootstrap.test.ts):
+ * Follows repo conventions (see tests/legacy-reply-hook-cleanup.test.ts):
  *   - mkdtempSync per-test temp dirs, afterEach rmSync cleanup
  *   - spawnSync for the subprocess, real fs, no mocks
  *   - absolute script path via fileURLToPath so CWD is irrelevant

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import * as fs from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createDeliveryQueue, isQueueRecord, parseQueueRecord, QUEUE_DIRECTORY_MODE, QUEUE_FILE_MODE, QUEUE_KEY_KEEP_MS, QUEUE_COMPACT_INTERVAL_MS, type QueueRecord, type QueueEvent, type DeliveryQueue } from '../src/delivery-queue.ts'
+import { createDeliveryQueue, isQueueRecord, parseQueueRecord, QUEUE_DIRECTORY_MODE, QUEUE_FILE_MODE, QUEUE_KEY_KEEP_MS, QUEUE_COMPACT_INTERVAL_MS, type AcceptedRecord, type QueueRecord, type QueueEvent, type DeliveryQueue } from '../src/delivery-queue.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
 import { MAX_RELOAD_FILE_BYTES } from '../src/config.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
@@ -14,8 +14,8 @@ let queues: DeliveryQueue[]
 beforeEach(() => { dir = fs.mkdtempSync(join(tmpdir(), 'delivery-queue-')); queues = [] })
 afterEach(async () => { await Promise.all(queues.map(q => q.stop())); fs.rmSync(dir, { recursive: true, force: true }) })
 async function open(options: Parameters<typeof makeQueue>[1] = {}) { const q = await makeQueue(dir, options); queues.push(q); return q }
-const accepted = (): QueueRecord => ({ ...slackInput(), v: 1, kind: 'accepted', seq: 1, received_at: 1000, ts: '1700000000.000001' })
-const kinds: QueueRecord[] = [accepted(), { v: 1, kind: 'fixed', seq: 1, parts: ['exact bytes\n🙂'] }, sentRecord(), deliveredRecord(), { v: 1, kind: 'refused', seq: 1, attempt: 1, at: 1000 }, { v: 1, kind: 'noticed', seq: 1, at: 1000 }]
+const accepted = (): AcceptedRecord => ({ ...slackInput(), v: 1, kind: 'accepted', seq: 1, received_at: 1000, ts: '1700000000.000001' })
+const kinds: QueueRecord[] = [accepted(), { v: 1, kind: 'fixed', seq: 1, parts: ['exact bytes\n🙂'] }, sentRecord(), deliveredRecord(), { v: 1, kind: 'refused', seq: 1, attempt: 1, at: 1000 }, { v: 1, kind: 'noticed', seq: 1, at: 1000 }, { v: 1, kind: 'reply-reminder', seq: 1, at: 1000, state: 'observed', delivery_attempts: [1] }]
 function recordSyncs() {
   const paths = new Map<number, string>(), synced: string[] = []
   let failingPath: string | undefined
@@ -33,7 +33,7 @@ function recordSyncs() {
     } as typeof fs,
   }
 }
-describe('six record schemas', () => {
+describe('durable record schemas', () => {
   test.each(kinds.map(r => [r.kind, r] as const))('%s roundtrips and rejects invalid versions, sequence and missing payload', (_, r) => {
     expect(parseQueueRecord(JSON.stringify(r))).toEqual(r)
     expect(isQueueRecord({ ...r, v: 2 })).toBe(false)
@@ -41,6 +41,37 @@ describe('six record schemas', () => {
     expect(isQueueRecord({ v: 1, kind: r.kind, seq: 1 })).toBe(false)
   })
   test.each(['{', 'null', '[]', '{"v":1,"seq":1,"kind":"future"}'])('invalid line %s is unreadable', line => expect(parseQueueRecord(line)).toBeUndefined())
+
+  test.each(['observed', 'replied', 'nudged', 'cancelled'] as const)('reply reminder state %s roundtrips with its row facts', state => {
+    const record: QueueRecord = { v: 1, kind: 'reply-reminder', seq: 1, at: 1000, delivered_at: 900, state, row_state: 'working', session_id: 'session', launch_started_at: null, delivery_attempts: [1, 3], ...(state === 'replied' ? { reply_attempts: [3] } : {}) }
+    expect(parseQueueRecord(JSON.stringify(record))).toEqual(record)
+  })
+
+  test.each([
+    { state: 'future' }, { at: null }, { row_state: 4 }, { session_id: false }, { launch_started_at: 5 },
+    // A malformed retention origin must not keep a candidate eligible forever.
+    { delivered_at: null }, { delivered_at: '1000' },
+    { reply_attempts: [1] }, { state: 'replied', reply_attempts: [] }, { state: 'replied', reply_attempts: [0] },
+    { state: 'replied', reply_attempts: ['1'] }, { state: 'replied', reply_attempts: [1.5] },
+    { delivery_attempts: [] }, { delivery_attempts: [0] }, { delivery_attempts: ['1'] }, { delivery_attempts: [1.5] },
+  ])('rejects malformed reminder fields %j rather than replaying them', fields => {
+    expect(parseQueueRecord(JSON.stringify({ v: 1, kind: 'reply-reminder', seq: 1, at: 1000, state: 'observed', ...fields }))).toBeUndefined()
+  })
+
+  test.each([
+    { source: 'slack', reminder_for: 1 }, { source: 'cron', reminder_for: 1 },
+    { source: 'interject', reminder_for: 0 }, { source: 'interject', reminder_for: -1 },
+    { source: 'interject', reminder_for: 1.5 }, { source: 'interject', reminder_for: '1' },
+  ])('rejects invalid reminder acceptance %j', fields => {
+    const record = { ...accepted(), sender: 'reply-reminder', ...(fields.source === 'slack' ? {} : { key: undefined }), ...fields }
+    expect(parseQueueRecord(JSON.stringify({ ...record, reminder_for: undefined }))).toBeDefined()
+    expect(parseQueueRecord(JSON.stringify(record))).toBeUndefined()
+  })
+
+  test('normal reminder acceptance retains its source sequence on disk', () => {
+    const record = { ...accepted(), source: 'interject' as const, sender: 'reply-reminder', key: undefined, reminder_for: 7 }
+    expect(parseQueueRecord(JSON.stringify(record))).toEqual(record)
+  })
 })
 test('real file acceptance fsyncs file and new directory, enforces permissions and survives restart', async () => {
   const synced: string[] = []; const paths = new Map<number, string>()

@@ -19,7 +19,7 @@ Postinstall creates a skeleton with an empty persona list, `{"personas": []}`. A
 A complete `config.json` in declarative mode (`allow_invited_channels` absent), with three personas:
 
 - `planner` receives every message in its home channel `C0123456789` and in the shared channel `C0555555555`. Its permission prompts and notices go to its home channel. It takes no DMs.
-- `reviewer` receives only its @mentions and `@here` / `@channel` broadcasts in the shared channel. It takes DMs, and its prompts and notices go by DM to its contact `U0123456789`. It has its own Claude config directory and turns the [Slack Reply Guard](bots.md#slack-reply-guard-stop-hook) off for itself.
+- `reviewer` receives only its @mentions and `@here` / `@channel` broadcasts in the shared channel. It takes DMs, and its prompts and notices go by DM to its contact `U0123456789`. It has its own Claude config directory and turns [Slack reply reminders](bots.md#slack-reply-reminders) off for itself.
 - `helpdesk` is DM-only: it is in no channel and is reached only by DM. Its prompts and notices go by DM to its contact `U0987654321`.
 
 `planner` and `helpdesk` inherit the top-level `claude_config_dir`. The server-wide settings turn on an acknowledgement reaction and set how replies are split.
@@ -75,7 +75,7 @@ Replace the channel IDs, user IDs and paths with your own. Each persona's creden
 | `permission_prompts` | string | in declarative mode, yes | — | Declarative mode only: the persona's **destination**, where its permission prompts and server notices are posted. One of the persona's own channel IDs, or `"dm"`. See [Permission prompts](#permission-prompts). Not read in fungible mode. |
 | `invited.permission_prompts` | string | no | `"dm"` | Fungible mode only: the persona's **destination**, where its permission prompts and server notices are posted. `"dm"` or a Slack channel ID such as `C0123456789`; the channel needs no listing. Not read in declarative mode. See [Permission prompts in fungible mode](channel-modes.md#permission-prompts-in-fungible-mode). |
 | `claude_config_dir` | path | no | top-level `claude_config_dir` | Claude config directory for this persona. See [Next-launch settings](#next-launch-settings). |
-| `stop_hook_bootstrap` | boolean | no | top-level `stop_hook_bootstrap` | Slack Reply Guard switch for this persona. See [Next-launch settings](#next-launch-settings). |
+| `stop_hook_bootstrap` | boolean | no | top-level `stop_hook_bootstrap` | Slack reply reminder switch for this persona. Confirmed changes apply immediately; see [Slack reply reminders](bots.md#slack-reply-reminders). |
 
 `dm` is an object holding `enabled` and `contact`: `"dm": { "enabled": true, "contact": "U0123456789" }`. It applies in both modes. `invited` is an object holding `permission_prompts`: `"invited": { "permission_prompts": "C0123456789" }`. A path is absolute, `~` or starts with `~/`. Paths are never redacted: a log line, preview or error that names a path shows it in full, with `~` expanded.
 
@@ -178,7 +178,7 @@ Choose a destination with [channel delivery](#channel-delivery) in mind. If two 
 
 ### Next-launch settings
 
-`claude_config_dir` and `stop_hook_bootstrap` can be set on a persona or at the top level. A persona's own value wins; the top-level value is the default for every persona without one. Once a change is confirmed, it takes effect at the persona's next launch (see [When next-launch and server-wide changes take effect](reload.md#when-next-launch-and-server-wide-changes-take-effect)).
+`claude_config_dir` can be set on a persona or at the top level. A persona's own value wins; the top-level value is the default for every persona without one. Once a change is confirmed, it takes effect at the persona's next launch (see [When next-launch and server-wide changes take effect](reload.md#when-next-launch-and-server-wide-changes-take-effect)).
 
 **`claude_config_dir`** is the Claude config directory the persona's instance launches with (`CLAUDE_CONFIG_DIR`), so each persona can authenticate as a different Claude account. Populate each directory before the persona first launches:
 
@@ -190,9 +190,10 @@ Use `--console` instead of `--claudeai` for a Console account. When neither the 
 - A directory that doesn't exist yet is fine when its parent exists.
 - A persona whose `claude_config_dir` can't be resolved to a real path (for example, a symlink on its path that points to nothing) is held: it closes or never opens its Slack connection and receives nothing, and `server.log` shows `persona-config-dir-unresolvable`. It reconnects once the directory resolves, with no restart.
 - A confirmed change to a persona's effective `claude_config_dir` makes it start a new conversation on the same instance at its next launch. Nothing is deleted: the old conversation stays in the old directory, with prior sessions retained in the same AD life.
-- The Slack Reply Guard never installs its hook in `~/.claude`, so a persona whose directory resolves there gets no reminder (see the debugging skill's [How the guard is installed and what it reads](../skills/debug-slack-channel-bots/SKILL.md#how-the-guard-is-installed-and-what-it-reads)).
 
-**`stop_hook_bootstrap`** turns the [Slack Reply Guard](bots.md#slack-reply-guard-stop-hook) reminder on (`true`, the default) or off for the persona. It applies to that persona alone, even when it shares its `claude_config_dir` with other personas. A running bot keeps the value it was launched with until it is relaunched. See [Personas that answer without `reply`](bots.md#personas-that-answer-without-reply--opt-them-out) for when to turn it off.
+### Slack reply reminders
+
+**`stop_hook_bootstrap`** turns [Slack reply reminders](bots.md#slack-reply-reminders) on (`true`, the default) or off. This compatibility setting can be set on a persona or at the top level; a persona's own boolean overrides the default. A confirmed change applies immediately to that persona, including when it shares its `claude_config_dir` with others. See [Personas that answer without `reply`](bots.md#personas-that-answer-without-reply--opt-them-out) for when to turn it off.
 
 ### Load-time rules
 

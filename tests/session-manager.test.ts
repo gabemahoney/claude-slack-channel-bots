@@ -1,3 +1,4 @@
+import { REPLY_TOOL_PREALLOWED_LABEL } from '../src/reply-reminder.ts'
 import { makePendingRowModel, PENDING_ROW_MODEL_NO_ROW, judgeNotJudged } from './test-helpers/pending-row-model.ts'
 import { errDialogMaybeOpen } from './test-helpers/agent-director-stub.ts'
 import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
@@ -46,7 +47,7 @@ import {
   type RetiredKeyAttemptStart,
 } from '../src/live-row-sequence.ts'
 import { _buildReconnectSessionAdapter, _setDeliveryLifecycle as setDeliveryLifecycle } from '../src/server.ts'
-import { _resetConfigDirFs, _resetConfiguredPersonaQuery, _resetFindMissingMemo, _resetInFlightLaunches, _resetLiveRowSequenceRegistry, _resetNotConnectedEpisodes, _resetNow, _resetPreLaunchReplyGuard, _resetPreLaunchTrustPatcher, _resetSpawnHomeDir, _resetWaitForWaitingTimeoutMs, _setConfigDirFs, _setFindMissingMemoTtlMs, _setNow, _setSpawnHomeDir, _setWaitForWaitingTimeoutMs, AGENT_DIRECTOR_LIVE_STATES, buildLiveRowSequenceDeps, bypassingFindMissingSweep, cancelWorkingRowWait, CARRIED_DEAD_EVIDENCE_NONE, carriedDeadEvidenceOf, checkLaunchConfigDir, checkPromptRowDeferral, compareRowToPersona, ConfigDirUnresolvableError, DEAD_EVIDENCE_NONE, DEAD_EVIDENCE_READ_BY_COLLISION_GET, DEAD_EVIDENCE_READ_BY_PATH, DEAD_EVIDENCE_READ_BY_POST_SWEEP_GET, DEAD_EVIDENCE_READ_BY_PROMPT_ROW_REREAD, DEAD_EVIDENCE_VOIDED_BY_RESUME_NOT_FOUND, DEAD_EVIDENCE_VOIDED_BY_RETIRED_KEY_FIRST_LAUNCH, DEAD_EVIDENCE_VOIDED_BY_REUSE_COLLISION_RERUN, DEAD_EVIDENCE_VOIDED_BY_ROW_NOT_INTERACTIVE, DEAD_SESSION_CAUSE_PROMPT_ROW_LADDER_GONE, DEAD_SESSION_CAUSE_ROW_ABSENT, DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE, DEAD_SESSION_CAUSE_ROW_READ_FINISHED, DEAD_SESSION_CAUSE_TMUX_GONE, DEAD_SESSION_CAUSES, deadEvidenceReadByCause, deadEvidenceVoidedLine, deadEvidenceVoidingRead, deadSessionRouteLine, decideNotResumable, describeDeadEvidence, describePersonaRowReread, ESCALATE_DEAD_EVIDENCE, ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ, ESCALATE_DEAD_VERDICTS,  escalateDeadSweepLine, escalateDeadVerdictOfCause, FIND_MISSING_LATCHED, FIND_MISSING_MEMO_TTL_MS, FIND_MISSING_REFUSED, FIND_MISSING_ROW_JUDGED_ALIVE, FIND_MISSING_ROW_LEFT_LIVE, FIND_MISSING_ROW_MARKED_MISSING, FIND_MISSING_ROW_NOT_JUDGED, findMissingRunReadName, forgetNotConnectedEpisode, handleDeliveryKeyError, handleDeliveryReadError, isDeadEvidence, isLaunchInFlight, isLiveRowSequenceRunning, joinedLaunchDropsDeadEvidenceLine, JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS, JSONL_DIAGNOSIS_REUSE_WORDING, JSONL_TRANSCRIPT_LOST_ENTRY_CLASS, KILL_CONTEXT_TEARDOWN, killPersonaInstance, killPersonaInstanceForTeardown, LAUNCH_VERB_RESUME, LAUNCH_VERB_REUSE_SPAWN, LAUNCH_VERB_SPAWN, launchForLiveRowSequence, launchSession, LIVE_ROW_START_NOT_INSTALLED, lostRaceOutcome, NOT_RESUMABLE_LATCHED, NOT_RESUMABLE_LOST_RACE, NOT_RESUMABLE_PENDING, NOT_RESUMABLE_PENDING_OUTCOME, NOT_RESUMABLE_SEQUENCE, notifyDisconnectedWithAutoRestartDisabled, notifyPersonaNotConnected, notifyRestartCapReached, notifySpawnFailure, notResumableSequenceOutcome, ORPHAN_CLEANUP_LIST_FAILED_LABEL, OWN_ROW_READ_ABSENT, OWN_ROW_READ_ROW, OWN_ROW_STATUS_ABSENT, OWN_ROW_STATUS_LATCHED, OWN_ROW_STATUS_REFUSED, OWN_ROW_STATUS_STATE, personaConfigDirLabelValue, plainSpawnCollisionLine, PRE_TRUST_LOG_PREFIX, preTrustLogLine, PROMPT_ROW_STATES, PROMPT_ROW_SWEEP_AFTER_MS, promptRowLadderAfterSweepLine, promptRowLadderLatchedLine, promptRowLadderNoActionLine, promptRowLadderNoPaneLine, promptRowLadderStoppingLine, readFindMissingRow, readPersonaOwnRow, readPersonaOwnRowStatus, readPersonaRowState, reconcileOrphans, RECONNECT_NOT_THIS_LAUNCH_NOTE, reconnectConflictLine, reconnectGoneLine, reconnectInvalidFlagsLine, reconnectLatchedLine, reconnectMcp, reconnectMcpWithCause, reconnectNotInteractiveLine, reconnectRowAbsentLine, reconnectStartLine, reconnectTransientLine, reconnectUnusableNameLine, REPLACE_REREAD_FINISHED_OUTCOME, REPLACE_REREAD_PENDING_OUTCOME, REPLACE_REREAD_REFUSED_OUTCOME, replaceRereadLine, resumeNotFoundSpawnLine, ROW_REREAD_FINISHED, ROW_REREAD_LATCHED, ROW_REREAD_LIVE, ROW_REREAD_PENDING, ROW_REREAD_REFUSED, ROW_REREAD_UNKNOWN, SEQUENCE_NOT_RESUMABLE_LOST_RACE_OUTCOME, sequenceLaunchAtCapLine, setConfigDirUnresolvableHook, setConfiguredPersonaQuery, setConflictLatch, setKillFailureAlerts, setPreLaunchReplyGuard, setPreLaunchTrustPatcher, setSessionNotifier, SPAWN_CAP_REACHED_REMEDIATION, SPAWN_FAILURE_DEFAULT_REMEDIATION, SPAWN_NOT_FOUND_REMEDIATION, spawnFailureNoticeText, spawnForPersona, spawnNotResumableLine, startLiveRowSequence, STARTUP_ERROR_SPAWN_FAILED, startupSessionManager, stopLiveRowSequence, sweepDeadTmuxChannel, transientReconnectLine, WAIT_OUTCOME_LATCHED, waitEndedDisconnectedLine, waitEndedOnStateReport, waitForWaitingAndReconnect, waitForWaitingAndReconnectWithCause, waitPollStatusErrorLine, waitRowAbsentLine, waitRowFinishedLine, waitTimedOutUnreadReport, whenLaunchSettled, type CarriedDeadEvidence, type ConfigDirUnresolvableHook, type DeadEvidenceSource, type DeadSessionCause, type FindMissingRowReading, type LaunchVerb, type NotConnectedNotice, type OwnRowReadSite, type PersonaRowReread, type PersonaTeardownKillResult, type ReconnectResult, type SessionConflictLatch, type SpawnPersonaResult, type StartupPersonaOutcome } from '../src/session-manager.ts'
+import { _resetConfigDirFs, _resetConfiguredPersonaQuery, _resetFindMissingMemo, _resetInFlightLaunches, _resetLiveRowSequenceRegistry, _resetNotConnectedEpisodes, _resetNow, _resetPreLaunchTrustPatcher, _resetSpawnHomeDir, _resetWaitForWaitingTimeoutMs, _setConfigDirFs, _setFindMissingMemoTtlMs, _setNow, _setSpawnHomeDir, _setWaitForWaitingTimeoutMs, AGENT_DIRECTOR_LIVE_STATES, buildLiveRowSequenceDeps, bypassingFindMissingSweep, cancelWorkingRowWait, CARRIED_DEAD_EVIDENCE_NONE, carriedDeadEvidenceOf, checkLaunchConfigDir, checkPromptRowDeferral, compareRowToPersona, ConfigDirUnresolvableError, DEAD_EVIDENCE_NONE, DEAD_EVIDENCE_READ_BY_COLLISION_GET, DEAD_EVIDENCE_READ_BY_PATH, DEAD_EVIDENCE_READ_BY_POST_SWEEP_GET, DEAD_EVIDENCE_READ_BY_PROMPT_ROW_REREAD, DEAD_EVIDENCE_VOIDED_BY_RESUME_NOT_FOUND, DEAD_EVIDENCE_VOIDED_BY_RETIRED_KEY_FIRST_LAUNCH, DEAD_EVIDENCE_VOIDED_BY_REUSE_COLLISION_RERUN, DEAD_EVIDENCE_VOIDED_BY_ROW_NOT_INTERACTIVE, DEAD_SESSION_CAUSE_PROMPT_ROW_LADDER_GONE, DEAD_SESSION_CAUSE_ROW_ABSENT, DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE, DEAD_SESSION_CAUSE_ROW_READ_FINISHED, DEAD_SESSION_CAUSE_TMUX_GONE, DEAD_SESSION_CAUSES, deadEvidenceReadByCause, deadEvidenceVoidedLine, deadEvidenceVoidingRead, deadSessionRouteLine, decideNotResumable, describeDeadEvidence, describePersonaRowReread, ESCALATE_DEAD_EVIDENCE, ESCALATE_DEAD_ROW_ABSENT_AT_PANE_READ, ESCALATE_DEAD_VERDICTS,  escalateDeadSweepLine, escalateDeadVerdictOfCause, FIND_MISSING_LATCHED, FIND_MISSING_MEMO_TTL_MS, FIND_MISSING_REFUSED, FIND_MISSING_ROW_JUDGED_ALIVE, FIND_MISSING_ROW_LEFT_LIVE, FIND_MISSING_ROW_MARKED_MISSING, FIND_MISSING_ROW_NOT_JUDGED, findMissingRunReadName, forgetNotConnectedEpisode, handleDeliveryKeyError, handleDeliveryReadError, isDeadEvidence, isLaunchInFlight, isLiveRowSequenceRunning, joinedLaunchDropsDeadEvidenceLine, JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS, JSONL_DIAGNOSIS_REUSE_WORDING, JSONL_TRANSCRIPT_LOST_ENTRY_CLASS, KILL_CONTEXT_TEARDOWN, killPersonaInstance, killPersonaInstanceForTeardown, LAUNCH_VERB_RESUME, LAUNCH_VERB_REUSE_SPAWN, LAUNCH_VERB_SPAWN, launchForLiveRowSequence, launchSession, LIVE_ROW_START_NOT_INSTALLED, lostRaceOutcome, NOT_RESUMABLE_LATCHED, NOT_RESUMABLE_LOST_RACE, NOT_RESUMABLE_PENDING, NOT_RESUMABLE_PENDING_OUTCOME, NOT_RESUMABLE_SEQUENCE, notifyDisconnectedWithAutoRestartDisabled, notifyPersonaNotConnected, notifyRestartCapReached, notifySpawnFailure, notResumableSequenceOutcome, ORPHAN_CLEANUP_LIST_FAILED_LABEL, OWN_ROW_READ_ABSENT, OWN_ROW_READ_ROW, OWN_ROW_STATUS_ABSENT, OWN_ROW_STATUS_LATCHED, OWN_ROW_STATUS_REFUSED, OWN_ROW_STATUS_STATE, personaConfigDirLabelValue, plainSpawnCollisionLine, PRE_TRUST_LOG_PREFIX, preTrustLogLine, PROMPT_ROW_STATES, PROMPT_ROW_SWEEP_AFTER_MS, promptRowLadderAfterSweepLine, promptRowLadderLatchedLine, promptRowLadderNoActionLine, promptRowLadderNoPaneLine, promptRowLadderStoppingLine, readFindMissingRow, readPersonaOwnRow, readPersonaOwnRowStatus, readPersonaRowState, reconcileOrphans, RECONNECT_NOT_THIS_LAUNCH_NOTE, reconnectConflictLine, reconnectGoneLine, reconnectInvalidFlagsLine, reconnectLatchedLine, reconnectMcp, reconnectMcpWithCause, reconnectNotInteractiveLine, reconnectRowAbsentLine, reconnectStartLine, reconnectTransientLine, reconnectUnusableNameLine, REPLACE_REREAD_FINISHED_OUTCOME, REPLACE_REREAD_PENDING_OUTCOME, REPLACE_REREAD_REFUSED_OUTCOME, replaceRereadLine, resumeNotFoundSpawnLine, ROW_REREAD_FINISHED, ROW_REREAD_LATCHED, ROW_REREAD_LIVE, ROW_REREAD_PENDING, ROW_REREAD_REFUSED, ROW_REREAD_UNKNOWN, SEQUENCE_NOT_RESUMABLE_LOST_RACE_OUTCOME, sequenceLaunchAtCapLine, setConfigDirUnresolvableHook, setConfiguredPersonaQuery, setConflictLatch, setKillFailureAlerts, setPreLaunchTrustPatcher, setSessionNotifier, SPAWN_CAP_REACHED_REMEDIATION, SPAWN_FAILURE_DEFAULT_REMEDIATION, SPAWN_NOT_FOUND_REMEDIATION, spawnFailureNoticeText, spawnForPersona, spawnNotResumableLine, startLiveRowSequence, STARTUP_ERROR_SPAWN_FAILED, startupSessionManager, stopLiveRowSequence, sweepDeadTmuxChannel, transientReconnectLine, WAIT_OUTCOME_LATCHED, waitEndedDisconnectedLine, waitEndedOnStateReport, waitForWaitingAndReconnect, waitForWaitingAndReconnectWithCause, waitPollStatusErrorLine, waitRowAbsentLine, waitRowFinishedLine, waitTimedOutUnreadReport, whenLaunchSettled, type CarriedDeadEvidence, type ConfigDirUnresolvableHook, type DeadEvidenceSource, type DeadSessionCause, type FindMissingRowReading, type LaunchVerb, type NotConnectedNotice, type OwnRowReadSite, type PersonaRowReread, type PersonaTeardownKillResult, type ReconnectResult, type SessionConflictLatch, type SpawnPersonaResult, type StartupPersonaOutcome } from '../src/session-manager.ts'
 import { useImmediateTypingLifecycle } from './test-helpers/legacy-typing.ts'
 useImmediateTypingLifecycle()
 
@@ -335,12 +336,6 @@ import {
 import { REDACTED_TOKEN_PLACEHOLDER, REDACTED_URL_PLACEHOLDER } from '../src/slack-log-redaction.ts'
 import { escapeSlackControlCharacters, unescapeSlackControlCharacters } from '../src/slack-text-escape.ts'
 import {
-  _resetLaunchedWithDirs,
-  getLaunchedWithDir,
-  managedHookCommand,
-  preLaunchReplyGuard,
-} from '../src/stop-hook-bootstrap.ts'
-import {
   createUnavailableRetryController,
   RETRY_BLOCK_LAUNCH,
   runInAttempt,
@@ -555,8 +550,7 @@ import {
   type RecoveryStubScript,
   type TimedLaunch
 } from './test-helpers/recovery-harness.ts'
-import { installRecordingReplyGuard, observeLaunchCalls, type LaunchCall } from './test-helpers/reply-guard-launch.ts'
-import { makeReplyGuardRecordDir, type ReplyGuardRecordDir } from './test-helpers/reply-guard-record.ts'
+import { observeLaunchCalls } from './test-helpers/launch-calls.ts'
 import { readRetiredKeysRecord, retiredKeysRecordOf, RFC3339_UTC, type RetiredKeySeed } from './test-helpers/retired-keys.ts'
 import {
   makeDeferredConnect,
@@ -720,8 +714,6 @@ afterEach(() => {
   _resetOutageState()
   _resetSpawnHomeDir()
   _resetPreLaunchTrustPatcher()
-  _resetPreLaunchReplyGuard()
-  _resetLaunchedWithDirs()
   _resetConfigDirFs()
   _resetNotConnectedEpisodes()
 
@@ -1025,7 +1017,7 @@ describe('spawnForPersona: SR-1.1 / SR-2.2 fresh spawn parameters', () => {
     expect(params.instance_id).toBe(`cscb_${key}`)
     expect(params.tmux_session_name).toBe(`slack_bot_${key}`)
     expect(params.relay_mode).toBe('on')
-    expect(params.label).toEqual(['service=cscb', 'tag_prompt=1', `persona=${key}`, configDirLabelFor(configDir)])
+    expect(params.label).toEqual(['service=cscb', 'tag_prompt=1', REPLY_TOOL_PREALLOWED_LABEL, `persona=${key}`, configDirLabelFor(configDir)])
     // The interim `channel=<key>` label is no longer written (E3 Task 6).
     expect(params.label!.some((l) => l.startsWith('channel='))).toBe(false)
     expect(params.extra_env).toEqual({
@@ -1061,7 +1053,7 @@ describe('spawnForPersona: SR-1.1 / SR-2.2 fresh spawn parameters', () => {
     expect('CLAUDE_CONFIG_DIR' in env).toBe(false)
     expect(spawnCalls[0].label).toEqual([
       'service=cscb',
-      'tag_prompt=1',
+      'tag_prompt=1', REPLY_TOOL_PREALLOWED_LABEL,
       'persona=C',
       `config_dir=${personaConfigDirLabelValue(undefined, home)}`,
     ])
@@ -1300,7 +1292,7 @@ describe('spawnForPersona: persona identity (SR-2.2)', () => {
     expect(params.cwd).toBe('/repo/general')
     expect(params.label).toEqual([
       'service=cscb',
-      'tag_prompt=1',
+      'tag_prompt=1', REPLY_TOOL_PREALLOWED_LABEL,
       'persona=C0AMDDZEHCY',
       configDirLabelFor(topLevel),
     ])
@@ -1467,7 +1459,7 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
     expect(spawnCalls).toHaveLength(2)
     // fresh spawn carries the original params (same persona labels / id)
     expect(spawnCalls[1].instance_id).toBe('cscb_C')
-    expect(spawnCalls[1].label).toEqual(['service=cscb', 'tag_prompt=1', 'persona=C', `config_dir=${personaConfigDirLabelValue(undefined, home)}`])
+    expect(spawnCalls[1].label).toEqual(['service=cscb', 'tag_prompt=1', REPLY_TOOL_PREALLOWED_LABEL, 'persona=C', `config_dir=${personaConfigDirLabelValue(undefined, home)}`])
     // row was already gone — no kill and no delete of a missing row
     expect(killCalls).toHaveLength(0)
     expect(deleteCalls).toHaveLength(0)
@@ -2106,7 +2098,7 @@ describe('collision ladder: config_dir guard before resume (b.av2 SR-6.2, AC 48)
     } else {
       expect(result).toEqual({ key: 'C', action: 'spawned' })
       expect(calls.spawnCalls.map((call) => call.reuse_finished)).toEqual([undefined, true])
-      expect(calls.spawnCalls[1].label).toEqual(['service=cscb', 'tag_prompt=1', 'persona=C', `config_dir=${expectedLabel}`])
+      expect(calls.spawnCalls[1].label).toEqual(['service=cscb', 'tag_prompt=1', REPLY_TOOL_PREALLOWED_LABEL, 'persona=C', `config_dir=${expectedLabel}`])
       expect(calls.spawnCalls[1].extra_env?.['CLAUDE_CONFIG_DIR']).toBe(configDir)
     }
     // A fresh spawn, not amnesia: no transcript diagnosis, record or notice.
@@ -2256,7 +2248,7 @@ describe('collision ladder: config_dir guard before resume (b.av2 SR-6.2, AC 48)
     expect(deleteCalls).toEqual([])
     expect(spawnCalls.map((call) => [call.instance_id, call.reuse_finished])).toEqual([['cscb_C', undefined], ['cscb_C', true]])
     expect(spawnCalls[1].extra_env?.['CLAUDE_CONFIG_DIR']).toBe(later)
-    expect(spawnCalls[1].label).toEqual(['service=cscb', 'tag_prompt=1', 'persona=C', configDirLabelFor(later)])
+    expect(spawnCalls[1].label).toEqual(['service=cscb', 'tag_prompt=1', REPLY_TOOL_PREALLOWED_LABEL, 'persona=C', configDirLabelFor(later)])
     expect(spawnCalls[1].label).not.toContain(configDirLabelFor(earlier))
   })
 })
@@ -2505,463 +2497,10 @@ describe('pre-launch trust patch (b.av2 SR-6.2)', () => {
   })
 })
 
-// ---------------------------------------------------------------------------
-// b.av2 SR-9.4 / SR-6.2 — the reply-guard pre-launch step precedes every
-// spawn and resume (E10 Director decisions 1, 2 and 9)
-// ---------------------------------------------------------------------------
-//
-// The real `preLaunchReplyGuard` is installed through `setPreLaunchReplyGuard`
-// (`installRecordingReplyGuard`, tests/test-helpers/reply-guard-launch.ts),
-// bound to a per-test `mkdtempSync` state directory (`makeReplyGuardRecordDir`,
-// removed in afterEach) and the test's applied persona set. The file-level
-// afterEach resets the seam and the launched-with directories. The persona
-// has a hashed key (`Guard Desk`), because a record key must be a real
-// persona key, and its own temp claude_config_dir, so the launch-time hook
-// pass only ever writes under the fixture directory.
-//
-// Order comes from one shared log: the installed step appends 'guard', its
-// undo 'undo', and the stub's `spawn` / `resume` their verb
-// (`observeLaunchCalls`, same helper). At each spawn or
-// resume the stub also snapshots the record's exact text, the launched-with
-// directory and whether the persona's settings.json holds the managed hook.
-
-/** The reply-guard persona: its name differs from its hashed key. */
+// A persona name whose derived key differs from its display name.
 const GUARD_NAME = 'Guard Desk'
 const GUARD_KEY = personaKey(GUARD_NAME)
 const GUARD_INSTANCE = `${PERSONA_INSTANCE_ID_PREFIX}${GUARD_KEY}`
-
-/** One entry of the reply-guard order log. */
-type GuardEvent = 'guard' | 'undo' | 'spawn' | 'resume'
-
-/** What the stub saw at one spawn or resume call. */
-interface GuardSnapshot {
-  call: LaunchCall
-  /** The record's exact text, or null when there is none. */
-  record: string | null
-  launchedWith: string | undefined
-  /** Whether the persona's settings.json held the managed reply-guard hook. */
-  hooked: boolean
-}
-
-describe('pre-launch reply guard (b.av2 SR-9.4, SR-6.2)', () => {
-  let rg: ReplyGuardRecordDir
-
-  beforeEach(() => {
-    rg = makeReplyGuardRecordDir()
-  })
-
-  afterEach(() => {
-    rg.cleanup()
-  })
-
-  type SpawnResult = import('agent-director').SpawnResult
-  const collision = () => cannedErr<SpawnResult>(errInstanceIdCollision())
-  const spawnOk = () => cannedOk<StubSpawnResult>({ instance_id: GUARD_INSTANCE })
-
-  /**
-   * The reply-guard persona with a real working directory and its own real
-   * claude_config_dir; `spec` adds persona fields.
-   */
-  function guardConfig(spec: { stop_hook_bootstrap?: boolean } = {}): { cfg: PersonaConfig; persona: Persona; configDir: string } {
-    useSpawnHome()
-    const configDir = fixtureSubdir('claude-config')
-    const cfg = makeMultiPersonaConfig(
-      [{ name: GUARD_NAME, working_directory: fixtureSubdir('work'), claude_config_dir: configDir, ...spec }],
-      fixtureDir,
-      { agent_director_poll_interval_ms: 1 },
-    )
-    return { cfg, persona: personaOf(cfg, GUARD_KEY), configDir }
-  }
-
-  /** Whether `dir`/settings.json holds the managed hook for this test's state directory. */
-  function hookedIn(dir: string): boolean {
-    const path = join(dir, 'settings.json')
-    if (!existsSync(path)) return false
-    return readFileSync(path, 'utf-8').includes(JSON.stringify(managedHookCommand(rg.stateDir)))
-  }
-
-  /**
-   * Log each spawn / resume through `stub` to `events` and snapshot the
-   * persona's record, launched-with dir and hook at that moment.
-   */
-  function observeGuardCalls(stub: StubClient, configDir: string, events: GuardEvent[], seen: GuardSnapshot[]): StubClient {
-    return observeLaunchCalls(stub, (call) => {
-      events.push(call)
-      seen.push({ call, record: rg.readRecord(GUARD_KEY), launchedWith: getLaunchedWithDir(GUARD_KEY), hooked: hookedIn(configDir) })
-    })
-  }
-
-  /** A ladder row for the reply-guard persona (its cwd and config_dir label match unless overridden). */
-  function guardRow(cfg: PersonaConfig, overrides: PersonaGetResultOverrides = {}): CannedGetResult {
-    return personaRow(cfg, GUARD_KEY, overrides)
-  }
-
-  /** One launch path: how to reach it, its `spawnForPersona` action and its order log. */
-  interface GuardPath {
-    install: (cfg: PersonaConfig, calls: LadderCalls) => StubClient
-    expected: string
-    events: GuardEvent[]
-  }
-
-  /** A stub whose first spawn collides with a row `row` and whose resume rejects with `resumeError`. */
-  function installResumeRejects(row: CannedGetResult, calls: LadderCalls, resumeError: Error): StubClient {
-    return installStub({ ...calls, spawnQueue: [collision(), spawnOk()], getResult: row, resumeError })
-  }
-
-  const SPAWN = ['guard', 'spawn'] as const satisfies readonly GuardEvent[]
-  /** The optimistic spawn met a row: its step is undone before the ladder goes on. */
-  const COLLIDED = ['guard', 'spawn', 'undo'] as const satisfies readonly GuardEvent[]
-  const RESUME = ['guard', 'resume'] as const satisfies readonly GuardEvent[]
-
-  /**
-   * The ticket's named paths (fresh spawn; resume of an ended or missing row;
-   * dead-session recovery; the reuse spawn of the same id after a cwd or
-   * config_dir mismatch on a finished row, b.jg5 SRJ-707), which between them
-   * reach the optimistic spawn, `client.resume` and the replace step's reuse
-   * spawn, plus one row for each other spawn call site: the single retry
-   * after ErrSpawnNotFound on the post-collision get and each fallback spawn
-   * in `resumeOrFreshSpawn` (the no-transcript reuse spawn among them). Paths
-   * that share a call site with a row here (resume_enabled false, a dead
-   * working row, the other no-transcript resume errors, the restart adapter —
-   * covered end to end in restart.test.ts) have no row of their own; a live
-   * row's replacement makes no launch call of its own (the live-row
-   * sequence's step 6 is the sequence-launch entry's), and a resume's
-   * ErrSpawnNotResumable launches nothing (b.jg5 SRJ-710).
-   */
-  const GUARD_PATHS: Array<[string, GuardPath]> = [
-    ['fresh spawn', {
-      install: (_cfg, calls) => installStub({ ...calls }),
-      expected: 'spawned',
-      events: [...SPAWN],
-    }],
-    ['resume of an ended row', {
-      install: (cfg, calls) => installResumeEntry('ended', guardRow(cfg), calls, GUARD_KEY),
-      expected: 'resumed',
-      events: [...COLLIDED, ...RESUME],
-    }],
-    ['resume of a missing row', {
-      install: (cfg, calls) => installResumeEntry('missing', guardRow(cfg), calls, GUARD_KEY),
-      expected: 'resumed',
-      events: [...COLLIDED, ...RESUME],
-    }],
-    ['dead-session recovery from a waiting row', {
-      install: (cfg, calls) => installResumeEntry('waiting (dead session)', guardRow(cfg), calls, GUARD_KEY),
-      expected: 'resumed',
-      events: [...COLLIDED, ...RESUME],
-    }],
-    ['ended row in another directory (cwd mismatch): a reuse spawn of the same id', {
-      install: (cfg, calls) =>
-        installStub({ ...calls, spawnQueue: [collision(), spawnOk()], getResult: guardRow(cfg, { state: 'ended', cwd: fixtureSubdir('elsewhere') }) }),
-      expected: 'spawned',
-      events: [...COLLIDED, ...SPAWN],
-    }],
-    ['ended row with a changed config_dir label: a reuse spawn of the same id', {
-      install: (cfg, calls) => {
-        const labels = { ...guardRow(cfg).labels, config_dir: personaConfigDirLabelValue(fixtureSubdir('earlier-config'), ladderHome()) }
-        return installResumeEntry('ended', guardRow(cfg, { labels }), calls, GUARD_KEY)
-      },
-      expected: 'spawned',
-      events: [...COLLIDED, ...SPAWN],
-    }],
-    ['ErrSpawnNotFound on the post-collision get: the single retry spawn', {
-      install: (_cfg, calls) => installStub({ ...calls, spawnQueue: [collision(), spawnOk()], getError: errSpawnNotFound() }),
-      expected: 'spawned',
-      events: [...COLLIDED, ...SPAWN],
-    }],
-    ['resume ErrJsonlMissing: its diagnosis, then the reuse spawn (b.jg5 SRJ-712)', {
-      install: (cfg, calls) => installResumeRejects(guardRow(cfg, { state: 'ended' }), calls, errJsonlMissing()),
-      expected: 'fresh-after-inconclusive-amnesia',
-      events: [...COLLIDED, ...RESUME, ...SPAWN],
-    }],
-    ['resume ErrSpawnNotFound: fresh spawn', {
-      install: (cfg, calls) => installResumeRejects(guardRow(cfg, { state: 'ended' }), calls, errSpawnNotFound()),
-      expected: 'spawned',
-      events: [...COLLIDED, ...RESUME, ...SPAWN],
-    }],
-  ]
-
-  test.each(GUARD_PATHS)('%s: the record holds the effective value, and the hook is in place, before each spawn or resume', async (_name, path) => {
-    captureStartupErrors()
-    const { cfg, persona, configDir } = guardConfig()
-    const events: GuardEvent[] = []
-    const seen: GuardSnapshot[] = []
-    installRecordingReplyGuard(cfg.personas, rg.stateDir, events)
-    const calls = newLadderCalls()
-    observeGuardCalls(path.install(cfg, calls), configDir, events, seen)
-
-    let result: unknown
-    await withCapturedErr(async () => {
-      result = await spawnForPersona(persona, cfg)
-    })
-
-    expect(result).toEqual({ key: GUARD_KEY, action: path.expected })
-    // Each spawn and resume is immediately preceded by its own step.
-    expect(events).toEqual(path.events)
-    expect(seen.map((s) => s.call)).toEqual(path.events.filter((e): e is LaunchCall => e === 'spawn' || e === 'resume'))
-    for (const snap of seen) {
-      expect(snap).toEqual({ call: snap.call, record: 'true', launchedWith: configDir, hooked: true })
-    }
-    // The launch leaves the persona's record and launched-with dir in place.
-    expect(rg.readRecord(GUARD_KEY)).toBe('true')
-    expect(getLaunchedWithDir(GUARD_KEY)).toBe(configDir)
-  })
-
-  // Production reads only the persona's own effective `stop_hook_bootstrap`
-  // (the loader's inheritance is covered in stop-hook-bootstrap.test.ts), and
-  // GUARD_PATHS covers `true`; this is the `false` value on each launch verb.
-  test.each([
-    ['fresh spawn', 'spawned', ['spawn']],
-    ['resume of an ended row', 'resumed', ['spawn', 'resume']],
-  ] as const)('stop_hook_bootstrap false (%s): the record reads exactly false before each call and no hook is installed', async (path, action, verbs) => {
-    const { cfg, persona, configDir } = guardConfig({ stop_hook_bootstrap: false })
-    expect(persona.stop_hook_bootstrap).toBe(false)
-    const events: GuardEvent[] = []
-    const seen: GuardSnapshot[] = []
-    installRecordingReplyGuard(cfg.personas, rg.stateDir, events)
-    const calls = newLadderCalls()
-    const stub = path === 'fresh spawn'
-      ? installStub({ ...calls })
-      : installResumeEntry('ended', guardRow(cfg), calls, GUARD_KEY)
-    observeGuardCalls(stub, configDir, events, seen)
-
-    await withCapturedErr(async () => {
-      expect(await spawnForPersona(persona, cfg)).toEqual({ key: GUARD_KEY, action })
-    })
-
-    expect(seen.map((s) => s.call)).toEqual([...verbs])
-    // The exact text `false`, and no managed hook for a disabled persona.
-    for (const snap of seen) expect(snap).toEqual({ call: snap.call, record: 'false', launchedWith: configDir, hooked: false })
-    expect(rg.readRecord(GUARD_KEY)).toBe('false')
-  })
-
-  /**
-   * Leave the persona's running instance as an earlier launch left it: that
-   * launch's real step, for the persona as it was then (`then`), over the
-   * persona set as it was then.
-   */
-  function launchedEarlier(persona: Persona, then: Partial<Persona>): void {
-    const earlier = { ...persona, ...then }
-    preLaunchReplyGuard(earlier, [earlier], rg.stateDir)
-  }
-
-  // Every live state runs the same undo; one reconnect branch and one no-op
-  // branch here (the decision-9 table below covers a live waiting row).
-  test.each([
-    ['working', 'reconnected'],
-    ['pending', 'no-op'],
-  ] as const)('a live %s row (%s): no launch, so the running instance keeps its record, launched-with dir and hook', async (state, action) => {
-    // The instance launched enabled; the persona is now configured off.
-    const { cfg, persona, configDir } = guardConfig({ stop_hook_bootstrap: false })
-    launchedEarlier(persona, { stop_hook_bootstrap: true })
-    expect(rg.readRecord(GUARD_KEY)).toBe('true')
-    expect(hookedIn(configDir)).toBe(true)
-    const events: GuardEvent[] = []
-    const seen: GuardSnapshot[] = []
-    installRecordingReplyGuard(cfg.personas, rg.stateDir, events)
-    const calls = newLadderCalls()
-    observeGuardCalls(installStub({ ...calls, spawnQueue: [collision()], getQueue: state === 'working' ? [cannedOk(guardRow(cfg, { state }))] : undefined, getResult: guardRow(cfg, { state: state === 'working' ? 'waiting' : state }) }), configDir, events, seen)
-
-    let result!: Awaited<ReturnType<typeof spawnForPersona>>
-    await withCapturedErr(async () => {
-      result = await spawnForPersona(persona, cfg)
-    })
-
-    expect(result).toEqual({ key: GUARD_KEY, action })
-    // Only the optimistic spawn ran a step, and it was undone (decision 9).
-    expect(events).toEqual([...COLLIDED])
-    expect(calls.spawnCalls).toHaveLength(1)
-    expect(calls.resumeCalls).toHaveLength(0)
-    expect(rg.readRecord(GUARD_KEY)).toBe('true')
-    expect(getLaunchedWithDir(GUARD_KEY)).toBe(configDir)
-    expect(hookedIn(configDir)).toBe(true)
-  })
-
-  test.each([
-    {
-      label: 'a record reading true from the running instance, the persona now off',
-      spec: { stop_hook_bootstrap: false },
-      earlier: { stop_hook_bootstrap: true } as Partial<Persona> | undefined,
-      atCall: { record: 'false', dir: 'current', hooked: false },
-      after: { record: 'true', dir: 'current', hooked: true },
-    },
-    {
-      label: 'a record reading false and another launched-with dir, the persona now on',
-      spec: { stop_hook_bootstrap: true },
-      earlier: { stop_hook_bootstrap: false, claude_config_dir: 'previous' } as Partial<Persona> | undefined,
-      atCall: { record: 'true', dir: 'current', hooked: true },
-      after: { record: 'false', dir: 'previous', hooked: true },
-    },
-    {
-      label: 'no record and no launched-with dir',
-      spec: { stop_hook_bootstrap: true },
-      earlier: undefined,
-      atCall: { record: 'true', dir: 'current', hooked: true },
-      after: { record: null, dir: undefined, hooked: true },
-    },
-  ] as const)('decision 9: the optimistic spawn meets ErrInstanceIdCollision (live waiting row) — $label: its step is undone', async ({ spec, earlier, atCall, after }) => {
-    const { cfg, persona, configDir } = guardConfig(spec)
-    const previousDir = fixtureSubdir('previous-config')
-    const dirOf = (d: 'current' | 'previous' | undefined) => (d === 'current' ? configDir : d === 'previous' ? previousDir : undefined)
-    if (earlier) {
-      launchedEarlier(persona, { ...earlier, ...(earlier.claude_config_dir ? { claude_config_dir: previousDir } : {}) })
-    }
-    const before = rg.readRecord(GUARD_KEY)
-    const events: GuardEvent[] = []
-    const seen: GuardSnapshot[] = []
-    installRecordingReplyGuard(cfg.personas, rg.stateDir, events)
-    const calls = newLadderCalls()
-    observeGuardCalls(installStub({ ...calls, spawnQueue: [collision()], getResult: guardRow(cfg, { state: 'waiting' }) }), configDir, events, seen)
-
-    let result!: Awaited<ReturnType<typeof spawnForPersona>>
-    await withCapturedErr(async () => {
-      result = await spawnForPersona(persona, cfg)
-    })
-
-    expect(result).toEqual({ key: GUARD_KEY, action: 'reconnected' })
-    expect(events).toEqual([...COLLIDED])
-    // The step ran before the optimistic spawn…
-    expect(seen).toEqual([{ call: 'spawn', record: atCall.record, launchedWith: dirOf(atCall.dir), hooked: atCall.hooked }])
-    // …and the undo restored the previous text (or deleted the record), the
-    // launched-with dir and, through the re-run launch pass, the hook.
-    expect(rg.readRecord(GUARD_KEY)).toBe(after.record)
-    expect(rg.readRecord(GUARD_KEY)).toBe(before)
-    expect(getLaunchedWithDir(GUARD_KEY)).toBe(dirOf(after.dir))
-    expect(hookedIn(configDir)).toBe(after.hooked)
-  })
-
-  // b.jg5 SRJ-805: a recorded key's first launch is a reuse spawn, and its
-  // step precedes it as it precedes the plain first spawn. Its collision (the
-  // row is live) undoes that step, as the plain first spawn's does; a later
-  // reuse that collides (the replace step's, in the one re-run of
-  // get-then-act) undoes nothing. The key is recorded in a real store over a
-  // temp state directory, installed as main() installs it (the file-level
-  // afterEach removes it); no live-row sequence registry is installed, so a
-  // live old life's sequence start answers not-installed and runs nothing.
-  test.each<readonly [string, (cfg: PersonaConfig) => Parameters<typeof makeStubClient>[0], SpawnPersonaResult, readonly GuardEvent[]]>([
-    ['no row: the one reuse succeeds', () => ({ getError: errSpawnNotFound() }), { key: GUARD_KEY, action: SPAWN_ACTION_FRESH_RETIRED }, SPAWN],
-    [
-      'a live waiting row (the old life): the reuse collides and the sequence is started',
-      (cfg) => ({ spawnQueue: [collision()], getResult: guardRow(cfg, { state: 'waiting' }) }),
-      { key: GUARD_KEY, action: 'sequence-waiting' },
-      COLLIDED,
-    ],
-    [
-      'the reuse colliding, the collision get reading ended: the replace step\'s reuse succeeds',
-      (cfg) => ({ spawnQueue: [collision(), spawnOk()], getResult: guardRow(cfg, { state: 'ended' }) }),
-      { key: GUARD_KEY, action: SPAWN_ACTION_FRESH_RETIRED },
-      [...COLLIDED, ...SPAWN],
-    ],
-    [
-      'the reuse colliding, the collision get reading ended: the replace step\'s reuse collides too',
-      (cfg) => ({ spawnQueue: [collision(), collision()], getResult: guardRow(cfg, { state: 'ended' }) }),
-      { key: GUARD_KEY, action: SPAWN_ACTION_RETRYING },
-      [...COLLIDED, ...SPAWN],
-    ],
-  ])('a recorded key\'s first launch, %s: the step precedes each reuse spawn, and only the first launch\'s collision undoes it', async (_label, script, expected, expectedEvents) => {
-    const { cfg, persona, configDir } = guardConfig()
-    const loaded = loadRetiredKeyStore(fixtureSubdir('retired-state'), { log: () => {} })
-    if (loaded.kind !== 'loaded') throw new Error('the retired-key record cannot be loaded')
-    loaded.store.record([{ key: GUARD_KEY, cause: RETIRED_KEY_CAUSE_REMOVED }])
-    setRetiredKeyStore(loaded.store)
-    const events: GuardEvent[] = []
-    installRecordingReplyGuard(cfg.personas, rg.stateDir, events)
-    const calls = newLadderCalls()
-    observeGuardCalls(installStub({ ...calls, ...script(cfg) }), configDir, events, [])
-
-    let result!: Awaited<ReturnType<typeof spawnForPersona>>
-    await withCapturedErr(async () => {
-      result = await spawnForPersona(persona, cfg)
-    })
-
-    expect(result).toStrictEqual(expected)
-    expect(events).toEqual([...expectedEvents])
-    expect(calls.spawnCalls.map((call) => call.reuse_finished)).toEqual(expectedEvents.filter((e) => e === 'spawn').map(() => true))
-    expect(calls.resumeCalls).toEqual([])
-  })
-
-  test('dry run: no step runs — no record, record directory, launched-with dir or settings.json — and nothing is launched', async () => {
-    process.env['SLACK_DRY_RUN'] = '1'
-    const { cfg, persona, configDir } = guardConfig()
-    const events: GuardEvent[] = []
-    installRecordingReplyGuard(cfg.personas, rg.stateDir, events)
-    const calls = newLadderCalls()
-    observeGuardCalls(installStub({ ...calls }), configDir, events, [])
-
-    await withCapturedErr(async () => {
-      expect(await spawnForPersona(persona, cfg)).toEqual({ key: GUARD_KEY, action: 'no-op' })
-      expect(await launchSession(GUARD_KEY, cfg)).toBe(true)
-    })
-
-    expect(events).toEqual([])
-    expect(calls).toEqual(newLadderCalls())
-    expect(existsSync(rg.recordDir)).toBe(false)
-    expect(getLaunchedWithDir(GUARD_KEY)).toBeUndefined()
-    expect(existsSync(join(configDir, 'settings.json'))).toBe(false)
-  })
-
-  test('the record cannot be written (a regular file where reply-guard/ belongs): the spawn still reaches agent-director and one log line names the persona key', async () => {
-    const readLog = captureStartupErrors()
-    const { cfg, persona, configDir } = guardConfig()
-    // A file, not a directory: unwritable even for root, which ignores mode bits.
-    writeFileSync(rg.recordDir, 'not a directory')
-    const events: GuardEvent[] = []
-    const seen: GuardSnapshot[] = []
-    installRecordingReplyGuard(cfg.personas, rg.stateDir, events)
-    const calls = newLadderCalls()
-    observeGuardCalls(installStub({ ...calls }), configDir, events, seen)
-
-    let result!: Awaited<ReturnType<typeof spawnForPersona>>
-    const errLog = await withCapturedErr(async () => {
-      result = await spawnForPersona(persona, cfg)
-    })
-
-    expect(result).toEqual({ key: GUARD_KEY, action: 'spawned' })
-    expect(events).toEqual([...SPAWN])
-    expect(calls.spawnCalls.map((p) => p.instance_id)).toEqual([GUARD_INSTANCE])
-    const lines = errLog.split('\n').filter((l) => l.includes('reply-guard: could not write the record'))
-    expect(lines).toHaveLength(1)
-    expect(lines[0]).toStartWith(`[slack] reply-guard: could not write the record for ${renderPersonaRef(GUARD_NAME, GUARD_KEY)} at `)
-    expect(lines[0]).toContain(`key=${GUARD_KEY}`)
-    expect(lines[0]).toContain('launching anyway')
-    // The file is left as it was; the failure is a log line, not a startup error or a notice.
-    expect(readFileSync(rg.recordDir, 'utf-8')).toBe('not a directory')
-    expect(readLog()).toBe('')
-    expect(notices).toHaveLength(0)
-  })
-
-  // AC 20 (b.av2 SR-10.3): a guard, or its undo, that throws an error whose
-  // message and properties carry fake tokens is logged by description only:
-  // type, safe code and the redacted message.
-  const guardError = (step: string): Error =>
-    Object.assign(new Error(leakyMessage(`${step} failed`, step)), { code: 'EIO', detail: LEAK_SENTINEL })
-
-  test.each([
-    ['the guard throws (fresh spawn)', 'spawned', 'guard', 'pre-launch reply guard failed', ' — launching anyway: '],
-    ['its undo throws (the optimistic spawn met an ended row, which is resumed)', 'resumed', 'undo', 'undoing the pre-launch reply guard failed', ': '],
-  ] as const)('AC 20: %s with an error carrying fake tokens — the launch goes on; one line names the error with its redacted message; nothing logged leaks', async (_label, action, step, fragment, separator) => {
-    const readLog = captureStartupErrors()
-    const { cfg, persona } = guardConfig()
-    const calls = newLadderCalls()
-    if (action === 'spawned') {
-      setPreLaunchReplyGuard(() => { throw guardError('guard') })
-      installStub({ ...calls })
-    } else {
-      setPreLaunchReplyGuard(() => () => { throw guardError('undo') })
-      installResumeEntry('ended', guardRow(cfg), calls, GUARD_KEY)
-    }
-
-    let result!: Awaited<ReturnType<typeof spawnForPersona>>
-    const errLog = await withCapturedErr(async () => {
-      result = await spawnForPersona(persona, cfg)
-    })
-
-    expect(result).toEqual({ key: GUARD_KEY, action })
-    expect(errLog.split('\n').filter((l) => l.includes(fragment)).map((l) => l.split(' at ')[0])).toEqual([
-      `[slack] spawnForPersona: ${fragment} for ${renderPersonaRef(GUARD_NAME, GUARD_KEY)}${separator}Error code=EIO message=${JSON.stringify(redactedLeakyMessage(`${step} failed`))}`,
-    ])
-    assertNoLeak({ errLog, startupErrorsLog: readLog(), notices })
-  })
-})
 
 // ---------------------------------------------------------------------------
 // b.svb / b.f2b — Claude Code's prompt suggestions are off in every persona
@@ -3197,10 +2736,9 @@ describe('launchSession: a key outside the applied set (b.av2 SR-8.6)', () => {
   const SERVING: PersonaConnectionStatus = { state: 'up', identity: { botUserId: 'U0APPLIED', botId: 'B0APPLIED' } }
 
   /**
-   * The reply-guard persona (its connection serving, its bring-up `up`) with
+   * The persona (its connection serving, its bring-up `up`) with
    * a real working directory and claude_config_dir, a recording trust
-   * patcher, the real reply guard over a temp record dir and a stub recording
-   * every verb. The applied set, read live by the gate and the reply guard,
+   * patcher and a stub recording every verb. The applied set, read live by the gate,
    * starts as the persona's config; `applied` replaces it.
    */
   function appliedFixture() {
@@ -3213,10 +2751,8 @@ describe('launchSession: a key outside the applied set (b.av2 SR-8.6)', () => {
       { agent_director_poll_interval_ms: 1 },
     )
     let appliedSet: readonly Persona[] = cfg.personas
-    const events: Array<LaunchEvent | 'guard' | 'undo'> = []
+    const events: LaunchEvent[] = []
     setPreLaunchTrustPatcher(() => void events.push('patch'))
-    const rg = makeReplyGuardRecordDir({ parentDir: fixtureDir })
-    installRecordingReplyGuard(() => appliedSet, rg.stateDir, events)
     const calls = makeStubCallLog()
     observeLaunchCalls(installStub(calls), (call) => events.push(call))
     const gateLines: string[] = []
@@ -3227,13 +2763,13 @@ describe('launchSession: a key outside the applied set (b.av2 SR-8.6)', () => {
     const applied = (personas: readonly Persona[]): void => {
       appliedSet = personas
     }
-    return { cfg, configDir, events, calls, rg, gateLines, canLaunch, applied, readLog }
+    return { cfg, configDir, events, calls, gateLines, canLaunch, applied, readLog }
   }
 
   test.each([
     ['the config passed still holds it (a stale snapshot)', true],
     ['the config passed no longer holds it', false],
-  ] as const)('removed from the applied set, %s: \'skipped\', one gate line, no agent-director call, no trust patch, no reply-guard record or hook', async (_label, passStale) => {
+  ] as const)('removed from the applied set, %s: \'skipped\', one gate line, no agent-director call, no trust patch, no settings hook', async (_label, passStale) => {
     const f = appliedFixture()
     // Step 1 of an apply that removes the persona: the applied set no longer holds it.
     f.applied([])
@@ -3248,15 +2784,13 @@ describe('launchSession: a key outside the applied set (b.av2 SR-8.6)', () => {
     expect(f.gateLines).toEqual([`[slack] persona=${GUARD_KEY}: not relaunched — it is no longer in the applied configuration`])
     expect(stubCallCount(f.calls)).toBe(0)
     expect(f.events).toEqual([])
-    expect(f.rg.readRecord(GUARD_KEY)).toBeNull()
-    expect(getLaunchedWithDir(GUARD_KEY)).toBeUndefined()
     expect(existsSync(join(f.configDir, 'settings.json'))).toBe(false)
     expect(notices).toEqual([])
     expect(f.readLog()).toBe('')
     expect(errLog).toBe('')
   })
 
-  test('control: an applied key through the same gate is patched, guarded and spawned as before; true', async () => {
+  test('control: an applied key through the same gate is patched and spawned; true', async () => {
     const f = appliedFixture()
 
     let result: LaunchSessionResult | undefined
@@ -3266,23 +2800,19 @@ describe('launchSession: a key outside the applied set (b.av2 SR-8.6)', () => {
 
     expect(result).toBe(true)
     expect(f.gateLines).toEqual([])
-    expect(f.events).toEqual(['patch', 'guard', 'spawn'])
+    expect(f.events).toEqual(['patch', 'spawn'])
     expect(f.calls.spawnCalls.map((p) => p.instance_id)).toEqual([GUARD_INSTANCE])
-    expect(f.rg.readRecord(GUARD_KEY)).toBe('true')
-    expect(getLaunchedWithDir(GUARD_KEY)).toBe(f.configDir)
   })
 })
 
 // ---------------------------------------------------------------------------
 // b.av2 SR-8.6 next-launch rows (AC 59): a launch takes the persona's
-// effective claude_config_dir and stop_hook_bootstrap from the applied set it
-// is handed at that moment (the server hands `personaConfig`, which a
-// confirmed apply's step 1 swaps), and the reply guard reads the live applied
-// set; nothing is kept from an earlier launch.
+// effective claude_config_dir from the applied set it is handed at that
+// moment (the server hands `personaConfig`, which a confirmed apply swaps).
 // ---------------------------------------------------------------------------
 
 describe('next launch: the applied values at launch time (b.av2 SR-8.6 next-launch rows, AC 59)', () => {
-  test('claude_config_dir and stop_hook_bootstrap changed between two launches: the first uses the old values; the second gives the old-label row a reuse spawn of the same id with the new CLAUDE_CONFIG_DIR (not created yet, under a symlinked parent), deletes nothing and writes the new record', async () => {
+  test('claude_config_dir changed between two launches: the first uses the old values; the second gives the old-label row a reuse spawn of the same id with the new CLAUDE_CONFIG_DIR (not created yet, under a symlinked parent), and deletes nothing', async () => {
     useSpawnHome()
     const work = fixtureSubdir('work')
     const oldDir = fixtureSubdir('claude-config-old')
@@ -3298,8 +2828,6 @@ describe('next launch: the applied values at launch time (b.av2 SR-8.6 next-laun
     const before = configFor(oldDir, true)
     const after = configFor(newDir, false)
     let applied = before
-    const rg = makeReplyGuardRecordDir({ parentDir: fixtureDir })
-    installRecordingReplyGuard(() => applied.personas, rg.stateDir, [])
 
     const first = makeStubCallLog()
     installStub(first)
@@ -3307,7 +2835,6 @@ describe('next launch: the applied values at launch time (b.av2 SR-8.6 next-laun
     expect(first.spawnCalls).toHaveLength(1)
     expect(first.spawnCalls[0]!.extra_env?.['CLAUDE_CONFIG_DIR']).toBe(oldDir)
     expect(first.spawnCalls[0]!.label).toContain(configDirLabelFor(oldDir))
-    expect(rg.readRecord(GUARD_KEY)).toBe('true')
     // The row the first launch left behind carries the old label.
     const row = personaRow(before, GUARD_KEY, { state: 'ended' })
     expect(first.spawnCalls[0]!.label).toContain(`config_dir=${row.labels['config_dir']}`)
@@ -3339,11 +2866,10 @@ describe('next launch: the applied values at launch time (b.av2 SR-8.6 next-laun
     expect(second.spawnCalls[1]!.extra_env?.['CLAUDE_CONFIG_DIR']).toBe(newDir)
     expect(second.spawnCalls[1]!.label).toEqual([
       'service=cscb',
-      'tag_prompt=1',
+      'tag_prompt=1', REPLY_TOOL_PREALLOWED_LABEL,
       `persona=${GUARD_KEY}`,
       `config_dir=${configDirLabelValue(join(realpathSync(realParent), 'claude-config-new'))}`,
     ])
-    expect(rg.readRecord(GUARD_KEY)).toBe('false')
     // Not held for the directory that does not exist yet (bug b.g57, Director decision 1).
     expect(errLog).not.toContain(PERSONA_CONFIG_DIR_UNRESOLVABLE)
   })
@@ -6041,9 +5567,8 @@ describe('b.g57: an unresolvable claude_config_dir keeps the row and skips the l
   const ENTRIES = ['ended', 'missing', 'waiting (dead session)'] as const
 
   /**
-   * The reply-guard persona (a hashed key) with a real working directory and
-   * claude_config_dir, a recording trust patcher, the real reply guard over a
-   * temp record dir, and a recording hold hook that does not hold (so the
+   * The persona (a hashed key) with a real working directory and
+   * claude_config_dir, a recording trust patcher and a recording hold hook that does not hold (so the
    * session manager logs the line itself). `broken` drives the injected
    * realpath for the config dir.
    */
@@ -6061,11 +5586,9 @@ describe('b.g57: an unresolvable claude_config_dir keeps the row and skips the l
     const row = personaRow(cfg, GUARD_KEY)
     const events: string[] = []
     setPreLaunchTrustPatcher(() => void events.push('patch'))
-    const rg = makeReplyGuardRecordDir({ parentDir: fixtureDir })
-    installRecordingReplyGuard(cfg.personas, rg.stateDir, events)
     const held: Array<Parameters<ConfigDirUnresolvableHook>> = []
     setConfigDirUnresolvableHook((...args) => (held.push(args), false))
-    return { cfg, persona, configDir, row, events, rg, held, readLog }
+    return { cfg, persona, configDir, row, events, held, readLog }
   }
 
   test.each(ENTRIES.flatMap((entry) => FAILURE_POINTS.map((point) => [entry, point] as const)))(
@@ -6090,7 +5613,7 @@ describe('b.g57: an unresolvable claude_config_dir keeps the row and skips the l
       expect(calls.deleteCalls).toEqual([])
       expect(calls.resumeCalls).toEqual([])
       if (point === 'before the launch') {
-        // Nothing ran: no agent-director call at all, no trust patch, no reply-guard step or record.
+        // Nothing ran: no agent-director call at all, no trust patch.
         expect(stubCallCount(calls)).toBe(0)
         expect(f.events).toEqual([])
       } else {
@@ -6099,7 +5622,6 @@ describe('b.g57: an unresolvable claude_config_dir keeps the row and skips the l
         expect(calls.getCalls).toHaveLength(entry === 'waiting (dead session)' ? 3 : 1)
         expect(errLog).not.toContain('config_dir label')
       }
-      expect(f.rg.readRecord(GUARD_KEY)).toBeNull()
       expect(f.held.map(([p, failure]) => [p.key, failure.class])).toEqual([[GUARD_KEY, PERSONA_CONFIG_DIR_UNRESOLVABLE]])
       expect(configDirLines(errLog)).toHaveLength(1)
       expectConfigDirUnresolvableLine(configDirLines(errLog)[0], f.persona, f.configDir)
@@ -6120,7 +5642,6 @@ describe('b.g57: an unresolvable claude_config_dir keeps the row and skips the l
       expect(after.resumeCalls.map((r) => r.instance_id)).toEqual([GUARD_INSTANCE])
       expect(after.deleteCalls).toEqual([])
       expect(after.spawnCalls).toHaveLength(1)
-      expect(f.rg.readRecord(GUARD_KEY)).toBe('true')
       expect(configDirLines(resumedLog)).toEqual([])
       assertNoLeak({ errLog, resumedLog, held: f.held })
     },
@@ -6161,7 +5682,6 @@ describe('b.g57: an unresolvable claude_config_dir keeps the row and skips the l
     expect(errLog).not.toContain('config_dir label')
     expect(f.held).toEqual([])
     expect(configDirLines(errLog)).toEqual([])
-    expect(f.rg.readRecord(GUARD_KEY)).toBeNull()
     expect(notices).toEqual([])
     assertNoLeak({ errLog, result })
   })
@@ -6326,7 +5846,7 @@ describe('b.g57: an unresolvable claude_config_dir keeps the row and skips the l
       expect(await spawnForPersona(personaOf(cfg, 'C'), cfg)).toEqual({ key: 'C', action: 'spawned' })
     })
 
-    expect(first.spawnCalls[0]!.label).toEqual(['service=cscb', 'tag_prompt=1', 'persona=C', `config_dir=${expected}`])
+    expect(first.spawnCalls[0]!.label).toEqual(['service=cscb', 'tag_prompt=1', REPLY_TOOL_PREALLOWED_LABEL, 'persona=C', `config_dir=${expected}`])
     expect(first.spawnCalls[0]!.extra_env?.['CLAUDE_CONFIG_DIR']).toBe(configDir)
     expect(configDirLines(errLog)).toEqual([])
 
@@ -6512,9 +6032,9 @@ describe('startupSessionManager', () => {
     // Each spawn carries its own persona's working directory and persona label.
     const byId = new Map(spawnCalls.map((p) => [p.instance_id, p]))
     expect(byId.get('cscb_alpha')!.cwd).toBe('/x/alpha')
-    expect(byId.get('cscb_alpha')!.label).toEqual(['service=cscb', 'tag_prompt=1', 'persona=alpha', expect.stringMatching(/^config_dir=/)])
+    expect(byId.get('cscb_alpha')!.label).toEqual(['service=cscb', 'tag_prompt=1', REPLY_TOOL_PREALLOWED_LABEL, 'persona=alpha', expect.stringMatching(/^config_dir=/)])
     expect(byId.get('cscb_beta')!.cwd).toBe('/x/beta')
-    expect(byId.get('cscb_beta')!.label).toEqual(['service=cscb', 'tag_prompt=1', 'persona=beta', expect.stringMatching(/^config_dir=/)])
+    expect(byId.get('cscb_beta')!.label).toEqual(['service=cscb', 'tag_prompt=1', REPLY_TOOL_PREALLOWED_LABEL, 'persona=beta', expect.stringMatching(/^config_dir=/)])
     // Result counts are per persona.
     expect(result.succeeded).toBe(2)
     expect(result.freshSpawned).toBe(2)
@@ -19099,8 +18619,8 @@ const RETRYING_ANSWER = { action: SPAWN_ACTION_RETRYING } as const
 // the reuse spawn, one stub `spawn` of `cscb_<key>` carrying the reuse flag.
 // The reuse spawn's describe covers its parameters (AC 57: a plain spawn's
 // apart from the flag), its success line (no earlier life kept when the id
-// had no row), the steps around it (the trust patch once, the reply guard
-// right before it, the launch in flight while it is held) and SRJ-112's
+// had no row), the steps around it (the trust patch once, the launch in
+// flight while it is held) and SRJ-112's
 // outcome table, one case per row, with the CONFLICT and UNUSABLE NAME rows'
 // whole matrices (their records and posts) left to
 // tests/conflict-latch.test.ts and the other arms through the sequence to
@@ -19380,20 +18900,15 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
       expect([h.stub.callCount(), getFailureCount(p), h.notices]).toEqual([0, 0, []])
     })
 
-    // SRJ-708, b.av2 SR-6.2: the trust patch once per launch attempt, the
-    // reply guard immediately before each launch call (a `resume` that went
-    // on to the reuse has run the patch).
+    // SRJ-708, b.av2 SR-6.2: the trust patch runs once per attempt, including
+    // a resume that proceeds to a reuse spawn.
     test.each([
-      ['the reuse kind', LIVE_ROW_LAUNCH_REUSE, ['patch', 'guard', 'spawn']],
-      ['a resume that answered ErrNoSessionId', LIVE_ROW_LAUNCH_RESUME, ['patch', 'guard', 'resume', 'guard', 'spawn']],
-    ] as const)('%s: the trust patch runs once in the attempt and the reply guard immediately before the reuse spawn', async (_label, kind, events) => {
+      ['the reuse kind', LIVE_ROW_LAUNCH_REUSE, ['patch', 'spawn']],
+      ['a resume that answered ErrNoSessionId', LIVE_ROW_LAUNCH_RESUME, ['patch', 'resume', 'spawn']],
+    ] as const)('%s: the trust patch runs once in the attempt before the reuse spawn', async (_label, kind, events) => {
       const { h, p } = srj105Build()
       const order: string[] = []
       setPreLaunchTrustPatcher(() => void order.push('patch'))
-      setPreLaunchReplyGuard(() => {
-        order.push('guard')
-        return () => void order.push('undo')
-      })
       observeLaunchCalls(h.stub.client, (call) => order.push(call))
       h.script({ resumeError: errNoSessionId() })
 
@@ -23527,8 +23042,7 @@ describe('b.jg5 SRJ-810, SRJ-1502, SRJ-1015 (E27 T3): the old-life gate at the l
 
   /**
    * A pre-persona row held at P's working directory, its row read live, the
-   * wait's first run held by `hold`; the trust patch and the reply guard
-   * record each call in `steps`.
+   * wait's first run held by `hold`; the trust patch records each call in `steps`.
    */
   function heldAtP(): { h: RecoveryHarness; p: string; b: string; hold: ReturnType<typeof holdFindMissing>; steps: string[] } {
     const { h, p, b } = srj105Build()
@@ -23538,9 +23052,6 @@ describe('b.jg5 SRJ-810, SRJ-1502, SRJ-1015 (E27 T3): the old-life gate at the l
     const steps: string[] = []
     setPreLaunchTrustPatcher((persona) => {
       steps.push(`patch ${persona.key}`)
-    })
-    setPreLaunchReplyGuard((persona) => {
-      steps.push(`guard ${persona.key}`)
     })
     return { h, p, b, hold, steps }
   }
@@ -23981,13 +23492,9 @@ describe('b.jg5 SRJ-111: the plain spawn\'s outcome table through the one handle
   // Hatch note E23: the collision at the entry runs no get-then-act inside the
   // sequence; the entry answers not launched (spawn-collision), and the
   // sequence's end arms the collision cause (tests/live-row-sequence.test.ts).
-  test('a collision at the plain spawn after the live-row sequence\'s launch entry\'s resume answers ErrSpawnNotFound: not launched (spawn-collision), no further call, nothing counted, no notice, no cause sent by the entry; the reply guard is undone', async () => {
+  test('a collision at the plain spawn after the live-row sequence\'s launch entry\'s resume answers ErrSpawnNotFound: not launched (spawn-collision), no further call, nothing counted, no notice, no cause sent by the entry', async () => {
     const { h, p } = srj105Build()
     const events: string[] = []
-    setPreLaunchReplyGuard(() => {
-      events.push('guard')
-      return () => void events.push('undo')
-    })
     observeLaunchCalls(h.stub.client, (call) => events.push(call))
     h.script(PLAIN_SPAWN_SITES.entry.script(h, p, errInstanceIdCollision(), []))
     const order = recordCallOrder(h)
@@ -23995,7 +23502,7 @@ describe('b.jg5 SRJ-111: the plain spawn\'s outcome table through the one handle
     expect(await PLAIN_SPAWN_SITES.entry.launch(h, p)).toEqual({ key: p, action: LIVE_ROW_OUTCOME_NOT_LAUNCHED, reason: LIVE_ROW_NOT_LAUNCHED_SPAWN_COLLISION })
 
     expect(order).toEqual(['resume', 'spawn'])
-    expect(events).toEqual(['guard', 'resume', 'guard', 'spawn', 'undo'])
+    expect(events).toEqual(['resume', 'spawn'])
     expect([h.notices, h.triggers, getFailureCount(p), h.latch.isLatched(p)]).toEqual([[], [], 0, false])
     expect(plainSpawnCollisionLinesOf(h, p, true)).toEqual([])
   })

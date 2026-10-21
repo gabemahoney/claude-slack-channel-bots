@@ -896,7 +896,7 @@ describe('several changes to one persona', () => {
     const { plan, lines } = preview(
       edited((c) => {
         entry(c, 'bravo').channels![1]!.delivery = 'all'
-        entry(c, 'bravo').stop_hook_bootstrap = false
+        entry(c, 'bravo').claude_config_dir = join(root, 'bravo-claude-2')
       }),
     )
 
@@ -904,7 +904,7 @@ describe('several changes to one persona', () => {
     expect(lines).toEqual([
       header({ inPlace: 1 }),
       'persona "bravo" (key=bravo): delivery changed: applied in place immediately, instance kept; ' +
-        'stop_hook_bootstrap changed: takes effect at its next launch, instance kept.',
+        'claude_config_dir changed: takes effect at its next launch, which starts fresh (the conversation is not resumed), instance kept until then.',
     ])
   })
 
@@ -940,22 +940,6 @@ describe('next-launch changes', () => {
       'claude_config_dir changed: takes effect at its next launch, which starts fresh (the conversation is not resumed), ' +
         'instance kept until then.',
     ],
-    [
-      ['stop_hook_bootstrap'],
-      (b) => (b.stop_hook_bootstrap = false),
-      false,
-      'stop_hook_bootstrap changed: takes effect at its next launch, instance kept.',
-    ],
-    [
-      ['claude_config_dir', 'stop_hook_bootstrap'],
-      (b) => {
-        b.stop_hook_bootstrap = false
-        b.claude_config_dir = join(root, 'bravo-claude-2')
-      },
-      true,
-      'claude_config_dir, stop_hook_bootstrap changed: takes effect at its next launch, which starts fresh ' +
-        '(the conversation is not resumed), instance kept until then.',
-    ],
   ])('a persona\'s own %p takes effect at its next launch and counts as modified in place', (settings, mutate, dirs, effect) => {
     const { plan, lines } = preview(edited((c) => mutate(entry(c, 'bravo'))))
 
@@ -975,15 +959,6 @@ describe('next-launch changes', () => {
       (c) => (c.claude_config_dir = join(root, 'claude-default-2')),
       true,
       "takes effect at each one's next launch, which starts fresh (the conversation is not resumed), instance kept until then.",
-    ],
-    [
-      'stop_hook_bootstrap',
-      (c) => {
-        c.stop_hook_bootstrap = false
-        entry(c, 'bravo').stop_hook_bootstrap = true
-      },
-      false,
-      "takes effect at each one's next launch, instance kept.",
     ],
   ])(
     'a changed top-level %s is one settings line listing exactly its inheritors, with no persona line',
@@ -1070,13 +1045,6 @@ describe('next-launch changes', () => {
         entry(c, 'charlie').claude_config_dir = join(root, 'claude-default')
       },
     ],
-    [
-      'stop_hook_bootstrap',
-      (c) => {
-        c.stop_hook_bootstrap = false
-        for (const p of c.personas) p.stop_hook_bootstrap = true
-      },
-    ],
   ])('a changed default %s that no persona inherits is recorded and says no instance is affected', (setting, mutate) => {
     const plan = buildChangePlan(applied(), valid(edited(mutate)), facts())
     if (!plan.valid) throw new Error('expected a valid plan')
@@ -1087,6 +1055,46 @@ describe('next-launch changes', () => {
     expect(render(plan)).toEqual([
       header({ settings: 1 }),
       `server-wide setting ${setting} changed: once applied, it is recorded; no persona inherits it, so no instance is affected.`,
+    ])
+  })
+})
+
+describe('stop_hook_bootstrap is the immediate reply-reminder switch', () => {
+  test('an own change is in place and has no next-launch effect', () => {
+    const { plan, lines } = preview(edited(c => { entry(c, 'bravo').stop_hook_bootstrap = false }))
+    expect(plan.inPlace).toEqual([{ ...ref('bravo', 1), settings: ['stop_hook_bootstrap'] }])
+    expect(plan.nextLaunch).toEqual([])
+    expect(plan.configDirsChanged).toBe(false)
+    expect(lines).toEqual([
+      header({ inPlace: 1 }),
+      'persona "bravo" (key=bravo): stop_hook_bootstrap changed: applied in place immediately, instance kept.',
+    ])
+  })
+
+  test('a changed default updates its inheritors in place while an override is kept', () => {
+    const { plan, lines } = preview(edited(c => {
+      c.stop_hook_bootstrap = false
+      entry(c, 'bravo').stop_hook_bootstrap = true
+    }))
+    expect(plan.inPlace.map(p => [p.key, p.settings])).toEqual([
+      ['alpha', ['stop_hook_bootstrap']], ['charlie', ['stop_hook_bootstrap']],
+    ])
+    expect(plan.unchanged).toEqual([ref('bravo', 1)])
+    expect(plan.nextLaunch).toEqual([])
+    expect(plan.configDirsChanged).toBe(false)
+    expect(lines.join('\n')).not.toMatch(/next (?:launch|server start)/)
+  })
+
+  test('a changed reminder default with explicit overrides on every persona has no instance effect', () => {
+    const before = edited(c => { for (const persona of c.personas) persona.stop_hook_bootstrap = true })
+    const after = edited(c => { c.stop_hook_bootstrap = false; for (const persona of c.personas) persona.stop_hook_bootstrap = true })
+    const { plan, lines } = previewBetween(before, after)
+    expect(plan.inPlace).toEqual([])
+    expect(plan.nextLaunch).toEqual([])
+    expect(plan.settings).toEqual([{ name: 'stop_hook_bootstrap', inheritedBy: [] }])
+    expect(lines).toEqual([
+      header({ settings: 1 }),
+      'server-wide setting stop_hook_bootstrap changed: once applied, it is recorded; no persona inherits the change, so no reply reminder is affected.',
     ])
   })
 })
@@ -1131,7 +1139,7 @@ describe('a changed claude_config_dir that cannot be resolved warns, as an added
     expect(lines).toEqual([header({ inPlace: 1 }), `persona "bravo" (key=bravo): claude_config_dir changed: takes effect at its next launch, ${FRESH}${warning}.`])
   })
 
-  test('with stop_hook_bootstrap changed too, the warning follows the joined next-launch effect', () => {
+  test('with stop_hook_bootstrap changed too, the directory warning follows only its next-launch effect', () => {
     const { f } = configDirFacts({ bravo: PROBLEM })
     const { lines } = preview(
       edited((c) => {
@@ -1142,7 +1150,8 @@ describe('a changed claude_config_dir that cannot be resolved warns, as an added
     )
 
     expect(lines[1]).toBe(
-      `persona "bravo" (key=bravo): claude_config_dir, stop_hook_bootstrap changed: takes effect at its next launch, ${FRESH}; ` +
+      'persona "bravo" (key=bravo): stop_hook_bootstrap changed: applied in place immediately, instance kept; ' +
+        `claude_config_dir changed: takes effect at its next launch, ${FRESH}; ` +
         `but at that launch it cannot come up: ${PROBLEM}.`,
     )
   })
@@ -1159,7 +1168,7 @@ describe('a changed claude_config_dir that cannot be resolved warns, as an added
     )
 
     expect(asked).toEqual([])
-    expect(plan.nextLaunch.map((p) => p.configDirUnresolvable)).toEqual([undefined])
+    expect(plan.nextLaunch).toEqual([])
     expect(lines.join('\n')).not.toContain('cannot come up')
   })
 
@@ -1201,13 +1210,13 @@ describe('a changed claude_config_dir that cannot be resolved warns, as an added
       f,
     )
 
-    const stopHook = plan.settings.find((s) => s.name === 'stop_hook_bootstrap')
-    expect(stopHook?.inheritedBy).toEqual([ref('alpha', 0), ref('bravo', 1), ref('charlie', 2)])
-    const stopHookLine = lines.find((l) => l.startsWith('server-wide setting stop_hook_bootstrap'))
-    expect(stopHookLine).toBe(
-      'server-wide setting stop_hook_bootstrap changed: inherited by "alpha" (key=alpha), "bravo" (key=bravo), "charlie" (key=charlie); ' +
-        "takes effect at each one's next launch, instance kept.",
-    )
+    expect(plan.inPlace.map(p => [p.key, p.settings])).toEqual([
+      ['alpha', ['stop_hook_bootstrap']], ['bravo', ['stop_hook_bootstrap']], ['charlie', ['stop_hook_bootstrap']],
+    ])
+    const stopHookLine = lines.find(l => l.startsWith('server-wide setting stop_hook_bootstrap'))
+    expect(stopHookLine).toBeDefined()
+    expect(stopHookLine).not.toContain('cannot come up')
+    expect(stopHookLine).not.toMatch(/next (?:launch|server start)/)
     expect(lines.find((l) => l.startsWith('server-wide setting claude_config_dir'))).toEndWith(
       `; but at that launch "alpha" (key=alpha), "charlie" (key=charlie) cannot come up: ${PROBLEM}.`,
     )
@@ -2170,17 +2179,17 @@ describe('no preview line says "destroyed"', () => {
    * Applied: alpha, bravo, charlie, foxtrot, golf. Candidate: foxtrot removed;
    * bravo and charlie destructively modified, bravo with a claude_config_dir
    * that cannot be resolved; alpha modified in place and at its next launch,
-   * and inheriting a changed default that could not be checked; golf's
+   * hotel inherits a changed default that could not be checked; golf's
    * credentials rotated; delta added, echo added but unable to come up; port
    * changed.
    */
   function everyKind(): ValidChangePlan {
     const problem = 'claude_config_dir cannot be resolved to a real path (ENOENT)'
     const appliedInput = baseInput()
-    appliedInput.personas.push(persona('foxtrot', 'C0F0001'), persona('golf', 'C0G0001'))
-    const [alpha, bravo, charlie, , golf] = structuredClone(appliedInput.personas)
+    appliedInput.personas.push(persona('foxtrot', 'C0F0001'), persona('golf', 'C0G0001'), persona('hotel', 'C0H0001'))
+    const [alpha, bravo, charlie, , golf, hotel] = structuredClone(appliedInput.personas)
     alpha!.channels![0]!.delivery = 'mentions'
-    alpha!.stop_hook_bootstrap = false
+    alpha!.claude_config_dir = join(root, 'alpha-claude-2')
     bravo!.working_directory = join(root, 'bravo-new-work')
     bravo!.claude_config_dir = join(root, 'bravo-claude-2')
     charlie!.working_directory = join(root, 'charlie-new-work')
@@ -2188,11 +2197,11 @@ describe('no preview line says "destroyed"', () => {
       ...appliedInput,
       port: 3200,
       claude_config_dir: join(root, 'claude-default-2'),
-      personas: [alpha!, bravo!, charlie!, golf!, persona('delta', 'C0D0001'), persona('echo', 'C0E0001')],
+      personas: [alpha!, bravo!, charlie!, golf!, hotel!, persona('delta', 'C0D0001'), persona('echo', 'C0E0001')],
     }
     const plan = buildChangePlan(parse(appliedInput), valid(parse(candidateInput)), {
       ...credentialsFacts({ held: { golf: DIGEST_OLD }, current: { [credentialsOf('golf')]: DIGEST_NEW } }),
-      configDirProblem: (p) => ({ bravo: problem, alpha: FACT_UNKNOWN })[p.key],
+      configDirProblem: (p) => ({ bravo: problem, hotel: FACT_UNKNOWN })[p.key],
       addedCannotComeUp: new Map([['echo', [{ step: 'working-directory', cause: 'working directory does not exist' }]]]),
     })
     if (!plan.valid) throw new Error('expected a valid plan')

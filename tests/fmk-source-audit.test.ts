@@ -419,7 +419,7 @@ const SRC_FILES: ReadonlyArray<readonly [string, string]> = (readdirSync(SRC_DIR
 
 describe('b.jg5 SRJ-716, SRJ-106, SRJ-612, SRJ-601: one source audit over every src/ file', () => {
   test('the real src/ has no finding, every listed non-literal start among them', () => {
-    expect(SRC_FILES.map(([name]) => name)).toEqual(expect.arrayContaining(['cli.ts', 'session-manager.ts', 'server.ts', 'stop-hook-bootstrap.ts']))
+    expect(SRC_FILES.map(([name]) => name)).toEqual(expect.arrayContaining(['cli.ts', 'session-manager.ts', 'server.ts', 'reply-reminder.ts']))
     expect(auditSources(SRC_FILES, NON_LITERAL_STARTS)).toEqual([])
   })
 })

@@ -1,10 +1,11 @@
+import { REPLY_TOOL_ALLOW_RULE } from '../src/agent-director-template.ts'
+import { queuePath, readQueue } from './test-helpers/delivery-queue.ts'
+import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
+import { IDLE_PANE } from './test-helpers/working-row-panes.ts'
 import { botSystemPromptPath } from '../src/bot-system-prompt.ts'
 import { resolveServerStateDir } from '../src/config.ts'
 import { readPersonaOwnRow } from '../src/session-manager.ts'
-import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
-import { queuePath, readQueue } from './test-helpers/delivery-queue.ts'
 import { useImmediateTypingLifecycle } from './test-helpers/legacy-typing.ts'
-import { IDLE_PANE } from './test-helpers/working-row-panes.ts'
 useImmediateTypingLifecycle()
 
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
@@ -574,11 +575,8 @@ describe('a confirmed removal tears the persona down (b.av2 SR-6.5, SR-8.6 step 
     // One kill, which succeeds at its first try, and no delete: the row is kept (b.jg5 SRJ-715).
     expect(composition.agentDirectorOrder).toEqual([`kill ${personaInstanceId(bravoKey)}`])
     expect(stubCallCount(composition.agentDirector)).toBe(1)
-    // Every dependency call is for bravo, except the Stop-hook pass, which re-evaluates against the personas still applied.
-    expect(composition.calls.filter(([member, key]) => member !== 'replyGuard.launchPass' && key !== bravoKey)).toEqual([])
-    expect(composition.calls.filter(([member]) => member === 'replyGuard.launchPass')).toEqual([
-      ['replyGuard.launchPass', keysOf('alpha', 'charlie').join(',')],
-    ])
+    // Every dependency call is for bravo alone.
+    expect(composition.calls.filter(([, key]) => key !== bravoKey)).toEqual([])
     expect(run.stub('bravo').socket.disconnectCalls).toBe(1)
     expect(run.connections.manager.status(bravoKey)).toBeUndefined()
     expect(run.bringUps.state(bravoKey)).toBeUndefined()
@@ -775,7 +773,7 @@ describe('apply step 1 records the retired keys before the last-applied record i
       label: 'an in-place change',
       change: ([alpha, bravo]) => ({ personas: [alpha!, { ...bravo!, channels: [{ id: ownChannel('bravo'), delivery: 'mentions' }] }] }),
     },
-    { label: 'a next-launch change', change: ([alpha, bravo]) => ({ personas: [alpha!, { ...bravo!, stop_hook_bootstrap: false }] }) },
+    { label: 'a next-launch change', change: ([alpha, bravo]) => ({ personas: [alpha!, { ...bravo!, claude_config_dir: h.configDir('bravo-next') }] }) },
     {
       label: "a change of a credentials file's content",
       change: (personas) => {
@@ -3175,9 +3173,9 @@ function configDirLink(name: string, target: string): string {
   return path
 }
 
-/** The memory-read rules the template holds for `dirs`: one per distinct directory, sorted, scoped to project memory (b.av2 SR-11). */
-function memoryRules(...dirs: string[]): string[] {
-  return [...new Set(dirs)].sort().map((dir) => `Read(/${dir}/projects/*/memory/**)`)
+/** Reply plus one memory-read rule per distinct directory, sorted and scoped to project memory. */
+function templateAllowRules(...dirs: string[]): string[] {
+  return [REPLY_TOOL_ALLOW_RULE, ...[...new Set(dirs)].sort().map((dir) => `Read(/${dir}/projects/*/memory/**)`)]
 }
 
 /** The agent-director calls made from `from` (an `agentDirectorCalls` length taken earlier) on. */
@@ -4460,18 +4458,60 @@ describe('b.jg5 SRJ-207, SRJ-715: a destructive modify ends a held persona\'s Er
   })
 })
 
-describe('AC 59: a claude_config_dir or stop_hook_bootstrap change costs no session and takes effect at the next launch (b.av2 SR-8.6, SR-6.2, SR-9.4)', () => {
+describe('reply-reminder configuration applies without relaunching', () => {
+  test.each([false, true])('an own toggle to %s takes effect on confirmation and keeps both instances', async enabled => {
+    const { run, personas } = await running(['alpha', ['bravo', { stop_hook_bootstrap: !enabled }]], { ...REAL_LAUNCH, sessions: true })
+    const [alpha] = personas
+    const bravoKey = h.key('bravo')
+    const sides = { alpha: slackSideOf(run, 'alpha'), bravo: slackSideOf(run, 'bravo') }
+    const sessions = { alpha: run.session('alpha'), bravo: run.session('bravo') }
+    const rows = { alpha: h.rowOf('alpha'), bravo: h.rowOf('bravo') }
+    const cp = run.checkpoint()
+    const adFrom = run.composition!.agentDirectorCalls.length
+    const lines = await previewConfig(run, [alpha!, h.persona('bravo', { stop_hook_bootstrap: enabled })])
+    expect(lines).toContain(`persona ${renderPersonaRef('bravo', bravoKey)}: stop_hook_bootstrap changed: applied in place immediately, instance kept.`)
+    expect(run.serverConfig()!.personas.find(p => p.key === bravoKey)!.stop_hook_bootstrap).toBe(!enabled)
+    h.confirm()
+    await run.ticks.tick()
+    expect(run.serverConfig()!.personas.find(p => p.key === bravoKey)!.stop_hook_bootstrap).toBe(enabled)
+    expect(run.since(cp).lifecycle).toEqual([{ op: 'update-in-place', key: bravoKey, via: 'apply', settings: ['stop_hook_bootstrap'] }])
+    expect(adCallsSince(run, adFrom)).toEqual([])
+    expect({ alpha: slackSideOf(run, 'alpha'), bravo: slackSideOf(run, 'bravo') }).toEqual(sides)
+    expect(run.session('alpha')).toBe(sessions.alpha!)
+    expect(run.session('bravo')).toBe(sessions.bravo!)
+    expect({ alpha: h.rowOf('alpha'), bravo: h.rowOf('bravo') }).toEqual(rows)
+    await expectNothingPendingAfter(run)
+    expectNoPostNoLeak(run)
+  })
+
+  test('a default toggle updates inheritors immediately and keeps an explicit override', async () => {
+    const { run, personas } = await running(['alpha', 'bravo', ['charlie', { stop_hook_bootstrap: true }]], { ...REAL_LAUNCH, top: { stop_hook_bootstrap: true } })
+    const adFrom = run.composition!.agentDirectorCalls.length
+    const cp = run.checkpoint()
+    await previewConfig(run, personas, { stop_hook_bootstrap: false })
+    h.confirm()
+    await run.ticks.tick()
+    expect(run.serverConfig()!.personas.map(p => [p.name, p.stop_hook_bootstrap])).toEqual([
+      ['alpha', false], ['bravo', false], ['charlie', true],
+    ])
+    expect(run.since(cp).lifecycle).toEqual(keysOf('alpha', 'bravo').map(key => ({ op: 'update-in-place', key, via: 'apply', settings: ['stop_hook_bootstrap'] })))
+    expect(adCallsSince(run, adFrom)).toEqual([])
+    await expectNothingPendingAfter(run)
+    expectNoPostNoLeak(run)
+  })
+})
+
+describe('AC 59: a claude_config_dir change keeps the session until the next launch', () => {
   beforeEach(useConfigDirs)
 
   test.each<{
-    setting: 'claude_config_dir' | 'stop_hook_bootstrap'
+    setting: 'claude_config_dir'
     what: string
     change: () => Partial<PersonaInput>
     refresh: boolean
     nextLaunch: string[]
     /** What the next launch answers: true for a reuse spawn, resumed-unreported for a resume (counted once its row reports in, b.4q8). */
     answer: LaunchSessionResult
-    record: string
     /** The `config_dir` label the next launch must carry; default the strict label of the new directory. */
     label?: () => string
     /** Asserted before the next launch: the new directory is still not created. */
@@ -4485,7 +4525,6 @@ describe('AC 59: a claude_config_dir or stop_hook_bootstrap change costs no sess
       // From an `ended` row labelled with the old directory: replaced by a reuse of the same id with the new one, nothing deleted.
       nextLaunch: ['spawn ErrInstanceIdCollision', 'reuse-spawn ok'],
       answer: true,
-      record: 'true',
     },
     {
       setting: 'claude_config_dir',
@@ -4494,29 +4533,15 @@ describe('AC 59: a claude_config_dir or stop_hook_bootstrap change costs no sess
       refresh: true,
       nextLaunch: ['spawn ErrInstanceIdCollision', 'reuse-spawn ok'],
       answer: true,
-      record: 'true',
       // The nearest existing ancestor's real path (the link's target) plus the rest, never the path as written.
       label: () => configDirLabelValue(join(h.configDir('bravo-parent'), 'fresh', 'nested'), h.home),
       uncreated: true,
     },
-    {
-      setting: 'stop_hook_bootstrap',
-      what: 'stop_hook_bootstrap',
-      change: () => ({ stop_hook_bootstrap: false }),
-      refresh: false,
-      // The row's label still matches: resumed.
-      nextLaunch: ['spawn ErrInstanceIdCollision', 'resume ok'],
-      answer: LAUNCH_RESUMED_UNREPORTED,
-      record: 'false',
-    },
-  ])("AC 59: bravo's own $what changed records no teardown, bring-up or reconnect and no agent-director instance call, keeps its connection, MCP session, row and reply-guard record; its next launch uses the new value, and running alpha is unaffected (real launch)", async ({ setting, change, refresh, nextLaunch, answer, record, label: expectedLabel, uncreated }) => {
+  ])("AC 59: bravo's own $what changed records no teardown, bring-up or reconnect and no agent-director instance call, keeps its connection, MCP session and row; its next launch uses the new value, and running alpha is unaffected (real launch)", async ({ setting, change, refresh, nextLaunch, answer, label: expectedLabel, uncreated }) => {
     const { run, personas } = await running(['alpha', 'bravo'], { ...REAL_LAUNCH, sessions: true })
     const [alpha, bravo] = personas
     const bravoKey = h.key('bravo')
     const edited = h.persona('bravo', change())
-    const records = () => ({ alpha: h.readReplyGuardRecord('alpha'), bravo: h.readReplyGuardRecord('bravo') })
-    const recordsBefore = records()
-    expect(recordsBefore).toEqual({ alpha: 'true', bravo: 'true' })
     const rows = () => ({ alpha: h.rowOf('alpha'), bravo: h.rowOf('bravo') })
     const rowsBefore = rows()
     const sessions = { alpha: run.session('alpha'), bravo: run.session('bravo') }
@@ -4543,7 +4568,6 @@ describe('AC 59: a claude_config_dir or stop_hook_bootstrap change costs no sess
     expect(run.session('bravo')).toBe(sessions.bravo!)
     expect(run.session('alpha')).toBe(sessions.alpha!)
     expect(rows()).toEqual(rowsBefore)
-    expect(records()).toEqual(recordsBefore)
     expect(run.bringUps.state(bravoKey)?.outcome).toBe('up')
     expect(run.logsOf(RELOAD_APPLIED)).toHaveLength(1)
     await expectNothingPendingAfter(run)
@@ -4559,16 +4583,14 @@ describe('AC 59: a claude_config_dir or stop_hook_bootstrap change costs no sess
     const label = expectedLabel?.() ?? personaConfigDirLabelValue(edited.claude_config_dir, h.home)
     expect(lastSpawnOf(run, 'bravo')).toMatchObject({ claudeConfigDir: edited.claude_config_dir, configDirLabel: label })
     expect(h.rowOf('bravo')).toMatchObject({ state: 'waiting', labels: expect.objectContaining({ config_dir: label }) })
-    expect(h.readReplyGuardRecord('bravo')).toBe(record)
     // Never held as unresolvable, at the apply or the launch.
     expect(run.logsOf(PERSONA_CONFIG_DIR_UNRESOLVABLE)).toEqual([])
     expect(run.isUp('bravo')).toBe(true)
     // No lost-history or transcript-loss warning for it: no notice, no post.
     expect(run.sessionNotices).toEqual([])
-    // alpha, running beside it: no instance call, its row and its record unchanged.
+    // alpha, running beside it: no instance call, its row unchanged.
     expect(run.composition!.instanceCallsOf('alpha')).toHaveLength(alphaInstanceCalls)
     expect(h.rowOf('alpha')).toEqual(rowsBefore.alpha)
-    expect(h.readReplyGuardRecord('alpha')).toBe(recordsBefore.alpha)
     expect(run.session('alpha')).toBe(sessions.alpha!)
     expectNoPostNoLeak(run)
   })
@@ -4725,7 +4747,7 @@ describe('AC 61: a changed inherited default leaves every instance undisturbed a
   beforeEach(useConfigDirs)
 
   test.each<{
-    setting: 'claude_config_dir' | 'stop_hook_bootstrap'
+    setting: 'claude_config_dir'
     before: () => TopLevel
     after: () => TopLevel
     /** alpha's and bravo's overrides: they inherit the default. */
@@ -4739,8 +4761,8 @@ describe('AC 61: a changed inherited default leaves every instance undisturbed a
     /** What those launches answer: true for a reuse spawn, resumed-unreported for a resume (counted once its row reports in, b.4q8). */
     inheritorAnswer: LaunchSessionResult
     ownAnswer: LaunchSessionResult
-    /** What each persona's next launch used: its spawn's config directory and its reply-guard record. */
-    launched: (name: string) => { claudeConfigDir: string | undefined; record: string | undefined }
+    /** What each persona's next launch used: its spawn's config directory. */
+    launched: (name: string) => { claudeConfigDir: string | undefined }
   }>([
     {
       setting: 'claude_config_dir',
@@ -4753,26 +4775,13 @@ describe('AC 61: a changed inherited default leaves every instance undisturbed a
       ownLaunch: ['spawn ErrInstanceIdCollision', 'resume ok'],
       inheritorAnswer: true,
       ownAnswer: LAUNCH_RESUMED_UNREPORTED,
-      launched: (name) => ({ claudeConfigDir: name === 'charlie' ? ownConfigDir('charlie') : h.configDir('default-new'), record: 'true' }),
-    },
-    {
-      setting: 'stop_hook_bootstrap',
-      before: () => ({ stop_hook_bootstrap: true }),
-      after: () => ({ stop_hook_bootstrap: false }),
-      inherit: {},
-      own: { stop_hook_bootstrap: true },
-      refresh: false,
-      inheritorLaunch: ['spawn ErrInstanceIdCollision', 'resume ok'],
-      ownLaunch: ['spawn ErrInstanceIdCollision', 'resume ok'],
-      inheritorAnswer: LAUNCH_RESUMED_UNREPORTED,
-      ownAnswer: LAUNCH_RESUMED_UNREPORTED,
-      launched: (name) => ({ claudeConfigDir: ownConfigDir(name), record: name === 'charlie' ? 'true' : 'false' }),
+      launched: (name) => ({ claudeConfigDir: name === 'charlie' ? ownConfigDir('charlie') : h.configDir('default-new') }),
     },
   ])('AC 61: the top-level $setting changed, inherited by alpha and bravo and overridden by charlie, is previewed as one line listing exactly alpha and bravo, records no teardown, bring-up or reconnect, and each inheritor\'s next launch uses the new default while charlie\'s keeps its own (real launch)', async ({ setting, before, after, inherit, own, refresh, inheritorLaunch, ownLaunch, inheritorAnswer, ownAnswer, launched }) => {
     const names = ['alpha', 'bravo', 'charlie']
     const { run, personas } = await running([['alpha', inherit], ['bravo', inherit], ['charlie', own]], { ...REAL_LAUNCH, top: before() })
     const snapshot = () =>
-      Object.fromEntries(names.map((n) => [n, { row: h.rowOf(n), record: h.readReplyGuardRecord(n), side: slackSideOf(run, n) }]))
+      Object.fromEntries(names.map((n) => [n, { row: h.rowOf(n), side: slackSideOf(run, n) }]))
     const kept = snapshot()
     const adFrom = run.composition!.agentDirectorCalls.length
     const cp = run.checkpoint()
@@ -4801,9 +4810,8 @@ describe('AC 61: a changed inherited default leaves every instance undisturbed a
       const from = run.composition!.instanceCallsOf(name).length
       expect(await run.relaunch(name)).toBe(name === 'charlie' ? ownAnswer : inheritorAnswer)
       expect(instanceCallsSince(run, name, from)).toEqual(name === 'charlie' ? ownLaunch : inheritorLaunch)
-      const { claudeConfigDir, record } = launched(name)
+      const { claudeConfigDir } = launched(name)
       expect(lastSpawnOf(run, name)?.claudeConfigDir).toBe(claudeConfigDir)
-      expect(h.readReplyGuardRecord(name)).toBe(record)
     }
     expect(run.sessionNotices).toEqual([])
     expectNoPostNoLeak(run)
@@ -4914,14 +4922,14 @@ describe('step 5: the agent-director template refresh (b.av2 SR-8.6 step 5, SR-1
   test.each(REFRESH_ROWS)('step 5: $label changes the set of effective config directories, so the apply refreshes the template exactly once, its allow rules covering exactly the new set and every other field as installed (real composition)', async ({ next, dirs, noop }) => {
     const { run, personas } = await running(['alpha', 'bravo', ['charlie', { claude_config_dir: undefined }]], { realLifecycle: true, top: DEFAULT_TOP() })
     const installed = run.composition!.installedTemplate!
-    expect(installed.allow).toEqual(memoryRules(ownConfigDir('alpha'), ownConfigDir('bravo'), h.configDir('default')))
+    expect(installed.allow).toEqual(templateAllowRules(ownConfigDir('alpha'), ownConfigDir('bravo'), h.configDir('default')))
     const candidate = next(personas, DEFAULT_TOP())
     const cp = run.checkpoint()
 
     await applyConfig(run, candidate.personas, candidate.top)
 
     expect(run.lifecycle.of('template-refresh')).toEqual([refreshRecord('refreshed')])
-    expect(templateCalls(run)).toEqual([{ ...installed, allow: memoryRules(...dirs()), overwrite: true }])
+    expect(templateCalls(run)).toEqual([{ ...installed, allow: templateAllowRules(...dirs()), overwrite: true }])
     expect(run.logs.filter((l) => l.startsWith('[slack] template refresh: '))).toHaveLength(1)
     if (noop) {
       expect(run.since(cp).lifecycle).toEqual([refreshRecord('refreshed')])
@@ -4977,7 +4985,7 @@ describe('step 5: the agent-director template refresh (b.av2 SR-8.6 step 5, SR-1
     await applyConfig(run, withDelta(personas), { mcp_config_path: join(h.root, 'mcp-next.json'), system_prompt_mode: 'none' })
 
     expect(templateCalls(run)).toEqual([
-      { ...installed, allow: memoryRules(ownConfigDir('alpha'), ownConfigDir('bravo'), ownConfigDir('delta')), overwrite: true },
+      { ...installed, allow: templateAllowRules(ownConfigDir('alpha'), ownConfigDir('bravo'), ownConfigDir('delta')), overwrite: true },
     ])
     expect(run.serverConfig()!.mcp_config_path).toBe(startTop.mcp_config_path!)
     expect(run.serverConfig()!.system_prompt_mode).toBe('append')
@@ -5219,7 +5227,7 @@ describe('AC 20 at apply: no credential value in any log line, error, notice, to
    * the session notices, `extra`, and every regular file under the harness's
    * temp directory but the operator's own `config.json` and the credentials
    * files in `operatorFiles` (`h.serverSideFiles`: the pending file,
-   * `config.json.last-applied`, any leftover `config.json.apply`, reply-guard
+   * `config.json.last-applied`, any leftover `config.json.apply`, queue
    * records, anything else), each by name and content.
    */
   function sweep(run: ReloadRun, operatorFiles: readonly string[], extra: Record<string, unknown> = {}): void {

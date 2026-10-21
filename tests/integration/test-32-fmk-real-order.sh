@@ -41,6 +41,7 @@ case_assert down "${DOWN_ROW}" "${DOWN_MARK}" 13
 { flock -x 8; printf '' > "${SCENARIO_AD_SHIM_LOG%.log}.faults"; } 8> "${SCENARIO_AD_SHIM_LOG%.log}.faults.lock"
 start_server --live
 real_wait_launch "${REAL_KEY}"
+# Count original Slack/cron/interject inputs separately from legitimate no-reply reminders.
 real_wait_delivery "${REAL_KEY}" 13
 # Twenty queued items: actual faults plus bot restart during the blocked head.
 real_wait_idle "${REAL_KEY}"
