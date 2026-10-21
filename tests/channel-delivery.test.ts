@@ -57,7 +57,9 @@ function check(state: unknown) { assertNoLeak({ state, file: existsSync(sharedCh
     const authority = makeSharedAuthority(root, input(), { write: (_path, bytes) => { writes.push(bytes) } })
     const before = authority.snapshot()
     expect(authority.transact(0, () => { throw new Error('must not run') })).toEqual({ kind: 'stale', revision: 1 })
-    expect(authority.transact(1, next => { next.revision = -1 })).toEqual({ kind: 'failed', revision: 1 })
+    for (const revision of [-1, 1, 3]) {
+      expect(authority.transact(1, next => { next.revision = revision })).toEqual({ kind: 'failed', revision: 1 })
+    }
     expect(writes).toEqual([])
     expect(authority.snapshot()).toEqual(before)
     expect(authority.transact(1, next => {
@@ -74,9 +76,14 @@ function check(state: unknown) { assertNoLeak({ state, file: existsSync(sharedCh
     const received: unknown[] = []
     const unsubscribe = authority.subscribe(config => { expect(durable).toBe(true); received.push(config) })
     const edited = input(); edited.channel_mode = 'open'; edited.personas[0]!.channels = [{ id: 'C0TEST002', delivery: 'thread_hybrid' }]; edited.personas[0]!.permission_prompts = 'C0TEST002'
+    expect(authority.transact(authority.revision, next => { next.pendingIntent = { prepared: 'review' }; next.outcomes = { prior: 'retained' } }).kind).toBe('applied')
+    received.length = 0
+    durable = false
     expect(authority.applyReviewed(configBytes(edited), authority.revision).kind).toBe('applied')
     expect(received).toEqual([authority.config()])
     expect(readSharedState(root)!.applied).toEqual(authority.snapshot().applied)
+    expect(readSharedState(root)!.pendingIntent).toEqual({ prepared: 'review' })
+    expect(readSharedState(root)!.outcomes).toEqual({ prior: 'retained' })
     unsubscribe()
     authority.assign('alpha', authority.incarnation('alpha')!, 'C0TEST002', 'off', authority.revision)
     expect(received).toHaveLength(1)
@@ -103,6 +110,7 @@ function check(state: unknown) { assertNoLeak({ state, file: existsSync(sharedCh
     if (fault === 'before-rename') expect(readFileSync(authority.path)).toEqual(before)
     else {
       expect(authority.assign('alpha', initial.personas['alpha']!.incarnation, 'C0TEST001', 'off', 1).kind).toBe('unresolved')
+      expect(authority.observeMembership('alpha', initial.personas['alpha']!.incarnation, { event: 'join', identity: 'app', channel: 'C0TEST001', member: true, boundary: 0 }, 1).kind).toBe('unresolved')
       expect(() => authority.previewReviewed(configBytes(edited))).toThrow('unresolved')
       expect(writes).toBe(1)
       expect(createSharedChannelAuthority(authority.path, disk).config().channel_mode).toBe('open')
@@ -120,6 +128,20 @@ function check(state: unknown) { assertNoLeak({ state, file: existsSync(sharedCh
     check(authority.snapshot())
   })
 
+  test('observer reentrancy cannot publish a second revision and memory matches serialized state', () => {
+    const authority = makeSharedAuthority(root, input())
+    const results: unknown[] = []
+    authority.subscribe(() => {
+      results.push(authority.assign('alpha', authority.incarnation('alpha')!, 'C0TEST001', 'off', authority.revision))
+    })
+    expect(authority.transact(1, next => { next.pendingIntent['omitted'] = undefined })).toEqual({ kind: 'applied', revision: 2 })
+    expect(results).toEqual([{ kind: 'stale', revision: 2 }])
+    expect(authority.choice('alpha', 'C0TEST001')).toBe('all')
+    expect(Object.hasOwn(authority.snapshot().pendingIntent, 'omitted')).toBe(false)
+    expect(authority.snapshot()).toEqual(readSharedState(root)!)
+    check(results)
+  })
+
   test('retiring is adapter-local, rejects the held key and leaves its healthy neighbor writable', () => {
     const authority = makeSharedAuthority(root, input())
     const store = createChannelDeliveryStore(authority)
@@ -133,6 +155,84 @@ function check(state: unknown) { assertNoLeak({ state, file: existsSync(sharedCh
     check(authority.snapshot())
   })
  })
+
+test('replaying a verified leave preserves a later future preference, while a never-joined preference has no leave evidence', () => {
+  const authority = makeSharedAuthority(root, input())
+  const life = authority.incarnation('alpha')!
+  const leave = { event: 'verified-leave', identity: 'app', channel: 'C0TEST001', member: false, boundary: 0 }
+  expect(authority.observeMembership('alpha', life, leave, authority.revision).kind).toBe('applied')
+  const leaveRevision = authority.revision
+  expect(authority.assign('alpha', life, 'C0TEST001', 'thread_hybrid', authority.revision).kind).toBe('applied')
+  expect(authority.assign('alpha', life, 'C0FUTURE1', 'mentions', authority.revision).kind).toBe('applied')
+  const reopened = createSharedChannelAuthority(authority.path, readSharedState(root)!)
+  const before = readFileSync(authority.path)
+  expect(reopened.observeMembership('alpha', life, leave, reopened.revision)).toEqual({ kind: 'applied', revision: leaveRevision })
+  expect(readFileSync(authority.path)).toEqual(before)
+  expect(reopened.choice('alpha', 'C0TEST001')).toBe('thread_hybrid')
+  expect(reopened.choice('alpha', 'C0FUTURE1')).toBe('mentions')
+  const state = reopened.snapshot().personas['alpha']!
+  expect(state.membership['C0TEST001']!.member).toBe(false)
+  expect(state.assignments['C0TEST001']!.order).toBeGreaterThan(state.leaves['C0TEST001']!.boundary)
+  expect(state.membership['C0FUTURE1']).toBeUndefined()
+  expect(state.leaves['C0FUTURE1']).toBeUndefined()
+  let writes = 0
+  const unresolved = createSharedChannelAuthority(authority.path, reopened.snapshot(), { write(path, bytes) {
+    writes++
+    durableWriteFileSync(path, bytes)
+    throw new DurableWriteUnsyncedError(path, Object.assign(new Error(sentinelInMessage('sync')), { code: 'EIO' }))
+  } })
+  expect(unresolved.assign('alpha', life, 'C0FUTURE1', 'off', unresolved.revision).kind).toBe('unresolved')
+  expect(unresolved.observeMembership('alpha', life, leave, unresolved.revision).kind).toBe('unresolved')
+  expect(writes).toBe(1)
+  check(reopened.snapshot())
+})
+
+// Every malformed envelope is a mutation of durable production output, never a
+// separately maintained authority fixture. These relationships changed in gf.
+const appliedPersona = (s: SharedChannelState) => (s.applied['personas'] as Record<string, unknown>[])[0]!
+test.each<{ label: string; alter: (state: SharedChannelState) => void }>([
+  { label: 'reviewed bytes disagree with source', alter: s => { s.source['channel_mode'] = 'open' } },
+  { label: 'applied non-channel field differs from reviewed input', alter: s => { appliedPersona(s)['stop_hook_bootstrap'] = false } },
+  { label: 'declaration belongs to another key', alter: s => { s.personas['alpha']!.declaration.name = 'foreign' } },
+  { label: 'two current personas share an incarnation', alter: s => { s.personas['beta']!.incarnation = s.personas['alpha']!.incarnation } },
+  { label: 'current incarnation is retired', alter: s => { s.personas['beta']!.incarnation = Object.keys(s.retiredIdentities)[0]! } },
+  { label: 'retired channels repeat', alter: s => { const r = Object.values(s.retiredIdentities)[0]!; r.channels.push({ ...r.channels[0]! }) } },
+  { label: 'applied choice disagrees with assignment', alter: s => { appliedPersona(s)['channels'] = [{ id: 'C0TEST001', delivery: 'off' }] } },
+  { label: 'membership metadata has invalid type', alter: s => { Object.assign(s.personas['alpha']!.membership['C0TEST001']!, { isExtSharedChannel: 'false' }) } },
+  { label: 'current membership contradicts latest event', alter: s => { s.personas['alpha']!.membership['C0TEST001']!.member = true } },
+  { label: 'membership history is incomplete', alter: s => { delete s.personas['alpha']!.membershipEvents['left'] } },
+  { label: 'membership boundary disagrees with event order', alter: s => { s.personas['alpha']!.membershipEvents['joined']!.boundary++ } },
+  { label: 'leave points to a join', alter: s => { s.personas['alpha']!.leaves['C0TEST001']!.event = 'joined' } },
+  { label: 'assignment predates leave', alter: s => { s.personas['alpha']!.assignments['C0TEST001']!.order = s.personas['alpha']!.leaves['C0TEST001']!.boundary } },
+  { label: 'destination proof belongs to a foreign life', alter: s => { s.personas['alpha']!.removedDestinations['C0TEST001']!.incarnation = s.personas['beta']!.incarnation } },
+  { label: 'destination proof no longer names the configured destination', alter: s => {
+    const applied = appliedPersona(s)
+    const source = (s.source['personas'] as Record<string, unknown>[])[0]!
+    applied['permission_prompts'] = source['permission_prompts'] = 'C0OTHER01'
+    for (const persona of [applied, source]) (persona['channels'] as unknown[]).push({ id: 'C0OTHER01', delivery: 'all' })
+    s.personas['alpha']!.assignments['C0OTHER01'] = { delivery: 'all', order: s.revision }
+    s.sourceBytesBase64 = configBytes(s.source).toString('base64')
+  } },
+])('$label is refused by parser and constructor without publishing', ({ alter }) => {
+  const source = input()
+  const authority = makeSharedAuthority(root, source)
+  source.personas[1]!.working_directory = join(root, 'replacement')
+  expect(authority.applyReviewed(configBytes(source), authority.revision, [{ key: 'beta', channel: 'C0TEST001', delivery: 'all' }]).kind).toBe('applied')
+  const life = authority.incarnation('alpha')!
+  expect(authority.observeMembership('alpha', life, { event: 'joined', identity: 'app', channel: 'C0TEST001', member: true, boundary: 0 }, authority.revision).kind).toBe('applied')
+  expect(authority.observeMembership('alpha', life, { event: 'left', identity: 'app', channel: 'C0TEST001', member: false, boundary: authority.revision }, authority.revision).kind).toBe('applied')
+  expect(authority.assign('alpha', life, 'C0TEST001', 'mentions', authority.revision).kind).toBe('applied')
+  const seed = readSharedState(root)!
+  // Object property order is not a source mismatch; exact reviewed bytes stay separate.
+  seed.source = Object.fromEntries(Object.entries(seed.source).reverse())
+  expect(parseSharedChannelState(serializeSharedChannelState(seed), authority.path)!.sourceBytesBase64).toBe(seed.sourceBytesBase64)
+  const before = readFileSync(authority.path)
+  alter(seed)
+  expect(() => parseSharedChannelState(serializeSharedChannelState(seed), authority.path)).toThrow()
+  expect(() => createSharedChannelAuthority(authority.path, seed)).toThrow()
+  expect(readFileSync(authority.path)).toEqual(before)
+  check(authority.snapshot())
+})
 
  describe('identity and provenance foundations', () => {
   test('a real-path spelling preserves the life while a changed path retires it and rejects old work', () => {
@@ -150,7 +250,9 @@ function check(state: unknown) { assertNoLeak({ state, file: existsSync(sharedCh
     expect(authority.applyReviewed(configBytes(edited), authority.revision, [{ key: 'alpha', channel: 'C0TEST001', delivery: 'mentions' }]).kind).toBe('applied')
     expect(authority.incarnation('alpha')).not.toBe(life)
     expect(authority.snapshot().retiredIdentities[life]!.key).toBe('alpha')
-    expect(authority.assign('alpha', life, 'C0TEST001', 'all', authority.revision).kind).toBe('failed')
+    const beforeStale = readFileSync(authority.path)
+    expect(authority.assign('alpha', life, 'C0TEST001', 'all', authority.revision).kind).toBe('stale')
+    expect(readFileSync(authority.path)).toEqual(beforeStale)
     check(authority.snapshot())
   })
 

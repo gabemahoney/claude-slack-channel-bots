@@ -10,10 +10,6 @@ export const CHANNEL_DELIVERY_SET_STORED = 'stored'
 export const CHANNEL_DELIVERY_SET_UNREADABLE = 'unreadable'
 export const CHANNEL_DELIVERY_SET_INVALID = 'invalid'
 export const CHANNEL_DELIVERY_SET_WRITE_FAILED = 'write-failed'
-export const CHANNEL_DELIVERY_WRITTEN = 'written'
-export const CHANNEL_DELIVERY_NOTHING_TO_WRITE = 'nothing-to-write'
-export const CHANNEL_DELIVERY_WRITE_FAILED = 'failed'
-export const CHANNEL_DELIVERY_DROP_RETIRED = 'retired by a confirmed change'
 export type ChannelDeliveryDeclaration = PersonaDeclaration
 export const CHANNEL_DELIVERY_DECLARATION_FIELDS = ['name', 'credentials_file', 'working_directory'] as const
 export type ChannelDeliverySetInvalidField = 'key' | 'channel' | 'delivery' | 'declaration' | 'set_at'
@@ -22,8 +18,6 @@ export type ChannelDeliverySetResult =
   | { kind: typeof CHANNEL_DELIVERY_SET_UNREADABLE; path: string }
   | { kind: typeof CHANNEL_DELIVERY_SET_INVALID; field: ChannelDeliverySetInvalidField }
   | { kind: typeof CHANNEL_DELIVERY_SET_WRITE_FAILED; path: string }
-export type ChannelDeliveryWriteOutcome = typeof CHANNEL_DELIVERY_WRITTEN | typeof CHANNEL_DELIVERY_NOTHING_TO_WRITE | typeof CHANNEL_DELIVERY_WRITE_FAILED
-export interface ChannelDeliveryDrop { key: string; reason: string }
 export interface ChannelDeliveryStore {
   readonly path: string
   readonly readable: boolean

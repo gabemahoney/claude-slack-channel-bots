@@ -291,6 +291,7 @@ describe('setup wizard: how the change takes effect', () => {
     ['the running server writes config.json.pending', /\bwrites `config\.json\.pending`/],
     ['the operator confirms by renaming it to config.json.apply', /renaming `config\.json\.pending` to `config\.json\.apply`/],
     ['the rename command', /mv config\.json\.pending config\.json\.apply/],
+    ['confirmed own or inherited reminders apply immediately, keeping the session without a restart', /Confirmed `stop_hook_bootstrap` changes, whether set on a persona or inherited from the top level, also apply immediately to reminder checks and keep the running session; no restart is needed\./],
   ])('%s', (_label, pattern) => {
     expect(takesEffect()).toMatch(pattern)
   })

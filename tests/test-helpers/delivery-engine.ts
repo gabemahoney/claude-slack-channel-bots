@@ -12,13 +12,14 @@ import { makeQueue, injectedInput, readQueue } from './delivery-queue.ts'
 import { cannedGetResult, makeStubClient, type CannedGetResult } from './agent-director-stub.ts'
 import { appendTranscript, codexPromptEntry, endedTurn, promptEntry, replyEntry, writeTranscript } from './working-row-panes.ts'
 
-export async function makeEngineHarness(options: { keys?: string[]; constants?: DeliveryEngineDeps['constants']; stateDir?: string; configuredAgent?: 'claude' | 'codex'; clientFor?: DeliveryEngineDeps['clientFor']; onRow?: DeliveryEngineDeps['onRow']; inspectUpgrade?: DeliveryEngineDeps['inspectUpgrade']; refreshTranscript?: DeliveryEngineDeps['refreshTranscript']; onEvent?: DeliveryEngineDeps['onEvent'] } = {}) {
+export async function makeEngineHarness(options: { keys?: string[]; constants?: DeliveryEngineDeps['constants']; stateDir?: string; queue?: DeliveryQueue; configuredAgent?: 'claude' | 'codex'; clientFor?: DeliveryEngineDeps['clientFor']; onRow?: DeliveryEngineDeps['onRow']; inspectUpgrade?: DeliveryEngineDeps['inspectUpgrade']; refreshTranscript?: DeliveryEngineDeps['refreshTranscript']; onEvent?: DeliveryEngineDeps['onEvent'] } = {}) {
+  if (options.queue && !options.stateDir) throw new Error('an external queue needs its owned stateDir')
   const root = options.stateDir ?? mkdtempSync(join(tmpdir(), 'delivery-engine-'))
   const clock = createFakeClock(), events: DeliveryEngineEvent[] = [], errors: unknown[] = []
   const calls: { key: string; verb: string; at: number; params: unknown }[] = []
   const restarts: { key: string; cwd: string }[] = [], order: string[] = [], failures = new Map<string, number>()
   let queue!: DeliveryQueue, engines!: DeliveryEngines, start = 0
-  let realQueue = await makeQueue(root, { now: clock.now })
+  let realQueue = options.queue ?? await makeQueue(root, { now: clock.now })
   queue = { ...realQueue, async append(key, record) {
     const count = failures.get(record.kind) ?? 0
     if (count > 0) { failures.set(record.kind, count - 1); throw Object.assign(new Error('injected append failure'), { code: 'ENOSPC' }) }
@@ -104,6 +105,7 @@ export async function makeEngineHarness(options: { keys?: string[]; constants?: 
     keyCalls(key = 'alpha') { return calls.filter(c => c.key === key && c.verb === 'send-keys') as { key: string; verb: string; at: number; params: SendKeysParams }[] },
     textCalls(key = 'alpha') { return h.keyCalls(key).filter(c => c.params.no_enter) },
     async restartServer() {
+      if (options.queue) throw new Error('the caller owns external queue reopen')
       await engines.stop(); await realQueue.stop()
       realQueue = await makeQueue(root, { now: clock.now })
       const append = queue.append
@@ -111,7 +113,7 @@ export async function makeEngineHarness(options: { keys?: string[]; constants?: 
       lifecycle = createDeliveryLifecycle({ clock }); build()
       for (const key of personas.keys()) engines.wake(key)
     },
-    async cleanup() { await engines.stop(); await preparation.stop(); await queue.stop(); if (!options.stateDir) rmSync(root, { recursive: true, force: true }) },
+    async cleanup() { await engines.stop(); await preparation.stop(); if (!options.queue) await queue.stop(); if (!options.stateDir) rmSync(root, { recursive: true, force: true }) },
   }
   return h
 }

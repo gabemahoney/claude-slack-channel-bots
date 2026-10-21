@@ -5,15 +5,196 @@ import { readFileSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { DEFAULT_PERSONA_CONFIG_FS, type PersonaConfigFs } from '../src/config.ts'
 import { parseSharedChannelState, serializeSharedChannelState } from '../src/shared-channels.ts'
-import { assertNoLeak } from './test-helpers/credentials.ts'
-import { makeReloadHarness, type ReloadHarness, type ReloadRun } from './test-helpers/reload-harness.ts'
+import { reloadSharedAuthorityApplyFailedLine } from '../src/reload.ts'
+import { errnoSuffix } from '../src/persona-credentials.ts'
+import { assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
+import { makeReloadHarness, type ReloadHarness, type ReloadRun, type ReloadRunOptions } from './test-helpers/reload-harness.ts'
 import { channelPopulation, configBytes } from './test-helpers/shared-channels.ts'
+import { makeEngineHarness, type EngineHarness } from './test-helpers/delivery-engine.ts'
+import { slackInput } from './test-helpers/delivery-queue.ts'
 let h: ReloadHarness
 let runs: ReloadRun[]
-beforeEach(() => { h = makeReloadHarness(); runs = [] })
-afterEach(async () => { for (const run of runs) { expect(run.slackPosts()).toEqual([]); assertNoLeak(run.captured()); await run.stop() }; await h.cleanup() })
-async function start() { const run = await h.startDetecting({ dryRun: true }); runs.push(run); expect(run.outcome.kind).toBe('applied'); return run }
+let engines: EngineHarness[]
+beforeEach(() => { h = makeReloadHarness(); runs = []; engines = [] })
+afterEach(async () => { for (const e of engines) { assertNoLeak({ errors: e.errors, events: e.events }); await e.cleanup() }; for (const run of runs) { expect(run.slackPosts()).toEqual([]); assertNoLeak(run.captured()); await run.stop() }; await h.cleanup() })
+async function start(opts: ReloadRunOptions = {}) { const run = await h.startDetecting({ dryRun: true, ...opts }); runs.push(run); expect(run.outcome.kind).toBe('applied'); return run }
 function disk() { return parseSharedChannelState(readFileSync(h.paths.lastApplied), h.paths.lastApplied)! }
+
+test.each(['removal', 'replacement'] as const)('%s write failure after retirement preparation keeps the real delivery worker and its FIFO alive', async change => {
+  const alpha = h.persona('alpha'); const beta = h.persona('beta'); h.materialize(alpha, beta)
+  h.writeConfig({ personas: [alpha, beta] })
+  let engine: EngineHarness | undefined
+  const stopped: string[] = []
+  let fail = false, preparedRetirement = false
+  const run = await start({
+    stopDelivery: key => { stopped.push(key); return engine!.engine.forget(key) },
+    beforeWrite: path => {
+      if (fail && path === h.paths.lastApplied) {
+        preparedRetirement = run.retiredKeys.isRecorded(h.key('alpha'))
+        h.failWrites({ step: 'writeSync', code: 'ENOSPC' })
+        fail = false
+      }
+    },
+  })
+  engine = await makeEngineHarness({ stateDir: h.stateDir, queue: run.queue, keys: ['alpha', 'beta'] }); engines.push(engine)
+  for (const key of ['alpha', 'beta']) {
+    engine.p(key).row.state = 'working'
+    for (const seq of [1, 2]) {
+      const ts = `1700000000.00000${seq}`
+      const input = slackInput({ text: `  <@U0TEST001> ${key} ${seq} 😀\r\n`, key: { chat_id: 'C0TEST001', ts }, ts, thread_ts: '1700000000.000000', files: [{ name: 'retained.txt' }], queued_ack_reaction: 'hourglass' })
+      const accepted = await run.queue.accept(key, input)
+      expect(accepted.status).toBe('accepted')
+      if (accepted.status !== 'accepted') throw new Error('fixture acceptance failed')
+      await run.queue.append(key, { v: 1, kind: 'fixed', seq: accepted.seq, parts: [input.text] })
+    }
+    await engine.tick(key)
+    expect(engine.engine.running(key)).toBe(true)
+    expect(engine.textCalls(key)).toEqual([])
+  }
+  const accepted = ['alpha', 'beta'].map(key => run.queue.items(key).map(item => structuredClone(item.accepted)))
+  const previous = disk()
+  const replacement = { ...alpha, working_directory: h.persona('replacement').working_directory, permission_prompts: 'dm', dm: { enabled: true, contact: 'U0TEST001' } }
+  h.materialize(replacement)
+  const bytes = h.writeConfig({ channel_mode: 'open', personas: change === 'removal' ? [beta] : [replacement, beta] })
+  await run.ticks.tick(); h.confirm(); const confirmation = h.readApply()
+  const cp = run.checkpoint(); fail = true
+  await run.ticks.tick()
+  expect(preparedRetirement).toBe(true)
+  expect(stopped).toEqual([])
+  expect(run.retiredKeys.keys()).toEqual([])
+  expect(run.since(cp).lifecycle).toEqual([])
+  expect(run.appliedConfigs).toEqual([])
+  expect(disk()).toEqual(previous)
+  expect(h.readConfig()).toEqual(bytes)
+  expect(h.readApply()).toEqual(confirmation)
+  assertNoLeak(run.captured())
+  h.clearWriteFailure()
+  for (const key of ['alpha', 'beta']) engine.p(key).row.state = 'waiting'
+  // No wake/restart: workers that existed before the failed apply must continue.
+  await engine.until(() => run.queue.openCount('alpha') === 0 && run.queue.openCount('beta') === 0)
+  for (const [i, key] of ['alpha', 'beta'].entries()) {
+    expect(run.queue.items(key).map(item => item.accepted)).toEqual(accepted[i]!)
+    expect(engine.textCalls(key).map(call => call.params.text)).toEqual(accepted[i]!.map(item => item.text))
+    expect(engine.events.flatMap(event => event.type === 'item-delivered' && event.key === key ? [event.seq] : [])).toEqual([1, 2])
+  }
+  expect(engine.errors).toEqual([])
+  await engine.cleanup(); engines = []
+  await run.stop()
+  const reopened = await start()
+  expect(reopened.controller.sharedChannels()!.snapshot()).toEqual(previous)
+  expect(h.readConfig()).toEqual(bytes)
+  expect(h.readApply()).toEqual(confirmation)
+  expect(reopened.queue.openCount('alpha')).toBe(0)
+  for (const item of accepted[0]!) expect((await reopened.queue.accept('alpha', item)).status).toBe('duplicate')
+})
+
+test.each(['retirement', 'publication'] as const)('shutdown during %s preserves the correct authority and prepared input on reopen', async phase => {
+  const alpha = h.persona('alpha'); const beta = h.persona('beta'); h.materialize(alpha, beta)
+  h.writeConfig({ personas: [alpha, beta] })
+  let armed = false
+  const stopped: string[] = []
+  const run = await start({ stopDelivery: key => stopped.push(key), beforeWrite: path => {
+    if (armed && phase === 'retirement' && path === h.retiredKeysFile) run.controller.stopDetection()
+  } })
+  const authority = run.controller.sharedChannels()!
+  expect(authority.transact(authority.revision, next => { next.pendingIntent = { prepared: 'retained' } }).kind).toBe('applied')
+  const notificationsBefore = run.appliedConfigs.length
+  const before = authority.snapshot()
+  const bytes = h.writeConfig({ channel_mode: 'open', personas: [beta] })
+  await run.ticks.tick(); h.confirm(); const confirmation = h.readApply()
+  authority.subscribe(() => { if (armed && phase === 'publication') run.controller.stopDetection() })
+  const cp = run.checkpoint(); armed = true
+  await run.ticks.tick()
+  expect(stopped).toEqual([])
+  expect(run.since(cp).lifecycle).toEqual([])
+  expect(run.appliedConfigs.slice(notificationsBefore)).toEqual([])
+  expect(authority.config().channel_mode).toBe(phase === 'retirement' ? 'strict' : 'open')
+  expect(run.controller.applied()!.config).toEqual(authority.config())
+  expect(run.retiredKeys.keys()).toEqual(phase === 'retirement' ? [] : [h.key('alpha')])
+  expect(authority.snapshot().pendingIntent).toEqual(before.pendingIntent)
+  expect(h.readConfig()).toEqual(bytes)
+  if (phase === 'retirement') {
+    expect(authority.snapshot()).toEqual(before)
+    expect(h.readApply()).toEqual(confirmation)
+  }
+  assertNoLeak(run.captured())
+  await run.stop()
+  const reopened = await start()
+  expect(reopened.controller.applied()!.config.channel_mode).toBe(phase === 'retirement' ? 'strict' : 'open')
+  expect(reopened.controller.sharedChannels()!.snapshot()).toEqual(authority.snapshot())
+  expect(h.readConfig()).toEqual(bytes)
+})
+
+test('a reporting exception cannot undo durable application or repeat a consumed confirmation', async () => {
+  const alpha = h.persona('alpha'); h.materialize(alpha); h.writeConfig({ personas: [alpha] })
+  const run = await start({ onApplied: () => { throw new Error(sentinelInMessage('observer')) } })
+  const bytes = h.writeConfig({ channel_mode: 'open', personas: [{ ...alpha, stop_hook_bootstrap: false }] })
+  await run.ticks.tick(); h.confirm(); await run.ticks.tick()
+  expect(run.controller.sharedChannels()!.sourceBytes()).toEqual(bytes)
+  expect(run.controller.applied()!.config.channel_mode).toBe('open')
+  expect(run.controller.applied()!.config.personas[0]!.stop_hook_bootstrap).toBe(false)
+  expect(h.readApply()).toBeUndefined()
+  expect(h.readPending()).toBeUndefined()
+  const revision = disk().revision
+  await run.ticks.tick()
+  expect(disk().revision).toBe(revision)
+  assertNoLeak(run.captured())
+})
+
+test('shutdown in the first in-place operation prevents later fanout and bring-up, retaining the whole durable configuration', async () => {
+  const alpha = h.persona('alpha'); const beta = h.persona('beta'); const gamma = h.persona('gamma')
+  h.materialize(alpha, beta, gamma); h.writeConfig({ personas: [alpha, beta] })
+  const run = await start({ realLifecycle: true })
+  const update = run.composition!.lifecycle.updateInPlace
+  const stop = spyOn(run.composition!.lifecycle, 'updateInPlace').mockImplementation(change => {
+    run.controller.stopDetection()
+    return update(change)
+  })
+  try {
+    const bytes = h.writeConfig({ personas: [{ ...alpha, stop_hook_bootstrap: false }, { ...beta, stop_hook_bootstrap: false }, gamma] })
+    await run.ticks.tick(); h.confirm(); const confirmation = h.readApply(); const cp = run.checkpoint(); await run.ticks.tick()
+    expect(run.since(cp).lifecycle).toEqual([{ op: 'update-in-place', key: h.key('alpha'), via: 'apply', settings: ['stop_hook_bootstrap'] }])
+    expect(run.controller.sharedChannels()!.sourceBytes()).toEqual(bytes)
+    expect(run.controller.applied()!.config.personas.map(p => [p.name, p.stop_hook_bootstrap])).toEqual([['alpha', false], ['beta', false], ['gamma', true]])
+    expect(h.readApply()).toEqual(confirmation)
+    await run.stop()
+    const reopened = await start()
+    expect(reopened.controller.sharedChannels()!.sourceBytes()).toEqual(bytes)
+    expect(reopened.controller.applied()!.config.personas).toEqual(run.controller.applied()!.config.personas)
+  } finally { stop.mockRestore() }
+})
+
+test('post-read stat failure safely refuses startup and a later reload without losing the reviewed state', async () => {
+  const alpha = h.persona('alpha'); h.materialize(alpha); h.writeConfig({ personas: [alpha] })
+  let failing = true
+  const reads = new Set<number>(), opened = new Set<number>()
+  const configFs: Partial<PersonaConfigFs> = {
+    openFile(path) { const fd = DEFAULT_PERSONA_CONFIG_FS.openFile(path); opened.add(fd); return fd },
+    readFileFd(fd, max) { reads.add(fd); return DEFAULT_PERSONA_CONFIG_FS.readFileFd(fd, max) },
+    fstatFile(fd) {
+      if (failing && reads.has(fd)) throw Object.assign(new Error(sentinelInMessage('post-stat')), { code: 'EIO' })
+      return DEFAULT_PERSONA_CONFIG_FS.fstatFile(fd)
+    },
+    closeFile(fd) { reads.delete(fd); opened.delete(fd); DEFAULT_PERSONA_CONFIG_FS.closeFile(fd) },
+  }
+  const refused = await h.start({ dryRun: true, configFs }); runs.push(refused)
+  expect(refused.outcome.kind).toBe('refused')
+  expect(refused.controller.applied()).toBeUndefined()
+  expect(refused.lifecycle.records).toEqual([])
+  expect(opened.size).toBe(0)
+  await refused.stop(); failing = false
+  const run = await start({ configFs }); const before = disk()
+  const bytes = h.writeConfig({ channel_mode: 'open', personas: [alpha] })
+  failing = true
+  await run.ticks.tick()
+  expect(h.readPendingText()).toContain('INVALID')
+  expect(h.readPendingText()).toContain('EIO')
+  expect(disk()).toEqual(before)
+  expect(h.readConfig()).toEqual(bytes)
+  expect(run.appliedConfigs).toEqual([])
+  expect(opened.size).toBe(0)
+  assertNoLeak(run.captured())
+})
 
  test('unconfirmed mode, list and destination stay pending across reopen', async () => {
   const alpha = h.persona('alpha'); const beta = h.persona('beta'); h.materialize(alpha, beta)
@@ -68,7 +249,7 @@ function disk() { return parseSharedChannelState(readFileSync(h.paths.lastApplie
   expect(h.readConfig()).toEqual(prepared)
   expect(h.readApply()).toEqual(confirmation)
   expect(run.logsOf('reload-record-write-failed')).toEqual([
-    `[slack] reload-record-write-failed: cannot write the shared channel authority ${JSON.stringify(h.paths.lastApplied)} (ENOSPC); application failed; preserve the prepared input and authority evidence; the change remains pending`,
+    reloadSharedAuthorityApplyFailedLine(h.paths.lastApplied, 'failed', errnoSuffix({ code: 'ENOSPC' })),
   ])
   assertNoLeak(run.captured())
   h.clearWriteFailure()
@@ -130,7 +311,7 @@ function disk() { return parseSharedChannelState(readFileSync(h.paths.lastApplie
   const reopened = await start()
   expect(reopened.controller.sharedChannels()!.incarnation(h.key('alpha'))).toBe(incarnation)
   expect(reopened.controller.applied()!.config.channel_mode).toBe(when === 'before' ? 'strict' : 'open')
-  if (when === 'before') expect(disk().pendingIntent).toEqual(before.pendingIntent)
+  expect(disk().pendingIntent).toEqual(before.pendingIntent)
   expect(disk().outcomes).toEqual(before.outcomes)
  })
 
@@ -168,16 +349,28 @@ function disk() { return parseSharedChannelState(readFileSync(h.paths.lastApplie
   expect(reopened.controller.applied()!.config.personas).toHaveLength(421)
  })
 
- test('verified removal provenance survives a controller reopen, and never becomes configuration input authority', async () => {
-  const alpha = h.persona('alpha'); h.materialize(alpha); h.writeConfig({ personas: [alpha] })
+ test.each(['strict', 'open'] as const)('%s: only-channel removal with DMs disabled survives reopen and unrelated confirmation', async channel_mode => {
+  const alpha = h.persona('alpha', { dm: { enabled: false } }); h.materialize(alpha); h.writeConfig({ channel_mode, personas: [alpha] })
   const run = await start(); const authority = run.controller.sharedChannels()!
   const key = h.key(alpha.name); const life = authority.incarnation(key)!
+  expect((await run.queue.accept(key, slackInput({ text: '  <@U0TEST001> kept\r\n', channel: alpha.permission_prompts, key: { chat_id: alpha.permission_prompts, ts: '1700000000.000001' } }))).status).toBe('accepted')
+  const accepted = structuredClone(run.queued(alpha.name).map(item => item.accepted))
   expect(authority.observeMembership(key, life, { event: 'verified-leave', identity: 'authenticated-app', channel: alpha.permission_prompts, member: false, boundary: 0 }, authority.revision).kind).toBe('applied')
   await run.stop()
   const reopened = await start(); const current = reopened.controller.sharedChannels()!
   expect(current.config().personas[0]!.channels).toEqual([])
   expect(current.config().personas[0]!.permission_prompts).toBe(alpha.permission_prompts)
   expect(current.validatesRemovedDestination(current.config().personas[0]!)).toBe(true)
+  const prepared = h.writeConfig({ channel_mode, personas: [{ ...alpha, channels: [], stop_hook_bootstrap: false }] })
+  await reopened.ticks.tick()
+  assertNoLeak(reopened.captured())
+  await (await reopened.confirmPending()).applying
+  expect(current.sourceBytes()).toEqual(prepared)
+  expect(current.config().personas[0]!.channels).toEqual([])
+  expect(current.config().personas[0]!.permission_prompts).toBe(alpha.permission_prompts)
+  expect(current.config().personas[0]!.stop_hook_bootstrap).toBe(false)
+  expect(current.incarnation(key)).toBe(life)
+  expect(reopened.queued(alpha.name).map(item => item.accepted)).toEqual(accepted.map(item => ({ ...item, attempt_high_watermark: 0 })))
   const replacement = { ...alpha, working_directory: h.persona('replacement').working_directory, channels: [] }
   h.writeConfig({ personas: [replacement] })
   await reopened.ticks.tick()

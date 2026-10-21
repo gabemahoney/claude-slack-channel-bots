@@ -147,9 +147,9 @@ import {
   NO_STORED_CHOICE,
   type PersonaDiagnosticClass,
 } from '../src/persona-diagnostics.ts'
-import { RELOAD_DIAGNOSTIC_CLASSES, RELOAD_RECORD_WRITE_FAILED, reloadChannelDeliveryWriteFailedLine } from '../src/reload.ts'
-import { modeSwitchLine, recordedLine, type RecordedSectionKey } from '../src/reload-plan.ts'
-import { CHANNEL_DELIVERY_DROP_RETIRED, CHANNEL_DELIVERY_FILE_NAME, SET_CHANNEL_DELIVERY_TOOL } from '../src/channel-delivery.ts'
+import { RELOAD_DIAGNOSTIC_CLASSES, RELOAD_RECORD_WRITE_FAILED } from '../src/reload.ts'
+import { modeSwitchLine } from '../src/reload-plan.ts'
+import { CHANNEL_DELIVERY_FILE_NAME, SET_CHANNEL_DELIVERY_TOOL } from '../src/channel-delivery.ts'
 import {
   channelDeliveryChannelRefusal,
   channelDeliveryDeclarativeRefusal,
@@ -993,14 +993,6 @@ function quotedUpTo(rendered: string, through: string): string {
   const at = rendered.indexOf(through)
   if (at < 0) throw new Error(`"${through}" is not in the rendering "${rendered}"`)
   return `${rendered.slice(0, at + through.length)} …`
-}
-
-/** A recorded change's preview line for `fields`, with its fields and its section's mode as the skill's placeholders. */
-function recordedTemplate(fields: RecordedSectionKey[], mode: ChannelMode): string {
-  return recordedLine({ name: NAME, key: KEY, fields })
-    .replace(`: ${fields.join(', ')} changed`, ': <fields> changed')
-    .replace(`the ${mode} section`, 'the <declarative or fungible> section')
-    .replace(`selects ${mode} mode`, 'selects <declarative or fungible> mode')
 }
 
 /** The switch's preview line turning `mode` on for one persona, with the mode and the further personas as the skill's placeholders. */

@@ -217,9 +217,8 @@ export const PERSONA_TOP_LEVEL_KEYS: readonly string[] = [
 ]
 
 /**
- * Keys allowed in a persona entry. `invited` is
- * a known key in both channel modes, as `channels` and `permission_prompts`
- * are; which of them is read depends on the mode (`channelModeOf`).
+ * Keys allowed in a persona entry. Both modes validate the same channels
+ * and required permission destination; removed keys are always rejected.
  */
 export const PERSONA_ENTRY_KEYS: readonly (keyof PersonaInput)[] = [
   'name',
@@ -1321,13 +1320,6 @@ function checkPersonaCrossSettings(
   }
 }
 
-/**
- * The section in force of one persona entry, parsed and checked by the
- * channel mode: the resolved `channels`,
- * `permission_prompts` and `fungible_destination`. The section not in force
- * is never looked at.
- */
-
 /** Parse the shared channels, DMs and required destination for one persona. Trusted removal provenance comes only from the recovered authority, never submitted JSON. Errors identify settings without echoing rejected values. */
 function parsePersonaEntry(
   raw: unknown,
@@ -1906,9 +1898,10 @@ export interface PersonaConfigFs {
   openFile(path: string): number
   /**
    * Stat an open descriptor. `size` is the file's size in bytes; the reader
-   * refuses a file larger than `MAX_RELOAD_FILE_BYTES` before reading it. An
-   * override may omit `size`: the bounded read (`readFileFd`) enforces the
-   * limit either way. Throws an errno-style error (with `code`) on failure.
+   * compares descriptor metadata before and after reading. Only callers
+   * selecting the bounded policy refuse sizes above `MAX_RELOAD_FILE_BYTES`.
+   * An override may omit `size`; the bounded read still enforces its limit.
+   * Throws an errno-style error (with `code`) on failure.
    */
   fstatFile(fd: number): { isFile(): boolean; isDirectory(): boolean; size?: number; mtimeMs?: number; ctimeMs?: number; ino?: number; dev?: number }
   /**
@@ -2019,7 +2012,10 @@ export function readPersonaConfigBytes(
   const io: PersonaConfigFs = { ...DEFAULT_PERSONA_CONFIG_FS, ...fs }
   const failure = (cause: string, code: string | undefined) =>
     new PersonaConfigReadError(`loadPersonaConfig: cannot read persona config at "${configPath}": ${cause}`, code)
-  const errnoFailure = (err: unknown) => failure(err instanceof Error ? err.message : String(err), readErrnoCode(err))
+  const errnoFailure = (err: unknown) => {
+    const code = readErrnoCode(err)
+    return failure(code === undefined ? 'file operation failed' : `file operation failed (${code})`, code)
+  }
   const tooLarge = () => failure(`it is larger than the ${MAX_RELOAD_FILE_SIZE_TEXT} limit`, FILE_TOO_LARGE_CODE)
 
   let fd: number
@@ -2046,7 +2042,12 @@ export function readPersonaConfigBytes(
       throw errnoFailure(err)
     }
     if (!uncapped && bytes.length > MAX_RELOAD_FILE_BYTES) throw tooLarge()
-    const after = io.fstatFile(fd)
+    let after: ReturnType<PersonaConfigFs['fstatFile']>
+    try {
+      after = io.fstatFile(fd)
+    } catch (err) {
+      throw errnoFailure(err)
+    }
     if (!after.isFile() || (typeof stats.size === 'number' && bytes.length !== stats.size) ||
         (['size', 'mtimeMs', 'ctimeMs', 'ino', 'dev'] as const).some(key => stats[key] !== undefined && after[key] !== stats[key])) {
       throw failure('it changed while being read; retry with a stable regular file', 'EAGAIN')

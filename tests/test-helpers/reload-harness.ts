@@ -978,6 +978,8 @@ export interface ReloadRunOptions {
   applySteps?: ApplyStepSlots
   /** Also called with every configuration the controller's `onApplied` is told (after `run.appliedConfigs` records it). */
   onApplied?: (config: PersonaConfig) => void
+  /** Bind an instrumented or real delivery worker's retirement callback. */
+  stopDelivery?: (key: string) => unknown
   /**
    * Bind the real lifecycle composition (`run.composition`, see
    * `RealLifecycleComposition`) behind the recorder's `teardown`,
@@ -2684,7 +2686,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       channelDeliveryStore = createChannelDeliveryStore(authority)
     }
     controller = createReloadController({
-      stopDelivery: async () => {},
+      stopDelivery: runOpts.stopDelivery ?? (async () => {}),
       queueOpenCount: queue.openCount,
       onQueueRetained: key => queue.retained(key),
       paths,

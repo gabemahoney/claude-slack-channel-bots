@@ -63,7 +63,7 @@ import {
 } from '../src/config.ts'
 import { personaKey, personaTmuxSessionName } from '../src/persona-identity.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
-import { buildChangePlan, MODE_SWITCH_SETTING, RECORDED_SECTION_KEYS } from '../src/reload-plan.ts'
+import { buildChangePlan, MODE_SWITCH_SETTING } from '../src/reload-plan.ts'
 import { configInEffect } from '../src/reload.ts'
 import { assertSendable } from '../src/lib.ts'
 import {
@@ -79,6 +79,7 @@ import {
   LEAK_SENTINEL,
   assertNoLeak, writtenFile,
   fakeToken,
+  sentinelInMessage,
   withoutName,
   writeCredentialsFile,
 } from './test-helpers/credentials.ts'
@@ -1822,7 +1823,7 @@ function recordingConfigFs(overrides: Partial<PersonaConfigFs> = {}) {
 /** An operation that throws an errno-style error with `code`. */
 function configFsFailsWith(code: string): () => never {
   return () => {
-    throw Object.assign(new Error(`simulated ${code}`), { code })
+    throw Object.assign(new Error(sentinelInMessage('config-io')), { code })
   }
 }
 
@@ -2107,28 +2108,30 @@ describe('credentialsFilesToProtect', () => {
     expect(lines).toEqual([])
   })
 
-  // The 64 KiB cap exempts this one read: a config.json grown past the cap
-  // still protects every credentials file it names, even one named only after
-  // the first 65,537 bytes. The padding is sentinel-bearing fake token text,
-  // so a leak of the file's content fails assertNoLeak.
+  // Complete config reads still protect credentials paths after the old cap.
+  // Invalid pending input carries sentinel-bearing padding; valid input uses
+  // leading whitespace so the padding itself introduces no schema error.
   /** A config.json over 3 × 64 KiB whose one persona names `credentialsFile` after the padding. */
-  function writeOversizedCurrent(credentialsFile: string): string {
+  function writeOversizedCurrent(credentialsFile: string, invalid = true): string {
     const unit = `${fakeToken(BOT_TOKEN_PREFIX, 'padding')} `
     const padding = unit.repeat(Math.ceil((3 * MAX_RELOAD_FILE_BYTES) / unit.length) + 1)
     const path = writeConfigFile(dir, {
-      notes: padding,
+      ...(invalid ? { notes: padding } : {}),
       ...makePersonaConfigInput({ personas: [makePersona({ name: 'current_bot', credentials_file: credentialsFile }, dir)] }, dir),
     })
+    if (!invalid) writeFileSync(path, ' '.repeat(padding.length) + readFileSync(path, 'utf8'))
     expect(statSync(path).size).toBeGreaterThan(3 * MAX_RELOAD_FILE_BYTES)
     expect(readFileSync(path, 'utf-8').indexOf(credentialsFile)).toBeGreaterThan(MAX_RELOAD_FILE_BYTES + 1)
     return path
   }
 
-  test('a config.json over the 64 KiB cap is read whole and uncapped: the path it names is listed and refused by assertSendable, while an explicitly bounded credential/control read refuses the same file with EFBIG', () => {
+  test.each([false, true])('large pending config (invalid=%s) protects every named credential path while a bounded control read still refuses EFBIG', invalid => {
     const applied = appliedPersonas()
     // Outside the state directory, so only the list can refuse it.
     const named = writeCredentialsFile(dir, 'outside/credentials.json')
-    const path = writeOversizedCurrent(named)
+    const path = writeOversizedCurrent(named, invalid)
+    if (invalid) expect(() => loadPersonaConfig(path, home)).toThrow()
+    else expect(loadPersonaConfig(path, home).personas[0]!.credentials_file).toBe(named)
     const { fs, calls, opened } = recordingConfigFs()
 
     const list = credentialsFilesToProtect(applied, path, home, fs)
@@ -2145,7 +2148,7 @@ describe('credentialsFilesToProtect', () => {
     expect(() => assertSendable(named, stateDir, inboxDir, list)).toThrow(`Blocked: cannot send ${named} — it is a persona credentials file.`)
     expect(() => assertSendable(named, stateDir, inboxDir, [applied[0].credentials_file])).not.toThrow()
 
-    // Every other read of the same file is capped.
+    // Callers with an independent bound still enforce it.
     let refused: unknown
     try {
       readPersonaConfigBytes(path, undefined, { uncapped: false })
@@ -2477,15 +2480,26 @@ describe('start-path primitives', () => {
         label: 'fstat fails with EIO (injected)',
         arrange: (p) => (writeFileSync(p, CONTENT), { fstatFile: configFsFailsWith('EIO') }),
         code: 'EIO',
-        cause: 'simulated EIO',
+        cause: 'file operation failed (EIO)',
         afterOpen: ['fstat', 'close'],
       },
       {
         label: 'the read fails with EIO (injected)',
         arrange: (p) => (writeFileSync(p, CONTENT), { readFileFd: configFsFailsWith('EIO') }),
         code: 'EIO',
-        cause: 'simulated EIO',
+        cause: 'file operation failed (EIO)',
         afterOpen: ['fstat', 'read', 'close'],
+      },
+      {
+        label: 'post-read fstat fails with EIO: classified without file or error content',
+        arrange: (p) => {
+          writeFileSync(p, CONTENT)
+          let stats = 0
+          return { fstatFile: fd => ++stats === 1 ? fstatSync(fd) : configFsFailsWith('EIO')() }
+        },
+        code: 'EIO',
+        cause: 'file operation failed (EIO)',
+        afterOpen: ['fstat', 'read', 'fstat', 'close'],
       },
       {
         label: 'closing throws (injected): ignored, the bytes stand',
@@ -2580,7 +2594,7 @@ describe('start-path primitives', () => {
       assertNoLeak(actual)
     })
 
-    test.each([0, 10, undefined])('stat size %p either returns complete bytes or refuses a changing file', size => {
+    test.each([0, 10, undefined])('stat size %p either returns complete bytes or refuses a byte-count mismatch', size => {
       const path = join(dir, 'config.json')
       const bytes = Buffer.from(' '.repeat(3 * MAX_RELOAD_FILE_BYTES) + '{}')
       writeFileSync(path, bytes)
@@ -2590,6 +2604,40 @@ describe('start-path primitives', () => {
       expect(() => fstatSync(opened()!)).toThrow()
       assertNoLeak(bytes)
     })
+
+    test.each(['stable', 'size', 'mtimeMs', 'ctimeMs', 'ino', 'dev'] as const)(
+      'sequenced metadata: %s after a complete read, with closure and safe diagnostics', field => {
+        const path = join(dir, 'config.json')
+        const bytes = Buffer.from(JSON.stringify({ notes: LEAK_SENTINEL }))
+        writeFileSync(path, bytes)
+        let statCalls = 0
+        const { fs, calls, opened } = recordingConfigFs({
+          fstatFile(fd) {
+            const stats = fstatSync(fd)
+            // Initial size matches the real bytes; only the post-read stat changes.
+            if (++statCalls === 2 && field !== 'stable') stats[field] += 1
+            return stats
+          },
+        })
+        if (field === 'stable') {
+          expect(readPersonaConfigBytes(path, fs)).toEqual(bytes)
+        } else {
+          const err = thrown(() => readPersonaConfigBytes(path, fs)) as PersonaConfigReadError
+          const startMessage = configFileReadFailureMessage(path, err.code)
+          expect(err).toBeInstanceOf(PersonaConfigReadError)
+          expect(err.code).toBe('EAGAIN')
+          expect(err.message).toBe(exactMessage(path, 'it changed while being read; retry with a stable regular file'))
+          expect(isMissingConfigCode(err.code)).toBe(false)
+          expect(startMessage).toBe(`The configuration file "${path}" cannot be read (EAGAIN). The server requires the configuration file to start.`)
+          assertNoLeak({ err, startMessage }, 'changed-file diagnostics')
+        }
+        expect(statCalls).toBe(2)
+        expect(calls.map(c => c.op)).toEqual(['open', 'fstat', 'read', 'fstat', 'close'])
+        expect(calls.find(c => c.op === 'read')?.returned).toBe(bytes.length)
+        expect(calls.slice(1).every(c => c.fd === opened())).toBe(true)
+        expect(() => fstatSync(opened()!)).toThrow()
+      },
+    )
   })
 
   describe('parsePersonaConfigBytes', () => {

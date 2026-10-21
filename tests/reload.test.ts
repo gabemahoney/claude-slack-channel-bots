@@ -72,6 +72,8 @@ import { existsSync, mkdirSync, readdirSync, rmSync, statSync, symlinkSync } fro
 import { dirname, join } from 'node:path'
 
 import { SET_CHANNEL_DELIVERY_TOOL } from '../src/channel-delivery.ts'
+import { DurableWriteUnsyncedError } from '../src/atomic-write.ts'
+import { errnoSuffix } from '../src/persona-credentials.ts'
 import {
   channelModeOf,
   DEFAULT_PERSONA_CONFIG_FS,
@@ -102,6 +104,10 @@ import {
   RELOAD_PREVIEW,
   RELOAD_RECORD_WRITE_FAILED,
   RELOAD_STALE_CONFIRMATION,
+  reloadRetiredKeysPutBackClause,
+  reloadSharedAuthorityApplyFailedLine,
+  reloadSharedAuthorityStartFailedLine,
+  reloadSharedAuthorityStartLine,
 } from '../src/reload.ts'
 import {
   APPLY_STEPS,
@@ -526,7 +532,7 @@ describe('a start without a record applies the configuration file or refuses', (
     expect(broughtUp(run)).toEqual(keysOf('alpha', 'bravo'))
     expect(run.lifecycle.keys('launch').sort()).toEqual(keysOf('alpha', 'bravo'))
     expect(run.logs).toContain(
-      `[slack] Starting from the shared channel authority "${h.paths.lastApplied}" at revision 1`,
+      reloadSharedAuthorityStartLine(h.paths.lastApplied, 1),
     )
     assertNoLeak(run.captured())
   })
@@ -594,7 +600,8 @@ describe('a start without a record applies the configuration file or refuses', (
     { step: 'writeSync', code: 'ENOSPC', call: undefined },
     { step: 'fsyncSync', code: 'EIO', call: 1 },
     { step: 'renameSync', code: 'EROFS', call: undefined },
-  ] as const)('a record that cannot be written ($step, $code) refuses the start with reload-record-write-failed', async ({ step, code, call }) => {
+    { step: 'writeSync', code: fakeToken(BOT_TOKEN_PREFIX, 'unsafe-errno'), call: undefined },
+  ] as const)('a record that cannot be written ($step) refuses the start with reload-record-write-failed', async ({ step, code, call }) => {
     const personas = materialized('alpha')
     const configBytes = h.writeConfig(configOf(...personas))
     h.failWrites({ step, code, call })
@@ -608,16 +615,19 @@ describe('a start without a record applies the configuration file or refuses', (
     expect(h.readConfig()).toEqual(configBytes)
     expect(h.configDirEntries()).toEqual(['config.json'])
     expect(run.logs).toEqual([
-      `[slack] ${RELOAD_RECORD_WRITE_FAILED}: cannot durably establish the shared channel authority "${h.paths.lastApplied}" (${code}); preserve the prepared configuration and authority evidence; the server does not start`,
+      reloadSharedAuthorityStartFailedLine(h.paths.lastApplied, { code }),
     ])
     assertNoLeak(run.captured())
   })
 
-  test('a record written but whose directory cannot be synced refuses the start, says so, and the next start runs it', async () => {
+  test.each([
+    { label: 'safe errno', code: 'EIO' },
+    { label: 'secret-bearing errno and error message', code: fakeToken(BOT_TOKEN_PREFIX, 'unsynced-errno') },
+  ])('a record written but whose directory cannot be synced ($label) refuses the start, says so, and the next start runs it', async ({ code }) => {
     const personas = materialized('alpha', 'bravo')
     const configBytes = h.writeConfig(configOf(personas[0]!))
     // The second fsync is the directory's, after the rename.
-    h.failWrites({ step: 'fsyncSync', code: 'EIO', call: 2 })
+    h.failWrites({ step: 'fsyncSync', code, call: 2 })
 
     const run = await h.start()
 
@@ -626,7 +636,7 @@ describe('a start without a record applies the configuration file or refuses', (
     expect(run.outcome.kind === 'refused' && run.outcome.class).toBe(RELOAD_RECORD_WRITE_FAILED)
     expect(run.writes).toEqual([h.lastAppliedWrite(false)])
     expect(run.logs).toEqual([
-      `[slack] ${RELOAD_RECORD_WRITE_FAILED}: cannot durably establish the shared channel authority "${h.paths.lastApplied}" (EIO); the authority was renamed but its directory could not be synced, so the durable outcome is unresolved; preserve the prepared configuration and authority evidence; the server does not start`,
+      reloadSharedAuthorityStartFailedLine(h.paths.lastApplied, new DurableWriteUnsyncedError(h.paths.lastApplied, { code })),
     ])
     expect(JSON.parse(h.readRecord()!.toString()).source).toEqual(JSON.parse(configBytes.toString()))
     expect(h.configDirEntries()).toEqual(['config.json', 'config.json.last-applied'])
@@ -689,7 +699,7 @@ describe('a start with a record runs the record', () => {
     expect(run.writes).toEqual([])
     expect(h.readRecord()).toEqual(recordBytes)
     expect(h.readConfig()).toEqual(configBytes)
-    expect(run.logs).toContain(`[slack] Starting from the shared channel authority "${h.paths.lastApplied}" at revision 1`)
+    expect(run.logs).toContain(reloadSharedAuthorityStartLine(h.paths.lastApplied, 1))
     assertNoLeak(run.captured())
   })
 
@@ -3379,7 +3389,7 @@ describe('confirmation and apply', () => {
     {
       label: 'before the rename (openSync)',
       failure: { step: 'openSync', call: 3 },
-      line: () => failureLine(`[slack] ${RELOAD_RECORD_WRITE_FAILED}: cannot write the shared channel authority `, h.paths.lastApplied, 'EIO'),
+      line: () => reloadSharedAuthorityApplyFailedLine(h.paths.lastApplied, 'failed', errnoSuffix({ code: 'EIO' }), reloadRetiredKeysPutBackClause(h.retiredKeysFile)),
       recordWrites: [false],
     },
 

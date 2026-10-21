@@ -452,17 +452,23 @@ Explain the case that matches Step 3. Link to `docs/reload.md`.
   configuration, and the change (a new persona, a changed switch) stays
   pending. After the start, confirm as above.
 
-A change to the channel-mode switch from Step 4 is the one server-wide setting
-that applies in place: once confirmed, it takes effect at once, from the next
-event, tool call, prompt and notice, with no restart, and every session is
-kept. Its preview line reads `server-wide setting channel_mode
+A change to the channel-mode switch from Step 4 applies in place: once
+confirmed, it takes effect at once, from the next event, tool call, prompt and
+notice, with no restart, and every session is kept. Its preview line reads
+`server-wide setting channel_mode
 changed: turns <mode> mode on, applied in place at once, from the next event,
 tool call, prompt and notice, for …`, naming the mode it turns on and every
 persona it affects. See `docs/channel-modes.md`'s `## Turning open mode on or off`.
 
-A change to another server-wide setting, such as `port`, is recorded when
-confirmed and takes effect at the next server start (`docs/reload.md` `## When next-launch and server-wide
-changes take effect`). `append_system_prompt_file` and `system_prompt_mode` from Step 7
+Confirmed `stop_hook_bootstrap` changes, whether set on a persona or inherited
+from the top level, also apply immediately to reminder checks and keep the
+running session; no restart is needed. A confirmed `claude_config_dir` change
+takes effect at each affected persona's next launch.
+
+Most other server-wide changes, such as `port`, are recorded when confirmed
+and take effect at the next server start. See `docs/reload.md`'s
+`## When next-launch and server-wide changes take effect` for these and the
+CLI timeout exceptions. `append_system_prompt_file` and `system_prompt_mode` from Step 7
 are part of the agent-director template the server registers once, at start.
 On a running server, a confirmation doesn't change that template: every
 persona, including one the same change adds, keeps launching with the system

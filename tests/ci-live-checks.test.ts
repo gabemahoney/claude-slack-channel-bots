@@ -173,7 +173,7 @@ import { checkPersonaTarget, createSessionServer, slackRefusalToolErrorText, typ
 import { personaDestinationOf } from '../src/persona-destination.ts'
 import { RELOAD_APPLIED, RELOAD_NOOP, renderAppliedLogLine, renderNoopLogLine } from '../src/reload-apply.ts'
 import { createSharedChannelAuthority, initialSharedChannelState, parseSharedChannelState, serializeSharedChannelState } from '../src/shared-channels.ts'
-import { RELOAD_NOTHING_PENDING } from '../src/reload.ts'
+import { RELOAD_NOTHING_PENDING, reloadSharedAuthorityStartLine } from '../src/reload.ts'
 import { PENDING_FILE_HEADER } from '../src/reload-fingerprint.ts'
 import {
   channelDeliverySetCause as srcChannelDeliverySetCause,
@@ -198,7 +198,6 @@ import {
   MODE_SWITCH_SETTING,
   modeSwitchLine,
   NO_EFFECTIVE_CHANGE,
-  recordedLine,
   removedLine,
   renderChangePlanCounts,
   renderPreviewLines,
@@ -606,7 +605,7 @@ function startSummary(ending: string): string {
 function startLog(cAt: number | null, ending = START_SUMMARY_END): [number, string][] {
   const connected = (l: PersonaLetter) => `[slack] Session connected: persona "persona_${l}" (key=persona_${l}) cwd="/home/cscb/cscb-live/${l}"`
   return [
-    [20, `[slack] Starting from the shared channel authority "${S}/config.json.last-applied" at revision 1`],
+    [20, reloadSharedAuthorityStartLine(`${S}/config.json.last-applied`, 1)],
     [20, '[slack] Loaded persona config: 3 persona(s)'],
     ...(['a', 'b', 'c'] as const).map((l, i): [number, string] => [25, `[slack] persona-start: personas[${i}] "persona_${l}" (key=persona_${l}): bring-up starting`]),
     [80, connected('a')],
@@ -2748,7 +2747,7 @@ function retriedStartLog(opts: { up?: boolean; connected?: boolean; notBroughtUp
   const path = 'path="/home/testuser/.config/cscb-credentials/persona_a-credentials.json"'
   const session = (l: PersonaLetter) => `[slack] Session connected: persona "persona_${l}" (key=persona_${l}) cwd="/home/cscb/cscb-live/${l}"`
   const lines: [number, string][] = [
-    [20, `[slack] Starting from the shared channel authority "${S}/config.json.last-applied" at revision 1`],
+    [20, reloadSharedAuthorityStartLine(`${S}/config.json.last-applied`, 1)],
     [20, '[slack] Loaded persona config: 3 persona(s)'],
     ...(['a', 'b', 'c'] as const).map((l, i): [number, string] => [25, `[slack] persona-start: personas[${i}] "persona_${l}" (key=persona_${l}): bring-up starting`]),
     [35, `[2026-09-26T19:51:41.070Z] [slack] persona-slack-unreachable: personas[0] ${ref} ${path}: Slack unreachable checking app_token via the Socket Mode open: WebSocket phase timed out after 10 s`],
@@ -4385,7 +4384,6 @@ describe('expected texts match the package', () => {
       credentials: sized(counts.credentials),
       nextLaunch: [],
       unchanged: [],
-      recorded: [],
       settings: sized(counts.settings),
       noEffectiveChange: false,
       configDirsChanged: false,
@@ -4513,7 +4511,7 @@ describe('expected texts match the package', () => {
     expect(invitedRecordedLine(C_NAME)).toBe(invitedInPlaceLine(C_NAME))
     expect(invitedRecordedLine(C_NAME)).toContain('permission_prompts changed: applied in place immediately')
     const plan: ValidChangePlan = {
-      valid: true, added: [], removed: [], destructive: [], inPlace: [], credentials: [], nextLaunch: [], unchanged: [], recorded: [], settings: [],
+      valid: true, added: [], removed: [], destructive: [], inPlace: [], credentials: [], nextLaunch: [], unchanged: [], settings: [],
       noEffectiveChange: true, configDirsChanged: false,
     }
     expect([NO_EFFECTIVE_CHANGE_PREVIEW]).toEqual(renderPreviewLines(plan))

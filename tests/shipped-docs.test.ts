@@ -237,7 +237,7 @@ import { REPLY_REMINDER_TEXT } from '../src/reply-reminder.ts'
  *     and rows, "Confirming a change" and the switch's take-effect exception
  * ; the troubleshooting entries and the downgrade steps.
  * Setting names come from `src/` or typed names, preview
- *     lines from `modeSwitchLine` and `recordedLine` (built when the row
+ *     lines from `modeSwitchLine` (built when the row
  *     runs), labels from their exports; the switch's line is read in its
  *     second carrier too, the setup wizard's step on how a change takes
  *     effect (`WIZARD_SWITCH_LINE_ROW`);
@@ -425,11 +425,8 @@ import {
   NEXT_LAUNCH_SETTINGS,
   NO_EFFECTIVE_CHANGE,
   PENDING_PREVIEW_TITLE,
-  RECORDED_SECTION_KEYS,
-  recordedLine,
   renderPreviewLines,
   type NextLaunchSetting,
-  type RecordedSectionKey,
   type ValidChangePlan,
 } from '../src/reload-plan.ts'
 import { LAST_APPLIED_FILE_SUFFIX, RELOAD_RECORD_WRITE_FAILED } from '../src/reload.ts'
@@ -855,14 +852,11 @@ describe('README.md', () => {
      * One entry per change kind the plan classifies (`ValidChangePlan`'s lists),
      * the settings expanded from the plan's exported classes. A new kind in the
      * plan fails the typecheck here until it has a README row; a new setting in
-     * a class needs its name in that class's row, so the in-place row names
-     * `invited.permission_prompts` too. The plan reports the
+     * a class needs its name in that class's row. The plan reports the
      * switch (`MODE_SWITCH_SETTING`) among the server-wide settings, so the
      * switch's row is a second `settings` entry, found by the switch named in
      * its Change cell; the server-wide row names the switch only in its Once
-     * confirmed cell, as its exception, so each finder matches one row. The
-     * recorded row (a change to the section not in force) is found by the
-     * section keys its Change cell names (`RECORDED_SECTION_KEYS`).
+     * confirmed cell, as its exception, so each finder matches one row.
      */
     const EXPECTED: Record<
       Exclude<keyof ValidChangePlan, 'valid' | 'noEffectiveChange' | 'configDirsChanged' | 'unchanged'>,
@@ -901,7 +895,6 @@ describe('README.md', () => {
         destructive: true,
       })),
       settings: [SERVER_WIDE_ROW, SWITCH_ROW],
-      recorded: [],
       added: [
         {
           label: 'a persona is added',
@@ -7623,7 +7616,11 @@ function switchLineNoPersonaEnding(): string {
 const README_DEO_ROWS: readonly DocRow[] = [
 ["Channel modes: strict and open share configured choices", readmeSection(WHAT_EACH_MODE_SERVES_HEADING), [ci("`channel_mode`"), ci("`strict`"), ci("`open`"), ci("default")]],
 ["Channel modes: one shared list and destination", readmeSection(WHAT_EACH_MODE_SERVES_HEADING), [ci("shared"), ci("`channels`"), ci("`permission_prompts`"), ci("both modes")]],
-["Channel modes: changing mode preserves applied channel choices", readmeSection(TURNING_FUNGIBLE_HEADING), [ci("preserve"), ci("`delivery`"), ci("confirmed")]],
+['Channel modes: changing mode preserves applied channel choices', readmeSection(TURNING_FUNGIBLE_HEADING), [
+    ci('Mode changes preserve every applied `delivery` choice and the shared destination'),
+    ci('Strict mode uses the same shared channel choices and destination'),
+    ci('The mode switch preserves them, including choices made while open mode was active'),
+  ]],
 [`Channel modes: before turning it on, the operator reviews each app's channels and past ${UNCLAIMED_CHANNEL} lines`, readmeSection(TURNING_FUNGIBLE_HEADING), [
     ci("Before you turn it on, review each persona's app's channel memberships in Slack, private channels included"),
     ci(`Past ${code(UNCLAIMED_CHANNEL)} lines in ${code('server.log')} show channels`),
@@ -7631,7 +7628,17 @@ const README_DEO_ROWS: readonly DocRow[] = [
   ]],
 ["Channel modes: old keys require a manual edit", readmeSection(WHAT_EACH_MODE_SERVES_HEADING), [ci("manual"), ci("`allow_invited_channels`"), ci("`invited`"), ci("rejected")]],
 ["Channel modes: switching through pending confirmation", readmeSection(TURNING_FUNGIBLE_HEADING), [ci("confirmed"), ci("preview"), ci("no restart"), ci("`strict`"), ci("`open`")]],
-["Channel modes: four persistent listening choices and default off", readmeSection(FUNGIBLE_DELIVERY_HEADING), [ci("`off`"), ci("`mentions`"), ci("`all`"), ci("`thread_hybrid`"), ci("default"), ci("config.json.last-applied")]],
+['Channel modes: four persistent listening choices and default off', readmeSection(FUNGIBLE_DELIVERY_HEADING), [
+    ci('In both modes, the shared choices are `off`, `mentions`, `all` and `thread_hybrid`'),
+    ci('A channel with no assignment defaults to `off`'),
+    ci('Applied choices live in `config.json.last-applied` across server restarts and persona relaunches'),
+    ci('A mode switch preserves them'),
+    ci('A removed, renamed or replaced persona never inherits its previous incarnation’s choices'),
+  ]],
+['Channel modes: the loop guard holds other personas at mentions without enabling off choices', readmeSection(FUNGIBLE_DELIVERY_HEADING), [
+    ci('Another persona’s `permission_prompts` channel is held at `mentions` for other personas whose applied choice is non-off'),
+    ci('Its own destination and a `"dm"` destination hold nothing'),
+  ]],
 [`Channel modes: the ${RECEIVE_ALL_SHARED} approximation, a stored choice saying nothing of whether the other app remains in the channel`, readmeSection(FUNGIBLE_DELIVERY_HEADING), [
     ci(`**${code(RECEIVE_ALL_SHARED)} is an approximation.**`),
     ci("A stored choice says nothing about whether the other persona's app remains in the channel"),
@@ -7958,6 +7965,30 @@ describe('the README describes both channel modes', () => {
       for (const item of required.map(resolveItem)) {
         const edited = withItemCut(readme(), passage, item)
         expect({ element, item: String(item), reported: docRowProblems(passage, required, edited).includes(`lacks ${String(item)}`) }).toEqual({ element, item: String(item), reported: true })
+      }
+    })
+
+    test.each([
+      ['changing mode preserves applied channel choices', 'Mode changes preserve', 'Mode changes discard'],
+      ['changing mode preserves applied channel choices', 'including choices made while open mode was active', 'except choices made while open mode was active'],
+      ['four persistent listening choices and default off', 'A channel with no assignment defaults to `off`', 'A channel with no assignment defaults to `mentions`'],
+      ['four persistent listening choices and default off', 'A mode switch preserves them', 'A mode switch resets them'],
+      ['four persistent listening choices and default off', 'never inherits its previous incarnation’s choices', 'inherits its previous incarnation’s choices'],
+      ['the loop guard holds other personas at mentions without enabling off choices', 'is held at `mentions`', 'is held at `all`'],
+      ['the loop guard holds other personas at mentions without enabling off choices', 'whose applied choice is non-off', 'whose applied choice is off'],
+      ['the loop guard holds other personas at mentions without enabling off choices', 'Its own destination and a `"dm"` destination hold nothing', 'Its own destination and a `"dm"` destination hold every channel'],
+    ])('self-check: Channel modes: %s rejects omission or reversal of "%s"', (label, original, reversal) => {
+      const element = `Channel modes: ${label}`
+      const row = README_DEO_ROWS.find(([name]) => name === element)
+      if (row === undefined) throw new Error(`no README row for ${element}`)
+      const [, passage, required] = row
+      const text = readme()
+      expect(docRowProblems(passage, required, text)).toEqual([])
+      for (const replacement of ['', reversal]) {
+        const edited = text.replace(original, replacement)
+        expect(edited).not.toBe(text)
+        expect(passage(edited)).not.toBe(passage(text))
+        expect(docRowProblems(passage, required, edited).length).toBeGreaterThan(0)
       }
     })
 

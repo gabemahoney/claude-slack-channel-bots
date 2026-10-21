@@ -3,73 +3,29 @@
  * rules, and apply step 1's retired keys
  *
  *
- * Saving `config.json` does not change what runs. The server keeps a byte
- * copy of the last applied configuration, `config.json.last-applied` (the
- * record), beside the configuration file, and every start runs it:
+ * Saving config.json does not change what runs. config.json.last-applied
+ * holds the sole shared authority: the exact reviewed bytes, the applied
+ * configuration and its ordered channel/identity evidence. Startup validates
+ * and recovers that authority; a missing record permits a valid configuration
+ * to establish it durably. A malformed or unreadable record stops startup
+ * without consuming prepared input or guessing a replacement. The CLI reads
+ * this same validated applied state. No removed delivery store is consulted.
  *
- * - record present: its bytes are read once and validated in record mode
- *   (`parsePersonaConfigBytes`), where a real-path collision is left to the
- * bring-up. The configuration file is not read to decide
- *   what runs. A record that cannot be read or validated stops the start; the
- *   line names the record and says that deleting it makes the next start
- *   apply the configuration file;
- * - no record: the configuration file's bytes are read once and validated in
- *   default mode. A missing, unreadable or invalid file (a pre-persona file
- * gets the conversion error) stops the start. A valid file's bytes
- *   are written to the record with the durable writer before anything is
- *   applied; a failed write stops the start (`reload-record-write-failed`),
- *   including one whose record reached the disk but whose directory could
- *   not be synced (that line says the next start will run the record).
+ * Detection compares config.json with the reviewed source bytes and compares
+ * referenced credentials with the in-memory digests held by bring-up (never
+ * in dry run). It renders the merged candidate without applying it. The
+ * confirmation fingerprint also includes the authority revision, so intervening
+ * automatic assignments invalidate older reviews without changing config.json.
  *
- * The start reads no credentials file: the start bring-up reads them as they
- * stand, so a credentials change made while the server was down takes effect
- * at the start. An empty `personas` array is a valid applied set.
- *
- * Detection: once the start bring-up pass has
- * returned, `startDetection` hands the detection tick to the injected tick
- * driver (every 5 s in production). Each pass compares the configuration
- * file's bytes with the applied bytes and, unless in dry run, each
- * referenced credentials file's digest with the one the persona's bring-up
- * holds, and keeps `config.json.pending` (the preview, rendered from
- * the change plan of `reload-plan.ts`, behind a fingerprint,
- * `reload-fingerprint.ts`) in step: written while a change is pending,
- * deleted when nothing is. Its first pass after a start from the record is
- * the comparison, so an unconfirmed edit stays pending.
- *
- * Confirmation and apply: each pass first processes
- * `config.json.apply` (the operator's rename of the pending file), deleting it
- * before anything is applied. A confirmation whose fingerprint matches the
- * pass's applies the bytes and the change plan that pass derived: an invalid
- * candidate logs `reload-invalid` and changes nothing; a valid one runs step
- * 1 (when a persona it brings up, an added one or a
- * destructive modify's new half, has an unwritten drop in the stored-choice
- * store, first write that store's record, a failure of that write failing
- * the apply with nothing applied beside; then record
- * the retired keys of removed personas, a renamed
- * persona's old key included, and of the old halves of destructive modifies,
- * and the key of each persona it brings up that is held as retired only in
- * memory, durably through the injected retired-key store, a failure of that
- * write failing the apply with nothing applied; then
- * stop the dialog approver of each key recorded; then rewrite the
- * record; if the rewrite fails, nothing is applied,
- * `reload-record-write-failed` is logged, and the keys this apply recorded
- * are removed again, a key held as retired before the apply staying retired,
- * once the rewrite succeeded, begin an old-life hold on each
- * removed or destructively modified key's `cscb_<key>` at its old working
- * directory, drop the stored choices of each of those keys
- * and mark each destructive modify's key as retiring
- * then swap the applied state and tell `onApplied`), then steps 2–6
- * of `reload-apply.ts` in order (by default through the
- * lifecycle operations: step 2 tears down each removed persona and the old
- * half of each destructive modify, steps 3 and 4 update in place and
- * reconnect, step 5 refreshes the agent-director template when the config
- * directories changed, and step 6 brings up each added persona and the new
- * half of each destructive modify; the retiring keys are cleared once step 2
- * has settled, before step 3 starts), and logs
- * `reload-applied`, or `reload-noop` when nothing effective changed. A
- * mismatched, unreadable or malformed confirmation applies nothing and logs
- * `reload-stale-confirmation`. The pending state is then refreshed against
- * what is applied.
+ * Confirmation applies exact reviewed bytes and the plan derived from them.
+ * Step 1 prepares retirement, durably applies one mode/list/identity/destination
+ * combination, then stops retired delivery workers and publishes to consumers.
+ * A definite failure restores retirement and retains the input and confirmation;
+ * an uncertain post-rename outcome retains its evidence and blocks more writes.
+ * Successful application consumes the confirmation. Steps 2–6 tear down,
+ * update in place, reconnect, refresh templates and bring up, using the existing
+ * per-persona lifecycle. Shutdown prevents further operations from starting.
+ * No path deletes or reselects accepted queue items.
  *
  * The controller (`createReloadController`) is built with every dependency
  * injected, as `createCronScheduler` is: the paths, the durable
@@ -96,7 +52,7 @@
  */
 
 import { createHash } from 'node:crypto'
-import { createSharedChannelAuthority, initialSharedChannelState, parseSharedChannelState, sharedAppliedConfig, serializeSharedChannelState, type SharedChannelAuthority, type SharedChannelState } from './shared-channels.ts'
+import { createSharedChannelAuthority, initialSharedChannelState, parseSharedChannelState, sharedAppliedConfig, serializeSharedChannelState, type SharedChannelAuthority, type SharedChannelState, type SharedMutationResult } from './shared-channels.ts'
 import { dirname, resolve } from 'node:path'
 import {
   durableUnlinkSync,
@@ -212,8 +168,8 @@ export { RELOAD_APPLIED, RELOAD_NOOP, RELOAD_STALE_CONFIRMATION } from './reload
  * nothing is applied and the change stays pending. At a confirmed apply the
  * same class names a failed write of the retired-key record at step 1, and
  * a failed rewrite's line says how the retired-key record's restore went
- * and a failed write of the stored-choice file before a
- * bring-up.
+ *. An unresolved durable write preserves authority evidence
+ * for recovery rather than claiming the old state was restored.
  */
 export const RELOAD_RECORD_WRITE_FAILED = 'reload-record-write-failed'
 
@@ -261,24 +217,35 @@ export function reloadRetiredKeysPutBackFailedClause(path: string): string {
   )
 }
 
-/**
- * The one `reload-record-write-failed` line of a failed write of the
- * stored-choice file at step 1 (beside): a key
- * the confirmed change brings up has an unwritten drop, and writing it before
- * the bring-up failed, so nothing is applied. Names the stored-choice file at
- * `channelDeliveryPath` and the last-applied record at `lastAppliedPath`
- * (each quoted as JSON), and nothing else: no channel, no choice, no token,
- * no file content and no error code (the store's own `[slack]
- * channel-delivery:` line carries the code). Pure.
- *
- * [slack] reload-record-write-failed: cannot write the stored-choice file "<path>" before bringing up a persona whose stored choices were dropped; the retired-key record is not written, the last-applied record "<path>" is not rewritten, and the confirmed change is not applied and stays pending
- */
-export function reloadChannelDeliveryWriteFailedLine(channelDeliveryPath: string, lastAppliedPath: string): string {
+/** Startup refusal when establishing the shared authority fails. Echoes only safe errno, never error text. */
+export function reloadSharedAuthorityStartFailedLine(path: string, error: unknown): string {
+  const outcome = error instanceof DurableWriteUnsyncedError
+    ? '; the authority was renamed but its directory could not be synced, so the durable outcome is unresolved' : ''
   return (
-    `[slack] ${RELOAD_RECORD_WRITE_FAILED}: cannot write the stored-choice file ${JSON.stringify(channelDeliveryPath)} ` +
-    'before bringing up a persona whose stored choices were dropped; the retired-key record is not written, the ' +
-    `last-applied record ${JSON.stringify(lastAppliedPath)} is not rewritten, and the confirmed change is not ` +
-    'applied and stays pending'
+    `[slack] ${RELOAD_RECORD_WRITE_FAILED}: cannot durably establish the shared channel authority ${JSON.stringify(path)}${errnoSuffix(error)}${outcome}; ` +
+    'preserve the prepared configuration and authority evidence; the server does not start'
+  )
+}
+
+/** Startup uses the recovered shared authority at this revision. */
+export function reloadSharedAuthorityStartLine(path: string, revision: number): string {
+  return `[slack] Starting from the shared channel authority "${path}" at revision ${revision}`
+}
+
+/**
+ * A failed reviewed application keeps its input and authority evidence.
+ * `failure` is the authority's echo-safe errno suffix; `restored` is a clause
+ * from the retired-key restore builders above. Neither carries raw errors.
+ */
+export function reloadSharedAuthorityApplyFailedLine(
+  path: string,
+  outcome: Exclude<SharedMutationResult['kind'], 'applied'>,
+  failure: string,
+  restored = '',
+): string {
+  return (
+    `[slack] ${RELOAD_RECORD_WRITE_FAILED}: cannot write the shared channel authority ${JSON.stringify(path)}${failure}; ` +
+    `application ${outcome}; preserve the prepared input and authority evidence; the change remains pending${restored}`
   )
 }
 
@@ -493,18 +460,10 @@ export interface ReloadControllerDeps {
   retiredKeys: RetiredKeyStore
   /** The read/write adapter over this controller's recovered authority. It owns only the in-memory retiring-session guard; configuration and identity application use one atomic authority write. */
   channelDelivery: () => ChannelDeliveryStore
-  /**
-   * Stop delivery running for a key apply step 1 recorded as
-   * retired (production `stopDialogApprover` with
-   * the retired-key reason, which logs the stop and its reason and also
-   * cancels the approver a launch in flight would start; no pending-row rule
-   * run follows). Called synchronously in step 1, for each key of the batch,
-   * once the record did not fail (written, or unchanged for a key already
-   * recorded with no mark), before the last-applied rewrite and so before
-   * any teardown is submitted; its returned value is not awaited, and a
-   * throw or rejection is logged. A failed step-1 write stops nothing, and a
-   * failed rewrite restarts no approver.
-   */
+  /** Stop the retired key's delivery and reminder workers after durable
+   * authority application, before any teardown. Called synchronously without
+   * awaiting the returned work; throws/rejections are logged. Definite
+   * pre-activation failure leaves the existing workers running. */
   stopDelivery: (key: string) => unknown
   /**
    * The server's old-life hold set (`createOldLifeHoldSet`,
@@ -1317,6 +1276,7 @@ function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetecti
    */
   async function processConfirmation(state: PendingState): Promise<boolean> {
     const confirmation = readConfirmation()
+    if (stopped) return false
     if (confirmation.kind === 'absent') {
       ignoredConfirmation = undefined
       failedConfirmation = undefined
@@ -1347,6 +1307,7 @@ function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetecti
       deps.log(renderStaleConfirmationLogLine(paths.apply, stale))
       return false
     }
+    if (stopped) return false
     const changed = await host.applyConfirmed(state)
     if (stopped) return changed
     if (changed || !state.plan.valid) ignoredConfirmation = removeConfirmation(false) ? undefined : identity
@@ -1364,6 +1325,7 @@ function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetecti
     running = true
     try {
       let state = derive()
+      if (stopped) return
       const appliedNow = await processConfirmation(state)
       // Stopped at shutdown while an apply step ran: the pass ends there.
       if (stopped) return
@@ -1482,6 +1444,7 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
             `${renderPersonaRef(persona.name, persona.key)}: ${describeThrownValue(err)}`,
         ),
       credentialsBrokenNow,
+      () => !detectionStopped,
     )
   let phase: StartPhase = 'unresolved'
   let appliedState: AppliedConfiguration | undefined
@@ -1522,10 +1485,7 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
     if (applied.sharedState === undefined) {
       try { write(paths.lastApplied, serializeSharedChannelState(sharedState)) }
       catch (err) {
-        const outcome = err instanceof DurableWriteUnsyncedError
-          ? '; the authority was renamed but its directory could not be synced, so the durable outcome is unresolved' : ''
-        return refuse(applied.source, RELOAD_RECORD_WRITE_FAILED,
-          `[slack] ${RELOAD_RECORD_WRITE_FAILED}: cannot durably establish the shared channel authority ${JSON.stringify(paths.lastApplied)}${errnoSuffix(err)}${outcome}; preserve the prepared configuration and authority evidence; the server does not start`)
+        return refuse(applied.source, RELOAD_RECORD_WRITE_FAILED, reloadSharedAuthorityStartFailedLine(paths.lastApplied, err))
       }
     }
     sharedChannels = createSharedChannelAuthority(paths.lastApplied, sharedState, { write, home: deps.home, sourcePath: paths.config })
@@ -1533,9 +1493,9 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
       // Reviewed activation establishes old-life guards before notifying consumers.
       if (applyingReviewed) return
       if (appliedState !== undefined) appliedState = { config, bytes: sharedChannels!.sourceBytes(), source: 'record' }
-      notifyApplied(config)
+      if (!detectionStopped) notifyApplied(config)
     })
-    deps.log(`[slack] Starting from the shared channel authority "${paths.lastApplied}" at revision ${sharedChannels.revision}`)
+    deps.log(reloadSharedAuthorityStartLine(paths.lastApplied, sharedChannels.revision))
     phase = 'applied'
     appliedState = applied
     return { kind: 'applied', ...applied }
@@ -1641,89 +1601,31 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
     }
   }
 
-  /**
-   * Apply a confirmed candidate: the exact bytes and the plan
-   * the tick derived from them, never a second read or diff. An invalid
-   * candidate logs one `reload-invalid` line and changes nothing. A valid one
-   * runs step 1 in one synchronous stretch,
-   * with no await between its writes, over the one stored-choice store
-   * `channelDelivery` answers, asked once here, before the first write.
-   * First, when a key the apply brings up (an added persona, a key-changing
-   * rename's new key included, or a destructive modify's new half) has an
-   * unwritten drop, the stored-choice store's record is written (
-   * beside). When that write fails (an unsynced rename
-   * included), one `reload-record-write-failed` line names the stored-choice
-   * file (`reloadChannelDeliveryWriteFailedLine`) and nothing is applied: no
-   * retired-key record is written, no approver stopped, nothing rewritten,
-   * held, dropped or marked, and the change stays pending. Nothing is written
-   * when no such key has an unwritten drop, or when the store is unreadable.
-   * Then:
-   * 1. record the retired keys (`retiredKeysToRecord`) with one
-   *      write of the retired-key store, when there are any: each removed
-   *      persona's key (a renamed persona's old key included) as `removed`,
-   *      each destructive modify's key as `destructive-modify`, and the key
-   *      of each persona the apply adds that the store holds only in memory.
-   *      When that write fails, the store is restored to the record it held
-   *      before the apply, as far as it can be, one
-   *      `reload-record-write-failed` line naming the retired-key file is
-   *      logged, and nothing is applied: the last-applied record is not
-   * rewritten and the change stays pending. Once the record
-   *      did not fail (written, or nothing to write for keys already
-   *      recorded with no mark), the dialog approver of each key of the
-   * batch is stopped (`stopDelivery`), before the rewrite and
-   *      before any teardown's kill;
-   *   2. rewrite the last-applied record. When that fails, the retired-key
-   *      record, if step 1 wrote it, is restored to what it held before the
-   *      apply (the keys this apply recorded removed again, keys and marks
-   *      held before it kept), one `reload-record-write-failed` line says how
-   * the restore went, and nothing is applied; no approver
-   *      stopped in step 1 is started again, and no old-life hold begins.
-   *      Once it succeeded, each removed persona's key (a rename's old key
-   *      included) and each destructive modify's key holds its old life's
-   * working directory (`oldLifeHoldsToBegin`), before any
-   *      teardown's kill; a failed retired-key write above began none
-   *      either. Then the stored choices of those same keys are dropped in
-   * one batch with the retired reason, and each
-   * destructive modify's key is marked as retiring, in
-   *      both modes and whether or not the store is readable. A failed drop
-   *      write is the store's own line and never fails the apply; a failed
-   *      stored-choice write, retired-key write or rewrite above drops
-   *      nothing and marks nothing;
-   *   3. swap the applied state and tell `onApplied`.
-   * Then the bound steps 2–6 run in order (`applyStepsFor`: none but the
-   * template refresh for a no-op, and that only when the config directories
-   * changed): step 2 on its own first, and once it has settled (fulfilled,
-   * rejected, unbound or not run) the retiring keys are cleared, before step
-   * 3 starts, on every path out of the apply; then steps 3–6.
-   * Then `reload-applied` or `reload-noop` is logged. A candidate
-   * whose only changes are recorded ones (the section the switch does not
-   * select) has no effective change: it rewrites the record, swaps the
-   * applied state and logs `reload-noop`, with no lifecycle operation
-   * A change of the switch is a
-   * server-wide setting the swap applies in place (`configInEffect`); it puts
-   * no persona in any step, so on its own it runs no teardown, bring-up,
-   * launch, reconnect or in-place operation and every session is kept
-   * Resolves
-   * whether the applied state changed. Rejects only on a programming error (a
-   * plan naming a key its configuration lacks, or a `channelDelivery`
-   * accessor with no store to answer), before anything is written; the tick
-   * logs it as a failed pass.
-   */
+  /** Apply exact reviewed bytes at their authority revision. Step 1 prepares
+   * retirement, durably applies the shared authority, then stops retired
+   * workers and publishes the whole combination. Definite failure restores
+   * retirement without stopping accepted work; an unresolved durability
+   * outcome retains both records for recovery. Steps 2–6 use the reviewed
+   * plan and stop scheduling work when the controller stops. */
   async function applyConfirmed(state: PendingState): Promise<boolean> {
     const current = appliedState
     const { plan, candidate, bytes } = state
-    if (current === undefined) return false
+    if (current === undefined || detectionStopped) return false
     if (!plan.valid) {
       deps.log(renderConfirmedInvalidLogLine(plan))
       return false
     }
     // A valid plan always comes from bytes that were read and parsed.
     if (candidate.kind !== 'valid' || bytes === undefined) return false
+    const reviewedRevision = state.authorityRevision
+    if (sharedChannels === undefined || !sharedChannels.readable || reviewedRevision !== sharedChannels.revision) return false
     const steps = applyStepsFor(plan)
-    // the one stored-choice store, asked
-    // once per apply, before step 1's first write, and used for the whole
-    // apply.
+    // Resolve every planned persona before any durable mutation. The candidate
+    // already includes merged automatic choices at the reviewed revision.
+    const mergedInputs = applyStepInputs(plan, current.config, candidate.config)
+    // The one file-free adapter owns the retiring-session guard.
     const channelDelivery = deps.channelDelivery()
+    if (detectionStopped) return false
 
     // Retirement and the one authority application run without an await.
     // A definite failure restores retirement; an uncertain durable outcome
@@ -1735,24 +1637,31 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
       deps.log(retiredKeysWriteFailedLine(store, store.restore(recorded.snapshot)))
       return false
     }
-    // each recorded key's approver stops now, before the
-    // rewrite and the teardown's kill; nothing awaited, so step 1 stays one
-    // synchronous stretch.
-    for (const { key } of batch) stopDeliveryOf(key)
-    const reviewedRevision = state.authorityRevision
+    if (detectionStopped) {
+      if (recorded?.outcome === RETIRED_KEYS_WRITTEN) store.restore(recorded.snapshot)
+      return false
+    }
     let result
     applyingReviewed = true
-    try { result = sharedChannels?.applyReviewed(bytes, reviewedRevision!) }
+    try { result = sharedChannels.applyReviewed(bytes, reviewedRevision) }
     finally { applyingReviewed = false }
     if (result?.kind !== 'applied') {
       const restored = result?.kind !== 'unresolved' && recorded !== undefined && recorded.outcome === RETIRED_KEYS_WRITTEN
         ? retiredKeysRestoredClause(store, store.restore(recorded.snapshot)) : ''
       const failure = sharedChannels?.failure ?? ''
-      deps.log(`[slack] ${RELOAD_RECORD_WRITE_FAILED}: cannot write the shared channel authority ${JSON.stringify(paths.lastApplied)}${failure}; application ${result?.kind ?? 'failed'}; preserve the prepared input and authority evidence; the change remains pending` + restored)
+      deps.log(reloadSharedAuthorityApplyFailedLine(paths.lastApplied, result?.kind ?? 'failed', failure, restored))
       return false
     }
-    const merged = sharedChannels!.config()
-    const mergedInputs = applyStepInputs(plan, current.config, merged)
+    const merged = sharedChannels.config()
+    appliedState = { config: merged, bytes: sharedChannels.sourceBytes(), source: 'config' }
+    if (detectionStopped) return true
+    // A failed application leaves the current delivery/reminder workers
+    // intact. Retire them only after the authority is durably applied.
+    for (const { key } of batch) {
+      if (detectionStopped) return true
+      stopDeliveryOf(key)
+    }
+    if (detectionStopped) return true
     // the rewrite succeeded, so each key this step recorded
     // holds its old life's working directory from now, before any teardown's
     // kill; a failed write or rewrite above began none.
@@ -1760,23 +1669,22 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
     for (const persona of plan.removed) {
       try { deps.onQueueRetained?.(persona.key, deps.queueOpenCount?.(persona.key) ?? 0) } catch { /* observer cannot interrupt apply */ }
     }
-    // each destructive modify's key is retiring from here
+    // Each destructive modify's key is retiring from here
     // until step 2 has settled, so no call stores a choice for it meanwhile.
     const retiring = plan.destructive.map(({ key }) => key)
     setRetiring(channelDelivery, retiring, true)
     const onStepFailure = (step: ApplyStepName, err: unknown): void =>
       deps.log(`[slack] reload: apply step ${applyStepNumber(step)} (${step}) failed: ${describeThrownValue(err)}`)
     try {
-      appliedState = { config: merged, bytes: sharedChannels!.sourceBytes(), source: 'config' }
-      notifyApplied(merged)
+      if (!detectionStopped) notifyApplied(merged)
       // Step 2 on its own, so the retiring window closes once it has
       // settled, before step 3 starts; `runApplySteps` keeps its order and
       // failure isolation across the two calls.
-      await runApplySteps(applySlots, mergedInputs, steps.filter((step) => step === TEARDOWNS_STEP), onStepFailure)
+      await runApplySteps(applySlots, mergedInputs, steps.filter((step) => step === TEARDOWNS_STEP), onStepFailure, () => !detectionStopped)
     } finally {
       setRetiring(channelDelivery, retiring, false)
     }
-    if (!detectionStopped) await runApplySteps(applySlots, mergedInputs, steps.filter((step) => step !== TEARDOWNS_STEP), onStepFailure)
+    await runApplySteps(applySlots, mergedInputs, steps.filter((step) => step !== TEARDOWNS_STEP), onStepFailure, () => !detectionStopped)
     deps.log(plan.noEffectiveChange ? renderNoopLogLine(paths.lastApplied) : renderAppliedLogLine(plan, paths.lastApplied))
     return true
   }

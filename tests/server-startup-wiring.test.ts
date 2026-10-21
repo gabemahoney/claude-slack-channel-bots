@@ -5071,14 +5071,15 @@ describe('server.ts\'s file guard refuses every persona credentials file (sectio
   })
 
   // Configuration and authority reads are complete by default. The unrelated
-  // agent-director settings file explicitly retains its bounded policy; only
-  // these named readers may pass a size-policy option.
-  test('only the named readers pass a size policy, and agent-director settings explicitly remain bounded', () => {
+  // agent-director settings and legacy hook cleanup explicitly retain their
+  // bounded policies; only these named readers may pass a size-policy option.
+  test('only the named readers pass a size policy, and agent-director settings and legacy hook cleanup explicitly remain bounded', () => {
     const files = srcFiles().map(([path, source]) => [path, stripComments(source)] as const)
     const POLICY_SITES: ReadonlyArray<[string, RegExp, string]> = [
       ['src/config.ts', /\bexport\s+function\s+credentialsFilesToProtect\s*\(/, '{ uncapped: true }'],
       ['src/retired-keys.ts', /\bexport\s+function\s+loadRetiredKeyStore\s*\(/, '{ uncapped: true }'],
       ['src/ad-settings.ts', /\bfunction\s+readAdSettingsFile\s*\(/, '{ uncapped: false }'],
+      ['src/legacy-reply-hook-cleanup.ts', /\bexport\s+function\s+removeLegacyReplyHooks\s*\(/, '{ uncapped: false }'],
     ]
     const sitePaths = POLICY_SITES.map(([path]) => path)
     // config.ts declares the option; elsewhere it appears only at its permitted call.

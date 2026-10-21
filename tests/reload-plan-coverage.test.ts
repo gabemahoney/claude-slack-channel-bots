@@ -53,7 +53,6 @@ import {
   IN_PLACE_SETTINGS,
   MODE_SWITCH_SETTING,
   NEXT_LAUNCH_SETTINGS,
-  RECORDED_SECTION_KEYS,
   type ServerSettingChange,
   type ValidChangePlan,
 } from '../src/reload-plan.ts'
@@ -260,7 +259,6 @@ interface Classes {
   inPlace: [string, readonly string[]][]
   /** Own next-launch settings. */
   nextLaunch: [string, readonly string[]][]
-  recorded: [string, readonly string[]][]
   unchanged: string[]
   settings: ServerSettingChange[]
   noEffectiveChange: boolean
@@ -273,7 +271,6 @@ function classesOf(plan: ValidChangePlan): Classes {
     destructive: plan.destructive.map((p) => [p.key, p.settings]),
     inPlace: plan.inPlace.map((p) => [p.key, p.settings]),
     nextLaunch: plan.nextLaunch.map((p) => [p.key, p.own]),
-    recorded: plan.recorded.map((p) => [p.key, p.fields]),
     unchanged: plan.unchanged.map((p) => p.key),
     settings: plan.settings,
     noEffectiveChange: plan.noEffectiveChange,
@@ -288,7 +285,6 @@ function classes(c: Partial<Classes>): Classes {
     destructive: [],
     inPlace: [],
     nextLaunch: [],
-    recorded: [],
     unchanged: [],
     settings: [],
     noEffectiveChange: false,
@@ -305,7 +301,6 @@ const PLAN_CLASSES = {
   destructive: DESTRUCTIVE_SETTINGS,
   inPlace: IN_PLACE_SETTINGS,
   nextLaunch: NEXT_LAUNCH_SETTINGS,
-  recorded: RECORDED_SECTION_KEYS,
 } as const satisfies Record<string, readonly string[]>
 type PlanClass = keyof typeof PLAN_CLASSES
 
@@ -342,13 +337,11 @@ describe('a persona change is classified by the section in force when both confi
 
     const result = planBetween(input(top, before), input(top, after))
 
-    // A recorded change modifies no persona: alpha is unchanged and the plan has no effect.
-    const recordedOnly = cls === 'recorded'
     expect(classesOf(result)).toEqual(
       classes({
         [cls]: [['alpha', [setting]]],
-        unchanged: recordedOnly ? ['alpha'] : [],
-        noEffectiveChange: recordedOnly,
+        unchanged: [],
+        noEffectiveChange: false,
       }),
     )
   })

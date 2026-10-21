@@ -91,13 +91,10 @@ import {
   MODE_SWITCH_SETTING,
   modeSwitchLine,
   PENDING_PREVIEW_TITLE,
-  RECORDED_SECTION_KEYS,
   RELOAD_PREVIEW,
-  recordedLine,
   renderChangePlanCounts,
   type ChangePlanCounts,
   type InPlaceSetting,
-  type RecordedSectionKey,
 } from '../src/reload-plan.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
 import {
@@ -605,22 +602,6 @@ const EDITS: readonly Edit[] = [
 /** A preview header's counts with nothing counted. */
 const NO_COUNTS: ChangePlanCounts = { added: 0, removed: 0, destructive: 0, inPlace: 0, credentials: 0, settings: 0 }
 
-/** Every non-empty choice of the recorded section keys, in their reported order. */
-function recordedFieldSets(): RecordedSectionKey[][] {
-  const sets: RecordedSectionKey[][] = []
-  for (let mask = 1; mask < 1 << RECORDED_SECTION_KEYS.length; mask++) {
-    sets.push(RECORDED_SECTION_KEYS.filter((_k, i) => (mask & (1 << i)) !== 0))
-  }
-  return sets
-}
-
-/** Every line `recordedLine` can build for a persona of `fixture`. */
-function recordedLinesOf(h: ReloadHarness, fixture: UpgradeFixture): string[] {
-  return fixture.input.personas.flatMap((p) =>
-    recordedFieldSets().map((fields) => recordedLine({ name: p.name, key: h.key(p.name), fields })),
-  )
-}
-
 describe("a 0.11.1-style edit is previewed and confirmed as in 0.11.1 (switch-absent half)", () => {
   test.each(FIXTURES.flatMap((f) => EDITS.map((e) => [f.file, e.edit, f, e] as const)))(
     '%s, %s: the preview is the header and the in-place line, with no recorded line, no switch line and no term; the confirmation updates that persona in place, records the edited bytes and stays declarative',
@@ -643,8 +624,6 @@ describe("a 0.11.1-style edit is previewed and confirmed as in 0.11.1 (switch-ab
       expect(run.lastPreviewText()).toEqual(preview)
       expect(run.previewEmissionCount()).toBe(1)
       expect(run.since(beforeConfirm).lifecycle).toEqual([])
-      const recorded = new Set(recordedLinesOf(h, fixture))
-      expect(preview!.filter((line) => recorded.has(line))).toEqual([])
       expect(preview!.filter((line) => CHANNEL_MODES.some((mode) => line.startsWith(modeSwitchLineHead(mode))))).toEqual([])
       expect(termHits([h.readPendingText()!])).toEqual({})
       expectNoTerms(run, RELOAD_PREVIEW)

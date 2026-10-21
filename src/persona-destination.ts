@@ -2,20 +2,11 @@
  * persona-destination.ts — Where a persona's permission prompts and server
  * notices go, and the post there.
  *
- * A persona's destination comes from one rule, `personaDestinationOf`
- * over the configuration in effect: its
- * `permission_prompts` setting in declarative mode, its fungible destination
- * (`invited.permission_prompts`, `dm` by default) in fungible mode; either way
- * a channel ID, or `dm`. The resolver reads the configuration in effect
- * through its injected `getPersonaConfig` at each attempt,
- * which every resolver is given. The destination hold and the permission poller ask the resolver
- * (`destinationOf`, `refusalOf`, `settingOf`), so all of them read the one
- * switch. In fungible mode prompts and notices go to the fungible
- * destination on the persona's own client, and after a
- * confirmed switch change the next attempt goes to the destination of the
- * mode turned on. A channel destination is that channel. A
- * `dm` destination is the persona's DM conversation with its `dm.contact`,
- * explicit or by default in fungible mode, obtained with
+ * A persona's required `permission_prompts` selects one common destination
+ * in strict and open modes, read through `personaDestinationOf` at each
+ * attempt. A channel destination stays that channel even after verified
+ * removal from the shared list. A `dm` destination uses the persona's own
+ * client and configured `dm.contact`, obtained with
  * `conversations.open` on the persona's own client (Slack returns the existing
  * conversation, or creates one when none exists, so a DM-only persona's first
  * post needs no prior DM and no history or conversation-list lookup). Posts
@@ -42,8 +33,7 @@
  * has `dm.enabled` on and `dm.contact` set. Should
  * either be missing anyway, nothing is opened or posted: the refusal is logged
  * and returned. Its line names the destination setting in force
- * (`destinationSettingOf`): `permission_prompts` in
- * declarative mode, `invited.permission_prompts` in fungible mode. It does
+ * (`destinationSettingOf`): the common `permission_prompts`. It does
  * not go through the MCP tool-scope check (`checkPersonaTarget`).
  *
  * Every line elsewhere that names a destination setting (the destination
@@ -69,7 +59,7 @@
  */
 
 import type { WebClient } from '@slack/web-api'
-import { DM_DESTINATION, channelModeOf, type Persona, type ServerSettings } from './config.ts'
+import { DM_DESTINATION, type Persona, type ServerSettings } from './config.ts'
 import type { PersonaFungibleDestination } from './delivery-decision.ts'
 import { renderPersonaRef } from './persona-identity.ts'
 import { describeSlackCallFailure, describeThrownValue, isSafeIdentifier } from './persona-connection-errors.ts'

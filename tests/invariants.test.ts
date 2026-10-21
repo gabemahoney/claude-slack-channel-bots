@@ -14,10 +14,8 @@ import { cannedDelivery } from './test-helpers/agent-director-stub.ts'
  *     posting-scope check and its classifier, `src/persona-routing.ts` only
  *     in the decision's input, `src/persona-destination.ts` only in the one
  *     destination rule.
- * - the readers of the resolved forms: `sections` is read
- *     only by the reload plan; `fungible_destination` only by the one
- *     destination rule, the delivery decision, the routing's input to it and
- *     the reload plan (`src/config.ts` reads it only where it builds it).
+ *   - The retired split forms `sections`, `invited` and
+ *     `fungible_destination` have no source readers.
  * - one destination rule: declared once, in
  *     `src/persona-destination.ts`; the destination hold, the permission
  *     poller, the persona notifier and the lost-message notice read none of
@@ -155,9 +153,6 @@ const ONE_DESTINATION_RULE = 'personaDestinationOf'
 
 /** Where `src/config.ts` builds a persona's resolved forms: building them is no read. */
 const PERSONA_BUILDER = 'parsePersonaEntry'
-
-/** the only files that may read `sections` (the reload plan). */
-const SECTIONS_READERS: readonly string[] = ['reload-plan.ts']
 
 /**
  * the only files that may read `fungible_destination`: the one
@@ -596,7 +591,6 @@ describe('the section not in force is never read', () => {
     expect([...modules.keys()]).toEqual(everyTs)
     const named = [
       ...FIXED_READERS,
-      ...SECTIONS_READERS,
       ...FUNGIBLE_DESTINATION_READERS,
       ...DESTINATION_CONSUMERS,
       ...PLACEMENT.map((row) => row.file),
@@ -618,16 +612,14 @@ describe('the section not in force is never read', () => {
   })
 })
 
-describe('the readers of sections and fungible_destination', () => {
+describe('the shared schema has no readers of retired split fields', () => {
   const modules = srcSources()
 
-  test('sections is read only by the reload plan', () => {
-    expect(readersFindings(modules, 'sections', SECTIONS_READERS)).toEqual([])
-    expect(allFieldReads(modules).filter((r) => r.field === 'sections').length).toBeGreaterThan(0)
-  })
-
-  test.each(['invited', 'fungible_destination'] as const)('removed field %s has no reader under src/', field => {
+  test.each(['sections', 'invited', 'fungible_destination'] as const)('removed field %s has no reader under src/', field => {
     expect(readersFindings(modules, field, [])).toEqual([])
+    const planted = new Map([['reload-plan.ts', `export const read = (persona: P) => persona.${field}`]])
+    expect(readersFindings(planted, field, [])).toHaveLength(1)
+    expect(readersFindings(new Map([['reload-plan.ts', 'export const read = (persona: P) => persona.name']]), field, [])).toEqual([])
   })
 })
 

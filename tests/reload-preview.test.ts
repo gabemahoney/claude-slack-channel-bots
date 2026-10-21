@@ -18,14 +18,9 @@
  * is injected as data. One row change kind pins its class, its
  * effect wording, the `DESTRUCTIVE:` prefix exactly when the persona is
  * retired, and its header count. Every server-wide setting has a wording
- * group; the `allow_invited_channels` switch's line is built through
- * `modeSwitchLine`, with one pin case per direction that
- * checks the whole line against the builder and each element
- * requires. Across a switch change each persona is classified by the
- * candidate's section in force; a change to the section not in
- * force gets the line `recordedLine` builds, checked element by
- * element in one case and built through the builder everywhere else. What the
- * detection tick gathers and when
+ * group; the channel_mode switch's line is built through modeSwitchLine,
+ * with a pin case per direction. Both modes keep channel-list, delivery and
+ * destination edits active. What the detection tick gathers and when
  * it writes and logs the preview is covered in tests/reload.test.ts.
  *
  * The retired lines: one case pins a removal's line and a
@@ -85,8 +80,6 @@ import {
   renderPreviewLines,
   renderPreviewLogLines,
   PENDING_PREVIEW_TITLE,
-  RECORDED_SECTION_KEYS,
-  recordedLine,
   removedLine,
   type AddedPersonaCause,
   type ChangePlan,
@@ -98,7 +91,6 @@ import {
   type InPlaceSetting,
   type InvalidChangePlan,
   type NextLaunchSetting,
-  type RecordedSectionKey,
   type ValidChangePlan,
 } from '../src/reload-plan.ts'
 import { assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, LEAK_SENTINEL, makeCredentials } from './test-helpers/credentials.ts'
@@ -246,7 +238,6 @@ function planWith(overrides: Partial<ValidChangePlan>): ValidChangePlan {
     credentials: [],
     nextLaunch: [],
     unchanged: [],
-    recorded: [],
     settings: [],
     noEffectiveChange: false,
     configDirsChanged: false,
@@ -1519,7 +1510,7 @@ describe('shared fields are applied in place across mode changes', () => {
     })
     const { plan, lines } = previewBetween(before, after)
     expect(plan.inPlace).toEqual([{ ...ref('bravo', 1), settings: ['channels', 'permission_prompts'] }])
-    expect(plan.recorded).toEqual([])
+    expect(lines.some(line => line.includes('recorded (not applied)'))).toBe(false)
     expect(lines.some(line => line.includes('bravo') && line.includes('permission_prompts'))).toBe(true)
     assertNoLeak({ plan, lines })
   })

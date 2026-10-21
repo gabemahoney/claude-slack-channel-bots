@@ -1,6 +1,7 @@
 import { REPLY_TOOL_ALLOW_RULE } from '../src/agent-director-template.ts'
 import { createHash } from 'node:crypto'
-import { queuePath, readQueue } from './test-helpers/delivery-queue.ts'
+import { queuePath, readQueue, slackInput, sentRecord, deliveredRecord } from './test-helpers/delivery-queue.ts'
+import { createReplyReminders, REPLY_TOOL_PREALLOWED_LABEL, type ReplyReminders } from '../src/reply-reminder.ts'
 import { cannedReadPaneResult } from './test-helpers/ad-results.ts'
 import { IDLE_PANE } from './test-helpers/working-row-panes.ts'
 import { botSystemPromptPath } from '../src/bot-system-prompt.ts'
@@ -69,6 +70,7 @@ import {
   type SessionEntry,
 } from '../src/registry.ts'
 import { renderNoopLogLine } from '../src/reload-apply.ts'
+import { errnoSuffix } from '../src/persona-credentials.ts'
 import { DESTRUCTIVE_SETTINGS, MODE_SWITCH_SETTING, type DestructiveSetting, type InPlaceSetting } from '../src/reload-plan.ts'
 import {
   RELOAD_APPLIED,
@@ -76,9 +78,9 @@ import {
   RELOAD_RECORD_WRITE_FAILED,
   RELOAD_RETIRED_KEYS_RESTORE_FAILED,
   RELOAD_RETIRED_KEYS_RESTORED,
-  reloadChannelDeliveryWriteFailedLine,
   reloadRetiredKeysPutBackClause,
   reloadRetiredKeysPutBackFailedClause,
+  reloadSharedAuthorityApplyFailedLine,
 } from '../src/reload.ts'
 import { LAUNCH_RESUMED_UNREPORTED, type LaunchSessionResult } from '../src/restart.ts'
 import {
@@ -102,6 +104,7 @@ import {
   cannedErr,
   cannedFindMissing,
   cannedGetResultPlural,
+  cannedGetResult,
   cannedKillResult,
   cannedListRow,
   cannedOk,
@@ -986,6 +989,7 @@ describe('a failed apply undoes its recording', () => {
   test.each<{ label: string; failure: Partial<WriteFailure>; seeded: boolean; lastAppliedWrites: boolean[] }>([
     { label: 'before the rename, over a record seeded before the apply', failure: { step: 'openSync', call: 3 }, seeded: true, lastAppliedWrites: [false] },
     { label: 'before the rename, with no record before the apply', failure: { step: 'openSync', call: 3 }, seeded: false, lastAppliedWrites: [false] },
+    { label: 'before the rename, with secret-bearing errno and error message', failure: { step: 'openSync', call: 3, code: fakeToken(BOT_TOKEN_PREFIX, 'apply-errno') }, seeded: true, lastAppliedWrites: [false] },
   ])('a rewrite failing $label applies nothing, logs one reload-record-write-failed line, and puts the record back: the keys it recorded removed, the marks it cleared back, keys recorded before it kept; a fresh confirmation then applies and records', async ({ failure, seeded, lastAppliedWrites }) => {
     const before = seed(seeded)
     const { run, personas } = await running(['alpha', 'bravo', 'charlie'])
@@ -1018,8 +1022,10 @@ describe('a failed apply undoes its recording', () => {
     // restore stops or restarts none.
     // Nothing applied, the change pending, one line naming the last-applied record and the retired-key record.
     const lines = recordWriteFailedLines(run)
-    expect(lines).toHaveLength(1)
-    expect(lines[0]).toContain(JSON.stringify(h.paths.lastApplied))
+    assertNoLeak(lines)
+    expect(lines).toEqual([
+      reloadSharedAuthorityApplyFailedLine(h.paths.lastApplied, 'failed', errnoSuffix({ code: failure.code ?? 'EIO' }), reloadRetiredKeysPutBackClause(h.retiredKeysFile)),
+    ])
     // The restore succeeded: the line says the record is put back, never that the apply's keys stay retired.
     expect(lines[0]).toContain(reloadRetiredKeysPutBackClause(h.retiredKeysFile))
     expect(lines[0]).not.toContain(reloadRetiredKeysPutBackFailedClause(h.retiredKeysFile))
@@ -1042,7 +1048,11 @@ describe('a failed apply undoes its recording', () => {
     expectNoPostNoLeak(run)
   })
 
-  test.each([true, false])('uncertain authority activation preserves retirement and input evidence until reopen (seeded=%s)', async seeded => {
+  test.each([
+    { label: 'seeded, safe errno', seeded: true, code: 'EIO' },
+    { label: 'unseeded, safe errno', seeded: false, code: 'EIO' },
+    { label: 'seeded, secret-bearing errno and error message', seeded: true, code: fakeToken(BOT_TOKEN_PREFIX, 'unsynced-apply-errno') },
+  ])('uncertain authority activation preserves retirement and input evidence until reopen ($label)', async ({ seeded, code }) => {
     seed(seeded)
     const { run, personas: [alpha, , charlie] } = await running(['alpha', 'bravo', 'charlie'])
     const applied = run.controller.applied()
@@ -1050,7 +1060,7 @@ describe('a failed apply undoes its recording', () => {
     const input = h.writeConfig(configOf(alpha!, movedDirectory(charlie!)))
     await run.ticks.tick()
     h.confirm()
-    h.failWrites({ step: 'fsyncSync', call: 4 })
+    h.failWrites({ step: 'fsyncSync', call: 4, code })
     const checkpoint = run.checkpoint()
     await run.ticks.tick()
     expect(run.controller.sharedChannels()!.readable).toBe(false)
@@ -1061,6 +1071,9 @@ describe('a failed apply undoes its recording', () => {
     expect(run.since(checkpoint).lifecycle).toEqual([])
     expect(run.oldLifeHolds.snapshot()).toEqual([])
     expectNoPostNoLeak(run)
+    expect(recordWriteFailedLines(run)).toEqual([
+      reloadSharedAuthorityApplyFailedLine(h.paths.lastApplied, 'unresolved', errnoSuffix({ code })),
+    ])
     h.clearWriteFailure()
     h.confirm()
     await run.ticks.tick()
@@ -1086,11 +1099,12 @@ describe('a failed apply undoes its recording', () => {
 
   test('a rewrite that fails with the restore failing too names the failed restore in its one line, and the keys the apply recorded stay retired', async () => {
     const before = seed(true)
+    const code = fakeToken(BOT_TOKEN_PREFIX, 'restore-errno')
     let failing = false
     const { run, personas } = await running(['alpha', 'bravo', 'charlie'], {
       // From the last-applied write on, every write fails: the rewrite and the restore after it.
       beforeWrite: (path) => {
-        if (failing && path === h.paths.lastApplied) h.failWrites()
+        if (failing && path === h.paths.lastApplied) h.failWrites({ code })
       },
     })
     const [alpha, , charlie] = personas
@@ -1104,7 +1118,10 @@ describe('a failed apply undoes its recording', () => {
 
     expect(run.since(cp).writes.slice(0, 3)).toEqual([h.retiredKeysWrite(), h.lastAppliedWrite(false), h.retiredKeysWrite(false)])
     const lines = recordWriteFailedLines(run)
-    expect(lines).toHaveLength(1)
+    assertNoLeak(lines)
+    expect(lines).toEqual([
+      reloadSharedAuthorityApplyFailedLine(h.paths.lastApplied, 'failed', errnoSuffix({ code }), reloadRetiredKeysPutBackFailedClause(h.retiredKeysFile)),
+    ])
     expect(lines[0]).toContain(reloadRetiredKeysPutBackFailedClause(h.retiredKeysFile))
     expect(lines[0]).not.toContain(reloadRetiredKeysPutBackClause(h.retiredKeysFile))
     // The apply's keys stay recorded, on disk and in memory; the keys recorded before it too.
@@ -4485,6 +4502,55 @@ describe('a destructive modify ends a held persona\'s ErrInvalidFlags hold at it
 })
 
 describe('reply-reminder configuration applies without relaunching', () => {
+  const monitors: ReplyReminders[] = []
+  afterEach(async () => { for (const monitor of monitors.splice(0)) await monitor.stop() })
+
+  /** Observe the same AD life on either side of a real confirmed reload. */
+  async function observeAcrossConfirmation(run: ReloadRun, names: string[]) {
+    const errors: unknown[] = []
+    const monitor = createReplyReminders({
+      queue: run.queue, clock: run.clock,
+      getRow: async () => undefined,
+      ready: key => run.isUp(names.find(name => h.key(name) === key)!),
+      enabled: key => run.serverConfig()!.personas.find(persona => persona.key === key)?.stop_hook_bootstrap === true,
+      prepare: async () => {}, onError: (_key, error) => { errors.push(error) },
+    })
+    monitors.push(monitor)
+    const rows = names.map(name => {
+      const persona = run.serverConfig()!.personas.find(p => p.key === h.key(name))!
+      const row = h.rowOf(name)!
+      return cannedGetResult({ ...row, state: 'working', labels: { ...row.labels, ...Object.fromEntries([REPLY_TOOL_PREALLOWED_LABEL.split('=')]) } }, persona, h.root)
+    })
+    async function delivered(name: string, i: number) {
+      const key = h.key(name)
+      const accepted = await run.queue.accept(key, slackInput())
+      if (accepted.status !== 'accepted') throw new Error('reminder fixture acceptance failed')
+      await run.queue.append(key, { v: 1, kind: 'fixed', seq: accepted.seq, parts: ['delivered body'] })
+      await run.queue.append(key, { ...sentRecord(accepted.seq), at: run.clock.now(), session_id: rows[i]!.session_id })
+      await run.queue.append(key, deliveredRecord(accepted.seq, run.clock.now()))
+    }
+    for (const [i, name] of names.entries()) {
+      const key = h.key(name)
+      if (!run.serverConfig()!.personas.find(persona => persona.key === key)!.stop_hook_bootstrap) continue
+      await delivered(name, i)
+      await monitor.observe(key, rows[i]!)
+    }
+    return async (enabled: boolean[]) => {
+      for (const [i, name] of names.entries()) {
+        const key = h.key(name)
+        // Opt-in covers the next delivered message; opt-out suppresses the
+        // pending reminder already observed in this same AD life.
+        if (run.queue.items(key).length === 0) await delivered(name, i)
+        await monitor.observe(key, rows[i]!)
+        await monitor.observe(key, { ...rows[i]!, state: 'waiting' })
+        const reminders = run.queue.items(key).filter(item => item.accepted.reminder_for !== undefined)
+        expect(reminders.map(item => item.accepted.reminder_for)).toEqual(enabled[i] ? [1] : [])
+      }
+      expect(errors).toEqual([])
+      assertNoLeak({ errors, captured: run.captured() })
+    }
+  }
+
   test.each([false, true])('an own toggle to %s takes effect on confirmation and keeps both instances', async enabled => {
     const { run, personas } = await running(['alpha', ['bravo', { stop_hook_bootstrap: !enabled }]], { ...REAL_LAUNCH, sessions: true })
     const [alpha] = personas
@@ -4492,6 +4558,7 @@ describe('reply-reminder configuration applies without relaunching', () => {
     const sides = { alpha: slackSideOf(run, 'alpha'), bravo: slackSideOf(run, 'bravo') }
     const sessions = { alpha: run.session('alpha'), bravo: run.session('bravo') }
     const rows = { alpha: h.rowOf('alpha'), bravo: h.rowOf('bravo') }
+    const observe = await observeAcrossConfirmation(run, ['alpha', 'bravo'])
     const cp = run.checkpoint()
     const adFrom = run.composition!.agentDirectorCalls.length
     const lines = await previewConfig(run, [alpha!, h.persona('bravo', { stop_hook_bootstrap: enabled })])
@@ -4506,6 +4573,7 @@ describe('reply-reminder configuration applies without relaunching', () => {
     expect(run.session('alpha')).toBe(sessions.alpha!)
     expect(run.session('bravo')).toBe(sessions.bravo!)
     expect({ alpha: h.rowOf('alpha'), bravo: h.rowOf('bravo') }).toEqual(rows)
+    await observe([true, enabled])
     await expectNothingPendingAfter(run)
     expectNoPostNoLeak(run)
   })
@@ -4513,6 +4581,7 @@ describe('reply-reminder configuration applies without relaunching', () => {
   test('a default toggle updates inheritors immediately and keeps an explicit override', async () => {
     const { run, personas } = await running(['alpha', 'bravo', ['charlie', { stop_hook_bootstrap: true }]], { ...REAL_LAUNCH, top: { stop_hook_bootstrap: true } })
     const adFrom = run.composition!.agentDirectorCalls.length
+    const observe = await observeAcrossConfirmation(run, ['alpha', 'bravo', 'charlie'])
     const cp = run.checkpoint()
     await previewConfig(run, personas, { stop_hook_bootstrap: false })
     h.confirm()
@@ -4522,6 +4591,7 @@ describe('reply-reminder configuration applies without relaunching', () => {
     ])
     expect(run.since(cp).lifecycle).toEqual(keysOf('alpha', 'bravo').map(key => ({ op: 'update-in-place', key, via: 'apply', settings: ['stop_hook_bootstrap'] })))
     expect(adCallsSince(run, adFrom)).toEqual([])
+    await observe([false, false, true])
     await expectNothingPendingAfter(run)
     expectNoPostNoLeak(run)
   })
