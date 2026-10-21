@@ -406,16 +406,21 @@ try {
     console.log('recorded: receipt duplicate counted without failure')
     const retryRecords=records.flatMap(r=>r.kind==='delivered'&&r.seq===1?[
       {...records[2],send_kind:'retype',attempt:2,at:2100},
-      {...records[2],send_kind:'enter',attempt:3,at:2800},r,
+      {...records[2],send_kind:'enter',attempt:3,at:12800},{...r,at:13000},
     ]:[r])
-    write(retryRecords)
-    const originalShim=readFileSync(log,'utf8')
-    const enterCall='call\t2.9\t1\t1\tbun\tsend-keys --instance-id cscb_control --key Enter\n'
-    const enterFault='fault\t2.5\t1\t1\tbun\tsend-keys key=Enter swallow 1\n'
-    writeFileSync(log,originalShim+enterFault+enterCall)
+    write(retryRecords,[{...originalTakes[0]!,timestamp:new Date(12950).toISOString()},originalTakes[1]!])
+    const originalShim=readFileSync(log,'utf8').trimEnd().split('\n')
+    const duplicateText=originalShim[0]!.replace('call\t2\t1\t', 'call\t2.1\t2\t')+'\n'
+    const swallowedCall='call\t2.499\t3\t1\tbun\tsend-keys --instance-id cscb_control --key Enter\n'
+    const enterCall='call\t12.9\t4\t1\tbun\tsend-keys --instance-id cscb_control --key Enter\n'
+    const enterFault='fault\t2.5\t3\t1\tbun\tsend-keys key=Enter swallow 1\n'
+    // Chronological calls, including the actual swallowed PID, and a real
+    // 10-second recovery gap. A later item's text cannot supply the backoff.
+    const retryShim=originalShim[0]+'\n'+duplicateText+swallowedCall+enterFault+enterCall+originalShim[1]+'\n'
+    writeFileSync(log,retryShim)
     const keyProof=()=>Bun.spawnSync([process.execPath,import.meta.path,'key-proof',dir,'control',log,dir,'1','enter'])
     check(keyProof().exitCode===0,'Enter-only recovery rejected a permitted duplicate text attempt')
-    writeFileSync(log,originalShim+enterCall)
+    writeFileSync(log,retryShim.replace(enterFault,''))
     check(keyProof().exitCode!==0,'Enter-only recovery passed without the injected missed Enter')
     console.log('recorded: Enter-only recovery accepts duplicate text and requires the swallowed Enter')
     const invoke=(name:string,...args:string[])=>Bun.spawnSync([process.execPath,import.meta.path,name,dir,'control',log,dir,...args])
