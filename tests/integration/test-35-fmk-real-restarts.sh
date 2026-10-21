@@ -35,13 +35,15 @@ for mode in restart resume fresh upgrade; do
     OLD_SESSION="$(real_ad get --instance-id "$(real_instance "${REAL_KEY}")" | jq -r .session_id)"
     [[ -n "${OLD_SESSION}" && "${OLD_SESSION}" != null ]] || fail 'old conversation was not reported by AD'
     if [[ "${mode}" == upgrade ]]; then stop_server; else stop_server --stop-bots; fi
+    # Capture after stop so a connection racing shutdown is historical too.
+    CONNECTION_LINE_BASE="$(wc -l < "${SLACK_STATE_DIR}/server.log")"
     if [[ "${mode}" == upgrade ]]; then
         ad_store_edit "UPDATE spawns SET labels = json_remove(labels, '$.tag_prompt'), row_version = row_version + 1 WHERE instance_id = '$(real_instance "${REAL_KEY}")'" >/dev/null
     fi
     start_server --live
     REPLACED_SESSION=''
     if [[ "${mode}" == fresh || "${mode}" == upgrade ]]; then REPLACED_SESSION="${OLD_SESSION}"; fi
-    real_wait_launch "${REAL_KEY}" "${REPLACED_SESSION}"
+    real_wait_launch "${REAL_KEY}" "${REPLACED_SESSION}" "${CONNECTION_LINE_BASE}"
     NEW_SESSION="$(real_ad get --instance-id "$(real_instance "${REAL_KEY}")" | jq -r .session_id)"
     if [[ "${mode}" == resume ]]; then [[ "${NEW_SESSION}" == "${OLD_SESSION}" ]] || fail 'resume changed conversation'; fi
     if [[ "${mode}" == fresh || "${mode}" == upgrade ]]; then [[ "${NEW_SESSION}" != "${OLD_SESSION}" ]] || fail 'replacement kept old conversation'; fi

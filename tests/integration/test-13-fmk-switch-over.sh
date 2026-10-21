@@ -464,13 +464,24 @@ no_repeated_posts() {
     echo "${TEST_NAME}: $1: ${POSTS_COMPARED} post(s) compared by channel and text, none repeated"
 }
 
-# trail_us <ts>: a trail record's `ts` (UTC, whole milliseconds) in
-# microseconds, the milliseconds taken as rounded down.
-trail_us() {
-    local us
-    us="$(date -u -d "$1" +%s%3N)" || fail "the trail time '$1' does not read as a time"
-    [[ "${us}" =~ ^[0-9]+$ ]] || fail "the trail time '$1' does not read as a time"
-    printf '%s000\n' "${us}"
+# A durable proof for the one successful resume after its last invocation.
+# Poll publication as well as the row: waiting may become visible first.
+t13_resume_reported() {
+    local id="$1" session="$2" after_us="$3" proof
+    lines_after "${AD_TRAIL}" "${LEG_B_TRAIL_FROM}" "${SCENARIO_ROOT}/leg-b-trail"
+    proof="$(jq -er -s --arg id "${id}" --arg session "${session}" --argjson after "${after_us}" '
+        def epoch: capture("^(?<s>[^.Z]+)(\\.(?<f>[0-9]+))?Z$")
+            | (.s + "Z" | fromdateiso8601) + ("0." + (.f // "0") | tonumber);
+        map(select(.instance_id == $id and (.ts | epoch) > ($after / 1000000))) as $events
+        | [$events[] | select(.event == "ad.resume.moved_to_pending")] as $pending
+        | [$events[] | select(.event == "ad.spawn.state_transition" and .prior_state == "pending"
+            and .new_state == "waiting" and .triggering_event_name == "SessionStart")] as $moved
+        | [$events[] | select(.event == "ad.hook.fired" and .event_name == "SessionStart"
+            and .session_id == $session and .upsert_outcome == "updated")] as $hooks
+        | select(($pending | length) == 1 and ($moved | length) == 1 and ($hooks | length) > 0)
+        | [$pending[0].ts, $moved[0].ts, $hooks[0].ts] | @tsv' "${SCENARIO_ROOT}/leg-b-trail")" || return 1
+    read -r pending_ts moved_ts fired_ts <<< "${proof}"
+    moved_to=waiting
 }
 
 # The launch-start check's samples (step 10): `agent-director list --state
@@ -1698,78 +1709,12 @@ for i in "${!PERSONA_IDS[@]}"; do
     (( WAITING_B_US[${id}] <= restart_done_us + LEG_B_WAIT_S * 1000000 )) \
         || fail "leg B: row ${id} read waiting more than ${LEG_B_WAIT_S}s after clean_restart's end"
 
-    # It read pending until its resumed worker reported in, from the trail's
-    # records after leg B's start: in trail order, the first move out of
-    # pending by SessionStart and the last resume's move to pending before
-    # it; and by time, the SessionStart hook.fired record nearest that move
-    # (the latest at or before it, else the first after it: the resumed
-    # launch's SessionStart, whatever the records' order in the trail).
-    lines_after "${AD_TRAIL}" "${LEG_B_TRAIL_FROM}" "${SCENARIO_ROOT}/leg-b-trail"
-    jq -r --arg id "${id}" 'select(.instance_id == $id)
-        | (if .event == "ad.resume.moved_to_pending" then "pending"
-           elif .event == "ad.spawn.state_transition" and .triggering_event_name == "SessionStart" and .prior_state == "pending" then "moved"
-           elif .event == "ad.hook.fired" and .event_name == "SessionStart" then "fired"
-           else empty end) as $kind
-        | "\($kind) \(.ts) \(.new_state // "-")"' "${SCENARIO_ROOT}/leg-b-trail" > "${SCENARIO_ROOT}/leg-b-trail-${id}" \
-        || fail "leg B: could not read the trail ${AD_TRAIL}"
-    pending_ts=""
-    moved_ts=""
-    moved_to=""
-    fired_ts=""
-    fired_all=()
-    candidate_pending=""
-    while read -r kind ts new_state; do
-        case "${kind}" in
-            pending)
-                [[ -n "${moved_ts}" ]] || candidate_pending="${ts}"
-                ;;
-            moved)
-                if [[ -z "${moved_ts}" ]]; then
-                    pending_ts="${candidate_pending}"
-                    moved_ts="${ts}"
-                    moved_to="${new_state}"
-                fi
-                ;;
-            fired)
-                fired_all+=("${ts}")
-                ;;
-        esac
-    done < "${SCENARIO_ROOT}/leg-b-trail-${id}"
-    [[ -n "${moved_ts}" ]] \
-        || fail "leg B: the trail holds no SessionStart ad.spawn.state_transition out of pending for row ${id} after the restart"
-    [[ -n "${pending_ts}" ]] \
-        || fail "leg B: the trail holds no ad.resume.moved_to_pending record for row ${id} before its move out of pending"
-    (( ${#fired_all[@]} > 0 )) \
-        || fail "leg B: the trail holds no SessionStart ad.hook.fired record for row ${id} after the restart"
-    pending_us="$(trail_us "${pending_ts}")"
-    moved_us="$(trail_us "${moved_ts}")"
-    before_ts=""
-    before_us=""
-    after_ts=""
-    after_us=""
-    for ts in "${fired_all[@]}"; do
-        us="$(trail_us "${ts}")"
-        if (( us <= moved_us )); then
-            if [[ -z "${before_us}" ]] || (( us >= before_us )); then
-                before_ts="${ts}"
-                before_us="${us}"
-            fi
-        elif [[ -z "${after_us}" ]] || (( us < after_us )); then
-            after_ts="${ts}"
-            after_us="${us}"
-        fi
-    done
-    if [[ -n "${before_ts}" ]]; then
-        fired_ts="${before_ts}"
-        fired_us="${before_us}"
-    else
-        fired_ts="${after_ts}"
-        fired_us="${after_us}"
-    fi
-    (( pending_us > last_resume_us )) \
-        || fail "leg B: row ${id}'s ad.resume.moved_to_pending record (${pending_ts}) does not come after the restarted server's last resume call"
-    (( fired_us > last_resume_us )) \
-        || fail "leg B: row ${id}'s SessionStart record (${fired_ts}) does not come after the restarted server's last resume call"
+    # It read pending until its resumed worker reported in. Require AD's
+    # pending transition and an applied SessionStart for this conversation.
+    # Hook/transition publication and the harness get are independent observers:
+    # their timestamps do not establish the order of the underlying row write.
+    wait_until "${LEG_B_WAIT_S}" "leg B: no correlated applied SessionStart/transition for ${id}" \
+        t13_resume_reported "${id}" "${SID_OF[${id}]}" "${last_resume_us}"
     first_waiting_us=""
     trail_pending=0
     while read -r from_us at_us rid rstate rlaunch; do
@@ -1777,17 +1722,12 @@ for i in "${!PERSONA_IDS[@]}"; do
         if [[ "${rstate}" == waiting && -z "${first_waiting_us}" ]]; then
             first_waiting_us="${at_us}"
         fi
-        (( at_us < moved_us )) || continue
-        [[ "${rstate}" != waiting ]] \
-            || fail "leg B: a harness read of row ${id} ending before its move out of pending (${moved_ts}) read waiting"
-        (( from_us >= pending_us + 1000 )) || continue
-        [[ "${rstate}" == pending && "${rlaunch}" != - ]] \
-            || fail "leg B: a harness read of row ${id} after its move to pending (${pending_ts}) and before its move out (${moved_ts}) read ${rstate} with launch start ${rlaunch}, not pending with a launch start"
-        trail_pending=$(( trail_pending + 1 ))
+        if [[ "${rstate}" == pending ]]; then
+            [[ "${rlaunch}" != - ]] || fail "leg B: pending row ${id} has no launch start"
+            trail_pending=$(( trail_pending + 1 ))
+        fi
     done < "${LEG_B_READS}"
     [[ -n "${first_waiting_us}" ]] || fail "leg B: no harness read of row ${id} after the restarted server's last resume call read waiting"
-    (( fired_us <= first_waiting_us )) \
-        || fail "leg B: row ${id}'s SessionStart record (${fired_ts}) comes after the first harness read of waiting"
 
     for verb in read-pane send-keys; do
         server_calls_naming "${LEG_B_LOG}" "${verb}" "${id}" "${SERVER_PID}" "${SCENARIO_ROOT}/leg-b-${verb}"
@@ -1832,7 +1772,7 @@ for i in "${!PERSONA_IDS[@]}"; do
     done
     [[ "${resumed_with}" == "${SID_OF[${id}]}" ]] \
         || fail "leg B: row ${id}'s worker (PID ${worker_pids[0]}) was started with --resume '${resumed_with}', not ${SID_OF[${id}]}"
-    record "leg B: persona ${name}: ${spawns} spawn(s), ${collisions} answered by a collision, then ${resumes} resume(s) by the bot server, ${refusals} still-stopping refusal(s); its row read pending with a launch start, then waiting; last resume call at ${last_resume_us} (epoch microseconds); the trail: moved to pending ${pending_ts}, out of pending to ${moved_to} by SessionStart ${moved_ts}, SessionStart hook fired ${fired_ts}, first harness read of waiting ended at ${first_waiting_us} (epoch microseconds); ${trail_pending} harness read(s) between the moves, each pending with a launch start; SessionStart completed without automatic startup keys; conversation ${SID_OF[${id}]} kept, worker started with --resume"
+    record "leg B: persona ${name}: ${spawns} spawn(s), ${collisions} answered by a collision, then ${resumes} resume(s) by the bot server, ${refusals} still-stopping refusal(s); its row read pending with a launch start, then waiting; last resume call at ${last_resume_us} (epoch microseconds); the trail: moved to pending ${pending_ts}, out of pending to ${moved_to} by SessionStart ${moved_ts}, SessionStart hook fired ${fired_ts}, first harness read of waiting ended at ${first_waiting_us} (epoch microseconds); ${trail_pending} pending harness read(s) after resume, each with a launch start; SessionStart completed without automatic startup keys; conversation ${SID_OF[${id}]} kept, worker started with --resume"
 done
 if (( refusals_total == 0 )); then
     expect_completion "${#PERSONA_IDS[@]}" "leg B: every persona comes back resumed" \

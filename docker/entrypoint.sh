@@ -6,6 +6,14 @@
 # No tmux, no orchestrator Claude.
 set -euo pipefail
 
+# CI credentials become native credentials only inside the disposable image.
+# An explicitly supplied CI family replaces the whole legacy family.
+if [[ ${CI_ANTHROPIC_API_KEY+x} || ${CI_ANTHROPIC_BASE_URL+x} || ${CI_ANTHROPIC_MODEL+x} ]]; then
+    export ANTHROPIC_API_KEY="${CI_ANTHROPIC_API_KEY:-}"
+    export ANTHROPIC_BASE_URL="${CI_ANTHROPIC_BASE_URL:-}"
+    export ANTHROPIC_MODEL="${CI_ANTHROPIC_MODEL:-}"
+fi
+
 TESTUSER_HOME=/home/testuser
 
 mkdir -p "${TESTUSER_HOME}/.claude"

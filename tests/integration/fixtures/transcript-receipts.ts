@@ -252,6 +252,25 @@ function diagnosticTime(log: readonly string[], kind: string, key: string, item:
   return Math.min(...matches)
 }
 export interface AuditOptions { stateDir: string; key: string; shimLog: string; transcripts: string[]; expectedCount?: number; noRetype?: boolean }
+/** Only distinct original-workload parts with a durable, exact, own-session
+ * take-in advance the functional watchdog. Retries, reminders and duplicates
+ * cannot keep a stuck batch alive. Success still requires auditReceipts. */
+export function receiptProgress(options: AuditOptions, entries: readonly TranscriptEntry[], adapters: ReceiptAdapters): number {
+  const journal = receiptJournal(options.stateDir, options.key)
+  const log = readFileSync(join(options.stateDir, 'server.log'), 'utf8').split('\n')
+  const takes = personaTranscripts(options.key, journal, log, entries).filter(e => e.kind === 'take-in' && e.text !== undefined)
+  let completed = 0
+  for (const item of workloadItems(journal)) {
+    const fixed = journal.find(r => r.kind === 'fixed' && r.seq === item.seq)
+    for (const [index, text] of (fixed?.parts ?? []).entries()) {
+      if (journal.some(r => r.kind === 'delivered' && r.seq === item.seq && r.part === index + 1 &&
+        takes.some(e => e.path === r.receipt?.path && e.at >= item.received_at &&
+          (r.receipt.uuid ? e.uuid === r.receipt.uuid : e.offset === r.receipt?.offset) &&
+          adapters.receiptTextMatches(e.text!, text)))) completed++
+    }
+  }
+  return completed
+}
 export function auditReceipts(options: AuditOptions, entries: readonly TranscriptEntry[], adapters: ReceiptAdapters) {
   const journal = receiptJournal(options.stateDir, options.key)
   const accepted = journal.filter(r => r.kind === 'accepted' && !r.compact).sort((a, b) => a.seq - b.seq)
@@ -394,7 +413,7 @@ if (import.meta.main) {
       process.exit(0)
     }
     const [command, stateDir, key, shimLog, root, count, mode, statusFile] = process.argv.slice(2)
-    if (!stateDir || !key || !shimLog || !root || !['audit', 'ready', 'latency', 'diagnostic'].includes(command ?? '')) throw new Error('Usage: transcript-receipts <audit|ready|latency|diagnostic> <state-dir> <key> <shim-log> <transcript-root> [count] [no-retype]')
+    if (!stateDir || !key || !shimLog || !root || !['audit', 'ready', 'progress', 'latency', 'diagnostic'].includes(command ?? '')) throw new Error('Usage: transcript-receipts <audit|ready|progress|latency|diagnostic> <state-dir> <key> <shim-log> <transcript-root> [count] [no-retype]')
     const adapters = await packedReceiptAdapters()
     if (command === 'diagnostic') {
       const readJSON = (path?: string) => { try { return path ? JSON.parse(readFileSync(path, 'utf8')) : {} } catch { return {} } }
@@ -407,6 +426,10 @@ if (import.meta.main) {
     }
     const transcripts = transcriptFiles(root)
     const entries = readTranscripts(transcripts, adapters)
+    if (command === 'progress') {
+      console.log(receiptProgress({ stateDir, key, shimLog, transcripts }, entries, adapters))
+      process.exit(0)
+    }
     const result = auditReceipts({ stateDir, key, shimLog, transcripts, expectedCount: command !== 'latency' && count ? Number(count) : undefined, noRetype: mode === 'no-retype' }, entries, adapters)
     if (command !== 'ready') {
       console.log(`recorded: receipts ${JSON.stringify({ items: result.items, reminders: result.reminders, transcripts: transcripts.length, timings: result.timings })}`)
@@ -421,7 +444,7 @@ if (import.meta.main) {
     }
   } catch (error) {
     if (process.argv[2] === 'diagnostic') console.error('recorded: delivery receipt diagnostic unavailable')
-    else if (process.argv[2] !== 'ready') console.error(`FAIL: transcript-receipts: ${error instanceof Error ? error.message : 'unknown failure'}`)
+    else if (!['ready', 'progress'].includes(process.argv[2] ?? '')) console.error(`FAIL: transcript-receipts: ${error instanceof Error ? error.message : 'unknown failure'}`)
     process.exit(1)
   }
 }

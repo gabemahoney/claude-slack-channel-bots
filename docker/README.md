@@ -255,16 +255,24 @@ Image marker).
 
 ## Credential env vars passed to the container
 
-`/ci`'s `docker run` step forwards `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, and
-`ANTHROPIC_MODEL` from the host environment (each via the no-value `--env VAR`
-pass-through form). The bot Claudes spawned by the daemon-under-test consume
-these. Every full `/ci` run uses the key for real model calls in the nine
+`/ci` reads `CI_ANTHROPIC_API_KEY`, `CI_ANTHROPIC_BASE_URL` and
+`CI_ANTHROPIC_MODEL` directly on the host and forwards only defined variables through bare
+`--env VAR` names. Only the disposable container's `docker/entrypoint.sh`
+translates them to native `ANTHROPIC_*` for the tools inside it. Never remap
+or export native credential variables on the host. The verdict reader needs
+the same CI environment to redact its report.
+
+Any explicit CI input selects the whole CI family, including empty inputs;
+missing CI values never borrow personal credentials or routing. The Docker
+child omits the unused native family. Source compatibility for callers with
+only native inputs remains, but this project's host route uses CI names.
+Every full `/ci` run uses the key for real model calls in the nine
 `-fmk-real-` Claude scripts; ordinary scripts keep the stub. Claude uses no OAuth or
 subscription fallback. The Codex gate uses only its separately admitted existing
-login file and selected model (see [Codex admission](#codex-admission-login-and-scratch-lifecycle)). A raw `sk-ant-api…` key needs only `ANTHROPIC_API_KEY` — Claude Code
-defaults to `api.anthropic.com` when `ANTHROPIC_BASE_URL` is absent. A gateway
-credential (e.g. NVIDIA InferenceHub) additionally requires `ANTHROPIC_BASE_URL`
-and `ANTHROPIC_MODEL` so the bot Claudes hit the gateway rather than
+login file and selected model (see [Codex admission](#codex-admission-login-and-scratch-lifecycle)). A raw `sk-ant-api…` key needs only `CI_ANTHROPIC_API_KEY` — Claude Code
+defaults to `api.anthropic.com` when `CI_ANTHROPIC_BASE_URL` is absent. A gateway
+credential (e.g. NVIDIA InferenceHub) additionally requires `CI_ANTHROPIC_BASE_URL`;
+provide `CI_ANTHROPIC_MODEL` to select its test model. The bot Claudes hit the gateway rather than
 `api.anthropic.com`; if only the key were forwarded, the gateway key would 401
 against Anthropic's direct endpoint.
 
@@ -393,6 +401,39 @@ The sharded `/ci` runner is `scripts/ci-run.ts`. It runs the integration
 scripts in up to 6 capped, isolated shards, normally all from one test image
 it builds per run.
 
+Track A runs scripts that need no Codex login. Track B runs login-bearing
+scripts (test-41 today), each with its own test-1. After shared preparation,
+A starts while B waits for its exclusive login lease. The merged full gate
+requires complete passing coverage from both tracks plus integrity and
+cleanup checks; neither a completed track nor a selective rerun is a full PASS.
+
+Default execution is fail-fast within each shard. `--keep-going` retains all
+failures and continues independent scripts after verified cleanup; failed or
+skipped prerequisites and uncertain cleanup prevent continuation. The
+[runner evidence contract](../tests/README.md#the-in-container-runner-and-the-in-shard-files)
+defines the reasons and final-cleanup failure behavior.
+
+### Performance measurement guard
+
+Participating `/ci` runs share `performance.lock` in the account's admission
+directory. Host packing/builds and shard workloads hold shared `flock`s;
+waiting for a Codex login holds no performance lock. Before test-32, its
+runner removes the intentional baseline daemon and verifies quiescence,
+releases shared ownership, and takes exclusive ownership for that script.
+After verified cleanup it returns to shared ownership for later work.
+
+The guard coordinates these managed builds and scripts, not unrelated host
+work or the heavy coordinator. It preserves native AC76's 20 samples and
+p95 limits (typing start 2 s, delivery 10 s). Lock controls do not establish
+native latency acceptance; use actual native results. Existing shard/run
+deadlines bound guard waits, so contention can still fail a run.
+
+On unsafe cleanup the shard does not unlock for subsequent work. Final
+cleanup uncertainty logs `FAIL: runner.sh: unsafe-cleanup` and withholds
+`done`, even after passing script ENDs. It stays alive holding the guard
+until the host's existing limit or stop retires it; the shard fails. This
+path can wait until that limit rather than report immediate completion.
+
 ### Codex admission, login and scratch lifecycle
 
 A selected `-fmk-real-codex` script gets its own shard containing exactly test-1 and that script. Its prerequisite unit may contain nothing else. A mixed ordinary/Codex run needs at least one ordinary shard in addition to each dedicated shard; the current full run therefore refuses `--shards 1`. A selection of only test 41 and test-1 may use one shard, but remains selective and cannot establish a full gate result. Automatic admission reduces N only as far as this isolation minimum.
@@ -407,7 +448,16 @@ Codex 0.159.2 truncates and writes file credentials in place, so token refresh f
 
 **Lease and retirement.** Gate and local heavy runs share process-owned exclusive `flock` on `codex-login.lock` beside the host login. Its 30-minute wait is separate from ordinary admission's 30-second lock wait and included in the runner's build/deadline allowance. The lease covers every login-bearing container through verified retirement, postchecks and secret scanning. A surviving container labelled `cscb.codex-login=true`, stopped or running, or an unverifiable survivor check refuses another run. Failed retirement fails the run and holds the lease until runner exit; exit releases flock, but survivor refusal still protects the next run. Never bypass either guard.
 
-Before launch and after retirement, revalidate valid JSON, device/inode identity, runner ownership and mode 0600. Keep token strings from both reads only in memory for masking and output scans, including refreshed tokens. A postcheck, cleanup or token-scan failure fails the run. Inspect containers/images only through `bun scripts/safe-docker-inspect.ts docker container inspect NAME` or its supported image form; wrapper failure is final, with no raw inspection fallback.
+Before launch and after retirement, revalidate valid JSON, device/inode identity, runner ownership and mode 0600. A postcheck, cleanup or token-scan failure fails the run. Inspect containers/images only through `bun scripts/safe-docker-inspect.ts docker container inspect NAME` or its supported image form; wrapper failure is final, with no raw inspection fallback.
+
+For `/ci`, Track B completes its retirement verification, login postcheck,
+and scans of retired login evidence and the runner log before releasing the
+lease, without waiting for Track A. Original and refreshed token strings
+stay in memory for masking and the final whole-run scan of late ordinary
+output. A released login is never reread. Login/model, survivor or UID
+admission errors at this stage fail the run; ordinary shards can already
+have started. The reader relays the actual failure rather than turning it
+into an early `NOT RUN`.
 
 **Native-written scratch config (amended decision 22).** The harness creates no Codex `config.toml` and copies no host settings. It must be absent before first spawn. Later preparation/recovery needs a durable successful-native-spawn receipt tied to the exact private home's device/inode; config presence alone grants nothing. The names-only checker allows only fixed native-written `tui.screen_reader_detection_done` and genuine parent tables containing exclusively allowed descendants. That leaf and its parent may overlap host key names without reading or copying their host values. All other host keys and every model, reasoning, profile/profiles, provider/auth or unknown key reject the script. Scalar/array namespace impostors and unknown descendants also reject it. Record only key names and unknown-key counts. New allowlist entries require native-source or observed-run evidence. Native CLI `tui.show_tooltips=false` avoids the optional startup counter without broadening this allowlist.
 
@@ -433,9 +483,9 @@ criterion numbers). This requires both `--ai-only` and explicit Claude versions,
 keeps three trials per selected criterion, and records `claude-ai-selected`
 with `REAL-AGENT-CLAUDE-AI-SELECTED-VERDICT`. It cannot certify omitted criteria.
 
-Use the established `CI_ANTHROPIC_*` prefix on the `/ci` runner and **every** `ci-verdict.ts` wait/stop/report/recovery call, as the current CI skill describes. The heavy coordinator reads those CI names directly. Never put credential values in arguments or diagnostic output.
+Supply the same `CI_ANTHROPIC_*` environment directly to `/ci` and every `ci-verdict.ts` wait/stop/report/recovery call. The heavy coordinator also reads those names directly. Never put credential values in arguments or diagnostic output.
 
-Final E7 acceptance passed: default full `/ci` `20261018t042311z-fik3tlbb` (no selection arguments, reader exit 0) passed all 46 executions in 2,521.526 s, including the 17-item native Codex fault/recovery/fidelity gate. Focused local heavy `real-1792299930887-3167396` ended `REAL-AGENT-CODEX-VERDICT PASS`: 15 unique completed native trials, AC11/12/15/20/106 each 3 of 3, in 1,726.57 s, on Codex 0.159.2 / `gpt-6-astra`.
+Historical E7 acceptance, before the current track/cleanup changes: default full `/ci` `20261018t042311z-fik3tlbb` (no selection arguments, reader exit 0) passed all 46 executions in 2,521.526 s, including the 17-item native Codex fault/recovery/fidelity gate. Focused local heavy `real-1792299930887-3167396` ended `REAL-AGENT-CODEX-VERDICT PASS`: 15 unique completed native trials, AC11/12/15/20/106 each 3 of 3, in 1,726.57 s, on Codex 0.159.2 / `gpt-6-astra`.
 
 All 441 heavy auth/config checks and 15 final symlink checks passed, along with full CI's 48 checks. The login stayed the single existing read-write file bind, never copied, printed, hashed or scheduled; host config stayed unchanged.
 
@@ -454,6 +504,12 @@ Ordinary shards use the per-shard memory cap, 2 GiB to start; each dedicated
 Codex shard adds 2 GiB to its cap and reservation (see
 [The per-shard memory cap and out-of-memory kills](#the-per-shard-memory-cap-and-out-of-memory-kills)
 for the current cap).
+
+Admission reserves the whole selected workload conservatively, including
+Track B while it waits. The reservation remains until whole-run cleanup;
+finishing a track or releasing the login lease does not free that capacity
+early. Track A's freedom from the login lease does not waive CPU, memory,
+disk, ownership or performance-guard checks.
 
 **Pod memory.** The pod figures come from the cgroup-namespace root, never
 from a cgroup on the runner's own path:
@@ -922,12 +978,16 @@ removes itself, and only the runner removes it, after its final reading.
 
 **Mounts.** Each mount is a `--mount type=bind,...`, never `-v`, so Docker
 never creates a missing source: every source is a file or directory the
-runner made or validated. Every shard has these two:
+runner made or validated. Every shard has these three:
 
 | Source | Target | Mode |
 |---|---|---|
 | The run's tarball | `/tmp/package.tgz`, the path test-1 installs from | Read-only |
 | The shard's subdirectory, `shard-<k>` in the run directory (created 0700 before any docker command) | `/test-results` | Read-write |
+| The account's regular `performance.lock` file | `/run/cscb-ci-performance.lock` | Read-only; `flock` coordinates the shared inode without writing it |
+
+`Dockerfile.test` precreates `/run/cscb-ci-performance.lock` as a regular-file
+mount target. The runner still verifies the host file's read-only bind mount.
 
 A dedicated Codex shard additionally mounts exactly the validated host login
 file read-write at `/run/codex-login/auth.json`; ordinary shards never do.
@@ -935,9 +995,12 @@ The only other permitted extra mount is a `leak:<k>,<j>` fault: shard k's subdir
 at `/leak-shard-<k>` in shard j (see
 [`tests/README.md`](../tests/README.md#fault-injection)).
 
-**Credentials.** The list names `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL` and
-`ANTHROPIC_MODEL` by bare name only (`--env <NAME>`), so Docker copies each
-that is set from the runner's environment. The list also names bare
+**Credentials.** The list includes only allowlisted names defined in the
+final Docker child environment, by bare name only (`--env <NAME>`).
+Unset names are omitted; explicitly empty values are retained. With CI
+inputs, both the child environment and the argument list omit the unused
+native Anthropic family; native translation happens inside the entrypoint.
+The list also names bare
 `CODEX_TEST_MODEL` and `CODEX_HOST_CONFIG_KEYS`. The model is replaced with
 the run's admitted model (or empty without a lease); the names-only projection
 is populated only for Codex shards and empty for ordinary shards. Neither
@@ -946,7 +1009,7 @@ and `GH_TOKEN` never does (see
 [Credential env vars passed to the container](#credential-env-vars-passed-to-the-container)).
 
 Each list is checked for secrets first, then written to the runner log as one
-`docker run: <JSON>` line, then spawned. A list that passes `ANTHROPIC_API_KEY`
+`docker run: <JSON>` line, then spawned. A list that passes `CI_ANTHROPIC_API_KEY`, `ANTHROPIC_API_KEY`
 or `GH_TOKEN` as `NAME=value`, or holds a secret value anywhere, is never
 logged or spawned, and its shard fails to start; the refusal names the
 argument's place and the credential's name, never its value.

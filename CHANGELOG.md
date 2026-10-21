@@ -6,6 +6,27 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 ## Unreleased
 
+- New Claude launches retain the exact Slack `reply` allowance on resume
+  through saved `--allowedTools` arguments. Template updates do not retrofit
+  existing agent-director rows or their saved arguments, even when
+  `reply_tool_preallowed=1` is present. Ordinary fresh or reuse launches obtain
+  the new pair; existing conversations and permission decisions remain under
+  operator control, with deny rules, managed restrictions and other tool
+  permissions unchanged.
+- `/ci` starts ordinary scripts independently of the Codex login wait and
+  releases the login lease after the login track's protected retirement
+  checks. A full gate still requires both tracks. Resource reservations
+  remain conservative; a shared/exclusive guard isolates test-32's native
+  latency measurements from participating CI builds and scripts.
+- `/ci --keep-going` retains failures and continues independent scripts
+  after verified cleanup; fail-fast remains the default. Results preserve
+  skip explanations in `notrunReason`. Uncertain final cleanup withholds
+  normal completion and keeps the guard until host retirement.
+- The runner and verdict reader now accept `CI_ANTHROPIC_*` directly on the
+  host; native-name translation stays inside the disposable container.
+  Timing assertions use correlated AD events, exact receipt progress and
+  fresh connection evidence while retaining native AC76 requirements.
+
 ---
 
 ## 0.18.0 (2026-10-21)

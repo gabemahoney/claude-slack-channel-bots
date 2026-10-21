@@ -152,6 +152,9 @@ export function buildTemplateParams(
   // b.omv SR-7.2: the shared composed file is mandatory in every mode.
   agent_args.push('--append-system-prompt-file', botSystemPromptPath(resolveServerStateDir()))
 
+  // AD preserves agent_args on resume, but not the template's allow overlay.
+  agent_args.push('--allowedTools', REPLY_TOOL_ALLOW_RULE)
+
   // b.b1j SR-2: last, after the mandatory composed prompt, so a
   // resumed or restarted bot reloads the current system prompt file and
   // CLAUDE.md. Only a `fresh_system_prompt` of exactly `false` leaves it out.

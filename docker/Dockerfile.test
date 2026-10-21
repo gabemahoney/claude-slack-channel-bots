@@ -11,8 +11,10 @@ COPY testplans /test-repo/testplans
 # Consolidated into one RUN: each separate RUN incurs ~25s of docker-daemon
 # container-lifecycle overhead on this host (per b.5oh). Chained chmods +
 # useradd + chown pay that overhead once.
+# Precreate the regular-file target for the read-only performance lock mount.
 RUN chmod +x /usr/local/bin/entrypoint.sh && \
     chmod +x /tests/runner.sh /tests/integration/*.sh && \
+    touch /run/cscb-ci-performance.lock && \
     useradd -m -s /bin/bash testuser && \
     chown -R testuser:testuser /test-repo
 

@@ -1,6 +1,14 @@
-import { describe, expect, test } from 'bun:test'
-import { assertFirstLaunchWaiting, assertResetKeyRecovery, assertSwallowedEnterRecovery, assertUnknownKeyRecovery } from './integration/fixtures/real-case-assertions.ts'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { assertFirstLaunchWaiting, assertResetKeyRecovery, assertSameConversationReplyPermission, assertSwallowedEnterRecovery, assertUnknownKeyRecovery } from './integration/fixtures/real-case-assertions.ts'
 import { makeEngineHarness } from './test-helpers/delivery-engine.ts'
+import { cannedGetResult } from './test-helpers/agent-director-stub.ts'
+import { makePersonaConfig } from './test-helpers/persona-config.ts'
+import { assertNoLeak, BOT_TOKEN_PREFIX, fakeToken } from './test-helpers/credentials.ts'
+import { buildTemplateParams, REPLY_TOOL_ALLOW_RULE } from '../src/agent-director-template.ts'
+import { REPLY_TOOL_PREALLOWED_LABEL } from '../src/reply-reminder.ts'
 import { ENTER_DELAY_MS } from '../src/delivery-engine.ts'
 
 const instance = 'cscb_control'
@@ -14,6 +22,102 @@ const fixed = { kind: 'fixed', seq: 1, parts: ['message'] }
 function proveEnter(journal: any[], calls: Parameters<typeof assertSwallowedEnterRecovery>[1], faults: Parameters<typeof assertSwallowedEnterRecovery>[2]) {
   return assertSwallowedEnterRecovery([fixed, ...journal], [key(1000, 'text'), key(2000, 'enter'), ...calls], faults, 1, instance)
 }
+
+describe('same-conversation reply permission proof (b.pb8)', () => {
+  let home: string
+  beforeEach(() => { home = mkdtempSync(join(tmpdir(), 'reply-permission-proof-')) })
+  afterEach(() => { rmSync(home, { recursive: true, force: true }) })
+
+  function rows(freshSystemPrompt = true) {
+    const params = buildTemplateParams(makePersonaConfig({ system_prompt_mode: 'none', fresh_system_prompt: freshSystemPrompt }, home))
+    assertNoLeak({ params })
+    const before = cannedGetResult({ instance_id: instance, session_id: 'native-session', agent_args: params.agent_args })
+    before.labels = { ...before.labels, ...Object.fromEntries([REPLY_TOOL_PREALLOWED_LABEL.split('=')]) }
+    // Canned saved rows test the oracle; they do not simulate AD's resume policy.
+    return { before, after: structuredClone(before) }
+  }
+  function prove(f: ReturnType<typeof rows>) {
+    return assertSameConversationReplyPermission(f.before, f.after, instance, REPLY_TOOL_ALLOW_RULE)
+  }
+  function expectProofRejection(f: ReturnType<typeof rows>, message: string) {
+    let failure: unknown
+    try { prove(f) } catch (error) { failure = error }
+    // Check the whole error, including its stack/cause/properties, before an assertion can print it.
+    assertNoLeak({ error: failure })
+    expect(failure).toBeInstanceOf(Error)
+    expect((failure as Error).message).toContain(message)
+  }
+
+  test.each([true, false])('accepts the actual template argument pair in the same saved conversation (snapshot=%s)', snapshot => {
+    const f = rows(snapshot)
+    expect(f.after.agent_args).toContain(REPLY_TOOL_ALLOW_RULE)
+    expect(() => prove(f)).not.toThrow()
+  })
+
+  test.each([
+    ['before', undefined], ['after', undefined],
+    ['before', ''], ['after', ''],
+    ['before', 'another-session'], ['after', 'another-session'],
+  ] as const)('rejects %s session %s despite a valid saved pair', (side, session) => {
+    const f = rows()
+    Object.assign(f[side], { session_id: session })
+    expectProofRejection(f, 'same native session')
+  })
+
+  test('rejects matching blank session identifiers', () => {
+    const f = rows()
+    f.before.session_id = f.after.session_id = ' \t'
+    expectProofRejection(f, 'same native session')
+  })
+
+  test.each(['before', 'after'] as const)('rejects a different %s instance despite matching session and pair', side => {
+    const f = rows()
+    f[side].instance_id = 'cscb_other'
+    expectProofRejection(f, 'wrong AD instance')
+  })
+
+  test('a retained preallowed label and pre-resume pair cannot replace missing resumed arguments', () => {
+    const f = rows()
+    expect(f.after.labels).toEqual(f.before.labels)
+    expect(f.before.agent_args).toContain(REPLY_TOOL_ALLOW_RULE)
+    f.after.agent_args = []
+    expectProofRejection(f, 'exact reply permission pair')
+  })
+
+  test.each([
+    ['rule without flag', [REPLY_TOOL_ALLOW_RULE]],
+    ['flag without rule', ['--allowedTools']],
+    ['wrong rule', ['--allowedTools', 'Bash(*)']],
+    ['nonadjacent rule', ['--allowedTools', '--system-prompt-snapshot', REPLY_TOOL_ALLOW_RULE]],
+    ['widened tool list', ['--allowedTools', `${REPLY_TOOL_ALLOW_RULE},Bash(*)`]],
+    ['wildcard rule', ['--allowedTools', `${REPLY_TOOL_ALLOW_RULE}*`]],
+    ['duplicate exact flags', ['--allowedTools', REPLY_TOOL_ALLOW_RULE, '--allowedTools', REPLY_TOOL_ALLOW_RULE]],
+    ['duplicate flags with a later exact pair', ['--allowedTools', 'Bash(*)', '--allowedTools', REPLY_TOOL_ALLOW_RULE]],
+    ['missing args', undefined],
+    ['null args', null],
+    ['string args', `--allowedTools ${REPLY_TOOL_ALLOW_RULE}`],
+    ['array-like args', { 0: '--allowedTools', 1: REPLY_TOOL_ALLOW_RULE, length: 2 }],
+    ['non-string rule', ['--allowedTools', { rule: REPLY_TOOL_ALLOW_RULE }]],
+  ] as const)('rejects %s', (_, args) => {
+    const f = rows()
+    // Deliberately malformed JSON evidence crosses the typed AD row boundary.
+    Object.assign(f.after, { agent_args: args })
+    expectProofRejection(f, 'exact reply permission pair')
+  })
+
+  test.each([
+    ['before', 'instance_id', 'wrong AD instance'],
+    ['after', 'instance_id', 'wrong AD instance'],
+    ['before', 'session_id', 'same native session'],
+    ['after', 'session_id', 'same native session'],
+    ['after', 'agent_args', 'exact reply permission pair'],
+  ] as const)('rejects a token-bearing %s %s without echoing the saved evidence', (side, field, message) => {
+    const f = rows()
+    const secret = fakeToken(BOT_TOKEN_PREFIX, 'reply-permission-evidence')
+    Object.assign(f[side], { [field]: field === 'agent_args' ? ['--allowedTools', secret] : secret })
+    expectProofRejection(f, message)
+  })
+})
 
 describe('real key recovery proof', () => {
   test.each([

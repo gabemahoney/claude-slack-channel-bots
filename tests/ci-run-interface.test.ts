@@ -1966,7 +1966,7 @@ describe('E2: validation stages 2–8 (b.uqm SR-2.3, SR-2.6, SR-3.1, SR-3.2, SR-
     test.each(MISSING_ROWS)('ANTHROPIC_API_KEY %s is a missing credential, naming the variable', async (_label, env, cause) => {
       const run = await refused(worktree(), [], env())
 
-      expect(run.refusal).toEqual(stageRefusalOf([missingApiKeyReason(cause)]))
+      expect(run.refusal).toEqual(stageRefusalOf([missingApiKeyReason(cause, cause === 'unset' ? 'CI_ANTHROPIC_API_KEY' : 'ANTHROPIC_API_KEY')]))
       expectNamed(run.refusal, [[API_KEY_NAME]])
       expectNoValueShown(run, env())
     })
@@ -2171,7 +2171,7 @@ describe('E2: validation stages 2–8 (b.uqm SR-2.3, SR-2.6, SR-3.1, SR-3.2, SR-
         options: () => ({}),
         args: () => [],
         env: () => ({ GH_TOKEN: secretOfLength('short', SECRET_MIN_LENGTH - 1) }),
-        reasons: () => [missingApiKeyReason('unset'), badCredentialReason('GH_TOKEN')],
+        reasons: () => [missingApiKeyReason('unset', 'CI_ANTHROPIC_API_KEY'), badCredentialReason('GH_TOKEN')],
       },
     ]
 

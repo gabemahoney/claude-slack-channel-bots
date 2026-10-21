@@ -477,36 +477,33 @@ t19_poll_has_waiting() {
     jq -e -s 'any(.[]; .state == "waiting")' "$1" > /dev/null 2>&1
 }
 
-# t19_check_pending_then_waiting <file> <id> <step>: the reads hold one of
-# `pending` with a launch start, then one of `waiting`, and no `waiting`
-# before that `pending`.
+# t19_check_pending_then_waiting <file> <id> <step>: AD's durable transition
+# proves pending even if every harness read occurs after the report-in. Bind
+# the applied hook to the observed session and to this leg's launch window.
 t19_check_pending_then_waiting() {
-    local file="$1" id="$2" step="$3" verdict launches
-    verdict="$(jq -r -s '
-        (map(.state == "pending" and .launch_started_at != "") | index(true)) as $p
-        | if $p == null then "no-pending"
-          else ((.[$p:] | map(.state == "waiting") | index(true)) as $w
-                | if $w == null then "no-waiting-after"
-                  elif (.[:$p] | any(.state == "waiting")) then "waiting-before"
-                  else "ok \(.[$p].t) \(.[$p].launch_started_at) \(.[$p + $w].t)" end)
-          end' "${file}")" || fail "${step}: could not read the background get's reads of ${id}"
-    case "${verdict}" in
-        ok\ *)
-            read -r _ T19_PENDING_T T19_LAUNCH_START T19_WAITING_T <<< "${verdict}"
-            echo "${TEST_NAME}: ${step}: the harness get read ${id} pending at ${T19_PENDING_T} (launch start ${T19_LAUNCH_START}), then waiting at ${T19_WAITING_T}"
-            ;;
-        *)
-            jq -c . "${file}" | sed 's/^/  | /' >&2 || true
-            case "${verdict}" in
-                no-pending) fail "${step}: the harness get never read ${id} pending with a launch start ($(t19_lines "${file}") reads, ${POLL_PERIOD_S} s apart): the pending window was too short to read" ;;
-                no-waiting-after) fail "${step}: the harness get read ${id} pending with a launch start but never waiting after it" ;;
-                waiting-before) fail "${step}: the harness get read ${id} waiting before the pending launch" ;;
-                *) fail "${step}: the background get's reads of ${id} gave '${verdict}'" ;;
-            esac
-            ;;
-    esac
-    launches="$(jq -r -s '[.[] | select(.state == "pending") | .launch_started_at] | "\(length) read(s), launch start(s): \(unique | join(" "))"' "${file}")"
-    echo "${TEST_NAME}: NOTE: ${step}: the pending reads of ${id}: ${launches}"
+    local file="$1" id="$2" step="$3" session
+    session="$(jq -er -s --argjson after "${MARK_TIME}" '[.[] | select(.state == "waiting" and (.t | tonumber) > $after)]
+        | first | .session_id | select(type == "string" and length > 0)' "${file}")" \
+        || fail "${step}: no waiting observation with a session for ${id} after the mark"
+    wait_until "${ROW_WAIT_S}" "${step}: no matching pending-to-waiting transition and applied SessionStart for ${id}" \
+        t19_reported "${id}" "${session}"
+    echo "${TEST_NAME}: ${step}: AD recorded pending-to-waiting and applied SessionStart for ${id} session ${session}; harness observed waiting"
+}
+
+t19_reported() {
+    local id="$1" session="$2" transitions hooks
+    transitions="$(ad_trail_events ad.spawn.state_transition "${id}")" || exit 1
+    hooks="$(ad_trail_events ad.hook.fired "${id}")" || exit 1
+    jq -e -s --arg id "${id}" --arg session "${session}" --argjson after "${MARK_TIME}" '
+        def epoch: capture("^(?<s>[^.Z]+)(\\.(?<f>[0-9]+))?Z$")
+            | (.s + "Z" | fromdateiso8601) + ("0." + (.f // "0") | tonumber);
+        map(select(.instance_id == $id and (.ts | epoch) > $after))
+        | any(.[]; .event == "ad.spawn.state_transition" and .prior_state == "pending"
+            and .new_state == "waiting" and .triggering_event_name == "SessionStart")
+          and any(.[]; .event == "ad.hook.fired" and .event_name == "SessionStart"
+            and .session_id == $session and .upsert_outcome == "updated")' \
+        <<< "${transitions}
+${hooks}" >/dev/null
 }
 
 # ---------------------------------------------------------------------------
@@ -610,9 +607,6 @@ t19_leg() {
     # 3. The new life's mode, a plain stop, the mark and a start, with the
     #    background get reading from before it.
     stub_mode "${!work_var}" "${STUB_MODE_TRANSCRIPT_ON_FIRST_MESSAGE}"
-    # Keep the new launch pending long enough for the authoritative sampler;
-    # immediate SessionStart can otherwise fall between two AD get calls.
-    stub_report_delay "${!work_var}" 2
     stop_server
     t19_mark
     poll="${SCENARIO_ROOT}/poll-${p}.jsonl"
@@ -622,7 +616,7 @@ t19_leg() {
     wait_until 10 "${step}: the background get never read ${id} waiting" t19_poll_has_waiting "${poll}"
     t19_bg_stop "${T19_POLLER_PID}" "${poll}.stop" "${step}: stop the background get"
 
-    # 4. pending with a launch start, then waiting.
+    # 4. Durable pending-to-waiting evidence, independent of sampling speed.
     t19_check_pending_then_waiting "${poll}" "${id}" "${step}"
 
     # 5. The reuse spawn, the resume (or none), the diagnosis.
