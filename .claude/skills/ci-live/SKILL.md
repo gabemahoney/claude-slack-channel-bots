@@ -1,14 +1,15 @@
 ---
 name: ci-live
-description: Run the testplans/b.yko live Slack acceptance checks against the test workspace in a throwaway docker container. Returns PASS or FAIL per check.
+description: Run the live Slack acceptance checks documented in ci-live/README.md against the test workspace in a throwaway docker container. Returns PASS or FAIL per check.
 user-invocable: true
 allowed-tools: [Bash]
 ---
 
 # /ci-live
 
-The live, pre-deploy acceptance run of CSCB: every `testplans/b.yko` check that can
-be automated, against the **test workspace** only (never a production workspace),
+The live, pre-deploy acceptance run of CSCB: the automated checks from the
+checked-in scenario `testplans/b.yko/b.yko.md` (test fixture data, not an Apiary
+workflow store), against the **test workspace** only (never a production workspace),
 in a fresh container built from the `/ci` base (`cscb-ci-base:v8`), with the
 package under test installed the way a customer installs it. The production
 bots on this host are never touched: the container has its own HOME, config,

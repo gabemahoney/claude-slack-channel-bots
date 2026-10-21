@@ -564,7 +564,7 @@ async function runHealthCheckTick(): Promise<void> {
         // heal, live+disconnected → reconnectSession, pending → the
         // `pending` deferral, dead → kill+relaunch).
         //
-        // NOTE (b.4vj, larva): a future inbound-delivery retry driver will
+        // NOTE (b.4vj): a future inbound-delivery retry driver will
         // also poke unreachable sessions. If it lands, reconcile the two poke
         // paths so they don't race on the same persona.
         // (Read once: b.f2b words the delay-0 notice by it.)

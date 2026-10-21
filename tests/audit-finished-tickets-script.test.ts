@@ -2,10 +2,10 @@
  * audit-finished-tickets-script.test.ts — coverage for
  * scripts/audit-finished-tickets.sh (bug b.jaa guardrail).
  *
- * The script is a read-only stranded-work reconciliation: for every `finished`
- * bee in the Bugs/Plans hives it flags tickets whose fix is neither on main nor
- * explicitly closed, plus unmerged branches referencing finished tickets. It
- * exits non-zero when stranded work is found, zero when clean.
+ * The script is a read-only stranded-work reconciliation: `done` and legacy
+ * `finished` tickets in Bugs/Ideas/Plans need landing or closure evidence;
+ * their branches must be merged. Invalid Bugs need no merge. Findings exit 1,
+ * clean runs exit 0, and missing setup exits 2.
  *
  * Testing strategy — FIXTURES, no real repo/hives touched:
  *   The script derives its hive paths (<project>/Bugs, <project>/Ideas/Plans)
@@ -332,6 +332,67 @@ function recoverPreFixScript(
   return preFixScript
 }
 
+describe('audit-finished-tickets.sh — Apiary closed-work release gate', () => {
+  for (const hive of ['Bugs', 'Ideas', 'Plans'] as const) {
+    for (const status of ['done', 'finished']) {
+      test(`${hive}: ${status} without landing evidence or closure exits 1`, () => {
+        const fx = makeFixture({ tickets: [{ id: 'b.acc', hive, status }] })
+        const r = runAudit(fx)
+        expect(r.status).toBe(1)
+        expect(r.stdout).toContain(`[${hive}] b.acc`)
+        expect(r.stdout).toContain(`${status}, but no commit on main lands it`)
+      })
+
+      test(`${hive}: ${status} branch must reach main even with ticket landing evidence`, () => {
+        const fx = makeFixture({
+          tickets: [{ id: 'b.acc', hive, status }],
+          commits: [{ subject: 'fix: land b.acc' }],
+        })
+        git(fx, ['checkout', '-q', '-b', 'b_acc'])
+        git(fx, ['commit', '-q', '--allow-empty', '-m', 'remaining accepted work'])
+        git(fx, ['checkout', '-q', 'main'])
+        const stranded = runAudit(fx)
+        expect(stranded.status).toBe(1)
+        expect(stranded.stdout).not.toContain(`[${hive}] b.acc`)
+        expect(stranded.stdout).toContain(`references ${status} ticket b.acc`)
+        expect(stranded.stdout).toContain('not an ancestor of main')
+
+        git(fx, ['merge', '--ff-only', 'b_acc'])
+        expect(runAudit(fx).status).toBe(0)
+      })
+    }
+
+    test(`${hive}: done closure headings pass, but a pending merge disqualifies them`, () => {
+      const fx = makeFixture({
+        tickets: [
+          { id: 'b.doc', hive, status: 'done', body: '## +closed:docs-only\n' },
+          { id: 'b.out', hive, status: 'done', body: '## +closed:out-of-repo /external/artifact\n' },
+          { id: 'b.pen', hive, status: 'done', body: '## +closed:docs-only\nPending merge.\n' },
+        ],
+      })
+      const r = runAudit(fx)
+      expect(r.status).toBe(1)
+      expect(r.stdout).not.toContain('b.doc')
+      expect(r.stdout).not.toContain('b.out')
+      expect(r.stdout).toContain(`[${hive}] b.pen`)
+      expect(r.stdout).toContain('done with an in-repo')
+    })
+  }
+
+  for (const status of ['draft', 'defined', 'active', 'invalid']) {
+    test(`Bug status ${status} needs no merge or closure marker`, () => {
+      const fx = makeFixture({ tickets: [{ id: 'b.ign', hive: 'Bugs', status }] })
+      git(fx, ['checkout', '-q', '-b', 'b_ign'])
+      git(fx, ['commit', '-q', '--allow-empty', '-m', 'unmerged work'])
+      git(fx, ['checkout', '-q', 'main'])
+      const r = runAudit(fx)
+      expect(r.status).toBe(0)
+      expect(r.stdout).not.toContain('b.ign')
+      expect(r.stdout).not.toContain('b_ign')
+    })
+  }
+})
+
 describe('audit-finished-tickets.sh — landed vs stranded finished tickets', () => {
   test('finished ticket with a main commit mentioning its id → clean, exit 0', () => {
     const fx = makeFixture({
@@ -411,19 +472,16 @@ describe('audit-finished-tickets.sh — landed vs stranded finished tickets', ()
     expect(r.status).not.toBe(0)
   })
 
-  // Regression guard for the collect_statuses `set -euo pipefail` defect: a
-  // non-finished ticket that sorts alphabetically LAST in a hive must not abort
-  // the script. The fix restructured the marker line into an `if`, so a
-  // non-finished ticket no longer returns 1 as the function's last command.
-  // Non-finished tickets are ignored entirely and the run exits 0 clean.
-  test('non-finished (open / worker / pupa) tickets are ignored entirely → clean, exit 0', () => {
+  // An open ticket sorting last in a hive must not make collect_statuses
+  // return a failure under set -e, preventing the remaining audit passes.
+  test('open (draft / active / defined) tickets are ignored entirely → clean, exit 0', () => {
     const fx = makeFixture({
       tickets: [
-        { id: 'b.op1', hive: 'Bugs', status: 'open' },
-        { id: 'b.wk1', hive: 'Bugs', status: 'worker' },
-        { id: 'b.pu1', hive: 'Plans', status: 'pupa' },
+        { id: 'b.op1', hive: 'Bugs', status: 'draft' },
+        { id: 'b.wk1', hive: 'Bugs', status: 'active' },
+        { id: 'b.pu1', hive: 'Plans', status: 'defined' },
       ],
-      // no commits reference any of them; only 'finished' should ever be flagged
+      // no commits reference any of them; only done/finished work is selected
     })
     const r = runAudit(fx)
     expect(r.stdout).not.toContain('b.op1')
@@ -1503,9 +1561,9 @@ describe('audit-finished-tickets.sh — stranded branches', () => {
   // Companion guard for the same collect_statuses fix: a lone non-finished
   // ticket sorts last in its hive but no longer aborts the script before the
   // branch pass runs, so its branch is correctly left alone.
-  test('branch for a NON-finished ticket (worker) is NOT flagged', () => {
+  test('branch for an open ticket (active) is NOT flagged', () => {
     const fx = makeFixture({
-      tickets: [{ id: 'b.wrk', hive: 'Plans', status: 'worker' }],
+      tickets: [{ id: 'b.wrk', hive: 'Plans', status: 'active' }],
     })
     const firstSha = git(fx, ['rev-list', '--max-parents=0', 'main']).trim()
     git(fx, ['checkout', '-q', '-b', 'b.wrk', firstSha])

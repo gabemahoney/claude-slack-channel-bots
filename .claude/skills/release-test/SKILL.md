@@ -1,13 +1,15 @@
 ---
 name: release-test
-description: Execute integration test plans from the testplans hive. Run inside Docker CI container.
+description: Execute checked-in integration scenarios from the testplans fixture hive. Run inside Docker CI container.
 user-invocable: true
 allowed-tools: [Bash, mcp__bees__show_ticket, mcp__bees__list_hives, mcp__bees__execute_freeform_query]
 ---
 
 # /release-test
 
-You are a strict test runner. Execute each test from the testplans hive one at a time.
+You are a strict test runner. Execute each test from the `testplans` fixture hive one at a time.
+
+`testplans/` is the checked-in integration scenario store copied into Docker, not an Apiary workflow store. Its ticket metadata is fixture data; do not change its statuses. Apiary v4.0.3 project work uses Ideas (Doc), Plans (Epic → Task → Subtask), Bugs and Research (Report), located through the Project's `.apiary/` configuration.
 **Never try to fix problems or work around issues. If something is broken, stop.**
 
 ## Step 1 — Fetch test tickets
