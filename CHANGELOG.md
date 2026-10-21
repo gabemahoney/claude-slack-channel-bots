@@ -6,6 +6,10 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 ## Unreleased
 
+---
+
+## 0.18.0 (2026-10-21)
+
 - Slack acknowledgements now have two configurable, startup-only stages: `queued_ack_reaction` defaults to `beehive` after durable acceptance; `ack_reaction` now defaults to `spinthinking` after receipt-backed delivery. Queued is removed before delivered is added, and the first successful correlated reply clears the actual stage. Custom emoji must exist in the Slack workspace before configuration; `spinthinking` is custom. See [settings and retention limits](docs/server-settings.md#acknowledgement-reactions).
 
 - **b.d6n:** delegate native workspace trust and transcript references to agent-director; remove archive-derived history-loss verdicts, dormant transcript cleanup, synthetic delivery launch identities and the readiness settle timer. Unconfirmed delivery follows AD state/session transitions while retaining guarded recovery.
