@@ -1,6 +1,6 @@
 # User Docs Guide
 
-Where each piece of operator documentation goes, and the rules every user doc follows. The writing style is in [doc-writing-guide.md](doc-writing-guide.md); the rules for shipped text (persona terms, banned terms, secrets) are its "Shipped descriptions" section.
+Where each piece of operator documentation goes, and the rules every user doc follows. The writing style is in [docs/doc-writing-guide.md](doc-writing-guide.md); the rules for shipped text (persona terms, banned terms, secrets) are its "Shipped descriptions" section.
 
 ## The user docs
 

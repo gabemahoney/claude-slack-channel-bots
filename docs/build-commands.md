@@ -1,6 +1,6 @@
 # Build commands
 
-This is `guide:build-commands.md`, resolved by the host's Apiary setup. One code folder: the checkout root (`../` from this file). Run each command from that root. Document and skill links below resolve relative to this file's folder.
+One code folder: the checkout root (`../` from this file). Run each command from that root. Document and skill links below resolve relative to this file's folder.
 
 ## Compile
 

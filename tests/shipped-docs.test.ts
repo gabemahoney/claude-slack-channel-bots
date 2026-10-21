@@ -5317,6 +5317,24 @@ describe("E36 T2: the README's install and startup texts point to the runbook an
 const ARCHITECTURE_FILE = 'docs/architecture.md'
 const ENGINEERING_GUIDE_FILE = 'docs/engineering-guide.md'
 
+// Project instructions must be usable without a host workflow installation.
+describe('generic project guides', () => {
+  test.each([
+    'AGENTS.md', 'CLAUDE.md', CONTRIBUTING_FILE, ENGINEERING_GUIDE_FILE,
+    'docs/build-commands.md', 'docs/testing-guide.md', 'docs/test-review-guide.md',
+    'docs/doc-writing-guide.md', 'docs/user-docs-guide.md',
+  ])('%s contains no host workflow names, pointers or ownership instructions', (file) => {
+    expect(readRepoFile(file)).not.toMatch(/apiary|guide:|Managing Intelligence|Guidance Documents?|Round Feedback Epic|write-plan|write-epic|develop-epic|fix-bug|define-bug|idea-review|teardown-worktree|`release`/i)
+  })
+
+  test.each(['AGENTS.md', 'CLAUDE.md'])('%s retains the cardinal rules and plain guide location', (file) => {
+    const text = readRepoFile(file)
+    expect(text).toContain('**CSCB relies on agent-director for agent state.**')
+    expect(text).toContain("**CSCB does not write code that parses an agent's TUI.**")
+    expect(text.split('\n')).toContain('Project guides live in docs/.')
+  })
+})
+
 /** The two texts SRJ-1105 and SRJ-1106 describe. */
 const DESIGN_DOCS: readonly string[] = [ARCHITECTURE_FILE, ENGINEERING_GUIDE_FILE]
 

@@ -2,7 +2,7 @@
 
 ## The two cardinal rules
 
-**These two rules override everything else in this guide, every SRD, every plan and every review. No exception, no workaround, no "just this once".**
+**These two rules override everything else in this guide, every requirements document, every plan and every review. No exception, no workaround, no "just this once".**
 
 1. **CSCB relies on agent-director for agent state.**
 2. **CSCB does not write code that parses an agent's TUI.**
@@ -12,15 +12,13 @@ What they mean:
 - **Agent state is agent-director's answer, and only agent-director's.** "Working", "waiting", "at a prompt", "safe to type into", "stuck", "idle": CSCB gets each of these from agent-director's verbs and fields (row `state`, `family_state`, request records, and refusals such as `ErrDialogMaybeOpen`). CSCB acts on that answer and on agent-director's refusals. CSCB never works out agent state for itself.
 - **No TUI parsing, of any kind.** CSCB never reads an agent's screen to decide anything: no footer, prompt marker, border, spinner, timer, menu, dialog, picker or status-line text, for Claude Code, Codex or any other agent. Pane text from `read-pane` is never matched, scanned or classified by CSCB code. Agents' TUIs are not a contract. They change every release, and code that reads them breaks every release.
 - **If CSCB needs a state agent-director doesn't report, ask agent-director for it.** File a feature request in agent-director's repository and block the CSCB work on it. Never fill the gap by reading the screen.
-- **Reviews enforce this.** Any SRD, plan, task or diff that reads an agent's TUI, or derives agent state in CSCB, is rejected, even if the SRD asks for it.
+- **Reviews enforce this.** Any requirements document, plan, task or diff that reads an agent's TUI, or derives agent state in CSCB, is rejected, even if the requirements ask for it.
 
-## Scope and workflow
+## Scope
 
-This is `guide:engineering-best-practices.md`, resolved by the host's Apiary setup through its Project Folder's `.apiary/` pointer. It sets engineering and review rules. Read the relevant [architecture contracts](architecture.md) when changing a subsystem; their state transitions, ordering and exception tables remain constraints. Keep module maps, algorithms and log catalogues there, rather than duplicating them here.
+This guide sets engineering and review rules. Read the relevant [architecture contracts](architecture.md) when changing a subsystem; their state transitions, ordering and exception tables remain constraints. Keep module maps, algorithms and log catalogues there, rather than duplicating them here.
 
-Apiary's workflow is `~/.apiary/system/workflow.md`. Use its ticket terms (Idea, Plan, Epic, Task, Subtask, Bug, Doc, Research ticket and Report) and skills: `write-plan`, `write-epic`, `develop-epic`, `idea-review`, `fix-bug`, `teardown-worktree` and `release`. Change only the tickets and statuses your assigned skill owns. See [Definition of Done](#definition-of-done).
-
-Use the other Guidance Documents for their own responsibilities: `guide:test-guide.md` for tests, `guide:doc-writing-guide.md` for documentation, `guide:build-commands.md` for checks, `guide:release-guide.md` for release permissions and procedure, and the Bug and research guides for those tasks. Resolve guidance cumulatively from the main checkout and parent `.apiary/` folders as Apiary specifies; worktree guidance may be under development.
+Use [docs/testing-guide.md](testing-guide.md) for tests, [docs/test-review-guide.md](test-review-guide.md) for test reviews, [docs/doc-writing-guide.md](doc-writing-guide.md) for documentation, [docs/build-commands.md](build-commands.md) for checks and [CONTRIBUTING.md](../CONTRIBUTING.md#release-process) for release permissions and procedure. See [Definition of Done](#definition-of-done).
 
 ## Layering: agent-director Owns tmux
 
@@ -236,18 +234,16 @@ Validate `allow_invited_channels` in `validatePersonaServerSettings` before pars
 
 ## Review Prioritization
 
-Prioritize security, logic, missing tests, architecture, touched code quality, then style. Fix security/logic immediately, add missing tests before merge, address architecture within scope when feasible and let tooling handle style. Don't hunt unrelated cleanup; record out-of-scope work for the Managing Intelligence.
+Prioritize security, logic, missing tests, architecture, touched code quality, then style. Fix security/logic immediately, add missing tests before merge, address architecture within scope when feasible and let tooling handle style. Don't hunt unrelated cleanup; record out-of-scope work for follow-up.
 
 ## Definition of Done
 
-Apiary statuses are `draft`, `defined`, `active`, `done`, plus `invalid` for Bugs. They describe tickets, not agent-director rows. Only the assigned skill's owner changes its statuses. The orchestrator (Managing Intelligence) sets PRDs/SRDs `defined` on approval, then a `draft` Idea `defined` once both are approved, and sets Ideas/Bugs `done` on acceptance after testing; engineers and reviewers do not accept their own work.
+Work is complete when it is merged to main, checks pass, documentation is updated and the release audit is clean.
 
-Before handing back implementation:
+- Complete the assigned scope, required reviews and the checks in [docs/build-commands.md](build-commands.md); report pass/fail/not applicable and evidence. Record declined or unaddressed findings with reasons.
+- Update architecture, user docs, diagnostic catalogue and release notes when behavior requires them. Follow [docs/doc-writing-guide.md](doc-writing-guide.md), including shipped-text rules; keep `tests/shipped-docs.test.ts` and `tests/access-file-retired.test.ts` green. Manually check shipped texts outside their scan lists; never add an audit exemption to make text pass.
+- Commit in the working branch, include a work reference where applicable and record commit SHAs plus unresolved work. Have the changes independently reviewed and tested. Correct review findings and failed tests, then repeat the affected checks before merging. Resolve merge conflicts and verify the result.
 
-- Complete the assigned scope, required reviews and the checks in the assigned skill and `guide:build-commands.md`; report pass/fail/not applicable and evidence. Record declined/unaddressed findings with reasons on the relevant ticket.
-- Update architecture, user docs, diagnostic catalogue and release notes when behavior requires them. Follow [doc-writing-guide.md](doc-writing-guide.md), including shipped-text rules; keep `tests/shipped-docs.test.ts` and `tests/access-file-retired.test.ts` green. Manually check shipped texts outside their scan lists; never add an audit exemption to make text pass.
-- Commit in the recorded worktree, name the ticket where applicable and record commit SHAs plus unresolved work. Return for the orchestrator's testing/acceptance. `idea-review` corrections go through a Round Feedback Epic, `write-epic` and `develop-epic` before another review; a failed Bug test returns to `fix-bug` in the same worktree, not `define-bug`.
+Before release, account for completed work on main or a truthful explicit non-repository/no-change resolution. Record the artifact path or reason and where superseding work lives; do not silently strand commits.
 
-Acceptance and merge are separate gates: Ideas/Bugs become `done` on acceptance, then `teardown-worktree` merges them, then `release` follows the Project's release guide. A merge conflict returns the Idea/Bug to `active` by the orchestrator; the owning workflow resolves it. Before release, account for accepted work on main or a truthful explicit non-repository/no-change resolution. Record the artifact path or reason and where superseding work lives; do not silently strand accepted commits.
-
-The read-only release audit checks `done` and legacy `finished` tickets and their unmerged branches against main; `invalid` Bugs need no merge. It is a pre-release gate, after acceptance and teardown, and keeps the explicit closure headings `## +closed:out-of-repo <path>` and `## +closed:docs-only` for qualifying work. Do not change statuses to satisfy it. See [the audit contract](../CONTRIBUTING.md#stranded-work-audit) for its evidence rules and exit codes. Release permissions, gates and recovery belong in `guide:release-guide.md` and [CONTRIBUTING.md](../CONTRIBUTING.md#release-process).
+The read-only `scripts/audit-finished-tickets.sh` selects tickets with `done` or legacy `finished` status and checks their landing evidence and unmerged branches against main. Other statuses are outside that selection. It keeps the explicit closure headings `## +closed:out-of-repo <path>` and `## +closed:docs-only` for qualifying work. Do not change statuses to satisfy it. See [CONTRIBUTING.md](../CONTRIBUTING.md#stranded-work-audit) for its evidence rules and exit codes, and its [release process](../CONTRIBUTING.md#release-process) for permissions, gates and recovery.

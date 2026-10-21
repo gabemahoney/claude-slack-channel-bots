@@ -3,7 +3,7 @@
 ## Document Types
 
 ### User docs (Customer-facing: README.md and the docs/ pages)
-- [user-docs-guide.md](user-docs-guide.md) names each user doc, what goes in it, its size budget and the rules all of them follow; read it before you add or move operator text
+- [docs/user-docs-guide.md](user-docs-guide.md) names each user doc, what goes in it, its size budget and the rules all of them follow; read it before you add or move operator text
 - Target audience: operators setting up and running the Slack Channel Router
 - Tone: practical, step-by-step, assumes technical competence but no familiarity with the codebase
 - Format: H2 sections separated by `---`, H3 subsections, fenced code blocks for commands and config
@@ -12,7 +12,7 @@
 - Don't explain common tools (bash, tmux, npm, etc.) — assume the operator knows them
 
 ### Shipped descriptions (user docs, skills, manifest, MCP instructions)
-- Shipped descriptions are the README, the user docs under `docs/` that [user-docs-guide.md](user-docs-guide.md) lists, `CONTRIBUTING.md`, every file under `skills/` (`skills/EXAMPLE_CLAUDE.md` included), `slack-app-manifest.yml`, the MCP instruction text (`MCP_INSTRUCTIONS` in `src/registry.ts`) and `set_channel_delivery`'s exported texts (`SET_CHANNEL_DELIVERY_DESCRIPTION`, `SET_CHANNEL_DELIVERY_CHANNEL_DESCRIPTION` and `SET_CHANNEL_DELIVERY_DELIVERY_DESCRIPTION`); they describe personas and nothing else (AC 46)
+- Shipped descriptions are the README, the user docs under `docs/` that [docs/user-docs-guide.md](user-docs-guide.md) lists, `CONTRIBUTING.md`, every file under `skills/` (`skills/EXAMPLE_CLAUDE.md` included), `slack-app-manifest.yml`, the MCP instruction text (`MCP_INSTRUCTIONS` in `src/registry.ts`) and `set_channel_delivery`'s exported texts (`SET_CHANNEL_DELIVERY_DESCRIPTION`, `SET_CHANNEL_DELIVERY_CHANNEL_DESCRIPTION` and `SET_CHANNEL_DELIVERY_DELIVERY_DESCRIPTION`); they describe personas and nothing else (AC 46)
 - Use persona terms: personas, their `channels` and `delivery`, `dm`, `permission_prompts`, credentials files, the confirmed reload, and for the channel modes the switch `allow_invited_channels`, declarative and fungible mode, `invited.permission_prompts`, channel delivery, a stored choice and `set_channel_delivery`. Never describe the pre-persona shape (`routes`, `default_route`, `default_dm_session`, per-route or routing-config wording), the token environment variables (`SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `export` lines), a token on a command line, or the access-control file and its model (`access.json`, `allowFrom`, `dmPolicy`, allowlist or pairing wording)
 - The one place a pre-persona key may appear is the debugging skill's `## Pre-persona configuration` entry, which names `routes`, `default_route` and `default_dm_session` only to say they are rejected; keep that heading as written
 - The two runbook sections of `docs/migration.md`, the switch-over runbook and the rollback runbook under `## Migration`, may name `access.json`, and only as the previous CSCB's file to save (switch-over) or restore (rollback); it stays banned in every other section and file. Nothing else is allowed in them: the runbooks say "the Slack token environment variables" and never name one, and carry no token `export` line, access-control model wording or pre-persona key. Keep both headings as written; a renamed or moved heading fails the audit
@@ -63,7 +63,7 @@
 ## When to Update
 
 After completing work that:
-- Adds a user-facing feature → update the user doc that [user-docs-guide.md](user-docs-guide.md) names for it
+- Adds a user-facing feature → update the user doc that [docs/user-docs-guide.md](user-docs-guide.md) names for it
 - Changes how the system works internally → update docs/architecture.md
 - Introduces new coding patterns → update relevant guide
 - Adds new config fields → update both docs/configuration.md and docs/architecture.md (except the test-only `test_timer_overrides` block and `test_mcp_drop_endpoint` switch, which no user doc names; see docs/engineering-guide.md, Configuration). Keep both out of shipped settings examples and operator instructions; document their startup-only behavior internally.

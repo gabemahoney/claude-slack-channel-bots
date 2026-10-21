@@ -5,10 +5,10 @@
 When reviewing tests, check for:
 
 ### Coverage
-- [ ] All acceptance criteria from the SRD have corresponding tests
+- [ ] All acceptance criteria from the requirements have corresponding tests
 - [ ] Happy path tested for each public function/endpoint
 - [ ] Error paths tested (invalid input, API failures, missing data)
-- [ ] Edge cases from the PRD/SRD are covered
+- [ ] Edge cases from the requirements are covered
 - [ ] Concurrent/parallel scenarios tested where applicable
 - [ ] A rule that rejects duplicate paths is tested with a symlinked duplicate and a non-existent path (lexical fallback), both rooted inside the test's `mkdtempSync` directory, plus a non-collision control that loads
 - [ ] Every path that serves a persona's instance (MCP registration, the permission poller, and any new endpoint, tool or poller that serves an instance) has a test for a persona that is not up, and an up persona beside it still served. Cross-module and integration tests build the up check with the real `createPersonaUpPredicate`; a handler unit test (such as MCP admission) may inject a stand-in predicate only when a source audit of `server.ts` (as in `server-startup-wiring.test.ts`) pins the production predicate to that path; a new serving path with no not-up case is a defect. Queue acceptance instead must cover configured personas both up and down: `/interject` returns 200 after storage, 500 on storage failure, and cron directly accepts with `queued`/`queue-failed`; neither depends on a session or performs HTTP dispatch
@@ -123,7 +123,7 @@ For every script whose `TEST_NAME` carries `-fmk-` (b.jg5 SRJ-1401; b.jg5 SRJ-13
 
 ### Conciseness
 - [ ] 3+ tests with the same structure and different inputs use `test.each`
-- [ ] No meta-tests — tests of factories, stubs, or other test infrastructure add no value; real tests validate them. `tests/integration/test-0-fmk-harness-self-check.sh` is not one: it is the `/ci` check of the fmk harness that the Epic requires, run once, in the one shard that holds it, not before every fmk scenario, and not a unit meta-test. Two kinds of helper test are kept as well: a shared helper's isolation and refusal contract (the refused homes and temp directories, the bytes it writes), as in the stored-choice helper's contract in `tests/channel-delivery.test.ts` and the retired-key helper's in `tests/retired-keys.test.ts`, and a builder's parity with the production loader, as in the fungible parity case in `tests/config.test.ts`
+- [ ] No meta-tests — tests of factories, stubs, or other test infrastructure add no value; real tests validate them. `tests/integration/test-0-fmk-harness-self-check.sh` is not one: it is the `/ci` check of the required fmk harness, run once, in the one shard that holds it, not before every fmk scenario, and not a unit meta-test. Two kinds of helper test are kept as well: a shared helper's isolation and refusal contract (the refused homes and temp directories, the bytes it writes), as in the stored-choice helper's contract in `tests/channel-delivery.test.ts` and the retired-key helper's in `tests/retired-keys.test.ts`, and a builder's parity with the production loader, as in the fungible parity case in `tests/config.test.ts`
 - [ ] No constants wrapping simple domain strings (`const STATUS_OPEN = 'open'`) — inline them
 - [ ] Tests assert behavior (outputs, state, captured calls), not implementation (which internal function was called, with what encoding)
 - [ ] No gold-plating — 80/20 rule; redundant permutations of an already-covered behavior should be removed
