@@ -134,10 +134,11 @@ call_verb="${argv[verb_index]:-}"
 # Keep its lock through that call so a collision cannot steal the fault
 # intended for the following reuse/resume, or race a concurrent invocation.
 consume_fault() {
-    rules[i]="${verb} ${match} ${candidate} $((10#${count} - 1))"
+    rules[i]="${verb} ${match} ${candidate} $((10#${count} - 1))${target:+ ${target}}"
     printf '%s\n' "${rules[@]}" > "${faults}.$$" || exit 70
     /usr/bin/mv -f "${faults}.$$" "${faults}" || exit 70
     printf -v fault_words '%q %q %q %q' "${verb}" "${match}" "${candidate}" "${count}"
+    if [[ -n "${target}" ]]; then fault_words+=" ${target}"; fi
     printf -v fault_line 'fault\t%s\t%s\t%s\t%s\t%s' "${EPOCHREALTIME/,/.}" "$$" "${PPID}" "${parent}" "${fault_words}"
     { /usr/bin/flock -x 9 && printf '%s\n' "${fault_line}" >&9; } 9>> "${log}" || exit 70
 }
@@ -146,12 +147,31 @@ if [[ -f "${faults}" ]]; then
     /usr/bin/flock -x 8 || exit 70
     rules=()
     mapfile -t rules < "${faults}" || exit 70
+    # Optional instance:message_id scope binds an Enter to the preceding
+    # outbound text for that instance. This reads our arguments, never a TUI.
+    # Keep the header under the fault lock, including swallowed text attempts.
+    instance=''; text_header=''; has_text=0; previous=''
+    for arg in "$@"; do
+        case "${previous}" in
+            --instance-id) instance="${arg}" ;;
+            --text) text_header="${arg%%>*}"; has_text=1 ;;
+        esac
+        previous="${arg}"
+    done
+    header_file=''
+    if [[ "${call_verb}" == send-keys && "${instance}" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        header_file="${faults}.header.${instance}"
+        if (( has_text )); then printf '%s' "${text_header}" > "${header_file}" || exit 70; fi
+    fi
     for i in "${!rules[@]}"; do
         [[ -z "${rules[i]}" || "${rules[i]}" == \#* ]] && continue
-        read -r verb match candidate count extra <<< "${rules[i]}"
+        read -r verb match candidate count target extra <<< "${rules[i]}"
         if [[ -n "${extra}" || ! "${count}" =~ ^[0-9]+$ || ${#count} -gt 6 ]]; then
             printf 'agent-director-shim: invalid fault rule\n' >&2
             exit 70
+        fi
+        if [[ -n "${target}" ]]; then
+            [[ "${verb}" == send-keys && "${target}" =~ ^[a-zA-Z0-9_-]+:[0-9]+\.[0-9]{6}$ ]] || exit 70
         fi
         case "${candidate}" in
             swallow|unknown-typed|unknown-untyped|launch-reply-timeout) ;;
@@ -178,6 +198,11 @@ if [[ -f "${faults}" ]]; then
             *) printf 'agent-director-shim: invalid fault matcher\n' >&2; exit 70 ;;
         esac
         (( matches )) || continue
+        if [[ -n "${target}" ]]; then
+            [[ "${instance}" == "${target%%:*}" && -f "${header_file}" ]] || continue
+            header="$(/usr/bin/cat "${header_file}")" || exit 70
+            [[ "${header}" == '<channel '* && "${header}" == *" message_id=\"${target#*:}\""* ]] || continue
+        fi
         action="${candidate}"
         [[ "${action}" == launch-reply-timeout ]] || consume_fault
         break

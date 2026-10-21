@@ -23,13 +23,24 @@ export function assertSwallowedEnterRecovery(journal: any[], calls: KeyCall[], f
   const sent = journal.filter(record => record.kind === 'sent' && record.seq === seq)
   const text = sent.filter(record => record.send_kind !== 'enter')
   const enter = sent.filter(record => record.send_kind === 'enter')
+  const fixed = journal.find(record => record.kind === 'fixed' && record.seq === seq)
   check(enter.some(retry => text.some(typed => typed.part === retry.part && typed.session_id === retry.session_id
-    && typed.at <= retry.at && faults.some(fault => fault.at >= typed.at && fault.at < retry.at
-      && fault.words[1] === 'key=Enter' && fault.words[2] === 'swallow'
-      && (calls.find(call => call.at > fault.at && recoveryKey(call, instance))?.at ?? -Infinity) - fault.at >= 10000
-      && calls.some(call => call.at >= retry.at && recoveryKey(call, instance)
-        && call.words.includes('--key') && call.words.includes('Enter'))))),
-    'swallowed Enter has no observed durable Enter-only recovery under the existing backoff')
+    && typed.at <= retry.at && faults.some(fault => {
+      if (!fault.pid || fault.at < typed.at || fault.at >= retry.at
+        || fault.words[1] !== 'key=Enter' || fault.words[2] !== 'swallow') return false
+      const swallowed = calls.find(call => call.pid === fault.pid && call.at <= fault.at && call.at >= typed.at
+        && recoveryKey(call, instance) && call.words.includes('--key') && call.words.includes('Enter'))
+      if (!swallowed) return false
+      const preceding = calls.filter(call => call.at < swallowed.at && recoveryKey(call, instance)).at(-1)
+      // A reminder (or another part) can consume a global fault in this same
+      // time window. Require this exact durable part's text and the consuming PID.
+      if (!preceding || preceding.at < typed.at || !preceding.words.includes('--no-enter')
+        || !fixed?.parts?.[typed.part - 1]
+        || preceding.words[preceding.words.indexOf('--text') + 1] !== fixed.parts[typed.part - 1]) return false
+      const recovery = calls.find(call => call.at > fault.at && recoveryKey(call, instance))
+      return recovery && recovery.at - fault.at >= 10000 && recovery.at >= retry.at
+        && recovery.words.includes('--key') && recovery.words.includes('Enter')
+    }))), 'swallowed Enter has no observed durable Enter-only recovery under the existing backoff')
 }
 
 type LaunchObservation = { key: string; session_id: string; at: number }
@@ -172,7 +183,7 @@ try {
     const j=cumulativeJournal(), seq=workloadItem(j,Number(arg)).seq, s=j.filter(r=>r.kind==='sent'&&r.seq===seq)
     const text=s.filter(r=>r.send_kind!=='enter')
     if(arg2==='enter') {
-      const faults=readFileSync(shim!,'utf8').split('\n').filter(l=>l.startsWith('fault\t')).map(l=>{const f=l.split('\t');return {at:Number(f[1])*1000,words:shimWords(f[5]!)}})
+      const faults=readFileSync(shim!,'utf8').split('\n').filter(l=>l.startsWith('fault\t')).map(l=>{const f=l.split('\t');return {at:Number(f[1])*1000,pid:f[2],words:shimWords(f[5]!)}})
       assertSwallowedEnterRecovery(j,calls(),faults,seq,'cscb_'+key)
     }
     if(arg2==='retype') check(text.length>=2, 'missed text was not retyped')

@@ -4,12 +4,16 @@ import { makeEngineHarness } from './test-helpers/delivery-engine.ts'
 import { ENTER_DELAY_MS } from '../src/delivery-engine.ts'
 
 const instance = 'cscb_control'
-const fault = { at: 2000, words: ['send-keys', 'key=Enter', 'swallow'] }
+const fault = { at: 2000, pid: '2000', words: ['send-keys', 'key=Enter', 'swallow'] }
 const key = (at: number, kind: 'enter' | 'text', id = instance) => ({
-  at, words: ['send-keys', '--instance-id', id, ...(kind === 'enter' ? ['--key', 'Enter'] : ['--text', 'message', '--no-enter'])],
+  at, pid: String(at), words: ['send-keys', '--instance-id', id, ...(kind === 'enter' ? ['--key', 'Enter'] : ['--text', 'message', '--no-enter'])],
 })
 const text = { kind: 'sent', seq: 1, part: 1, send_kind: 'text', session_id: 'native-session', at: 1000 }
 const enter = { ...text, send_kind: 'enter', at: 12000 }
+const fixed = { kind: 'fixed', seq: 1, parts: ['message'] }
+function proveEnter(journal: any[], calls: Parameters<typeof assertSwallowedEnterRecovery>[1], faults: Parameters<typeof assertSwallowedEnterRecovery>[2]) {
+  return assertSwallowedEnterRecovery([fixed, ...journal], [key(1000, 'text'), key(2000, 'enter'), ...calls], faults, 1, instance)
+}
 
 describe('real key recovery proof', () => {
   test.each([
@@ -131,7 +135,7 @@ describe('real key recovery proof', () => {
   })
 
   test('swallowed Enter permits a durable Enter-only recovery without a second text', () => {
-    expect(() => assertSwallowedEnterRecovery([text, enter], [key(12000, 'enter')], [fault], 1, instance)).not.toThrow()
+    expect(() => proveEnter([text, enter], [key(12000, 'enter')], [fault])).not.toThrow()
   })
 
   test.each([
@@ -144,6 +148,19 @@ describe('real key recovery proof', () => {
     ['another launch', [text, { ...enter, session_id: 'other' }], [key(12000, 'enter')], [fault]],
     ['no injected fault', [text, enter], [key(12000, 'enter')], []],
   ])('swallowed Enter proof rejects %s', (_, journal, calls, faults) => {
+    expect(() => proveEnter(journal, calls, faults)).toThrow('durable Enter-only recovery')
+  })
+
+  test.each([
+    ['fault on a reminder', (calls: any[], faults: any[]) => { calls[0].words[calls[0].words.indexOf('--text') + 1] = 'reply reminder' }],
+    ['fault on another persona', (calls: any[], faults: any[]) => { calls[1] = key(2000, 'enter', 'cscb_other') }],
+    ['fault on another PID', (calls: any[], faults: any[]) => { faults[0].pid = 'other' }],
+    ['fault without PID', (calls: any[], faults: any[]) => { delete faults[0].pid }],
+    ['no durable fixed part', (calls: any[], faults: any[], journal: any[]) => { journal.shift() }],
+  ])('swallowed Enter proof rejects %s despite a later durable recovery', (_, mutate) => {
+    const calls = [key(1000, 'text'), key(2000, 'enter'), key(12000, 'enter')]
+    const faults = [{ ...fault }], journal = [fixed, text, enter]
+    mutate(calls, faults, journal)
     expect(() => assertSwallowedEnterRecovery(journal, calls, faults, 1, instance)).toThrow('durable Enter-only recovery')
   })
 })
