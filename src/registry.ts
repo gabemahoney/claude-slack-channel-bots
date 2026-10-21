@@ -664,10 +664,10 @@ export interface SessionToolDeps {
   /** Resolve a user's display name through the persona's client */
   resolveUserName: (personaKey: string, userId: string) => Promise<string>
   /**
-   * Consume persona `personaKey`'s pending ack entry for the conversation and
-   * message — returns true if that persona's own entry existed
+   * Record a successful correlated reply and clean up its captured ack stage.
+   * The removal fallback is only for legacy entries without a captured reaction.
    */
-  consumeAck: (personaKey: string, channelId: string, messageTs: string) => boolean
+  consumeAck: (personaKey: string, channelId: string, messageTs: string, removeLegacy?: () => Promise<unknown>) => boolean | Promise<void>
   /** TCP port the MCP HTTP server is listening on (retained for diagnostics). */
   serverPort: number
   /**
@@ -1448,6 +1448,16 @@ export function createSessionServer(
 
         const settings = getReplySettings()
         const chunks = chunkText(text, settings.reply_chunk_limit, settings.reply_chunk_mode)
+        // Record the first successful reply immediately; a held reaction call
+        // may delay cleanup, but never the remaining content or tool result.
+        const clearAck = () => {
+          if (!messageId) return
+          try {
+            void Promise.resolve(consumeAck(persona.key, chatId, messageId, async () => {
+              if (settings.ack_reaction) await web.reactions.remove({ channel: chatId, timestamp: messageId, name: settings.ack_reaction })
+            })).catch(() => {})
+          } catch { /* reaction cleanup cannot fail a successful reply */ }
+        }
 
         let lastTs = ''
         let firstChunk = true
@@ -1467,16 +1477,7 @@ export function createSessionServer(
           // a user target, the DM just opened).
           if (firstChunk) {
             firstChunk = false
-            const reaction = settings.ack_reaction
-            if (messageId && consumeAck(persona.key, chatId, messageId) && reaction) {
-              try {
-                await web.reactions.remove({
-                  channel: chatId,
-                  timestamp: messageId,
-                  name: reaction,
-                })
-              } catch { /* non-critical */ }
-            }
+            clearAck()
           }
         }
 
@@ -1502,12 +1503,9 @@ export function createSessionServer(
           if (threadTs) uploadArgs.thread_ts = threadTs
           await web.filesUploadV2(uploadArgs as any)
           uploaded++
-        }
-
-        if (firstChunk && uploaded > 0 && messageId) {
-          const reaction = settings.ack_reaction
-          if (consumeAck(persona.key, chatId, messageId) && reaction) {
-            try { await web.reactions.remove({ channel: chatId, timestamp: messageId, name: reaction }) } catch { /* non-critical */ }
+          if (firstChunk) {
+            firstChunk = false
+            clearAck()
           }
         }
 

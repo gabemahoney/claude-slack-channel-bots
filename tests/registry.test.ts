@@ -2655,21 +2655,26 @@ describe('reply — ack reaction removal', () => {
 
   // Beta Bot also tracks the message, so a reply that removed per chunk would
   // show a second removal even if it consumed another persona's entry.
-  test('a multi-chunk reply carrying a tracked message_id removes the reaction exactly once, after its first chunk', async () => {
+  test('a multi-chunk reply cancels the tracked message_id at first success and removes its own reaction exactly once', async () => {
     shareAlphaChannelWithBeta()
     trackAck(h.alpha.key, A_ALL, MSG_TS)
     trackAck(h.beta.key, A_ALL, MSG_TS)
-    const session = await openWithSettings(h.alpha, { reply_chunk_limit: 5 })
+    const consumed: { key: string; channel: string; ts: string; posts: number }[] = []
+    const session = await openSession(registerSession(h.alpha.working_directory, h.alpha.key, makeTransport(), makeServer()), {
+      ...depsWithReplySettings({ reply_chunk_limit: 5 }),
+      consumeAck: (key, channel, ts, remove) => {
+        consumed.push({ key, channel, ts, posts: stubOf(h.alpha).calls.postMessage.length })
+        return remove ? consumeAck(key, channel, ts, remove) : consumeAck(key, channel, ts)
+      },
+    })
 
     const result = await session.call('reply', { chat_id: A_ALL, text: 'one\ntwo\nthree', message_id: MSG_TS })
 
     expect(result.content[0]!.text).toStartWith(`Sent 3 message(s) to ${A_ALL}`)
-    expect(stubOf(h.alpha).callLog.map((c) => c.method)).toEqual([
-      'chat.postMessage',
-      'reactions.remove',
-      'chat.postMessage',
-      'chat.postMessage',
-    ])
+    expect(consumed).toEqual([{ key: h.alpha.key, channel: A_ALL, ts: MSG_TS, posts: 1 }])
+    expect(stubOf(h.alpha).calls.postMessage.map(c => 'text' in c ? c.text : undefined)).toEqual(['one', 'two', 'three'])
+    const methods = stubOf(h.alpha).callLog.map(c => c.method)
+    expect(methods.indexOf('reactions.remove')).toBeGreaterThan(methods.indexOf('chat.postMessage'))
     expect(stubOf(h.alpha).calls.reactionsRemove).toEqual([REMOVE_EYES])
     expect(stubOf(h.beta).callLog).toEqual([])
   })

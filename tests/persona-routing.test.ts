@@ -111,7 +111,7 @@ test('partial fanout suppresses ack; retry prepares retained accepted-only A and
   let failing = true; const order: string[] = []
   const routing = createPersonaRouting({ getPersonaConfig: () => config, getBotIdentity: () => ({ botUserId: 'U0BOT001', botId: 'B0BOT001' }), archive: () => {}, log: () => {}, queue: { lookupSlackKey: queue.lookupSlackKey, accept: async (key, input) => { order.push('store:' + key); return key === 'beta' && failing ? { status: 'failed', error: new Error('EIO') } : queue.accept(key, input) } }, onReceived: (key) => { order.push('received:' + key) }, prepare: async (key, item) => { order.push('prepare:' + key); await queue.append(key, { v: 1, kind: 'fixed', seq: item.accepted.seq, parts: ['fixed'] }) } })
   const event = makeChannelMessage({ channel: CS }); await routing.receive(event, () => { order.push('ack') }, ['alpha', 'beta'])
-  expect(order).toEqual(['store:alpha', 'store:beta']); expect(queue.items('alpha')).toHaveLength(1); expect(queue.items('beta')).toEqual([])
+  expect(order).toEqual(['store:alpha', 'store:beta', 'received:alpha']); expect(queue.items('alpha')).toHaveLength(1); expect(queue.items('beta')).toEqual([])
   failing = false; order.length = 0; await routing.receive(event, () => { order.push('ack') }, ['alpha', 'beta'])
   expect(order).toEqual(['store:beta', 'ack', 'received:alpha', 'received:beta', 'prepare:alpha', 'prepare:beta'])
   for (const key of ['alpha', 'beta']) { expect(queue.items(key)).toHaveLength(1); expect(queue.items(key)[0]!.fixed!.parts).toEqual(['fixed']); expect(readQueue(dir, key).filter(r => r.kind === 'accepted' && !('compact' in r))).toHaveLength(1) }; await queue.stop()

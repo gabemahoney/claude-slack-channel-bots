@@ -1328,6 +1328,7 @@ describe('server-wide settings', () => {
     ['cron_table_path', () => join(root, 'other-crontab')],
     ['cron_log_path', () => join(root, 'other-cron.log')],
     ['cron_log_max_bytes', () => 1024],
+    ['queued_ack_reaction', () => 'hourglass'],
     ['ack_reaction', () => 'eyes'],
     ['reply_chunk_limit', () => 2000],
     ['reply_chunk_mode', () => 'length'],

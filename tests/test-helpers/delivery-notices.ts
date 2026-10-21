@@ -10,13 +10,13 @@ import { makeMultiPersonaConfig } from './persona-config.ts'
 import { makeNoticeAlertsRig, makeNotifierHarness } from './persona-notifier.ts'
 import { makeQueue, slackInput, deliveredRecord } from './delivery-queue.ts'
 
-export async function makeDeliveryNoticeHarness(options: { queue?: DeliveryQueue } = {}) {
+export async function makeDeliveryNoticeHarness(options: { queue?: DeliveryQueue; leakMarker?: string } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'delivery-notices-'))
   const config = makeMultiPersonaConfig([
     { name: 'alpha', channels: [{ id: 'C0ALPHA01', delivery: 'all' }, { id: 'C0BETA001', delivery: 'all' }], permission_prompts: 'C0ALPHA01' },
     { name: 'beta', channels: [{ id: 'C0BETA001', delivery: 'all' }, { id: 'C0ALPHA01', delivery: 'all' }], permission_prompts: 'C0BETA001' },
   ], root)
-  const h = makeNotifierHarness(config)
+  const h = makeNotifierHarness(config, { leakMarker: options.leakMarker })
   const rig = makeNoticeAlertsRig(h, { logDir: root, omitStderr: true })
   const logs: string[] = [], blocked: { key: string; rule: 'menu' | 'input' }[] = [], delivered: { key: string; item: QueueItem }[] = []
   const states = new Map(config.personas.map(p => [p.key, { up: true } as DeliveryReportState]))

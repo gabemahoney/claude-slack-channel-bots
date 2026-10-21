@@ -833,6 +833,10 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
         token_hash: token === undefined || token === '' ? null : tokenHash(token),
       }
       if (args.channel !== undefined) fields.channel = args.channel
+      if (method === 'reactions.add' || method === 'reactions.remove') {
+        if (args.name !== undefined) fields.name = recordedText(method, args.name)
+        if (args.timestamp !== undefined) fields.timestamp = recordedText(method, args.timestamp)
+      }
       if (args.user !== undefined) fields.user = args.user
       if (args.thread_ts !== undefined) fields.thread_ts = recordedText(method, args.thread_ts)
       if (args.text !== undefined) fields.text = recordedText(method, args.text)

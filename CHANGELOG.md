@@ -6,6 +6,7 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 ## Unreleased
 
+- Slack acknowledgements now have two configurable, startup-only stages: `queued_ack_reaction` defaults to `beehive` after durable acceptance; `ack_reaction` now defaults to `spinthinking` after receipt-backed delivery. Queued is removed before delivered is added, and the first successful correlated reply clears the actual stage. Custom emoji must exist in the Slack workspace before configuration; `spinthinking` is custom. See [settings and retention limits](docs/server-settings.md#acknowledgement-reactions).
 - Live acceptance checks route agent input and restart faults through agent-director, with bounded state polling and confirmed kill results (b.ou8).
 - Release audits and finished-ticket sweeps follow Apiary 4.0.3 acceptance rules (b.vrx).
 
@@ -260,7 +261,8 @@ Earlier releases ignore this release’s queue and can resume a bot without thei
 
 1. **Stop sending and empty the queues.** Wait until `server.log` shows every received item delivered. Otherwise explicitly accept that undelivered messages are lost when using the earlier release.
 2. **Disable resume on the current release.** Set `resume_enabled` to `false` in `config.json`, [confirm the pending change](docs/reload.md#confirming-a-change), and verify `config.json.last-applied` holds `resume_enabled: false`. Keep the current server running until this is applied.
-   If the target release does not support these settings, first give every persona a valid declarative section (`permission_prompts`, and `channels` unless `dm.enabled` is `true`; see [Load-time rules](docs/configuration.md#load-time-rules)), remove `allow_invited_channels` and every persona’s `invited`, confirm, and ensure the last-applied record holds neither. These precautions do not replace any phase.
+   If the target release does not support these settings, first give every persona a valid declarative section (`permission_prompts`, and `channels` unless `dm.enabled` is `true`; see [Load-time rules](docs/configuration.md#load-time-rules)), remove `allow_invited_channels` and every persona’s `invited`, confirm, and ensure the last-applied record holds neither.
+   If the target release does not support `queued_ack_reaction`, remove it from `config.json`, confirm while the current server is running, and verify it is absent from `config.json.last-applied`. These precautions do not replace any phase.
 3. **Stop with the bots, then install and pin the earlier build.** Run `claude-slack-channel-bots stop --stop-bots` and verify it succeeds, install the earlier build (for example `bun install -g claude-slack-channel-bots@<version>`), then restore its required Claude Code version pin before starting it.
 4. **Start the earlier release fresh with channels, then restore resume.** Run `claude-slack-channel-bots start`; verify every bot starts a new conversation with that release’s channels launch and no configuration load error. Only then set `resume_enabled` back to its previous value and confirm the change. The earlier build ignores `channel-delivery.json`; leave it in place.
 

@@ -4105,6 +4105,8 @@ const ENTRIES: Readonly<Record<string, Entry>> = joinEntryTables({
   PERSONA_CHANNEL_DELIVERY_SET: constantEntry('persona-diagnostics.ts', 'PERSONA_CHANNEL_DELIVERY_SET'),
   MESSAGE_RECEIVED: constantEntry('persona-diagnostics.ts', 'MESSAGE_RECEIVED'),
   MESSAGE_DELIVERED: constantEntry('persona-diagnostics.ts', 'MESSAGE_DELIVERED'),
+  DEFAULT_QUEUED_ACK_REACTION: constantEntry('config.ts', 'DEFAULT_QUEUED_ACK_REACTION'),
+  DEFAULT_ACK_REACTION: constantEntry('config.ts', 'DEFAULT_ACK_REACTION'),
   channelDeliverySetCause: deliverySetCause,
   NO_STORED_CHOICE: constantEntry('persona-diagnostics.ts', 'NO_STORED_CHOICE'),
   SET_CHANNEL_DELIVERY_TOOL: constantEntry('channel-delivery.ts', 'SET_CHANNEL_DELIVERY_TOOL'),

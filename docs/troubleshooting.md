@@ -20,6 +20,9 @@ The first start recorded the bad setting, such as `port` or `bind`, before it fa
 **A persona doesn't come up or doesn't answer**
 The persona is silent. Accepted messages remain queued while its instance is unavailable. Find its key on its `persona-start` line in `server.log` and read its lines: each names a class (such as `persona-credentials-invalid` or `persona-directory-missing`) and the file or directory to fix. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-doesnt-come-up-or-doesnt-answer).
 
+**Acknowledgement reaction missing or stuck**
+Check that both configured emoji exist in the workspace and the confirmed settings took effect at server start; use `message-delivered` to confirm delivery when Slack reaction calls fail. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-acknowledgement-reaction-missing-or-stuck).
+
 **A persona's instance waits at a startup prompt**
 agent-director pre-trusts the working directory during launch. If any startup prompt still needs an answer, attach with `tmux attach -t =slack_bot_<key>` and answer it yourself; CSCB sends no automatic startup answers. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-personas-instance-waits-at-a-startup-prompt).
 
