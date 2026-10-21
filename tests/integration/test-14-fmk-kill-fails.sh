@@ -690,7 +690,7 @@ t14_retired_cause() {
 }
 
 # t14_stub_workers: print each running stub worker process (a process whose
-# argv holds the stub's path, ${SCENARIO_BIN}/claude) as `<pid> <session>`,
+# Bash script argument is ${SCENARIO_BIN}/claude) as `<pid> <session>`,
 # <session> the scenario's tmux session whose pane runs it or its parent
 # chain, `-` for none.
 t14_stub_workers() {
@@ -721,7 +721,11 @@ for d in os.listdir("/proc"):
             argv = f.read().split(b"\0")
     except OSError:
         continue
-    if stub not in argv:
+    # The stub's /usr/bin/env bash shebang becomes `bash <stub> ...`.
+    # A tmux launcher also carries <stub>, but only as a later argument.
+    # Match the interpreter and script position, including orphaned workers;
+    # pane/row ownership is checked separately below, never used as a filter.
+    if len(argv) < 2 or os.path.basename(argv[0]) != b"bash" or argv[1] != stub:
         continue
     state, _ = stat(d)
     if state in ("", "Z", "X"):

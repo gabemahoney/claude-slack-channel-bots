@@ -118,7 +118,7 @@ function startupFailure(): never {
 await prepare().catch(startupFailure)
 crashCheckpoint('prepared', { prepared: true })
 // Load only packed production modules after image/scratch/model/auth guards.
-const [engineModule, queueModule, intakeModule, diagnostics, identity, notices, description, evidence, observation, transport, receipts] = await Promise.all([
+const [engineModule, queueModule, intakeModule, diagnostics, identity, notices, description, evidence, observation, transport, receipts, versionGate] = await Promise.all([
   import(join(pkg, 'src/delivery-engine.ts')), import(join(pkg, 'src/delivery-queue.ts')),
   import(join(pkg, 'src/delivery-intake.ts')), import(join(pkg, 'src/persona-diagnostics.ts')),
   import(join(pkg, 'src/persona-identity.ts')), import(join(pkg, 'src/delivery-notices.ts')),
@@ -126,11 +126,12 @@ const [engineModule, queueModule, intakeModule, diagnostics, identity, notices, 
   import('../integration/fixtures/real-observations.ts'),
   import(import.meta.resolve('agent-director', join(pkg, 'src/agent-director-startup.ts'))),
   import('../integration/fixtures/transcript-receipts.ts'),
+  import(join(pkg, 'src/ad-version-gate.ts')),
 ]).catch(startupFailure)
 crashCheckpoint('modules-ready')
 // Deliberately omit storePath/home; Codex's AD hooks resolve through HOME.
 const client = await transport.Client.create().catch(startupFailure)
-if (client.binaryPath !== shim || client.binaryVersion !== '0.12.0') {
+if (client.binaryPath !== shim || !versionGate.meetsPhase1Floor(client.binaryVersion)) {
   await client.close()
   startupFailure()
 }
