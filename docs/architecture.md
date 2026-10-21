@@ -144,6 +144,15 @@ reaches the host. Check 24's blocking recovery also requires the original
 item's transcript tag and sequence; the helper loads no production adapter
 on the host. See `docs/testing-guide.md`, The /ci-live runner.
 
+`ci-live/checks/agent-control.ts` owns Check 12 and Check 18's agent input:
+optional agent-director Escape, bounded polling of agent-director `status`
+for `waiting`, then one text submission with agent-director's guards intact.
+Check 7 requires agent-director `kill` to return `kill_sent: true` before
+checking reconnection and a Slack reply. This is a partial test-harness
+migration (b.ou8); native idle-compaction capability, Check 13's process
+continuity evidence and general diagnostic pane capture still require
+upstream support. See [Remaining agent-director dependencies](testing-guide.md#remaining-agent-director-dependencies-bou8).
+
 The E6 real-agent harness drives the packed production install in containers. AD waiting/refusals govern actions; independent transcript assertions confirm exact delivery. Failure artifacts omit pane text.
 
 Failure-only `tests/real-agent/ai-failure-diagnostics.ts` projects Claude/Codex transcript metadata before scenario cleanup. Structured errors preserve allowlisted classification, HTTP status and retry fields, nested causes and Codex error-info variants; free-text messages, bodies, headers and tokens are withheld. Notification header IDs/status survive from user content and consumed `queued_command` prompts; result/summary prose cannot supply linkage. These records survive in full-CI failure logs or the heavy runner's private `real-agent-failures.jsonl`, annotated with its job/version. They neither supply oracle answers nor initiate retries.

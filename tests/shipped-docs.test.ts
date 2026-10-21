@@ -8588,9 +8588,9 @@ describe('released agent-director 0.12 migration instructions (b.m2o)', () => {
   })
 })
 
-// b.omv SR-7.1/2/4/6: maintained release notes describe this breaking upgrade.
-test('0.17.0 records fresh conversations, retained memory and the typed launch contract', () => {
-  const released = sectionOf(CHANGELOG_FILE, '## 0.17.0 (2026-10-19)')(readFileSync(join(REPO_ROOT, CHANGELOG_FILE), 'utf-8'))
+// b.omv SR-7.1/2/4/6: the published 0.17.0 notes describe this breaking upgrade.
+test('the 0.17.0 release notes record fresh conversations, retained memory and the typed launch contract', () => {
+  const released = requiredSection(operatorText(CHANGELOG_FILE), '## 0.17.0 (2026-10-19)', CHANGELOG_FILE)
   for (const term of ['fresh conversation', 'memory', 'tag_prompt', 'bot-system-prompt.md']) expect(released.toLowerCase()).toContain(term)
 })
 

@@ -15,6 +15,7 @@ import { isFrom, messageText, notYetOnTransient, tsAfter } from '../lib/human-se
 import { personaName, type PersonaLetter } from '../lib/personas.ts'
 import { waitFor, BRINGUP_TIMEOUT_MS, MINUTE, POLL_MS, REPLY_TIMEOUT_MS, SECOND } from '../lib/wait.ts'
 import type { CheckContext } from './context.ts'
+import { sendPersonaText } from './agent-control.ts'
 import { waitDeliveryLines } from './delivery-evidence.ts'
 import { Findings, type CheckDef } from './framework.ts'
 import {
@@ -256,8 +257,10 @@ export const check7: CheckDef<CheckContext> = {
   async run(ctx) {
     const f = new Findings()
     const m = await mark(ctx)
-    const kill = await guarded(ctx, 'tmux kill-session -t slack_bot_persona_a')
-    if (!f.expect(kill.ok && kill.code === 0, 'the guarded tmux kill-session did not run')) return f.result()
+    const kill = await guarded(ctx, "agent-director kill --instance-id 'cscb_persona_a'")
+    let killSent = false
+    try { killSent = JSON.parse(kill.out).kill_sent === true } catch { /* A missing result is not an injected fault. */ }
+    if (!f.expect(kill.ok && kill.code === 0 && killSent, 'agent-director did not confirm a kill sent to persona_a')) return f.result()
     const back = await waitLog(ctx, m, 'Session connected: persona "persona_a" (key=persona_a)', 5 * MINUTE)
     f.expect(back !== null, 'A did not reconnect within five minutes')
     const log = await since(ctx, m)
@@ -481,17 +484,6 @@ export function check12Start(ids: { coordination: string; aUserId: string; bUser
 }
 
 /**
- * The script that types `text` into a persona's tmux session and presses
- * Enter. `interrupt` presses Escape first, ending the persona's current turn;
- * without it, text typed mid-turn waits as the persona's next prompt.
- */
-export function typeIntoPane(letter: PersonaLetter, text: string, interrupt: boolean): string {
-  const session = `slack_bot_persona_${letter}`
-  const escape = interrupt ? `tmux send-keys -t ${session} Escape; sleep 1; ` : ''
-  return `${escape}tmux send-keys -t ${session} -l ${q(text)}; sleep 1; tmux send-keys -t ${session} Enter`
-}
-
-/**
  * Step 6: lift the stop for A and B the way it reached them: in coordination,
  * and in their terminals too when the stop was typed there. Never throws: a
  * lift that fails is a note (the check's result rests on the plan's Expected
@@ -507,8 +499,7 @@ export async function liftCheck12Stop(ctx: CheckContext, f: Findings, inPanes: b
   if (!inPanes) return
   for (const l of ['a', 'b'] as const) {
     try {
-      const typed = await guarded(ctx, typeIntoPane(l, CHECK12_LIFT, false))
-      if (!typed.ok || typed.code !== 0) f.note(`Check 12: the lift could not be typed into ${personaName(l)}'s terminal (exit ${typed.code})`)
+      await sendPersonaText(ctx, l, CHECK12_LIFT)
     } catch (err) {
       f.note(`Check 12: the lift could not be typed into ${personaName(l)}'s terminal (${describeError(err)})`)
     }
@@ -577,7 +568,7 @@ export const check12: CheckDef<CheckContext> = {
       if (lastAfterStop.some((p) => tsAfter(p.ts, recentCut))) {
         f.note('Check 12: the personas kept posting after the stop message; stopped in their terminals (Escape + message)')
         stoppedInPanes = true
-        for (const l of ['a', 'b'] as const) await guarded(ctx, typeIntoPane(l, CHECK12_PANE_STOP, true))
+        for (const l of ['a', 'b'] as const) await sendPersonaText(ctx, l, CHECK12_PANE_STOP, true)
       }
       const quiet = await waitFor(
         async () => {

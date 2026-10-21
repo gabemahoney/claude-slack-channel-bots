@@ -216,6 +216,7 @@ import {
   check12Start,
   CHECK5_PROMPT_1,
   CHECK5_PROMPT_2,
+  check7,
   check8,
   check9,
   COMPLETE_FIRST_START,
@@ -223,8 +224,8 @@ import {
   judgeLimitLines,
   rawShape,
   tagAttr,
-  typeIntoPane,
 } from '../ci-live/checks/channel-checks.ts'
+import { personaInterruptCommand, personaTextCommand, sendPersonaText } from '../ci-live/checks/agent-control.ts'
 import { DRY_RUN_IDS, liveIdsFrom, type CheckContext } from '../ci-live/checks/context.ts'
 import type { CheckPromptGuard, PromptExpectation } from '../ci-live/checks/prompt-guard.ts'
 import {
@@ -370,7 +371,7 @@ import {
 import type { ProcResult } from '../ci-live/lib/proc.ts'
 import { RESULTS_COLUMNS, renderResultsMarkdown, type RunSummary } from '../ci-live/lib/results.ts'
 import { personaName, type PersonaLetter } from '../ci-live/lib/personas.ts'
-import { MINUTE, SECOND } from '../ci-live/lib/wait.ts'
+import { MINUTE, POLL_MS, REPLY_TIMEOUT_MS, SECOND } from '../ci-live/lib/wait.ts'
 import { emptyAppsState } from '../ci-live/lib/apps-state.ts'
 import { cannedErr, errTmuxKillFailed, type StubClientOptions } from './test-helpers/agent-director-stub.ts'
 import { deliveredRecord, makeQueue, sentRecord, slackInput } from './test-helpers/delivery-queue.ts'
@@ -2279,6 +2280,7 @@ describe("Check 12: the stop bans nothing, and is lifted once coordination is qu
           events.push(`sh ${script}`)
           if (opts.fail !== undefined && script.includes(opts.fail)) throw new Error(`container: ${opts.fail} failed`)
           if (script.includes(CHECK12_PANE_STOP)) paneStopped = true
+          if (script.startsWith('agent-director status ')) return JSON.stringify({ state: 'waiting' })
           if (script === 'mark') return '1:0'
           if (script.startsWith('tags b ')) return tagFrom(A)
           if (script.startsWith('tags a ')) return tagFrom(B)
@@ -2295,7 +2297,8 @@ describe("Check 12: the stop bans nothing, and is lifted once coordination is qu
   }
 
   const liftPost = `post ${COORD} ${MENTIONS} ${CHECK12_LIFT}`
-  const paneScript = (l: 'a' | 'b', text: string, interrupt: boolean) => `sh guard || exit 90\n${typeIntoPane(l, text, interrupt)}`
+  const paneScript = (l: 'a' | 'b', text: string) => `sh guard || exit 90\n${personaTextCommand(l, text)}`
+  const interruptScript = (l: 'a' | 'b') => `sh guard || exit 90\n${personaInterruptCommand(l)}`
   const LIMIT_SEARCH = "sh since '1:0' | grep -inE 'limit|throttl|loop|too many'"
 
   test('the stop and the lift ban nothing; the lift says A and B may post in coordination again', () => {
@@ -2316,7 +2319,7 @@ describe("Check 12: the stop bans nothing, and is lifted once coordination is qu
     expect(lift!.at - stop!.at).toBeGreaterThanOrEqual(2 * MINUTE)
     expect(events.indexOf(LIMIT_SEARCH)).toBeGreaterThan(events.indexOf(`post ${COORD} ${stop!.text}`))
     expect(events.indexOf(liftPost)).toBeGreaterThan(events.indexOf(LIMIT_SEARCH))
-    expect(events.filter((e) => e.includes('tmux send-keys'))).toEqual([])
+    expect(events.filter((e) => e.includes('agent-director send-keys'))).toEqual([])
     expect(r.evidence).toContain(`the stop lifted in coordination: ${lift!.ts}`)
     assertNoLeak(r)
   })
@@ -2326,19 +2329,21 @@ describe("Check 12: the stop bans nothing, and is lifted once coordination is qu
     const r = await check12.run(ctx)
     expect([r.status, r.reason]).toEqual(['PASS', undefined])
     expect(r.notes).toContain('Check 12: the personas kept posting after the stop message; stopped in their terminals (Escape + message)')
-    const panes = events.filter((e) => e.includes('tmux send-keys'))
+    const panes = events.filter((e) => e.includes('agent-director send-keys'))
     expect(panes).toEqual([
-      paneScript('a', CHECK12_PANE_STOP, true),
-      paneScript('b', CHECK12_PANE_STOP, true),
-      paneScript('a', CHECK12_LIFT, false),
-      paneScript('b', CHECK12_LIFT, false),
+      interruptScript('a'),
+      paneScript('a', CHECK12_PANE_STOP),
+      interruptScript('b'),
+      paneScript('b', CHECK12_PANE_STOP),
+      paneScript('a', CHECK12_LIFT),
+      paneScript('b', CHECK12_LIFT),
     ])
-    expect(panes.slice(2).some((e) => e.includes('Escape'))).toBe(false)
+    expect(panes.slice(4).some((e) => e.includes('Escape'))).toBe(false)
     // The lift follows the terminal stop, the quiet wait and the limit search, and is posted before it is typed.
     const liftAt = events.indexOf(liftPost)
-    expect(liftAt).toBeGreaterThan(events.indexOf(panes[1]!))
+    expect(liftAt).toBeGreaterThan(events.indexOf(panes[3]!))
     expect(liftAt).toBeGreaterThan(events.indexOf(LIMIT_SEARCH))
-    expect(events.indexOf(panes[2]!)).toBeGreaterThan(liftAt)
+    expect(events.indexOf(panes[4]!)).toBeGreaterThan(liftAt)
   })
 
   test('a step that throws after the stop still lifts it before the error ends the check', async () => {
@@ -2382,11 +2387,111 @@ describe("Check 12: the stop bans nothing, and is lifted once coordination is qu
     expect(section).toContain(`post: "${check12Start({ coordination: '<COORDINATION_CHANNEL_ID>', aUserId: '<A_BOT_USER_ID>', bUserId: '<B_BOT_USER_ID>' })}"`)
   })
 
-  test('typeIntoPane: Escape first only when interrupting; the text is one literal word', () => {
-    expect(typeIntoPane('b', "it's over", false)).toBe(`tmux send-keys -t slack_bot_persona_b -l 'it'\\''s over'; sleep 1; tmux send-keys -t slack_bot_persona_b Enter`)
-    expect(typeIntoPane('a', 'stop', true)).toBe(
-      `tmux send-keys -t slack_bot_persona_a Escape; sleep 1; tmux send-keys -t slack_bot_persona_a -l 'stop'; sleep 1; tmux send-keys -t slack_bot_persona_a Enter`,
-    )
+  test('AD commands quote text literally and send interruption as one named key', () => {
+    expect(personaTextCommand('b', "it's over")).toBe(`agent-director send-keys --instance-id 'cscb_persona_b' --text 'it'\\''s over'`)
+    expect(personaInterruptCommand('a')).toBe("agent-director send-keys --instance-id 'cscb_persona_a' --key Escape")
+  })
+})
+
+describe('live agent control through AD (b.ou8)', () => {
+  test.each([true, false])('Check 7 keeps the recovery and Slack reply oracle (reply=%s)', async reply => {
+    const clock = virtualClock()
+    const workspace = scriptedHuman(clock, reply ? {
+      [DRY_RUN_IDS.aHome]: [{ ts: '1700000200.000001', text: 'back', user: A.userId }],
+    } : {})
+    const recovery = [
+      '[slack] Session disconnected: persona "persona_a" (key=persona_a)',
+      '[slack] Scheduling restart for persona=persona_a in 1 second',
+      '[slack] Relaunching session for persona=persona_a cwd=/test/a',
+      '[slack] Session connected: persona "persona_a" (key=persona_a)',
+    ].join('\n')
+    const { container, scripts } = fakeContainer([
+      ['mark', '1:0'],
+      ['agent-director kill', '{"kill_sent":true}'],
+      ['since', recovery],
+      ['rows', ['a', 'b', 'c'].map(l => `cscb_persona_${l} persona_${l} waiting`).join('\n')],
+    ])
+    const result = await check7.run(makeCtx({ mode: 'real', clock, human: workspace.human, container }))
+    expect(result.status).toBe(reply ? 'PASS' : 'FAIL')
+    if (!reply) expect(result.reason).toContain('A back in A-home: no answer in time')
+    expect(workspace.posts.map(p => [p.channel, p.text])).toEqual([[DRY_RUN_IDS.aHome, 'Reply with the word back.']])
+    expect(scripts.filter(script => script.includes('agent-director kill'))).toEqual(["guard || exit 90\nagent-director kill --instance-id 'cscb_persona_a'"])
+  })
+
+  test('interrupts once, polls hook state until waiting, then submits once without pane inspection', async () => {
+    const clock = virtualClock()
+    let polls = 0
+    const { container, scripts } = fakeContainer([
+      ['agent-director status', () => JSON.stringify({ state: ++polls === 1 ? 'working' : 'waiting' })],
+    ])
+    const ctx = makeCtx({ container, clock })
+    const started = clock.now()
+    await sendPersonaText(ctx, 'b', 'stop', true)
+    expect(clock.now() - started).toBe(POLL_MS)
+    expect(scripts).toEqual([
+      `guard || exit 90\n${personaInterruptCommand('b')}`,
+      "agent-director status --instance-id 'cscb_persona_b'",
+      "agent-director status --instance-id 'cscb_persona_b'",
+      `guard || exit 90\n${personaTextCommand('b', 'stop')}`,
+    ])
+  })
+
+  test.each([
+    ['status error', { code: 1, stdout: '{"state":"waiting"}' }],
+    ['malformed status', 'not-json'],
+    ['missing state', '{}'],
+    ['permission', '{"state":"check_permission"}'],
+    ['question', '{"state":"ask_user"}'],
+    ['ended', '{"state":"ended"}'],
+    ['missing', '{"state":"missing"}'],
+  ] as const)('%s never submits or reads a pane', async (_name, reply) => {
+    const { container, scripts } = fakeContainer([['agent-director status', reply]])
+    await expect(sendPersonaText(makeCtx({ container }), 'a', 'hello')).rejects.toThrow('agent-director')
+    expect(scripts).toEqual(["agent-director status --instance-id 'cscb_persona_a'"])
+  })
+
+  test.each(['pending', 'working'])('a %s row times out with no input or pending override', async state => {
+    const { container, scripts } = fakeContainer([['agent-director status', JSON.stringify({ state })]])
+    const clock = virtualClock()
+    const started = clock.now()
+    await expect(sendPersonaText(makeCtx({ container, clock }), 'a', 'hello')).rejects.toThrow('within the input deadline')
+    expect(clock.now() - started).toBe(REPLY_TIMEOUT_MS)
+    expect(scripts.every(script => script === "agent-director status --instance-id 'cscb_persona_a'")).toBe(true)
+  })
+
+  test.each([90, 1])('a refused or uncertain interruption (exit %s) is never retried and submits nothing', async code => {
+    const { container, scripts } = fakeContainer([['--key Escape', { code }]])
+    await expect(sendPersonaText(makeCtx({ container }), 'a', 'stop', true)).rejects.toThrow('interrupt refused or unconfirmed')
+    expect(scripts).toEqual([`guard || exit 90\n${personaInterruptCommand('a')}`])
+  })
+
+  test.each([90, 1])('a refused or uncertain text send (exit %s) is attempted once', async code => {
+    const { container, scripts } = fakeContainer([
+      ['agent-director status', '{"state":"waiting"}'],
+      ['agent-director send-keys', { code }],
+    ])
+    await expect(sendPersonaText(makeCtx({ container }), 'a', 'hello')).rejects.toThrow('input was not retried')
+    expect(scripts).toEqual([
+      "agent-director status --instance-id 'cscb_persona_a'",
+      `guard || exit 90\n${personaTextCommand('a', 'hello')}`,
+    ])
+  })
+
+  test.each([
+    ['guard refusal', 90, '{"kill_sent":true}'],
+    ['AD refusal', 1, '{"kill_sent":true}'],
+    ['finished-row no-op', 0, '{"kill_sent":false}'],
+    ['missing confirmation', 0, '{}'],
+    ['unusable confirmation', 0, 'not-json'],
+  ] as const)('Check 7: %s cannot pass as an injected crash', async (_name, code, stdout) => {
+    const { container, scripts } = fakeContainer([
+      ['mark', '1:0'],
+      ['agent-director kill', { code, stdout }],
+    ])
+    const result = await check7.run(makeCtx({ container }))
+    expect(result.status).toBe('FAIL')
+    expect(result.reason).toContain('agent-director did not confirm a kill sent')
+    expect(scripts).toEqual(['mark', "guard || exit 90\nagent-director kill --instance-id 'cscb_persona_a'"])
   })
 })
 
@@ -4121,7 +4226,8 @@ describe('the prompts each check declares to the prompt guard, before it raises 
       [
         '',
         (script) => {
-          if (script.includes('tmux send-keys')) events.push('type')
+          if (script.includes('agent-director send-keys')) events.push('type')
+          if (script.startsWith('agent-director status ')) return JSON.stringify({ state: 'waiting' })
           return script === 'mark' ? '1:0' : ''
         },
       ],

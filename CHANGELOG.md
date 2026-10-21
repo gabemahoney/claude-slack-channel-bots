@@ -6,6 +6,9 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 ## Unreleased
 
+- Live acceptance checks route agent input and restart faults through agent-director, with bounded state polling and confirmed kill results (b.ou8).
+- Release audits and finished-ticket sweeps follow Apiary 4.0.3 acceptance rules (b.vrx).
+
 ---
 
 ## 0.17.1 (2026-10-20)
