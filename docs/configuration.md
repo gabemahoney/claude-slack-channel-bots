@@ -22,7 +22,7 @@ A complete `config.json` in declarative mode (`allow_invited_channels` absent), 
 - `reviewer` receives only its @mentions and `@here` / `@channel` broadcasts in the shared channel. It takes DMs, and its prompts and notices go by DM to its contact `U0123456789`. It has its own Claude config directory and turns [Slack reply reminders](bots.md#slack-reply-reminders) off for itself.
 - `helpdesk` is DM-only: it is in no channel and is reached only by DM. Its prompts and notices go by DM to its contact `U0987654321`.
 
-`planner` and `helpdesk` inherit the top-level `claude_config_dir`. The server-wide settings turn on an acknowledgement reaction and set how replies are split.
+`planner` and `helpdesk` inherit the top-level `claude_config_dir`. The server-wide settings select queued/delivered reactions and reply splitting. **Custom emoji must exist in the Slack workspace before configuration**; `spinthinking` is custom. Ensure both names below are available, or choose available names; see [Acknowledgement reactions](server-settings.md#acknowledgement-reactions).
 
 ```json
 {
@@ -55,7 +55,8 @@ A complete `config.json` in declarative mode (`allow_invited_channels` absent), 
   "port": 3100,
   "session_restart_delay": 60,
   "claude_config_dir": "~/.claude-bots",
-  "ack_reaction": "eyes",
+  "queued_ack_reaction": "beehive",
+  "ack_reaction": "spinthinking",
   "reply_chunk_limit": 3000, "reply_chunk_mode": "newline"
 }
 ```

@@ -200,6 +200,9 @@ const RENAMED_POLL_INTERVAL_KEY = 'claude_director_poll_interval_ms'
 /** Default `reply_chunk_limit` (b.av2 SR-1.6): today's reply-tool default. */
 export const DEFAULT_REPLY_CHUNK_LIMIT = 4000
 
+export const DEFAULT_QUEUED_ACK_REACTION = 'beehive'
+export const DEFAULT_ACK_REACTION = 'spinthinking'
+
 /** Allowed `reply_chunk_mode` values (b.av2 SR-1.6). */
 export const REPLY_CHUNK_MODES = ['length', 'newline'] as const
 
@@ -207,11 +210,11 @@ export const REPLY_CHUNK_MODES = ['length', 'newline'] as const
 export const DEFAULT_REPLY_CHUNK_MODE: ReplyChunkMode = 'newline'
 
 /** Top-level keys that only the persona shape accepts (b.av2 SR-1.6). */
-const PERSONA_ONLY_SERVER_KEYS = ['ack_reaction', 'reply_chunk_limit', 'reply_chunk_mode'] as const
+const PERSONA_ONLY_SERVER_KEYS = ['queued_ack_reaction', 'ack_reaction', 'reply_chunk_limit', 'reply_chunk_mode'] as const
 
 /**
  * Every top-level key the persona shape accepts (b.av2 SR-1.1, SR-1.6):
- * `personas`, the shared server-wide keys and the three persona-only ones.
+ * `personas`, the shared server-wide keys and the persona-only ones.
  */
 export const PERSONA_TOP_LEVEL_KEYS: readonly string[] = [
   'personas',
@@ -507,7 +510,9 @@ export interface PersonaInput {
 export interface PersonaConfigInput extends ServerSettingsInput {
   /** Required; may be empty. */
   personas: PersonaInput[]
-  /** Emoji name of the acknowledgement reaction. Absent means no acknowledgement. */
+  /** Emoji for durably queued Slack messages. Defaults to `beehive`. */
+  queued_ack_reaction?: string
+  /** Emoji for receipt-confirmed delivery. Defaults to `spinthinking`. */
   ack_reaction?: string
   /** Largest reply chunk, in characters. Positive integer; defaults to 4000. */
   reply_chunk_limit?: number
@@ -580,17 +585,17 @@ export interface Persona {
 export interface PersonaConfig extends ServerSettings {
   /** In file order. */
   personas: Persona[]
-  /** Absent means no acknowledgement reaction. */
+  /** Startup-only acknowledgement settings, with defaults applied. */
+  queued_ack_reaction?: string
   ack_reaction?: string
   reply_chunk_limit: number
   reply_chunk_mode: ReplyChunkMode
 }
 
 /**
- * The three server-wide reply settings (b.av2 SR-1.6): the acknowledgement
- * reaction and how replies are split. They take effect at server start.
+ * Server-wide acknowledgement and reply settings. They take effect at server start.
  */
-export type ReplySettings = Pick<PersonaConfig, 'ack_reaction' | 'reply_chunk_limit' | 'reply_chunk_mode'>
+export type ReplySettings = Pick<PersonaConfig, 'queued_ack_reaction' | 'ack_reaction' | 'reply_chunk_limit' | 'reply_chunk_mode'>
 
 /**
  * The server-wide reply settings of `config` (b.av2 SR-1.6). With no
@@ -599,6 +604,7 @@ export type ReplySettings = Pick<PersonaConfig, 'ack_reaction' | 'reply_chunk_li
  */
 export function replySettingsOf(config: PersonaConfig | null | undefined): ReplySettings {
   return {
+    queued_ack_reaction: config?.queued_ack_reaction,
     ack_reaction: config?.ack_reaction,
     reply_chunk_limit: config?.reply_chunk_limit ?? DEFAULT_REPLY_CHUNK_LIMIT,
     reply_chunk_mode: config?.reply_chunk_mode ?? DEFAULT_REPLY_CHUNK_MODE,
@@ -1176,7 +1182,7 @@ type PersonaServerSettings = Omit<PersonaConfig, 'personas'>
  * resolution (not the persona path rule), with `~` expanded under `home`;
  * the crontable's default is `resolveDefaultCronTablePath` over `configDir`,
  * `home` and `env` (bug b.avm), and the cron log's sits under `configDir`.
- * Adds the persona-only `ack_reaction`, `reply_chunk_limit` and
+ * Adds the persona-only `queued_ack_reaction`, `ack_reaction`, `reply_chunk_limit` and
  * `reply_chunk_mode`. Errors name the key and the rule, never the rejected
  * value.
  */
@@ -1197,7 +1203,8 @@ function resolvePersonaServerSettings(
   const settings: PersonaServerSettings = {
     ...withDefaults,
     ...resolveServerPaths(withDefaults, home),
-    ack_reaction: input.ack_reaction,
+    queued_ack_reaction: input.queued_ack_reaction === undefined ? DEFAULT_QUEUED_ACK_REACTION : input.queued_ack_reaction,
+    ack_reaction: input.ack_reaction === undefined ? DEFAULT_ACK_REACTION : input.ack_reaction,
     reply_chunk_limit: input.reply_chunk_limit ?? DEFAULT_REPLY_CHUNK_LIMIT,
     reply_chunk_mode: input.reply_chunk_mode ?? DEFAULT_REPLY_CHUNK_MODE,
   }
@@ -1219,6 +1226,7 @@ function validatePersonaServerSettings(settings: PersonaServerSettings): void {
   checkBoolean(settings.stop_hook_bootstrap, 'stop_hook_bootstrap', style)
   checkBoolean(settings.fresh_system_prompt, 'fresh_system_prompt', style) // b.b1j SR-1
   validateServerPollAndCron(settings, style)
+  checkOptionalNonEmptyString(settings.queued_ack_reaction, 'queued_ack_reaction', style)
   checkOptionalNonEmptyString(settings.ack_reaction, 'ack_reaction', style)
   checkOptionalPositiveInteger(settings.reply_chunk_limit, 'reply_chunk_limit', style)
   checkAllowedValue(settings.reply_chunk_mode, 'reply_chunk_mode', REPLY_CHUNK_MODES, style)

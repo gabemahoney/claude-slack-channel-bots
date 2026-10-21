@@ -322,7 +322,7 @@ import {
 import { forgetFailures, isAtCap as backoffIsAtCap } from './backoff.ts'
 import { isDryRun } from './tokens.ts'
 import { checkPidConflict, writePidFile, removePidFile } from './pid.ts'
-import { createDeliveryAckCallback, consumeAck, forgetPersonaAcks } from './ack-tracker.ts'
+import { createQueuedAckCallback, createDeliveryAckCallback, consumeAck, forgetPersonaAcks } from './ack-tracker.ts'
 import {
   openArchiveDatabase,
   createPersonaArchiveWriter,
@@ -1276,12 +1276,12 @@ function getAppliedPersona(key: string): Persona | undefined {
 }
 
 /**
- * The server-wide reply settings (b.av2 SR-1.6): `ack_reaction`,
+ * The server-wide reply settings: `queued_ack_reaction`, `ack_reaction`,
  * `reply_chunk_limit` and `reply_chunk_mode`, read from `personaConfig` at
  * call time. A confirmed apply keeps their start-time values (`configInEffect`),
  * so they change only at the next start (b.av2 SR-8.6). Before main() resolves
  * the start: no reaction and the default chunking (`replySettingsOf`). The one source for the
- * inbound ack step and the `reply` tool.
+ * queued/delivered callbacks and the `reply` tool.
  */
 function getReplySettings(): ReplySettings {
   return replySettingsOf(personaConfig)
@@ -3437,7 +3437,8 @@ export async function main(): Promise<void> {
     stuckAfterMs: testTimers.deliveryStuckAfterMs,
     log: line => console.error(line),
     notify: (key, text) => personaNotifier.notify(key, text),
-    delivered: createDeliveryAckCallback({ getReaction: () => getReplySettings().ack_reaction, clientFor }),
+    queued: createQueuedAckCallback({ getReaction: () => getReplySettings().queued_ack_reaction, clientFor, queue: deliveryQueue! }),
+    delivered: createDeliveryAckCallback({ getReaction: () => getReplySettings().ack_reaction, clientFor, queue: deliveryQueue! }),
   })
   for (const event of bufferedQueueEvents.splice(0)) deliveryReporting.queueEvent(event)
   deliveryReporting.startupFindings(deliveryQueue!.startupFindings())
@@ -3552,6 +3553,9 @@ export async function main(): Promise<void> {
     onStatus: composePersonaStatusListeners(
       createPersonaUpFlushListener(personaNotifier),
       (key, status) => bringUps?.onConnectionStatus(key, status),
+      // Apply recovery precedes teardown/bring-up. Restore retained feedback
+      // with the usable client, on initial success and background retry alike.
+      (key, status) => { if (status.state === 'up') deliveryReporting?.reconcileQueued(key) },
     ),
   })
   connections = manager

@@ -76,6 +76,7 @@ export interface DeliveryReportingDeps {
   state(key: string): DeliveryReportState
   log(line: string): void
   notify(key: string, text: string): void | Promise<unknown>
+  queued?(key: string, item: QueueItem): void | Promise<void>
   delivered?(key: string, item: QueueItem): void | Promise<void>
   stuckAfterMs?: number
   now?: () => number
@@ -95,8 +96,22 @@ export function createDeliveryReporting(deps: DeliveryReportingDeps) {
   }
   function receivedItem(key: string, item: QueueItem): void {
     const id = `${key}:${item.accepted.seq}`
-    if (received.has(id)) return
-    received.add(id); log(MESSAGE_RECEIVED, key, deliveryIdentity(item.accepted))
+    if (!received.has(id)) {
+      received.add(id); log(MESSAGE_RECEIVED, key, deliveryIdentity(item.accepted))
+    }
+    // Log lifetime is the server run; reaction lifetime is one persona life.
+    // The tracker deduplicates successful stages and permits restoration/retry.
+    if (item.accepted.source === 'slack' && !item.delivered) protect(() => deps.queued?.(key, item))
+  }
+  function reconcileQueued(key: string): void {
+    if (!deps.persona(key) || !deps.state(key).up) return
+    // One pass when the current life becomes usable, detached from Slack and
+    // delivery. Unreported intake still belongs to its normal post-ack path.
+    for (const item of deps.queue.items(key)) {
+      if (received.has(`${key}:${item.accepted.seq}`) && item.accepted.source === 'slack' && !item.delivered) {
+        protect(() => deps.queued?.(key, item))
+      }
+    }
   }
   function queueEvent(event: QueueEvent): void {
     const key = event.key
@@ -175,5 +190,5 @@ export function createDeliveryReporting(deps: DeliveryReportingDeps) {
     if (begun === 'begun') log(DELIVERY_STUCK, key, identity, `reason=${reason} age_ms=${status.ageMs}`)
     deps.episodes.post(key, 'delivery-stuck', buildDeliveryStuckNotice(ref(key), key, status.count, status.ageMs, reason, status.retypeCount + 1))
   }
-  return { received: (key: string, item: QueueItem) => protect(() => receivedItem(key, item)), queueEvent: (event: QueueEvent) => protect(() => queueEvent(event)), engineEvent: (event: DeliveryEngineEvent) => protect(() => engineEvent(event)), startupFindings, forget(key: string) { failures.delete(key); unwritable.delete(key); heads.delete(key) } }
+  return { received: (key: string, item: QueueItem) => protect(() => receivedItem(key, item)), reconcileQueued: (key: string) => protect(() => reconcileQueued(key)), queueEvent: (event: QueueEvent) => protect(() => queueEvent(event)), engineEvent: (event: DeliveryEngineEvent) => protect(() => engineEvent(event)), startupFindings, forget(key: string) { failures.delete(key); unwritable.delete(key); heads.delete(key) } }
 }

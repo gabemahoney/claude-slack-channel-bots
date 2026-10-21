@@ -1,6 +1,7 @@
 /** Durable Slack intake and existing message-triggered recovery (b.omv SR-4.1/4.2). */
 import {
   CHANNEL_ID_RE,
+  DEFAULT_QUEUED_ACK_REACTION,
   channelModeOf,
   type ChannelMode,
   type Persona,
@@ -66,7 +67,7 @@ export type SlackAck = () => Promise<void> | void
  * delay, and the `allow_invited_channels` switch, read through
  * `channelModeOf` at each event (b.deo SRI-201).
  */
-export type PersonaRoutingConfig = Pick<PersonaConfig, 'personas' | 'session_restart_delay' | 'allow_invited_channels'>
+export type PersonaRoutingConfig = Pick<PersonaConfig, 'personas' | 'session_restart_delay' | 'allow_invited_channels'> & Partial<Pick<PersonaConfig, 'queued_ack_reaction'>>
 
 /** Dependencies injected into `createPersonaRouting`. */
 export interface PersonaRoutingDeps {
@@ -81,6 +82,8 @@ export interface PersonaRoutingDeps {
   queue: Pick<DeliveryQueue, 'accept' | 'lookupSlackKey'>
   /** Fix stored text after the envelope ack; E3's wake follows durable fixation. */
   prepare(key: string, item: QueueItem): Promise<void>
+  /** Durable retained acceptance: after envelope ack, or after partial-fanout
+   * failure suppresses it. Reporting must not await Slack or authorize delivery. */
   onReceived?(key: string, item: QueueItem): void
   /** Fire-and-forget archive, before the decision, with no pre-ack await. */
   archive(key: string, event: unknown): void
@@ -253,6 +256,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
     isExtSharedChannel?: unknown,
   ): Promise<void> {
     const afterAck: Array<() => Promise<void>> = []
+    const accepted: Array<() => void> = []
     let storeFailed = false
     if (typeof event === 'object' && event !== null) {
       const keys = typeof personaKeys === 'string' ? [personaKeys] : personaKeys
@@ -270,6 +274,9 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
           // A retry after partial fanout must prepare the already retained, unfixed target too.
           const duplicate = slackKey ? deps.queue.lookupSlackKey(key, slackKey) : undefined
           const persona = config?.personas.find(p => p.key === key)
+          const report = (item: QueueItem) => accepted.push(() => {
+            try { void Promise.resolve(deps.onReceived?.(key, item)).catch(() => {}) } catch { /* reporting cannot prevent preparation */ }
+          })
           const post = (item: QueueItem) => async () => {
             const posted = postAcked.get(key) ?? new Set<number>()
             if (posted.has(item.accepted.seq)) return
@@ -277,13 +284,15 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
             // retry here, but concurrent/redelivered copies recover just once.
             posted.add(item.accepted.seq)
             postAcked.set(key, posted)
-            try { void Promise.resolve(deps.onReceived?.(key, item)).catch(() => {}) } catch { /* reporting cannot prevent preparation */ }
             const session = getSessionByPersona(key)
             if (persona && config && (!session || !session.connected)) await handleLostMessage(persona, persona.working_directory, config)
             await deps.prepare(key, item)
           }
           if (duplicate && duplicate.status !== 'failed') {
-            if (duplicate.item && !duplicate.item.fixed && !duplicate.item.delivered) afterAck.push(post(duplicate.item))
+            if (duplicate.item && !duplicate.item.fixed && !duplicate.item.delivered) {
+              report(duplicate.item)
+              afterAck.push(post(duplicate.item))
+            }
             return
           }
           if (!config || !persona) return
@@ -302,6 +311,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
           })) : undefined
           const input: AcceptedInput = {
             source: 'slack', key: slackKey, channel: slackKey.chat_id, ts: slackKey.ts,
+            queued_ack_reaction: config.queued_ack_reaction ?? DEFAULT_QUEUED_ACK_REACTION,
             channel_type: stringField('channel_type'), thread_ts: stringField('thread_ts'), edited_ts: slackKey.edited_ts,
             user: stringField('user'), bot_id: stringField('bot_id'), username: stringField('username'),
             bot_profile_name: typeof profile === 'object' && profile !== null && 'name' in profile && typeof profile.name === 'string' ? profile.name : undefined,
@@ -310,7 +320,7 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
           try {
             const result = await deps.queue.accept(key, input)
             if (result.status === 'failed') { storeFailed = true; return }
-            if (result.item && !result.item.delivered) afterAck.push(post(result.item))
+            if (result.item && !result.item.delivered) { report(result.item); afterAck.push(post(result.item)) }
           } catch { storeFailed = true }
         } catch (err) {
           // Decision/routing failures keep the historical ack behavior (SR-4.1).
@@ -318,8 +328,11 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
         }
       }))
     }
-    if (storeFailed) return
+    // A failed sibling suppresses the aggregate ack, but retained targets still
+    // deserve queued feedback. Preparation/recovery continue only after ack.
+    if (storeFailed) { for (const report of accepted) report(); return }
     try { await ack() } catch (err) { deps.log(`[slack] persona-routing: failed to ack event${describeSlackCallFailure(err)}`) }
+    for (const report of accepted) report()
     await Promise.all(afterAck.map(async work => {
       try { await work() } catch (err) { deps.log(`[slack] persona-routing: post-accept preparation failed${describeSlackCallFailure(err)}`) }
     }))

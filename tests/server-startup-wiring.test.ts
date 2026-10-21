@@ -14,6 +14,12 @@ import type * as AdStartupModule from '../src/agent-director-startup.ts'
 import type { runAgentDirectorStartupGate, StartupGateOptions } from '../src/agent-director-startup.ts'
 import type * as ChannelDeliveryModule from '../src/channel-delivery.ts'
 import type { PersonaConfig } from '../src/config.ts'
+import { _resetAckTracker, createQueuedAckCallback, forgetPersonaAcks } from '../src/ack-tracker.ts'
+import { createDeliveryPreparation } from '../src/delivery-intake.ts'
+import { createDeliveryReporting, MESSAGE_RECEIVED } from '../src/delivery-notices.ts'
+import { createPersonaBringUpController } from '../src/persona-bringup-controller.ts'
+import { composePersonaStatusListeners, createPersonaUpFlushListener } from '../src/persona-start.ts'
+import { configInEffect } from '../src/reload.ts'
 import type * as ConflictLatchModule from '../src/conflict-latch.ts'
 import type { ConflictLatch, ConflictLatchDeps, ConflictLatchHolds, LatchRecheckController } from '../src/conflict-latch.ts'
 import type { HealthCheckDeps } from '../src/health-check.ts'
@@ -65,6 +71,11 @@ import type { SlowRecoveryTracker, SlowRecoveryTrackerDeps } from '../src/slow-r
 import type * as UnavailableRetryModule from '../src/unavailable-retry.ts'
 import type { FullModeRetryDeps, RetryRunGateDeps, UnavailableRetryController, UnavailableRetryDeps } from '../src/unavailable-retry.ts'
 import { makeStubCallLog } from './test-helpers/agent-director-stub.ts'
+import { assertNoLeak } from './test-helpers/credentials.ts'
+import { makeEngineHarness } from './test-helpers/delivery-engine.ts'
+import { makeDeliveryNoticeHarness } from './test-helpers/delivery-notices.ts'
+import { slackInput } from './test-helpers/delivery-queue.ts'
+import { makeConnectionHarness } from './test-helpers/persona-connection-harness.ts'
 import { runInFakeHome } from './test-helpers/fake-home-subprocess.ts'
 import {
   atMainTopLevel,
@@ -1633,7 +1644,7 @@ describe('startupSessionManager runs the SR-6.1 bring-up over the loaded persona
 // ---------------------------------------------------------------------------
 
 describe('server.ts wires the persona connection seams (SR-3.1, SR-3.4, SR-4.1, SR-7.2)', () => {
-  test('the connection manager takes dry run from isDryRun() and, on each status, flushes on up the notifier every persona notice goes through and tells the bring-up controller', () => {
+  test('the connection manager takes dry run from isDryRun() and, on each status, flushes on up the notifier every persona notice goes through, tells the bring-up controller and reconciles queued feedback on up', () => {
     const notifier = constOf('createPersonaNotifier')
     // The notices' notifier: the session manager's sink and the outage state's
     // notify. The outage notify passes its options through, so the notifier
@@ -1649,13 +1660,15 @@ describe('server.ts wires the persona connection seams (SR-3.1, SR-3.4, SR-4.1, 
     expect(props.get('dryRun')).toBe('isDryRun()')
     expect(props.get('onStatus')).toStartWith('composePersonaStatusListeners(')
     const listeners = onlyCallArgs('composePersonaStatusListeners')
-    expect(listeners).toHaveLength(2)
+    expect(listeners).toHaveLength(3)
     expect(listeners[0]).toBe(`createPersonaUpFlushListener(${notifier})`)
     // The controller is built after (and over) the manager, so the listener
     // reaches it through the module-scope holder, never the local const (which
     // would be in its temporal dead zone when the manager is built).
     expect(listeners[1]).toMatch(/^\((\w+), (\w+)\) => bringUps\?\.onConnectionStatus\(\1, \2\)$/)
     expect(listeners[1]).not.toContain(constOf('createPersonaBringUpController'))
+    // Resolve reporting on the up notification, when the current client is usable.
+    expect(listeners[2]).toMatch(/^\((\w+), (\w+)\) => \{ if \(\2\.state === 'up'\) deliveryReporting\?\.reconcileQueued\(\1\) \}$/)
   })
 
   test('the Slack API base URL override (E14 Task 4): resolved once, inside main(), from process.env with the manager’s log, before the manager is built, and passed to it as slackApiUrl', () => {
@@ -5577,13 +5590,126 @@ describe('typed delivery reporting production wiring', () => {
     expect(life.has('onReconnectScreen')).toBe(false)
     expect(onlyCallProps('createDeliveryReporting').has('reconnectBlocked')).toBe(false)
   })
-  test('durable completion adds configured reactions through the persona own client and pairs its remover', () => {
-    const effect = onlyCallProps('createDeliveryReporting').get('delivered')!
-    expect(effect).toBe('createDeliveryAckCallback({ getReaction: () => getReplySettings().ack_reaction, clientFor })')
-    expect(callsOf('createDeliveryAckCallback')).toHaveLength(1)
-    const adapter = onlyCallProps('createDeliveryAckCallback')
-    expect(adapter.get('getReaction')).toBe('() => getReplySettings().ack_reaction')
+  test.each([
+    ['queued', 'createQueuedAckCallback', 'queued_ack_reaction'],
+    ['delivered', 'createDeliveryAckCallback', 'ack_reaction'],
+  ])('b.p3h: %s reporting uses its configured reaction and the persona client', (stage, factory, setting) => {
+    const effect = onlyCallProps('createDeliveryReporting').get(stage)!
+    expect(effect).toBe(`${factory}({ getReaction: () => getReplySettings().${setting}, clientFor, queue: deliveryQueue! })`)
+    expect(callsOf(factory)).toHaveLength(1)
+    expect(importSource(SERVER_CODE, factory)).toBe('./ack-tracker.ts')
+    const adapter = onlyCallProps(factory)
+    expect(adapter.get('getReaction')).toBe(`() => getReplySettings().${setting}`)
     expect(adapter.get('clientFor')).toBe('clientFor')
+    expect(adapter.get('queue')).toBe('deliveryQueue!')
     expect(effect).not.toContain('consumeAck(')
+  })
+})
+
+describe('b.p3h production bring-up reaction recovery', () => {
+  /** Run only the actual dependency expression, never server main or a copy of
+   * its listeners. Bind all effects to the in-process fixtures below. */
+  function expression<T>(code: string, bindings: Record<string, unknown>): T {
+    const js = ts.transpileModule(`const callback = (${code});`, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText
+    return new Function(...Object.keys(bindings), `${js}\nreturn callback;`)(...Object.values(bindings)) as T
+  }
+
+  test.each(['remove/re-add', 'destructive modification', 'startup retry'] as const)('%s restores retained queued feedback on actual client bring-up, without an extra manual recovery', async path => {
+    _resetAckTracker()
+    const e = await makeEngineHarness()
+    e.p().row.state = 'working'
+    const n = await makeDeliveryNoticeHarness({ queue: e.queue })
+    const conn = makeConnectionHarness([{ name: 'alpha' }], e.root, {
+      files: true, stubOptions: { alpha: path === 'startup retry' ? { authTest: [{ kind: 'network' }] } : {} },
+    })
+    const persona = conn.p('alpha'), config = conn.config!, stub = conn.stub(persona)
+    const queuedName = config.queued_ack_reaction!
+    const launches: string[] = []
+    const controller = createPersonaBringUpController({
+      connections: conn.manager, clock: conn.clock, dryRun: false,
+      checkConfigDir: () => ({ ok: true }), appliedPersonas: () => conn.personas,
+      launch: expression(onlyCallProps('createPersonaBringUpController').get('launch')!, {
+        personaConfig: config, appliedConfig: config,
+        spawnForPersona: async (p: typeof persona) => { launches.push(p.key) },
+      }),
+      log: line => conn.lines.push(line),
+    })
+    const reporting = createDeliveryReporting({
+      queue: e.queue, episodes: n.rig.episodes, persona: conn.getPersona,
+      state: key => ({ up: controller.isUp(key) }), log: line => n.logs.push(line),
+      notify: (key, text) => n.h.notifier.notify(key, text),
+      queued: createQueuedAckCallback({ queue: e.queue, getReaction: () => config.queued_ack_reaction, clientFor: conn.clientFor }),
+    })
+    const preparation = createDeliveryPreparation({
+      queue: e.queue, clock: conn.clock, clientFor: conn.clientFor, resolveUserName: async (_key, user) => user,
+      onReceived: (key, item) => reporting.received(key, item), wake: key => e.engine.wake(key),
+    })
+    const bindings = {
+      composePersonaStatusListeners, createPersonaUpFlushListener, personaNotifier: n.h.notifier, bringUps: controller,
+      deliveryPreparation: preparation, deliveryReporting: reporting, clientFor: conn.clientFor,
+      personaConfig: config, appliedConfig: config, configInEffect,
+    }
+    conn.onStatus = expression(onlyCallProps('createPersonaConnectionManager').get('onStatus')!, bindings)
+    const onApplied = expression<(config: PersonaConfig) => void>(onlyCallProps('createReloadController').get('onApplied')!, bindings)
+    const settle = async () => { await conn.clock.flush(); await e.clock.flush() }
+    const teardown = async () => {
+      controller.cancel(persona.key)
+      await conn.manager.stop(persona.key)
+      reporting.forget(persona.key); preparation.forget(persona.key); forgetPersonaAcks(persona.key)
+      await settle()
+    }
+    try {
+      const accepted = await e.queue.accept(persona.key, slackInput({ queued_ack_reaction: config.queued_ack_reaction }))
+      if (accepted.status === 'failed') throw new Error('store failed')
+      await e.queue.append(persona.key, { v: 1, kind: 'fixed', seq: accepted.seq, parts: ['retained fixed input'] })
+      await controller.bringUp(persona, conn.personas)
+      // The server's end-of-startup recovery is allowed once. Subsequent
+      // recovery must be triggered by the actual production callbacks.
+      await preparation.recover()
+      await settle()
+      if (path === 'startup retry') {
+        expect(conn.clientFor(persona.key)).toBeUndefined()
+        expect(stub.calls.reactionsAdd).toEqual([])
+        await conn.clock.runNext()
+      } else {
+        expect(stub.calls.reactionsAdd.map(call => call.name)).toEqual([queuedName])
+        if (path === 'destructive modification') { onApplied(config); await settle() }
+        await teardown()
+        expect(conn.clientFor(persona.key)).toBeUndefined()
+        if (path === 'remove/re-add') { onApplied(config); await settle() }
+        expect(stub.calls.reactionsRemove.map(call => call.name)).toEqual([queuedName])
+        await controller.bringUp(persona, conn.personas)
+      }
+      expect(conn.manager.status(persona.key)?.state).toBe('up')
+      expect(controller.isUp(persona.key)).toBe(true)
+      expect(conn.clientFor(persona.key)).toBeDefined()
+      if (path === 'startup retry') expect(launches).toEqual([persona.key])
+      const expectedAdds = path === 'startup retry' ? 1 : 2
+      for (let turn = 0; turn < 20 && stub.calls.reactionsAdd.length < expectedAdds; turn++) await settle()
+      await e.tick()
+      expect(e.keyCalls()).toEqual([])
+      expect(e.queue.openCount(persona.key)).toBe(1)
+      expect(e.queue.item(persona.key, accepted.seq)!.fixed!.parts).toEqual(['retained fixed input'])
+      expect(n.logs.filter(line => line.includes(MESSAGE_RECEIVED))).toHaveLength(1)
+      const visible = new Set<string>()
+      for (const call of stub.callLog) {
+        if (call.method !== 'reactions.add' && call.method !== 'reactions.remove') continue
+        const args = call.args
+        if (typeof args !== 'object' || args === null || !('name' in args) || typeof args.name !== 'string') throw new Error('invalid reaction call')
+        if (call.method === 'reactions.add') visible.add(args.name)
+        else visible.delete(args.name)
+        expect(visible.size).toBeLessThanOrEqual(1)
+      }
+      expect({ adds: stub.calls.reactionsAdd.map(call => call.name), visible: [...visible] }).toEqual({
+        adds: Array(expectedAdds).fill(queuedName), visible: [queuedName],
+      })
+    } finally {
+      controller.cancelAll()
+      await conn.manager.stopAll()
+      await preparation.stop()
+      expect(conn.clock.pendingCount()).toBe(0)
+      assertNoLeak({ lines: conn.lines, logs: n.logs, calls: stub.callLog })
+      await n.cleanup(); await e.cleanup(); _resetAckTracker()
+    }
   })
 })

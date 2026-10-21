@@ -472,10 +472,18 @@ it (Step 10). Then ask whether to add another persona.
 
 ### Step 6 — Server-wide settings (optional)
 
-Only if the operator asks, set top-level settings such as `ack_reaction`,
+Only if the operator asks, set top-level settings such as `queued_ack_reaction`, `ack_reaction`,
 `reply_chunk_limit`, `reply_chunk_mode`, `port` or `session_restart_delay`.
 `docs/server-settings.md`'s `## Server-wide settings` table lists each field, its type and
 default. Write only the fields the operator sets.
+
+Before starting, check that the selected acknowledgement emoji names are available
+in each persona's Slack workspace, including when using the defaults: queued
+`beehive`, delivered `spinthinking`. **Custom emoji must exist in the Slack
+workspace before configuring them.** `spinthinking` is custom. If a name is
+unavailable, have the operator add it in Slack or choose an available name.
+Both settings require a server start after confirmation; see
+[Acknowledgement reactions](../../docs/server-settings.md#acknowledgement-reactions).
 
 The channel-mode switch, `allow_invited_channels`, is a server-wide setting
 too, but it is set only in Step 4, which collects every persona's section and

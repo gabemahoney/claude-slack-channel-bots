@@ -449,16 +449,16 @@ retain their existing text excerpts; receipt confirmation has its own line.
 ### `message-received`
 
 - **Line:** `[slack] message-received: persona="<name>" (key=<key>) source=<source> chat_id="<chat>" ts="<ts>" sender_id="<sender>"`
-- **Meaning:** The item was stored and acknowledged to its source. It remains queued until its transcript confirms delivery.
+- **Meaning:** The item was durably stored. It remains queued until its transcript confirms delivery; a failed sibling store can still withhold the aggregate Slack envelope acknowledgement.
 - **Cause:** An incoming Slack message, injected message or scheduled fire was accepted. Injected sources show sender instead of chat_id.
-- **Fix:** No action is needed. Find the corresponding message-delivered line to confirm take-in.
+- **Fix:** No action is needed. Accepted Slack work requests `queued_ack_reaction` (default `beehive`); find the corresponding message-delivered line to confirm take-in. See [Acknowledgement reaction missing or stuck](#symptom-acknowledgement-reaction-missing-or-stuck) if feedback is absent.
 
 ### `message-delivered`
 
 - **Line:** `[slack] message-delivered: persona="<name>" (key=<key>) source=<source> chat_id="<chat>" ts="<ts>" sender_id="<sender>" at=<time> wait_ms=<ms>`
 - **Meaning:** All parts have transcript receipts and the final delivery record is durable. The next item can proceed.
 - **Cause:** The bot took in the typed message; a successful typing call alone does not produce this line.
-- **Fix:** No action is needed. A configured acknowledgement reaction is added through this persona only, unless it already replied.
+- **Fix:** No action is needed. For Slack work, this persona removes its original queued reaction before adding `ack_reaction` (default `spinthinking`), unless a tracked successful reply suppresses it. A failed queued removal can leave queued visible even after delivery; see [Acknowledgement reaction missing or stuck](#symptom-acknowledgement-reaction-missing-or-stuck).
 
 ### `message-retyped`
 
@@ -6968,6 +6968,27 @@ See the `Session connected with CWD "<path>" — no matching persona` and `Sessi
 ### Symptom: A persona doesn't come up or doesn't answer
 
 See [Triage](#triage), [Reading a persona line](#reading-a-persona-line), the [persona diagnostic classes](#persona-diagnostic-classes) and [A persona is down but its instance is still running](#a-persona-is-down-but-its-instance-is-still-running).
+
+### Symptom: Acknowledgement reaction missing or stuck
+
+**Custom emoji must exist in the Slack workspace before you configure them.**
+`spinthinking` is custom. Check both selected names in each persona's workspace;
+the defaults are queued `beehive` and delivered `spinthinking`. Both settings
+require a server start after a confirmed change; see
+[Acknowledgement reactions](../../docs/server-settings.md#acknowledgement-reactions).
+
+Slack reaction failures do not block message delivery or reply content. Failed
+queued removal keeps the delivered stage from being added beside it, so use
+`message-delivered` to confirm delivery rather than the visible emoji. A failed
+reply cleanup can also leave a reaction behind; there is no guaranteed reaction
+retry loop.
+
+Outstanding work retains its original queued name across restart/config changes.
+Recovery and a persona becoming up after reconnect or re-add can restore queued
+feedback with that name; they do not repeat its received log in the same server
+run. Early-reply suppression lasts 24 hours and pending/completed tracking 30 days
+in memory; restart loses reply suppression, so an already answered retained
+message can acquire a reaction again.
 
 ### Symptom: A persona's instance waits at a startup prompt
 

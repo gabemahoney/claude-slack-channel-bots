@@ -849,14 +849,14 @@ describe('AC 61: server-wide settings keep their start-time values after a confi
   // except the allow_invited_channels switch, the one server-wide setting
   // applied in place (b.av2 SR-8.6, b.deo SRI-201).
   // The acknowledgement reaction and the reply chunk settings reach their
-  // consumers (the routing's ack step and the reply tool) through the one
+  // consumers (the two stage callbacks and the reply tool) through the one
   // accessor getReplySettings, which reads the same holder at call time
   // (pinned by the last tests of this block).
   test('configInEffect takes the confirmed persona set and allow_invited_channels switch and keeps every other server-wide setting of the start-time config', () => {
     const startTime = makePersonaConfig({ claude_config_dir: '/start/claude' }, '/start-base')
     const persona = startTime.personas[0]!
     // Every server-wide setting changed (the switch turned on among them), one
-    // added (ack_reaction) and one dropped (claude_config_dir), and the
+    // added (append_system_prompt_file) and one dropped (claude_config_dir), and the
     // persona set replaced.
     const applied = makePersonaConfig(
       {
@@ -874,6 +874,8 @@ describe('AC 61: server-wide settings keep their start-time values after a confi
         fresh_system_prompt: false, // b.b1j SR-1.3: the start's true is kept
         agent_director_poll_interval_ms: 12_345,
         agent_director_call_timeout_ms: MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
+        append_system_prompt_file: '/applied/prompt.md',
+        queued_ack_reaction: 'hourglass',
         ack_reaction: 'eyes',
         reply_chunk_limit: 1000,
         reply_chunk_mode: 'length',
@@ -897,7 +899,7 @@ describe('AC 61: server-wide settings keep their start-time values after a confi
       expect([key, inEffect[key as keyof typeof inEffect]]).toEqual([key, from[key as keyof typeof from]])
     }
     // A setting the start did not have stays absent until the next start.
-    expect('ack_reaction' in inEffect).toBe(false)
+    expect('append_system_prompt_file' in inEffect).toBe(false)
     // The confirmed persona set itself, each persona's resolved (inherited)
     // values included.
     expect(inEffect.personas).toBe(applied.personas)
@@ -937,15 +939,15 @@ describe('AC 61: server-wide settings keep their start-time values after a confi
     ['the MCP session tools (the reply tool\'s chunking and ack removal)', () => constObjectProps('sessionToolDeps')],
   ])('%s get getReplySettings: getReplySettings, the one accessor', (_consumer, props) => {
     expect(props().get('getReplySettings')).toBe('getReplySettings')
-    // Nothing in server.ts calls it (a value read once and handed on): the
-    // only `getReplySettings(` is its declaration.
+    // Only the two lazy reaction callbacks call the accessor in server.ts;
+    // the session tools receive the accessor itself.
     const reads = anyCallOf('getReplySettings')
     const declaration = indicesOf(/(?<=\bfunction\s+)getReplySettings\s*\(/g, SERVER_CODE)
-    expect(reads).toHaveLength(declaration.length + 1)
+    expect(reads).toHaveLength(declaration.length + 2)
     const reporting = callsOf(SERVER_CODE, 'createDeliveryReporting')[0]!
     const [open, close] = balancedAfter(SERVER_CODE, reporting, '(', ')')
-    expect(reads.filter(at => at > open && at < close)).toHaveLength(1)
-    expect(anyCallOf('getReplySettings')).toHaveLength(2)
+    expect(reads.filter(at => at > open && at < close)).toHaveLength(2)
+    expect(anyCallOf('getReplySettings')).toHaveLength(3)
   })
 
   test('getReplySettings, declared once at module scope, is exactly `return replySettingsOf(<applied config holder>)`, with config.ts\'s replySettingsOf', () => {
@@ -959,7 +961,7 @@ describe('AC 61: server-wide settings keep their start-time values after a confi
     expect(SERVER_CODE.slice(paramsEnd + 1, bodyStart - 1).replace(/\s+/g, ' ').trim()).toBe(': ReplySettings')
     // The whole body: the holder onApplied swaps (read at call time), never
     // the reload controller's applied config, a copy taken at start or a
-    // hand-written merge of the three keys.
+    // hand-written merge of the four keys.
     const holder = loadedConfigName(SERVER_CODE)
     expect(SERVER_CODE.slice(bodyStart, bodyEnd).replace(/\s+/g, ' ').trim()).toMatch(
       new RegExp(`^return replySettingsOf\\s*\\(\\s*${holder}\\s*\\)\\s*;?$`),
@@ -969,12 +971,12 @@ describe('AC 61: server-wide settings keep their start-time values after a confi
     expect(indicesOf(/\b(?:function|let|const|var)\s+replySettingsOf\b/g, SERVER_CODE)).toEqual([])
   })
 
-  test('replySettingsOf over the holder after a confirmed apply that changes ack_reaction, reply_chunk_limit and reply_chunk_mode yields the start-time values', () => {
-    const startTime = makePersonaConfig({ ack_reaction: 'eyes', reply_chunk_limit: 2000, reply_chunk_mode: 'length' }, '/start-base')
-    const applied = makePersonaConfig({ ack_reaction: 'thumbsup', reply_chunk_limit: 1000, reply_chunk_mode: 'newline' }, '/applied-base')
-    const startValues: ReplySettings = { ack_reaction: 'eyes', reply_chunk_limit: 2000, reply_chunk_mode: 'length' }
-    // The fixture changes all three.
-    expect(replySettingsOf(applied)).toEqual({ ack_reaction: 'thumbsup', reply_chunk_limit: 1000, reply_chunk_mode: 'newline' })
+  test('replySettingsOf over the holder after a confirmed apply that changes both reaction settings and both chunk settings yields the start-time values', () => {
+    const startTime = makePersonaConfig({ queued_ack_reaction: 'hourglass', ack_reaction: 'eyes', reply_chunk_limit: 2000, reply_chunk_mode: 'length' }, '/start-base')
+    const applied = makePersonaConfig({ queued_ack_reaction: 'bee', ack_reaction: 'thumbsup', reply_chunk_limit: 1000, reply_chunk_mode: 'newline' }, '/applied-base')
+    const startValues: ReplySettings = { queued_ack_reaction: 'hourglass', ack_reaction: 'eyes', reply_chunk_limit: 2000, reply_chunk_mode: 'length' }
+    // The fixture changes all four.
+    expect(replySettingsOf(applied)).toEqual({ queued_ack_reaction: 'bee', ack_reaction: 'thumbsup', reply_chunk_limit: 1000, reply_chunk_mode: 'newline' })
 
     // onApplied's `<holder> = configInEffect(<start-time>, <confirmed>)` (pinned above).
     const inEffect = configInEffect(startTime, applied)
@@ -982,14 +984,15 @@ describe('AC 61: server-wide settings keep their start-time values after a confi
     expect(replySettingsOf(inEffect)).toEqual(startValues)
   })
 
-  test('replySettingsOf over the holder after a confirmed apply that adds an ack_reaction the start had none of yields no reaction and the start\'s chunking', () => {
+  test('replySettingsOf retains default reactions and chunking after a confirmed change', () => {
     const startTime = makePersonaConfig({}, '/start-base')
-    const applied = makePersonaConfig({ ack_reaction: 'eyes', reply_chunk_limit: 1000, reply_chunk_mode: 'length' }, '/applied-base')
+    const applied = makePersonaConfig({ queued_ack_reaction: 'hourglass', ack_reaction: 'eyes', reply_chunk_limit: 1000, reply_chunk_mode: 'length' }, '/applied-base')
 
     const settings = replySettingsOf(configInEffect(startTime, applied))
 
-    expect(settings.ack_reaction).toBeUndefined()
-    expect(settings).toEqual({ ack_reaction: undefined, reply_chunk_limit: startTime.reply_chunk_limit, reply_chunk_mode: startTime.reply_chunk_mode })
+    expect(settings).toEqual(replySettingsOf(startTime))
+    expect(settings.queued_ack_reaction).not.toBe(applied.queued_ack_reaction)
+    expect(settings.ack_reaction).not.toBe(applied.ack_reaction)
     expect([settings.reply_chunk_limit, settings.reply_chunk_mode]).not.toEqual([1000, 'length'])
   })
 })
@@ -999,7 +1002,7 @@ describe('AC 61: server-wide settings keep their start-time values after a confi
 // ---------------------------------------------------------------------------
 
 describe('replySettingsOf (b.av2 SR-1.6)', () => {
-  const DEFAULTS: ReplySettings = { ack_reaction: undefined, reply_chunk_limit: DEFAULT_REPLY_CHUNK_LIMIT, reply_chunk_mode: DEFAULT_REPLY_CHUNK_MODE }
+  const DEFAULTS: ReplySettings = { queued_ack_reaction: undefined, ack_reaction: undefined, reply_chunk_limit: DEFAULT_REPLY_CHUNK_LIMIT, reply_chunk_mode: DEFAULT_REPLY_CHUNK_MODE }
 
   test.each([
     ['null (before the start resolves)', null],
@@ -1011,31 +1014,31 @@ describe('replySettingsOf (b.av2 SR-1.6)', () => {
     expect(settings.ack_reaction).toBeUndefined()
   })
 
-  test('a config with all three keys: exactly its three values, and the config is not changed', () => {
-    const config = makePersonaConfig({ ack_reaction: 'eyes', reply_chunk_limit: 1234, reply_chunk_mode: 'length' }, '/base')
+  test('a config with all four keys: exactly its four values, and the config is not changed', () => {
+    const config = makePersonaConfig({ queued_ack_reaction: 'hourglass', ack_reaction: 'eyes', reply_chunk_limit: 1234, reply_chunk_mode: 'length' }, '/base')
     // Not the defaults, so a default can't stand in for a value read.
     expect([config.reply_chunk_limit, config.reply_chunk_mode]).not.toEqual([DEFAULT_REPLY_CHUNK_LIMIT, DEFAULT_REPLY_CHUNK_MODE])
     const before = structuredClone(config)
 
     const settings = replySettingsOf(config)
 
-    expect(settings).toEqual({ ack_reaction: 'eyes', reply_chunk_limit: 1234, reply_chunk_mode: 'length' })
-    expect(Object.keys(settings).sort()).toEqual(['ack_reaction', 'reply_chunk_limit', 'reply_chunk_mode'])
+    expect(settings).toEqual({ queued_ack_reaction: 'hourglass', ack_reaction: 'eyes', reply_chunk_limit: 1234, reply_chunk_mode: 'length' })
+    expect(Object.keys(settings).sort()).toEqual(['ack_reaction', 'queued_ack_reaction', 'reply_chunk_limit', 'reply_chunk_mode'])
     expect(config).toEqual(before)
   })
 
-  test('a config missing all three keys: no reaction and the default chunking', () => {
-    const { ack_reaction: _a, reply_chunk_limit: _l, reply_chunk_mode: _m, ...rest } = makePersonaConfig({}, '/base')
+  test('a config missing all four keys: no reaction and the default chunking', () => {
+    const { queued_ack_reaction: _q, ack_reaction: _a, reply_chunk_limit: _l, reply_chunk_mode: _m, ...rest } = makePersonaConfig({}, '/base')
     const config = rest as PersonaConfig
-    expect(['ack_reaction', 'reply_chunk_limit', 'reply_chunk_mode'].filter((key) => key in config)).toEqual([])
+    expect(['ack_reaction', 'queued_ack_reaction', 'reply_chunk_limit', 'reply_chunk_mode'].filter((key) => key in config)).toEqual([])
 
     expect(replySettingsOf(config)).toEqual(DEFAULTS)
   })
 
-  test('a config with a reaction but no chunk keys: its reaction, and the defaults fill the missing chunking', () => {
-    const { reply_chunk_limit: _l, reply_chunk_mode: _m, ...rest } = makePersonaConfig({ ack_reaction: 'eyes' }, '/base')
+  test('a config with reactions but no chunk keys: its reactions, and the defaults fill the missing chunking', () => {
+    const { reply_chunk_limit: _l, reply_chunk_mode: _m, ...rest } = makePersonaConfig({ queued_ack_reaction: 'hourglass', ack_reaction: 'eyes' }, '/base')
 
-    expect(replySettingsOf(rest as PersonaConfig)).toEqual({ ...DEFAULTS, ack_reaction: 'eyes' })
+    expect(replySettingsOf(rest as PersonaConfig)).toEqual({ ...DEFAULTS, queued_ack_reaction: 'hourglass', ack_reaction: 'eyes' })
   })
 })
 

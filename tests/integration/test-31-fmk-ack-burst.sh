@@ -22,6 +22,8 @@ HUMAN="U0${SCENARIO_TAG^^}HUMAN"
 PRINTER="${SCENARIO_FIXTURES}/fmk-texts.ts"
 RECEIVED="$(bun "${PRINTER}" MESSAGE_RECEIVED)" || fail "cannot print received label"
 DELIVERED="$(bun "${PRINTER}" MESSAGE_DELIVERED)" || fail "cannot print delivered label"
+QUEUED_REACTION="$(bun "${PRINTER}" DEFAULT_QUEUED_ACK_REACTION)" || fail "cannot print queued reaction"
+DELIVERED_REACTION="$(bun "${PRINTER}" DEFAULT_ACK_REACTION)" || fail "cannot print delivered reaction"
 SESSION="$(bun "${PRINTER}" personaTmuxSessionName "${KEY}")" || fail "cannot print session name"
 INSTANCE="$(bun "${PRINTER}" personaInstanceId "${KEY}")" || fail "cannot print instance id"
 stub_mode "${WORK}" "${STUB_MODE_SILENT}"
@@ -92,12 +94,20 @@ burst_acked() {
         "${SCENARIO_SLACK_RECORD}" > /dev/null
 }
 wait_until 30 "not all 1,000 actual WebSocket ACKs arrived" burst_acked
+# Reactions are detached from envelope ACKs. Wait for successful queued adds,
+# then compare their exact identities; ACK timing remains measured above.
+burst_reacted() {
+    jq -se --arg token_label "${LABEL}" --arg name "${QUEUED_REACTION}" \
+        '[.[] | select(.event == "api" and .method == "reactions.add" and .label == $token_label and .name == $name and .answer == "ok")] | length >= 1000' \
+        "${SCENARIO_SLACK_RECORD}" > /dev/null
+}
+wait_until 30 "not all 1,000 queued reactions completed" burst_reacted
 queue_accepted "${KEY}" > "${SCENARIO_ROOT}/accepted.jsonl"
 python3 - "${SCENARIO_ROOT}/submitted.jsonl" "${SCENARIO_SLACK_RECORD}" "${SCENARIO_ROOT}/accepted.jsonl" \
-    "${SLACK_STATE_DIR}/queue/${KEY}.jsonl" "${LABEL}" "${CHANNEL}" "${HUMAN}" << 'EOF' \
+    "${SLACK_STATE_DIR}/queue/${KEY}.jsonl" "${LABEL}" "${CHANNEL}" "${HUMAN}" "${QUEUED_REACTION}" "${DELIVERED_REACTION}" << 'EOF' \
     || fail "burst ACK timing, identity or outstanding queue proof failed"
 import collections, json, math, sys, uuid
-submitted_path, stub_path, accepted_path, journal_path, label, channel, human = sys.argv[1:]
+submitted_path, stub_path, accepted_path, journal_path, label, channel, human, queued, delivered = sys.argv[1:]
 def read(path):
     with open(path) as f:
         return [json.loads(line) for line in f if line.strip()]
@@ -144,11 +154,16 @@ assert all(a.get("source") == "slack" and a.get("user") == human and a.get("via"
 # a compacted key or an extra accepted row would invalidate that proof.
 assert len([r for r in journal if r["kind"] == "accepted"]) == 1000, "unexpected compacted/extra acceptance"
 assert not any(r["kind"] in ("sent", "delivered", "refused") for r in journal), "message typing/delivery occurred"
-assert not any(r["event"] == "api" and r.get("method") == "reactions.add" for r in stub), "premature receipt reaction"
+reactions = [r for r in stub if r["event"] == "api" and r.get("method") == "reactions.add"]
+assert queued != delivered, "stage defaults must distinguish queued from delivered"
+assert len(reactions) == 1000, "missing or duplicate queued reactions"
+assert all(r.get("name") == queued and r.get("label") == label and r.get("answer") == "ok" for r in reactions), "failed, foreign or premature delivered reaction"
+assert collections.Counter((r.get("channel"), r.get("timestamp")) for r in reactions) == collections.Counter(intended), "queued reaction set differs"
+assert not any(r["event"] == "api" and r.get("method") == "reactions.remove" for r in stub), "queued reaction removed before reply/delivery"
 print(f"ACK burst: sent=1000 acked=1000 outstanding=1000 max_ms={maximum:.3f} p95_ms={p95:.3f} over_limit={over_limit}")
 EOF
 
-# Positive ACK completion above settles these absence checks; no quiet sleep.
+# Positive ACK and queued-reaction completion settle these checks; no quiet sleep.
 [[ "$(cscb_ad_count send-keys)" == 0 ]] || fail "CSCB typed into the silent worker"
 [[ "$(count_log "$(matcher "[slack] Session connected:")")" == 0 ]] || fail "silent worker opened MCP"
 # Received reporting follows ACK submission; wait for that positive evidence.

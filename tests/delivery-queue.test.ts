@@ -7,12 +7,14 @@ import { assertNoLeak } from './test-helpers/credentials.ts'
 import { MAX_RELOAD_FILE_BYTES } from '../src/config.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { createDeliveryPreparation } from '../src/delivery-intake.ts'
+import { _resetAckTracker, createQueuedAckCallback } from '../src/ack-tracker.ts'
 import { deliveredRecord, injectedInput, makeQueue, queuePath, readQueue, seedQueue, sentRecord, slackInput } from './test-helpers/delivery-queue.ts'
+import { makeStubSlack } from './test-helpers/slack-stub.ts'
 
 let dir: string
 let queues: DeliveryQueue[]
 beforeEach(() => { dir = fs.mkdtempSync(join(tmpdir(), 'delivery-queue-')); queues = [] })
-afterEach(async () => { await Promise.all(queues.map(q => q.stop())); fs.rmSync(dir, { recursive: true, force: true }) })
+afterEach(async () => { await Promise.all(queues.map(q => q.stop())); _resetAckTracker(); fs.rmSync(dir, { recursive: true, force: true }) })
 async function open(options: Parameters<typeof makeQueue>[1] = {}) { const q = await makeQueue(dir, options); queues.push(q); return q }
 const accepted = (): AcceptedRecord => ({ ...slackInput(), v: 1, kind: 'accepted', seq: 1, received_at: 1000, ts: '1700000000.000001' })
 const kinds: QueueRecord[] = [accepted(), { v: 1, kind: 'fixed', seq: 1, parts: ['exact bytes\n🙂'] }, sentRecord(), deliveredRecord(), { v: 1, kind: 'refused', seq: 1, attempt: 1, at: 1000 }, { v: 1, kind: 'noticed', seq: 1, at: 1000 }, { v: 1, kind: 'reply-reminder', seq: 1, at: 1000, state: 'observed', delivery_attempts: [1] }]
@@ -85,6 +87,131 @@ test.each([false, true])('b.d6n: sent journal with legacy launch_id=%s replays a
   const replay = await open()
   expect(replay.openCount('alpha')).toBe(1)
   expect(replay.item('alpha', 1)!.records.filter(r => r.kind === 'sent')).toEqual([sent])
+})
+describe('b.p3h durable queued reaction metadata', () => {
+  test('legacy adoption keeps the first name and open delivery facts through replay and compaction', async () => {
+    seedQueue(dir, [accepted(), { v: 1, kind: 'fixed', seq: 1, parts: ['first', 'second'] }, sentRecord(), deliveredRecord()])
+    let q = await open({ now: createFakeClock({ start: 1000 }).now })
+    const before = q.item('alpha', 1)!
+    expect(before.accepted.queued_ack_reaction).toBeUndefined()
+    expect(await Promise.all([
+      q.rememberQueuedReaction('alpha', 1, 'original_queue'),
+      q.rememberQueuedReaction('alpha', 1, 'changed_queue'),
+    ])).toEqual(['original_queue', 'original_queue'])
+    const adopted = { ...before.accepted, queued_ack_reaction: 'original_queue' }
+    expect(q.item('alpha', 1)!.accepted).toEqual(adopted)
+    expect(readQueue(dir).filter(r => r.kind === 'accepted' && !('compact' in r))).toEqual([adopted])
+    for (const compact of [false, true]) {
+      if (compact) await q.compact('alpha')
+      await q.stop()
+      q = await open()
+      const item = q.item('alpha', 1)!
+      expect(item.accepted).toMatchObject(adopted)
+      expect(item.records.filter(r => r.kind !== 'accepted')).toEqual(before.records.filter(r => r.kind !== 'accepted'))
+      expect({ delivered: item.delivered, nextAttempt: item.nextAttempt, open: q.openCount('alpha') }).toEqual({ delivered: false, nextAttempt: before.nextAttempt, open: 1 })
+      const bytes = fs.readFileSync(queuePath(dir))
+      expect(await q.rememberQueuedReaction('alpha', 1, 'later_config')).toBe('original_queue')
+      expect(fs.readFileSync(queuePath(dir))).toEqual(bytes)
+      expect(q.lookupSlackKey('alpha', slackInput().key!)).toMatchObject({ status: 'duplicate', seq: 1 })
+    }
+  })
+
+  test.each(['', ' \t\n', null, 17])('rejects invalid metadata %p in both replay schema and adoption without altering the legacy item', async name => {
+    expect(parseQueueRecord(JSON.stringify({ ...accepted(), queued_ack_reaction: name }))).toBeUndefined()
+    seedQueue(dir, [accepted()])
+    const q = await open(), before = q.item('alpha', 1), bytes = fs.readFileSync(queuePath(dir))
+    // Exercise persisted/untyped input validation at the public boundary.
+    await expect(q.rememberQueuedReaction('alpha', 1, name as string)).rejects.toThrow('Invalid queued reaction')
+    expect(q.item('alpha', 1)).toEqual(before)
+    expect(fs.readFileSync(queuePath(dir))).toEqual(bytes)
+    expect(await q.rememberQueuedReaction('alpha', 1, 'custom_queue')).toBe('custom_queue')
+    expect(parseQueueRecord(JSON.stringify(q.item('alpha', 1)!.accepted))).toEqual(q.item('alpha', 1)!.accepted)
+  })
+
+  test('missing, injected and already delivered legacy work cannot acquire queued metadata', async () => {
+    seedQueue(dir, [accepted(), { v: 1, kind: 'fixed', seq: 1, parts: ['complete'] }, deliveredRecord()])
+    const q = await open()
+    expect((await q.accept('alpha', injectedInput())).status).toBe('accepted')
+    const bytes = fs.readFileSync(queuePath(dir))
+    for (const seq of [1, 2, 999]) expect(await q.rememberQueuedReaction('alpha', seq, 'custom_queue')).toBeUndefined()
+    expect(fs.readFileSync(queuePath(dir))).toEqual(bytes)
+  })
+
+  test('adoption reconciles a failed append rollback without reviving its bytes or changing FIFO identity', async () => {
+    const clock = createFakeClock({ start: 1000 })
+    let failing = false
+    const truncations: number[] = []
+    const seam = { ...fs,
+      fsyncSync(fd: number) {
+        if (failing && fs.fstatSync(fd).isFile()) throw new Error('EIO append sync')
+        fs.fsyncSync(fd)
+      },
+      ftruncateSync(fd: number, length = 0) {
+        if (failing) throw new Error('EIO rollback')
+        truncations.push(length)
+        fs.ftruncateSync(fd, length)
+      },
+    } as typeof fs
+    seedQueue(dir, [accepted(), { v: 1, kind: 'fixed', seq: 1, parts: ['first', 'second'] }, sentRecord(), deliveredRecord()])
+    const q = await open({ fs: seam, now: clock.now }), before = q.item('alpha', 1)!
+    const boundary = fs.statSync(queuePath(dir)).size
+    failing = true
+    await expect(q.append('alpha', { v: 1, kind: 'noticed', seq: 1, at: 1000 })).rejects.toThrow('EIO append sync')
+    expect(fs.statSync(queuePath(dir)).size).toBeGreaterThan(boundary)
+    failing = false
+    expect(await q.rememberQueuedReaction('alpha', 1, 'original_queue')).toBe('original_queue')
+    expect(truncations).toEqual([boundary])
+    expect(readQueue(dir).some(r => r.kind === 'noticed')).toBe(false)
+    expect(q.item('alpha', 1)!.records.filter(r => r.kind !== 'accepted')).toEqual(before.records.filter(r => r.kind !== 'accepted'))
+    await q.append('alpha', { ...deliveredRecord(), part: 2 })
+    expect(q.isWritable!('alpha')).toBe(true)
+    expect(q.openCount('alpha')).toBe(0)
+    expect(await q.accept('alpha', injectedInput())).toMatchObject({ status: 'accepted', seq: 2 })
+    await q.stop()
+    const replay = await open({ now: clock.now })
+    expect(replay.items('alpha').map(item => item.accepted.seq)).toEqual([2])
+    expect(replay.lookupSlackKey('alpha', slackInput().key!)).toEqual({ status: 'duplicate', seq: 1 })
+  })
+
+  test.each(['write', 'fsync', 'rename', 'directory-sync'] as const)('failed %s while adopting legacy work permits no queued Slack mutation; recovery retries durably', async step => {
+    let failing = false, failures = 0
+    const seam = { ...fs,
+      writeSync(fd: number, buffer: Uint8Array, offset: number, length: number, position: number | null) {
+        if (failing && step === 'write') { failures++; throw new Error('EIO metadata write') }
+        return fs.writeSync(fd, buffer, offset, length, position)
+      },
+      fsyncSync(fd: number) {
+        const stat = fs.fstatSync(fd)
+        if (failing && ((step === 'fsync' && stat.isFile()) || (step === 'directory-sync' && stat.isDirectory()))) { failures++; throw new Error('EIO metadata fsync') }
+        fs.fsyncSync(fd)
+      },
+      renameSync(from: fs.PathLike, to: fs.PathLike) {
+        if (failing && step === 'rename') { failures++; throw new Error('EIO metadata rename') }
+        fs.renameSync(from, to)
+      },
+    } as typeof fs
+    seedQueue(dir, [accepted()])
+    const q = await open({ fs: seam }), slack = makeStubSlack()
+    const item = q.item('alpha', 1)!, bytes = fs.readFileSync(queuePath(dir))
+    const queued = createQueuedAckCallback({ queue: q, getReaction: () => 'custom_queue', clientFor: () => slack.web })
+    failing = true
+    await queued('alpha', item)
+    expect(failures).toBe(1)
+    expect(slack.callLog).toEqual([])
+    expect(q.item('alpha', 1)).toEqual(item)
+    expect(q.isWritable!('alpha')).toBe(true)
+    // Directory sync can fail after rename; the candidate bytes are not proof
+    // of durable adoption and still must not permit a Slack mutation.
+    if (step !== 'directory-sync') expect(fs.readFileSync(queuePath(dir))).toEqual(bytes)
+    failing = false
+    await queued('alpha', item)
+    expect(slack.calls.reactionsAdd).toEqual([{ channel: item.accepted.channel!, timestamp: item.accepted.ts, name: 'custom_queue' }])
+    expect(slack.calls.reactionsRemove).toEqual([])
+    await q.append('alpha', { v: 1, kind: 'fixed', seq: 1, parts: ['still deliverable'] })
+    await q.stop()
+    expect((await open()).item('alpha', 1)!.accepted.queued_ack_reaction).toBe('custom_queue')
+    assertNoLeak(slack.callLog)
+  })
 })
 test('real file acceptance fsyncs file and new directory, enforces permissions and survives restart', async () => {
   const synced: string[] = []; const paths = new Map<number, string>()

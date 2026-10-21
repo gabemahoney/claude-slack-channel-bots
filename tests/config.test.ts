@@ -27,6 +27,8 @@ import {
   type PersonaDmInput,
   type PersonaInvitedInput,
   DEFAULT_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
+  DEFAULT_ACK_REACTION,
+  DEFAULT_QUEUED_ACK_REACTION,
   MAX_AGENT_DIRECTOR_CALL_TIMEOUT_MS,
   MAX_TEST_TIMER_OVERRIDE_MS,
   MAX_TEST_TIMER_OVERRIDE_S,
@@ -38,6 +40,7 @@ import {
   loadPersonaConfig,
   prePersonaConversionMessage,
   resolvePersonaConfig,
+  replySettingsOf,
   resolveRealPath,
   resolveRealPathStrict,
   credentialsFilesToProtect,
@@ -62,7 +65,8 @@ import {
 } from '../src/config.ts'
 import { personaKey, personaTmuxSessionName } from '../src/persona-identity.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
-import { MODE_SWITCH_SETTING, RECORDED_SECTION_KEYS } from '../src/reload-plan.ts'
+import { buildChangePlan, MODE_SWITCH_SETTING, RECORDED_SECTION_KEYS } from '../src/reload-plan.ts'
+import { configInEffect } from '../src/reload.ts'
 import { assertSendable } from '../src/lib.ts'
 import {
   makeFungiblePersona,
@@ -1277,6 +1281,44 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
   })
 
   describe('server-wide settings (SR-1.6)', () => {
+    test('b.p3h: loaded defaults are queued beehive and delivered spinthinking', () => {
+      const config = load(makePersonaConfigInput({}, dir))
+      expect(config).toMatchObject({ queued_ack_reaction: 'beehive', ack_reaction: 'spinthinking' })
+      expect(replySettingsOf(config)).toMatchObject({ queued_ack_reaction: 'beehive', ack_reaction: 'spinthinking' })
+    })
+
+    test.each([
+      [{ queued_ack_reaction: 'hourglass' }, { queued_ack_reaction: 'hourglass', ack_reaction: 'spinthinking' }],
+      [{ ack_reaction: 'bee' }, { queued_ack_reaction: 'beehive', ack_reaction: 'bee' }],
+      [{ queued_ack_reaction: 'eyes', ack_reaction: 'custom_working' }, { queued_ack_reaction: 'eyes', ack_reaction: 'custom_working' }],
+      [{ queued_ack_reaction: 'same', ack_reaction: 'same' }, { queued_ack_reaction: 'same', ack_reaction: 'same' }],
+    ])('b.p3h: acknowledgement stages can be configured independently: %j', (settings, expected) => {
+      const config = load({ ...makePersonaConfigInput({}, dir), ...settings })
+      expect(config).toMatchObject(expected)
+      expect(replySettingsOf(config)).toMatchObject(expected)
+    })
+
+    test.each(['', '   ', null, 0, false, [], {}].map(value => ({ value })))('b.p3h: queued_ack_reaction rejects a bad value $value as a string setting', ({ value }) => {
+      const error = loadError({ ...makePersonaConfigInput({}, dir), queued_ack_reaction: value })
+      expect(error).toContain('queued_ack_reaction')
+      expect(error).not.toContain('unknown top-level')
+      assertNoLeak(error)
+    })
+
+    test('b.p3h: both reaction keys are registered server settings; reload records them and keeps startup values in effect', () => {
+      expect(PERSONA_TOP_LEVEL_KEYS).toContain('queued_ack_reaction')
+      expect(PERSONA_TOP_LEVEL_KEYS).toContain('ack_reaction')
+      const start = load({ ...makePersonaConfigInput({}, dir), queued_ack_reaction: 'start_queue', ack_reaction: 'start_delivery' })
+      const next = load({ ...makePersonaConfigInput({}, dir), queued_ack_reaction: 'next_queue', ack_reaction: 'next_delivery' })
+      const plan = buildChangePlan(start, { kind: 'valid', config: next }, { realPath: path => path, home, dryRun: true })
+      expect(plan.valid).toBe(true)
+      if (!plan.valid) throw new Error('expected a valid plan')
+      expect(plan.settings.map(setting => setting.name).sort()).toEqual(['ack_reaction', 'queued_ack_reaction'])
+      expect(plan.noEffectiveChange).toBe(false)
+      expect(replySettingsOf(configInEffect(start, next))).toMatchObject({ queued_ack_reaction: 'start_queue', ack_reaction: 'start_delivery' })
+      expect(replySettingsOf(next)).toMatchObject({ queued_ack_reaction: 'next_queue', ack_reaction: 'next_delivery' })
+    })
+
     // Defaults when absent are pinned by 'the default input resolves to the
     // makePersonaConfig shape' above.
     test('every server-wide key accepts a valid non-default value, ~ paths expanded under the injected home', () => {
@@ -1301,6 +1343,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
         cron_table_path: '~/cron/crontab',
         cron_log_path: '~/cron/cron.log',
         cron_log_max_bytes: 1024,
+        queued_ack_reaction: 'hourglass',
         ack_reaction: 'eyes',
         reply_chunk_limit: 12000,
         reply_chunk_mode: 'length',
@@ -1578,8 +1621,8 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
     // odd formatting makes the byte-identical check meaningful.
     const ACCESS_JSON = '{ "ackReaction": "thumbsup",\n  "textChunkLimit": 1234, "chunkMode": "length" }\n\n'
     test.each([
-      ['a config without the three keys loads the defaults', {}, { ack_reaction: undefined, reply_chunk_limit: 4000, reply_chunk_mode: 'newline' }],
-      ['a config setting all three loads exactly them', { ack_reaction: 'eyes', reply_chunk_limit: 2500, reply_chunk_mode: 'length' }, { ack_reaction: 'eyes', reply_chunk_limit: 2500, reply_chunk_mode: 'length' }],
+      ['a config without the four keys loads the defaults', {}, { queued_ack_reaction: DEFAULT_QUEUED_ACK_REACTION, ack_reaction: DEFAULT_ACK_REACTION, reply_chunk_limit: 4000, reply_chunk_mode: 'newline' }],
+      ['a config setting all four loads exactly them', { queued_ack_reaction: 'hourglass', ack_reaction: 'eyes', reply_chunk_limit: 2500, reply_chunk_mode: 'length' }, { queued_ack_reaction: 'hourglass', ack_reaction: 'eyes', reply_chunk_limit: 2500, reply_chunk_mode: 'length' }],
     ] as const)('beside a leftover access.json, %s; the access.json is byte-identical afterwards', (_label, set, expected) => {
       const accessPath = join(dir, 'access.json')
       writeFileSync(accessPath, ACCESS_JSON, 'utf-8')
@@ -1588,6 +1631,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
       const config = loadPersonaConfig(path, home)
       assertNoLeak(config, 'config')
       expect({
+        queued_ack_reaction: config.queued_ack_reaction,
         ack_reaction: config.ack_reaction,
         reply_chunk_limit: config.reply_chunk_limit,
         reply_chunk_mode: config.reply_chunk_mode,

@@ -32,6 +32,8 @@ export interface AcceptedInput {
   via?: string
   /** Internal link for an injected reply reminder; never accepted from Slack intake. */
   reminder_for?: number
+  /** Original queued emoji, retained with open work across configuration changes. */
+  queued_ack_reaction?: string
 }
 interface BaseRecord { v: 1; seq: number }
 export interface AcceptedRecord extends BaseRecord, AcceptedInput {
@@ -89,6 +91,8 @@ export interface DeliveryQueue {
   start(): Promise<void>
   accept: QueueAccept
   append(key: string, record: QueueRecord): Promise<void>
+  /** Adopt pre-two-stage accepted work before its first queued Slack mutation. */
+  rememberQueuedReaction(key: string, seq: number, name: string): Promise<string | undefined>
   lookupSlackKey(key: string, slackKey: SlackKey): QueueAcceptResult | undefined
   /** A current snapshot of one item, without cloning the rest of the queue. */
   item(key: string, seq: number): QueueItem | undefined
@@ -140,6 +144,7 @@ export function isQueueRecord(value: unknown): value is QueueRecord {
       if (r.compact !== undefined || !['slack', 'interject', 'cron'].includes(String(r.source)) || !str(r.text) || !str(r.ts) || !number(r.received_at)) return false
       if (r.reminder_for !== undefined && (!positive(r.reminder_for) || r.source !== 'interject')) return false
       if (r.attempt_high_watermark !== undefined && !integer(r.attempt_high_watermark)) return false
+      if (r.queued_ack_reaction !== undefined && (!str(r.queued_ack_reaction) || !r.queued_ack_reaction.trim())) return false
       for (const k of ['sender', 'channel', 'channel_type', 'thread_ts', 'edited_ts', 'user', 'bot_id', 'username', 'bot_profile_name', 'via']) if (r[k] !== undefined && !str(r[k])) return false
       if (r.files !== undefined && (!Array.isArray(r.files) || !r.files.every(f => object(f) && str(f.name) && (f.mimetype === undefined || str(f.mimetype)) && (f.size === undefined || number(f.size))))) return false
       return r.source === 'slack' ? isSlackKey(r.key) && str(r.channel) && str(r.via) : timestamp(r.ts) && str(r.sender) && r.key === undefined
@@ -417,13 +422,16 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
     }
     return [...targets.values()]
   }
-  function compactOne(key: string): void {
-    load(key)
-    const j = journal(key)
+  function reconcileRollback(key: string, j: Journal): void {
     if (j.pendingRollback !== undefined) {
       const fd = fs.openSync(pathFor(key), 'r+')
       try { fs.ftruncateSync(fd, j.pendingRollback); fs.fsyncSync(fd); delete j.pendingRollback } finally { fs.closeSync(fd) }
     }
+  }
+  function compactOne(key: string): void {
+    load(key)
+    const j = journal(key)
+    reconcileRollback(key, j)
     const at = now(), retained: QueueRecord[] = []
     const queuedReminders = new Set(materialize(j).flatMap(item => item.accepted.reminder_for === undefined ? [] : [item.accepted.reminder_for]))
     for (const r of j.records) if (r.kind === 'accepted' && 'compact' in r && r.compact === 'key' && at - r.received_at < QUEUE_KEY_KEEP_MS) retained.push(r)
@@ -589,6 +597,25 @@ export function createDeliveryQueue(options: DeliveryQueueOptions): ReplyReminde
         })
         if (appendBlocked.delete(key)) event({ type: 'writable', key })
       } catch (error) { appendBlocked.add(key); event({ type: 'append-failed', key, path: pathFor(key), seq: record.seq, error }); throw error }
+    },
+    async rememberQueuedReaction(key, seq, name) {
+      return serial(key, () => {
+        if (!started || stopped) throw new Error('Queue is not writable')
+        load(key)
+        const j = journal(key), item = j.items.get(seq)
+        if (!item || item.accepted.source !== 'slack') return undefined
+        if (item.accepted.queued_ack_reaction) return item.accepted.queued_ack_reaction
+        // Delivery may have completed while reporting waited for its turn.
+        if (item.delivered) return undefined
+        const accepted = { ...item.accepted, queued_ack_reaction: name }
+        if (!isQueueRecord(accepted)) throw new Error('Invalid queued reaction')
+        reconcileRollback(key, j)
+        const records = j.records.map(r => isAccepted(r) && r.seq === seq ? accepted : r)
+        rewrite(key, records)
+        j.records = records
+        rebuild(j)
+        return name
+      })
     },
     lookupSlackKey,
     item(key, seq) {
