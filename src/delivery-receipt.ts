@@ -66,12 +66,12 @@ export function effectiveSends(item: QueueItem, part: number): SentRecord[] {
   const refused = new Set(item.records.filter(r => r.kind === 'refused').map(r => r.attempt))
   return item.records.filter((r): r is SentRecord => r.kind === 'sent' && !('unknown_outcome' in r) && r.part === part && !refused.has(r.attempt))
 }
-export function deliveryTranscriptPath(agent: DeliveryAgent, row: DeliveryTranscriptRow, configDir?: string): string | undefined {
-  return agent === 'codex' ? row.jsonl_path || undefined : locateTranscript(row, configDir)
+export function deliveryTranscriptPath(agent: DeliveryAgent, row: DeliveryTranscriptRow): string | undefined {
+  return locateTranscript(row)
 }
 interface CachedFile { dev: number; ino: number; size: number; pending: Buffer; records: ReceiptRecord[] }
 export interface DeliveryReceiptReader {
-  read(agent: DeliveryAgent, row: DeliveryTranscriptRow, item: QueueItem, part: number, allItems?: readonly QueueItem[], configDir?: string): ReceiptObservation
+  read(agent: DeliveryAgent, row: DeliveryTranscriptRow, item: QueueItem, part: number, allItems?: readonly QueueItem[]): ReceiptObservation
   forget(): void
 }
 function receiptIdentity(receipt: { path: string; uuid?: string; offset?: number }): string {
@@ -127,7 +127,7 @@ export function createDeliveryReceiptReader(options: { fs?: typeof nodeFs } = {}
   }
   return {
     forget() { files.clear(); observed.clear(); windows.clear() },
-    read(agent, row, item, part, allItems = [item], configDir) {
+    read(agent, row, item, part, allItems = [item]) {
       // Register all durable sends before discovering/reading this lap's
       // files. This also preserves the discovery order when the next FIFO
       // head is first observed after another item's receipt was read.
@@ -138,10 +138,10 @@ export function createDeliveryReceiptReader(options: { fs?: typeof nodeFs } = {}
           if (!windows.has(identity)) windows.set(identity, new Map(observed))
         }
       }
-      const path = deliveryTranscriptPath(agent, row, configDir) ?? ''
+      const path = deliveryTranscriptPath(agent, row) ?? ''
       const sends = effectiveSends(item, part), first = sends[0]
       const unknown = item.records.find(r => r.kind === 'sent' && 'unknown_outcome' in r)
-      const paths = new Set([path, ...sends.map(s => s.transcript_path), ...(row.prior_sessions ?? []).map(r => deliveryTranscriptPath(agent, r, configDir) ?? '')].filter(Boolean))
+      const paths = new Set([path, ...sends.map(s => s.transcript_path), ...(row.prior_sessions ?? []).map(r => deliveryTranscriptPath(agent, r) ?? '')].filter(Boolean))
       const records: ReceiptRecord[] = []
       const availability = new Map<string, ReceiptObservation['availability']>()
       let size = 0, unreadable = false

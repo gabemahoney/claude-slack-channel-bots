@@ -1,57 +1,21 @@
 /**
- * jsonl-persistence-check.ts — Startup safeguard: detect JSONL transcript loss
- * BEFORE the resume path silently throws ErrJsonlMissing and wipes a persona's memory.
+ * jsonl-persistence-check.ts — Storage persistence and AD transcript references.
  *
- * Two layers, both fire-safe (never throw, never block startup), run over the
- * applied personas (b.av2 SR-6.2):
- *
- *   Layer 1 — non-persistent storage check (ported from b.a3g design):
- *     resolveJsonlRoots(config, home?)                    — deduped <configDir>/projects roots
- *     checkMountFstype(dirPath, readMountinfo?)           — longest-prefix mount fstype or null
- *     checkJsonlPersistence(config, readMountinfo?, home?) — { nonPersistent[], warnings[] }
- *   A root on tmpfs/ramfs means resume is structurally impossible on this host.
- *   A persona a confirmed apply brings up gets Layer 1 for its own root only
- *   (`runPersonaStorageCheck`).
- *
- *   Layer 2 — per-persona missing-transcript check (the 2026-09-20 incident class):
- *     For each persona, fetch the AD row and stat the persisted vs fallback
- *     JSONL path. If the persisted path is gone but the current-session fallback
- *     exists, report the stale path with the fallback available for resume. If
- *     both paths are gone and archived messages prove activity since spawn,
- *     report transcript loss. Idle-since-spawn personas stay quiet. A row the
- *     collision ladder will replace rather than resume (its
- *     `cwd` or `config_dir` label does not match the persona) is only logged.
- *
- * Archive evidence follows b.av2 SR-7.4 and b.deo SRI-704
- * (`personaArchiveEvidenceScope`): in declarative mode only the persona's
- * `delivery: all` channels are counted, and a zero count proves nothing when
- * the persona has a `mentions` channel or DMs on; in fungible mode no channel
- * is counted and a zero count proves nothing, so no lost transcript is ever
- * reported. Layer 2 reads the mode from the configuration it is given. The
- * session manager's transcript-loss diagnosis uses the same helper and count.
- *
- * Warnings reach Slack only through the persona-keyed notice seam (production:
- * the per-persona notifier, b.av2 SR-7.2), which posts to the persona's
- * destination and adds the persona reference.
- *
- * Every external effect (mountinfo read, stat, AD get, archive query, error
- * record, notice, home directory) is injectable so the Test Writer needs no
- * mock.module.
+ * The storage check reads mountinfo for configured directories. The transcript
+ * check reports only agent-director's current-session and history fields; it
+ * does not reconstruct native paths or infer agent history from Slack traffic.
+ * Both checks are isolated per persona and never block startup.
  *
  * SPDX-License-Identifier: MIT
  */
 
-import { existsSync, readFileSync, statSync } from 'node:fs'
+import { readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { Database } from 'bun:sqlite'
 import type { GetResult } from 'agent-director'
 import {
-  channelModeOf,
   resolveRealPathStrict,
-  type ChannelMode,
   type Persona,
   type PersonaConfig,
-  type ServerSettings,
   type StrictRealPathFs,
 } from './config.ts'
 import { recordStartupError as defaultRecordStartupError } from './startup-errors.ts'
@@ -60,7 +24,7 @@ import { ErrSpawnNotFound } from './agent-director-errors.ts'
 import { isAdErrorInstance } from './ad-error-class.ts'
 import { personaInstanceId, renderPersonaRef, resolveClaudeConfigDir } from './persona-identity.ts'
 import { describeThrownValue } from './persona-connection-errors.ts'
-import { resolveJsonlPath } from './cozempic.ts'
+import { describeTranscriptReference, type TranscriptRowFields } from './session-transcript.ts'
 import { notifySafely, type PersonaNotify } from './persona-notifier.ts'
 // Import cycle with session-manager.ts: use these imports only inside functions, never at module top level.
 import { compareRowToPersona } from './session-manager.ts'
@@ -71,40 +35,23 @@ import { compareRowToPersona } from './session-manager.ts'
 
 /** Result of checkJsonlPersistence: roots confirmed non-persistent, and roots that warned. */
 export interface JsonlPersistenceCheckResult {
-  /** Roots whose mount fstype is tmpfs or ramfs — resume is structurally impossible. */
+  /** Configured directories whose mount fstype is tmpfs or ramfs. */
   nonPersistent: string[]
   /** Roots whose fstype could not be determined (unreadable/unparseable/unresolvable). */
   warnings: string[]
 }
 
-/**
- * Counts archived messages in any of `channelIds` with timestamp strictly
- * after `sinceEpochSeconds`. Returns null when the archive is unconfigured or
- * unreadable. `ref` is the persona reference its log lines name.
- */
-export type ArchiveCountSince = (
-  channelIds: readonly string[],
-  sinceEpochSeconds: number,
-  ref: string,
-) => number | null
-
 /** Injectable deps for runJsonlPersistenceSafeguard — every real-world effect is a seam. */
 export interface JsonlPersistenceSafeguardDeps {
+  /** Live startup shutdown query. A thrown query stops the pass as well. */
+  isShuttingDown?: () => boolean
   /** Reads /proc/self/mountinfo (Layer 1). Default: real read. */
   readMountinfo?: () => string
-  /** Stats a path; returns true when it exists and is non-empty. Default: real statSync. */
-  statFn?: (path: string) => boolean
   /**
    * Fetches the AD row for a persona's instance id (Layer 2). Default routes
    * through withOutageDetection so AD-unreachable is flagged per persona.
    */
   getRow?: (key: string, instanceId: string) => Promise<GetResult>
-  /**
-   * Counts archived messages in a persona's evidence channels (Layer 2).
-   * Default: `makeDefaultArchiveCount(config)`, which opens
-   * config.message_archive_db read-only per query.
-   */
-  archiveCountSince?: ArchiveCountSince
   recordStartupError?: typeof defaultRecordStartupError
   /**
    * Home directory an unset claude_config_dir resolves against
@@ -130,24 +77,23 @@ const NON_PERSISTENT_FSTYPES = new Set(['tmpfs', 'ramfs'])
 /** Distinct startup-error keys — grep anchors, kept together for discoverability. */
 const ERR_KEY_NON_PERSISTENT = 'jsonl-non-persistent'
 const ERR_KEY_PERSISTENCE_WARNING = 'jsonl-persistence-check-warning'
-const ERR_KEY_STALE_PATH = 'jsonl-transcript-stale-path'
-const ERR_KEY_LOST = 'jsonl-transcript-lost'
+const ERR_KEY_TRANSCRIPT_REFERENCE = 'jsonl-transcript-reference-warning'
 
 // ---------------------------------------------------------------------------
 // resolveJsonlRoots
 // ---------------------------------------------------------------------------
 
 /**
- * A persona's JSONL root: `<effective claude_config_dir>/projects`, the same
- * composition resolveJsonlPath uses. An absent directory means `<home>/.claude`.
+ * The configured storage directory, without assuming a native transcript layout.
+ * An absent directory means `<home>/.claude`.
  */
 function personaJsonlRoot(persona: Pick<Persona, 'claude_config_dir'>, home: string): string {
-  return `${resolveClaudeConfigDir(persona.claude_config_dir, home)}/projects`
+  return resolveClaudeConfigDir(persona.claude_config_dir, home)
 }
 
 /**
- * Returns the deduplicated set of JSONL root directories across the applied
- * personas: one `<effective claude_config_dir>/projects` per distinct
+ * Returns the deduplicated set of configured storage directories across the
+ * applied personas: one effective `claude_config_dir` per distinct
  * directory. Persona config dirs are already absolute and tilde-expanded; an
  * absent one means `<home>/.claude`. With no personas at all, the home default
  * root is returned.
@@ -262,7 +208,7 @@ export function checkMountFstype(
 
 /**
  * Checks all JSONL root directories for persistence. Returns:
- * - nonPersistent: roots on tmpfs/ramfs (resume is structurally impossible)
+ * - nonPersistent: configured directories on tmpfs/ramfs
  * - warnings: roots whose fstype could not be determined (one entry per root)
  * Never throws.
  *
@@ -302,144 +248,8 @@ function classifyJsonlRoots(roots: readonly string[], readMountinfo?: () => stri
 }
 
 // ---------------------------------------------------------------------------
-// Archive evidence (b.av2 SR-7.4, b.deo SRI-704)
-// ---------------------------------------------------------------------------
-
-/** Which archived messages count as evidence of a persona's activity. */
-export interface PersonaArchiveEvidenceScope {
-  /**
-   * IDs of the channels counted: in declarative mode the persona's
-   * `delivery: all` channels; in fungible mode none.
-   */
-  channelIds: string[]
-  /**
-   * Whether a zero count proves the persona was idle. In declarative mode
-   * false when the persona has any `delivery: mentions` channel or
-   * `dm.enabled` on: the archive cannot attribute messages from those to a
-   * persona, so zero proves nothing. In fungible mode always false.
-   */
-  zeroIsAttributable: boolean
-}
-
-/**
- * A persona's archive-evidence scope (b.av2 SR-7.4, b.deo SRI-704) in `mode`
- * (absent: declarative). Both the start safeguard's Layer 2 and the session
- * manager's transcript-loss diagnosis classify through this helper, so they
- * agree.
- *
- * In fungible mode a persona serves every channel its app is a member of, so
- * configuration cannot predict its traffic: the scope counts no channel,
- * whatever the persona's resolved `channels` holds, and its zero is never
- * attributable (`FUNGIBLE_MODE_ZERO_REASON`). `channels` is read only in
- * declarative mode (b.deo SRI-202). Pure.
- */
-export function personaArchiveEvidenceScope(
-  persona: Pick<Persona, 'channels' | 'dm'>,
-  mode: ChannelMode = 'declarative',
-): PersonaArchiveEvidenceScope {
-  if (mode === 'fungible') return { channelIds: [], zeroIsAttributable: false }
-  return {
-    channelIds: persona.channels.filter((c) => c.delivery === 'all').map((c) => c.id),
-    zeroIsAttributable: !persona.dm.enabled && persona.channels.every((c) => c.delivery !== 'mentions'),
-  }
-}
-
-/**
- * Why a zero archive count is not evidence for a persona whose zero is not
- * attributable, in declarative mode. Shared by Layer 2's log line and the
- * diagnosis reason.
- */
-export const UNATTRIBUTABLE_ZERO_REASON =
-  'the persona has a `delivery: mentions` channel or DMs on, and the message archive cannot attribute ' +
-  'messages from `mentions` channels or DMs to a persona, so 0 archived messages since spawn in its ' +
-  '`delivery: all` channels proves nothing'
-
-/**
- * Why a zero archive count is not evidence in fungible mode (b.deo SRI-704).
- * Shared by Layer 2's log line and the diagnosis reason.
- */
-export const FUNGIBLE_MODE_ZERO_REASON =
-  'the server is in fungible mode (`allow_invited_channels` is true), where a persona serves every channel ' +
-  'its app is a member of and the configuration cannot predict its traffic, so no channel is counted and ' +
-  '0 archived messages since spawn proves nothing'
-
-/**
- * The reason a zero archive count is not evidence in `mode` (absent:
- * declarative): `FUNGIBLE_MODE_ZERO_REASON` in fungible mode, else
- * `UNATTRIBUTABLE_ZERO_REASON`. Pure.
- */
-export function unattributableZeroReason(mode: ChannelMode = 'declarative'): string {
-  return mode === 'fungible' ? FUNGIBLE_MODE_ZERO_REASON : UNATTRIBUTABLE_ZERO_REASON
-}
-
-/**
- * Builds a default archive-count function bound to config.message_archive_db.
- * Reads only that setting, so any config carrying it (the persona config,
- * the server settings) satisfies the parameter.
- *
- * The returned function counts messages in any of the given channels with
- * timestamp strictly after `sinceEpochSeconds`. An empty channel set returns
- * 0 without touching the database. Otherwise it opens the existing DB
- * read-only per query (never creates, migrates, or writes it) and returns null
- * when the archive is unconfigured, the DB file does not yet exist (no
- * evidence — do not fabricate an empty archive), or any error occurs
- * (unreadable, bad schema, etc.).
- *
- * The archive stores `timestamp` as REAL epoch seconds (parseFloat of the
- * Slack ts); `started_at` is RFC3339, converted to epoch seconds by the caller.
- */
-export function makeDefaultArchiveCount(
-  config: Pick<ServerSettings, 'message_archive_db'>,
-): ArchiveCountSince {
-  return (channelIds: readonly string[], sinceEpochSeconds: number, ref: string): number | null => {
-    const ids = [...new Set(channelIds)]
-    if (ids.length === 0) return 0
-    const dbPath = config.message_archive_db
-    if (!dbPath) return null
-    // Absent file → no evidence. Opening read-write would silently create an
-    // empty archive and mask a real transcript loss as "count 0".
-    if (!existsSync(dbPath)) return null
-    let db: Database | undefined
-    try {
-      db = new Database(dbPath, { readonly: true })
-      const placeholders = ids.map(() => '?').join(', ')
-      const row = db
-        .query(`SELECT COUNT(*) AS n FROM messages WHERE channel_id IN (${placeholders}) AND timestamp > ?`)
-        .get(...ids, sinceEpochSeconds) as { n: number } | null
-      return row ? Number(row.n) : 0
-    } catch (err) {
-      console.error(`[slack] jsonl-persistence-check: archive count failed for ${ref}: ${describeThrownValue(err)}`)
-      return null
-    } finally {
-      try {
-        db?.close()
-      } catch {
-        /* ignore */
-      }
-    }
-  }
-}
-
-/** Parse an RFC3339 timestamp to epoch seconds; null on unparseable input. */
-export function rfc3339ToEpochSeconds(value: string): number | null {
-  if (!value) return null
-  const ms = Date.parse(value)
-  return Number.isNaN(ms) ? null : ms / 1000
-}
-
-// ---------------------------------------------------------------------------
 // Default effect implementations (Layer 2)
 // ---------------------------------------------------------------------------
-
-/** Default stat: true when the path exists and is a non-empty regular file. */
-function defaultStatFn(path: string): boolean {
-  try {
-    const st = statSync(path)
-    return st.isFile() && st.size > 0
-  } catch {
-    return false
-  }
-}
 
 /**
  * Default AD row fetch — routed through withOutageDetection (the sanctioned
@@ -450,9 +260,10 @@ function defaultStatFn(path: string): boolean {
  * start (SRJ-513) latch no one, and a retired key's row read live with its
  * mark set clears no retired-key entry (SRJ-807); they change nothing.
  */
-function defaultGetRow(key: string, instanceId: string): Promise<GetResult> {
+function defaultGetRow(key: string, instanceId: string, isShuttingDown: () => boolean): Promise<GetResult> {
   return withOutageDetection(key, undefined, 'get', (client) =>
     client.get({ instance_id: instanceId }),
+    { isShuttingDown },
   )
 }
 
@@ -478,20 +289,17 @@ function sendNotice(notify: PersonaNotify | undefined, persona: Pick<Persona, 'n
 }
 
 // ---------------------------------------------------------------------------
-// Layer 2 — per-persona transcript check
+// Layer 2 — agent-director transcript references
 // ---------------------------------------------------------------------------
 
 /** Layer 2's effects, resolved from the deps. */
 interface Layer2Effects {
   notify: PersonaNotify | undefined
-  statFn: (path: string) => boolean
+  isShuttingDown: () => boolean
   getRow: (key: string, id: string) => Promise<GetResult>
-  archiveCountSince: ArchiveCountSince
   recordError: typeof defaultRecordStartupError
   home: string
   configDirFs: Partial<StrictRealPathFs> | undefined
-  /** The channel mode of the configuration Layer 2 was given (b.deo SRI-704). */
-  mode: ChannelMode
 }
 
 /**
@@ -519,8 +327,7 @@ function rowReplacementReason(
 }
 
 /**
- * Classifies one persona's transcript health and fires the appropriate loud /
- * quiet signal. Isolated per persona — any thrown error is caught by the
+ * Reports one persona's AD transcript references without inferring disk loss. Isolated per persona — any thrown error is caught by the
  * caller's per-persona try/catch, never aborting the sweep.
  */
 async function checkPersonaTranscript(persona: Persona, fx: Layer2Effects): Promise<void> {
@@ -542,12 +349,14 @@ async function checkPersonaTranscript(persona: Persona, fx: Layer2Effects): Prom
     return
   }
 
-  let row: GetResult
+  let row: GetResult & TranscriptRowFields
+  if (fx.isShuttingDown()) return
   try {
     row = await fx.getRow(key, instanceId)
   } catch (err) {
+    if (fx.isShuttingDown()) return
     if (isAdErrorInstance(err, ErrSpawnNotFound)) {
-      // Case 1: no row — nothing to lose.
+      // No row to resume.
       console.error(`[slack] jsonl-persistence-check: no AD row for ${ref} — nothing to resume`)
       return
     }
@@ -555,6 +364,7 @@ async function checkPersonaTranscript(persona: Persona, fx: Layer2Effects): Prom
     console.error(`[slack] jsonl-persistence-check: AD get failed for ${ref} — skipping: ${describeThrownValue(err)}`)
     return
   }
+  if (fx.isShuttingDown()) return
 
   // Case 7: the collision ladder will replace this row rather than resume or
   // reconnect it (b.av2 SR-6.2), so there is no resume to warn about.
@@ -567,94 +377,19 @@ async function checkPersonaTranscript(persona: Persona, fx: Layer2Effects): Prom
     return
   }
 
-  // Case 1 (cont.): row exists but never produced a session — nothing to lose.
-  if (!row.session_id) {
-    console.error(`[slack] jsonl-persistence-check: ${ref} has no session_id — nothing to resume`)
-    return
-  }
+  const detail = `${ref} instance=${instanceId}: ${describeTranscriptReference(row)}.`
+  console.error(`[slack] jsonl-persistence-check: ${detail}`)
+  if (row.transcript_status !== 'rotated') return
 
-  const persistedPath = row.jsonl_path
-  const fallbackPath = resolveJsonlPath(
-    row.cwd,
-    row.session_id,
-    resolveClaudeConfigDir(persona.claude_config_dir, fx.home),
-  )
-
-  const persistedExists = persistedPath ? fx.statFn(persistedPath) : false
-
-  // Case 3: persisted path present and non-empty — healthy, quiet.
-  if (persistedExists) return
-
-  const fallbackExists = fx.statFn(fallbackPath)
-
-  // Case 4: persisted gone but the current-session fallback exists — report
-  // the stale recorded path; AD 0.12 tries this fallback on resume too.
-  if (fallbackExists) {
-    const detail =
-      `${ref} instance=${instanceId}: AD persisted jsonl_path is missing/empty ` +
-      `("${persistedPath}") but the transcript EXISTS at the resolved fallback path ("${fallbackPath}"). ` +
-      `The current-session fallback is available for agent-director to try on resume.`
-    fx.recordError(ERR_KEY_STALE_PATH, detail)
-    sendNotice(
-      fx.notify,
-      persona,
-      `⚠️ CSCB startup warning: my saved conversation transcript exists on disk (\`${fallbackPath}\`) but ` +
-        `agent-director's recorded path (\`${persistedPath || '(empty)'}\`) is missing or empty. ` +
-        `The current-session fallback is available for agent-director to try on resume. ` +
-        `An operator can investigate the stale recorded path.`,
-    )
-    return
-  }
-
-  // Case 5: transcript does not exist anywhere. Distinguish lost vs never-created
-  // using the message archive as evidence, counted over the persona's
-  // `delivery: all` channels only in declarative mode (b.av2 SR-7.4), and
-  // over no channel in fungible mode (b.deo SRI-704).
-  const scope = personaArchiveEvidenceScope(persona, fx.mode)
-  const startedAtEpoch = rfc3339ToEpochSeconds(row.started_at)
-  const counted = startedAtEpoch === null ? null : fx.archiveCountSince(scope.channelIds, startedAtEpoch, ref)
-  // b.deo SRI-704: in fungible mode no channel is counted, so a count is
-  // never evidence of activity and a lost transcript is never reported: any
-  // count given is a zero, which is not attributable. No count keeps the
-  // no-count outcome.
-  const archivedSinceSpawn = counted !== null && fx.mode === 'fungible' ? 0 : counted
-
-  if (archivedSinceSpawn !== null && archivedSinceSpawn > 0) {
-    // Conversation provably happened since spawn, yet no transcript survives. LOST.
-    const detail =
-      `${ref} instance=${instanceId}: no transcript at persisted ("${persistedPath}") ` +
-      `or fallback ("${fallbackPath}") path, but the message archive holds ${archivedSinceSpawn} message(s) ` +
-      `since spawn (started_at=${row.started_at}). Conversation history has been LOST; resume will fresh-spawn.`
-    fx.recordError(ERR_KEY_LOST, detail)
-    sendNotice(
-      fx.notify,
-      persona,
-      `⚠️ CSCB startup warning: my conversation transcript file is gone from disk, but the message archive ` +
-        `shows ${archivedSinceSpawn} message(s) since I started. My conversation memory has been lost and ` +
-        `resume will start me fresh. An operator should investigate the transcript storage.`,
-    )
-    return
-  }
-
-  // A zero count is not evidence of idleness when the archive cannot see all
-  // of the persona's traffic (in fungible mode, never): handled like
-  // unavailable evidence, quietly.
-  if (archivedSinceSpawn === 0 && !scope.zeroIsAttributable) {
-    console.error(
-      `[slack] jsonl-persistence-check: ${ref} has no transcript yet ` +
-        `(persisted="${persistedPath}", fallback="${fallbackPath}"); archive evidence is inconclusive because ` +
-        `${unattributableZeroReason(fx.mode)}; resume will fresh-spawn.`,
-    )
-    return
-  }
-
-  // Quiet-but-informative: no transcript anywhere and no archived activity since
-  // spawn (or archive unavailable). Expected for a persona idle since spawn —
-  // Claude creates the .jsonl lazily on first message. No loud error, no Slack.
-  console.error(
-    `[slack] jsonl-persistence-check: ${ref} has no transcript yet ` +
-      `(persisted="${persistedPath}", fallback="${fallbackPath}") and no archived activity since spawn — ` +
-      `expected for an idle-since-spawn persona; resume will fresh-spawn.`,
+  if (fx.isShuttingDown()) return
+  fx.recordError(ERR_KEY_TRANSCRIPT_REFERENCE, detail)
+  if (fx.isShuttingDown()) return
+  sendNotice(
+    fx.notify,
+    persona,
+    `⚠️ CSCB startup warning: agent-director reports that my current session has no recorded transcript ` +
+      `and my instance retains prior-session history (transcript_status=rotated). Resume may be unavailable; ` +
+      `whether prior transcript files remain readable is unverified. An operator can inspect agent-director's session history.`,
   )
 }
 
@@ -682,7 +417,7 @@ function reportStorageLayer(personas: readonly Persona[], roots: readonly string
   for (const root of nonPersistent) {
     fx.recordError(
       ERR_KEY_NON_PERSISTENT,
-      `JSONL storage root is on a non-persistent filesystem (tmpfs/ramfs) — resume is structurally impossible on this host. root="${root}"`,
+      `Configured storage directory is on a non-persistent filesystem (tmpfs/ramfs); data on this mount will not survive a reboot. root="${root}"`,
     )
     // Roots are per persona, so notify only the personas whose effective
     // JSONL root is this flagged non-persistent root.
@@ -692,7 +427,7 @@ function reportStorageLayer(personas: readonly Persona[], roots: readonly string
         fx.notify,
         persona,
         `⚠️ CSCB startup warning: my conversation storage at \`${root}\` is on a non-persistent filesystem ` +
-          `(tmpfs/ramfs). Session resume will not survive a reboot on this host.`,
+          `(tmpfs/ramfs). Data on this mount will not survive a reboot; transcript storage on other mounts is unverified.`,
       )
     }
   }
@@ -740,30 +475,9 @@ export function runPersonaStorageCheck(
 // ---------------------------------------------------------------------------
 
 /**
- * Startup safeguard: runs Layer 1 (non-persistent storage) then Layer 2
- * (per-persona transcript loss detection) over the applied personas. Designed
- * to be awaited between trustBootstrap and startupSessionManager in main(),
- * wrapped so a rejection can never kill startup.
- *
- * `notify` is the persona-keyed notice seam: it takes a persona key and a
- * notice body (production: the per-persona notifier).
- *
- * - Non-persistent root: recordStartupError(jsonl-non-persistent) + one
- *   notice per persona whose effective JSONL root is that root.
- * - Unresolvable root fstype: recordStartupError(jsonl-persistence-check-warning),
- *   no notice.
- * - Per-persona stale-path / lost-transcript: loud (record + notice to that persona).
- * - Idle-since-spawn persona, or a zero count the archive cannot attribute
- *   (b.av2 SR-7.4; in fungible mode every count, b.deo SRI-704): single quiet
- *   console line, no loud signal. The mode is `config`'s.
- * - A row the collision ladder will replace rather than resume: single
- *   quiet console line, no loud signal.
- * - A persona whose claude_config_dir cannot be resolved to a real path (bug
- *   b.g57): skipped for this pass before any AD call, with one quiet console
- *   line; no lost-history, inconclusive or transcript-loss signal and no
- *   label mismatch (its launch waits for the directory, row kept).
- * - notify undefined (a unit test): no notices; loud errors still recorded.
- * - Own unexpected failure: one warning line, returns (never throws).
+ * Report configured storage persistence and agent-director transcript references
+ * before startupSessionManager. No native transcript lookup or archive queries.
+ * Notices use the persona-keyed seam; each persona's failures stay local.
  */
 export async function runJsonlPersistenceSafeguard(
   config: PersonaConfig,
@@ -772,28 +486,39 @@ export async function runJsonlPersistenceSafeguard(
 ): Promise<void> {
   const recordError = deps?.recordStartupError ?? defaultRecordStartupError
   const readMountinfo = deps?.readMountinfo
+  let stopped = false
+  const isShuttingDown = (): boolean => {
+    if (stopped) return true
+    try {
+      stopped = deps?.isShuttingDown?.() === true
+    } catch {
+      stopped = true
+    }
+    return stopped
+  }
 
   try {
+    if (isShuttingDown()) return
     const home = deps?.home ?? homedir()
     const fx: Layer2Effects = {
       notify,
-      statFn: deps?.statFn ?? defaultStatFn,
-      getRow: deps?.getRow ?? defaultGetRow,
-      archiveCountSince: deps?.archiveCountSince ?? makeDefaultArchiveCount(config),
+      isShuttingDown,
+      getRow: deps?.getRow ?? ((key, instanceId) => defaultGetRow(key, instanceId, isShuttingDown)),
       recordError,
       home,
       configDirFs: deps?.configDirFs,
-      mode: channelModeOf(config),
     }
 
     // Layer 1 — non-persistent storage.
     reportStorageLayer(config.personas, resolveJsonlRoots(config, home), { notify, recordError, readMountinfo, home })
 
-    // Layer 2 — per-persona transcript loss. Isolated per persona.
+    // Layer 2 — agent-director transcript references. Isolated per persona.
     for (const persona of config.personas) {
+      if (isShuttingDown()) return
       try {
         await checkPersonaTranscript(persona, fx)
       } catch (err) {
+        if (isShuttingDown()) return
         console.error(
           `[slack] jsonl-persistence-check: unexpected error checking ${personaRef(persona)} — continuing: ` +
             describeThrownValue(err),

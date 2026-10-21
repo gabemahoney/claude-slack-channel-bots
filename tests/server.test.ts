@@ -4799,7 +4799,7 @@ describe('b.acu: reconnect adapter respects the checked delivery GONE recovery o
   test.each([false, true])('delivery recovery starts a sequence=%s: only an unowned wait arms deferred reconnect', async startSequence => {
     const h = makeRecoveryHarness({ harnessNow: true })
     const key = h.keys[0]!
-    const life = createDeliveryLifecycle({ startId: 'gone-adapter', clock: h.clock })
+    const life = createDeliveryLifecycle({ clock: h.clock })
     _setDeliveryLifecycle(life)
     setDeliveryPersonaLookup(appliedLookupOf(h))
     let row = personaRow(h, key, { state: 'waiting' })
@@ -4807,7 +4807,7 @@ describe('b.acu: reconnect adapter respects the checked delivery GONE recovery o
     const hold = holdFindMissing(h.stub.client)
     const handedOff: boolean[] = []
     life.setRecovery(async () => {
-      if (startSequence) handedOff.push(recoverDeliveryGone(key, row, life.launchId(key)))
+      if (startSequence) handedOff.push(recoverDeliveryGone(key, row))
       return false
     })
     try {

@@ -136,8 +136,7 @@ import {
   type SessionEntry,
   type SessionToolDeps,
 } from '../../src/registry.ts'
-import { _resetConfiguredPersonaQuery, _resetFindMissingMemo, _resetInFlightLaunches, _resetInvalidFlagsHold, _resetLiveRowSequenceRegistry, _resetOldLifeHolds, _resetOldLifeWaitBindings, _resetPreLaunchTrustPatcher, _resetRetiredKeyStore, _resetSpawnHomeDir, _setSpawnHomeDir, buildLiveRowSequenceDeps, checkLaunchConfigDir, createOldLifeHoldEndRetry, forgetOldLifeWaits, isLiveRowSequenceRunning, oldLifeHeldDirectory, personaRetryBlockCause, killPersonaInstanceForTeardown, launchSession, oldLifeHoldStep, personaConfigDirLabelValue, setConfigDirUnresolvableHook, setConfiguredPersonaQuery, setConflictLatch, setInvalidFlagsHold, setLiveRowSequenceRegistry, setOldLifeHolds, setOldLifeWaitBindings, setPreLaunchTrustPatcher, setRetiredKeyStore, setSessionNotifier, SPAWN_ACTION_FRESH_RETIRED, spawnForPersona, startLiveRowSequence, stopLiveRowSequence, whenLaunchSettled, type SpawnPersonaResult } from '../../src/session-manager.ts'
-import { trustPatchPersona } from '../../src/trust-bootstrap.ts'
+import { _resetConfiguredPersonaQuery, _resetFindMissingMemo, _resetInFlightLaunches, _resetInvalidFlagsHold, _resetLiveRowSequenceRegistry, _resetOldLifeHolds, _resetOldLifeWaitBindings, _resetRetiredKeyStore, _resetSpawnHomeDir, _setSpawnHomeDir, buildLiveRowSequenceDeps, checkLaunchConfigDir, createOldLifeHoldEndRetry, forgetOldLifeWaits, isLiveRowSequenceRunning, oldLifeHeldDirectory, personaRetryBlockCause, killPersonaInstanceForTeardown, launchSession, oldLifeHoldStep, personaConfigDirLabelValue, setConfigDirUnresolvableHook, setConfiguredPersonaQuery, setConflictLatch, setInvalidFlagsHold, setLiveRowSequenceRegistry, setOldLifeHolds, setOldLifeWaitBindings, setRetiredKeyStore, setSessionNotifier, SPAWN_ACTION_FRESH_RETIRED, spawnForPersona, startLiveRowSequence, stopLiveRowSequence, whenLaunchSettled, type SpawnPersonaResult } from '../../src/session-manager.ts'
 import type { ApplyBringUpOptions, ApplyStepSlots, InPlaceApplyInput } from '../../src/reload-apply.ts'
 import { composePendingFile, parsePendingFingerprint } from '../../src/reload-fingerprint.ts'
 import { DESTRUCTIVE_PREFIX, PENDING_PREVIEW_TITLE, type InPlaceSetting } from '../../src/reload-plan.ts'
@@ -3160,7 +3159,6 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
 
       _resetInFlightLaunches()
       _resetFindMissingMemo()
-      setPreLaunchTrustPatcher(trustPatchPersona)
       setConfigDirUnresolvableHook((persona, failure) => bringUps.holdForConfigDir(persona, failure))
       setSessionNotifier((key, text, options) => {
         sessionNotices.push({ key, text })
@@ -3551,7 +3549,6 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
           resetClientForTests()
           _resetSpawnHomeDir()
           _resetFindMissingMemo()
-          _resetPreLaunchTrustPatcher()
           setConfigDirUnresolvableHook(undefined)
           setSessionNotifier(undefined)
           setConflictLatch(undefined)

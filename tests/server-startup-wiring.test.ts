@@ -1055,7 +1055,6 @@ describe('main() installs the runtime agent-director version re-check right afte
     ['the reload detection tick (<controller>.startDetection)', (controller) => new RegExp(`\\b${controller}\\s*\\.\\s*startDetection\\s*\\(`, 'g')],
     ['the boot template install (installSlackChannelBotTemplate)', () => /(?<![\w.$])installSlackChannelBotTemplate\s*\(/g],
     ['the start sweep (reconcileOrphans)', () => /(?<![\w.$])reconcileOrphans\s*\(/g],
-    ['the trust bootstrap (trustBootstrap)', () => /(?<![\w.$])trustBootstrap\s*\(/g],
     ['the JSONL-persistence safeguard (runJsonlPersistenceSafeguard)', () => /(?<![\w.$])runJsonlPersistenceSafeguard\s*\(/g],
     ['the legacy hook cleanup', () => /(?<![\w.$])removeLegacyReplyHooks\s*\(personaConfig\.personas/g],
   ])('main() starts %s only if no shutdown has begun: an `if (shuttingDown) return` in main()\'s own statement list after the last await before the call', (_what, callPattern) => {
@@ -5572,6 +5571,8 @@ describe('typed delivery reporting production wiring', () => {
     expect(engine.get('onEvent')).toBe('event => deliveryEngineEvents.emit(event)')
     expect(engine.get('inspectUpgrade')).toContain('deliveryScope.run(key, client as Client, beforeCall,')
     expect(engine.get('inspectUpgrade')).toContain('inspectPersonaUpgrade(key, getAppliedPersona(key))')
+    expect(engine.get('refreshTranscript')).toContain('deliveryScope.run(key, client as Client, beforeCall, () => refreshDeliveryTranscript(key))')
+    expect(importSource(SERVER_CODE, 'refreshDeliveryTranscript')).toBe('./session-manager.ts')
     const life = onlyCallProps('createDeliveryLifecycle')
     expect(life.has('onReconnectScreen')).toBe(false)
     expect(onlyCallProps('createDeliveryReporting').has('reconnectBlocked')).toBe(false)

@@ -87,6 +87,8 @@ Preserve the [intake](architecture.md#durable-intake-queue-bomv-sr-2sr-3), [engi
 
 ## Session recovery
 
+Delegate native trust and transcript paths to AD. Use its `jsonl_path` verbatim and report its transcript diagnostics without inferring history loss from archive counts. Unconfirmed delivery follows observed pending/ended/missing states or session-id changes; AD waiting is readiness, with no synthetic launch identity or settle timer (b.d6n).
+
 Slack reply reminders use AD working-to-waiting transitions and CSCB delivery/reply facts, with one durable queued nudge per delivery. Clean up only the retired CSCB-managed Stop hook, preserving unrelated settings. New Claude launches pre-allow reply; older conversations lacking the pre-allow label receive no new reminders. Confirmed reloads apply the compatibility `stop_hook_bootstrap` switch immediately (b.js7).
 
 An agent-director installation disappearance leaves agent state unknown. Keep the outage, restart failure count and slow-recovery episode unchanged; wait for a fresh authoritative AD observation before recovery. Never kill or relaunch because the installation is unavailable (b.jpf).

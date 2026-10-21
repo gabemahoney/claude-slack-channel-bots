@@ -146,7 +146,7 @@ function receivedItem(item: any) {
 function engineEvent(event: any) {
   appendFileSync(join(stateDir, 'engine-events.jsonl'), JSON.stringify({ instance, ...event }) + '\n', { mode: 0o600 })
   if (event.type === 'launch-observed' || event.type === 'launch-first-waiting') {
-    log(`[slack] delivery-${event.type}: ${JSON.stringify({ key, launch_id: event.launchId, session_id: event.sessionId, at: event.at })}`); return
+    log(`[slack] delivery-${event.type}: ${JSON.stringify({ key, session_id: event.sessionId, at: event.at })}`); return
   }
   const item = queue.item(key, event.seq)
   if (!item) return

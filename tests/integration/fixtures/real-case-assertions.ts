@@ -23,7 +23,7 @@ export function assertSwallowedEnterRecovery(journal: any[], calls: KeyCall[], f
   const sent = journal.filter(record => record.kind === 'sent' && record.seq === seq)
   const text = sent.filter(record => record.send_kind !== 'enter')
   const enter = sent.filter(record => record.send_kind === 'enter')
-  check(enter.some(retry => text.some(typed => typed.part === retry.part && typed.launch_id === retry.launch_id
+  check(enter.some(retry => text.some(typed => typed.part === retry.part && typed.session_id === retry.session_id
     && typed.at <= retry.at && faults.some(fault => fault.at >= typed.at && fault.at < retry.at
       && fault.words[1] === 'key=Enter' && fault.words[2] === 'swallow'
       && (calls.find(call => call.at > fault.at && recoveryKey(call, instance))?.at ?? -Infinity) - fault.at >= 10000
@@ -32,25 +32,34 @@ export function assertSwallowedEnterRecovery(journal: any[], calls: KeyCall[], f
     'swallowed Enter has no observed durable Enter-only recovery under the existing backoff')
 }
 
-type LaunchObservation = { key: string; launch_id: string; session_id: string; at: number }
+type LaunchObservation = { key: string; session_id: string; at: number }
+
+/** Bind first-waiting evidence to this persona and its durable AD session. */
+export function assertFirstLaunchWaiting(waiting: LaunchObservation[], sent: { session_id?: string }[], key: string, start: number, textAt: number): LaunchObservation {
+  const observed = waiting.find(r => r.key === key && r.at >= start && r.at <= textAt)
+  check(observed, 'actual first-waiting launch observation missing')
+  check(sent.length > 0 && !!observed.session_id && sent.every(r => r.session_id === observed.session_id),
+    'fresh launch sends do not match AD waiting session')
+  return observed
+}
 
 /** Restart resets the first receipt/retry wait to 10s. The next retype has
  * two 30s waits, separated by its durable guarded Enter recovery. Checking
  * those stages distinguishes a reset from retaining the old 60s/120s slot. */
 export function assertResetKeyRecovery(journal: any[], calls: KeyCall[], faults: KeyCall[], waiting: LaunchObservation[], seq: number, instance: string) {
   const sent = journal.filter(record => record.kind === 'sent' && record.seq === seq)
-  const launch = sent.at(-1)?.launch_id
-  const newer = sent.filter(record => record.launch_id === launch)
+  const observed = waiting.filter(row => 'cscb_' + row.key === instance && row.session_id === sent.at(-1)?.session_id
+    && row.at <= sent.at(-1)?.at).at(-1)
+  check(observed, 'reset lacks an AD first-waiting observation')
+  const newer = sent.filter(record => record.at >= observed.at)
   check(newer.length === 4 && newer.map(record => record.send_kind).join(',') === 'enter,retype,enter,retype',
     'reset requires the durable Enter/text/Enter/text recovery sequence')
   const [initial, first, recovery, second] = newer
-  const old = sent.filter(record => record.launch_id !== launch && record.send_kind !== 'enter')
+  const old = sent.filter(record => record.at < observed.at && record.send_kind !== 'enter')
   check(old.length >= 3 && old.every(record => record.at < initial.at && record.part === initial.part),
     'reset did not interrupt a growing retry episode for this part')
   check(newer.every(record => record.part === initial.part && record.session_id === initial.session_id
-    && record.launch_id && record.session_id), 'reset stages have inconsistent part/session/launch identity')
-  const observed = waiting.find(row => 'cscb_' + row.key === instance && row.launch_id === launch && row.session_id === initial.session_id)
-  check(observed && initial.at >= observed.at + 1000, 'reset lacks the new launch first-waiting/settle evidence')
+    && record.session_id), 'reset stages have inconsistent part/session identity')
   const keys = calls.filter(call => recoveryKey(call, instance)
     && call.words[call.words.indexOf('--instance-id') + 1] === instance && call.at >= initial.at)
   const enterCall = (record: any, end: number) => keys.find(call => call.at >= record.at && call.at < end
@@ -73,7 +82,7 @@ export function assertResetKeyRecovery(journal: any[], calls: KeyCall[], faults:
   }
   check(!calls.some(call => call.at >= initial.at && call.at <= secondKey.at && call.words.includes('read-pane')),
     'reset recovery read native pane text')
-  return { launch, stages, sends: newer.map(record => ({ kind: record.send_kind, at: record.at })) }
+  return { session: initial.session_id, stages, sends: newer.map(record => ({ kind: record.send_kind, at: record.at })) }
 }
 
 async function main() {
@@ -81,6 +90,12 @@ const [command, state, key, shim, root, arg = '', arg2 = '', arg3 = ''] = proces
 function journal() { return jsonLines(join(state!, 'queue', `${key}.jsonl`)) }
 function cumulativeJournal() { return receiptJournal(state!, key!) }
 function calls() { return readFileSync(shim!, 'utf8').split('\n').filter(l => l.startsWith('call\t')).map(l => { const f=l.split('\t'); return { at:Number(f[1])*1000, pid:f[2], words:shimWords(f[5]!) } }) }
+function firstWaiting(): LaunchObservation[] {
+  return readFileSync(join(state!, 'server.log'), 'utf8').split('\n').flatMap(line => {
+    const marker = 'delivery-launch-first-waiting: ', index = line.indexOf(marker)
+    return index < 0 ? [] : [JSON.parse(line.slice(index + marker.length))]
+  })
+}
 function blocks(e:any):any[] { return e.value?.type==='assistant'&&Array.isArray(e.value?.message?.content)?e.value.message.content:[] }
 async function entries() { return readTranscripts(transcriptFiles(root!), await packedReceiptAdapters()) }
 async function confirmReceipts() {
@@ -272,9 +287,7 @@ try {
     const j=cumulativeJournal(), item=j.find(r=>r.kind==='accepted'&&!r.compact&&r.received_at>=start), fixed=j.find(r=>r.kind==='fixed'&&r.seq===item?.seq)
     check(fixed?.parts?.length===1&&text.every(t=>t.words[t.words.indexOf('--text')+1]===fixed.parts[0]),'fresh launch text does not match its first message')
     check(!j.some(r=>r.kind==='sent'&&r.seq===item.seq&&r.send_kind==='enter'),'fresh launch needed an Enter-only recovery')
-    const waiting=readFileSync(join(state!,'server.log'),'utf8').split('\n').flatMap(line=>{const marker='delivery-launch-first-waiting: ';const i=line.indexOf(marker);if(i<0)return [];try{return [JSON.parse(line.slice(i+marker.length))]}catch{return []}}).find(r=>r.key===key&&r.at>=start&&r.at<=text[0]!.at)
-    check(waiting,'actual first-waiting launch observation missing')
-    check(text[0]!.at-waiting.at>=1000,'fresh launch settle shorter than 1 second')
+    const waiting=assertFirstLaunchWaiting(firstWaiting(),j.filter(r=>r.kind==='sent'&&r.seq===item.seq),key!,start,text[0]!.at)
     let pending:typeof text[number]|undefined
     const pauses:number[]=[]
     for(const send of s) {
@@ -285,7 +298,7 @@ try {
         pauses.push(send.at-pending.at);pending=undefined
       }
     }
-    console.log('recorded: fresh-launch timing '+JSON.stringify({settle_ms:text[0]!.at-waiting.at,enter_ms:pauses,text_attempts:text.length,duplicate_text_attempts:text.length-1}))
+    console.log('recorded: fresh-launch timing '+JSON.stringify({after_waiting_ms:text[0]!.at-waiting.at,enter_ms:pauses,text_attempts:text.length,duplicate_text_attempts:text.length-1}))
   } else if(command==='posts') {
     const posts=jsonLines(arg).filter(r=>r.event==='api'&&r.method==='chat.postMessage')
     const wanted=JSON.parse(readFileSync(arg2,'utf8'))
@@ -334,7 +347,7 @@ try {
     const records:any[]=texts.flatMap((text,i)=>[
       {v:1,kind:'accepted',seq:i+1,source:'slack',text,ts:'1792000000.000001',channel:'C0CONTROL'+i,user:'U0CONTROL',received_at:900},
       {v:1,kind:'fixed',seq:i+1,parts:[text]},
-      {v:1,kind:'sent',seq:i+1,part:1,attempt:1,send_kind:'text',at:2000+i*20000,launch_id:1,session_id:'session-control',transcript_path:transcript,transcript_size:0},
+      {v:1,kind:'sent',seq:i+1,part:1,attempt:1,send_kind:'text',at:2000+i*20000,session_id:'session-control',transcript_path:transcript,transcript_size:0},
       {v:1,kind:'delivered',seq:i+1,part:1,at:3000+i*20000,receipt:{path:transcript,uuid:'r'+i}},
     ])
     const originalTakes=texts.map((text,i)=>({type:'user',uuid:'r'+i,sessionId:'session-control',timestamp:new Date(2500+i*20000).toISOString(),message:{role:'user',content:text}}))
@@ -447,7 +460,7 @@ try {
       if(duplicate)attempts.push({...records[2],send_kind:'retype',attempt:2,at:3000})
       write(attempts,takes)
       writeFileSync(log,textCall(textAt)+call(enterAt,'--key Enter')+(duplicate?textCall(3000)+call(duplicateEnter,'--key Enter'):''))
-      writeFileSync(join(dir,'server.log'),originalLines.slice(0,2).join('\n')+'\n[slack] delivery-launch-first-waiting: '+JSON.stringify({key:'control',at:1000})+'\n')
+      writeFileSync(join(dir,'server.log'),originalLines.slice(0,2).join('\n')+'\n[slack] delivery-launch-first-waiting: '+JSON.stringify({key:'control',session_id:'session-control',at:1000})+'\n')
     }
     writeLaunch();check(audit().items===1,'first-launch baseline lacks valid receipt identities')
     expectControl('first-launch baseline',()=>invoke('first-launch','0'))
@@ -459,8 +472,10 @@ try {
     const launchJournal=join(dir,'queue','control.jsonl')
     writeFileSync(launchJournal,readFileSync(launchJournal,'utf8')+JSON.stringify({...records[2],send_kind:'enter',attempt:3,at:3500})+'\n')
     expectControl('first-launch recorded Enter recovery',()=>invoke('first-launch','0'),'Enter-only recovery')
-    writeLaunch(false,1999,2500)
-    expectControl('first-launch 999ms settle',()=>invoke('first-launch','0'),'settle shorter than 1 second')
+    writeLaunch(false,1000,1500)
+    expectControl('first-launch immediate AD waiting readiness',()=>invoke('first-launch','0'))
+    writeLaunch(false,999,1500)
+    expectControl('first-launch before AD waiting',()=>invoke('first-launch','0'),'first-waiting launch observation missing')
     writeLaunch(false,2000,2499)
     expectControl('first-launch 499ms pause',()=>invoke('first-launch','0'),'pause shorter than 0.5 seconds')
     writeLaunch(true,2000,2500,3499)
@@ -468,6 +483,40 @@ try {
     writeLaunch()
     writeFileSync(join(dir,'server.log'),readFileSync(join(dir,'server.log'),'utf8').replace('"key":"control"','"key":"other"'))
     expectControl('first-launch other persona waiting',()=>invoke('first-launch','0'),'first-waiting launch observation missing')
+    writeLaunch()
+    writeFileSync(join(dir,'server.log'),readFileSync(join(dir,'server.log'),'utf8').replace('"session_id":"session-control"','"session_id":"other-session"'))
+    expectControl('first-launch other AD session',()=>invoke('first-launch','0'),'sends do not match AD waiting session')
+
+    const resetRecords=[records[0],records[1],...[
+      [2000,'text'],[22500,'retype'],[83000,'retype'],
+      [101000,'enter'],[111000,'retype'],[141500,'enter'],[171500,'retype'],
+    ].map(([at,send_kind],i)=>({...records[2],at,send_kind,attempt:i+1})),{...records[3],at:173000}]
+    const writeReset=(patch:{waitingAt?:number;initialKey?:boolean;session?:string;late?:boolean;missingRetype?:boolean}={})=>{
+      // Move all later evidence together so the late control fails on backoff,
+      // while the baseline proves 10s, 30s and 30s with a 500ms guarded Enter.
+      const at=(time:number)=>time+(patch.late&&time>=111000?20000:0)
+      const lines=[diagnostic('message-received',0,1000),diagnostic('message-delivered',0,at(174000)),
+        ...[1000,patch.waitingAt??100000].map(time=>'[slack] delivery-launch-first-waiting: '+JSON.stringify({key:'control',session_id:patch.session??'session-control',at:time}))]
+      write(resetRecords.filter(r=>!(patch.missingRetype&&r.kind==='sent'&&r.at===171500)).map(r=>r.at===undefined?r:{...r,at:at(r.at)}),
+        [{...originalTakes[0]!,timestamp:new Date(at(172500)).toISOString()}],undefined,lines)
+      writeFileSync(log,[textCall(2000),call(2500,'--key Enter'),textCall(22500),call(23000,'--key Enter'),
+        textCall(83000),call(83500,'--key Enter'),`call\t99\t1\t1\tbun\tresume --instance-id cscb_control\n`,
+        patch.initialKey===false?'':call(101000,'--key Enter'),textCall(at(111000)),
+        `fault\t${at(111000)/1000}\t1\t1\tbun\tsend-keys no_enter swallow 1\n`,
+        call(at(111500),'--key Enter'),call(at(141500),'--key Enter'),textCall(at(171500)),call(at(172000),'--key Enter')].join(''))
+    }
+    writeReset()
+    expectControl('same-session AD waiting resets unconfirmed retry spacing',()=>invoke('reset-spacing','1'))
+    for(const [name,patch,reason] of [
+      ['no new waiting',{waitingAt:1000},'durable Enter/text/Enter/text recovery sequence'],
+      ['no initial recovery key',{initialKey:false},'reset stages lack actual persona key calls'],
+      ['foreign AD session',{session:'other-session'},'reset lacks an AD first-waiting observation'],
+      ['old retry backoff',{late:true},'reset retained or skipped a backoff stage: 0'],
+      ['missing retype',{missingRetype:true},'durable Enter/text/Enter/text recovery sequence'],
+    ] as const) {
+      writeReset(patch)
+      expectControl('reset-spacing '+name,()=>invoke('reset-spacing','1'),reason)
+    }
 
     const checkpoint=join(dir,'active-tool.json'), base=Date.now()-3500
     let checkpointDelay=0
@@ -553,7 +602,7 @@ try {
       await queue.append('control',{v:1,kind:'fixed',seq,parts})
       for(const [p,text] of parts.entries()) {
         const at=received+1000+1000*p,uuid=`compact-${seq}-${p}`
-        await queue.append('control',{v:1,kind:'sent',seq,part:p+1,attempt:p+1,send_kind:'text',at,launch_id:'compact-launch',session_id:'compact-session',transcript_path:compactTranscript,transcript_size:0})
+        await queue.append('control',{v:1,kind:'sent',seq,part:p+1,attempt:p+1,send_kind:'text',at,session_id:'compact-session',transcript_path:compactTranscript,transcript_size:0})
         compactTakes.push({type:'user',uuid,sessionId:'compact-session',timestamp:new Date(at+200).toISOString(),message:{role:'user',content:text}})
         compactCalls.push(`call\t${at/1000}\t1\t1\tbun\tsend-keys --instance-id cscb_control --text ${text.replaceAll('<','\\<').replaceAll('>','\\>')} --no-enter`)
         if(seq!==5)await queue.append('control',{v:1,kind:'delivered',seq,part:p+1,at:at+300,receipt:{path:compactTranscript,uuid}})

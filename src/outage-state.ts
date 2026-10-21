@@ -278,6 +278,11 @@ export interface OutageDetectionOptions {
   /** Independent persona delivery client; does not replace the singleton. */
   readonly client?: Client
   /**
+   * Live startup shutdown query. A true answer or throw skips all outcome
+   * effects after the call settles; its result or error still passes through.
+   */
+  readonly isShuttingDown?: () => boolean
+  /**
    * Present for a call made outside every launch or recovery attempt that
    * must arm nothing: a persona teardown's kill (b.jg5 SRJ-110, SRJ-301;
    * hatch A3). Its error is then not reported (`reportAgentDirectorError` is
@@ -303,6 +308,15 @@ export interface OutageDetectionOptions {
    * outcome is never tried again and stands at once.
    */
   readonly deferUnavailableReport?: boolean
+}
+
+/** A stopped startup call must neither raise nor clear outages, nor report its error. */
+function outageCallStopped(options: OutageDetectionOptions | undefined): boolean {
+  try {
+    return options?.isShuttingDown?.() === true
+  } catch {
+    return true
+  }
 }
 
 /** `options.armsNothing.personaConfigured()`, a throw counting as false. Never throws. */
@@ -820,6 +834,7 @@ export async function withOutageDetection<T>(
       const result = await fn(deps.getClient())
       answer = result
     }
+    if (outageCallStopped(options)) return answer
     clearOutageFlag(key, 'ad-unreachable')
     clearOutageFlag(key, AD_CONFIG_MALFORMED)
     if (isTmuxTouchingCall(call)) {
@@ -830,6 +845,7 @@ export async function withOutageDetection<T>(
     }
     return answer
   } catch (err) {
+    if (outageCallStopped(options)) throw err
     const { errorClass } = classifyAdError(err)
     const armsNothing = effectiveOptions?.armsNothing
     // b.jg5 SRJ-110 (hatch A3): a call that arms nothing raises an

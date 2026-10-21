@@ -1,27 +1,24 @@
 /** Locates a Claude transcript for exact delivery receipt matching. */
-import { basename } from 'node:path'
-import { resolveJsonlPath } from './cozempic.ts'
+import { renderLogMessageText } from './persona-connection-errors.ts'
 
 /** The agent-director row fields the transcript is located from (`GetResult`). */
 export interface TranscriptRowFields {
   jsonl_path?: string
   session_id?: string
   cwd?: string
+  transcript_status?: string
+  prior_sessions?: readonly { jsonl_path?: string; session_id?: string; cwd?: string }[]
 }
 
-/**
- * The transcript of the row's current Claude session, or undefined when it
- * can't be located. With a `session_id`: the persisted `jsonl_path`
- * when its file name is `<session_id>.jsonl` (a path left from an
- * earlier session is never read), else the composed path under `configDir`
- * (the persona's effective claude_config_dir, absolute; undefined: not
- * composed). Without one: the persisted path, if any. Pure.
- */
-export function locateTranscript(row: TranscriptRowFields, configDir: string | undefined): string | undefined {
-  const persisted = row.jsonl_path || undefined
-  const sessionId = row.session_id || undefined
-  if (sessionId === undefined) return persisted
-  if (persisted !== undefined && basename(persisted) === `${sessionId}.jsonl`) return persisted
-  if (configDir === undefined || !row.cwd) return undefined
-  return resolveJsonlPath(row.cwd, sessionId, configDir)
+/** The current transcript path reported by agent-director, without native-layout assumptions. Pure. */
+export function locateTranscript(row: TranscriptRowFields): string | undefined {
+  return row.jsonl_path || undefined
+}
+
+/** AD's transcript references, without inferring file health or conversation loss. Pure. */
+export function describeTranscriptReference(row: TranscriptRowFields): string {
+  const status = renderLogMessageText(row.transcript_status) || '(not reported)'
+  const path = renderLogMessageText(row.jsonl_path) || '(not recorded)'
+  const history = Array.isArray(row.prior_sessions) ? row.prior_sessions.length : '(not reported)'
+  return `agent-director transcript_status=${status}, jsonl_path=${path}, prior_sessions=${history}; recorded references do not verify that transcript files remain readable`
 }

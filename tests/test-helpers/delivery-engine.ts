@@ -12,7 +12,7 @@ import { makeQueue, injectedInput, readQueue } from './delivery-queue.ts'
 import { cannedGetResult, makeStubClient, type CannedGetResult } from './agent-director-stub.ts'
 import { appendTranscript, codexPromptEntry, endedTurn, promptEntry, replyEntry, writeTranscript } from './working-row-panes.ts'
 
-export async function makeEngineHarness(options: { keys?: string[]; constants?: DeliveryEngineDeps['constants']; stateDir?: string; configuredAgent?: 'claude' | 'codex'; clientFor?: DeliveryEngineDeps['clientFor']; onRow?: DeliveryEngineDeps['onRow']; inspectUpgrade?: DeliveryEngineDeps['inspectUpgrade']; onEvent?: DeliveryEngineDeps['onEvent'] } = {}) {
+export async function makeEngineHarness(options: { keys?: string[]; constants?: DeliveryEngineDeps['constants']; stateDir?: string; configuredAgent?: 'claude' | 'codex'; clientFor?: DeliveryEngineDeps['clientFor']; onRow?: DeliveryEngineDeps['onRow']; inspectUpgrade?: DeliveryEngineDeps['inspectUpgrade']; refreshTranscript?: DeliveryEngineDeps['refreshTranscript']; onEvent?: DeliveryEngineDeps['onEvent'] } = {}) {
   const root = options.stateDir ?? mkdtempSync(join(tmpdir(), 'delivery-engine-'))
   const clock = createFakeClock(), events: DeliveryEngineEvent[] = [], errors: unknown[] = []
   const calls: { key: string; verb: string; at: number; params: unknown }[] = []
@@ -58,7 +58,7 @@ export async function makeEngineHarness(options: { keys?: string[]; constants?: 
     })
     return [key, { ...state, stub, state }] as const
   }))
-  let lifecycle = createDeliveryLifecycle({ startId: `server-${start}`, clock })
+  let lifecycle = createDeliveryLifecycle({ clock })
   const preparation = createDeliveryPreparation({ queue, clock, clientFor: () => undefined,
     resolveUserName: async () => { order.push('lookup'); return 'sender' },
     onPending: key => engines?.wake(key), wake: key => engines?.wake(key),
@@ -73,7 +73,7 @@ export async function makeEngineHarness(options: { keys?: string[]; constants?: 
       prepare: (key, item) => preparation.owns(key, item.accepted.seq) ? preparation.prepare(key, item) : Promise.resolve(),
       isRestartPendingOrActive: key => personas.get(key)?.state.restartPending ?? false, scheduleRestart: (key, cwd) => restarts.push({ key, cwd }),
       reconnect: async (key, _client, beforeCall) => { beforeCall(); calls.push({ key, verb: 'reconnect', at: clock.now(), params: {} }) },
-      onRow: options.onRow, inspectUpgrade: options.inspectUpgrade, onEvent: event => { events.push(event); options.onEvent?.(event) }, onError: (_key, error) => errors.push(error),
+      onRow: options.onRow, inspectUpgrade: options.inspectUpgrade, refreshTranscript: options.refreshTranscript, onEvent: event => { events.push(event); options.onEvent?.(event) }, onError: (_key, error) => errors.push(error),
       onKeyError: async (_key, error) => { errors.push(error) },
     })
   }
@@ -108,7 +108,7 @@ export async function makeEngineHarness(options: { keys?: string[]; constants?: 
       realQueue = await makeQueue(root, { now: clock.now })
       const append = queue.append
       Object.assign(queue, realQueue, { append })
-      lifecycle = createDeliveryLifecycle({ startId: `server-${++start}`, clock }); build()
+      lifecycle = createDeliveryLifecycle({ clock }); build()
       for (const key of personas.keys()) engines.wake(key)
     },
     async cleanup() { await engines.stop(); await preparation.stop(); await queue.stop(); if (!options.stateDir) rmSync(root, { recursive: true, force: true }) },

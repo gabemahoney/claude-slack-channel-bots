@@ -13,31 +13,91 @@ afterEach(async () => {
 })
 function harness() {
   const clock = createFakeClock(), calls: { key: string; at: number }[] = []
-  const life = createDeliveryLifecycle({ startId: 'server-run', clock })
+  const life = createDeliveryLifecycle({ clock })
   lives.push(life)
   life.setReconnect(async key => { calls.push({ key, at: clock.now() }) })
   return { clock, life, calls }
 }
 
-describe('launch identity and typing leases', () => {
-  test('identity follows normalized launch stamps, pending transitions and sessions, independently of server start', () => {
+describe('AD relaunch observations and typing leases', () => {
+  test.each(['pending', 'ended', 'missing'])('entry into %s resets readiness and reports relaunch once, per persona', state => {
     const { life } = harness()
-    const first = life.launchId('alpha')
-    expect(life.hasWaited('alpha')).toBe(false)
-    const stamped = life.observeRow('alpha', { state: 'waiting', session_id: 's1', launch_started_at: '2026-10-15T01:00:00Z' })
-    expect(stamped).not.toBe(first)
+    const events: unknown[] = []
+    life.setRelaunchObserver((key, row) => events.push({ key, row }))
+    life.observeRow('alpha', { state: 'waiting', session_id: 'same-session' })
+    life.observeRow('beta', { state: 'waiting', session_id: 'sibling' })
     expect(life.hasWaited('alpha')).toBe(true)
-    expect(life.observeRow('alpha', { state: 'working', session_id: 's1', launch_started_at: '2026-10-15T01:00:00.000Z' })).toBe(stamped)
-    const pending = life.observeRow('alpha', { state: 'pending', session_id: 's1' })
-    expect(pending).not.toBe(stamped)
+    const oldLease = life.acquire('alpha', 'delivery')!
+    const siblingLease = life.acquire('beta', 'delivery')!
+    const row = { state, session_id: 'same-session' }
+    life.observeRow('alpha', row)
+    life.observeRow('alpha', row)
+    expect(events).toEqual([{ key: 'alpha', row }])
     expect(life.hasWaited('alpha')).toBe(false)
-    expect(life.observeRow('alpha', { state: 'pending', session_id: 's1', launch_started_at: 'bad-stamp' })).toBe(pending)
-    const resumed = life.observeRow('alpha', { state: 'working', session_id: 's2' })
-    expect(resumed).not.toBe(pending)
-    expect(life.beforeLaunch('alpha')).not.toBe(resumed)
-    expect(life.launchId('beta')).toBe(first)
-    const nextServer = createDeliveryLifecycle({ startId: 'another-run' }); lives.push(nextServer)
-    expect(nextServer.launchId('alpha')).not.toBe(first)
+    expect(life.hasWaited('beta')).toBe(true)
+    expect(life.owner('alpha')).toBe('free')
+    expect(life.owner('beta')).toBe('delivery')
+    const replacementLease = life.acquire('alpha', 'reconnect')!
+    oldLease()
+    expect(life.owner('alpha')).toBe('reconnect')
+    replacementLease(); siblingLease()
+    life.observeRow('alpha', { state: 'waiting', session_id: 'same-session' })
+    expect(life.hasWaited('alpha')).toBe(true)
+  })
+  test('session_id change reports relaunch; working cannot establish readiness; waiting establishes it immediately', () => {
+    const { life } = harness()
+    const events: unknown[] = []
+    life.setRelaunchObserver((key, row) => events.push({ key, row }))
+    life.observeRow('alpha', { state: 'working', session_id: 's1' })
+    expect(life.hasWaited('alpha')).toBe(false)
+    life.observeRow('alpha', { state: 'waiting', session_id: 's1' })
+    expect(life.hasWaited('alpha')).toBe(true)
+    life.observeRow('alpha', { state: 'working', session_id: 's1' })
+    expect(events).toEqual([])
+    const row = { state: 'working', session_id: 's2' }
+    life.observeRow('alpha', row)
+    expect(events).toEqual([{ key: 'alpha', row }])
+    expect(life.hasWaited('alpha')).toBe(false)
+    life.observeRow('alpha', { state: 'waiting', session_id: 's2' })
+    expect(life.hasWaited('alpha')).toBe(true)
+  })
+  test('first waiting observer fires once for each AD readiness episode and keeps personas separate', () => {
+    const { life } = harness()
+    const events: Array<{ key: string; row: { state: string; session_id?: string } }> = []
+    life.setFirstWaitingObserver((key, row) => events.push({ key, row }))
+    const waiting = { state: 'waiting', session_id: 's1' }
+    life.observeRow('alpha', { state: 'working', session_id: 's1' })
+    expect(events).toEqual([])
+    life.observeRow('alpha', waiting)
+    life.observeRow('alpha', waiting)
+    life.observeRow('alpha', { state: 'working', session_id: 's1' })
+    life.observeRow('alpha', waiting)
+    life.observeRow('beta', waiting)
+    expect(events).toEqual([{ key: 'alpha', row: waiting }, { key: 'beta', row: waiting }])
+    life.observeRow('alpha', { state: 'missing' })
+    life.observeRow('alpha', { state: 'working', session_id: 's1' })
+    expect(life.hasWaited('alpha')).toBe(false)
+    life.observeRow('alpha', waiting)
+    const replacement = { state: 'waiting', session_id: 's2' }
+    life.observeRow('alpha', replacement)
+    expect(events).toEqual([
+      { key: 'alpha', row: waiting }, { key: 'beta', row: waiting },
+      { key: 'alpha', row: waiting }, { key: 'alpha', row: replacement },
+    ])
+    expect(life.hasWaited('beta')).toBe(true)
+  })
+  test('activation supplies no fabricated relaunch evidence and preserves an in-flight lease', () => {
+    const { life } = harness()
+    const events: unknown[] = []
+    life.setRelaunchObserver((key, row) => events.push({ key, row }))
+    life.observeRow('alpha', { state: 'waiting', session_id: 's1' })
+    const release = life.acquire('alpha', 'delivery')!
+    life.activate('alpha')
+    expect(events).toEqual([])
+    expect(life.hasWaited('alpha')).toBe(true)
+    expect(life.acquire('alpha', 'reconnect')).toBeUndefined()
+    release()
+    expect(life.owner('alpha')).toBe('free')
   })
   test.each(['delivery', 'reconnect'] as const)('%s holds one persona gate; stale releases cannot free a replacement lease', owner => {
     const { life } = harness()
@@ -48,7 +108,7 @@ describe('launch identity and typing leases', () => {
     expect(life.owner('beta')).toBe('delivery')
     life.forget('alpha')
     expect(life.acquire('alpha', owner)).toBeUndefined()
-    life.beforeLaunch('alpha')
+    life.activate('alpha')
     const replacement = life.acquire('alpha', 'reconnect')!
     release()
     expect(life.owner('alpha')).toBe('reconnect')
@@ -149,16 +209,16 @@ test('concurrent and nested reconnect scopes keep each persona client and budget
 
 
 describe('retained reconnect input ownership', () => {
-  test.each(['new-launch', 'new-session', 'new-stamp', 'ended', 'missing', 'teardown'] as const)(
+  test.each(['new-launch', 'new-session', 'ended', 'missing', 'teardown'] as const)(
     '%s cancels the old command continuation while preserving the sibling', event => {
       const { life } = harness()
       for (const key of ['alpha', 'beta']) {
         life.observeRow(key, { state: 'waiting', session_id: 'old-session', launch_started_at: '2026-10-15T01:00:00Z' })
-        life.rememberReconnectInput(key, { launch: life.launchId(key), session: 'old-session' })
+        life.rememberReconnectInput(key, { session: 'old-session' })
       }
-      if (event === 'new-launch') life.beforeLaunch('alpha')
+      if (event === 'new-launch') life.observeRow('alpha', { state: 'pending' })
       else if (event === 'teardown') life.forget('alpha')
-      else life.observeRow('alpha', { state: event === 'ended' || event === 'missing' ? event : 'waiting', session_id: event === 'new-session' ? 'new-session' : 'old-session', launch_started_at: event === 'new-stamp' ? '2026-10-15T02:00:00Z' : '2026-10-15T01:00:00Z' })
+      else life.observeRow('alpha', { state: event === 'ended' || event === 'missing' ? event : 'waiting', session_id: event === 'new-session' ? 'new-session' : 'old-session', launch_started_at: '2026-10-15T01:00:00Z' })
       expect(life.reconnectInput('alpha')).toBeUndefined()
       expect(life.reconnectInput('beta')).toBeDefined()
       expect(life.acquire('beta', 'delivery')).toBeUndefined()
@@ -166,7 +226,7 @@ describe('retained reconnect input ownership', () => {
   )
   test('a pending command keeps its retry timer when a connected engine takes ownership', async () => {
     const { life, clock, calls } = harness()
-    life.rememberReconnectInput('alpha', { launch: life.launchId('alpha'), session: 's1' })
+    life.rememberReconnectInput('alpha', { session: 's1' })
     life.setReconnect(async key => { calls.push({ key, at: clock.now() }); life.clearReconnectInput(key); life.clearDeferred(key) })
     life.defer('alpha')
     life.engineRunning('alpha', true)

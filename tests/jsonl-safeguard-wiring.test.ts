@@ -47,6 +47,7 @@ import {
   loadedConfigName,
   mainBody,
   onlyCallArguments,
+  objectProperties,
   splitTopLevel,
   startResolution,
   stripComments,
@@ -88,11 +89,21 @@ function startBringUpAt(): number {
 /** Every start-time pass SR-6.2 requires to run over the applied personas. */
 const START_PASSES = [
   'installSlackChannelBotTemplate',
-  'trustBootstrap',
   'runJsonlPersistenceSafeguard',
 ] as const
 
 describe('server.ts wires the JSONL-persistence safeguard', () => {
+  test('passes the restart module\'s live shutdown query to the per-persona safeguard', () => {
+    const args = splitTopLevel(onlyCallArguments(SERVER_CODE, 'runJsonlPersistenceSafeguard'))
+    expect(args).toHaveLength(3)
+    const safeguard = objectProperties(args[2]!)
+    const restartArgs = splitTopLevel(onlyCallArguments(SERVER_CODE, 'initRestart'))
+    const restart = objectProperties(restartArgs[0]!)
+    const query = safeguard.get('isShuttingDown')
+    expect(query).toMatch(/^\(\) => \w+$/)
+    expect(query).toBe(restart.get('isShuttingDown'))
+  })
+
   test('imports runJsonlPersistenceSafeguard from the safeguard module', () => {
     // The import regex subsumes a bare `toContain` name check.
     expect(SERVER_SRC).toMatch(
@@ -111,7 +122,7 @@ describe('server.ts wires the JSONL-persistence safeguard', () => {
 })
 
 describe('server.ts runs every start-time pass over the applied personas (b.av2 SR-6.2)', () => {
-  test.each(['trustBootstrap', 'runJsonlPersistenceSafeguard'])(
+  test.each(['runJsonlPersistenceSafeguard'])(
     'every %s call comes BEFORE the start bring-up (`<controller>.runStartBringUp()` in main())',
     (pass) => {
       const passCalls = callsOf(pass)
@@ -142,38 +153,8 @@ describe('server.ts runs every start-time pass over the applied personas (b.av2 
   )
 })
 
-describe('server.ts installs the pre-launch trust patcher (b.av2 SR-6.2)', () => {
-  /** The setter call carrying the single-persona trust patch. */
-  const INSTALL = /\bsetPreLaunchTrustPatcher\s*\(/g
-
-  test('imports the setter from the session manager and the patch from trust-bootstrap', () => {
-    expect(SERVER_CODE).toMatch(
-      /import\s*\{[^}]*\bsetPreLaunchTrustPatcher\b[^}]*\}\s*from\s*['"]\.\/session-manager\.ts['"]/,
-    )
-    expect(SERVER_CODE).toMatch(
-      /import\s*\{[^}]*\btrustPatchPersona\b[^}]*\}\s*from\s*['"]\.\/trust-bootstrap\.ts['"]/,
-    )
-  })
-
-  test('installs trustPatchPersona as the pre-launch trust patcher', () => {
-    expect(indicesOf(INSTALL, SERVER_CODE).length).toBeGreaterThan(0)
-    // Every install carries the persona trust patch, never something else.
-    const args = splitTopLevel(onlyCallArguments(SERVER_CODE, 'setPreLaunchTrustPatcher'))
-    expect(args.length).toBeGreaterThan(0)
-    for (const arg of args) expect(arg.replace(/\s+/g, ' ')).toMatch(/^persona => \{ removeLegacyReplyHooks\(\[persona\.claude_config_dir\]\) trustPatchPersona\(persona\) \}$/)
-  })
-
-  test.each([
-    ['the template install', 'installSlackChannelBotTemplate'],
-    ['the persona Slack connections', 'createPersonaConnectionManager'],
-    ['Bun.serve', 'Bun\\.serve'],
-    ['initRestart', 'initRestart'],
-    ['the start bring-up', 'runStartBringUp'],
-  ])('installs the patcher BEFORE %s', (_label, anchor) => {
-    const [install] = indicesOf(INSTALL, SERVER_CODE)
-    expect(install).toBeDefined()
-    expect(install!).toBeLessThan(firstCallOf(anchor))
-  })
+test('AD owns pre-trust: server installs no native trust writer', () => {
+  expect(SERVER_CODE).not.toMatch(/\b(?:trustBootstrap|trustPatchPersona|setPreLaunchTrustPatcher)\b/)
 })
 
 describe('server.ts removes legacy hooks without installing a pre-launch hook', () => {
@@ -186,12 +167,9 @@ describe('server.ts removes legacy hooks without installing a pre-launch hook', 
     expect(SERVER_CODE).not.toMatch(/\b(?:setPreLaunchReplyGuard|preLaunchReplyGuard|stopHookBootstrap)\s*\(/)
   })
 
-  test('prepares the system prompt after the trust patcher is installed', () => {
+  test('prepares the system prompt and retries legacy-hook cleanup before launches', () => {
     expect(() => onlyCallArguments(SERVER_CODE, 'setSystemPromptPreparer')).not.toThrow()
-    const trust = callsOf('setPreLaunchTrustPatcher')[0] ?? -1
-    const prompt = SERVER_CODE.indexOf('setSystemPromptPreparer(prepareSystemPrompt)')
-    expect(trust).toBeGreaterThan(-1)
-    expect(prompt).toBeGreaterThan(trust)
+    expect(SERVER_CODE).toContain('removeLegacyReplyHooks([persona.claude_config_dir])')
     expect(SERVER_CODE).toContain("prepareSystemPrompt('server-start')")
   })
 })

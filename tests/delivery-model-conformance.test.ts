@@ -55,12 +55,14 @@ test('ENGINE_ACTIONS equals the current TLA source vocabulary and frozen fixture
 test('every frozen state replays AD/receipt decisions; recovery intents also tolerate disconnected MCP', async () => {
   const c = coverage()
   let states = 0, divergentReadings = 0, savedReadings = 0, expiredSteps = 0, mcpIndependentRecoveries = 0, recoveryEnters = 0
+  let sameSessionResumes = 0, changedSessions = 0
   // Decode one envelope at a time to bound replay memory.
   for (const [name, hash] of Object.entries(c.fixtures)) {
     const envelope = decodeDeliveryFixture(join(fixtures, name), hash as string)
     const result = await replayDeliveryFixture(envelope)
     states += result.states; divergentReadings += result.divergentReadings; savedReadings += result.savedReadings; expiredSteps += result.expiredSteps
     mcpIndependentRecoveries += result.mcpIndependentRecoveries; recoveryEnters += result.recoveryEnters
+    sameSessionResumes += result.sameSessionResumes; changedSessions += result.changedSessions
   }
   expect(states).toBe(c.summary.states)
   expect(divergentReadings).toBeGreaterThan(0)
@@ -68,6 +70,8 @@ test('every frozen state replays AD/receipt decisions; recovery intents also tol
   expect(expiredSteps).toBeGreaterThan(0)
   expect(mcpIndependentRecoveries).toBeGreaterThan(0)
   expect(recoveryEnters).toBeGreaterThan(0)
+  expect(sameSessionResumes).toBeGreaterThan(0)
+  expect(changedSessions).toBeGreaterThan(0)
 }, 180000)
 
 test('an isolated mutation of production FIFO selection is detected by the same local TLC replay', async () => {
@@ -79,5 +83,6 @@ test('an isolated mutation of production FIFO selection is detected by the same 
   const mutant = await import(path)
   const name = 'control_next_item-001.json', c = coverage()
   const envelope = decodeDeliveryFixture(join(fixtures, name), c.fixtures[name])
+  await replayDeliveryFixture(envelope)
   await expect(replayDeliveryFixture(envelope, mutant)).rejects.toThrow('production choice/target mismatch')
 })

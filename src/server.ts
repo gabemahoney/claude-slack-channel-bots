@@ -55,13 +55,11 @@
  */
 
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js'
-import { randomBytes } from 'node:crypto'
 import { prepareBotSystemPrompt, botSystemPromptPath } from './bot-system-prompt.ts'
 import type { Client } from 'agent-director'
 import { createDeliveryEngines, createDeliveryLifecycle, type DeliveryEngines, type DeliveryLifecycle, type DeliveryEngineEvent } from './delivery-engine.ts'
 import { createDeliveryAdScope } from './delivery-ad-scope.ts'
-import { parseLaunchStart } from './pending-row.ts'
-import { setDeliveryLifecycle, setDeliveryPersonaLookup, inspectPersonaUpgrade, isTagUpgradePending, hasNotConnectedEpisode, applyDeliveryOwnRowRead, handleDeliveryKeyError, handleDeliveryReadError, recoverDeliveryGone } from './session-manager.ts'
+import { setDeliveryLifecycle, setDeliveryPersonaLookup, inspectPersonaUpgrade, isTagUpgradePending, hasNotConnectedEpisode, applyDeliveryOwnRowRead, handleDeliveryKeyError, handleDeliveryReadError, recoverDeliveryGone, refreshDeliveryTranscript } from './session-manager.ts'
 import type { WebClient } from '@slack/web-api'
 import { join, resolve } from 'path'
 import { fileURLToPath } from 'url'
@@ -82,7 +80,7 @@ import {
   type ServerSettings,
   MCP_SERVER_NAME,
 } from './config.ts'
-import { personaInstanceId, renderPersonaRef, resolvePersonaTarget, resolveClaudeConfigDir } from './persona-identity.ts'
+import { personaInstanceId, renderPersonaRef, resolvePersonaTarget } from './persona-identity.ts'
 import {
   applyOwnRowStatusStep,
   buildLatchRecheck,
@@ -147,7 +145,6 @@ import {
   createOldLifeWaitUnclassifiedErrors,
   type OldLifeWaitUnclassifiedErrors,
   waitsOnKillFailedHold,
-  setPreLaunchTrustPatcher,
   setSystemPromptPreparer,
   setRetiredKeyStore,
   setSessionNotifier,
@@ -277,7 +274,6 @@ import {
   type LivenessReading,
 } from './liveness-reading.ts'
 import { getClient, closeClient } from './agent-director-client.ts'
-import { trustBootstrap, trustPatchPersona } from './trust-bootstrap.ts'
 import { runJsonlPersistenceSafeguard, runPersonaStorageCheck } from './jsonl-persistence-check.ts'
 import { removeLegacyReplyHooks } from './legacy-reply-hook-cleanup.ts'
 import { forgetPersonaPrompts, startPermissionPoller, stopPermissionPoller, hasNativePromptWarning } from './permission-poller.ts'
@@ -2883,18 +2879,12 @@ export async function main(): Promise<void> {
   const testTimers = installTestTimerOverrides(personaConfig.test_timer_overrides, (line) => console.error(line))
   const testMcpDropEnabled = personaConfig.test_mcp_drop_endpoint === true
   if (testMcpDropEnabled) console.error(TEST_MCP_DROP_START_LINE)
-  // b.av2 SR-6.2: the trust patch precedes every launch. Installed as soon as
-  // the persona config is set — before the Slack connections, Bun.serve and
-  // initRestart — so no launch path (start, restart or a human trigger) can
-  // run unpatched.
-  setPreLaunchTrustPatcher(persona => {
-    removeLegacyReplyHooks([persona.claude_config_dir])
-    trustPatchPersona(persona)
-  })
   // b.omv SR-7.2: startup failure is local; every launch retries the write and fails closed.
   const prepareSystemPrompt = (key: string): void => {
     try {
       if (personaConfig === null) throw new Error('persona configuration unavailable')
+      const persona = personaConfig.personas.find(persona => persona.key === key)
+      if (persona) removeLegacyReplyHooks([persona.claude_config_dir])
       prepareBotSystemPrompt(personaConfig, STATE_DIR)
     } catch (err) {
       const code = redactSlackLogText(queueErrorCode(err))
@@ -3452,7 +3442,6 @@ export async function main(): Promise<void> {
   for (const event of bufferedQueueEvents.splice(0)) deliveryReporting.queueEvent(event)
   deliveryReporting.startupFindings(deliveryQueue!.startupFindings())
   deliveryLifecycle = createDeliveryLifecycle({
-    startId: randomBytes(16).toString('hex'), parseLaunchStart,
     onError: error => console.error(`[slack] deferred reconnect failed: ${describeThrownValue(error)}`),
   })
   setDeliveryLifecycle(deliveryLifecycle)
@@ -3464,7 +3453,7 @@ export async function main(): Promise<void> {
     clientFor: key => deliveryClients!.clientFor(key),
     call: (key, verb, client, run) => withOutageDetection(key, undefined, verb, c => run(c), { client: client as Client, armsNothing: { personaConfigured: () => !!getAppliedPersona(key) } }),
     instanceId: personaInstanceId,
-    persona: key => { const p = getAppliedPersona(key); return p ? { cwd: p.working_directory, configDir: resolveClaudeConfigDir(p.claude_config_dir) } : undefined },
+    persona: key => { const p = getAppliedPersona(key); return p ? { cwd: p.working_directory } : undefined },
     isUp: key => !shuttingDown && isPersonaUp(key),
     isLatched: key => conflictLatch.isLatched(key),
     isHeld: key => invalidFlagsHold.isHeld(key) || personaKillFailureAlerts?.isOpen(key) === true || waitsOnKillFailedHold(key) || isOwnRowOldLifeHeld(key) || isLiveRowSequenceRunning(key),
@@ -3479,12 +3468,13 @@ export async function main(): Promise<void> {
       return held
     },
     inspectUpgrade: (key, _row, client, beforeCall) => deliveryScope.run(key, client as Client, beforeCall, async () => { await inspectPersonaUpgrade(key, getAppliedPersona(key)) }),
+    refreshTranscript: (key, client, beforeCall) => deliveryScope.run(key, client as Client, beforeCall, () => refreshDeliveryTranscript(key)),
     onKeyError: handleDeliveryKeyError,
     onReadError: handleDeliveryReadError,
     isRestartPendingOrActive, scheduleRestart,
     recoverGone: recoverDeliveryGone,
-    recoverAbsent: (key, launch) => {
-      if (deliveryLifecycle?.launchId(key) !== launch) return false
+    recoverAbsent: key => {
+      if (!deliveryLifecycle?.active(key)) return false
       const result = retryTimers.runNow(key, { kind: 'delivery-row-absent' }, 'delivery-row-absent')
       // An already running retry may stop on a row read from before the
       // absence. Keep the engine's GONE evidence unless a new pass started.
@@ -3992,7 +3982,7 @@ export async function main(): Promise<void> {
   })
 
   // b.av2 SR-6.3 as amended by b.jg5 SRJ-1506; b.jg5 SRJ-116, SRJ-714: the
-  // start sweep, BEFORE the trust patch and any spawn. One `list` reads every
+  // start sweep, before any spawn. One `list` reads every
   // `service=cscb` row in every state; then, over the whole list and before
   // any kill, the latch pass (a latched persona's own row and every row
   // labelled with it are left unkilled) and one batch record of the keys of
@@ -4015,19 +4005,9 @@ export async function main(): Promise<void> {
     console.error(`[slack] Warning: orphan reconciliation failed: ${describeThrownValue(err)}`)
   }
 
-  // b.uhv / b.k54 / b.av2 SR-6.2: patch .claude.json for every applied
-  // persona's working directory so the trust dialog and project onboarding are
-  // pre-accepted before any spawn fires (the pre-launch patcher repeats it per
-  // launch). Runs for both real and dry-run modes (config-file patch, not a
-  // session operation).
-  // A shutdown may have begun during the sweep: no bootstrap pass starts
-  // after it (b.jg5 SRJ-205).
-  if (shuttingDown) return
-  await trustBootstrap(personaConfig)
-
   // b.zak: preventative JSONL-persistence safeguard. Detect non-persistent
-  // storage roots (Layer 1) and personas whose transcript would be treated as
-  // missing on resume (Layer 2) and say so LOUDLY, BEFORE startupSessionManager
+  // storage directories (Layer 1) and AD-reported transcript references
+  // (Layer 2), before startupSessionManager
   // runs the resume path, which on ErrJsonlMissing brings the persona up fresh
   // by a reuse spawn of the same id.
   // Runs over the applied personas. Awaited but wrapped so a rejection can
@@ -4037,7 +4017,7 @@ export async function main(): Promise<void> {
   // (b.jg5 SRJ-205).
   if (shuttingDown) return
   try {
-    await runJsonlPersistenceSafeguard(personaConfig, personaNotifier.notify)
+    await runJsonlPersistenceSafeguard(personaConfig, personaNotifier.notify, { isShuttingDown: () => shuttingDown })
   } catch (err) {
     console.error(`[slack] Warning: jsonl-persistence safeguard failed — continuing: ${describeThrownValue(err)}`)
   }

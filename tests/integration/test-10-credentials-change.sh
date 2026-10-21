@@ -10,8 +10,8 @@
 # a literal loopback URL; the server logs only its origin). A live start also
 # launches each persona through the real agent-director:
 # fixtures/stub-claude.sh is first on PATH as `claude` (as Test 4 arranges),
-# the working dirs come from `make_workdir` (the start's trust patch covers
-# them), the health check is off (`health_check_interval: 0`, so no restart
+# the working dirs come from `make_workdir` (agent-director owns pre-trust),
+# the health check is off (`health_check_interval: 0`, so no restart
 # chases the stub's missing MCP session) and `exit_timeout` is 5 s
 # (stub-claude ignores the `/exit` that `stop --stop-bots` sends, so the stop
 # escalates to a kill after 5 s).

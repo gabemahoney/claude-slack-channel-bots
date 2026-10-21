@@ -23,7 +23,7 @@ function sample(duplicate = false) {
     return [{ v: 1, kind: 'accepted', seq, source: 'interject', sender: 'synthetic', ts: `1.00000${seq}`, text: `body-${i}`, received_at: 900 + i * 1000 },
       { v: 1, kind: 'fixed', seq, parts: [texts[i]] },
       { v: 1, kind: 'sent', seq, part: 1, send_kind: 'text', attempt: 1, at: 1000 + i * 1000,
-        session_id: session, transcript_path: path, transcript_size: rollout.records[0]!.end, launch_id: 'synthetic-launch' },
+        session_id: session, transcript_path: path, transcript_size: rollout.records[0]!.end },
       { v: 1, kind: 'delivered', seq, part: 1, at: 1200 + i * 1000, receipt: { path, offset: receipt.offset } }]
   })
   const events = [1, 2].map(seq => ({ instance, type: 'item-delivered', seq, at: 201 + seq * 1000 }))

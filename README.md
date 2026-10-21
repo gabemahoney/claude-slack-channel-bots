@@ -6,7 +6,7 @@ A single HTTP MCP server that runs several independent Claude Code bots, called 
 
 ## Quick Start
 
-**[Bun](https://bun.sh) is required** — it is CSCB's runtime and the interpreter its install and start scripts run under. Install bun before you install CSCB. `npm install -g claude-slack-channel-bots` on a box without bun fails during postinstall (the postinstall script is a bun script).
+Install [Bun](https://bun.sh) before installing CSCB. For installation problems, see [Troubleshooting](docs/troubleshooting.md#troubleshooting).
 
 1. **Install globally via bun:**
 
@@ -20,7 +20,7 @@ A single HTTP MCP server that runs several independent Claude Code bots, called 
    bun pm -g trust claude-slack-channel-bots
    ```
 
-   Bun blocks the lifecycle scripts of untrusted packages, so the postinstall does not run on the plain `install` above — you must trust the package for it to fire. The `-g` flag targets the global install; without it `bun pm trust` looks for a `package.json` in the current directory and errors with `No package.json was found`. (Run `bun pm -g untrusted` to confirm it is listed first.) The postinstall then creates skeleton config files in `~/.config/claude-slack-channel-bots/` (or in `SLACK_STATE_DIR` when it is set and non-empty, the same directory the server reads) and `~/.claude/slack-mcp.json`, and links the `debug-slack-channel-bots` skill into `~/.claude/skills/`. Skip this step and a later `start` fails with `missing prerequisite: config.json`.
+   Postinstall creates skeleton config files in `~/.config/claude-slack-channel-bots/` (or `SLACK_STATE_DIR` when set and non-empty) and `~/.claude/slack-mcp.json`, and links the `debug-slack-channel-bots` skill into `~/.claude/skills/`.
 
 3. **Run the setup skill:**
 
@@ -47,11 +47,10 @@ A single HTTP MCP server that runs several independent Claude Code bots, called 
 ## Prerequisites
 
 - [Bun](https://bun.sh) `>= 1.0.21` (agent-director minimum)
-- [Claude Code](https://claude.ai/code) 2.1.280 or later for the workers, installed and authenticated: CSCB's supported minimum and the version the fleet runs. No version pin or channels permission is required. A Claude Code too old for exec-form hooks (older than 2.1.139) has its hooks ignored, so every launch stays `pending`. The `claude` on the workers' `PATH` must be Claude Code's native binary or a wrapper that `exec`s it: a launcher or shim that runs Claude Code as a child process makes agent-director ignore every hook (`ad.hook.ignored` with the reason `pid_mismatch`), so every launch stays `pending`.
-- [`agent-director`](https://github.com/gabemahoney/agent-director) 0.12.0 or later, **installed system-wide** as a prerequisite, like `git` or `docker`. The npm `agent-director` package CSCB depends on is the client only: it finds the system-installed binary at startup and refuses to start when the binary is missing, too old, or unreachable. This release pins the client to `agent-director@0.12.0` and requires the CLI at 0.12.0 or later, installed on the host together with it, and the two are rolled back together; CSCB changes no agent-director code (see "Switching over to agent-director Phase 1" in [Migration](docs/migration.md#migration)). Every agent on the host, with every long-running agent-director process (`agent-director serve` included), is stopped before either binary change (the Phase 1 install, and the rollback's restore of the previous binary) and started again after it. The startup gate refuses a binary below the client's own minimum (`min_binary_version` in the client's `dist/version-floor.json`) or below 0.12.0, and names the required version (see [Startup errors](docs/troubleshooting.md#startup-errors)). To check the install before you start, run `bun run install-check` (see [Checking your agent-director install](docs/agent-director.md#checking-your-agent-director-install)).
+- [Claude Code](https://claude.ai/code) 2.1.280 or later for the workers, installed and authenticated: CSCB's supported minimum and the version the fleet runs. The `claude` on the workers' `PATH` must be Claude Code's native binary or a wrapper that `exec`s it. See [Troubleshooting](docs/troubleshooting.md#troubleshooting) for launches that stay `pending`.
+- [`agent-director`](https://github.com/gabemahoney/agent-director) 0.12.0 or later, **installed system-wide**. Check it with `bun run install-check`; see [Checking your agent-director install](docs/agent-director.md#checking-your-agent-director-install). For an existing installation, follow [Migration](docs/migration.md#migration), including its switch-over and rollback runbooks.
 - [tmux](https://github.com/tmux/tmux) 3.2 or later, with `remain-on-exit` off. agent-director runs it; CSCB starts no tmux process. agent-director does not depend on tmux's `base-index` or `pane-base-index`, so their values don't matter.
 - Slack workspace admin access (to create and configure one Slack app per persona)
-- **cozempic** (optional) — Python 3.10+ and `pip install cozempic` — used by JSONL path resolution helpers retained for downstream callers.
 
 ### Supported platforms (inherited from agent-director)
 
@@ -63,7 +62,7 @@ A single HTTP MCP server that runs several independent Claude Code bots, called 
 | `darwin-x64` (Intel Mac) | **Not supported** by agent-director |
 | Windows | **Not supported** by agent-director |
 
-If the host is unsupported, the system-installed `agent-director` itself will refuse to install or run; CSCB's startup gate then exits non-zero with one of the `ad-system-install-*` class labels (see [Startup errors](docs/troubleshooting.md#startup-errors)) and writes the failure to `~/.config/claude-slack-channel-bots/startup-errors.log` and stderr. Consult [agent-director's documentation](https://github.com/gabemahoney/agent-director) for the canonical platform support list.
+Consult [agent-director's documentation](https://github.com/gabemahoney/agent-director) for the canonical platform support list. For installation or startup failures, see [Startup errors](docs/troubleshooting.md#startup-errors).
 
 ---
 

@@ -1,9 +1,19 @@
 Per-persona delivery model tooling provenance
 
-CURRENT b.acu/b.aqj pin refresh:
-The pin inventory below matches all 107 current runner.input_paths inputs and
-the frozen report.inputs of the cardinal-final-causal-proof-20261020T054736Z
-candidate. Model SHA-256:
+CURRENT b.d6n pin refresh:
+The 107 pins below bind the AD row/session relaunch model without synthetic
+launch IDs or a launch-settle timer. The complete current-source local run is
+ci/.runs/bd6n-model-verified-20261020; results and per-file changes are recorded in
+docs/bd6n-delivery-verification.md. The model/config/helper snapshot, raw logs,
+independent proofs and regenerated fixtures retain local provenance only;
+this pin refresh grants no scheduler certificate or CI verdict.
+Historical reports and admission/reduction profiles below retain their original
+hashes and claims; they are not evidence for these changed model bytes.
+
+HISTORICAL b.acu/b.aqj pin refresh:
+At release 1, all 107 runner.input_paths input pins matched the frozen
+report.inputs of the cardinal-final-causal-proof-20261020T054736Z candidate.
+That revision's model SHA-256:
 a4a3d8784998a853337c64f3c98016a2ccac71669d13d908f07887c35290266d
 Temporal-helper SHA-256:
 ddfe487624d5465b8daab0b0e605bfa33271fda75b19e672e1461be099c904d5
@@ -582,7 +592,7 @@ Pin inventory (all current runner.input_paths source/operational inputs;
 PROVENANCE.txt is excluded from check_cardinal.py's frozen input set, and
 runner.verify_pins separately returns its hash without a recursive entry):
 
-a4a3d8784998a853337c64f3c98016a2ccac71669d13d908f07887c35290266d  PersonaDelivery.tla
+22316e7dd97487a3d05dbd41c6b27c420f4cae86bf3c632ae00a632210091949  PersonaDelivery.tla
 8d01a668d509971772037342e1db277119ee99f4e74939d64a913ac4620730b1  ci/cfg/control_compact_open.cfg
 653e888b7356f5bbe7ec9a0993b99d5c540e11e93569e63bffd0df60ffe7f144  ci/cfg/control_deferred_only_open.cfg
 e0b71e1af5083fb9c17aad2fe4ba5a12c5352fb096f803710ae9261553eea236  ci/cfg/control_duplicate_key.cfg
@@ -661,7 +671,7 @@ d1635448926931678a58a05b78133e52d5cec3a79c700d3e812ad2cf1bfca145  ci/cfg/safety_
 29effbacac8c192cd691ecf99740981680851a64abfb730f4ef4531f216cadba  ci/cfg/witness_duplicates.cfg
 3e01c4358aa953f24c58d602c273a24d7e05d726d875a1c15bc6bb321f4a96e1  ci/check_cardinal.py
 f45dd20c7b8e098e535f6d35f144b66aac087d75a182b37cfd3b4abab4c549b7  ci/extract-traces.sh
-70daf8a387a8f0895d77274fd3f34b0e9d92a9e51836bff9141ee7f0a35c61d9  ci/fairness-probe/PermissionFairness.tla
+350c04a9658447e0b7ab40318830b47d07bf6742b390d4a4b77c5ca2d2703ad8  ci/fairness-probe/PermissionFairness.tla
 9fdd2b5d45e2aef25059dd5e8e3cc72425d6445ffe6ddaa9ec7fa69641c2dc7b  ci/fairness-probe/cfg/delivery_reachable.cfg
 bf7a7750eea9d465ef1fa405d3f34ec2b63676175ef592da0173b6b952535e78  ci/fairness-probe/cfg/eventually_delivered.cfg
 f74f14965b858defc58ad8181dcaeeb43eb4f88ae4890c05e839cdeafa13c3cc  ci/fairness-probe/cfg/head_taken_in.cfg
@@ -671,7 +681,7 @@ b37208699173217b850d4eabffd76ced0af48035c01209cafa695bfe4058dc8f  ci/fairness-pr
 d2db6ef66618d4fbffb793ea41d6ee9d91ecf7ad09f464ad5495ef639f6277db  ci/fairness-probe/probe.py
 37177dcb9a08b9f3a993dc0e4b7b74b5fef840b85221bdfd94602db72c9e5aec  ci/feasibility_profile.json
 6b30251530b2876f1ffd73e7f563c8603aaac9b2420c0fd1c6d4d46e192a3def  ci/local_storage.py
-3ece8ca5174c7adcfe0acc78bb513e6ed6bd84f9836fc4947178662a8a41ffa6  ci/profile_restart.py
+1e5eee64ffc3e4935cd535f21d6246bdd4667ddbde907464e9c5c2ccb3a137e3  ci/profile_restart.py
 8093ed4385b4ca6f5faf04fd07a89e0fa69bb8564ce09a7779af896a88add9e4  ci/proof/TraceProof.tla
 93f96977eafbb7cbf513b9e177d5ddf735dbb2ee0ff70e8ade54b11aa8c6e379  ci/proof/cfg/proof_safety.cfg
 00f918276acc97c5b36061095f92eee9fa30997330c4805d6d727aded5753762  ci/proof/cfg/proof_simulation.cfg
@@ -682,7 +692,7 @@ ccf519c735c4d4bb494a90843b03d88a577b216b6ac48d8ee58811d33528bb42  ci/run_ci.sh
 6ee064c43aab3f0fbaf527d03b214f6a3639e9600f2203629a497b99967dd04f  ci/runner.py
 a9f91affd07d7d1f313cf02c4478fb2de5977bce2061c32577d2329c1de55967  ci/screen_cfgs.py
 df549f204601121b1d871142f6a4d6bd5f2c8a81f1b2cf019c76e440fa4a6013  ci/suite.tsv
-ddfe487624d5465b8daab0b0e605bfa33271fda75b19e672e1461be099c904d5  ci/temporal_sensitivity.py
+352af19a6d0d8492adccbcf79297f6437c46c7dc35b83cd8a46cc12007da90ab  ci/temporal_sensitivity.py
 599a88a0c2e119f45cb8dd9caf10845af172002c282d6752984fd2b07b029a9b  ci/trace_contract.py
 4908e62b9214aeb5c888df8305d84a9d90b05669827d976a2bdec48617d66097  ci/work_witness.py
 6966e1e0e8f60a784c767e47075576ca788903591a7488fc09f64374f99bbe81  jobs/lib/Dockerfile

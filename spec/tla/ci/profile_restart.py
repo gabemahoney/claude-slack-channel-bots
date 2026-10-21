@@ -25,7 +25,7 @@ DATAFLOW = {
     "p.records": "omitted: append/filter only; no transition/property reads its contents except its own compaction filter",
     "e.phase/target/attempt/request": "retained: engine dispatch, call ownership, gate grants and continuation",
     "e.recoveryAttempt": "retained: successful recovery Enter identity selects Enter versus full retype; cleared on restart/new launch",
-    "e.launchSeen/sessionSeen": "retained: observed lifecycle changes reset/recheck the attempt",
+    "relaunch/e.sessionSeen": "retained: AD pending/terminal row transitions or session changes reset/recheck the attempt",
     "e.retypes/noticed/appendBlocked": "retained: retry guards, notice writes, write completion",
     "e.timers": "retained: all pending/expired tests and explicit expiry; already binary, no timer progress is forced",
     "e.keyReading": "projected: KeyReading fields plus receipt-set emptiness are all future KeyEvent inputs",

@@ -48,7 +48,7 @@ export interface QueueAllocationRecord extends BaseRecord {
 export interface FixedRecord extends BaseRecord { kind: 'fixed'; parts: string[] }
 export interface SentRecord extends BaseRecord {
   kind: 'sent'; attempt: number; part: number; send_kind: 'text' | 'enter' | 'retype'
-  at: number; launch_id: string; session_id: string; transcript_path: string; transcript_size: number
+  at: number; session_id: string; transcript_path: string; transcript_size: number
 }
 /** A damaged send remains evidence of an unknown outcome, across compaction/restart. */
 export interface UnknownSentRecord extends BaseRecord {
@@ -147,7 +147,7 @@ export function isQueueRecord(value: unknown): value is QueueRecord {
     case 'sent':
       if (!positive(r.attempt) || !number(r.at)) return false
       if (r.unknown_outcome === true) return object(r.quarantine) && str(r.quarantine.path) && positive(r.quarantine.line)
-      return positive(r.part) && ['text', 'enter', 'retype'].includes(String(r.send_kind)) && str(r.launch_id) && str(r.session_id) && str(r.transcript_path) && integer(r.transcript_size)
+      return positive(r.part) && ['text', 'enter', 'retype'].includes(String(r.send_kind)) && str(r.session_id) && str(r.transcript_path) && integer(r.transcript_size)
     case 'delivered': return positive(r.part) && number(r.at) && object(r.receipt) && str(r.receipt.path) && (str(r.receipt.uuid) || integer(r.receipt.offset))
     case 'refused': return positive(r.attempt) && number(r.at)
     case 'reply-reminder': return number(r.at) && (r.delivered_at === undefined || number(r.delivered_at)) && ['observed', 'replied', 'nudged', 'cancelled'].includes(String(r.state)) && (r.row_state === undefined || str(r.row_state)) && (r.session_id === undefined || str(r.session_id)) && (r.launch_started_at === undefined || r.launch_started_at === null || str(r.launch_started_at)) && (r.reply_attempts === undefined || (r.state === 'replied' && Array.isArray(r.reply_attempts) && r.reply_attempts.length > 0 && r.reply_attempts.every(positive))) && (r.delivery_attempts === undefined || (Array.isArray(r.delivery_attempts) && r.delivery_attempts.length > 0 && r.delivery_attempts.every(positive)))

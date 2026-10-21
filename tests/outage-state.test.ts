@@ -1663,6 +1663,31 @@ function makeRecordingHarness(opts: { sink?: boolean; observer?: boolean; observ
   return { emissions, arms, starts, cleared }
 }
 
+describe('withOutageDetection shutdown outcome contract', () => {
+  test.each([
+    ['success', true], ['success', 'throw'], ['rejection', true], ['rejection', 'throw'],
+  ] as const)('a deferred %s retains its original outcome when the live shutdown query answers %s', async (answer, stop) => {
+    const h = makeRecordingHarness()
+    const held = Promise.withResolvers<object>()
+    const outcome = answer === 'success' ? { result: 'original AD result' } : errTmuxNotAvailable(undefined, 'get')
+    let stopped = false
+    const result = withOutageDetection(P1, WRAP_WORKDIR, 'get', () => held.promise, {
+      isShuttingDown: () => {
+        if (stopped && stop === 'throw') throw new Error('shutdown query unavailable')
+        return stopped
+      },
+    }).then(value => ({ value }), error => ({ error }))
+    stopped = true
+    if (answer === 'success') held.resolve(outcome)
+    else held.reject(outcome)
+    const settled = await result
+    if (answer === 'success') expect('value' in settled && settled.value).toBe(outcome)
+    else expect('error' in settled && settled.error).toBe(outcome)
+    expect(h).toEqual({ emissions: [], arms: [], starts: [], cleared: [] })
+    expect([...getOutageFlags(P1)]).toEqual([])
+  })
+})
+
 /** A readable name for a declared call. */
 function declaredName(call: AdCall): string {
   return typeof call === 'string' ? call : `kill (row read live: ${call.rowReadLive})`

@@ -215,6 +215,15 @@ export function personaTranscripts(key: string, journal: readonly any[], log: re
     if (typeof record.transcript_path === 'string' && record.transcript_path && basename(record.transcript_path, '.jsonl') === record.session_id) directories.add(dirname(resolve(record.transcript_path)))
   }
   for (const line of log) {
+    const referenceMarker = '[slack] delivery-transcript-reference: '
+    const referenceIndex = line.indexOf(referenceMarker)
+    if (referenceIndex >= 0) {
+      const reference = JSON.parse(line.slice(referenceIndex + referenceMarker.length))
+      if (reference.key === key && reference.instance_id === `cscb_${key}` && sessions.has(reference.session_id) &&
+        typeof reference.jsonl_path === 'string' && basename(reference.jsonl_path, '.jsonl') === reference.session_id) {
+        directories.add(dirname(resolve(reference.jsonl_path)))
+      }
+    }
     const marker = '[slack] delivery-launch-observed: '
     const index = line.indexOf(marker)
     if (index < 0) continue

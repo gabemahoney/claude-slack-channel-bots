@@ -30,7 +30,7 @@ async function fixture() {
     if (a.reminder_for === undefined) lines.push(diagnostic('message-received'))
     await queue.append('alpha', { v: 1, kind: 'fixed', seq, parts: [text] })
     now += 10
-    await queue.append('alpha', { v: 1, kind: 'sent', seq, part: 1, attempt: 1, send_kind: 'text', at: now, launch_id: 'launch', session_id: 'session', transcript_path: transcript, transcript_size: 0 })
+    await queue.append('alpha', { v: 1, kind: 'sent', seq, part: 1, attempt: 1, send_kind: 'text', at: now, session_id: 'session', transcript_path: transcript, transcript_size: 0 })
     calls.push(`call\t${now / 1000}\t1\t1\tbun\tsend-keys --instance-id cscb_alpha --text ${text.replace(/[^a-zA-Z0-9]/g, c => '\\' + c)} --no-enter`)
     now += 10
     takes.push({ ...promptEntry(text), uuid: `take-${seq}`, sessionId: 'session', timestamp: new Date(now).toISOString() })

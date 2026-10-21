@@ -930,11 +930,6 @@ const RAW_ERROR_ALLOWED: { file: string; anchor: string; reason: string }[] = [
     reason: "the CLI entry point's last-resort catch-all for an unexpected throw from start, stop or clean_restart",
   },
   {
-    file: 'src/cozempic.ts',
-    anchor: 'cozempic: spawn error',
-    reason: 'the cozempic subprocess failing to spawn; no Slack or agent-director call',
-  },
-  {
     file: 'src/cron-log.ts',
     anchor: 'cron-log: append failed',
     reason: 'a file-system error appending to the cron log',
@@ -978,11 +973,6 @@ const RAW_ERROR_ALLOWED: { file: string; anchor: string; reason: string }[] = [
     file: 'src/server.ts',
     anchor: "'[slack] Fatal:'",
     reason: "the server entry point's last-resort catch-all for an unexpected throw from main()",
-  },
-  {
-    file: 'src/trust-bootstrap.ts',
-    anchor: 'unexpected error for',
-    reason: "the .claude.json trust patch's catch-all (file system and JSON only), recorded at start and logged per launch",
   },
 ]
 

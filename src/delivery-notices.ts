@@ -134,7 +134,11 @@ export function createDeliveryReporting(deps: DeliveryReportingDeps) {
   function engineEvent(event: DeliveryEngineEvent): void {
     const key = event.key
     if (event.type === 'launch-observed' || event.type === 'launch-first-waiting') {
-      deps.log(`[slack] delivery-${event.type}: ${JSON.stringify({ key, launch_id: event.launchId, session_id: event.sessionId, at: event.at })}`)
+      deps.log(`[slack] delivery-${event.type}: ${JSON.stringify({ key, session_id: event.sessionId, at: event.at })}`)
+      return
+    }
+    if (event.type === 'transcript-reference') {
+      deps.log(`[slack] delivery-transcript-reference: ${JSON.stringify({ key: safe(key), instance_id: safe(event.instanceId), session_id: safe(event.sessionId), jsonl_path: safe(event.path), at: event.at })}`)
       return
     }
     if (event.type === 'marker-missing' || event.type === 'delivered') return

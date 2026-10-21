@@ -1,82 +1,32 @@
-/**
- * jsonl-persistence-check.test.ts — Branch-matrix tests for the b.zak startup
- * JSONL-persistence safeguard (src/jsonl-persistence-check.ts), run over the
- * applied personas (b.av2 SR-6.2).
- *
- * Layer 1 (pure): resolveJsonlRoots dedup/precedence, checkMountFstype
- * longest-prefix + malformed/edge parsing, checkJsonlPersistence tmpfs/ramfs
- * classification.
- *
- * Layer 2 (per-persona via runJsonlPersistenceSafeguard with injected deps):
- * every classification branch — healthy, stale-path-loud, lost-loud (archive
- * evidence), idle-quiet, no-row skip, empty-session skip, AD-error-continue,
- * never-throws — plus the logged skip for a row the collision ladder will
- * replace (another cwd, or a missing or changed config_dir label). Notices go through the persona-keyed notice seam; some
- * cases wire it to the real per-persona notifier (b.av2 SR-7.2). Bug b.g57: a
- * persona whose claude_config_dir cannot be resolved (an injected EIO, or a
- * symlink pointing to nothing) is skipped for the pass before its row lookup,
- * with one line and no notice, record or label mismatch, while another
- * persona is checked as before; once it resolves it is checked again.
- *
- * Archive evidence (b.av2 SR-7.4): personaArchiveEvidenceScope and the real
- * makeDefaultArchiveCount against temp sqlite archives with several channels —
- * only a persona's `delivery: all` channels count, and a zero count is
- * inconclusive when the persona has a `mentions` channel or DMs on.
- *
- * Archive evidence in fungible mode (b.av2 SR-7.4, b.deo SRI-704): the scope
- * helper counts no channel and its zero is never attributable, whatever the
- * persona's resolved `channels` holds; with the mode absent or declarative it
- * is SR-7.4's (as amended by b.deo SRI-704). Layer 2, reading the mode from the configuration it is given,
- * reports a persona whose `delivery: all` channel holds archived messages
- * since spawn as inconclusive with `FUNGIBLE_MODE_ZERO_REASON`, never lost
- * (the same fixture in declarative mode is lost); its no-count path keeps its
- * declarative outcome. The fungible-mode reason is distinct from the
- * declarative unattributable-zero reason and names fungible mode.
- *
- * All external effects are dependency-injected — no mock.module, no real /proc
- * reads. Files (archives, symlinks, homes) live only in mkdtempSync dirs
- * removed after each test.
- *
- * SPDX-License-Identifier: MIT
- */
-
+/** Configured storage persistence and AD transcript-reference diagnostics (b.d6n).
+ * Paths, archives and homes are confined to each test's temporary directory. */
 import { describe, test, expect, afterEach, beforeEach, spyOn } from 'bun:test'
 import { homedir, tmpdir } from 'node:os'
-import { mkdtempSync, mkdirSync, symlinkSync, existsSync, chmodSync, writeFileSync, rmSync, realpathSync } from 'node:fs'
+import { mkdtempSync, symlinkSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
-import { Database } from 'bun:sqlite'
-import type { GetResult } from 'agent-director'
 import {
   resolveJsonlRoots,
   checkMountFstype,
   checkJsonlPersistence,
   runJsonlPersistenceSafeguard,
   runPersonaStorageCheck,
-  makeDefaultArchiveCount,
-  personaArchiveEvidenceScope,
-  UNATTRIBUTABLE_ZERO_REASON,
-  FUNGIBLE_MODE_ZERO_REASON,
-  unattributableZeroReason,
   type JsonlPersistenceSafeguardDeps,
 } from '../src/jsonl-persistence-check.ts'
-import { resolveJsonlPath } from '../src/cozempic.ts'
 import { personaInstanceId, renderPersonaRef } from '../src/persona-identity.ts'
 import { personaConfigDirLabelValue } from '../src/session-manager.ts'
-import { AgentDirectorError, ErrSpawnNotFound } from '../src/agent-director-errors.ts'
-import { channelModeOf, type Persona, type PersonaConfig } from '../src/config.ts'
-import { buildTempArchiveDb, type ArchiveRow } from './test-helpers/archive-db.ts'
+import { type PersonaConfig } from '../src/config.ts'
+import type { Client } from 'agent-director'
+import { _resetOutageState, initOutageState, getOutageFlags, setOutageFlag, raiseAdConfigMalformed } from '../src/outage-state.ts'
+import { buildTempArchiveDb } from './test-helpers/archive-db.ts'
 import { makeMultiPersonaConfig, type PersonaSpec } from './test-helpers/persona-config.ts'
-import { makeNotifierHarness } from './test-helpers/persona-notifier.ts'
-import { stubOpenedDmId } from './test-helpers/slack-stub.ts'
-import { cannedGetResult } from './test-helpers/agent-director-stub.ts'
+import { cannedGetResult, errConfigMalformed, errSpawnNotFound, errTmuxNotAvailable, makeStubClient, type CannedGetResult, type PersonaGetResultOverrides } from './test-helpers/agent-director-stub.ts'
 import {
-  APP_TOKEN_PREFIX,
   BOT_TOKEN_PREFIX,
   LEAK_SENTINEL,
-  REDACTED_SENTINEL_TAIL,
   assertNoLeak,
   fakeToken,
   sentinelInMessage,
+  REDACTED_SENTINEL_TAIL,
 } from './test-helpers/credentials.ts'
 
 // ---------------------------------------------------------------------------
@@ -158,7 +108,7 @@ const fixture = (content: string): (() => string) => () => content
 describe('resolveJsonlRoots', () => {
   test('personas inheriting one top-level claude_config_dir dedup to one root', () => {
     const config = makeMultiPersonaConfig([{}, {}], makeTempDir(), { claude_config_dir: '/home/user/.claude-corp' })
-    expect(resolveJsonlRoots(config, home)).toEqual(['/home/user/.claude-corp/projects'])
+    expect(resolveJsonlRoots(config, home)).toEqual(['/home/user/.claude-corp'])
   })
 
   test('per-persona claude_config_dir takes precedence over the top-level one', () => {
@@ -169,8 +119,8 @@ describe('resolveJsonlRoots', () => {
     )
     const roots = resolveJsonlRoots(config, home)
     expect(roots).toHaveLength(2)
-    expect(roots).toContain('/home/user/.claude-a/projects')
-    expect(roots).toContain('/home/user/.claude-global/projects')
+    expect(roots).toContain('/home/user/.claude-a')
+    expect(roots).toContain('/home/user/.claude-global')
   })
 
   test('two personas sharing a per-persona dir dedup to one root', () => {
@@ -178,22 +128,22 @@ describe('resolveJsonlRoots', () => {
       [{ claude_config_dir: '/home/user/.claude-shared' }, { claude_config_dir: '/home/user/.claude-shared' }],
       makeTempDir(),
     )
-    expect(resolveJsonlRoots(config, home)).toEqual(['/home/user/.claude-shared/projects'])
+    expect(resolveJsonlRoots(config, home)).toEqual(['/home/user/.claude-shared'])
   })
 
   test('no config dir anywhere → <home>/.claude default', () => {
     const config = makeMultiPersonaConfig([{}], makeTempDir())
-    expect(resolveJsonlRoots(config, home)).toEqual([`${home}/.claude/projects`])
+    expect(resolveJsonlRoots(config, home)).toEqual([`${home}/.claude`])
   })
 
   test('zero personas → <home>/.claude default fallback', () => {
     const config = makeMultiPersonaConfig([], makeTempDir())
-    expect(resolveJsonlRoots(config, home)).toEqual([`${home}/.claude/projects`])
+    expect(resolveJsonlRoots(config, home)).toEqual([`${home}/.claude`])
   })
 
   test('home omitted → the OS home default', () => {
     const config = makeMultiPersonaConfig([{}], makeTempDir())
-    expect(resolveJsonlRoots(config)).toEqual([join(homedir(), '.claude', 'projects')])
+    expect(resolveJsonlRoots(config)).toEqual([join(homedir(), '.claude')])
   })
 })
 
@@ -204,7 +154,7 @@ describe('resolveJsonlRoots', () => {
 describe('checkMountFstype', () => {
   test.each([
     ['/tmp/some/path/to/dir', 'tmpfs', 'nested under /tmp tmpfs'],
-    ['/home/user/.claude/projects', 'ext4', 'nested under /home ext4'],
+    ['/home/user/.claude', 'ext4', 'nested under /home ext4'],
     ['/var/data', 'ext4', 'falls through to root ext4'],
     ['/var/lib/docker/overlay2/abc123/merged/ws', 'overlay', 'nested under overlay'],
     ['/mnt/ramfs/data', 'ramfs', 'nested under ramfs'],
@@ -257,13 +207,13 @@ describe('checkJsonlPersistence', () => {
 
   test('tmpfs root → nonPersistent, no warnings', () => {
     const r = checkJsonlPersistence(configForDir('/tmp/claude'), fixture(REALISTIC_MOUNTINFO), home)
-    expect(r.nonPersistent).toEqual(['/tmp/claude/projects'])
+    expect(r.nonPersistent).toEqual(['/tmp/claude'])
     expect(r.warnings).toEqual([])
   })
 
   test('ramfs root → nonPersistent, no warnings', () => {
     const r = checkJsonlPersistence(configForDir('/mnt/ramfs/claude'), fixture(REALISTIC_MOUNTINFO), home)
-    expect(r.nonPersistent).toEqual(['/mnt/ramfs/claude/projects'])
+    expect(r.nonPersistent).toEqual(['/mnt/ramfs/claude'])
     expect(r.warnings).toEqual([])
   })
 
@@ -277,14 +227,14 @@ describe('checkJsonlPersistence', () => {
     const throws = (): string => { throw new Error('ENOENT') }
     const r = checkJsonlPersistence(configForDir('/home/user/.claude'), throws, home)
     expect(r.nonPersistent).toEqual([])
-    expect(r.warnings).toEqual(['/home/user/.claude/projects'])
+    expect(r.warnings).toEqual(['/home/user/.claude'])
   })
 
   test('unresolvable mount (no root line) → warnings', () => {
     const noRoot = '24 23 8:2 / /home rw,relatime shared:2 - ext4 /dev/sda2 rw\n'
     const r = checkJsonlPersistence(configForDir('/no/matching/mount'), fixture(noRoot), home)
     expect(r.nonPersistent).toEqual([])
-    expect(r.warnings).toEqual(['/no/matching/mount/projects'])
+    expect(r.warnings).toEqual(['/no/matching/mount'])
   })
 
   test('multi-root mixed: tmpfs + ext4 classified independently', () => {
@@ -293,7 +243,7 @@ describe('checkJsonlPersistence', () => {
       makeTempDir(),
     )
     const r = checkJsonlPersistence(config, fixture(REALISTIC_MOUNTINFO), home)
-    expect(r.nonPersistent).toEqual(['/tmp/claude-tmp/projects'])
+    expect(r.nonPersistent).toEqual(['/tmp/claude-tmp'])
     expect(r.warnings).toEqual([])
   })
 
@@ -313,1504 +263,347 @@ describe('checkJsonlPersistence', () => {
 // so they reach the transcript check rather than the collision-ladder skip.
 // ---------------------------------------------------------------------------
 
-const CH = 'C_TEST1'
-const CONFIG_DIR = '/home/user/.claude' // ext4 in REALISTIC_MOUNTINFO → no Layer-1 noise
-const STARTED_AT = '2026-09-20T05:00:00Z'
-const STALE_PATH = '/some/other/stale/path.jsonl'
 
-/** The one Layer-2 persona: its working directory yields the `-repo-app` project dir. */
-const LAYER2_SPEC: PersonaSpec = {
-  name: 'Layer Two Bot',
-  working_directory: '/repo/app',
-  claude_config_dir: CONFIG_DIR,
-  channels: [{ id: CH, delivery: 'all' }],
-  permission_prompts: CH,
-}
-
-function layer2Config(overrides: Partial<Omit<PersonaConfig, 'personas'>> = {}): PersonaConfig {
-  return makeMultiPersonaConfig([LAYER2_SPEC], makeTempDir(), overrides)
-}
-
-function layer2Persona(): Persona {
-  return layer2Config().personas[0]!
-}
-
-/**
- * GetResult fixture with the fields Layer 2 reads, as a spawn of `persona`
- * writes it under the test's home; overridable.
- */
-function makeRow(overrides: Partial<GetResult> = {}, persona: Persona = layer2Persona()): GetResult {
-  return cannedGetResult(
-    {
-      state: 'live',
-      jsonl_path: `${CONFIG_DIR}/projects/-repo-app/sess-abc.jsonl`,
-      session_id: 'sess-abc',
-      started_at: STARTED_AT,
-      last_seen_at: '2026-09-20T05:10:00Z',
-      ...overrides,
-    },
-    persona,
-    home,
-  )
-}
-
-interface Captured {
-  errors: Array<{ key: string; message: string }>
-  /** Notices raised through the notice seam: persona key and notice body. */
-  notices: Array<{ key: string; text: string }>
-}
-
-/**
- * Runs the safeguard with fully-injected deps; returns captured loud signals.
- *
- * `config` overrides the default single-persona Layer-2 config. `withNotify`
- * defaults true (a capturing notice seam); pass false for no seam at all
- * (notify undefined → no notices). Any dep in `deps` overrides the
- * defaults below — including archiveCountSince, so a test can drop it to
- * exercise the REAL makeDefaultArchiveCount against a temp DB.
- */
-async function runLayer2(
-  deps: Partial<JsonlPersistenceSafeguardDeps>,
-  config: PersonaConfig = layer2Config(),
-  withNotify = true,
-): Promise<Captured> {
-  const captured: Captured = { errors: [], notices: [] }
-  const notify = withNotify
-    ? (key: string, text: string): void => {
-        captured.notices.push({ key, text })
-      }
-    : undefined
-  const fullDeps: JsonlPersistenceSafeguardDeps = {
-    readMountinfo: fixture(REALISTIC_MOUNTINFO),
-    statFn: () => false,
-    getRow: async () => makeRow(),
-    archiveCountSince: () => null,
-    recordStartupError: (key: string, message: string) => {
-      captured.errors.push({ key, message })
-    },
-    home,
-    ...deps,
+function referenceHarness(specs: PersonaSpec[] = [{ name: 'Alpha' }]) {
+  const configDir = makeTempDir('reference-config-')
+  const config = makeMultiPersonaConfig(specs, makeTempDir(), { claude_config_dir: configDir })
+  const errors: Array<{ key: string; message: string }> = []
+  const notices: Array<{ key: string; text: string }> = []
+  const lookups: Array<{ key: string; instanceId: string }> = []
+  function row(key = config.personas[0]!.key, overrides: PersonaGetResultOverrides = {}): CannedGetResult {
+    const p = config.personas.find(p => p.key === key)!
+    return cannedGetResult({ instance_id: personaInstanceId(key), cwd: p.working_directory,
+      labels: { tag_prompt: '1', config_dir: personaConfigDirLabelValue(configDir, home) },
+      session_id: 'current-session', jsonl_path: join(configDir, 'ad-opaque-rollout.jsonl'),
+      ...overrides }, p, home)
   }
-  await runJsonlPersistenceSafeguard(config, notify, fullDeps)
-  return captured
+  async function run(deps: Partial<JsonlPersistenceSafeguardDeps> = {}) {
+    await runJsonlPersistenceSafeguard(config, (key, text) => { notices.push({ key, text }) }, {
+      home, readMountinfo: () => '1 0 8:1 / / rw - ext4 /dev/disk rw',
+      getRow: async (key, instanceId) => { lookups.push({ key, instanceId }); return row(key) },
+      recordStartupError: (key, message) => { errors.push({ key, message }) }, ...deps,
+    })
+  }
+  return { config, configDir, errors, notices, lookups, row, run }
 }
 
-describe('runJsonlPersistenceSafeguard — Layer 2 classification', () => {
-  test('looks up the row by cscb_<key>, the persona key (b.av2 SR-2.2)', async () => {
-    const persona = layer2Persona()
-    const lookups: Array<[string, string]> = []
-    await runLayer2({
-      getRow: async (key: string, instanceId: string) => {
-        lookups.push([key, instanceId])
-        return makeRow()
-      },
-    })
-    expect(lookups).toEqual([[persona.key, personaInstanceId(persona.key)]])
-    expect(lookups[0][1]).toBe(`cscb_${persona.key}`)
+describe('AD transcript references', () => {
+  test.each(['present', 'unknown', undefined])('status %s reports AD facts without checking native file health or inventing loss', async status => {
+    const h = referenceHarness(), logs = captureErrorLog()
+    await h.run({ getRow: async () => h.row(undefined, { transcript_status: status }) })
+    expect(h.errors).toEqual([])
+    expect(h.notices).toEqual([])
+    expect(logs.join('\n')).toContain('jsonl_path=' + h.row().jsonl_path)
+    expect(logs.join('\n')).toContain('recorded references do not verify that transcript files remain readable')
+    expect(logs.join('\n')).not.toMatch(/history.*LOST|never.created|fresh.spawn/i)
   })
-
-  test('healthy: persisted path exists → quiet (no error, no notice)', async () => {
-    const persisted = makeRow().jsonl_path
-    const c = await runLayer2({ statFn: (p) => p === persisted })
-    expect(c.errors).toEqual([])
-    expect(c.notices).toEqual([])
+  test('rotated status warns with uncertainty and never promises readable prior sessions', async () => {
+    const h = referenceHarness()
+    await h.run({ getRow: async () => h.row(undefined, { transcript_status: 'rotated', jsonl_path: '',
+      prior_sessions: [{ session_id: 'old', jsonl_path: join(h.configDir, 'missing-history.jsonl') }] }) })
+    expect(h.errors).toHaveLength(1)
+    expect(h.errors[0]!.key).toBe('jsonl-transcript-reference-warning')
+    expect(h.errors[0]!.message).toContain('prior_sessions=1')
+    expect(h.notices).toHaveLength(1)
+    expect(h.notices[0]!.key).toBe(h.config.personas[0]!.key)
+    expect(h.notices[0]!.text).toContain('transcript_status=rotated')
+    expect(h.notices[0]!.text).toContain('remain readable is unverified')
+    expect(h.notices[0]!.text).not.toMatch(/history.*LOST|never.created/i)
   })
-
-  test('stale-path: persisted missing but fallback exists → LOUD record + persona notice', async () => {
-    const row = makeRow()
-    const fallback = resolveJsonlPath(row.cwd, row.session_id, CONFIG_DIR)
-    // Persisted path differs from fallback so persisted stat is false, fallback true.
-    const staleRow = makeRow({ jsonl_path: STALE_PATH })
-    const c = await runLayer2({
-      getRow: async () => staleRow,
-      statFn: (p) => p === fallback,
-    })
-    expect(c.errors).toHaveLength(1)
-    expect(c.errors[0]!.key).toBe('jsonl-transcript-stale-path')
-    expect(c.notices).toHaveLength(1)
-    expect(c.notices[0]!.key).toBe(layer2Persona().key)
-    expect(c.notices[0]!.text).toContain(fallback)
-    for (const detail of [c.errors[0]!.message, c.notices[0]!.text]) {
-      expect(detail).toContain('The current-session fallback is available for agent-director to try on resume.')
-      expect(detail).not.toMatch(/ErrJsonlMissing|fresh.spawn|history has been LOST/)
-    }
-    expect(c.notices[0]!.text).not.toContain('this channel')
+  test.each([0, 4])('Slack archive count %d cannot establish transcript loss or absence', async count => {
+    const h = referenceHarness(), logs = captureErrorLog()
+    const archive = buildTempArchiveDb(Array.from({ length: count }, (_, i) => ({ channel: h.config.personas[0]!.channels[0]!.id, ts: 2000000000 + i })), 'unrelated')
+    cleanups.push(archive.cleanup)
+    h.config.message_archive_db = archive.dbPath
+    await h.run({ getRow: async () => h.row(undefined, { jsonl_path: '', transcript_status: 'unknown' }) })
+    expect(h.errors).toEqual([])
+    expect(h.notices).toEqual([])
+    expect(logs.join('\n')).not.toMatch(/history.*LOST|never.created|archive.*(?:count|holds|shows)/i)
   })
-
-  test('lost: both paths missing but archive shows activity since spawn → LOUD record + persona notice', async () => {
-    const c = await runLayer2({
-      statFn: () => false,
-      archiveCountSince: () => 5,
-    })
-    expect(c.errors).toHaveLength(1)
-    expect(c.errors[0]!.key).toBe('jsonl-transcript-lost')
-    expect(c.errors[0]!.message).toContain('5 message')
-    expect(c.notices).toHaveLength(1)
-    expect(c.notices[0]!.key).toBe(layer2Persona().key)
-    expect(c.notices[0]!.text).toContain('5 message(s)')
-    expect(c.notices[0]!.text).not.toContain('this channel')
+  test.each(['absent', 'failure', 'rotated'])('one persona %s does not suppress its sibling', async answer => {
+    const h = referenceHarness([{ name: 'Alpha' }, { name: 'Beta' }]), logs = captureErrorLog(), keys: string[] = []
+    const [a, b] = h.config.personas
+    await h.run({ getRow: async key => {
+      keys.push(key)
+      if (key === a!.key && answer === 'absent') throw errSpawnNotFound()
+      if (key === a!.key && answer === 'failure') throw new Error('get failed')
+      return h.row(key, { transcript_status: key === a!.key ? 'rotated' : 'present' })
+    } })
+    expect(keys).toEqual([a!.key, b!.key])
+    expect(logs.join('\n')).toContain(renderPersonaRef(b!.name, b!.key))
+    expect(h.notices.map(n => n.key)).toEqual(answer === 'rotated' ? [a!.key] : [])
   })
-
-  test('idle-since-spawn: both missing, archive count 0 → quiet (no error, no notice)', async () => {
-    const c = await runLayer2({ statFn: () => false, archiveCountSince: () => 0 })
-    expect(c.errors).toEqual([])
-    expect(c.notices).toEqual([])
+  test('queries exactly each persona instance id', async () => {
+    const h = referenceHarness([{ name: 'Alpha' }, { name: 'Beta' }])
+    await h.run()
+    expect(h.lookups).toEqual(h.config.personas.map(p => ({ key: p.key, instanceId: personaInstanceId(p.key) })))
   })
-
-  test('idle-since-spawn: both missing, archive unconfigured/unreadable (null) → quiet', async () => {
-    const c = await runLayer2({ statFn: () => false, archiveCountSince: () => null })
-    expect(c.errors).toEqual([])
-    expect(c.notices).toEqual([])
+  test.each(['cwd', 'tag_prompt', 'config_dir'])('a row replaced for %s mismatch produces no transcript warning', async mismatch => {
+    const h = referenceHarness(), base = h.row(), logs = captureErrorLog()
+    const row = mismatch === 'cwd' ? { ...base, cwd: makeTempDir() } : { ...base, labels: { ...base.labels, [mismatch]: 'different' } }
+    await h.run({ getRow: async () => ({ ...row, transcript_status: 'rotated' }) })
+    expect(h.errors).toEqual([])
+    expect(h.notices).toEqual([])
+    expect(logs.join('\n')).toContain('collision ladder will replace this row')
   })
-
-  test('no AD row (ErrSpawnNotFound) → quiet skip', async () => {
-    const c = await runLayer2({
-      getRow: async () => { throw new ErrSpawnNotFound('get', 'ErrSpawnNotFound', 'not found') },
-    })
-    expect(c.errors).toEqual([])
-    expect(c.notices).toEqual([])
+  test('an unresolvable configuration directory skips its row; recovery checks it again', async () => {
+    const h = referenceHarness(), logs = captureErrorLog()
+    await h.run({ configDirFs: { realpath: () => { throw Object.assign(new Error('mount unavailable'), { code: 'EIO' }) } } })
+    expect(h.lookups).toEqual([])
+    expect(h.notices).toEqual([])
+    expect(logs.join('\n')).toContain('transcript not checked this pass')
+    await h.run()
+    expect(h.lookups).toHaveLength(1)
   })
-
-  test('row present but empty session_id → quiet skip (nothing to resume)', async () => {
-    const c = await runLayer2({ getRow: async () => makeRow({ session_id: '' }) })
-    expect(c.errors).toEqual([])
-    expect(c.notices).toEqual([])
+  test('a dangling configuration symlink skips AD; another persona is still checked', async () => {
+    const h = referenceHarness([{ name: 'Alpha' }, { name: 'Beta' }]), logs = captureErrorLog()
+    const link = join(makeTempDir(), 'dangling-config')
+    symlinkSync(join(makeTempDir(), 'missing'), link)
+    h.config.personas[0]!.claude_config_dir = link
+    await h.run()
+    expect(h.lookups.map(l => l.key)).toEqual([h.config.personas[1]!.key])
+    expect(logs.join('\n')).toContain('transcript not checked this pass')
+    expect(h.notices).toEqual([])
   })
-
-  test('non-ErrSpawnNotFound AD error → warn + continue (quiet, does not throw)', async () => {
-    const c = await runLayer2({
-      getRow: async () => { throw new Error('AD unreachable') },
-    })
-    expect(c.errors).toEqual([])
-    expect(c.notices).toEqual([])
+  test('a throwing per-persona record sink does not suppress the next persona lookup', async () => {
+    const h = referenceHarness([{ name: 'Alpha' }, { name: 'Beta' }]), keys: string[] = [], logs = captureErrorLog()
+    await h.run({ getRow: async key => { keys.push(key); return h.row(key, { transcript_status: 'rotated' }) },
+      recordStartupError: () => { throw new Error(fakeToken(BOT_TOKEN_PREFIX, 'record-sink')) } })
+    expect(keys).toEqual(h.config.personas.map(p => p.key))
+    expect(h.notices).toEqual([])
+    assertNoLeak(logs)
   })
-
-  test('per-persona error inside classification is isolated — the next persona is still checked, sweep never throws', async () => {
-    // statFn throws for Boom Bot (checked first); the per-persona try/catch
-    // must swallow it so Safe Bot is still checked and still goes loud.
-    const config = makeMultiPersonaConfig(
-      [
-        { name: 'Boom Bot', working_directory: '/repo/boom' },
-        { name: 'Safe Bot', working_directory: '/repo/safe' },
-      ],
-      makeTempDir(),
-      { claude_config_dir: CONFIG_DIR },
-    )
-    const [boom, safe] = config.personas
-    expect([boom!.name, safe!.name]).toEqual(['Boom Bot', 'Safe Bot'])
-    const byKey = new Map(config.personas.map((p) => [p.key, p]))
-    const safePaths: string[] = []
-    const log = captureErrorLog()
-    const c = await runLayer2(
-      {
-        getRow: async (key: string) => makeRow({}, byKey.get(key)!),
-        statFn: (p) => {
-          if (p.includes('-repo-boom')) throw new Error('boom')
-          if (p.includes('-repo-safe')) safePaths.push(p)
-          return false
-        },
-        archiveCountSince: (_ids, _since, ref) => (ref === renderPersonaRef(safe!.name, safe!.key) ? 2 : 0),
-      },
-      config,
-    )
-    // Boom Bot's error was caught and logged against Boom Bot.
-    expect(log.filter((l) => l.includes(`unexpected error checking ${renderPersonaRef(boom!.name, boom!.key)}`))).toHaveLength(1)
-    // Safe Bot's own fallback path was checked and its loss recorded and noticed.
-    expect(safePaths).toHaveLength(1)
-    expect(c.errors.map((e) => e.key)).toEqual(['jsonl-transcript-lost'])
-    expect(c.errors[0]!.message).toContain(renderPersonaRef(safe!.name, safe!.key))
-    expect(c.notices.map((n) => n.key)).toEqual([safe!.key])
-  })
-
-  test('persona with no claude_config_dir: its JSONL root, fallback path and row label resolve under deps.home', async () => {
-    const config = makeMultiPersonaConfig([{ ...LAYER2_SPEC, claude_config_dir: undefined }], makeTempDir())
-    const persona = config.personas[0]!
-    const staleRow = makeRow({ jsonl_path: STALE_PATH }, persona)
-    const fallback = resolveJsonlPath(staleRow.cwd, staleRow.session_id, join(home, '.claude'))
-    // Only the temp home is tmpfs, so Layer 1 flags exactly the root under it.
-    const homeTmpfs = `23 0 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n25 23 0:20 / ${home} rw shared:3 - tmpfs tmpfs rw\n`
-    const c = await runLayer2(
-      { readMountinfo: fixture(homeTmpfs), getRow: async () => staleRow, statFn: (p) => p === fallback },
-      config,
-    )
-    expect(c.errors.map((e) => e.key)).toEqual(['jsonl-non-persistent', 'jsonl-transcript-stale-path'])
-    expect(c.errors[0]!.message).toContain(`root="${home}/.claude/projects"`)
-    expect(c.notices.map((n) => n.key)).toEqual([persona.key, persona.key])
-    expect(c.notices[1]!.text).toContain(fallback)
-  })
-
-  test('notify undefined (no notice seam): loud error still recorded, no notice', async () => {
-    const c = await runLayer2({ statFn: () => false, archiveCountSince: () => 3 }, layer2Config(), false)
-    expect(c.errors).toHaveLength(1)
-    expect(c.errors[0]!.key).toBe('jsonl-transcript-lost')
-    expect(c.notices).toEqual([]) // notify undefined → no notice
+  test('AD fields and get errors never leak credentials into diagnostics', async () => {
+    const h = referenceHarness(), args = captureErrorArgs(), token = fakeToken(BOT_TOKEN_PREFIX, 'ad-transcript')
+    await h.run({ getRow: async () => h.row(undefined, { transcript_status: token, jsonl_path: join(h.configDir, token) }) })
+    await h.run({ getRow: async () => { throw Object.assign(new TypeError(`AD lookup failed: ${sentinelInMessage('ad-transcript')}`), { code: 'EIO', data: LEAK_SENTINEL }) } })
+    const diagnostic = args.flat().join('\n')
+    expect(diagnostic).toContain('AD get failed')
+    expect(diagnostic).toContain('TypeError code=EIO')
+    expect(diagnostic).toContain(`message="AD lookup failed: ${REDACTED_SENTINEL_TAIL}"`)
+    assertNoLeak([args, h.errors, h.notices])
   })
 })
 
-// ---------------------------------------------------------------------------
-// Layer 2 iterates personas, not channels (b.av2 SR-6.2, SR-7.4)
-// ---------------------------------------------------------------------------
-
-describe('runJsonlPersistenceSafeguard — one pass per persona', () => {
-  test('a persona in several channels gets one row lookup, one count over its `all` channels, one notice', async () => {
-    const config = makeMultiPersonaConfig(
-      [
-        {
-          ...LAYER2_SPEC,
-          channels: [
-            { id: 'C0ALL0001', delivery: 'all' },
-            { id: 'C0ALL0002', delivery: 'all' },
-            { id: 'C0MENT001', delivery: 'mentions' },
-          ],
-          permission_prompts: 'C0ALL0001',
-        },
-      ],
-      makeTempDir(),
-    )
-    const persona = config.personas[0]!
-    const h = makeNotifierHarness(config)
-    const lookups: Array<[string, string]> = []
-    const counts: Array<[readonly string[], number, string]> = []
-    const errors: string[] = []
-    await runJsonlPersistenceSafeguard(config, h.notifier.notify, {
-      readMountinfo: fixture(REALISTIC_MOUNTINFO),
-      statFn: () => false,
-      getRow: async (key, id) => {
-        lookups.push([key, id])
-        return makeRow({}, persona)
+describe('AD transcript safeguard shutdown', () => {
+  test.each([true, 'throw'] as const)('an initial stop (%s) reads no storage or AD state and sends nothing', async stop => {
+    const h = referenceHarness()
+    let mountReads = 0
+    await h.run({
+      isShuttingDown: () => {
+        if (stop === 'throw') throw new Error('shutdown query unavailable')
+        return stop
       },
-      archiveCountSince: (ids, since, ref) => {
-        counts.push([[...ids], since, ref])
-        return 3
-      },
-      recordStartupError: (key) => {
-        errors.push(key)
-      },
-      home,
+      readMountinfo: () => { mountReads++; return '1 0 0:1 / / rw - tmpfs tmpfs rw' },
     })
-    expect(lookups).toEqual([[persona.key, `cscb_${persona.key}`]])
-    expect(counts).toEqual([
-      [['C0ALL0001', 'C0ALL0002'], Date.parse(STARTED_AT) / 1000, renderPersonaRef(persona.name, persona.key)],
+    expect(mountReads).toBe(0)
+    expect(h.lookups).toEqual([])
+    expect(h.errors).toEqual([])
+    expect(h.notices).toEqual([])
+  })
+
+  test.each([
+    ['rotated', 'true'], ['rotated', 'throw'], ['rejected', 'true'], ['rejected', 'throw'],
+  ] as const)('a deferred %s AD answer after a one-shot %s stop has no effects or sibling lookup', async (answer, stop) => {
+    const h = referenceHarness([{ name: 'Alpha' }, { name: 'Beta' }])
+    const logs = captureErrorLog()
+    const held = Promise.withResolvers<CannedGetResult>()
+    const keys: string[] = []
+    let stopNextQuery = false
+    const run = h.run({
+      isShuttingDown: () => {
+        if (!stopNextQuery) return false
+        // Later queries would answer false: the pass must retain this stop.
+        stopNextQuery = false
+        if (stop === 'throw') throw new Error('shutdown query unavailable')
+        return true
+      },
+      getRow: async key => { keys.push(key); return held.promise },
+    })
+    expect(keys).toEqual([h.config.personas[0]!.key])
+    stopNextQuery = true
+    if (answer === 'rejected') held.reject(new Error('late AD failure'))
+    else held.resolve(h.row(undefined, { transcript_status: 'rotated' }))
+    await run
+    expect(keys).toEqual([h.config.personas[0]!.key])
+    expect(h.errors).toEqual([])
+    expect(h.notices).toEqual([])
+    expect(logs.join('\n')).not.toContain('AD get failed')
+  })
+
+  test('shutdown begun by resolving the persona directory prevents its AD call', async () => {
+    const h = referenceHarness()
+    let shuttingDown = false
+    await h.run({
+      isShuttingDown: () => shuttingDown,
+      configDirFs: { realpath: () => { shuttingDown = true; return h.configDir } },
+    })
+    expect(shuttingDown).toBe(true)
+    expect(h.lookups).toEqual([])
+    expect(h.errors).toEqual([])
+    expect(h.notices).toEqual([])
+  })
+
+  test('shutdown begun by the record sink prevents the late notice and next persona lookup', async () => {
+    const h = referenceHarness([{ name: 'Alpha' }, { name: 'Beta' }])
+    const keys: string[] = []
+    let shuttingDown = false
+    await h.run({
+      isShuttingDown: () => shuttingDown,
+      getRow: async key => { keys.push(key); return h.row(key, { transcript_status: 'rotated' }) },
+      recordStartupError: (key, message) => { h.errors.push({ key, message }); shuttingDown = true },
+    })
+    expect(keys).toEqual([h.config.personas[0]!.key])
+    expect(h.errors.map(e => e.key)).toEqual(['jsonl-transcript-reference-warning'])
+    expect(h.notices).toEqual([])
+  })
+
+  test('a live false query preserves storage warnings and rotated-reference notices for both personas', async () => {
+    const h = referenceHarness([{ name: 'Alpha' }, { name: 'Beta' }])
+    const keys: string[] = []
+    await h.run({
+      isShuttingDown: () => false,
+      readMountinfo: () => '1 0 0:1 / / rw - tmpfs tmpfs rw',
+      getRow: async key => { keys.push(key); return h.row(key, { transcript_status: 'rotated' }) },
+    })
+    const personaKeys = h.config.personas.map(p => p.key)
+    expect(keys).toEqual(personaKeys)
+    expect(h.errors.map(e => e.key)).toEqual([
+      'jsonl-non-persistent', 'jsonl-transcript-reference-warning', 'jsonl-transcript-reference-warning',
     ])
-    expect(errors).toEqual(['jsonl-transcript-lost'])
-    const posts = h.posts(persona.key)
-    expect(posts).toHaveLength(1)
-    expect(posts[0]!.channel).toBe('C0ALL0001')
-    expect(posts[0]!.text).toContain('3 message(s)')
+    expect(h.notices.map(n => n.key)).toEqual([...personaKeys, ...personaKeys])
   })
 })
 
-// ---------------------------------------------------------------------------
-// Rows the collision ladder will replace rather than resume or reconnect
-// (compareRowToPersona: cwd real path, config_dir label) — logged only. The
-// skip line is found by the persona reference plus the reason text, so the
-// "stays loud" rows' empty-match checks cannot pass on a reworded ending.
-// ---------------------------------------------------------------------------
-
-describe('runJsonlPersistenceSafeguard — rows the collision ladder will replace', () => {
-  type RowKind = 'markerless' | 'other-cwd' | 'empty-cwd' | 'absent-cwd' | 'no-label' | 'wrong-label' | 'matching' | 'symlinked-cwd'
-  type Condition = 'fallback exists' | 'archived rows since spawn'
-
-  /** The reason texts of the skip line (rowReplacementReason): one per guard. */
-  const SKIP_REASONS = ['differs from working_directory', 'config_dir label', 'tag_prompt']
-
-  /** A persona whose working directory really exists, plus a sibling dir and a symlink to it. */
-  function ladderFixture(): { config: PersonaConfig; persona: Persona; otherWork: string; link: string } {
-    const dir = makeTempDir()
-    const work = join(dir, 'work')
-    const otherWork = join(dir, 'other-work')
-    const link = join(dir, 'work-link')
-    mkdirSync(work)
-    mkdirSync(otherWork)
-    symlinkSync(work, link)
-    const config = makeMultiPersonaConfig([{ ...LAYER2_SPEC, working_directory: work }], dir)
-    return { config, persona: config.personas[0]!, otherWork, link }
-  }
-
-  function rowFor(kind: RowKind, fx: ReturnType<typeof ladderFixture>): GetResult {
-    const base = makeRow({ jsonl_path: STALE_PATH }, fx.persona)
-    const { config_dir: _label, ...labelsWithout } = base.labels
-    switch (kind) {
-      case 'markerless': {
-        const { tag_prompt: _old, ...labels } = base.labels
-        return { ...base, labels }
-      }
-      case 'other-cwd':
-        return { ...base, cwd: fx.otherWork }
-      case 'empty-cwd':
-        return { ...base, cwd: '' }
-      case 'absent-cwd': {
-        const { cwd: _cwd, ...withoutCwd } = base
-        return withoutCwd as GetResult
-      }
-      case 'no-label':
-        return { ...base, labels: labelsWithout }
-      case 'wrong-label':
-        return { ...base, labels: { ...labelsWithout, config_dir: personaConfigDirLabelValue('/home/user/.claude-other', home) } }
-      case 'matching':
-        return base
-      case 'symlinked-cwd':
-        return { ...base, cwd: fx.link }
+describe('AD transcript safeguard shutdown through the default outage wrapper', () => {
+  function defaultReadHarness() {
+    const h = referenceHarness([{ name: 'Alpha' }, { name: 'Beta' }])
+    const held = Promise.withResolvers<CannedGetResult>()
+    const ids: string[] = []
+    const arms: Array<{ key: string; kind: string }> = []
+    const cleared: Array<{ key: string; cls: string }> = []
+    const client = makeStubClient()
+    client.get = async ({ instance_id }) => {
+      ids.push(instance_id)
+      if (ids.length === 1) return held.promise
+      return h.row(h.config.personas.find(p => personaInstanceId(p.key) === instance_id)!.key)
     }
-  }
-
-  /** Deps that would make a matching row loud under `condition`. */
-  function loudDeps(condition: Condition): Partial<JsonlPersistenceSafeguardDeps> {
-    return condition === 'fallback exists'
-      ? { statFn: (p) => p !== STALE_PATH, archiveCountSince: () => null }
-      : { statFn: () => false, archiveCountSince: () => 4 }
-  }
-
-  async function run(kind: RowKind, condition: Condition) {
-    const fx = ladderFixture()
-    const h = makeNotifierHarness(fx.config)
-    const errors: string[] = []
-    const log = captureErrorLog()
-    await runJsonlPersistenceSafeguard(fx.config, h.notifier.notify, {
-      readMountinfo: fixture(REALISTIC_MOUNTINFO),
-      getRow: async () => rowFor(kind, fx),
-      recordStartupError: (key) => {
-        errors.push(key)
-      },
-      home,
-      ...loudDeps(condition),
+    _resetOutageState()
+    cleanups.push(_resetOutageState)
+    initOutageState({
+      getClient: () => client as unknown as Client,
+      notify: (key, text) => { h.notices.push({ key, text }) },
+      triggerSink: { arm: (key, cause) => { arms.push({ key, kind: cause.kind }); return true } },
+      onFlagCleared: (key, cls) => { cleared.push({ key, cls }) },
     })
-    const ref = renderPersonaRef(fx.persona.name, fx.persona.key)
-    const ladderLines = log.filter((l) => l.includes(ref) && SKIP_REASONS.some((r) => l.includes(r)))
-    return { fx, h, errors, log, ladderLines }
-  }
-
-  test.each([
-    ['markerless', 'fallback exists', 'tag_prompt'],
-    ['markerless', 'archived rows since spawn', 'tag_prompt'],
-    ['other-cwd', 'fallback exists', 'differs from working_directory'],
-    ['other-cwd', 'archived rows since spawn', 'differs from working_directory'],
-    // No cwd on the row (empty or absent): printed as `<none>`.
-    ['empty-cwd', 'fallback exists', 'row cwd=<none> differs from working_directory='],
-    ['absent-cwd', 'archived rows since spawn', 'row cwd=<none> differs from working_directory='],
-    ['no-label', 'fallback exists', 'config_dir label missing'],
-    ['no-label', 'archived rows since spawn', 'config_dir label missing'],
-    ['wrong-label', 'fallback exists', 'config_dir label was='],
-    ['wrong-label', 'archived rows since spawn', 'config_dir label was='],
-  ] as Array<[RowKind, Condition, string]>)(
-    '%s row, %s → one log line, no record, no notice',
-    async (kind, condition, reason) => {
-      const { fx, h, errors, log, ladderLines } = await run(kind, condition)
-      expect(errors).toEqual([])
-      expect(h.totalPosts()).toBe(0)
-      expect(ladderLines).toHaveLength(1)
-      expect(ladderLines[0]).toContain(renderPersonaRef(fx.persona.name, fx.persona.key))
-      expect(ladderLines[0]).toContain(reason)
-      // A row with no cwd prints `<none>`, never `undefined`.
-      expect(log.filter((l) => l.includes('cwd=undefined'))).toEqual([])
-      // The transcript was never checked.
-      expect(log.filter((l) => l.includes('no transcript'))).toEqual([])
-    },
-  )
-
-  test.each([
-    ['matching', 'fallback exists', 'jsonl-transcript-stale-path'],
-    ['matching', 'archived rows since spawn', 'jsonl-transcript-lost'],
-    ['symlinked-cwd', 'fallback exists', 'jsonl-transcript-stale-path'],
-    ['symlinked-cwd', 'archived rows since spawn', 'jsonl-transcript-lost'],
-  ] as Array<[RowKind, Condition, string]>)('%s row, %s → stays loud (%s + one notice)', async (kind, condition, key) => {
-    const { fx, h, errors, ladderLines } = await run(kind, condition)
-    expect(errors).toEqual([key])
-    expect(h.posts(fx.persona.key)).toHaveLength(1)
-    expect(ladderLines).toEqual([])
-  })
-})
-
-// ---------------------------------------------------------------------------
-// Notice seam wired to the real per-persona notifier (b.av2 SR-7.2)
-// ---------------------------------------------------------------------------
-
-describe('runJsonlPersistenceSafeguard — real per-persona notifier', () => {
-  test("stale-path notice for A posts once, on A's client, to A's destination, with A's reference; nothing on B's", async () => {
-    const personaConfig = makeMultiPersonaConfig([{ name: 'Alpha Bot' }, { name: 'Beta Bot' }], makeTempDir(), {
-      claude_config_dir: CONFIG_DIR,
-    })
-    const a = personaConfig.personas[0]!
-    const b = personaConfig.personas[1]!
-    // The persona key is distinct from the destination channel, so a notice
-    // addressed to the channel ID instead of the key would be dropped.
-    expect(a.key).not.toBe(a.permission_prompts)
-    const h = makeNotifierHarness(personaConfig)
-
-    const staleRow = makeRow({ jsonl_path: STALE_PATH }, a)
-    const fallback = resolveJsonlPath(staleRow.cwd, staleRow.session_id, CONFIG_DIR)
-    await runJsonlPersistenceSafeguard(personaConfig, h.notifier.notify, {
-      readMountinfo: fixture(REALISTIC_MOUNTINFO),
-      statFn: (p) => p === fallback,
-      getRow: async (key) => {
-        if (key === a.key) return staleRow
-        throw new ErrSpawnNotFound('get', 'ErrSpawnNotFound', 'x')
-      },
-      archiveCountSince: () => null,
-      recordStartupError: () => {},
-      home,
-    })
-
-    const aPosts = h.posts(a.key)
-    expect(aPosts).toHaveLength(1)
-    expect(aPosts[0]!.channel).toBe(a.permission_prompts!)
-    expect(aPosts[0]!.text).toContain(renderPersonaRef(a.name, a.key))
-    expect(aPosts[0]!.text).toContain(fallback)
-    expect(h.posts(b.key)).toEqual([])
-    // Posted, not dropped, dry-run or failed: the notifier logged nothing.
-    expect(h.logs).toEqual([])
-  })
-
-  test("non-persistent-storage warning: a dm persona gets it once in its DM with its contact, on its own client, with the channel persona's text; nothing on the persona off the tmpfs root", async () => {
-    const contact = 'U0DELTADM'
-    // A (channel) and D (dm) share the tmpfs root /tmp/claude; B is on ext4.
-    const config = makeMultiPersonaConfig(
-      [
-        { name: 'Alpha Bot', claude_config_dir: '/tmp/claude' },
-        { name: 'Delta Bot', channels: [], dm: { enabled: true, contact }, permission_prompts: 'dm', claude_config_dir: '/tmp/claude' },
-        { name: 'Beta Bot', claude_config_dir: '/home/user/.claude' },
-      ],
-      makeTempDir(),
-    )
-    const [a, d, b] = config.personas as [Persona, Persona, Persona]
-    const h = makeNotifierHarness(config)
-    // Collect the notifier's pending deliveries: a DM post settles only after its conversations.open.
-    const pending: Promise<void>[] = []
-    const errors: string[] = []
-    await runJsonlPersistenceSafeguard(config, (key, text, options) => {
-      const p = h.notifier.notify(key, text, options)
-      pending.push(p)
-      return p
-    }, {
-      readMountinfo: fixture(REALISTIC_MOUNTINFO),
-      statFn: () => true,
-      getRow: async () => {
-        throw new ErrSpawnNotFound('get', 'ErrSpawnNotFound', 'x')
-      },
-      archiveCountSince: () => null,
-      recordStartupError: (key) => {
-        errors.push(key)
-      },
-      home,
-    })
-    await Promise.all(pending)
-
-    expect(errors).toEqual(['jsonl-non-persistent'])
-    // D: one open with its contact, then one post to the returned D… conversation, both on D's client.
-    const dStub = h.stub(d.key)
-    expect(dStub.web.callLog.map((c) => c.method)).toEqual(['conversations.open', 'chat.postMessage'])
-    expect(dStub.calls.conversationsOpen).toEqual([{ users: contact }])
-    const dPosts = h.posts(d.key)
-    expect(dPosts).toHaveLength(1)
-    expect(Object.keys(dPosts[0]!).sort()).toEqual(['channel', 'text'])
-    expect(dPosts[0]!.channel).toBe(stubOpenedDmId(contact))
-    const refD = renderPersonaRef(d.name, d.key)
-    expect(dPosts[0]!.text).toContain(refD)
-    expect(dPosts[0]!.text).toContain('/tmp/claude/projects')
-    expect(dPosts[0]!.text).toMatch(/non-persistent filesystem/)
-    // A (channel destination) is unchanged: one post to its channel, no open.
-    expect(h.stub(a.key).web.callLog.map((c) => c.method)).toEqual(['chat.postMessage'])
-    const aPosts = h.posts(a.key)
-    expect(aPosts).toEqual([{ channel: a.permission_prompts!, text: expect.any(String) }])
-    // Same notice text for either destination, apart from the persona reference.
-    const refA = renderPersonaRef(a.name, a.key)
-    expect(dPosts[0]!.text.replace(refD, '<ref>')).toBe(aPosts[0]!.text.replace(refA, '<ref>'))
-    expect(dPosts[0]!.text).not.toContain(refA)
-    // B is off the flagged root: nothing on its client.
-    expect(h.stub(b.key).callLog).toEqual([])
-    expect(h.logs).toEqual([])
-  })
-})
-
-// ---------------------------------------------------------------------------
-// Layer 1 loud path through the orchestrator
-// ---------------------------------------------------------------------------
-
-describe('runJsonlPersistenceSafeguard — Layer 1 loud path', () => {
-  // Layer-2 healthy (statFn true) and no AD rows → the only signals are Layer 1's.
-  const quietLayer2: Partial<JsonlPersistenceSafeguardDeps> = {
-    statFn: () => true,
-    getRow: async () => { throw new ErrSpawnNotFound('get', 'ErrSpawnNotFound', 'x') },
-  }
-
-  test('tmpfs root → jsonl-non-persistent recorded + one notice per persona on that root', async () => {
-    const config = makeMultiPersonaConfig(
-      [
-        { name: 'A', claude_config_dir: '/tmp/claude' },
-        { name: 'B', claude_config_dir: '/tmp/claude' },
-      ],
-      makeTempDir(),
-    )
-    const [a, b] = config.personas
-    const c = await runLayer2(quietLayer2, config)
-    const nonPersistent = c.errors.filter((e) => e.key === 'jsonl-non-persistent')
-    expect(nonPersistent).toHaveLength(1)
-    // One notice per persona key whose effective root is flagged (both A and B).
-    expect(c.notices.map((n) => n.key).sort()).toEqual([a!.key, b!.key].sort())
-    for (const n of c.notices) expect(n.text).not.toContain('this channel')
-  })
-
-  test('mixed roots: notice goes ONLY to personas on the flagged tmpfs root; record fires once', async () => {
-    // Two personas with different effective JSONL roots; only /tmp/claude is tmpfs.
-    // A → /tmp/claude/projects (tmpfs, flagged). B → /home/user/.claude/projects (ext4, clean).
-    const config = makeMultiPersonaConfig(
-      [
-        { name: 'A', claude_config_dir: '/tmp/claude' },
-        { name: 'B', claude_config_dir: '/home/user/.claude' },
-      ],
-      makeTempDir(),
-    )
-    const c = await runLayer2(quietLayer2, config)
-    const nonPersistent = c.errors.filter((e) => e.key === 'jsonl-non-persistent')
-    // recordStartupError fires once per flagged root (one tmpfs root here).
-    expect(nonPersistent).toHaveLength(1)
-    expect(nonPersistent[0]!.message).toContain('/tmp/claude/projects')
-    // The notice targets ONLY the persona whose effective root is the flagged root.
-    expect(c.notices.map((n) => n.key)).toEqual([config.personas[0]!.key])
-    expect(c.notices[0]!.text).toContain('/tmp/claude/projects')
-    expect(c.notices[0]!.text).not.toContain('this channel')
-  })
-
-  test('unresolvable root → jsonl-persistence-check-warning recorded, no notice', async () => {
-    const config = makeMultiPersonaConfig([{ name: 'A', claude_config_dir: '/no/matching/mount' }], makeTempDir())
-    const noRoot = '24 23 8:2 / /home rw,relatime shared:2 - ext4 /dev/sda2 rw\n'
-    const c = await runLayer2({ ...quietLayer2, readMountinfo: fixture(noRoot) }, config)
-    expect(c.errors.map((e) => e.key)).toContain('jsonl-persistence-check-warning')
-    expect(c.notices).toEqual([])
-  })
-})
-
-// ---------------------------------------------------------------------------
-// makeDefaultArchiveCount — real temp-sqlite coverage (exercised through the
-// safeguard's default archiveCountSince, i.e. NO archiveCountSince injected).
-//
-// STARTED_AT '2026-09-20T05:00:00Z' → the spawn boundary in epoch seconds. The
-// default counter reads config.message_archive_db read-only and counts
-// messages in the persona's `all` channels WHERE timestamp > boundary. A
-// positive count surfaces as a loud jsonl-transcript-lost record whose message
-// embeds the exact count; 0 / null (unconfigured, missing, corrupt) stay
-// quiet. statFn is forced false so Layer 2 always reaches the archive-count
-// branch.
-// ---------------------------------------------------------------------------
-
-const SPAWN_EPOCH = Date.parse(STARTED_AT) / 1000 // 2026-09-20T05:00:00Z
-
-/** Builds a temp archive DB with the given (timestamp, channel) rows; returns its path. */
-function makeArchiveDb(rows: ArchiveRow[]): string {
-  const built = buildTempArchiveDb(rows, CH)
-  cleanups.push(built.cleanup)
-  return built.dbPath
-}
-
-/** Config whose message_archive_db points at dbPath (undefined → unconfigured). */
-function archiveConfig(dbPath: string | undefined): PersonaConfig {
-  return layer2Config({ message_archive_db: dbPath })
-}
-
-describe('makeDefaultArchiveCount (real temp sqlite, via default archiveCountSince)', () => {
-  test('unconfigured message_archive_db → null → quiet (no loud lost signal)', async () => {
-    const c = await runLayer2({ statFn: () => false, archiveCountSince: undefined }, archiveConfig(undefined))
-    expect(c.errors).toEqual([])
-    expect(c.notices).toEqual([])
-  })
-
-  test('missing DB file → null → quiet AND the file is not created', async () => {
-    const dbPath = join(makeTempDir('jsonl-archive-test-'), 'does-not-exist.db')
-    const c = await runLayer2({ statFn: () => false, archiveCountSince: undefined }, archiveConfig(dbPath))
-    expect(c.errors).toEqual([])
-    expect(c.notices).toEqual([])
-    // Read-only counter must never fabricate an empty archive on disk.
-    expect(existsSync(dbPath)).toBe(false)
-  })
-
-  test('existing DB → counts only rows strictly after the spawn boundary (> excludes the boundary row)', async () => {
-    // 1 before, 1 exactly at the boundary (excluded by >), 3 after, plus 1 after
-    // for a DIFFERENT channel (must not be counted). Expected count for CH = 3.
-    const dbPath = makeArchiveDb([
-      { ts: SPAWN_EPOCH - 10 },
-      { ts: SPAWN_EPOCH }, // exactly at boundary → excluded
-      { ts: SPAWN_EPOCH + 1 },
-      { ts: SPAWN_EPOCH + 100 },
-      { ts: SPAWN_EPOCH + 9999 },
-      { ts: SPAWN_EPOCH + 5, channel: 'OTHER_CH' },
-    ])
-    const c = await runLayer2({ statFn: () => false, archiveCountSince: undefined }, archiveConfig(dbPath))
-    expect(c.errors).toHaveLength(1)
-    expect(c.errors[0]!.key).toBe('jsonl-transcript-lost')
-    expect(c.errors[0]!.message).toContain('3 message(s)')
-    expect(c.notices).toHaveLength(1)
-    expect(c.notices[0]!.key).toBe(layer2Persona().key)
-    expect(c.notices[0]!.text).toContain('3 message(s)')
-    expect(c.notices[0]!.text).not.toContain('this channel')
-  })
-
-  test('existing DB with only pre-boundary rows → count 0 → quiet', async () => {
-    const dbPath = makeArchiveDb([{ ts: SPAWN_EPOCH - 100 }, { ts: SPAWN_EPOCH }])
-    const c = await runLayer2({ statFn: () => false, archiveCountSince: undefined }, archiveConfig(dbPath))
-    expect(c.errors).toEqual([])
-    expect(c.notices).toEqual([])
-  })
-
-  test('corrupt/unreadable DB file → null → quiet (error swallowed)', async () => {
-    const dbPath = join(makeTempDir('jsonl-archive-test-'), 'corrupt.db')
-    // Not a valid sqlite file → new Database(...).query throws → counter returns null.
-    writeFileSync(dbPath, 'this is not a sqlite database, it is plain garbage bytes')
-    chmodSync(dbPath, 0o644)
-    const c = await runLayer2({ statFn: () => false, archiveCountSince: undefined }, archiveConfig(dbPath))
-    expect(c.errors).toEqual([])
-    expect(c.notices).toEqual([])
-  })
-})
-
-// ---------------------------------------------------------------------------
-// b.av2 SR-7.4 — which archived messages count as a persona's evidence
-//
-// Channels: two `all` channels, one `mentions` channel and a DM conversation
-// the persona under test may hold, and a channel of another persona.
-// ---------------------------------------------------------------------------
-
-const ALL_1 = 'C0ALL0001'
-const ALL_2 = 'C0ALL0002'
-const MENT = 'C0MENT001'
-const DM_CONV = 'D0DM00001'
-const OTHER = 'C0OTHER01'
-
-/** `n` archive rows in `channel`, all strictly after the spawn boundary. */
-function after(channel: string, n: number): ArchiveRow[] {
-  return Array.from({ length: n }, (_, i) => ({ ts: SPAWN_EPOCH + 1 + i, channel }))
-}
-
-/** Pre-boundary noise in every channel: never counted by any case. */
-const PRE_BOUNDARY: ArchiveRow[] = [ALL_1, ALL_2, MENT, DM_CONV, OTHER].map((channel) => ({
-  ts: SPAWN_EPOCH - 1,
-  channel,
-}))
-
-/** Rows in every channel after the boundary: 1 / 2 / 3 / 4 / 5 per channel. */
-const EVERYWHERE: ArchiveRow[] = [
-  ...after(ALL_1, 1),
-  ...after(ALL_2, 2),
-  ...after(MENT, 3),
-  ...after(DM_CONV, 4),
-  ...after(OTHER, 5),
-]
-
-const all = (id: string) => ({ id, delivery: 'all' as const })
-const mentions = (id: string) => ({ id, delivery: 'mentions' as const })
-
-/**
- * A config of the persona under test (`spec`) and another persona in OTHER,
- * both matching the rows makeRow builds.
- */
-function evidenceConfig(spec: PersonaSpec, dbPath?: string): PersonaConfig {
-  return makeMultiPersonaConfig(
-    [
-      { ...LAYER2_SPEC, ...spec },
-      { name: 'Other Bot', working_directory: '/repo/other', channels: [all(OTHER)] },
-    ],
-    makeTempDir(),
-    { claude_config_dir: CONFIG_DIR, ...(dbPath ? { message_archive_db: dbPath } : {}) },
-  )
-}
-
-describe('personaArchiveEvidenceScope + makeDefaultArchiveCount (real temp sqlite, several channels)', () => {
-  test.each([
-    {
-      name: 'rows in its one `all` channel are counted',
-      spec: { channels: [all(ALL_1)] },
-      rows: after(ALL_1, 2),
-      ids: [ALL_1],
-      attributable: true,
-      count: 2,
-    },
-    {
-      name: 'rows in two `all` channels are summed',
-      spec: { channels: [all(ALL_1), all(ALL_2)] },
-      rows: [...after(ALL_1, 2), ...after(ALL_2, 3)],
-      ids: [ALL_1, ALL_2],
-      attributable: true,
-      count: 5,
-    },
-    {
-      name: 'rows only in its `mentions` channel are not counted',
-      spec: { channels: [all(ALL_1), mentions(MENT)] },
-      rows: after(MENT, 4),
-      ids: [ALL_1],
-      attributable: false,
-      count: 0,
-    },
-    {
-      name: 'rows only in a DM conversation are not counted',
-      spec: { channels: [all(ALL_1)], dm: { enabled: true } },
-      rows: after(DM_CONV, 4),
-      ids: [ALL_1],
-      attributable: false,
-      count: 0,
-    },
-    {
-      name: "rows in another persona's channel are not counted",
-      spec: { channels: [all(ALL_1)] },
-      rows: after(OTHER, 4),
-      ids: [ALL_1],
-      attributable: true,
-      count: 0,
-    },
-    {
-      name: 'rows everywhere: only the `all` channels count (1 + 2)',
-      spec: { channels: [mentions(MENT), all(ALL_1), all(ALL_2)], dm: { enabled: true } },
-      rows: EVERYWHERE,
-      ids: [ALL_1, ALL_2],
-      attributable: false,
-      count: 3,
-    },
-    {
-      name: 'a DM-only persona with no channels counts nothing',
-      spec: { channels: [], dm: { enabled: true }, permission_prompts: 'dm' },
-      rows: EVERYWHERE,
-      ids: [],
-      attributable: false,
-      count: 0,
-    },
-  ] as Array<{ name: string; spec: PersonaSpec; rows: ArchiveRow[]; ids: string[]; attributable: boolean; count: number }>)(
-    '$name',
-    ({ spec, rows, ids, attributable, count }) => {
-      const dbPath = makeArchiveDb([...PRE_BOUNDARY, ...rows])
-      const persona = evidenceConfig(spec).personas[0]!
-      const scope = personaArchiveEvidenceScope(persona)
-      expect(scope).toEqual({ channelIds: ids, zeroIsAttributable: attributable })
-      const countSince = makeDefaultArchiveCount({ message_archive_db: dbPath })
-      expect(countSince(scope.channelIds, SPAWN_EPOCH, renderPersonaRef(persona.name, persona.key))).toBe(count)
-    },
-  )
-
-  test.each([
-    ['unconfigured', (): string | undefined => undefined],
-    ['missing-file', (): string | undefined => join(makeTempDir('jsonl-archive-test-'), 'absent.db')],
-    [
-      'corrupt-file',
-      (): string | undefined => {
-        const p = join(makeTempDir('jsonl-archive-test-'), 'corrupt.db')
-        writeFileSync(p, 'not a sqlite database')
-        return p
-      },
-    ],
-  ])('no `all` channels → 0 without opening the %s archive (an `all` channel gives null)', (label, dbPathFor) => {
-    const dbPath = dbPathFor()
-    const countSince = makeDefaultArchiveCount({ message_archive_db: dbPath })
-    expect(countSince([], SPAWN_EPOCH, 'ref')).toBe(0)
-    expect(countSince([ALL_1], SPAWN_EPOCH, 'ref')).toBeNull()
-    if (label === 'missing-file') expect(existsSync(dbPath!)).toBe(false)
-  })
-})
-
-// ---------------------------------------------------------------------------
-// b.av2 SR-7.4 — zero-count interpretation in the safeguard (real sqlite,
-// default archive count, real per-persona notifier)
-// ---------------------------------------------------------------------------
-
-describe('runJsonlPersistenceSafeguard — zero archive count per SR-7.4', () => {
-  async function runEvidence(spec: PersonaSpec, rows: ArchiveRow[]) {
-    const dbPath = makeArchiveDb([...PRE_BOUNDARY, ...rows])
-    const config = evidenceConfig(spec, dbPath)
-    const [persona, other] = config.personas
-    const h = makeNotifierHarness(config)
-    const errors: Array<{ key: string; message: string }> = []
-    const log = captureErrorLog()
-    await runJsonlPersistenceSafeguard(config, h.notifier.notify, {
-      readMountinfo: fixture(REALISTIC_MOUNTINFO),
-      statFn: () => false,
-      // Only the persona under test has a row.
-      getRow: async (key) => {
-        if (key === persona!.key) return makeRow({}, persona!)
-        throw new ErrSpawnNotFound('get', 'ErrSpawnNotFound', 'x')
-      },
-      recordStartupError: (key, message) => {
-        errors.push({ key, message })
-      },
-      home,
-    })
-    const ref = renderPersonaRef(persona!.name, persona!.key)
-    return { persona: persona!, other: other!, h, errors, personaLines: log.filter((l) => l.includes(ref)) }
-  }
-
-  test.each([
-    ['rows only in its `mentions` channel', { channels: [all(ALL_1), mentions(MENT)] }, after(MENT, 3)],
-    ['DMs on and archived rows only in a DM', { channels: [all(ALL_1)], dm: { enabled: true } }, after(DM_CONV, 3)],
-    [
-      'a DM-only persona with no channels',
-      { channels: [], dm: { enabled: true }, permission_prompts: 'dm' },
-      after(DM_CONV, 3),
-    ],
-  ] as Array<[string, PersonaSpec, ArchiveRow[]]>)(
-    '%s → zero is inconclusive: no LOST record, no notice, one quiet line',
-    async (_label, spec, rows) => {
-      const { h, errors, personaLines } = await runEvidence(spec, rows)
-      expect(errors).toEqual([])
-      expect(h.totalPosts()).toBe(0)
-      const inconclusive = personaLines.filter((l) => l.includes('archive evidence is inconclusive'))
-      expect(inconclusive).toHaveLength(1)
-      expect(inconclusive[0]).toContain(UNATTRIBUTABLE_ZERO_REASON)
-    },
-  )
-
-  test('a `mentions` channel plus archived `all`-channel rows → LOST record and one notice counting only `all` rows', async () => {
-    const { persona, other, h, errors } = await runEvidence(
-      { channels: [all(ALL_1), mentions(MENT)] },
-      [...after(ALL_1, 2), ...after(MENT, 3), ...after(OTHER, 4)],
-    )
-    expect(errors.map((e) => e.key)).toEqual(['jsonl-transcript-lost'])
-    expect(errors[0]!.message).toContain('2 message(s)')
-    const posts = h.posts(persona.key)
-    expect(posts).toHaveLength(1)
-    expect(posts[0]!.text).toContain('2 message(s)')
-    expect(h.posts(other.key)).toEqual([])
-  })
-
-  test('an `all`-only persona with DMs off and zero `all` rows → idle-quiet, not inconclusive', async () => {
-    const { h, errors, personaLines } = await runEvidence({ channels: [all(ALL_1)] }, after(OTHER, 3))
-    expect(errors).toEqual([])
-    expect(h.totalPosts()).toBe(0)
-    expect(personaLines.filter((l) => l.includes('no archived activity since spawn'))).toHaveLength(1)
-    expect(personaLines.filter((l) => l.includes('inconclusive'))).toEqual([])
-  })
-})
-
-// ---------------------------------------------------------------------------
-// b.av2 SR-7.4, b.deo SRI-704 — archive evidence in fungible mode
-//
-// The persona under test is built under the switch on (or off, for a
-// declarative control) with its resolved `channels` set by spec, which the
-// loader leaves empty in fungible mode, so a case proves those channels are
-// never counted. DMs are off and its fungible destination is a channel
-// (b.deo SRI-104). The channels and rows are the SR-7.4 ones above.
-// ---------------------------------------------------------------------------
-
-/** The persona under test, without its `channels`: DMs off, a channel fungible destination. */
-const FUNGIBLE_EVIDENCE_SPEC: PersonaSpec = {
-  name: LAYER2_SPEC.name,
-  working_directory: LAYER2_SPEC.working_directory,
-  claude_config_dir: CONFIG_DIR,
-  dm: { enabled: false },
-  invited: { permission_prompts: ALL_1 },
-}
-
-/**
- * `FUNGIBLE_EVIDENCE_SPEC` with `spec` over it, and another persona in OTHER,
- * in fungible mode (`fungible` true: the switch on) or declarative mode.
- * Declarative mode sends the persona's notices to its first channel.
- */
-function modeEvidenceConfig(spec: PersonaSpec, fungible: boolean, dbPath?: string): PersonaConfig {
-  return makeMultiPersonaConfig(
-    [
-      { ...FUNGIBLE_EVIDENCE_SPEC, ...spec },
-      { name: 'Other Bot', working_directory: '/repo/other', channels: [all(OTHER)], invited: { permission_prompts: OTHER } },
-    ],
-    makeTempDir(),
-    { claude_config_dir: CONFIG_DIR, allow_invited_channels: fungible, ...(dbPath ? { message_archive_db: dbPath } : {}) },
-  )
-}
-
-describe('b.deo SRI-704: personaArchiveEvidenceScope in fungible mode (b.av2 SR-7.4)', () => {
-  test.each([
-    {
-      name: 'one `all` channel',
-      spec: { channels: [all(ALL_1)] },
-      declarative: { channelIds: [ALL_1], zeroIsAttributable: true },
-    },
-    {
-      name: 'two `all` channels',
-      spec: { channels: [all(ALL_1), all(ALL_2)] },
-      declarative: { channelIds: [ALL_1, ALL_2], zeroIsAttributable: true },
-    },
-    {
-      name: 'an `all` and a `mentions` channel',
-      spec: { channels: [all(ALL_1), mentions(MENT)] },
-      declarative: { channelIds: [ALL_1], zeroIsAttributable: false },
-    },
-    {
-      name: 'an `all` channel and DMs on',
-      spec: { channels: [all(ALL_2)], dm: { enabled: true } },
-      declarative: { channelIds: [ALL_2], zeroIsAttributable: false },
-    },
-    {
-      name: 'no channels',
-      spec: { channels: [] },
-      declarative: { channelIds: [], zeroIsAttributable: true },
-    },
-  ] as Array<{ name: string; spec: PersonaSpec; declarative: { channelIds: string[]; zeroIsAttributable: boolean } }>)(
-    '$name: fungible mode counts no channel and its zero is never attributable; with the mode absent or declarative the scope is SR-7.4\'s',
-    ({ spec, declarative }) => {
-      const config = modeEvidenceConfig(spec, true)
-      expect(channelModeOf(config)).toBe('fungible')
-      const persona = config.personas[0]!
-      // The resolved `channels` hold the spec's channels, as set.
-      expect(persona.channels).toEqual(spec.channels!)
-
-      const fungibleScope = personaArchiveEvidenceScope(persona, 'fungible')
-      expect(fungibleScope).toEqual({ channelIds: [], zeroIsAttributable: false })
-      expect(personaArchiveEvidenceScope(persona)).toEqual(declarative)
-      expect(personaArchiveEvidenceScope(persona, 'declarative')).toEqual(declarative)
-
-      assertNoLeak({ fungibleScope, persona })
-    },
-  )
-})
-
-describe('b.deo SRI-704: runJsonlPersistenceSafeguard in fungible mode (b.av2 SR-7.4)', () => {
-  /** The SRD's persona: one `delivery: all` channel, DMs off. */
-  const SRD_SPEC: PersonaSpec = { channels: [all(ALL_1)] }
-
-  /** The SRD's archive: rows since spawn in the persona's `all` channel and in another persona's channel. */
-  const SRD_ROWS: ArchiveRow[] = [...after(ALL_1, 3), ...after(OTHER, 4)]
-
-  /**
-   * One safeguard pass over `modeEvidenceConfig(SRD_SPEC, fungible)` with a
-   * real temp archive of `rows` and the real per-persona notifier; only the
-   * persona under test has a row (`rowOverrides` over it). `log` is the
-   * test's console capture; the result's `personaLines` are this pass's lines
-   * naming the persona.
-   */
-  async function runMode(
-    fungible: boolean,
-    log: string[],
-    opts: { rows?: ArchiveRow[]; deps?: Partial<JsonlPersistenceSafeguardDeps>; rowOverrides?: Partial<GetResult> } = {},
-  ) {
-    const dbPath = makeArchiveDb([...PRE_BOUNDARY, ...(opts.rows ?? SRD_ROWS)])
-    const config = modeEvidenceConfig(SRD_SPEC, fungible, dbPath)
-    const [persona, other] = config.personas as [Persona, Persona]
-    const h = makeNotifierHarness(config)
-    const errors: Array<{ key: string; message: string }> = []
-    const from = log.length
-    await runJsonlPersistenceSafeguard(config, h.notifier.notify, {
-      readMountinfo: fixture(REALISTIC_MOUNTINFO),
-      statFn: () => false,
-      getRow: async (key) => {
-        if (key === persona.key) return makeRow(opts.rowOverrides ?? {}, persona)
-        throw new ErrSpawnNotFound('get', 'ErrSpawnNotFound', 'x')
-      },
-      recordStartupError: (key, message) => {
-        errors.push({ key, message })
-      },
-      home,
-      ...opts.deps,
-    })
-    const ref = renderPersonaRef(persona.name, persona.key)
-    return { config, persona, other, h, errors, ref, personaLines: log.slice(from).filter((l) => l.includes(ref)) }
-  }
-
-  const inconclusiveLines = (lines: string[]): string[] => lines.filter((l) => l.includes('archive evidence is inconclusive'))
-
-  test('b.deo SRI-704 (AC 41): a `delivery: all` channel with archived messages since spawn, DMs off → inconclusive with the fungible-mode reason, never lost: no record, no notice, one quiet line', async () => {
-    const log = captureErrorLog()
-    const { config, persona, h, errors, personaLines } = await runMode(true, log)
-    expect(channelModeOf(config)).toBe('fungible')
-    expect(persona.channels).toEqual([all(ALL_1)])
-    expect(persona.dm.enabled).toBe(false)
-    expect(persona.fungible_destination).toBe(ALL_1)
-
-    expect(errors).toEqual([])
-    expect(h.totalPosts()).toBe(0)
-    const inconclusive = inconclusiveLines(personaLines)
-    expect(inconclusive).toHaveLength(1)
-    expect(inconclusive[0]).toContain(FUNGIBLE_MODE_ZERO_REASON)
-    expect(personaLines.filter((l) => l.includes(UNATTRIBUTABLE_ZERO_REASON))).toEqual([])
-    expect(personaLines.filter((l) => l.includes('no archived activity since spawn'))).toEqual([])
-    assertNoLeak({ errors, personaLines, posts: h.allPosts(), logs: h.logs })
-  })
-
-  test('b.deo SRI-704: declarative control — the same fixture under the switch off → LOST record and one notice counting its `all` rows', async () => {
-    const log = captureErrorLog()
-    const { config, persona, other, h, errors, personaLines } = await runMode(false, log)
-    expect(channelModeOf(config)).toBe('declarative')
-
-    expect(errors.map((e) => e.key)).toEqual(['jsonl-transcript-lost'])
-    expect(errors[0]!.message).toContain('3 message(s)')
-    const posts = h.posts(persona.key)
-    expect(posts).toHaveLength(1)
-    expect(posts[0]!.channel).toBe(ALL_1)
-    expect(posts[0]!.text).toContain('3 message(s)')
-    expect(h.posts(other.key)).toEqual([])
-    expect(inconclusiveLines(personaLines)).toEqual([])
-    expect(personaLines.filter((l) => l.includes(FUNGIBLE_MODE_ZERO_REASON))).toEqual([])
-    assertNoLeak({ errors, personaLines, posts: h.allPosts(), logs: h.logs })
-  })
-
-  test('b.deo SRI-704: the archive count is asked for no channel, and a count it answers is no evidence: inconclusive with the fungible-mode reason, never lost', async () => {
-    const log = captureErrorLog()
-    const asked: Array<[readonly string[], number, string]> = []
-    const { h, errors, ref, personaLines } = await runMode(true, log, {
-      deps: {
-        archiveCountSince: (ids, since, countRef) => {
-          asked.push([[...ids], since, countRef])
-          return 5
-        },
-      },
-    })
-
-    expect(asked).toEqual([[[], SPAWN_EPOCH, ref]])
-    expect(errors).toEqual([])
-    expect(h.totalPosts()).toBe(0)
-    const inconclusive = inconclusiveLines(personaLines)
-    expect(inconclusive).toHaveLength(1)
-    expect(inconclusive[0]).toContain(FUNGIBLE_MODE_ZERO_REASON)
-    expect(personaLines.filter((l) => l.includes('5 message'))).toEqual([])
-    assertNoLeak({ errors, personaLines, posts: h.allPosts() })
-  })
-
-  test.each<[string, { deps?: Partial<JsonlPersistenceSafeguardDeps>; rowOverrides?: Partial<GetResult> }]>([
-    ['the row\'s started_at is unparseable', { rowOverrides: { started_at: 'not-a-timestamp' } }],
-    ['the archive count answers no count', { deps: { archiveCountSince: () => null } }],
-  ])('b.deo SRI-704: the no-count path (%s) keeps its declarative outcome: one quiet idle line, no record, no notice', async (_label, opts) => {
-    const log = captureErrorLog()
-    const fungible = await runMode(true, log, opts)
-    const declarative = await runMode(false, log, opts)
-
-    expect(fungible.errors).toEqual([])
-    expect(fungible.h.totalPosts()).toBe(0)
-    expect(fungible.personaLines.filter((l) => l.includes('no archived activity since spawn'))).toHaveLength(1)
-    expect(fungible.personaLines.filter((l) => l.includes('inconclusive'))).toEqual([])
-    // The same outcome as the declarative pass over the same fixture.
-    expect(fungible.personaLines).toEqual(declarative.personaLines)
-    expect(fungible.errors).toEqual(declarative.errors)
-    expect(declarative.h.totalPosts()).toBe(0)
-    assertNoLeak({ fungible: fungible.personaLines, declarative: declarative.personaLines })
-  })
-})
-
-describe('b.deo SRI-704: the fungible-mode zero reason (b.av2 SR-7.4)', () => {
-  test('it is distinct from the declarative unattributable-zero reason, names fungible mode, and is the reason in fungible mode only', () => {
-    expect(FUNGIBLE_MODE_ZERO_REASON).not.toBe(UNATTRIBUTABLE_ZERO_REASON)
-    expect(FUNGIBLE_MODE_ZERO_REASON).not.toContain(UNATTRIBUTABLE_ZERO_REASON)
-    expect(UNATTRIBUTABLE_ZERO_REASON).not.toContain(FUNGIBLE_MODE_ZERO_REASON)
-    expect(FUNGIBLE_MODE_ZERO_REASON).toContain('fungible mode')
-    expect(UNATTRIBUTABLE_ZERO_REASON).not.toContain('fungible mode')
-    expect(unattributableZeroReason('fungible')).toBe(FUNGIBLE_MODE_ZERO_REASON)
-    expect(unattributableZeroReason('declarative')).toBe(UNATTRIBUTABLE_ZERO_REASON)
-    expect(unattributableZeroReason()).toBe(UNATTRIBUTABLE_ZERO_REASON)
-    assertNoLeak({ FUNGIBLE_MODE_ZERO_REASON, UNATTRIBUTABLE_ZERO_REASON })
-  })
-})
-
-// ---------------------------------------------------------------------------
-// runPersonaStorageCheck — Layer 1 for one persona a confirmed apply brings
-// up (b.av2 SR-6.2): its own effective JSONL root only, recorded and warned
-// about exactly as the start safeguard does; never throws.
-// ---------------------------------------------------------------------------
-
-describe('runPersonaStorageCheck — one persona\'s root at apply (b.av2 SR-6.2)', () => {
-  /** Run the check for `persona` with a recording notify and startup-error sink. */
-  function runFor(
-    persona: Persona,
-    deps: Partial<Pick<JsonlPersistenceSafeguardDeps, 'readMountinfo' | 'recordStartupError'>> = {},
-    notify?: (key: string, text: string) => void,
-  ): Captured {
-    const captured: Captured = { errors: [], notices: [] }
-    runPersonaStorageCheck(persona, notify ?? ((key, text) => void captured.notices.push({ key, text })), {
-      readMountinfo: fixture(REALISTIC_MOUNTINFO),
-      recordStartupError: (key, message) => void captured.errors.push({ key, message }),
-      home,
-      ...deps,
-    })
-    return captured
-  }
-
-  /** The Layer 1 signals the start safeguard gives for a config holding only `persona`. */
-  async function atStart(persona: Persona, readMountinfo = fixture(REALISTIC_MOUNTINFO)): Promise<Captured> {
-    return runLayer2(
-      { readMountinfo, statFn: () => true, getRow: async () => { throw new ErrSpawnNotFound('get', 'ErrSpawnNotFound', 'x') } },
-      { ...layer2Config(), personas: [persona] },
-    )
-  }
-
-  test('a non-persistent root: the same jsonl-non-persistent record and warning as at start, to this persona only — not to another persona on the same root', async () => {
-    const config = makeMultiPersonaConfig(
-      [{ name: 'Alpha Bot', claude_config_dir: '/tmp/claude' }, { name: 'Beta Bot', claude_config_dir: '/tmp/claude' }],
-      makeTempDir(),
-    )
-    const [a] = config.personas as [Persona, Persona]
-
-    const c = runFor(a)
-
-    expect(c.errors.map((e) => e.key)).toEqual(['jsonl-non-persistent'])
-    expect(c.errors[0]!.message).toContain('root="/tmp/claude/projects"')
-    expect(c.notices.map((n) => n.key)).toEqual([a.key])
-    expect(c).toEqual(await atStart(a))
-  })
-
-  test.each<[string, string, string | undefined, string[]]>([
-    ['on a persistent root: nothing recorded, no warning', '/home/user/.claude', undefined, []],
-    ['on an unresolvable root: the jsonl-persistence-check-warning record as at start, no warning', '/no/matching/mount',
-      '24 23 8:2 / /home rw,relatime shared:2 - ext4 /dev/sda2 rw\n', ['jsonl-persistence-check-warning']],
-  ])('the persona %s, although another persona sits on a tmpfs root', async (_label, dir, mountinfo, recorded) => {
-    const config = makeMultiPersonaConfig(
-      [{ name: 'Alpha Bot', claude_config_dir: dir }, { name: 'Beta Bot', claude_config_dir: '/tmp/claude' }],
-      makeTempDir(),
-    )
-    const [a] = config.personas as [Persona, Persona]
-    const readMountinfo = fixture(mountinfo ?? REALISTIC_MOUNTINFO)
-
-    const c = runFor(a, { readMountinfo })
-
-    expect(c.errors.map((e) => e.key)).toEqual(recorded)
-    expect(c.notices).toEqual([])
-    expect(c).toEqual(await atStart(a, readMountinfo))
-  })
-
-  test('a persona with no claude_config_dir is checked at <home>/.claude/projects under deps.home', () => {
-    const config = makeMultiPersonaConfig([{ name: 'Alpha Bot' }], makeTempDir())
-    const [a] = config.personas as [Persona]
-    const homeOnTmpfs = `${REALISTIC_MOUNTINFO}99 23 0:30 / ${home} rw,relatime shared:11 - tmpfs tmpfs rw\n`
-
-    const c = runFor(a, { readMountinfo: fixture(homeOnTmpfs) })
-
-    expect(c.errors).toEqual([{ key: 'jsonl-non-persistent', message: expect.stringContaining(`root="${home}/.claude/projects"`) }])
-    expect(c.notices.map((n) => n.key)).toEqual([a.key])
-  })
-
-  test.each<[string, Partial<Pick<JsonlPersistenceSafeguardDeps, 'readMountinfo' | 'recordStartupError'>>, boolean]>([
-    ['the startup-error sink throws', { recordStartupError: () => { throw new Error('sink exploded') } }, true],
-    ['the notice seam throws', {}, false],
-    ['the mountinfo reader throws', { readMountinfo: () => { throw new Error('no /proc') } }, false],
-  ])('never throws when %s', (_label, deps, unexpected) => {
-    const config = makeMultiPersonaConfig([{ name: 'Alpha Bot', claude_config_dir: '/tmp/claude' }], makeTempDir())
-    const [a] = config.personas as [Persona]
-    const lines = captureErrorLog()
-
-    expect(() => runFor(a, deps, () => { throw new Error('notify exploded') })).not.toThrow()
-
-    const failedLine = `[slack] Warning: jsonl-persistence-check failed unexpectedly for ${renderPersonaRef(a.name, a.key)} — continuing: Error`
-    expect(lines.filter((l) => l.startsWith(failedLine))).toHaveLength(unexpected ? 1 : 0)
-  })
-})
-
-// ---------------------------------------------------------------------------
-// Bug b.g57: a claude_config_dir that cannot be resolved is not checked this
-// pass — no lost-history, inconclusive or transcript-loss notice, and no
-// config_dir label mismatch (the lexical label would have mismatched the row)
-// ---------------------------------------------------------------------------
-
-describe('b.g57: runJsonlPersistenceSafeguard — a claude_config_dir that cannot be resolved', () => {
-  /** Only `/` (ext4): the temp config dirs raise no Layer-1 record or notice. */
-  const EXT4_ROOT = '23 0 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n'
-
-  /**
-   * A, whose claude_config_dir is a symlink onto a "drive", and B, whose
-   * claude_config_dir is a plain directory. Both rows were written while the
-   * drive was there (so their config_dir labels match), and both have archived
-   * rows since spawn and no transcript: each is loud whenever it is checked.
-   */
-  function g57Fixture() {
-    const dir = makeTempDir()
-    const drive = join(dir, 'mnt', 'a')
-    mkdirSync(drive, { recursive: true })
-    const aDir = join(dir, 'claude-a')
-    symlinkSync(drive, aDir)
-    const bDir = join(dir, 'claude-b')
-    mkdirSync(bDir)
-    const config = makeMultiPersonaConfig(
-      [
-        { ...LAYER2_SPEC, name: 'Alpha Bot', working_directory: '/repo/alpha', claude_config_dir: aDir },
-        { ...LAYER2_SPEC, name: 'Beta Bot', working_directory: '/repo/beta', claude_config_dir: bDir },
-      ],
-      dir,
-    )
-    const [a, b] = config.personas as [Persona, Persona]
-    const rows = new Map(config.personas.map((p) => [p.key, makeRow({ jsonl_path: STALE_PATH }, p)]))
-    return { config, a, b, aDir, drive, rows, refA: renderPersonaRef(a.name, a.key), refB: renderPersonaRef(b.name, b.key) }
-  }
-  type G57Fixture = ReturnType<typeof g57Fixture>
-
-  /** One pass over both personas; `configDirFs` as given (the real file system when undefined). */
-  async function pass(fx: G57Fixture, configDirFs?: JsonlPersistenceSafeguardDeps['configDirFs']) {
-    const lookups: string[] = []
-    const c = await runLayer2(
-      {
-        readMountinfo: fixture(EXT4_ROOT),
-        getRow: async (key: string) => {
-          lookups.push(key)
-          return fx.rows.get(key)!
-        },
-        statFn: () => false,
-        archiveCountSince: () => 4,
-        ...(configDirFs === undefined ? {} : { configDirFs }),
-      },
-      fx.config,
-    )
-    return { ...c, lookups }
-  }
-
-  const skipLine = (fx: G57Fixture, code: string) =>
-    `[slack] jsonl-persistence-check: ${fx.refA} claude_config_dir="${fx.aDir}" cannot be resolved to a real path (${code}) — transcript not checked this pass`
-
-  /** A realpath that fails with EIO for A's directory while `broken.on`, the real one otherwise. */
-  function eioFor(path: string, broken: { on: boolean }): JsonlPersistenceSafeguardDeps['configDirFs'] {
-    return {
-      realpath: (p) => {
-        if (broken.on && p === path) throw Object.assign(new Error('simulated I/O error'), { code: 'EIO' })
-        return realpathSync(p)
-      },
+    function run(isShuttingDown: () => boolean) {
+      // Deliberately omit getRow: this must exercise defaultGetRow and its wrapper.
+      return runJsonlPersistenceSafeguard(h.config, (key, text) => { h.notices.push({ key, text }) }, {
+        home, isShuttingDown, readMountinfo: () => '1 0 8:1 / / rw - ext4 /dev/disk rw',
+        recordStartupError: (key, message) => { h.errors.push({ key, message }) },
+      })
     }
+    const flags = () => h.config.personas.map(p => ({ key: p.key, flags: [...getOutageFlags(p.key)].sort() }))
+    return { ...h, held, ids, arms, cleared, flags, run }
   }
 
-  test.each<[string, string, (fx: G57Fixture) => JsonlPersistenceSafeguardDeps['configDirFs']]>([
-    ['a realpath failing with EIO (a dropped mount), injected', 'EIO', (fx) => eioFor(fx.aDir, { on: true })],
-    ['a symlink pointing to nothing (an unmounted drive)', 'ENOENT', (fx) => {
-      rmSync(fx.drive, { recursive: true })
-      return undefined
-    }],
-  ])('b.g57: %s: A is skipped before its row lookup with one line and no notice, record or label mismatch; B is checked as before', async (_label, code, arrange) => {
-    const fx = g57Fixture()
-    const configDirFs = arrange(fx)
-    const log = captureErrorLog()
-
-    const c = await pass(fx, configDirFs)
-
-    expect(c.lookups).toEqual([fx.b.key])
-    expect(log.filter((l) => l.includes(fx.refA))).toEqual([skipLine(fx, code)])
-    expect(c.notices.map((n) => n.key)).toEqual([fx.b.key])
-    expect(c.errors.map((e) => e.key)).toEqual(['jsonl-transcript-lost'])
-    expect(c.errors[0]!.message).toContain(fx.refB)
-    expect(c.errors.filter((e) => e.message.includes(fx.refA))).toEqual([])
-    assertNoLeak({ c, log })
-  })
-
-  test('b.g57: A\'s directory resolves again in the next pass: A is checked normally, with no skip line', async () => {
-    const fx = g57Fixture()
-    const broken = { on: true }
-    const configDirFs = eioFor(fx.aDir, broken)
-    const log = captureErrorLog()
-    const first = await pass(fx, configDirFs)
-    expect(first.lookups).toEqual([fx.b.key])
-    const firstLines = log.length
-
-    broken.on = false
-    const second = await pass(fx, configDirFs)
-
-    expect(second.lookups).toEqual([fx.a.key, fx.b.key])
-    expect(second.notices.map((n) => n.key)).toEqual([fx.a.key, fx.b.key])
-    expect(second.errors.map((e) => e.key)).toEqual(['jsonl-transcript-lost', 'jsonl-transcript-lost'])
-    expect(second.errors[0]!.message).toContain(fx.refA)
-    expect(log.slice(firstLines).filter((l) => l.includes('cannot be resolved') || l.includes('config_dir label'))).toEqual([])
-    assertNoLeak({ first, second, log })
-  })
-})
-
-// ---------------------------------------------------------------------------
-// AC 20 (b.av2 SR-10.3): the safeguard's lines carry no credential value when
-// the value that reaches them does — the b.g57 "transcript not checked this
-// pass" line (a realpath error), the agent-director get-failure line, the
-// archive-count, per-persona and whole-pass failure lines, and
-// runPersonaStorageCheck's notice-failure and own-failure lines, each under
-// an error carrying fake tokens. A line that describes an error keeps its
-// message only through `redactSlackLogText`, so in a message the leak marker
-// sits only inside a fake token and a Socket Mode `ticket=` URL, both of which
-// redaction replaces. Every console.error argument is kept unformatted. The
-// configured claude_config_dir path is echoed by design (it is not a
-// credential), so it stays a plain temp path here.
-// ---------------------------------------------------------------------------
-
-describe('AC 20: jsonl-persistence-check lines carry no credential value', () => {
-  const EXT4_ROOT = '23 0 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n'
-
-  /** One persona with its own claude_config_dir under a temp dir; `settings` go to the config's server settings. */
-  function ac20Fixture(settings: Parameters<typeof makeMultiPersonaConfig>[2] = {}) {
-    const dir = makeTempDir()
-    const configDir = join(dir, 'claude-a')
-    mkdirSync(configDir)
-    const config = makeMultiPersonaConfig(
-      [{ ...LAYER2_SPEC, name: 'Alpha Bot', working_directory: '/repo/alpha', claude_config_dir: configDir }],
-      dir,
-      settings,
-    )
-    const [a] = config.personas as [Persona]
-    return { config, a, configDir, ref: renderPersonaRef(a.name, a.key) }
-  }
-
-  /** An error whose message and properties carry fake tokens, with `code` as given. */
-  function sentinelError(message: string, code: string): Error {
-    return Object.assign(new Error(`${message} (${sentinelInMessage('err')})`), {
-      code,
-      path: fakeToken(APP_TOKEN_PREFIX, 'path'),
-      detail: LEAK_SENTINEL,
+  const ANSWERS = ['environment', 'config', 'success'] as const
+  function lateError(answer: 'environment' | 'config') {
+    return Object.assign(answer === 'environment' ? errTmuxNotAvailable(undefined, 'get') : errConfigMalformed(), {
+      message: sentinelInMessage('late-default-get'), data: LEAK_SENTINEL,
     })
   }
 
-  test.each([
-    ['an errno code (EIO)', 'EIO', 'EIO'],
-    ['a code that is itself a fake token', fakeToken(BOT_TOKEN_PREFIX, 'code'), 'unknown'],
-  ])('AC 20: realpath throws an error carrying fake tokens with %s — one "transcript not checked this pass" line, no row lookup; no captured argument carries a credential value', async (_label, code, shown) => {
-    const fx = ac20Fixture()
-    const errArgs = captureErrorArgs()
-    const lookups: string[] = []
-
-    const c = await runLayer2(
-      {
-        readMountinfo: fixture(EXT4_ROOT),
-        getRow: async (key: string) => {
-          lookups.push(key)
-          return makeRow({}, fx.a)
-        },
-        configDirFs: { realpath: () => { throw sentinelError('realpath failed', code) } },
-      },
-      fx.config,
-    )
-
-    expect(lookups).toEqual([])
-    expect(errArgs.map((args) => args.map(String).join(' ')).filter((l) => l.includes(fx.ref))).toEqual([
-      `[slack] jsonl-persistence-check: ${fx.ref} claude_config_dir="${fx.configDir}" cannot be resolved to a real path (${shown}) — transcript not checked this pass`,
-    ])
-    assertNoLeak({ errArgs, c })
-  })
-
-  // The "AD get failed … skipping:" line logs describeThrownValue of the error
-  // (type, safe code or errName, redacted message, frames), never the error itself.
-  test.each<[string, () => Error, string]>([
-    [
-      'a plain error with a safe code',
-      () => sentinelError('agent-director get failed', 'ErrGeneric'),
-      `Error code=ErrGeneric message="agent-director get failed (${REDACTED_SENTINEL_TAIL})"`,
-    ],
-    [
-      'a base AgentDirectorError whose description carries a fake token',
-      () => new AgentDirectorError('get', 'ErrSomethingNew', `bad (${sentinelInMessage('desc')})`),
-      `AgentDirectorError errName=ErrSomethingNew message="ErrSomethingNew: bad (${REDACTED_SENTINEL_TAIL})"`,
-    ],
-  ])('AC 20: agent-director get rejects with %s — the persona is skipped with its one line; no captured argument carries a credential value', async (_label, makeErr, shown) => {
-    const fx = ac20Fixture()
-    const errArgs = captureErrorArgs()
-
-    const c = await runLayer2(
-      {
-        readMountinfo: fixture(EXT4_ROOT),
-        getRow: async () => { throw makeErr() },
-      },
-      fx.config,
-    )
-
-    expect(c).toEqual({ errors: [], notices: [] })
-    const lines = errArgs.filter((args) => String(args[0]).includes('AD get failed'))
-    expect(lines).toHaveLength(1)
-    expect(lines[0]).toHaveLength(1)
-    expect(String(lines[0]![0])).toStartWith(`[slack] jsonl-persistence-check: AD get failed for ${fx.ref} — skipping: ${shown}`)
-    assertNoLeak({ errArgs, c })
-  })
-
-  /** `line` up to the error's description (`Error …`), which may itself hold `: `. */
-  const descriptionPrefix = (line: string): string => line.slice(0, line.indexOf(': Error ') + 2)
-
-  /**
-   * A real archive DB whose `messages` is a view over a column named by a
-   * fake token, so the counter's query fails with a SQLite error whose message
-   * quotes that token (the redacted message shows `<redacted-token>`). Returns
-   * its path.
-   */
-  function archiveDbFailingWithToken(): string {
-    const dbPath = join(makeTempDir('jsonl-archive-test-'), 'archive.db')
-    const db = new Database(dbPath, { create: true })
-    db.run('CREATE TABLE base (a INTEGER)')
-    db.run(`CREATE VIEW messages AS SELECT [${fakeToken(BOT_TOKEN_PREFIX, 'column')}] AS channel_id, a AS timestamp FROM base`)
-    db.close()
-    return dbPath
-  }
-
-  // The archive-count, per-persona and whole-pass failure lines log
-  // describeThrownValue of the error (its message redacted), never the error itself.
-  test.each<[string, (fx: ReturnType<typeof ac20Fixture>) => Partial<JsonlPersistenceSafeguardDeps>, (ref: string) => string, boolean]>([
-    [
-      'the archive count\'s query fails with a SQLite error quoting a fake token',
-      () => ({ archiveCountSince: undefined }),
-      (ref) => `[slack] jsonl-persistence-check: archive count failed for ${ref}: Error code=SQLITE_ERROR message="no such column: <redacted-token>"`,
-      true,
-    ],
-    [
-      'the persona\'s check throws an error carrying fake tokens',
-      () => ({ statFn: () => { throw sentinelError('stat failed', 'EIO') } }),
-      (ref) => `[slack] jsonl-persistence-check: unexpected error checking ${ref} — continuing: Error code=EIO message="stat failed (${REDACTED_SENTINEL_TAIL})"`,
-      false,
-    ],
-    [
-      'the pass itself fails (the startup-error sink throws an error carrying fake tokens)',
-      () => ({
-        readMountinfo: fixture('24 23 8:2 / /home rw,relatime shared:2 - ext4 /dev/sda2 rw\n'),
-        recordStartupError: () => { throw sentinelError('sink failed', 'EIO') },
-      }),
-      () => `[slack] Warning: jsonl-persistence-check failed unexpectedly — startup continues: Error code=EIO message="sink failed (${REDACTED_SENTINEL_TAIL})"`,
-      false,
-    ],
-  ])('AC 20: %s — its one line names the error with its message redacted; no captured argument carries a credential value', async (_label, depsFor, expectedLine, withArchive) => {
-    const fx = ac20Fixture(withArchive ? { message_archive_db: archiveDbFailingWithToken() } : {})
-    const errArgs = captureErrorArgs()
-
-    const c = await runLayer2(
-      {
-        readMountinfo: fixture(EXT4_ROOT),
-        getRow: async () => makeRow({}, fx.a),
-        ...depsFor(fx),
-      },
-      fx.config,
-    )
-
-    const line = expectedLine(fx.ref)
-    // Every line up to the error's description, which ends at its first frame.
-    const prefix = descriptionPrefix(line)
-    const matching = errArgs.map((args) => args.map(String).join(' ')).filter((l) => l.startsWith(prefix))
-    expect(matching.map((l) => l.split(' at ')[0])).toEqual([line])
-    assertNoLeak({ errArgs, c })
-  })
-
-  // runPersonaStorageCheck (a persona a confirmed apply brings up) on a tmpfs
-  // root: its notice-failure and own-failure lines, the same way.
-  test.each<[string, 'notify' | 'record', (ref: string) => string]>([
-    [
-      'the notice seam throws',
-      'notify',
-      (ref) => `[slack] jsonl-persistence-check: notice failed for ${ref}: Error code=EIO message="notify failed (${REDACTED_SENTINEL_TAIL})"`,
-    ],
-    [
-      'the startup-error sink throws',
-      'record',
-      (ref) => `[slack] Warning: jsonl-persistence-check failed unexpectedly for ${ref} — continuing: Error code=EIO message="record failed (${REDACTED_SENTINEL_TAIL})"`,
-    ],
-  ])('AC 20: runPersonaStorageCheck on a tmpfs root, %s with an error carrying fake tokens — its one line names the error with its message redacted; no captured argument carries a credential value', (_label, failing, expectedLine) => {
-    const fx = ac20Fixture()
-    const errArgs = captureErrorArgs()
-    const recorded: Array<[string, string]> = []
-    const boom = (): never => { throw sentinelError(`${failing} failed`, 'EIO') }
-
-    runPersonaStorageCheck(fx.a, failing === 'notify' ? boom : () => {}, {
-      readMountinfo: fixture(`${EXT4_ROOT}99 23 0:30 / ${fx.configDir} rw,relatime shared:11 - tmpfs tmpfs rw\n`),
-      recordStartupError: failing === 'record' ? boom : (key, message) => void recorded.push([key, message]),
-      home,
-    })
-
-    const line = expectedLine(fx.ref)
-    const prefix = descriptionPrefix(line)
-    const matching = errArgs.map((args) => args.map(String).join(' ')).filter((l) => l.startsWith(prefix))
-    expect(matching.map((l) => l.split(' at ')[0])).toEqual([line])
-    expect(recorded.map(([key]) => key)).toEqual(failing === 'notify' ? ['jsonl-non-persistent'] : [])
-    assertNoLeak({ errArgs, recorded })
-  })
-})
-
-// b.omv SR-7.6: classification only; replacement execution belongs to upgrade-replacement.test.ts.
-test('a markerless persona is log-only while a marked neighbor still gets its genuine lost-history notice', async () => {
-  const config = makeMultiPersonaConfig([{ ...LAYER2_SPEC, name: 'old_bot' }, { ...LAYER2_SPEC, name: 'current_bot', working_directory: join(home, 'neighbor-work'), credentials_file: join(home, 'neighbor-credentials') }], makeTempDir())
-  const [old, current] = config.personas
-  const h = makeNotifierHarness(config), errors: string[] = [], lookedUp: string[] = []
-  const log = captureErrorLog()
-  await runJsonlPersistenceSafeguard(config, h.notifier.notify, {
-    readMountinfo: fixture(REALISTIC_MOUNTINFO), statFn: () => false, home, archiveCountSince: () => 4,
-    getRow: async key => {
-      lookedUp.push(key)
-      const row = makeRow({}, key === old!.key ? old! : current!)
-      if (key === old!.key) delete row.labels.tag_prompt
-      return row
+  test.each(ANSWERS.flatMap(answer => ([true, 'throw'] as const).map(stop => [answer, stop] as const)))(
+    'a deferred %s answer after a one-shot %s stop leaves outages, notices and retry scheduling untouched',
+    async (answer, stop) => {
+      const h = defaultReadHarness(), logs = captureErrorArgs()
+      if (answer === 'success') {
+        for (const p of h.config.personas) {
+          setOutageFlag(p.key, 'ad-unreachable', join(h.configDir, 'agent-director'))
+          raiseAdConfigMalformed(p.key, errConfigMalformed())
+        }
+      }
+      const before = h.flags()
+      h.notices.length = 0
+      logs.length = 0
+      let stopNextQuery = false
+      let queriesAfterStop = 0
+      let sawStop = false
+      const run = h.run(() => {
+        if (sawStop) queriesAfterStop++
+        if (!stopNextQuery) return false
+        stopNextQuery = false
+        sawStop = true
+        if (stop === 'throw') throw new Error(sentinelInMessage('shutdown-query'))
+        return true
+      })
+      const firstId = personaInstanceId(h.config.personas[0]!.key)
+      expect(h.ids).toEqual([firstId])
+      stopNextQuery = true
+      if (answer === 'success') h.held.resolve(h.row(undefined, { transcript_status: 'rotated' }))
+      else h.held.reject(lateError(answer))
+      await run
+      expect(sawStop).toBe(true)
+      expect(queriesAfterStop).toBe(0)
+      expect(h.ids).toEqual([firstId])
+      expect(h.flags()).toEqual(before)
+      expect(h.arms).toEqual([])
+      expect(h.cleared).toEqual([])
+      expect(h.errors).toEqual([])
+      expect(h.notices).toEqual([])
+      expect(logs).toEqual([])
+      assertNoLeak([logs, h.errors, h.notices])
     },
-    recordStartupError: key => { errors.push(key) },
+  )
+
+  test.each([...ANSWERS])('a live false guard preserves the default wrapper\'s %s effects and sibling lookup', async answer => {
+    const h = defaultReadHarness(), logs = captureErrorArgs()
+    const first = h.config.personas[0]!
+    if (answer === 'success') {
+      setOutageFlag(first.key, 'ad-unreachable', join(h.configDir, 'agent-director'))
+      raiseAdConfigMalformed(first.key, errConfigMalformed())
+    }
+    h.notices.length = 0
+    logs.length = 0
+    const run = h.run(() => false)
+    if (answer === 'success') h.held.resolve(h.row())
+    else h.held.reject(lateError(answer))
+    await run
+    expect(h.ids).toEqual(h.config.personas.map(p => personaInstanceId(p.key)))
+    expect(h.errors).toEqual([])
+    expect([...getOutageFlags(h.config.personas[1]!.key)]).toEqual([])
+    expect(h.notices.map(n => n.key)).toEqual([first.key])
+    expect([...getOutageFlags(first.key)]).toEqual(answer === 'success' ? [] : [answer === 'environment' ? 'tmux-unavailable' : 'ad-config-malformed'])
+    expect(h.arms).toEqual(answer === 'success' ? [] : [{ key: first.key, kind: answer }])
+    expect(h.cleared.map(c => c.cls)).toEqual(answer === 'success' ? ['ad-unreachable', 'ad-config-malformed'] : [])
+    expect(logs.flat().join('\n')).toContain(answer === 'success' ? renderPersonaRef(first.name, first.key) : 'AD get failed')
+    assertNoLeak([logs, h.errors, h.notices])
   })
-  expect(lookedUp).toEqual([old!.key, current!.key])
-  expect(errors).toEqual(['jsonl-transcript-lost'])
-  expect(h.posts(old!.key)).toEqual([])
-  expect(h.posts(current!.key)).toHaveLength(1)
-  expect(log.filter(line => line.includes('tag_prompt'))).toHaveLength(1)
+})
+
+describe('configured storage directories', () => {
+  test('checks the configured directory mount without assuming a projects subdirectory', async () => {
+    const h = referenceHarness()
+    await h.run({ readMountinfo: () => `1 0 8:1 / / rw - ext4 /dev/disk rw\n2 1 0:1 / ${h.configDir}/projects rw - tmpfs tmpfs rw` })
+    expect(h.errors).toEqual([])
+    expect(h.notices).toEqual([])
+  })
+  test('a tmpfs directory warns its persona once; a sibling on persistent storage receives nothing', async () => {
+    const aDir = makeTempDir(), bDir = makeTempDir()
+    const h = referenceHarness([{ name: 'Alpha', claude_config_dir: aDir }, { name: 'Beta', claude_config_dir: bDir }])
+    await h.run({ readMountinfo: () => `1 0 8:1 / / rw - ext4 /dev/disk rw\n2 1 0:1 / ${aDir} rw - tmpfs tmpfs rw` })
+    expect(h.errors.map(e => e.key)).toEqual(['jsonl-non-persistent'])
+    expect(h.errors[0]!.message).toContain(`root="${aDir}"`)
+    expect(h.notices.map(n => n.key)).toEqual([h.config.personas[0]!.key])
+  })
+  test('apply storage check checks only the supplied persona and never queries AD', () => {
+    const h = referenceHarness(), errors: unknown[] = [], notices: unknown[] = [], p = h.config.personas[0]!
+    runPersonaStorageCheck(p, (key, text) => { notices.push({ key, text }) }, {
+      home, readMountinfo: () => '1 0 0:1 / / rw - ramfs ramfs rw', recordStartupError: (key, message) => { errors.push({ key, message }) },
+    })
+    expect(errors).toHaveLength(1)
+    expect(notices).toHaveLength(1)
+    expect(h.lookups).toEqual([])
+  })
 })

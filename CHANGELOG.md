@@ -6,6 +6,8 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 ## Unreleased
 
+- **b.d6n:** delegate native workspace trust and transcript references to agent-director; remove archive-derived history-loss verdicts, dormant transcript cleanup, synthetic delivery launch identities and the readiness settle timer. Unconfirmed delivery follows AD state/session transitions while retaining guarded recovery.
+
 ### Slack reply reminders use agent-director state
 
 Slack reply reminders now work for Claude and Codex. After a delivered Slack message, an observed agent-director `working` → `waiting` transition with no subsequent call to CSCB's own `reply` tool queues at most one reminder per delivery. Scheduled prompts and `/interject` do not arm reminders. CSCB no longer reads native transcripts or panes to decide whether to remind.

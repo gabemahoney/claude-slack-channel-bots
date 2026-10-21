@@ -5,7 +5,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { latchRowStateRead } from '../src/conflict-latch.ts'
 import { createDeliveryAdScope } from '../src/delivery-ad-scope.ts'
-import { DELIVERY_MAX_AD_CALLS_PER_S, LAUNCH_SETTLE_MS, RECEIPT_WAIT_MS } from '../src/delivery-engine.ts'
+import { DELIVERY_MAX_AD_CALLS_PER_S, RECEIPT_WAIT_MS } from '../src/delivery-engine.ts'
 import { _buildReconnectSessionAdapter } from '../src/server.ts'
 import { _resetInFlightLaunches, applyDeliveryOwnRowRead, inspectPersonaUpgrade, isTagUpgradePending, reconnectMcpWithCause, setDeliveryLifecycle, setDeliveryPersonaLookup } from '../src/session-manager.ts'
 import { cannedFindMissing, cannedKillResult, cannedResumeResult, cannedSpawnResult, cannedStatusResult, errInstanceIdCollision, errTmuxKillFailed } from './test-helpers/agent-director-stub.ts'
@@ -156,15 +156,14 @@ describe('earlier-release replacement', () => {
     const f = fleet('waiting', true)
     const engine = await deliveryFleet(f)
     await engine.accept('queued before marker loss', f.p)
-    await engine.tick(f.p)
     let readyRowReads = 0
     engine.p(f.p).getHook = () => {
-      if (engine.clock.now() >= LAUNCH_SETTLE_MS && ++readyRowReads === 1) {
+      if (++readyRowReads === 2) {
         const { tag_prompt: _tag, ...labels } = f.row().labels
         f.change({ state: 'working', labels })
       }
     }
-    await engine.advance(LAUNCH_SETTLE_MS + RECEIPT_WAIT_MS)
+    await engine.tick(f.p)
     expect(readyRowReads).toBeGreaterThan(0)
     expect(engine.keyCalls(f.p)).toEqual([])
     expect(engine.queue.openCount(f.p)).toBe(1)

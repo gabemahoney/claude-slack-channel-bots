@@ -17,9 +17,9 @@ test('launch timing diagnostics preserve structured engine evidence without post
   // b.omv SR-14.2: the real-agent timing assertion consumes these JSON facts.
   const r = await run()
   const events = [
-    { type: 'launch-observed' as const, key: r.alpha, launchId: 'launch:"one"', sessionId: 'session\\one', at: 137 },
-    { type: 'launch-first-waiting' as const, key: r.alpha, launchId: 'launch:"one"', sessionId: 'session\\one', at: 971 },
-    { type: 'launch-observed' as const, key: r.beta, launchId: 'launch-two', sessionId: 'session-two', at: 2001 },
+    { type: 'launch-observed' as const, key: r.alpha, sessionId: 'session\\one', at: 137 },
+    { type: 'launch-first-waiting' as const, key: r.alpha, sessionId: 'session\\one', at: 971 },
+    { type: 'launch-observed' as const, key: r.beta, sessionId: 'session-two', at: 2001 },
   ]
   for (const event of events) r.reporting.engineEvent(event)
   await r.flush()
@@ -27,11 +27,26 @@ test('launch timing diagnostics preserve structured engine evidence without post
   for (const [i, event] of events.entries()) {
     const prefix = `[slack] delivery-${event.type}: `
     expect(r.logs[i]!.startsWith(prefix)).toBe(true)
-    expect(JSON.parse(r.logs[i]!.slice(prefix.length))).toEqual({ key: event.key, launch_id: event.launchId, session_id: event.sessionId, at: event.at })
+    expect(JSON.parse(r.logs[i]!.slice(prefix.length))).toEqual({ key: event.key, session_id: event.sessionId, at: event.at })
   }
   expect(r.h.totalPosts()).toBe(0)
   expect(r.queue.items(r.alpha)).toEqual([])
   expect(r.queue.items(r.beta)).toEqual([])
+})
+
+test('late AD transcript references retain their identity in redacted diagnostics without a Slack notice', async () => {
+  const r = await run(), prefix = '[slack] delivery-transcript-reference: '
+  r.reporting.engineEvent({ type: 'transcript-reference', key: r.alpha, instanceId: `cscb_${r.alpha}`, sessionId: 'native-session', path: '/native/native-session.jsonl', at: 1500 })
+  const secret = sentinelInMessage('late-reference')
+  r.reporting.engineEvent({ type: 'transcript-reference', key: r.alpha, instanceId: secret, sessionId: secret, path: secret, at: 2500 })
+  await r.flush()
+  expect(r.logs).toHaveLength(2)
+  expect(JSON.parse(r.logs[0]!.slice(prefix.length))).toEqual({
+    key: r.alpha, instance_id: `cscb_${r.alpha}`, session_id: 'native-session', jsonl_path: '/native/native-session.jsonl', at: 1500,
+  })
+  expect(r.logs[1]).not.toContain(secret)
+  assertNoLeak(r.logs)
+  expect(r.h.totalPosts()).toBe(0)
 })
 
 // The sole literal wording pin for this notice module; behavior uses its builders.
