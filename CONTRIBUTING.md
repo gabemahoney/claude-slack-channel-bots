@@ -1,6 +1,6 @@
 # Contributing
 
-For working on CSCB itself. The engineering, testing and documentation guides are in [docs/](docs/); `CLAUDE.md` lists them.
+For working on CSCB itself. CSCB's guides are checked into [docs/](docs/) and resolved through the host's Apiary `guide:` walk (`~/.apiary/system/workflow.md`). The orchestrator maintains host-only pointers in the Project Folder's `.apiary/`; paths in a pointer resolve relative to that pointer's folder.
 
 ## Installing from a local worktree
 

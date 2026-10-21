@@ -16,7 +16,7 @@ What they mean:
 
 ## Scope and workflow
 
-This is `guide:engineering-best-practices.md`, resolved through the Project's `.apiary/` pointer. It sets engineering and review rules. Read the relevant [architecture contracts](architecture.md) when changing a subsystem; their state transitions, ordering and exception tables remain constraints. Keep module maps, algorithms and log catalogues there, rather than duplicating them here.
+This is `guide:engineering-best-practices.md`, resolved by the host's Apiary setup through its Project Folder's `.apiary/` pointer. It sets engineering and review rules. Read the relevant [architecture contracts](architecture.md) when changing a subsystem; their state transitions, ordering and exception tables remain constraints. Keep module maps, algorithms and log catalogues there, rather than duplicating them here.
 
 Apiary's workflow is `~/.apiary/system/workflow.md`. Use its ticket terms (Idea, Plan, Epic, Task, Subtask, Bug, Doc, Research ticket and Report) and skills: `write-plan`, `write-epic`, `develop-epic`, `idea-review`, `fix-bug`, `teardown-worktree` and `release`. Change only the tickets and statuses your assigned skill owns. See [Definition of Done](#definition-of-done).
 
