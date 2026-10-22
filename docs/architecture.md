@@ -365,7 +365,7 @@ The first successful correlated `reply` text post or file upload calls `consumeA
 
 ### Delivery model code map (b.omv SR-15.6)
 
-[spec/tla/README.md](../spec/tla/README.md) describes the current model boundary and verification status. The b.d6n model retains release 1's AD `waiting` contract and removes synthetic launch IDs and the launch-settle timer. The [b.d6n verification report](bd6n-delivery-verification.md) records current per-row results, frozen inputs and production replay. It distinguishes bounded exhaustive checks, sampled simulations and the supplemental finite pullback witness; local `certification: false` establishes no scheduler certificate. Full `/ci` has no verdict from this follow-up. The [release-1 report](cardinal-delivery-verification.md) remains historical evidence.
+[spec/tla/README.md](../spec/tla/README.md) describes the current AD-only model, checked properties and reproduction commands. Relaunch observations use AD row transitions and `session_id`. The verification scope distinguishes bounded exhaustive checks, sampled simulations and the supplemental finite pullback witness; local `certification: false` establishes no scheduler certificate or `/ci` verdict.
 
 `DeliveryPolicyKnowledge.p` projects durable queue facts; `e` is volatile engine state; `r` is an AD/receipt observation separate from hidden agent state. The gate gets an independent reading; an owned key operation retains its saved reading until completion. Replay uses production policy and exact receipt inputs without a native screen renderer.
 
@@ -802,7 +802,7 @@ A read error never starts the `tmux-unresponsive` condition, because `status`, `
 
 **Outcome-only read-pane probes (b.jg5 SRJ-117).** `readPersonaOwnPane` discards the AD success payload and returns only an outcome class. Its retained consumers are prompt-row recovery and teardown probes. The separate latch probe also discards the payload. No pane contents, hash or presentation classification reaches policy or diagnostics.
 
-Success establishes only that AD completed the probe. GONE, row-absent, CONFLICT, UNUSABLE NAME and other failures retain typed error/latch/outage handling; they do not imply idle or authorize keys. [The verification report](cardinal-delivery-verification.md) lists all three concrete call sites.
+Success establishes only that AD completed the probe. GONE, row-absent, CONFLICT, UNUSABLE NAME and other failures retain typed error/latch/outage handling; they do not imply idle or authorize keys. [The model README](../spec/tla/README.md#outcome-only-probes) lists all three outcome-only probe paths.
 
 ### Log-only routing (b.jg5 SRJ-1002)
 

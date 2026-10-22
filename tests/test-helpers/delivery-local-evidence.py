@@ -533,9 +533,12 @@ def export(directory):
     # Stage/validate everything above before replacing any previous evidence.
     DESTINATION.mkdir(exist_ok=True)
     previous = {p.name for p in DESTINATION.iterdir()}
-    changes_path = REPO / "tests/test-helpers/cardinal-trace-changes.json"
-    # Keep the original baseline when a validated export is repeated after a
-    # replay/test adjustment, so removed historical samples remain reviewable.
+    # Keep inventories in ignored storage, keyed by the resolved run directory.
+    # Re-exporting that run retains its baseline; a new run starts from the
+    # fixtures present at its first export, never an earlier run's inventory.
+    run_key = digest(str(directory.resolve()).encode())
+    changes_path = SOURCE / "ci/.runs/export-inventories" / run_key / "trace-changes.json"
+    changes_path.parent.mkdir(parents=True, exist_ok=True)
     original = {entry["file"].rsplit("/", 1)[-1] for entry in json.loads(changes_path.read_text())
                 if entry["change"] != "added"} if changes_path.exists() else previous
     inventory_path = directory.parent / "cardinal-recovery-inventory.json"

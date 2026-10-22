@@ -3,8 +3,8 @@ Per-persona delivery model tooling provenance
 CURRENT b.d6n pin refresh:
 The 107 pins below bind the AD row/session relaunch model without synthetic
 launch IDs or a launch-settle timer. The complete current-source local run is
-ci/.runs/bd6n-model-verified-20261020; results and per-file changes are recorded in
-docs/bd6n-delivery-verification.md. The model/config/helper snapshot, raw logs,
+ci/.runs/bd6n-model-verified-20261020. Current scope and reproduction are
+documented in spec/tla/README.md. The model/config/helper snapshot, raw logs,
 independent proofs and regenerated fixtures retain local provenance only;
 this pin refresh grants no scheduler certificate or CI verdict.
 Historical reports and admission/reduction profiles below retain their original
@@ -23,8 +23,8 @@ its own returned pin map. Refreshing this inventory therefore changes no
 frozen cardinal input. Earlier snapshot/admission paragraphs and artifact
 paths below are historical provenance; pruned diagnostic paths are not current
 verification evidence. This pin refresh establishes no checker verdict, trace
-export, conformance result or full unit/CI result. Final evidence belongs in
-docs/cardinal-delivery-verification.md.
+export, conformance result or full unit/CI result. Current scope and evidence
+validation are documented in spec/tla/README.md.
 
 SUPERSEDING NOTICE — owner-authorized complete current-source local admission:
 The owner authorized a fresh full76 profile and metadata-only admission refresh,
@@ -433,7 +433,7 @@ model. Temporal evidence must show refusal of first TEXT calls, no accepted text
 in the full prefix/cycle, no retry/fault budget spent, and complete accounting of
 all seven SF/WF obligations over the original lasso. Enter-only retries are also
 bounded at 4. This reduced model cannot certify E1. A PROOF-VERDICT or diagnostic
-verdict is never a CI-VERDICT PASS. Historical jobs remain in ci/jobs.jsonl.
+verdict is never a CI-VERDICT PASS. New scheduler receipts are written to ignored ci/jobs.jsonl.
 
 Restart mutation sensitivity gate (owner-authorized after terminal notice for
 j20261015082417-c62087): all fourteen INVARIANT-targeting original mutants now

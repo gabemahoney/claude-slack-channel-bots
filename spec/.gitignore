@@ -1,2 +1,4 @@
 tla/ci/.runs/
 __pycache__/
+tla/ci/jobs.jsonl
+tla/ci/verdicts.txt
