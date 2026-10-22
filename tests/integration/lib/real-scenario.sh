@@ -104,8 +104,8 @@ real_persona() {
     jq -cn --arg name "${REAL_NAME}" --arg creds "${creds}" --arg work "${REAL_WORK}" \
         --arg channel "${REAL_CHANNEL}" --arg user "${REAL_USER}" \
         '{name:$name,credentials_file:$creds,working_directory:$work,channels:[{id:$channel,delivery:"all"}],dm:{enabled:true,contact:$user},permission_prompts:"dm"}' >> "${REAL_PERSONAS}"
-    jq -cn --arg token_label "${REAL_LABEL}" --arg user_id "${REAL_BOT_USER_ID}" --arg bot_id "${REAL_BOT_ID}" \
-        '{suffix:$token_label,label:$token_label,user_id:$user_id,bot_id:$bot_id,auth:"ok",connections:"ok"}' >> "${REAL_TOKENS}"
+    jq -cn --arg token_label "${REAL_LABEL}" --arg user_id "${REAL_BOT_USER_ID}" --arg bot_id "${REAL_BOT_ID}" --arg channel "${REAL_CHANNEL}" \
+        '{suffix:$token_label,label:$token_label,user_id:$user_id,bot_id:$bot_id,memberships:[$channel],auth:"ok",connections:"ok"}' >> "${REAL_TOKENS}"
     python3 - "${HOME}/.claude.json" "${REAL_WORK}" <<'PY'
 import json,sys
 p,work=sys.argv[1:]

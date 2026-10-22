@@ -293,6 +293,7 @@ import {
 import { AD_VERSION_RECHECK_INTERVAL_MS, DEBUG_SKILL_PATH, DEBUG_SKILL_RUNTIME_STOP_SECTION_TITLE, PHASE1_FLOOR_VERSION, PHASE1_RUNBOOK_DOC, PHASE1_RUNBOOK_SECTION_TITLE, PUBLISHING_HOST_BLOCK_HEADING } from '../src/ad-version-gate.ts'
 import { DEFAULT_STORE_PATH } from '../src/agent-director-client.ts'
 import { CHANNEL_DELIVERY_FILE_NAME, SET_CHANNEL_DELIVERY_TOOL } from '../src/channel-delivery.ts'
+import { MEMBERSHIP_READINESS_ROUTE, MEMBERSHIP_REQUIRED_SUBSCRIPTIONS } from '../src/channel-membership-readiness.ts'
 import {
   CLEAR_LATCH_COMMAND,
   CLEAR_LATCH_DIAL_HOST,
@@ -634,7 +635,7 @@ describe('slack-app-manifest.yml', () => {
 
   test('the bot events are exactly the pinned list (none dropped, none added)', () => {
     expect([...manifest.settings.event_subscriptions.bot_events].sort()).toEqual(
-      ['app_mention', 'message.channels', 'message.groups', 'message.im'].sort(),
+      ['app_mention', 'message.channels', 'message.groups', 'message.im', 'member_joined_channel', 'channel_left'].sort(),
     )
   })
 
@@ -8798,4 +8799,20 @@ describe('R55: documented downgrade matches the executed safety barriers', () =>
     expect(asReadmeText(copy.replace('1. ', '1. Changed instruction. ')).trim()).not.toBe(current.trim())
     expect(asReadmeText(copy.replace('2. ', '2.\n3. ')).trim()).not.toBe(current.trim())
   })
+})
+
+// 7p's narrow operator contract. Full operating documentation remains a later Epic.
+const MEMBERSHIP_RECORD_TERMS = [MEMBERSHIP_READINESS_ROUTE, ...MEMBERSHIP_REQUIRED_SUBSCRIPTIONS,
+  'installation', 'teamId', 'appId', 'botUserId', 'botId', 'subscriptions', 'reinstall', 'record', 'read']
+function membershipRecordMissing(text: string): string[] {
+  return MEMBERSHIP_RECORD_TERMS.filter(term => !new RegExp(`(?<![A-Za-z0-9_-])${term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![A-Za-z0-9_-])`).test(text))
+}
+test('membership readiness: shipped guidance exposes the app-bound manual record and readback fields', () => {
+  const text = `${userDocsText()}\n${operatorText(DEBUG_SKILL_FILE)}`
+  expect(membershipRecordMissing(text)).toEqual([])
+})
+test.each(MEMBERSHIP_RECORD_TERMS)('membership readiness manual record check detects omitted %s', term => {
+  const example = MEMBERSHIP_RECORD_TERMS.join('\n')
+  expect(membershipRecordMissing(example)).toEqual([])
+  expect(membershipRecordMissing(MEMBERSHIP_RECORD_TERMS.filter(value => value !== term).join('\n'))).toContain(term)
 })

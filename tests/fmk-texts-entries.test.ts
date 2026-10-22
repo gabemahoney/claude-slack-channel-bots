@@ -82,6 +82,8 @@ import * as reloadPlan from '../src/reload-plan.ts'
 import * as restart from '../src/restart.ts'
 import * as rowReadRules from '../src/row-read-rules.ts'
 import * as sessionManager from '../src/session-manager.ts'
+import * as channelMembershipReadiness from '../src/channel-membership-readiness.ts'
+import * as channelMembershipScan from '../src/channel-membership-scan.ts'
 import * as sharedChannels from '../src/shared-channels.ts'
 import * as testTimerOverrides from '../src/test-timer-overrides.ts'
 import * as unavailableRetry from '../src/unavailable-retry.ts'
@@ -102,6 +104,8 @@ const MODULES: Readonly<Record<string, Readonly<Record<string, unknown>>>> = {
   'ad-version-gate.ts': adVersionGate,
   'backoff.ts': backoff,
   'channel-delivery.ts': channelDelivery,
+  'channel-membership-readiness.ts': channelMembershipReadiness,
+  'channel-membership-scan.ts': channelMembershipScan,
   'config.ts': config,
   'conflict-latch.ts': conflictLatch,
   'delivery-decision.ts': deliveryDecision,

@@ -20,6 +20,31 @@ afterEach(async () => { for (const e of engines) { assertNoLeak({ errors: e.erro
 async function start(opts: ReloadRunOptions = {}) { const run = await h.startDetecting({ dryRun: true, ...opts }); runs.push(run); expect(run.outcome.kind).toBe('applied'); return run }
 function disk() { return parseSharedChannelState(readFileSync(h.paths.lastApplied), h.paths.lastApplied)! }
 
+test('shared transaction order reservations reject invalid spans before callbacks or writes and preserve ordinary one-order commits', async () => {
+  const alpha = h.persona('alpha'); h.materialize(alpha); h.writeConfig({ personas: [alpha] })
+  let writes = 0, callbacks = 0
+  const run = await start({ beforeWrite: path => { if (path === h.paths.lastApplied) writes++ } })
+  const authority = run.controller.sharedChannels()!, before = authority.snapshot(), initialWrites = writes
+  for (const span of [0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER]) {
+    expect(authority.transact(authority.revision, () => { callbacks++ }, span).kind).toBe('failed')
+    expect(callbacks).toBe(0)
+    expect(writes).toBe(initialWrites)
+    expect(authority.snapshot()).toEqual(before)
+    expect(disk()).toEqual(before)
+  }
+  const orders: number[] = []
+  const record = (next: ReturnType<typeof authority.snapshot>, order: number) => {
+    orders.push(order); next.pendingIntent = { reservedOrder: order }
+  }
+  expect(authority.transact(authority.revision, record).kind).toBe('applied')
+  expect(authority.revision).toBe(before.revision + 1)
+  expect(authority.transact(authority.revision, record, 3).kind).toBe('applied')
+  expect(orders).toEqual([before.revision + 1, before.revision + 4])
+  expect(writes).toBe(initialWrites + 2)
+  expect(disk()).toEqual(authority.snapshot())
+  expect(disk().pendingIntent).toEqual({ reservedOrder: before.revision + 4 })
+})
+
 test.each(['removal', 'replacement'] as const)('%s write failure after retirement preparation keeps the real delivery worker and its FIFO alive', async change => {
   const alpha = h.persona('alpha'); const beta = h.persona('beta'); h.materialize(alpha, beta)
   h.writeConfig({ personas: [alpha, beta] })

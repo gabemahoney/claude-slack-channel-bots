@@ -146,12 +146,12 @@ The shipped `slack-app-manifest.yml` also grants the `lists:read` and `lists:wri
 
 Channel delivery applies in both modes; see [Channel delivery in open mode](channel-modes.md#channel-delivery-in-open-mode). Each channel entry's `delivery` sets which messages in that channel reach the persona:
 
-- **`off`**: no channel messages. Unassigned channels default to `off`.
+- **`off`**: no channel messages. A newly verified member without a choice starts at `off` in strict or `mentions` in open, using the mode at application; duplicate joins preserve choices, including `off`.
 - **`thread_hybrid`**: an explicit shared channel delivery choice.
 - **`all`**: every message in the channel.
 - **`mentions`**: only messages that @mention the persona directly, and `@here` / `@channel` broadcasts.
 
-Any number of personas may list the same channel, each with its own `delivery`. One persona can't list a channel twice. Invite the persona's Slack app to each of its channels. [How a persona receives messages](bots.md#how-a-persona-receives-messages) says how each message arrives and which `via` it carries.
+Any number of personas may list the same channel, each with its own `delivery`; one persona can't list it twice. Invite each app, but listing, inviting, hearing or posting alone proves no current membership. Listening requires current verified membership; valid positives can progress before inventory completion. [How a persona receives messages](bots.md#how-a-persona-receives-messages) describes delivery; [membership readiness](../skills/debug-slack-channel-bots/SKILL.md#membership-setup-record-and-readback) distinguishes inventory from setup.
 
 ### Direct messages (`dm.enabled`)
 

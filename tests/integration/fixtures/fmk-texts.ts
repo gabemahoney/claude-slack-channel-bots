@@ -61,6 +61,8 @@
  *       also compares resolved applied configuration with that input.
  *   sharedConfigurationValue <config-path> <record-path> <port|resume_enabled>
  *       Print only the named safe applied setting, never pending input.
+ *   sharedAuthorityPreserved <config-path> <before-record> <after-record>
+ *       Validate preserved choices, identity and reviewed input across fresh discovery.
  *   reloadSharedAuthorityStartLine <config-path> <record-path>
  *       Build the production startup line using the validated record revision.
  *   PHASE1_FLOOR_VERSION                         src/ad-version-gate.ts, the Phase 1 floor
@@ -3974,7 +3976,11 @@ const deliverySetResult: Entry = {
 async function readSharedConfiguration(context: EntryContext, configPath: string, recordPath: string) {
   const read = await packageFunction<(path: string) => Uint8Array>(context, 'config.ts', 'readPersonaConfigBytes')
   const parse = await packageFunction<(bytes: Uint8Array, path: string, deps: { sourcePath: string }) =>
-    { sourceBytesBase64: string; revision: number } | undefined>(context, 'shared-channels.ts', 'parseSharedChannelState')
+    { sourceBytesBase64: string; revision: number; personas: Record<string, {
+      incarnation: string; declaration: unknown; assignments: unknown; leaves: unknown; removedDestinations: unknown;
+      membership: Record<string, { member: boolean; boundary: number; identity: string }>;
+      membershipInventory?: { incarnation: string; identity: string };
+    }>; retiredIdentities: unknown; pendingIntent?: unknown } | undefined>(context, 'shared-channels.ts', 'parseSharedChannelState')
   const applied = await packageFunction<(state: object, path: string) => { port: number; resume_enabled: boolean }>(
     context, 'shared-channels.ts', 'sharedAppliedConfig')
   try {
@@ -4005,6 +4011,31 @@ const sharedConfigurationMatches: Entry = {
       if (comparison === 'applied' && !isDeepStrictEqual(applied, parse(expected, configPath, dirname(configPath)))) throw new Error()
     } catch {
       throw new PrinterFailure('shared configuration does not preserve the expected reviewed input or applied configuration', PRINTER_FAIL_EXIT)
+    }
+    return ''
+  },
+}
+
+const sharedAuthorityPreserved: Entry = {
+  synopsis: '<config-path> <before-record> <after-record>',
+  async print(args, context) {
+    expectArguments('sharedAuthorityPreserved', args, ['config-path', 'before-record', 'after-record'])
+    const [configPath, beforePath, afterPath] = args
+    const before = await readSharedConfiguration(context, configPath, beforePath)
+    const after = await readSharedConfiguration(context, configPath, afterPath)
+    const preserved = ({ state, applied }: typeof before) => ({
+      sourceBytesBase64: state.sourceBytesBase64, applied, retiredIdentities: state.retiredIdentities, pendingIntent: state.pendingIntent,
+      personas: Object.fromEntries(Object.entries(state.personas).map(([key, life]) => [key, {
+        incarnation: life.incarnation, declaration: life.declaration, assignments: life.assignments,
+        leaves: life.leaves, removedDestinations: life.removedDestinations,
+        membership: Object.fromEntries(Object.entries(life.membership).map(([channel, fact]) => [channel, {
+          member: fact.member, boundary: fact.boundary, identity: fact.identity,
+        }])),
+        inventoryIdentity: life.membershipInventory && { incarnation: life.membershipInventory.incarnation, identity: life.membershipInventory.identity },
+      }])),
+    })
+    if (!isDeepStrictEqual(preserved(before), preserved(after))) {
+      throw new PrinterFailure('shared authority changed a preserved choice, identity, boundary or reviewed input', PRINTER_FAIL_EXIT)
     }
     return ''
   },
@@ -4041,6 +4072,7 @@ const sharedAuthorityStartLine: Entry = {
 /** The printer's entries, by the name a script passes. Later scenarios add entries here. */
 const ENTRIES: Readonly<Record<string, Entry>> = joinEntryTables({
   sharedConfigurationMatches,
+  sharedAuthorityPreserved,
   sharedConfigurationValue,
   reloadSharedAuthorityStartLine: sharedAuthorityStartLine,
   // Scenario 8 (test-20-fmk-old-binary.sh).
@@ -4162,6 +4194,8 @@ const ENTRIES: Readonly<Record<string, Entry>> = joinEntryTables({
   liveRowSequenceStartLine: sequenceStartLine,
   RELOAD_APPLIED: constantEntry('reload-apply.ts', 'RELOAD_APPLIED'),
   // test-29 (test-29-invited-channels.sh), a shared-mode scenario.
+  MEMBERSHIP_READINESS_ROUTE: constantEntry('channel-membership-readiness.ts', 'MEMBERSHIP_READINESS_ROUTE'),
+  MEMBERSHIP_INVENTORY_COMPLETE: constantEntry('channel-membership-scan.ts', 'MEMBERSHIP_INVENTORY_COMPLETE'),
   UNCLAIMED_CHANNEL: constantEntry('persona-diagnostics.ts', 'UNCLAIMED_CHANNEL'),
   unclaimedChannelCause: builderEntry('persona-diagnostics.ts', 'unclaimedChannelCause', ['channel']),
   ...constantEntries('persona-diagnostics.ts', UNCLAIMED_REASON_NAMES),

@@ -11,7 +11,9 @@ The top-level setting `channel_mode` selects `strict` or `open` for every person
 | Channel choices | Shared `channels` and `delivery` in both modes | The same shared choices |
 | Prompts and notices | Required `permission_prompts` | The same destination |
 
-Both modes share one list and destination. An invite or a mode switch alone creates no listening choice; unassigned channels default to `off`. DMs follow `dm.enabled` in both modes; group DMs are never served. Slack Connect channels are served only in strict mode, with the channel listed.
+Both modes share one list and destination. A newly verified member without a choice starts at `off` in strict or `mentions` in open, using the mode when the join is applied. Duplicate joins and mode switches preserve choices, including `off`. DMs follow `dm.enabled` in both modes; group DMs are never served. Slack Connect channels are served only in strict mode, with the channel listed.
+
+Listening requires current verified membership. Listing, hearing a message, posting or inviting alone supplies no such evidence. Valid current positives can progress before the inventory completes; [membership readiness](../skills/debug-slack-channel-bots/SKILL.md#membership-setup-record-and-readback) reports inventory and live-event setup separately.
 
 Configurations using `allow_invited_channels` or `invited` are rejected; a manual edit is required.
 
@@ -19,7 +21,7 @@ Configurations using `allow_invited_channels` or `invited` are rejected; a manua
 
 Read this before turning open mode on. Each persona's Claude worker runs with tool access on the host, and channel assignments determine who can reach that worker.
 
-- **Assignments change a persona's audience.** A channel invitation and an applied listening choice can expose a persona's worker to new people. This includes private channels, which the operator may not be able to see.
+- **Assignments change a persona's audience.** A channel invitation and an applied listening choice can expose a persona's worker to new people. In open mode, a verified join without a choice creates `mentions`. This includes private channels, which the operator may not be able to see.
 - **Anyone who can reach the persona can switch a channel to `all`.** In any channel it serves, or by DM, anyone can ask the persona to switch any channel it serves to `all`, including a channel they are not in. From then on, every message in that channel reaches the worker.
 - **`fetch_messages` reads every channel the app is in.** The persona's `fetch_messages` can read the history of every channel its app is a member of, so content can be carried from one channel to another.
 - **Slack Connect channels are never served.** An externally shared channel is never served in open mode; serve it in strict mode, with the channel listed.
@@ -55,9 +57,9 @@ grep unclaimed-channel ~/.config/claude-slack-channel-bots/server.log*
 
 ## Channel delivery in open mode
 
-In both modes, the shared choices are `off`, `mentions`, `all` and `thread_hybrid`. A channel with no assignment defaults to `off`; `mentions` delivers direct mentions and broadcasts, while `all` delivers every message.
+In both modes, the shared choices are `off`, `mentions`, `all` and `thread_hybrid`. A channel with no assignment defaults to `off`. A newly verified member gets an assignment using the mode's join default described above, preserving any existing choice. `mentions` delivers direct mentions and broadcasts, while `all` delivers every message.
 
-- **Choices persist.** Applied choices live in `config.json.last-applied` across server restarts and persona relaunches. A mode switch preserves them. A removed, renamed or replaced persona never inherits its previous incarnation’s choices.
+- **Choices persist.** Applied choices live in `config.json.last-applied` across server restarts and persona relaunches. A mode switch preserves them. A proven leave removes the prior choice; incomplete scans cannot prove a leave, and uncertain ordering holds the channel without erasing a newer reviewed choice. A removed, renamed or replaced persona never inherits its previous incarnation’s choices.
 - **The loop guard.** Another persona’s `permission_prompts` channel is held at `mentions` for other personas whose applied choice is non-off. Its own destination and a `"dm"` destination hold nothing.
 
 - **`receive_all_shared` is an approximation.** A persona at `all` in a channel receives a message there as `receive_all_shared` when at least one other persona's channel delivery for that channel, computed by the same rule, is `all`. A stored choice says nothing about whether the other persona's app remains in the channel, so a persona whose app has left the channel counts too.

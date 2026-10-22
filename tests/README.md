@@ -397,7 +397,7 @@ tests/
                                    # servers (see fmk scenario list). Its legs: a renamed session, another TMUX_TMPDIR, a re-bound socket, a restarted tmux
                                    # server (health ticks for that leg only), remain-on-exit, a `pending` row with no launch start, and no CSCB-parented
                                    # tmux line. It runs at agent-director's default settings, holds past the outage's third retry and runs about 22 minutes
-    test-29-invited-channels.sh # to, shared mode, live against the Slack stub: a 0.11.x configuration; fungible mode switched on and exercised; the stored choice across a restart; fungible mode switched off; exact received-log acceptance set, paired-event dedupe, shared recipients and direct DM evidence
+    test-29-invited-channels.sh    # shared strict/open mode against explicit Slack membership inventory: strict discovery off, open choices retained through restart/strict reactivation, exact received-log acceptance, paired-event dedupe, shared recipients and direct DM evidence
     test-30-state-dir-upgrade.sh #, shared mode, dry run: the state directory's first start of this build from each layout an earlier release left,
                                    # each in a fresh HOME under SCENARIO_ROOT (the container's agent-director install linked in) with no SLACK_STATE_DIR or
                                    # XDG_CONFIG_HOME: up to 0.13 (only ~/.claude/channels/slack), 0.14.0 (that, plus ~/.config/cscb holding only the crontable
@@ -405,7 +405,7 @@ tests/
                                    # ~/.config/claude-slack-channel-bots. Each layout checks the files at the new directory, each old name a link to it (the
                                    # 0.15.0 link to ~/.config/cscb repointed straight at it), exactly the layout's `state-migrate:` lines and no state-migrate
                                    # warning, and that the CLI's `stop` finds the server
-    test-31-fmk-ack-burst.sh       # Slack acknowledgement burst, fmk mode: 1,000 concurrent Slack events for one silent stub persona, every actual WebSocket ACK
+    test-31-fmk-ack-burst.sh # /, fmk mode: explicit membership/readiness before 1,000 concurrent Slack events for one silent stub persona, every actual WebSocket ACK
                                    # within 3,000 ms of its pre-send monotonic timestamp; exactly 1,000 items remain outstanding with no typing, receipts or model calls
     test-32-fmk-real-order.sh      # real Claude: down-queue order, one in flight with faults/restart, 20-DM p95 latency
     test-33-fmk-real-keys.sh       # swallowed text/Enter, repeated misses, unknown outcomes and 5,000-byte multipart recovery
@@ -3096,6 +3096,22 @@ builder's output for the given arguments.
   audit covers it.
 - It makes no agent-director call, starts no process or server, opens no
   socket, reads no token and writes no file.
+- `sharedAuthorityPreserved <config-path> <before-record> <after-record>`
+  production-parses both records and silently succeeds only when reviewed
+  source bytes, applied configuration, retired/pending intent, persona identity,
+  choices, leave/destination boundaries, membership identity/member/boundary
+  and inventory identity/incarnation are preserved. New observation times,
+  evidence and shared revision may differ. Mismatch gives a safe generic error.
+  Test 29 uses this after restart discovery; its source audit rejects changed
+  choices, persona/app identity, reviewed bytes and parse validity, leak-checking
+  input, baseline and current authority bytes before corruption.
+- Test 29's strict discovery adds `off` entries while preserving reviewed input
+  bytes: U1 is discovered off, U0 is genuinely unlisted. Explicit open-mode
+  choices survive strict reactivation. `check_phase_a_inventory` is a test-only
+  check, not an operator API. Tests 29/31 use explicit Slack inventory and the
+  image-guarded bounded readiness wait in `scenario.sh`. Shared real-persona
+  fixtures supply explicit membership data; existing FIFO, session, AD,
+  acceptance and receipt controls stay.
 - Its entries sit in one named map (`ENTRIES`), each named after the `src/`
   export it prints; `ENTRIES` joins the shared table with the fixed-argument
   and one-function tables (`ARGS_ENTRIES`, `FN_ENTRIES`) some scenarios'
@@ -3523,9 +3539,12 @@ variable for the integration suite only (see Environment Variables in
 `http://127.0.0.1…` or `http://[::1]…` URL, and the stub listens on
 127.0.0.1.
 
-- It answers `auth.test` with an identity per token, `apps.connections.open`
-  with a WebSocket URL on itself that sends `hello`, and every other Web API
-  method with an `ok: true` shape CSCB reads.
+- It answers `auth.test` and `bots.info` with team/app/bot/user identity per
+  token, and `apps.connections.open` with a WebSocket URL that sends `hello`.
+  `users.conversations` has explicit memberships and cursor-keyed raw pages;
+  its default is a valid empty inventory page, not generic success. Other Web
+  API methods return the shapes CSCB reads. Request observations sanitize
+  cursor/types/team fields, and pushed authorization identifies the issuing app.
 - A control file (or `POST /_control`) sets each token's answers by token
   suffix: refused auth, a handshake to a closed port, and so on. The scenario
   rewrites it to switch answers mid-run.
@@ -3638,7 +3657,9 @@ transcript tag before cleanup.
 stub bot and production delivery timers. It submits 1,000 distinct events
 concurrently, without waiting for an ACK between submissions. Each has a
 unique envelope ID and event ID; the intended channel/timestamp set must
-match all 1,000 durable acceptances exactly.
+match all 1,000 durable acceptances exactly. Before submission, explicit
+Slack-side membership is discovered and the bounded production readiness
+wait completes; configuration alone supplies no membership evidence.
 
 For every event, elapsed time is `ack_mono_ms - sent_mono_ms` on the Slack
 stub process's monotonic clock. The start is captured immediately before

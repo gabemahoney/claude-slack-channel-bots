@@ -753,7 +753,7 @@ describe('an unresolvable claude_config_dir holds the persona retrying with its 
   /** A's socket activity since `since`, as [event, credential set]. */
   const socketActivity = (h: Harness, since: number) =>
     h.conn.slack.activityOf(a.key).slice(since).filter((e) => e.kind === 'socket').map((e) => [e.event, e.credentials])
-  const identityOf = (stub: StubSlack) => ({ botUserId: stub.identity.botUserId, botId: stub.identity.botId })
+  const identityOf = (stub: StubSlack) => ({ botUserId: stub.identity.botUserId, botId: stub.identity.botId, teamId: stub.identity.teamId })
   const changeFailedLines = (h: Harness) => h.lines.filter((l) => l.includes(`${PERSONA_CREDENTIALS_CHANGE_FAILED}:`))
   const escapeRegExp = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 

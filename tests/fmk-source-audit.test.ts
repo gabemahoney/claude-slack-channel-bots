@@ -2792,3 +2792,157 @@ describe('test-17 loses only a successful, targeted AD launch response', () => {
     expect(actualFaults()).toEqual([])
   })
 })
+
+describe('integration configuration and discovery prerequisites', () => {
+  const source = readFileSync(join(import.meta.dir, 'integration/test-29-invited-channels.sh'), 'utf8')
+  const builder = source.slice(source.indexOf('write_persona_config() {'), source.indexOf('\n\n# --- Start'))
+  const channels = source.slice(source.indexOf('CH_TAG='), source.indexOf('ALPHA_BOT_USER='))
+  function build(mode: string, body = builder, root?: string) {
+    const home = root ?? mkdtempSync(join(tmpdir(), 'membership-config-contract-'))
+    try {
+      return spawnSync('/bin/bash', ['--noprofile', '--norc', '-uc', `
+SCENARIO_TAG=fixture
+${channels}
+SWITCH_KEY=channel_mode
+ALPHA=alpha BRAVO=bravo ALPHA_CREDS=/tmp/alpha-creds BRAVO_CREDS=/tmp/bravo-creds
+ALPHA_CREDS="\${FIXTURE_ROOT}/alpha-creds" BRAVO_CREDS="\${FIXTURE_ROOT}/bravo-creds"
+ALPHA_DIR="\${FIXTURE_ROOT}/alpha-work" BRAVO_DIR="\${FIXTURE_ROOT}/bravo-work" CONTACT=U0CONTACT SCENARIO_PORT=3100 MCP_CONFIG="\${FIXTURE_ROOT}/mcp.json"
+ALPHA_SUFFIX=alpha BRAVO_SUFFIX=bravo ALPHA_LABEL=alpha BRAVO_LABEL=bravo
+ALPHA_BOT_USER=U0MEMBER0 ALPHA_BOT_ID=B0MEMBER0 BRAVO_BOT_USER=U0MEMBER1 BRAVO_BOT_ID=B0MEMBER1
+STUB_CONTROL="\${FIXTURE_ROOT}/control.json" CONFIG="\${FIXTURE_ROOT}/config.json" LAST="\${FIXTURE_ROOT}/config.json.last-applied"
+write_config() { cat; }
+write_file() { cat; }
+fail() { printf '%s' "$1" >&2; exit 1; }
+${body}
+write_persona_config '${mode}'`], { encoding: 'utf8', timeout: 5000, env: hostSafeChildEnv(home, { tools: ['cat', 'jq'], extras: { FIXTURE_ROOT: home } }) })
+    } finally { if (!root) rmSync(home, { recursive: true, force: true }) }
+  }
+  test.each(['declarative', 'fungible', 'switch-off'])('test29 %s builder executes with nounset and retains distinct intended channel values', mode => {
+    const result = build(mode)
+    assertNoLeak({ stdout: result.stdout, stderr: result.stderr })
+    expect(result.status).toBe(0); expect(result.stderr).toBe('')
+    const config = JSON.parse(result.stdout)
+    expect(config.channel_mode).toBe(mode === 'declarative' ? undefined : mode === 'fungible' ? 'open' : 'strict')
+    for (const persona of config.personas) {
+      const ids = persona.channels.map((entry: { id: string }) => entry.id)
+      expect(new Set(ids).size).toBe(ids.length)
+      expect(ids.every((id: string) => /^[CG][A-Z0-9]+$/.test(id))).toBe(true)
+      if (mode !== 'declarative') {
+        // U1 was discovered off in phase A; both personas explicitly share it after the mode change.
+        expect(persona.channels).toContainEqual({ id: 'C0FIXTUREU1', delivery: 'all' })
+        expect(persona.channels).toContainEqual({ id: 'C0FIXTUREF1', delivery: 'mentions' })
+      }
+    }
+  })
+  test('regression control: the original undefined S1 aborts the actual extracted builder', () => {
+    const result = build('fungible', builder.replaceAll('${U1}', '${S1}'))
+    expect(result.status).not.toBe(0)
+    expect(result.stderr).toContain('S1: unbound variable')
+  })
+  test('test29 actual discovery and phase-A oracle agree, retain an unlisted control and preserve choices across both mode switches', async () => {
+    const { makeMembershipHarness, membershipPage } = await import('./test-helpers/shared-channels.ts')
+    const home = mkdtempSync(join(tmpdir(), 'phase-a-inventory-')), f = makeMembershipHarness(home, { names: ['alpha', 'bravo'] })
+    const control = source.slice(source.indexOf('jq -n --arg asuf '), source.indexOf('\n# The MCP config each persona'))
+    const check = source.slice(source.indexOf('check_phase_a_inventory() {'), source.indexOf('\ncheck_phase_a_inventory ||'))
+    const checkBody = `${check}\nwrite_persona_config() { check_phase_a_inventory; }`
+    try {
+      const initial = build('declarative', builder, home), inventory = build('declarative', `${control}\nwrite_persona_config() { :; }`, home)
+      expect(initial.status).toBe(0); expect(inventory.status).toBe(0)
+      assertNoLeak({ initial, inventory })
+      writeFileSync(join(home, 'config.json'), initial.stdout)
+      expect(f.authority.applyReviewed(Buffer.from(initial.stdout), f.authority.revision).kind).toBe('applied')
+      const tokens = JSON.parse(inventory.stdout).tokens as Array<{ label: string; memberships: string[] }>
+      for (const token of tokens) {
+        expect(token.memberships).not.toContain('C0FIXTUREU0')
+        f.h.stub(f.h.p(token.label)).script.inventory.push(membershipPage(token.memberships))
+      }
+      await f.start(); await f.scan()
+      for (const key of ['alpha', 'bravo']) {
+        expect(f.scanner.status(key).state).toBe('complete')
+        expect(f.authority.snapshot().personas[key]!.assignments.C0FIXTUREU1?.delivery).toBe('off')
+        expect(f.authority.snapshot().personas[key]!.assignments.C0FIXTUREU0).toBeUndefined()
+      }
+      expect(build('declarative', checkBody, home).status).toBe(0)
+      const strict = f.authority.snapshot()
+      expect(f.assign('C0FIXTUREU1', 'mentions').kind).toBe('applied')
+      expect(build('declarative', checkBody, home).status).not.toBe(0)
+      expect(f.assign('C0FIXTUREU1', 'off').kind).toBe('applied')
+      expect(build('declarative', checkBody, home).status).toBe(0)
+      expect(f.assign('C0FIXTUREU0', 'off').kind).toBe('applied')
+      expect(build('declarative', checkBody, home).status).not.toBe(0)
+      // Resume the untouched strict authority, then use the actual builders.
+      const authority = createSharedChannelAuthority(f.authority.path, strict)
+      for (const mode of ['fungible', 'switch-off']) {
+        const next = build(mode, builder, home)
+        expect(next.status).toBe(0)
+        expect(authority.applyReviewed(Buffer.from(next.stdout), authority.revision).kind).toBe('applied')
+        for (const key of ['alpha', 'bravo']) {
+          expect(authority.snapshot().personas[key]!.assignments.C0FIXTUREU0).toBeUndefined()
+          expect(authority.snapshot().personas[key]!.assignments.C0FIXTUREU1?.delivery).toBe('all')
+          expect(authority.snapshot().personas[key]!.assignments.C0FIXTUREF1?.delivery).toBe(mode === 'fungible' ? 'mentions' : 'all')
+        }
+        expect(authority.snapshot().personas.alpha!.assignments.G0FIXTUREF2?.delivery).toBe('off')
+        expect(authority.snapshot().personas.bravo!.assignments.G0FIXTUREF2?.delivery).toBe('mentions')
+        if (mode === 'fungible') for (const key of ['alpha', 'bravo']) {
+          expect(authority.assign(key, authority.incarnation(key)!, 'C0FIXTUREF1', 'all', authority.revision).kind).toBe('applied')
+        }
+      }
+      assertNoLeak(f.captured())
+    } finally { await f.close(); expect(f.h.clock.pendingCount()).toBe(0); rmSync(home, { recursive: true, force: true }) }
+  })
+})
+
+test('test29 restart authority assertion accepts fresh inventory but detects changed choices, identities, reviewed bytes and invalid state', async () => {
+  const { isDeepStrictEqual } = await import('node:util')
+  const { dirname } = await import('node:path')
+  const config = await import('../src/config.ts')
+  const shared = await import('../src/shared-channels.ts')
+  const { makeMembershipHarness, membershipPage, SHARED_CHANNEL_IDS: ids } = await import('./test-helpers/shared-channels.ts')
+  const root = mkdtempSync(join(tmpdir(), 'restart-authority-'))
+  const f = makeMembershipHarness(root)
+  try {
+    f.h.stub(f.h.p('alpha')).script.inventory.push(membershipPage([ids.primary]))
+    await f.start(); await f.scan(); f.assign(ids.primary, 'off')
+    const input = join(root, 'config.json'), before = join(root, 'before.json')
+    writeFileSync(input, f.authority.sourceBytes()); writeFileSync(before, readFileSync(f.authority.path))
+    const source = readFileSync(join(import.meta.dir, 'integration/fixtures/fmk-texts.ts'), 'utf8')
+    const declarations = source.slice(source.indexOf('async function readSharedConfiguration('), source.indexOf('const sharedAuthorityStartLine: Entry'))
+    const compiled = ts.transpileModule(declarations, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText
+    const modules: Record<string, Record<string, unknown>> = { 'config.ts': config, 'shared-channels.ts': shared }
+    const printer = new Function('packageFunction', 'expectArguments', 'PrinterFailure', 'PRINTER_FAIL_EXIT', 'isDeepStrictEqual', 'dirname', 'Buffer', `${compiled}\nreturn sharedAuthorityPreserved;`)(
+      async (_context: unknown, file: string, name: string) => { expect(modules[file]?.[name]).toBeTypeOf('function'); return modules[file]![name] },
+      (_entry: string, args: string[], expected: string[]) => expect(args).toHaveLength(expected.length),
+      Error, 1, isDeepStrictEqual, dirname, Buffer,
+    ) as { print(args: string[], context: object): Promise<string> }
+    const args = [input, before, f.authority.path]
+    f.h.stub(f.h.p('alpha')).script.inventory.push(membershipPage([ids.primary]))
+    f.scanner.request('alpha'); await f.scan()
+    expect(readFileSync(before).equals(readFileSync(f.authority.path))).toBe(false)
+    expect(await printer.print(args, {})).toBe('')
+    assertNoLeak({ captured: f.captured(), input: writtenFile(input), before: writtenFile(before) })
+    for (const mutation of ['choice', 'identity', 'installation', 'reviewed-bytes', 'invalid'] as const) {
+      const original = shared.parseSharedChannelState(readFileSync(before), f.authority.path)!
+      const authority = createSharedChannelAuthority(f.authority.path, original)
+      if (mutation === 'choice') authority.assign('alpha', authority.incarnation('alpha')!, ids.primary, 'all', authority.revision)
+      if (mutation === 'identity') {
+        const source = structuredClone(original.source)
+        ;(source.personas as Array<Record<string, unknown>>)[0]!.working_directory = join(root, 'replacement')
+        authority.applyReviewed(configBytes(source), authority.revision)
+      }
+      if (mutation === 'installation') expect(authority.observeMembership('alpha', authority.incarnation('alpha')!, {
+        event: 'EvREPLACED', channel: ids.primary, member: true, identity: JSON.stringify(['T0OTHER', 'A0OTHER', 'U0OTHER', 'B0OTHER']),
+        boundary: original.personas.alpha!.membership[ids.primary]!.boundary,
+      }, authority.revision).kind).toBe('applied')
+      if (mutation === 'reviewed-bytes') authority.applyReviewed(Buffer.concat([authority.sourceBytes(), Buffer.from('\n')]), authority.revision)
+      // Inspect each valid written authority before intentionally corrupting
+      // it or replacing it on the next iteration.
+      assertNoLeak(writtenFile(f.authority.path))
+      if (mutation === 'invalid') writeFileSync(f.authority.path, '{')
+      await expect(printer.print(args, {})).rejects.toThrow()
+    }
+    const scenario = readFileSync(join(import.meta.dir, 'integration/test-29-invited-channels.sh'), 'utf8')
+    expect(scenario).toContain('sharedAuthorityPreserved "${CONFIG}" "${STORE_BEFORE_RESTART}" "${STORE_FILE}"')
+    expect(scenario).not.toContain('cmp -s -- "${STORE_FILE}" "${STORE_BEFORE_RESTART}"')
+    assertNoLeak({ logs: f.lines, manager: f.h.lines, statuses: f.h.statuses })
+  } finally { await f.close(); expect(f.h.clock.pendingCount()).toBe(0); rmSync(root, { recursive: true, force: true }) }
+})

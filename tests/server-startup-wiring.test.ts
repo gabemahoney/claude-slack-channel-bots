@@ -1,3 +1,8 @@
+import { createChannelMembership } from '../src/channel-membership.ts'
+import { createMembershipScanner, membershipConnectionListener } from '../src/channel-membership-scan.ts'
+import { createMembershipReadiness } from '../src/channel-membership-readiness.ts'
+import { makeSharedAuthority } from './test-helpers/shared-channels.ts'
+import { makePersonaConfigInput, makePersona } from './test-helpers/persona-config.ts'
 
 
 import { afterEach, describe, expect, test } from 'bun:test'
@@ -71,7 +76,7 @@ import type { SlowRecoveryTracker, SlowRecoveryTrackerDeps } from '../src/slow-r
 import type * as UnavailableRetryModule from '../src/unavailable-retry.ts'
 import type { FullModeRetryDeps, RetryRunGateDeps, UnavailableRetryController, UnavailableRetryDeps } from '../src/unavailable-retry.ts'
 import { makeStubCallLog } from './test-helpers/agent-director-stub.ts'
-import { assertNoLeak } from './test-helpers/credentials.ts'
+import { assertNoLeak, writtenFile } from './test-helpers/credentials.ts'
 import { makeEngineHarness } from './test-helpers/delivery-engine.ts'
 import { makeDeliveryNoticeHarness } from './test-helpers/delivery-notices.ts'
 import { slackInput } from './test-helpers/delivery-queue.ts'
@@ -1658,15 +1663,16 @@ describe('server.ts wires the persona connection seams', () => {
     expect(props.get('dryRun')).toBe('isDryRun()')
     expect(props.get('onStatus')).toStartWith('composePersonaStatusListeners(')
     const listeners = onlyCallArgs('composePersonaStatusListeners')
-    expect(listeners).toHaveLength(3)
-    expect(listeners[0]).toBe(`createPersonaUpFlushListener(${notifier})`)
+    expect(listeners).toHaveLength(4)
+    expect(listeners[0]).toBe('(key, status) => { membershipStatus?.(key, status); membershipReadiness?.report(key) }')
+    expect(listeners[1]).toBe(`createPersonaUpFlushListener(${notifier})`)
     // The controller is built after (and over) the manager, so the listener
     // reaches it through the module-scope holder, never the local const (which
     // would be in its temporal dead zone when the manager is built).
-    expect(listeners[1]).toMatch(/^\((\w+), (\w+)\) => bringUps\?\.onConnectionStatus\(\1, \2\)$/)
-    expect(listeners[1]).not.toContain(constOf('createPersonaBringUpController'))
+    expect(listeners[2]).toMatch(/^\((\w+), (\w+)\) => bringUps\?\.onConnectionStatus\(\1, \2\)$/)
+    expect(listeners[2]).not.toContain(constOf('createPersonaBringUpController'))
     // Resolve reporting on the up notification, when the current client is usable.
-    expect(listeners[2]).toMatch(/^\((\w+), (\w+)\) => \{ if \(\2\.state === 'up'\) deliveryReporting\?\.reconcileQueued\(\1\) \}$/)
+    expect(listeners[3]).toMatch(/^\((\w+), (\w+)\) => \{ if \(\2\.state === 'up'\) deliveryReporting\?\.reconcileQueued\(\1\) \}$/)
   })
 
   test('the Slack API base URL override (section 4): resolved once, inside main(), from process.env with the manager’s log, before the manager is built, and passed to it as slackApiUrl', () => {
@@ -4270,7 +4276,7 @@ describe('server.ts binds the persona routing\'s lost-message state inputs to th
     const MEMBERS: Array<keyof PersonaRoutingDeps> = [
       'getPersonaConfig', 'getBotIdentity', 'queue', 'prepare', 'onReceived', 'archive', 'log',
       'isPersonaUp', ROUTING_LATCHED, ROUTING_TMUX_UNRESPONSIVE, LAUNCH_RUNNING, KILL_FAILED, ROUTING_WORK_IN_FLIGHT, ROUTING_ROW_READ,
-      'isRetryArmed', 'armRetryTimerIfMissing', SEQUENCE_WAIT, HELD_ON_INVALID_FLAGS, 'getChannelDelivery',
+      'isRetryArmed', 'armRetryTimerIfMissing', SEQUENCE_WAIT, HELD_ON_INVALID_FLAGS, 'getChannelDelivery', 'membership',
     ]
     expect([...onlyCallProps('createPersonaRouting').keys()].sort()).toEqual([...MEMBERS].sort())
   })
@@ -4817,7 +4823,7 @@ describe('server.ts refuses service to a persona that is not up', () => {
     expect(outcomes.get('isUp')).toMatch(/^\((\w+)\) => bringUps\?\.isUp\(\1\) \?\? false$/)
     expect(outcomes.get('isApplied')).toMatch(/^\((\w+)\) => bringUps\?\.isApplied\(\1\) \?\? false$/)
     // Never called directly, and no serving check copied in.
-    expect(callsOf('isPersonaUp')).toHaveLength(3)
+    expect(callsOf('isPersonaUp')).toHaveLength(4)
     expect(withinCall(callsOf('isPersonaUp'), onlyCallOf('createDeliveryReporting'))).toBe(1)
     expect(withinCall(callsOf('isPersonaUp'), onlyCallOf('createDeliveryEngines'))).toBe(1)
     expect(withinCall(callsOf('isPersonaUp'), onlyCallOf('createReplyReminders'))).toBe(1)
@@ -5201,12 +5207,12 @@ describe('main() adapts the recovered shared authority once before bring-up', ()
     expect(atMainTopLevel(SERVER_CODE, at)).toBe(true)
     expect(at).toBeGreaterThan(startResolution(SERVER_CODE).assignAt)
     expect(at).toBeLessThan(onlyCallOf('runStartBringUp'))
-    expect(onlyCallArguments(SERVER_CODE, 'createChannelDeliveryStore').trim()).toBe('reload.sharedChannels()!')
+    expect(onlyCallArgs('createChannelDeliveryStore')).toEqual(['reload.sharedChannels()!', "(key, channel) => !isDryRun() && !shuttingDown && isPersonaUp(key) && channelMembership?.read(key, channel, 'open').kind === 'eligible'"])
     expect(SERVER_CODE).not.toMatch(/\b(?:loadChannelDeliveryStore|loadChannelDeliveryAtStart|serializeChannelDelivery|parseChannelDelivery)\b/)
   })
   test('the one adapter holder is assigned only from that recovered authority', () => {
     declaredOnce(CHANNEL_DELIVERY_HOLDER)
-    expect(assignmentsTo(CHANNEL_DELIVERY_HOLDER).map(({ value }) => value)).toEqual(['createChannelDeliveryStore(reload.sharedChannels()!)'])
+    expect(assignmentsTo(CHANNEL_DELIVERY_HOLDER).map(({ value }) => value)).toEqual(['createChannelDeliveryStore(reload.sharedChannels()!, (key, channel) =>'])
     const accessor = onlyCallProps('createReloadController').get(CONTROLLER_CHANNEL_DELIVERY)
     expect(accessor).toContain('return channelDeliveryStore')
   })
@@ -5508,8 +5514,10 @@ describe('production bring-up reaction recovery', () => {
     const e = await makeEngineHarness()
     e.p().row.state = 'working'
     const n = await makeDeliveryNoticeHarness({ queue: e.queue })
+    const authority = makeSharedAuthority(e.root, makePersonaConfigInput({ personas: [makePersona({ name: 'alpha' }, e.root)] }, e.root))
     const conn = makeConnectionHarness([{ name: 'alpha' }], e.root, {
-      files: true, stubOptions: { alpha: path === 'startup retry' ? { authTest: [{ kind: 'network' }] } : {} },
+      incarnationFor: key => authority.incarnation(key),
+      files: true, stubOptions: { alpha: { appId: 'A0RESTORE', ...(path === 'startup retry' ? { authTest: [{ kind: 'network' } as const] } : {}) } },
     })
     const persona = conn.p('alpha'), config = conn.config!, stub = conn.stub(persona)
     const queuedName = config.queued_ack_reaction!
@@ -5533,7 +5541,12 @@ describe('production bring-up reaction recovery', () => {
       queue: e.queue, clock: conn.clock, clientFor: conn.clientFor, resolveUserName: async (_key, user) => user,
       onReceived: (key, item) => reporting.received(key, item), wake: key => e.engine.wake(key),
     })
+    const membership = createChannelMembership({ authority, dryRun: false, log: line => conn.lines.push(line), requestReconciliation: key => scanner.request(key) })
+    const scanner = createMembershipScanner({ authority, membership, dryRun: false, connections: conn.manager, clock: conn.clock, log: line => conn.lines.push(line) })
+    const membershipStatus = membershipConnectionListener(membership, scanner, conn.manager, false)
+    const membershipReadiness = createMembershipReadiness({ authority, provenance: key => conn.manager.provenance(key), inventory: key => scanner.status(key), dryRun: false, log: line => conn.lines.push(line) })
     const bindings = {
+      membershipStatus, membershipReadiness,
       composePersonaStatusListeners, createPersonaUpFlushListener, personaNotifier: n.h.notifier, bringUps: controller,
       deliveryPreparation: preparation, deliveryReporting: reporting, clientFor: conn.clientFor,
       personaConfig: config, appliedConfig: config, configInEffect,
@@ -5570,6 +5583,9 @@ describe('production bring-up reaction recovery', () => {
         await controller.bringUp(persona, conn.personas)
       }
       expect(conn.manager.status(persona.key)?.state).toBe('up')
+      for (let turn = 0; turn < 5 && scanner.status(persona.key).state !== 'complete'; turn++) await conn.clock.runNext()
+      expect(membershipReadiness.read(persona.key).inventory.state).toBe('complete')
+      expect(conn.lines.filter(line => line.includes('status listener'))).toEqual([])
       expect(controller.isUp(persona.key)).toBe(true)
       expect(conn.clientFor(persona.key)).toBeDefined()
       if (path === 'startup retry') expect(launches).toEqual([persona.key])
@@ -5593,12 +5609,41 @@ describe('production bring-up reaction recovery', () => {
         adds: Array(expectedAdds).fill(queuedName), visible: [queuedName],
       })
     } finally {
+      scanner.close(); membership.close(); membershipReadiness.close()
       controller.cancelAll()
       await conn.manager.stopAll()
       await preparation.stop()
       expect(conn.clock.pendingCount()).toBe(0)
-      assertNoLeak({ lines: conn.lines, logs: n.logs, calls: stub.callLog })
+      assertNoLeak({ lines: conn.lines, logs: n.logs, calls: stub.callLog, authority: writtenFile(authority.path) })
       await n.cleanup(); await e.cleanup(); _resetAckTracker()
     }
+  })
+})
+
+describe('membership uses the recovered authority and real lifecycle/HTTP boundaries', () => {
+  test('one membership/scanner/readiness composition is wired before start, with dry run and shutdown cancellation', () => {
+    for (const name of ['createChannelMembership', 'createMembershipScanner', 'createMembershipReadiness']) {
+      const at = onlyCallOf(name)
+      expect(insideMain(at)).toBe(true)
+      expect(at).toBeLessThan(onlyCallOf('runStartBringUp'))
+      expect(onlyCallProps(name).get('authority')).toBe('reload.sharedChannels()!')
+      expect(onlyCallProps(name).get('dryRun')).toBe('isDryRun()')
+    }
+    expect(onlyCallProps('createMembershipScanner').get('connections')).toBe('manager')
+    expect(onlyCallProps('createChannelMembership').get('requestReconciliation')).toBe('key => membershipScanner?.request(key)')
+    expect(onlyCallProps('createPersonaEventRouter').get('membership')).toBe('channelMembership')
+    expect(onlyCallProps('createPersonaConnectionManager').get('incarnationFor')).toBe('key => channelDeliveryStore?.authority.incarnation(key)')
+    expect(onlyCallProps('createPersonaConnectionManager').get('canRevalidateMembership')).toBe('key => !shuttingDown && channelDeliveryStore?.isRetiring(key) === false && bringUps?.canRevalidateMembership(key) === true')
+    for (const owner of ['membershipScanner', 'channelMembership', 'membershipReadiness']) expect(SERVER_CODE).toContain(`${owner}?.close()`)
+    expect(SERVER_CODE).toContain('membershipScanner?.stop(key)')
+  })
+  test('the production HTTP route passes the actual peer address to the operator handler', () => {
+    const args = onlyCallArgs('handleMembershipReadiness')
+    expect(args).toHaveLength(3)
+    expect(args[0]).toBe('req')
+    expect(args[1]).toContain('requestIP(req)')
+    expect(args[1]).not.toContain('headers')
+    expect(args[2]).toContain('readiness: membershipReadiness')
+    expect(SERVER_CODE).toContain('MEMBERSHIP_READINESS_ROUTE')
   })
 })

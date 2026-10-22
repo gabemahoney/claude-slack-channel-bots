@@ -116,6 +116,7 @@ const CREDENTIALS_HELPER = 'tests/test-helpers/credentials.ts'
  * SCREAMING_CASE constant from one of them makes a suite touching.
  */
 const SOURCE_SURFACES: [RegExp, string][] = [
+  [/^src\/channel-membership(?:-scan|-readiness|-evidence)?\.ts$/, 'authenticated installation and durable membership evidence, API diagnostics and operator records'],
   [/^src\/codex-config-keys\.ts$/, 'the names-only Codex config scanner and authorized top-level host model reader'],
   [/^src\/config\.ts$/, 'the persona config loader and record validation'],
   [/^src\/shared-channels\.ts$/, 'the durable applied configuration, source input and persona identity authority'],
@@ -177,7 +178,7 @@ const HELPER_SURFACES: Record<string, Record<string, string>> = {
     sentinelInMessage: 'plants the leak sentinel in an error message (in a fake token and a ticket URL)',
     sentinelTicketUrl: 'plants the leak sentinel in a ticket URL',
   },
-  'tests/test-helpers/shared-channels.ts': { configBytes: 'serializes config input', initialSharedState: 'builds a shared config-state envelope', writeSharedState: 'writes the shared config-state envelope', makeSharedAuthority: 'builds and writes the shared authority' },
+  'tests/test-helpers/shared-channels.ts': { makeMembershipHarness: 'builds authenticated connection and durable membership composition', configBytes: 'serializes config input', initialSharedState: 'builds a shared config-state envelope', writeSharedState: 'writes the shared config-state envelope', makeSharedAuthority: 'builds and writes the shared authority' },
   'tests/test-helpers/persona-config.ts': { writeConfigFile: 'writes a config file' },
   'tests/test-helpers/ad-settings.ts': { writeAgentDirectorConfig: "writes agent-director's config.toml" },
   'tests/test-helpers/channel-delivery.ts': { writeChannelDeliveryRecord: 'writes a stored-choice file holding persona declarations' },
@@ -426,6 +427,24 @@ describe('every suite that touches config, credentials or reload calls assertNoL
       ...(SOURCE_FILES.some((file) => re.test(file)) ? [] : [`${re.source}: stale surface: matches no module under src/`]),
     ])
     expect(checked(failures, 'source-surface failures')).toEqual([])
+  })
+
+  test('membership functions and the composition helper require leak checks, while constants and types do not', () => {
+    const suite = 'tests/channel-membership.test.ts'
+    for (const [module, name] of [
+      ['channel-membership', 'createChannelMembership'], ['channel-membership-scan', 'createMembershipScanner'],
+      ['channel-membership-readiness', 'handleMembershipReadiness'], ['channel-membership-evidence', 'orderMembershipRecovery'],
+    ]) {
+      expect(SOURCE_SURFACES.some(([re]) => re.test(`src/${module}.ts`))).toBe(true)
+      expect(touchReasonsOf(suite, `import { ${name} as use } from '../src/${module}.ts'`).length).toBe(1)
+      expect(touchReasonsOf(suite, `const use = await import('../src/${module}.ts')`).length).toBe(1)
+      expect(touchReasonsOf(suite, `import type { Example } from '../src/${module}.ts'`)).toEqual([])
+    }
+    expect(touchReasonsOf(suite, "import { MEMBERSHIP_UNRESOLVED } from '../src/channel-membership.ts'")).toEqual([])
+    expect(touchReasonsOf(suite, "import { makeMembershipHarness } from './test-helpers/shared-channels.ts'").length).toBe(1)
+    for (const file of ['tests/channel-membership.test.ts', 'tests/channel-membership-readiness.test.ts']) {
+      expect(callsAssertNoLeak(file)).toBe(true); expect(file in EXEMPT).toBe(false)
+    }
   })
 
   test('the test-only MCP route is a source surface: handlers and key rendering touch; constants and types alone do not; every consumer leak-checks', () => {

@@ -283,6 +283,38 @@ export interface SlackBotIdentity {
   botUserId: string
   /** `auth.test` `bot_id`. */
   botId: string
+  /** Authenticated installation fields; absent means unverified membership. */
+  teamId?: string
+  appId?: string
+  enterpriseId?: string
+}
+
+export interface SlackInstallationIdentity extends SlackBotIdentity {
+  teamId: string
+  appId: string
+}
+
+/** Only validated IDs are safe to persist or display as installation evidence. */
+export function slackInstallationIdentity(identity: SlackBotIdentity | undefined): SlackInstallationIdentity | undefined {
+  if (!identity || !/^T[A-Z0-9]+$/.test(identity.teamId ?? '') ||
+      !/^A[A-Z0-9]+$/.test(identity.appId ?? '') || !/^[UW][A-Z0-9]+$/.test(identity.botUserId) ||
+      !/^B[A-Z0-9]+$/.test(identity.botId)) return undefined
+  return { ...identity, teamId: identity.teamId!, appId: identity.appId! }
+}
+
+export function slackInstallationKey(identity: SlackInstallationIdentity): string {
+  return JSON.stringify([identity.teamId, identity.appId, identity.botUserId, identity.botId])
+}
+
+/** bots.info supplies app_id when auth.test omits it. It must describe the
+ * exact authenticated bot and user; a name or another bot is not evidence. */
+export function installationFromBotInfo(identity: SlackBotIdentity, result: unknown): SlackBotIdentity {
+  const bot = readProp(result, 'bot')
+  const appId = readProp(bot, 'app_id')
+  if (readProp(result, 'ok') !== true || readProp(bot, 'id') !== identity.botId ||
+      readProp(bot, 'user_id') !== identity.botUserId || readProp(bot, 'deleted') === true ||
+      typeof appId !== 'string' || !/^A[A-Z0-9]+$/.test(appId)) return identity
+  return { ...identity, appId }
 }
 
 /** `auth.test` returned the bot identity. */
@@ -381,7 +413,14 @@ export function botIdentityFromAuthTest(result: unknown): SlackUpOutcome | Slack
   const botUserId = readProp(result, 'user_id')
   const botId = readProp(result, 'bot_id')
   if (typeof botUserId === 'string' && botUserId !== '' && typeof botId === 'string' && botId !== '') {
-    return { kind: 'up', identity: { botUserId, botId } }
+    const teamId = readProp(result, 'team_id')
+    const appId = readProp(result, 'app_id')
+    const enterpriseId = readProp(result, 'enterprise_id')
+    return { kind: 'up', identity: { botUserId, botId,
+      ...(typeof teamId === 'string' && /^T[A-Z0-9]+$/.test(teamId) ? { teamId } : {}),
+      ...(typeof appId === 'string' && /^A[A-Z0-9]+$/.test(appId) ? { appId } : {}),
+      ...(typeof enterpriseId === 'string' && /^E[A-Z0-9]+$/.test(enterpriseId) ? { enterpriseId } : {}),
+    } }
   }
   return unreachable('auth.test', 'no-identity')
 }

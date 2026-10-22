@@ -139,7 +139,7 @@ jq '.channel_mode // "strict"' "$STATE_DIR/config.json"
 
 On a fresh install, explain both modes, suggest `strict`, and ask which one. On an existing install, state the applied mode and ask whether to change it. An absent selector and `"strict"` mean the same mode. A differing input mode is pending until confirmed.
 
-To change modes, edit only `channel_mode`, preserving channel choices and the shared destination. Before selecting `open`, review each app’s channel memberships, private channels included, and past `unclaimed-channel` lines in `server.log`. A channel invitation alone does not create a listening choice. Have the operator read `docs/channel-modes.md`’s `## Who can reach a persona in fungible mode` before selecting it. Check every persona against the debug skill’s `### The load-time rules`; Step 10 describes confirmation.
+To change modes, edit only `channel_mode`, preserving channel choices and the shared destination. Before selecting `open`, review each app’s channel memberships, private channels included, and past `unclaimed-channel` lines in `server.log`. A newly verified member without a choice starts at `off` in strict mode or `mentions` in open mode, using the mode when the join is applied. Duplicate joins and mode switches preserve existing choices, including `off`. Have the operator read `docs/channel-modes.md`’s `## Who can reach a persona in fungible mode` before selecting it. Check every persona against the debug skill’s `### The load-time rules`; Step 10 describes confirmation.
 
 ---
 
@@ -215,6 +215,25 @@ the `lists:read` and `lists:write` scopes, which a bot needs to use a Slack
 List: add both the same way, then re-install.
 An app already used by another persona can't be reused.
 
+**Membership setup, for new and existing apps:** check the currently installed
+app's **Event Subscriptions** → **Subscribe to bot events** for both
+`member_joined_channel` and `channel_left`, and its bot scopes for
+`channels:read` (public) and `groups:read` (private). A fresh manifest install
+includes them; an existing app needs any missing subscriptions/scopes added
+and its one-time reinstall completed. An ordinarily restarted, already
+verified app needs no redundant reinstall. Ordinary CSCB startup neither
+checks nor changes these Slack installation settings; thread following adds
+no separate scope or reinstall requirement.
+
+Once the persona is applied and running, follow the debug skill's
+[Membership setup record and readback](../debug-slack-channel-bots/SKILL.md#membership-setup-record-and-readback):
+read the authenticated installation IDs, inspect that exact app, record each
+subscription as `verified`, `missing` or `unknown` and reinstall as `complete`,
+`incomplete` or `unknown`, then read back both states. This local interface
+needs no new runtime credentials; tokens still go only into 5.10's terminal
+command. Keep uninspectable setup `unknown`; a successful scan, silence or
+one observed event does not verify it.
+
 #### 5.3 Credentials file path
 
 Agree the `credentials_file` path: absolute or starting with `~/`, one file
@@ -243,7 +262,7 @@ share one, and the configuration is rejected.
 In both modes, collect each channel’s fields below. A persona with no channels must have DMs enabled:
 
 - **`id`**: a Slack channel ID, pattern `^[CG][A-Z0-9]+$`. In Slack, click the channel name; the ID is at the bottom of **About**.
-- **`delivery`**: explicitly choose `off`, `mentions`, `all` or `thread_hybrid`. `off` disables channel listening; `mentions` delivers direct mentions and broadcasts; `all` delivers every message. Unassigned channels default to `off`.
+- **`delivery`**: explicitly choose `off`, `mentions`, `all` or `thread_hybrid`. `off` disables channel listening; `mentions` delivers direct mentions and broadcasts; `all` delivers every message. A newly verified member without a choice starts at `off` in strict or `mentions` in open; existing choices are preserved.
 
 See `docs/configuration.md`’s `### Channel entries` and `### Channel delivery`.
 
@@ -254,7 +273,10 @@ the persona should serve, in that channel:
 /invite @<the persona's bot display name>
 ```
 
-In open mode, listening also requires a non-off applied choice.
+Listening requires current verified membership and a non-off applied choice.
+An invitation, a listed choice or a received message alone supplies no current
+membership evidence. Valid current positives can progress before the inventory
+is complete; open mode also excludes externally shared channels.
 Invite the app to its destination channel from 5.7 too, when that is a
 channel. If the persona stays silent in a channel its app was invited to,
 point to the debugging skill's entry "A persona is silent in a channel its app
@@ -492,6 +514,11 @@ channels and wait for its answer: in strict mode, a channel listed in its
 `channels`; in open mode, a channel its app was invited to. In either
 mode, a persona with DMs on can be DMed instead.
 
+Read [membership readiness](../debug-slack-channel-bots/SKILL.md#membership-setup-record-and-readback)
+for each persona too: report `inventory.state` separately from `setup.state`.
+A reply does not prove complete inventory or verified subscription/reinstall
+setup. Dry run verifies neither and starts no membership probes or retries.
+
 ```bash
 grep -F 'persona-start:' "$STATE_DIR/server.log" | tail -n 20
 grep -F '(key=<key>)' "$STATE_DIR/server.log" | tail -n 20
@@ -507,6 +534,11 @@ in a channel its app was invited to, point to the debugging skill's entry
 ### Step 11 — Summary
 
 Report:
+
+- Each persona's membership inventory state (`unverified`, `scanning`,
+  `incomplete` or `complete`) and, separately, current-app setup state
+  (`verified`, `missing-subscriptions`, `incomplete-reinstall` or `unknown`),
+  with any recorded missing/unknown subscriptions and reinstall status.
 
 - The channel mode `config.json` holds (strict or open), and whether
   Step 4 changed it. A changed switch applies in place, at once, once

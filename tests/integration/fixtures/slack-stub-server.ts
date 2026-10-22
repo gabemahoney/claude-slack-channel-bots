@@ -106,7 +106,8 @@
  *   an object). `"omit": ["is_ext_shared_channel"]` in place of it leaves the
  *   flag out of the payload. Every other envelope field is fixed or generated
  *   by the stub: `envelope_id` and `event_id` are unique per push, and
- *   `team_id` and `api_app_id` are the stub's team and app.
+ *   `team_id`, `api_app_id` and bot authorization match the label's most
+ *   recent successful auth.test (including per-token identity overrides).
  * - The push goes to the label's newest open WebSocket: the one opened last
  *   among its sockets that are open now. A closed or closing socket is never
  *   chosen.
@@ -200,6 +201,12 @@ export interface StubAnswers {
   ws_scheme?: 'ws' | 'wss'
   user_id?: string
   bot_id?: string
+  team_id?: string
+  app_id?: string
+  /** Explicit Slack-side memberships; never inferred from posted traffic/config. */
+  memberships?: string[]
+  /** Cursor-keyed raw pages allow empty nonterminal and malformed responses. */
+  inventory_pages?: Record<string, Record<string, unknown>>
 }
 
 /** One control entry: the tokens ending in `suffix` are `label`'s. */
@@ -322,7 +329,7 @@ function recordedBlocks(text: string): Record<string, unknown>[] | null {
 // Control validation
 // ---------------------------------------------------------------------------
 
-const ANSWER_KEYS = ['auth', 'connections', 'ticket', 'ws_scheme', 'user_id', 'bot_id'] as const
+const ANSWER_KEYS = ['auth', 'connections', 'ticket', 'ws_scheme', 'user_id', 'bot_id', 'team_id', 'app_id'] as const
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -338,6 +345,14 @@ function checkAnswers(value: unknown, where: string): StubAnswers {
     if (key === 'ws_scheme' && field !== 'ws' && field !== 'wss') throw new Error(`${where}.ws_scheme must be ws or wss`)
     if (key === 'ticket' && !/^[A-Za-z0-9_-]+$/.test(field)) throw new Error(`${where}.ticket must be letters, digits, _ or -`)
     ;(answers as Record<string, string>)[key] = field
+  }
+  if (value.memberships !== undefined) {
+    if (!Array.isArray(value.memberships) || value.memberships.some(id => typeof id !== 'string' || !/^[CG][A-Z0-9]+$/.test(id))) throw new Error(`${where}.memberships must contain channel IDs`)
+    answers.memberships = [...value.memberships] as string[]
+  }
+  if (value.inventory_pages !== undefined) {
+    if (!isObject(value.inventory_pages) || Object.values(value.inventory_pages).some(page => !isObject(page))) throw new Error(`${where}.inventory_pages must contain pages`)
+    answers.inventory_pages = structuredClone(value.inventory_pages) as Record<string, Record<string, unknown>>
   }
   return answers
 }
@@ -608,6 +623,7 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
   let ticketSeq = 0
   let pushSeq = 0
   let control: StubControl = options.control ?? {}
+  const authenticatedInstallations = new Map<string, { team_id: string; app_id: string; user_id: string }>()
   let controlStamp = ''
   const tickets = new Map<string, { label: string; mode: string }>()
   const sockets = new Set<Bun.ServerWebSocket<ConnData>>()
@@ -731,10 +747,12 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
     pushSeq += 1
     const envelopeId = randomUUID()
     const eventId = `Ev0STUB${String(pushSeq).padStart(4, '0')}${randomUUID().slice(0, 8).toUpperCase()}`
+    const installation = authenticatedInstallations.get(label) ?? control.tokens?.find(rule => rule.label === label) ?? control.default ?? {}
     const payload: Record<string, unknown> = {
+      authorizations: [{ team_id: installation.team_id ?? TEAM_ID, user_id: installation.user_id, is_bot: true }],
       type: 'event_callback',
-      team_id: TEAM_ID,
-      api_app_id: APP_ID,
+      team_id: installation.team_id ?? TEAM_ID,
+      api_app_id: installation.app_id ?? APP_ID,
       event,
       event_id: eventId,
       event_time: Math.floor(Date.now() / 1000),
@@ -837,6 +855,7 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
         if (args.name !== undefined) fields.name = recordedText(method, args.name)
         if (args.timestamp !== undefined) fields.timestamp = recordedText(method, args.timestamp)
       }
+      if (method === 'users.conversations') { fields.cursor = recordedText(method, args.cursor ?? ''); fields.types = recordedText(method, args.types ?? ''); fields.team_id = recordedText(method, args.team_id ?? '') }
       if (args.user !== undefined) fields.user = args.user
       if (args.thread_ts !== undefined) fields.thread_ts = recordedText(method, args.thread_ts)
       if (args.text !== undefined) fields.text = recordedText(method, args.text)
@@ -894,16 +913,29 @@ export function startSlackStub(options: SlackStubOptions): SlackStub {
 
       if (method === 'auth.test') {
         const hash = tokenHash(token!).toUpperCase().slice(0, 10)
+        authenticatedInstallations.set(label, { team_id: answers.team_id ?? TEAM_ID, app_id: answers.app_id ?? APP_ID, user_id: answers.user_id ?? `U${hash}` })
         return answer('ok', {
           ok: true,
           url: `http://127.0.0.1:${srv.port}/`,
           team: 'stub-team',
-          team_id: TEAM_ID,
+          team_id: answers.team_id ?? TEAM_ID,
           user: label,
           user_id: answers.user_id ?? `U${hash}`,
           bot_id: answers.bot_id ?? `B${hash}`,
           is_enterprise_install: false,
         })
+      }
+      if (method === 'bots.info') {
+        const hash = tokenHash(token!).toUpperCase().slice(0, 10)
+        return answer('ok', { ok: true, bot: { id: answers.bot_id ?? `B${hash}`, user_id: answers.user_id ?? `U${hash}`, app_id: answers.app_id ?? APP_ID, deleted: false } })
+      }
+      if (method === 'users.conversations') {
+        const page = answers.inventory_pages?.[args.cursor ?? '']
+        if (page) return answer('ok', page)
+        if (args.cursor) return answer('invalid_cursor', { ok: false, error: 'invalid_cursor' })
+        return answer('ok', { ok: true, channels: (answers.memberships ?? []).map(id => ({
+          id, is_channel: id.startsWith('C'), is_group: id.startsWith('G'), is_im: false, is_mpim: false, is_ext_shared: false,
+        })), response_metadata: { next_cursor: '' } })
       }
       return answer('ok', okBody(method, args, n, `http://127.0.0.1:${srv.port}/upload/`, control))
     },

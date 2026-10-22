@@ -24,16 +24,18 @@
 #   MCP sessions registered; a push to an unknown label is refused
 #   (`no-open-socket`) with its `push-refused` record line.
 # - A, a 0.11.x configuration (the upgrade path): neither key of this
-#   work; config.json equals its copy and the authority's reviewed input; no
-#   stored-choice file; no server.log line names the switch's key, fungible
+#   work; config.json equals its copy and the authority's reviewed input;
+#   discovery adds strict `off` entries to the applied view, never a legacy
+#   store; no server.log line names the switch's key, fungible
 #   mode or a class this work adds. alpha A1 plain is delivered `receive_all`
-#   (the first-delivery control); U1, unlisted, one mention as both its
+#   (the first-delivery control); U1 is discovered and drops as `off`;
+#   U0, absent from both inventories and configurations, one mention as both its
 #   events, logs exactly two `unclaimed-channel` lines (drops store no dedupe
 #   fact); A2 plain is a
 #   `not-mentioned` drop; A2 and B1 mentions are delivered `mention`; the
 #   tool is refused with the declarative text (the first-tool-result control),
 #   and nothing is written.
-# - Switch on: the switch and alpha's `invited.permission_prompts`;
+# - Switch on : open mode and explicit F1/F2/U1 choices;
 #   the pending file carries the switch's line; its confirmation applies it
 #   with both sessions kept (no registration or launch line, read after a
 #   delivery on each persona's connection, in phase B).
@@ -43,11 +45,12 @@
 #   destination, then set_channel_delivery: stored, refused, held by the loop
 #   guard, and shared delivery, exactly once to each persona.
 # - Restart: a plain stop (the bots keep running) and a live start;
-#   the stored-choice file keeps its bytes; the reconnect's new MCP clients
+#   shared choices, identities and reviewed bytes survive fresh discovery;
+#   the reconnect's new MCP clients
 # repeat no call; the stored choice applies again.
 # - Switch off: declarative mode again, sessions kept (read after
-#   a delivery on each persona's connection), the stored choice inert and the
-#   file unchanged.
+#   a delivery on each persona's connection), shared choices still applied
+#   and new tool assignments refused.
 # - Closing: `stop --stop-bots`; the port closed; the Slack stub
 #   stopped; no token-like text anywhere; the elapsed time on the PASS line.
 #
@@ -139,9 +142,10 @@ CH_TAG="${SCENARIO_TAG^^}"
 A1="C0${CH_TAG}A1"          # alpha: listed `all`; alpha's fungible destination in fungible mode
 A2="C0${CH_TAG}A2"          # alpha: listed `mentions`
 B1="C0${CH_TAG}B1"          # bravo: listed `mentions`
-F1="C0${CH_TAG}F1"          # public, listed by no persona
-F2="G0${CH_TAG}F2"          # private (`group`), listed by no persona
-U1="C0${CH_TAG}U1"          # public, listed by no persona (phase A)
+F1="C0${CH_TAG}F1"          # public, discovered off in strict; explicitly mentions in open
+F2="G0${CH_TAG}F2"          # private (`group`), discovered off; bravo explicitly mentions in open
+U1="C0${CH_TAG}U1"          # public, discovered off; explicitly shared all after phase A
+U0="C0${CH_TAG}U0"          # genuinely unlisted: neither inventory nor configuration
 X1="C0${CH_TAG}X1"          # externally shared (flag true)
 X2="C0${CH_TAG}X2"          # no flag
 X3="C0${CH_TAG}X3"          # a flag that is not a boolean
@@ -153,7 +157,7 @@ BRAVO_BOT_USER="U0${CH_TAG}BRAVO"
 BRAVO_BOT_ID="B0${CH_TAG}BRAVO"
 HUMAN="U0${CH_TAG}HUMAN"    # every event's author
 CONTACT="U0${CH_TAG}CONTACT" # bravo's dm.contact
-for id in "${A1}" "${A2}" "${B1}" "${F1}" "${F2}" "${U1}" "${X1}" "${X2}" "${X3}" "${GDM}" "${DM}" \
+for id in "${A1}" "${A2}" "${B1}" "${F1}" "${F2}" "${U1}" "${U0}" "${X1}" "${X2}" "${X3}" "${GDM}" "${DM}" \
     "${ALPHA_BOT_USER}" "${BRAVO_BOT_USER}" "${HUMAN}" "${CONTACT}"; do
     [[ "${id}" =~ ^[A-Z0-9]{1,24}$ ]] || fail "ID ${id} is not 1 to 24 characters from A-Z0-9"
 done
@@ -209,6 +213,7 @@ plain_drop() {
     matcher "[slack] persona $1 dropped message from channel=$2 " ": $3"
 }
 DROP_NOT_MENTIONED='not-mentioned'
+DROP_CHANNEL_OFF='channel-off'
 DROP_GROUP_DM='group-dm'
 # src/delivery-decision.ts Via (a type only): how a delivered message reached
 # its persona, the accepted queue record's `meta.via`.
@@ -655,9 +660,10 @@ write_credentials "${BRAVO_CREDS}" "${BRAVO_SUFFIX}"
 # mention names it); any other token is refused.
 jq -n --arg asuf "${ALPHA_SUFFIX}" --arg al "${ALPHA_LABEL}" --arg au "${ALPHA_BOT_USER}" --arg ab "${ALPHA_BOT_ID}" \
     --arg bsuf "${BRAVO_SUFFIX}" --arg bl "${BRAVO_LABEL}" --arg bu "${BRAVO_BOT_USER}" --arg bb "${BRAVO_BOT_ID}" \
+    --arg a1 "${A1}" --arg a2 "${A2}" --arg b1 "${B1}" --arg f1 "${F1}" --arg f2 "${F2}" --arg u1 "${U1}" \
     '{tokens: [
-        {suffix: $asuf, label: $al, auth: "ok", connections: "ok", user_id: $au, bot_id: $ab},
-        {suffix: $bsuf, label: $bl, auth: "ok", connections: "ok", user_id: $bu, bot_id: $bb}],
+        {suffix: $asuf, label: $al, auth: "ok", connections: "ok", user_id: $au, bot_id: $ab, memberships: [$a1,$a2,$f1,$f2,$u1]},
+        {suffix: $bsuf, label: $bl, auth: "ok", connections: "ok", user_id: $bu, bot_id: $bb, memberships: [$b1,$a1,$f1,$f2,$u1]}],
       default: {auth: "invalid_auth", connections: "invalid_auth"}}' | write_file "${STUB_CONTROL}" \
     || fail "could not write the stub's control file ${STUB_CONTROL}"
 
@@ -687,9 +693,9 @@ wait_until "${RECORD_WAIT_S}" "the stub never loaded the control file's labels" 
 # --- Configurations --------------------------------------------------------
 # write_persona_config <declarative|fungible|switch-off>:
 # - declarative: the 0.11.x shape of the contract (neither key of this work);
-# - fungible: that plus the switch, and alpha's invited.permission_prompts A1
-# (bravo has no `invited`, so its default "dm" applies);
-# - switch-off: fungible without the switch.
+# - fungible: open mode plus explicit mentions/all choices for discovered
+# channels; alpha's permission destination remains A1 ;
+# - switch-off: the same reviewed choices with strict mode.
 write_persona_config() {
     local switch='' extra_alpha='' extra_bravo=''
     case "$1" in
@@ -698,8 +704,8 @@ write_persona_config() {
             local mode='open'
             [[ "$1" == 'switch-off' ]] && mode='strict'
             switch=$'\n  "'"${SWITCH_KEY}"'": "'"${mode}"'",'
-            extra_alpha=', { "id": "'"${F1}"'", "delivery": "mentions" }, { "id": "'"${S1}"'", "delivery": "all" }'
-            extra_bravo=', { "id": "'"${F1}"'", "delivery": "mentions" }, { "id": "'"${F2}"'", "delivery": "mentions" }, { "id": "'"${A1}"'", "delivery": "mentions" }, { "id": "'"${S1}"'", "delivery": "all" }'
+            extra_alpha=', { "id": "'"${F1}"'", "delivery": "mentions" }, { "id": "'"${U1}"'", "delivery": "all" }'
+            extra_bravo=', { "id": "'"${F1}"'", "delivery": "mentions" }, { "id": "'"${F2}"'", "delivery": "mentions" }, { "id": "'"${A1}"'", "delivery": "mentions" }, { "id": "'"${U1}"'", "delivery": "all" }'
             ;;
         *) fail "write_persona_config: unknown shape '$1'" ;;
     esac
@@ -741,6 +747,8 @@ CONFIG_A_COPY="${SCENARIO_ROOT}/config-phase-a.json"
 cp -- "${CONFIG}" "${CONFIG_A_COPY}"
 
 start_server --live
+wait_membership_complete "${ALPHA}"
+wait_membership_complete "${BRAVO}"
 
 # The texts, printed while the start pass brings the personas up.
 UNCLAIMED_CHANNEL="$(printed UNCLAIMED_CHANNEL)"
@@ -758,7 +766,7 @@ SWITCH_OFF_LINE="$(printed modeSwitchLine "${DECLARATIVE}" "${ALPHA}" "${BRAVO}"
 REASON_EXTERNALLY_SHARED="$(printed UNCLAIMED_REASON_EXTERNALLY_SHARED)"
 REASON_FLAG_MISSING="$(printed UNCLAIMED_REASON_FLAG_MISSING)"
 REASON_FLAG_NOT_BOOLEAN="$(printed UNCLAIMED_REASON_FLAG_NOT_BOOLEAN)"
-U1_CAUSE="$(printed unclaimedChannelCause "${U1}")"
+U0_CAUSE="$(printed unclaimedChannelCause "${U0}")"
 F1_CAUSE="$(printed unclaimedChannelCause "${F1}")"
 X1_CAUSE="$(printed fungibleUnclaimedChannelCause "${X1}" "${REFUSAL_EXTERNALLY_SHARED}")"
 X2_CAUSE="$(printed fungibleUnclaimedChannelCause "${X2}" "${REFUSAL_FLAG_MISSING}")"
@@ -773,7 +781,7 @@ F2_HEARD_CAUSE="$(printed invitedChannelCause "${F2}" private mentions)"
 F1_SET_CAUSE="$(printed channelDeliverySetCause "${F1}" mentions all all)"
 F1_SET_AGAIN_CAUSE="$(printed channelDeliverySetCause "${F1}" all all all)"
 A1_SET_HELD_CAUSE="$(printed channelDeliverySetCause "${A1}" mentions all mentions)"
-U1_UNCLAIMED="$(persona_line "${UNCLAIMED_CHANNEL}" alpha "${U1_CAUSE}")"
+U0_UNCLAIMED="$(persona_line "${UNCLAIMED_CHANNEL}" alpha "${U0_CAUSE}")"
 F1_UNCLAIMED="$(persona_line "${UNCLAIMED_CHANNEL}" alpha "${F1_CAUSE}")"
 X1_UNCLAIMED="$(persona_line "${UNCLAIMED_CHANNEL}" alpha "${X1_CAUSE}")"
 X2_UNCLAIMED="$(persona_line "${UNCLAIMED_CHANNEL}" alpha "${X2_CAUSE}")"
@@ -859,7 +867,20 @@ check_upgrade_log() {
 
 cmp -s -- "${CONFIG}" "${CONFIG_A_COPY}" || fail "phase A: config.json is not its copy, byte for byte"
 [[ -f "${LAST}" ]] || fail "phase A: config.json.last-applied was not written"
-configuration_record_matches "${CONFIG}" "${LAST}" applied || fail "phase A: reviewed bytes or applied configuration differ from config.json"
+configuration_record_matches "${CONFIG}" "${LAST}" reviewed || fail "phase A: reviewed input differs from config.json"
+# Compare the entire applied configuration, allowing exactly the entries
+# discovered as off in strict mode. U0 must remain genuinely unlisted.
+check_phase_a_inventory() {
+    jq -ne --slurpfile input "${CONFIG}" --slurpfile record "${LAST}" \
+        --arg alpha "${ALPHA}" --arg bravo "${BRAVO}" --arg a1 "${A1}" \
+        --arg f1 "${F1}" --arg f2 "${F2}" --arg u1 "${U1}" '
+        ($input[0] | .personas |= map(.channels = ((.channels +
+          (if .name == $alpha then [$f1,$f2,$u1]
+           elif .name == $bravo then [$a1,$f1,$f2,$u1]
+           else error("unexpected persona") end | map({id: ., delivery: "off"}))) | sort_by(.id)))) as $expected |
+        ($record[0].applied | .personas |= map(.channels |= sort_by(.id))) == $expected' > /dev/null
+}
+check_phase_a_inventory || fail "phase A: applied configuration differs from the exact discovered strict choices"
 [[ ! -e "${SLACK_STATE_DIR}/channel-delivery.json" ]] || fail "phase A: a legacy store was created"
 check_upgrade_log "phase A after the start"
 
@@ -869,13 +890,20 @@ push_message "${ALPHA_LABEL}" "${A1}" channel "$(plain_text)"
 A_A1_TS="${PUSH_TS}"
 wait_queued "phase A: alpha A1 plain" "${ALPHA_DIR}" "${A1}" "${A_A1_TS}" "${VIA_RECEIVE_ALL}"
 
-# alpha U1, unlisted: one mention as both its events: exactly two
+# alpha U1 is discovered off: a message cannot select it or turn it on.
+A_OFF_MARK="$(log_mark)"
+push_message "${ALPHA_LABEL}" "${U1}" channel "$(mention_text "${ALPHA_BOT_USER}")"
+A_OFF_TS="${PUSH_TS}"
+wait_since "${A_OFF_MARK}" "$(plain_drop "${ALPHA_REF}" "${U1}" "${DROP_CHANNEL_OFF}")" "${EVENT_WAIT_S}" "phase A: discovered U1 did not drop as off"
+expect_queued "phase A: discovered alpha U1" 0 "${ALPHA_DIR}" "${U1}" "${A_OFF_TS}"
+
+# alpha U0, unlisted: one mention as both its events: exactly two
 # `unclaimed-channel` lines, no delivery; drops store no durable dedupe fact.
-A_U1_MARK="$(log_mark)"
-push_mention "${ALPHA_LABEL}" "${U1}" channel "$(mention_text "${ALPHA_BOT_USER}")" app-first
-A_U1_TS="${PUSH_TS}"
-wait_since "${A_U1_MARK}" "${U1_UNCLAIMED}" "${EVENT_WAIT_S}" "phase A: alpha U1: no 0.11.1 unclaimed-channel line"
-expect_queued "phase A: alpha U1" 0 "${ALPHA_DIR}" "${U1}" "${A_U1_TS}"
+A_U0_MARK="$(log_mark)"
+push_mention "${ALPHA_LABEL}" "${U0}" channel "$(mention_text "${ALPHA_BOT_USER}")" app-first
+A_U0_TS="${PUSH_TS}"
+wait_since "${A_U0_MARK}" "${U0_UNCLAIMED}" "${EVENT_WAIT_S}" "phase A: alpha U0: no unclaimed-channel line"
+expect_queued "phase A: alpha U0" 0 "${ALPHA_DIR}" "${U0}" "${A_U0_TS}"
 
 # alpha A2 plain: a `not-mentioned` drop, no delivery.
 A_A2_MARK="$(log_mark)"
@@ -886,11 +914,12 @@ wait_since "${A_A2_MARK}" "$(plain_drop "${ALPHA_REF}" "${A2}" "${DROP_NOT_MENTI
 expect_queued "phase A: alpha A2 plain" 0 "${ALPHA_DIR}" "${A2}" "${A_A2_TS}"
 
 # alpha A2 mention: delivered `mention`; a later positive control on alpha's
-# connection, after which U1's and A1's counts are final.
+# connection, after which U0's, U1's and A1's counts are final.
 push_message "${ALPHA_LABEL}" "${A2}" channel "$(mention_text "${ALPHA_BOT_USER}")"
 wait_queued "phase A: alpha A2 mention" "${ALPHA_DIR}" "${A2}" "${PUSH_TS}" "${VIA_MENTION}"
-expect_since "${A_U1_MARK}" "${U1_UNCLAIMED}" 2 "phase A: alpha U1's unclaimed-channel lines"
-expect_queued "phase A: alpha U1, after a later delivery" 0 "${ALPHA_DIR}" "${U1}" "${A_U1_TS}"
+expect_since "${A_U0_MARK}" "${U0_UNCLAIMED}" 2 "phase A: alpha U0's unclaimed-channel lines"
+expect_queued "phase A: alpha U0, after a later delivery" 0 "${ALPHA_DIR}" "${U0}" "${A_U0_TS}"
+expect_queued "phase A: discovered alpha U1, after a later delivery" 0 "${ALPHA_DIR}" "${U1}" "${A_OFF_TS}"
 expect_queued "phase A: alpha A1 plain" 1 "${ALPHA_DIR}" "${A1}" "${A_A1_TS}"
 
 # bravo B1 mention: delivered `mention`.
@@ -1026,9 +1055,8 @@ expect_since "${B6_MARK}" "$(plain_drop "${ALPHA_REF}" "${GDM}" "${DROP_GROUP_DM
 expect_queued "step 6: alpha's group DM" 0 "${ALPHA_DIR}" "${GDM}" "${B6_TS}"
 expect_since "${B6_MARK}" "[slack] ${UNCLAIMED_CHANNEL}:" 0 "step 6: unclaimed-channel lines"
 
-# 7. alpha, A1 (listed `all`, alpha's own fungible destination, no stored
-#    choice), plain: no delivery, a not-mentioned line, one
-#    persona-invited-channel line (alpha, A1, public, mentions).
+# 7. alpha, A1 (explicit `all`, alpha's own permission destination), plain:
+#    delivery remains receive_all with one diagnostic naming all.
 B7_MARK="$(log_mark)"
 push_message "${ALPHA_LABEL}" "${A1}" channel "$(plain_text)"
 B7_TS="${PUSH_TS}"
@@ -1122,6 +1150,8 @@ for session in "${ALPHA_TMUX}" "${BRAVO_TMUX}"; do
         || fail "restart: the plain stop ended the tmux session ${session}"
 done
 start_server --live
+wait_membership_complete "${ALPHA}"
+wait_membership_complete "${BRAVO}"
 wait_for_count "${STARTUP_COMPLETE}" $(( completions_before + 1 )) "${START_WAIT_S}" \
     "restart: the restarted server's start pass never completed"
 # Both bots kept running: the start pass reconnects each, launching none.
@@ -1134,7 +1164,8 @@ wait_until "${RECORD_WAIT_S}" "restart: no new WebSocket for ${ALPHA_LABEL}" \
     rec_at_least $(( alpha_sockets_before + 1 )) event=ws-open label="${ALPHA_LABEL}"
 wait_until "${RECORD_WAIT_S}" "restart: no new WebSocket for ${BRAVO_LABEL}" \
     rec_at_least $(( bravo_sockets_before + 1 )) event=ws-open label="${BRAVO_LABEL}"
-cmp -s -- "${STORE_FILE}" "${STORE_BEFORE_RESTART}" || fail "restart: ${STORE_FILE} changed across the restart"
+bun "${SCENARIO_FIXTURES}/fmk-texts.ts" sharedAuthorityPreserved "${CONFIG}" "${STORE_BEFORE_RESTART}" "${STORE_FILE}" \
+    || fail "restart: shared choices, identities or reviewed input changed"
 for dir in "${ALPHA_DIR}" "${BRAVO_DIR}"; do
     # Delivered content is compacted at startup; its exact dedupe facts
     # survive, while this scenario retains its own acceptance evidence.
@@ -1179,7 +1210,7 @@ STORE_BEFORE_OFF="${SCENARIO_ROOT}/store-before-off.json"
 cp -- "${STORE_FILE}" "${STORE_BEFORE_OFF}"
 confirm_switch switch-off "${SWITCH_OFF_LINE}" "switch off"
 
-# alpha, F1, plain: no delivery, one 0.11.1 unclaimed-channel line.
+# alpha, F1, plain: strict mode retains its shared applied all choice.
 OFF_MARK="$(log_mark)"
 push_message "${ALPHA_LABEL}" "${F1}" channel "$(plain_text)"
 OFF_F1_TS="${PUSH_TS}"

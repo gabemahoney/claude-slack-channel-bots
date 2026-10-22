@@ -105,6 +105,8 @@ Whoever runs this skill (the operator, or a Claude session acting for one):
    and [A persona's instance runs but isn't connected](#a-personas-instance-runs-but-isnt-connected).
    **Silent only in a channel its app was invited to?** See
    [A persona is silent in a channel its app was invited to](#a-persona-is-silent-in-a-channel-its-app-was-invited-to).
+   Read [membership readiness](#membership-setup-record-and-readback) to
+   distinguish incomplete inventory from unknown or deficient app setup.
    **Answering every message in a channel, not only @mentions?** See
    [A persona receives every message in a channel](#a-persona-receives-every-message-in-a-channel).
    An `unclaimed-channel` line ending
@@ -418,7 +420,7 @@ hex digits. Don't derive it by hand: read it from the persona's
 | Outcome | Causes | Recovers on its own? |
 |---|---|---|
 | `up` | None | — |
-| `broken` | Credentials missing, unreadable, invalid or refused by Slack | No: fix the credentials file, wait for the pending change and confirm it (see [Recovering a persona broken by its credentials](#recovering-a-persona-broken-by-its-credentials)); no restart |
+| `broken` | Credentials missing, unreadable, invalid or refused by Slack | Membership-origin refusals can recover after Slack-side repair through [idle revalidation of already applied credentials](#membership-recovery-bounds); invalid/revoked credentials stay held while validation fails. Otherwise fix the credentials file, wait for the pending change and confirm it (see [Recovering a persona broken by its credentials](#recovering-a-persona-broken-by-its-credentials)); no restart |
 | `retrying` | Slack unreachable, working directory missing or unusable, or `claude_config_dir` unresolvable | Yes, once the cause clears; no restart |
 
 A persona that is not up posts nothing to Slack, and its instance, if one is
@@ -602,8 +604,10 @@ retain their existing text excerpts; receipt confirmation has its own line.
 
 ### `persona-credentials-refused`
 
-- **State:** `broken`. Doesn't recover on its own. Logged by the connection
-  manager, with the credentials file as `path`.
+- **State:** `broken`. Logged by the connection manager, with the credentials
+  file as `path`. A membership-origin refusal has bounded idle revalidation
+  of already applied credentials; other refusals keep the confirmed-change
+  recovery below. See [Membership recovery bounds](#membership-recovery-bounds).
 - **Meaning:** Slack answered and refused a token. Three checks can refuse:
   - `bot_token refused by auth.test: Slack error <code>` (at bring-up)
   - `app_token refused by the Socket Mode open: Slack error <code>` (at
@@ -614,8 +618,9 @@ retain their existing text excerpts; receipt confirmation has its own line.
   the five transient ones listed under `persona-slack-unreachable`. The
   expected ones are `not_authed`, `invalid_auth`, `account_inactive`,
   `token_revoked`, `token_expired` and `not_allowed_token_type`. For a Web API
-  call, only `invalid_auth`, `token_revoked`, `account_inactive` and
-  `not_authed`.
+  call, `invalid_auth`, `token_revoked`, `account_inactive` and `not_authed`;
+  membership discovery also classifies access failures such as `missing_scope`
+  and `access_denied`. Check the accompanying inventory reason.
 - **Fix:** Get a working token from the persona's Slack app and have the
   operator write it into the credentials file, in their own terminal, with
   `claude-slack-channel-bots credentials <persona>` (it asks for both tokens
@@ -854,6 +859,198 @@ retain their existing text excerpts; receipt confirmation has its own line.
   or `[slack] persona "<name>" (key=<key>): closing its Slack connection for its claude_config_dir failed: <error>`
   line is an internal error: report it as a bug.
 
+### `channel-membership-unresolved`
+
+The named persona/channel lacks trustworthy current membership. `installation-unverified`
+requires the current authenticated app; `current-membership-missing` requires
+responsive inventory after startup, a gap or a live observation. A received
+join/leave is authenticated history, not current presence or absence by itself.
+`eligibility-missing` needs valid channel type and sharing metadata;
+`event-order-conflict` needs reconciliation beyond the conflicting observations.
+`shared-state-unreadable` requires readable shared state before recovery.
+
+`history-unresolved` means current inventory cannot establish historical order:
+contradictory event IDs, ambiguous old history, or a missed absence crossing a
+newer explicit choice. The hold preserves the original uncertainty and choice
+across retry/restart; later absent or present scans and live events cannot
+invent a leave, default or order. Retain it for reviewed state recovery; there
+is no operator clear action here and no instruction to edit durable state.
+
+Read [membership readiness](#membership-setup-record-and-readback) and the
+inventory cause. Unaffected current positives and already accepted queues can
+progress. Listing a channel, receiving a message, posting or waiting supplies
+no missing authority. Dry run starts no membership clients/probes/retries and
+grants no fresh channel-assignment authority.
+
+### `channel-membership-storage-failed`
+
+`event-not-durable` means the named channel's event or retained history obligation
+could not be saved. Restore readable, writable shared state and free disk space;
+read readiness again after the idle retry. A live event is acknowledged only
+after its effect or all required recovery evidence is durable; if neither write
+succeeds it stays unacknowledged. An in-run hold cannot guarantee crash recovery
+of evidence that was never written. Accepted work remains queued.
+
+### `channel-membership-inventory-incomplete`
+
+The persona's current inventory is unverified, scanning or incomplete, never
+an empty complete inventory. Read `pages`, `positives`, `reason`, optional
+`slack_error`, `deadline_at`, `next_attempt_at` and `retry_after_seconds`; the
+readback uses `problem`, `slackError`, `deadline`, `nextAttemptAt` and
+`retryAfterSeconds`. Times ending in `At` and `deadline` are epoch milliseconds;
+Retry-After is seconds.
+
+| Reason | Missing evidence and action |
+|---|---|
+| `none` | No classified failure yet; read `inventory.state` for unverified/scanning progress. |
+| `deadline`, `transport`, `malformed-page` | No complete responsive pagination; restore Slack/network service and let the bounded retry run. A short or empty page with a cursor is not completion. |
+| `access` | Slack refused membership access, for example `missing_scope` or `access_denied`. Check the current app's public/private read scopes and workspace access, complete any required reinstall, and record setup separately. |
+| `authentication`, `installation-unverified` | Current authenticated installation is unavailable; follow the credential diagnostic. Invalid/revoked credentials stay held while validation fails. |
+| `storage` | Restore shared-state readability/writability; no incomplete negative batch may remove choices. |
+| `superseded`, `current-membership-missing` | The observation is obsolete or current evidence was invalidated; wait for the replacement reconciliation. |
+| `eligibility-missing`, `event-order-conflict`, `history-unresolved` | Follow [`channel-membership-unresolved`](#channel-membership-unresolved); current scans cannot solve unprovable history. |
+
+Independent valid positive channels can progress before completion. A failed,
+partial or expired scan cannot prove absence. Complete catch-up can establish
+a still-visible leave, but a leave/rejoin wholly during downtime without
+authoritative absence cannot be reconstructed. Repeated absence cannot erase
+a freshly reviewed future preference; a never-joined preference is not a leave.
+
+### `channel-membership-inventory-complete`
+
+All available pages and the final shared-state write completed for the current
+authenticated persona. No repair is needed for that inventory. Read setup
+separately: completion does not verify subscriptions or reinstall completion.
+A gap, identity change or new unresolved observation invalidates current
+completeness; saved historical evidence alone does not restore it.
+
+### `channel-membership-deadline`
+
+A membership request, credential validation/open, or whole reconciliation
+attempt expired. Inventory reports `reason=deadline`; this typed timeout code
+is not a separate claim that a leave or repair occurred. Follow the next retry
+in readiness and [Membership recovery bounds](#membership-recovery-bounds).
+Expiry never authorizes discarding held history or accepted work.
+
+### Membership recovery bounds
+
+Membership requests have a **10000 ms end-to-end deadline**, covering queued
+HTTP work; the membership client disables SDK retries, so SDK retry time cannot
+extend it. Composite credential validation/socket open is bounded at **20000 ms**,
+and a whole reconciliation attempt at **120000 ms**. Inventory requests use
+**200 channels per page** and follow every cursor, including after empty pages.
+
+Idle retries start with **5000 ms**, doubling through 10000, 20000 and 40000
+to a local ceiling of **60000 ms**. A longer Slack `Retry-After` controls the
+actual next start. Long waits are rearmed in chunks no larger than
+**2147483647 ms**, never shortened into an early retry.
+
+With responsive Slack and persistence after repair, recovery takes at most the
+remaining in-flight deadline + next permitted retry wait (including Retry-After)
++ successful available-page scan/persistence work. For example, with 30000 ms
+remaining, a 90-second Retry-After, validation/open taking at most 20000 ms and
+two pages taking at most 10000 ms each, that is **160000 ms plus persistence**,
+provided the successful attempt completes within its 120000 ms bound. This is
+a conditional calculation, not a fixed total independent of pages/rate limits.
+
+Membership-origin access repair runs while idle without a new message,
+reconnect request or restart. The existing credential/client owner revalidates
+already applied credentials, the current authenticated installation and all
+persona admission checks. Pending credential edits are not adopted. Other
+credential/posting failures retain their recovery policy; this is not automatic
+recovery for every broken persona. Shutdown, supersession and identity changes
+invalidate obsolete results and retries. Elapsed time grants no membership.
+
+### `channel-membership-setup-unknown`
+
+The persona has no complete manual evidence for its current installation.
+`installation-unverified`, `shared-state-unreadable`, `manual-evidence-missing`
+and `manual-evidence-incomplete` identify what is unavailable. Unknown does not
+mean missing subscriptions. Read the current installation, restore any named
+state/authentication problem, then [inspect and record setup](#membership-setup-record-and-readback).
+Setup uncertainty does not invalidate independently trustworthy current positives.
+
+### `channel-membership-subscriptions-missing`
+
+Manual evidence says one or both required subscriptions are missing from this
+persona's current app. Add the named `member_joined_channel` or `channel_left`
+subscription and finish the required reinstall, then record and read back the
+result. Check `reinstall` too: it can remain `incomplete` even when missing
+subscriptions is the primary setup state. Inventory completion cannot repair it.
+
+### `channel-membership-reinstall-incomplete`
+
+The current app's manual record says reinstall is incomplete. Finish that app's
+installation in Slack, then record the observed result and read it back. Neither
+a successful scan nor a received event completes this setup evidence.
+
+### `channel-membership-setup-verified`
+
+The current authenticated installation has both subscriptions manually verified
+and reinstall recorded complete. No redundant reinstall is needed on ordinary
+restart. This says nothing about inventory completeness; check its separate
+state. An old installation's record cannot verify a replacement app.
+
+### `channel-membership-setup-recorded`
+
+Manual setup evidence was saved for the current authenticated installation.
+Read back `setup.state`, both subscription values and `reinstall`: a saved
+record can describe a deficiency or unknown state. Inventory and saved choices
+are unchanged; this line alone does not mean setup is verified.
+
+### Membership setup record and readback
+
+Use local **POST `/membership-readiness`** on the running server. No CLI
+subcommand, bot tool or new runtime credential is needed. Run the commands on
+the server host, using its loopback listener; the actual peer address is
+checked, and forwarded headers cannot make a remote request local. If `bind`
+provides no loopback listener, resolve that listener configuration first.
+
+1. Check that `server.port` belongs to the running PID, then read the persona
+   (replace `ops_bot` with its applied key or name). Stop if any check fails:
+
+   ```sh
+   STATE_DIR="${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-slack-channel-bots}"
+   CSCB_PID=$(cat "$STATE_DIR/server.pid") && kill -0 "$CSCB_PID" &&
+   CSCB_PORT=$(jq -er --argjson pid "$CSCB_PID" 'select(.pid == $pid) | .port | select(type == "number" and floor == . and . >= 1 and . <= 65535)' "$STATE_DIR/server.port") &&
+   curl --fail-with-body --silent --show-error "http://127.0.0.1:$CSCB_PORT/membership-readiness" \
+     -H 'Content-Type: application/json' --data '{"action":"read","persona":"ops_bot"}' | jq .
+   ```
+
+2. Read `view.setup.installation`: `teamId`, `appId`, `botUserId`, `botId`.
+   If it is absent, resolve `setup.reason` before recording. Inspect that exact
+   app/workspace in Slack: both `member_joined_channel` and `channel_left` under
+   Event Subscriptions, `channels:read`/`groups:read` bot scopes, and reinstall
+   completion. New manifest installs include these; existing apps need missing
+   subscriptions/scopes added and their one-time reinstall completed. Ordinary
+   CSCB startup does not inspect or change Slack installation settings.
+3. Record only what was checked. Replace the four ID placeholders below with
+   the readback IDs. Each subscription accepts `verified`, `missing` or
+   `unknown`; `reinstall` accepts `complete`, `incomplete` or `unknown`. Change
+   the example values to record known deficiencies or uninspectable setup:
+
+   ```sh
+   curl --fail-with-body --silent --show-error "http://127.0.0.1:$CSCB_PORT/membership-readiness" \
+     -H 'Content-Type: application/json' --data '{"action":"record","persona":"ops_bot","installation":{"teamId":"<team ID>","appId":"<app ID>","botUserId":"<bot user ID>","botId":"<bot ID>"},"subscriptions":{"member_joined_channel":"verified","channel_left":"verified"},"reinstall":"complete"}' | jq .
+   ```
+
+4. A successful write returns `kind: "recorded"`, `revision` and `view`.
+   Repeat the read request: its response is `{ok:true,persona,view}`. Keep
+   `view.inventory.state` (`unverified`, `scanning`, `incomplete`, `complete`)
+   separate from `view.setup.state` (`verified`, `missing-subscriptions`,
+   `incomplete-reinstall`, `unknown`). Setup also exposes `missingSubscriptions`,
+   `unknownSubscriptions`, `reinstall` and, when present, `record` with the
+   submitted evidence, `recordedAt` and `order`.
+
+HTTP 400 means invalid input; 404 means no such applied persona; 409 means
+unverified/mismatched installation or a superseded write; 503 means storage
+failed. Read again after resolving the cause; never edit durable authority by
+hand. Records survive restart for the same installation but cannot be borrowed
+by another. Scans, silence, a single event and elapsed time verify neither
+subscriptions nor reinstall. Dry run supplies no production installation
+identity or record-write authority. Tokens stay in the existing terminal
+credentials workflow, never these requests or chat.
+
 ### `unclaimed-channel`
 
 - **State:** the persona is `up`; this is about a message, not the persona.
@@ -877,7 +1074,7 @@ retain their existing text excerpts; receipt confirmation has its own line.
     confirmed (see [Confirming a pending change](#confirming-a-pending-change))
     it applies in place, with no restart, and the persona keeps its instance
     and conversation.
-  - In open mode too, explicitly assign a non-off shared channel choice in `config.json` and confirm it. Selecting open mode alone does not create a choice. Only public or private channels that are not externally shared can be served in open mode.
+  - In open mode too, explicitly assign a non-off shared channel choice in `config.json` and confirm it. Selecting open mode alone does not create a choice. Only public or private channels that are not externally shared can be served in open mode. A newly verified join without a choice creates `mentions`; an existing `off` choice stays off. Listening requires current eligible membership.
   - Remove the app from the channel.
 
   These channel choices are never for a group DM: a group DM is never served in either mode. If the ID is a group DM (someone @mentioned the persona in
@@ -960,6 +1157,8 @@ retain their existing text excerpts; receipt confirmation has its own line.
   - goes only to `server.log`, and carries no message text, user ID or
     token.
 
+  Hearing this event alone proves no current membership; check
+  [membership readiness](#membership-setup-record-and-readback) for holds.
   The delivery shown is the one in force at that first event; a later
   change to it logs no second line of this class (a change made with
   `set_channel_delivery` logs a
@@ -978,7 +1177,7 @@ retain their existing text excerpts; receipt confirmation has its own line.
   delivery shown is `mentions`, whatever the persona chose for the channel,
   when the channel is another persona's open destination (its
   `permission_prompts` channel), so two personas can't answer each
-  other in a loop. An unassigned channel defaults to `off`; an unreadable authority has no fallback choice (see [`channel-delivery-unreadable`](#channel-delivery-unreadable)). A persona
+  other in a loop. A newly verified join without a choice uses `mentions` in open mode; duplicate joins preserve explicit choices, including `off`. Without such a join or an assignment, delivery is `off`; an unreadable authority has no fallback choice (see [`channel-delivery-unreadable`](#channel-delivery-unreadable)). A persona
   that hears a channel but doesn't answer there is covered under
   [A persona is silent in a channel its app was invited to](#a-persona-is-silent-in-a-channel-its-app-was-invited-to).
 - **Two personas at `all` in one channel:** don't. Each receives every
@@ -998,8 +1197,8 @@ retain their existing text excerpts; receipt confirmation has its own line.
 - **Meaning:** The persona's agent called `set_channel_delivery` and the
   server stored its choice for that channel. The line:
   - is logged once for each accepted call, including one that stores the
-    value already stored, and including in dry run, where the tool stores
-    its choice the same way and makes no Slack call;
+    value already stored, after current eligible membership is rechecked.
+    Dry run supplies no current membership and cannot store a new choice;
   - is logged only in open mode (`channel_mode` is `"open"`):
     in strict mode every call is refused;
   - goes only to `server.log`, in the `[slack]` stream: no
@@ -1073,10 +1272,12 @@ retain their existing text excerpts; receipt confirmation has its own line.
   `Tool "set_channel_delivery" failed for persona "<name>" (key=<key>): the choice was not stored (the store refused its <field>), so channel delivery is unchanged.`
   This is not one of the refusals above, which the server checks before the
   store. Nothing is stored or written, and no line is logged. `<field>` is
-  `key`, `channel`, `delivery`, `declaration` or `set_at`. The refusals above
-  screen the first four, so in practice it is `set_at`: the host's clock gave
-  no valid time to store with the choice. Fix: have the operator check the
-  host's system clock, then ask the persona to set the value again.
+  `key`, `channel`, `delivery`, `declaration`, `set_at` or `membership`.
+  A `membership` refusal means current eligible membership could not be
+  verified when the choice was to be stored; hearing or listing the channel,
+  or holding a saved choice, is insufficient. Follow
+  [membership recovery](#channel-membership-inventory-incomplete), read back
+  the current inventory, and retry only after eligible membership is verified.
 
 ### `persona-destination-failed`
 
@@ -1280,9 +1481,11 @@ needed.
 ### Recovering a persona broken by its credentials
 
 A persona that is `broken` (`persona-credentials-missing`, `-unreadable`,
-`-invalid` or `-refused`) comes up again through a confirmed change to its
-credentials file, with no restart. This holds whether it broke at a start, when
-a confirmed change added it, or while it was running.
+`-invalid` or `-refused`) can come up through a confirmed change to its
+credentials file, with no restart. This applies at start, addition or runtime.
+For a membership-origin refusal repaired on Slack's side, first use
+[the idle recovery path](#fixed-on-slacks-side-same-tokens); it needs no file
+byte change. Invalid/revoked credentials remain held while validation fails.
 
 1. Have the operator correct the file: create it, fix its permissions, rewrite
    it in the required shape (see
@@ -1309,14 +1512,17 @@ file, but it cuts off every persona and isn't the fix.
 
 ### Fixed on Slack's side, same tokens
 
-A persona refused by Slack (`persona-credentials-refused`) whose app was then
-repaired in Slack (re-installed to the workspace, or re-enabled) with the same
-tokens stays `broken`. Nothing is pending, because the file didn't change, and
-a persona broken by its credentials recovers only through a confirmed change
-to its credentials file.
+A **membership-origin** refusal can recover after the app's access is repaired
+in Slack, using the already applied tokens. The existing credential/client
+owner revalidates the current authenticated installation and all admission
+checks while idle, within [Membership recovery bounds](#membership-recovery-bounds).
+Read inventory status and its next attempt; no re-save, message or restart is
+required. Pending credential-file bytes are not adopted, and invalid/revoked
+tokens remain held while validation fails.
 
-**Fix:** have the operator re-save the credentials file with any byte change
-that keeps it valid; for example, re-save with a trailing newline, then confirm.
+**Other credential refusals** retain confirmed-change recovery. If nothing is
+pending after a Slack-side fix, have the operator re-save the credentials file
+with a byte change that keeps it valid, for example a trailing newline, then confirm.
 A newline after the closing `}` is enough; a newline inside a token's string
 makes the file invalid. Then wait for `config.json.pending` and confirm it as in
 [Recovering a persona broken by its credentials](#recovering-a-persona-broken-by-its-credentials).
@@ -1399,8 +1605,11 @@ Slack accepts the token: `persona-credentials-refused` is Slack's answer.
 
 ## A persona is silent in a channel its app was invited to
 
-The persona's Slack app is a member of a channel, but a message there gets no
-answer. An invite alone creates no listening choice; check the shared assignment as well as membership. Work it out from two things.
+The persona was invited to a channel, but a message there gets no answer.
+A newly verified member without a choice starts `off` in strict or `mentions`
+in open, using the mode at application. Existing choices, especially `off`,
+survive duplicate joins; an invitation or a received message alone supplies no
+current evidence. Check the mode, applied choice and membership readiness.
 
 **1. The mode in force.** The running server runs its last-applied record, so
 read the switch there (the record holds no token):
@@ -1427,8 +1636,15 @@ persona heard in its current life) and for the drop line, if any, logged at
 the time of the silent message. A `[slack] RAW message event persona=<key>: …`
 line shows that the message's event reached the persona's app at all.
 
+Read [membership readiness](#membership-setup-record-and-readback) too. Current
+inventory can be incomplete while independent valid positives progress;
+setup can be unknown while current membership is trustworthy. Historical
+membership or an old setup record does not establish either current state.
+
 | Cause | Sign in the log | Fix |
 |---|---|---|
+| **Current membership is held** | `channel-membership-unresolved`, `channel-membership-storage-failed` or `channel-membership-inventory-incomplete`. | Follow the named cause and next retry in [membership diagnostics](#channel-membership-unresolved); partial scans cannot prove absence. Accepted work stays queued and unaffected positives progress. |
+| **The applied choice is `off`** | The shared applied choice is `off`, including a strict-mode join default or an explicit opt-out. | Confirm a non-off choice if listening is wanted. A duplicate join or mode switch preserves `off`. |
 | **Strict mode** | The strict [`unclaimed-channel`](#unclaimed-channel) line (`… not delivered: no applied persona lists this channel`). No line at all when another applied persona lists the channel: that persona receives it. A `not-mentioned` plain line when this persona lists it at `delivery: mentions`. | List the channel in this persona’s `channels` with a non-off `delivery` and confirm the change (see the Fix under [`unclaimed-channel`](#unclaimed-channel)). |
 | **An externally shared channel** (open mode) | The open [`unclaimed-channel`](#unclaimed-channel) line with the reason `the channel is externally shared`, and no `persona-invited-channel` line. The other four reasons of that line are covered there too. | Open mode never serves it. Serve it in strict mode, with the channel listed. |
 | **A group DM** | In both modes, a plain `[slack] persona "<name>" (key=<key>) dropped message from channel=<id> …: group-dm` line. An @mention there logs `unclaimed-channel` in strict mode and no line of its own in open mode. | None: a group DM is never served, in either mode (see **Group DMs** under [`persona-dm-dropped`](#persona-dm-dropped)). Use a channel, or a DM with the persona. |
@@ -6564,6 +6780,10 @@ See [A persona is silent in a channel its app was invited to](#a-persona-is-sile
 ### Symptom: A persona is silent in a channel it was invited to
 
 See [A persona is silent in a channel its app was invited to](#a-persona-is-silent-in-a-channel-its-app-was-invited-to).
+
+### Symptom: Membership inventory or app setup is unresolved
+
+Read [membership readiness](#membership-setup-record-and-readback) to separate inventory completeness from current-app subscription/reinstall evidence. Follow the named access/storage cause and [recovery bounds](#membership-recovery-bounds); retain unprovable history as [`channel-membership-unresolved`](#channel-membership-unresolved) describes.
 
 ### Symptom: A persona receives every message in a channel
 

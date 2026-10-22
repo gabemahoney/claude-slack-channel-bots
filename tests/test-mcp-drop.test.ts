@@ -14,6 +14,7 @@ import {
 import { _buildRestartDisconnectedPersona, startSseKeepAlive, stopAllKeepAliveTimers, stopSseKeepAlive } from '../src/server.ts'
 import { handleTestMcpDrop, TEST_MCP_DROP_ROUTE, TEST_MCP_DROP_START_LINE, testMcpDropLine, type TestMcpDropDeps } from '../src/test-mcp-drop.ts'
 import { INTERJECT_BODY_CAP_BYTES } from '../src/interject.ts'
+import { MEMBERSHIP_READINESS_ROUTE } from '../src/channel-membership-readiness.ts'
 import { assertNoLeak, BOT_TOKEN_PREFIX, fakeToken, sentinelInMessage } from './test-helpers/credentials.ts'
 import { runInFakeHome } from './test-helpers/fake-home-subprocess.ts'
 import { makeMultiPersonaConfig, makePersonaConfigInput, writeConfigFile } from './test-helpers/persona-config.ts'
@@ -158,7 +159,7 @@ function listener(start: PersonaConfig) {
     };
   `, {
     start, console: { error: (line: string) => logs.push(line) },
-    TEST_MCP_DROP_ROUTE, TEST_MCP_DROP_START_LINE, handleTestMcpDrop,
+    TEST_MCP_DROP_ROUTE, TEST_MCP_DROP_START_LINE, handleTestMcpDrop, MEMBERSHIP_READINESS_ROUTE,
     getSessionByPersona, resolveTransportForRequest,
     isHttpVerbose: () => false, CLEAR_LATCH_ROUTE: '/clear-latch',
     unregisterByMcpSessionId, restartDisconnectedPersona: () => {},

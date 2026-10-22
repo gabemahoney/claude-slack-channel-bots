@@ -199,6 +199,15 @@ export function validationWebClientOptions(slackApiUrl?: string): WebClientOptio
   return { ...validationRequestLimits(slackApiUrl), logger: redactingSlackLogger() }
 }
 
+/** Only discovery/revalidation requests: no SDK retry queue, and abortable
+ * even while a request is queued or DNS/TCP connection establishment stalls. */
+export function membershipWebClientOptions(signal: AbortSignal, slackApiUrl?: string): WebClientOptions {
+  return {
+    ...validationWebClientOptions(slackApiUrl),
+    requestInterceptor: request => { request.signal = signal; return request },
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Library loggers
 // ---------------------------------------------------------------------------
@@ -427,6 +436,7 @@ export interface PersonaSocketClient {
  */
 export interface PersonaValidationClient {
   auth: { test(): Promise<unknown> }
+  bots?: { info(args: { bot: string; team_id?: string }): Promise<unknown> }
 }
 
 // ---------------------------------------------------------------------------

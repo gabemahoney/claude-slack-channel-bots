@@ -36,7 +36,10 @@ Normal for a short time after every launch: the server waits it out and never la
 Check that its Slack app is invited to the channel, that the channel is listed in `channels` with the `delivery` you want (strict mode) or that its channel delivery there is the one you want (open mode), that the edit is confirmed, and for DMs that `dm.enabled` is `true`. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-doesnt-receive-messages-in-a-channel-or-dm).
 
 **A persona is silent in a channel it was invited to**
-An invite alone creates no listening choice in either mode, and never a Slack Connect channel or a group DM. An edit that adds a mention, or a message posted before the invite, delivers nothing; the `unclaimed-channel` and `persona-invited-channel` lines in `server.log` show which case applies. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-is-silent-in-a-channel-it-was-invited-to).
+A newly verified join without a choice starts `off` in strict or `mentions` in open; duplicate joins preserve choices. Check current membership, the applied choice and channel restrictions; an invitation alone proves no current evidence. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-is-silent-in-a-channel-it-was-invited-to).
+
+**Membership inventory or app setup is unresolved**
+Read inventory completeness separately from current-app subscription/reinstall evidence; restore the named access/storage cause and follow the bounded idle retry, keeping unprovable history held. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-membership-inventory-or-app-setup-is-unresolved).
 
 **A persona receives every message in a channel**
 In open mode its agent stored `all` there (a `persona-channel-delivery-set` line): ask it to switch back to `mentions`, remove its app from the channel. A mode switch preserves the shared choice. In strict mode, change the channel's `delivery` to `mentions` and confirm the change. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-persona-receives-every-message-in-a-channel).

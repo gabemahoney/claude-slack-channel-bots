@@ -224,6 +224,9 @@ import { resolveSlackApiUrlOverride } from './persona-slack-clients.ts'
 import { createUnhandledRejectionHandler, describeThrownValue, renderLogMessageText } from './persona-connection-errors.ts'
 import { redactSlackLogText } from './slack-log-redaction.ts'
 import { createPersonaEventRouter } from './persona-event-router.ts'
+import { createChannelMembership, type ChannelMembership } from './channel-membership.ts'
+import { createMembershipScanner, membershipConnectionListener, type MembershipScanner } from './channel-membership-scan.ts'
+import { createMembershipReadiness, handleMembershipReadiness, MEMBERSHIP_READINESS_ROUTE, type MembershipReadiness } from './channel-membership-readiness.ts'
 import {
   composePersonaStatusListeners,
   createPersonaClientLookup,
@@ -477,6 +480,9 @@ export function stopAllKeepAliveTimers(): void {
 // ---------------------------------------------------------------------------
 
 let connections: PersonaConnectionManager | undefined
+let channelMembership: ChannelMembership | undefined
+let membershipScanner: MembershipScanner | undefined
+let membershipReadiness: MembershipReadiness | undefined
 
 /**
  * The per-persona bring-up outcomes and retries; built in main(), told of
@@ -1137,6 +1143,11 @@ export const deliveryQueueEvents = { emit: (event: QueueEvent): void => { if (de
 /** engine binds this hook after startup; until then queued work waits. */
 export const deliveryQueueWake = { wake: (_key: string): void => {} }
 const personaRouting = createPersonaRouting({
+  membership: {
+    read: (key, channel, mode) => channelMembership?.read(key, channel, mode) ?? { kind: 'unresolved', reason: 'current-membership-missing' },
+    hasUnresolved: (key, channel) => channelMembership?.hasUnresolved(key, channel) ?? false,
+    request: key => channelMembership?.request(key),
+  },
   getPersonaConfig: () => personaConfig,
   getBotIdentity: identityFor,
   queue: {
@@ -1354,6 +1365,9 @@ let cronScheduler: CronScheduler | null = null
 async function shutdown(reason: string, exitCode = 0): Promise<void> {
   if (shuttingDown) return
   shuttingDown = true
+  membershipScanner?.close()
+  channelMembership?.close()
+  membershipReadiness?.close()
   stopPermissionPoller()
   stopHealthCheck()
   // The runtime version re-check: its timers are cleared and
@@ -2891,7 +2905,12 @@ export async function main(): Promise<void> {
   // Every consumer shares the authority already recovered by the reload controller.
   // This adapter creates no store and performs no I/O.
 
-  channelDeliveryStore = createChannelDeliveryStore(reload.sharedChannels()!)
+  channelMembership = createChannelMembership({
+    authority: reload.sharedChannels()!, dryRun: isDryRun(),
+    log: line => console.error(line), requestReconciliation: key => membershipScanner?.request(key),
+  })
+  channelDeliveryStore = createChannelDeliveryStore(reload.sharedChannels()!, (key, channel) =>
+    !isDryRun() && !shuttingDown && isPersonaUp(key) && channelMembership?.read(key, channel, 'open').kind === 'eligible')
 
   // agent-director's timing settings. Read once here, after
   // the startup gate has passed and the start has resolved its configuration,
@@ -3505,9 +3524,11 @@ export async function main(): Promise<void> {
   // logged once), any other value ignored with one warning. Unset, the clients use the library
   // default. Never set on an operator's host.
   const slackApiUrl = resolveSlackApiUrlOverride(process.env, (line) => console.error(line))
+  let membershipStatus: ReturnType<typeof membershipConnectionListener> | undefined
   const manager = createPersonaConnectionManager({
     onEvent: createPersonaEventRouter({
       routing: personaRouting,
+      membership: channelMembership,
       clientFor,
       getPersona: getAppliedPersona,
       log: (line) => console.error(line),
@@ -3515,11 +3536,14 @@ export async function main(): Promise<void> {
     log: (line) => console.error(line),
     dryRun: isDryRun(),
     slackApiUrl,
+    incarnationFor: key => channelDeliveryStore?.authority.incarnation(key),
+    canRevalidateMembership: key => !shuttingDown && channelDeliveryStore?.isRetiring(key) === false && bringUps?.canRevalidateMembership(key) === true,
     // a running persona whose Web API call is refused for its bot
     // token is marked credentials-broken at once; only the network close of
     // its detached socket goes through the per-persona serializer.
     serialize: personaLifecycle.run,
     onStatus: composePersonaStatusListeners(
+      (key, status) => { membershipStatus?.(key, status); membershipReadiness?.report(key) },
       createPersonaUpFlushListener(personaNotifier),
       (key, status) => bringUps?.onConnectionStatus(key, status),
       // Apply recovery precedes teardown/bring-up. Restore retained feedback
@@ -3528,6 +3552,16 @@ export async function main(): Promise<void> {
     ),
   })
   connections = manager
+  membershipScanner = createMembershipScanner({
+    authority: reload.sharedChannels()!, membership: channelMembership,
+    connections: manager, dryRun: isDryRun(), log: line => console.error(line),
+  })
+  membershipStatus = membershipConnectionListener(channelMembership, membershipScanner, manager, isDryRun())
+  membershipReadiness = createMembershipReadiness({
+    authority: reload.sharedChannels()!, provenance: key => manager.provenance(key),
+    inventory: key => membershipScanner!.status(key), dryRun: isDryRun(),
+    isRetiring: key => shuttingDown || channelDeliveryStore!.isRetiring(key), log: line => console.error(line),
+  })
 
   // each persona's bring-up outcome (up, broken or
   // retrying) and its retries on its own timers. A persona that reaches up
@@ -3575,7 +3609,7 @@ export async function main(): Promise<void> {
     isShuttingDown: () => shuttingDown,
     log: (line) => console.error(line),
     whenLaunchSettled,
-    stopDelivery: async (key) => { const stopping = deliveryEngines?.forget(key); deliveryLifecycle?.forget(key); const remindersStopping = replyReminders?.forget(key); await Promise.all([stopping, remindersStopping]) },
+    stopDelivery: async (key) => { membershipScanner?.stop(key); membershipReadiness?.forget(key); const stopping = deliveryEngines?.forget(key); deliveryLifecycle?.forget(key); const remindersStopping = replyReminders?.forget(key); await Promise.all([stopping, remindersStopping]) },
     stopLiveRowSequence: (key) => stopLiveRowSequence(key, LIVE_ROW_STOP_TEARDOWN),
     // a teardown cancels a launch's wait for a `working` row rather
     // than wait it out (up to 10 min).
@@ -3727,6 +3761,12 @@ export async function main(): Promise<void> {
         return handleClearLatch(req, server.requestIP(req)?.address, {
           getPersonaConfig: () => personaConfig,
           clearByHand,
+        })
+      }
+
+      if (url.pathname === MEMBERSHIP_READINESS_ROUTE) {
+        return handleMembershipReadiness(req, server.requestIP(req)?.address, {
+          getPersonaConfig: () => personaConfig, readiness: membershipReadiness!,
         })
       }
 

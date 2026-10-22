@@ -57,6 +57,7 @@ import {
 import { UNCLAIMED_CHANNEL } from '../src/persona-diagnostics.ts'
 import { FUNGIBLE_DESTINATION_SETTING } from '../src/persona-destination.ts'
 import { MODE_SWITCH_SETTING } from '../src/reload-plan.ts'
+import { MEMBERSHIP_REQUIRED_SUBSCRIPTIONS } from '../src/channel-membership-readiness.ts'
 import { flat, headingAnchors, headings, requiredSection, sectionRange, splitFences } from './test-helpers/markdown.ts'
 
 const REPO_ROOT = resolve(import.meta.dirname, '..')
@@ -136,6 +137,12 @@ describe('setup wizard: the per-persona step covers each item', () => {
 // Current configuration has one shared list and one required destination.
 const modeStep = (doc: string) => requiredSection(doc, titled(3, 'Channel mode'), SKILL_FILE)
 const personaStep = (doc: string, title: string) => requiredSection(requiredSection(doc, titled(3, 'Add a persona'), SKILL_FILE), titled(4, title), SKILL_FILE)
+test('membership setup: the Slack app step checks both subscriptions for existing apps as well as new manifest installs', () => {
+  const app = flat(personaStep(skill, 'Slack app'))
+  expect(MEMBERSHIP_REQUIRED_SUBSCRIPTIONS.filter(event => !app.includes(event))).toEqual([])
+  expect(app).toMatch(/existing app/i)
+  expect(app).toMatch(/re-?install/i)
+})
 const modeRequirements: Array<[string, RegExp]> = [
   ['the setting name', /`channel_mode`/],
   ...CHANNEL_MODES.map(mode => [`mode ${mode}`, new RegExp('`' + mode + '`')] as [string, RegExp]),

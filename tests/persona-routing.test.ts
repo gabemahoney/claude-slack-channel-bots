@@ -7,12 +7,13 @@ import type { WebClient } from '@slack/web-api'
 import { createPersonaRouting } from '../src/persona-routing.ts'
 import { buildTagParts, NAME_LOOKUP_TIMEOUT_MS } from '../src/tag-wrapper.ts'
 import { createDeliveryPreparation } from '../src/delivery-intake.ts'
+import type { AcceptedRecord } from '../src/delivery-queue.ts'
 import { sanitizeFilename } from '../src/lib.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
 import { makeRoutingHarness, resetRoutingState, NEVER_FIRE_RESTART_DELAY_S, type RoutingHarness } from './test-helpers/persona-routing-harness.ts'
 import { makeAppMention, makeChannelMessage, makeDm, makeBotMessage, makeWebhookPost, makeStubSlack, mentionText, ENVELOPE_FLAG_FORMS, type SlackEvent } from './test-helpers/slack-stub.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
-import { readQueue, seedQueue, slackInput } from './test-helpers/delivery-queue.ts'
+import { readQueue, seedQueue, slackInput, queuePath } from './test-helpers/delivery-queue.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { makeQueue } from './test-helpers/delivery-queue.ts'
 import { isRestartPendingOrActive } from '../src/restart.ts'
@@ -234,11 +235,37 @@ test('channel caches are persona scoped, slow preparation leaves unrelated work 
   } finally { expect(fake.pendingCount()).toBe(0) }
 })
 
-test('ordinary decision failure still acks while storing nothing for either persona', async () => {
-  const queue = await makeQueue(dir)
+test('decision failure withholds ack until replay can durably retain both recipients', async () => {
+  const clock = createFakeClock({ start: 1700000000000 })
+  const queue = await makeQueue(dir, { now: clock.now })
+  const config = makeMultiPersonaConfig([{ name: 'alpha', channels: [{ id: CA, delivery: 'all' }] }, { name: 'beta', channels: [{ id: CA, delivery: 'all' }] }], dir)
   let acknowledgments = 0
-  const routing = createPersonaRouting({ queue, prepare: async () => {}, getPersonaConfig: () => makeMultiPersonaConfig([{ name: 'alpha' }, { name: 'beta' }], dir), getBotIdentity: () => { throw new Error('identity unavailable') }, archive: () => {}, log: () => {} })
-  try { await routing.receive(makeChannelMessage(), () => { acknowledgments++ }, ['alpha', 'beta']); expect(acknowledgments).toBe(1); expect(queue.items('alpha')).toEqual([]); expect(queue.items('beta')).toEqual([]) } finally { await queue.stop() }
+  let identityAvailable = false
+  const routing = createPersonaRouting({ queue, now: clock.now, prepare: async () => {}, getPersonaConfig: () => config, getBotIdentity: () => { if (!identityAvailable) throw new Error('identity unavailable'); return { botUserId: 'U0BOT001', botId: 'B0BOT001' } }, archive: () => {}, log: () => {} })
+  try {
+    const keys = ['alpha', 'beta'], text = '  > "quoted"\r\n\t repeated  repeated\n\n  ', ts = '1700000000.000001'
+    const event = makeChannelMessage({ channel: CA, user: 'U0SENDER1', ts, text })
+    const expected: AcceptedRecord = { v: 1, kind: 'accepted', seq: 1, source: 'slack', channel: CA, channel_type: 'channel',
+      key: { chat_id: CA, ts }, ts, user: 'U0SENDER1', text, via: 'receive_all_shared',
+      received_at: clock.now(), queued_ack_reaction: config.queued_ack_reaction }
+    const atAck: Array<Array<{ persona: string; records: ReturnType<typeof readQueue> }>> = []
+    const ack = () => { atAck.push(keys.map(persona => ({ persona, records: readQueue(dir, persona) }))); acknowledgments++ }
+    await routing.receive(event, ack, keys)
+    expect(acknowledgments).toBe(0); expect(queue.items('alpha')).toEqual([]); expect(queue.items('beta')).toEqual([])
+    expect(atAck).toEqual([])
+    identityAvailable = true
+    await routing.receive(event, ack, keys)
+    expect(acknowledgments).toBe(1)
+    const durable = keys.map(persona => ({ persona, records: [expected] }))
+    expect(atAck).toEqual([durable])
+    for (const key of keys) expect(queue.items(key).map(item => item.accepted)).toEqual([expected])
+    const retained = keys.map(key => ({ items: structuredClone(queue.items(key)), bytes: readFileSync(queuePath(dir, key), 'utf8') }))
+    await clock.advance(1)
+    await routing.receive(event, ack, keys)
+    expect(acknowledgments).toBe(2)
+    expect(atAck).toEqual([durable, durable])
+    expect(keys.map(key => ({ items: queue.items(key), bytes: readFileSync(queuePath(dir, key), 'utf8') }))).toEqual(retained)
+  } finally { await queue.stop() }
 })
 
 

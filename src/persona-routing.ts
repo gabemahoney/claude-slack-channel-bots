@@ -8,6 +8,8 @@ import {
   type PersonaConfig,
 } from './config.ts'
 import type { SlackBotIdentity } from './persona-slack-validation.ts'
+import type { ChannelMembership } from './channel-membership.ts'
+import type { PersonaEventProvenance } from './persona-connections.ts'
 import {
   decideDelivery,
   type DeliveryDecision,
@@ -71,6 +73,7 @@ export type PersonaRoutingConfig = Pick<PersonaConfig, 'personas' | 'session_res
 
 /** Dependencies injected into `createPersonaRouting`. */
 export interface PersonaRoutingDeps {
+  membership?: Pick<ChannelMembership, 'read' | 'hasUnresolved' | 'request'>
   /** The applied persona config, read at call time; null or undefined when there is none. */
   getPersonaConfig(): PersonaRoutingConfig | null | undefined
   /**
@@ -220,6 +223,7 @@ export interface PersonaRouting {
     ack: SlackAck,
     personaKeys: string | readonly string[],
     isExtSharedChannel?: unknown,
+    provenance?: PersonaEventProvenance,
   ): Promise<void>
   /**
    * Forget ephemeral heard-channel state on teardown. Durable queue records
@@ -254,7 +258,11 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
     ack: SlackAck,
     personaKeys: string | readonly string[],
     isExtSharedChannel?: unknown,
+    provenance?: PersonaEventProvenance,
   ): Promise<void> {
+    if (provenance?.candidate) { deps.membership?.request(provenance.key); return }
+    if (provenance?.applied && !provenance.isCurrent()) { await ack(); return }
+    if (provenance && !provenance.applied) return
     const afterAck: Array<() => Promise<void>> = []
     const accepted: Array<() => void> = []
     let storeFailed = false
@@ -293,16 +301,29 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
               report(duplicate.item)
               afterAck.push(post(duplicate.item))
             }
+            if (slackKey && deps.membership?.hasUnresolved(key, slackKey.chat_id)) {
+              storeFailed = true
+              deps.membership.request(key)
+            }
             return
           }
           if (!config || !persona) return
           if (deps.getChannelDelivery?.()?.readable === false) { storeFailed = true; return }
-          const identity = deps.getBotIdentity(key)
+          const identity = provenance?.key === key ? provenance.identity : deps.getBotIdentity(key)
           const decision = decideDelivery(ev, { key, botUserId: identity?.botUserId, botId: identity?.botId, channels: persona.channels, dmEnabled: persona.dm.enabled }, config.personas, fungibleInputs(config, mode, isExtSharedChannel))
           const path = fungiblePathOf(decision)
           if (path !== undefined) logFirstHeard(persona, String(ev['channel']), path)
           if (decision.action === 'drop') { logDrop(persona, ev, decision); return }
           if (!slackKey) return
+          if (decision.via !== 'dm' && deps.membership) {
+            const membership = deps.membership.read(key, slackKey.chat_id, mode)
+            if (membership.kind === 'ineligible') return
+            if (membership.kind === 'unresolved' || deps.isPersonaUp?.(key) === false || (provenance && !provenance.isCurrent())) {
+              storeFailed = true
+              deps.membership.request(key)
+              return
+            }
+          }
           const stringField = (field: string) => typeof ev[field] === 'string' ? ev[field] as string : undefined
           const profile = ev['bot_profile']
           const files = Array.isArray(ev['files']) ? ev['files'].filter(f => typeof f === 'object' && f !== null).map(f => ({
@@ -324,7 +345,8 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
             if (result.item && !result.item.delivered) { report(result.item); afterAck.push(post(result.item)) }
           } catch { storeFailed = true }
         } catch (err) {
-          // Decision/routing failures keep the historical ack behavior.
+          // A failed selection is undecidable, never permission to discard.
+          storeFailed = true
           deps.log(`[slack] persona-routing: error handling event for persona ${refForKey(key)}${describeSlackCallFailure(err)}`)
         }
       }))

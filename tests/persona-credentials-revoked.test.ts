@@ -48,6 +48,7 @@ import { resetRoutingState } from './test-helpers/persona-routing-harness.ts'
 import { makeManagedRouting } from './test-helpers/persona-routing-managed.ts'
 import { makeChannelMessage, type StubSlack } from './test-helpers/slack-stub.ts'
 import { makeReloadHarness, type ReloadHarness, type ReloadRun } from './test-helpers/reload-harness.ts'
+import { membershipPage } from './test-helpers/shared-channels.ts'
 
 let h: ReloadHarness
 /** The server lines the tool handlers write to `console.error` (a failed tool call's line), for `assertNoLeak`. */
@@ -98,6 +99,9 @@ async function running(): Promise<Running> {
   h.writeRecord({ personas: [alpha, bravo] })
   h.writeConfig({ personas: [alpha, bravo] })
   const run = await h.startDetecting({ realLifecycle: true })
+  for (const persona of [alpha, bravo]) run.stub(persona.name).script.inventory.push(membershipPage([channelOf(persona)]))
+  await run.membershipClock.runNext()
+  for (const persona of [alpha, bravo]) expect(run.membershipScanner.status(h.key(persona.name)).state).toBe('complete')
   await run.ticks.tick()
   expect(h.pendingExists()).toBe(false)
   expect([run.isUp('alpha'), run.isUp('bravo')]).toEqual([true, true])
@@ -169,8 +173,10 @@ async function revokeThroughReact(run: ReloadRun, alpha: PersonaInput): Promise<
  * applies it. Returns the new credential set's stub.
  */
 async function recover(run: ReloadRun, alpha: PersonaInput): Promise<StubSlack> {
-  const { label } = h.rotateCredentials(alpha)
+  const { label } = h.rotateCredentials(alpha, { slack: { appId: 'A0RECOVER', inventory: [membershipPage([channelOf(alpha)])] } })
   await (await run.confirmPending()).applying
+  await run.membershipClock.runNext()
+  expect(run.membershipScanner.status(h.key(alpha.name)).state).toBe('complete')
   return run.credentialsStub('alpha', label)
 }
 
@@ -300,7 +306,7 @@ describe('recovery through the confirmed credentials change', () => {
     const bravoSockets = run.stub('bravo').sockets.length
 
     // The operator places a working file: previewed on the next tick, nothing applied.
-    const { label } = h.rotateCredentials(alpha)
+    const { label } = h.rotateCredentials(alpha, { slack: { appId: 'A0RECOVER', inventory: [membershipPage([channelOf(alpha)])] } })
     const newStub = run.credentialsStub('alpha', label)
     const cp = run.checkpoint()
     await run.ticks.tick()
@@ -336,6 +342,8 @@ describe('recovery through the confirmed credentials change', () => {
     // session-manager.test.ts's collision ladder).
     expect(stubCallCount(run.composition!.agentDirector)).toBe(0)
     expect(run.admitSession('alpha')).toMatchObject({ kind: 'admitted' })
+    await run.membershipClock.runNext()
+    expect(run.membershipScanner.status(a.key).state).toBe('complete')
 
     // A serves again under its new identity only: an event reaches its session, its tool call posts on the new client.
     const text = 'to alpha after the recovery'

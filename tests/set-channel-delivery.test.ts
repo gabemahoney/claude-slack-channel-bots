@@ -1,3 +1,4 @@
+import { membershipPage } from './test-helpers/shared-channels.ts'
 /** Tool guards and writes share the recovered authority; no separate delivery file exists. */
 import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test'
 import { existsSync, readFileSync } from 'node:fs'
@@ -17,11 +18,16 @@ afterEach(async () => {
   try { for (const r of h.runs) { assertNoLeak(r.captured({ lines, outputs })); expect(r.slackPosts()).toEqual([]) } }
   finally { await h.cleanup(); consoleSpy.mockRestore() }
 })
-async function start(channel_mode: 'strict' | 'open' = 'open') {
+async function start(channel_mode: 'strict' | 'open' = 'open', discover = true) {
   const alpha = h.persona('alpha'); const beta = h.persona('beta'); h.materialize(alpha, beta)
   h.writeConfig({ channel_mode, personas: [alpha, beta] })
   run = await h.startDetecting({ realLifecycle: true })
   expect(run.outcome!.kind).toBe('applied')
+  if (discover) {
+    for (const p of [alpha, beta]) run.stub(p.name).script.inventory.push(membershipPage(p.channels!.map(c => c.id)))
+    await run.membershipClock.runNext()
+    for (const p of [alpha, beta]) expect(run.membershipScanner.status(h.key(p.name)).state).toBe('complete')
+  }
   run.registerSession('alpha'); run.registerSession('beta')
   return { alpha, beta, authority: run.controller.sharedChannels()! }
 }
@@ -39,7 +45,7 @@ async function call(args: Record<string, unknown>, name = 'alpha', session?: Par
   }
  })
  test('strict mode refuses before value/channel parsing and changes no durable state', async () => {
-  const { alpha, authority } = await start('strict')
+  const { alpha, authority } = await start('strict', false)
   const before = readFileSync(h.paths.lastApplied)
   const result = await call({ delivery: LEAK_SENTINEL, channel: LEAK_SENTINEL })
   expect(result).toEqual({ isError: true, text: channelDeliveryDeclarativeRefusal(alpha.name, h.key(alpha.name)) })
@@ -95,3 +101,59 @@ async function call(args: Record<string, unknown>, name = 'alpha', session?: Par
   expect(authority.revision).toBe(revision)
   expect(authority.incarnation(h.key('alpha'))).toBeUndefined()
  })
+
+test('real MCP and routed traffic refuse unverified/absent membership; authenticated discovery alone enables a fresh assignment', async () => {
+  const { alpha, authority } = await start('open', false)
+  const channel = alpha.channels![0]!.id
+  const before = authority.snapshot()
+  expect((await call({ channel, delivery: 'off' })).isError).toBe(true)
+  const { makeChannelMessage } = await import('./test-helpers/slack-stub.ts')
+  await run.deliver('alpha', makeChannelMessage({ channel }))
+  expect(run.stub('alpha').socket.acks).toHaveLength(0)
+  expect(run.queued('alpha')).toEqual([])
+  expect(run.stub('alpha').calls.inventory).toHaveLength(0)
+  expect(authority.snapshot()).toEqual(before)
+  await run.membershipClock.runNext() // The stub's valid empty inventory establishes absence.
+  expect(run.membership.read('alpha', channel, 'open')).toEqual({ kind: 'ineligible', reason: 'absent' })
+  const absent = authority.snapshot()
+  expect((await call({ channel, delivery: 'off' })).isError).toBe(true)
+  expect(authority.snapshot()).toEqual(absent)
+  run.stub('alpha').script.inventory.push(membershipPage([channel]))
+  run.membershipScanner.request('alpha'); await run.membershipClock.runNext()
+  expect(run.membership.read('alpha', channel, 'open').kind).toBe('eligible')
+  expect((await call({ channel, delivery: 'off' })).isError).toBe(false)
+  expect(authority.choice('alpha', channel)).toBe('off')
+})
+
+test('dry restart composes the real MCP guard with persisted membership, queue and pending input but constructs no Slack work', async () => {
+  const { alpha, beta } = await start()
+  const channel = alpha.channels![0]!.id
+  const { slackInput } = await import('./test-helpers/delivery-queue.ts')
+  await run.queue.accept('alpha', slackInput({ text: '  retained\r\n\r\nbody  ', queued_ack_reaction: 'hourglass' }))
+  const accepted = structuredClone(run.queued('alpha')[0]!.accepted)
+  h.writeConfig({ channel_mode: 'open', personas: [{ ...alpha, stop_hook_bootstrap: false }, beta] })
+  await run.ticks.tick()
+  expect(h.pendingExists()).toBe(true)
+  const input = readFileSync(h.paths.config), pending = readFileSync(h.paths.pending)
+  const before = run.controller.sharedChannels()!.snapshot()
+  await run.stop()
+  for (let restart = 0; restart < 2; restart++) {
+    run = await h.start({ dryRun: true, realLifecycle: true })
+    run.registerSession('alpha')
+    expect((await call({ channel, delivery: 'all' })).isError).toBe(true)
+    await run.clock.advance(60_000); await run.membershipClock.advance(60_000)
+    expect(run.membershipClock.pendingCount()).toBe(0)
+    expect(run.slack.builds).toEqual([])
+    expect(run.clock.pendingCount()).toBe(0)
+    expect(run.membershipScanner.status('alpha').state).toBe('unverified')
+    expect(run.membership.read('alpha', channel, 'open').kind).toBe('unresolved')
+    expect(run.controller.sharedChannels()!.snapshot()).toEqual(before)
+    expect(run.queued('alpha')[0]!.accepted).toEqual({ ...accepted, attempt_high_watermark: 0 })
+    expect(readFileSync(h.paths.config)).toEqual(input)
+    expect(readFileSync(h.paths.pending)).toEqual(pending)
+    await run.stop()
+  }
+  run = await h.start({ realLifecycle: true })
+  run.stub('alpha').script.inventory.push(membershipPage([channel])); await run.membershipClock.runNext()
+  expect(run.membership.read('alpha', channel, 'open').kind).toBe('eligible')
+})

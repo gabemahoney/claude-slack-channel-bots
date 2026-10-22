@@ -5695,3 +5695,20 @@ configuration_applied_is() {
     value="$(configuration_applied_value "$1" "$2" "$3")" || return 1
     [[ "${value}" == "$4" ]]
 }
+
+# Authenticated inventory is a separate prerequisite from agent/MCP readiness.
+# Only scenarios testing the current membership feature call this helper.
+_scenario_membership_complete() {
+    require_ci_image "_scenario_membership_complete"
+    local persona="$1" route="$2"
+    curl -fsS --max-time 3 -H 'Content-Type: application/json' \
+        --data "$(jq -cn --arg persona "${persona}" '{action:"read",persona:$persona}')" \
+        "http://127.0.0.1:${SCENARIO_PORT}${route}" \
+        | jq -e '.ok == true and .view.inventory.state == "complete"' > /dev/null 2>&1
+}
+wait_membership_complete() {
+    require_ci_image "wait_membership_complete"
+    local persona="$1" route
+    route="$(bun "${SCENARIO_FIXTURES}/fmk-texts.ts" MEMBERSHIP_READINESS_ROUTE)" || fail 'cannot print membership readiness route'
+    wait_until 30 "authenticated inventory did not complete for ${persona}" _scenario_membership_complete "${persona}" "${route}"
+}

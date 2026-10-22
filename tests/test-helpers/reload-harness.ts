@@ -1,3 +1,5 @@
+import { createChannelMembership, type ChannelMembership } from '../../src/channel-membership.ts'
+import { createMembershipScanner, membershipConnectionListener, type MembershipScanner } from '../../src/channel-membership-scan.ts'
 import { createDeliveryQueue, type QueueItem, type QueueEvent } from '../../src/delivery-queue.ts'
 import { createDeliveryPreparation } from '../../src/delivery-intake.ts'
 
@@ -187,7 +189,7 @@ import {
   type CredentialsOverrides,
   type WrittenFile,
 } from './credentials.ts'
-import type { FakeClock } from './fake-clock.ts'
+import { createFakeClock, type FakeClock } from './fake-clock.ts'
 import { makeFifo as makeFifoAt, mkfifoAvailable } from './fifo.ts'
 import { makePersona } from './persona-config.ts'
 import { makeConnectionHarness, type ConnectionHarness } from './persona-connection-harness.ts'
@@ -1103,6 +1105,10 @@ export interface ReloadRun {
    * its retiring keys and unwritten drops start empty.
    */
   readonly channelDelivery: ChannelDeliveryStore
+  readonly membership: ChannelMembership
+  readonly membershipScanner: MembershipScanner
+  /** Discovery has its own injectable clock; connection retry assertions use clock. */
+  readonly membershipClock: FakeClock
   /**
    * The run's old-life hold set, read-only (`createOldLifeHoldSet`
    *), built empty at the run's start as `main()` builds its one set,
@@ -1853,7 +1859,9 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       root,
       {
         dryRun,
-        stubOptions: runOpts.slack,
+        stubOptions: Object.fromEntries([...tokensByName.keys()].map((name, i) => [name, { appId: `A0RELOAD${i}`, ...runOpts.slack?.[name] }])),
+        incarnationFor: key => controller.sharedChannels()?.incarnation(key),
+        canRevalidateMembership: key => !stopped && channelDeliveryStore?.isRetiring(key) === false && bringUps.canRevalidateMembership(key),
         tokens: Object.fromEntries(tokensByName),
         ...(serializer === undefined ? {} : { serialize: serializer.run }),
       },
@@ -2006,7 +2014,16 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     const queue = createDeliveryQueue({stateDir, now: connections.clock.now, onEvent: event => queueEvents.push(event)})
     const queueReady = queue.start()
     const preparation = createDeliveryPreparation({queue, clientFor, resolveUserName})
+    const membershipClock = createFakeClock()
+    let membership: ChannelMembership | undefined
+    let membershipScanner: MembershipScanner | undefined
+    let membershipStatus: ReturnType<typeof membershipConnectionListener> | undefined
     const coreRouting = createPersonaRouting({
+      membership: {
+        read: (key, channel, mode) => membership?.read(key, channel, mode) ?? { kind: 'unresolved', reason: 'current-membership-missing' },
+        hasUnresolved: (key, channel) => membership?.hasUnresolved(key, channel) ?? true,
+        request: key => membership?.request(key),
+      },
       getPersonaConfig: appliedConfig,
       getBotIdentity: identityFor,
       queue,
@@ -2025,8 +2042,9 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       isPersonaUp,
     })
     const routing = {...coreRouting, receive: async (...args: Parameters<typeof coreRouting.receive>) => {await queueReady; return coreRouting.receive(...args)}}
-    connections.onEvent = createPersonaEventRouter({ routing, clientFor, getPersona: getAppliedPersona, log })
+    connections.onEvent = createPersonaEventRouter({ routing, membership: { observe: (...args) => membership?.observe(...args) ?? false }, clientFor, getPersona: getAppliedPersona, log })
     connections.onStatus = composePersonaStatusListeners(
+      (key, status) => membershipStatus?.(key, status),
       createPersonaUpFlushListener(noticeStack.notifier),
       (key, status) => bringUps.onConnectionStatus(key, status),
     )
@@ -2683,7 +2701,11 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
     function loadChannelDeliveryForStart(start: PersonaConfig): void {
       const authority = controller.sharedChannels()
       if (!authority) throw new Error('reload-harness: resolved start has no shared authority')
-      channelDeliveryStore = createChannelDeliveryStore(authority)
+      membership = createChannelMembership({ authority, dryRun, log, requestReconciliation: key => membershipScanner?.request(key) })
+      membershipScanner = createMembershipScanner({ authority, membership, connections: connections.manager, clock: membershipClock, dryRun, log })
+      membershipStatus = membershipConnectionListener(membership, membershipScanner, connections.manager, dryRun)
+      channelDeliveryStore = createChannelDeliveryStore(authority, (key, channel) =>
+        !dryRun && !stopped && isPersonaUp(key) && membership?.read(key, channel, 'open').kind === 'eligible')
     }
     controller = createReloadController({
       stopDelivery: runOpts.stopDelivery ?? (async () => {}),
@@ -2878,6 +2900,9 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       writes,
       removes,
       retiredKeys,
+      membershipClock,
+      get membership() { if (!membership) throw new Error('membership not loaded'); return membership },
+      get membershipScanner() { if (!membershipScanner) throw new Error('membership scanner not loaded'); return membershipScanner },
       get channelDelivery() {
         if (channelDeliveryStore === undefined) {
           throw new Error(
@@ -3090,6 +3115,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       async stop() {
         if (stopped) return
         stopped = true
+        membershipScanner?.close()
+        membership?.close()
         await preparation.stop()
         await queue.stop()
         // The server stopped at `opts.stopBeforeWrite`: nothing it wrote after that point survives.

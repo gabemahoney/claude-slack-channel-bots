@@ -286,6 +286,7 @@ interface FlagIntakeCall {
   key: unknown
   /** The fourth argument, the envelope flag: undefined when absent. */
   flag: unknown
+  provenance: Parameters<PersonaRouting['receive']>[4]
   /** How many arguments the call had. */
   arity: number
   /** Every argument but the ack, for the no-envelope-field checks. */
@@ -298,8 +299,8 @@ function flagIntake(): Pick<PersonaRouting, 'receive'> & { calls: FlagIntakeCall
   return {
     calls,
     receive: async (...args: Parameters<PersonaRouting['receive']>) => {
-      const [event, ack, key, flag] = args
-      calls.push({ event, key, flag, arity: args.length, data: args.filter((arg) => arg !== ack) })
+      const [event, ack, key, flag, provenance] = args
+      calls.push({ event, key, flag, provenance, arity: args.length, data: args.filter((arg) => arg !== ack) })
       await ack()
     },
   }
@@ -558,7 +559,9 @@ describe('the envelope flag reaches the intake exactly as sent, and the RAW line
       expect(call!.event).toEqual(sent)
       expect(call!.key).toBe(h.A.key)
       expect(call!.flag).toBe(flag)
-      expect(call!.arity).toBeLessThanOrEqual(4)
+      expect(call!.arity).toBe(5)
+      expect(call!.provenance).toEqual({ ...h.manager.provenance(h.A.key)!, isCurrent: expect.any(Function) })
+      expect(call!.provenance?.isCurrent()).toBe(true)
       expectNoEnvelopeField(call!)
       expect(h.stub(h.A).socket.acks).toHaveLength(1)
       assertNoLeak({ logs })
@@ -832,7 +835,7 @@ describe('carry: clientFor serves A\'s long-lived client only while A is serving
     h.stub(h.A).socket.drop()
     expect(h.manager.status(h.A.key)).toEqual({ state: 'lost' })
     expect(h.clientFor(h.A.key)).toBe(a)
-    expect(h.identityFor(h.A.key)).toEqual({ botUserId: h.stub(h.A).identity.botUserId, botId: h.stub(h.A).identity.botId })
+    expect(h.identityFor(h.A.key)).toEqual({ botUserId: h.stub(h.A).identity.botUserId, botId: h.stub(h.A).identity.botId, teamId: h.stub(h.A).identity.teamId })
 
     // The hung reopen is abandoned 10 s in; the retry at +5 s fails (network).
     await h.clock.advance(10_000)
@@ -923,8 +926,8 @@ describe('carry: clientFor serves A\'s long-lived client only while A is serving
 
     const a = h.identityFor(h.A.key)
     const b = h.identityFor(h.B.key)
-    expect(a).toEqual({ botUserId: h.stub(h.A).identity.botUserId, botId: h.stub(h.A).identity.botId })
-    expect(b).toEqual({ botUserId: h.stub(h.B).identity.botUserId, botId: h.stub(h.B).identity.botId })
+    expect(a).toEqual({ botUserId: h.stub(h.A).identity.botUserId, botId: h.stub(h.A).identity.botId, teamId: h.stub(h.A).identity.teamId })
+    expect(b).toEqual({ botUserId: h.stub(h.B).identity.botUserId, botId: h.stub(h.B).identity.botId, teamId: h.stub(h.B).identity.teamId })
     expect(a!.botUserId).not.toBe(b!.botUserId)
     expect(a!.botId).not.toBe(b!.botId)
   })

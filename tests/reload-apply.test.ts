@@ -1,3 +1,4 @@
+import { membershipPage } from './test-helpers/shared-channels.ts'
 import { REPLY_TOOL_ALLOW_RULE } from '../src/agent-director-template.ts'
 import { createHash } from 'node:crypto'
 import { queuePath, readQueue, slackInput, sentRecord, deliveredRecord } from './test-helpers/delivery-queue.ts'
@@ -232,7 +233,13 @@ async function running(
   const run = await h.startDetecting(runOpts)
   await run.ticks.tick()
   expect(h.pendingExists()).toBe(false)
-  if (sessions) for (const persona of personas) run.registerSession(persona.name)
+  if (sessions) {
+    for (const persona of personas) {
+      run.registerSession(persona.name)
+      run.stub(persona.name).script.inventory.push(membershipPage(persona.channels!.map(c => c.id)))
+    }
+    await run.membershipClock.runNext()
+  }
   return { run, personas }
 }
 
@@ -1849,6 +1856,8 @@ describe('routing, posting scope and destinations follow the new values from the
     expect(allowedBefore.isError).toBe(false)
 
     await applyConfig(run, [alpha!, h.persona('bravo', { channels: [{ id: own, delivery: 'all' }, { id: EXTRA_CHANNEL, delivery: 'off' }, { id: OTHER_CHANNEL, delivery: 'all' }] })])
+    run.stub('bravo').script.inventory.push(membershipPage([own, EXTRA_CHANNEL, OTHER_CHANNEL]))
+    run.membershipScanner.request(h.key('bravo')); await run.membershipClock.runNext()
     const cp = run.checkpoint()
     const bravoCalls = run.stub('bravo').callLog.length
 
@@ -1947,7 +1956,7 @@ describe('routing, posting scope and destinations follow the new values from the
     await applyConfig(run, [personas[0]!, h.persona('bravo', after(own))])
 
     expect(await noticeCalls(run, 'bravo')).toEqual(next(own))
-    expect(run.stub('alpha').callLog.map((c) => c.method)).toEqual(['auth.test'])
+    expect(run.stub('alpha').callLog.map((c) => c.method)).toEqual(['auth.test', 'bots.info', 'users.conversations'])
     assertNoLeak(run.captured())
   })
 
@@ -1969,7 +1978,7 @@ describe('routing, posting scope and destinations follow the new values from the
     expect(run.lifecycle.keys('update-in-place')).toEqual([h.key('bravo')])
     expect(await noticeCalls(run, 'bravo')).toEqual([`conversations.open ${NEW_CONTACT}`, `chat.postMessage ${newDm}`])
     expect(await noticeCalls(run, 'bravo')).toEqual([`chat.postMessage ${newDm}`])
-    expect(run.stub('alpha').callLog.map((c) => c.method)).toEqual(['auth.test'])
+    expect(run.stub('alpha').callLog.map((c) => c.method)).toEqual(['auth.test', 'bots.info', 'users.conversations'])
     assertNoLeak(run.captured())
   })
 
@@ -1989,7 +1998,7 @@ describe('routing, posting scope and destinations follow the new values from the
     // Same contact, yet the conversation is opened again rather than taken from the cache.
     expect(await noticeCalls(run, 'bravo')).toEqual([`conversations.open ${CONTACT}`, `chat.postMessage ${dm}`])
     expect(run.lifecycle.keys('update-in-place')).toEqual(keysOf('bravo', 'bravo'))
-    expect(run.stub('alpha').callLog.map((c) => c.method)).toEqual(['auth.test'])
+    expect(run.stub('alpha').callLog.map((c) => c.method)).toEqual(['auth.test', 'bots.info'])
     assertNoLeak(run.captured())
   })
 
@@ -2247,6 +2256,9 @@ describe('a persona that is not up is still updated in place, and nothing brings
       await run.clock.runNext()
       expect(run.bringUps.state(bravoKey)?.outcome).toBe('up')
       expect(run.since(retry).lifecycle).toEqual([{ op: 'launch', key: bravoKey, via: 'retry' }])
+      // The new connection must discover its memberships before routing.
+      run.stub('bravo').script.inventory.splice(0, run.stub('bravo').script.inventory.length, membershipPage([own, EXTRA_CHANNEL]))
+      await run.membershipClock.runNext()
       // Up, it routes by the new values: its added channel is delivered.
       expect(await deliverTo(run, 'bravo', makeChannelMessage({ channel: EXTRA_CHANNEL }))).toEqual([
         { chat_id: EXTRA_CHANNEL, via: 'receive_all' },
@@ -2296,8 +2308,8 @@ describe('a persona that is not up is still updated in place, and nothing brings
 // ---------------------------------------------------------------------------
 
 /** A persona's bot identity as the manager and a stub name it. */
-function identityOf(stub: { identity: { botUserId: string; botId: string } }) {
-  return { botUserId: stub.identity.botUserId, botId: stub.identity.botId }
+function identityOf(stub: { identity: { botUserId: string; botId: string; teamId: string; appId?: string } }) {
+  return { ...stub.identity }
 }
 
 /** The start of a preview's credentials line for `persona` (its wording is `tests/reload-preview.test.ts`'s). */
@@ -2340,7 +2352,7 @@ describe('a confirmed token rotation reconnects only that persona (step 4, the c
     const activityFrom = run.socketActivity('bravo').length
     const oldAuthTests = oldStub.calls.authTest.length
 
-    const { tokens, label } = h.rotateCredentials(bravo!)
+    const { tokens, label } = h.rotateCredentials(bravo!, { slack: { appId: 'A0ROTATED' } })
     const cp = run.checkpoint()
     await (await run.confirmPending()).applying
 
@@ -2382,6 +2394,8 @@ describe('a confirmed token rotation reconnects only that persona (step 4, the c
     expect(run.isUp('bravo')).toBe(true)
     // Its next event arrives on the new connection, and the new client names the author.
     const own = ownChannel('bravo')
+    run.credentialsStub('bravo', label).script.inventory.push(membershipPage([own]))
+    await run.membershipClock.runNext()
     const usersInfoFrom = run.credentialsStub('bravo', label).calls.usersInfo.length
     await run.credentialsStub('bravo', label).socket.deliver(makeChannelMessage({ channel: own }))
     expect(deliveredSince(run, 'bravo', 0)).toEqual([{ chat_id: own, via: 'receive_all' }])
@@ -2429,7 +2443,7 @@ describe('a confirmed token rotation reconnects only that persona (step 4, the c
       expect(newCalls).toEqual([])
       expect(callsSince(run, 'bravo', oldFrom)).toEqual([`chat.postMessage ${dm}`])
     }
-    expect(run.stub('alpha').callLog.map((c) => c.method)).toEqual(['auth.test'])
+    expect(run.stub('alpha').callLog.map((c) => c.method)).toEqual(['auth.test', 'bots.info'])
     assertNoLeak(run.captured())
   })
 
@@ -2438,6 +2452,8 @@ describe('a confirmed token rotation reconnects only that persona (step 4, the c
     const [alpha, bravo] = personas
     const [bravoKey, deltaKey] = keysOf('bravo', 'delta')
     run.registerSession('alpha')
+    run.stub('alpha').script.inventory.push(membershipPage([ownChannel('alpha')]))
+    await run.membershipClock.runNext()
     const oldLabel = h.credentialsLabel('bravo')
     const oldIdentity = identityOf(run.stub('bravo'))
     const { label } = h.rotateCredentials(bravo!, { slack: { connect: [{ kind: 'open-never-answers' }] } })

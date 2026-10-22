@@ -1785,7 +1785,7 @@ describe('Slack validation classification (both legs, sentinel-bearing errors)',
     if (run.outcome.kind === 'up') {
       expect(lines).toEqual([])
       if ('identity' in run.outcome) {
-        expect(run.outcome.identity).toEqual({ botUserId: run.stub.identity.botUserId, botId: run.stub.identity.botId })
+        expect(run.outcome.identity).toEqual({ botUserId: run.stub.identity.botUserId, botId: run.stub.identity.botId, teamId: run.stub.identity.teamId })
       }
       return
     }
@@ -2348,7 +2348,7 @@ describe('connection manager: bring-up and identity', () => {
 
     for (const p of [h.a, h.b]) {
       const stub = stubOf(h, p)
-      const identity = { botUserId: stub.identity.botUserId, botId: stub.identity.botId }
+      const identity = { botUserId: stub.identity.botUserId, botId: stub.identity.botId, teamId: stub.identity.teamId }
       expect(h.manager.status(p.key)).toEqual({ state: 'up', identity })
       expect(h.manager.identity(p.key)).toEqual(identity)
       expect(h.slack.buildsOf(p.key).map(build => build.kind)).toEqual(['validation', 'web', 'socket'])
@@ -4615,7 +4615,7 @@ type ManagedWebClient = NonNullable<ReturnType<PersonaConnectionManager['webClie
 interface RotatedCredentials {
   tokens: PersonaSlackTokens
   stub: StubSlack
-  identity: { botUserId: string; botId: string }
+  identity: { botUserId: string; botId: string; teamId: string }
 }
 
 /**
@@ -4630,13 +4630,13 @@ function rotateCredentials(h: Harness, p: ManagedPersona, label = ROTATED, opts:
     fakeToken(APP_TOKEN_PREFIX, `${p.key}-${label}-app`),
   )
   const stub = h.slack.addCredentials(p.key, label, tokens, { leakMarker: LEAK_SENTINEL, teamId: 'T0ROTATED', ...opts })
-  return { tokens, stub, identity: { botUserId: stub.identity.botUserId, botId: stub.identity.botId } }
+  return { tokens, stub, identity: { botUserId: stub.identity.botUserId, botId: stub.identity.botId, teamId: stub.identity.teamId } }
 }
 
 /** The identity the persona's initial credential set's `auth.test` returns. */
-function initialIdentityOf(h: Harness, p: ManagedPersona): { botUserId: string; botId: string } {
-  const { botUserId, botId } = stubOf(h, p).identity
-  return { botUserId, botId }
+function initialIdentityOf(h: Harness, p: ManagedPersona): { botUserId: string; botId: string; teamId: string } {
+  const { botUserId, botId, teamId } = stubOf(h, p).identity
+  return { botUserId, botId, teamId }
 }
 
 /** The persona's clients built from credential set `label`, by kind, in build order. */
@@ -5159,7 +5159,7 @@ describe('connection manager: a credentials reconnect’s beforeSwap hook (crede
   /** What beforeSwap saw of A when it ran: its reported status, identity, client and both sockets. */
   interface SwapView {
     status: PersonaConnectionStatus | undefined
-    identity: { botUserId: string; botId: string } | undefined
+    identity: ReturnType<Harness['manager']['identity']>
     oldClient: boolean
     oldSocketConnected: boolean
     newSocketConnected: boolean
@@ -8285,7 +8285,7 @@ describe('bring-up outcomes ()', () => {
       expect(hookCalls).toEqual([swapHook])
       expect(swaps).toEqual([{ late: expected.kind === 'retrying', wasUp }])
       expect(f.controller.state(a.key)).toEqual({ outcome: 'up', causes: {} })
-      expect(f.h.manager.identity(a.key)).toEqual({ botUserId: fresh.identity.botUserId, botId: fresh.identity.botId })
+      expect(f.h.manager.identity(a.key)).toEqual({ botUserId: fresh.identity.botUserId, botId: fresh.identity.botId, teamId: fresh.identity.teamId })
       expect(f.controller.credentialsDigest(a.key)).toBe(fileDigest(a.credentials_file))
       await f.h.clock.flush()
       expect(f.launches).toEqual(refuse ? [a.key] : [])

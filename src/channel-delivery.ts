@@ -12,7 +12,7 @@ export const CHANNEL_DELIVERY_SET_INVALID = 'invalid'
 export const CHANNEL_DELIVERY_SET_WRITE_FAILED = 'write-failed'
 export type ChannelDeliveryDeclaration = PersonaDeclaration
 export const CHANNEL_DELIVERY_DECLARATION_FIELDS = ['name', 'credentials_file', 'working_directory'] as const
-export type ChannelDeliverySetInvalidField = 'key' | 'channel' | 'delivery' | 'declaration' | 'set_at'
+export type ChannelDeliverySetInvalidField = 'key' | 'channel' | 'delivery' | 'declaration' | 'set_at' | 'membership'
 export type ChannelDeliverySetResult =
   | { kind: typeof CHANNEL_DELIVERY_SET_STORED; previous: DeliveryMode | undefined }
   | { kind: typeof CHANNEL_DELIVERY_SET_UNREADABLE; path: string }
@@ -32,7 +32,7 @@ export interface ChannelDeliveryStore {
 export function channelDeliveryDeclarationOf(persona: Pick<Persona, 'name' | 'credentials_file' | 'working_directory'>): ChannelDeliveryDeclaration {
   return { name: persona.name, credentials_file: persona.credentials_file, working_directory: persona.working_directory }
 }
-export function createChannelDeliveryStore(authority: SharedChannelAuthority): ChannelDeliveryStore {
+export function createChannelDeliveryStore(authority: SharedChannelAuthority, currentMembership?: (key: string, channel: string) => boolean): ChannelDeliveryStore {
   const retiring = new Set<string>()
   return {
     path: authority.path,
@@ -45,6 +45,7 @@ export function createChannelDeliveryStore(authority: SharedChannelAuthority): C
       const snapshot = authority.snapshot()
       const life = Object.hasOwn(snapshot.personas, key) ? snapshot.personas[key] : undefined
       if (!life || retiring.has(key) || !sameSharedDeclaration(life.declaration, declaration)) return { kind: CHANNEL_DELIVERY_SET_INVALID, field: 'declaration' }
+      if (currentMembership && !currentMembership(key, channel)) return { kind: CHANNEL_DELIVERY_SET_INVALID, field: 'membership' }
       const previous = this.storedChoice(key, channel)
       const result = authority.assign(key, life.incarnation, channel, delivery, authority.revision)
       if (result.kind === 'applied') return { kind: CHANNEL_DELIVERY_SET_STORED, previous }

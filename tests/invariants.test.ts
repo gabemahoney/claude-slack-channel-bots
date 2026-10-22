@@ -219,6 +219,8 @@ const STORED_CHOICES_ENTRY = "a persona key's entry of the stored-choice file: i
 
 const ADMITTED_READS: readonly AdmittedRead[] = [
   { file: 'channel-delivery.ts', within: 'createChannelDeliveryStore > storedChannels', read: 'authority.channels', count: 1, reason: 'the shared authority method, not a persona field or independent store' },
+  { file: 'channel-membership-scan.ts', within: 'parsePage', read: "value['channels']", count: 2, reason: 'validate and iterate the Slack users.conversations response array, not a persona configuration' },
+  { file: 'channel-membership-scan.ts', within: 'createMembershipScanner > collect', read: 'page.channels', count: 1, reason: 'iterate the parsed users.conversations page returned by the connection manager membershipPage call, not a persona configuration' },
 ]
 
 /** How a field is read. */
@@ -732,6 +734,26 @@ describe('negative controls for the reader audit', () => {
     expect(outsideListFindings(modules, FIXED_READERS, [entry])).toEqual([])
     expect(outsideListFindings(modules, FIXED_READERS, [{ ...entry, count: 1 }])).toEqual(['admitted read matches 2 reads, not 1: src/planted.ts p.channels (in f)'])
     expect(outsideListFindings(modules, FIXED_READERS, [{ ...entry, count: 3 }])).toEqual(['admitted read matches 2 reads, not 3: src/planted.ts p.channels (in f)'])
+  })
+
+  test.each([
+    ['a persona field in the page parser', "const metadata = value['response_metadata']", "const metadata = value['response_metadata']; persona.channels", 'property read of channels persona.channels (in parsePage)'],
+    ['a persona field beside the parsed page', 'const metadata = JSON.stringify(', 'persona.channels; const metadata = JSON.stringify(', 'property read of channels persona.channels (in createMembershipScanner > collect)'],
+    ['the same read outside the parser', "return { channels, cursor: typeof cursor === 'string' ? cursor : '' }", "return { channels, cursor: typeof cursor === 'string' ? cursor : '' } } function other(value: any) { return value['channels']", "string key read of channels value['channels'] (in other)"],
+    ['an extra response read', "const metadata = value['response_metadata']", "value['channels']; const metadata = value['response_metadata']", "admitted read matches 3 reads, not 2: src/channel-membership-scan.ts value['channels'] (in parsePage)"],
+    ['a removed response read', "for (const raw of value['channels'])", 'for (const raw of [])', "admitted read matches 1 reads, not 2: src/channel-membership-scan.ts value['channels'] (in parsePage)"],
+    ['an extra parsed-page read', 'for (const channel of page.channels)', 'page.channels; for (const channel of page.channels)', 'admitted read matches 2 reads, not 1: src/channel-membership-scan.ts page.channels (in createMembershipScanner > collect)'],
+    ['a removed parsed-page read', 'for (const channel of page.channels)', 'for (const channel of [])', 'admitted read matches 0 reads, not 1: src/channel-membership-scan.ts page.channels (in createMembershipScanner > collect)'],
+  ] as const)('Slack page admissions still reject %s', (_what, from, to, finding) => {
+    const file = 'channel-membership-scan.ts'
+    const source = readFileSync(join(SRC_DIR, file), 'utf8')
+    const admitted = ADMITTED_READS.filter(entry => entry.file === file)
+    expect(outsideListFindings(new Map([[file, source]]), FIXED_READERS, admitted)).toEqual([])
+    expect(source.split(from)).toHaveLength(2)
+    const mutant = new Map([[file, source.replace(from, to)]])
+    expect(syntaxFindings(mutant)).toEqual([])
+    const findings = outsideListFindings(mutant, FIXED_READERS, admitted)
+    expect(findings).toEqual([finding.startsWith('admitted read') ? finding : `src/${file}: ${finding}`])
   })
 
   test("a read inside the list but outside its file's part is a finding, and a part with no read is one", () => {

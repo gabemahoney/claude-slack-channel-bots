@@ -287,6 +287,8 @@ export function makeDeferredConnect(): DeferredConnect {
 
 /** Per-call outcome queues. Consumed front to back; an empty queue means success. */
 export interface StubSlackScript {
+  botsInfo: WebApiOutcome[]
+  inventory: WebApiOutcome[]
   authTest: WebApiOutcome[]
   connect: ConnectOutcome[]
   post: WebApiOutcome[]
@@ -318,6 +320,10 @@ export interface StubSlackScript {
 
 export interface StubSlackOptions {
   /** Initial `auth.test` outcomes (copied; push more onto `stub.script.authTest`). */
+  botsInfo?: readonly WebApiOutcome[]
+  inventory?: readonly WebApiOutcome[]
+  /** Enable authenticated installation discovery through bots.info. */
+  appId?: string
   authTest?: readonly WebApiOutcome[]
   /** Initial socket `start()` outcomes, shared by every socket client of this stub. */
   connect?: readonly ConnectOutcome[]
@@ -383,6 +389,8 @@ export function stubOpenedDmId(users: string): string {
 
 /** A Web API method the stub imitates, as it appears in a `callLog`. */
 export type StubWebMethod =
+  | 'bots.info'
+  | 'users.conversations'
   | 'auth.test'
   | 'chat.postMessage'
   | 'chat.update'
@@ -429,7 +437,8 @@ export interface StubWebClient {
     replies: WebClient['conversations']['replies']
     info: WebClient['conversations']['info']
   }
-  users: { info: WebClient['users']['info'] }
+  bots?: { info: WebClient['bots']['info'] }
+  users: { info: WebClient['users']['info']; conversations: WebClient['users']['conversations'] }
   /** As on the real `WebClient`, a prototype method that needs the client as `this` (a detached call throws). */
   filesUploadV2: WebClient['filesUploadV2']
   /**
@@ -547,6 +556,8 @@ export interface StubWebClientBuild {
 
 /** Arguments of each captured Web API call. */
 export interface StubSlackCalls {
+  botsInfo: Parameters<WebClient['bots']['info']>[0][]
+  inventory: Parameters<WebClient['users']['conversations']>[0][]
   authTest: Parameters<WebClient['auth']['test']>[0][]
   postMessage: Parameters<WebClient['chat']['postMessage']>[0][]
   update: Parameters<WebClient['chat']['update']>[0][]
@@ -570,7 +581,7 @@ export interface StubApiCall {
 
 export interface StubSlack {
   /** The identity a successful `auth.test` returns. */
-  readonly identity: { botUserId: string; botId: string; teamId: string }
+  readonly identity: { botUserId: string; botId: string; teamId: string; appId?: string }
   /** Outcome queues; push onto them at any time. */
   readonly script: StubSlackScript
   /** Captured Web API call arguments, shared by every Web API client of this stub. */
@@ -810,8 +821,11 @@ function buildStubSlack(opts: StubSlackOptions, observe: SocketEventObserver | u
     botUserId: opts.botUserId ?? `U${randomIdTail()}`,
     botId: opts.botId ?? `B${randomIdTail()}`,
     teamId: opts.teamId ?? 'T0STUB0001',
+    ...(opts.appId === undefined ? {} : { appId: opts.appId }),
   }
   const script: StubSlackScript = {
+    botsInfo: [...(opts.botsInfo ?? [])],
+    inventory: [...(opts.inventory ?? [])],
     authTest: [...(opts.authTest ?? [])],
     connect: [...(opts.connect ?? [])],
     post: [...(opts.post ?? [])],
@@ -827,6 +841,8 @@ function buildStubSlack(opts: StubSlackOptions, observe: SocketEventObserver | u
     apiCall: [...(opts.apiCall ?? [])],
   }
   const calls: StubSlackCalls = {
+    botsInfo: [],
+    inventory: [],
     authTest: [],
     postMessage: [],
     update: [],
@@ -997,7 +1013,20 @@ function buildStubSlack(opts: StubSlackOptions, observe: SocketEventObserver | u
           )
         },
       },
+      ...(opts.appId ? { bots: { info: (args: Parameters<WebClient['bots']['info']>[0]) => {
+        record('bots.info', args)
+        calls.botsInfo.push(args)
+        return runWebApiCall(script.botsInfo.shift(), ctx('bots.info'), overrides => mergeDroppingUndefined({
+          ok: true, bot: { id: identity.botId, user_id: identity.botUserId, app_id: opts.appId, deleted: false },
+        }, overrides))
+      } } } : {}),
       users: {
+        conversations: args => {
+          record('users.conversations', args)
+          calls.inventory.push(args)
+          return runWebApiCall(script.inventory.shift(), ctx('users.conversations'), overrides =>
+            mergeDroppingUndefined({ ok: true, channels: [], response_metadata: { next_cursor: '' } }, overrides))
+        },
         info: (args) => {
           record('users.info', args)
           calls.usersInfo.push(args)
@@ -1229,7 +1258,8 @@ function buildStubSlack(opts: StubSlackOptions, observe: SocketEventObserver | u
           {
             type: 'event_callback',
             team_id: identity.teamId,
-            api_app_id: 'A0STUB0001',
+            api_app_id: opts.appId ?? 'A0STUB0001',
+            authorizations: [{ team_id: identity.teamId, user_id: identity.botUserId, is_bot: true }],
             event,
             event_id: `Ev0STUB${envelopeSeq}`,
             event_time: 1700000000,

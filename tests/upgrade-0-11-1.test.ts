@@ -105,6 +105,7 @@ import {
   type StartedReloadRun,
 } from './test-helpers/reload-harness.ts'
 import { makeAppMention, makeChannelMessage, mentionText, stubOpenedDmId, type SlackEvent } from './test-helpers/slack-stub.ts'
+import { membershipPage } from './test-helpers/shared-channels.ts'
 
 // ---------------------------------------------------------------------------
 // The fixtures: paths and bytes, read once
@@ -638,6 +639,11 @@ describe("a 0.11.1-style edit is previewed and confirmed as in 0.11.1 (switch-ab
       expect(h.pendingExists()).toBe(false)
 
       // The edit's effect: the probe reaches only the changed persona, as its edited entry says.
+      // Slack independently confirms the edited persona's channel membership.
+      run.stub(name).script.inventory.push(membershipPage(edited.personas.find(p => p.name === name)!.channels!.map(c => c.id)))
+      run.membershipScanner.request(h.key(name))
+      await run.membershipClock.runNext()
+      expect(run.membershipScanner.status(h.key(name)).state).toBe('complete')
       const outcome = await deliverSample(run, fixture, { event: edit.edit, to: name, kind: edit.probe.kind, channel })
       expect(outcome).toEqual({ event: edit.edit, deliveries: deliveredTo(fixture, name, channel, edit.probe.via(edited, name, channel)), dropLines: [] })
       expect(run.slackPosts()).toEqual([])
@@ -761,7 +767,12 @@ function startingWith(prefix: string) {
 /** Start `fixture` through the fixture-start helper and register every channel persona's session. */
 async function startWithSessions(h: ReloadHarness, fixture: UpgradeFixture) {
   const started = await startFixture(h, fixture)
-  for (const p of channelPersonas(fixture)) started.run.registerSession(p.name)
+  for (const p of channelPersonas(fixture)) {
+    started.run.registerSession(p.name)
+    started.run.stub(p.name).script.inventory.push(membershipPage(p.channels!.map(c => c.id)))
+  }
+  await started.run.membershipClock.runNext()
+  for (const p of channelPersonas(fixture)) expect(started.run.membershipScanner.status(h.key(p.name)).state).toBe('complete')
   return started
 }
 
