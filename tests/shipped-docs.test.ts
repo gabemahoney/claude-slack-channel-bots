@@ -3581,7 +3581,7 @@ const overRollbackCarriers = <T extends readonly unknown[]>(rows: readonly T[]) 
 
 /** A count as the runbooks write it, in words; throws for a count it lacks, so a changed count fails naming it. */
 function countWord(n: number): string {
-  const words: Record<number, string> = { 7: 'seven', 8: 'eight', 9: 'nine' }
+  const words: Record<number, string> = { 6: 'six', 7: 'seven', 8: 'eight', 9: 'nine' }
   const word = words[n]
   if (word === undefined) throw new Error(`countWord has no word for ${n}`)
   return word
@@ -5287,20 +5287,19 @@ describe("E36 T2: the README's install and startup texts point to the runbook an
       expect(noMemoryProblems(edited)).toEqual([`the resume_enabled row: agent-director\` ≥ ${HISTORICAL_VERSIONS.resumeRecoveryMinimum}`])
     })
 
-    test('"Preflight gates" fails as the seven-gate list without SR-2.5', () => {
+    test('"Preflight gates" fails as the six-gate list without SR-2.5', () => {
       const text = operatorText(CONTRIBUTING_FILE)
       const edited = text
         .replace(/^6\. \*\*The host's agent-director[^\n]*\n/m, '')
-        .replace('enforces eight fail-fast gates', 'enforces seven fail-fast gates')
-        .replace(/^7\. \*\*No stranded/m, '6. **No stranded')
-        .replace(/^8\. \*\*`\/ci`/m, '7. **`/ci`')
+        .replace('enforces seven fail-fast gates', 'enforces six fail-fast gates')
+        .replace(/^7\. \*\*`\/ci`/m, '6. **`/ci`')
       expect(edited).not.toBe(text)
       expect(preflightGateProblems(edited)).toEqual([`0 gates name ${code(AD_VERSION_CHECK_SCRIPT)}, expected 1`])
     })
 
     test('"Preflight gates" fails when the lead\'s count and the list disagree', () => {
       const text = operatorText(CONTRIBUTING_FILE)
-      const edited = text.replace('enforces eight fail-fast gates', 'enforces seven fail-fast gates')
+      const edited = text.replace('enforces seven fail-fast gates', 'enforces six fail-fast gates')
       expect(edited).not.toBe(text)
       expect(preflightGateProblems(edited)).not.toEqual([])
     })

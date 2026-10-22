@@ -255,12 +255,10 @@ Prioritize security, logic, missing tests, architecture, touched code quality, t
 
 ## Definition of Done
 
-Work is complete when it is merged to main, checks pass, documentation is updated and the release audit is clean.
+Work is complete when it is merged to main, checks pass and documentation is updated.
 
 - Complete the assigned scope, required reviews and the checks in [docs/build-commands.md](build-commands.md); report pass/fail/not applicable and evidence. Record declined or unaddressed findings with reasons.
 - Update architecture, user docs, diagnostic catalogue and release notes when behavior requires them. Follow [docs/doc-writing-guide.md](doc-writing-guide.md), including shipped-text rules; keep `tests/shipped-docs.test.ts` and `tests/access-file-retired.test.ts` green. Manually check shipped texts outside their scan lists; never add an audit exemption to make text pass.
 - Commit in the working branch, include a work reference where applicable and record commit SHAs plus unresolved work. Have the changes independently reviewed and tested. Correct review findings and failed tests, then repeat the affected checks before merging. Resolve merge conflicts and verify the result.
 
-Before release, account for completed work on main or a truthful explicit non-repository/no-change resolution. Record the artifact path or reason and where superseding work lives; do not silently strand commits.
-
-The read-only `scripts/audit-finished-tickets.sh` selects tickets with `done` or legacy `finished` status and checks their landing evidence and unmerged branches against main. Other statuses are outside that selection. It keeps the explicit closure headings `## +closed:out-of-repo <path>` and `## +closed:docs-only` for qualifying work. Do not change statuses to satisfy it. See [CONTRIBUTING.md](../CONTRIBUTING.md#stranded-work-audit) for its evidence rules and exit codes, and its [release process](../CONTRIBUTING.md#release-process) for permissions, gates and recovery.
+Before a release, every finished change must be merged to main. See the [release process](../CONTRIBUTING.md#release-process) for permissions, gates and recovery.

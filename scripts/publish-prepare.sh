@@ -43,12 +43,6 @@
 #   15  SR-2.5  preflight: host agent-director missing, its version unreadable, or
 #                below the installed agent-director client's minimum (or that
 #                minimum unreadable); names the switch-over runbook section
-#   16  SR-2.6  preflight: stranded accepted work (done/legacy-finished ticket not on main and
-#                not explicitly closed, or unmerged branch references a done/legacy-finished ticket)
-#   17  SR-2.6  preflight: the stranded-work audit could not run (could not locate the
-#                hives / a git repo / a 'main' ref from this checkout) — a setup
-#                failure, NOT stranded work. FAIL CLOSED: release still blocked.
-#                Recovery: rerun from the canonical checkout beside the hives.
 #   20  SR-3.1  npm version bump failed, OR CHANGELOG.md has no '## Unreleased'
 #                heading, OR its rewrite to the release's heading failed
 #   --  SR-3.2  rollback, no exit code of its own. Runs on the 20, 21, 22, 23

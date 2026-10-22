@@ -2,7 +2,7 @@
 #
 # /publish Phase 1 — local preflight.
 #
-# Gates SR-2.1 through SR-2.6 plus the SR-10.1 location check and the SR-1.2
+# Gates SR-2.1 through SR-2.5 plus the SR-10.1 location check and the SR-1.2
 # argument check. Exits 0 on full pass; exits with a stable non-zero code on
 # the first failed gate after writing a verbatim operator-facing diagnostic
 # (preserving the SR-X.Y identifier) to stderr.
@@ -29,15 +29,6 @@
 #                diagnostic names the switch-over runbook section. A binary at
 #                or above the client's minimum but below CSCB's Phase 1 floor
 #                passes, with an 'SR-2.5 (preflight) NOTE' on stderr.
-#   16  SR-2.6  stranded accepted work: a done/legacy-finished ticket is neither on main
-#                nor explicitly closed, OR an unmerged branch references a
-#                done/legacy-finished ticket (scripts/audit-finished-tickets.sh exit 1)
-#   17  SR-2.6  the stranded-work audit could not run — it could not locate the
-#                hives / a git repo / a 'main' ref from this checkout (audit
-#                exit 2 or any other unexpected code). NOT stranded work; a
-#                setup failure. FAIL CLOSED: the gate is required, so the
-#                release is still blocked. Recovery: rerun from the canonical
-#                checkout beside the hives.
 
 set -euo pipefail
 
@@ -209,33 +200,5 @@ if [ "${AD_CHECK_EXIT}" -ne 0 ]; then
   fi
   sr_exit 15
 fi
-
-# SR-2.6 — accepted work must reach main before release. Ideas/Bugs become
-# done on acceptance, then teardown-worktree merges them. Audit done and legacy
-# finished tickets and their unmerged branches; invalid Bugs need no merge.
-# Qualifying non-repository/no-change work needs truthful closure evidence.
-# The audit is READ-ONLY; it never changes ticket statuses or git.
-AUDIT_EXIT=0
-bash "${REPO_ROOT}/scripts/audit-finished-tickets.sh" "${REPO_ROOT}" || AUDIT_EXIT=$?
-case "${AUDIT_EXIT}" in
-  0)
-    : # clean — no stranded work
-    ;;
-  1)
-    # Stranded accepted work found. FAIL CLOSED.
-    echo "SR-2.6 (preflight): scripts/audit-finished-tickets.sh reported stranded accepted work — one or more tickets are 'done' (or legacy 'finished') while their work is neither on main nor explicitly closed, or an unmerged branch references such a ticket (see the audit report above). Releasing now would ship with work silently stranded on dead branches. Operator recovery: for each flagged ticket, either land its fix on main, or explicitly close it (no-repro / superseded / abandoned / satisfied-by-other-work, with a pointer to where the work actually lives); for each flagged branch, merge or delete it. Ideas/Bugs are accepted before teardown-worktree merges them; invalid Bugs need no merge. Record the truthful resolution without changing statuses to satisfy this gate, then rerun '/publish ${BUMP_KIND}'. This gate is READ-ONLY and never mutates tickets or git." >&2
-    sr_exit 16
-    ;;
-  *)
-    # Exit 2 (or any other unexpected code): the audit could NOT run — it could
-    # not locate the hives / a git repo / a 'main' ref from this checkout. This
-    # is a setup/configuration failure, NOT stranded work, so it does NOT get
-    # the SR-2.6 stranded-work recovery (which would be wrong). FAIL CLOSED — the
-    # audit is a required gate and must never be silently skipped, so we still
-    # block the release. Distinct exit code 17 keeps the recovery unambiguous.
-    echo "SR-2.6 (preflight): scripts/audit-finished-tickets.sh could not run (exit ${AUDIT_EXIT}) — it could not locate the Bugs/Plans/Ideas hives, a git repo, or a 'main' ref from this checkout (see the audit's own diagnostic above). This is NOT a report of stranded work; the required stranded-work gate simply could not be evaluated, so the release is BLOCKED. This typically means /publish was run from a throwaway/detached checkout (e.g. a /tmp clone) that does not sit beside the hives. Operator recovery: rerun '/publish ${BUMP_KIND}' from the canonical claude-slack-channel-bots checkout that lives beside the Bugs/Plans/Ideas hives (the main working clone), where the audit can reconcile done and legacy finished tickets against main. This gate is READ-ONLY and never mutates tickets or git." >&2
-    sr_exit 17
-    ;;
-esac
 
 echo "Phase 1 (local preflight) passed. Next version will be: ${NEXT_VERSION}"

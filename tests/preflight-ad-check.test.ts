@@ -224,11 +224,11 @@ function headerEntry(text: string): HeaderEntry | undefined {
   return headerEntries(shellHeader(text), 'SR-2.5').find((entry) => entry.code !== null)
 }
 
-/** SR-2.5's block: from its `# SR-2.5` comment to the `# SR-2.6` comment. */
+/** SR-2.5's block: from its `# SR-2.5` comment to the preflight success message. */
 function sr25Block(text: string): string {
   const start = text.search(/^# SR-2\.5\b/m)
-  const end = text.search(/^# SR-2\.6\b/m)
-  if (start < 0 || end < start) throw new Error(`${PREFLIGHT} has no # SR-2.5 block before # SR-2.6`)
+  const end = text.search(/^echo "Phase 1 \(local preflight\) passed\./m)
+  if (start < 0 || end < start) throw new Error(`${PREFLIGHT} has no # SR-2.5 block before its success message`)
   return text.slice(start, end)
 }
 
@@ -317,7 +317,7 @@ describe('SR-2.5 in the scripts and the publish skills', () => {
     ['upgrade advice', `echo "${SR25_PREFIX}: ${PHASE1_RUNBOOK_SECTION_TITLE}; upgrade the host's agent-director to match the range, then rerun." >&2`, `SR-2.5 code: ${UPGRADE_WORDING_LABEL}`],
     ['a changed exit code', `sr_exit ${AD_VERSION_CHECK_FAIL_EXIT_CODE + 1}`, `,${AD_VERSION_CHECK_FAIL_EXIT_CODE + 1}, not ${AD_VERSION_CHECK_FAIL_EXIT_CODE}`],
   ])('the preflight audit flags %s put back into SR-2.5', (_name, line, finding) => {
-    const mutated = preflight.replace(/^# SR-2\.6\b/m, `${line}\n$&`)
+    const mutated = preflight.replace(/^echo "Phase 1 \(local preflight\) passed\./m, `${line}\n$&`)
     expect(preflightFindings(mutated, listedCode)).toContainEqual(expect.stringContaining(finding))
   })
 
