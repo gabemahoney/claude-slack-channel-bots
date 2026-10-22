@@ -645,7 +645,7 @@ function ladderHome(): string {
  * directory, its instance ID `cscb_<key>` and its `config_dir` label the
  * persona's current one under the seam home (`ladderHome`). A ladder fixture
  * built from it stays on the state path it tests instead of meeting the `cwd`
- * or `config_dir` guard (b.av2 SR-6.2). Overrides win, so a guard case can
+ * or `config_dir` guard. Overrides win, so a guard case can
  * replace `cwd` or `labels`.
  */
 function personaRow(cfg: PersonaConfig, key: string, overrides: PersonaGetResultOverrides = {}): CannedGetResult {
@@ -682,7 +682,7 @@ beforeEach(() => {
   savedEnv = { ...process.env }
   fixtureDir = mkdtempSync(join(tmpdir(), 'cscb-sm-'))
 
-  // the background (b.jg5 SRJ-401). Cap it short, so one left on the real
+  // the background. Cap it short, so one left on the real
 
   // Wire the outage-state module so withOutageDetection / withSpawnDetection
   // can resolve the AD client and emit Slack onset/all-clear messages.
@@ -717,15 +717,15 @@ afterEach(() => {
   _resetConfigDirFs()
   _resetNotConnectedEpisodes()
 
-  // b.f2b cases pass a fake clock's `now` to the session manager (`_setNow`).
+  // cases pass a fake clock's `now` to the session manager (`_setNow`).
   _resetNow()
   setConfigDirUnresolvableHook(undefined)
   setSessionNotifier(undefined)
-  // b.jg5 SRJ-502: a case that installs its own latch leaves none behind.
+  // a case that installs its own latch leaves none behind.
   setConflictLatch(undefined)
-  // b.jg5 SRJ-114: nor its own configured-persona query.
+  // nor its own configured-persona query.
   _resetConfiguredPersonaQuery()
-  // b.jg5 SRJ-807: nor a retired-key store.
+  // nor a retired-key store.
   _resetRetiredKeyStore()
   installedHold?.cancelAll()
   installedHold = undefined
@@ -734,11 +734,11 @@ afterEach(() => {
 })
 
 // ---------------------------------------------------------------------------
-// b.en2 Epic 4 shared helpers
+// component 4 shared helpers
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Persona notices (b.av2 SR-7.2) — the real notifier over per-persona stubs
+// Persona notices — the real notifier over per-persona stubs
 // ---------------------------------------------------------------------------
 
 /** The notice persona: its name differs from its key. */
@@ -817,7 +817,7 @@ let installedHold: PersonaDestinationHold | undefined
  * validated unless `validated: false`; `post` scripts the notice persona's
  * `chat.postMessage` outcomes; `leakMarker` goes to every stub.
  *
- * The notifier's destination hold (b.av2 SR-7.1, `h.hold`) runs on the
+ * The notifier's destination hold (`h.hold`) runs on the
  * harness's fake clock (`h.clock`), so a notice held after a failed post
  * creates no real timer: its retry runs only when the test moves the clock.
  */
@@ -870,7 +870,7 @@ async function settleNotices(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 0))
 }
 
-/** The stub's default launch start on a `pending` row, in ms, read with E16's reader (`parseLaunchStart`). */
+/** The stub's default launch start on a `pending` row, in ms, read with reader (`parseLaunchStart`). */
 const SAMPLE_LAUNCH_START_MS = parseLaunchStart(SAMPLE_LAUNCH_START_DEFAULT)!
 
 /** A `status` answer through the stub's canned builder: a `pending` row carries the sample launch start. */
@@ -883,7 +883,7 @@ function pendingRowTrigger(key: string): { key: string; kind: string } {
 }
 
 /**
- * Persona `key` was armed only for its `pending` row (b.jg5 SRJ-301, SRJ-409):
+ * Persona `key` was armed only for its `pending` row:
  * its triggers are exactly `arms` pending-only arms (one per launch that
  * returned success, or per covered `pending` row its ladder left), and its
  * retry timer watches the row in pending-only mode.
@@ -925,7 +925,7 @@ function onlyStartupEntry(log: string, classLabel: string): string {
   return entries[0]!
 }
 
-// AC 20 (b.av2 SR-10.3, E13 Director decision 16): an agent-director error's
+//: an agent-director error's
 // description can carry a short-lived URL or a token. These build one that
 // carries both (the URL embeds the sentinel), and what `redactSlackLogText`
 // leaves of it.
@@ -939,7 +939,7 @@ const REDACTED_AD_DESCRIPTION = `upload ${REDACTED_URL_PLACEHOLDER} refused ${RE
 const tokenErrName = (): string => fakeToken(APP_TOKEN_PREFIX, 'errname')
 
 // A thrown error's message stays in log lines after `redactSlackLogText`
-// (Task 0 decision B1), so a leak case plants the sentinel in a message only
+// (section 0 decision B1), so a leak case plants the sentinel in a message only
 // inside a fake token and a Socket Mode `ticket=` URL, the shapes redaction
 // removes; a bare sentinel there would survive redaction and prove nothing.
 
@@ -956,14 +956,14 @@ function preSetAllFlags(key: string): void {
 }
 
 // ---------------------------------------------------------------------------
-// SR-1.1 / b.av2 SR-2.2 — fresh spawn parameters
+// fresh spawn parameters
 // ---------------------------------------------------------------------------
 //
 // Spawns are keyed by persona: `cscb_<key>`, `slack_bot_<key>`, the labels
 // `service=cscb`, `persona=<key>`, `config_dir=<12 hex of the REAL effective
-// claude_config_dir>` and nothing else (no `channel` label since E3 Task 6),
+// claude_config_dir>` and nothing else (no `channel` label since section 6),
 // and the env `CSCB_PERSONA` / `CLAUDE_MANAGED_CHANNEL` (the key),
-// `CSCB_CRONTABLE_PATH`, `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false` (b.svb;
+// `CSCB_CRONTABLE_PATH`, `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false` (
 // every launch path is covered in its own block below), and
 // `CLAUDE_CONFIG_DIR` only when a directory is configured.
 //
@@ -992,7 +992,7 @@ function configDirLabelFor(dir: string): string {
   return `config_dir=${configDirLabelValue(realpathSync(dir))}`
 }
 
-describe('spawnForPersona: SR-1.1 / SR-2.2 fresh spawn parameters', () => {
+describe('spawnForPersona: fresh spawn parameters', () => {
   test('emits SpawnParams with the persona instance id, tmux name, exact labels and env', async () => {
     const spawnCalls: import('agent-director').SpawnParams[] = []
     installStub({ spawnCalls })
@@ -1018,7 +1018,7 @@ describe('spawnForPersona: SR-1.1 / SR-2.2 fresh spawn parameters', () => {
     expect(params.tmux_session_name).toBe(`slack_bot_${key}`)
     expect(params.relay_mode).toBe('on')
     expect(params.label).toEqual(['service=cscb', 'tag_prompt=1', REPLY_TOOL_PREALLOWED_LABEL, `persona=${key}`, configDirLabelFor(configDir)])
-    // The interim `channel=<key>` label is no longer written (E3 Task 6).
+    // The interim `channel=<key>` label is no longer written ( section 6).
     expect(params.label!.some((l) => l.startsWith('channel='))).toBe(false)
     expect(params.extra_env).toEqual({
       CLAUDE_CONFIG_DIR: configDir,
@@ -1126,7 +1126,7 @@ describe('spawnForPersona: SR-1.1 / SR-2.2 fresh spawn parameters', () => {
     })
   })
 
-  // Bug b.avm: bots self-schedule by appending to CSCB_CRONTABLE_PATH, so it
+  // bots self-schedule by appending to CSCB_CRONTABLE_PATH, so it
   // must name the default outside ~/.claude (no permission prompt per write).
   test('a config loaded with no cron_table_path and SLACK_STATE_DIR unset spawns with CSCB_CRONTABLE_PATH the new default, <home>/.config/claude-slack-channel-bots/crontab', async () => {
     const spawnCalls: import('agent-director').SpawnParams[] = []
@@ -1166,13 +1166,13 @@ describe('spawnForPersona: SR-1.1 / SR-2.2 fresh spawn parameters', () => {
 })
 
 // ---------------------------------------------------------------------------
-// b.av2 SR-2.2, SR-1.5 — the `config_dir` label hashes the REAL path of the
+// the `config_dir` label hashes the REAL path of the
 // effective claude_config_dir; a directory not created yet gets the label of
-// the real path it will have (bug b.g57: no lexical fallback; see the b.g57
+// the real path it will have (no lexical fallback; see the
 // block for the unresolvable and not-yet-created cases).
 // ---------------------------------------------------------------------------
 
-describe('spawnForPersona: config_dir label (SR-2.2, SR-1.5)', () => {
+describe('spawnForPersona: config_dir label', () => {
   /** Spawn every persona of `cfg` once and return the spawn params by key. */
   async function spawnAll(cfg: PersonaConfig): Promise<Map<string, import('agent-director').SpawnParams>> {
     const spawnCalls: import('agent-director').SpawnParams[] = []
@@ -1241,7 +1241,7 @@ describe('spawnForPersona: config_dir label (SR-2.2, SR-1.5)', () => {
     expect(params.label).toContain(`config_dir=${configDirLabelValue(missing)}`)
   })
 
-  test('no directory configured: the label is that of .claude under an injected temp home', () => {
+  test('no directory configured: the label is that .claude under an injected temp home', () => {
     const home = fixtureSubdir('home')
     mkdirSync(join(home, '.claude'))
     const expected = configDirLabelValue(resolveRealPath(join(realpathSync(home), '.claude')), home)
@@ -1257,10 +1257,10 @@ describe('spawnForPersona: config_dir label (SR-2.2, SR-1.5)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// b.av2 SR-2.2 — spawn identity is the persona key, never the name
+// spawn identity is the persona key, never the name
 // ---------------------------------------------------------------------------
 
-describe('spawnForPersona: persona identity (SR-2.2)', () => {
+describe('spawnForPersona: persona identity', () => {
   test('an in-form name is its own key', async () => {
     const spawnCalls: import('agent-director').SpawnParams[] = []
     installStub({ spawnCalls })
@@ -1329,10 +1329,10 @@ describe('spawnForPersona: persona identity (SR-2.2)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// SR-1.4 — idempotency dispatch on ErrInstanceIdCollision
+// idempotency dispatch on ErrInstanceIdCollision
 // ---------------------------------------------------------------------------
 
-describe('spawnForPersona: SR-1.4 collision-then-act', () => {
+describe('spawnForPersona: collision-then-act', () => {
   test('ended state + resume_enabled → resume()', async () => {
     const spawnCalls: import('agent-director').SpawnParams[] = []
     const resumeCalls: import('agent-director').ResumeParams[] = []
@@ -1349,7 +1349,7 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
     expect(resumeCalls[0].instance_id).toBe('cscb_C')
   })
 
-  // b.jg5 SRJ-707: the no-transcript answer brings the persona up by one
+  // the no-transcript answer brings the persona up by one
   // reuse spawn of the same id; nothing is deleted.
   test('ended state + ErrNoSessionId on resume → one reuse spawn of the same id, no delete', async () => {
     const spawnCalls: import('agent-director').SpawnParams[] = []
@@ -1374,7 +1374,7 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
     expect(deleteCalls).toEqual([])
   })
 
-  // b.jg5 SRJ-707: resume_enabled false over a finished row: one reuse spawn
+  // resume_enabled false over a finished row: one reuse spawn
   // of the same id; nothing is killed or deleted.
   test('missing state + resume_enabled=false → one reuse spawn of the same id (no resume, kill or delete)', async () => {
     const spawnCalls: import('agent-director').SpawnParams[] = []
@@ -1430,13 +1430,13 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
     }
   })
 
-  // b.2oy — resume rejects with ErrSpawnNotFound (row vanished between the
+  // resume rejects with ErrSpawnNotFound (row vanished between the
   // dead-session verdict and resume: operator delete, expire, race). Recovery
   // must fresh-spawn directly with the original params — NO kill, NO delete,
   // no spawn-failure notice — and report 'spawned'. Pre-fix this fell
   // into the generic resume-catch, which posted a Slack "spawn failure" and
   // returned action: 'failed'.
-  test('b.2oy: ErrSpawnNotFound on resume → fresh spawn (no kill, no delete, no spawn-failure notice)', async () => {
+  test('ErrSpawnNotFound on resume → fresh spawn (no kill, no delete, no spawn-failure notice)', async () => {
     const spawnCalls: import('agent-director').SpawnParams[] = []
     const killCalls: import('agent-director').KillParams[] = []
     const deleteCalls: StubDeleteParams[] = []
@@ -1467,11 +1467,11 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
     expect(notices).toHaveLength(0)
   })
 
-  // b.2oy — ErrSpawnNotFound recovery still surfaces genuine spawn failures.
+  // ErrSpawnNotFound recovery still surfaces genuine spawn failures.
   // Resume throws ErrSpawnNotFound, then the fresh spawn fails with a LAUNCH
   // FAILURE (ErrTmuxSessionCreate, no spawn in its place) → 'failed' and a
-  // spawn-failure notice goes to the persona's destination (b.av2 SR-7.2).
-  test('b.2oy: ErrSpawnNotFound on resume + fresh spawn fails → failed + spawn-failure notice to the persona destination', async () => {
+  // spawn-failure notice goes to the persona's destination.
+  test('ErrSpawnNotFound on resume + fresh spawn fails → failed + spawn-failure notice to the persona destination', async () => {
     const spawnCalls: import('agent-director').SpawnParams[] = []
     const deleteCalls: StubDeleteParams[] = []
     const readLog = captureStartupErrors()
@@ -1520,21 +1520,21 @@ describe('spawnForPersona: SR-1.4 collision-then-act', () => {
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-104 — ErrInvalidFlags from resume: one immediate re-check, UNCLASSIFIED
+// ErrInvalidFlags from resume: one immediate re-check, UNCLASSIFIED
 // ---------------------------------------------------------------------------
 //
 // The real re-check (`installAdVersionRecheck`) runs over a counting stub
 // `resolveSystemBinary` and a fake clock that is never moved, so every call
 // recorded is the immediate re-check the resume path triggered. A re-check
 // that does not stop the server leaves the resume's ErrInvalidFlags
-// UNCLASSIFIED, which takes SRJ-105's UNCLASSIFIED row (b.jg5 SRJ-313): no
+// UNCLASSIFIED, which takes UNCLASSIFIED row: no
 // spawn-failure notice, one refusal line, the persona's timer armed with the
 // UNCLASSIFIED cause, a refused launch (never counted), and the outcome
 // reported once to the persona's unclassified-error episode, with the site's
 // own classification. Those cases run on `makeRecoveryHarness` (the
 // production composition); the exact-once report runs over recording sinks.
 
-describe('collision ladder: ErrInvalidFlags on resume makes one version re-check, then is UNCLASSIFIED (b.jg5 SRJ-104)', () => {
+describe('collision ladder: ErrInvalidFlags on resume makes one version re-check, then is UNCLASSIFIED', () => {
   /** Every `resolveSystemBinary` call the installed re-check made, by its opts. */
   let resolveCalls: Array<object | undefined>
   /** The exit codes the re-check stopped with. */
@@ -1555,7 +1555,7 @@ describe('collision ladder: ErrInvalidFlags on resume makes one version re-check
 
   afterEach(() => {
     resetAdVersionRecheckForTests()
-    srj105AfterEach()
+    recoveryAfterEach()
   })
 
   /** A persona `C` whose spawn collides with its `ended` row, so the ladder resumes it and the resume rejects with `resumeError`. */
@@ -1579,20 +1579,20 @@ describe('collision ladder: ErrInvalidFlags on resume makes one version re-check
     return { cfg, calls }
   }
 
-  /** The UNCLASSIFIED rendering of a resume's ErrInvalidFlags after its re-check (the site's classification, b.jg5 SRJ-104). */
+  /** The UNCLASSIFIED rendering of a resume's ErrInvalidFlags after its re-check (the site's classification). */
   function invalidFlagsClassText(invalidFlags: Error & { errName: string; errDescription: string }): string {
     return `class=${AD_ERROR_CLASS_UNCLASSIFIED} name=${invalidFlags.errName} message=${JSON.stringify(invalidFlags.errDescription)}`
   }
 
-  /** The one refusal line of a resume's ErrInvalidFlags for persona `key` after the re-check answered `kind` (b.jg5 SRJ-105, SRJ-313). */
+  /** The one refusal line of a resume's ErrInvalidFlags for persona `key` after the re-check answered `kind`. */
   function invalidFlagsRefusalLine(key: string, invalidFlags: Error & { errName: string; errDescription: string }, kind: string): string {
     return (
       `[slack] spawnForPersona: resume refused for ${renderPersonaRef(key, key)}: ${invalidFlagsClassText(invalidFlags)} ` +
-      `(after one immediate agent-director version re-check: ${kind}) — no spawn-failure notice; nothing more is called (b.jg5 SRJ-105)`
+      `(after one immediate agent-director version re-check: ${kind}) — no spawn-failure notice; nothing more is called`
     )
   }
 
-  test('b.jg5 SRJ-313: the resume\'s ErrInvalidFlags is reported once to the unclassified sink, with the site\'s UNCLASSIFIED classification (never as STATE by the wrapper too), and arms the timer once with the UNCLASSIFIED cause', async () => {
+  test('the resume\'s ErrInvalidFlags is reported once to the unclassified sink, with the site\'s UNCLASSIFIED classification (never as STATE by the wrapper too), and arms the timer once with the UNCLASSIFIED cause', async () => {
     const reports: Array<{ key: string; error: unknown; classification: unknown }> = []
     const armed: Array<{ key: string; kind: string }> = []
     const unclassifiedSink: UnclassifiedErrorSink = {
@@ -1621,7 +1621,7 @@ describe('collision ladder: ErrInvalidFlags on resume makes one version re-check
     expect(notices).toEqual([])
   })
 
-  test('ErrNoSessionId: no re-check call; one reuse spawn of the same id and no delete (b.jg5 SRJ-707)', async () => {
+  test('ErrNoSessionId: no re-check call; one reuse spawn of the same id and no delete', async () => {
     const { cfg, calls } = installEndedRowResumeRejects(errNoSessionId())
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
     expect(resolveCalls).toHaveLength(0)
@@ -1631,10 +1631,10 @@ describe('collision ladder: ErrInvalidFlags on resume makes one version re-check
     expect(calls.spawnCalls.map((call) => call.reuse_finished)).toEqual([undefined, true])
   })
 
-  // E8 (b.jg5 SRJ-205, SRJ-302): a re-check that decides the stop posts
+  // a re-check that decides the stop posts
   // nothing and ends a launch the restart path does not count; any other
   // re-check answer (it passes, or could not run) leaves the ErrInvalidFlags
-  // UNCLASSIFIED: a refusal with no notice (b.jg5 SRJ-105, SRJ-313).
+  // UNCLASSIFIED: a refusal with no notice.
 
   /** Replace the installed re-check with one whose `resolveSystemBinary` answers `outcome`, recorded as the default one is. */
   function reinstallRecheck(outcome: StubResolveSystemBinaryOutcome): void {
@@ -1698,9 +1698,9 @@ describe('collision ladder: ErrInvalidFlags on resume makes one version re-check
   test.each([
     [RECHECK_OUTCOME_PASS, undefined],
     [RECHECK_OUTCOME_COULD_NOT_RUN, { throws: new Error('the resolve failed') }],
-  ] as const)('b.jg5 SRJ-105, SRJ-313: the re-check answers %s (exactly one resolveSystemBinary call): UNCLASSIFIED handling — no spawn-failure notice or spawn-failed entry, one refusal line and no resume failed line, retrying, P\'s timer armed with the UNCLASSIFIED cause, never counted (launchSession \'refused\'), the outcome reported once to P\'s episode; nothing killed, deleted or launched after it; B launches', async (kind, outcome) => {
+  ] as const)('the re-check answers %s (exactly one resolveSystemBinary call): UNCLASSIFIED handling — no spawn-failure notice or spawn-failed entry, one refusal line and no resume failed line, retrying, P\'s timer armed with the UNCLASSIFIED cause, never counted (launchSession \'refused\'), the outcome reported once to P\'s episode; nothing killed, deleted or launched after it; B launches', async (kind, outcome) => {
     if (outcome !== undefined) reinstallRecheck(outcome)
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     const persona = harnessPersona(h, p)
     const invalidFlags = errInvalidFlags('resume')
     const script = (): RecoveryStubScript => ({ ...collided(h, persona, { state: 'ended' }), resumeError: invalidFlags })
@@ -1742,10 +1742,10 @@ describe('collision ladder: ErrInvalidFlags on resume makes one version re-check
 })
 
 // ---------------------------------------------------------------------------
-// b.av2 SR-6.2 / SR-6.3 — row-vs-persona comparison (compareRowToPersona)
+// row-vs-persona comparison (compareRowToPersona)
 // ---------------------------------------------------------------------------
 
-describe('compareRowToPersona (b.av2 SR-6.2, SR-6.3)', () => {
+describe('compareRowToPersona', () => {
   /** Paths for one case, all under this test's fixture dir; `home` is real-pathed. */
   interface CompareFixture {
     work: string
@@ -1851,16 +1851,16 @@ function newLadderCalls(): LadderCalls {
 }
 
 // ---------------------------------------------------------------------------
-// b.av2 SR-6.2 / AC 4, as amended (b.jg5 SRJ-1503, SRJ-707) — a row in
+// — a row in
 // another directory is replaced on every ladder path with no row deleted: a
 // finished row by one reuse spawn of the same id in the persona's working
 // directory, a live row (`pending` included) through the live-row sequence
 // first, whose start the launch answers `sequence-waiting` for with no call
 // of its own. These cases install no sequence registry (the start answers
-// `not-installed`); the sequence itself is the SRJ-707 describe's.
+// `not-installed`); the sequence itself is the describe's.
 // ---------------------------------------------------------------------------
 
-describe('collision ladder: cwd guard (b.av2 SR-6.2, AC 4)', () => {
+describe('collision ladder: cwd guard', () => {
   /** Persona `C` with working_directory `work` (a real temp directory by default), the seam home installed. */
   function guardConfig(work = fixtureSubdir('work')): { cfg: PersonaConfig; work: string } {
     useSpawnHome()
@@ -1986,7 +1986,7 @@ describe('collision ladder: cwd guard (b.av2 SR-6.2, AC 4)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// b.av2 SR-6.2 / AC 48, as amended (b.jg5 SRJ-1504, SRJ-707) — before any
+// — before any
 // resume, a missing or changed `config_dir` label means no resume (a resume
 // would keep the old config dir): a finished row gets one reuse spawn of the
 // same id carrying the current label and CLAUDE_CONFIG_DIR, a live row (the
@@ -2039,7 +2039,7 @@ function installResumeEntry(entry: ResumeEntry, row: CannedGetResult, calls: Lad
   })
 }
 
-describe('collision ladder: config_dir guard before resume (b.av2 SR-6.2, AC 48)', () => {
+describe('collision ladder: config_dir guard before resume', () => {
   /** How the row's `config_dir` label relates to the persona's current one. */
   const LABEL_VARIANTS = ['matching', 'changed', 'missing'] as const
   type LabelVariant = (typeof LABEL_VARIANTS)[number]
@@ -2198,12 +2198,12 @@ describe('collision ladder: config_dir guard before resume (b.av2 SR-6.2, AC 48)
     expect(errLog).not.toContain('config_dir label')
   })
 
-  // AC 48 (b.av2 SR-14 "session-manager"): a persona inheriting the top-level
+  // ("session-manager"): a persona inheriting the top-level
   // claude_config_dir runs; its effective directory then changes through a
   // per-persona override. The row still carries the earlier label, so the
   // ladder replaces it by a reuse spawn of the same id with the new
-  // CLAUDE_CONFIG_DIR, deleting nothing (b.jg5 SRJ-1504).
-  test('AC 48: a changed effective claude_config_dir (inherited, then overridden) gives a reuse spawn of the same id with the new CLAUDE_CONFIG_DIR and deletes nothing', async () => {
+  // CLAUDE_CONFIG_DIR, deleting nothing.
+  test('a changed effective claude_config_dir (inherited, then overridden) gives a reuse spawn of the same id with the new CLAUDE_CONFIG_DIR and deletes nothing', async () => {
     const home = useSpawnHome()
     const work = fixtureSubdir('work')
     const earlier = fixtureSubdir('top-level-config')
@@ -2254,7 +2254,7 @@ describe('collision ladder: config_dir guard before resume (b.av2 SR-6.2, AC 48)
 })
 
 // ---------------------------------------------------------------------------
-// b.av2 SR-6.2 — AD owns native pre-trust on every launch
+// AD owns native pre-trust on every launch
 // ---------------------------------------------------------------------------
 //
 // Native config is fixture data only. Every launch path preserves its bytes;
@@ -2271,7 +2271,7 @@ function recordLaunchCalls(stub: StubClient, events: LaunchEvent[]): StubClient 
   return observeLaunchCalls(stub, (call) => events.push(call))
 }
 
-describe('AD pre-trust ownership (b.d6n)', () => {
+describe('AD pre-trust ownership', () => {
   /** One launch path: how to reach it, what it returns and the expected launch-order log. */
   interface LaunchPath {
     install: (cfg: PersonaConfig, calls: LadderCalls) => StubClient
@@ -2309,11 +2309,11 @@ describe('AD pre-trust ownership (b.d6n)', () => {
     ['restart launchSession adapter, resume of an ended row', {
       install: (cfg, calls) => installResumeEntry('ended', personaRow(cfg, 'C'), calls),
       launch: (cfg) => launchSession('C', cfg),
-      // b.4q8: counted once its row reports in.
+      // counted once its row reports in.
       expected: LAUNCH_RESUMED_UNREPORTED,
       events: ['spawn', 'resume'],
     }],
-    ['the reuse spawn after resume ErrJsonlMissing and its diagnosis (b.jg5 SRJ-712)', {
+    ['the reuse spawn after resume ErrJsonlMissing and its diagnosis', {
       install: (cfg, calls) =>
         installStub({
           ...calls,
@@ -2352,7 +2352,7 @@ const GUARD_KEY = personaKey(GUARD_NAME)
 const GUARD_INSTANCE = `${PERSONA_INSTANCE_ID_PREFIX}${GUARD_KEY}`
 
 // ---------------------------------------------------------------------------
-// b.svb / b.f2b — Claude Code's prompt suggestions are off in every persona
+// Claude Code's prompt suggestions are off in every persona
 // session. Its end-of-turn suggestion fork runs the session's PreToolUse
 // hooks and flips an idle persona's row to `working`, so every spawn a ladder
 // makes carries CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false in `extra_env`.
@@ -2360,7 +2360,7 @@ const GUARD_INSTANCE = `${PERSONA_INSTANCE_ID_PREFIX}${GUARD_KEY}`
 // stored with the row at spawn, so a resume passes nothing else.
 // ---------------------------------------------------------------------------
 
-describe('prompt suggestions off on every launch (b.svb, b.f2b)', () => {
+describe('prompt suggestions off on every launch', () => {
   type SpawnResult = import('agent-director').SpawnResult
   const collision = () => cannedErr<SpawnResult>(errInstanceIdCollision())
   const spawnOk = () => cannedOk<StubSpawnResult>({ instance_id: 'cscb_C' })
@@ -2391,11 +2391,11 @@ describe('prompt suggestions off on every launch (b.svb, b.f2b)', () => {
    * Every way a launch reaches agent-director: the fresh spawn; a resume
    * (ended, missing, dead waiting and working rows, the restart relaunch);
    * each replacement of a finished row, a reuse spawn of the same id
-   * (resume_enabled false, cwd and config_dir mismatches; b.jg5 SRJ-707), and
+   * (resume_enabled false, cwd and config_dir mismatches), and
    * the retry after ErrSpawnNotFound on the get; and each spawn after a
    * rejected resume, the fresh-after-amnesia one included. A live row's
    * replacement and a resume's ErrSpawnNotResumable make no launch of their
-   * own (b.jg5 SRJ-705, SRJ-710).
+   * own.
    */
   const ENV_PATHS: Array<[string, EnvPath]> = [
     ['fresh spawn', { install: (_cfg, calls) => installStub({ ...calls }), expected: spawned, spawns: 1, resumes: 0 }],
@@ -2435,11 +2435,11 @@ describe('prompt suggestions off on every launch (b.svb, b.f2b)', () => {
       install: (_cfg, calls) => installStub({ ...calls, spawnQueue: [collision(), spawnOk()], getError: errSpawnNotFound() }),
       expected: spawned, spawns: 2, resumes: 0,
     }],
-    ['resume ErrJsonlMissing: the reuse spawn after its diagnosis (fresh after amnesia; b.jg5 SRJ-712)', {
+    ['resume ErrJsonlMissing: the reuse spawn after its diagnosis (fresh after amnesia)', {
       install: (cfg, calls) => installResumeRejects(cfg, calls, errJsonlMissing()),
       expected: { key: 'C', action: 'fresh-after-inconclusive-amnesia' }, spawns: 2, resumes: 1,
     }],
-    ['resume ErrNoSessionId: the reuse spawn (b.jg5 SRJ-707)', {
+    ['resume ErrNoSessionId: the reuse spawn', {
       install: (cfg, calls) => installResumeRejects(cfg, calls, errNoSessionId()),
       expected: spawned, spawns: 2, resumes: 1,
     }],
@@ -2506,7 +2506,7 @@ describe('prompt suggestions off on every launch (b.svb, b.f2b)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// launchSession's relaunch gate (b.av2 SR-6.1: a persona whose Slack
+// launchSession's relaunch gate (a persona whose Slack
 // connection is not serving is not relaunched). The server passes
 // `createPersonaRelaunchGate` as `canLaunch`; tests/persona-relaunch-gate.test.ts
 // covers the gate itself.
@@ -2554,7 +2554,7 @@ describe('launchSession: the relaunch gate (canLaunch)', () => {
     expect(f.calls.spawnCalls.map((p) => p.instance_id)).toEqual(['cscb_C'])
   })
 
-  // The gate is asked first (b.av2 SR-8.6: a key a confirmed apply removed is
+  // The gate is asked first (a key a confirmed apply removed is
   // 'skipped', not a failure); a key the gate lets through that no applied
   // persona has is still a failure that launches nothing.
   test('an unknown key the gate lets through is false: the gate is asked once, then nothing is patched or launched', async () => {
@@ -2571,14 +2571,14 @@ describe('launchSession: the relaunch gate (canLaunch)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// b.av2 SR-8.6 — a key outside the applied set is never launched. From a
+// a key outside the applied set is never launched. From a
 // confirmed apply's step 1 on, the server's relaunch gate (the real
 // `createPersonaRelaunchGate`, with the bring-up controller's `isApplied`)
 // refuses a removed key, whether or not the config the restart path passes
 // still holds it; `launchSession` asks the gate before it looks the key up.
 // ---------------------------------------------------------------------------
 
-describe('launchSession: a key outside the applied set (b.av2 SR-8.6)', () => {
+describe('launchSession: a key outside the applied set', () => {
   const SERVING: PersonaConnectionStatus = { state: 'up', identity: { botUserId: 'U0APPLIED', botId: 'B0APPLIED' } }
 
   /**
@@ -2651,12 +2651,12 @@ describe('launchSession: a key outside the applied set (b.av2 SR-8.6)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// b.av2 SR-8.6 next-launch rows (AC 59): a launch takes the persona's
+// next-launch rows: a launch takes the persona's
 // effective claude_config_dir from the applied set it is handed at that
 // moment (the server hands `personaConfig`, which a confirmed apply swaps).
 // ---------------------------------------------------------------------------
 
-describe('next launch: the applied values at launch time (b.av2 SR-8.6 next-launch rows, AC 59)', () => {
+describe('next launch: the applied values at launch time (next-launch rows)', () => {
   test('claude_config_dir changed between two launches: the first uses the old values; the second gives the old-label row a reuse spawn of the same id with the new CLAUDE_CONFIG_DIR (not created yet, under a symlinked parent), and deletes nothing', async () => {
     useSpawnHome()
     const work = fixtureSubdir('work')
@@ -2715,16 +2715,16 @@ describe('next launch: the applied values at launch time (b.av2 SR-8.6 next-laun
       `persona=${GUARD_KEY}`,
       `config_dir=${configDirLabelValue(join(realpathSync(realParent), 'claude-config-new'))}`,
     ])
-    // Not held for the directory that does not exist yet (bug b.g57, Director decision 1).
+    // Not held for the directory that does not exist yet.
     expect(errLog).not.toContain(PERSONA_CONFIG_DIR_UNRESOLVABLE)
   })
 })
 
 // ---------------------------------------------------------------------------
-// b.av2 SR-6.3 / AC 4 — the fixed instance ID and one in-flight launch per persona
+// the fixed instance ID and one in-flight launch per persona
 // ---------------------------------------------------------------------------
 
-describe('spawnForPersona: fixed instance ID and one launch in flight per persona (b.av2 SR-6.3, AC 4)', () => {
+describe('spawnForPersona: fixed instance ID and one launch in flight per persona', () => {
   test('the same persona spawned twice in turn: both spawns use cscb_<key>; the second meets ErrInstanceIdCollision and resolves through the ladder', async () => {
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
     const spawnCalls: import('agent-director').SpawnParams[] = []
@@ -2856,16 +2856,16 @@ describe('spawnForPersona: fixed instance ID and one launch in flight per person
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-301 — every collision ladder is a launch attempt. An
+// every collision ladder is a launch attempt. An
 // agent-director error inside it that the arming predicate answers a cause
 // for is sent to the trigger sink installed with `initOutageState`
 // (`triggerSink`; gone with `_resetOutageState` in afterEach), and a `failed`
-// launch whose last error armed the timer answers `retrying` (SRJ-1015);
+// launch whose last error armed the timer answers `retrying`;
 // `launchSession` answers `'refused'` for it, which the restart path never
-// counts (SRJ-302), and the start pass counts it only under `retrying`.
+// counts, and the start pass counts it only under `retrying`.
 // ---------------------------------------------------------------------------
 
-describe('launch attempt: the retrying result and launchSession\'s \'refused\' (b.jg5 SRJ-301, SRJ-302, SRJ-1015)', () => {
+describe('launch attempt: the retrying result and launchSession\'s \'refused\'', () => {
   /** Every arm the recording sink received: persona key and cause kind. */
   let armed: Array<{ key: string; kind: string }>
   /** The controller a case installed as the sink, with its fake clock and log lines; stopped in afterEach. */
@@ -2942,8 +2942,7 @@ describe('launch attempt: the retrying result and launchSession\'s \'refused\' (
   /**
    * The fresh spawn's answers: an UNAVAILABLE one arms with its cause and
    * answers `retrying`; a LAUNCH FAILURE (ErrTmuxSessionCreate) arms P's timer
-   * at once in pending-only mode and is counted, never `retrying` (b.jg5
-   * SRJ-111, SRJ-409);
+   * at once in pending-only mode and is counted, never `retrying`;
    * a DIRECTORY one arms nothing. Each is built with the stub's builders or
    * the client's own class.
    */
@@ -3094,7 +3093,7 @@ describe('launch attempt: the retrying result and launchSession\'s \'refused\' (
       { key: 'gamma', action: 'spawned' },
     ])
     // Only beta is armed in full mode; alpha's and gamma's launches returned,
-    // so each watches its `pending` row in pending-only mode (b.jg5 SRJ-301, SRJ-409).
+    // so each watches its `pending` row in pending-only mode.
     expect(r.controller.armedKeys()).toEqual(['alpha', 'beta', 'gamma'])
     for (const key of ['alpha', 'gamma']) {
       expect(r.controller.view(key)).toMatchObject({ phase: 'waiting', mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, causes: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW] })
@@ -3111,7 +3110,7 @@ describe('launch attempt: the retrying result and launchSession\'s \'refused\' (
 })
 
 // ---------------------------------------------------------------------------
-// b.av2 SR-6.4 — a directory-broken persona's working directory
+// a directory-broken persona's working directory
 // ---------------------------------------------------------------------------
 
 /**
@@ -3170,7 +3169,7 @@ function countDeferredLines(errLog: string): number {
 }
 
 /**
- * A pre-persona row (b.1ix) as the start sweep's `list` answers it: only the
+ * A pre-persona row as the start sweep's `list` answers it: only the
  * `service` and `channel` labels, in `state`, with instance id `id` and the
  * tmux session that id names.
  */
@@ -3184,12 +3183,12 @@ function prePersonaRow(state: string, id = `cscb_old_${state}_C0OLD`): import('a
 }
 
 // ---------------------------------------------------------------------------
-// b.av2 SR-6.3 (formerly SR-1.6), amended by b.jg5 SRJ-1506 — the start sweep
-// (b.jg5 SRJ-714, SRJ-1514)
+// (formerly), amended by the start sweep
+//
 // ---------------------------------------------------------------------------
 
 /**
- * Run the start sweep with its kill retries on `clock` (b.jg5 SRJ-702),
+ * Run the start sweep with its kill retries on `clock`,
  * moving the clock only to each wait between a kill's tries as it is set
  * (the sweep's own steps run in event-loop turns, bounded); fails the case
  * if the sweep does not settle or leaves a timer pending.
@@ -3209,13 +3208,13 @@ async function reconcileOnClock(cfg: PersonaConfig, clock: FakeClock = createFak
   return work
 }
 
-/** The start sweep's result (b.jg5 SRJ-714's counts): every count 0 but `counts`. */
+/** The start sweep's result (counts): every count 0 but `counts`. */
 function sweepResult(counts: Partial<OrphanReconcileResult> = {}): OrphanReconcileResult {
   return { listed: 0, killed: 0, kept: 0, killFailed: 0, recordedAsRetired: 0, leftForLatch: 0, ...counts }
 }
 
 /**
- * The sweep ended with its one summary line for `result` (b.jg5 SRJ-714):
+ * The sweep ended with its one summary line for `result`:
  * the builder's line, once, and the last of the sweep's lines in `log` (a
  * captured log, or the lines).
  */
@@ -3247,10 +3246,10 @@ function sweepSurvivorEntry(row: import('agent-director').ListRow, survivorDescr
 
 /**
  * The `orphan-cleanup` entry of a sweep kill of `row` that did not succeed
- * (b.jg5 SRJ-714, SRJ-1013): the row (`persona` its label as the sweep names
+ * the row (`persona` its label as the sweep names
  * it; none for a pre-persona row), its listed state and session and the
  * outcome that stands; then the ordinary version quoting `ordinary`, when
- * SRJ-714 calls for it; none for a kill whose tries a shutdown stopped.
+ * calls for it; none for a kill whose tries a shutdown stopped.
  */
 function sweepKillFailedEntry(
   row: import('agent-director').ListRow,
@@ -3271,7 +3270,7 @@ function sweepKillFailedEntry(
   return `${entry}; kill-failure alert: ${sweepAlertEntry(row, { version: KILL_FAILURE_VERSION_ORDINARY, session: row.tmux_session_name, instanceId: row.instance_id, quotes: ordinary })}`
 }
 
-describe('reconcileOrphans: the start sweep by persona kills its live strays with the result checked and deletes no row (b.av2 SR-6.3, AC 4; b.jg5 SRJ-714, SRJ-1506, SRJ-1514)', () => {
+describe('reconcileOrphans: the start sweep by persona kills its live strays with the result checked and deletes no row', () => {
   /**
    * Three applied personas in real temp working directories, except that
    * beta's configured working_directory is a symlink to `betaReal` (the path
@@ -3351,7 +3350,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
     expectSummaryLast(errLog, result)
   })
 
-  // b.av2 SR-6.4: the sweep runs before any bring-up, so it cannot compare a
+  // the sweep runs before any bring-up, so it cannot compare a
   // directory-broken persona's rows by real path. It keeps them and defers the
   // cwd check to the launch; the other three conditions still apply, to that
   // persona and to every other row in the same sweep.
@@ -3498,7 +3497,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
     expect(countDeferredLines(errLog)).toBe(1)
   })
 
-  // b.jg5 SRJ-110, SRJ-701, SRJ-714 (HO C2, C17 Verify; AC 24, AC 77): the
+  // (HO C2, C17 Verify): the
   // start sweep's kill is a checked kill and deletes no row, whatever its
   // outcome. A kill that does not succeed keeps the row with one
   // `orphan-cleanup` entry naming the row, its state, its session and the
@@ -3506,13 +3505,12 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
   // an `ErrTmuxKillFailed` that stands or any failure after a survivor-naming
   // try; a success after a survivor-naming try counts killed and writes one
   // `persona-kill-survivor` entry. Nothing latches (a CONFLICT or an UNUSABLE
-  // NAME is routed per SRJ-1002, even for a configured persona's row with the
+  // NAME is routed, even for a configured persona's row with the
   // server's latch installed), nothing is posted (kill-failure alerts over a
   // recording sink are installed, as main() installs them), no retry timer is
-  // armed and no unclassified-error episode is fed (b.jg5 SRJ-110). An
-  // `ErrInvalidFlags` gets exactly one immediate version re-check (b.jg5
-  // SRJ-104, SRJ-204); a stop it decides ends the sweep's calls (SRJ-205).
-  describe('b.jg5 SRJ-110, SRJ-701, SRJ-714: the start sweep\'s checked kill', () => {
+  // armed and no unclassified-error episode is fed. An
+  // `ErrInvalidFlags` gets exactly one immediate version re-check; a stop it decides ends the sweep's calls.
+  describe('the start sweep\'s checked kill', () => {
     /** Every arm the outage state's trigger sink received. */
     let armed: Array<{ key: string; kind: string }>
     /** Every report the outage state's unclassified sink received. */
@@ -3559,7 +3557,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
 
     /**
      * Sweep `rows` (built over `sweepConfig`'s personas) with the stub
-     * answering `script`, its kill retries on a fake clock (b.jg5 SRJ-702),
+     * answering `script`, its kill retries on a fake clock,
      * the server's latch and configured-persona query installed; answers the
      * calls by instance id, the log and the startup-errors entries, leak-checked.
      */
@@ -3612,7 +3610,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
     /**
      * How a sweep kill's tries end, the stub answering `script`: the outcome
      * that stands, the kills and reads made, whether its success stands, and
-     * the alert SRJ-714 calls for (the ordinary version's quotes, or the
+     * the alert calls for (the ordinary version's quotes, or the
      * survivor version's description).
      */
     interface SweepKillScenario {
@@ -3625,7 +3623,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       readonly survivorDescription?: string
     }
 
-    /** A kill answering `err` at every try: tried again only while UNAVAILABLE (b.jg5 SRJ-702); the ordinary version for an `ErrTmuxKillFailed`. */
+    /** A kill answering `err` at every try: tried again only while UNAVAILABLE; the ordinary version for an `ErrTmuxKillFailed`. */
     function failingAtEveryTry(err: Error): SweepKillScenario {
       const standing = killOutcomeOf({ thrown: err })
       const tries = standing.kind === KILL_OUTCOME_NOT_KILLED && standing.errorClass === AD_ERROR_CLASS_UNAVAILABLE ? KILL_RETRY_TRIES : 1
@@ -3648,13 +3646,13 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
     /** A survivor-naming `ErrTmuxKillFailed`, its session carrying the sentinel. */
     const survivorNaming = (label: string): Error => errTmuxKillFailed(sentinelInMessage(label), 'pane-process-survived')
 
-    /** Every kill outcome at one live row (b.jg5 SRJ-714's test, HO C2's non-success list, SRJ-1002's CONFLICT and UNUSABLE NAME). */
+    /** Every kill outcome at one live row (test, HO C2's non-success listCONFLICT and UNUSABLE NAME). */
     const SWEEP_KILL_SCENARIOS: ReadonlyArray<readonly [string, () => SweepKillScenario]> = [
       ['succeeds with kill_sent true', () => succeeding({ killResult: cannedKillResult(true) }, { kind: KILL_OUTCOME_KILLED, killSent: true })],
       ['succeeds with kill_sent false', () => succeeding({ killResult: cannedKillResult(false) }, { kind: KILL_OUTCOME_KILLED, killSent: false })],
       ['succeeds with no kill_sent', () => succeeding({ killResult: cannedKillResult() }, { kind: KILL_OUTCOME_KILLED })],
       ['answers ErrSpawnNotFound', () => succeeding({ killError: errSpawnNotFound() }, { kind: KILL_OUTCOME_ROW_GONE })],
-      // b.jg5 SRJ-104, SRJ-110: for `kill`, gone is success.
+      // for `kill`, gone is success.
       ['answers GONE (ErrTmuxCaptureFailed)', () => succeeding({ killError: errTmuxCaptureFailed(undefined, 'kill') }, { kind: KILL_OUTCOME_SESSION_GONE, name: errTmuxCaptureFailed().errName })],
       ['answers GONE (ErrTmuxSendKeys)', () => succeeding({ killError: errTmuxSendKeys() }, { kind: KILL_OUTCOME_SESSION_GONE, name: errTmuxSendKeys().errName })],
       ...KILL_FAILED_DESCRIPTIONS.map((d) => [`answers ErrTmuxKillFailed (${d})`, () => failingAtEveryTry(errTmuxKillFailed(sentinelInMessage(`sweep-${d}`), d))] as const),
@@ -3668,7 +3666,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       ['answers an UNUSABLE NAME ErrInternal', () => failingAtEveryTry(errUnusableName())],
       ['answers ErrConfigMalformed', () => failingAtEveryTry(errConfigMalformed())],
       ['answers another error (ErrKillBroken)', () => failingAtEveryTry(errGeneric('kill', 'ErrKillBroken'))],
-      // b.jg5 SRJ-110: a class the kill has no row for is UNCLASSIFIED; the sweep arms nothing for it.
+      // a class the kill has no row for is UNCLASSIFIED; the sweep arms nothing for it.
       ['answers a STATE name (ErrInstanceIdCollision), UNCLASSIFIED', () => failingAtEveryTry(errInstanceIdCollision())],
       ['answers a STATE name (ErrSpawnNotResumable), UNCLASSIFIED', () => failingAtEveryTry(errSpawnNotResumable())],
       ['answers a LAUNCH FAILURE name (ErrTmuxSessionCreate), UNCLASSIFIED', () => failingAtEveryTry(errTmuxSessionCreate('kill'))],
@@ -3715,7 +3713,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
     ]
 
     test.each(STRAY_ROWS.flatMap(([rowLabel, row, persona]) => SWEEP_KILL_SCENARIOS.map(([label, scenario]) => [rowLabel, label, row, persona, scenario] as const)))(
-      '%s whose kill %s: no delete; counted killed or kept with a failed kill in its sub-count, the summary line agreeing; an orphan-cleanup entry for a failed kill, with the ordinary text only where SRJ-714 says, and a persona-kill-survivor entry only for a success after a survivor-naming try; one find-missing; nothing latched, posted, armed or reported',
+      '%s whose kill %s: no delete; counted killed or kept with a failed kill in its sub-count, the summary line agreeing; an orphan-cleanup entry for a failed kill, with the ordinary text only where says, and a persona-kill-survivor entry only for a success after a survivor-naming try; one find-missing; nothing latched, posted, armed or reported',
       async (_rowLabel, _label, row, persona, scenario) => {
         const s = scenario()
 
@@ -3729,7 +3727,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
         const expected = sweepResult(s.killed ? { listed: 1, killed: 1 } : { listed: 1, kept: 1, killFailed: 1 })
         expect(r.result).toEqual(expected)
         expectSummaryLast(r.errLog, expected)
-        // b.jg5 SRJ-714, SRJ-120: a kill was made, whatever its outcome, so one run follows.
+        // a kill was made, whatever its outcome, so one run follows.
         expect(r.findMissingCalls).toBe(1)
         expect(startupEntriesIn(r.entries, ORPHAN_CLEANUP_LABEL)).toEqual(s.killed ? [] : [sweepKillFailedEntry(listed, persona, s.standing, s.ordinary)])
         expect(startupEntriesIn(r.entries, PERSONA_KILL_SURVIVOR_LABEL)).toEqual(s.survivorDescription === undefined ? [] : [sweepSurvivorEntry(listed, s.survivorDescription)])
@@ -3747,7 +3745,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       expect(r.entries).toContain(REDACTED_SENTINEL_TAIL)
     })
 
-    // b.jg5 SRJ-1002, SRJ-512 (the E16 and E20 hatch notes): a CONFLICT or
+    // (the and design notes): a CONFLICT or
     // an UNUSABLE NAME answer at the kill of a configured persona's own row
     // swept for its cwd latches no one, though the row is the persona's own.
     test.each<[string, () => Error]>([
@@ -3762,13 +3760,13 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       expect(r.killCalls).toEqual(['cscb_alpha'])
       expect(r.deleteCalls).toEqual([])
       expect(startupEntriesIn(r.entries, ORPHAN_CLEANUP_LABEL)).toEqual([sweepKillFailedEntry(r.rows[0]!, renderPersonaRef('alpha', 'alpha'), killOutcomeOf({ thrown: err }))])
-      // b.jg5 SRJ-1002: its server-log line is the entry's own (written to stderr by its writer); no latch line of either kind.
+      // its server-log line is the entry's own (written to stderr by its writer); no latch line of either kind.
       expect(r.errLog.split('\n').filter((line) => line.includes(' — CONFLICT: ') || line.includes(' — UNUSABLE NAME: ') || line.includes('conflict-latch: '))).toEqual([])
       expect([r.latch.isLatched('alpha'), r.latch.record('alpha')]).toEqual([false, undefined])
       expect([notices, outageEmissions, armed, reported]).toEqual([[], [], [], []])
     })
 
-    describe('an ErrInvalidFlags at a sweep kill (b.jg5 SRJ-104, SRJ-204, SRJ-205)', () => {
+    describe('an ErrInvalidFlags at a sweep kill', () => {
       let resolveCalls: Array<object | undefined>
       let stops: number[]
 
@@ -3901,7 +3899,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
         ])
       })
 
-      // b.jg5 SRJ-205, SRJ-702, SRJ-714 (PM finding F1): a re-check stop after
+      // (PM finding F1): a re-check stop after
       // a survivor-naming try is a kill a shutdown stopped, so its one line
       // quotes that survivor; the entry carries no alert text.
       test('a survivor-naming ErrTmuxKillFailed, then an ErrInvalidFlags whose re-check decides that the server stops: one stopped line quoting the redacted survivor description, with the re-check\'s cause; the orphan-cleanup entry has no alert text and there is no persona-kill-survivor entry', async () => {
@@ -3933,7 +3931,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       })
     })
 
-    // b.jg5 SRJ-110, SRJ-301, SRJ-714 (hatch A3; the E11 and E12 hatch
+    // (design A3; the and design
     // notes): an ENVIRONMENT or CONFIG answer at a start-sweep kill arms no
     // retry timer and deletes nothing. It raises the row's persona's outage
     // (`tmux-unavailable`, `ad-config-malformed`) only when that persona is
@@ -3944,7 +3942,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       ['ENVIRONMENT', 'departed', 'cscb_departed', false, 'tmux-unavailable', () => errTmuxNotAvailable(undefined, 'kill')],
       ['CONFIG', 'alpha', 'cscb_alpha_old', true, 'ad-config-malformed', () => errConfigMalformed()],
       ['CONFIG', 'departed', 'cscb_departed', false, 'ad-config-malformed', () => errConfigMalformed()],
-    ])('b.jg5 SRJ-110 (hatch A3): an %s answer at the sweep kill of %s\'s row (%s, configured: %p) raises %s only for a configured persona; recorded in the row\'s orphan-cleanup entry; no retry timer armed, nothing deleted', async (_class, persona, id, configured, flag, make) => {
+    ])('(hatch A3): an %s answer at the sweep kill of %s\'s row (%s, configured: %p) raises %s only for a configured persona; recorded in the row\'s orphan-cleanup entry; no retry timer armed, nothing deleted', async (_class, persona, id, configured, flag, make) => {
       const err = make()
 
       const r = await sweepOne(id, persona, { killError: err })
@@ -3960,12 +3958,12 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       for (const key of ['beta', 'gamma']) expect(getOutageFlags(key).size).toBe(0)
     })
 
-    // b.jg5 SRJ-702 (AC 56, AC 84): each sweep kill of a row listed live is
+    // each sweep kill of a row listed live is
     // tried up to 3 times 2 s apart, with one bare `status` read of the row
     // before each further try, on the sweep's clock and with one pass budget:
     // once a row has used its tries on UNAVAILABLE, every later kill in the
-    // pass is made once. A row listed finished is never killed (SRJ-714).
-    describe('b.jg5 SRJ-702: the sweep\'s kills take the bounded retry with one pass budget (AC 56, AC 84)', () => {
+    // pass is made once. A row listed finished is never killed.
+    describe('the sweep\'s kills take the bounded retry with one pass budget', () => {
       test('tmux wedged at start: the first live row gets the exported try count, every later live row (swept or pre-persona) one kill; the pass takes no more virtual time than one row\'s retries; nothing deleted, nothing armed', async () => {
         const r = await sweepListed(
           (cfg, home) => [sweptRow(cfg, home, 'cscb_alpha_old', 'alpha'), prePersonaRow('waiting'), sweptRow(cfg, home, 'cscb_departed', 'departed')],
@@ -4017,7 +4015,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
         expect(r.result).toEqual(sweepResult({ listed: 3, killed: 1, kept: 2, killFailed: 1 }))
       })
 
-      // b.jg5 SRJ-110, SRJ-316, SRJ-714 (hatch A3; the E12 hatch note): a
+      // (design A3; the design note): a
       // CONFIG answer at the status read between a sweep kill's tries raises
       // its outage for a configured persona's row only, and arms no timer.
       test.each<[string, string, string, number, boolean]>([
@@ -4044,12 +4042,12 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
     })
   })
 
-  // b.jg5 SRJ-714, SRJ-120 (b.1ix): after the kills, one findMissing run over
+  // after the kills, one findMissing run over
   // every row given a kill, swept and pre-persona rows alike and whatever
   // the outcome, since agent-director's kill leaves the row's state as it
   // was; none when no kill was made. A pre-persona row is never deleted: no
   // launch reuses its ID, and `expire` removes it later.
-  describe('b.jg5 SRJ-714, SRJ-120: one findMissing run after the kills', () => {
+  describe('one findMissing run after the kills', () => {
     /** Every row id the default (empty) findMissing result leaves live, as the post-kill line lists them. */
     const POST_KILL_ROWS: ReadonlyArray<readonly [string, (cfg: PersonaConfig) => import('agent-director').ListRow[]]> = [
       ['a swept row only', () => [cannedListRow({ instance_id: 'cscb_departed', labels: { tag_prompt: '1', service: 'cscb', persona: 'departed' } })]],
@@ -4128,7 +4126,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       expect(killCalls.map((k) => k.instance_id)).toEqual([...liveIds, pendingLeftLive])
       expect(deleteCalls).toHaveLength(0)
       expect(findMissingCalls).toEqual([{}])
-      // b.jg5 SRJ-120: the killed `pending` row the sweep left in neither list
+      // the killed `pending` row the sweep left in neither list
       // was not judged; the one in unverified_ids and the other rows in
       // neither list still read live.
       const pendingId = `cscb_old_${AGENT_DIRECTOR_PENDING_STATE}_C0OLD`
@@ -4140,7 +4138,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       expect(errLog).not.toContain('cscb_old_missing_C0OLD')
     })
 
-    // b.jg5 SRJ-714, SRJ-408: a swept `pending` row with no launch start is
+    // a swept `pending` row with no launch start is
     // killed with no wait before the first try; the run judges it by
     // agent-director's ordinary rules, so one in neither list was not judged.
     test('swept pending rows with no launch start (an absent persona\'s, a wrong instance ID\'s): each killed at once, with no read and no wait first; the post-kill line reports them not judged', async () => {
@@ -4227,7 +4225,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
 
     // agent-director 0.10.0 modelled: `kill` ends the tmux session but leaves
     // the row's state as it was, and `findMissing` marks a live row whose
-    // session is gone `missing`. Before b.1ix's follow-up the killed row still
+    // session is gone `missing`. Before follow-up the killed row still
     // read live at every later start and was killed again each time.
     test('across two starts: a killed row whose session is gone reads missing after the first start\'s sweep and the second start leaves it alone; a row whose session survived its kill is killed again', async () => {
       const { cfg } = sweepConfig()
@@ -4285,7 +4283,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
   // Every case below runs on `makeRecoveryHarness` over P and B: its latch,
   // configured-persona query and retired-key store (over its temp state
   // directory) installed as `main()` installs them, its notice episodes as
-  // the recording notice sink; `srj105AfterEach` leak-checks everything
+  // the recording notice sink; `recoveryAfterEach` leak-checks everything
   // captured and puts every install back. The sweep runs as `main()` runs it,
   // its kill retries on the harness clock.
 
@@ -4313,12 +4311,12 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
     for (const [key, entry] of retiredKeysRecordOf(others)) expect(record?.get(key)).toEqual(entry)
   }
 
-  // b.jg5 SRJ-116, SRJ-714 (its list, latch and record parts), SRJ-502
-  // (AC 55), SRJ-504 (AC 45's list half), SRJ-513, SRJ-803, SRJ-807; the
-  // E13, E14, E16 and E24 hatch notes. A latched persona's rows are never
+  // (its list, latch and record parts)
+  //(list half); the
+  // and design notes. A latched persona's rows are never
   // killed; the kills, the summary and the stops are the next describe's.
-  describe('b.jg5 SRJ-116, SRJ-714: the one list latches each configured persona from its own row, records absent personas\' keys as retired in one write before the first kill, clears at its rows, and never kills a latched persona\'s rows', () => {
-    afterEach(srj105AfterEach)
+  describe('the one list latches each configured persona from its own row, records absent personas\' keys as retired in one write before the first kill, clears at its rows, and never kills a latched persona\'s rows', () => {
+    afterEach(recoveryAfterEach)
 
     /** The sweep's own latch lines: one per persona it holds. */
     const sweepLatchLines = (h: RecoveryHarness): string[] =>
@@ -4328,7 +4326,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
     const latchedFromListLine = (p: string, latchCase: string): string => startSweepLatchedFromOwnRowLine(renderPersonaRef(p, p), personaInstanceId(p), latchCase)
 
     test('one list carrying the service label alone, with no state filter, and nothing else: a sweep listing no row makes no other call, latches, records and posts nothing', async () => {
-      const { h } = srj105Build()
+      const { h } = buildRecoveryCase()
 
       const run = await sweepOver(h, [])
 
@@ -4340,7 +4338,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
     })
 
     test.each(EVERY_STATE)('a row listed %s reaches the decisions: an absent persona\'s row in that state has its key recorded absent-at-start, in the one write, before any kill', async (state) => {
-      const { h } = srj105Build()
+      const { h } = buildRecoveryCase()
 
       const run = await sweepOver(h, [absentRow(h, LAUNCH_START_ABSENT_PERSONA_KEY, { state })])
 
@@ -4353,7 +4351,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
     })
 
     test('several rows of two absent personas, in every state, with configured personas\' rows and a pre-persona row: both keys in one write before the first kill; no configured or pre-persona key is recorded', async () => {
-      const { h, p, b } = srj105Build()
+      const { h, p, b } = buildRecoveryCase()
       const rows = [
         // Swept first: B's row under another instance id.
         listed(h, b, { instance_id: `${personaInstanceId(b)}_old` }),
@@ -4379,7 +4377,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       ['every absent key already recorded with no mark', { [LAUNCH_START_ABSENT_PERSONA_KEY]: { cause: RETIRED_KEY_CAUSE_REMOVED } }, (h) => [absentRow(h, LAUNCH_START_ABSENT_PERSONA_KEY, { state: 'ended' })], 1],
       ['no absent persona\'s row listed', { [LAUNCH_START_ABSENT_PERSONA_KEY]: { cause: RETIRED_KEY_CAUSE_REMOVED } }, (h) => [listed(h, h.keys[0]!)], 0],
     ])('nothing new to record (%s): no write, the record file byte-identical and no store line', async (_label, seeded, rows, named) => {
-      const { h } = srj105Build({ retiredKeys: () => seeded })
+      const { h } = buildRecoveryCase({ retiredKeys: () => seeded })
       const before = readFileSync(h.retiredKeys.path)
 
       const run = await sweepOver(h, rows(h))
@@ -4389,12 +4387,12 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       expect(run.result.recordedAsRetired).toBe(named)
     })
 
-    // b.jg5 SRJ-714, SRJ-803, SRJ-807: recording a marked key clears its mark,
-    // so a live row of it is the old life again; the same sweep's SRJ-807
+    // recording a marked key clears its mark,
+    // so a live row of it is the old life again; the same sweep's
     // clear does not apply to that row, and the whole is one write.
     test.each(['waiting', LIVENESS_DEAD_ROW_ENDED])('an absent persona\'s key recorded with its mark set, its own row listed %s: the recording clears the mark (cause absent-at-start) in one write; the entry stays, with no clear; another marked key is untouched', async (state) => {
       const marked: RetiredKeySeed = { cause: RETIRED_KEY_CAUSE_REMOVED, mark: true }
-      const { h, b } = srj105Build({ retiredKeys: ([, b]) => ({ [LAUNCH_START_ABSENT_PERSONA_KEY]: marked, [b!]: marked }) })
+      const { h, b } = buildRecoveryCase({ retiredKeys: ([, b]) => ({ [LAUNCH_START_ABSENT_PERSONA_KEY]: marked, [b!]: marked }) })
 
       await sweepOver(h, [absentRow(h, LAUNCH_START_ABSENT_PERSONA_KEY, { state })])
 
@@ -4431,7 +4429,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       expect(h.retiredKeys.isMarked(p)).toBe(pMarked)
     })
 
-    // AC 55: P's own row carrying the note latches P, and the sweep leaves it
+    // P's own row carrying the note latches P, and the sweep leaves it
     // as it is, whatever it would otherwise decide (another cwd is swept when
     // P is not latched).
     test.each<[string, string, (h: RecoveryHarness) => Partial<ListRow>]>([
@@ -4439,8 +4437,8 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       ['in P\'s working directory', LIVENESS_DEAD_ROW_ENDED, () => ({})],
       ['in another existing cwd', 'waiting', (h) => ({ cwd: h.home })],
       ['in another existing cwd', LIVENESS_DEAD_ROW_ENDED, (h) => ({ cwd: h.home })],
-    ])('AC 55: P\'s own row %s, listed %s with provenance_conflict: P latches with "conflicting labels" and one post, recording the state listed; the row is not killed and is left for the latch', async (_where, state, where) => {
-      const { h, p, b } = srj105Build()
+    ])('P\'s own row %s, listed %s with provenance_conflict: P latches with "conflicting labels" and one post, recording the state listed; the row is not killed and is left for the latch', async (_where, state, where) => {
+      const { h, p, b } = buildRecoveryCase()
 
       const run = await sweepOver(h, [listed(h, p, { state, liveness_note: provenanceNote, ...where(h) })])
 
@@ -4451,7 +4449,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       expectUntouched(h, b)
     })
 
-    // b.jg5 SRJ-513, SRJ-1020 (the E16 hatch note): every list row of the
+    // (the design note): every list row of the
     // helper's table (P's current life, another cwd, another config_dir; each
     // form of "no launch start"), and one also carrying the note, which takes
     // the launch-start case only.
@@ -4464,8 +4462,8 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       })),
     ]
 
-    test.each(byName(LISTED_LAUNCH_START_ROWS))('%s: P latches with "launch start not recorded" and one SRJ-1020 post; the row is not killed and is left for the latch', async (_name, row) => {
-      const { h, p, b } = srj105Build()
+    test.each(byName(LISTED_LAUNCH_START_ROWS))('%s: P latches with "launch start not recorded" and one post; the row is not killed and is left for the latch', async (_name, row) => {
+      const { h, p, b } = buildRecoveryCase()
 
       const run = await sweepOver(h, [row.build(harnessPersona(h, p), h.home)])
 
@@ -4477,7 +4475,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
     })
 
     test('P\'s own row (cscb_<key>) labelled with another persona and carrying the note latches P, not that persona, and is left unkilled', async () => {
-      const { h, p, b } = srj105Build()
+      const { h, p, b } = buildRecoveryCase()
       const labels = { ...listed(h, b).labels }
 
       const run = await sweepOver(h, [listed(h, p, { liveness_note: provenanceNote, labels })])
@@ -4493,7 +4491,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       ['an absent persona\'s own row', (h) => absentRow(h, LAUNCH_START_ABSENT_PERSONA_KEY, { liveness_note: provenanceNote })],
       ['a pre-persona row', () => ({ ...prePersonaRow('waiting'), liveness_note: provenanceNote })],
     ])('the note on %s latches no one and posts nothing; the row is killed as today', async (_label, build) => {
-      const { h, p } = srj105Build()
+      const { h, p } = buildRecoveryCase()
       const row = build(h, p)
 
       const run = await sweepOver(h, [row])
@@ -4509,7 +4507,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
         (row) => [row.name, (h: RecoveryHarness, p: string) => row.build(harnessPersona(h, p), h.home)] as const,
       ),
     ])('%s: latches no one and posts nothing', async (_label, build) => {
-      const { h, p } = srj105Build()
+      const { h, p } = buildRecoveryCase()
 
       const run = await sweepOver(h, [build(h, p)])
 
@@ -4518,7 +4516,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       expect(sweepLatchLines(h)).toEqual([])
     })
 
-    // b.jg5 SRJ-502, SRJ-714: decided over the whole list before the first
+    // decided over the whole list before the first
     // kill, so the order of P's rows around its latching own row changes
     // nothing; B's swept row is listed first and still killed.
     test.each([
@@ -4526,7 +4524,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       ['P\'s own row between its other rows', [1, 0, 2]],
       ['P\'s own row last', [1, 2, 0]],
     ] as const)('P latching from its own row (%s): its rows under another instance id and in another cwd get no kill and are left for the latch; P was latched before the first kill', async (_order, order) => {
-      const { h, p, b } = srj105Build()
+      const { h, p, b } = buildRecoveryCase()
       const pRows = [
         listed(h, p, { liveness_note: provenanceNote }),
         listed(h, p, { instance_id: `${personaInstanceId(p)}_old` }),
@@ -4544,7 +4542,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
     })
 
     test('P latched before the sweep runs: none of its rows is killed (its own, another instance id, another cwd), with one line and no second post; B\'s swept row is still killed', async () => {
-      const { h, p, b } = srj105Build()
+      const { h, p, b } = buildRecoveryCase()
       h.script({ getResult: harnessRow(h, harnessPersona(h, p), { liveness_note: provenanceNote }) })
       await readPersonaOwnRow(p, { site: 'session-manager.test', what: 'own-row read' })
       expectNoteLatchedOnce(h, p, latchRowStateRead('waiting'))
@@ -4565,7 +4563,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       ])
     })
 
-    // AC 45's list half (b.jg5 SRJ-504): a restart is two harness lifetimes
+    // list half: a restart is two harness lifetimes
     // over the same listed row; the second starts with P unlatched.
     test.each<[string, (h: RecoveryHarness, p: string) => ListRow, (h: RecoveryHarness, p: string) => void]>([
       ['carries provenance_conflict', (h, p) => listed(h, p, { liveness_note: provenanceNote }), (h, p) => expectNoteLatchedOnce(h, p, latchRowStateRead('waiting'))],
@@ -4574,14 +4572,14 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
         (h, p) => launchStartCurrentLifeOf('list')[0]!.build(harnessPersona(h, p), h.home),
         (h, p) => expectLatchedOnce(h, p, launchStartLatch(p, launchStartCurrentLifeOf('list')[0]!)),
       ],
-    ])('AC 45: P\'s own listed row %s: P latches at each server start\'s sweep with exactly one post; after the restart\'s sweep the start pass answers latched for P with no call for it', async (_label, row, expectLatched) => {
-      const first = srj105Build()
+    ])('P\'s own listed row %s: P latches at each server start\'s sweep with exactly one post; after the restart\'s sweep the start pass answers latched for P with no call for it', async (_label, row, expectLatched) => {
+      const first = buildRecoveryCase()
       await sweepOver(first.h, [row(first.h, first.p)])
       expectLatched(first.h, first.p)
       // The restart: leak-checked and cleaned up as afterEach does.
-      srj105AfterEach()
+      recoveryAfterEach()
 
-      const { h, p } = srj105Build()
+      const { h, p } = buildRecoveryCase()
       expect(p).toBe(first.p)
       expect([h.latch.isLatched(p), h.latchEvents, h.episodeNotices]).toEqual([false, [], []])
       await sweepOver(h, [row(h, p)])
@@ -4593,11 +4591,11 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       expect(h.episodeNotices).toHaveLength(1)
     })
 
-    // Hatch A3 (b.jg5 SRJ-714, SRJ-803, SRJ-805): a failed absent-at-start
+    // design A3: a failed absent-at-start
     // write is the store's one line; the file is unchanged, this server holds
     // the key as retired in memory, and the sweep goes on to its kills.
     async function sweepWithFailedWrite(): Promise<{ h: RecoveryHarness; p: string; bOld: string; before: Buffer; run: SweepRun }> {
-      const { h, p, b } = srj105Build({ resumeEnabled: true, retiredKeys: () => ({ earlier: { cause: RETIRED_KEY_CAUSE_REMOVED } }) })
+      const { h, p, b } = buildRecoveryCase({ resumeEnabled: true, retiredKeys: () => ({ earlier: { cause: RETIRED_KEY_CAUSE_REMOVED } }) })
       const before = readFileSync(h.retiredKeys.path)
       const bOld = `${personaInstanceId(b)}_old`
       h.failRetiredKeyWrites()
@@ -4636,7 +4634,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
     test('hatch A3: a key the failed write left held only in memory, once recorded through the store as apply step 1 records it (the store\'s record entry, called directly; the apply itself is tests/reload-apply.test.ts\'s), is written; after a restart over the same state directory P is still recorded and gets one reuse spawn and no resume', async () => {
       const { h, p } = await sweepWithFailedWrite()
 
-      // Apply step 1's record of a key held only in memory (`retiredKeysToRecord`; the write itself is E24's test).
+      // Apply step 1's record of a key held only in memory (`retiredKeysToRecord`; the write itself is test).
       expect(h.retiredKeys.record([{ key: p, cause: h.retiredKeys.entry(p)!.cause }]).outcome).toBe(RETIRED_KEYS_WRITTEN)
       expectRecordedAbsent(h, [p], { earlier: { cause: RETIRED_KEY_CAUSE_REMOVED } })
 
@@ -4667,7 +4665,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
         'recording the keys of absent personas\' rows as retired failed: ',
       ],
     ])('%s: one sweep line, nothing recorded or counted, and the sweep goes on to its kills', async (_label, install, says) => {
-      const { h } = srj105Build()
+      const { h } = buildRecoveryCase()
       install(h)
 
       const run = await sweepOver(h, [absentRow(h, LAUNCH_START_ABSENT_PERSONA_KEY)])
@@ -4678,7 +4676,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
     })
 
     test('a list failure: one orphan-cleanup-list-failed entry; no latch, post, kill, record write or find-missing; the start pass after it goes on', async () => {
-      const { h, p } = srj105Build()
+      const { h, p } = buildRecoveryCase()
       h.script({ listError: errGeneric('list', 'ErrListBroken') })
       const order = recordCallOrder(h)
 
@@ -4695,7 +4693,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
     })
 
     test('a dry run makes no list and latches, records and kills nothing', async () => {
-      const { h, p } = srj105Build()
+      const { h, p } = buildRecoveryCase()
       process.env['SLACK_DRY_RUN'] = '1'
 
       const run = await sweepOver(h, [listed(h, p, { liveness_note: provenanceNote }), absentRow(h, LAUNCH_START_ABSENT_PERSONA_KEY)])
@@ -4707,15 +4705,15 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
     })
   })
 
-  // b.jg5 SRJ-714, SRJ-1506, SRJ-1514 (HO C2, C17; AC 55, AC 77), with the
-  // E3, E14, E20 and E24–E25 hatch notes and the orchestrator's ruling on a
+  // (HO C2, C17), with the
+  // and design notes and the orchestrator's ruling on a
   // kill retry a shutdown stopped: what the sweep does past its latch pass
   // and record, on the harness, as `main()` runs it.
-  describe('b.jg5 SRJ-714, SRJ-1506, SRJ-1514: the sweep kills its live strays with the result checked, deletes no row, runs one find-missing, ends with its summary and stops at a shutdown', () => {
+  describe('the sweep kills its live strays with the result checked, deletes no row, runs one find-missing, ends with its summary and stops at a shutdown', () => {
     afterEach(() => {
-      expectNoDeleteOrIncludeFinished(srj105Harness)
-      expect(srj105Harness?.clock.pendingCount() ?? 0).toBe(0)
-      srj105AfterEach()
+      expectNoDeleteOrIncludeFinished(recoveryHarness)
+      expect(recoveryHarness?.clock.pendingCount() ?? 0).toBe(0)
+      recoveryAfterEach()
     })
 
     /** The harness's `orphan-cleanup` and `persona-kill-survivor` entries. */
@@ -4724,9 +4722,9 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
     /** The harness's lines that are exactly `line`. */
     const linesEqual = (h: RecoveryHarness, line: string): string[] => h.errors.filter((candidate) => candidate === line)
 
-    // SRJ-714's Test line, the sprint demo.
+    // Test line, the sprint demo.
     test('demo: at start a finished row of an absent persona has its key recorded and gets no kill, a live pre-persona row is killed and kept, and P\'s own row carrying provenance_conflict in another cwd latches P and is not killed, nor is P\'s other row; no delete; one find-missing; the summary ends the sweep', async () => {
-      const { h, p } = srj105Build()
+      const { h, p } = buildRecoveryCase()
       const legacy = prePersonaRow('waiting')
 
       const run = await sweepOver(h, [
@@ -4746,7 +4744,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
     })
 
     test('the summary line\'s counts equal the result\'s: a row left for P\'s latch, a row matching B, a killed swept row, a failed kill (kept, in the sub-count), a finished row and a killed pre-persona row; the absent key recorded', async () => {
-      const { h, p, b } = srj105Build()
+      const { h, p, b } = buildRecoveryCase()
       const bOld = `${personaInstanceId(b)}_old`
       const conflict = errTmuxSessionConflict('kill', 'not-this-launch')
       h.script({ killQueue: [cannedOk(cannedKillResult(true)), cannedErr(conflict), cannedOk(cannedKillResult(false))] })
@@ -4769,11 +4767,11 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       expect(h.stub.calls.findMissingCalls).toHaveLength(1)
     })
 
-    // b.jg5 SRJ-714, SRJ-120 (E14's post-kill half): a configured persona's
+    // ( post-kill half): a configured persona's
     // own row killed by the sweep and judged left live by the run is read
     // with one `get`, and a provenance_conflict note there latches it.
     test('P\'s own row in another cwd, listed with no note, is killed; the post-kill run lists it in unverified_ids, and its get reads the note: P latches once; the kill still counts and the post-kill line names it still live', async () => {
-      const { h, p } = srj105Build()
+      const { h, p } = buildRecoveryCase()
       scriptNotedRows(h, new Map([[p, { liveness_note: provenanceNote }]]))
       h.script({ findMissingResult: unverifiedRowsOf(p) })
 
@@ -4785,10 +4783,10 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       expect(linesEqual(h, startSweepPostKillLine(1, [], [personaInstanceId(p)], []))).toHaveLength(1)
     })
 
-    // b.jg5 SRJ-807 (the E24–E25 hatch note): the between-try `status` read
+    // (the design note): the between-try `status` read
     // of a row whose id is a key's own applies the entry clear alone, naming
     // its site; it latches no one, and a shutdown begun by the time the read
-    // returns stops the clear (SRJ-714).
+    // returns stops the clear.
     test.each<[string, string, boolean, boolean]>([
       ['reads waiting: P\'s entry is cleared once, naming the read', 'waiting', false, true],
       ['reads pending: nothing is cleared', AGENT_DIRECTOR_PENDING_STATE, false, false],
@@ -4807,11 +4805,11 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       expectNoNoteLatch(h)
     })
 
-    // b.jg5 SRJ-714, SRJ-205 (the E3 hatch note): once the server's shutdown
+    // (the design note): once the server's shutdown
     // query answers true, the sweep makes no further agent-director call and
     // no further latch, record write or clear; what it did stands, the rows it
     // left unkilled count as kept, and it logs one stop line and its summary.
-    describe('the shutdown stop (b.jg5 SRJ-714, SRJ-702)', () => {
+    describe('the shutdown stop', () => {
       /** P's own row with the note (P latches), an absent persona's row (its key recorded) and B's row under another instance id (swept). */
       function stopRows(h: RecoveryHarness, p: string, b: string): ListRow[] {
         return [
@@ -4828,7 +4826,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
           throw new Error('shutdown query broken')
         }],
       ])('shutting down by the time the list returns (%s): no latch, record write, kill or find-missing; every row kept; one stop line, then the summary', async (_label, isShuttingDown) => {
-        const { h, p, b } = srj105Build()
+        const { h, p, b } = buildRecoveryCase()
 
         const run = await sweepOver(h, stopRows(h, p, b), h.config, isShuttingDown)
 
@@ -4842,7 +4840,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       })
 
       test('shutting down once the absent key is recorded, before the first kill: P\'s latch and the record stand; no kill, status, find-missing or get; the unkilled rows count as kept; one stop line, then the summary', async () => {
-        const { h, p, b } = srj105Build()
+        const { h, p, b } = buildRecoveryCase()
 
         const run = await sweepOver(h, stopRows(h, p, b), h.config, () => h.retiredKeyWrites.length > 0)
 
@@ -4864,7 +4862,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
           (err) => ({ kind: KILL_RETRY_ALERT_ORDINARY, lastKillFailedDescription: killFailedDescriptionOf(err)! }),
         ],
       ])('shutting down during the first row\'s tries, after a first try answering %s: no further try or read for it, no kill of a later row, no find-missing; the latch and the record made before the kills stand; its orphan-cleanup entry has no alert text and there is no persona-kill-survivor entry; its one line quotes the descriptions; one stop line, then the summary', async (_label, make, alert) => {
-        const { h, p, b } = srj105Build()
+        const { h, p, b } = buildRecoveryCase()
         const err = make()
         h.script({ killError: err })
         const rows = stopRows(h, p, b)
@@ -4887,7 +4885,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       })
 
       test('shutting down while the post-kill find-missing runs: no get of P\'s own killed row it lists in unverified_ids, so P latches nothing; one stop line, then the no-get line, then the summary ends the sweep', async () => {
-        const { h, p } = srj105Build()
+        const { h, p } = buildRecoveryCase()
         scriptNotedRows(h, new Map([[p, { liveness_note: provenanceNote }]]))
         h.script({ findMissingResult: unverifiedRowsOf(p) })
 
@@ -4909,7 +4907,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       // PM finding F2: a shutdown begun during a find-missing run that then
       // fails is logged by the sweep's end, once, before its summary.
       test('shutting down while the post-kill find-missing runs, which then fails: the failure line and the post-kill failure line, then exactly one stop line, then the summary ends the sweep; no get', async () => {
-        const { h } = srj105Build()
+        const { h } = buildRecoveryCase()
         h.script({ findMissingError: errGeneric('find-missing', 'ErrFindBroken') })
         const legacy = prePersonaRow('waiting')
 
@@ -4953,7 +4951,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
           'status read between kill tries',
         ],
       ])('P\'s own row in another cwd, its first kill answering ErrTmuxUnresponsive; %s: no outage raised for P, nothing armed, triggered or posted; one line says so; no find-missing', async (_label, script, shuttingDown, errorClass, call) => {
-        const { h, p, b } = srj105Build()
+        const { h, p, b } = buildRecoveryCase()
         h.script(script())
 
         const run = await sweepOver(h, [listed(h, p, { cwd: h.home })], h.config, () => shuttingDown(h))
@@ -4971,7 +4969,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       // (The get's own outage wrapper is the shared module's and is not
       // asserted here.)
       test('shutting down as the post-run get of P\'s own killed row settles, the row carrying provenance_conflict: P latches nothing and nothing is posted; one not-acted-on line, and the reads line says so; one stop line, then the summary', async () => {
-        const { h, p } = srj105Build()
+        const { h, p } = buildRecoveryCase()
         scriptNotedRows(h, new Map([[p, { liveness_note: provenanceNote }]]))
         h.script({ findMissingResult: unverifiedRowsOf(p) })
 
@@ -4989,7 +4987,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       })
 
       test('the stopped kill\'s line quotes the survivor-naming description, redacted', async () => {
-        const { h, p, b } = srj105Build()
+        const { h, p, b } = buildRecoveryCase()
         h.script({ killError: errTmuxKillFailed(sentinelInMessage('sweep-stopped-quote'), 'pane-process-survived') })
 
         await sweepOver(h, stopRows(h, p, b), h.config, () => h.stub.calls.killCalls.length > 0)
@@ -5000,7 +4998,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       })
     })
 
-    // The orchestrator's ruling (2026-10-02; b.jg5 SRJ-702, SRJ-704, SRJ-714):
+    // The orchestrator's ruling (2026-10-02):
     // a kill retry a server shutdown stopped posts nothing and leaves the row
     // live; the next start's sweep is where that kill is retried, checked and
     // alerted. Two harness lifetimes: the first server's live-row sequence
@@ -5031,7 +5029,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
         true,
       ],
     ])('a row an earlier server\'s attempt kill left live when its shutdown stopped the tries (nothing posted or recorded then) is killed and checked by the next start\'s sweep: %s', async (_label, outcome, killed) => {
-      const first = srj105Build()
+      const first = buildRecoveryCase()
       scriptLiveRowElsewhere(first.h, first.p, { killError: errTmuxUnresponsive('kill') })
       const firstKill = first.h.stub.client.kill.bind(first.h.stub.client)
       first.h.stub.client.kill = async (params) => {
@@ -5044,9 +5042,9 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       expect(await launchThroughSequence(first.h, first.p)).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_SHUTDOWN })
       expect([first.h.startupErrors(), first.h.episodeNotices]).toEqual([[], []])
       // The restart: leak-checked and cleaned up as afterEach does.
-      srj105AfterEach()
+      recoveryAfterEach()
 
-      const { h, p } = srj105Build()
+      const { h, p } = buildRecoveryCase()
       expect(p).toBe(first.p)
       const o = outcome()
       h.script(o.script)
@@ -5068,15 +5066,15 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
     })
   })
 
-  // b.jg5 SRJ-809, SRJ-714 (the E26 hatch note): the sweep's holds begin after
+  // (the design note): the sweep's holds begin after
   // its recording and before its first kill, and its post-kill find-missing
   // run ends the hold on each row its `ids` list; a row it lists in
   // `unverified_ids`, or a `pending` row it did not judge, keeps its hold.
   // Which rows the sweep holds is tests/old-life-wait.test.ts's.
-  describe('b.jg5 SRJ-809, SRJ-714: the sweep\'s holds begin after its recording and before its first kill, and its post-kill find-missing ends a hold only on a row its ids list', () => {
+  describe('the sweep\'s holds begin after its recording and before its first kill, and its post-kill find-missing ends a hold only on a row its ids list', () => {
     afterEach(() => {
-      expect(srj105Harness?.clock.pendingCount() ?? 0).toBe(0)
-      srj105AfterEach()
+      expect(recoveryHarness?.clock.pendingCount() ?? 0).toBe(0)
+      recoveryAfterEach()
     })
 
     /** The hold set's lines among the case's errors. */
@@ -5084,7 +5082,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
     const holdLines = (h: RecoveryHarness, what: 'began' | 'ended'): string[] => h.errors.filter((line) => line.startsWith(`${OLD_LIFE_HOLD_LOG_PREFIX} ${what} ${what === 'ended' ? 'on ' : ''}`))
 
     test('an absent persona\'s live row: its key\'s record line, then the hold\'s began line, both before the first kill; one write and one hold when the kill is sent', async () => {
-      const { h } = srj105Build()
+      const { h } = buildRecoveryCase()
       const row = absentRow(h, LAUNCH_START_ABSENT_PERSONA_KEY)
       let atFirstKill: { writes: number; holds: string[] } | undefined
       const kill = h.stub.client.kill.bind(h.stub.client)
@@ -5111,7 +5109,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
     }
 
     test('the post-kill find-missing listing both rows in its ids ends both holds, the killed row\'s and the failed kill\'s, with one end line each naming the run', async () => {
-      const { h, b } = srj105Build()
+      const { h, b } = buildRecoveryCase()
       const { absent, bOld } = heldRows(h, b)
       h.script({ findMissingResult: cannedFindMissing({ rows: { [absent.instance_id]: 'ids', [bOld.instance_id]: 'ids' } }) })
 
@@ -5133,7 +5131,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       ['in unverified_ids (judged still live)', 'unverified_ids', 'waiting'],
       ['in neither list, its pending row not judged', 'neither', AGENT_DIRECTOR_PENDING_STATE],
     ])('the post-kill find-missing listing the rows %s keeps both holds, with no end line', async (_label, placement, state) => {
-      const { h, b } = srj105Build()
+      const { h, b } = buildRecoveryCase()
       const { absent, bOld } = heldRows(h, b)
       const rows = [{ ...absent, state }, { ...bOld, state }]
       h.script({ findMissingResult: cannedFindMissing({ rows: Object.fromEntries(rows.map((row) => [row.instance_id, placement])) }) })
@@ -5145,7 +5143,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
       expect(holdLines(h, 'ended')).toEqual([])
     })
 
-    // b.jg5 SRJ-714: once the sweep has stopped, it acts on no answer, so a
+    // once the sweep has stopped, it acts on no answer, so a
     // read that settles after the stop ends no hold.
     test.each<[string, (h: RecoveryHarness, p: string) => RecoveryStubScript, (h: RecoveryHarness) => boolean]>([
       [
@@ -5159,7 +5157,7 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
         (h) => h.stub.calls.findMissingCalls.length > 0,
       ],
     ])('P\'s held own row listed in another cwd, %s: the read settles after the sweep stopped, so P\'s hold stays, with no end line', async (_label, script, shuttingDown) => {
-      const { h, p } = srj105Build()
+      const { h, p } = buildRecoveryCase()
       beginApplyHold(h, p)
       h.script(script(h, p))
 
@@ -5172,11 +5170,11 @@ describe('reconcileOrphans: the start sweep by persona kills its live strays wit
 })
 
 // ---------------------------------------------------------------------------
-// b.av2 SR-6.4 — the collision ladder keeps a row while the persona's
+// the collision ladder keeps a row while the persona's
 // working directory cannot be resolved, and reuses it once the persona is up
 // ---------------------------------------------------------------------------
 
-describe('collision ladder: a directory-broken persona keeps its row (b.av2 SR-6.4)', () => {
+describe('collision ladder: a directory-broken persona keeps its row', () => {
   /** Persona `C` in `workingDirectory`, the seam home installed. */
   function brokenConfig(workingDirectory: string): PersonaConfig {
     useSpawnHome()
@@ -5204,7 +5202,7 @@ describe('collision ladder: a directory-broken persona keeps its row (b.av2 SR-6
   // differs lexically from the configured path (a lexically equal one never
   // reaches the cwd guard). The guard runs before the ladder branches on
   // state, so two states that would otherwise reuse the row are enough, and a
-  // `pending` row gets the same (b.jg5 SRJ-411, hatch A3: the undecided
+  // `pending` row gets the same (design A3: the undecided
   // answer is the status-only sites'; the ladder keeps its cwd guard).
   test.each(['ended', 'waiting', AGENT_DIRECTOR_PENDING_STATE] as const)(
     'a dangling symlink, row cwd its old real target, state=%s: no kill, delete, resume or reconnect; cwd-unreachable and failed (the spawn-failure path)',
@@ -5265,7 +5263,7 @@ describe('collision ladder: a directory-broken persona keeps its row (b.av2 SR-6
   // A row whose cwd resolves to an existing directory elsewhere is not
   // deferred even while the persona's own directory is missing: it may be
   // another persona's instance, so it is replaced, never adopted (a finished
-  // row by a reuse spawn of the same id, b.jg5 SRJ-707). The reuse then fails
+  // row by a reuse spawn of the same id). The reuse then fails
   // on the missing directory as any spawn there would.
   test('a removed directory whose row cwd is another existing directory: replaced by a reuse spawn of the same id, nothing killed or deleted; the reuse fails with ErrCwdNotFound → cwd-unreachable', async () => {
     const work = fixtureSubdir('work')
@@ -5365,7 +5363,7 @@ describe('collision ladder: a directory-broken persona keeps its row (b.av2 SR-6
 })
 
 // ---------------------------------------------------------------------------
-// Bug b.g57 — a claude_config_dir with no real path has no `config_dir` label
+// a claude_config_dir with no real path has no `config_dir` label
 // (no lexical fallback): the launch keeps the row, makes no agent-director
 // call that could kill, delete, spawn or resume, hands the persona to the
 // hold hook and is `'skipped'` on the restart path. The failing realpath is
@@ -5406,7 +5404,7 @@ function configDirLines(errLog: string): string[] {
   return errLog.split('\n').filter((line) => line.includes(`${PERSONA_CONFIG_DIR_UNRESOLVABLE}:`))
 }
 
-describe('b.g57: an unresolvable claude_config_dir keeps the row and skips the launch', () => {
+describe('an unresolvable claude_config_dir keeps the row and skips the launch', () => {
   /** When the injected realpath starts failing for the persona's claude_config_dir. */
   const FAILURE_POINTS = ['before the launch', 'during the launch (after its pre-launch check)'] as const
   const ENTRIES = ['ended', 'missing', 'waiting (dead session)'] as const
@@ -5436,7 +5434,7 @@ describe('b.g57: an unresolvable claude_config_dir keeps the row and skips the l
   }
 
   test.each(ENTRIES.flatMap((entry) => FAILURE_POINTS.map((point) => [entry, point] as const)))(
-    'b.g57: %s row with its matching label, realpath failing %s: \'skipped\' — no kill, delete or resume, no fresh spawn, one line naming the persona and the path, one hold; once it resolves the same row is resumed',
+    '%s row with its matching label, realpath failing %s: \'skipped\' — no kill, delete or resume, no fresh spawn, one line naming the persona and the path, one hold; once it resolves the same row is resumed',
     async (entry, point) => {
       const f = unresolvableFixture()
       const calls = makeStubCallLog()
@@ -5481,7 +5479,7 @@ describe('b.g57: an unresolvable claude_config_dir keeps the row and skips the l
         result = await launchSession(GUARD_KEY, f.cfg)
       })
 
-      // b.4q8: a resume is counted once its row reports in.
+      // a resume is counted once its row reports in.
       expect(result).toBe(LAUNCH_RESUMED_UNREPORTED)
       expect(after.resumeCalls.map((r) => r.instance_id)).toEqual([GUARD_INSTANCE])
       expect(after.deleteCalls).toEqual([])
@@ -5491,7 +5489,7 @@ describe('b.g57: an unresolvable claude_config_dir keeps the row and skips the l
     },
   )
 
-  test('b.g57: the ladder\'s comparison finds the directory unresolvable and the re-check right after finds it resolved again: \'skipped\' — the row kept (no kill, delete, resume or fresh spawn), one line, no hold', async () => {
+  test('the ladder\'s comparison finds the directory unresolvable and the re-check right after finds it resolved again: \'skipped\' — the row kept (no kill, delete, resume or fresh spawn), one line, no hold', async () => {
     const f = unresolvableFixture()
     const calls = makeStubCallLog()
     installResumeEntry('ended', f.row, calls, GUARD_KEY)
@@ -5530,16 +5528,16 @@ describe('b.g57: an unresolvable claude_config_dir keeps the row and skips the l
     assertNoLeak({ errLog, result })
   })
 
-  // b.jg5 SRJ-409 (b.g57, b.av2 SR-6.4): at the ladder's pending branch a
+  // at the ladder's pending branch a
   // claude_config_dir that cannot be resolved leaves the row undecided: kept,
   // P's retry timer armed in pending-only mode to decide again at its next
 
-  // AC 20 (b.av2 SR-10.3): the same mid-launch line when the realpath error
+  // the same mid-launch line when the realpath error
   // carries fake tokens in its message and properties; every console.error
   // argument is kept unformatted (errors whole), so a line that echoed the
   // thrown error would fail the check. The configured claude_config_dir path
   // is not a credential (paths stay echoed on purpose), so it stays plain.
-  test('AC 20: the mid-launch "could not be resolved during the launch" line, under a realpath error carrying fake tokens — no captured argument, record or result carries a credential value', async () => {
+  test('the mid-launch "could not be resolved during the launch" line, under a realpath error carrying fake tokens — no captured argument, record or result carries a credential value', async () => {
     const f = unresolvableFixture()
     const calls = makeStubCallLog()
     installResumeEntry('ended', f.row, calls, GUARD_KEY)
@@ -5588,7 +5586,7 @@ describe('b.g57: an unresolvable claude_config_dir keeps the row and skips the l
         throw new Error('hold exploded')
       },
     ],
-  ])('b.g57: %s — deferred with no agent-director call; the session manager logs the line %d time(s)', async (_label, lineCount, hook) => {
+  ])('%s — deferred with no agent-director call; the session manager logs the line %d time(s)', async (_label, lineCount, hook) => {
     const f = unresolvableFixture()
     setConfigDirUnresolvableHook(hook)
     const calls = makeStubCallLog()
@@ -5611,7 +5609,7 @@ describe('b.g57: an unresolvable claude_config_dir keeps the row and skips the l
     assertNoLeak({ errLog, result })
   })
 
-  test('b.g57: dry run runs the same check — deferred, not the dry-run no-op; nothing launched', async () => {
+  test('dry run runs the same check — deferred, not the dry-run no-op; nothing launched', async () => {
     process.env['SLACK_DRY_RUN'] = '1'
     const f = unresolvableFixture()
     const calls = makeStubCallLog()
@@ -5629,7 +5627,7 @@ describe('b.g57: an unresolvable claude_config_dir keeps the row and skips the l
     assertNoLeak({ errLog, held: f.held })
   })
 
-  test('b.g57: the start pass counts a persona whose claude_config_dir is unresolvable as not brought up (retrying, its cause the claude_config_dir); the other persona is spawned', async () => {
+  test('the start pass counts a persona whose claude_config_dir is unresolvable as not brought up (retrying, its cause the claude_config_dir); the other persona is spawned', async () => {
     const readLog = captureStartupErrors()
     useSpawnHome()
     const aDir = fixtureSubdir('claude-config-a')
@@ -5669,7 +5667,7 @@ describe('b.g57: an unresolvable claude_config_dir keeps the row and skips the l
     assertNoLeak({ errLog, result })
   })
 
-  test('b.g57: a claude_config_dir not created yet under a symlinked parent spawns fresh with its parent\'s real path plus the rest; once created, the next launch computes the same label and resumes', async () => {
+  test('a claude_config_dir not created yet under a symlinked parent spawns fresh with its parent\'s real path plus the rest; once created, the next launch computes the same label and resumes', async () => {
     const home = useSpawnHome()
     const realParent = fixtureSubdir('config-parent-real')
     const linkParent = join(fixtureDir, 'config-parent-link')
@@ -5708,9 +5706,9 @@ describe('b.g57: an unresolvable claude_config_dir keeps the row and skips the l
   })
 })
 
-// Bug b.g57 — compareRowToPersona gives no config_dir verdict for an
+// compareRowToPersona gives no config_dir verdict for an
 // unresolvable directory, and personaConfigDirLabelValue has no label for it.
-describe('b.g57: compareRowToPersona and personaConfigDirLabelValue with an unresolvable claude_config_dir', () => {
+describe('compareRowToPersona and personaConfigDirLabelValue with an unresolvable claude_config_dir', () => {
   /** How the directory is unresolvable: the configured path, the realpath override (none: the real one) and the errno code. */
   interface Unresolvable {
     configDir: string
@@ -5750,7 +5748,7 @@ describe('b.g57: compareRowToPersona and personaConfigDirLabelValue with an unre
         return { configDir: join(file, 'claude'), code: 'ENOTDIR' }
       },
     ],
-  ])('b.g57: %s — configDirResolved false, no config_dir verdict, no label; the row\'s lexical label is not a match', (_label, build) => {
+  ])('%s — configDirResolved false, no config_dir verdict, no label; the row\'s lexical label is not a match', (_label, build) => {
     const home = realpathSync(fixtureSubdir('home'))
     const work = fixtureSubdir('work')
     const { configDir, realpath, code } = build()
@@ -5780,7 +5778,7 @@ describe('b.g57: compareRowToPersona and personaConfigDirLabelValue with an unre
     expect(thrown).toMatchObject({ path: configDir, code })
   })
 
-  test('b.g57 control: a resolvable directory (and one not created yet) has configDirResolved true and the verdict as before', () => {
+  test('control: a resolvable directory (and one not created yet) has configDirResolved true and the verdict as before', () => {
     const home = realpathSync(fixtureSubdir('home'))
     const work = fixtureSubdir('work')
     const existing = fixtureSubdir('claude-config')
@@ -5797,7 +5795,7 @@ describe('b.g57: compareRowToPersona and personaConfigDirLabelValue with an unre
 })
 
 // ---------------------------------------------------------------------------
-// startupSessionManager — iterate personas (b.av2 SR-6.3)
+// startupSessionManager — iterate personas
 // ---------------------------------------------------------------------------
 
 describe('startupSessionManager', () => {
@@ -5839,9 +5837,9 @@ describe('startupSessionManager', () => {
     ])
   })
 
-  // AC 3 (b.av2 SR-14 "session-manager: one spawn"): a persona listed in two
+  // ("session-manager: one spawn"): a persona listed in two
   // channels is ONE instance — exactly one spawn, never one per channel.
-  test('AC 3: one persona listed in two channels produces exactly one spawn', async () => {
+  test('one persona listed in two channels produces exactly one spawn', async () => {
     const spawnCalls: import('agent-director').SpawnParams[] = []
     installStub({ spawnCalls })
     const cfg = makeMultiPersonaConfig(
@@ -5889,7 +5887,7 @@ describe('startupSessionManager', () => {
     ])
   })
 
-  // b.av2 SR-2.2: logs and errors name the persona in rendered form — the name
+  // logs and errors name the persona in rendered form — the name
   // JSON-quoted with the key beside it.
   test('a startup spawn failure names the persona in rendered form (JSON-quoted name plus key)', async () => {
     const readLog = captureStartupErrors()
@@ -5920,7 +5918,7 @@ describe('startupSessionManager', () => {
 })
 
 // ---------------------------------------------------------------------------
-// startupSessionManager with the SR-6.1 bring-up (b.av2 SR-6.1, SR-11)
+// startupSessionManager with the bring-up
 //
 // The server passes its bring-up controller as `bringUp`: each persona goes
 // through its credentials, working-directory and Slack steps and ends `up`,
@@ -5932,7 +5930,7 @@ describe('startupSessionManager', () => {
 // comes up later is launched outside the pool.
 // ---------------------------------------------------------------------------
 
-describe('startupSessionManager: SR-6.1 bring-up', () => {
+describe('startupSessionManager: bring-up', () => {
   let managers: PersonaConnectionManager[] = []
   let controllers: PersonaBringUpController[] = []
 
@@ -5964,7 +5962,7 @@ describe('startupSessionManager: SR-6.1 bring-up', () => {
    * `beforeEach` installs) as its claude_config_dir check, as server.ts wires
    * them. `lines` holds the manager's and the controller's lines. The
    * controller's `connections.stop` (which closes a persona held for its
-   * claude_config_dir, bug b.g57) is the manager's.
+   * claude_config_dir) is the manager's.
    */
   function bringUpFixture(slackA: StubSlackOptions = {}, names = ['Alpha Desk', 'Beta Ops'], slack: Record<string, StubSlackOptions> = {}) {
     const h = makeConnectionHarness(names.map((name) => ({ name })), fixtureDir, {
@@ -5992,7 +5990,7 @@ describe('startupSessionManager: SR-6.1 bring-up', () => {
     return { h, cfg, a, b, lines, order: h.order, bringUp }
   }
 
-  // b.av2 SR-6.1: each cause gives A its outcome — credentials-broken is
+  // each cause gives A its outcome — credentials-broken is
   // `broken`; directory-broken and Slack-unreachable are `retrying` (their
   // retries run on the persona's own timers, which these cases never fire).
   test.each<[string, (f: ReturnType<typeof bringUpFixture>) => void, StubSlackOptions, Exclude<PersonaBringUpOutcome, 'up'>, PersonaBringUpStep, string]>([
@@ -6097,12 +6095,12 @@ describe('startupSessionManager: SR-6.1 bring-up', () => {
     assertNoLeak({ lines: f.lines, errLog, result })
   })
 
-  // AC 20 (b.av2 SR-10.3): the launch covers the persona's Slack bring-up, so
+  // the launch covers the persona's Slack bring-up, so
   // the thrown value's message can carry a secret. The unexpected-error line
   // and its startup-errors.log entry carry only its description (type, safe
   // code, redacted message, frames), with no cause appended; every
   // console.error argument is kept unformatted.
-  test('AC 20: A\'s launch throws an error carrying fake tokens — the unexpected-error line and its startup-errors.log detail name its type, code and redacted message; nothing logged, recorded or returned leaks', async () => {
+  test('A\'s launch throws an error carrying fake tokens — the unexpected-error line and its startup-errors.log detail name its type, code and redacted message; nothing logged, recorded or returned leaks', async () => {
     const readLog = captureStartupErrors()
     installStub({})
     const f = bringUpFixture()
@@ -6212,7 +6210,7 @@ describe('startupSessionManager: SR-6.1 bring-up', () => {
     assertNoLeak({ lines: f.lines, errLog, result })
   })
 
-  // b.av2 SR-6.1: retries run outside the pool. A (Slack unreachable at start)
+  // retries run outside the pool. A (Slack unreachable at start)
   // is `retrying` and B (credentials file missing) is `broken`; neither takes a
   // slot or counts as failed. With the single slot held by C and D queued, A's
   // manager retry (fake clock) brings it up and the controller launches it at
@@ -6321,24 +6319,24 @@ describe('startupSessionManager: SR-6.1 bring-up', () => {
 })
 
 // ---------------------------------------------------------------------------
-// b.rmy, b.3ce — ErrTmuxSendKeys at the reconnect and accurate outcome reporting
+// ErrTmuxSendKeys at the reconnect and accurate outcome reporting
 //
-// b.jg5 SRJ-118, SRJ-609 (HO C20): the reconnect makes one `send-keys`. One
+// (HO C20): the reconnect makes one `send-keys`. One
 // ErrTmuxSendKeys is `dead-session` at once, with no second try, and the ladder recovers the persona.
 // ---------------------------------------------------------------------------
 
-describe('b.rmy: ErrTmuxSendKeys at the reconnect + reconnect outcome', () => {
-  test('reconnectMcp: one ErrTmuxSendKeys → dead-session after one send-keys, no failure notice (HO C20 Verify; AC 77)', async () => {
+describe('ErrTmuxSendKeys at the reconnect + reconnect outcome', () => {
+  test('reconnectMcp: one ErrTmuxSendKeys → dead-session after one send-keys, no failure notice (HO C20 Verify)', async () => {
     const sendKeysCalls: import('agent-director').SendKeysParams[] = []
     installStub({ sendKeysCalls, sendKeysError: errTmuxSendKeys() })
     const result = await reconnectMcp('C')
     expect(result).toBe('dead-session')
     expect(sendKeysCalls.map((c) => [c.instance_id, c.text])).toEqual([['cscb_C', RECONNECT_TEXT]])
-    // b.3ce: dead-session hands recovery to the caller — no premature failure notice
+    // dead-session hands recovery to the caller — no premature failure notice
     expect(notices).toHaveLength(0)
   })
 
-  test('spawnForPersona waiting branch (b.3ce): ErrTmuxSendKeys → resume recovery after one send-keys, not failed', async () => {
+  test('spawnForPersona waiting branch: ErrTmuxSendKeys → resume recovery after one send-keys, not failed', async () => {
     const readLog = captureStartupErrors()
     const resumeCalls: import('agent-director').ResumeParams[] = []
     const sendKeysCalls: import('agent-director').SendKeysParams[] = []
@@ -6351,7 +6349,7 @@ describe('b.rmy: ErrTmuxSendKeys at the reconnect + reconnect outcome', () => {
       resumeCalls,
     })
     const result = await spawnForPersona(personaOf(cfg, 'C'), cfg)
-    // b.3ce: pre-fix this reported 'failed' and gave up; now the dead session
+    // pre-fix this reported 'failed' and gave up; now the dead session
     // falls through to the ended/missing recovery logic (resume-first).
     expect(result.action).toBe('resumed')
     expect(sendKeysCalls).toHaveLength(1)
@@ -6359,10 +6357,10 @@ describe('b.rmy: ErrTmuxSendKeys at the reconnect + reconnect outcome', () => {
     expect(readLog()).toBe('')
   })
 
-  // b.jg5 SRJ-710: ErrSpawnNotResumable is never by itself a reason to kill
+  // ErrSpawnNotResumable is never by itself a reason to kill
   // and replace: the row is read again, and a row that finished since is a
   // lost race: nothing is killed, deleted or launched.
-  test('spawnForPersona waiting branch (b.3ce): dead session + resume not resumable, the re-read finds the row ended → a lost race: retrying, nothing killed, deleted or launched', async () => {
+  test('spawnForPersona waiting branch: dead session + resume not resumable, the re-read finds the row ended → a lost race: retrying, nothing killed, deleted or launched', async () => {
     const killCalls: import('agent-director').KillParams[] = []
     const deleteCalls: StubDeleteParams[] = []
     const spawnCalls: import('agent-director').SpawnParams[] = []
@@ -6421,7 +6419,7 @@ describe('b.rmy: ErrTmuxSendKeys at the reconnect + reconnect outcome', () => {
   test('startupSessionManager: unrecoverable channels are counted (no false "0 failed")', async () => {
     captureStartupErrors() // keep startup-errors.log in a temp dir
     // Both routes collide into `waiting` rows whose reconnect send-keys
-    // answers GONE — the 2026-09-18 post-reboot outage shape — AND the b.3ce
+    // answers GONE — the 2026-09-18 post-reboot outage shape — AND the
     // resume recovery fails, so both must land in the failed bucket.
     const sendKeysCalls: import('agent-director').SendKeysParams[] = []
     const cfg = makeStandInPersonaConfig({ C1: { working_directory: '/x1' }, C2: { working_directory: '/x2' } }, fixtureDir)
@@ -6446,7 +6444,7 @@ describe('b.rmy: ErrTmuxSendKeys at the reconnect + reconnect outcome', () => {
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-605: the working-row wait's `status` errors
+// the working-row wait's `status` errors
 //
 // `ErrSpawnNotFound` at the poll or at the timeout read is an absent row: the
 // wait answers 'dead-session' with one line and no tmux probe, and the
@@ -6464,21 +6462,21 @@ describe('b.rmy: ErrTmuxSendKeys at the reconnect + reconnect outcome', () => {
 /** The wait's timeout on the fake clock where a case reaches it: short of the unproven-idle bound, so polls on a working row raise no notice. */
 const FAKE_WAIT_TIMEOUT_MS = 3 * 60_000
 
-/** A `status` error other than `ErrSpawnNotFound` that the working-row wait meets (b.jg5 SRJ-605). */
+/** A `status` error other than `ErrSpawnNotFound` that the working-row wait meets. */
 interface WaitStatusError {
   readonly label: string
   /** Builds it for the `status` verb. */
   readonly make: () => Error
   /** Its class, as the wait's lines name it. */
   readonly errorClass: AdErrorClass
-  /** The retry cause it arms inside a launch attempt (b.jg5 SRJ-105, SRJ-301). */
+  /** The retry cause it arms inside a launch attempt. */
   readonly cause: string
   /** The outage it raises for the persona, and that outage's onset text; none for the rest. */
   readonly outage?: { readonly cls: OutageClass; readonly onset: (err: Error) => string }
 }
 
 /**
- * The wait's `status` errors, one per form: E10's UNAVAILABLE builders,
+ * The wait's `status` errors, one per form: UNAVAILABLE builders,
  * UNCLASSIFIED (an `ErrInternal`, a store that cannot be opened, an
  * unhandled name, and `ErrSystemInstallDisappeared`, which raises
  * `ad-unreachable`), ENVIRONMENT in both forms (`tmux-unavailable`) and
@@ -6574,14 +6572,14 @@ function rowFailingAtEveryRead(clock: FakeClock, reading: RowReading, opts: Stub
 const POLLS_BEFORE_FAKE_DEADLINE = FAKE_WAIT_TIMEOUT_MS / 60_000
 
 // ---------------------------------------------------------------------------
-// b.3ce — waitForWaitingAndReconnect timeout liveness verdict + working-branch
+// waitForWaitingAndReconnect timeout liveness verdict + working-branch
 // dead-session recovery
 // ---------------------------------------------------------------------------
 
-describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session recovery', () => {
-  // b.ecw: the timeout branch now keys on the claude PROCESS via a fresh
+describe('waitForWaitingAndReconnect timeout liveness + dead-session recovery', () => {
+  // the timeout branch now keys on the claude PROCESS via a fresh
   // findMissing sweep + one status call, NOT the raw tmux probe. A process
-  // merely mid-long-turn reports a live state and is left alive. b.f2b: the
+  // merely mid-long-turn reports a live state and is left alive. the
   // outcome is
   // 'not-reconnected' ('ok' only when `/mcp reconnect` was typed).
   test('timeout with claude process alive (status working) → not-reconnected, nothing typed (long turns are not errors — regression guard)', async () => {
@@ -6591,7 +6589,7 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
     installStub({
       findMissingCalls,
       sendKeysCalls,
-      findMissingResult: cannedFindMissing(), // b.m4r: empty sweep — a genuinely-alive long-turn row is untouched
+      findMissingResult: cannedFindMissing(), // empty sweep — a genuinely-alive long-turn row is untouched
       statusResult: { state: 'working' } as import('agent-director').StatusResult, // process mid-long-turn
     })
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
@@ -6601,7 +6599,7 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
     expect(findMissingCalls).toHaveLength(1)
   })
 
-  // b.ecw: at the 10-minute deadline the 10s memo has expired, so a FRESH
+  // at the 10-minute deadline the 10s memo has expired, so a FRESH
   // whole-store findMissing sweep fires before the timeout status call. TTL=0
   // forces the memo to expire so the second (timeout) sweep is observable.
   test('timeout fires a FRESH findMissing sweep before the timeout status call', async () => {
@@ -6615,13 +6613,13 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
     })
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir, { agent_director_poll_interval_ms: 1 })
     const result = await waitForWaitingAndReconnect('C', cfg)
-    expect(result).toBe('not-reconnected') // status live at timeout → left alive, nothing typed (b.f2b)
+    expect(result).toBe('not-reconnected') // status live at timeout → left alive, nothing typed
     // Up-front sweep + fresh timeout sweep = 2 (TTL=0 defeats memo reuse).
     expect(findMissingCalls).toHaveLength(2)
   })
 
-  // b.ecw: the timeout status reads the row `missing` → 'dead-session' (cause
-  // `row-read-finished`, a row read and not dead evidence, b.jg5 SRJ-611),
+  // the timeout status reads the row `missing` → 'dead-session' (cause
+  // `row-read-finished`, a row read and not dead evidence),
   // with NO tmux probe. The poll loop stays `working`
   // (frozen mid-turn) until the deadline; only the timeout status flips to
   // `missing`, so the timeout branch (not the ended/missing loop branch) decides.
@@ -6643,11 +6641,11 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
     expect(result).toBe('dead-session')
   })
 
-  // b.jg5 SRJ-605: ErrSpawnNotFound at the TIMEOUT CALL is an absent row:
+  // ErrSpawnNotFound at the TIMEOUT CALL is an absent row:
   // 'dead-session' directly, with one line. The
   // polls read `working` until the deadline; only the read after the
   // deadline's fresh sweep answers it.
-  test('b.jg5 SRJ-605: timeout with ErrSpawnNotFound → dead-session with one row-absent line; nothing typed, no notice', async () => {
+  test('timeout with ErrSpawnNotFound → dead-session with one row-absent line; nothing typed, no notice', async () => {
     const clock = useFakeNow()
     const row = rowFailingAtTimeoutRead(clock, errSpawnNotFound())
 
@@ -6663,12 +6661,12 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
     expect(linesWith(errLog, ' agent-director row is absent (ErrSpawnNotFound)')).toEqual([waitRowAbsentLine(WAIT_REF_C, FAKE_WAIT_TIMEOUT_MS)])
   })
 
-  // b.jg5 SRJ-105, SRJ-512: an UNUSABLE NAME answer at the TIMEOUT CALL
+  // an UNUSABLE NAME answer at the TIMEOUT CALL
   // latches C (the state unreadable: the read that met it read none) and
   // ends the wait latched, never 'dead-session' or
   // 'not-reconnected'; nothing typed, no notice, no further call, one
   // UNUSABLE NAME line.
-  test('b.jg5 SRJ-105, SRJ-512: timeout with an UNUSABLE NAME answer → latched (C latched, its state unreadable), nothing typed, no notice, nothing called after the read', async () => {
+  test('timeout with an UNUSABLE NAME answer → latched (C latched, its state unreadable), nothing typed, no notice, nothing called after the read', async () => {
     _setWaitForWaitingTimeoutMs(30)
     _setFindMissingMemoTtlMs(0)
     const latch = createConflictLatch({ log: () => {} })
@@ -6702,13 +6700,13 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
     assertNoLeak({ errLog, notices })
   })
 
-  // b.jg5 SRJ-605: any other `status` error at the TIMEOUT CALL ends the wait
+  // any other `status` error at the TIMEOUT CALL ends the wait
   // 'not-reconnected' through the wait-ended report: one line from the
   // exported builders and, with session_restart_delay 0, one not-connected
   // notice naming why. It is never 'dead-session' or 'failed', no tmux probe
   // is made, nothing is typed, and an error that raises an
   // outage raises it once.
-  test.each(WAIT_STATUS_ERROR_ROWS)('b.jg5 SRJ-605: timeout with %s → not-reconnected through the wait-ended report (its line, and at session_restart_delay 0 its notice); never dead-session or failed; no probe, nothing typed; its outage, if any, raised once', async (_label, { make, errorClass, outage }) => {
+  test.each(WAIT_STATUS_ERROR_ROWS)('timeout with %s → not-reconnected through the wait-ended report (its line, and at session_restart_delay 0 its notice); never dead-session or failed; no probe, nothing typed; its outage, if any, raised once', async (_label, { make, errorClass, outage }) => {
     const clock = useFakeNow()
     const err = make()
     const row = rowFailingAtTimeoutRead(clock, err)
@@ -6731,13 +6729,13 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
     expect(notices.map((n) => [n.key, n.text])).toEqual([['C', await renderedNotice('C', report.notice)]])
   })
 
-  // b.jg5 SRJ-605: the same errors at the POLL let the wait poll on: no
+  // the same errors at the POLL let the wait poll on: no
   // post, no notice, no 'failed' and no 'dead-session'. The first failed read
   // is logged (one line for a run of one class); the poll after the run reads
   // the row waiting, and C is reconnected. An error that raises an outage
   // raises it once, at the first failed read.
 
-  test('b.jg5 SRJ-605: a run of failed polls is logged at its first read and again only when the class changes: UNAVAILABLE, UNAVAILABLE, CONFIG, UNAVAILABLE gives three lines, then the row reads waiting and C is reconnected', async () => {
+  test('a run of failed polls is logged at its first read and again only when the class changes: UNAVAILABLE, UNAVAILABLE, CONFIG, UNAVAILABLE gives three lines, then the row reads waiting and C is reconnected', async () => {
     const clock = useFakeNow()
     const unavailable = errTmuxUnresponsive('status')
     const config = errConfigMalformed()
@@ -6760,7 +6758,7 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
     expect(notices).toEqual([])
   })
 
-  // b.jg5 SRJ-605 through the ladder's working branch, for each error that
+  // through the ladder's working branch, for each error that
   // raises an outage (ErrSystemInstallDisappeared, ENVIRONMENT in both forms,
   // CONFIG): failing at every read (the poll's run, then the timeout read) or
   // only at the timeout read, the wait ends 'not-reconnected' and so does the
@@ -6772,7 +6770,7 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
   // path's launch over the same row (`launchSession`) answers true, and
   // nothing is counted.
   const OUTAGE_RAISING_WAIT_ERRORS = WAIT_STATUS_ERRORS.filter((e) => e.outage !== undefined)
-  test.each(OUTAGE_RAISING_WAIT_ERRORS.flatMap((e) => (['every read', 'the timeout read'] as const).map((at) => [e.label, at, e] as const)))('b.jg5 SRJ-104, SRJ-605: spawnForPersona working branch, %s at %s → not-reconnected, never failed or refused; nothing typed, no kill/delete/resume/second spawn, no probe; one onset per raise; C armed with its cause at each failed read; no spawn-failed entry; launchSession answers true and nothing is counted', async (_label, at, { make, cause, outage }) => {
+  test.each(OUTAGE_RAISING_WAIT_ERRORS.flatMap((e) => (['every read', 'the timeout read'] as const).map((at) => [e.label, at, e] as const)))('spawnForPersona working branch, %s at %s → not-reconnected, never failed or refused; nothing typed, no kill/delete/resume/second spawn, no probe; one onset per raise; C armed with its cause at each failed read; no spawn-failed entry; launchSession answers true and nothing is counted', async (_label, at, { make, cause, outage }) => {
     const readLog = captureStartupErrors()
     const armed: Array<{ key: string; kind: string }> = []
     initOutageState({
@@ -6817,7 +6815,7 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
     expect([...getOutageFlags('C')]).toEqual([outage!.cls])
     // One onset per raise. Failing at every read, the polls raise C's outage
     // and the deadline's sweep, a successful call, clears an agent-director
-    // outage (b.jg5 SRJ-312) before the timeout read raises it again; only a
+    // outage before the timeout read raises it again; only a
     // tmux-touching success clears tmux-unavailable.
     const raises = at === 'every read' && outage!.cls !== 'tmux-unavailable' ? 2 : 1
     expect(outageEmissions.filter((e) => e.key === 'C' && e.text === outage!.onset(err))).toHaveLength(raises)
@@ -6834,7 +6832,7 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
     assertNoLeak({ errLog, notices, startupErrors: readLog() })
   })
 
-  // b.ecw: the poll loop's ended/missing branch aborts early. `statusFn` flips to
+  // the poll loop's ended/missing branch aborts early. `statusFn` flips to
   // `missing` on the FIRST poll after the up-front sweep (findMissingCalls >= 1),
   // so waitForWaitingAndReconnect returns dead-session from the loop branch WITHOUT
   // ever reaching the deadline — the timeout branch never runs. spawnForPersona then
@@ -6861,9 +6859,9 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
     expect(resumeCalls).toHaveLength(1)
   })
 
-  // b.f2b: the ladder reports the wait's real outcome — `reconnected` only
+  // the ladder reports the wait's real outcome — `reconnected` only
   // when `/mcp reconnect` was typed — and launchSession still counts it as a
-  // launch that did not fail (SR-25.1 counting unchanged).
+  // launch that did not fail (counting unchanged).
   test('spawnForPersona working branch: timeout + session alive → not-reconnected, nothing typed (no kill/resume/spawn); launchSession maps it to true', async () => {
     _setWaitForWaitingTimeoutMs(30)
     // The timeout live path decides on the fresh status call alone.
@@ -6898,12 +6896,12 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
 })
 
 // ---------------------------------------------------------------------------
-// b.4dk — findMissing-before-resume on the dead-session recovery path
+// findMissing-before-resume on the dead-session recovery path
 //
 // AD's resume verb requires a terminal (ended/missing) row. A dead-session
 // verdict arrives with a LIVE-state row (waiting/working), so pre-fix resume
 // was structurally guaranteed to throw ErrSpawnNotResumable, which is now a
-// lost race (b.jg5 SRJ-710) and never a replacement. The fix runs one
+// lost race and never a replacement. The fix runs one
 // client.findMissing({}) BEFORE resume (only on the dead-session callers) so
 // AD transitions the dead row to `missing` and resume can succeed.
 //
@@ -6911,7 +6909,7 @@ describe('b.3ce: waitForWaitingAndReconnect timeout liveness + dead-session reco
 // the call count and that it carries an empty-params sweep ({}).
 // ---------------------------------------------------------------------------
 
-describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
+describe('findMissing-before-resume on dead-session recovery', () => {
   // Drive the WAITING-branch dead-session verdict: the reconnect's one
   // send-keys answers GONE (ErrTmuxSendKeys), which is the 'dead-session'
   // signal for a waiting row.
@@ -6940,7 +6938,7 @@ describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
   })
 
   // Drive the WORKING-branch dead-session verdict: waitForWaitingAndReconnect
-  // times out and the timeout status reads the row `missing` (b.ecw — the
+  // times out and the timeout status reads the row `missing` (the
   // timeout branch keys on the row via a fresh findMissing sweep + status, not
   // the raw tmux probe). TTL=0 makes the timeout sweep observable
   // and lets the reconciled `missing` verdict flip in.
@@ -6976,7 +6974,7 @@ describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
     expect(callLog.indexOf('findMissing')).toBeLessThan(callLog.indexOf('resume'))
   })
 
-  // ended/missing caller (SR-1.4 collision resolved to a terminal row) does NOT
+  // ended/missing caller (collision resolved to a terminal row) does NOT
   // set reconcileMissingFirst — the row is already terminal, straight to resume.
   test('ended/missing path: resume called with NO findMissing call', async () => {
     const findMissingCalls: import('agent-director').FindMissingParams[] = []
@@ -6996,11 +6994,11 @@ describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
 
   // findMissing rejects → still attempt resume anyway → on a still-live row AD
   // throws ErrSpawnNotResumable → the re-read finds the row ended since → a
-  // lost race (b.jg5 SRJ-710): nothing killed, deleted or launched.
+  // lost race: nothing killed, deleted or launched.
   // The rejection is one that is no refusal at `find-missing` (an UNUSABLE
-  // NAME answer, b.jg5 SRJ-105); an UNAVAILABLE, ENVIRONMENT, CONFIG or
-  // UNCLASSIFIED one stops the attempt there (the SRJ-105, SRJ-311, SRJ-316 and
-  // SRJ-313 sweep cases below).
+  // NAME answer); an UNAVAILABLE, ENVIRONMENT, CONFIG or
+  // UNCLASSIFIED one stops the attempt there (the and
+  // sweep cases below).
   test('waiting dead-session: findMissing rejects → resume attempted → ErrSpawnNotResumable → the re-read finds the row ended → a lost race, nothing killed, deleted or launched', async () => {
     const findMissingCalls: import('agent-director').FindMissingParams[] = []
     const resumeCalls: import('agent-director').ResumeParams[] = []
@@ -7035,7 +7033,7 @@ describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
   // resume_enabled=false short-circuits BEFORE the findMissing block: the
   // replace step decides on the row last read, `waiting` (live), so the
   // live-row sequence goes first (none installed here) — no findMissing, no
-  // resume, kill, delete or spawn of the launch's own (b.jg5 SRJ-707).
+  // resume, kill, delete or spawn of the launch's own.
   test('resume_enabled=false dead-session: no findMissing, no resume; the live row goes to the live-row sequence (sequence-waiting), nothing killed or deleted', async () => {
     const findMissingCalls: import('agent-director').FindMissingParams[] = []
     const resumeCalls: import('agent-director').ResumeParams[] = []
@@ -7061,7 +7059,7 @@ describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
     expect([killCalls, deleteCalls]).toEqual([[], []])
   })
 
-  // b.jg5 SRJ-602: an ErrTmuxSessionCreate on resume in the dead-session path,
+  // an ErrTmuxSessionCreate on resume in the dead-session path,
   // after the findMissing sweep, is one counted launch failure.
   test('waiting dead-session: findMissing then resume ErrTmuxSessionCreate → failed and counted; nothing killed and no spawn in its place', async () => {
     const findMissingCalls: import('agent-director').FindMissingParams[] = []
@@ -7089,20 +7087,20 @@ describe('b.4dk: findMissing-before-resume on dead-session recovery', () => {
 })
 
 // ---------------------------------------------------------------------------
-// b.m4r — waitForWaitingAndReconnect runs an up-front findMissing sweep,
+// waitForWaitingAndReconnect runs an up-front findMissing sweep,
 // instead of spinning `status` for the full 10-minute window
 //
 // A bot killed mid-turn never fires SessionEnd, so its AD row freezes at
 // `working`. Without the sweep, waitForWaitingAndReconnect would poll `status`
 // (which stays `working`) until WAIT_FOR_WAITING_TIMEOUT_MS (10 min). It runs
-// ONE evidence-based findMissing sweep up front (t1.93m.hp): a genuinely-dead
+// ONE evidence-based findMissing sweep up front: a genuinely-dead
 // row reconciles to `missing`, so the FIRST status poll hits the ended/missing
 // branch and returns 'dead-session' in seconds, with no tmux probe. A
 // genuinely-alive long-turn row is untouched by the sweep (empty result) and
-// keeps its polling (b.rmy guard).
+// keeps its polling (guard).
 // ---------------------------------------------------------------------------
 
-describe('b.m4r: waitForWaitingAndReconnect up-front findMissing sweep → fast dead-session', () => {
+describe('waitForWaitingAndReconnect up-front findMissing sweep → fast dead-session', () => {
   // Fast path (ticket acceptance criterion): working-row collision, process gone.
   // Models the real frozen row — a bot killed mid-turn: AD reports `working`
   // on every status poll UNTIL the up-front findMissing sweep reconciles the
@@ -7150,8 +7148,8 @@ describe('b.m4r: waitForWaitingAndReconnect up-front findMissing sweep → fast 
   // findMissing rejects → logged, poll loop proceeds exactly as today. Here the
   // row then transitions working→waiting and reconnectMcp succeeds → 'ok'. No
   // crash, no behavior change from the sweep failure. The rejection is one
-  // that is no refusal at `find-missing` (an UNUSABLE NAME answer, b.jg5
-  // SRJ-105); a refused one stops the wait (the sweep cases below).
+  // that is no refusal at `find-missing` (an UNUSABLE NAME answer
+  //); a refused one stops the wait (the sweep cases below).
   test('findMissing rejects → poll loop proceeds → working→waiting → reconnect ok', async () => {
     _setWaitForWaitingTimeoutMs(60_000)
     const findMissingCalls: import('agent-director').FindMissingParams[] = []
@@ -7171,7 +7169,7 @@ describe('b.m4r: waitForWaitingAndReconnect up-front findMissing sweep → fast 
   })
 
   // -------------------------------------------------------------------------
-  // Memo (single-flight + short-TTL) around reconcileMissingSweep (b.m4r).
+  // Memo (single-flight + short-TTL) around reconcileMissingSweep.
   // The sweep is idempotent, so back-to-back callers within the TTL must share
   // ONE actual client.findMissing({}); past the TTL a caller re-sweeps; a failed
   // sweep is never memoized, so the next caller retries.
@@ -7238,25 +7236,25 @@ describe('b.m4r: waitForWaitingAndReconnect up-front findMissing sweep → fast 
 })
 
 // ---------------------------------------------------------------------------
-// t1.tkk.e4 / b.sv7 — sweepDeadTmuxChannel: the exported escalate-dead wrapper
+// sweepDeadTmuxChannel: the exported escalate-dead wrapper
 //
 // The wrapper bundles an UNCONDITIONAL operator log line (emitted before/outside
 // the memoized helper — memo hits return silently, so the log must not live
 // inside reconcileMissingSweep) plus a call into the still-private memoized
-// reconcileMissingSweep (b.m4r). Exercised here through its exported surface.
+// reconcileMissingSweep. Exercised here through its exported surface.
 //
 // Coverage:
 //   - Log content: the operator line names the channel id, the dead-tmux
 //     verdict, and that reconciliation was triggered — emitted UNCONDITIONALLY,
-//     including on a memo hit (Epic AC 3, I1).
-//   - b.nk5 fleet shape: several distinct channel ids escalate concurrently in
+// including on a memo hit (component, I1).
+// - fleet shape: several distinct channel ids escalate concurrently in
 //     one tick window → exactly ONE client.findMissing sweep (in-flight sharing),
 //     all callers resolve; a caller past the TTL re-sweeps.
-//   - b.m4r contract pins through the wrapper: one memoized TTL-guarded
+// - contract pins through the wrapper: one memoized TTL-guarded
 //     in-flight-shared sweep; failures NOT memoized; never a second sweep pattern.
 // ---------------------------------------------------------------------------
 
-describe('t1.tkk.e4: sweepDeadTmuxChannel escalate-dead wrapper', () => {
+describe('sweepDeadTmuxChannel escalate-dead wrapper', () => {
   // Capture console.error to assert on the operator-visible log line. The
   // wrapper (and reconcileMissingSweep) log via console.error; we restore it in
   // afterEach so no capture leaks into later tests.
@@ -7312,12 +7310,12 @@ describe('t1.tkk.e4: sweepDeadTmuxChannel escalate-dead wrapper', () => {
     expect(line!.toLowerCase()).toContain('reconciliation')
   })
 
-  // b.nk5 post-reboot fleet shape: every channel's tmux session is dead, so the
+  // post-reboot fleet shape: every channel's tmux session is dead, so the
   // health-check tick escalates them all in one window. The sweep is whole-store
   // and single-flight, so N concurrent wrapper calls must collapse to exactly
   // ONE client.findMissing({}) — the fleet is served by one in-flight-shared
   // sweep, not N. All callers resolve (the wrapper never throws).
-  test('b.nk5: N channels escalating concurrently in one tick share ONE findMissing', async () => {
+  test('N channels escalating concurrently in one tick share ONE findMissing', async () => {
     const findMissingCalls: import('agent-director').FindMissingParams[] = []
     installStub({ findMissingCalls, findMissingResult: cannedFindMissing({ count: 3, ids: ['cscb_A', 'cscb_B', 'cscb_C'] }) })
 
@@ -7343,7 +7341,7 @@ describe('t1.tkk.e4: sweepDeadTmuxChannel escalate-dead wrapper', () => {
 
   // Past the TTL, a later escalate re-sweeps — the memo is a short-TTL cache, not
   // a latch. TTL=0 defeats reuse so the second wrapper call issues a fresh sweep.
-  test('b.nk5/b.m4r: a caller past the TTL re-sweeps', async () => {
+  test('a caller past the TTL re-sweeps', async () => {
     _setFindMissingMemoTtlMs(0)
     const findMissingCalls: import('agent-director').FindMissingParams[] = []
     installStub({ findMissingCalls, findMissingResult: cannedFindMissing({ count: 1, ids: ['cscb_C'] }) })
@@ -7354,7 +7352,7 @@ describe('t1.tkk.e4: sweepDeadTmuxChannel escalate-dead wrapper', () => {
     expect(findMissingCalls).toHaveLength(2) // TTL=0 → no reuse, each escalate sweeps
   })
 
-  // b.jdc, b.jg5 SRJ-613: the line says what the verdict observed, its text
+  // the line says what the verdict observed, its text
   // taken from `ESCALATE_DEAD_EVIDENCE`. A GONE answer (a prompt row's
   // included), a refused keystroke and an absent row each say only what was
   // seen; none says a tmux session or a worker is "provably dead".
@@ -7367,7 +7365,7 @@ describe('t1.tkk.e4: sweepDeadTmuxChannel escalate-dead wrapper', () => {
     expect(escalateDeadSweepLine('C', verdict)).toContain(` verdict=${verdict} — ${ESCALATE_DEAD_EVIDENCE[verdict]}, `)
   })
 
-  // b.jg5 SRJ-610: the sweep's line names no outcome. A swept row may stay
+  // the sweep's line names no outcome. A swept row may stay
   // live for further ticks, each escalate-dead tick sweeping again, so the
   // line never promises the restart finds the row dead. The line's one
   // literal pin; every other case compares with `escalateDeadSweepLine`.
@@ -7382,7 +7380,7 @@ describe('t1.tkk.e4: sweepDeadTmuxChannel escalate-dead wrapper', () => {
     }
   })
 
-  // b.jg5 SRJ-610: the six reconnect lines logged before an escalate-dead
+  // the six reconnect lines logged before an escalate-dead
   // sweep promise no relaunch: each opens with what it found (the failure's
   // description where it names one) and what it does not do, then the shared
   // tail, then its own references. The lines' one literal pin; every other
@@ -7399,9 +7397,9 @@ describe('t1.tkk.e4: sweepDeadTmuxChannel escalate-dead wrapper', () => {
     }
   })
 
-  // b.m4r contract pin through the wrapper: a FAILED sweep is not memoized, so
+  // contract pin through the wrapper: a FAILED sweep is not memoized, so
   // the next escalate retries. The wrapper still never throws on the failure.
-  test('b.m4r pin: a failed sweep is not memoized → next escalate retries, wrapper never throws', async () => {
+  test('pin: a failed sweep is not memoized → next escalate retries, wrapper never throws', async () => {
     const findMissingCalls: import('agent-director').FindMissingParams[] = []
     installStub({ findMissingCalls, findMissingError: errGeneric('find-missing', 'ErrProbeFailed') })
 
@@ -7413,11 +7411,11 @@ describe('t1.tkk.e4: sweepDeadTmuxChannel escalate-dead wrapper', () => {
 })
 
 // ---------------------------------------------------------------------------
-// b.c3o — waitForWaitingAndReconnect early-abort liveness verdict
+// waitForWaitingAndReconnect early-abort liveness verdict
 // ---------------------------------------------------------------------------
 
-describe('b.c3o: waitForWaitingAndReconnect early-abort liveness verdict', () => {
-  // b.ecw: the ended/missing loop branch now keys on the claude PROCESS. After
+describe('waitForWaitingAndReconnect early-abort liveness verdict', () => {
+  // the ended/missing loop branch now keys on the claude PROCESS. After
   // the up-front evidence-based sweep, `missing`/`ended` is a provably-gone
   // process → 'dead-session' DIRECTLY.
   test.each([
@@ -7432,7 +7430,7 @@ describe('b.c3o: waitForWaitingAndReconnect early-abort liveness verdict', () =>
     expect(result).toBe('dead-session')
   })
 
-  // b.f2b: a live transient state ends the wait with the session left alive and
+  // a live transient state ends the wait with the session left alive and
   // nothing typed into its prompt: 'not-reconnected' ('ok' before).
   test('transition to live transient state (ask_user) → not-reconnected without probing, recovery or typing (regression guard)', async () => {
     const sendKeysCalls: import('agent-director').SendKeysParams[] = []
@@ -7455,9 +7453,9 @@ describe('b.c3o: waitForWaitingAndReconnect early-abort liveness verdict', () =>
     expect(result).toBe('not-reconnected')
   })
 
-  // b.jg5 SRJ-605: ErrSpawnNotFound at the poll is an absent row:
+  // ErrSpawnNotFound at the poll is an absent row:
   // 'dead-session' at that poll, with one line; nothing is typed.
-  test('b.jg5 SRJ-605: ErrSpawnNotFound at the poll → dead-session at that poll with one row-absent line; nothing typed, no notice', async () => {
+  test('ErrSpawnNotFound at the poll → dead-session at that poll with one row-absent line; nothing typed, no notice', async () => {
     const clock = useFakeNow()
     const row = installWorkingRow(clock, { state: errSpawnNotFound(), pane: SPINNER_PANE, stepMs: 1_000 })
 
@@ -7490,7 +7488,7 @@ describe('b.c3o: waitForWaitingAndReconnect early-abort liveness verdict', () =>
 })
 
 // ---------------------------------------------------------------------------
-// b.f2b — a stale `working` row must not strand a persona
+// a stale `working` row must not strand a persona
 //
 // agent-director can leave a persona's row `working` after its turn ended
 // (live Check 24). While the row reads `working`, the wait at a launch
@@ -7498,13 +7496,13 @@ describe('b.c3o: waitForWaitingAndReconnect early-abort liveness verdict', () =>
 // read the persona's evidence: its pane and, when the pane shows an idle
 // screen, its transcript. On the restart path the pane is the working-row
 // verdict's one read (in `src/server.ts`, its cells in tests/server.test.ts),
-// and `checkWorkingRowPane` folds it with no read of its own (b.jg5 SRJ-603).
+// and `checkWorkingRowPane` folds it with no read of its own.
 // The row is stale only on the
 // positive-idle rule: across STALE_WORKING_WINDOW_MS (60 s), every read shows
 // the same idle screen (no spinner, busy hint, API retry row, prompt or
 // dialog) AND the same transcript, unchanged, ending with a completed turn. A
 // live turn, an API retry or stall included, never ends its transcript that
-// way, so it is never typed into, and neither is a prompt or dialog (b.rmy).
+// way, so it is never typed into, and neither is a prompt or dialog.
 // A `waiting` row's pane is read once before a reconnect
 // (`checkWaitingRowPane`). A wait that ends with the session alive and nothing
 // typed returns 'not-reconnected' and says what happens next; with
@@ -7642,9 +7640,9 @@ const RECONNECT_TEXT = `/mcp reconnect ${MCP_SERVER_NAME}`
 
 /** A transcript read that ended with a completed turn, its snapshot `SNAPSHOT` with `change`. */
 
-describe('b.f2b: the not-connected notice, once per episode', () => {
+describe('the not-connected notice, once per episode', () => {
 
-  // The existing first-line pin also owns SR-8.5's one-line reconnect
+  // The existing first-line pin also owns one-line reconnect
   // variants; those include the human-only ending on that same line.
 
   test.each<['disconnected' | undefined, string, string]>([
@@ -7660,17 +7658,17 @@ describe('b.f2b: the not-connected notice, once per episode', () => {
   })
 })
 
-// b.f2b, b.jg5 SRJ-605: the wait's reports and lines, each builder pinned
+// the wait's reports and lines, each builder pinned
 // once with literal text; every other case compares the wait's lines and
 // notices with these builders' output.
-describe('b.f2b, b.jg5 SRJ-605: the wait-ended reports and the wait\'s lines (one literal pin per builder)', () => {
+describe('the wait-ended reports and the wait\'s lines (one literal pin per builder)', () => {
   /** A failed status read's description, as the redacting describer would render one. */
   const DESCRIBED = 'ErrTimeout message="timed out"'
 
   test('waitTimedOutUnreadReport: the failed timeout read named with its class, the health check\'s recovery, and a notice saying agent-director could not report the state', () => {
     expect(waitTimedOutUnreadReport(WAIT_REF_C, 10 * 60_000, DESCRIBED, AD_ERROR_CLASS_UNCLASSIFIED)).toEqual({
-      logHead: '[slack] waitForWaitingAndReconnect: timed out for persona=C after 600000ms — its status read failed: ErrTimeout message="timed out" (class=UNCLASSIFIED), so its state is not known — not reconnected (b.jg5 SRJ-605)',
-      enabledFollowUp: 'the health check recovers it from its own reads of the row: once agent-director answers with the row live and the persona disconnected, the tick schedules a reconnect (b.9a7)',
+      logHead: '[slack] waitForWaitingAndReconnect: timed out for persona=C after 600000ms — its status read failed: ErrTimeout message="timed out" (class=UNCLASSIFIED), so its state is not known — not reconnected',
+      enabledFollowUp: 'the health check recovers it from its own reads of the row: once agent-director answers with the row live and the persona disconnected, the tick schedules a reconnect',
       notice: { reason: 'auto-restart-disabled', cause: 'agent-director could not report its state when CSCB stopped waiting for it, 10 min after launching it' },
     })
   })
@@ -7678,7 +7676,7 @@ describe('b.f2b, b.jg5 SRJ-605: the wait-ended reports and the wait\'s lines (on
   test('waitEndedOnStateReport: the state the row moved to, the health check\'s recovery, and a notice by state (a prompt: blocked-on-prompt; any other: the state it moved to)', () => {
     expect(waitEndedOnStateReport(WAIT_REF_C, 'ask_user')).toEqual({
       logHead: '[slack] waitForWaitingAndReconnect: persona=C transitioned to state=ask_user — aborting',
-      enabledFollowUp: 'the health check reconnects it (tick sees alive && !connected on two ticks -> scheduleRestart -> reconnect, b.9a7; an ask_user or check_permission row is never typed into, b.f2b)',
+      enabledFollowUp: 'the health check reconnects it (tick sees alive && !connected on two ticks -> scheduleRestart -> reconnect; an ask_user or check_permission row is never typed into)',
       notice: { reason: 'blocked-on-prompt', autoRestartDisabled: true },
     })
     expect(waitEndedOnStateReport(WAIT_REF_C, 'compacting').notice).toEqual({
@@ -7691,32 +7689,32 @@ describe('b.f2b, b.jg5 SRJ-605: the wait-ended reports and the wait\'s lines (on
     const report = { logHead: '[slack] the head', enabledFollowUp: 'what the health check does next' }
 
     expect(waitEndedDisconnectedLine(report, 0)).toBe(
-      '[slack] the head; session_restart_delay is 0, so nothing will reconnect it — the not-connected notice reports it (once per episode) (b.f2b)',
+      '[slack] the head; session_restart_delay is 0, so nothing will reconnect it — the not-connected notice reports it (once per episode)',
     )
     expect(waitEndedDisconnectedLine(report, 60)).toBe('[slack] the head; what the health check does next')
   })
 
   test('waitRowAbsentLine: the absent row at the poll and at the timeout read, a dead session either way, its cause a row read that is not dead evidence', () => {
     expect(waitRowAbsentLine(WAIT_REF_C)).toBe(
-      "[slack] waitForWaitingAndReconnect: persona=C's agent-director row is absent (ErrSpawnNotFound) — dead session (cause=row-absent: not dead evidence); the recovery's spawn classifies any leftover session (b.jg5 SRJ-605, SRJ-611)",
+      "[slack] waitForWaitingAndReconnect: persona=C's agent-director row is absent (ErrSpawnNotFound) — dead session (cause=row-absent: not dead evidence); the recovery's spawn classifies any leftover session",
     )
     expect(waitRowAbsentLine(WAIT_REF_C, 10 * 60_000)).toBe(
-      "[slack] waitForWaitingAndReconnect: timed out for persona=C after 600000ms — agent-director row is absent (ErrSpawnNotFound) — dead session (cause=row-absent: not dead evidence); the recovery's spawn classifies any leftover session (b.jg5 SRJ-605, SRJ-611)",
+      "[slack] waitForWaitingAndReconnect: timed out for persona=C after 600000ms — agent-director row is absent (ErrSpawnNotFound) — dead session (cause=row-absent: not dead evidence); the recovery's spawn classifies any leftover session",
     )
   })
 
   test('waitRowFinishedLine: a row read ended or missing at the poll and at the timeout read, a dead session either way, its cause a row read that is not dead evidence', () => {
     expect(waitRowFinishedLine(WAIT_REF_C, 'missing')).toBe(
-      "[slack] waitForWaitingAndReconnect: persona=C's row reads state=missing — dead session (cause=row-read-finished: not dead evidence); the recovery's resume or spawn decides what holds its name (b.ecw, b.jg5 SRJ-605, SRJ-611)",
+      "[slack] waitForWaitingAndReconnect: persona=C's row reads state=missing — dead session (cause=row-read-finished: not dead evidence); the recovery's resume or spawn decides what holds its name",
     )
     expect(waitRowFinishedLine(WAIT_REF_C, 'ended', 10 * 60_000)).toBe(
-      "[slack] waitForWaitingAndReconnect: timed out for persona=C after 600000ms — its row reads state=ended — dead session (cause=row-read-finished: not dead evidence); the recovery's resume or spawn decides what holds its name (b.ecw, b.jg5 SRJ-605, SRJ-611)",
+      "[slack] waitForWaitingAndReconnect: timed out for persona=C after 600000ms — its row reads state=ended — dead session (cause=row-read-finished: not dead evidence); the recovery's resume or spawn decides what holds its name",
     )
   })
 
   test('waitPollStatusErrorLine: the failed poll read named with its class; the wait goes on and posts nothing', () => {
     expect(waitPollStatusErrorLine(WAIT_REF_C, DESCRIBED, AD_ERROR_CLASS_UNAVAILABLE)).toBe(
-      '[slack] waitForWaitingAndReconnect: status read failed for persona=C: ErrTimeout message="timed out" (class=UNAVAILABLE) — its state is not known; still waiting for its working row, nothing posted (b.jg5 SRJ-605)',
+      '[slack] waitForWaitingAndReconnect: status read failed for persona=C: ErrTimeout message="timed out" (class=UNAVAILABLE) — its state is not known; still waiting for its working row, nothing posted',
     )
   })
 
@@ -7731,7 +7729,7 @@ describe('b.f2b, b.jg5 SRJ-605: the wait-ended reports and the wait\'s lines (on
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-613 (AC 44), the launch wait's half: with no session of the
+// the launch wait's half: with no session of the
 // row's current launch there and exactly one leftover of the persona,
 // agent-director's `read-pane` answers the leftover's pane, so the wait acts
 // on no pane alone. A launch of P meets its colliding `working` row and
@@ -7745,24 +7743,24 @@ describe('b.f2b, b.jg5 SRJ-605: the wait-ended reports and the wait\'s lines (on
 // latched (`launchSession` 'skipped'), with no resume, kill, delete or
 // counted failure. On `makeRecoveryHarness` (its latch composed as `main()`
 // composes it); the wait's clock (`useFakeNow`) moves at each status poll,
-// and `srj105AfterEach` runs `assertNoLeak` over every line, notice and
-// startup-errors entry the harness captured. T1's per-cell CONFLICT cases
+// and `recoveryAfterEach` runs `assertNoLeak` over every line, notice and
+// startup-errors entry the harness captured. per-cell CONFLICT cases
 // (the ladder's branches, over every reconnect row) are the cells' evidence.
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// b.dup — a findMissing sweep ends a row just before its /mcp reconnect lands
+// a findMissing sweep ends a row just before its /mcp reconnect lands
 //
 // agent-director's send-keys refuses an `ended` or `missing` row with
 // ErrSpawnNotInteractive. Another persona's launch wait starts with a
-// findMissing sweep (b.m4r), and that sweep can mark a persona's row
+// findMissing sweep, and that sweep can mark a persona's row
 // `missing` after its ladder read the row `waiting` and before its
 // `/mcp reconnect` keystrokes land (/ci-live run 5, Checks 24-teardown and
 // 28: `find_missing.tick cscb_persona_a waiting→missing`, then
 // `send_keys cscb_persona_a ErrSpawnNotInteractive` 11 ms later). The
 // reconnect answers 'dead-session' (cause `row-not-interactive`) and the
 // caller recovers the persona; the refusal routes it into that recovery's
-// decision and proves nothing about its worker (b.jg5 SRJ-609). Before the
+// decision and proves nothing about its worker. Before the
 // fix it answered 'failed': a `[spawn-failed]`
 // startup error and a spawn-failure notice, and the persona stayed down until
 // the restart backoff relaunched it.
@@ -7770,8 +7768,8 @@ describe('b.f2b, b.jg5 SRJ-605: the wait-ended reports and the wait\'s lines (on
 // Cases marked REPRO fail on the code before the fix.
 // ---------------------------------------------------------------------------
 
-describe('b.dup: a row a findMissing sweep ended just before /mcp reconnect landed (ErrSpawnNotInteractive)', () => {
-  /** The reconnect's one line for persona `ref` when agent-director refuses its keystrokes as not interactive (b.jg5 SRJ-609). */
+describe('a row a findMissing sweep ended just before /mcp reconnect landed (ErrSpawnNotInteractive)', () => {
+  /** The reconnect's one line for persona `ref` when agent-director refuses its keystrokes as not interactive. */
   const refusedLine = (ref: string): string => reconnectNotInteractiveLine(ref, describeAdFailureForLog(errSpawnNotInteractive('send-keys')))
 
   /** Personas `A` and `B`, each launch polling every 1 ms. */
@@ -7853,7 +7851,7 @@ describe('b.dup: a row a findMissing sweep ended just before /mcp reconnect land
     expect(readLog()).toBe('')
     expect(notices).toEqual([])
     expect(errLog.split('\n').filter((line) => line === refusedLine(renderPersonaRef('A', 'A')))).toEqual([])
-    // b.jg5 SRJ-611: the route names its own cause, a refusal that is not dead evidence.
+    // the route names its own cause, a refusal that is not dead evidence.
     expect(linesWith(errLog, '[slack] spawnForPersona: dead session for ')).toEqual([
       deadSessionRouteLine(renderPersonaRef('A', 'A'), 'waiting', carriedDeadEvidenceOf(DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE), CARRIED_DEAD_EVIDENCE_NONE),
     ])
@@ -7875,7 +7873,7 @@ describe('b.dup: a row a findMissing sweep ended just before /mcp reconnect land
   })
 
   /**
-   * The wait's three reconnects (b.f2b), each refused because the row was
+   * The wait's three reconnects, each refused because the row was
    * ended just before: how the stub makes each (`installWorkingRow`), and the
    * row `get` answers.
    */
@@ -7931,13 +7929,13 @@ describe('b.dup: a row a findMissing sweep ended just before /mcp reconnect land
 })
 
 // ---------------------------------------------------------------------------
-// b.jdc — a launch meets a row waiting on a prompt: its cases, one per cell
-// of b.jg5 SRJ-117's ladder-action column (SRJ-607), are on the recovery
+// a launch meets a row waiting on a prompt: its cases, one per cell
+// of the contract ladder-action column, are on the recovery
 // harness below (`launchOnPromptRow`, after the shared read-pane's cases).
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// b.jdc — checkPromptRowDeferral: the restart path's run of deferrals on a
+// checkPromptRowDeferral: the restart path's run of deferrals on a
 // row waiting on a prompt whose one-line read-pane answers a pane or is
 // taken as alive. From PROMPT_ROW_SWEEP_AFTER_MS (10 min) after the run's
 // first deferral, each deferral runs the memoized findMissing sweep and reads
@@ -7946,7 +7944,7 @@ describe('b.dup: a row a findMissing sweep ended just before /mcp reconnect land
 // sweeps.
 // ---------------------------------------------------------------------------
 
-describe('b.jdc: checkPromptRowDeferral', () => {
+describe('checkPromptRowDeferral', () => {
   const min = (n: number): number => n * 60_000
   let clock: FakeClock
 
@@ -8007,7 +8005,7 @@ describe('b.jdc: checkPromptRowDeferral', () => {
     expect(errLog).not.toContain(LEAK_SENTINEL)
   })
 
-  // b.jg5 SRJ-1014 (E34 final review): the read's failure is named by
+  // ( final review): the read's failure is named by
   // `describeAdFailureForLog`: agent-director's reported error name, never
   // the client's placeholder, for an UNCLASSIFIED and a CONFIG answer.
   test.each([
@@ -8050,7 +8048,7 @@ describe('b.jdc: checkPromptRowDeferral', () => {
   })
 })
 
-describe('b.f2b: a teardown cancels a launch\'s wait for a working row (cancelWorkingRowWait)', () => {
+describe('a teardown cancels a launch\'s wait for a working row (cancelWorkingRowWait)', () => {
   let clock: FakeClock
   beforeEach(() => {
     clock = useFakeNow()
@@ -8122,7 +8120,7 @@ const recordUnhandledRejection = (reason: unknown): void => {
   unhandledRejections.push(reason)
 }
 
-describe('b.f2b: one persona waiting for its working row does not hold up the start pass', () => {
+describe('one persona waiting for its working row does not hold up the start pass', () => {
   afterEach(() => {
     process.off('unhandledRejection', recordUnhandledRejection)
   })
@@ -8193,7 +8191,7 @@ describe('b.f2b: one persona waiting for its working row does not hold up the st
       { key: 'B', action: 'spawned' },
       { key: 'C', action: 'spawned' },
     ])
-    // Read once A's launch has settled: the parked launch is counted in none of SRJ-1015's five counts either.
+    // Read once A's launch has settled: the parked launch is counted in none of the contract five counts either.
     expect(result!).toMatchObject({ waitingInBackground: 1, succeeded: 2, freshSpawned: 2, reconnected: 0, notReconnected: 0, failed: 0, latched: 0, retrying: 0, sequenceWaiting: 0, held: 0, freshRetired: 0 })
     expect(sendKeysCalls).toEqual([{ instance_id: 'cscb_A', text: RECONNECT_TEXT, no_enter: true }, { instance_id: 'cscb_A', key: 'Enter' }])
     const ref = renderPersonaRef('A', 'A')
@@ -8271,11 +8269,11 @@ describe('b.f2b: one persona waiting for its working row does not hold up the st
 })
 
 // ---------------------------------------------------------------------------
-// SR-8.6 invariant: live state set + instance-id helper
+// invariant: live state set + instance-id helper
 // ---------------------------------------------------------------------------
 
-describe('SR-8.6 invariants', () => {
-  test('AGENT_DIRECTOR_LIVE_STATES covers all expected SR-11 live states', () => {
+describe('invariants', () => {
+  test('AGENT_DIRECTOR_LIVE_STATES covers all expected live states', () => {
     expect(AGENT_DIRECTOR_LIVE_STATES.has('pending')).toBe(true)
     expect(AGENT_DIRECTOR_LIVE_STATES.has('waiting')).toBe(true)
     expect(AGENT_DIRECTOR_LIVE_STATES.has('working')).toBe(true)
@@ -8307,8 +8305,8 @@ describe('SR-8.6 invariants', () => {
 })
 
 // ---------------------------------------------------------------------------
-// b.4ie — merged approvePreSessionDialogs (dev-channels + trust needle),
-// through agent-director only (b.jg5 SRJ-402)
+// merged approvePreSessionDialogs (dev-channels + trust needle),
+// through agent-director only
 //
 // Each lap reads the persona's row with `status`; on `pending` with a launch
 // start it reads the pane once (`readPane`, 40 lines, `allow_pending`) and,
@@ -8330,7 +8328,7 @@ describe('SR-8.6 invariants', () => {
 // cap from its own start while `_setDialogReadyTimeoutMs` is set. At either it
 // writes one server-log line and, for a start-pass launch only, the
 // `dev-channels-approve-not-ready` entry; nothing reaches the notice notifier
-// (SRJ-405: the `DialogApprovalTimeout` spawn-failure notice is gone).
+// (the `DialogApprovalTimeout` spawn-failure notice is gone).
 // `ErrSpawnNotInteractive` on its Enter stops it with nothing typed and one
 // line; a CONFIG answer raises `ad-config-malformed` and arms P's retry timer
 
@@ -8355,10 +8353,10 @@ describe('SR-8.6 invariants', () => {
 // in flight when it was made (`recordCallsWithInFlight`).
 //
 // Each success site (`SUCCESS_SITES`) also checks its launch's `pre_trust`
-// line (b.jg5 SRJ-413) for one present value, the values taken in turn; the
+// line for one present value, the values taken in turn; the
 // `pre_trust` describe below crosses every value and the absent field on a
 // spawn, a `resume` and a reuse spawn, and shares the sites. The reuse spawn
-// (b.jg5 SRJ-112) is a success site too, reached through the live-row
+// is a success site too, reached through the live-row
 // sequence's launch entry (`launchForLiveRowSequence`), its only caller.
 // ---------------------------------------------------------------------------
 
@@ -8388,11 +8386,11 @@ const PRE_TRUST_LINE_END = commonEnd(
   ),
 )
 
-/** Both forms of a launch timeout (b.jg5 SRJ-407): `ErrCallTimeout`, and `ErrTmuxUnresponsive` carrying "the session may have been created". */
+/** Both forms of a launch timeout: `ErrCallTimeout`, and `ErrTmuxUnresponsive` carrying "the session may have been created". */
 const LAUNCH_TIMEOUT_FORMS: readonly LaunchTimeoutForm[] = [LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT, LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE]
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-413 — each launch's pre_trust is logged, and no launch passes
+// each launch's pre_trust is logged, and no launch passes
 // no_pre_trust
 //
 // agent-director pre-accepts the persona's folder trust at each launch and
@@ -8402,11 +8400,11 @@ const LAUNCH_TIMEOUT_FORMS: readonly LaunchTimeoutForm[] = [LAUNCH_TIMEOUT_FORM_
 // from a binary older than Phase 1) and lets no value change anything else: a
 
 // come from the stub's `PRE_TRUST_VALUES` and lines from the builder. Each
-// success site's own line, for one present value, is checked in the SRJ-401
+// success site's own line, for one present value, is checked in the
 // describe above.
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-413: each launch\'s pre_trust is logged once with the persona reference and changes nothing else; no launch carries no_pre_trust', () => {
+describe('each launch\'s pre_trust is logged once with the persona reference and changes nothing else; no launch carries no_pre_trust', () => {
   const KEY = SUCCESS_SITE_KEY
   const REF = renderPersonaRef(KEY, KEY)
   const VERBS: readonly LaunchVerb[] = [LAUNCH_VERB_SPAWN, LAUNCH_VERB_RESUME, LAUNCH_VERB_REUSE_SPAWN]
@@ -8453,7 +8451,7 @@ describe('b.jg5 SRJ-413: each launch\'s pre_trust is logged once with the person
 })
 
 // ---------------------------------------------------------------------------
-// b.en2 Epic 4 — wrapper-migration assertions
+// component 4 — wrapper-migration assertions
 // ---------------------------------------------------------------------------
 
 // Shared constants for wrapper tests
@@ -8485,7 +8483,7 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
   // Site #8 — waitForWaitingAndReconnect → status
   // -------------------------------------------------------------------------
 
-  // b.jg5 SRJ-605: the wait polls on through it and, failing at the
+  // the wait polls on through it and, failing at the
   // deadline too, ends not reconnected, never failed.
   test('site #8: waitForWaitingAndReconnect ErrSystemInstallDisappeared → ad-unreachable, no spawn-failure notice; the wait polls on and ends not-reconnected', async () => {
     const clock = useFakeNow()
@@ -8499,13 +8497,12 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
 
   // -------------------------------------------------------------------------
   // Site #9 — the replace step's reuse spawn (resume_enabled=false, a finished
-  // row; b.jg5 SRJ-707). The collision ladder makes no kill and no delete, so
+  // row). The collision ladder makes no kill and no delete, so
   // there are no kill or delete sites. ErrSystemInstallDisappeared is
-  // UNCLASSIFIED (b.jg5 SRJ-104): at the reuse it is a refusal (SRJ-112,
-  // SRJ-313), and the wrapper still raises the outage flag.
+  // UNCLASSIFIED: at the reuse it is a refusal, and the wrapper still raises the outage flag.
   // -------------------------------------------------------------------------
 
-  test('site #9: the reuse spawn replacing a finished row (resume_enabled=false) ErrSystemInstallDisappeared → ad-unreachable, refused (b.jg5 SRJ-112, SRJ-313): no further launch, no kill or delete, no spawn-failure notice', async () => {
+  test('site #9: the reuse spawn replacing a finished row (resume_enabled=false) ErrSystemInstallDisappeared → ad-unreachable, refused: no further launch, no kill or delete, no spawn-failure notice', async () => {
     const cfg = makeStandInPersonaConfig({ C: { working_directory: CWD } }, fixtureDir, { resume_enabled: false })
     const calls = newLadderCalls()
     installStub({
@@ -8582,7 +8579,7 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
   })
 
   // -------------------------------------------------------------------------
-  // Site #14 — the replace step's reuse spawn (resume_enabled=false, b.jg5 SRJ-707)
+  // Site #14 — the replace step's reuse spawn (resume_enabled=false)
   // -------------------------------------------------------------------------
 
   test('site #14: the reuse spawn replacing a finished row ErrCwdNotFound → cwd-unreachable, no spawn-failure notice', async () => {
@@ -8618,7 +8615,7 @@ describe('wrapper-migration: non-dialog outage cases (Group A)', () => {
   })
 
   // -------------------------------------------------------------------------
-  // Site #16 — spawnForPersona reuse spawn after ErrNoSessionId (b.jg5 SRJ-707)
+  // Site #16 — spawnForPersona reuse spawn after ErrNoSessionId
   // -------------------------------------------------------------------------
 
   test('site #16: reuse spawn after ErrNoSessionId ErrCwdNotFound → cwd-unreachable, no spawn-failure notice', async () => {
@@ -8731,7 +8728,7 @@ describe('wrapper-migration: spawn/resume success-clear (Group C)', () => {
   })
 
   // -------------------------------------------------------------------------
-  // Site #16 — reuse spawn after ErrNoSessionId success (b.jg5 SRJ-707)
+  // Site #16 — reuse spawn after ErrNoSessionId success
   // -------------------------------------------------------------------------
 
   test('site #16: reuse spawn after ErrNoSessionId success clears all three flags', async () => {
@@ -8752,17 +8749,17 @@ describe('wrapper-migration: spawn/resume success-clear (Group C)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// b.wrb — ErrJsonlMissing amnesia: legible diagnostic + honest startup counters
+// ErrJsonlMissing amnesia: legible diagnostic + honest startup counters
 //
 // When resume throws ErrJsonlMissing, CSCB brings the persona up fresh by one
-// reuse spawn of the same id, after the diagnosis (b.jg5 SRJ-707, SRJ-712),
+// reuse spawn of the same id, after the diagnosis,
 // and: (1) logs which transcript path(s) were tried and their source; (2)
 // reports AD transcript references while retaining uncertainty about actual loss; (3) counts the launch as its own
 // 'fresh-after-amnesia' bucket instead of folding it into "ok". The order of
-// the diagnosis and the reuse, and the texts, are the SRJ-712 describe's.
+// the diagnosis and the reuse, and the texts, are the describe's.
 // ---------------------------------------------------------------------------
 
-describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
+describe('ErrJsonlMissing amnesia diagnostic + honest counters', () => {
   const CH = 'C_WRB'
   const CWD = '/repo/wrb'
 
@@ -8815,7 +8812,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
     })
   }
 
-  test.each([0, 4, undefined])('b.d6n: archive count %s leaves history unverified, preserves the row, and counts the replacement separately', async archived => {
+  test.each([0, 4, undefined])('archive count %s leaves history unverified, preserves the row, and counts the replacement separately', async archived => {
     const readLog = captureStartupErrors()
     const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir,
       archived === undefined ? {} : { message_archive_db: makeArchiveWithMessagesSince('2026-09-20T05:00:00Z', archived) })
@@ -8914,7 +8911,7 @@ describe('b.wrb: ErrJsonlMissing amnesia diagnostic + honest counters', () => {
 
 // ---------------------------------------------------------------------------
 
-describe('b.jgf: ErrJsonlNeverWritten → a lossless reuse spawn of the same id', () => {
+describe('ErrJsonlNeverWritten → a lossless reuse spawn of the same id', () => {
   const CH = 'C_JGF'
   const CWD = '/repo/jgf'
 
@@ -8962,23 +8959,23 @@ describe('b.jgf: ErrJsonlNeverWritten → a lossless reuse spawn of the same id'
 
     const result = await spawnForPersona(personaOf(cfg, CH), cfg, true)
 
-    // AC-2/AC-3: plain success action — not 'failed', and not borrowed from the
+    // plain success action — not 'failed', and not borrowed from the
     // amnesia vocabulary, because nothing was lost.
     expect(result).toEqual({ key: CH, action: 'spawned' })
-    // Nothing deleted: the same id is spawned again with the reuse flag (b.jg5 SRJ-707).
+    // Nothing deleted: the same id is spawned again with the reuse flag.
     expect(deleteCalls).toEqual([])
     expect(spawnCalls.map((call) => [call.instance_id, call.reuse_finished])).toEqual([
       [`cscb_${CH}`, undefined],
       [`cscb_${CH}`, true],
     ])
-    // AC-4: no spawn-failure notice.
+    // no spawn-failure notice.
     expect(notices).toHaveLength(0)
-    // AC-3: only the collision-recovery get ran. diagnoseJsonlMissing fetches
+    // only the collision-recovery get ran. diagnoseJsonlMissing fetches
     // the row a second time, so a single get proves the diagnosis was skipped.
     expect(getCalls).toHaveLength(1)
   })
 
-  // AC-5 (no retry): restart.ts reschedules with doubling backoff whenever its
+  // (no retry): restart.ts reschedules with doubling backoff whenever its
   // launchSession adapter returns false. The wedge was that loop, so assert at
   // the adapter boundary rather than replicating restart.ts's timer.
   test('launchSession adapter returns true → restart.ts records success, schedules no retry', async () => {
@@ -9010,7 +9007,7 @@ describe('b.jgf: ErrJsonlNeverWritten → a lossless reuse spawn of the same id'
     expect(notices).toHaveLength(0)
   })
 
-  // AC-3: the startup summary must stay honest — a never-written transcript is
+  // the startup summary must stay honest — a never-written transcript is
   // an ordinary fresh spawn, not amnesia and not an undiagnosable one.
   test('startup counters: bucketed as freshSpawned, not amnesia and not failed', async () => {
     const cfg = makeStandInPersonaConfig({ [CH]: { working_directory: CWD } }, fixtureDir)
@@ -9027,11 +9024,11 @@ describe('b.jgf: ErrJsonlNeverWritten → a lossless reuse spawn of the same id'
 })
 
 // ---------------------------------------------------------------------------
-// b.av2 SR-7.2 — persona notices: hold until validated, restart cap,
+// persona notices: hold until validated, restart cap,
 // spawn-failure-post startup error, and the notifier seam
 // ---------------------------------------------------------------------------
 
-describe('persona notices (b.av2 SR-7.2)', () => {
+describe('persona notices', () => {
   /**
    * A startup spawn whose first spawn fails with a LAUNCH FAILURE
    * (`ErrTmuxSessionCreate`), one counted failure with no spawn in its
@@ -9074,7 +9071,7 @@ describe('persona notices (b.av2 SR-7.2)', () => {
     expect(h.posts(NOTICE_KEY)).toHaveLength(1)
   })
 
-  // --- dm destination (b.av2 SR-7.1 DM part, SR-7.2 DM destination) --------
+  // --- dm destination (DM partDM destination) --------
 
   test('held (mixed destinations): notices raised before validation make no Slack call, even on a flush; once validated each persona\'s held notices flush to its own destination on its own client, once each, with one DM open', async () => {
     captureStartupErrors()
@@ -9141,7 +9138,7 @@ describe('persona notices (b.av2 SR-7.2)', () => {
     expect(h.stub(OTHER_KEY).callLog).toHaveLength(1)
   })
 
-  // --- a failed flush is held and retried (b.av2 SR-7.1 failure part) ------
+  // --- a failed flush is held and retried (failure part) ------
 
   test('held then failed (dm): notices held before validation whose flushed DM open fails missing_scope are held under one episode line naming im:write, retried on backoff and posted once each, in raised order, after the cause clears', async () => {
     const readLog = captureStartupErrors()
@@ -9282,7 +9279,7 @@ describe('persona notices (b.av2 SR-7.2)', () => {
     ])
   })
 
-  // b.jg5 SRJ-713, SRJ-101: the remediation line is decided by the error's class; a collision has no line of its own.
+  // the remediation line is decided by the error's class; a collision has no line of its own.
   test.each<[string, () => AgentDirectorError, string]>([
     ['ErrSpawnNotFound (the client\'s class)', () => errSpawnNotFound(), SPAWN_NOT_FOUND_REMEDIATION],
     ['a collision handed to it directly (ErrInstanceIdCollision), which no launch site does', () => errInstanceIdCollision(), SPAWN_FAILURE_DEFAULT_REMEDIATION],
@@ -9298,7 +9295,7 @@ describe('persona notices (b.av2 SR-7.2)', () => {
     expect(text).not.toMatch(DISPATCHER_BUG_WORDING)
   })
 
-  // --- spawn-failure-post (b.av2 SR-11, startup-errors.log classes) --------
+  // --- spawn-failure-post (startup-errors.log classes) --------
 
   // Every scripted post failure carries LEAK_SENTINEL (message, original,
   // headers, data). recordStartupError writes the same line to stderr (fd 2,
@@ -9475,7 +9472,7 @@ describe('persona notices (b.av2 SR-7.2)', () => {
   // The cause names what failed. Known thrown values (the sentinel inside a
   // fake token and a URL in the message, bare in `data`) make the expected
   // cause exact: a failed post keeps the cause it had before DM destinations
-  // (`describeThrownValue` of the rejection, SR-11 byte-for-byte); a failed
+  // (`describeThrownValue` of the rejection byte-for-byte); a failed
   // DM open names the step and its code.
   const postErr = Object.assign(new Error(leakyMessage('An API error occurred: not_in_channel', 'post')), {
     code: 'slack_webapi_platform_error',
@@ -9576,7 +9573,7 @@ describe('persona notices (b.av2 SR-7.2)', () => {
     expect(errLog).not.toContain('ErrSpawnBroken')
   })
 
-  // AC 20 (b.av2 SR-10.3): the sink's error carries fake tokens in its
+  // the sink's error carries fake tokens in its
   // message and properties; the line names it by description only (type,
   // code, redacted message).
   const sinkError = (): Error =>
@@ -9585,7 +9582,7 @@ describe('persona notices (b.av2 SR-7.2)', () => {
   test.each([
     ['throws', () => { throw sinkError() }],
     ['rejects', () => Promise.reject(sinkError())],
-  ] as const)('a notifier that %s is contained: the spawn still reports failed and the error is logged by description (AC 20: nothing logged leaks)', async (_label, sink) => {
+  ] as const)('a notifier that %s is contained: the spawn still reports failed and the error is logged by description (nothing logged leaks)', async (_label, sink) => {
     const readLog = captureStartupErrors()
     installLaunchFailure()
     const cfg = makeNoticeConfig()
@@ -9623,17 +9620,17 @@ describe('persona notices (b.av2 SR-7.2)', () => {
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-713, SRJ-101: the spawn-failure notice's remediation hint
+// the spawn-failure notice's remediation hint
 // (`remediationHint`, the body only, comments stripped) has no collision
 // branch and decides by class through `isAdErrorInstance`, never by an
 // error's name and with no `instanceof` of its own; no file in `src/`, its
 // comments included, calls anything a "dispatcher bug". That no collision
-// reaches the notice at a launch site is the SRJ-111, SRJ-112 and SRJ-113
-// describes' (and `srj105AfterEach` checks every harness case's posts and
+// reaches the notice at a launch site is the and
+// describes' (and `recoveryAfterEach` checks every harness case's posts and
 // lines for the wording).
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-713: remediationHint has no collision branch and decides by class; no src/ file says "dispatcher bug"', () => {
+describe('remediationHint has no collision branch and decides by class; no src/ file says "dispatcher bug"', () => {
   /** The code of `remediationHint`'s body in `src/session-manager.ts`, comments stripped, so its doc block is no part of it. */
   function remediationHintBody(): string {
     const code = srcModules().get('session-manager.ts')!
@@ -9663,29 +9660,29 @@ describe('b.jg5 SRJ-713: remediationHint has no collision branch and decides by 
 
 // ---------------------------------------------------------------------------
 // The one checked kill each try of the persona teardown's kill makes
-// (b.av2 SR-6.5, b.jg5 SRJ-715)
+//
 //
 // `killPersonaInstance(key, { context: KILL_CONTEXT_TEARDOWN })` touches only
 // `cscb_<key>`, through `withOutageDetection` (its flags move as for any
 // other call), and is quiet: no log line, no startup error, no persona
-// notice. b.jg5 SRJ-110, SRJ-701: it is one checked kill that answers its
+// notice. it is one checked kill that answers its
 // outcome, `kill_sent` included, and never throws: a success (`kill_sent`
 // true, false or absent), the row-gone success for `ErrSpawnNotFound`, or a
 // non-success keeping the thrown value. The teardown's kill entry
 // (`killPersonaInstanceForTeardown`, the describe after this one) makes it
-// once per try; there is no delete (b.jg5 SRJ-715).
+// once per try; there is no delete.
 // ---------------------------------------------------------------------------
 
-describe('killPersonaInstance: the one checked kill each try of the persona teardown\'s kill makes (b.av2 SR-6.5, b.jg5 SRJ-715)', () => {
+describe('killPersonaInstance: the one checked kill each try of the persona teardown\'s kill makes', () => {
   const B = 'B'
   const A = 'A'
   /** The persona teardown's kill context (`main()`'s binding). */
   const TEARDOWN = { context: KILL_CONTEXT_TEARDOWN } as const
 
-  // Ruling (b.jg5 SRJ-110): the kill's context is required, so no caller
+  // Ruling: the kill's context is required, so no caller
   // takes either context by omission. Checked by `bun run typecheck`: each
   // call below must stay a type error. The function is never called.
-  test('b.jg5 SRJ-110: killPersonaInstance\'s context is a required parameter (a type error without it)', () => {
+  test('killPersonaInstance\'s context is a required parameter (a type error without it)', () => {
     const neverCalled = (): unknown[] => [
       // @ts-expect-error -- no options: the context is required
       killPersonaInstance(B),
@@ -9716,7 +9713,7 @@ describe('killPersonaInstance: the one checked kill each try of the persona tear
     ['true', true],
     ['false', false],
     ['absent', undefined],
-  ] as const)('b.jg5 SRJ-701, SRJ-703: a present row whose kill succeeds with kill_sent %s: kill addresses only cscb_B and resolves the killed outcome carrying it; no other verb, no line, no startup error, no notice', async (_label, killSent) => {
+  ] as const)('a present row whose kill succeeds with kill_sent %s: kill addresses only cscb_B and resolves the killed outcome carrying it; no other verb, no line, no startup error, no notice', async (_label, killSent) => {
     const calls = makeStubCallLog()
     installStub({ ...calls, killResult: cannedKillResult(killSent) })
 
@@ -9731,7 +9728,7 @@ describe('killPersonaInstance: the one checked kill each try of the persona tear
     expect(outageEmissions).toEqual([])
   })
 
-  test('a row already gone (ErrSpawnNotFound) is a success, quietly (b.jg5 SRJ-701: the kill resolves the row-gone outcome)', async () => {
+  test('a row already gone (ErrSpawnNotFound) is a success, quietly (the kill resolves the row-gone outcome)', async () => {
     installStub({ killError: errSpawnNotFound() })
 
     const r = await runQuietly(() => killPersonaInstance(B, TEARDOWN))
@@ -9743,7 +9740,7 @@ describe('killPersonaInstance: the one checked kill each try of the persona tear
     expect(outageEmissions).toEqual([])
   })
 
-  test('b.jg5 SRJ-701: kill: any other error is never rethrown: it resolves the non-success outcome keeping the same value, with no line, startup error or notice of its own', async () => {
+  test('kill: any other error is never rethrown: it resolves the non-success outcome keeping the same value, with no line, startup error or notice of its own', async () => {
     const err = errGeneric('kill', 'ErrBroken')
     installStub({ killError: err })
 
@@ -9757,7 +9754,7 @@ describe('killPersonaInstance: the one checked kill each try of the persona tear
     expect(outageEmissions).toEqual([])
   })
 
-  test('it goes through the outage wrapper: agent-director unreachable raises B\'s ad-unreachable flag (the kill answers its UNCLASSIFIED outcome, b.jg5 SRJ-701); a later success clears it with B\'s all-clear; A\'s flag is untouched', async () => {
+  test('it goes through the outage wrapper: agent-director unreachable raises B\'s ad-unreachable flag (the kill answers its UNCLASSIFIED outcome); a later success clears it with B\'s all-clear; A\'s flag is untouched', async () => {
     const BIN = '/opt/ad/bin/agent-director'
     setOutageFlag(A, 'ad-unreachable', BIN)
     outageEmissions = []
@@ -9785,8 +9782,7 @@ describe('killPersonaInstance: the one checked kill each try of the persona tear
 })
 
 // ---------------------------------------------------------------------------
-// The persona teardown's kill entry (b.jg5 SRJ-715, SRJ-110, SRJ-702,
-// SRJ-1002)
+// The persona teardown's kill entry
 //
 // `killPersonaInstanceForTeardown(key, { clock })` is the teardown's kill:
 // the bounded retry over the checked kill above, seeded as a live row it has
@@ -9797,17 +9793,17 @@ describe('killPersonaInstance: the one checked kill each try of the persona tear
 // tries as a success; a CONFLICT is never tried again, and each CONFLICT or
 // UNUSABLE NAME met, at a try or at a read, is answered for the teardown's
 // routing and latched on nothing. A persona teardown is no launch or
-// recovery attempt (SRJ-110): nothing arms a retry timer or starts the
+// recovery attempt: nothing arms a retry timer or starts the
 // `tmux-unresponsive` condition. It answers the retry's alert decision for
 // the caller to raise (persona-lifecycle's teardown route is tested in
 // tests/persona-lifecycle.test.ts); it never deletes. Of the row-read rule
-// its read between tries applies the entry clear alone (SRJ-807): a marked
+// its read between tries applies the entry clear alone: a marked
 // key's row read live other than `pending` clears the key's entry. Every
 // expected line is built with `src/kill-retry.ts`'s builder.
 // ---------------------------------------------------------------------------
 
-describe('killPersonaInstanceForTeardown: the persona teardown\'s bounded, checked kill, arming and latching nothing (b.jg5 SRJ-715, SRJ-110, SRJ-702, SRJ-1002)', () => {
-  afterEach(srj105AfterEach)
+describe('killPersonaInstanceForTeardown: the persona teardown\'s bounded, checked kill, arming and latching nothing', () => {
+  afterEach(recoveryAfterEach)
 
   /** The teardown kill's line head for persona `key` (its reference when none is given). */
   const prefixOf = (key: string): string => `[slack] persona teardown kill for persona=${key}`
@@ -9846,7 +9842,7 @@ describe('killPersonaInstanceForTeardown: the persona teardown\'s bounded, check
     ['ErrTmuxUnresponsive', () => errTmuxUnresponsive('kill'), () => ({ kind: KILL_RETRY_ALERT_NONE })],
     ['ErrCallTimeout', () => errCallTimeout('kill'), () => ({ kind: KILL_RETRY_ALERT_NONE })],
   ])('UNAVAILABLE (%s) at every try: every try is made, the row read live before each further try; the outcome stands (exhausted) with the retry\'s alert decision; nothing armed, latched or deleted', async (_what, make, alert) => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     const err = make()
     h.script({ killError: err })
 
@@ -9872,7 +9868,7 @@ describe('killPersonaInstanceForTeardown: the persona teardown\'s bounded, check
     ['missing', cannedOk(cannedStatusResult({ state: 'missing' })), KILL_ROW_FINISHED_MISSING],
     ['ErrSpawnNotFound', cannedErr(errSpawnNotFound()), KILL_ROW_FINISHED_NO_ROW],
   ])('a read between tries answering %s ends the tries as the row-finished success, with no further kill', async (_what, read, finished) => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     h.script({ killError: errTmuxUnresponsive('kill'), statusQueue: [read] })
 
     const result = await teardownKill(h, p, b, 1, 1)
@@ -9881,7 +9877,7 @@ describe('killPersonaInstanceForTeardown: the persona teardown\'s bounded, check
   })
 
   test('a survivor-naming ErrTmuxKillFailed, then a success: two tries and one read; the survivor decision quotes the survivor-naming description', async () => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     const survivor = errTmuxKillFailed(undefined, 'pane-process-survived')
     h.script({ killQueue: [cannedErr(survivor), cannedOk(cannedKillResult(true))] })
 
@@ -9901,7 +9897,7 @@ describe('killPersonaInstanceForTeardown: the persona teardown\'s bounded, check
     ['CONFLICT (ErrTmuxSessionConflict)', () => errTmuxSessionConflict('kill', 'different-id'), AD_ERROR_CLASS_CONFLICT],
     ['UNUSABLE NAME', () => errUnusableName(), AD_ERROR_CLASS_UNUSABLE_NAME],
   ])('%s at the first try: never tried again; the outcome stands and the answer is returned for routing, at the kill; nothing latches', async (_what, make, errorClass) => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     const err = make()
     h.script({ killQueue: [cannedErr(err), cannedOk(cannedKillResult(true))] })
 
@@ -9915,7 +9911,7 @@ describe('killPersonaInstanceForTeardown: the persona teardown\'s bounded, check
     ['CONFLICT (ErrTmuxSessionConflict)', () => errTmuxSessionConflict('status', 'different-id'), AD_ERROR_CLASS_CONFLICT],
     ['UNUSABLE NAME', () => errUnusableName(), AD_ERROR_CLASS_UNUSABLE_NAME],
   ])('%s at the first read between tries: returned for routing, at the status read; nothing latches and the next try goes ahead', async (_what, make, errorClass) => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     const err = make()
     const unavailable = errTmuxUnresponsive('kill')
     h.script({ killError: unavailable, statusQueue: [cannedErr(err)] })
@@ -9926,7 +9922,7 @@ describe('killPersonaInstanceForTeardown: the persona teardown\'s bounded, check
     expect(result.refusals).toEqual([{ at: KILL_REFUSAL_AT_READ, errorClass, error: err }])
   })
 
-  // b.jg5 SRJ-316, SRJ-702: the read between tries goes through the outage
+  // the read between tries goes through the outage
   // wrapper arming nothing, so a CONFIG answer raises `ad-config-malformed`
   // only while the persona is configured (a later successful read clears it
   // as from any verb); it is no refusal, and after a read other than
@@ -9935,7 +9931,7 @@ describe('killPersonaInstanceForTeardown: the persona teardown\'s bounded, check
     ['a configured persona', true],
     ['a persona no longer configured', false],
   ])('a CONFIG answer at the first read between tries, for %s: the next try goes ahead; ad-config-malformed raised once (then cleared by the next read) only when configured; nothing armed, latched or refused', async (_label, configured) => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     const configErr = errConfigMalformed()
     const unavailable = errTmuxUnresponsive('kill')
     h.script({ killError: unavailable, statusQueue: [cannedErr(configErr)] })
@@ -9952,10 +9948,10 @@ describe('killPersonaInstanceForTeardown: the persona teardown\'s bounded, check
     expect([...getOutageFlags(p)]).toEqual([])
   })
 
-  // b.jg5 SRJ-702: SRJ-316's rule between tries: a CONFIG answer at a read
+  // rule between tries: a CONFIG answer at a read
   // that follows a read of `pending` ends the tries with no further kill.
   test('a CONFIG answer at a read following a read of pending ends the tries (read-config) with no further kill; ad-config-malformed raised once; nothing armed, latched or refused', async () => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     const configErr = errConfigMalformed()
     const unavailable = errTmuxUnresponsive('kill')
     h.script({ killError: unavailable, statusQueue: [cannedOk(cannedStatusResult({ state: 'pending' })), cannedErr(configErr)] })
@@ -9976,7 +9972,7 @@ describe('killPersonaInstanceForTeardown: the persona teardown\'s bounded, check
     expect(h.errors.filter((line) => line.startsWith(prefixOf(p))).at(-1)).toBe(killRetryEndLine(prefixOf(p), personaInstanceId(p), result))
   })
 
-  // b.jg5 SRJ-807, SRJ-115, SRJ-715: of the row-read rule the read between
+  // of the row-read rule the read between
   // tries applies the entry clear alone: P recorded with its mark set and its
   // row read live other than `pending` has its entry cleared, with the
   // store's one line naming the read; nothing latches and the next try goes
@@ -10011,7 +10007,7 @@ describe('killPersonaInstanceForTeardown: the persona teardown\'s bounded, check
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-303, SRJ-115: the UNAVAILABLE retry timer's row read
+// the UNAVAILABLE retry timer's row read
 //
 // `readPersonaRowState(key)` makes one `status` call for `cscb_<key>` through
 // `withOutageDetection` (no findMissing sweep, no other call) and logs
@@ -10027,7 +10023,7 @@ describe('killPersonaInstanceForTeardown: the persona teardown\'s bounded, check
 // installed trigger sink with the arming predicate's cause.
 // ---------------------------------------------------------------------------
 
-describe('readPersonaRowState: the retry timer\'s row read, one status call through the outage wrapper (b.jg5 SRJ-303, SRJ-115)', () => {
+describe('readPersonaRowState: the retry timer\'s row read, one status call through the outage wrapper', () => {
   const B = 'B'
   const A = 'A'
 
@@ -10036,9 +10032,9 @@ describe('readPersonaRowState: the retry timer\'s row read, one status call thro
 
   beforeEach(() => {
     armed = []
-    // b.jg5 SRJ-513, SRJ-408: B is a key no configured persona uses, so a
+    // B is a key no configured persona uses, so a
     // pending row with no launch start latches no one here (under a
-    // configured persona's key it latches the persona instead: the SRJ-513
+    // configured persona's key it latches the persona instead: the
     // describes). The file's `afterEach` removes the query.
     setConfiguredPersonaQuery(() => false)
   })
@@ -10150,7 +10146,7 @@ describe('readPersonaRowState: the retry timer\'s row read, one status call thro
     ['an UNAVAILABLE error (ErrTmuxUnresponsive)', () => errTmuxUnresponsive('status')],
     ['an UNCLASSIFIED error (ErrInternal)', () => errInternal()],
     ['a base AgentDirectorError whose description carries a fake token', () => errGeneric('status', 'ErrBroken', `status refused (${sentinelInMessage('status')})`)],
-    // b.jg5 SRJ-101, SRJ-104: no row is decided by the client's class; a look-alike merely named so is UNCLASSIFIED.
+    // no row is decided by the client's class; a look-alike merely named so is UNCLASSIFIED.
     ['a base AgentDirectorError merely named ErrSpawnNotFound (no instance of the client\'s class)', () => errGeneric('status', 'ErrSpawnNotFound', 'spawn not found')],
     ['a plain Error', () => new Error(`boom (${sentinelInMessage('plain')})`)],
   ])('%s propagates to the caller as the same value, with no line, startup error or notice of its own', async (_label, build) => {
@@ -10189,13 +10185,13 @@ describe('readPersonaRowState: the retry timer\'s row read, one status call thro
     expectQuiet(ok)
   })
 
-  // b.jg5 SRJ-312: a successful `status` is no tmux answer, so the row read
+  // a successful `status` is no tmux answer, so the row read
   // leaves tmux-unavailable raised; a tmux-touching success for B (its
   // `/mcp reconnect` keystrokes) clears it with B's one all-clear.
   test.each<[string, () => Error, string]>([
     ['tmux cannot be run', () => new ErrTmuxNotAvailable('status', 'ErrTmuxNotAvailable', 'tmux not available'), ONSET_TEMPLATES['tmux-unavailable']()],
     ['the different-server form', () => errTmuxNotAvailableDifferentServer(undefined, 'status'), tmuxServerChangedOnset()],
-  ])('b.jg5 SRJ-312, SRJ-1021: goes through the outage wrapper: ErrTmuxNotAvailable (%s) raises B\'s tmux-unavailable flag with the form\'s onset (and rethrows); a later successful read leaves it raised with no all-clear; a tmux-touching success for B clears it with B\'s all-clear; A\'s flag is untouched', async (_label, build, onset) => {
+  ])('goes through the outage wrapper: ErrTmuxNotAvailable (%s) raises B\'s tmux-unavailable flag with the form\'s onset (and rethrows); a later successful read leaves it raised with no all-clear; a tmux-touching success for B clears it with B\'s all-clear; A\'s flag is untouched', async (_label, build, onset) => {
     setOutageFlag(A, 'ad-unreachable', '/opt/ad/bin/agent-director')
     outageEmissions = []
     const failure = build()
@@ -10233,13 +10229,13 @@ describe('readPersonaRowState: the retry timer\'s row read, one status call thro
     expect([...getOutageFlags(A)]).toEqual(['ad-unreachable'])
   })
 
-  // b.jg5 SRJ-311: ENVIRONMENT from any verb for B arms B's timer in any
+  // ENVIRONMENT from any verb for B arms B's timer in any
   // context; inside B's attempt it is also B's last error, so a launch it
   // ended would be refused.
   test.each<[string, () => Error, string]>([
     ['tmux cannot be run', () => errTmuxNotAvailable(undefined, 'status'), ONSET_TEMPLATES['tmux-unavailable']()],
     ['the different-server form', () => errTmuxNotAvailableDifferentServer(undefined, 'status'), tmuxServerChangedOnset()],
-  ])('b.jg5 SRJ-311: ErrTmuxNotAvailable (%s) from the row read is reported to the sink with the ENVIRONMENT cause in every context (outside any attempt, inside A\'s, inside B\'s), always under B; it still propagates', async (_label, build, onset) => {
+  ])('ErrTmuxNotAvailable (%s) from the row read is reported to the sink with the ENVIRONMENT cause in every context (outside any attempt, inside A\'s, inside B\'s), always under B; it still propagates', async (_label, build, onset) => {
     installRecordingSink()
     const err = build()
     installStub({ statusError: err })
@@ -10262,7 +10258,7 @@ describe('readPersonaRowState: the retry timer\'s row read, one status call thro
       { key: B, kind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT },
     ])
     expect(attempt!.lastError).toEqual({ verb: 'status', causeKind: UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT, armed: true })
-    // One onset for B's bad stretch, the form's (b.jg5 SRJ-1021): the repeats dedupe.
+    // One onset for B's bad stretch, the form's: the repeats dedupe.
     expect(outageEmissions).toEqual([{ key: B, text: onset }])
   })
 
@@ -10315,11 +10311,11 @@ describe('readPersonaRowState: the retry timer\'s row read, one status call thro
 })
 
 // ---------------------------------------------------------------------------
-// whenLaunchSettled (b.av2 SR-6.6): a teardown waits for a launch still in
+// whenLaunchSettled: a teardown waits for a launch still in
 // flight for its key (the start pass's, which runs outside the serializer).
 // ---------------------------------------------------------------------------
 
-describe('whenLaunchSettled: waits for the key\'s launch in flight, never rejects, starts nothing (b.av2 SR-6.6)', () => {
+describe('whenLaunchSettled: waits for the key\'s launch in flight, never rejects, starts nothing', () => {
   /** Whether `p` settled (either way) once pending continuations ran. */
   async function settledNow(p: Promise<unknown>): Promise<boolean> {
     let done = false
@@ -10380,12 +10376,12 @@ describe('whenLaunchSettled: waits for the key\'s launch in flight, never reject
 })
 
 // ---------------------------------------------------------------------------
-// AC 20 (b.av2 SR-10.3, E13 Director decision 16): an agent-director error's
+//: an agent-director error's
 // text in the spawn and orphan-cleanup startup records and in the
 // spawn-failure notice posted to Slack
 // ---------------------------------------------------------------------------
 
-describe('AC 20: agent-director failure text in startup records and the spawn-failure notice', () => {
+describe('agent-director failure text in startup records and the spawn-failure notice', () => {
   /** Persona `alpha` in a real temp working directory, the seam home installed. */
   function orphanConfig(): { cfg: PersonaConfig; home: string } {
     const home = useSpawnHome()
@@ -10405,7 +10401,7 @@ describe('AC 20: agent-director failure text in startup records and the spawn-fa
   // `message="…"` when the errName is a short identifier, else
   // describeThrownValue (the type, the redacted message `<errName>:
   // <description>`, frames). The description appears once. (A spawn whose
-  // error has a token-shaped errName is UNCLASSIFIED, b.jg5 SRJ-313: refused
+  // error has a token-shaped errName is UNCLASSIFIED, refused
   // with no spawn-failed record; its case follows this one.)
   test('a failed orphan list with a base AgentDirectorError whose errName is token-shaped and whose description holds a URL and a fake token → the orphan-cleanup-list-failed record names its type and the redacted description once; nothing leaks', async () => {
     const readLog = captureStartupErrors()
@@ -10423,12 +10419,12 @@ describe('AC 20: agent-director failure text in startup records and the spawn-fa
     assertNoLeak({ errLog, startupErrorsLog: readLog(), notices })
   })
 
-  // b.jg5 SRJ-110, SRJ-701, SRJ-714: the sweep's kill is a checked kill, so a
+  // the sweep's kill is a checked kill, so a
   // failed orphan kill keeps the row (no delete) and its record names the
   // row, its state, its session and the outcome: the class, and the redacted
   // description once (the token-shaped errName is no safe identifier, so it
   // is left out).
-  test('b.jg5 SRJ-110, SRJ-701, SRJ-714: a failed orphan kill with a base AgentDirectorError whose errName is token-shaped and whose description holds a URL and a fake token → the row is kept (no delete) and the orphan-cleanup record names the row and the outcome with the redacted description once; nothing leaks', async () => {
+  test('a failed orphan kill with a base AgentDirectorError whose errName is token-shaped and whose description holds a URL and a fake token → the row is kept (no delete) and the orphan-cleanup record names the row and the outcome with the redacted description once; nothing leaks', async () => {
     const readLog = captureStartupErrors()
     const err = new AgentDirectorError('kill', tokenErrName(), adDescription())
     let result: Awaited<ReturnType<typeof reconcileOrphans>> | undefined
@@ -10454,7 +10450,7 @@ describe('AC 20: agent-director failure text in startup records and the spawn-fa
     assertNoLeak({ errLog, startupErrorsLog: readLog(), notices })
   })
 
-  test('b.jg5 SRJ-313: a spawn failing with a base AgentDirectorError whose errName is token-shaped (UNCLASSIFIED) and whose description holds a URL and a fake token is refused: no spawn-failed record and no notice; its one refusal line names its type and the redacted description once; nothing leaks', async () => {
+  test('a spawn failing with a base AgentDirectorError whose errName is token-shaped (UNCLASSIFIED) and whose description holds a URL and a fake token is refused: no spawn-failed record and no notice; its one refusal line names its type and the redacted description once; nothing leaks', async () => {
     const readLog = captureStartupErrors()
     installStub({ spawnError: new AgentDirectorError('spawn', tokenErrName(), adDescription()) })
     const cfg = makeStandInPersonaConfig({ C: { working_directory: '/x' } }, fixtureDir)
@@ -10491,7 +10487,7 @@ describe('AC 20: agent-director failure text in startup records and the spawn-fa
     assertNoLeak({ errLog, startupErrorsLog: readLog(), notices })
   })
 
-  // notifySpawnFailure (E13 carry): the notice's Error line is
+  // notifySpawnFailure ( carry): the notice's Error line is
   // "`<label>` — <description>". The label is the errName when it is a short
   // identifier, else the describer's type with no message and no stack
   // frames (so neither the unchecked errName, a second copy of the
@@ -10529,9 +10525,9 @@ describe('AC 20: agent-director failure text in startup records and the spawn-fa
     assertNoLeak({ text, logs: h.logs, notices })
   })
 
-  // spawnFailureNoticeText (b.av2 SR-7.2, b.jg5 SRJ-1018): the notice's body
+  // spawnFailureNoticeText: the notice's body
   // is three lines; its Error line quotes agent-director's description as
-  // SRJ-1018 quotes one: redacted, on one line, capped
+  // quotes one: redacted, on one line, capped
   // (renderLogMessageText), then escaped once for Slack, so a `<!channel>`,
   // a `<@U…>` mention or an `&` in it reaches Slack as text, never markup.
   describe('spawnFailureNoticeText', () => {
@@ -10587,15 +10583,15 @@ describe('AC 20: agent-director failure text in startup records and the spawn-fa
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-105: UNAVAILABLE and read errors in the collision ladder (AC 25)
+// UNAVAILABLE and read errors in the collision ladder
 //
 // Every case runs on `makeRecoveryHarness` (both settings 0): the real retry
 // controller is the trigger sink, so a refusal arms P's timer and the
-// launch answers `retrying` (b.jg5 SRJ-1015), and the `tmux-unresponsive` condition is
+// launch answers `retrying`, and the `tmux-unresponsive` condition is
 // installed as `main()` installs it. Launches go through the real
 // `spawnForPersona` as the start pass makes them (`h.launch`, so a
 // `spawn-failed` startup-errors entry would be written), then once more
-// through `launchSession`. Errors come from E4's stub builders.
+// through `launchSession`. Errors come from stub builders.
 //
 // At every site the refused call is the last launch or destructive call: the
 // stub's `spawn`, `resume`, `kill`, `delete` and `send-keys` counts are
@@ -10605,17 +10601,17 @@ describe('AC 20: agent-director failure text in startup records and the spawn-fa
 // before the next tick), no outage notice, no `spawn-failed` entry, one
 // refusal line, a `retrying` result, `launchSession` answering
 // `'refused'`, a failure count left at 0, and persona B launching as before.
-// The working-row wait's `status` reads are the exception (b.jg5 SRJ-605):
+// The working-row wait's `status` reads are the exception:
 // no refusal, the launch answering the wait's outcome (`expectWaitGoesOnAt`
 // over `WAIT_STATUS_SITES`). After every case, nothing the harness captured
 // leaks a secret (`assertNoLeak`, in each describe's `afterEach`).
 // ---------------------------------------------------------------------------
 
-/** E4's UNAVAILABLE forms of agent-director's own errors but `ErrTmuxKillFailed`, each built for the verb that meets it. */
-const SRJ105_UNAVAILABLE = unavailableForms('ErrUnknownErrorName', 'ErrCallTimeout', 'a wrapped UnknownError', 'ErrTmuxUnresponsive')
+/** UNAVAILABLE forms of agent-director's own errors but `ErrTmuxKillFailed`, each built for the verb that meets it. */
+const UNAVAILABLE_CASES = unavailableForms('ErrUnknownErrorName', 'ErrCallTimeout', 'a wrapped UnknownError', 'ErrTmuxUnresponsive')
 
 /** `ErrTmuxKillFailed`, the UNAVAILABLE form only a kill answers. */
-const SRJ105_KILL_FAILED = unavailableForms('ErrTmuxKillFailed')[0]!
+const KILL_FAILED_CASES = unavailableForms('ErrTmuxKillFailed')[0]!
 
 /** The launch and destructive calls a launch made, by verb. */
 interface LaunchVerbCalls {
@@ -10657,12 +10653,12 @@ interface LadderSite {
   /**
    * Set on the reconnect's sites only: the ladder branch (`waiting` or
    * `working`) whose reconnect meets the error. The reconnect answers
-   * `transient` by SRJ-118's reconnect row, with its own lines in place of
-   * SRJ-105's refusal line (`reconnectTransientLine`, then the ladder's
+   * `transient` by the contract reconnect row, with its own lines in place of
+   * refusal line (`reconnectTransientLine`, then the ladder's
    * `transientReconnectLine`).
    */
   readonly reconnectBranch?: 'waiting' | 'working'
-  /** Set on a reuse spawn site (b.jg5 SRJ-707): its last spawn is P's one reuse spawn; at every other site no spawn carries the reuse flag. */
+  /** Set on a reuse spawn site: its last spawn is P's one reuse spawn; at every other site no spawn carries the reuse flag. */
   readonly reuse?: true
 }
 
@@ -10671,14 +10667,14 @@ function harnessRow(h: RecoveryHarness, persona: Persona, overrides: PersonaGetR
   return cannedGetResult(overrides, persona, h.home)
 }
 
-/** `persona`'s row in its own directory reading `state`, with no `config_dir` label (b.av2 SR-6.2: never resumed). */
+/** `persona`'s row in its own directory reading `state`, with no `config_dir` label (never resumed). */
 function unlabelledRow(h: RecoveryHarness, persona: Persona, state: RecoveryRowState): PersonaGetResultOverrides {
   const labels: Record<string, string> = { ...harnessRow(h, persona, { state }).labels }
   delete labels['config_dir']
   return { state, labels }
 }
 
-/** `persona`'s row in its own directory reading `state`, its `config_dir` label naming another directory (b.av2 SR-6.2: never resumed). */
+/** `persona`'s row in its own directory reading `state`, its `config_dir` label naming another directory (never resumed). */
 function relabelledRow(h: RecoveryHarness, persona: Persona, state: RecoveryRowState): PersonaGetResultOverrides {
   const labels: Record<string, string> = { ...harnessRow(h, persona, { state }).labels, config_dir: personaConfigDirLabelValue(h.stateDir, h.home) }
   return { state, labels }
@@ -10695,7 +10691,7 @@ function fastPolls(h: RecoveryHarness): void {
 }
 
 /**
- * The working-row wait's deadline is its start (b.jg5 SRJ-605): it makes no
+ * The working-row wait's deadline is its start: it makes no
  * poll, only its up-front sweep, the timeout sweep and the timeout `status`
  * read, at once.
  */
@@ -10704,7 +10700,7 @@ function deadlineAtStart(h: RecoveryHarness): void {
   _setWaitForWaitingTimeoutMs(0)
 }
 
-/** `resume_enabled: false`: every row found is replaced (a finished row by a reuse spawn of the same id, b.jg5 SRJ-707). */
+/** `resume_enabled: false`: every row found is replaced (a finished row by a reuse spawn of the same id). */
 function noResume(h: RecoveryHarness): void {
   h.config.resume_enabled = false
 }
@@ -10714,8 +10710,7 @@ function promptRowPanesGone(h: RecoveryHarness): void {
 }
 
 /**
- * The replacement sites over a finished row (b.jg5 SRJ-707, SRJ-1503,
- * SRJ-1504): `resume_enabled` false, a row in another directory, and a
+ * The replacement sites over a finished row: `resume_enabled` false, a row in another directory, and a
  * `config_dir` label missing or different, each over an `ended` row the
  * collision `get` read; the ladder's one reuse spawn of the same id there is
  * the refused call (the colliding first spawn, then the reuse).
@@ -10766,7 +10761,7 @@ const SPAWN_AND_RESUME_SITES: readonly LadderSite[] = [
   },
   { name: 'the resume of an ended row', verb: 'resume', script: (h, p, err) => ({ ...collided(h, p, { state: 'ended' }), resumeError: err }), calls: ladderCallsOf({ spawn: 1, resume: 1 }) },
   { name: 'the resume of a missing row', verb: 'resume', script: (h, p, err) => ({ ...collided(h, p, { state: 'missing' }), resumeError: err }), calls: ladderCallsOf({ spawn: 1, resume: 1 }) },
-  // b.jg5 SRJ-707, SRJ-709: each no-transcript answer's reuse spawn of the
+  // each no-transcript answer's reuse spawn of the
   // same id; nothing is deleted.
   {
     name: 'the reuse spawn after the resume\'s ErrNoSessionId',
@@ -10783,7 +10778,7 @@ const SPAWN_AND_RESUME_SITES: readonly LadderSite[] = [
     reuse: true,
   },
   {
-    // b.jg5 SRJ-712: the diagnosis `get` reads the row ended (inconclusive: the
+    // the diagnosis `get` reads the row ended (inconclusive: the
     // harness configures no message archive); its notice waits for a reuse
     // that brings P up, so a refused reuse posts none.
     name: 'the reuse spawn after the resume\'s ErrJsonlMissing and its diagnosis',
@@ -10798,16 +10793,15 @@ const SPAWN_AND_RESUME_SITES: readonly LadderSite[] = [
     script: (h, p, err) => ({ ...collided(h, p, { state: 'ended' }, err), resumeError: errSpawnNotFound() }),
     calls: ladderCallsOf({ spawn: 2, resume: 1 }),
   },
-  // b.jg5 SRJ-707, SRJ-709: each replacement site over a finished row makes
+  // each replacement site over a finished row makes
   // one reuse spawn of the same id, with no kill or delete before it.
   ...REPLACEMENT_REUSE_SITES,
 ]
 
 /**
- * The reconnect's one `send-keys` (b.jg5 SRJ-118, SRJ-609: never retried, so
+ * The reconnect's one `send-keys` (never retried, so
  * there is no second site): never 'dead-session' (no resume) for these
- * answers, but `transient`, which the ladder maps to `retrying` (b.jg5
- * SRJ-1015).
+ * answers, but `transient`, which the ladder maps to `retrying`.
  */
 const RECONNECT_SITES: readonly LadderSite[] = [
   {
@@ -10850,21 +10844,21 @@ function clearedScript(script: RecoveryStubScript): RecoveryStubScript {
 
 /** The refusal lines `refusalAt` logged for persona `key`. */
 function refusalLines(h: RecoveryHarness, key: string): string[] {
-  return h.errors.filter((line) => line.includes(` refused for ${renderPersonaRef(key, key)}: `) && line.endsWith('nothing more is called (b.jg5 SRJ-105)'))
+  return h.errors.filter((line) => line.includes(` refused for ${renderPersonaRef(key, key)}: `) && line.endsWith('nothing more is called') && !/ — (?:CONFLICT|UNUSABLE NAME):/.test(line))
 }
 
-let srj105Harness: RecoveryHarness | undefined
+let recoveryHarness: RecoveryHarness | undefined
 
 /** A recovery harness over two personas, P and B, cleaned up after the case. */
-function srj105Build(options?: RecoveryHarnessOptions): { h: RecoveryHarness; p: string; b: string } {
-  const h = (srj105Harness = makeRecoveryHarness(options))
+function buildRecoveryCase(options?: RecoveryHarnessOptions): { h: RecoveryHarness; p: string; b: string } {
+  const h = (recoveryHarness = makeRecoveryHarness(options))
   const [p, b] = h.keys as [string, string]
   return { h, p, b }
 }
 
 /**
  * The immediate re-check answers that hold P at a reuse's ErrInvalidFlags
- * (b.jg5 SRJ-207, SRJ-204; a re-check that is not running holds too): the
+ * (a re-check that is not running holds too): the
  * label, the answer's kind as the reuse's line names it, the binary
  * resolve's answer (none: no re-check is installed, so it is not running)
  * and the version the hold begins under: the pass's own (one the re-check
@@ -10880,7 +10874,7 @@ const HOLDING_RECHECKS: ReadonlyArray<readonly [string, string, StubResolveSyste
 
 /**
  * Persona `p` was held once by a reuse spawn's ErrInvalidFlags `err` whose
- * re-check answered `kind` (b.jg5 SRJ-207, SRJ-1008): P is the one persona
+ * re-check answered `kind`: P is the one persona
  * held, under `version`; one alert at its destination; the hold's one set
  * line and the reuse's one line (naming the error, the re-check's answer
  * and the version); nothing counted, posted, armed or reported to P's
@@ -10896,7 +10890,7 @@ function expectHeldOnce(h: RecoveryHarness, p: string, err: Error, kind: string,
   expect([h.unclassifiedErrorOpen(p), unclassifiedStartedLines(h, p)]).toEqual([false, []])
 }
 
-/** No call of the case's harness was a `delete` or carried `include_finished` (b.jg5 SRJ-707, SRJ-1001); nothing when no harness was built. */
+/** No call of the case's harness was a `delete` or carried `include_finished`; nothing when no harness was built. */
 function expectNoDeleteOrIncludeFinished(h: RecoveryHarness | undefined): void {
   if (h === undefined) return
   const everyCall = Object.values(h.stub.calls).flat() as unknown[]
@@ -10907,14 +10901,14 @@ function expectNoDeleteOrIncludeFinished(h: RecoveryHarness | undefined): void {
 /** The head of the collision ladder's lines (`spawnForPersona`'s), which the not-resumable step's line opens with there. */
 const LADDER_HEAD = '[slack] spawnForPersona:'
 
-/** The lines the collision ladder logged for persona `ref`'s voided dead evidence (`deadEvidenceVoidedLine`; b.jg5 SRJ-611), in order. */
+/** The lines the collision ladder logged for persona `ref`'s voided dead evidence (`deadEvidenceVoidedLine`), in order. */
 function voidedEvidenceLines(h: RecoveryHarness, ref: string): string[] {
   return h.errors.filter((line) => line.startsWith(`${LADDER_HEAD} ${ref}'s dead evidence (`))
 }
 
 /**
  * The re-read states that are neither finished, `pending` nor in
- * `AGENT_DIRECTOR_LIVE_STATES` (b.jg5 SRJ-710, SRJ-611), each with how a line
+ * `AGENT_DIRECTOR_LIVE_STATES`, each with how a line
  * names it: a short identifier CSCB does not know, named as read, and a value
  * that is not a short identifier, recorded and named `unreadable`. A re-read
  * in either is `unknown`, which never leads to a kill.
@@ -10924,13 +10918,13 @@ const UNKNOWN_REREAD_STATES: ReadonlyArray<readonly [string, string, string]> = 
   ['an unreadable state', 'not a state', 'unreadable'],
 ]
 
-/** Each SRJ-105 describe's `afterEach`: nothing the case's harness captured leaks a secret, then the harness is cleaned up. */
-function srj105AfterEach(): void {
-  const h = srj105Harness
-  srj105Harness = undefined
+/** Each describe's `afterEach`: nothing the case's harness captured leaks a secret, then the harness is cleaned up. */
+function recoveryAfterEach(): void {
+  const h = recoveryHarness
+  recoveryHarness = undefined
   if (h === undefined) return
   try {
-    // b.jg5 SRJ-713: no post or line of any case, a collision's included, calls anything a "dispatcher bug".
+    // no post or line of any case, a collision's included, calls anything a "dispatcher bug".
     expect(dispatcherBugWordingIn(h)).toEqual([])
     assertNoLeak(h.captured())
   } finally {
@@ -10945,9 +10939,9 @@ function srj105AfterEach(): void {
  * the outage state posts nothing. With it, P's `outageClass` flag is raised by
  * the first launch with one onset reading exactly `onsetText`, and is still
  * raised at the end, B's never: an
- * ENVIRONMENT answer raises `tmux-unavailable` (b.jg5 SRJ-311; the onset the
- * raising error's form picks, SRJ-1021), a CONFIG answer
- * `ad-config-malformed` (SRJ-316, SRJ-1018).
+ * ENVIRONMENT answer raises `tmux-unavailable` (the onset the
+ * raising error's form picks), a CONFIG answer
+ * `ad-config-malformed`.
  */
 async function expectRefusedAt(
   site: LadderSite,
@@ -10956,7 +10950,7 @@ async function expectRefusedAt(
   onsetText?: string,
   outageClass: OutageClass = 'tmux-unavailable',
 ): Promise<{ h: RecoveryHarness; p: string }> {
-  const { h, p, b } = srj105Build()
+  const { h, p, b } = buildRecoveryCase()
   const persona = harnessPersona(h, p)
   site.setup?.(h)
   const script = site.script(h, persona, err)
@@ -10968,7 +10962,7 @@ async function expectRefusedAt(
   expect(ladderCallsMade(h)).toEqual(site.calls)
   expect(h.reuseSpawns()).toEqual(site.reuse === true ? [reuseSpawnOf(h, p)] : [])
   expect(h.notices).toEqual([])
-  // No tmux-unresponsive onset (or any other episode post) before the next tick (b.jg5 SRJ-707, SRJ-308).
+  // No tmux-unresponsive onset (or any other episode post) before the next tick.
   expect(h.episodeNotices).toEqual([])
   if (onsetText === undefined) {
     expect(h.outageNotices).toEqual([])
@@ -10981,7 +10975,7 @@ async function expectRefusedAt(
   if (site.reconnectBranch === undefined) {
     expect(refusalLines(h, p)).toHaveLength(1)
   } else {
-    // b.jg5 SRJ-118: the reconnect's transient line, then the ladder's, and no refusal line.
+    // the reconnect's transient line, then the ladder's, and no refusal line.
     const ref = renderPersonaRef(p, p)
     expect(refusalLines(h, p)).toEqual([])
     expect(h.errors.filter((line) => line === reconnectTransientLine(ref, describeAdFailureForLog(err), classifyAdError(err).errorClass))).toHaveLength(1)
@@ -11080,24 +11074,24 @@ async function launchBothThroughOneSweep(
   return [await pLaunch, await bLaunch]
 }
 
-describe('b.jg5 SRJ-105: UNAVAILABLE is never destructive', () => {
-  afterEach(srj105AfterEach)
+describe('UNAVAILABLE is never destructive', () => {
+  afterEach(recoveryAfterEach)
 
-  const spawnCross = SRJ105_UNAVAILABLE.flatMap(([what, make]) =>
+  const spawnCross = UNAVAILABLE_CASES.flatMap(([what, make]) =>
     [...SPAWN_AND_RESUME_SITES, ...RECONNECT_SITES].map((site) => [what, site.name, make, site] as const),
   )
   test.each(spawnCross)('%s at %s: no kill, delete or launch after it, never dead-session, no notice or spawn-failed entry, refused and never counted; B launches', async (_what, _site, make, site) => {
     await expectRefusedAt(site, make(site.verb), UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE)
   })
 
-  // The collision ladder makes no kill or delete (b.jg5 SRJ-707): a live
+  // The collision ladder makes no kill or delete: a live
   // row's kills, their UNAVAILABLE tries and ErrTmuxKillFailed's outcome are
-  // the live-row sequence's (tests/live-row-sequence.test.ts; AC 64's half,
+  // the live-row sequence's (tests/live-row-sequence.test.ts half,
   // that ErrTmuxKillFailed never starts the condition, is
   // tests/tmux-unresponsive.test.ts's at the sequence's kill).
 
-  test.each([...SRJ105_UNAVAILABLE, SRJ105_KILL_FAILED])('regression: the persona teardown\'s kill (killPersonaInstance, which the live-row sequence\'s and the restart path\'s kills wrap) answering %s answers its UNAVAILABLE outcome carrying it (b.jg5 SRJ-701: never rethrown), quietly: no line, delete, notice, startup-errors entry or trigger', async (_what, make) => {
-    const { h, p } = srj105Build()
+  test.each([...UNAVAILABLE_CASES, KILL_FAILED_CASES])('regression: the persona teardown\'s kill (killPersonaInstance, which the live-row sequence\'s and the restart path\'s kills wrap) answering %s answers its UNAVAILABLE outcome carrying it (never rethrown), quietly: no line, delete, notice, startup-errors entry or trigger', async (_what, make) => {
+    const { h, p } = buildRecoveryCase()
     const err = make('kill')
     h.script({ killError: err })
 
@@ -11120,16 +11114,16 @@ describe('b.jg5 SRJ-105: UNAVAILABLE is never destructive', () => {
     readonly sendKeys: number
   }
 
-  // runs after its launch call returned, outside P's attempt (b.jg5 SRJ-401),
+  // runs after its launch call returned, outside P's attempt,
 
   // P's launch attempt" below.
   const PASS_THROUGH_SITES: readonly PassThroughSite[] = [
 
   ]
 
-  const passThroughCross = PASS_THROUGH_SITES.flatMap((site) => SRJ105_UNAVAILABLE.map(([what, make]) => [site.name, what, make, site] as const))
+  const passThroughCross = PASS_THROUGH_SITES.flatMap((site) => UNAVAILABLE_CASES.map(([what, make]) => [site.name, what, make, site] as const))
   test.each(passThroughCross)('regression: %s answering %s keeps its outcome: logged, the launch goes on, no kill, delete, resume or notice, no spawn-failed entry', async (_site, _what, make, site) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     site.setup?.(h)
     h.script(site.script(h, harnessPersona(h, p), make(site.verb)))
 
@@ -11145,7 +11139,7 @@ describe('b.jg5 SRJ-105: UNAVAILABLE is never destructive', () => {
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-702, SRJ-707, SRJ-705: a live row's kill at a collision ladder
+// a live row's kill at a collision ladder
 // replacement site is the live-row sequence's, which takes the bounded retry.
 // The ladder makes no kill: P's launch meets its row read `waiting` in
 // another directory, starts P's sequence through the start entry and answers
@@ -11160,17 +11154,17 @@ describe('b.jg5 SRJ-105: UNAVAILABLE is never destructive', () => {
 // non-latching class at both kills are tests/live-row-sequence.test.ts's.
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-702: the live-row sequence\'s kill of a row read live at a replacement site makes its tries, reading the row before each further try', () => {
-  afterEach(srj105AfterEach)
+describe('the live-row sequence\'s kill of a row read live at a replacement site makes its tries, reading the row before each further try', () => {
+  afterEach(recoveryAfterEach)
 
   /** The lines naming a kill-failure alert decision of `kind`. */
   const decisionLines = (h: RecoveryHarness, kind: string): string[] => h.errors.filter((line) => line.includes(`alert=${kind}`))
 
-  // ErrTmuxUnresponsive at every try is the SRJ-110 matrix's UNAVAILABLE row
-  // at each live replacement site (the SRJ-707 describe below).
+  // ErrTmuxUnresponsive at every try is the matrix's UNAVAILABLE row
+  // at each live replacement site (the describe below).
 
   test('a second-try success goes on to the sequence\'s get, run and one reuse spawn of the same id; nothing is armed but the reuse\'s pending-only watch, nothing deleted', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     scriptLiveRowElsewhere(h, p, { killQueue: [cannedErr(errTmuxUnresponsive('kill')), cannedOk(cannedKillResult(true))] })
 
     expect(await launchThroughSequence(h, p)).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_REUSE, result: { key: p, action: 'spawned' } })
@@ -11182,14 +11176,14 @@ describe('b.jg5 SRJ-702: the live-row sequence\'s kill of a row read live at a r
     expect(decisionLines(h, KILL_RETRY_ALERT_SURVIVOR)).toEqual([])
   })
 
-  // b.jg5 SRJ-702 (hatch A2), SRJ-502: a read between tries that latches P
+  // (design A2), a read between tries that latches P
   // ends the tries with no further kill; the latch stops the sequence, and
   // nothing is armed for the latched persona.
   test.each<[string, CannedResponse<StatusResult>, Record<string, unknown>]>([
     ['an UNUSABLE NAME answer', cannedErr(errUnusableName()), { latchCase: LATCH_CASE_UNUSABLE_RECORDED_NAME, refusedOperation: REFUSED_OPERATION_NONE, rowState: LATCH_ROW_STATE_UNREADABLE }],
     ['P\'s own row pending with no launch start', cannedOk(cannedStatusResult({ state: 'pending', launch_started_at: SAMPLE_LAUNCH_START_NONE })), { latchCase: LATCH_CASE_LAUNCH_START_NOT_RECORDED, rowState: latchRowStateRead('pending') }],
   ])('a read between tries answering %s latches P and ends the tries with no further kill: the sequence stops for the latch; no get, launch or delete, nothing armed', async (_label, read, record) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     scriptLiveRowElsewhere(h, p, { killError: errTmuxUnresponsive('kill'), statusQueue: [read] })
 
     expect(await launchThroughSequence(h, p)).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_LATCHED })
@@ -11203,7 +11197,7 @@ describe('b.jg5 SRJ-702: the live-row sequence\'s kill of a row read live at a r
     expect(getFailureCount(p)).toBe(0)
   })
 
-  // b.jg5 SRJ-702, SRJ-501, SRJ-704, SRJ-1007: a second try answering
+  // a second try answering
   // CONFLICT is never tried again and latches P. An earlier failure naming no
   // survivor (or ErrTmuxUnresponsive) that the CONFLICT replaced as the last
   // outcome calls for no alert; after a survivor-naming one, the ordinary
@@ -11212,7 +11206,7 @@ describe('b.jg5 SRJ-702: the live-row sequence\'s kill of a row read live at a r
     ['ErrTmuxUnresponsive', () => errTmuxUnresponsive('kill')],
     ['an ErrTmuxKillFailed naming no survivor', () => errTmuxKillFailed()],
   ])('a first try answering %s, then a second answering CONFLICT: latched, two kills and one read, no delete and no launch, no retry timer armed for P; no alert decision', async (_label, makeFirst) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     scriptLiveRowElsewhere(h, p, {
       killQueue: [cannedErr(makeFirst()), cannedErr(errTmuxSessionConflict('kill', 'not-this-launch')), cannedErr(errTmuxUnresponsive('kill'))],
     })
@@ -11229,11 +11223,11 @@ describe('b.jg5 SRJ-702: the live-row sequence\'s kill of a row read live at a r
     expect(getFailureCount(p)).toBe(0)
   })
 
-  // b.jg5 SRJ-702, SRJ-316 (AC 84): the sequence last read the row
+  // the sequence last read the row
   // `waiting`, so a CONFIG answer at a read between tries raises the outage
   // (one onset) and the next try goes ahead.
   test('a CONFIG answer at each read between tries of a row read waiting: ad-config-malformed raised with one onset, and every try is made; the UNAVAILABLE outcome that stands is reported once', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const configErr = errConfigMalformed()
     scriptLiveRowElsewhere(h, p, { killError: errTmuxUnresponsive('kill'), statusError: configErr })
 
@@ -11247,7 +11241,7 @@ describe('b.jg5 SRJ-702: the live-row sequence\'s kill of a row read live at a r
   })
 
   test('the keep-going check: P not up stops the tries after the first wait, with no read and no further kill; the sequence stops, nothing armed', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     scriptLiveRowElsewhere(h, p, { killError: errTmuxUnresponsive('kill') })
     h.setUp(p, false)
 
@@ -11262,7 +11256,7 @@ describe('b.jg5 SRJ-702: the live-row sequence\'s kill of a row read live at a r
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-704, SRJ-1007, SRJ-702 (E20 T3): the kill-failure alert at the
+// the kill-failure alert at the
 // live-row sequence's kill of a row read live, started at a collision ladder
 // replacement site
 //
@@ -11285,8 +11279,8 @@ describe('b.jg5 SRJ-702: the live-row sequence\'s kill of a row read live at a r
 // tests/live-row-sequence.test.ts's.
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-704, SRJ-1007, SRJ-702: the kill-failure alert at the live-row sequence\'s kill of a row read live, started at a replacement site', () => {
-  afterEach(srj105AfterEach)
+describe('the kill-failure alert at the live-row sequence\'s kill of a row read live, started at a replacement site', () => {
+  afterEach(recoveryAfterEach)
 
   /** The stub's survivor-naming `ErrTmuxKillFailed`. */
   const survivorErr = (): Error => errTmuxKillFailed(undefined, 'pane-process-survived')
@@ -11312,8 +11306,8 @@ describe('b.jg5 SRJ-704, SRJ-1007, SRJ-702: the kill-failure alert at the live-r
   // the sequence's next step, and opens no episode.
   // A read between the tries that ends them makes no further kill; a second
   // try's success ends them at two. Nothing is armed but a failed read's own
-  // cause (b.jg5 SRJ-301: a read inside the sequence's attempt) and the reuse
-  // spawn's pending-only watch (SRJ-409).
+  // cause (a read inside the sequence's attempt) and the reuse
+  // spawn's pending-only watch.
   test.each<[string, RecoveryStubScript, number, readonly string[]]>([
     ['a read of ended', { statusQueue: [cannedOk(cannedStatusResult({ state: 'ended' }))] }, 1, []],
     ['a read of missing', { statusQueue: [cannedOk(cannedStatusResult({ state: 'missing' }))] }, 1, []],
@@ -11323,7 +11317,7 @@ describe('b.jg5 SRJ-704, SRJ-1007, SRJ-702: the kill-failure alert at the live-r
     ['a second try\'s success with kill_sent false', { killQueue: [cannedErr(survivorErr()), cannedOk(cannedKillResult(false))] }, 2, []],
     ['a second try answering ErrSpawnNotFound', { killQueue: [cannedErr(survivorErr()), cannedErr(errSpawnNotFound())] }, 2, []],
   ])('a survivor-naming ErrTmuxKillFailed, then %s: one survivor version at P\'s destination quoting it, posted before the sequence\'s reuse spawn, which follows; no kill-failure episode opens', async (_label, script, kills, armed) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const survivor = survivorErr()
     scriptLiveRowElsewhere(h, p, { killQueue: [cannedErr(survivor)], ...script })
     const atSpawn = postsAtSpawn(h)
@@ -11335,14 +11329,14 @@ describe('b.jg5 SRJ-704, SRJ-1007, SRJ-702: the kill-failure alert at the live-r
     // The ladder's colliding spawn, then the reuse after the post.
     expect(atSpawn).toEqual([0, 1])
     expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 2, kill: kills }))
-    // The failed read's own cause, then the reuse's pending-only watch (b.jg5 SRJ-409).
+    // The failed read's own cause, then the reuse's pending-only watch.
     expect(h.triggers).toEqual([...armed.map((kind) => ({ key: p, kind })), pendingRowTrigger(p)])
     expect(h.killFailureOpen(p)).toBe(false)
     expect(killFailureLines(h, p)).toEqual([killFailurePostedLine(p, content)])
   })
 
   test('after the survivor version, a later ordinary kill failure for P still posts its alert', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const survivor = survivorErr()
     scriptLiveRowElsewhere(h, p, { killQueue: [cannedErr(survivor)], statusQueue: [cannedOk(cannedStatusResult({ state: 'ended' }))] })
     await launchThroughSequence(h, p)
@@ -11356,7 +11350,7 @@ describe('b.jg5 SRJ-704, SRJ-1007, SRJ-702: the kill-failure alert at the live-r
     expect(h.killFailureOpen(p)).toBe(true)
   })
 
-  // Hatch A2 (SRJ-702, SRJ-1007): a status read between tries that latches P
+  // design A2: a status read between tries that latches P
   // ends the tries with no further kill; an ErrTmuxKillFailed that then stands
   // raises the ordinary version with the latched closing, after P's own hold
   // post, and no retry timer runs for P.
@@ -11365,7 +11359,7 @@ describe('b.jg5 SRJ-704, SRJ-1007, SRJ-702: the kill-failure alert at the live-r
     ['an ErrTmuxKillFailed naming no survivor', () => errTmuxKillFailed(), cannedErr(errUnusableName())],
     ['an ErrTmuxKillFailed naming no survivor (P\'s own row read pending with no launch start)', () => errTmuxKillFailed(), cannedOk(cannedStatusResult({ state: 'pending', launch_started_at: SAMPLE_LAUNCH_START_NONE }))],
   ])('%s, then a read between tries that latches P: no second kill; P\'s hold post, then one ordinary alert quoting that description with the latched closing; no retry timer for P', async (_label, makeErr, read) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const err = makeErr()
     scriptLiveRowElsewhere(h, p, { killQueue: [cannedErr(err)], statusQueue: [read] })
 
@@ -11377,10 +11371,10 @@ describe('b.jg5 SRJ-704, SRJ-1007, SRJ-702: the kill-failure alert at the live-r
     expect(h.controller.isArmed(p)).toBe(false)
   })
 
-  // SRJ-702, SRJ-704: with no survivor-naming failure, a standing outcome other
+  // with no survivor-naming failure, a standing outcome other
   // than ErrTmuxKillFailed calls for no alert.
   test('an ErrTmuxUnresponsive first try with no survivor-naming failure, then a read that latches P: no second kill and no alert of either version; P latched with its own post only', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     scriptLiveRowElsewhere(h, p, { killQueue: [cannedErr(errTmuxUnresponsive('kill'))], statusQueue: [cannedErr(errUnusableName())] })
 
     expect(await launchThroughSequence(h, p)).toMatchObject({ kind: LIVE_ROW_OUTCOME_STOPPED, reason: LIVE_ROW_STOP_LATCHED })
@@ -11392,10 +11386,10 @@ describe('b.jg5 SRJ-704, SRJ-1007, SRJ-702: the kill-failure alert at the live-r
     expect(killFailureLines(h, p)).toEqual([])
   })
 
-  // SRJ-704, SRJ-1013: a persona no longer in the applied configuration when
+  // a persona no longer in the applied configuration when
   // the survivor version is raised gets one persona-kill-survivor entry.
   test('a survivor-naming ErrTmuxKillFailed, then a read of ended with P removed from the applied configuration meanwhile: one persona-kill-survivor entry with the recovery context; nothing posted', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const survivor = survivorErr()
     scriptLiveRowElsewhere(h, p, { killQueue: [cannedErr(survivor)], statusQueue: [cannedOk(cannedStatusResult({ state: 'ended' }))] })
     const status = h.stub.client.status.bind(h.stub.client)
@@ -11414,13 +11408,13 @@ describe('b.jg5 SRJ-704, SRJ-1007, SRJ-702: the kill-failure alert at the live-r
     expect(h.killFailureOpen(p)).toBe(false)
   })
 
-  // b.jg5 SRJ-702: tries stopped by the keep-going check while
+  // tries stopped by the keep-going check while
   // ErrTmuxKillFailed stands are no notice: neither version is raised and
   // nothing is posted; one line names the context, the last outcome's class,
   // the stop's cause and the redacted description; a configured persona gets
   // that line only.
   test('the keep-going check stops the tries because the server is shutting down while ErrTmuxKillFailed stands: one line naming the last outcome\'s class, the stop\'s cause and the redacted description; no post, no episode, no entry', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const err = errTmuxKillFailed()
     scriptLiveRowElsewhere(h, p, { killError: err })
     const kill = h.stub.client.kill.bind(h.stub.client)
@@ -11441,11 +11435,11 @@ describe('b.jg5 SRJ-704, SRJ-1007, SRJ-702: the kill-failure alert at the live-r
     expect(h.startupErrors()).toEqual([])
   })
 
-  // b.jg5 SRJ-702: a stopped retry's line quotes the latest survivor-naming
+  // a stopped retry's line quotes the latest survivor-naming
   // description when a try returned one; for a configured persona that line
   // is all: no entry, no post, neither version.
   test('a survivor-naming ErrTmuxKillFailed, then an ErrTmuxKillFailed naming no survivor that stands as the keep-going check stops the tries (the server shutting down): the one stop line quotes both descriptions; no entry, no post and no episode', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const survivor = survivorErr()
     const last = errTmuxKillFailed(undefined, 'unverifiable-session-present')
     scriptLiveRowElsewhere(h, p, { killQueue: [cannedErr(survivor), cannedErr(last)] })
@@ -11467,12 +11461,12 @@ describe('b.jg5 SRJ-704, SRJ-1007, SRJ-702: the kill-failure alert at the live-r
     expect(killFailureLines(h, p)).toEqual([killFailureNotRaisedLine(p, liveRowStopCauseText(LIVE_ROW_STOP_SHUTDOWN), { last, earlierSurvivor: survivor })])
   })
 
-  // b.jg5 SRJ-702, SRJ-1013: P removed from the applied configuration during
+  // P removed from the applied configuration during
   // the tries is not up, so the keep-going check stops them; a persona
   // removed during the tries also gets its persona-kill-failed entry, whose
   // text is the stop's line, with no alert text.
   test('the keep-going check stops the tries because P was removed from the applied configuration while ErrTmuxKillFailed stands: the stop line, then one persona-kill-failed entry holding that line with the recovery context and no alert text; no post, no episode, no further kill', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const err = errTmuxKillFailed()
     scriptLiveRowElsewhere(h, p, { killError: err })
     const kill = h.stub.client.kill.bind(h.stub.client)
@@ -11501,12 +11495,12 @@ describe('b.jg5 SRJ-704, SRJ-1007, SRJ-702: the kill-failure alert at the live-r
     expect(h.triggers).toEqual([])
   })
 
-  // b.jg5 SRJ-702, SRJ-204: an ordinary decision whose last outcome's version
+  // an ordinary decision whose last outcome's version
   // re-check decided that the server stops is a stopped retry too, raised
   // through raisePersonaKillFailureAlert into the installed alerts: its one
   // line names that outcome's class and the re-check as the stop's cause.
   test('an ordinary decision (a survivor-naming failure, then an ErrInvalidFlags whose re-check stops the server): one stop line naming the standing outcome\'s class and the re-check as the cause, quoting the survivor-naming description; no post, no entry, no episode', () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const survivor = survivorErr()
     const standing = killOutcomeOf({ thrown: errInvalidFlags('kill') })
     if (standing.kind !== KILL_OUTCOME_NOT_KILLED) throw new Error('an ErrInvalidFlags kill is a non-success')
@@ -11530,7 +11524,7 @@ describe('b.jg5 SRJ-704, SRJ-1007, SRJ-702: the kill-failure alert at the live-r
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-702: the stop's cause a stopped retry's alert input carries
+// the stop's cause a stopped retry's alert input carries
 //
 // `raisePersonaKillFailureAlert` hands the alerts the last outcome's class
 // and the stop's cause: the caller's own (the live-row sequence passes its
@@ -11541,7 +11535,7 @@ describe('b.jg5 SRJ-704, SRJ-1007, SRJ-702: the kill-failure alert at the live-r
 // input is asserted; the alerts' line for it is tests/persona-episodes.test.ts's.
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-702: the stop\'s cause raisePersonaKillFailureAlert hands the alerts for a stopped retry', () => {
+describe('the stop\'s cause raisePersonaKillFailureAlert hands the alerts for a stopped retry', () => {
   const KEY = 'stop_cause_key'
 
   afterEach(() => {
@@ -11624,7 +11618,7 @@ describe('b.jg5 SRJ-702: the stop\'s cause raisePersonaKillFailureAlert hands th
     expect(inputs).toEqual([expect.objectContaining({ stopped: true, stopCause: liveRowStopCauseText(reason) })])
   })
 
-  // b.jg5 SRJ-702, SRJ-704 (E34 final review): with no kill-failure alerts
+  // ( final review): with no kill-failure alerts
   // installed, a stopped retry is recorded by its one stop line
   // (`personaKillStoppedNoAlertsLine`), its decision `none` included, naming
   // the stop's cause and the last outcome's class; a `none` decision whose
@@ -11666,16 +11660,16 @@ describe('b.jg5 SRJ-702: the stop\'s cause raisePersonaKillFailureAlert hands th
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-704, SRJ-1016 (E20 T3): the shared own-row reads end P's
+// the shared own-row reads end P's
 // kill-failure episode, at a collision ladder replacement site too
 //
 // The episode runs from the ordinary alert until P's own row reads `ended` or
 // `missing`, or is gone (`ErrSpawnNotFound`). The shared own-row `status`
-// read (`readPersonaOwnRowStatus`, through `applyOwnRowStatusStep`) and E14's
+// read (`readPersonaOwnRowStatus`, through `applyOwnRowStatusStep`) and
 // shared `get` read (`readPersonaOwnRow`) end it silently; a live reading,
 // any other failed read and a read of another persona's row do not. On the
 // replacing path these are the ladder's collision `get` and the live-row
-// sequence's `get`s (no ladder path deletes a row, b.jg5 SRJ-707): a row
+// sequence's `get`s (no ladder path deletes a row): a row
 // seen finished or gone there ends the episode before the next launch. The
 // episode is opened by the live-row sequence's kill, started at a
 // replacement site, failing at every try, on the recovery harness with its
@@ -11697,12 +11691,12 @@ async function readOwnRow(h: RecoveryHarness, key: string, read: 'status' | 'get
 /** The two shared own-row reads `readOwnRow` makes. */
 const READS = ['status', 'get'] as const
 
-describe('b.d6n: shared own-row readers forward absent rows to delivery lifecycle', () => {
+describe('shared own-row readers forward absent rows to delivery lifecycle', () => {
   let life: DeliveryLifecycle
-  afterEach(async () => { await life?.stop(); setDeliveryLifecycle(undefined); srj105AfterEach() })
+  afterEach(async () => { await life?.stop(); setDeliveryLifecycle(undefined); recoveryAfterEach() })
 
   function fixture() {
-    const f = srj105Build()
+    const f = buildRecoveryCase()
     life = createDeliveryLifecycle({ clock: createFakeClock() })
     setDeliveryLifecycle(life)
     const row = harnessRow(f.h, harnessPersona(f.h, f.p), { state: 'waiting', session_id: 'same-ad-session' })
@@ -11748,8 +11742,8 @@ describe('b.d6n: shared own-row readers forward absent rows to delivery lifecycl
   })
 })
 
-describe('b.jg5 SRJ-704, SRJ-1016: the shared own-row status and get reads end P\'s kill-failure episode, at a replacement site too', () => {
-  afterEach(srj105AfterEach)
+describe('the shared own-row status and get reads end P\'s kill-failure episode, at a replacement site too', () => {
+  afterEach(recoveryAfterEach)
 
   /** Open P's kill-failure episode: a sequence started at a replacement site whose kill fails ErrTmuxKillFailed at every try; resolves with its one alert. */
   async function openEpisode(h: RecoveryHarness, p: string): Promise<{ key: string; text: string }> {
@@ -11768,7 +11762,7 @@ describe('b.jg5 SRJ-704, SRJ-1016: the shared own-row status and get reads end P
     [read, 'missing', KILL_FAILURE_END_ROW_FINISHED],
     [read, 'ErrSpawnNotFound', KILL_FAILURE_END_ROW_GONE],
   ] as const))('the shared %s read answering %s ends P\'s episode silently, with one ended line; nothing posted', async (read, answer, reason) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const alert = await openEpisode(h, p)
 
     await readOwnRow(h, p, read, answer === 'ErrSpawnNotFound' ? errSpawnNotFound() : answer)
@@ -11782,7 +11776,7 @@ describe('b.jg5 SRJ-704, SRJ-1016: the shared own-row status and get reads end P
     [read, 'a live reading (waiting)', 'waiting'],
     [read, 'a failed read (ErrTmuxUnresponsive)', errTmuxUnresponsive(read)],
   ] as const))('the shared %s read answering %s leaves P\'s episode open', async (read, _label, answer) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     await openEpisode(h, p)
     const before = killFailureLines(h, p)
 
@@ -11793,7 +11787,7 @@ describe('b.jg5 SRJ-704, SRJ-1016: the shared own-row status and get reads end P
   })
 
   test.each([...READS])('the shared %s read of Q\'s own row reading ended leaves P\'s episode open', async (read) => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     await openEpisode(h, p)
 
     await readOwnRow(h, b, read, 'ended')
@@ -11802,7 +11796,7 @@ describe('b.jg5 SRJ-704, SRJ-1016: the shared own-row status and get reads end P
     expect(killFailureLines(h, p).filter((line) => line.includes(' ended — '))).toEqual([])
   })
 
-  // b.jg5 SRJ-704, SRJ-1016, SRJ-707 (E19–E20's note on E22): a row seen
+  // ( note on ): a row seen
   // finished or gone at a replacement site ends P's episode silently before
   // the launch that follows (a healthy persona no longer reports lost-message
   // state 4): the ladder's collision get reading P's finished row in another
@@ -11824,7 +11818,7 @@ describe('b.jg5 SRJ-704, SRJ-1016: the shared own-row status and get reads end P
       KILL_FAILURE_END_ROW_GONE,
     ],
   ])('%s ends P\'s episode silently, with its ended line and nothing posted, before the reuse spawn; a lost message then does not report kill-failed, and a later kill failure posts a new alert', async (_label, script, action, reason) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const alert = await openEpisode(h, p)
     const openLines = killFailureLines(h, p)
     script(h, p)
@@ -11861,7 +11855,7 @@ describe('b.jg5 SRJ-704, SRJ-1016: the shared own-row status and get reads end P
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-1016: the shared own-row status and get reads end P's
+// the shared own-row status and get reads end P's
 // stuck-launch episode on a read live out of `pending`, silently; `pending`,
 // `ended`, `missing`, no row and a failed read do not, and a read of Q's row
 // never ends P's. On the recovery harness, which installs its episodes in
@@ -11869,8 +11863,8 @@ describe('b.jg5 SRJ-704, SRJ-1016: the shared own-row status and get reads end P
 // is opened through the held text's poster over them.
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-1016: the shared own-row status and get reads end P\'s stuck-launch episode on a read live out of pending, silently; no other reading ends it', () => {
-  afterEach(srj105AfterEach)
+describe('the shared own-row status and get reads end P\'s stuck-launch episode on a read live out of pending, silently; no other reading ends it', () => {
+  afterEach(recoveryAfterEach)
 
   const STUCK = PERSONA_EPISODE_KIND_STUCK_LAUNCH
   /** The live states out of `pending`: the readings that end the episode. */
@@ -11894,7 +11888,7 @@ describe('b.jg5 SRJ-1016: the shared own-row status and get reads end P\'s stuck
   test.each(READS.flatMap((read) => LIVE_OUT_OF_PENDING.map((state) => [read, state] as const)))(
     'the shared %s read of P\'s own row reading %s ends P\'s episode silently, with one ended line naming the state; nothing posted',
     async (read, state) => {
-      const { h, p } = srj105Build()
+      const { h, p } = buildRecoveryCase()
       const post = openEpisode(h, p)
 
       await readOwnRow(h, p, read, state)
@@ -11916,7 +11910,7 @@ describe('b.jg5 SRJ-1016: the shared own-row status and get reads end P\'s stuck
     [read, 'no row (ErrSpawnNotFound)', errSpawnNotFound()],
     [read, 'a failed read (ErrTmuxUnresponsive)', errTmuxUnresponsive(read)],
   ] as const))('the shared %s read of P\'s own row answering %s leaves P\'s episode open, with no ended line', async (read, _label, answer) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const post = openEpisode(h, p)
 
     await readOwnRow(h, p, read, answer)
@@ -11927,7 +11921,7 @@ describe('b.jg5 SRJ-1016: the shared own-row status and get reads end P\'s stuck
   })
 
   test.each([...READS])('the shared %s read of Q\'s own row reading waiting ends Q\'s episode only; P\'s stays open', async (read) => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     openEpisode(h, p)
     openEpisode(h, b)
 
@@ -11938,8 +11932,8 @@ describe('b.jg5 SRJ-1016: the shared own-row status and get reads end P\'s stuck
     expect(endedLinesOf(h, b)).toHaveLength(1)
   })
 
-  test('a get whose caller stopped before it settled (SRJ-714) is not acted on: reading waiting, it leaves P\'s episode open', async () => {
-    const { h, p } = srj105Build()
+  test('a get whose caller stopped before it settled is not acted on: reading waiting, it leaves P\'s episode open', async () => {
+    const { h, p } = buildRecoveryCase()
     openEpisode(h, p)
     h.script({ getError: undefined, getResult: cannedGetResult({ state: 'waiting' }, harnessPersona(h, p), h.home) })
 
@@ -11950,7 +11944,7 @@ describe('b.jg5 SRJ-1016: the shared own-row status and get reads end P\'s stuck
   })
 
   test('with no episodes installed in the session manager a read live out of pending ends nothing and throws nothing', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     openEpisode(h, p)
     setStuckLaunchEpisodes(undefined)
 
@@ -11962,7 +11956,7 @@ describe('b.jg5 SRJ-1016: the shared own-row status and get reads end P\'s stuck
   })
 
   test('after the read ended it, P\'s next held post begins a new episode and posts again', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const post = openEpisode(h, p)
     await readOwnRow(h, p, 'get', 'waiting')
 
@@ -11972,7 +11966,7 @@ describe('b.jg5 SRJ-1016: the shared own-row status and get reads end P\'s stuck
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-118, SRJ-412, SRJ-1017: the per-launch record of a send-keys that
+// the per-launch record of a send-keys that
 // answered ErrSpawnNotInteractive. Set and read by launch start, raw or
 // parsed, so every form of one instant matches; any other instant, another
 // key, or no launch start does not; a later record replaces it; the
@@ -11980,7 +11974,7 @@ describe('b.jg5 SRJ-1016: the shared own-row status and get reads end P\'s stuck
 // case by the file's `_resetInFlightLaunches`.
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-118, SRJ-412, SRJ-1017: the record of a launch whose send-keys answered ErrSpawnNotInteractive', () => {
+describe('the record of a launch whose send-keys answered ErrSpawnNotInteractive', () => {
   const P = 'alpha'
   const Q = 'beta'
   /** The whole-second sample's instant (epoch ms). */
@@ -12068,108 +12062,108 @@ describe('b.jg5 SRJ-118, SRJ-412, SRJ-1017: the record of a launch whose send-ke
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-311: ENVIRONMENT (`ErrTmuxNotAvailable`) at the collision ladder,
-// the reconnect and the working-row wait (SRJ-105's ENVIRONMENT row)
+// ENVIRONMENT (`ErrTmuxNotAvailable`) at the collision ladder,
+// the reconnect and the working-row wait (ENVIRONMENT row)
 //
-// The working-row wait's `status` reads are no refusal (b.jg5 SRJ-605,
+// The working-row wait's `status` reads are no refusal (
 // `expectWaitGoesOnAt`): the launch answers the wait's outcome, nothing is
 // typed for the error, the onset is posted once. Every other site of the
-// SRJ-105 cases above, fed each ENVIRONMENT form, is a refusal through
+// cases above, fed each ENVIRONMENT form, is a refusal through
 // `expectRefusedAt`: the stub's call counts are exact (no
 // kill, delete, resume or launch after it, never dead-session), no
 // spawn-failure notice, no `spawn-failed` entry, one refusal line, P's timer
 // armed with the ENVIRONMENT cause, `launchSession` answering 'refused', the
 // failure count left at 0, and B launching. On top of that, P's
 // `tmux-unavailable` outage is raised with one onset and stays raised, and
-// ENVIRONMENT never starts P's `tmux-unresponsive` condition (SRJ-307).
+// ENVIRONMENT never starts P's `tmux-unresponsive` condition.
 // ---------------------------------------------------------------------------
 
 /**
  * The ENVIRONMENT answers, each built for the verb that meets it,
  * with the onset it raises: tmux cannot be run, with today's onset text, and
- * the different-server form, with b.jg5 SRJ-1021's.
+ * the different-server form, with.
  */
-const SRJ311_ENVIRONMENT: ReadonlyArray<readonly [string, (verb: string) => Error, string]> = [
+const ENVIRONMENT_CASES: ReadonlyArray<readonly [string, (verb: string) => Error, string]> = [
   ['ErrTmuxNotAvailable (tmux cannot be run)', (verb) => errTmuxNotAvailable(undefined, verb), ONSET_TEMPLATES['tmux-unavailable']()],
   ['ErrTmuxNotAvailable (not the tmux server the agent was launched on)', (verb) => errTmuxNotAvailableDifferentServer(undefined, verb), tmuxServerChangedOnset()],
 ]
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-105's CONFIG row, SRJ-316: a CONFIG answer (`ErrConfigMalformed`)
+// CONFIG row, a CONFIG answer (`ErrConfigMalformed`)
 // at the collision ladder, the reconnect, the working-row wait and the
 // findMissing sweeps
 //
 // "No action, nothing counted, never 'dead'; the retry timer is armed." Every
-// site of the SRJ-105 cases above, fed the stub's CONFIG answer, is a refusal
+// site of the cases above, fed the stub's CONFIG answer, is a refusal
 // through `expectRefusedAt`: the stub's call counts are exact (no kill, delete,
 // resume or launch after it, never a dead-session resume), no spawn-failure
 // notice, no `spawn-failed` entry, one refusal line, P's timer armed with the
 // CONFIG cause, `launchSession` answering 'refused', the failure count left at
 // 0, and B launching. On top of that, P's `ad-config-malformed` outage is
-// raised by the wrapper with one onset (SRJ-1018's, built by `src/` from the
+// raised by the wrapper with one onset (built by `src/` from the
 // thrown value) and one raise line per onset, and CONFIG never starts P's
-// `tmux-unresponsive` condition (SRJ-307). The ErrJsonlMissing diagnosis get
+// `tmux-unresponsive` condition. The ErrJsonlMissing diagnosis get
 // writes no inconclusive entry. The working-row wait's `status` reads are no
-// refusal (b.jg5 SRJ-605, `expectWaitGoesOnAt`).
+// refusal (`expectWaitGoesOnAt`).
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-105's UNCLASSIFIED row, SRJ-313: an UNCLASSIFIED outcome at the
+// UNCLASSIFIED row, an UNCLASSIFIED outcome at the
 // collision ladder, the reconnect, the working-row wait and the findMissing
 // sweeps
 //
-// "No step follows" (SRJ-110, SRJ-111, SRJ-113). Every site of the SRJ-105
+// "No step follows". Every site of the
 // cases above, fed an UNCLASSIFIED answer (an `ErrInternal` whose description
 // does not carry the unusable recorded name, a name CSCB gives no handling,
 // and at every action site `ErrSystemInstallDisappeared`), is a refusal
 // through `expectRefusedAt`: the stub's call counts are exact (no kill,
 // delete, resume or launch after it, never a dead-session resume), no
 // spawn-failure notice, no `spawn-failed` entry, one refusal line, P's timer
-// armed with the UNCLASSIFIED cause (a read keeps E10's read-error cause),
+// armed with the UNCLASSIFIED cause (a read keeps read-error cause),
 // `launchSession` answering 'refused', the failure count left at 0, and B
 // launching. On top of that, P's `tmux-unresponsive` condition is never
-// started (SRJ-307), the outcome is reported to P's unclassified-error
+// started, the outcome is reported to P's unclassified-error
 // episode (one started line across both launches, quoting the classifier's
 // rendering; the episode open; no alert at the same instant), B's episode
 // stays closed, and `ErrSystemInstallDisappeared` still raises P's
-// `ad-unreachable` with one onset (SRJ-104, Q-3). At the working-row wait's
+// `ad-unreachable` with one onset (Q-3). At the working-row wait's
 // `status` reads an `ErrInternal` and `ErrSystemInstallDisappeared` are no
-// refusal (b.jg5 SRJ-605, `expectWaitGoesOnAt`): the launch answers the
+// refusal (`expectWaitGoesOnAt`): the launch answers the
 // wait's outcome, never `failed`, and is never counted, with the same report
 // and arming. The exact-once report and the arming are pinned over
 // recording sinks at the end.
 // ---------------------------------------------------------------------------
 
 /** The UNCLASSIFIED answers fed to every site, each built for the verb that meets it. */
-const SRJ313_UNCLASSIFIED: ReadonlyArray<readonly [string, (verb: string) => Error]> = [
+const UNCLASSIFIED_CASES: ReadonlyArray<readonly [string, (verb: string) => Error]> = [
   ['an ErrInternal (its description not the unusable recorded name)', () => errInternal()],
   ['a name CSCB gives no handling (ErrNotHandled)', (verb) => errGeneric(verb, 'ErrNotHandled')],
 ]
 
 /**
  * At a findMissing sweep (not a read verb) every UNCLASSIFIED answer is a
- * refusal (b.jg5 SRJ-105, SRJ-313), the read errors of the SRJ-105 read
+ * refusal, the read errors of the read
  * describe included.
  */
-const SRJ313_SWEEP_UNCLASSIFIED: ReadonlyArray<readonly [string, (verb: string) => Error]> = [
-  ...SRJ313_UNCLASSIFIED,
+const SWEEP_UNCLASSIFIED_CASES: ReadonlyArray<readonly [string, (verb: string) => Error]> = [
+  ...UNCLASSIFIED_CASES,
   ['an UNCLASSIFIED read error (ErrTimeout)', (verb) => errGeneric(verb, 'ErrTimeout')],
   ['a store that cannot be opened (ErrSchemaMismatch)', () => errSchemaMismatch()],
 ]
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-301, SRJ-105: a persona that joins another's in-flight shared
+// a persona that joins another's in-flight shared
 // findMissing sweep gets its own refusal, for every outcome class
 //
-// A joiner's sweep failure is its own (SRJ-301): P starts the one prompt-row
+// A joiner's sweep failure is its own: P starts the one prompt-row
 // sweep, B joins it, and the sweep's answer refuses both under their own keys,
 // each armed once with the answer's cause and nothing destructive after it for
 // either. The outage each class raises is raised by each persona's own site:
 // ENVIRONMENT raises `tmux-unavailable` (the error's form picks the onset,
-// SRJ-1021, so B's text is checked as well as P's) and CONFIG raises
-// `ad-config-malformed` (one onset and one raise line each, SRJ-316); the
+// so B's text is checked as well as P's) and CONFIG raises
+// `ad-config-malformed` (one onset and one raise line each); the
 // UNAVAILABLE forms raise nothing. An UNCLASSIFIED answer begins each
-// persona's own unclassified-error episode once (SRJ-313); no other class
+// persona's own unclassified-error episode once; no other class
 // begins one.
 // ---------------------------------------------------------------------------
 
@@ -12178,18 +12172,18 @@ type JoinedSweepOutage = readonly [OutageClass, (err: Error) => string]
 
 /** Each answer of the joined sweep, built for `find-missing`, with the cause it arms and the outage it raises (none for `undefined`). */
 const JOINED_SWEEP_ANSWERS: ReadonlyArray<readonly [string, (verb: string) => Error, string, JoinedSweepOutage | undefined]> = [
-  ...SRJ105_UNAVAILABLE.map(([what, make, kind]) => [`${what} (UNAVAILABLE)`, make, kind, undefined] as const),
+  ...UNAVAILABLE_CASES.map(([what, make, kind]) => [`${what} (UNAVAILABLE)`, make, kind, undefined] as const),
   // The re-bound (different-server) row pins wiring only: today's agent-director never returns this error from `find-missing`; it proves the joiner's site hands its error to `raiseTmuxUnavailable`.
-  ...SRJ311_ENVIRONMENT.map(([what, make, text]) => [what, make, UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT, ['tmux-unavailable', () => text] as const] as const),
+  ...ENVIRONMENT_CASES.map(([what, make, text]) => [what, make, UNAVAILABLE_RETRY_CAUSE_ENVIRONMENT, ['tmux-unavailable', () => text] as const] as const),
   ['a CONFIG answer (ErrConfigMalformed)', () => errConfigMalformed(), UNAVAILABLE_RETRY_CAUSE_CONFIG, ['ad-config-malformed', (err) => adConfigMalformedOnset(err)]],
-  ...SRJ313_SWEEP_UNCLASSIFIED.map(([what, make]) => [what, make, UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED, undefined] as const),
+  ...SWEEP_UNCLASSIFIED_CASES.map(([what, make]) => [what, make, UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED, undefined] as const),
 ]
 
-describe('b.jg5 SRJ-301, SRJ-105: a persona that joins another\'s in-flight shared sweep gets its own refusal, for every outcome class', () => {
-  afterEach(srj105AfterEach)
+describe('a persona that joins another\'s in-flight shared sweep gets its own refusal, for every outcome class', () => {
+  afterEach(recoveryAfterEach)
 
   test.each(JOINED_SWEEP_ANSWERS)('%s at P\'s prompt-row sweep, which B joined: one findMissing call; each persona is refused under its own key at the prompt-row sweep, armed once with the cause, never counted, raises its own outage only for ENVIRONMENT or CONFIG and begins its own unclassified-error episode only for UNCLASSIFIED; no resume, kill, delete, launch, notice or spawn-failed entry for either', async (_what, make, kind, outage) => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     const err = make('find-missing')
     const [pResult, bResult] = await launchBothThroughOneSweep(h, p, b, err)
 
@@ -12222,10 +12216,10 @@ describe('b.jg5 SRJ-301, SRJ-105: a persona that joins another\'s in-flight shar
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-105's CONFLICT row, SRJ-501, SRJ-502, SRJ-111, SRJ-113, SRJ-1015:
+// CONFLICT row,
 // a CONFLICT at every spawn and resume of the collision ladder latches the
-// persona, and a latched persona is launched by no path (AC 7's unit half,
-// AC 46's automated half for the launch paths)
+// persona, and a latched persona is launched by no path (unit half,
+// automated half for the launch paths)
 //
 // Every case runs on `makeRecoveryHarness`, whose one latch is composed as
 // `main()` composes it (installed in the session manager; the holds, then the
@@ -12254,7 +12248,7 @@ describe('b.jg5 SRJ-301, SRJ-105: a persona that joins another\'s in-flight shar
 // `launchSession`) answers `latched` / `'skipped'` with no agent-director
 // call, and B launches as before.
 //
-// The recorded state follows SRJ-501's words ("the state that the path which
+// The recorded state follows the contract words ("the state that the path which
 // met the condition last read"): a write the path made after its last read (a
 // kill, a delete, a findMissing sweep) is not followed by a re-read, so a row
 // in another directory read `waiting`, then killed and deleted, records
@@ -12270,7 +12264,7 @@ function statusAnswering(state: LatchRowState): RecoveryStubScript {
 
 /**
  * The latch row state a read of the row a plain spawn's CONFLICT left gives
- * (b.jg5 SRJ-111; HO rev 15, rev 20): no row after the pre-spawn scan's
+ * (HO rev 15, rev 20): no row after the pre-spawn scan's
  * refusal, `ended` after "duplicate session".
  */
 function rowAfterState(rowAfter: PlainSpawnRowAfter): LatchRowState {
@@ -12287,7 +12281,7 @@ interface LatchSite {
   /**
    * Stub answers that make P's launch meet `err` here; a site that reads
    * nothing answers the latch-time read with the row a plain spawn's refusal
-   * left (`row.rowAfter`, b.jg5 SRJ-111), else with `row`'s state.
+   * left (`row.rowAfter`), else with `row`'s state.
    */
   script(h: RecoveryHarness, persona: Persona, err: Error, row: Pick<ConflictCaseRow, 'rowState' | 'rowAfter'>): RecoveryStubScript
   /** Every launch and destructive call the launch makes, the refused one included. */
@@ -12300,10 +12294,10 @@ interface LatchSite {
    * The `jsonl-diagnosis-inconclusive` entries the path writes before the
    * refused call (the ErrJsonlMissing diagnosis's); none by default. Its
    * notice is posted only once the reuse spawn brings P up, so a refused
-   * reuse posts none (b.jg5 SRJ-712).
+   * reuse posts none.
    */
   readonly inconclusiveEntries?: number
-  /** Set on a reuse spawn site (b.jg5 SRJ-707): the refused call is P's one reuse spawn, its refused operation "reuse spawn". */
+  /** Set on a reuse spawn site: the refused call is P's one reuse spawn, its refused operation "reuse spawn". */
   readonly reuse?: true
 }
 
@@ -12329,7 +12323,7 @@ const LATCH_SPAWN_SITES: readonly LatchSite[] = [
     reads: { get: 1, status: 0 },
     lastRead: LATCH_ROW_STATE_NO_ROW,
   },
-  // b.jg5 SRJ-707, SRJ-712: resume's no-transcript answers go on to one reuse
+  // resume's no-transcript answers go on to one reuse
   // spawn of the same id, after the diagnosis on ErrJsonlMissing; no delete.
   {
     name: 'the reuse spawn after the resume\'s ErrNoSessionId (an ended row)',
@@ -12372,13 +12366,13 @@ const LATCH_SPAWN_SITES: readonly LatchSite[] = [
     reads: { get: 1, status: 0 },
     lastRead: MISSING_READ,
   },
-  // b.jg5 SRJ-707, SRJ-709, SRJ-501: each replacement site over a finished
+  // each replacement site over a finished
   // row makes one reuse spawn of the same id, which records "reuse spawn" and
   // the state the collision get read; a live row there is the live-row
   // sequence's, whose own launch's CONFLICT rows are
   // tests/conflict-latch.test.ts's.
   ...REPLACEMENT_REUSE_SITES.map((site): LatchSite => ({ ...site, verb: 'spawn', reads: { get: 1, status: 0 }, lastRead: ENDED_READ })),
-  // b.jg5 SRJ-605: the wait's absent row is a dead session; its recovery's
+  // the wait's absent row is a dead session; its recovery's
   // fresh spawn, after the resume finds no row either, decides what holds the
   // name, and a CONFLICT there latches P with no row read.
   {
@@ -12469,7 +12463,7 @@ const LATCH_RESUME_SITES: readonly LatchSite[] = [
   },
 ]
 
-/** The refused operation a site records: "resume", "reuse spawn" at a reuse site (b.jg5 SRJ-501), else "plain spawn". */
+/** The refused operation a site records: "resume", "reuse spawn" at a reuse site, else "plain spawn". */
 function refusedOperationAt(site: LatchSite): RefusedOperation {
   if (site.verb === 'resume') return REFUSED_OPERATION_RESUME
   return site.reuse === true ? REFUSED_OPERATION_REUSE_SPAWN : REFUSED_OPERATION_PLAIN_SPAWN
@@ -12497,7 +12491,7 @@ const LATCH_CROSS = [...LATCH_SPAWN_SITES, ...LATCH_RESUME_SITES].flatMap((site)
 /** The session manager's CONFLICT lines in `text`'s lines for persona `key` (`conflictAt`: one per CONFLICT it met). */
 function conflictLinesIn(lines: readonly string[], key: string): string[] {
   return lines.filter(
-    (line) => line.includes(` refused for ${renderPersonaRef(key, key)}: `) && line.includes(' — CONFLICT: ') && line.endsWith('nothing more is called (b.jg5 SRJ-105, SRJ-501)'),
+    (line) => line.includes(` refused for ${renderPersonaRef(key, key)}: `) && line.includes(' — CONFLICT: ') && line.endsWith('nothing more is called'),
   )
 }
 
@@ -12508,7 +12502,7 @@ const ONE_LATCH_STEPS = ['set', 'hold', 'hold', 'hold', 'notice'] as const
 interface ExpectedLatch {
   /** The whole record the latch holds for P, from the helper's builders (`tests/test-helpers/conflict-cases.ts`). */
   readonly record: ConflictLatchRecord
-  /** The one notice body the latch posts to P (the CONFLICT, SRJ-1019 or SRJ-1020 notice). */
+  /** The one notice body the latch posts to P (the CONFLICTor notice). */
   readonly notice: string
   /** The session manager's lines of this latch's kind for persona `key`: one per latch of that kind it logged. */
   readonly lines: (h: RecoveryHarness, key: string) => string[]
@@ -12559,7 +12553,7 @@ function launchStartLatch(p: string, row: LaunchStartCaseRow): ExpectedLatch {
  * or the lost-message driver, or posted through the session manager's
  * notices (no spawn-failure notice, and no diagnosis notice: an
  * ErrJsonlMissing diagnosis's notice waits for the reuse spawn to bring P up,
- * b.jg5 SRJ-712), recorded `spawn-failed` or as any diagnosis entry but the
+ *), recorded `spawn-failed` or as any diagnosis entry but the
  * `inconclusiveEntries` the path wrote before the latching call, armed,
  * triggered, refused, started as `tmux-unresponsive` or reported to the
  * unclassified-error episode.
@@ -12570,7 +12564,7 @@ function expectLatchedOnce(h: RecoveryHarness, p: string, expected: ExpectedLatc
   expect(h.latchEvents.map((event) => [event.step, event.key])).toEqual(ONE_LATCH_STEPS.map((step) => [step, p]))
   expect(h.latchEvents[0]).toMatchObject({ step: 'set', key: p, outcome: CONFLICT_LATCH_SET_LATCHED })
   expect(h.episodeNotices).toEqual([{ key: p, text: expected.notice }])
-  // The latch's one post is P's only post: no spawn-failure notice, outage onset or lost-message notice (b.jg5 SRJ-713, AC 7).
+  // The latch's one post is P's only post: no spawn-failure notice, outage onset or lost-message notice.
   expect([h.notices, h.outageNotices, h.lostMessageNotices]).toEqual([[], [], []])
   const log = h.startupErrors().join('\n')
   expect(countStartupEntries(log, STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
@@ -12578,7 +12572,7 @@ function expectLatchedOnce(h: RecoveryHarness, p: string, expected: ExpectedLatc
   expect(countStartupEntries(log, JSONL_TRANSCRIPT_LOST_ENTRY_CLASS)).toBe(0)
   expect(getFailureCount(p)).toBe(0)
   expect(h.controller.isArmed(p)).toBe(false)
-  // None for P; another persona launched beside it has only its launch's pending-only watch (b.jg5 SRJ-409).
+  // None for P; another persona launched beside it has only its launch's pending-only watch.
   expect(h.triggers.filter((t) => t.key === p || t.kind !== UNAVAILABLE_RETRY_CAUSE_PENDING_ROW)).toEqual([])
   expect(refusalLines(h, p)).toEqual([])
   expect(h.tmuxUnresponsive.holds(p)).toBe(false)
@@ -12621,15 +12615,15 @@ async function expectLaunchedByNoPath(h: RecoveryHarness, p: string, b: string, 
   expectOnlyPendingRowWatch(h, b)
 }
 
-describe('b.jg5 SRJ-105, SRJ-501, SRJ-502: a CONFLICT at any spawn or resume of the collision ladder latches the persona; nothing else is done for it', () => {
-  afterEach(srj105AfterEach)
+describe('a CONFLICT at any spawn or resume of the collision ladder latches the persona; nothing else is done for it', () => {
+  afterEach(recoveryAfterEach)
 
-  // Covers SRJ-111 (AC 7's unit half: the first spawn's plain-spawn rows read no
+  // Covers (unit half: the first spawn's plain-spawn rows read no
   // row after the scan's refusal, ended after "duplicate session"; latched with
-  // plain spawn, never counted, never a kill) and SRJ-113 (a resume latches with
+  // plain spawn, never counted, never a kill) and (a resume latches with
   // "resume" and the collision get's state; never a kill, delete or fresh spawn).
-  test.each(LATCH_CROSS)('b.jg5 SRJ-111, SRJ-113: %s answering %s: latched with the row\'s case and session, the site\'s refused operation and the state the path last read; the refused call is the last; one CONFLICT notice after the holds; nothing counted or posted as a spawn failure; then no launch path reaches agent-director; B launches', async (_site, _row, site, row) => {
-    const { h, p, b } = srj105Build()
+  test.each(LATCH_CROSS)('%s answering %s: latched with the row\'s case and session, the site\'s refused operation and the state the path last read; the refused call is the last; one CONFLICT notice after the holds; nothing counted or posted as a spawn failure; then no launch path reaches agent-director; B launches', async (_site, _row, site, row) => {
+    const { h, p, b } = buildRecoveryCase()
     const persona = harnessPersona(h, p)
     site.setup?.(h)
     const script = site.script(h, persona, row.build(), row)
@@ -12647,7 +12641,7 @@ describe('b.jg5 SRJ-105, SRJ-501, SRJ-502: a CONFLICT at any spawn or resume of 
       Array(site.reads.status + latchTimeReads).fill(`${PERSONA_INSTANCE_ID_PREFIX}${p}`),
     )
     expect(order.slice(order.lastIndexOf(site.verb))).toEqual([site.verb, ...(latchTimeReads === 1 ? ['status'] : [])])
-    // b.jg5 SRJ-707: at a reuse site the refused spawn is P's one reuse; elsewhere no spawn carries the flag.
+    // at a reuse site the refused spawn is P's one reuse; elsewhere no spawn carries the flag.
     expect(h.reuseSpawns()).toEqual(site.reuse === true ? [reuseSpawnOf(h, p)] : [])
 
     expectLatchedOnce(h, p, conflictLatch(p, row, refusedOperationAt(site), site.lastRead ?? row.rowState), site.inconclusiveEntries)
@@ -12655,11 +12649,11 @@ describe('b.jg5 SRJ-105, SRJ-501, SRJ-502: a CONFLICT at any spawn or resume of 
     await expectLaunchedByNoPath(h, p, b, script)
   })
 
-  // SRJ-1015 (hatch A3): launchSession answers 'skipped' for a launch that
+  // (design A3): launchSession answers 'skipped' for a launch that
   // latches, as for one already latched; nothing is recorded. The mapping does
   // not depend on the site: one spawn site and one resume site.
-  test.each([LATCH_SPAWN_SITES[0]!, LATCH_RESUME_SITES[0]!].map((site) => [site.name, site] as const))('b.jg5 SRJ-1015: launchSession whose launch meets a CONFLICT at %s answers \'skipped\': P latched, nothing counted, no spawn-failure notice', async (_name, site) => {
-    const { h, p } = srj105Build()
+  test.each([LATCH_SPAWN_SITES[0]!, LATCH_RESUME_SITES[0]!].map((site) => [site.name, site] as const))('launchSession whose launch meets a CONFLICT at %s answers \'skipped\': P latched, nothing counted, no spawn-failure notice', async (_name, site) => {
+    const { h, p } = buildRecoveryCase()
     const row = conflictRowsFor(site.verb)[0]!
     site.setup?.(h)
     h.script(site.script(h, harnessPersona(h, p), row.build(), row))
@@ -12673,10 +12667,10 @@ describe('b.jg5 SRJ-105, SRJ-501, SRJ-502: a CONFLICT at any spawn or resume of 
     expect(h.episodeNotices.filter((n) => n.key === p)).toHaveLength(1)
   })
 
-  // HO rev 15, b.jg5 SRJ-112: with no row, the reuse after the diagnosis is an
+  // HO rev 15, with no row, the reuse after the diagnosis is an
   // ordinary fresh spawn, which the pre-spawn scan refuses.
-  test('b.jg5 SRJ-501: the ErrJsonlMissing diagnosis get answering ErrSpawnNotFound is the last read: the reuse spawn after it, refused by the pre-spawn scan, latches P with "reuse spawn" and no row; no status read is added, no delete, and the inconclusive entry is kept with no notice', async () => {
-    const { h, p, b } = srj105Build()
+  test('the ErrJsonlMissing diagnosis get answering ErrSpawnNotFound is the last read: the reuse spawn after it, refused by the pre-spawn scan, latches P with "reuse spawn" and no row; no status read is added, no delete, and the inconclusive entry is kept with no notice', async () => {
+    const { h, p, b } = buildRecoveryCase()
     const row = reuseSpawnScanRows()[0]!
     const script: RecoveryStubScript = {
       spawnQueue: [cannedErr(errInstanceIdCollision()), cannedErr(row.build())],
@@ -12704,8 +12698,8 @@ describe('b.jg5 SRJ-105, SRJ-501, SRJ-502: a CONFLICT at any spawn or resume of 
     expect(await h.launch(b)).toEqual({ key: b, action: 'spawned' })
   })
 
-  test('b.jg5 SRJ-502: a latched persona\'s launch runs no pre-launch step: no trust patch and no agent-director call, while B\'s launch patches and spawns', async () => {
-    const { h, p, b } = srj105Build()
+  test('a latched persona\'s launch runs no pre-launch step: no trust patch and no agent-director call, while B\'s launch patches and spawns', async () => {
+    const { h, p, b } = buildRecoveryCase()
     const row = conflictRowsFor('spawn')[0]!
     h.script({ spawnError: row.build(), ...statusAnswering(row.rowState) })
     expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
@@ -12717,8 +12711,8 @@ describe('b.jg5 SRJ-105, SRJ-501, SRJ-502: a CONFLICT at any spawn or resume of 
     expect(await h.launch(b)).toEqual({ key: b, action: 'spawned' })
   })
 
-  test('b.jg5 SRJ-502, SRJ-1015: a persona latched during the start pass records no spawn-failed entry and is counted neither failed nor succeeded; B is counted; a second start pass makes no call for P', async () => {
-    const { h, p, b } = srj105Build()
+  test('a persona latched during the start pass records no spawn-failed entry and is counted neither failed nor succeeded; B is counted; a second start pass makes no call for P', async () => {
+    const { h, p, b } = buildRecoveryCase()
     const row = conflictRowsFor('spawn')[0]!
     const pId = `${PERSONA_INSTANCE_ID_PREFIX}${p}`
     h.script({
@@ -12753,7 +12747,7 @@ describe('b.jg5 SRJ-105, SRJ-501, SRJ-502: a CONFLICT at any spawn or resume of 
   })
 })
 
-describe('b.jg5 SRJ-501, SRJ-502: the session manager\'s latch install', () => {
+describe('the session manager\'s latch install', () => {
   test('with no latch installed a CONFLICT at the first spawn answers latched with no latch-time read, no notice and no spawn-failed entry, and holds nothing back: the next launch spawns again', async () => {
     const readLog = captureStartupErrors()
     setConflictLatch(undefined)
@@ -12824,12 +12818,12 @@ describe('b.jg5 SRJ-501, SRJ-502: the session manager\'s latch install', () => {
     expect(getFailureCount('C')).toBe(0)
   })
 
-  // b.jg5 SRJ-114: a provenance_conflict note on P's own row (the
+  // a provenance_conflict note on P's own row (the
   // configured-persona query installed) takes the same fallbacks as the
   // CONFLICT row: with no latch, or a set that throws, the read still answers
   // latched and the launch calls nothing after the collision get.
   test.each<[string, (sets: string[]) => SessionConflictLatch | undefined, string]>([
-    ['no latch is installed', () => undefined, ' — no latch is installed, so nothing is latched; nothing more is called for it '],
+    ['no latch is installed', () => undefined, ' — no latch is installed, so nothing is latched; nothing more is called for it'],
     [
       'an installed latch whose set throws',
       (sets) => ({
@@ -12872,7 +12866,7 @@ describe('b.jg5 SRJ-501, SRJ-502: the session manager\'s latch install', () => {
     assertNoLeak({ errLog, notices })
   })
 
-  // Fail safe (b.jg5 SRJ-502): a latch the gate cannot read holds the launch back.
+  // Fail safe: a latch the gate cannot read holds the launch back.
   test.each<[string, SessionConflictLatch, string]>([
     [
       'its latched query throws',
@@ -12920,7 +12914,7 @@ describe('b.jg5 SRJ-501, SRJ-502: the session manager\'s latch install', () => {
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-114 (with SRJ-501, SRJ-502): the note rules at the session
+// (with): the note rules at the session
 // manager's get sites
 //
 // At each get site that exists today (the collision `get`, the
@@ -12939,14 +12933,14 @@ describe('b.jg5 SRJ-501, SRJ-502: the session manager\'s latch install', () => {
 // outside the applied configuration, no configured-persona query installed,
 // one that throws, or another caller's row). Every case runs on `makeRecoveryHarness`, which
 // installs the latch and the configured-persona query as `main()` does, and
-// `srj105AfterEach` runs `assertNoLeak` over what it captured.
+// `recoveryAfterEach` runs `assertNoLeak` over what it captured.
 // ---------------------------------------------------------------------------
 
 const WORKING_READ = latchRowStateRead('working')
 
-/** The working-row verdict's one read of P's row (`workingReconnectVerdict` in `src/server.ts`, b.jg5 SRJ-603): full, the row read `working`. */
+/** The working-row verdict's one read of P's row (`workingReconnectVerdict` in `src/server.ts`): full, the row read `working`. */
 
-/** A get site of SRJ-114 that P's launch reaches. */
+/** A get site of the contract that P's launch reaches. */
 interface NoteSite {
   readonly name: string
   /** Configuration or seams the site needs, set before the launch. */
@@ -13001,7 +12995,7 @@ function expectNoteLatchedOnce(h: RecoveryHarness, p: string, rowState: LatchRow
   expect(countStartupEntries(log, JSONL_DIAGNOSIS_INCONCLUSIVE_ENTRY_CLASS)).toBe(0)
   expect(getFailureCount(p)).toBe(0)
   expect(h.controller.isArmed(p)).toBe(false)
-  // None for P; another persona launched beside it has only its launch's pending-only watch (b.jg5 SRJ-409).
+  // None for P; another persona launched beside it has only its launch's pending-only watch.
   expect(h.triggers.filter((t) => t.key === p || t.kind !== UNAVAILABLE_RETRY_CAUSE_PENDING_ROW)).toEqual([])
   expect(refusalLines(h, p)).toEqual([])
 }
@@ -13069,12 +13063,12 @@ function waitLatchedLines(h: RecoveryHarness): string[] {
   return h.errors.filter((line) => line.startsWith('[slack] waitForWaitingAndReconnect: ') && line.includes(' is latched — the wait ends'))
 }
 
-describe('b.jg5 SRJ-114, SRJ-501, SRJ-502: a provenance_conflict note on a configured persona\'s own row latches it at each get site; no other note, and no row that is not a configured persona\'s own, latches anyone', () => {
-  afterEach(srj105AfterEach)
+describe('a provenance_conflict note on a configured persona\'s own row latches it at each get site; no other note, and no row that is not a configured persona\'s own, latches anyone', () => {
+  afterEach(recoveryAfterEach)
 
   // Demo: a provenance_conflict note on the persona's row latches it once.
   test.each(NOTE_SITES.map((site) => [site.name, site] as const))('a provenance_conflict note on P\'s own row at %s latches P once with the note\'s case, P\'s bring-up and the state read; nothing is called after that get; the launch answers latched; one CONFLICT notice; nothing counted or posted as a failure; then no launch path reaches agent-director; B launches', async (_name, site) => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     site.setup?.(h)
     const script = site.script(h, harnessPersona(h, p), { liveness_note: provenanceNote })
     h.script(script)
@@ -13107,7 +13101,7 @@ describe('b.jg5 SRJ-114, SRJ-501, SRJ-502: a provenance_conflict note on a confi
     ['a row in another directory (the cwd guard)', (h) => elsewhere(h, 'ended'), ENDED_READ],
     ['a waiting row with no config_dir label (the config_dir guard)', (h, persona) => unlabelledRow(h, persona, 'waiting'), WAITING_READ],
   ])('the note on P\'s own row at the collision get, %s: P latched with that state, before any guard or state branch: one spawn and one get, no status read, pane read or keystroke; latched', async (_row, row, rowState) => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     fastPolls(h)
     const persona = harnessPersona(h, p)
     const script = collided(h, persona, { ...row(h, persona), liveness_note: provenanceNote })
@@ -13133,7 +13127,7 @@ describe('b.jg5 SRJ-114, SRJ-501, SRJ-502: a provenance_conflict note on a confi
     (site === NOTE_SITES[0] ? PLAIN_NOTES : SAMPLE_PLAIN_NOTES).map(([label, note]) => [site.name, label, note, site] as const),
   )
   test.each(plainCross)('at %s, %s on P\'s own row latches no one: the launch takes today\'s step for the row and nothing is posted', async (_site, _label, note, site) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     site.setup?.(h)
     h.script(site.script(h, harnessPersona(h, p), { liveness_note: note }))
 
@@ -13146,10 +13140,10 @@ describe('b.jg5 SRJ-114, SRJ-501, SRJ-502: a provenance_conflict note on a confi
   // Demo: a provenance_conflict note on another caller's row latches no one.
   const notOwnCross = NOTE_SITES.flatMap((site) => NOT_A_CONFIGURED_OWN_ROW.map(([label, setup]) => [site.name, label, setup, site] as const))
   test.each(notOwnCross)('at %s, a provenance_conflict note on a row that is not a configured persona\'s own (%s) latches no one and changes nothing: today\'s step for the row', async (_site, _label, setup, site) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     site.setup?.(h)
     const noted = setup(h, p)
-    // b.omv SR-7.6: this matrix tests note ownership, with current prompt provenance.
+    // this matrix tests note ownership, with current prompt provenance.
     if (noted.labels) noted.labels = { ...noted.labels, tag_prompt: '1' }
     const removedWorking = _label.startsWith('P is not in the applied') && site === NOTE_SITES[2]
     if (removedWorking) deadlineAtStart(h)
@@ -13162,7 +13156,7 @@ describe('b.jg5 SRJ-114, SRJ-501, SRJ-502: a provenance_conflict note on a confi
   })
 
   test('regression: ErrSpawnNotFound at the collision get still retries the plain spawn once, and latches no one', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     h.script({ spawnQueue: [cannedErr(errInstanceIdCollision())], getError: errSpawnNotFound() })
 
     expect(await h.launch(p)).toEqual({ key: p, action: 'spawned' })
@@ -13173,7 +13167,7 @@ describe('b.jg5 SRJ-114, SRJ-501, SRJ-502: a provenance_conflict note on a confi
   })
 
   test('the start pass: P latched at its ErrJsonlMissing diagnosis get is listed latched and counted in neither amnesia counter, failed nor succeeded; no diagnosis entry or notice; B is counted', async () => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     const persona = harnessPersona(h, p)
     const pId = personaInstanceId(p)
     let pGets = 0
@@ -13204,7 +13198,7 @@ describe('b.jg5 SRJ-114, SRJ-501, SRJ-502: a provenance_conflict note on a confi
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-114: the "latches no one" line for a non-latching note on a
+// the "latches no one" line for a non-latching note on a
 // persona's own row is logged once per note for that persona, and again only
 // when the note changes. A read with no note, or with the latching note
 // (applied or not), forgets the logged note, so its return logs again. The
@@ -13215,7 +13209,7 @@ describe('b.jg5 SRJ-114, SRJ-501, SRJ-502: a provenance_conflict note on a confi
 // latches no one`, and read back as [head, note].
 // ---------------------------------------------------------------------------
 
-const NON_LATCHING_LINE = /^\[slack\] (.+): its row carries the liveness note "(.*)", which latches no one — going on \(b\.jg5 SRJ-114\)$/
+const NON_LATCHING_LINE = /^\[slack\] (.+): its row carries the liveness note "(.*)", which latches no one — going on$/
 
 /** The "latches no one" lines the harness captured, in order, each as [`<site>: <what> for <ref>`, note]. */
 function nonLatchingNoteLines(h: RecoveryHarness): Array<[string, string]> {
@@ -13252,11 +13246,11 @@ async function readOwnRowOnce(key: string, at: OwnRowReadSite = DEDUP_SITE): Pro
   expect(read.kind).toBe(OWN_ROW_READ_ROW)
 }
 
-describe('b.jg5 SRJ-114: the "latches no one" line for a non-latching note on a persona\'s own row is logged once per note, again only when the note changes', () => {
-  afterEach(srj105AfterEach)
+describe('the "latches no one" line for a non-latching note on a persona\'s own row is logged once per note, again only when the note changes', () => {
+  afterEach(recoveryAfterEach)
 
   test.each([nonLatchingNotes[0]!, unknownNote])('the note %s read twice on P\'s own row logs one line; nothing latched', async (note) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     scriptNotedRows(h, new Map([[p, { liveness_note: note }]]))
 
     await readOwnRowOnce(p)
@@ -13268,7 +13262,7 @@ describe('b.jg5 SRJ-114: the "latches no one" line for a non-latching note on a 
   })
 
   test('a changed note logs again: A, A, B, B, A logs A, B, A', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const [a, b] = nonLatchingNotes as [string, string]
     const notes = new Map<string, PersonaGetResultOverrides>()
     scriptNotedRows(h, notes)
@@ -13297,7 +13291,7 @@ describe('b.jg5 SRJ-114: the "latches no one" line for a non-latching note on a 
     ['provenance_conflict on another caller\'s row (not applied)', () => ({ liveness_note: provenanceNote, instance_id: ANOTHER_CALLERS_ROW })],
     ['provenance_conflict on P\'s own row (P latches)', () => ({ liveness_note: provenanceNote })],
   ])('note A, then a read with %s, then note A again logs A twice', async (_label, between) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const [a] = nonLatchingNotes as [string]
     const notes = new Map<string, PersonaGetResultOverrides>([[p, { liveness_note: a }]])
     scriptNotedRows(h, notes)
@@ -13316,7 +13310,7 @@ describe('b.jg5 SRJ-114: the "latches no one" line for a non-latching note on a 
   })
 
   test('forgetNotConnectedEpisode(P) forgets P\'s logged note, so P\'s next read of it logs again; Q\'s logged note is untouched', async () => {
-    const { h, p, b: q } = srj105Build()
+    const { h, p, b: q } = buildRecoveryCase()
     const [a] = nonLatchingNotes as [string]
     scriptNotedRows(h, new Map([[p, { liveness_note: a }], [q, { liveness_note: a }]]))
 
@@ -13334,7 +13328,7 @@ describe('b.jg5 SRJ-114: the "latches no one" line for a non-latching note on a 
   })
 
   test('the same note read for P at a second site logs nothing more: the line names the first site only', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const [a] = nonLatchingNotes as [string]
     scriptNotedRows(h, new Map([[p, { liveness_note: a }]]))
     const collisionGet: OwnRowReadSite = { site: 'spawnForPersona', what: 'collision get' }
@@ -13347,7 +13341,7 @@ describe('b.jg5 SRJ-114: the "latches no one" line for a non-latching note on a 
   })
 
   test('a launch whose collision get and ErrJsonlMissing diagnosis get both read the same note on P\'s own row logs one line, at the collision get; the launch goes on as without the note', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const [a] = nonLatchingNotes as [string]
     const persona = harnessPersona(h, p)
     h.script({
@@ -13367,15 +13361,15 @@ describe('b.jg5 SRJ-114: the "latches no one" line for a non-latching note on a 
   })
 })
 
-describe('b.jg5 SRJ-114, SRJ-122 (hatch A2): the gets SRJ-114 leaves alone latch no one and keep their behaviour', () => {
+describe('(hatch A2): the gets leaves alone latch no one and keep their behaviour', () => {
   afterEach(() => {
     stopPermissionPoller()
     _resetPollerState()
-    srj105AfterEach()
+    recoveryAfterEach()
   })
 
   test('the permission poller\'s get of P\'s own check_permission row carrying the note: its prompt is posted as without the note; nothing latched, no CONFLICT notice', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const persona = harnessPersona(h, p)
     const slack = makeStubSlack()
     const trail = makeTrailCapture()
@@ -13401,7 +13395,7 @@ describe('b.jg5 SRJ-114, SRJ-122 (hatch A2): the gets SRJ-114 leaves alone latch
   })
 
   test('the JSONL persistence safeguard\'s get of P\'s own row carrying the note: its AD transcript-reference notice is made as without the note; nothing latched, no CONFLICT notice', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const persona = harnessPersona(h, p)
     const pId = personaInstanceId(p)
     h.script({
@@ -13429,14 +13423,14 @@ describe('b.jg5 SRJ-114, SRJ-122 (hatch A2): the gets SRJ-114 leaves alone latch
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-120: findMissing run kinds, the memo window, and the not-judged
+// findMissing run kinds, the memo window, and the not-judged
 // reading
 //
 // Every findMissing caller today is an ordinary run: inside the memo window
 // (`FIND_MISSING_MEMO_TTL_MS`, measured on the session manager's clock
 // `_now`, a fake clock here) it reuses the memoized result, and while a run is
 // in flight it joins that run. A bypassing run (`bypassingFindMissingSweep`,
-// the one entry of the later Epics' bypassing callers) always makes a new
+// the one entry of the later components' bypassing callers) always makes a new
 // call, becomes the run in flight that ordinary callers join, and is memoized
 // for them. The memo keeps the result of the most recently started run that
 // succeeded: an older run resolving later never overwrites it nor clears the
@@ -13505,7 +13499,7 @@ async function settleTurns(clock: FakeClock): Promise<void> {
 /** The log site of the bypassing runs these cases make. */
 const BYPASS_SITE = 'bypassing test caller'
 
-describe('b.jg5 SRJ-120: bypassing findMissing runs, the memo window on the session manager\'s clock, joiners and the memo winner', () => {
+describe('bypassing findMissing runs, the memo window on the session manager\'s clock, joiners and the memo winner', () => {
   const C = 'C'
   let clock: FakeClock
   let lines: string[]
@@ -13529,7 +13523,7 @@ describe('b.jg5 SRJ-120: bypassing findMissing runs, the memo window on the sess
     assertNoLeak({ lines })
   })
 
-  // Demo (E14, AC 85's note half): a bypassing run inside the 10 s window
+  // Demo (E14note half): a bypassing run inside the 10 s window
   // makes a new findMissing call; an ordinary one reuses the memo.
   test('demo: a bypassing run inside the 10 s window makes a new findMissing call, and an ordinary one reuses the memo: an ordinary run primes it; a bypassing run inside FIND_MISSING_MEMO_TTL_MS calls again and is memoized; an ordinary caller after it makes no call and gets its result; at the window\'s end an ordinary caller calls again', async () => {
     const findMissingCalls: import('agent-director').FindMissingParams[] = []
@@ -13610,12 +13604,12 @@ describe('b.jg5 SRJ-120: bypassing findMissing runs, the memo window on the sess
     expect(sweptRowBuckets(lines)).toEqual(['missing'])
   })
 
-  // b.jg5 SRJ-120 says the caller goes on after a failure; the E12 refusal is
-  // kept (b.jg5 SRJ-105): a refused bypassing run stops its caller.
+  // says the caller goes on after a failure; the refusal is
+  // kept: a refused bypassing run stops its caller.
   test.each<[string, () => Error, typeof FIND_MISSING_REFUSED | undefined, string]>([
     ['an UNUSABLE NAME answer: the caller gets undefined and goes on', () => errUnusableName(), undefined, 'bypassing findMissing sweep failed for'],
     [
-      'an UNAVAILABLE answer: refused, the caller stops (b.jg5 SRJ-105)',
+      'an UNAVAILABLE answer: refused, the caller stops',
       () => unavailableForms('ErrCallTimeout')[0]![1]('find-missing'),
       FIND_MISSING_REFUSED,
       'bypassing findMissing sweep refused for',
@@ -13640,7 +13634,7 @@ describe('b.jg5 SRJ-120: bypassing findMissing runs, the memo window on the sess
   })
 })
 
-describe('b.jg5 SRJ-120: a pending row a findMissing run put in neither list was not judged (readFindMissingRow)', () => {
+describe('a pending row a findMissing run put in neither list was not judged (readFindMissingRow)', () => {
   const ROW = personaInstanceId('C')
 
   test.each<[string, FindMissingRowPlacement, string, FindMissingRowReading]>([
@@ -13659,14 +13653,14 @@ describe('b.jg5 SRJ-120: a pending row a findMissing run put in neither list was
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-120 with SRJ-114, SRJ-501 and SRJ-502: the get after
+// with the get after
 // unverified_ids, and the callers' stop
 //
 // After a run the server makes (never a memo reuse), each configured
 // persona's own row (`cscb_<key>`, the key in the applied set) listed in
 // `unverified_ids` is read with one `get` before any caller awaiting the run
 // goes on, except the row of the starter's next-step key; a
-// `provenance_conflict` note there latches that persona (SRJ-114). Another
+// `provenance_conflict` note there latches that persona. Another
 // caller's row, the row of a key the applied set does not hold, and a row in
 // `ids` or in neither list get no `get`. A persona already latched when the
 // run is done (a latched query that throws counts as latched) is skipped: no
@@ -13676,12 +13670,12 @@ describe('b.jg5 SRJ-120: a pending row a findMissing run put in neither list was
 // and their line lists the personas in `unverified_ids` order. A failed `get`
 // of the caller's own row refuses the caller (the describe after these);
 // another persona's failed `get` is only logged. A persona latched by such a
-// `get` stops its caller's path: the b.4dk sweep before `resume` answers `latched`,
+// `get` stops its caller's path: the sweep before `resume` answers `latched`,
 // `checkPromptRowDeferral` answers `latched` with no `status` read, and the
 // working-row wait ends `latched` with nothing typed. Every case runs on
 // `makeRecoveryHarness` (the real latch, the configured-persona query over
 // the live applied set and the recording notice sinks, installed as `main()`
-// installs them), and `srj105AfterEach` runs `assertNoLeak` over what it
+// installs them), and `recoveryAfterEach` runs `assertNoLeak` over what it
 // captured.
 // ---------------------------------------------------------------------------
 
@@ -13698,19 +13692,19 @@ function getIds(h: RecoveryHarness): string[] {
 /** What the one line of a run's post-run gets lists: `persona=<key> <read|latched|absent|refused (…)|skipped (latched)>, …`. */
 function postRunReadsOf(h: RecoveryHarness): string {
   const marker = ' — one get of each configured persona\'s own row in unverified_ids: '
-  const lines = h.errors.filter((line) => line.includes(marker) && line.endsWith(' (b.jg5 SRJ-120)'))
+  const lines = h.errors.filter((line) => line.includes(marker))
   expect(lines).toHaveLength(1)
-  return lines[0]!.slice(lines[0]!.indexOf(marker) + marker.length, -' (b.jg5 SRJ-120)'.length)
+  return lines[0]!.slice(lines[0]!.indexOf(marker) + marker.length)
 }
 
 /** The refusal lines of a failed post-run get of the caller's own row, logged at `logPrefix` for `ref`. */
 function postRunGetRefusalLines(h: RecoveryHarness, logPrefix: string, ref: string): string[] {
-  return h.errors.filter((line) => line.startsWith(`[slack] ${logPrefix}: post-sweep get refused for ${ref}: `) && line.endsWith(' — no spawn-failure notice; nothing more is called (b.jg5 SRJ-105)'))
+  return h.errors.filter((line) => line.startsWith(`[slack] ${logPrefix}: post-sweep get refused for ${ref}: `) && line.endsWith(' — no spawn-failure notice; nothing more is called'))
 }
 
-/** Every refusal line (b.jg5 SRJ-105) the harness captured, at any site, for any persona. */
+/** Every refusal line the harness captured, at any site, for any persona. */
 function everyRefusalLine(h: RecoveryHarness): string[] {
-  return h.errors.filter((line) => line.endsWith(' — no spawn-failure notice; nothing more is called (b.jg5 SRJ-105)'))
+  return h.errors.filter((line) => line.endsWith(' — no spawn-failure notice; nothing more is called'))
 }
 
 /** The CONFLICT case-table row a launch meets to latch a persona before a run; its case is not the note's. */
@@ -13761,16 +13755,16 @@ const P_ROW_CALLERS: ReadonlyArray<readonly [string, (p: string) => Promise<unkn
   ['bypassingFindMissingSweep (a bypassing run), which answers FIND_MISSING_LATCHED', (p) => bypassingFindMissingSweep(p, BYPASS_SITE), FIND_MISSING_LATCHED],
 ]
 
-describe('b.jg5 SRJ-120, SRJ-114: after a run the server makes, one get of each configured persona\'s own row in unverified_ids; only a provenance_conflict note there latches, and only that persona', () => {
+describe('after a run the server makes, one get of each configured persona\'s own row in unverified_ids; only a provenance_conflict note there latches, and only that persona', () => {
   beforeEach(() => {
     _resetFindMissingMemo()
   })
-  afterEach(srj105AfterEach)
+  afterEach(recoveryAfterEach)
 
-  // Demo (E14, AC 85's note half): P's row in unverified_ids leads to one get,
+  // Demo (E14note half): P's row in unverified_ids leads to one get,
   // and a note there latches P.
   test.each(P_ROW_CALLERS)('demo: P\'s row in unverified_ids leads to one get, and a provenance_conflict note there latches P — through %s: findMissing, then exactly one get of P\'s own row before the caller goes on; P latched once with one CONFLICT notice', async (_caller, call, answer) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     scriptNotedRows(h, new Map([[p, { liveness_note: provenanceNote }]]))
     h.script({ findMissingResult: unverifiedRowsOf(p) })
     const order = recordCallOrder(h)
@@ -13783,7 +13777,7 @@ describe('b.jg5 SRJ-120, SRJ-114: after a run the server makes, one get of each 
   })
 
   test.each(PLAIN_NOTES)('%s on P\'s own row in unverified_ids: one get, nothing latched or posted, and the caller gets the run\'s result', async (_label, note) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     scriptNotedRows(h, new Map([[p, { liveness_note: note }]]))
     const result = unverifiedRowsOf(p)
     h.script({ findMissingResult: result })
@@ -13796,7 +13790,7 @@ describe('b.jg5 SRJ-120, SRJ-114: after a run the server makes, one get of each 
   })
 
   test('checkPromptRowDeferral past PROMPT_ROW_SWEEP_AFTER_MS, P\'s own row in unverified_ids with a non-latching note: the calls read findMissing, get, status; nothing latched; the check defers', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const clock = useFakeNow()
     scriptNotedRows(h, new Map([[p, { liveness_note: nonLatchingNotes[0] }]]))
     h.script({ findMissingResult: unverifiedRowsOf(p), statusResult: cannedStatusResult({ state: 'check_permission' }) })
@@ -13813,7 +13807,7 @@ describe('b.jg5 SRJ-120, SRJ-114: after a run the server makes, one get of each 
   })
 
   test('a run made for P that lists another configured persona\'s own row (B\'s) with the note: one get of B\'s row; B latches once, P does not, and P\'s caller gets the run\'s result', async () => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     scriptNotedRows(h, new Map([[b, { liveness_note: provenanceNote }]]))
     const result = unverifiedRowsOf(b)
     h.script({ findMissingResult: result })
@@ -13825,7 +13819,7 @@ describe('b.jg5 SRJ-120, SRJ-114: after a run the server makes, one get of each 
     expect(h.latch.isLatched(p)).toBe(false)
   })
 
-  // Demo (E14, AC 85's note half): another caller's row leads to no get and no latch.
+  // Demo (E14note half): another caller's row leads to no get and no latch.
   test.each<[string, (h: RecoveryHarness, p: string, b: string) => import('agent-director').FindMissingResult]>([
     ['demo: another caller\'s row in unverified_ids leads to no get and no latch (its id is no persona\'s)', () => cannedFindMissing({ rows: { [ANOTHER_CALLERS_ROW]: 'unverified_ids' } })],
     [
@@ -13838,7 +13832,7 @@ describe('b.jg5 SRJ-120, SRJ-114: after a run the server makes, one get of each 
     ['P\'s own row only in ids', (_h, p) => cannedFindMissing({ rows: { [personaInstanceId(p)]: 'ids' } })],
     ['P\'s own row in neither list', (_h, p) => cannedFindMissing({ rows: { [personaInstanceId(p)]: 'neither', [ANOTHER_CALLERS_ROW]: 'ids' } })],
   ])('%s: no get, no latch and no post, though every persona\'s row carries the note; the caller gets the run\'s result', async (_label, build) => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     scriptNotedRows(h, new Map([[p, { liveness_note: provenanceNote }], [b, { liveness_note: provenanceNote }]]))
     const result = build(h, p, b)
     h.script({ findMissingResult: result })
@@ -13852,7 +13846,7 @@ describe('b.jg5 SRJ-120, SRJ-114: after a run the server makes, one get of each 
   })
 
   test('a memo reuse makes no get: a second caller inside the window gets the memoized result with no findMissing call and no get, though the listed rows now carry the note', async () => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     const clock = useFakeNow()
     const notes = new Map<string, PersonaGetResultOverrides>()
     scriptNotedRows(h, notes)
@@ -13872,7 +13866,7 @@ describe('b.jg5 SRJ-120, SRJ-114: after a run the server makes, one get of each 
   })
 
   test('callers sharing one run make one get per listed configured row: B starts the run, B and P\'s prompt-row check join it; P latches once with one post, and P\'s joining check answers latched with no status read', async () => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     const clock = useFakeNow()
     scriptNotedRows(h, new Map([[p, { liveness_note: provenanceNote }]]))
     h.script({ statusResult: cannedStatusResult({ state: 'check_permission' }) })
@@ -13898,7 +13892,7 @@ describe('b.jg5 SRJ-120, SRJ-114: after a run the server makes, one get of each 
   })
 
   test('the next-step option: a bypassing run whose caller\'s next step is a get of P\'s row makes no get of it, while B\'s listed row gets its own and its note latches B', async () => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     scriptNotedRows(h, new Map([[p, { liveness_note: provenanceNote }], [b, { liveness_note: provenanceNote }]]))
     const result = unverifiedRowsOf(p, b)
     h.script({ findMissingResult: result })
@@ -13911,7 +13905,7 @@ describe('b.jg5 SRJ-120, SRJ-114: after a run the server makes, one get of each 
   })
 
   test('an already-latched persona is skipped: B, latched by a CONFLICT at its launch, has its own row with the note listed before P\'s in a run made for P: no get of B\'s row, B\'s latch record and case unchanged and nothing posted; P\'s listed row still gets its get; the run\'s line lists B as skipped in its place', async () => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     const before = await latchBeforeRun(h, b)
     scriptNotedRows(h, new Map([[b, { liveness_note: provenanceNote }]]))
     const result: import('agent-director').FindMissingResult = { count: 0, ids: [], unverified: 2, unverified_ids: [personaInstanceId(b), personaInstanceId(p)] }
@@ -13926,7 +13920,7 @@ describe('b.jg5 SRJ-120, SRJ-114: after a run the server makes, one get of each 
   })
 
   test('a latched query that throws for B counts as latched: B\'s listed row with the note gets no get and no latch call; P\'s listed row still gets its get, and P\'s caller gets the run\'s result', async () => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     // The harness's latch is read-only, so the case installs one of its own
     // whose latched query throws for B, as main() installs the server's latch.
     const own = createConflictLatch({ log: () => {} })
@@ -13960,7 +13954,7 @@ describe('b.jg5 SRJ-120, SRJ-114: after a run the server makes, one get of each 
   })
 
   test('every listed configured persona already latched (P and B, by CONFLICTs at their launches), each own row with the note: the run makes no get at all, relatches and posts nothing, and its line still lists each as skipped; P\'s caller gets FIND_MISSING_LATCHED', async () => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     const before = await latchBeforeRun(h, p, b)
     scriptNotedRows(h, new Map([[p, { liveness_note: provenanceNote }], [b, { liveness_note: provenanceNote }]]))
     h.script({ findMissingResult: unverifiedRowsOf(p, b) })
@@ -13974,7 +13968,7 @@ describe('b.jg5 SRJ-120, SRJ-114: after a run the server makes, one get of each 
   })
 
   test('an already-latched caller (P, latched by a CONFLICT at its launch) whose own row is listed: no get of P\'s row and the caller gets FIND_MISSING_LATCHED; B\'s listed row still gets its get', async () => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     const before = await latchBeforeRun(h, p)
     scriptNotedRows(h, new Map([[p, { liveness_note: provenanceNote }]]))
     h.script({ findMissingResult: unverifiedRowsOf(p, b) })
@@ -13987,15 +13981,15 @@ describe('b.jg5 SRJ-120, SRJ-114: after a run the server makes, one get of each 
     expect(postRunReadsOf(h)).toBe(`persona=${p} skipped (latched), persona=${b} read`)
   })
 
-  // b.jg5 SRJ-114, SRJ-105: the post-run get of the caller's own row is a get
+  // the post-run get of the caller's own row is a get
   // site; any error but ErrSpawnNotFound (and UNUSABLE NAME, below) refuses
   // the caller. The other listed row is read all the same, and the run's
   // result is memoized either way.
   test.each<[string, () => Error, boolean]>([
     ['ErrSpawnNotFound (the row is absent): the caller gets the run\'s result', () => errSpawnNotFound(), false],
-    ...SRJ105_UNAVAILABLE.map(([label, build]) => [`${label} (UNAVAILABLE): the caller is refused (FIND_MISSING_REFUSED) with one refusal line`, () => build('get'), true] as [string, () => Error, boolean]),
+    ...UNAVAILABLE_CASES.map(([label, build]) => [`${label} (UNAVAILABLE): the caller is refused (FIND_MISSING_REFUSED) with one refusal line`, () => build('get'), true] as [string, () => Error, boolean]),
   ])('the post-run get of the caller\'s (P\'s) own row answering %s; B\'s listed row is still read and its note latches B; P latches nothing and starts no tmux-unresponsive condition; the result is memoized, so an ordinary caller inside the window makes no second findMissing call', async (_label, err, refused) => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     const pId = personaInstanceId(p)
     const result = unverifiedRowsOf(p, b)
     h.script({
@@ -14018,12 +14012,12 @@ describe('b.jg5 SRJ-120, SRJ-114: after a run the server makes, one get of each 
     expect(getIds(h)).toHaveLength(2)
   })
 
-  // b.jg5 SRJ-512 (E14's hatch note): an UNUSABLE NAME answer at the post-run
+  // ( design note): an UNUSABLE NAME answer at the post-run
   // get of the caller's own row is no refusal: it latches P, the run's line
   // lists P latched, and P's caller stops (FIND_MISSING_LATCHED); B's listed
   // row is read all the same and B latches nothing.
   test.each(unusableNameRowsAt('get').map((row) => [row.name, row] as const))('the post-run get of the caller\'s (P\'s) own row answering UNUSABLE NAME (%s): P latched (unreadable) with one post, the caller gets FIND_MISSING_LATCHED, no refusal line; B\'s listed row is still read and B is not latched', async (_name, row) => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     const pId = personaInstanceId(p)
     h.script({
       findMissingResult: unverifiedRowsOf(p, b),
@@ -14044,7 +14038,7 @@ describe('b.jg5 SRJ-120, SRJ-114: after a run the server makes, one get of each 
   // The read's own answer stops the caller, not only the latch's query: with
   // no latch installed nothing is latched, and the caller still stops.
   test('with no latch installed, the post-run get of the caller\'s (P\'s) own row answering UNUSABLE NAME still stops the caller (FIND_MISSING_LATCHED), latching nothing; its line says no latch is installed', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     setConflictLatch(undefined)
     const pId = personaInstanceId(p)
     h.script({ findMissingResult: unverifiedRowsOf(p), getFn: (params) => (params.instance_id === pId ? errUnusableName() : errSpawnNotFound()) })
@@ -14061,9 +14055,9 @@ describe('b.jg5 SRJ-120, SRJ-114: after a run the server makes, one get of each 
   })
 
   test('the post-run get of another persona\'s (B\'s) own row failing (UNAVAILABLE) is only logged: P\'s caller gets the run\'s result; no refusal line for either persona; the run\'s line lists B refused', async () => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     const bId = personaInstanceId(b)
-    const [, unavailable] = SRJ105_UNAVAILABLE.find(([label]) => label.includes('ErrCallTimeout'))!
+    const [, unavailable] = UNAVAILABLE_CASES.find(([label]) => label.includes('ErrCallTimeout'))!
     const result = unverifiedRowsOf(p, b)
     h.script({
       findMissingResult: result,
@@ -14079,7 +14073,7 @@ describe('b.jg5 SRJ-120, SRJ-114: after a run the server makes, one get of each 
   })
 
   test('the post-run gets run at once: with two listed rows whose gets are held, both gets are made before either answers, and the run\'s line lists the personas in unverified_ids order, not in the order their gets answered', async () => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     // unverified_ids lists B's row before P's.
     const result: import('agent-director').FindMissingResult = { count: 0, ids: [], unverified: 2, unverified_ids: [personaInstanceId(b), personaInstanceId(p)] }
     h.script({ findMissingResult: result })
@@ -14102,7 +14096,7 @@ describe('b.jg5 SRJ-120, SRJ-114: after a run the server makes, one get of each 
   })
 
   test('a failed run makes no get: an UNUSABLE NAME findMissing answer reads no row', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     scriptNotedRows(h, new Map([[p, { liveness_note: provenanceNote }]]))
     h.script({ findMissingError: errUnusableName() })
 
@@ -14114,7 +14108,7 @@ describe('b.jg5 SRJ-120, SRJ-114: after a run the server makes, one get of each 
   })
 
   test('the start sweep\'s post-kill run (reconcileOrphans) listing a configured persona\'s own row with the note makes one get of it and latches that persona; its kill decisions are unchanged', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     scriptNotedRows(h, new Map([[p, { liveness_note: provenanceNote }]]))
     h.script({
       listResult: { spawns: [prePersonaRow('waiting')] },
@@ -14132,11 +14126,11 @@ describe('b.jg5 SRJ-120, SRJ-114: after a run the server makes, one get of each 
     expect(sweptRowBuckets(h.errors)).toEqual(['missing'])
   })
 
-  // b.jg5 SRJ-512, SRJ-1002: the start sweep acts for no persona, so an
+  // the start sweep acts for no persona, so an
   // UNUSABLE NAME answer to its post-run get is routed to the server log and
   // latches no one; the row-read rule still latches there (the control).
   test.each(unusableNameRowsAt('get').map((row) => [row.fault, row] as const))('the start sweep\'s post-kill run (reconcileOrphans) whose get of a configured persona\'s own row answers UNUSABLE NAME (%s): one routed line, nothing latched or posted, no refusal; the run\'s line lists that persona refused; its kill decisions are unchanged', async (_fault, row) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const err = row.build()
     h.script({
       listResult: { spawns: [prePersonaRow('waiting')] },
@@ -14151,7 +14145,7 @@ describe('b.jg5 SRJ-120, SRJ-114: after a run the server makes, one get of each 
     expect(getIds(h)).toEqual([personaInstanceId(p)])
     const failure = describeAdFailureForLog(err)
     expect(h.errors.filter((line) => line.includes(' — UNUSABLE NAME met in '))).toEqual([
-      `[slack] reconcileOrphans: post-sweep get for persona=${p}: ${failure} — UNUSABLE NAME met in the start sweep: routed to the server log; nothing latches (b.jg5 SRJ-512, SRJ-1002)`,
+      `[slack] reconcileOrphans: post-sweep get for persona=${p}: ${failure} — UNUSABLE NAME met in the start sweep: routed to the server log; nothing latches`,
     ])
     expect(postRunReadsOf(h)).toBe(`persona=${p} refused (${failure})`)
     expectNoNoteLatch(h)
@@ -14163,7 +14157,7 @@ describe('b.jg5 SRJ-120, SRJ-114: after a run the server makes, one get of each 
   })
 
   test('the control: the start sweep\'s post-kill run whose get reads a configured persona\'s own pending row with no launch start still latches that persona with "launch start not recorded" (one post); the run\'s line lists it latched', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const row = launchStartCurrentLifeOf('get')[0]!
     h.script({
       listResult: { spawns: [prePersonaRow('waiting')] },
@@ -14180,14 +14174,14 @@ describe('b.jg5 SRJ-120, SRJ-114: after a run the server makes, one get of each 
   })
 })
 
-describe('b.jg5 SRJ-120, SRJ-502: a persona latched by a run\'s get stops its caller\'s path', () => {
+describe('a persona latched by a run\'s get stops its caller\'s path', () => {
   beforeEach(() => {
     _resetFindMissingMemo()
   })
-  afterEach(srj105AfterEach)
+  afterEach(recoveryAfterEach)
 
-  test('the b.4dk path (the sweep before resume of a waiting row whose reconnect found a dead session): the run lists P\'s own row and its get reads the note: P latches, the launch answers latched, and no resume, kill, delete or spawn follows', async () => {
-    const { h, p } = srj105Build()
+  test('the path (the sweep before resume of a waiting row whose reconnect found a dead session): the run lists P\'s own row and its get reads the note: P latches, the launch answers latched, and no resume, kill, delete or spawn follows', async () => {
+    const { h, p } = buildRecoveryCase()
     const persona = harnessPersona(h, p)
     h.script({
       spawnQueue: [cannedErr(errInstanceIdCollision())],
@@ -14211,7 +14205,7 @@ describe('b.jg5 SRJ-120, SRJ-502: a persona latched by a run\'s get stops its ca
   })
 
   test('launchOnPromptRow (a check_permission row whose read-pane answers GONE): the sweep lists P\'s own row and its get reads the note: P latches and the launch answers latched, with no status read, resume, kill, delete or second spawn after the get', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     promptRowPanesGone(h)
     const persona = harnessPersona(h, p)
     h.script({
@@ -14233,7 +14227,7 @@ describe('b.jg5 SRJ-120, SRJ-502: a persona latched by a run\'s get stops its ca
   })
 
   test('checkPromptRowDeferral past PROMPT_ROW_SWEEP_AFTER_MS: the run lists P\'s own row and its get reads the note: P latches and the check answers latched, with no status read after the get', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const clock = useFakeNow()
     scriptNotedRows(h, new Map([[p, { liveness_note: provenanceNote }]]))
     h.script({ findMissingResult: unverifiedRowsOf(p), statusResult: cannedStatusResult({ state: 'check_permission' }) })
@@ -14251,32 +14245,32 @@ describe('b.jg5 SRJ-120, SRJ-502: a persona latched by a run\'s get stops its ca
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-114 with SRJ-105: the post-run get of the caller's own row is one
-// of SRJ-114's get sites, so its failure follows SRJ-105's get rule. When it
+// with the post-run get of the caller's own row is one
+// of the contract get sites, so its failure follows the contract get rule. When it
 // fails with an error other than ErrSpawnNotFound and UNUSABLE NAME, the
 // persona's caller, the run's starter or a joiner, is refused
 // (`FIND_MISSING_REFUSED`): one refusal line, its retry timer armed with the
 // cause, nothing counted, and no resume, kill, delete or launch. A joiner's
-// attempt sees the error under its own key (b.jg5 SRJ-301), since the get
+// attempt sees the error under its own key, since the get
 // ran in the starter's. An UNUSABLE NAME answer is no failed read: it latches
-// the persona (b.jg5 SRJ-512, unreadable), whose caller then stops
+// the persona (unreadable), whose caller then stops
 // (`FIND_MISSING_LATCHED`): no refusal line, nothing armed or counted, and
 // no resume, kill, delete or launch. Another persona's failed get only shows
 // in the run's line (above).
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-114, SRJ-105: a failed post-run get of the caller\'s own row stops the caller\'s attempt', () => {
+describe('a failed post-run get of the caller\'s own row stops the caller\'s attempt', () => {
   beforeEach(() => {
     _resetFindMissingMemo()
   })
-  afterEach(srj105AfterEach)
+  afterEach(recoveryAfterEach)
 
-  const [callTimeoutLabel, callTimeout, callTimeoutKind] = SRJ105_UNAVAILABLE.find(([label]) => label.includes('ErrCallTimeout'))!
+  const [callTimeoutLabel, callTimeout, callTimeoutKind] = UNAVAILABLE_CASES.find(([label]) => label.includes('ErrCallTimeout'))!
 
-  // The b.4dk path: a waiting row whose reconnect found its session dead runs
+  // The path: a waiting row whose reconnect found its session dead runs
   // the sweep before `resume`; its run lists P's own row, and the post-run
   // get of that row fails.
-  /** The b.4dk path's stub answers: a waiting row whose reconnect finds its session dead, its run listing P's own row, and P's post-run get answering `err`. */
+  /** The path's stub answers: a waiting row whose reconnect finds its session dead, its run listing P's own row, and P's post-run get answering `err`. */
   function b4dkPostRunGet(h: RecoveryHarness, p: string, err: Error): RecoveryStubScript {
     return {
       spawnQueue: [cannedErr(errInstanceIdCollision())],
@@ -14286,8 +14280,8 @@ describe('b.jg5 SRJ-114, SRJ-105: a failed post-run get of the caller\'s own row
     }
   }
 
-  test(`the b.4dk path (the sweep before resume), P's own post-run get answering ${callTimeoutLabel} (UNAVAILABLE): refused, no resume, kill, delete or spawn`, async () => {
-    const { h, p } = srj105Build()
+  test(`the path (the sweep before resume), P's own post-run get answering ${callTimeoutLabel} (UNAVAILABLE): refused, no resume, kill, delete or spawn`, async () => {
+    const { h, p } = buildRecoveryCase()
     h.script(b4dkPostRunGet(h, p, callTimeout('get')))
     const order = recordCallOrder(h)
 
@@ -14305,10 +14299,10 @@ describe('b.jg5 SRJ-114, SRJ-105: a failed post-run get of the caller\'s own row
     expectNoNoteLatch(h)
   })
 
-  // b.jg5 SRJ-512 at E14's get after unverified_ids: the UNUSABLE NAME row is
+  // at get after unverified_ids: the UNUSABLE NAME row is
   // a latch, not a refusal, and the resume does not go on.
-  test.each(unusableNameRowsAt('get').map((row) => [row.name, row] as const))('the b.4dk path (the sweep before resume), P\'s own post-run get answering UNUSABLE NAME (%s): P latched (unreadable), the launch answers latched with no resume, kill, delete or spawn after the get; no refusal line, nothing armed or counted; one post', async (_name, row) => {
-    const { h, p, b } = srj105Build()
+  test.each(unusableNameRowsAt('get').map((row) => [row.name, row] as const))('the path (the sweep before resume), P\'s own post-run get answering UNUSABLE NAME (%s): P latched (unreadable), the launch answers latched with no resume, kill, delete or spawn after the get; no refusal line, nothing armed or counted; one post', async (_name, row) => {
+    const { h, p, b } = buildRecoveryCase()
     const script = b4dkPostRunGet(h, p, row.build())
     h.script(script)
     const order = recordCallOrder(h)
@@ -14328,7 +14322,7 @@ describe('b.jg5 SRJ-114, SRJ-105: a failed post-run get of the caller\'s own row
   })
 
   test(`a joiner (B) whose own post-run get answers ${callTimeoutLabel} (UNAVAILABLE): P started the prompt-row sweep and B joined it; one findMissing call; B is refused under its own key (its attempt sees the error: armed once with the cause, never counted, no tmux-unresponsive condition) with no resume, kill, delete or launch; P, whose own get read its row, goes on (no-op: its row still reads check_permission)`, async () => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     const err = callTimeout('get')
 
     const [pResult, bResult] = await launchBothThroughOneSweep(h, p, b, unverifiedRowsOf(p, b), new Map([[b, err]]))
@@ -14351,7 +14345,7 @@ describe('b.jg5 SRJ-114, SRJ-105: a failed post-run get of the caller\'s own row
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-105's UNUSABLE NAME row, SRJ-512, SRJ-501, SRJ-502 (E16): an
+// UNUSABLE NAME row: an
 // UNUSABLE NAME answer (an `ErrInternal` naming "the recorded tmux session
 // name") from a verb on P's own row latches P with "unusable recorded name",
 // the refused operation "none" and the row state its path last read (a
@@ -14364,23 +14358,23 @@ describe('b.jg5 SRJ-114, SRJ-105: a failed post-run get of the caller\'s own row
 // makes no read, so it never meets the answer), the
 // shared own-row `status` read and its sites (the wait's poll and timeout
 // reads, `reconcileAndReadRowState`, the retry timer's row read, the
-// latch-time read) and E14's shared own-row `get` read at its callers (the
+// latch-time read) and shared own-row `get` read at its callers (the
 // collision `get`, the ErrJsonlMissing diagnosis `get`, the transcript `get`
 // and the post-run `get` after `unverified_ids`, the last in the find-missing
 // describes above). Nothing is called after the answer: no delete, kill,
 // spawn, `resume`, pane read or keystroke; no spawn-failure
 // notice, `spawn-failed` entry or counted failure; no `tmux-unresponsive`
-// onset and no unclassified-error episode; one SRJ-1019 post after the holds.
+// onset and no unclassified-error episode; one post after the holds.
 // Each case takes `UNUSABLE_NAME_CASE_ROWS` for its site kind
 // (`tests/test-helpers/conflict-cases.ts`): every fault at each read site,
 // and at the ladder's sites one fault per site, in turn, so every fault the
 // stub builds is met at some site of each kind (a fault changes only the
 // description, checked per fault in `tests/conflict-latch.test.ts`).
-// Controls: a phrase-less `ErrInternal` keeps E12's
+// Controls: a phrase-less `ErrInternal` keeps
 // UNCLASSIFIED handling, the persona teardown's kill and delete still rethrow
 // and latch nothing, and B launches beside a latched P. Every case runs on
 // `makeRecoveryHarness` (its latch and configured-persona query installed as
-// `main()` installs them); `srj105AfterEach` runs `assertNoLeak` over what it
+// `main()` installs them); `recoveryAfterEach` runs `assertNoLeak` over what it
 // captured, and the file's `afterEach` clears the session notifier, the latch
 // install and the configured-persona query.
 // ---------------------------------------------------------------------------
@@ -14395,8 +14389,7 @@ function unusableNameLinesOf(h: RecoveryHarness, key: string): string[] {
   return h.errors.filter(
     (line) =>
       line.includes(' — UNUSABLE NAME: ') &&
-      (line.includes(` for ${renderPersonaRef(key, key)}: `) || line.includes(` for persona=${key}: `)) &&
-      line.endsWith('(b.jg5 SRJ-105, SRJ-512)'),
+      (line.includes(` for ${renderPersonaRef(key, key)}: `) || line.includes(` for persona=${key}: `)),
   )
 }
 
@@ -14410,8 +14403,8 @@ interface UnusableLadderSite extends Omit<LatchSite, 'verb'> {
 
 /**
  * Every ladder site: each spawn (`plain spawn`, or `reuse spawn` at a reuse
- * site, the replacement sites' among them) and `resume` of E13's CONFLICT
- * sites. The ladder makes no kill and no delete (b.jg5 SRJ-707); the
+ * site, the replacement sites' among them) and `resume` of CONFLICT
+ * sites. The ladder makes no kill and no delete; the
  * live-row sequence's kills' UNUSABLE NAME rows are
  * tests/conflict-latch.test.ts's.
  */
@@ -14433,11 +14426,11 @@ const UNUSABLE_LADDER_CROSS = UNUSABLE_LADDER_SITES.map((site, i) => {
   return [site.name, row.fault, site, row] as const
 })
 
-describe('b.jg5 SRJ-105, SRJ-512, SRJ-501, SRJ-502: an UNUSABLE NAME answer at a spawn or resume of the collision ladder latches the persona; nothing else is done for it', () => {
-  afterEach(srj105AfterEach)
+describe('an UNUSABLE NAME answer at a spawn or resume of the collision ladder latches the persona; nothing else is done for it', () => {
+  afterEach(recoveryAfterEach)
 
   test.each(UNUSABLE_LADDER_CROSS)('%s answering UNUSABLE NAME (%s): latched with "unusable recorded name", "none" and the state the path last read (one latch-time status read only where it read nothing); the refused call is the last; one post after the holds; nothing counted, posted as a spawn failure, armed or started; then no launch path reaches agent-director; B launches', async (_site, _fault, site, row) => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     const persona = harnessPersona(h, p)
     site.setup?.(h)
     const script = site.script(h, persona, row.build(), row)
@@ -14457,11 +14450,11 @@ describe('b.jg5 SRJ-105, SRJ-512, SRJ-501, SRJ-502: an UNUSABLE NAME answer at a
     await expectLaunchedByNoPath(h, p, b, script)
   })
 
-  // SRJ-1015: launchSession answers 'skipped' for a launch that latches on an
+  // launchSession answers 'skipped' for a launch that latches on an
   // UNUSABLE NAME answer, as for a CONFLICT: never counted, no spawn-failure
   // notice. One site of each kind.
-  test.each(UNUSABLE_LADDER_SITES.filter((site, i, all) => all.findIndex((s) => s.kind === site.kind) === i).map((site) => [site.kind, site] as const))('b.jg5 SRJ-1015: launchSession whose launch meets UNUSABLE NAME at the first %s site answers \'skipped\': P latched, nothing counted, no spawn-failure notice, one post', async (_kind, site) => {
-    const { h, p } = srj105Build()
+  test.each(UNUSABLE_LADDER_SITES.filter((site, i, all) => all.findIndex((s) => s.kind === site.kind) === i).map((site) => [site.kind, site] as const))('launchSession whose launch meets UNUSABLE NAME at the first %s site answers \'skipped\': P latched, nothing counted, no spawn-failure notice, one post', async (_kind, site) => {
+    const { h, p } = buildRecoveryCase()
     const row = unusableNameRowsAt(site.kind)[0]!
     site.setup?.(h)
     h.script(site.script(h, harnessPersona(h, p), row.build(), row))
@@ -14475,8 +14468,8 @@ describe('b.jg5 SRJ-105, SRJ-512, SRJ-501, SRJ-502: an UNUSABLE NAME answer at a
     expect(h.episodeNotices.filter((n) => n.key === p)).toEqual([{ key: p, text: row.notice(p) }])
   })
 
-  test('b.jg5 SRJ-502, SRJ-1015: a persona latched on an UNUSABLE NAME answer during the start pass is listed latched and counted neither failed nor succeeded, with no spawn-failed entry; B is counted', async () => {
-    const { h, p, b } = srj105Build()
+  test('a persona latched on an UNUSABLE NAME answer during the start pass is listed latched and counted neither failed nor succeeded, with no spawn-failed entry; B is counted', async () => {
+    const { h, p, b } = buildRecoveryCase()
     const row = unusableNameRowsAt('plain spawn')[0]!
     const pId = personaInstanceId(p)
     h.script({
@@ -14497,12 +14490,12 @@ describe('b.jg5 SRJ-105, SRJ-512, SRJ-501, SRJ-502: an UNUSABLE NAME answer at a
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-1002, SRJ-501, SRJ-512 (t3.b6r.eg.r1.j3): a CONFLICT or an
+// a CONFLICT or an
 // UNUSABLE NAME met at a launch for a key the configured-persona query no
 // longer holds (an apply removed it while its launch ran) latches nothing:
 // no latch-time read, no latch entry, no post, no episode; the site's one
 // line carries `notConfiguredLatchOutcome`'s outcome, and no startup-errors
-// entry is written (SRJ-1013 has no class for it). The same answer for an
+// entry is written (has no class for it). The same answer for an
 // applied key beside it latches as before, and with no configured-persona
 // query installed, or one that throws, the removed key latches as before.
 // Two launch sites: the first spawn (which read nothing, so a latch would
@@ -14521,7 +14514,7 @@ const NOT_CONFIGURED_UNUSABLE_SITES: readonly UnusableLadderSite[] = [
 
 /**
  * P, no longer configured, met a latching answer at `site` and was routed
- * log-only (b.jg5 SRJ-1002): the launch made exactly the site's calls and no
+ * log-only: the launch made exactly the site's calls and no
  * latch-time read; P has no latch entry, no latch event and no post of any
  * kind; nothing was counted, armed, refused or reported; no startup-errors
  * entry of any class was written; and its one line of the answer's kind
@@ -14542,12 +14535,12 @@ function expectNotConfiguredRouted(h: RecoveryHarness, p: string, site: Pick<Lat
   assertNoLeak({ lines })
 }
 
-describe('b.jg5 SRJ-1002, SRJ-501, SRJ-512: a launch-site CONFLICT or UNUSABLE NAME for a key no longer in the applied configuration latches nothing, posts nothing and writes one line and no startup-errors entry; an applied key beside it latches', () => {
-  afterEach(srj105AfterEach)
+describe('a launch-site CONFLICT or UNUSABLE NAME for a key no longer in the applied configuration latches nothing, posts nothing and writes one line and no startup-errors entry; an applied key beside it latches', () => {
+  afterEach(recoveryAfterEach)
 
   const conflictCross = NOT_CONFIGURED_CONFLICT_SITES.flatMap((site) => conflictRowsAt(site).map((row) => [site.name, row.name, site, row] as const))
   test.each(conflictCross)('%s answering %s for P, which the configured-persona query no longer holds: answered latched with no latch-time read; nothing latched or posted; one CONFLICT line naming the case and the refused operation as not configured; no startup-errors entry. Then B, applied, meets the same answer and latches once', async (_site, _row, site, row) => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     setConfiguredPersonaQuery((key) => key === b)
     site.setup?.(h)
     h.script(site.script(h, harnessPersona(h, p), row.build(), row))
@@ -14564,7 +14557,7 @@ describe('b.jg5 SRJ-1002, SRJ-501, SRJ-512: a launch-site CONFLICT or UNUSABLE N
 
   const unusableCross = NOT_CONFIGURED_UNUSABLE_SITES.flatMap((site) => unusableNameRowsAt(site.kind).map((row) => [site.name, row.fault, site, row] as const))
   test.each(unusableCross)('%s answering UNUSABLE NAME (%s) for P, which the configured-persona query no longer holds: answered latched with no latch-time read; nothing latched or posted; one UNUSABLE NAME line saying not configured; no startup-errors entry. Then B, applied, meets the same answer and latches once', async (_site, _fault, site, row) => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     setConfiguredPersonaQuery((key) => key === b)
     site.setup?.(h)
     h.script(site.script(h, harnessPersona(h, p), row.build(), row))
@@ -14581,7 +14574,7 @@ describe('b.jg5 SRJ-1002, SRJ-501, SRJ-512: a launch-site CONFLICT or UNUSABLE N
 
   // With no configured-persona query installed, or one that throws, the guard
   // is not met: P latches exactly as a configured persona does; a throwing
-  // query logs one line naming P and the thrown value (b.jg5 SRJ-1002).
+  // query logs one line naming P and the thrown value.
   const QUERY_BROKEN = new Error('configured query broken')
   const queries: ReadonlyArray<readonly [string, () => void, number]> = [
     ['no configured-persona query is installed', () => setConfiguredPersonaQuery(undefined), 0],
@@ -14591,7 +14584,7 @@ describe('b.jg5 SRJ-1002, SRJ-501, SRJ-512: a launch-site CONFLICT or UNUSABLE N
   const queryFailedLinesOf = (h: RecoveryHarness, p: string): string[] =>
     h.errors.filter((line) => line === latchEntryQueryFailedLine(p, describeThrownValue(QUERY_BROKEN)))
   test.each(queries)('control, %s: a CONFLICT at the first spawn latches P as before, with its latch-time read and one post', async (_label, install, queryFailed) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     install()
     const site = LATCH_SPAWN_SITES[0]!
     const row = conflictRowsAt(site)[0]!
@@ -14606,7 +14599,7 @@ describe('b.jg5 SRJ-1002, SRJ-501, SRJ-512: a launch-site CONFLICT or UNUSABLE N
   })
 
   test.each(queries)('control, %s: an UNUSABLE NAME at the first spawn latches P as before, with its latch-time read and one post', async (_label, install, queryFailed) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     install()
     const site = NOT_CONFIGURED_UNUSABLE_SITES[0]!
     const row = unusableNameRowsAt(site.kind)[0]!
@@ -14621,14 +14614,14 @@ describe('b.jg5 SRJ-1002, SRJ-501, SRJ-512: a launch-site CONFLICT or UNUSABLE N
   })
 })
 
-// b.jg5 SRJ-502, SRJ-1014: the latched gate's line (`latchedLaunchSkipLine`),
+// the latched gate's line (`latchedLaunchSkipLine`),
 // for a persona latched with a readable record: each launch path logs it once,
 // naming the latch's case, and calls nothing.
-describe('b.jg5 SRJ-502, SRJ-1014: the latched gate logs one latched-launch-skip line per skipped launch', () => {
-  afterEach(srj105AfterEach)
+describe('the latched gate logs one latched-launch-skip line per skipped launch', () => {
+  afterEach(recoveryAfterEach)
 
   test('P latched on a CONFLICT: the start pass\'s launch, the restart path\'s and launchSession each log latchedLaunchSkipLine with the latch\'s case and make no call', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const site = LATCH_SPAWN_SITES[0]!
     const row = conflictRowsAt(site)[0]!
     const script = site.script(h, harnessPersona(h, p), row.build(), row)
@@ -14651,11 +14644,8 @@ describe('b.jg5 SRJ-502, SRJ-1014: the latched gate logs one latched-launch-skip
 
 /** A full read of P's own row by the direct cases, recording `lastRead` on a latch. */
 
-/** The SRJ each latch kind's reader line cites. */
-const PANE_LATCH_SRJ = { 'CONFLICT': 'SRJ-501', 'UNUSABLE NAME': 'SRJ-512' } as const
-
 /** A latch the shared reader sets: on a CONFLICT or an UNUSABLE NAME answer. */
-type PaneLatchKind = keyof typeof PANE_LATCH_SRJ
+type PaneLatchKind = 'CONFLICT' | 'UNUSABLE NAME'
 
 /** The shared reader's latch lines of `kind` for persona `key` at `site`, in `lines`. */
 function paneReadLatchLinesOf(lines: readonly string[], key: string, kind: PaneLatchKind, site: string): string[] {
@@ -14663,7 +14653,7 @@ function paneReadLatchLinesOf(lines: readonly string[], key: string, kind: PaneL
     (line) =>
       line.startsWith(`[slack] ${site}: pane read refused for persona=${key}: `) &&
       line.includes(` — ${kind}: `) &&
-      line.endsWith(`; nothing is typed and nothing more is called for it (b.jg5 SRJ-105, ${PANE_LATCH_SRJ[kind]})`),
+      line.endsWith(`; nothing is typed and nothing more is called for it`),
   )
 }
 
@@ -14696,10 +14686,10 @@ function paneUnusableNameLatch(p: string, row: UnusableNameCaseRow, rowState: La
 /** The stub's UNAVAILABLE forms a `read-pane` can answer (every one but the kill-only `ErrTmuxKillFailed`). */
 const PANE_UNAVAILABLE_FORMS = UNAVAILABLE_FORMS.filter(([, , cause]) => cause !== UNAVAILABLE_RETRY_CAUSE_KILL_FAILED)
 
-/** The outage class an ENVIRONMENT answer raises (b.jg5 SRJ-311). */
+/** The outage class an ENVIRONMENT answer raises. */
 const TMUX_UNAVAILABLE_CLASS: OutageClass = 'tmux-unavailable'
 
-/** The outage class a CONFIG answer raises (b.jg5 SRJ-316). */
+/** The outage class a CONFIG answer raises. */
 const AD_CONFIG_MALFORMED_CLASS: OutageClass = 'ad-config-malformed'
 
 /** The UNUSABLE NAME row of the `read-pane` site kind for each fault the stub builds. */
@@ -14717,8 +14707,8 @@ const PANE_UNCLASSIFIED_ANSWERS: ReadonlyArray<readonly [string, () => Error]> =
 ]
 
 // ---------------------------------------------------------------------------
-// b.jdc, b.jg5 SRJ-607 (SRJ-117's ladder-action column, with SRJ-501,
-// SRJ-502, SRJ-512): the collision ladder's action on a row waiting on a
+// (ladder-action column, with,
+//): the collision ladder's action on a row waiting on a
 // prompt (`launchOnPromptRow`).
 //
 // /ci-live run 6: persona A's session was killed while its row read
@@ -14732,13 +14722,13 @@ const PANE_UNCLASSIFIED_ANSWERS: ReadonlyArray<readonly [string, () => Error]> =
 // read again; `missing` → recovered through resume/fresh-spawn, while a row
 // still in its prompt state is left as it is. A pane, UNAVAILABLE,
 // UNCLASSIFIED, CONFIG and ENVIRONMENT (the last two raising their outage
-// once) are no action: nothing is ever typed into a prompt (b.rmy). CONFLICT
+// once) are no action: nothing is ever typed into a prompt. CONFLICT
 // (the case table's ladder-action rows) and UNUSABLE NAME latch P with the
 // prompt state, and no launch path reaches P again. One case per cell, for
 // each prompt state, on `makeRecoveryHarness`: P's launch goes through the
 // real `spawnForPersona` as the start pass makes it, its optimistic spawn
 // colliding and its collision `get` reading the prompt state, with every
-// stub verb in order (`recordCallOrder`); `srj105AfterEach` runs
+// stub verb in order (`recordCallOrder`); `recoveryAfterEach` runs
 // `assertNoLeak`. Cases marked
 // REPRO fail on the code before the fix.
 // ---------------------------------------------------------------------------
@@ -14788,22 +14778,22 @@ function linesEqualTo(h: RecoveryHarness, line: string): number {
   return h.errors.filter((l) => l === line).length
 }
 
-/** The `read-pane` answers the ladder takes as alive (b.jg5 SRJ-117, SRJ-105): each UNAVAILABLE form and each UNCLASSIFIED answer. */
+/** The `read-pane` answers the ladder takes as alive: each UNAVAILABLE form and each UNCLASSIFIED answer. */
 const PROMPT_ROW_TAKEN_AS_ALIVE: ReadonlyArray<readonly [string, () => Error]> = [
   ...PANE_UNAVAILABLE_FORMS.map(([label, make]) => [`UNAVAILABLE: ${label}`, () => make('read-pane')] as const),
   ...PANE_UNCLASSIFIED_ANSWERS.map(([label, make]) => [`UNCLASSIFIED: ${label}`, make] as const),
 ]
 
-/** The `read-pane` answers that raise P's outage and are otherwise no action (b.jg5 SRJ-316, SRJ-311): [label, answer, outage class, onset text]. */
+/** The `read-pane` answers that raise P's outage and are otherwise no action: [label, answer, outage class, onset text]. */
 const PROMPT_ROW_OUTAGE_ANSWERS: ReadonlyArray<readonly [string, () => Error, OutageClass, (err: Error) => string]> = [
   ['CONFIG (ErrConfigMalformed)', () => errConfigMalformed(), AD_CONFIG_MALFORMED_CLASS, (err) => adConfigMalformedOnset(err as Parameters<typeof adConfigMalformedOnset>[0])],
-  ...SRJ311_ENVIRONMENT.map(([what, make, onset]) => [`ENVIRONMENT: ${what}`, () => make('read-pane'), TMUX_UNAVAILABLE_CLASS, () => onset] as const),
+  ...ENVIRONMENT_CASES.map(([what, make, onset]) => [`ENVIRONMENT: ${what}`, () => make('read-pane'), TMUX_UNAVAILABLE_CLASS, () => onset] as const),
 ]
 
 /**
  * The `read-pane` answers that find no pane of the row's launch: GONE, and
- * the row absent (which takes the GONE column, b.jg5 SRJ-117), each with the
- * cause its recovery route carries (b.jg5 SRJ-611: GONE is dead evidence, an
+ * the row absent (which takes the GONE column), each with the
+ * cause its recovery route carries (GONE is dead evidence, an
  * absent row is a row read and is not).
  */
 const PROMPT_ROW_NO_PANE: ReadonlyArray<readonly [string, (key: string) => Error, DeadSessionCause]> = [
@@ -14816,7 +14806,7 @@ function forEachPromptState<T extends readonly unknown[]>(cells: ReadonlyArray<T
   return PROMPT_STATES.flatMap((state) => cells.map((cell) => [state, ...cell] as const))
 }
 
-describe('b.jdc, b.jg5 SRJ-117, SRJ-607: the collision ladder\'s action on a prompt row (launchOnPromptRow): one one-line read-pane, one case per cell', () => {
+describe('the collision ladder\'s action on a prompt row (launchOnPromptRow): one one-line read-pane, one case per cell', () => {
   /** The exit codes the installed version re-check stopped with. */
   let stops: number[]
 
@@ -14826,13 +14816,13 @@ describe('b.jdc, b.jg5 SRJ-117, SRJ-607: the collision ladder\'s action on a pro
 
   afterEach(() => {
     resetAdVersionRecheckForTests()
-    srj105AfterEach()
+    recoveryAfterEach()
   })
 
-  // SRJ-607's literal (the SRD's `n_lines` 1 for this site): the one pinned
+  // literal (the contract's `n_lines` 1 for this site): the one pinned
   // count; every other case takes it from `PROBE_PANE_READ_LINES`.
-  test('SRJ-607: the ladder\'s read-pane of a prompt row asks for exactly 1 line of P\'s own row', async () => {
-    const { h, p } = srj105Build()
+  test('the ladder\'s read-pane of a prompt row asks for exactly 1 line of P\'s own row', async () => {
+    const { h, p } = buildRecoveryCase()
 
     await launchOnPromptRow(h, p, promptRowLaunch(h, p, 'check_permission'))
 
@@ -14840,7 +14830,7 @@ describe('b.jdc, b.jg5 SRJ-117, SRJ-607: the collision ladder\'s action on a pro
   })
 
   test.each(PROMPT_STATES)('a %s row whose read-pane answers a pane → no-op: one one-line read-pane of P\'s own row, the last call; no sweep, resume or keystroke; the no-action line; nothing latched, counted or posted', async (state) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
 
     const { result, order } = await launchOnPromptRow(h, p, promptRowLaunch(h, p, state))
 
@@ -14853,8 +14843,8 @@ describe('b.jdc, b.jg5 SRJ-117, SRJ-607: the collision ladder\'s action on a pro
     expect(h.notices).toEqual([])
   })
 
-  test.each(forEachPromptState(PROMPT_ROW_NO_PANE).flatMap((cell) => [...AGENT_DIRECTOR_DEAD_STATES].map((after) => [...cell, after] as const)))('REPRO: a %s row whose session died with the prompt open, its read-pane answering %s → one findMissing sweep and a re-read; the row reads %s → resumed (one resume, no kill, delete or second spawn), the sweep the one find-missing right before it; nothing typed, no notice, nothing counted; the verdict\'s line (its builder\'s), the route\'s line naming its cause and dead-evidence answer (b.jg5 SRJ-611) and no no-action line', async (state, _label, build, cause, after) => {
-    const { h, p } = srj105Build()
+  test.each(forEachPromptState(PROMPT_ROW_NO_PANE).flatMap((cell) => [...AGENT_DIRECTOR_DEAD_STATES].map((after) => [...cell, after] as const)))('REPRO: a %s row whose session died with the prompt open, its read-pane answering %s → one findMissing sweep and a re-read; the row reads %s → resumed (one resume, no kill, delete or second spawn), the sweep the one find-missing right before it; nothing typed, no notice, nothing counted; the verdict\'s line (its builder\'s), the route\'s line naming its cause and dead-evidence answer and no no-action line', async (state, _label, build, cause, after) => {
+    const { h, p } = buildRecoveryCase()
     const err = build(p)
 
     const { result, order } = await launchOnPromptRow(h, p, promptRowLaunch(h, p, state, { answer: cannedErr(err), afterSweep: after }))
@@ -14868,7 +14858,7 @@ describe('b.jdc, b.jg5 SRJ-117, SRJ-607: the collision ladder\'s action on a pro
     expect(h.notices).toEqual([])
     expect(getFailureCount(p)).toBe(0)
     expect(linesEqualTo(h, promptRowLadderNoPaneLine(renderPersonaRef(p, p), state, paneReadFailureOf(err)))).toBe(1)
-    // b.jg5 SRJ-611 (dead evidence covers one life): the re-read found the row
+    // (dead evidence covers one life): the re-read found the row
     // finished, which voids a GONE; the route's line says so, and one voided
     // line names it. An absent row's cause is no dead evidence: nothing voided.
     const ref = renderPersonaRef(p, p)
@@ -14885,7 +14875,7 @@ describe('b.jdc, b.jg5 SRJ-117, SRJ-607: the collision ladder\'s action on a pro
     ['at a non-zero session_restart_delay: the health check\'s restart retries it', 60, 'the health check\'s restart retries it'],
     ['at session_restart_delay 0: nothing retries it before the next server start', 0, 'session_restart_delay is 0, so nothing retries it before the next server start'],
   ])('a check_permission row whose read-pane answers GONE but that still reads check_permission after the sweep → no-op, %s: one sweep, nothing resumed, killed, deleted or typed; the after-sweep line (its builder\'s)', async (_label, delay, next) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     h.config.session_restart_delay = delay
     const err = errTmuxCaptureFailed(personaTmuxSessionName(p))
 
@@ -14898,11 +14888,11 @@ describe('b.jdc, b.jg5 SRJ-117, SRJ-607: the collision ladder\'s action on a pro
     expect(linesEqualTo(h, promptRowLadderAfterSweepLine(renderPersonaRef(p, p), paneReadFailureOf(err), 'check_permission', next))).toBe(1)
   })
 
-  // b.jg5 SRJ-117: the row absent at the pane read takes the GONE column,
+  // the row absent at the pane read takes the GONE column,
   // and its after-sweep line says the row was absent, not that no pane was
   // found.
   test('an ask_user row whose read-pane finds the row absent (ErrSpawnNotFound) but that still reads ask_user after the sweep → no-op at a non-zero session_restart_delay: one sweep, nothing resumed, killed, deleted or typed; the after-sweep line with the absent wording (its builder\'s)', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     h.config.session_restart_delay = 60
     const err = errSpawnNotFound()
 
@@ -14917,7 +14907,7 @@ describe('b.jdc, b.jg5 SRJ-117, SRJ-607: the collision ladder\'s action on a pro
   })
 
   test.each(forEachPromptState(PROMPT_ROW_TAKEN_AS_ALIVE))('a %s row, its read-pane answering %s → taken as alive: no-op with one line naming the class; the read-pane the last call, no sweep, resume or keystroke; nothing latched, counted or posted', async (state, _label, make) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const err = make()
 
     const { result, order } = await launchOnPromptRow(h, p, promptRowLaunch(h, p, state, { answer: cannedErr(err) }))
@@ -14932,7 +14922,7 @@ describe('b.jdc, b.jg5 SRJ-117, SRJ-607: the collision ladder\'s action on a pro
   })
 
   test.each(forEachPromptState(PROMPT_ROW_OUTAGE_ANSWERS))('a %s row, its read-pane answering %s → no-op with its outage raised once (one onset) and one line naming the class; the read-pane the last call, no sweep, resume or keystroke; nothing latched or counted, no spawn-failure notice', async (state, _label, make, outageClass, onset) => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     const err = make()
 
     const { result, order } = await launchOnPromptRow(h, p, promptRowLaunch(h, p, state, { answer: cannedErr(err) }))
@@ -14949,7 +14939,7 @@ describe('b.jdc, b.jg5 SRJ-117, SRJ-607: the collision ladder\'s action on a pro
   })
 
   test.each(PROMPT_STATES.flatMap((state) => promptRowPaneConflictRowsAt('prompt-row ladder action', state).map((row) => [row.name, state, row] as const)))('CONFLICT at %s → latched: P latched once with that state and "P\'s next check or recovery", one post; the read-pane the last call, no sweep or resume; one ladder line; no launch path reaches P again (launchSession answers skipped); B launches', async (_name, state, row) => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     const script = promptRowLaunch(h, p, state, { answer: cannedErr(row.build()), afterSweep: 'missing' })
 
     const { result, order } = await launchOnPromptRow(h, p, script)
@@ -14961,8 +14951,8 @@ describe('b.jdc, b.jg5 SRJ-117, SRJ-607: the collision ladder\'s action on a pro
     await expectLaunchedByNoPath(h, p, b, script)
   })
 
-  test.each(forEachPromptState(PANE_UNUSABLE_NAME_ROWS.map((row) => [row.fault, row] as const)))('a %s row, its read-pane answering UNUSABLE NAME (%s) → latched: P latched once with "unusable recorded name", "none" and that state, one SRJ-1019 post; the read-pane the last call, no further call; one ladder line; no launch path reaches P again; B launches', async (state, _fault, row) => {
-    const { h, p, b } = srj105Build()
+  test.each(forEachPromptState(PANE_UNUSABLE_NAME_ROWS.map((row) => [row.fault, row] as const)))('a %s row, its read-pane answering UNUSABLE NAME (%s) → latched: P latched once with "unusable recorded name", "none" and that state, one post; the read-pane the last call, no further call; one ladder line; no launch path reaches P again; B launches', async (state, _fault, row) => {
+    const { h, p, b } = buildRecoveryCase()
     const script = promptRowLaunch(h, p, state, { answer: cannedErr(row.build()), afterSweep: 'missing' })
 
     const { result, order } = await launchOnPromptRow(h, p, script)
@@ -14974,7 +14964,7 @@ describe('b.jdc, b.jg5 SRJ-117, SRJ-607: the collision ladder\'s action on a pro
     await expectLaunchedByNoPath(h, p, b, script)
   })
 
-  // b.jg5 SRJ-204, SRJ-205: an ErrInvalidFlags whose version re-check
+  // an ErrInvalidFlags whose version re-check
   // decides that the server stops: the launch fails marked stopping, as at
   // the working-row wait, with nothing more called for P.
   test.each(PROMPT_STATES)('a %s row, its read-pane answering ErrInvalidFlags whose version re-check decides that the server stops → failed marked stopping: one stop, the read-pane the last call, no sweep; no spawn-failure notice, spawn-failed entry or count; one line saying the server stops', async (state) => {
@@ -14987,7 +14977,7 @@ describe('b.jdc, b.jg5 SRJ-117, SRJ-607: the collision ladder\'s action on a pro
       log: () => {},
       clock: createFakeClock(),
     })
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const err = errInvalidFlags('read-pane')
 
     const { result, order } = await launchOnPromptRow(h, p, promptRowLaunch(h, p, state, { answer: cannedErr(err), afterSweep: 'missing' }))
@@ -15002,10 +14992,10 @@ describe('b.jdc, b.jg5 SRJ-117, SRJ-607: the collision ladder\'s action on a pro
     expect(linesEqualTo(h, promptRowLadderStoppingLine(renderPersonaRef(p, p), state, stopped))).toBe(1)
   })
 
-  // b.jg5 SRJ-502: P latched elsewhere while its read-pane is awaited gets
+  // P latched elsewhere while its read-pane is awaited gets
   // no sweep, though the read answers GONE.
   test.each(PROMPT_STATES)('a %s row, P latched elsewhere while its read-pane (answering GONE) is awaited → latched: the read-pane the last call, no sweep or resume; the read\'s line and one ladder latched line; the latch set elsewhere stands alone', async (state) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const elsewhere = installLatchElsewhere()
     const err = errTmuxCaptureFailed(personaTmuxSessionName(p))
     h.script(promptRowLaunch(h, p, state, { answer: cannedErr(err), afterSweep: 'missing' }))
@@ -15030,31 +15020,31 @@ describe('b.jdc, b.jg5 SRJ-117, SRJ-607: the collision ladder\'s action on a pro
     const stopped: PaneReadFailure = { kind: PANE_READ_UNCLASSIFIED, errorClass: AD_ERROR_CLASS_UNCLASSIFIED, description: 'class=UNCLASSIFIED name=ErrInvalidFlags', stopping: true }
 
     expect(promptRowLadderNoPaneLine(ref, 'ask_user', gone)).toBe(
-      `[slack] spawnForPersona: "C" (key=C) reads ask_user but agent-director's read-pane found no pane of its launch: ${gone.description} — reconciling its row before deciding (${paneReadClassNote(gone)}; b.jdc, b.jg5 SRJ-607)`,
+      `[slack] spawnForPersona: "C" (key=C) reads ask_user but agent-director's read-pane found no pane of its launch: ${gone.description} — reconciling its row before deciding (${paneReadClassNote(gone)})`,
     )
     expect(promptRowLadderNoPaneLine(ref, 'check_permission', absent)).toBe(
-      `[slack] spawnForPersona: "C" (key=C) reads check_permission but its agent-director row was absent at the pane read: ${absent.description} — reconciling its row before deciding (${paneReadClassNote(absent)}; b.jdc, b.jg5 SRJ-607)`,
+      `[slack] spawnForPersona: "C" (key=C) reads check_permission but its agent-director row was absent at the pane read: ${absent.description} — reconciling its row before deciding (${paneReadClassNote(absent)})`,
     )
     expect(promptRowLadderAfterSweepLine(ref, gone, 'ask_user', 'the health check\'s restart retries it')).toBe(
-      '[slack] spawnForPersona: "C" (key=C): agent-director\'s read-pane found no pane of its launch, but its row still reads ask_user after the findMissing sweep — no action; the health check\'s restart retries it (b.jdc, b.jg5 SRJ-607)',
+      '[slack] spawnForPersona: "C" (key=C): agent-director\'s read-pane found no pane of its launch, but its row still reads ask_user after the findMissing sweep — no action; the health check\'s restart retries it',
     )
     expect(promptRowLadderAfterSweepLine(ref, gone, undefined, 'the health check\'s restart retries it')).toBe(
-      '[slack] spawnForPersona: "C" (key=C): agent-director\'s read-pane found no pane of its launch, but its row could not be read after the findMissing sweep — no action; the health check\'s restart retries it (b.jdc, b.jg5 SRJ-607)',
+      '[slack] spawnForPersona: "C" (key=C): agent-director\'s read-pane found no pane of its launch, but its row could not be read after the findMissing sweep — no action; the health check\'s restart retries it',
     )
     expect(promptRowLadderAfterSweepLine(ref, absent, 'check_permission', 'session_restart_delay is 0, so nothing retries it before the next server start')).toBe(
-      '[slack] spawnForPersona: "C" (key=C): its agent-director row was absent at the pane read, but its row still reads check_permission after the findMissing sweep — no action; session_restart_delay is 0, so nothing retries it before the next server start (b.jdc, b.jg5 SRJ-607)',
+      '[slack] spawnForPersona: "C" (key=C): its agent-director row was absent at the pane read, but its row still reads check_permission after the findMissing sweep — no action; session_restart_delay is 0, so nothing retries it before the next server start',
     )
     expect(promptRowLadderNoActionLine(ref, 'ask_user', unavailable)).toBe(
-      `[slack] spawnForPersona: "C" (key=C) reads ask_user and reading its pane failed: ${unavailable.description} — taken as alive (no proof the session is gone); no action (${paneReadClassNote(unavailable)}; b.jdc, b.jg5 SRJ-607, SRJ-117)`,
+      `[slack] spawnForPersona: "C" (key=C) reads ask_user and reading its pane failed: ${unavailable.description} — taken as alive (no proof the session is gone); no action (${paneReadClassNote(unavailable)})`,
     )
     expect(promptRowLadderNoActionLine(ref, 'check_permission', environment)).toBe(
-      `[slack] spawnForPersona: "C" (key=C) reads check_permission and reading its pane failed: ${environment.description} — tmux is not available; no action (${paneReadClassNote(environment)}; b.jdc, b.jg5 SRJ-607, SRJ-117)`,
+      `[slack] spawnForPersona: "C" (key=C) reads check_permission and reading its pane failed: ${environment.description} — tmux is not available; no action (${paneReadClassNote(environment)})`,
     )
     expect(promptRowLadderStoppingLine(ref, 'ask_user', stopped)).toBe(
-      `[slack] spawnForPersona: "C" (key=C) reads ask_user and reading its pane failed: ${stopped.description} — the agent-director version re-check decided that the server stops; nothing more is called for it (${paneReadClassNote(stopped)}; b.jg5 SRJ-204, SRJ-205)`,
+      `[slack] spawnForPersona: "C" (key=C) reads ask_user and reading its pane failed: ${stopped.description} — the agent-director version re-check decided that the server stops; nothing more is called for it (${paneReadClassNote(stopped)})`,
     )
     expect(promptRowLadderLatchedLine(ref, 'check_permission')).toBe(
-      '[slack] spawnForPersona: "C" (key=C) reads check_permission and is latched — no action; nothing typed and nothing more is called for it (b.jg5 SRJ-502)',
+      '[slack] spawnForPersona: "C" (key=C) reads check_permission and is latched — no action; nothing typed and nothing more is called for it',
     )
   })
 })
@@ -15080,8 +15070,8 @@ const UNUSABLE_STATUS_SITES: readonly StatusSite[] = [
   },
 ]
 
-describe('b.jg5 SRJ-115, SRJ-105, SRJ-512: the shared own-row status read, and an UNUSABLE NAME answer at each of its sites', () => {
-  afterEach(srj105AfterEach)
+describe('the shared own-row status read, and an UNUSABLE NAME answer at each of its sites', () => {
+  afterEach(recoveryAfterEach)
 
   test.each<[string, RecoveryStubScript, Awaited<ReturnType<typeof readPersonaOwnRowStatus>>]>([
     [
@@ -15092,7 +15082,7 @@ describe('b.jg5 SRJ-115, SRJ-105, SRJ-512: the shared own-row status read, and a
     ['a waiting row: state, with no launch start key', { statusResult: cannedStatusResult({ state: 'waiting' }) }, { kind: OWN_ROW_STATUS_STATE, state: 'waiting' }],
     ['no row (ErrSpawnNotFound): absent', { statusError: errSpawnNotFound() }, { kind: OWN_ROW_STATUS_ABSENT }],
   ])('%s, from one status call of P\'s own row; nothing latched or posted', async (_label, script, expected) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     h.script(script)
 
     expect(await readPersonaOwnRowStatus(p, STATUS_READ_SITE)).toStrictEqual(expected)
@@ -15103,7 +15093,7 @@ describe('b.jg5 SRJ-115, SRJ-105, SRJ-512: the shared own-row status read, and a
   })
 
   test('any other error (UNAVAILABLE ErrTmuxUnresponsive): refused, carrying the same value; nothing latched or posted', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const err = errTmuxUnresponsive('status')
     h.script({ statusError: err })
 
@@ -15116,7 +15106,7 @@ describe('b.jg5 SRJ-115, SRJ-105, SRJ-512: the shared own-row status read, and a
   })
 
   test.each(unusableNameRowsAt('status').map((row) => [row.fault, row] as const))('an UNUSABLE NAME answer (%s): latched, with the state unreadable; P latched once from that one call, one post', async (_fault, row) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     h.script({ statusError: row.build() })
 
     expect(await readPersonaOwnRowStatus(p, STATUS_READ_SITE)).toStrictEqual({ kind: OWN_ROW_STATUS_LATCHED, rowState: LATCH_ROW_STATE_UNREADABLE })
@@ -15127,7 +15117,7 @@ describe('b.jg5 SRJ-115, SRJ-105, SRJ-512: the shared own-row status read, and a
 
   const statusCross = UNUSABLE_STATUS_SITES.flatMap((site) => unusableNameRowsAt('status').map((row) => [site.name, row.fault, site, row] as const))
   test.each(statusCross)('a launch whose %s answers UNUSABLE NAME (%s): latched, P latched with the state unreadable; that read is the last call: no tmux fallback, no resume, nothing typed; then no launch path reaches agent-director; B launches', async (_site, _fault, site, row) => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     site.setup?.(h)
     const script = site.script(h, harnessPersona(h, p), row.build())
     h.script(script)
@@ -15143,7 +15133,7 @@ describe('b.jg5 SRJ-115, SRJ-105, SRJ-512: the shared own-row status read, and a
   })
 
   test.each(unusableNameRowsAt('status').map((row) => [row.fault, row] as const))('the retry timer\'s row read (readPersonaRowState) answering UNUSABLE NAME (%s): the state as the latch recorded it (unreadable), P latched; a pending-only retry makes that one call and stops with the latch\'s reason, handing nothing on', async (_fault, row) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     h.script({ statusError: row.build() })
     h.controller.armPendingOnly(p)
 
@@ -15162,12 +15152,12 @@ describe('b.jg5 SRJ-115, SRJ-105, SRJ-512: the shared own-row status read, and a
     expect(h.episodeNotices).toHaveLength(1)
   })
 
-  // The latch-time read (b.jg5 SRJ-501) answering UNUSABLE NAME records
+  // The latch-time read answering UNUSABLE NAME records
   // unreadable and makes no second read: that answer's own latch stands, so a
   // CONFLICT that asked for it posts no CONFLICT notice, and a spawn's
   // UNUSABLE NAME that asked for it sets nothing more.
-  test.each(unusableNameRowsAt('status').map((row) => [row.fault, row] as const))('a CONFLICT at the first spawn whose latch-time read answers UNUSABLE NAME (%s): one status read; P latched with "unusable recorded name", unreadable, and only the SRJ-1019 post; the CONFLICT line says the read\'s latch stands', async (_fault, row) => {
-    const { h, p, b } = srj105Build()
+  test.each(unusableNameRowsAt('status').map((row) => [row.fault, row] as const))('a CONFLICT at the first spawn whose latch-time read answers UNUSABLE NAME (%s): one status read; P latched with "unusable recorded name", unreadable, and only the post; the CONFLICT line says the read\'s latch stands', async (_fault, row) => {
+    const { h, p, b } = buildRecoveryCase()
     const script: RecoveryStubScript = { spawnError: conflictRowsFor('spawn')[0]!.build(), statusError: row.build() }
     h.script(script)
     const order = recordCallOrder(h)
@@ -15184,7 +15174,7 @@ describe('b.jg5 SRJ-115, SRJ-105, SRJ-512: the shared own-row status read, and a
   })
 
   test.each(unusableNameRowsAt('status').map((row) => [row.fault, row] as const))('an UNUSABLE NAME at the first spawn whose latch-time read answers UNUSABLE NAME too (%s): one status read; the read\'s latch (unreadable, its own description) stands and nothing more is set; one post', async (_fault, row) => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     const spawnRow = unusableNameRowsAt('plain spawn').find((r) => r.fault !== row.fault)!
     const script: RecoveryStubScript = { spawnError: spawnRow.build(), statusError: row.build() }
     h.script(script)
@@ -15206,7 +15196,7 @@ describe('b.jg5 SRJ-115, SRJ-105, SRJ-512: the shared own-row status read, and a
   })
 })
 
-/** A `get` of P's own row through E14's shared read, where P's launch meets the answer. */
+/** A `get` of P's own row through shared read, where P's launch meets the answer. */
 interface GetSite {
   readonly name: string
   setup?(h: RecoveryHarness): void
@@ -15231,12 +15221,12 @@ const UNUSABLE_GET_SITES: readonly GetSite[] = [
 
 ]
 
-describe('b.jg5 SRJ-114, SRJ-105, SRJ-512: an UNUSABLE NAME answer at E14\'s shared own-row get read latches the persona and its caller stops', () => {
-  afterEach(srj105AfterEach)
+describe('an UNUSABLE NAME answer at \'s shared own-row get read latches the persona and its caller stops', () => {
+  afterEach(recoveryAfterEach)
 
   const getCross = UNUSABLE_GET_SITES.flatMap((site) => unusableNameRowsAt('get').map((row) => [site.name, row.fault, site, row] as const))
   test.each(getCross)('%s answering UNUSABLE NAME (%s): latched, P latched with the state unreadable; that get is the last call; no diagnosis, spawn-failure notice or startup entry; then no launch path reaches agent-director; B launches', async (_site, _fault, site, row) => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     site.setup?.(h)
     const script = site.script(h, harnessPersona(h, p), row.build())
     h.script(script)
@@ -15257,8 +15247,8 @@ describe('b.jg5 SRJ-114, SRJ-105, SRJ-512: an UNUSABLE NAME answer at E14\'s sha
   })
 })
 
-describe('b.jg5 SRJ-313, SRJ-1002, SRJ-512: the controls — a phrase-less ErrInternal keeps E12\'s UNCLASSIFIED handling, and the persona teardown latches nothing', () => {
-  afterEach(srj105AfterEach)
+describe('the controls — a phrase-less ErrInternal keeps \'s UNCLASSIFIED handling, and the persona teardown latches nothing', () => {
+  afterEach(recoveryAfterEach)
 
   test('a phrase-less ErrInternal at the resume of an ended row: refused as UNCLASSIFIED (one refusal line, P armed with the UNCLASSIFIED cause, reported to P\'s unclassified-error episode), never latched; B launches', async () => {
     const site = SPAWN_AND_RESUME_SITES.find((s) => s.name === 'the resume of an ended row')!
@@ -15271,7 +15261,7 @@ describe('b.jg5 SRJ-313, SRJ-1002, SRJ-512: the controls — a phrase-less ErrIn
   })
 
   test('a phrase-less ErrInternal at the shared own-row status read: refused, carrying the same value; never latched', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const err = errInternal()
     h.script({ statusError: err })
 
@@ -15282,8 +15272,8 @@ describe('b.jg5 SRJ-313, SRJ-1002, SRJ-512: the controls — a phrase-less ErrIn
     expect(unusableNameLinesOf(h, p)).toEqual([])
   })
 
-  test('b.jg5 SRJ-701: the persona teardown\'s killPersonaInstance answering UNUSABLE NAME answers its UNUSABLE NAME outcome carrying the same value (never rethrown) and latches nothing: no set, no post, no UNUSABLE NAME line', async () => {
-    const { h, p } = srj105Build()
+  test('the persona teardown\'s killPersonaInstance answering UNUSABLE NAME answers its UNUSABLE NAME outcome carrying the same value (never rethrown) and latches nothing: no set, no post, no UNUSABLE NAME line', async () => {
+    const { h, p } = buildRecoveryCase()
     const err = unusableNameRowsAt(RESTART_KILL_SITE)[0]!.build()
     h.script({ killError: err })
 
@@ -15297,7 +15287,7 @@ describe('b.jg5 SRJ-313, SRJ-1002, SRJ-512: the controls — a phrase-less ErrIn
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-502 (with SRJ-315): a persona latched elsewhere while one of its
+// (with): a persona latched elsewhere while one of its
 // own-row reads is awaited (the health tick reads even while a launch is in
 // flight) gets nothing more called for it, whatever the read gave. The
 // collision get, the ErrJsonlMissing diagnosis get and the prompt row's
@@ -15346,15 +15336,15 @@ function expectLatchedElsewhereOnly(h: RecoveryHarness, p: string, elsewhere: { 
   expect(h.controller.isArmed(p)).toBe(false)
 }
 
-describe('b.jg5 SRJ-502: a persona latched elsewhere while one of its own-row reads is awaited gets nothing more called for it', () => {
-  afterEach(srj105AfterEach)
+describe('a persona latched elsewhere while one of its own-row reads is awaited gets nothing more called for it', () => {
+  afterEach(recoveryAfterEach)
 
   test.each<[string, (h: RecoveryHarness, persona: Persona) => RecoveryStubScript]>([
     ['an ended row (a resume would follow)', (h, persona) => collided(h, persona, { state: 'ended' })],
     ['a waiting row (a reconnect would follow)', (h, persona) => collided(h, persona, { state: 'waiting' })],
     ['no row, ErrSpawnNotFound (a retry spawn would follow)', () => ({ spawnQueue: [cannedErr(errInstanceIdCollision())], getError: errSpawnNotFound() })],
   ])('P latched elsewhere during the collision get, which reads %s: the launch answers latched, that get is the last call; one line; the latch set elsewhere stands alone', async (_label, script) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const elsewhere = installLatchElsewhere()
     h.script(script(h, harnessPersona(h, p)))
     const order = recordCallOrder(h, { at: 1, run: () => elsewhere.latch.set(p, LATCHED_ELSEWHERE) })
@@ -15364,7 +15354,7 @@ describe('b.jg5 SRJ-502: a persona latched elsewhere while one of its own-row re
     expect(order).toEqual(['spawn', 'get'])
     expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1 }))
     expect(latchedAfterReadLines(h)).toEqual([
-      `[slack] spawnForPersona: ${renderPersonaRef(p, p)} is latched after its collision get — nothing more is called for it (b.jg5 SRJ-502)`,
+      `[slack] spawnForPersona: ${renderPersonaRef(p, p)} is latched after its collision get — nothing more is called for it`,
     ])
     expectLatchedElsewhereOnly(h, p, elsewhere)
   })
@@ -15373,7 +15363,7 @@ describe('b.jg5 SRJ-502: a persona latched elsewhere while one of its own-row re
     ['a missing row', (h, persona) => cannedOk(harnessRow(h, persona, { state: 'missing' }))],
     ['no row, ErrSpawnNotFound (an inconclusive diagnosis would follow)', () => cannedErr(errSpawnNotFound())],
   ])('P latched elsewhere during the ErrJsonlMissing diagnosis get, which reads %s: the launch answers latched, that get is the last call; no diagnosis, delete or spawn; one line; the latch set elsewhere stands alone', async (_label, diagnosis) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const elsewhere = installLatchElsewhere()
     const persona = harnessPersona(h, p)
     h.script(jsonlMissingDiagnosisGets(h, persona, diagnosis(h, persona)))
@@ -15384,7 +15374,7 @@ describe('b.jg5 SRJ-502: a persona latched elsewhere while one of its own-row re
     expect(order).toEqual(['spawn', 'get', 'resume', 'get'])
     expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1, resume: 1 }))
     expect(latchedAfterReadLines(h)).toEqual([
-      `[slack] spawnForPersona: ${renderPersonaRef(p, p)} is latched after its ErrJsonlMissing diagnosis get — nothing more is called for it (b.jg5 SRJ-502)`,
+      `[slack] spawnForPersona: ${renderPersonaRef(p, p)} is latched after its ErrJsonlMissing diagnosis get — nothing more is called for it`,
     ])
     expectLatchedElsewhereOnly(h, p, elsewhere)
   })
@@ -15393,7 +15383,7 @@ describe('b.jg5 SRJ-502: a persona latched elsewhere while one of its own-row re
     ['an ended row (a resume would follow)', { statusResult: cannedStatusResult({ state: 'ended' }) }],
     ['no row, ErrSpawnNotFound', { statusError: errSpawnNotFound() }],
   ])('a check_permission row whose read-pane answers GONE, P latched elsewhere during its status read after the findMissing sweep, which reads %s: FIND_MISSING_LATCHED, so the launch answers latched with no resume or fresh spawn; that read is the last call; one line; the latch set elsewhere stands alone', async (_label, read) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     promptRowPanesGone(h)
     const elsewhere = installLatchElsewhere()
     h.script({ ...collided(h, harnessPersona(h, p), { state: 'check_permission' }), ...read })
@@ -15404,7 +15394,7 @@ describe('b.jg5 SRJ-502: a persona latched elsewhere while one of its own-row re
     expect(order).toEqual(['spawn', 'get', 'readPane', 'findMissing', 'status'])
     expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 1 }))
     expect(latchedAfterReadLines(h)).toEqual([
-      `[slack] spawnForPersona: prompt row: ${renderPersonaRef(p, p)} is latched after its status read after the findMissing sweep — nothing more is called for it (b.jg5 SRJ-502)`,
+      `[slack] spawnForPersona: prompt row: ${renderPersonaRef(p, p)} is latched after its status read after the findMissing sweep — nothing more is called for it`,
     ])
     expectLatchedElsewhereOnly(h, p, elsewhere)
   })
@@ -15419,7 +15409,7 @@ describe('b.jg5 SRJ-502: a persona latched elsewhere while one of its own-row re
   ]
   const latchTimeCross = refusals.flatMap(([refusal, build, lines, kind]) => reads.map(([read, answer]) => [refusal, read, build, lines, kind, answer] as const))
   test.each(latchTimeCross)('%s at the first spawn whose latch-time status read reads %s while P is latched elsewhere: the launch answers latched after that one read; the latch set elsewhere stands, with no second set and so no second post; the refusal\'s one line says so', async (_refusal, _read, build, lines, kind, answer) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const elsewhere = installLatchElsewhere()
     h.script({ spawnError: build(), ...answer })
     const order = recordCallOrder(h, { at: 1, run: () => elsewhere.latch.set(p, LATCHED_ELSEWHERE) })
@@ -15436,14 +15426,14 @@ describe('b.jg5 SRJ-502: a persona latched elsewhere while one of its own-row re
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-513, SRJ-1020 (E16 T2), with SRJ-114's Test clause "a pending row
-// with no launch start latches P" (AC 86) at E14's four `get` sites and
-// SRJ-115's `status` sites: a configured persona's own row that reads
+// with Test clause "a pending row
+// with no launch start latches P" at four `get` sites and
+// `status` sites: a configured persona's own row that reads
 // `pending` with no launch start (absent, `null` or unparseable; P's current
 // life, another `cwd` or another `config_dir` label: the helper's
 // `LAUNCH_START_CASE_ROWS`) latches P with "launch start not recorded", the
 // refused operation "none" and the state `pending`, the session
-// `slack_bot_<key>` and no description, with one SRJ-1020 post after the
+// `slack_bot_<key>` and no description, with one post after the
 // holds. At the collision `get` it decides before the `cwd` and `config_dir`
 // guards and the state branches, with no extra `status` read. Nothing is
 // called for P after the latching read (no reconnect,
@@ -15451,14 +15441,14 @@ describe('b.jg5 SRJ-502: a persona latched elsewhere while one of its own-row re
 // diagnosis is reported, nothing is counted, and no launch path reaches
 // agent-director for P afterwards while B launches. At the latch-time read,
 // that latch stands alone: a CONFLICT or an UNUSABLE NAME answer that asked
-// for it sets nothing more and posts no SRJ-1004 or SRJ-1019 notice
-// (SRJ-513; hatch A2). Controls: the same row with a launch start keeps
+// for it sets nothing more and posts no or notice
+// (design A2). Controls: the same row with a launch start keeps
 // today's `pending` branch, a key the configured-persona query does not hold
 // latches no one, and the permission poller's and the JSONL persistence
-// safeguard's `get`s (SRJ-122) latch and post nothing and keep their
+// safeguard's `get`s latch and post nothing and keep their
 // behaviour. Every case runs on `makeRecoveryHarness` (its latch and
 // configured-persona query installed as `main()` installs them);
-// `srj105AfterEach` runs `assertNoLeak` over the lines, notices and entries
+// `recoveryAfterEach` runs `assertNoLeak` over the lines, notices and entries
 // it captured, and the file's `afterEach` clears the notifier, the latch
 // install and the configured-persona query.
 // ---------------------------------------------------------------------------
@@ -15496,21 +15486,20 @@ function byName<R extends { readonly name: string }>(rows: readonly R[]): Array<
 /**
  * The session manager's launch-start latch lines for persona `key`, at a
  * launch (`"P" (key=P)`) or a check (`persona=P`): the shared `get` read's
- * (b.jg5 SRJ-114, SRJ-513) and the own-row `status` step's (b.jg5 SRJ-115,
- * SRJ-501).
+ * and the own-row `status` step's.
  */
 function launchStartLinesOf(h: RecoveryHarness, key: string): string[] {
   const pending = describeLatchRowState(latchRowStateRead(AGENT_DIRECTOR_PENDING_STATE))
   return h.errors.filter(
     (line) =>
       (line.includes(` for ${renderPersonaRef(key, key)}: `) || line.includes(` for persona=${key}: `)) &&
-      ((line.includes(`: its row reads pending with no launch start (state=${pending}) — `) && line.endsWith('; nothing more is called for it (b.jg5 SRJ-114, SRJ-513)')) ||
+      ((line.includes(`: its row reads pending with no launch start (state=${pending}) — `) && line.endsWith('; nothing more is called for it')) ||
         (line.includes(`: its row read latches the persona (case=${LATCH_CASE_LAUNCH_START_NOT_RECORDED}, state=${pending}) — `) &&
-          line.endsWith('; nothing more is called for it (b.jg5 SRJ-115, SRJ-501)'))),
+          line.endsWith('; nothing more is called for it'))),
   )
 }
 
-/** A `get` of P's own row through E14's shared read, reached by P's launch. */
+/** A `get` of P's own row through shared read, reached by P's launch. */
 interface LaunchStartGetSite {
   readonly name: string
   setup?(h: RecoveryHarness): void
@@ -15542,9 +15531,9 @@ const LAUNCH_START_GET_SITES: readonly LaunchStartGetSite[] = [
   },
 
   {
-    // b.4dk: a waiting row whose reconnect found its session dead runs the
+    // a waiting row whose reconnect found its session dead runs the
     // sweep before resume; the run lists P's own row in unverified_ids.
-    name: 'the get after unverified_ids (the b.4dk sweep before resume)',
+    name: 'the get after unverified_ids (the sweep before resume)',
     script: (h, p, row) => ({
       spawnQueue: [cannedErr(errInstanceIdCollision())],
       getQueue: [cannedOk(harnessRow(h, p, { state: 'waiting' })), cannedOk(harnessRow(h, p, { state: 'waiting' })), cannedOk(harnessRow(h, p, { state: 'waiting' })), cannedOk(row)],
@@ -15563,15 +15552,15 @@ const LAUNCH_START_GET_CROSS = LAUNCH_START_GET_SITES.flatMap((site) =>
   (site === LAUNCH_START_GET_SITES[0] ? launchStartRowsOf('get') : launchStartSampleOf('get')).map((row) => [site.name, row.name, site, row] as const),
 )
 
-describe('b.jg5 SRJ-513, SRJ-114, SRJ-1020: a configured persona\'s own pending row with no launch start latches it at each of E14\'s get sites, and its caller stops', () => {
+describe('a configured persona\'s own pending row with no launch start latches it at each of \'s get sites, and its caller stops', () => {
   beforeEach(() => {
     _resetFindMissingMemo()
   })
-  afterEach(srj105AfterEach)
+  afterEach(recoveryAfterEach)
 
-  // Demo (AC 86): a pending row with no launch start latches P.
-  test.each(LAUNCH_START_GET_CROSS)('%s reading %s: P latched with "launch start not recorded", "none" and pending; that get is the last call; one SRJ-1020 post; nothing counted, diagnosed or posted as a failure; the launch answers latched; then no launch path reaches agent-director; B launches', async (_site, _row, site, row) => {
-    const { h, p, b } = srj105Build()
+  // Demo: a pending row with no launch start latches P.
+  test.each(LAUNCH_START_GET_CROSS)('%s reading %s: P latched with "launch start not recorded", "none" and pending; that get is the last call; one post; nothing counted, diagnosed or posted as a failure; the launch answers latched; then no launch path reaches agent-director; B launches', async (_site, _row, site, row) => {
+    const { h, p, b } = buildRecoveryCase()
     const persona = harnessPersona(h, p)
     site.setup?.(h)
     const script = site.script(h, persona, row.build(persona, h.home))
@@ -15588,10 +15577,10 @@ describe('b.jg5 SRJ-513, SRJ-114, SRJ-1020: a configured persona\'s own pending 
     await expectLaunchedByNoPath(h, p, b, script)
   })
 
-  // SRJ-513's precedence (hatch A2): a row that also carries the note latches
+  // precedence (design A2): a row that also carries the note latches
   // with "launch start not recorded" only, with one post (no CONFLICT notice).
-  test('the collision get reading P\'s own pending row with no launch start that also carries provenance_conflict: one latch, "launch start not recorded" only, one SRJ-1020 post and no CONFLICT notice', async () => {
-    const { h, p, b } = srj105Build()
+  test('the collision get reading P\'s own pending row with no launch start that also carries provenance_conflict: one latch, "launch start not recorded" only, one post and no CONFLICT notice', async () => {
+    const { h, p, b } = buildRecoveryCase()
     const persona = harnessPersona(h, p)
     const row = LAUNCH_START_AND_NOTE_ROW
     const script: RecoveryStubScript = { spawnQueue: [cannedErr(errInstanceIdCollision())], getResult: row.build(persona, h.home) }
@@ -15608,7 +15597,7 @@ describe('b.jg5 SRJ-513, SRJ-114, SRJ-1020: a configured persona\'s own pending 
   })
 
   test.each(byName(launchStartSampleOf('get')))('the start pass: P latched at its ErrJsonlMissing diagnosis get (%s) is listed latched and counted in neither amnesia counter, failed nor succeeded; no delete, diagnosis entry or notice; B is counted', async (_name, row) => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     const persona = harnessPersona(h, p)
     const pId = personaInstanceId(p)
     let pGets = 0
@@ -15635,7 +15624,7 @@ describe('b.jg5 SRJ-513, SRJ-114, SRJ-1020: a configured persona\'s own pending 
   })
 
   test.each(byName(launchStartSampleOf('get')))('a bypassing run listing P\'s and B\'s own rows in unverified_ids, P\'s get reading %s: P latched and the caller gets FIND_MISSING_LATCHED; B\'s row is still read and B latches nothing', async (_name, row) => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     const pId = personaInstanceId(p)
     h.script({
       findMissingResult: unverifiedRowsOf(p, b),
@@ -15651,14 +15640,14 @@ describe('b.jg5 SRJ-513, SRJ-114, SRJ-1020: a configured persona\'s own pending 
   })
 })
 
-describe('b.jg5 SRJ-513, SRJ-114, SRJ-408: the controls at the collision get — a launch start recorded, or a key the configured-persona query does not hold, latches no one', () => {
-  afterEach(srj105AfterEach)
+describe('the controls at the collision get — a launch start recorded, or a key the configured-persona query does not hold, latches no one', () => {
+  afterEach(recoveryAfterEach)
 
   const recorded = LAUNCH_START_NON_LATCHING_ROWS.filter(
     (row): row is LaunchStartNonLatchingRowOf<'get'> => row.shape === 'get' && row.kind === 'launch start recorded',
   )
   test.each(byName(recorded))('P\'s own row %s keeps today\'s pending branch: no-op after one spawn and one get, no status read; nothing latched or posted', async (_name, row) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     h.script({ spawnQueue: [cannedErr(errInstanceIdCollision())], getResult: row.build(harnessPersona(h, p), h.home) })
     const order = recordCallOrder(h)
 
@@ -15671,7 +15660,7 @@ describe('b.jg5 SRJ-513, SRJ-114, SRJ-408: the controls at the collision get —
   })
 
   test.each(byName(launchStartCurrentLifeOf('get')))('the configured-persona query does not hold P, its own row %s: today\'s pending branch (no-op); nothing latched or posted', async (_name, row) => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     setConfiguredPersonaQuery((key) => key === b)
     h.script({ spawnQueue: [cannedErr(errInstanceIdCollision())], getResult: row.build(harnessPersona(h, p), h.home) })
     const order = recordCallOrder(h)
@@ -15703,11 +15692,11 @@ const LAUNCH_START_STATUS_SITES: readonly LaunchStartStatusSite[] = [
   },
 ]
 
-describe('b.jg5 SRJ-513, SRJ-115, SRJ-1020: a configured persona\'s own pending row with no launch start latches it at each of the session manager\'s status sites', () => {
-  afterEach(srj105AfterEach)
+describe('a configured persona\'s own pending row with no launch start latches it at each of the session manager\'s status sites', () => {
+  afterEach(recoveryAfterEach)
 
   test.each(byName(launchStartRowsOf('status')))('the shared own-row status read, %s: latched with pending, from one status call; P latched once, one post', async (_name, row) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     h.script({ statusResult: row.build(harnessPersona(h, p), h.home) })
 
     expect(await readPersonaOwnRowStatus(p, STATUS_READ_SITE)).toStrictEqual({ kind: OWN_ROW_STATUS_LATCHED, rowState: row.rowState })
@@ -15718,7 +15707,7 @@ describe('b.jg5 SRJ-513, SRJ-115, SRJ-1020: a configured persona\'s own pending 
   })
 
   test.each(byName(launchStartCurrentLifeOf('status')))('the shared own-row status read with the configured-persona query not holding P, %s: the state pending, nothing latched or posted', async (_name, row) => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     setConfiguredPersonaQuery((key) => key === b)
     h.script({ statusResult: row.build(harnessPersona(h, p), h.home) })
 
@@ -15731,7 +15720,7 @@ describe('b.jg5 SRJ-513, SRJ-115, SRJ-1020: a configured persona\'s own pending 
 
   const statusCross = LAUNCH_START_STATUS_SITES.flatMap((site) => launchStartCurrentLifeOf('status').map((row) => [site.name, row.form, site, row] as const))
   test.each(statusCross)('a launch whose %s reads pending with launch start %s: latched, P latched with pending; that read is the last call: no send-keys, find-missing, tmux fallback or dead-session verdict, no resume or launch; then no launch path reaches agent-director; B launches', async (_site, _form, site, row) => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     const persona = harnessPersona(h, p)
     site.setup?.(h)
     const script = site.script(h, persona, row.build(persona, h.home))
@@ -15749,7 +15738,7 @@ describe('b.jg5 SRJ-513, SRJ-115, SRJ-1020: a configured persona\'s own pending 
   })
 
   test.each(byName(launchStartCurrentLifeOf('status')))('the retry timer\'s row read (readPersonaRowState), %s: P latched with pending; a pending-only retry makes that one call and stops with the latch\'s reason, handing nothing to the restart path', async (_name, row) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     h.script({ statusResult: row.build(harnessPersona(h, p), h.home) })
     h.controller.armPendingOnly(p)
 
@@ -15766,11 +15755,11 @@ describe('b.jg5 SRJ-513, SRJ-115, SRJ-1020: a configured persona\'s own pending 
     expect(h.episodeNotices).toHaveLength(1)
   })
 
-  // SRJ-513's precedence at E13's latch-time read: the read's own latch
+  // precedence at latch-time read: the read's own latch
   // stands alone, so the CONFLICT or the UNUSABLE NAME that asked for it sets
   // nothing on top and posts nothing of its own.
-  test.each(byName(launchStartCurrentLifeOf('status')))('a CONFLICT at the first spawn whose latch-time status read reads %s: one status read; one latch, "launch start not recorded", with one SRJ-1020 post and no SRJ-1004 post; the CONFLICT line says the read\'s latch stands', async (_name, row) => {
-    const { h, p, b } = srj105Build()
+  test.each(byName(launchStartCurrentLifeOf('status')))('a CONFLICT at the first spawn whose latch-time status read reads %s: one status read; one latch, "launch start not recorded", with one post and no post; the CONFLICT line says the read\'s latch stands', async (_name, row) => {
+    const { h, p, b } = buildRecoveryCase()
     const script: RecoveryStubScript = { spawnError: conflictRowsFor('spawn')[0]!.build(), statusResult: row.build(harnessPersona(h, p), h.home) }
     h.script(script)
     const order = recordCallOrder(h)
@@ -15786,8 +15775,8 @@ describe('b.jg5 SRJ-513, SRJ-115, SRJ-1020: a configured persona\'s own pending 
     await expectLaunchedByNoPath(h, p, b, script)
   })
 
-  test.each(byName(launchStartCurrentLifeOf('status')))('an UNUSABLE NAME at the first spawn whose latch-time status read reads %s: one status read; one latch, "launch start not recorded", with one SRJ-1020 post and no SRJ-1019 post; the UNUSABLE NAME line says the read\'s latch stands', async (_name, row) => {
-    const { h, p, b } = srj105Build()
+  test.each(byName(launchStartCurrentLifeOf('status')))('an UNUSABLE NAME at the first spawn whose latch-time status read reads %s: one status read; one latch, "launch start not recorded", with one post and no post; the UNUSABLE NAME line says the read\'s latch stands', async (_name, row) => {
+    const { h, p, b } = buildRecoveryCase()
     const script: RecoveryStubScript = { spawnError: unusableNameRowsAt('plain spawn')[0]!.build(), statusResult: row.build(harnessPersona(h, p), h.home) }
     h.script(script)
     const order = recordCallOrder(h)
@@ -15804,15 +15793,15 @@ describe('b.jg5 SRJ-513, SRJ-115, SRJ-1020: a configured persona\'s own pending 
   })
 })
 
-describe('b.jg5 SRJ-122, SRJ-513 (hatch A2): the gets SRJ-122 leaves alone latch no one on a pending row with no launch start and keep their behaviour', () => {
+describe('(hatch A2): the gets leaves alone latch no one on a pending row with no launch start and keep their behaviour', () => {
   afterEach(() => {
     stopPermissionPoller()
     _resetPollerState()
-    srj105AfterEach()
+    recoveryAfterEach()
   })
 
   test.each(byName(launchStartCurrentLifeOf('get')))('the permission poller\'s get of P\'s own row reading %s, with a permission request: its prompt is posted as for any row; nothing latched, nothing posted to the latch', async (_name, row) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const persona = harnessPersona(h, p)
     const slack = makeStubSlack()
     const trail = makeTrailCapture()
@@ -15840,7 +15829,7 @@ describe('b.jg5 SRJ-122, SRJ-513 (hatch A2): the gets SRJ-122 leaves alone latch
   })
 
   test.each(byName(launchStartCurrentLifeOf('get')))('the JSONL persistence safeguard\'s get of P\'s own row reading %s: its AD transcript-reference notice is made as for any row; nothing latched, nothing posted to the latch', async (_name, row) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const persona = harnessPersona(h, p)
     const pId = personaInstanceId(p)
     h.script({
@@ -15869,7 +15858,7 @@ describe('b.jg5 SRJ-122, SRJ-513 (hatch A2): the gets SRJ-122 leaves alone latch
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-807, with SRJ-114's and SRJ-115's sites: a retired key's own row
+// with and sites: a retired key's own row
 // read `waiting`, `working`, `ask_user` or `check_permission` while its mark
 // is set clears its entry from the retired-key record, durably, at the shared
 // own-row `get` read (`readPersonaOwnRow`; the ladder's collision `get` among
@@ -15878,7 +15867,7 @@ describe('b.jg5 SRJ-122, SRJ-513 (hatch A2): the gets SRJ-122 leaves alone latch
 // site does next, are those of the same read with no record; the store logs
 // one line naming the read. Every case runs on `makeRecoveryHarness`, whose
 // one store is read over its state directory and installed as `main()`
-// installs it (removed by its cleanup, which `srj105AfterEach` runs after
+// installs it (removed by its cleanup, which `recoveryAfterEach` runs after
 // leak-checking everything captured, the record file included). The record
 // is seeded through `options.retiredKeys`: P and B both recorded, B with its
 // mark set, so B's entry beside P's shows that a read of P's row clears no
@@ -15897,7 +15886,7 @@ const MARKED_SEED: RetiredKeySeed = { cause: RETIRED_KEY_CAUSE_REMOVED, mark: tr
 
 /** A recovery harness over P and B whose record holds both, B marked and P marked unless `pMarked` is false. */
 function retiredBuild(pMarked = true): { h: RecoveryHarness; p: string; b: string } {
-  return srj105Build({
+  return buildRecoveryCase({
     retiredKeys: ([p, b]) => ({ [p!]: { ...MARKED_SEED, mark: pMarked }, [b!]: MARKED_SEED }),
   })
 }
@@ -15931,8 +15920,8 @@ function clearedLine(h: RecoveryHarness, p: string, state: string, at: OwnRowRea
   return retiredEntryClearedLine(h.retiredKeys.path, p, state, at)
 }
 
-describe('b.jg5 SRJ-807, SRJ-114: a retired key\'s own row read live other than pending with its mark set clears its entry at the shared own-row get read; the read answers as before', () => {
-  afterEach(srj105AfterEach)
+describe('a retired key\'s own row read live other than pending with its mark set clears its entry at the shared own-row get read; the read answers as before', () => {
+  afterEach(recoveryAfterEach)
 
   test.each(CLEARING_STATES)('the shared get read of P\'s own row reading %s with P\'s mark set answers the row, unlatched; P\'s entry leaves the file with one write and one line naming the read; B\'s entry stays and B is untouched', async (state) => {
     const { h, p, b } = retiredBuild()
@@ -15981,8 +15970,8 @@ describe('b.jg5 SRJ-807, SRJ-114: a retired key\'s own row read live other than 
   })
 })
 
-describe('b.jg5 SRJ-807, SRJ-115: a retired key\'s own row read live other than pending with its mark set clears its entry at the own-row status step; the read answers as before', () => {
-  afterEach(srj105AfterEach)
+describe('a retired key\'s own row read live other than pending with its mark set clears its entry at the own-row status step; the read answers as before', () => {
+  afterEach(recoveryAfterEach)
 
   test.each(CLEARING_STATES)('the shared status read of P\'s own row reading %s with P\'s mark set answers the state; P\'s entry leaves the file with one write and one line naming the read; B\'s entry stays and B is untouched', async (state) => {
     const { h, p, b } = retiredBuild()
@@ -15995,14 +15984,14 @@ describe('b.jg5 SRJ-807, SRJ-115: a retired key\'s own row read live other than 
     expectUntouched(h, b)
   })
 
-  // P is marked, so its live row is its new life (b.jg5 SRJ-805) and the
+  // P is marked, so its live row is its new life and the
   // ladder takes the working branch. The collision get's clear is refused
   // (its write fails), so the entry stays and the clear is the poll's.
 
 })
 
-describe('b.jg5 SRJ-807: the controls — an unmarked key, a pending row, a configured persona\'s own pending row with no launch start, an absent row, no store installed and a throwing mark query clear nothing', () => {
-  afterEach(srj105AfterEach)
+describe('the controls — an unmarked key, a pending row, a configured persona\'s own pending row with no launch start, an absent row, no store installed and a throwing mark query clear nothing', () => {
+  afterEach(recoveryAfterEach)
 
   test.each<[string, boolean, string]>([
     ['P recorded with no mark, its own row read waiting', false, 'waiting'],
@@ -16087,13 +16076,13 @@ describe('b.jg5 SRJ-807: the controls — an unmarked key, a pending row, a conf
     expect(lines).toHaveLength(queryLines)
     for (const line of lines) {
       expect(line).toStartWith(`[slack] retired-keys: the mark query for persona=${p} failed: `)
-      expect(line).toEndWith('; nothing is cleared (b.jg5 SRJ-807)')
+      expect(line).toEndWith('; nothing is cleared')
     }
   })
 })
 
-describe('b.jg5 SRJ-807: a clear whose write fails leaves the entry and changes nothing the site does; the next qualifying read clears it', () => {
-  afterEach(srj105AfterEach)
+describe('a clear whose write fails leaves the entry and changes nothing the site does; the next qualifying read clears it', () => {
+  afterEach(recoveryAfterEach)
 
   test('the collision get reading P\'s own row waiting with P\'s mark set, its clear\'s write refused: the ladder reconnects as usual; P\'s entry stays in memory and in the file, with one line; the next qualifying read (the shared get read) clears it, with one line', async () => {
     const { h, p, b } = retiredBuild()
@@ -16127,7 +16116,7 @@ describe('b.jg5 SRJ-807: a clear whose write fails leaves the entry and changes 
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-809 (E27 T1): the old-life hold ends at every read the session
+// the old-life hold ends at every read the session
 // manager makes of the held row
 //
 // A read of the old row by any call ends its hold when it reads `ended` or
@@ -16235,16 +16224,16 @@ function holdAt(view: OldLifeHold, directory: string): OldLifeHold {
   return { ...view, directory, realDirectory: realpathSync(directory) }
 }
 
-describe('b.jg5 SRJ-809: a read of the held row ended, missing or gone ends its hold at every read site of the session manager; a live read keeps it; another row\'s hold stays', () => {
+describe('a read of the held row ended, missing or gone ends its hold at every read site of the session manager; a live read keeps it; another row\'s hold stays', () => {
   afterEach(() => {
-    expect(srj105Harness?.clock.pendingCount() ?? 0).toBe(0)
-    srj105AfterEach()
+    expect(recoveryHarness?.clock.pendingCount() ?? 0).toBe(0)
+    recoveryAfterEach()
   })
 
   test.each(HOLD_READ_SITES.flatMap(([site, at]) =>
     HOLD_ENDING_ANSWERS.filter(([, answer]) => !(at.listsOnly && 'noRow' in answer)).map(([label, answer, reason, suffix]) => [site, label, at, answer, reason, suffix] as const),
   ))('%s reading P\'s row %s ends P\'s hold with one end line naming the read; B\'s hold stays', async (_site, _label, at, answer, reason, suffix) => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     const pHold = beginApplyHold(h, p)
     const bHold = beginApplyHold(h, b)
 
@@ -16255,7 +16244,7 @@ describe('b.jg5 SRJ-809: a read of the held row ended, missing or gone ends its 
   })
 
   test.each(HOLD_READ_SITES.flatMap(([site, at]) => HOLD_KEEPING_ANSWERS.map(([label, answer]) => [site, label, at, answer] as const)))('%s reading P\'s row %s keeps P\'s hold, with no end line', async (_site, _label, at, answer) => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     const pHold = beginApplyHold(h, p)
     const bHold = beginApplyHold(h, b)
 
@@ -16266,7 +16255,7 @@ describe('b.jg5 SRJ-809: a read of the held row ended, missing or gone ends its 
   })
 
   test('the shared own-row get reading P\'s row live in another cwd re-points P\'s hold to that cwd, with no line; the read answers the row as before', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const pHold = beginApplyHold(h, p)
     const row = harnessRow(h, harnessPersona(h, p), { state: 'waiting', cwd: h.home })
     h.script({ getResult: row })
@@ -16278,7 +16267,7 @@ describe('b.jg5 SRJ-809: a read of the held row ended, missing or gone ends its 
   })
 
   test('with no hold set installed, the shared get and status reads of P\'s row ended answer as before, end nothing and log no hold line', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const pHold = beginApplyHold(h, p)
     _resetOldLifeHolds()
     const row = harnessRow(h, harnessPersona(h, p), { state: LIVENESS_DEAD_ROW_ENDED })
@@ -16293,10 +16282,10 @@ describe('b.jg5 SRJ-809: a read of the held row ended, missing or gone ends its 
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-118, SRJ-609 (E19 T1): the reconnect is one `send-keys` decided
+// the reconnect is one `send-keys` decided
 // by class (`reconnectMcpWithCause`)
 //
-// One case per cell of SRJ-118's reconnect row, on `makeRecoveryHarness` (its
+// One case per cell of the contract reconnect row, on `makeRecoveryHarness` (its
 // latch installed as `main()` installs it), each call made inside a recovery
 // attempt for P as the restart path makes it: the outcome and its cause, the
 // stub's calls in order (`recordCallOrder`: exactly
@@ -16308,9 +16297,9 @@ describe('b.jg5 SRJ-809: a read of the held row ended, missing or gone ends its 
 // run, then `resume` (`resumed`); CONFLICT → `latched` with nothing more
 // called; a re-check stop → `failed` marked `stopping`. The ladder's
 // `retrying` result for UNAVAILABLE, ENVIRONMENT, CONFIG and
-// UNCLASSIFIED is checked at the reconnect sites of the SRJ-105, SRJ-311,
-// SRJ-316 and SRJ-313 describes (`RECONNECT_SITES`). The named AC 44
-// sequence is E19 T3's.
+// UNCLASSIFIED is checked at the reconnect sites of the,
+// and describes (`RECONNECT_SITES`). The named
+// sequence is .
 // ---------------------------------------------------------------------------
 
 /** A line from one of the reconnect's builders, matched whole around the latch's outcome text (which `build` takes). */
@@ -16320,10 +16309,10 @@ function reconnectLatchLines(build: (outcome: string) => string): (h: RecoveryHa
   return (h) => h.errors.filter((line) => line.startsWith(head) && line.endsWith(tail))
 }
 
-/** What the reconnect's latch line says once the latch is set (SRJ-118: nothing typed, never retried). */
+/** What the reconnect's latch line says once the latch is set (nothing typed, never retried). */
 const RECONNECT_LATCHED_SAYS = ': the persona latched; nothing was typed and the send-keys is not retried'
 
-/** The CONFLICT latch a reconnect of persona `p` sets from case-table `row` (SRJ-501: "P's next check or recovery", the caller's last read). */
+/** The CONFLICT latch a reconnect of persona `p` sets from case-table `row` ("P's next check or recovery", the caller's last read). */
 function reconnectConflictLatch(p: string, row: ConflictCaseRow): ExpectedLatch {
   const lines = reconnectLatchLines((outcome) =>
     reconnectConflictLine(renderPersonaRef(p, p), describeAdFailureForLog(row.build()), row.latchCase, outcome),
@@ -16331,7 +16320,7 @@ function reconnectConflictLatch(p: string, row: ConflictCaseRow): ExpectedLatch 
   return { ...conflictLatch(p, row, row.refusedOperation, row.rowState), lines: (h) => lines(h), says: RECONNECT_LATCHED_SAYS }
 }
 
-/** The unusable-name latch a reconnect of persona `p` sets from case-table `row` (SRJ-512: refused operation none, the caller's last read). */
+/** The unusable-name latch a reconnect of persona `p` sets from case-table `row` (refused operation none, the caller's last read). */
 function reconnectUnusableNameLatch(p: string, row: UnusableNameCaseRow): ExpectedLatch {
   const lines = reconnectLatchLines((outcome) => reconnectUnusableNameLine(renderPersonaRef(p, p), describeAdFailureForLog(row.build()), outcome))
   return { ...unusableNameLatch(p, row), lines: (h) => lines(h), says: RECONNECT_LATCHED_SAYS }
@@ -16339,10 +16328,10 @@ function reconnectUnusableNameLatch(p: string, row: UnusableNameCaseRow): Expect
 
 describe('disconnected reconnect reconciles AD liveness despite a dialog hold', () => {
   beforeEach(() => _resetFindMissingMemo())
-  afterEach(() => srj105AfterEach())
+  afterEach(() => recoveryAfterEach())
 
   test.each(['direct', 'startup'] as const)('%s keeps an unverified dialog-held row held across retries', async entry => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     h.script({
       ...collided(h, harnessPersona(h, p), { state: 'waiting' }),
       findMissingResult: unverifiedRowsOf(p),
@@ -16367,7 +16356,7 @@ describe('disconnected reconnect reconciles AD liveness despite a dialog hold', 
   })
 
   test.each(['startup', 'restart adapter'] as const)('%s routes the reconciled missing row toward resume without death evidence', async entry => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const persona = harnessPersona(h, p)
     let reconciled = false
     h.script({
@@ -16395,7 +16384,7 @@ describe('disconnected reconnect reconciles AD liveness despite a dialog hold', 
   })
 
   test.each(['missing', 'ended', 'pending', 'check_permission'] as const)('the fresh post-sweep %s row alone decides recovery', async state => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     let reconciled = false
     const launchStartedAt = new Date().toISOString()
     h.script({
@@ -16415,13 +16404,13 @@ describe('disconnected reconnect reconciles AD liveness despite a dialog hold', 
   })
 
   test.each([
-    ['UNAVAILABLE', () => SRJ105_UNAVAILABLE[0]![1]('find-missing'), true],
+    ['UNAVAILABLE', () => UNAVAILABLE_CASES[0]![1]('find-missing'), true],
     ['ENVIRONMENT', () => errTmuxNotAvailable('find-missing'), true],
     ['CONFIG', () => errConfigMalformed('find-missing'), true],
     ['UNCLASSIFIED', () => errGeneric('find-missing', 'ErrSweepUnknown'), true],
     ['UNUSABLE NAME', () => errUnusableName(), false],
   ] as const)('%s sweep error follows the shared class handling', async (_name, make, refused) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     h.script({ findMissingError: make(), sendKeysError: errDialogMaybeOpen() })
     const order = recordCallOrder(h)
     expect(await runInAttempt(p, 'recovery', () => reconnectMcpWithCause(p, WAITING_READ))).toEqual({ outcome: 'transient' })
@@ -16434,7 +16423,7 @@ describe('disconnected reconnect reconciles AD liveness despite a dialog hold', 
   })
 })
 
-describe('b.jg5 SRJ-118, SRJ-609: reconnectMcpWithCause makes one send-keys and decides its answer by class; no tmux server start, no retry, no failure counted or posted', () => {
+describe('reconnectMcpWithCause makes one send-keys and decides its answer by class; no tmux server start, no retry, no failure counted or posted', () => {
   /** Every `resolveSystemBinary` call the installed re-check made (the `ErrInvalidFlags` cells). */
   let resolveCalls: Array<object | undefined>
   /** The exit codes the re-check stopped with. */
@@ -16448,7 +16437,7 @@ describe('b.jg5 SRJ-118, SRJ-609: reconnectMcpWithCause makes one send-keys and 
 
   afterEach(() => {
     resetAdVersionRecheckForTests()
-    srj105AfterEach()
+    recoveryAfterEach()
   })
 
   /** Install the real re-check over a counting stub `resolveSystemBinary` answering `outcome` (the baseline when none). */
@@ -16469,7 +16458,7 @@ describe('b.jg5 SRJ-118, SRJ-609: reconnectMcpWithCause makes one send-keys and 
    * from then on in order (the stub's verbs) and P's reference.
    */
   async function reconnectOnce(script: RecoveryStubScript, lastRead: LatchRowState = WAITING_READ) {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     h.script(script)
     const order = recordCallOrder(h)
     const ref = renderPersonaRef(p, p)
@@ -16579,7 +16568,7 @@ describe('b.jg5 SRJ-118, SRJ-609: reconnectMcpWithCause makes one send-keys and 
     expect(h.triggers).toEqual([{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED }])
   })
 
-  // b.jg5 SRJ-104, SRJ-204, SRJ-205: send-keys gives ErrInvalidFlags no
+  // send-keys gives ErrInvalidFlags no
   // meaning: one immediate version re-check, then UNCLASSIFIED.
   test.each([
     [RECHECK_OUTCOME_PASS, undefined, false],
@@ -16606,7 +16595,7 @@ describe('b.jg5 SRJ-118, SRJ-609: reconnectMcpWithCause makes one send-keys and 
     expectOneSendKeysOnly(h, p, order)
     expectLatchedOnce(h, p, reconnectConflictLatch(p, row))
     const [line] = reconnectConflictLatch(p, row).lines(h, p)
-    // SRJ-613: "not this launch's session" on a live row that is not pending is a leftover of an earlier launch.
+    // "not this launch's session" on a live row that is not pending is a leftover of an earlier launch.
     expect(line!.includes(RECONNECT_NOT_THIS_LAUNCH_NOTE)).toBe(row.leftoverOfEarlierLaunch === true)
 
     // The next reconnect of P (any caller) finds it latched: no send-keys, nothing more posted or set.
@@ -16631,7 +16620,7 @@ describe('b.jg5 SRJ-118, SRJ-609: reconnectMcpWithCause makes one send-keys and 
   })
 
   test('a latched P: no send-keys and no other call; transient (latched), one line, nothing posted or set', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const before = await latchBeforeRun(h, p)
     const order = recordCallOrder(h)
     const ref = renderPersonaRef(p, p)
@@ -16643,7 +16632,7 @@ describe('b.jg5 SRJ-118, SRJ-609: reconnectMcpWithCause makes one send-keys and 
     expectNoRelatch(h, before)
   })
 
-  // b.jg5 SRJ-611: each verdict keeps its cause's dead-evidence answer, so a
+  // each verdict keeps its cause's dead-evidence answer, so a
   // reconnect cause that is not dead evidence never maps to the GONE verdict.
   // A cause the reconnect does not answer is no input (the typecheck refuses
   // it): no verdict, and so no dead evidence, is made up for it.
@@ -16656,7 +16645,7 @@ describe('b.jg5 SRJ-118, SRJ-609: reconnectMcpWithCause makes one send-keys and 
     expect(isDeadEvidence(verdict)).toBe(isDeadEvidence(cause))
   })
 
-  // b.jg5 SRJ-609: the row-not-interactive evidence text and line claim no
+  // the row-not-interactive evidence text and line claim no
   // dead worker: a finished row is not proof of death.
   test('the row-not-interactive evidence text and the reconnect\'s line claim neither the process nor the worker is gone or dead', () => {
     const claim = /\b(?:process|worker|session)\b[^;.()]*?\b(?:is|are|was|has been|have been)\s+(?:gone|dead|ended|exited)\b/i
@@ -16666,7 +16655,7 @@ describe('b.jg5 SRJ-118, SRJ-609: reconnectMcpWithCause makes one send-keys and 
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-611: only GONE-based verdicts are dead evidence, and every
+// only GONE-based verdicts are dead evidence, and every
 // dead-session and escalate-dead verdict carries what proved it.
 //
 // The rule (`isDeadEvidence`) runs over every value of the exported lists
@@ -16690,9 +16679,9 @@ describe('b.jg5 SRJ-118, SRJ-609: reconnectMcpWithCause makes one send-keys and 
 // resume are the ladder describe's below and the prompt-row describe's.
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-611: dead evidence, the launch wait\'s dead-session cause and the verdict a relaunch carries', () => {
+describe('dead evidence, the launch wait\'s dead-session cause and the verdict a relaunch carries', () => {
   afterEach(() => {
-    srj105AfterEach()
+    recoveryAfterEach()
   })
 
   /**
@@ -16750,17 +16739,17 @@ describe('b.jg5 SRJ-611: dead evidence, the launch wait\'s dead-session cause an
   test('deadSessionRouteLine: the route\'s own cause, the verdict carried in, and whether the path holds dead evidence (either does)', () => {
     const ref = renderPersonaRef('C', 'C')
     expect(deadSessionRouteLine(ref, 'waiting', carriedDeadEvidenceOf(DEAD_SESSION_CAUSE_TMUX_GONE), CARRIED_DEAD_EVIDENCE_NONE)).toBe(
-      `[slack] spawnForPersona: dead session for ${ref} (state=waiting) — cause=tmux-gone: dead evidence (GONE-based); the path holds dead evidence; recovering via resume/fresh-spawn (b.jg5 SRJ-611)`,
+      `[slack] spawnForPersona: dead session for ${ref} (state=waiting) — cause=tmux-gone: dead evidence (GONE-based); the path holds dead evidence; recovering via resume/fresh-spawn`,
     )
     expect(deadSessionRouteLine(ref, 'working', carriedDeadEvidenceOf(DEAD_SESSION_CAUSE_ROW_ABSENT), carriedDeadEvidenceOf('prompt-row-tmux-gone'))).toBe(
-      `[slack] spawnForPersona: dead session for ${ref} (state=working) — cause=row-absent: not dead evidence; the restart path carried in cause=prompt-row-tmux-gone: dead evidence (GONE-based); the path holds dead evidence; recovering via resume/fresh-spawn (b.jg5 SRJ-611)`,
+      `[slack] spawnForPersona: dead session for ${ref} (state=working) — cause=row-absent: not dead evidence; the restart path carried in cause=prompt-row-tmux-gone: dead evidence (GONE-based); the path holds dead evidence; recovering via resume/fresh-spawn`,
     )
     expect(deadSessionRouteLine(ref, 'ended', CARRIED_DEAD_EVIDENCE_NONE, carriedDeadEvidenceOf(DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE))).toBe(
-      `[slack] spawnForPersona: dead session for ${ref} (state=ended) — no cause carried: not dead evidence; the restart path carried in cause=row-not-interactive: not dead evidence; the path holds no dead evidence; recovering via resume/fresh-spawn (b.jg5 SRJ-611)`,
+      `[slack] spawnForPersona: dead session for ${ref} (state=ended) — no cause carried: not dead evidence; the restart path carried in cause=row-not-interactive: not dead evidence; the path holds no dead evidence; recovering via resume/fresh-spawn`,
     )
     // Dead evidence covers one life: the read or answer that voids it is named.
     expect(deadSessionRouteLine(ref, 'ended', CARRIED_DEAD_EVIDENCE_NONE, carriedDeadEvidenceOf('prompt-row-tmux-gone'), 'the collision get read the row ended')).toBe(
-      `[slack] spawnForPersona: dead session for ${ref} (state=ended) — no cause carried: not dead evidence; the restart path carried in cause=prompt-row-tmux-gone: dead evidence (GONE-based); the path holds no dead evidence: the collision get read the row ended, which voids it; recovering via resume/fresh-spawn (b.jg5 SRJ-611)`,
+      `[slack] spawnForPersona: dead session for ${ref} (state=ended) — no cause carried: not dead evidence; the restart path carried in cause=prompt-row-tmux-gone: dead evidence (GONE-based); the path holds no dead evidence: the collision get read the row ended, which voids it; recovering via resume/fresh-spawn`,
     )
     // With no dead evidence to void, the words are not used.
     expect(deadSessionRouteLine(ref, 'waiting', carriedDeadEvidenceOf(DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE), CARRIED_DEAD_EVIDENCE_NONE, 'unused')).toBe(
@@ -16768,8 +16757,8 @@ describe('b.jg5 SRJ-611: dead evidence, the launch wait\'s dead-session cause an
     )
   })
 
-  // The voided-evidence line and the words naming what voided it (b.jg5 SRJ-611, dead evidence covers one life).
-  test('deadEvidenceVoidedLine names the ref, the voided cause and what voided it, citing SRJ-611; deadEvidenceVoidingRead names the read and the state it read, or no row; deadEvidenceReadByCause names the route\'s cause; the answers that void are named', () => {
+  // The voided-evidence line and the words naming what voided it (dead evidence covers one life).
+  test('deadEvidenceVoidedLine names the ref, the voided cause and what voided it, citing; deadEvidenceVoidingRead names the read and the state it read, or no row; deadEvidenceReadByCause names the route\'s cause; the answers that void are named', () => {
     const ref = renderPersonaRef('C', 'C')
     expect(deadEvidenceVoidingRead(DEAD_EVIDENCE_READ_BY_COLLISION_GET, latchRowStateRead(LIVENESS_DEAD_ROW_ENDED))).toBe('the collision get read the row ended')
     expect(deadEvidenceVoidingRead(DEAD_EVIDENCE_READ_BY_POST_SWEEP_GET, LATCH_ROW_STATE_NO_ROW)).toBe("the get of its own row after the path's find-missing run found no row (ErrSpawnNotFound)")
@@ -16777,7 +16766,7 @@ describe('b.jg5 SRJ-611: dead evidence, the launch wait\'s dead-session cause an
     expect(deadEvidenceVoidingRead(DEAD_EVIDENCE_READ_BY_PROMPT_ROW_REREAD, latchRowStateRead(LIVENESS_DEAD_ROW_ENDED))).toBe("the prompt-row ladder action's re-read after its find-missing run read the row ended")
     expect(deadEvidenceReadByCause(DEAD_SESSION_CAUSE_ROW_READ_FINISHED)).toBe('the read behind its dead-session cause (cause=row-read-finished)')
     expect(deadEvidenceVoidedLine(ref, carriedDeadEvidenceOf('prompt-row-tmux-gone'), 'the collision get read the row ended')).toBe(
-      `[slack] spawnForPersona: ${ref}'s dead evidence (cause=prompt-row-tmux-gone: dead evidence (GONE-based)) is void for the rest of this attempt — the collision get read the row ended; a later live reading of the row is a launch that evidence never saw, handled as on a path with no dead evidence (b.jg5 SRJ-611)`,
+      `[slack] spawnForPersona: ${ref}'s dead evidence (cause=prompt-row-tmux-gone: dead evidence (GONE-based)) is void for the rest of this attempt — the collision get read the row ended; a later live reading of the row is a launch that evidence never saw, handled as on a path with no dead evidence`,
     )
     expect(DEAD_EVIDENCE_VOIDED_BY_ROW_NOT_INTERACTIVE).toBe("the reconnect's send-keys answered ErrSpawnNotInteractive (row-not-interactive): the row is finished, or pending under a launch the verdict never saw")
     expect(DEAD_EVIDENCE_VOIDED_BY_RESUME_NOT_FOUND).toBe('resume answered ErrSpawnNotFound: the row is gone')
@@ -16788,11 +16777,11 @@ describe('b.jg5 SRJ-611: dead evidence, the launch wait\'s dead-session cause an
   test('joinedLaunchDropsDeadEvidenceLine: the joining call\'s verdict, dropped', () => {
     const ref = renderPersonaRef('C', 'C')
     expect(joinedLaunchDropsDeadEvidenceLine(ref, carriedDeadEvidenceOf('dead-session'))).toBe(
-      `[slack] spawnForPersona: the joining call for ${ref} carried an escalate-dead verdict (cause=dead-session: dead evidence (GONE-based)) — dropped; it gets the launch in flight's result (b.jg5 SRJ-611)`,
+      `[slack] spawnForPersona: the joining call for ${ref} carried an escalate-dead verdict (cause=dead-session: dead evidence (GONE-based)) — dropped; it gets the launch in flight's result`,
     )
   })
 
-  // b.jg5 SRJ-605, SRJ-611: each dead-session end of the launch wait carries
+  // each dead-session end of the launch wait carries
   // exactly one cause: the wait's reconnect's (its `send-keys` on a row the
   // poll read `waiting`), `row-absent` for a `status` read answering
   // `ErrSpawnNotFound`, and `row-read-finished` with the state for a row read
@@ -16811,13 +16800,13 @@ describe('b.jg5 SRJ-611: dead evidence, the launch wait\'s dead-session cause an
   ]
 
   test.each(WAIT_DEAD_ENDS)('the launch wait: %s → dead-session with exactly its one cause (and the state read for a finished row); one line from its builder for a row read', async (_label, setup, script, expected, lineOf) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     setup(h)
     h.script(script)
 
     const result = await waitForWaitingAndReconnectWithCause(p, h.config)
 
-    // `lastRead` is the SRJ-501 cases'; everything else is the dead-session end.
+    // `lastRead` is the cases'; everything else is the dead-session end.
     expect({ ...result, lastRead: undefined }).toEqual({ outcome: 'dead-session', ...expected, lastRead: undefined })
     expect(Object.keys(result).filter((k) => k !== 'lastRead').sort()).toEqual(['outcome', ...Object.keys(expected)].sort())
     if (lineOf !== undefined) expect(h.errors.filter((l) => l === lineOf(`persona=${p}`))).toHaveLength(1)
@@ -16858,7 +16847,7 @@ describe('b.jg5 SRJ-611: dead evidence, the launch wait\'s dead-session cause an
    * [case, P's row, the row state the route's line names, the verdict the
    * relaunch carries, the route's own cause (none on the finished-row
    * route), the evidence the path holds at the not-resumable step, and the
-   * read or answer that voided the carried verdict (b.jg5 SRJ-611: dead
+   * read or answer that voided the carried verdict (dead
    * evidence covers one life; none when nothing was voided)].
    */
   const CARRIED_ROUTES: ReadonlyArray<readonly [string, (h: RecoveryHarness, p: string) => RecoveryStubScript, string, CarriedDeadEvidence | undefined, CarriedDeadEvidence, CarriedDeadEvidence, string | undefined]> = [
@@ -16869,14 +16858,14 @@ describe('b.jg5 SRJ-611: dead evidence, the launch wait\'s dead-session cause an
     ]),
     // Deliberately inconsistent, cast past the brand: the ladder must re-decide from the source.
     ['an ended row, a hand-built value claiming evidence for row-not-interactive → decided again from its cause: no dead evidence, nothing voided', finishedRow(LIVENESS_DEAD_ROW_ENDED), LIVENESS_DEAD_ROW_ENDED, handBuilt(DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE, true), CARRIED_DEAD_EVIDENCE_NONE, NOT_INTERACTIVE, undefined],
-    // AC 59 as amended: the reconnect's row-not-interactive voids the carried verdict.
+    // the reconnect's row-not-interactive voids the carried verdict.
     ['a waiting row whose reconnect is refused as not interactive, a GONE-based verdict carried → that answer voids it: the path holds its own cause, no dead evidence', waitingRow(errSpawnNotInteractive('send-keys')), 'waiting', GONE_VERDICT, NOT_INTERACTIVE, NOT_INTERACTIVE, DEAD_EVIDENCE_VOIDED_BY_ROW_NOT_INTERACTIVE],
     ['a waiting row whose reconnect is refused as not interactive, no verdict carried → no dead evidence', waitingRow(errSpawnNotInteractive('send-keys')), 'waiting', undefined, NOT_INTERACTIVE, NOT_INTERACTIVE, undefined],
     ['a waiting row whose reconnect answers GONE, a row-not-interactive verdict carried → the path holds its own evidence', waitingRow(errTmuxSendKeys()), 'waiting', NOT_INTERACTIVE, OWN_GONE, OWN_GONE, undefined],
   ]
 
   test.each(CARRIED_ROUTES)('the restart path\'s relaunch: %s; the route\'s line and the not-resumable step\'s line name it, one voided line for a voided verdict, and its re-read of an ended row is a lost race; nothing killed or deleted', async (_label, reach, routeState, carried, own, held, voidedBy) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const ref = renderPersonaRef(p, p)
 
     const { launched, routes, notResumable } = await launchCarrying(h, p, reach(h, p), carried)
@@ -16898,7 +16887,7 @@ describe('b.jg5 SRJ-611: dead evidence, the launch wait\'s dead-session cause an
     ['carrying a GONE-based verdict → its verdict is dropped with one line', carriedDeadEvidenceOf('dead-session')],
     ['carrying nothing → no drop line', undefined],
   ])('a relaunch joining P\'s launch in flight, %s; it gets that launch\'s result', async (_label, carried) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const held = holdSpawns(h.stub.client)
     const first = h.launch(p)
     await held.entered(personaInstanceId(p))
@@ -16918,13 +16907,13 @@ describe('b.jg5 SRJ-611: dead evidence, the launch wait\'s dead-session cause an
   })
 })
 
-describe('b.jg5 SRJ-118, SRJ-609: the ladder\'s waiting and working branches map the reconnect\'s answer', () => {
+describe('the ladder\'s waiting and working branches map the reconnect\'s answer', () => {
   beforeEach(() => {
     _resetFindMissingMemo()
   })
   afterEach(() => {
     resetAdVersionRecheckForTests()
-    srj105AfterEach()
+    recoveryAfterEach()
   })
 
   /** The ladder branch, with the stub answers that reach its reconnect (the working branch through its wait's poll reading `waiting`). */
@@ -16934,7 +16923,7 @@ describe('b.jg5 SRJ-118, SRJ-609: the ladder\'s waiting and working branches map
   ]
 
   test.each(BRANCHES)('%s: ok → reconnected, after one send-keys', async (_branch, reach, setup) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     setup?.(h)
     h.script(reach(h, harnessPersona(h, p)))
 
@@ -16952,8 +16941,8 @@ describe('b.jg5 SRJ-118, SRJ-609: the ladder\'s waiting and working branches map
       ['ErrSpawnNotFound', () => errSpawnNotFound(), DEAD_SESSION_CAUSE_ROW_ABSENT],
     ] as const).map(([what, make, cause]) => [branch, what, reach, setup, make, cause] as const),
   )
-  test.each(DEAD_CROSS)('%s: %s → dead-session → one find-missing run, then resume: resumed, with one send-keys; the route\'s one line names the reconnect\'s cause and its dead-evidence answer (b.jg5 SRJ-611); no kill, delete, notice, spawn-failed entry or counted failure', async (branch, _what, reach, setup, make, cause) => {
-    const { h, p } = srj105Build()
+  test.each(DEAD_CROSS)('%s: %s → dead-session → one find-missing run, then resume: resumed, with one send-keys; the route\'s one line names the reconnect\'s cause and its dead-evidence answer; no kill, delete, notice, spawn-failed entry or counted failure', async (branch, _what, reach, setup, make, cause) => {
+    const { h, p } = buildRecoveryCase()
     setup?.(h)
     h.script({ ...reach(h, harnessPersona(h, p)), sendKeysError: make(), findMissingResult: cannedFindMissing({ count: 1, ids: [personaInstanceId(p)] }) })
     const order = recordCallOrder(h)
@@ -16972,7 +16961,7 @@ describe('b.jg5 SRJ-118, SRJ-609: the ladder\'s waiting and working branches map
     expect(getFailureCount(p)).toBe(0)
   })
 
-  // b.jg5 SRJ-605, SRJ-611: the working branch's dead sessions its wait
+  // the working branch's dead sessions its wait
   // decides from a row read (the poll's or the timeout read's
   // `ErrSpawnNotFound`, `ended` or `missing`) take the same route: one line
   // naming the row read's cause, never dead evidence, then the find-missing
@@ -16983,8 +16972,8 @@ describe('b.jg5 SRJ-118, SRJ-609: the ladder\'s waiting and working branches map
     ['the timeout read answers ErrSpawnNotFound', deadlineAtStart, { statusError: errSpawnNotFound() }, DEAD_SESSION_CAUSE_ROW_ABSENT],
     ...[...AGENT_DIRECTOR_DEAD_STATES].map((state) => [`the timeout read reads ${state}`, deadlineAtStart, { statusResult: cannedStatusResult({ state }) }, DEAD_SESSION_CAUSE_ROW_READ_FINISHED] as const),
   ]
-  test.each(WAIT_ROW_READS)('working: %s → dead-session → one find-missing run, then resume: resumed, with nothing typed; the route\'s one line names the row read\'s cause, not dead evidence (b.jg5 SRJ-611); no kill, delete, notice or counted failure', async (_what, setup, script, cause) => {
-    const { h, p } = srj105Build()
+  test.each(WAIT_ROW_READS)('working: %s → dead-session → one find-missing run, then resume: resumed, with nothing typed; the route\'s one line names the row read\'s cause, not dead evidence; no kill, delete, notice or counted failure', async (_what, setup, script, cause) => {
+    const { h, p } = buildRecoveryCase()
     setup(h)
     h.script({ ...collided(h, harnessPersona(h, p), { state: 'working' }), ...script })
     const order = recordCallOrder(h)
@@ -17011,7 +17000,7 @@ describe('b.jg5 SRJ-118, SRJ-609: the ladder\'s waiting and working branches map
     return [branch, row.name, reach, setup, row] as const
   })
   test.each(CONFLICT_CROSS)('%s: CONFLICT (%s) → latched (launchSession \'skipped\'), one post, no resume, kill, delete or spawn after the send-keys; no path launches P again', async (_branch, _name, reach, setup, row) => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     setup?.(h)
     const script = { ...reach(h, harnessPersona(h, p)), sendKeysError: row.build() }
     h.script(script)
@@ -17032,7 +17021,7 @@ describe('b.jg5 SRJ-118, SRJ-609: the ladder\'s waiting and working branches map
       log: () => {},
       clock: createFakeClock(),
     })
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     h.script({ ...collided(h, harnessPersona(h, p), { state: 'waiting' }), sendKeysError: errInvalidFlags('send-keys') })
 
     expect(await h.launch(p)).toStrictEqual({ key: p, action: 'failed', stopping: true })
@@ -17047,18 +17036,18 @@ describe('b.jg5 SRJ-118, SRJ-609: the ladder\'s waiting and working branches map
 
 const LAUNCH_AND_READ_VERBS: ReadonlySet<string> = new Set(['spawn', 'resume', 'get', 'kill', 'delete', 'findMissing'])
 
-/** The `retrying` launch result, uncounted (b.jg5 SRJ-105, SRJ-301, SRJ-1015). */
+/** The `retrying` launch result, uncounted. */
 const RETRYING_ANSWER = { action: SPAWN_ACTION_RETRYING } as const
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-705 step 6, SRJ-706 (E21 T1), SRJ-112, SRJ-708 (E22 T1): the
+// step 6: the
 // live-row sequence's launch entry (`launchForLiveRowSequence`), its reuse
 // spawn (the session manager's `reuseSpawnForPersona`) and the sequence's
 // dependency builder (`buildLiveRowSequenceDeps`)
 //
 // On the recovery harness, whose `sequenceDeps` come from the builder. The
 // entry is a launch call: a `resume` through the ladder's launch helper whose
-// outcomes follow SRJ-113's table (`RESUME_OUTCOME_ROWS`, one case per row,
+// outcomes follow the contract table (`RESUME_OUTCOME_ROWS`, one case per row,
 // and the sequence `resume` CONFLICT rows of the case table): its
 // no-transcript answers go on to the reuse spawn once, its ErrSpawnNotFound
 // to one plain spawn of the id with no spawn-failure notice (whose scan
@@ -17068,29 +17057,29 @@ const RETRYING_ANSWER = { action: SPAWN_ACTION_RETRYING } as const
 // FAILURE or DIRECTORY result is counted, and a call joining the entry's
 // launch gets its result. A reuse is
 // the reuse spawn, one stub `spawn` of `cscb_<key>` carrying the reuse flag.
-// The reuse spawn's describe covers its parameters (AC 57: a plain spawn's
+// The reuse spawn's describe covers its parameters (a plain spawn's
 // apart from the flag), its success line (no earlier life kept when the id
 // had no row), the steps around it (the trust patch once, the launch in
-// flight while it is held) and SRJ-112's
+// flight while it is held) and
 // outcome table, one case per row, with the CONFLICT and UNUSABLE NAME rows'
 // whole matrices (their records and posts) left to
 // tests/conflict-latch.test.ts and the other arms through the sequence to
 
-// SRJ-401 and SRJ-413 describes' (a `SUCCESS_SITES` row). No case makes a
+// and describes' (a `SUCCESS_SITES` row). No case makes a
 // `delete` or a `kill` from the entry, and no call sets `include_finished`
 // or `no_pre_trust` (checked after each case). The sequence's other steps
 // are tests/live-row-sequence.test.ts's.
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch entry, its reuse spawn and the sequence\'s dependency builder', () => {
+describe('step 6, the sequence-launch entry, its reuse spawn and the sequence\'s dependency builder', () => {
   afterEach(() => {
-    const h = srj105Harness
+    const h = recoveryHarness
     if (h !== undefined) {
       const everyCall = Object.values(h.stub.calls).flat() as unknown[]
       const carrying = (field: string) => everyCall.filter((params) => typeof params === 'object' && params !== null && field in params)
       expect([carrying('include_finished'), carrying('no_pre_trust'), h.stub.calls.deleteCalls]).toEqual([[], [], []])
     }
-    srj105AfterEach()
+    recoveryAfterEach()
   })
 
   /** What the sequence last read before its launch: the row `ended`. */
@@ -17123,7 +17112,7 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
   }
 
   test('a launch call: isLaunchInFlight is true while its resume is held and whenLaunchSettled waits for it; both clear once it settles', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const held = holdResume(h)
     const entry = launchEntry(h, p, LIVE_ROW_LAUNCH_RESUME)
     await held.entered
@@ -17142,7 +17131,7 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
   })
 
   test('with a launch for P already held in flight, the entry waits for it to settle and never overlaps it', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const id = personaInstanceId(p)
     const hold = holdSpawns(h.stub.client)
     const first = h.launch(p)
@@ -17162,12 +17151,12 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
 
   })
 
-  // b.jg5 SRJ-706: the sequence's stop signal goes with its launch; once it
+  // the sequence's stop signal goes with its launch; once it
   // is set (P's teardown, shutdown, P's latch) the entry makes no call.
   test.each([LIVE_ROW_STOP_TEARDOWN, LIVE_ROW_STOP_SHUTDOWN, LIVE_ROW_STOP_LATCHED] as const)(
     'with a launch for P held in flight, a stop for %s set while the entry waits for it: the entry answers not launched (stopped) at once with one line, no call and nothing registered as in flight',
     async (reason) => {
-      const { h, p } = srj105Build()
+      const { h, p } = buildRecoveryCase()
       const id = personaInstanceId(p)
       const hold = holdSpawns(h.stub.client)
       const first = h.launch(p)
@@ -17192,7 +17181,7 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
   )
 
   test('a stop set before the entry is called: no wait and no call, not launched (stopped)', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const stop = createLiveRowSequenceStop()
     stop.stop(LIVE_ROW_STOP_TEARDOWN)
 
@@ -17204,7 +17193,7 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
     expect([h.stub.callCount(), isLaunchInFlight(p)]).toEqual([0, false])
   })
 
-  // b.jg5 SRJ-705, SRJ-707, SRJ-712: the sequence's `resume` leg with no
+  // the sequence's `resume` leg with no
   // transcript to resume goes on to the reuse. After ErrJsonlMissing the
   // diagnosis's get comes first and the launch answers its amnesia result
   // (inconclusive: the harness configures no message archive), its line
@@ -17216,7 +17205,7 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
     ['ErrJsonlMissing', () => errJsonlMissing(), 'fresh-after-inconclusive-amnesia', ['resume', 'get', 'spawn'], 1],
     ['ErrJsonlNeverWritten', () => errJsonlNeverWritten(), 'spawned', ['resume', 'spawn'], 0],
   ] as const)('resume answering %s goes on to exactly one reuse spawn of the id, with the flag, answering %s; the diagnosis get, if any, before it; no delete, kill or plain spawn, nothing counted', async (_label, make, action, calls, diagnoses) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     h.script({ resumeError: make() })
     const order = recordCallOrder(h)
 
@@ -17234,17 +17223,17 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
 
   })
 
-  // b.jg5 SRJ-113 at the sequence-launch entry's `resume` leg: one case per
+  // at the sequence-launch entry's `resume` leg: one case per
   // row of the table (`RESUME_OUTCOME_ROWS`), over the row the sequence last
   // read `ended`, with a session id. Every non-success but the three
   // no-transcript fallbacks and ErrSpawnNotFound's plain spawn ends the
   // launch with no further launch; ErrSpawnNotResumable makes its one re-read.
 
-  // b.jg5 SRJ-113, SRJ-501 (HO rev 15, rev 20): each sequence `resume` row of
+  // (HO rev 15, rev 20): each sequence `resume` row of
   // the case table latches P with its case, the refused operation "resume"
   // and the state the sequence last read; one post; no further call.
-  test.each(sequenceResumeConflictRowsAt(LIVENESS_DEAD_ROW_ENDED).map((row) => [row.name, row] as const))('SRJ-113 at the entry: resume answering CONFLICT (%s) latches P with the refused operation "resume" and the state last read; one post; no kill and no further call', async (_name, row) => {
-    const { h, p } = srj105Build()
+  test.each(sequenceResumeConflictRowsAt(LIVENESS_DEAD_ROW_ENDED).map((row) => [row.name, row] as const))('at the entry: resume answering CONFLICT (%s) latches P with the refused operation "resume" and the state last read; one post; no kill and no further call', async (_name, row) => {
+    const { h, p } = buildRecoveryCase()
     h.script({ resumeError: row.build() })
     const order = recordCallOrder(h)
 
@@ -17254,14 +17243,14 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
     expectLatchedOnce(h, p, conflictLatch(p, row, REFUSED_OPERATION_RESUME, LAST_READ))
   })
 
-  // b.jg5 SRJ-113, SRJ-111, SRJ-501 (HO rev 15, rev 20): the plain spawn
+  // (HO rev 15, rev 20): the plain spawn
   // after the entry's ErrSpawnNotFound makes agent-director's pre-spawn scan;
   // each of the plain spawn's CONFLICT rows (the scan's refusal, leaving no
   // row, and each "duplicate session" answer, leaving the row `ended`)
   // latches P with the refused operation "plain spawn" and the state the
   // sequence last read (resume is not a read): no kill, no further call.
-  test.each(PLAIN_SPAWN_CONFLICT_CASE_ROWS.map((row) => [row.name, row.rowAfter, row] as const))('SRJ-113, SRJ-111 at the entry: ErrSpawnNotFound, then the plain spawn\'s CONFLICT (%s, the row left: %s): latched with "plain spawn" and the state last read, no read of the row after it; no kill, no spawn-failure notice, nothing counted, no further call', async (_name, _rowAfter, row) => {
-    const { h, p } = srj105Build()
+  test.each(PLAIN_SPAWN_CONFLICT_CASE_ROWS.map((row) => [row.name, row.rowAfter, row] as const))('at the entry: ErrSpawnNotFound, then the plain spawn\'s CONFLICT (%s, the row left: %s): latched with "plain spawn" and the state last read, no read of the row after it; no kill, no spawn-failure notice, nothing counted, no further call', async (_name, _rowAfter, row) => {
+    const { h, p } = buildRecoveryCase()
     h.script({ resumeError: errSpawnNotFound(), spawnError: row.build() })
     const order = recordCallOrder(h)
 
@@ -17273,14 +17262,14 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
     expectLatchedOnce(h, p, conflictLatch(p, row, REFUSED_OPERATION_PLAIN_SPAWN, LAST_READ))
   })
 
-  // b.jg5 SRJ-113, SRJ-705: a step-6 `resume` answering ErrSpawnNotFound
+  // a step-6 `resume` answering ErrSpawnNotFound
   // makes one plain spawn of the id, with no spawn-failure notice for the
   // ErrSpawnNotFound itself, and the sequence
   // launches. The sequence runs over the harness's dependencies outside the
   // registry, so a restart-path launch made while the `resume` is held joins
   // the entry's launch and gets its result.
   test('a step-6 resume answering ErrSpawnNotFound: one plain spawn of the id (no reuse flag) and the sequence launches; no spawn-failure notice, nothing counted, nothing armed but the spawn\'s one pending-only watch; a restart-path launch that joins it gets its success', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const err = errSpawnNotFound()
     h.script({ getResult: harnessRow(h, harnessPersona(h, p), ENDED_WITH_SESSION), resumeError: err })
     const held = holdResume(h)
@@ -17310,7 +17299,7 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
 
   })
 
-  describe('b.jg5 SRJ-112, SRJ-708: the reuse spawn through the entry\'s reuse kind', () => {
+  describe('the reuse spawn through the entry\'s reuse kind', () => {
     /** The entry's reuse of persona `key`, the sequence having last read `lastRead` (the row `ended` by default). */
     const reuseEntry = (h: RecoveryHarness, key: string, lastRead: LatchRowState = LAST_READ) =>
       launchForLiveRowSequence(harnessPersona(h, key), h.config, { kind: LIVE_ROW_LAUNCH_REUSE, lastRead })
@@ -17318,12 +17307,12 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
     /** Persona `key`'s one reuse spawn, as the stub recorded it. */
     const oneReuseOf = (h: RecoveryHarness, key: string) => [reuseSpawnOf(h, key)]
 
-    // AC 57, SRJ-708: one derivation of the parameters, the flag the only difference.
+    // one derivation of the parameters, the flag the only difference.
     test.each([
       ['a persona with the top-level default claude_config_dir', false],
       ['a persona with its own claude_config_dir', true],
-    ] as const)('AC 57, %s: P\'s reuse equals P\'s plain first spawn, as the stub recorded both, once the reuse field is removed (template, cwd, instance id, relay mode, session name, labels and extra_env, prompt suggestions off); the field is true on the reuse and absent on the plain spawn', async (_label, ownConfigDir) => {
-      const { h, p } = srj105Build(ownConfigDir ? { personas: [{ claude_config_dir: fixtureSubdir('claude-config') }, {}] } : undefined)
+    ] as const)(', %s: P\'s reuse equals P\'s plain first spawn, as the stub recorded both, once the reuse field is removed (template, cwd, instance id, relay mode, session name, labels and extra_env, prompt suggestions off); the field is true on the reuse and absent on the plain spawn', async (_label, ownConfigDir) => {
+      const { h, p } = buildRecoveryCase(ownConfigDir ? { personas: [{ claude_config_dir: fixtureSubdir('claude-config') }, {}] } : undefined)
       const persona = harnessPersona(h, p)
       expect(persona.claude_config_dir !== undefined).toBe(ownConfigDir)
 
@@ -17342,7 +17331,7 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
 
     test('an unresolvable claude_config_dir: the reuse makes no agent-director call and answers deferred; nothing counted', async () => {
       const configDir = fixtureSubdir('claude-config')
-      const { h, p } = srj105Build({ personas: [{ claude_config_dir: configDir }, {}] })
+      const { h, p } = buildRecoveryCase({ personas: [{ claude_config_dir: configDir }, {}] })
       setConfigDirUnresolvableHook(() => false)
       _setConfigDirFs({ realpath: realpathFailingUnder(configDir, () => true) })
 
@@ -17351,13 +17340,13 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
       expect([h.stub.callCount(), getFailureCount(p), h.notices]).toEqual([0, 0, []])
     })
 
-    // SRJ-708, b.av2 SR-6.2: the trust patch runs once per attempt, including
+    // the trust patch runs once per attempt, including
     // a resume that proceeds to a reuse spawn.
     test.each([
       ['the reuse kind', LIVE_ROW_LAUNCH_REUSE, ['spawn']],
       ['a resume that answered ErrNoSessionId', LIVE_ROW_LAUNCH_RESUME, ['resume', 'spawn']],
     ] as const)('%s: delegates launches to AD', async (_label, kind, events) => {
-      const { h, p } = srj105Build()
+      const { h, p } = buildRecoveryCase()
       const order: string[] = []
       observeLaunchCalls(h.stub.client, (call) => order.push(call))
       h.script({ resumeError: errNoSessionId() })
@@ -17369,14 +17358,14 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
 
     })
 
-    // SRJ-112: the success line says whether the id had a row when the
+    // the success line says whether the id had a row when the
     // sequence last read it (step 3's `get`); with none the reuse is an
     // ordinary fresh spawn and keeps no prior sessions.
     test.each([
       ['no row (ErrSpawnNotFound)', true],
       ['the row ended', false],
     ] as const)('step 3\'s get reading %s, then a reuse that succeeds: one reuse success line, which says whether the AD life and prior sessions are retained', async (_label, noRow) => {
-      const { h, p } = srj105Build()
+      const { h, p } = buildRecoveryCase()
       h.script(noRow ? { getError: errSpawnNotFound() } : { getResult: cannedGetResult({ state: LIVENESS_DEAD_ROW_ENDED }, harnessPersona(h, p), h.home) })
 
       expect(await h.runSequence(p, { lastReadState: cannedStatusResult().state })).toMatchObject({
@@ -17389,14 +17378,14 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
         ? 'the id had no row when last read (an ordinary fresh spawn), so no prior sessions are kept'
         : 'its Claude row retains its AD life and prior sessions'
       expect(h.errors.filter((line) => line.includes(': reuse-spawned '))).toEqual([
-        `[slack] reuseSpawnForPersona: reuse-spawned ${renderPersonaRef(p, p)} instanceId=${personaInstanceId(p)} — a fresh conversation on its own id; ${earlierLife} (b.jg5 SRJ-112)`,
+        `[slack] reuseSpawnForPersona: reuse-spawned ${renderPersonaRef(p, p)} instanceId=${personaInstanceId(p)} — a fresh conversation on its own id; ${earlierLife}`,
       ])
       expect(h.reuseSpawns()).toEqual(oneReuseOf(h, p))
 
     })
 
     test('a launch call: isLaunchInFlight is true while the reuse spawn is held, and false once it settled', async () => {
-      const { h, p } = srj105Build()
+      const { h, p } = buildRecoveryCase()
       const hold = holdSequenceReuse(h, p)
       const entry = reuseEntry(h, p)
       await hold.entered
@@ -17409,11 +17398,11 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
 
     })
 
-    // b.jg5 SRJ-112, SRJ-602: the entry counts a counted failure once; a
+    // the entry counts a counted failure once; a
     // restart-path launch that joins the entry's launch in flight reads it as
     // `retrying` (launchSession's 'refused'), so it is not counted twice.
     test('a restart-path launch that joins the held reuse gets the uncounted \'refused\' answer when the reuse fails with a directory error; the failure is counted once', async () => {
-      const { h, p } = srj105Build()
+      const { h, p } = buildRecoveryCase()
       const hold = holdSpawns(h.stub.client)
       const entry = reuseEntry(h, p)
       await hold.entered(personaInstanceId(p))
@@ -17427,7 +17416,7 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
       expect(hold.calls).toHaveLength(1)
     })
 
-    /** One row of SRJ-112's outcome table at the entry: what the reuse spawn answers and what it does. */
+    /** One row of the contract outcome table at the entry: what the reuse spawn answers and what it does. */
     interface ReuseOutcome {
       /** The reuse spawn's answer: an error to throw, or success. */
       readonly make: () => Error | undefined
@@ -17447,9 +17436,9 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
       readonly unclassified?: true
       /**
        * Whether one `get` of P's row follows the reuse (an UNAVAILABLE outcome,
-       * b.jg5 SRJ-407); the case has it read the row `ended`, as the sequence
+       *); the case has it read the row `ended`, as the sequence
        * last read it, so nothing more is called. That `get`'s other answers
-       * are the SRJ-407 describe's.
+       * are the describe's.
        */
       readonly oneGet?: true
     }
@@ -17459,13 +17448,13 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
     const [UNUSABLE_ROW] = REUSE_SPAWN_UNUSABLE_NAME_CASE_ROWS
 
     /**
-     * SRJ-112's rows, one case each. UNAVAILABLE in every form, a value that
+     * rows, one case each. UNAVAILABLE in every form, a value that
      * is no agent-director error among them; one CONFLICT and one UNUSABLE
      * NAME row (every such row, with its record and post, is
      * tests/conflict-latch.test.ts's); UNCLASSIFIED in each form CSCB meets.
      */
     const REUSE_OUTCOMES: ReadonlyArray<readonly [string, ReuseOutcome]> = [
-      // A reuse that returned arms P's pending-only watch over the row it left (b.jg5 SRJ-301, SRJ-409).
+      // A reuse that returned arms P's pending-only watch over the row it left.
       ['success', { make: () => undefined, answer: { action: 'spawned' }, armed: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW], counted: 0 }],
       [
         'ErrInstanceIdCollision: not launched (reuse-collision), no further launch, nothing counted, no notice',
@@ -17529,13 +17518,13 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
         { make: () => errCwdNotADirectory(), answer: { action: 'failed', countedClass: true }, armed: [], counted: 1, outage: 'cwd-unreachable' },
       ],
       ...[
-        ...SRJ313_UNCLASSIFIED.map(([label, make]) => [label, make, undefined] as const),
+        ...UNCLASSIFIED_CASES.map(([label, make]) => [label, make, undefined] as const),
         ['a store that cannot be opened (ErrSchemaMismatch)', () => errSchemaMismatch(), undefined] as const,
         [`a store that cannot be opened (${ERR_STORE_OPEN_NAME})`, () => errUnknownErrorName(ERR_STORE_OPEN_NAME), undefined] as const,
-        // Its wrapper raises ad-unreachable (b.jg5 SRJ-104).
+        // Its wrapper raises ad-unreachable.
         ['ErrSystemInstallDisappeared', (verb: string) => errSystemInstallDisappeared(verb), 'ad-unreachable'] as const,
       ].map(([label, make, outage]): readonly [string, ReuseOutcome] => [
-        `UNCLASSIFIED (${label}): refused, never counted, reported once to P's episode (AC 69)`,
+        `UNCLASSIFIED (${label}): refused, never counted, reported once to P's episode`,
         {
           make: () => make('spawn'),
           answer: RETRYING,
@@ -17547,8 +17536,8 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
       ]),
     ]
 
-    test.each(REUSE_OUTCOMES)('SRJ-112, %s; the one reuse spawn is the last launch: no kill, delete, resume or second spawn', async (_label, row) => {
-      const { h, p, b } = srj105Build()
+    test.each(REUSE_OUTCOMES)(', %s; the one reuse spawn is the last launch: no kill, delete, resume or second spawn', async (_label, row) => {
+      const { h, p, b } = buildRecoveryCase()
       const err = row.make()
       if (err !== undefined) h.script({ spawnError: err })
       if (row.oneGet === true) h.script({ getResult: harnessRow(h, harnessPersona(h, p), { state: LIVENESS_DEAD_ROW_ENDED }) })
@@ -17572,11 +17561,11 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
 
     })
 
-    // b.jg5 SRJ-112, SRJ-207: the reuse's ErrInvalidFlags gets one immediate
+    // the reuse's ErrInvalidFlags gets one immediate
     // version re-check; one that passes, cannot run or is not running holds P
     // under the version it began under, with one alert, and nothing else.
-    test.each(HOLDING_RECHECKS)('SRJ-112, SRJ-207, ErrInvalidFlags, the one version re-check %s: P held, answering held, with one alert; no other launch (no plain spawn, no resume, no second reuse), nothing counted, armed or reported to P\'s unclassified-error episode', async (_label, kind, answer, version) => {
-      const { h, p } = srj105Build()
+    test.each(HOLDING_RECHECKS)(', ErrInvalidFlags, the one version re-check %s: P held, answering held, with one alert; no other launch (no plain spawn, no resume, no second reuse), nothing counted, armed or reported to P\'s unclassified-error episode', async (_label, kind, answer, version) => {
+      const { h, p } = buildRecoveryCase()
       const rc = answer === undefined ? undefined : h.versionRecheck(answer)
       const err = errInvalidFlags('spawn')
       h.script({ spawnError: err })
@@ -17589,14 +17578,14 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
       expectHeldOnce(h, p, err, kind, version)
     })
 
-    // HO rev 15, SRJ-713: a reuse of an id with no row is an ordinary fresh
+    // HO rev 15, a reuse of an id with no row is an ordinary fresh
     // spawn; its scan's refusals are tests/conflict-latch.test.ts's. Its
     // ErrTmuxSessionCreate is counted, never killed, and arms P's timer at
     // once in pending-only mode; the row the stub then models reads pending,
     // and P's next retry reads it (its `status`, then the one covered-row
-    // `get`, b.jg5 SRJ-409) with no kill and no delete, and keeps the watch.
+    // `get`) with no kill and no delete, and keeps the watch.
     test('a reuse of an id with no row answering ErrTmuxSessionCreate: counted once with one notice, never killed; P\'s timer armed at once in pending-only mode with the pending-row cause, and its retry reads the pending row it left with no kill, delete or launch', async () => {
-      const { h, p } = srj105Build()
+      const { h, p } = buildRecoveryCase()
       h.script({ spawnError: errTmuxSessionCreate('spawn') })
 
       expect(await reuseEntry(h, p, LATCH_ROW_STATE_NO_ROW)).toStrictEqual({ key: p, action: 'failed', countedClass: true, pendingOnlyArmed: true })
@@ -17623,7 +17612,7 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
   // The dependency builder, as the harness builds it (`h.sequenceDeps`).
 
   test('the builder reads nothing and starts nothing when called', () => {
-    const { h } = srj105Build()
+    const { h } = buildRecoveryCase()
     const deps = buildLiveRowSequenceDeps({ retryArm: h.controller, clock: h.clock, log: () => {}, appliedConfig: () => h.config })
 
     expect(typeof deps.readRow).toBe('function')
@@ -17631,7 +17620,7 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
   })
 
   test('each get goes through the shared own-row read: one get of P\'s instance; a provenance_conflict note on P\'s row latches P', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const persona = harnessPersona(h, p)
     const row = cannedGetResult({}, persona, h.home)
     h.script({ getQueue: [cannedOk(row), cannedOk(cannedGetResult({ liveness_note: provenanceNote }, persona, h.home))] })
@@ -17644,7 +17633,7 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
   })
 
   test('each run is a bypassing run with P\'s key as its next-step get: a fresh memo inside its window still yields a new call; P\'s row in unverified_ids gets no post-run get, Q\'s gets one', async () => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     _setNow(h.clock.now)
     const id = personaInstanceId(p)
     h.script({ findMissingResult: cannedFindMissing({ rows: { [id]: 'unverified_ids', [personaInstanceId(b)]: 'unverified_ids' } }) })
@@ -17666,7 +17655,7 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
     )
 
   test('each kill goes through the bounded retry over the deferred-report binding, its between-try read the shared status read: UNAVAILABLE then success arms no timer', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     h.script({ killQueue: [cannedErr(errTmuxUnresponsive('kill')), cannedOk(cannedKillResult(true))] })
     const order = recordCallOrder(h)
 
@@ -17678,7 +17667,7 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
   })
 
   test('three failed tries arm P\'s retry timer once, with the outcome that stands', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     h.script({ killError: errTmuxUnresponsive('kill') })
 
     expect(await killThroughDeps(h, p)).toMatchObject({ tries: KILL_RETRY_TRIES })
@@ -17688,7 +17677,7 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
   })
 
   test('the between-try read is the shared status read: P\'s own pending row with no launch start there latches P and ends the tries', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     h.script({
       killError: errTmuxUnresponsive('kill'),
       statusResult: cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_NONE }),
@@ -17700,7 +17689,7 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
   })
 
   test('the launch dependency refuses a key outside the applied set with no call, while an applied key beside it launches', async () => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     h.remove(p)
     const noRow = { kind: LIVE_ROW_SEQUENCE_NO_ROW } as const
 
@@ -17719,7 +17708,7 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
   })
 
   test('the launch-kind facts come from the applied resume_enabled, the row comparison and the store\'s retired-key reading at the call', () => {
-    const { h, p } = srj105Build({ resumeEnabled: false })
+    const { h, p } = buildRecoveryCase({ resumeEnabled: false })
     const own = cannedGetResult({}, harnessPersona(h, p), h.home)
 
     expect(h.sequenceDeps.personaFacts(p, own)).toEqual({ resumeEnabled: false, cwdMatches: true, configDirMatches: true, retired: false })
@@ -17730,7 +17719,7 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
       configDirMatches: false,
       retired: false,
     })
-    // b.jg5 SRJ-805: read at each call, so a key recorded after an earlier call reads retired, marked or not, with a row or none.
+    // read at each call, so a key recorded after an earlier call reads retired, marked or not, with a row or none.
     h.retireKey(p)
     expect(h.sequenceDeps.personaFacts(p, own)).toEqual({ resumeEnabled: false, cwdMatches: true, configDirMatches: true, retired: true })
     h.retireKey(p, { mark: true })
@@ -17741,7 +17730,7 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
 })
 
 // ---------------------------------------------------------------------------
-// b.4q8: the restart cap at the live-row sequence's step-6 launch, on
+// the restart cap at the live-row sequence's step-6 launch, on
 // `makeRecoveryHarness`. A read of P's row while its sequence runs (the
 // sequence's own `get` included) can count P's resumed launch as failed, its
 // row ended before reporting in, and reach the cap. The start entry
@@ -17754,10 +17743,10 @@ describe('b.jg5 SRJ-705 step 6, SRJ-706, SRJ-112, SRJ-708: the sequence-launch e
 // runs; the sequence's own run to `capped` is tests/restart.test.ts's.
 // ---------------------------------------------------------------------------
 
-describe('b.4q8: the live-row sequence\'s start entry forwards whether P was below the restart cap, and its launch entry makes no call for a P that reached the cap since', () => {
+describe('the live-row sequence\'s start entry forwards whether P was below the restart cap, and its launch entry makes no call for a P that reached the cap since', () => {
   afterEach(() => {
-    expectNoDeleteOrIncludeFinished(srj105Harness)
-    srj105AfterEach()
+    expectNoDeleteOrIncludeFinished(recoveryHarness)
+    recoveryAfterEach()
   })
 
   /** What the sequence last read before its launch: the row `ended`. */
@@ -17769,7 +17758,7 @@ describe('b.4q8: the live-row sequence\'s start entry forwards whether P was bel
     ['P at the cap, the request carrying true: forwarded as it came (true)', RESTART_FAILURE_CAP, true, true],
     ['P below the cap, the request carrying false: forwarded as it came (false)', 0, false, false],
   ])('the start entry, %s, with the rest of the request as given; nothing counted', (_label, failures, given, forwarded) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     for (let i = 0; i < failures; i++) recordFailure(p)
     const starts = recordSequenceStarts()
     const request: LiveRowSequenceRequest = {
@@ -17780,14 +17769,14 @@ describe('b.4q8: the live-row sequence\'s start entry forwards whether P was bel
 
     expect(startLiveRowSequence(request)).toBe(LIVE_ROW_START_STARTED)
 
-    // The entry's other addition: the store's reading at the attempt's start, P not recorded (b.jg5 SRJ-806).
+    // The entry's other addition: the store's reading at the attempt's start, P not recorded.
     expect(starts).toEqual([{ ...request, retiredAtStart: { recorded: false, marked: false, generation: undefined }, belowCapAtStart: forwarded }])
     expect(starts[0]!.belowCapAtStart).toBe(forwarded)
     expect(getFailureCount(p)).toBe(failures)
   })
 
   test('the launch entry for P at the cap, below it when its sequence started: not launched (capped), with no agent-director call and one line; nothing counted, armed or posted, and nothing registered as in flight', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     for (let i = 0; i < RESTART_FAILURE_CAP; i++) recordFailure(p)
 
     expect(await launchForLiveRowSequence(harnessPersona(h, p), h.config, { kind: LIVE_ROW_LAUNCH_REUSE, lastRead: LAST_READ, belowCapAtStart: true })).toEqual({
@@ -17806,7 +17795,7 @@ describe('b.4q8: the live-row sequence\'s start entry forwards whether P was bel
     ['P at the cap, the request carrying no reading', RESTART_FAILURE_CAP, undefined],
     ['P one failure below the cap, below it when its sequence started', RESTART_FAILURE_CAP - 1, true],
   ])('the launch entry for %s: launched by its one reuse spawn, with no at-cap line; the success resets the count', async (_label, failures, belowCapAtStart) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     for (let i = 0; i < failures; i++) recordFailure(p)
 
     expect(await launchForLiveRowSequence(harnessPersona(h, p), h.config, { kind: LIVE_ROW_LAUNCH_REUSE, lastRead: LAST_READ, belowCapAtStart })).toEqual({ key: p, action: 'spawned' })
@@ -17819,10 +17808,10 @@ describe('b.4q8: the live-row sequence\'s start entry forwards whether P was bel
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-602 (HO C1, AC 77) and SRJ-711 (AC 57), on `makeRecoveryHarness`
+// (HO C1) and, on `makeRecoveryHarness`
 // (both settings 0).
 //
-// SRJ-602: an `ErrTmuxSessionCreate` from the plain spawn at each of its four
+// an `ErrTmuxSessionCreate` from the plain spawn at each of its four
 // calls (the live-row sequence's launch entry's included), from a `resume` of
 // an `ended` row (each through the start pass's launch, `h.launch`, and the
 // restart path's `launchSession`) and from a reuse spawn (through the
@@ -17831,9 +17820,9 @@ describe('b.4q8: the live-row sequence\'s start entry forwards whether P was bel
 // it (no spawn in its place), no kill of any kind (no stub `kill`), a
 // `failed` result that is counted and never refused, one
 // spawn-failure notice, and P's retry timer armed at once in pending-only
-// mode (SRJ-111, SRJ-113, SRJ-409).
+// mode.
 //
-// SRJ-711: no plain spawn carries the reuse flag (the first spawn of a key
+// no plain spawn carries the reuse flag (the first spawn of a key
 // with no row, as a renamed persona's new key has, the retry spawn after the
 // collision `get` answers `ErrSpawnNotFound`, and the spawn after `resume`
 // answers `ErrSpawnNotFound`), and a first spawn that collides with an
@@ -17844,8 +17833,8 @@ describe('b.4q8: the live-row sequence\'s start entry forwards whether P was bel
 /** An `ended` row of the persona with a session id, so a `resume` of it would keep the conversation. */
 const ENDED_WITH_SESSION = { state: LIVENESS_DEAD_ROW_ENDED, session_id: 'a-session-id' } as const
 
-describe('b.jg5 SRJ-602, SRJ-711: ErrTmuxSessionCreate is one counted launch failure that kills nothing, and a first spawn stays plain', () => {
-  afterEach(srj105AfterEach)
+describe('ErrTmuxSessionCreate is one counted launch failure that kills nothing, and a first spawn stays plain', () => {
+  afterEach(recoveryAfterEach)
 
   /** A launch site meeting `ErrTmuxSessionCreate`: the answers that bring the launch there, and the stub calls it makes, in order. */
   interface LaunchFailureSite {
@@ -17878,8 +17867,8 @@ describe('b.jg5 SRJ-602, SRJ-711: ErrTmuxSessionCreate is one counted launch fai
     ['a resume of an ended row', ENDED_ROW_RESUME],
   ]
 
-  /** Every SRJ-602 site, with how one launch reaches it and how many `spawn-failed` entries it writes. */
-  const SRJ602_SITES: ReadonlyArray<readonly [string, LaunchFailureSite & { launch(h: RecoveryHarness, key: string): Promise<unknown>; readonly entries: number }]> = [
+  /** Every site, with how one launch reaches it and how many `spawn-failed` entries it writes. */
+  const LAUNCH_FAILURE_SITES: ReadonlyArray<readonly [string, LaunchFailureSite & { launch(h: RecoveryHarness, key: string): Promise<unknown>; readonly entries: number }]> = [
     ...LADDER_SITES.map(([name, site]) => [`${name} (the start pass)`, { ...site, launch: (h: RecoveryHarness, key: string) => h.launch(key), entries: 1 }] as const),
     [
       // The entry is no start-pass launch: it writes no entry and counts its failure itself.
@@ -17893,7 +17882,7 @@ describe('b.jg5 SRJ-602, SRJ-711: ErrTmuxSessionCreate is one counted launch fai
       },
     ],
     [
-      // b.jg5 SRJ-111: the plain spawn after the entry's resume answers ErrSpawnNotFound, through the one plain-spawn outcome handler.
+      // the plain spawn after the entry's resume answers ErrSpawnNotFound, through the one plain-spawn outcome handler.
       'the plain spawn after the live-row sequence\'s launch entry\'s resume answers ErrSpawnNotFound',
       {
         script: () => ({ resumeError: errSpawnNotFound(), spawnError: errTmuxSessionCreate('spawn') }),
@@ -17905,8 +17894,8 @@ describe('b.jg5 SRJ-602, SRJ-711: ErrTmuxSessionCreate is one counted launch fai
     ],
   ]
 
-  test.each(SRJ602_SITES)('SRJ-602, ErrTmuxSessionCreate from %s: one launch call there and none in its place, no kill of any kind, a counted failed result (never refused), one spawn-failure notice, and P\'s timer armed at once in pending-only mode', async (_name, site) => {
-    const { h, p, b } = srj105Build()
+  test.each(LAUNCH_FAILURE_SITES)(', ErrTmuxSessionCreate from %s: one launch call there and none in its place, no kill of any kind, a counted failed result (never refused), one spawn-failure notice, and P\'s timer armed at once in pending-only mode', async (_name, site) => {
+    const { h, p, b } = buildRecoveryCase()
     h.script(site.script(h, p))
     const order = recordCallOrder(h)
 
@@ -17923,8 +17912,8 @@ describe('b.jg5 SRJ-602, SRJ-711: ErrTmuxSessionCreate is one counted launch fai
     expect(personaCallCounts(h, b)).toEqual({})
   })
 
-  test.each(LADDER_SITES)('SRJ-602, ErrTmuxSessionCreate from %s through the restart path\'s launchSession: it answers false once (counted by the restart path, never \'refused\'), with no kill and no launch after it', async (_name, site) => {
-    const { h, p } = srj105Build()
+  test.each(LADDER_SITES)(', ErrTmuxSessionCreate from %s through the restart path\'s launchSession: it answers false once (counted by the restart path, never \'refused\'), with no kill and no launch after it', async (_name, site) => {
+    const { h, p } = buildRecoveryCase()
     h.script(site.script(h, p))
     const order = recordCallOrder(h)
 
@@ -17936,8 +17925,8 @@ describe('b.jg5 SRJ-602, SRJ-711: ErrTmuxSessionCreate is one counted launch fai
   })
 
   // The removed self-heal, its default killer and the killer's set and reset
-  // seams, matched by the parts of their names (b.jg5 SRJ-601's list).
-  test('SRJ-602: the session manager\'s namespace carries no self-heal and no tmux session killer or its seams', async () => {
+  // seams, matched by the parts of their names (list).
+  test('the session manager\'s namespace carries no self-heal and no tmux session killer or its seams', async () => {
     const sessionManager: Record<string, unknown> = await import('../src/session-manager.ts')
 
     expect(Object.keys(sessionManager).filter((name) => /selfHeal|TmuxSessionKiller|KillTmuxSession/i.test(name))).toEqual([])
@@ -17958,8 +17947,8 @@ describe('b.jg5 SRJ-602, SRJ-711: ErrTmuxSessionCreate is one counted launch fai
     ],
   ]
 
-  test.each(PLAIN_SPAWN_SITES)('SRJ-711, %s: every spawn is plain, with no reuse flag, and the launch answers spawned', async (_name, script, order) => {
-    const { h, p } = srj105Build()
+  test.each(PLAIN_SPAWN_SITES)(', %s: every spawn is plain, with no reuse flag, and the launch answers spawned', async (_name, script, order) => {
+    const { h, p } = buildRecoveryCase()
     h.script(script(h, p))
     const calls = recordCallOrder(h)
 
@@ -17972,8 +17961,8 @@ describe('b.jg5 SRJ-602, SRJ-711: ErrTmuxSessionCreate is one counted launch fai
 
   })
 
-  test('SRJ-711: a first spawn that collides with an ended row carrying a session id goes to get and then resume, with no reuse: the conversation is kept', async () => {
-    const { h, p } = srj105Build()
+  test('a first spawn that collides with an ended row carrying a session id goes to get and then resume, with no reuse: the conversation is kept', async () => {
+    const { h, p } = buildRecoveryCase()
     h.script(collided(h, harnessPersona(h, p), ENDED_WITH_SESSION))
     const calls = recordCallOrder(h)
 
@@ -17989,7 +17978,7 @@ describe('b.jg5 SRJ-602, SRJ-711: ErrTmuxSessionCreate is one counted launch fai
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-707, SRJ-712 (E22 T3), with SRJ-112 and SRJ-113, on
+// with and, on
 // `makeRecoveryHarness`: `resume`'s `ErrNoSessionId`, `ErrJsonlNeverWritten`
 // and `ErrJsonlMissing` (by class) go on to exactly one reuse spawn of
 // `cscb_<key>`, carrying the reuse flag and the persona's `extra_env`, with
@@ -18002,14 +17991,14 @@ describe('b.jg5 SRJ-602, SRJ-711: ErrTmuxSessionCreate is one counted launch fai
 // counted. At the sequence-launch entry a
 // refused or latching diagnosis `get` launches nothing. The ladder's
 // per-outcome rows at the reuse after each of the three answers are the
-// SRJ-105 (UNAVAILABLE), SRJ-311 (ENVIRONMENT), SRJ-316 (CONFIG), SRJ-313
+// (UNAVAILABLE)(ENVIRONMENT)(CONFIG)
 // (UNCLASSIFIED), CONFLICT and UNUSABLE NAME describes' (their no-transcript
 // reuse sites); after ErrJsonlMissing a refused reuse posts no diagnosis
-// notice. The entry's three answers are the SRJ-705 step-6 describe's.
+// notice. The entry's three answers are the step-6 describe's.
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-707, SRJ-712: resume\'s no-transcript answers go on to one reuse spawn of the same id, the diagnosis first after ErrJsonlMissing, and nothing is deleted', () => {
-  afterEach(srj105AfterEach)
+describe('resume\'s no-transcript answers go on to one reuse spawn of the same id, the diagnosis first after ErrJsonlMissing, and nothing is deleted', () => {
+  afterEach(recoveryAfterEach)
 
   /** One no-transcript answer of `resume`: its builder, the ladder's result on a reuse that succeeds, and the stub calls before the reuse. */
   const NO_TRANSCRIPT_ANSWERS: ReadonlyArray<readonly [string, () => Error, SpawnPersonaResult['action'], readonly string[]]> = [
@@ -18019,7 +18008,7 @@ describe('b.jg5 SRJ-707, SRJ-712: resume\'s no-transcript answers go on to one r
   ]
 
   test.each(NO_TRANSCRIPT_ANSWERS)('at the collision ladder, resume answering %s: exactly one reuse spawn of cscb_<key> with the flag and P\'s extra_env, after the diagnosis get on ErrJsonlMissing; no delete, kill or plain spawn after the resume; the launch answers %s', async (_label, make, action, before) => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     h.script({ ...collided(h, harnessPersona(h, p), ENDED_WITH_SESSION), resumeError: make() })
     const order = recordCallOrder(h)
 
@@ -18035,7 +18024,7 @@ describe('b.jg5 SRJ-707, SRJ-712: resume\'s no-transcript answers go on to one r
   })
 
   test('AD 0.12 unmessaged same-agent reuse with rotated history diagnoses ErrJsonlMissing before reuse, preserving uncertainty', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     // The native CLI includes these history fields beyond the SDK row type.
     const rotatedRow = {
       ...ENDED_WITH_SESSION,
@@ -18056,14 +18045,14 @@ describe('b.jg5 SRJ-707, SRJ-712: resume\'s no-transcript answers go on to one r
 
   })
 
-  // b.jg5 SRJ-112, SRJ-301: the first reuse collision re-runs the ladder's
+  // the first reuse collision re-runs the ladder's
   // get-then-act once (its get reads the row ended again, so the resume and
   // its no-transcript answer repeat); a collision in that re-run arms P's
   // timer with the collision cause and ends the attempt with
   // `retrying`. The diagnosis's notice is not posted: the reuse
   // collided and did not bring P up.
   test.each(NO_TRANSCRIPT_ANSWERS)('at the collision ladder, resume answering %s, then a reuse spawn that collides, twice: get-then-act re-runs once, then the attempt ends retrying with no third launch; nothing counted, posted or recorded spawn-failed; P\'s timer armed with the collision cause; the restart path\'s launch answers refused', async (_label, make, _action, before) => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     // A fresh script for each launch: the stub consumes its spawn queue.
     const script = (): RecoveryStubScript => ({
       ...collided(h, harnessPersona(h, p), ENDED_WITH_SESSION, errInstanceIdCollision(), errInstanceIdCollision()),
@@ -18091,13 +18080,13 @@ describe('b.jg5 SRJ-707, SRJ-712: resume\'s no-transcript answers go on to one r
     expect(personaCallCounts(h, b)).toEqual({})
   })
 
-  // b.jg5 SRJ-709, SRJ-712 (the E13 hatch note): the diagnosis's notice
+  // (the design note): the diagnosis's notice
   // waits for a reuse that brings P up. Every refusal class at the reuse
   // after ErrJsonlMissing is a row of the class describes'
   // (`SPAWN_AND_RESUME_SITES`), each asserting no notice; this case shows the
   // diagnosis did run there.
-  test('at the collision ladder, resume answering ErrJsonlMissing, its diagnosis inconclusive, then a reuse refused as UNAVAILABLE: the diagnosis line is logged and its inconclusive entry written, but no diagnosis notice is posted; refused, nothing counted; the reuse\'s one get (b.jg5 SRJ-407) reads the row ended and nothing follows it', async () => {
-    const { h, p } = srj105Build()
+  test('at the collision ladder, resume answering ErrJsonlMissing, its diagnosis inconclusive, then a reuse refused as UNAVAILABLE: the diagnosis line is logged and its inconclusive entry written, but no diagnosis notice is posted; refused, nothing counted; the reuse\'s one get reads the row ended and nothing follows it', async () => {
+    const { h, p } = buildRecoveryCase()
     h.script({ ...collided(h, harnessPersona(h, p), ENDED_WITH_SESSION, errTmuxUnresponsive('spawn')), resumeError: errJsonlMissing() })
     const order = recordCallOrder(h)
 
@@ -18110,13 +18099,13 @@ describe('b.jg5 SRJ-707, SRJ-712: resume\'s no-transcript answers go on to one r
     expect([h.notices, h.triggers, getFailureCount(p)]).toEqual([[], [{ key: p, kind: UNAVAILABLE_RETRY_CAUSE_UNAVAILABLE }], 0])
   })
 
-  // E14 at the entry: the diagnosis get's refusal or latch ends the step
-  // with no reuse (b.jg5 SRJ-105, SRJ-502).
+  // at the entry: the diagnosis get's refusal or latch ends the step
+  // with no reuse.
   test.each<[string, (h: RecoveryHarness, key: string) => RecoveryStubScript, Record<string, unknown>]>([
     ['refused (UNAVAILABLE)', () => ({ getError: errTmuxUnresponsive('get') }), { action: SPAWN_ACTION_RETRYING }],
     ['latching P (a provenance_conflict note on its own row)', (h, key) => ({ getResult: cannedGetResult({ ...ENDED_WITH_SESSION, liveness_note: provenanceNote }, harnessPersona(h, key), h.home) }), { action: 'latched' }],
   ])('at the sequence-launch entry, resume answering ErrJsonlMissing and its diagnosis get %s: no reuse spawn and no other launch; no diagnosis notice', async (_label, script, answer) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     h.script({ ...script(h, p), resumeError: errJsonlMissing() })
     const order = recordCallOrder(h)
 
@@ -18129,8 +18118,8 @@ describe('b.jg5 SRJ-707, SRJ-712: resume\'s no-transcript answers go on to one r
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504 (E22 T4), with SRJ-705, SRJ-706,
-// SRJ-110, SRJ-112 and SRJ-710, on `makeRecoveryHarness` (its registry, latch
+// with,
+// and, on `makeRecoveryHarness` (its registry, latch
 // and kill-failure alerts installed as `main()` installs them): every row the
 // collision ladder cannot keep (`resume_enabled` false, a `cwd` that differs
 // by real path, a `config_dir` label missing or different) is replaced with
@@ -18140,32 +18129,32 @@ describe('b.jg5 SRJ-707, SRJ-712: resume\'s no-transcript answers go on to one r
 //   `cscb_<key>` carrying the reuse field and the persona's `extra_env`
 //   (`reuseSpawnOf`), after the colliding plain spawn, with no `delete`, kill
 //   or other spawn; a `config_dir` site's reuse carries the current label
-//   and CLAUDE_CONFIG_DIR. SRJ-112's rows at each such site and at T3's
-//   three no-transcript sites (SRJ-709): the UNAVAILABLE, ENVIRONMENT,
-//   CONFIG, UNCLASSIFIED, CONFLICT and UNUSABLE NAME rows are the SRJ-105,
-//   SRJ-311, SRJ-316, SRJ-313, CONFLICT and UNUSABLE NAME describes' (their
+// and CLAUDE_CONFIG_DIR. rows at each such site and at
+// three no-transcript sites: the UNAVAILABLE, ENVIRONMENT,
+// CONFIG, UNCLASSIFIED, CONFLICT and UNUSABLE NAME rows are the,
+// CONFLICT and UNUSABLE NAME describes' (their
 //   reuse sites); here a collision re-runs get-then-act exactly once, a
 //   second collision arms the collision cause with nothing counted or
-//   posted (T3's three sites: the T3 describe above), `ErrTmuxSessionCreate`
+// posted ( three sites: the describe above), `ErrTmuxSessionCreate`
 //   is one counted launch failure that kills nothing, `ErrInvalidFlags` makes
 //   one version re-check and launches nothing more, and a directory error is
 //   counted.
 // - A live row (`pending` with a launch start included) the path may act on
 //   (a row in another directory, a `pending` row whose `config_dir` label is
 //   missing or differs, or a dead-session route holding GONE-based dead
-//   evidence, SRJ-611): the launch starts P's live-row sequence through the
+// evidence): the launch starts P's live-row sequence through the
 //   start entry (entry at step 1, seeded with that state, the conversation
 //   not kept, alert context `recovery`) and answers `sequence-waiting` with
 //   no call of its own, nothing counted; the sequence's kill, run and `get`
 //   follow on the clock and its step 6 is a reuse spawn although the row
-//   carries a session id. SRJ-110 at each such site: the sequence's first
+// carries a session id. at each such site: the sequence's first
 //   kill answering UNAVAILABLE, `ErrTmuxKillFailed`, CONFLICT or UNUSABLE
 //   NAME is followed by no launch and no `delete`.
-// - S4 (SRJ-609, SRJ-611): a dead-session route holding no dead evidence
+// - S4: a dead-session route holding no dead evidence
 //   (`row-not-interactive`) never acts on its earlier live read: the row is
 //   read again first and the fresh state decides. A finished row gets one
 //   reuse spawn; a `pending` row gets the ladder's `pending` step (a covered
-//   row is left, one that is not covered gets SRJ-411's sequence); any other
+// row is left, one that is not covered gets sequence); any other
 //   live state, or a state CSCB does not know (an unreadable one included),
 //   is a lost race with no kill; a refused re-read answers the refusal.
 // - `cwdCheckDeferred` keeps the row: no reuse and no sequence. A resume's
@@ -18179,10 +18168,10 @@ describe('b.jg5 SRJ-707, SRJ-712: resume\'s no-transcript answers go on to one r
 // No call of any case sets `include_finished`.
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site replaces P\'s row with no delete: a finished row by one reuse spawn of the same id, a live row through the live-row sequence first', () => {
+describe('each replacement site replaces P\'s row with no delete: a finished row by one reuse spawn of the same id, a live row through the live-row sequence first', () => {
   afterEach(() => {
-    expectNoDeleteOrIncludeFinished(srj105Harness)
-    srj105AfterEach()
+    expectNoDeleteOrIncludeFinished(recoveryHarness)
+    recoveryAfterEach()
   })
 
   /** The row the sequence's `get`s read after the ladder's: `ENDED_WITH_SESSION` (a resume would keep the conversation). */
@@ -18201,10 +18190,10 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
 
   /**
    * The dead-session verdict of a `waiting` row whose reconnect's one
-   * send-keys answers GONE (`tmux-gone`): dead evidence (b.jg5 SRJ-611), so a
+   * send-keys answers GONE (`tmux-gone`): dead evidence, so a
    * replacement at the resume step acts on the row's earlier live read and
    * starts the sequence. A verdict that is not dead evidence reads the row
-   * again first (the non-evidence cases below; SRJ-609).
+   * again first (the non-evidence cases below).
    */
   const GONE_WAITING: RecoveryStubScript = { sendKeysError: errTmuxSendKeys() }
 
@@ -18216,7 +18205,7 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
 
   /**
    * The dead-session routes of a `waiting` row that end in a replacement at
-   * the resume step (b.jg5 SRJ-707, SRJ-1504): a `config_dir` label missing
+   * the resume step: a `config_dir` label missing
    * or different (the guard before resume, after the find-missing run), or
    * `resume_enabled` false (before any run). `row` gives the route's row
    * reading `state`, at the collision `get` and at a re-read.
@@ -18229,7 +18218,7 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
     readonly swept: boolean
     /** The route's calls up to the replacement. */
     readonly before: readonly string[]
-    /** Whether the route's row read `pending` is covered (b.jg5 SRJ-409, SRJ-411): a `config_dir` label missing or different never is. */
+    /** Whether the route's row read `pending` is covered: a `config_dir` label missing or different never is. */
     readonly pendingCovered: boolean
   }
 
@@ -18300,7 +18289,7 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
   }
 
   test.each(LIVE_SITES.map((site) => [site.name, site] as const))('%s: the launch starts P\'s sequence (step 1, its seed the state read, recovery context) and answers sequence-waiting with no call of its own; the sequence\'s kill, get, run and get follow, and its step 6 is one reuse spawn though the row has a session id (the conversation is not kept); nothing counted or deleted', async (_name, site) => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     scriptLiveSite(h, p, site)
     const order = recordCallOrder(h)
 
@@ -18321,13 +18310,13 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
     expect(h.lines).toContain(liveRowSequenceStartLine(renderPersonaRef(p, p), h.sequenceRequest(p, { lastReadState: site.seed })))
     expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p)])
     expect(h.stub.calls.resumeCalls).toEqual([])
-    // Nothing armed but the step-6 reuse's pending-only watch (b.jg5 SRJ-409).
+    // Nothing armed but the step-6 reuse's pending-only watch.
     expect([getFailureCount(p), h.triggers, h.notices]).toEqual([0, [pendingRowTrigger(p)], []])
     expect(personaCallCounts(h, b)).toEqual({})
 
   })
 
-  // b.jg5 SRJ-609, SRJ-611, SRJ-707 (S4): on a route whose verdict is not
+  // (S4): on a route whose verdict is not
   // dead evidence (`row-not-interactive`), a replacement at the resume step
   // never acts on the route's earlier live read and never starts the
   // sequence itself: it reads the row again first through the shared
@@ -18335,10 +18324,10 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
   // replace step's one reuse spawn; a live row other than `pending`, or a
   // state CSCB does not know (an unreadable one included), is a lost race;
   // a `pending` row gets the ladder's `pending` step (a covered row is left,
-  // P armed pending-only; one that is not covered gets SRJ-411's sequence there).
+  // P armed pending-only; one that is not covered gets sequence there).
   const UNKNOWN_STATES: ReadonlySet<string> = new Set(UNKNOWN_REREAD_STATES.map(([, state]) => state))
   // A GONE-based verdict the restart path carried in changes nothing here:
-  // the reconnect's row-not-interactive voids it (b.jg5 SRJ-611, AC 59 as
+  // the reconnect's row-not-interactive voids it (as
   // amended), with one line.
   const CARRIED_GONE = carriedDeadEvidenceOf('prompt-row-tmux-gone')
   const NOT_EVIDENCE_REREADS = DEAD_SESSION_REPLACEMENT_ROUTES.flatMap((route) =>
@@ -18347,7 +18336,7 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
     ),
   )
   test.each(NOT_EVIDENCE_REREADS)('S4: %s, after its row-not-interactive verdict (no dead evidence): one re-read of the row reading "%s" decides; the route\'s live read starts no sequence and makes no kill', async (_name, reread, route, carried) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     route.setup?.(h)
     const persona = harnessPersona(h, p)
     h.script({
@@ -18373,7 +18362,7 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
             row: harnessRow(h, persona, route.row(h, p, state)),
             lastRead: latchRowStateRead(state),
           }
-    const tail = (outcome: string): string => `: re-read: ${describePersonaRowReread(rereadOf(reread))} — ${outcome} (b.jg5 SRJ-609, SRJ-611, SRJ-707)`
+    const tail = (outcome: string): string => `: re-read: ${describePersonaRowReread(rereadOf(reread))} — ${outcome}`
     const rereadLines = h.errors.filter((line) => line.startsWith(`[slack] spawnForPersona: replacing the row of ${renderPersonaRef(p, p)} (`) && line.includes(' — the path holds no dead evidence, so the row is read again first: '))
     expect(rereadLines).toHaveLength(1)
     expect(rereadLines[0]).toContain(describeDeadEvidence(carriedDeadEvidenceOf(DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE)))
@@ -18385,7 +18374,7 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
       expect(rereadLines[0]!.endsWith(tail(REPLACE_REREAD_FINISHED_OUTCOME))).toBe(true)
       expect(order.slice(route.before.length + 1, route.before.length + 2)).toEqual(['spawn'])
       expect(h.reuseSpawns()).toEqual([reuseSpawnOf(h, p)])
-      // Nothing armed but the reuse's pending-only watch (b.jg5 SRJ-409).
+      // Nothing armed but the reuse's pending-only watch.
       expect([h.sequenceRunning(p), h.triggers]).toEqual([false, [pendingRowTrigger(p)]])
 
       return
@@ -18405,7 +18394,7 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
     expect(rereadLines[0]!.endsWith(tail(REPLACE_REREAD_PENDING_OUTCOME))).toBe(true)
     if (route.pendingCovered) {
       // A covered `pending` row is a launch in progress: left as it is, P's
-      // timer armed in pending-only mode (b.jg5 SRJ-409).
+      // timer armed in pending-only mode.
       expect(result).toStrictEqual({ key: p, action: 'no-op' })
       expect(h.stub.calls.killCalls).toEqual([])
       expect(order).toEqual([...route.before, 'get'])
@@ -18413,7 +18402,7 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
       expectPendingOnlyWatch(h, p)
       return
     }
-    // b.jg5 SRJ-411: a `pending` row whose config_dir label is missing or differs is not covered: SRJ-411's sequence, seeded pending, the conversation not kept.
+    // a `pending` row whose config_dir label is missing or differs is not covered: sequence, seeded pending, the conversation not kept.
     expect(result).toStrictEqual({ key: p, action: 'sequence-waiting' })
     expect(h.lines).toContain(liveRowSequenceStartLine(renderPersonaRef(p, p), h.sequenceRequest(p, { lastReadState: AGENT_DIRECTOR_PENDING_STATE })))
     expect(await h.driveSequence(h.sequenceSettled(p))).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_REUSE, result: { key: p, action: 'spawned' } })
@@ -18421,11 +18410,11 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
 
   })
 
-  // The re-read's own error rows (b.jg5 SRJ-114, SRJ-105): a refused re-read
+  // The re-read's own error rows: a refused re-read
   // answers the refusal result, armed with the read's own cause only; the
   // replacement makes no further call.
   test.each(DEAD_SESSION_REPLACEMENT_ROUTES.map((route) => [route.name, route] as const))('S4: %s, after its row-not-interactive verdict, its re-read refused (UNAVAILABLE): retrying, P armed with the read\'s cause; no sequence, kill or launch', async (_name, route) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     route.setup?.(h)
     const persona = harnessPersona(h, p)
     const err = unavailableAt('get')
@@ -18441,14 +18430,14 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
     expect(order).toEqual([...route.before, 'get'])
     expect(h.triggers).toEqual([{ key: p, kind: unavailableForms('ErrCallTimeout')[0]![2] }])
     expect(h.errors.filter((line) => line.includes(' — the path holds no dead evidence, so the row is read again first: '))).toEqual([
-      expect.stringContaining(`re-read: ${describePersonaRowReread({ kind: ROW_REREAD_REFUSED })} — ${REPLACE_REREAD_REFUSED_OUTCOME} `),
+      expect.stringContaining(`re-read: ${describePersonaRowReread({ kind: ROW_REREAD_REFUSED })} — ${REPLACE_REREAD_REFUSED_OUTCOME}`),
     ])
     expect([h.sequenceRunning(p), h.stub.calls.killCalls, getFailureCount(p), h.notices]).toEqual([false, [], 0, []])
   })
 
   /**
-   * One non-success answer of the sequence's step-1 kill (b.jg5 SRJ-110; HO C2's list): its class, whether it
-   * latches P, the kill tries it takes (only UNAVAILABLE is tried again, SRJ-702), the cause its own handling arms
+   * One non-success answer of the sequence's step-1 kill (HO C2's list): its class, whether it
+   * latches P, the kill tries it takes (only UNAVAILABLE is tried again), the cause its own handling arms
    * (none when it latches), and the outage it raises or the unclassified report it makes.
    */
   interface FirstKillFailure {
@@ -18473,15 +18462,15 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
     ['UNCLASSIFIED (an ErrInternal not naming the recorded tmux session name)', { make: () => errInternal(), errorClass: AD_ERROR_CLASS_UNCLASSIFIED, latches: false, tries: 1, cause: UNAVAILABLE_RETRY_CAUSE_UNCLASSIFIED, unclassified: true }],
   ]
 
-  test.each(LIVE_SITES.flatMap((site) => FIRST_KILL_FAILURES.map(([what, row]) => [site.name, what, site, row] as const)))('SRJ-110: %s, the sequence\'s first kill answering %s: the sequence aborts at step 1 by its class; no launch and no delete follow; nothing counted', async (_name, _what, site, row) => {
-    const { h, p } = srj105Build()
+  test.each(LIVE_SITES.flatMap((site) => FIRST_KILL_FAILURES.map(([what, row]) => [site.name, what, site, row] as const)))('%s, the sequence\'s first kill answering %s: the sequence aborts at step 1 by its class; no launch and no delete follow; nothing counted', async (_name, _what, site, row) => {
+    const { h, p } = buildRecoveryCase()
     scriptLiveSite(h, p, site, { killError: row.make() })
 
     expect(await h.launch(p)).toStrictEqual({ key: p, action: 'sequence-waiting' })
     const outcome = await h.driveSequence(h.sequenceSettled(p))
 
     expect(outcome).toMatchObject({ kind: LIVE_ROW_OUTCOME_ABORTED, step: 1, errorClass: row.errorClass, latched: row.latches, kills: 1, runs: 0 })
-    // SRJ-301: an abort that latched nothing ends without the launch and arms the other-end cause.
+    // an abort that latched nothing ends without the launch and arms the other-end cause.
     expect(outcome?.armed).toBe(row.latches ? undefined : LIVE_ROW_ARM_ENDED)
     expect(h.stub.calls.killCalls).toHaveLength(row.tries)
     // The colliding plain spawn only: no launch, resume or delete after the kill, and no get of the sequence's.
@@ -18535,7 +18524,7 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
   }
 
   test.each(REUSE_SITES.map((site) => [site.name, site] as const))('%s: exactly one reuse spawn of cscb_<key> with the reuse field, P\'s extra_env and its current config_dir label, after the colliding plain spawn; no delete, kill, resume or other spawn', async (_name, site) => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     scriptReuseSite(h, p, site, undefined)
     const order = recordCallOrder(h)
 
@@ -18551,10 +18540,10 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
 
   })
 
-  // SRJ-112: a collision means the row turned live; the ladder re-runs its
+  // a collision means the row turned live; the ladder re-runs its
   // get-then-act once, whose get reads it finished again, and goes on.
-  test.each([...REUSE_SITES, ...NO_TRANSCRIPT_SITES].map((site) => [site.name, site] as const))('SRJ-112, %s: the reuse collides, get-then-act re-runs exactly once (its get reads the row finished again) and its reuse succeeds; nothing counted or posted, nothing armed but the reuse\'s pending-only watch', async (_name, site) => {
-    const { h, p } = srj105Build()
+  test.each([...REUSE_SITES, ...NO_TRANSCRIPT_SITES].map((site) => [site.name, site] as const))(', %s: the reuse collides, get-then-act re-runs exactly once (its get reads the row finished again) and its reuse succeeds; nothing counted or posted, nothing armed but the reuse\'s pending-only watch', async (_name, site) => {
+    const { h, p } = buildRecoveryCase()
     scriptReuseSite(h, p, site, errInstanceIdCollision(), undefined)
     const order = recordCallOrder(h)
 
@@ -18567,8 +18556,8 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
 
   })
 
-  test.each(REUSE_SITES.map((site) => [site.name, site] as const))('SRJ-112, %s: a second collision, in the one re-run, arms the collision cause and answers retrying; no third launch, nothing counted or posted', async (_name, site) => {
-    const { h, p } = srj105Build()
+  test.each(REUSE_SITES.map((site) => [site.name, site] as const))(', %s: a second collision, in the one re-run, arms the collision cause and answers retrying; no third launch, nothing counted or posted', async (_name, site) => {
+    const { h, p } = buildRecoveryCase()
     scriptReuseSite(h, p, site, errInstanceIdCollision(), errInstanceIdCollision(), undefined)
     const order = recordCallOrder(h)
 
@@ -18581,8 +18570,8 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
     expect(countStartupEntries(h.startupErrors().join('\n'), STARTUP_ERROR_SPAWN_FAILED)).toBe(0)
   })
 
-  test.each([...REUSE_SITES, ...NO_TRANSCRIPT_SITES].map((site) => [site.name, site] as const))('SRJ-112, SRJ-602, %s: ErrTmuxSessionCreate at the reuse is one counted launch failure: one notice and one spawn-failed entry, P armed at once in pending-only mode, no kill and no spawn in its place', async (_name, site) => {
-    const { h, p } = srj105Build()
+  test.each([...REUSE_SITES, ...NO_TRANSCRIPT_SITES].map((site) => [site.name, site] as const))(', %s: ErrTmuxSessionCreate at the reuse is one counted launch failure: one notice and one spawn-failed entry, P armed at once in pending-only mode, no kill and no spawn in its place', async (_name, site) => {
+    const { h, p } = buildRecoveryCase()
     scriptReuseSite(h, p, site, errTmuxSessionCreate('spawn'))
     const order = recordCallOrder(h)
 
@@ -18595,7 +18584,7 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
     expect(h.controller.view(p)).toMatchObject({ mode: UNAVAILABLE_RETRY_MODE_PENDING_ONLY, causes: [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW] })
   })
 
-  // b.jg5 SRJ-112, SRJ-207 (AC 23): at every reuse site the reuse's
+  // at every reuse site the reuse's
   // ErrInvalidFlags gets exactly one immediate version re-check; one that
   // passes, cannot run or is not running holds P, with one alert at its
   // destination, and the launch answers held: no further launch of any kind,
@@ -18603,8 +18592,8 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
   // unclassified-error episode.
   test.each(
     [...REUSE_SITES, ...NO_TRANSCRIPT_SITES].flatMap((site) => HOLDING_RECHECKS.map(([label, kind, answer, version]) => [site.name, label, site, kind, answer, version] as const)),
-  )('SRJ-112, SRJ-207, %s: ErrInvalidFlags at the reuse, the one version re-check %s: P held, answering held, one alert; no other launch, no kill, nothing counted, armed, posted or reported', async (_name, _label, site, kind, answer, version) => {
-    const { h, p, b } = srj105Build()
+  )(', %s: ErrInvalidFlags at the reuse, the one version re-check %s: P held, answering held, one alert; no other launch, no kill, nothing counted, armed, posted or reported', async (_name, _label, site, kind, answer, version) => {
+    const { h, p, b } = buildRecoveryCase()
     const rc = answer === undefined ? undefined : h.versionRecheck(answer)
     const err = errInvalidFlags('spawn')
     scriptReuseSite(h, p, site, err)
@@ -18620,10 +18609,10 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
     expect(personaCallCounts(h, b)).toEqual({})
   })
 
-  // b.jg5 SRJ-205 (AC 23): a re-check that reads a binary below the floor
+  // a re-check that reads a binary below the floor
   // stops the server; nothing is held and nothing is posted.
-  test.each([...REUSE_SITES, ...NO_TRANSCRIPT_SITES].map((site) => [site.name, site] as const))('SRJ-205, %s: ErrInvalidFlags at the reuse whose one re-check reads a binary below the floor answers the stopping result: the server stops once, non-zero; no hold, no alert, nothing counted or armed, no further call', async (_name, site) => {
-    const { h, p } = srj105Build()
+  test.each([...REUSE_SITES, ...NO_TRANSCRIPT_SITES].map((site) => [site.name, site] as const))(', %s: ErrInvalidFlags at the reuse whose one re-check reads a binary below the floor answers the stopping result: the server stops once, non-zero; no hold, no alert, nothing counted or armed, no further call', async (_name, site) => {
+    const { h, p } = buildRecoveryCase()
     const rc = h.versionRecheck({ version: DEV_PLACEHOLDER_VERSION })
     scriptReuseSite(h, p, site, errInvalidFlags('spawn'))
     const order = recordCallOrder(h)
@@ -18637,8 +18626,8 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
     expect(h.unclassifiedErrorOpen(p)).toBe(false)
   })
 
-  test.each([...REUSE_SITES, ...NO_TRANSCRIPT_SITES].map((site) => [site.name, site] as const))('SRJ-112, %s: a directory error (ErrCwdNotFound) at the reuse is counted: cwd-unreachable raised, no further launch, nothing armed', async (_name, site) => {
-    const { h, p } = srj105Build()
+  test.each([...REUSE_SITES, ...NO_TRANSCRIPT_SITES].map((site) => [site.name, site] as const))(', %s: a directory error (ErrCwdNotFound) at the reuse is counted: cwd-unreachable raised, no further launch, nothing armed', async (_name, site) => {
+    const { h, p } = buildRecoveryCase()
     scriptReuseSite(h, p, site, errCwdNotFound())
     const order = recordCallOrder(h)
 
@@ -18649,10 +18638,10 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
     expect(h.triggers).toEqual([])
   })
 
-  // b.av2 SR-6.4: a row whose cwd has no real path while P's working
+  // a row whose cwd has no real path while P's working
   // directory has none either is kept: no replacement of either kind.
   test('cwdCheckDeferred: a live row whose cwd has no real path, P\'s working directory unresolvable: the row is kept; no reuse and no sequence; cwd-unreachable, failed', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const persona = harnessPersona(h, p)
     const gone = join(h.home, 'gone-work')
     persona.working_directory = gone
@@ -18666,14 +18655,14 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
     expect(getOutageFlags(p).has('cwd-unreachable')).toBe(true)
   })
 
-  // b.jg5 SRJ-710: ErrSpawnNotResumable is never by itself a reason to kill
+  // ErrSpawnNotResumable is never by itself a reason to kill
   // and replace, at any path that resumes: its re-read of a row that has
   // finished since is a lost race, whatever evidence the path holds.
   test.each<[string, RecoveryStubScript, readonly string[]]>([
     ['the dead-session path of a waiting row (after its sweep)', { ...NOT_INTERACTIVE_WAITING }, ['spawn', 'get', 'get', 'get', 'sendKeys', 'findMissing', 'resume', 'get']],
     ['a check_permission row whose read-pane answered GONE, swept and re-read ended', { readPaneError: errTmuxCaptureFailed(), statusResult: cannedStatusResult({ state: LIVENESS_DEAD_ROW_ENDED }) }, ['spawn', 'get', 'readPane', 'findMissing', 'status', 'resume', 'get']],
-  ])('SRJ-710: resume answering ErrSpawnNotResumable on %s, its re-read finding the row ended, is a lost race: no kill, delete or launch, nothing counted or posted, P armed with the lost-race cause', async (_name, script, order) => {
-    const { h, p } = srj105Build()
+  ])('resume answering ErrSpawnNotResumable on %s, its re-read finding the row ended, is a lost race: no kill, delete or launch, nothing counted or posted, P armed with the lost-race cause', async (_name, script, order) => {
+    const { h, p } = buildRecoveryCase()
     const state = script.readPaneError ? 'check_permission' : LIVE
     const persona = harnessPersona(h, p)
     h.script({
@@ -18694,12 +18683,12 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
   })
 
   // The reconcile note's start flag: a sequence runs detached from the start
-  // pass that started it (SRJ-706), so its step-6 launch is no start-pass
+  // pass that started it, so its step-6 launch is no start-pass
   // launch: a LAUNCH FAILURE there is counted once and posts its notice, but
   // writes no spawn-failed entry, where the ladder's own reuse at the start
   // pass writes one (the ErrTmuxSessionCreate rows above).
   test('the start flag: a sequence a start-pass launch starts makes its step-6 reuse outside the start pass: its ErrTmuxSessionCreate posts the notice and is counted once, but writes no startup-errors entry', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     scriptLiveSite(h, p, LIVE_SITES.find((site) => site.seed === LIVE)!)
     h.script({ spawnQueue: [cannedErr(errInstanceIdCollision()), cannedErr(errTmuxSessionCreate('spawn'))] })
 
@@ -18714,14 +18703,14 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
     expect(h.startupErrors()).toEqual([])
   })
 
-  // The start flag on the resume leg (b.jg5 SRJ-712, SRJ-611): a sequence a
+  // The start flag on the resume leg: a sequence a
   // start-pass launch starts on a GONE-evidence path ends in a `resume`
   // (the conversation kept); that resume's ErrJsonlMissing runs the
   // diagnosis and posts its notice once the reuse spawn brings P up, but
   // writes no startup-errors entry, where the ladder's own ErrJsonlMissing at
-  // the start pass writes one (the T3 describe above).
+  // the start pass writes one (the describe above).
   test('the start flag: a sequence a start-pass launch starts on a GONE-evidence path (resume ErrSpawnNotResumable, re-read waiting) makes its step-6 resume outside the start pass: its ErrJsonlMissing runs the diagnosis and posts its notice, the launch answers fresh-after-inconclusive-amnesia, but no jsonl-transcript-lost-on-resume or jsonl-diagnosis-inconclusive entry is written', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const persona = harnessPersona(h, p)
     h.script({
       spawnQueue: [cannedErr(errInstanceIdCollision())],
@@ -18754,7 +18743,7 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-706 (E21 T2): the session manager's registry installer, start
+// the session manager's registry installer, start
 // entry and running query, the sequence-waiting gate at the start pass, and
 // the latch's set observer that stops a latched persona's sequence
 //
@@ -18763,16 +18752,16 @@ describe('b.jg5 SRJ-707, SRJ-709, SRJ-1503, SRJ-1504: each replacement site repl
 // the stub's `holdFindMissing`. A launch of P and the restart path's
 // `launchSession` answering `sequence-waiting` and the uncounted `'refused'`
 // while P's sequence runs, Q unaffected, are tests/live-row-sequence.test.ts's
-// scheduling cases; the summary line's count for it is E26's.
+// scheduling cases; the summary line's count for it is .
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-706: the sequence registry\'s installer and entries, the start pass while a sequence runs, and the latch\'s sequence stop', () => {
+describe('the sequence registry\'s installer and entries, the start pass while a sequence runs, and the latch\'s sequence stop', () => {
   afterEach(() => {
-    srj105AfterEach()
+    recoveryAfterEach()
   })
 
   test('the start pass returns while P\'s sequence still runs: P answers sequence-waiting with no spawn, resume, status, get or kill for P from the launch, and B is launched as today; once the sequence has ended, a launch of P runs as today', async () => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     const hold = holdFindMissing(h.stub.client)
     ownRowsLiveThenMissing(h)
     const run = await startSequenceHeldAtRun(h, p, hold)
@@ -18808,7 +18797,7 @@ describe('b.jg5 SRJ-706: the sequence registry\'s installer and entries, the sta
   })
 
   test('with no registry installed, the running query answers false, a stop resolves false, a start answers not-installed with one line and no call, and a launch of P is not held', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     _resetLiveRowSequenceRegistry()
 
     expect(startLiveRowSequence(h.sequenceRequest(p, { lastReadState: cannedStatusResult().state }))).toBe(LIVE_ROW_START_NOT_INSTALLED)
@@ -18825,7 +18814,7 @@ describe('b.jg5 SRJ-706: the sequence registry\'s installer and entries, the sta
   // tests/conflict-latch.test.ts's (a running sequence stops when P latches
   // from another path).
   test('a latch installed after the registry: a latch of P stops P\'s running sequence and makes no further call for it; B\'s sequence, not latched, runs on to its launch', async () => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     const replacementLatch = createConflictLatch({ log: () => {} })
     setConflictLatch(replacementLatch)
     const hold = holdFindMissing(h.stub.client)
@@ -18835,7 +18824,7 @@ describe('b.jg5 SRJ-706: the sequence registry\'s installer and entries, the sta
     const pending = cannedStatusResult({ state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_NONE })
     h.script({ statusFn: (params) => (params.instance_id === personaInstanceId(p) ? pending : cannedStatusResult()) })
 
-    // Another path's own-row read latches P (SRJ-513).
+    // Another path's own-row read latches P.
     replacementLatch.set(p, LATCHED_ELSEWHERE)
     const pCalls = personaCallCounts(h, p)
     expect(h.lines.filter((line) => line.includes('stop asked'))).toEqual([expect.stringContaining(`persona=${p}: stop asked`)])
@@ -18851,7 +18840,7 @@ describe('b.jg5 SRJ-706: the sequence registry\'s installer and entries, the sta
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-113: `resume`'s outcome table at `resumeOrFreshSpawn`,
+// `resume`'s outcome table at `resumeOrFreshSpawn`,
 // one case per row (`RESUME_OUTCOME_ROWS`; the entry's are in the
 // sequence-launch entry's describe), on the recovery harness: the
 // optimistic spawn collides and the collision `get` reads the row `ended`
@@ -18864,10 +18853,10 @@ describe('b.jg5 SRJ-706: the sequence registry\'s installer and entries, the sta
 // line builders are here; the cases compare with the builders.
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-113: resume\'s outcome table at resumeOrFreshSpawn, one case per row; HO rev 28\'s restore sentences change nothing', () => {
+describe('resume\'s outcome table at resumeOrFreshSpawn, one case per row; HO rev 28\'s restore sentences change nothing', () => {
   afterEach(() => {
-    expectNoDeleteOrIncludeFinished(srj105Harness)
-    srj105AfterEach()
+    expectNoDeleteOrIncludeFinished(recoveryHarness)
+    recoveryAfterEach()
   })
 
   /** P's launch: the colliding first spawn, the collision `get` reading the row `ended` with a session id, and the `resume` answering `err` (success when unset). */
@@ -18880,14 +18869,13 @@ describe('b.jg5 SRJ-113: resume\'s outcome table at resumeOrFreshSpawn, one case
   // the row could not be restored and stays pending is counted and arms P's
   // retry timer at once in pending-only mode, with no `get` first, so the
   // retry's read decides; nothing is killed. At the first pending-only retry
-  // the row, P's own and not a retired key's, is covered (apply21; b.jg5
-  // SRJ-409): its one `get` reads it, and it is left, with no kill and no launch.
+  // the row, P's own and not a retired key's, is covered (apply21
+  //): its one `get` reads it, and it is left, with no kill and no launch.
 
   /**
    * One of HO rev 28's four failures met after the `resume`'s move, and the
    * outcome it has whatever restore sentence ends its description. Only the
-   * UNAVAILABLE one is followed by a call: one `get` of the row (b.jg5
-   * SRJ-407), which reads it `ended` here; the row it reads decides, never the
+   * UNAVAILABLE one is followed by a call: one `get` of the row, which reads it `ended` here; the row it reads decides, never the
    * sentence.
    */
   const RESTORE_FAILURES: ReadonlyArray<readonly [string, () => Error, (h: RecoveryHarness, p: string, err: Error) => void]> = [
@@ -18918,8 +18906,8 @@ describe('b.jg5 SRJ-113: resume\'s outcome table at resumeOrFreshSpawn, one case
     'ErrTmuxNotAvailable': RETRYING_ANSWER,
   }
 
-  test.each(RESTORE_FAILURES.flatMap(([label, make, check]) => [undefined, ...RESTORE_SENTENCES].map((sentence) => [label, sentence ?? '(no restore sentence)', make, check, sentence] as const)))('SRJ-113, SRJ-1303 (HO rev 28): resume answering %s ending with %s has the same outcome: the launch\'s answer, its causes and latch, no kill, nothing after the resume but an UNAVAILABLE outcome\'s one get', async (label, _sentenceLabel, make, check, sentence) => {
-    const { h, p } = srj105Build()
+  test.each(RESTORE_FAILURES.flatMap(([label, make, check]) => [undefined, ...RESTORE_SENTENCES].map((sentence) => [label, sentence ?? '(no restore sentence)', make, check, sentence] as const)))('(HO rev 28): resume answering %s ending with %s has the same outcome: the launch\'s answer, its causes and latch, no kill, nothing after the resume but an UNAVAILABLE outcome\'s one get', async (label, _sentenceLabel, make, check, sentence) => {
+    const { h, p } = buildRecoveryCase()
     const base = make() as AgentDirectorError
     const err = sentence === undefined ? base : withRestoreSentence(base, sentence)
     h.script(endedRowResume(h, p, err))
@@ -18933,7 +18921,7 @@ describe('b.jg5 SRJ-113: resume\'s outcome table at resumeOrFreshSpawn, one case
     check(h, p, err)
   })
 
-  test('src/ holds none of the four restore sentences: CSCB keys no behaviour on them (b.jg5 SRJ-113, SRJ-702)', () => {
+  test('src/ holds none of the four restore sentences: CSCB keys no behaviour on them', () => {
     const srcDir = join(import.meta.dir, '..', 'src')
     const files = readdirSync(srcDir).filter((name) => name.endsWith('.ts'))
     expect(files.length).toBeGreaterThan(0)
@@ -18944,13 +18932,13 @@ describe('b.jg5 SRJ-113: resume\'s outcome table at resumeOrFreshSpawn, one case
     expect(hits).toEqual([])
   })
 
-  // b.jg5 SRJ-113, SRJ-111, SRJ-501 (HO rev 15): the plain spawn after the
+  // (HO rev 15): the plain spawn after the
   // ladder's ErrSpawnNotFound makes agent-director's pre-spawn scan; its
   // refusal latches P with "plain spawn" and the state the path last read
   // (`resume` is not a read), the stub holding no row afterwards. Every plain
   // spawn row at every ladder resume path is `LATCH_CROSS`'s.
   test('ErrSpawnNotFound, then the plain spawn\'s scan CONFLICT (scan-leftover): latched with "plain spawn" and the state the collision get read; the stub holds no row; nothing counted, no kill, no spawn-failure notice', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const row = CONFLICT_CASE_ROWS.find((caseRow) => caseRow.site === 'plain spawn' && caseRow.stubCase === 'scan-leftover')!
     h.script({
       spawnQueue: [cannedErr(errInstanceIdCollision()), cannedErr(row.build())],
@@ -18974,10 +18962,10 @@ describe('b.jg5 SRJ-113: resume\'s outcome table at resumeOrFreshSpawn, one case
     const failure = describeAgentDirectorFailure(errSpawnNotResumable())
     const ended: PersonaRowReread = { kind: ROW_REREAD_FINISHED, lastRead: latchRowStateRead(LIVENESS_DEAD_ROW_ENDED) }
     expect(spawnNotResumableLine(LADDER_HEAD, ref, failure, ended, carriedDeadEvidenceOf(DEAD_SESSION_CAUSE_TMUX_GONE), lostRaceOutcome(true))).toBe(
-      `[slack] spawnForPersona: ${failure} on resume for ${ref} — re-read: state=ended; cause=tmux-gone: dead evidence (GONE-based) — a lost race: nothing killed, deleted or launched; answering retrying, no spawn-failure notice, nothing counted; the retry timer is armed (cause=spawn-not-resumable-lost-race) (b.jg5 SRJ-710, SRJ-611)`,
+      `[slack] spawnForPersona: ${failure} on resume for ${ref} — re-read: state=ended; cause=tmux-gone: dead evidence (GONE-based) — a lost race: nothing killed, deleted or launched; answering retrying, no spawn-failure notice, nothing counted; the retry timer is armed (cause=spawn-not-resumable-lost-race)`,
     )
     expect(spawnNotResumableLine(LIVE_ROW_SEQUENCE_LOG_PREFIX, ref, failure, { kind: ROW_REREAD_REFUSED }, undefined, SEQUENCE_NOT_RESUMABLE_LOST_RACE_OUTCOME)).toBe(
-      `${LIVE_ROW_SEQUENCE_LOG_PREFIX} ${failure} on resume for ${ref} — re-read: the read failed — a lost race: no second sequence and no further call; the sequence ends without its launch (cause=spawn-not-resumable-lost-race unless the persona is latched), nothing counted (b.jg5 SRJ-710, SRJ-706)`,
+      `${LIVE_ROW_SEQUENCE_LOG_PREFIX} ${failure} on resume for ${ref} — re-read: the read failed — a lost race: no second sequence and no further call; the sequence ends without its launch (cause=spawn-not-resumable-lost-race unless the persona is latched), nothing counted`,
     )
     expect(describePersonaRowReread({ kind: ROW_REREAD_LATCHED })).toBe('the read latched the persona')
     expect(describePersonaRowReread({ kind: ROW_REREAD_FINISHED, lastRead: LATCH_ROW_STATE_NO_ROW })).toBe(`state=${describeLatchRowState(LATCH_ROW_STATE_NO_ROW)}`)
@@ -18986,43 +18974,43 @@ describe('b.jg5 SRJ-113: resume\'s outcome table at resumeOrFreshSpawn, one case
     )
     expect(lostRaceOutcome(false)).toContain('the retry timer could not be armed (cause=spawn-not-resumable-lost-race)')
     expect(replaceRereadLine(ref, 'resume_enabled is false', latchRowStateRead('waiting'), carriedDeadEvidenceOf(DEAD_SESSION_CAUSE_ROW_NOT_INTERACTIVE), ended, REPLACE_REREAD_FINISHED_OUTCOME)).toBe(
-      `[slack] spawnForPersona: replacing the row of ${ref} (resume_enabled is false; last read waiting; cause=row-not-interactive: not dead evidence) — the path holds no dead evidence, so the row is read again first: re-read: state=ended — the row is finished: the replace step's reuse spawn of the same id (b.jg5 SRJ-609, SRJ-611, SRJ-707)`,
+      `[slack] spawnForPersona: replacing the row of ${ref} (resume_enabled is false; last read waiting; cause=row-not-interactive: not dead evidence) — the path holds no dead evidence, so the row is read again first: re-read: state=ended — the row is finished: the replace step's reuse spawn of the same id`,
     )
     expect(resumeNotFoundSpawnLine(LADDER_HEAD, ref)).toBe(
-      `[slack] spawnForPersona: ErrSpawnNotFound on resume for ${ref} — fresh-spawn: one plain spawn of the same id, which makes agent-director's pre-spawn scan; no spawn-failure notice for the ErrSpawnNotFound (b.jg5 SRJ-113, SRJ-111)`,
+      `[slack] spawnForPersona: ErrSpawnNotFound on resume for ${ref} — fresh-spawn: one plain spawn of the same id, which makes agent-director's pre-spawn scan; no spawn-failure notice for the ErrSpawnNotFound`,
     )
   })
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-710: `resume`'s ErrSpawnNotResumable at
+// `resume`'s ErrSpawnNotResumable at
 // `resumeOrFreshSpawn` makes exactly one `get` of the row through the shared
-// own-row read (SRJ-114: its latch and error rows apply), and the re-read
+// own-row read (its latch and error rows apply), and the re-read
 // decides (`decideNotResumable`):
 //   - `pending` is a launch in progress: nothing counted or posted, no
 //     sequence of its own whatever evidence the path held; the ladder's
 //     `pending` step answers (a covered row left with no kill; a row that is
-//     not covered, its `config_dir` label differing, gets SRJ-411's sequence
+// not covered, its `config_dir` label differing, gets sequence
 //     through the replace step). Its arms equal a direct call of the
 //     ladder's `pending` branch on the same row (B's launch, its collision
-//     `get` reading that row: one pending-only arm, b.jg5 SRJ-409);
+// `get` reading that row: one pending-only arm);
 //   - another live state starts the live-row sequence only on a path that
-//     holds dead evidence (the SRJ-611 matrix below); otherwise, and for
+// holds dead evidence (the matrix below); otherwise, and for
 //     `ended`, `missing`, no row, a refused read or a state CSCB does not
 //     know (an unreadable one included, whatever evidence the path holds;
-//     the SRJ-611 describe's unknown-state cases), a lost race: nothing
+// the describe's unknown-state cases), a lost race: nothing
 //     killed, deleted or launched, nothing counted, P's timer armed with the
 //     lost-race cause (after the read-error cause for a refused read).
 // Each path reaches the `resume` either through the GONE dead-session route
 // of a `waiting` row (dead evidence) or through a collision `get` that read
-// the row `ended` (none). AC 3's unit half is the covered `pending` row held
+// the row `ended` (none). unit half is the covered `pending` row held
 // at the dev-channels dialog, its session id kept.
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-710: ErrSpawnNotResumable\'s one re-read through the shared own-row read decides; pending is a launch in progress, a lost race kills, counts and posts nothing', () => {
+describe('ErrSpawnNotResumable\'s one re-read through the shared own-row read decides; pending is a launch in progress, a lost race kills, counts and posts nothing', () => {
   afterEach(() => {
-    expectNoDeleteOrIncludeFinished(srj105Harness)
-    srj105AfterEach()
+    expectNoDeleteOrIncludeFinished(recoveryHarness)
+    recoveryAfterEach()
   })
 
   /** A re-read of each kind, for the pure decision. */
@@ -19103,11 +19091,11 @@ describe('b.jg5 SRJ-710: ErrSpawnNotResumable\'s one re-read through the shared 
     causes: h.controller.view(key)?.causes ?? [],
   })
 
-  // AC 3's unit half: a `resume` forced on a row held at the dev-channels
+  // unit half: a `resume` forced on a row held at the dev-channels
   // dialog (its session id kept, a launch start) gets ErrSpawnNotResumable,
   // which is neither counted nor posted.
-  test.each([...PATHS])('a covered pending row with a launch start (AC 3: held at the dev-channels dialog, its session id kept), the path holding %s: the ladder\'s pending step answers no-op and arms P\'s timer in pending-only mode (b.jg5 SRJ-409); no sequence, kill, delete or launch; nothing counted or posted; its arms equal a direct call of the ladder\'s pending branch on the same row', async (path) => {
-    const { h, p, b } = srj105Build()
+  test.each([...PATHS])('a covered pending row with a launch start (held at the dev-channels dialog, its session id kept), the path holding %s: the ladder\'s pending step answers no-op and arms P\'s timer in pending-only mode; no sequence, kill, delete or launch; nothing counted or posted; its arms equal a direct call of the ladder\'s pending branch on the same row', async (path) => {
+    const { h, p, b } = buildRecoveryCase()
     const pendingOf = (key: string) => harnessRow(h, harnessPersona(h, key), { state: AGENT_DIRECTOR_PENDING_STATE, session_id: ENDED_WITH_SESSION.session_id })
     scriptNotResumable(h, p, path, cannedOk<GetResult>(pendingOf(p)))
     const order = recordCallOrder(h)
@@ -19133,8 +19121,8 @@ describe('b.jg5 SRJ-710: ErrSpawnNotResumable\'s one re-read through the shared 
     expect(callCountsSince(callCounts(h), callsBeforeB)).toEqual({ spawnCalls: 1, getCalls: 1 })
   })
 
-  test.each([...PATHS])('a pending row with a launch start whose config_dir label differs (never covered, SRJ-411), the path holding %s: the ErrSpawnNotResumable starts no sequence itself; the ladder\'s pending step starts SRJ-411\'s (seeded pending, the conversation not kept, context recovery) and the launch answers sequence-waiting; nothing counted or posted', async (path) => {
-    const { h, p } = srj105Build()
+  test.each([...PATHS])('a pending row with a launch start whose config_dir label differs (never covered), the path holding %s: the ErrSpawnNotResumable starts no sequence itself; the ladder\'s pending step starts (seeded pending, the conversation not kept, context recovery) and the launch answers sequence-waiting; nothing counted or posted', async (path) => {
+    const { h, p } = buildRecoveryCase()
     const persona = harnessPersona(h, p)
     const mismatched = harnessRow(h, persona, relabelledRow(h, persona, AGENT_DIRECTOR_PENDING_STATE))
     scriptNotResumable(h, p, path, cannedOk<GetResult>(mismatched))
@@ -19144,7 +19132,7 @@ describe('b.jg5 SRJ-710: ErrSpawnNotResumable\'s one re-read through the shared 
 
     const pathCalls = path === 'dead evidence' ? ['spawn', 'get', 'get', 'get', 'sendKeys', 'findMissing', 'resume'] : PATH_CALLS[path]
     expect(order.slice(0, pathCalls.length + 1)).toEqual([...pathCalls, 'get'])
-    expect(notResumableLines(h, p)).toEqual([expect.stringContaining(` — ${NOT_RESUMABLE_PENDING_OUTCOME} `)])
+    expect(notResumableLines(h, p)).toEqual([expect.stringContaining(` — ${NOT_RESUMABLE_PENDING_OUTCOME}`)])
     expect(h.lines).toContain(liveRowSequenceStartLine(renderPersonaRef(p, p), h.sequenceRequest(p, { lastReadState: AGENT_DIRECTOR_PENDING_STATE })))
     // The conversation is not kept: the row has a session id, yet step 6 is a reuse.
     expect(await h.driveSequence(h.sequenceSettled(p))).toMatchObject({ kind: LIVE_ROW_OUTCOME_LAUNCHED, launchKind: LIVE_ROW_LAUNCH_REUSE, result: { key: p, action: 'spawned' }, kills: 1 })
@@ -19157,7 +19145,7 @@ describe('b.jg5 SRJ-710: ErrSpawnNotResumable\'s one re-read through the shared 
     ['a pending row with no launch start (latch case "launch start not recorded")', (h, p) => harnessRow(h, harnessPersona(h, p), { state: AGENT_DIRECTOR_PENDING_STATE, launch_started_at: SAMPLE_LAUNCH_START_NONE })],
     ['a waiting row carrying a provenance_conflict note (latch case "conflicting labels")', (h, p) => harnessRow(h, harnessPersona(h, p), { state: 'waiting', liveness_note: provenanceNote })],
   ])('the re-read latches P on %s: latched, with no further call, no sequence and no kill, though the path holds dead evidence', async (_name, row) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     scriptNotResumable(h, p, 'dead evidence', cannedOk<GetResult>(row(h, p)))
     const order = recordCallOrder(h)
 
@@ -19177,7 +19165,7 @@ describe('b.jg5 SRJ-710: ErrSpawnNotResumable\'s one re-read through the shared 
   ]
 
   test.each(LOST_RACE_REREADS)('the re-read reads %s: a lost race: retrying; no kill, delete or launch; nothing counted or posted; P armed with the lost-race cause and re-evaluated at its retry', async (_name, reread) => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     scriptNotResumable(h, p, 'no evidence', reread(h, p))
     const order = recordCallOrder(h)
 
@@ -19188,13 +19176,13 @@ describe('b.jg5 SRJ-710: ErrSpawnNotResumable\'s one re-read through the shared 
     expect([h.sequenceRunning(p), getFailureCount(p), h.notices, h.episodeNotices, h.startupErrors()]).toEqual([false, 0, [], [], []])
     const lines = notResumableLines(h, p)
     expect(lines).toHaveLength(1)
-    expect(lines[0]!.endsWith(` — ${lostRaceOutcome(true)} (b.jg5 SRJ-710, SRJ-611)`)).toBe(true)
+    expect(lines[0]!.endsWith(` — ${lostRaceOutcome(true)}`)).toBe(true)
     expect(personaCallCounts(h, b)).toEqual({})
   })
 
   // The PM ruling: a refused re-read takes the shared read's own error rows
   // (the `get` arms P's timer with the cause its error gives: the UNAVAILABLE
-  // cause, or the read-error cause for any other read error, SRJ-301), and
+  // cause, or the read-error cause for any other read error), and
   // the step then ends as the lost race, nothing counted.
   const REFUSED_REREADS = PATHS.flatMap((path) =>
     ([
@@ -19203,7 +19191,7 @@ describe('b.jg5 SRJ-710: ErrSpawnNotResumable\'s one re-read through the shared 
     ] as const).map(([what, make, cause]) => [what, path, make, cause] as const),
   )
   test.each(REFUSED_REREADS)('the re-read is refused (%s), the path holding %s: no sequence, kill or launch; nothing counted; P armed with the read\'s own cause, then the lost-race cause', async (_what, path, make, cause) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     scriptNotResumable(h, p, path, cannedErr<GetResult>(make()))
     const order = recordCallOrder(h)
 
@@ -19217,8 +19205,8 @@ describe('b.jg5 SRJ-710: ErrSpawnNotResumable\'s one re-read through the shared 
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-611's Test line (homed in T1, observed here), SRJ-710, AC 58,
-// AC 59 (both as amended by the dead-evidence rule: dead evidence covers one
+// Test line (homed in , observed here),
+// (both the dead-evidence rule: dead evidence covers one
 // life): for each dead-session path and cause, the `resume` answers
 // ErrSpawnNotResumable and the re-read finds the row `waiting` (live, not
 // `pending`). Only a path holding GONE-based dead evidence (the reconnect's
@@ -19230,7 +19218,7 @@ describe('b.jg5 SRJ-710: ErrSpawnNotResumable\'s one re-read through the shared 
 // session id), never a reuse; the ladder answers `sequence-waiting` and
 // nothing is counted. A path that read the row `ended`, `missing` or gone
 // (the collision `get`, the prompt-row action's re-read, the working-row
-// wait, the reconnect's `ErrSpawnNotFound`, SRJ-120's post-run `get`,
+// wait, the reconnect's `ErrSpawnNotFound`post-run `get`,
 // `resume`'s `ErrSpawnNotFound`), and a carried verdict a reconnect's
 // `row-not-interactive` answered, holds none from then on: one voided line
 // per piece, then the lost race. Every cause that is no dead evidence
@@ -19241,15 +19229,15 @@ describe('b.jg5 SRJ-710: ErrSpawnNotResumable\'s one re-read through the shared 
 // new evidence (the one-life boundary). A re-read in a state CSCB does not
 // know (an unreadable one included) is a lost race on every path whose
 // evidence stands, and again at the sequence's own step-6 `resume`: no
-// sequence, kill or launch follows it. Then AC 59 with its later retry, and
-// SRJ-110 at this site: the sequence's first kill's C2 non-successes, on its
+// sequence, kill or launch follows it. Then with its later retry, and
+// at this site: the sequence's first kill's C2 non-successes, on its
 // checked kill.
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-611, SRJ-710 (AC 58, AC 59): an ErrSpawnNotResumable on a row re-read waiting starts the live-row sequence, ending in resume, only for a GONE-based cause on a path whose last read is live (dead evidence covers one life)', () => {
+describe('an ErrSpawnNotResumable on a row re-read waiting starts the live-row sequence, ending in resume, only for a GONE-based cause on a path whose last read is live (dead evidence covers one life)', () => {
   afterEach(() => {
-    expectNoDeleteOrIncludeFinished(srj105Harness)
-    srj105AfterEach()
+    expectNoDeleteOrIncludeFinished(recoveryHarness)
+    recoveryAfterEach()
   })
 
   /** The dead evidence a path voided, in the order its lines are logged, and the read or answer that voided it. */
@@ -19294,7 +19282,7 @@ describe('b.jg5 SRJ-611, SRJ-710 (AC 58, AC 59): an ErrSpawnNotResumable on a ro
 
   /**
    * What a reconnect's `cause` leaves the path holding with `carried`
-   * carried in (b.jg5 SRJ-611): a GONE (`tmux-gone`) on the row read live is
+   * carried in: a GONE (`tmux-gone`) on the row read live is
    * the path's own evidence, and stands; `row-not-interactive` voids the
    * carried verdict, the route's own cause being none; `row-absent` read no
    * row, which voids all the path holds.
@@ -19344,7 +19332,7 @@ describe('b.jg5 SRJ-611, SRJ-710 (AC 58, AC 59): an ErrSpawnNotResumable on a ro
         })),
       ]
     }),
-    // b.jdc's ladder action: its re-read after the sweep found the row ended,
+    // ladder action: its re-read after the sweep found the row ended,
     // which voids its own GONE and any carried verdict (one line each).
     ...[undefined, CARRIED_GONE].flatMap((carried) =>
       ([
@@ -19407,8 +19395,8 @@ describe('b.jg5 SRJ-611, SRJ-710 (AC 58, AC 59): an ErrSpawnNotResumable on a ro
   /** The launch and read calls from the first `resume` on. */
   const fromResume = (order: readonly string[]): string[] => order.slice(order.indexOf('resume')).filter((verb) => LAUNCH_AND_READ_VERBS.has(verb))
 
-  test.each(PATH_CAUSES.map((path) => [path.name, path] as const))('SRJ-611: %s', async (_name, path) => {
-    const { h, p, b } = srj105Build()
+  test.each(PATH_CAUSES.map((path) => [path.name, path] as const))('%s', async (_name, path) => {
+    const { h, p, b } = buildRecoveryCase()
     scriptPath(h, p, path)
     const order = recordCallOrder(h)
     const id = personaInstanceId(p)
@@ -19418,7 +19406,7 @@ describe('b.jg5 SRJ-611, SRJ-710 (AC 58, AC 59): an ErrSpawnNotResumable on a ro
     // Each voided piece is logged once, naming the read or the answer that voided it.
     expect(voidedEvidenceLines(h, renderPersonaRef(p, p))).toEqual(expectedVoidedLines(p, path.voided))
     if (!path.liveEvidence) {
-      // AC 59, and AC 58 as amended: a lost race: nothing killed, deleted or launched; nothing counted.
+      // and : a lost race: nothing killed, deleted or launched; nothing counted.
       expect(result).toStrictEqual({ key: p, action: SPAWN_ACTION_RETRYING })
       expect(fromResume(order)).toEqual(['resume', 'get'])
       expect([h.sequenceRunning(p), h.stub.calls.killCalls, h.reuseSpawns(), h.stub.calls.spawnCalls.length, getFailureCount(p)]).toEqual([false, [], [], 1, 0])
@@ -19430,7 +19418,7 @@ describe('b.jg5 SRJ-611, SRJ-710 (AC 58, AC 59): an ErrSpawnNotResumable on a ro
       ])
       return
     }
-    // AC 58: one sequence, the conversation kept, ending in resume.
+    // one sequence, the conversation kept, ending in resume.
     expect(result).toStrictEqual({ key: p, action: 'sequence-waiting' })
     expect(h.sequenceRunning(p)).toBe(true)
     expect(h.lines).toContain(liveRowSequenceStartLine(renderPersonaRef(p, p), h.sequenceRequest(p, { lastReadState: 'waiting', keepsConversation: true })))
@@ -19444,7 +19432,7 @@ describe('b.jg5 SRJ-611, SRJ-710 (AC 58, AC 59): an ErrSpawnNotResumable on a ro
     expect(fromResume(order)).toEqual(['resume', 'get', 'kill', 'get', 'findMissing', 'get', 'resume'])
     expect(h.stub.calls.resumeCalls).toEqual([{ instance_id: id }, { instance_id: id }])
     expect([h.reuseSpawns(), h.stub.calls.spawnCalls.length, getFailureCount(p)]).toEqual([[], 1, 0])
-    // Nothing armed but the step-6 resume's pending-only watch (b.jg5 SRJ-409).
+    // Nothing armed but the step-6 resume's pending-only watch.
     expectOnlyPendingRowWatch(h, p)
     expect(personaCallCounts(h, b)).toEqual({})
 
@@ -19457,15 +19445,15 @@ describe('b.jg5 SRJ-611, SRJ-710 (AC 58, AC 59): an ErrSpawnNotResumable on a ro
     lastRead: latchRowStateRead(state),
   })
 
-  // b.jg5 SRJ-710, SRJ-611: GONE-based evidence never makes a re-read in a
+  // GONE-based evidence never makes a re-read in a
   // state CSCB does not know (an unreadable one included) a reason to kill:
   // a lost race at the collision ladder, its line naming the state as read,
   // or `unreadable`, and the evidence the path held.
   const GONE_UNKNOWN_REREADS = PATH_CAUSES.filter((path) => path.liveEvidence).flatMap((path) =>
     UNKNOWN_REREAD_STATES.map(([label, state, named]) => [path.name, label, path, state, named] as const),
   )
-  test.each(GONE_UNKNOWN_REREADS)('SRJ-710: %s, the re-read finding %s: a lost race: no sequence, kill, delete or launch; nothing counted or posted; P armed with the lost-race cause', async (_name, _label, path, state, named) => {
-    const { h, p, b } = srj105Build()
+  test.each(GONE_UNKNOWN_REREADS)('%s, the re-read finding %s: a lost race: no sequence, kill, delete or launch; nothing counted or posted; P armed with the lost-race cause', async (_name, _label, path, state, named) => {
+    const { h, p, b } = buildRecoveryCase()
     scriptPath(h, p, path, {}, state)
     const order = recordCallOrder(h)
     const ref = renderPersonaRef(p, p)
@@ -19483,12 +19471,12 @@ describe('b.jg5 SRJ-611, SRJ-710 (AC 58, AC 59): an ErrSpawnNotResumable on a ro
     expect(personaCallCounts(h, b)).toEqual({})
   })
 
-  // b.jg5 SRJ-710, SRJ-706: the sequence a GONE-based path starts ends in
+  // the sequence a GONE-based path starts ends in
   // its own `resume`; that resume's ErrSpawnNotResumable, its re-read finding
   // a state CSCB does not know (an unreadable one included), is a lost race
   // there too: no second sequence, no second kill, no launch.
-  test.each(UNKNOWN_REREAD_STATES)('SRJ-710 at the sequence\'s step 6: GONE-based evidence and a waiting re-read start the sequence; its step-6 resume answering ErrSpawnNotResumable, the re-read finding %s, ends it not launched: no second sequence, kill or launch; nothing counted or posted; the lost-race cause armed', async (_label, state, named) => {
-    const { h, p, b } = srj105Build()
+  test.each(UNKNOWN_REREAD_STATES)('at the sequence\'s step 6: GONE-based evidence and a waiting re-read start the sequence; its step-6 resume answering ErrSpawnNotResumable, the re-read finding %s, ends it not launched: no second sequence, kill or launch; nothing counted or posted; the lost-race cause armed', async (_label, state, named) => {
+    const { h, p, b } = buildRecoveryCase()
     const persona = harnessPersona(h, p)
     const ended = cannedOk<GetResult>(harnessRow(h, persona, ENDED_WITH_SESSION))
     // The collision get, the ladder's re-read, the sequence's two gets, then step 6's re-read.
@@ -19518,11 +19506,11 @@ describe('b.jg5 SRJ-611, SRJ-710 (AC 58, AC 59): an ErrSpawnNotResumable on a ro
     expect(personaCallCounts(h, b)).toEqual({})
   })
 
-  // b.jg5 SRJ-609's AC 59 half: the reconnect's ErrSpawnNotInteractive is a
+  // half: the reconnect's ErrSpawnNotInteractive is a
   // route into the restart decision only; on a row the re-read finds live it
   // kills, deletes and counts nothing, and P is re-evaluated at its retry.
-  test('AC 59: the reconnect\'s send-keys answers ErrSpawnNotInteractive, the re-read finds the row waiting and the resume answered ErrSpawnNotResumable: nothing killed, deleted or counted; P\'s next retry re-evaluates it', async () => {
-    const { h, p } = srj105Build()
+  test('the reconnect\'s send-keys answers ErrSpawnNotInteractive, the re-read finds the row waiting and the resume answered ErrSpawnNotResumable: nothing killed, deleted or counted; P\'s next retry re-evaluates it', async () => {
+    const { h, p } = buildRecoveryCase()
     const path = PATH_CAUSES.find((candidate) => candidate.collision === 'waiting' && candidate.carried === undefined && candidate.name.includes('ErrSpawnNotInteractive'))!
     scriptPath(h, p, path)
 
@@ -19539,7 +19527,7 @@ describe('b.jg5 SRJ-611, SRJ-710 (AC 58, AC 59): an ErrSpawnNotResumable on a ro
     expect([h.stub.calls.killCalls, getFailureCount(p)]).toEqual([[], 0])
   })
 
-  /** The sequence's first kill's C2 non-successes (b.jg5 SRJ-110; HO C2's list), each with whether it latches P and the tries it takes. */
+  /** The sequence's first kill's C2 non-successes (HO C2's list), each with whether it latches P and the tries it takes. */
   const FIRST_KILL_NON_SUCCESSES: ReadonlyArray<readonly [string, () => Error, boolean, number]> = [
     ['ErrTmuxKillFailed', () => errTmuxKillFailed(), false, KILL_RETRY_TRIES],
     ['ErrTmuxUnresponsive', () => errTmuxUnresponsive('kill'), false, KILL_RETRY_TRIES],
@@ -19550,8 +19538,8 @@ describe('b.jg5 SRJ-611, SRJ-710 (AC 58, AC 59): an ErrSpawnNotResumable on a ro
     ['ErrCallTimeout', () => errCallTimeout('kill'), false, KILL_RETRY_TRIES],
   ]
 
-  test.each(FIRST_KILL_NON_SUCCESSES)('SRJ-110 at this site: GONE-based evidence and a waiting re-read start the sequence; its first kill answering %s through the bounded retry aborts it at step 1: no launch and no delete', async (_label, make, latches, tries) => {
-    const { h, p } = srj105Build()
+  test.each(FIRST_KILL_NON_SUCCESSES)('at this site: GONE-based evidence and a waiting re-read start the sequence; its first kill answering %s through the bounded retry aborts it at step 1: no launch and no delete', async (_label, make, latches, tries) => {
+    const { h, p } = buildRecoveryCase()
     scriptPath(h, p, PATH_CAUSES[0]!, { killError: make() })
 
     expect(await h.launch(p)).toStrictEqual({ key: p, action: 'sequence-waiting' })
@@ -19564,8 +19552,8 @@ describe('b.jg5 SRJ-611, SRJ-710 (AC 58, AC 59): an ErrSpawnNotResumable on a ro
     expect(getFailureCount(p)).toBe(0)
   })
 
-  test('SRJ-110 at this site: the sequence\'s first kill answering ErrSpawnNotFound counts as success: the sequence goes on and ends in its resume', async () => {
-    const { h, p } = srj105Build()
+  test('at this site: the sequence\'s first kill answering ErrSpawnNotFound counts as success: the sequence goes on and ends in its resume', async () => {
+    const { h, p } = buildRecoveryCase()
     scriptPath(h, p, PATH_CAUSES[0]!, { killError: errSpawnNotFound() })
 
     expect(await h.launch(p)).toStrictEqual({ key: p, action: 'sequence-waiting' })
@@ -19574,11 +19562,11 @@ describe('b.jg5 SRJ-611, SRJ-710 (AC 58, AC 59): an ErrSpawnNotResumable on a ro
 
   })
 
-  // b.jg5 SRJ-710: a `pending` re-read after a path whose evidence was
+  // a `pending` re-read after a path whose evidence was
   // voided goes to the ladder's `pending` step, as on any path: the covered
   // row is left, never the lost race and never a sequence.
   test.each(PATH_CAUSES.filter((path) => path.voided !== undefined).map((path) => [path.name, path] as const))('a pending re-read after a voided path (%s): the ladder\'s pending step leaves the covered row, P armed pending-only; no sequence, kill or launch; nothing counted or posted', async (_name, path) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     scriptPath(h, p, path, {}, AGENT_DIRECTOR_PENDING_STATE)
     const order = recordCallOrder(h)
 
@@ -19586,14 +19574,13 @@ describe('b.jg5 SRJ-611, SRJ-710 (AC 58, AC 59): an ErrSpawnNotResumable on a ro
 
     expect(fromResume(order)).toEqual(['resume', 'get'])
     expect(voidedEvidenceLines(h, renderPersonaRef(p, p))).toEqual(expectedVoidedLines(p, path.voided))
-    expect(notResumableAt(h, p)).toEqual([expect.stringContaining(` — ${NOT_RESUMABLE_PENDING_OUTCOME} `)])
+    expect(notResumableAt(h, p)).toEqual([expect.stringContaining(` — ${NOT_RESUMABLE_PENDING_OUTCOME}`)])
     expect([h.sequenceRunning(p), h.stub.calls.killCalls, h.reuseSpawns(), getFailureCount(p), h.notices]).toEqual([false, [], [], 0, []])
     expectOnlyPendingRowWatch(h, p)
   })
 
   // ---------------------------------------------------------------------------
-  // The voiding reads and answers that re-run get-then-act (b.jg5 SRJ-611,
-  // SRJ-111, SRJ-112, SRJ-113, SRJ-805): the re-run carries no dead evidence,
+  // The voiding reads and answers that re-run get-then-act: the re-run carries no dead evidence,
   // so its `row-not-interactive` (no evidence of its own) and a re-read of
   // `waiting` after ErrSpawnNotResumable are a lost race. The one-life
   // boundary: a GONE the re-run meets on the row it reads live is new
@@ -19629,14 +19616,14 @@ describe('b.jg5 SRJ-611, SRJ-710 (AC 58, AC 59): an ErrSpawnNotResumable on a ro
 
   const RERUNS: readonly Rerun[] = [
     {
-      // b.jg5 SRJ-111: the collision get found no row; the plain spawn after it collides.
+      // the collision get found no row; the plain spawn after it collides.
       name: 'the collision get answers ErrSpawnNotFound and the plain spawn after it collides',
       script: (h, p) => ({ spawnQueue: [collides(), collides()], getQueue: [cannedErr<GetResult>(errSpawnNotFound()), waitingOf(h, p), waitingOf(h, p), waitingOf(h, p), waitingOf(h, p)] }),
       calls: ['spawn', 'get', 'spawn', 'get', 'get', 'get', 'resume', 'get'],
       voided: { pieces: [CARRIED_GONE], by: deadEvidenceVoidingRead(DEAD_EVIDENCE_READ_BY_COLLISION_GET, LATCH_ROW_STATE_NO_ROW) },
     },
     {
-      // b.jg5 SRJ-113: the path held its own GONE and the carried verdict until resume found no row.
+      // the path held its own GONE and the carried verdict until resume found no row.
       name: 'the reconnect answers GONE, resume answers ErrSpawnNotFound and the plain spawn after it collides',
       script: (h, p) => ({
         spawnQueue: [collides(), collides()],
@@ -19648,7 +19635,7 @@ describe('b.jg5 SRJ-611, SRJ-710 (AC 58, AC 59): an ErrSpawnNotResumable on a ro
       voided: { pieces: [OWN_GONE, CARRIED_GONE], by: DEAD_EVIDENCE_VOIDED_BY_RESUME_NOT_FOUND },
     },
     {
-      // b.jg5 SRJ-112: the collision get read the row ended; resume's ErrNoSessionId gives the reuse, which collides.
+      // the collision get read the row ended; resume's ErrNoSessionId gives the reuse, which collides.
       name: 'the collision get reads ended, resume answers ErrNoSessionId and the reuse spawn after it collides',
       script: (h, p) => ({
         spawnQueue: [collides(), collides()],
@@ -19659,7 +19646,7 @@ describe('b.jg5 SRJ-611, SRJ-710 (AC 58, AC 59): an ErrSpawnNotResumable on a ro
       voided: { pieces: [CARRIED_GONE], by: deadEvidenceVoidingRead(DEAD_EVIDENCE_READ_BY_COLLISION_GET, latchRowStateRead(LIVENESS_DEAD_ROW_ENDED)) },
     },
     {
-      // b.jg5 SRJ-112: the path read the row live and still carries the verdict when its reuse collides.
+      // the path read the row live and still carries the verdict when its reuse collides.
       name: 'the reconnect answers GONE, resume answers ErrNoSessionId and the reuse spawn after it collides',
       script: (h, p) => ({
         spawnQueue: [collides(), collides()],
@@ -19672,8 +19659,8 @@ describe('b.jg5 SRJ-611, SRJ-710 (AC 58, AC 59): an ErrSpawnNotResumable on a ro
     },
   ]
 
-  test.each(RERUNS.map((rerun) => [rerun.name, rerun] as const))('SRJ-611: carrying a GONE-based verdict, %s; the re-run\'s collision get reads waiting, its reconnect answers ErrSpawnNotInteractive, resume answers ErrSpawnNotResumable and the re-read finds waiting: the re-run carries no dead evidence, a lost race; each voided piece logged once', async (_name, rerun) => {
-    const { h, p } = srj105Build()
+  test.each(RERUNS.map((rerun) => [rerun.name, rerun] as const))('carrying a GONE-based verdict, %s; the re-run\'s collision get reads waiting, its reconnect answers ErrSpawnNotInteractive, resume answers ErrSpawnNotResumable and the re-read finds waiting: the re-run carries no dead evidence, a lost race; each voided piece logged once', async (_name, rerun) => {
+    const { h, p } = buildRecoveryCase()
     h.script({
       getResult: harnessRow(h, harnessPersona(h, p), ENDED_WITH_SESSION),
       resumeQueue: [cannedErr(errSpawnNotResumable())],
@@ -19695,7 +19682,7 @@ describe('b.jg5 SRJ-611, SRJ-710 (AC 58, AC 59): an ErrSpawnNotResumable on a ro
   // The one-life boundary: the reuse-collision re-run reads the row waiting,
   // and its reconnect's GONE (ErrTmuxSendKeys) is new evidence of that life.
   test('one-life boundary: carrying a GONE-based verdict, the collision get reads ended (voiding it), resume answers ErrNoSessionId and the reuse collides; the re-run reads waiting and its reconnect answers ErrTmuxSendKeys; resume answers ErrSpawnNotResumable and the re-read finds waiting: the live-row sequence starts on the new evidence and ends in resume', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const reuseRerun = RERUNS.find((rerun) => rerun.name.startsWith('the collision get reads ended'))!
     h.script({ getResult: harnessRow(h, harnessPersona(h, p), ENDED_WITH_SESSION), sendKeysError: errTmuxSendKeys(), ...reuseRerun.script(h, p) })
     const order = recordCallOrder(h)
@@ -19714,12 +19701,12 @@ describe('b.jg5 SRJ-611, SRJ-710 (AC 58, AC 59): an ErrSpawnNotResumable on a ro
 
   })
 
-  // b.jg5 SRJ-805, SRJ-611 (R11): a retired key's first launch is a reuse
+  // (R11): a retired key's first launch is a reuse
   // spawn that starts a new life; the get-then-act its collision enters
   // carries no verdict. With its mark set, the live row it reads is the new
   // life (handled as any live row).
   test('R11: a retired key (its mark set) carrying a GONE-based verdict: its first launch\'s reuse collides; one voided line; the get-then-act reads waiting, its reconnect answers ErrSpawnNotInteractive, resume answers ErrSpawnNotResumable and the re-read finds waiting: a lost race, its route carrying nothing in', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     h.retireKey(p, { mark: true })
     h.script({
       spawnQueue: [collides()],
@@ -19739,7 +19726,7 @@ describe('b.jg5 SRJ-611, SRJ-710 (AC 58, AC 59): an ErrSpawnNotResumable on a ro
   })
 
   // ---------------------------------------------------------------------------
-  // b.jg5 SRJ-120, SRJ-611 (R12): the `get` of P's own row after the path's
+  // (R12): the `get` of P's own row after the path's
   // own find-missing run, made for a row the run left in `unverified_ids`, is
   // a voiding read when it finds the row finished or gone, and becomes the
   // path's last read. The run's listing voids nothing, and neither does a
@@ -19749,14 +19736,14 @@ describe('b.jg5 SRJ-611, SRJ-710 (AC 58, AC 59): an ErrSpawnNotResumable on a ro
   /** A find-missing result leaving P's own row in `unverified_ids`, or putting it in `ids`. */
   const listing = (p: string, where: 'unverified_ids' | 'ids'): import('agent-director').FindMissingResult => cannedFindMissing({ rows: { [personaInstanceId(p)]: where } })
 
-  /** The SRJ-120 `get`'s answers: the row ended or missing, or no row. */
+  /** The `get`'s answers: the row ended or missing, or no row. */
   const POST_SWEEP_READS: ReadonlyArray<readonly [string, (h: RecoveryHarness, p: string) => CannedResponse<GetResult>, LatchRowState]> = [
     ...[...AGENT_DIRECTOR_DEAD_STATES].map((state) => [`the row ${state}`, (h: RecoveryHarness, p: string) => cannedOk<GetResult>(harnessRow(h, harnessPersona(h, p), { state })), latchRowStateRead(state)] as const),
     ['no row (ErrSpawnNotFound)', () => cannedErr<GetResult>(errSpawnNotFound()), LATCH_ROW_STATE_NO_ROW],
   ]
 
-  test.each(POST_SWEEP_READS)('SRJ-120: a waiting row whose reconnect answers GONE (tmux-gone), its find-missing run listing P in unverified_ids, the get after it finding %s; resume answers ErrSpawnNotResumable and the re-read finds waiting: the get voided the GONE, a lost race', async (_label, read, readState) => {
-    const { h, p } = srj105Build()
+  test.each(POST_SWEEP_READS)('a waiting row whose reconnect answers GONE (tmux-gone), its find-missing run listing P in unverified_ids, the get after it finding %s; resume answers ErrSpawnNotResumable and the re-read finds waiting: the get voided the GONE, a lost race', async (_label, read, readState) => {
+    const { h, p } = buildRecoveryCase()
     h.script({
       spawnQueue: [collides()],
       getQueue: [waitingOf(h, p), waitingOf(h, p), waitingOf(h, p), read(h, p), waitingOf(h, p)],
@@ -19774,15 +19761,15 @@ describe('b.jg5 SRJ-611, SRJ-710 (AC 58, AC 59): an ErrSpawnNotResumable on a ro
     expectLostRaceAfterRerun(h, p, result, CARRIED_DEAD_EVIDENCE_NONE)
   })
 
-  // The controls: no SRJ-120 `get`, so nothing is voided and the GONE on the row read live stands.
+  // The controls: no `get`, so nothing is voided and the GONE on the row read live stands.
   test.each<[string, (h: RecoveryHarness, p: string) => Promise<void>, RecoveryStubScript]>([
     ['P\'s row in ids (the run marked it missing): no get of it', async () => {}, {}],
     ['a memo hit (a run made just before, its own get finding the row ended): no run and no get', async (h, p) => {
       h.script({ getResult: harnessRow(h, harnessPersona(h, p), { state: LIVENESS_DEAD_ROW_ENDED }), findMissingResult: listing(p, 'unverified_ids') })
       await sweepDeadTmuxChannel(p, 'dead-session')
     }, {}],
-  ])('SRJ-120 control: a waiting row whose reconnect answers GONE, %s; resume answers ErrSpawnNotResumable and the re-read finds waiting: nothing voided, the live-row sequence starts', async (_label, before) => {
-    const { h, p } = srj105Build()
+  ])('control: a waiting row whose reconnect answers GONE, %s; resume answers ErrSpawnNotResumable and the re-read finds waiting: nothing voided, the live-row sequence starts', async (_label, before) => {
+    const { h, p } = buildRecoveryCase()
     h.script({ findMissingResult: listing(p, 'ids') })
     await before(h, p)
     const sweeps = h.stub.calls.findMissingCalls.length
@@ -19806,12 +19793,12 @@ describe('b.jg5 SRJ-611, SRJ-710 (AC 58, AC 59): an ErrSpawnNotResumable on a ro
 
   })
 
-  // R12: the SRJ-120 get's finished read is the path's last read from then
+  // R12: the get's finished read is the path's last read from then
   // on: the config_dir guard's replacement reuses the finished row at once
   // (no re-read, no sequence, no kill), and a CONFLICT at the resume latches
   // with the state that get read.
-  test('R12, SRJ-707: a waiting row whose config_dir label differs, its reconnect answering GONE, the run listing P in unverified_ids and the get after it reading ended: the guard\'s replacement is one reuse spawn of the finished row; no re-read, sequence or kill', async () => {
-    const { h, p } = srj105Build()
+  test('R12, a waiting row whose config_dir label differs, its reconnect answering GONE, the run listing P in unverified_ids and the get after it reading ended: the guard\'s replacement is one reuse spawn of the finished row; no re-read, sequence or kill', async () => {
+    const { h, p } = buildRecoveryCase()
     const persona = harnessPersona(h, p)
     h.script({
       spawnQueue: [collides()],
@@ -19831,7 +19818,7 @@ describe('b.jg5 SRJ-611, SRJ-710 (AC 58, AC 59): an ErrSpawnNotResumable on a ro
   })
 
   test('R12: a waiting row whose reconnect answers GONE, the run listing P in unverified_ids and the get after it reading ended, then a resume CONFLICT: P latched with the refused operation resume and the state that get read', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const err = conflictRowsFor('resume').find((row) => row.latchCase === LATCH_CASE_LEFTOVER)!.build()
     h.script({
       spawnQueue: [collides()],
@@ -19849,14 +19836,14 @@ describe('b.jg5 SRJ-611, SRJ-710 (AC 58, AC 59): an ErrSpawnNotResumable on a ro
     expect([h.sequenceRunning(p), h.stub.calls.killCalls]).toEqual([false, []])
   })
 
-  // b.jg5 SRJ-707, SRJ-611: the `resume_enabled` false replace step on a
+  // the `resume_enabled` false replace step on a
   // finished last read behaves the same with a voided GONE-based verdict as
   // with none: one reuse spawn of the finished row, no re-read.
   test.each<[string, CarriedDeadEvidence | undefined]>([
     ['carrying a GONE-based verdict (voided by the collision get\'s read)', CARRIED_GONE],
     ['carrying nothing', undefined],
   ])('resume_enabled false, the collision get reading ended, %s: one reuse spawn of the same id, no re-read, sequence or kill', async (_label, carried) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     noResume(h)
     h.script({ spawnQueue: [collides()], getQueue: [endedOf(h, p)] })
     const order = recordCallOrder(h)
@@ -19875,32 +19862,32 @@ describe('b.jg5 SRJ-611, SRJ-710 (AC 58, AC 59): an ErrSpawnNotResumable on a ro
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-207, SRJ-1008, SRJ-112 (AC 23): the ErrInvalidFlags hold
+// the ErrInvalidFlags hold
 //
 // On the recovery harness, whose one hold is composed as main() composes it
 // (installed in the session manager; its set reaction stops P's retry timer
-// and posts SRJ-1008's alert once in P's episode; its held query bound into
+// and posts alert once in P's episode; its held query bound into
 // the restart deps and the retry action; the version-changed listener ends
 // it and retries P at once). P is held through a real reuse spawn of the
 // same id that answers ErrInvalidFlags (`holdThroughReuse`): its launch
 // meets its row finished in another directory. The reuse sites' rows are in
 // the replacement-site describe above; here: every launch path while P is
 // held, the start pass's tally, a latched and held P, a reuse with no hold
-// installed or a hold whose set throws, AC 23 end to end with the
+// installed or a hold whose set throws end to end with the
 // version re-check on the harness clock, below the floor, a server restart,
 // and only a reuse holds (a plain spawn's and a resume's ErrInvalidFlags
 // keep the re-check, then UNCLASSIFIED).
 // ---------------------------------------------------------------------------
 
-/** One SRJ-1008 alert at persona `key`'s destination, as the harness's episodes capture it. */
+/** One alert at persona `key`'s destination, as the harness's episodes capture it. */
 function holdAlert(key: string): { key: string; text: string } {
   return { key, text: INVALID_FLAGS_HOLD_ALERT_TEXT }
 }
 
-describe('b.jg5 SRJ-207, SRJ-1015: every launch path for a held persona answers held with no agent-director call; launchSession answers \'skipped\' and the start pass counts it neither failed nor succeeded', () => {
+describe('every launch path for a held persona answers held with no agent-director call; launchSession answers \'skipped\' and the start pass counts it neither failed nor succeeded', () => {
   afterEach(() => {
-    expectNoDeleteOrIncludeFinished(srj105Harness)
-    srj105AfterEach()
+    expectNoDeleteOrIncludeFinished(recoveryHarness)
+    recoveryAfterEach()
   })
 
   /** What the sequence last read before a launch: the row `ended`. */
@@ -19920,7 +19907,7 @@ describe('b.jg5 SRJ-207, SRJ-1015: every launch path for a held persona answers 
   ]
 
   test.each(HELD_PATHS)('%s for a held P: its held answer, with zero stub calls and one held line; no launch, kill or delete, nothing counted, recorded, armed or posted, no second alert; Q launches normally afterwards', async (_label, call, answer, site, refOf = (key: string) => renderPersonaRef(key, key)) => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     await holdThroughReuse(h, p)
     // One failure on record: a success recorded for P would clear it, a failure add one.
     recordFailure(p)
@@ -19943,8 +19930,8 @@ describe('b.jg5 SRJ-207, SRJ-1015: every launch path for a held persona answers 
 
   })
 
-  test('b.jg5 SRJ-1015: the start pass over a held P and an unheld Q: P\'s outcome is held with no call, counted neither failed nor succeeded; Q is spawned and counted', async () => {
-    const { h, p, b } = srj105Build()
+  test('the start pass over a held P and an unheld Q: P\'s outcome is held with no call, counted neither failed nor succeeded; Q is spawned and counted', async () => {
+    const { h, p, b } = buildRecoveryCase()
     await holdThroughReuse(h, p)
     const before = personaCallCounts(h, p)
 
@@ -19959,9 +19946,9 @@ describe('b.jg5 SRJ-207, SRJ-1015: every launch path for a held persona answers 
   })
 
   // The latched gate answers for a persona both latched and held: the latch
-  // is a human's to clear, and its answer is the one SRJ-502 gives.
+  // is a human's to clear, and its answer is the one gives.
   test('a P both latched and held answers latched, not held, at spawnForPersona and the sequence-launch entry, with no call; launchSession answers \'skipped\'', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const row = CONFLICT_CASE_ROWS.find((r) => r.site === 'plain spawn' && r.rowState === LATCH_ROW_STATE_NO_ROW)!
     h.script({ spawnError: row.build(), getError: errSpawnNotFound() })
     expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
@@ -19978,7 +19965,7 @@ describe('b.jg5 SRJ-207, SRJ-1015: every launch path for a held persona answers 
   })
 
   test('a held query that throws counts as held (fail safe): no call, held, one line naming what it threw', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     setInvalidFlagsHold({
       set: () => false,
       isHeld: () => {
@@ -20001,7 +19988,7 @@ describe('b.jg5 SRJ-207, SRJ-1015: every launch path for a held persona answers 
   // With no hold installed (unit tests, the integration driver) the reuse
   // still answers held, and its line says nothing is held.
   test('a reuse answering ErrInvalidFlags with no hold installed: held, with one line saying no hold is installed; nothing is held or posted, and P\'s next launch reaches agent-director', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     _resetInvalidFlagsHold()
     const err = errInvalidFlags('spawn')
     scriptReuseInvalidFlags(h, p, err)
@@ -20019,7 +20006,7 @@ describe('b.jg5 SRJ-207, SRJ-1015: every launch path for a held persona answers 
   })
 
   test('a hold whose set throws: the reuse still answers held, with one line naming what the set threw, redacted; nothing is posted', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     setInvalidFlagsHold({
       set: () => {
         throw Object.assign(new Error(`hold set broke (${sentinelInMessage('hold-set')})`), { note: LEAK_SENTINEL })
@@ -20041,17 +20028,17 @@ describe('b.jg5 SRJ-207, SRJ-1015: every launch path for a held persona answers 
   })
 })
 
-describe('b.jg5 SRJ-207, SRJ-1008, SRJ-204 (AC 23) end to end: a forced reuse getting ErrInvalidFlags with a passing binary launches nothing for P, alerts once, deletes nothing, and relaunches P at once when the binary\'s version changes', () => {
+describe('end to end: a forced reuse getting ErrInvalidFlags with a passing binary launches nothing for P, alerts once, deletes nothing, and relaunches P at once when the binary\'s version changes', () => {
   afterEach(() => {
-    expectNoDeleteOrIncludeFinished(srj105Harness)
-    srj105AfterEach()
+    expectNoDeleteOrIncludeFinished(recoveryHarness)
+    recoveryAfterEach()
   })
 
   /** A passing version other than the baseline (`PHASE1_RC_VERSION`): the floor itself. */
   const NEW_VERSION = PHASE1_FLOOR_VERSION
 
   test('a cwd mismatch on a finished row forces a reuse; held with one alert; several backoff waits and re-check intervals at the same version make no call for P; the version changes and the next re-check retries P once, at that clock time, by one reuse, and P comes up; a second ErrInvalidFlags begins a new hold with one new alert', async () => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     const rc = h.versionRecheck({ version: PHASE1_RC_VERSION })
     await holdThroughReuse(h, p)
     expect(rc.resolves).toHaveLength(1)
@@ -20091,7 +20078,7 @@ describe('b.jg5 SRJ-207, SRJ-1008, SRJ-204 (AC 23) end to end: a forced reuse ge
   })
 
   test('below the floor: the same forced reuse whose re-check reads a below-floor binary stops the server once, non-zero, with one startup-errors entry of its class; no hold, no alert, and no further stub call for P', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const rc = h.versionRecheck({ version: DEV_PLACEHOLDER_VERSION })
     scriptReuseInvalidFlags(h, p)
 
@@ -20111,12 +20098,12 @@ describe('b.jg5 SRJ-207, SRJ-1008, SRJ-204 (AC 23) end to end: a forced reuse ge
   })
 
   test('a server restart holds nothing: a fresh harness after a held run launches P normally', async () => {
-    const first = srj105Build()
+    const first = buildRecoveryCase()
     await holdThroughReuse(first.h, first.p)
     expectNoDeleteOrIncludeFinished(first.h)
-    srj105AfterEach()
+    recoveryAfterEach()
 
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     expect(h.invalidFlagsHold.heldKeys()).toEqual([])
     expect(await h.launch(p)).toStrictEqual({ key: p, action: 'spawned' })
     expect(h.episodeNotices).toEqual([])
@@ -20124,15 +20111,15 @@ describe('b.jg5 SRJ-207, SRJ-1008, SRJ-204 (AC 23) end to end: a forced reuse ge
   })
 })
 
-describe('b.jg5 SRJ-207, SRJ-111, SRJ-113: only a reuse holds; a plain spawn\'s and a resume\'s ErrInvalidFlags hold nothing and post no alert', () => {
+describe('only a reuse holds; a plain spawn\'s and a resume\'s ErrInvalidFlags hold nothing and post no alert', () => {
   afterEach(() => {
-    expectNoDeleteOrIncludeFinished(srj105Harness)
-    srj105AfterEach()
+    expectNoDeleteOrIncludeFinished(recoveryHarness)
+    recoveryAfterEach()
   })
 
-  // SRJ-113's row: the resume's ErrInvalidFlags keeps the re-check, then UNCLASSIFIED.
+  // row: the resume's ErrInvalidFlags keeps the re-check, then UNCLASSIFIED.
   test('the ladder\'s resume answering ErrInvalidFlags with a passing re-check: exactly one re-check, refused and reported to P\'s unclassified-error episode; P is not held and nothing is posted', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const rc = h.versionRecheck({ version: PHASE1_RC_VERSION })
     h.script({ ...collided(h, harnessPersona(h, p), { state: LIVENESS_DEAD_ROW_ENDED }), resumeError: errInvalidFlags('resume') })
     const order = recordCallOrder(h)
@@ -20148,11 +20135,11 @@ describe('b.jg5 SRJ-207, SRJ-111, SRJ-113: only a reuse holds; a plain spawn\'s 
   })
 
   // The plain spawn's row (a re-check, then UNCLASSIFIED, never the hold) at
-  // each plain-spawn site is SRJ-111's table describe's, at the end of this file.
+  // each plain-spawn site is table describe's, at the end of this file.
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-805, SRJ-806: while a key is recorded as retired, every launch
+// while a key is recorded as retired, every launch
 // path launches it by a reuse spawn of its own id and never resumes it; a
 // reuse that succeeds sets its "new life has begun" mark and answers
 // `fresh-retired` (`SPAWN_ACTION_FRESH_RETIRED`), a success as `spawned` is.
@@ -20171,21 +20158,21 @@ describe('b.jg5 SRJ-207, SRJ-111, SRJ-113: only a reuse holds; a plain spawn\'s 
 // over the same directory, as the next start loads it (`markOf`).
 // ---------------------------------------------------------------------------
 
-/** A launch attempt's retired-key reading (b.jg5 SRJ-806) for a key recorded once since the store loaded, with no mark. */
+/** A launch attempt's retired-key reading for a key recorded once since the store loaded, with no mark. */
 const RECORDED_ONCE_AT_START: RetiredKeyAttemptStart = { recorded: true, marked: false, generation: 1 }
 
 /** A launch attempt's retired-key reading for a key not recorded when the attempt began: no generation is read. */
 const NOT_RECORDED_AT_START: RetiredKeyAttemptStart = { recorded: false, marked: false, generation: undefined }
 
-describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at every launch path, never resumed, and its reuse that succeeds sets the mark and answers fresh-retired', () => {
+describe('a recorded key is launched by a reuse spawn at every launch path, never resumed, and its reuse that succeeds sets the mark and answers fresh-retired', () => {
   afterEach(() => {
-    expectNoDeleteOrIncludeFinished(srj105Harness)
-    srj105AfterEach()
+    expectNoDeleteOrIncludeFinished(recoveryHarness)
+    recoveryAfterEach()
   })
 
   /** A harness over P and B with P recorded (removed), its mark set when `mark`. */
   function retiredLaunchBuild(mark = false, options?: RecoveryHarnessOptions): { h: RecoveryHarness; p: string; b: string } {
-    const built = srj105Build(options)
+    const built = buildRecoveryCase(options)
     built.h.retireKey(built.p, { mark })
     return built
   }
@@ -20195,7 +20182,7 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
    * retired-key flag, the conversation not kept, context `recovery`, the
    * ladder's retired-key reading at its start (`retiredAtStart`; by default a
    * key recorded once since the store loaded, with no mark), and the start
-   * entry's reading that P is below the restart cap (b.4q8; no case here
+   * entry's reading that P is below the restart cap (no case here
    * records a failure).
    */
   function retiredSequenceRequest(
@@ -20227,7 +20214,7 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
     return reuseRecordedInFlightLine(renderPersonaRef(harnessPersona(h, key).name, key), how)
   }
 
-  /** The reuse's in-flight lines among the case's errors (b.jg5 SRJ-806). */
+  /** The reuse's in-flight lines among the case's errors. */
   const inFlightLinesIn = (h: RecoveryHarness): string[] => h.errors.filter((line) => line.includes("while this reuse spawn's launch attempt was in flight"))
 
   /** P's row before its first launch: none, `missing`, or `ended` with a session id (resume_enabled true), as every read finds it. */
@@ -20268,9 +20255,9 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
     expect(h.retiredKeyWrites.slice(writes)).toEqual([])
   })
 
-  // apply21 (HO rev 28; b.jg5 SRJ-409, SRJ-411, SRJ-112): P's reuse with no
+  // apply21 (HO rev 28): P's reuse with no
   // row answering ErrTmuxSessionCreate leaves the row `pending`; it is
-  // counted and arms P at once in pending-only mode (E22's, pinned above).
+  // counted and arms P at once in pending-only mode (pinned above).
   // At the first pending-only retry the one covered-row `get` decides: with
   // no mark the row is the retired key's old life, so one live-row sequence
   // starts (the retired-key flag, the conversation not kept, context
@@ -20305,7 +20292,7 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
   }
 
   // A recorded key's dead-session route after a live last read reuses first
-  // (b.jg5 SRJ-805: the reuse whatever row the caller last read): the row
+  // (the reuse whatever row the caller last read): the row
   // still live makes it collide, and get-then-act, run once more, reads the
   // old life and starts the sequence. P is recorded while its reconnect's
   // send-keys is out, so the ladder reached the branch as for any key, or
@@ -20316,7 +20303,7 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
     ['working (the wait\'s poll reads waiting)', fastPolls, 'working', 'sendKeys'],
     ['waiting, P recorded during the findMissing sweep before the resume', undefined, 'waiting', 'findMissing'],
   ] as const)('the dead-session route from %s, P recorded while its send-keys answers GONE or during the sweep: no resume; one colliding reuse after the plain first spawn, one more get, and one sequence start with the retired-key flag seeded with that get\'s state and the ladder\'s reading from before P was recorded; sequence-waiting, no mark', async (_branch, setup, state, recordedAt) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     setup?.(h)
     const starts = recordSequenceStarts()
     h.script({
@@ -20335,12 +20322,12 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
     expect(ladderCallsMade(h)).toEqual(ladderCallsOf({ spawn: 2, sendKeys: 1 }))
     expect(h.stub.calls.resumeCalls).toEqual([])
     expect(h.stub.calls.getCalls).toHaveLength(state === 'working' ? 5 : 4)
-    // The ladder started before P was recorded, so its reading at its start goes with the sequence (b.jg5 SRJ-806).
+    // The ladder started before P was recorded, so its reading at its start goes with the sequence.
     expect(starts).toEqual([retiredSequenceRequest(h, p, 'waiting', NOT_RECORDED_AT_START)])
     expect(h.retiredEntry(p)).toMatchObject({ recorded: true, marked: false })
   })
 
-  // b.jg5 SRJ-707, SRJ-805: the resume site's first read decides only the
+  // the resume site's first read decides only the
   // resume_enabled false step for a key not recorded; a key recorded then
   // (its new life's waiting row: the collision get's clear refused) whose
   // entry the sweep's await cleared takes that step after the sweep, never a resume.
@@ -20371,12 +20358,12 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
     ])
   })
 
-  // b.jg5 SRJ-607: the prompt-row recovery's re-read finding the row
+  // the prompt-row recovery's re-read finding the row
   // finished recovers it by a reuse for a recorded key, never a resume.
-  // SRJ-806: P was recorded after the ladder started, so that reuse began the
+  // P was recorded after the ladder started, so that reuse began the
   // life being retired: no mark, answering spawned, with the in-flight line.
   test.each([LIVENESS_DEAD_ROW_ENDED, LIVENESS_DEAD_ROW_MISSING])('the prompt-row recovery, P recorded while its read-pane answers GONE, its re-read after the sweep reading %s: one reuse after the plain first spawn, no resume; spawned with no mark and the in-flight line naming that P was not recorded when the attempt started', async (after) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     h.script(promptRowLaunch(h, p, 'ask_user', { answer: cannedErr(errTmuxCaptureFailed(personaTmuxSessionName(p))), afterSweep: after }))
     retireWhenCalled(h, p, 'readPane')
 
@@ -20412,7 +20399,7 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
     expect(h.retiredKeyWrites.slice(writes)).toEqual([])
   })
 
-  // b.jg5 SRJ-207: a retired key's reuse meeting ErrInvalidFlags holds P
+  // a retired key's reuse meeting ErrInvalidFlags holds P
   // (no re-check is installed, so it is not running, which holds too).
   test('P recorded with no row, its reuse answering ErrInvalidFlags: held, no mark; then every launch entry answers held, with no agent-director call', async () => {
     const { h, p } = retiredLaunchBuild()
@@ -20430,7 +20417,7 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
     expect(order).toEqual([])
   })
 
-  // b.jg5 SRJ-806's failed mark write: one line from the store, the mark
+  // failed mark write: one line from the store, the mark
   // held in memory (read as set, so the new life is never sequenced), and
   // written again at the key's next launch decision.
   test('a reuse success whose mark write fails: fresh-retired with one store line; the running server reads P as marked, so its live row is reconnected, not sequenced, while every write still fails; the next launch decision writes the mark', async () => {
@@ -20477,7 +20464,7 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
   })
 
   // With the mark set a live row is P's new life, handled as any live row of
-  // P and never sequenced. The waiting row's clear (b.jg5 SRJ-807) is refused
+  // P and never sequenced. The waiting row's clear is refused
   // so P is still recorded and marked when the ladder decides; a pending row
   // with a launch start clears nothing and takes the pending-row handling as
   // B, not recorded, takes it on the same row.
@@ -20499,14 +20486,14 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
 
     h.script(collided(h, harnessPersona(h, b), { state }))
     expect(await h.launch(b)).toStrictEqual({ key: b, action })
-    // A marked key's pending row is its new life, covered as B's is: both watched pending-only (b.jg5 SRJ-409).
+    // A marked key's pending row is its new life, covered as B's is: both watched pending-only.
     if (state === AGENT_DIRECTOR_PENDING_STATE) {
       expectOnlyPendingRowWatch(h, p)
       expectOnlyPendingRowWatch(h, b)
     }
   })
 
-  // b.jg5 SRJ-711: a key not recorded launches exactly as before beside a recorded one.
+  // a key not recorded launches exactly as before beside a recorded one.
   test('B, not recorded, beside a recorded P: B\'s first spawn is plain and its ended row is resumed (get, then resume), while P comes up fresh-retired; only P\'s spawn carries the reuse flag', async () => {
     const { h, p, b } = retiredLaunchBuild()
     h.script(collided(h, harnessPersona(h, b), ENDED_WITH_SESSION))
@@ -20523,7 +20510,7 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
 
   })
 
-  test('the start pass counts a recorded P\'s fresh-retired in succeeded and freshRetired, never freshSpawned, beside B\'s plain spawn (b.jg5 SRJ-1015)', async () => {
+  test('the start pass counts a recorded P\'s fresh-retired in succeeded and freshRetired, never freshSpawned, beside B\'s plain spawn', async () => {
     const { h, p, b } = retiredLaunchBuild()
 
     const result = await startupSessionManager(h.config, { concurrency: 1 })
@@ -20560,7 +20547,7 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
   /** The reuse's one line for a recorded key that began its new life, `mark` saying what the mark's write did. */
   function freshRetiredLine(h: RecoveryHarness, key: string, mark: string): string {
     const ref = renderPersonaRef(harnessPersona(h, key).name, key)
-    return `[slack] reuseSpawnForPersona: ${ref}'s key is retired and its new life has begun — answering ${SPAWN_ACTION_FRESH_RETIRED}; ${mark} (b.jg5 SRJ-806, SRJ-112)`
+    return `[slack] reuseSpawnForPersona: ${ref}'s key is retired and its new life has begun — answering ${SPAWN_ACTION_FRESH_RETIRED}; ${mark}`
   }
 
   test.each<readonly [string, boolean, (h: RecoveryHarness) => void, string]>([
@@ -20591,9 +20578,9 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
 
   })
 
-  // b.jg5 SRJ-805: the start entry sets the retired-key flag for a recorded
+  // the start entry sets the retired-key flag for a recorded
   // key, marked or not, whatever the starter passed, with one line only when
-  // the starter had not set it; a key not recorded keeps its flag. SRJ-806: a
+  // the starter had not set it; a key not recorded keeps its flag. a
   // request with no attempt-start reading gets the store's reading now, with
   // the record generation for a recorded key; one that carries a reading (a
   // ladder's, taken before P was recorded here) is forwarded with it as given.
@@ -20612,19 +20599,19 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
 
     expect(startLiveRowSequence(request)).toBe(LIVE_ROW_START_STARTED)
 
-    // b.4q8: the entry also adds its reading that P is below the restart cap.
+    // the entry also adds its reading that P is below the restart cap.
     expect(starts).toEqual([{ ...request, retiredKey: flagged || forced, retiredAtStart: forwarded, belowCapAtStart: true }])
     expect(starts[0]!.retiredAtStart).toStrictEqual(forwarded)
-    const forcedLine = `${LIVE_ROW_SEQUENCE_LOG_PREFIX} ${ref}: its key is retired, so the sequence carries the retired-key flag and ends in a reuse spawn, never a resume (b.jg5 SRJ-805, SRJ-705)`
+    const forcedLine = `${LIVE_ROW_SEQUENCE_LOG_PREFIX} ${ref}: its key is retired, so the sequence carries the retired-key flag and ends in a reuse spawn, never a resume`
     expect(h.errors.filter((line) => line.startsWith(`${LIVE_ROW_SEQUENCE_LOG_PREFIX} `))).toEqual(forced ? [forcedLine] : [])
   })
 
   // A recorded query that throws reads not recorded, as with no store; the
-  // launch then takes the path of a key that is not retired (b.jg5 SRJ-711).
+  // launch then takes the path of a key that is not retired.
   test('the installed store\'s recorded query throwing for a recorded P: the reading is not recorded, with one line per reading; P\'s launch with no row is a plain first spawn answering spawned, with no mark written', async () => {
     const { h, p } = retiredLaunchBuild()
     installThrowingQuery(h, 'isRecorded', QUERY_THROWN)
-    const line = `[slack] retired-keys: the recorded query for persona=${p} failed: ${describeThrownValue(QUERY_THROWN)}; taken as not recorded (b.jg5 SRJ-805)`
+    const line = `[slack] retired-keys: the recorded query for persona=${p} failed: ${describeThrownValue(QUERY_THROWN)}; taken as not recorded`
     const before = storeLines(h).length
     const writes = h.retiredKeyWrites.length
 
@@ -20647,7 +20634,7 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
     const { h, p } = retiredLaunchBuild(true)
     const starts = recordSequenceStarts()
     installThrowingQuery(h, 'isMarked', QUERY_THROWN)
-    const line = `[slack] retired-keys: the mark query for persona=${p} failed: ${describeThrownValue(QUERY_THROWN)}; taken as not marked, so its row is the old life (b.jg5 SRJ-805, SRJ-806)`
+    const line = `[slack] retired-keys: the mark query for persona=${p} failed: ${describeThrownValue(QUERY_THROWN)}; taken as not marked, so its row is the old life`
     const before = storeLines(h).length
     const writes = h.retiredKeyWrites.length
 
@@ -20664,13 +20651,13 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
     expect(h.retiredEntry(p)).toMatchObject({ recorded: true, marked: true })
   })
 
-  // b.jg5 SRJ-112: a recorded key's first launch is a reuse, so its collision
+  // a recorded key's first launch is a reuse, so its collision
   // is the attempt's one reuse collision and the get-then-act it enters is the
   // one re-run: a reuse there that collides too re-runs nothing and arms the
   // retry timer with the collision cause, so the launch answers
   // `retrying` (`SPAWN_ACTION_RETRYING`, `retryingWhenArmed`), uncounted.
   test.each([
-    // A `fresh-retired` reuse arms P's pending-only watch as any launch that returned does (b.jg5 SRJ-301, SRJ-409).
+    // A `fresh-retired` reuse arms P's pending-only watch as any launch that returned does.
     ['succeeds', [] as Error[], { action: SPAWN_ACTION_FRESH_RETIRED }, [UNAVAILABLE_RETRY_CAUSE_PENDING_ROW] as string[]],
     ['collides again', [errInstanceIdCollision()], { action: SPAWN_ACTION_RETRYING }, [UNAVAILABLE_RETRY_CAUSE_COLLISION]],
   ] as const)('P recorded with no mark, its first reuse colliding and the collision get reading ended: the replace step\'s reuse %s; exactly two reuse spawns and one get, no resume, and the first collision\'s line names the one get-then-act', async (_label, later, answer, armed) => {
@@ -20686,7 +20673,7 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
     expect(h.triggers).toEqual(armed.map((kind) => ({ key: p, kind })))
     expect([getFailureCount(p), h.notices]).toEqual([0, []])
     expect(h.errors.filter((line) => line.includes(' collided — fetching current state'))).toEqual([
-      `[slack] spawnForPersona: the retired key's reuse spawn of ${ref} collided — fetching current state; this is the one get-then-act a reuse collision gives (b.jg5 SRJ-805, SRJ-112)`,
+      `[slack] spawnForPersona: the retired key's reuse spawn of ${ref} collided — fetching current state; this is the one get-then-act a reuse collision gives`,
     ])
     if (answer.action === SPAWN_ACTION_FRESH_RETIRED) {
       expectPendingOnlyWatch(h, p)
@@ -20708,7 +20695,7 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
     }
   }
 
-  // b.jg5 SRJ-806: the launch of a reuse is decided before its call, so a key
+  // the launch of a reuse is decided before its call, so a key
   // recorded while the call is in flight (a re-record that writes nothing, a
   // re-record that clears the mark, a first recording) began the old life,
   // which is never marked: the reuse answers spawned with one line. A
@@ -20731,7 +20718,7 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
   })
 
   test('P not recorded at its launch decision, its ended row in another directory replaced by a reuse spawn during which P is first recorded: spawned, no mark, and the in-flight line naming that it was not recorded when the launch attempt started', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     h.script(collided(h, harnessPersona(h, p), elsewhere(h, LIVENESS_DEAD_ROW_ENDED)))
     recordDuringReuse(h, p)
 
@@ -20768,7 +20755,7 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
 
     expect(h.stub.calls.spawnCalls).toEqual([reuseSpawnOf(h, p)])
     expect(storeLines(h).slice(before)).toEqual([
-      `[slack] retired-keys: the record-generation query for persona=${p} failed: ${describeThrownValue(QUERY_THROWN)}; a recording during the launch attempt cannot be ruled out, so no mark is set (b.jg5 SRJ-806)`,
+      `[slack] retired-keys: the record-generation query for persona=${p} failed: ${describeThrownValue(QUERY_THROWN)}; a recording during the launch attempt cannot be ruled out, so no mark is set`,
     ])
     expect(inFlightLinesIn(h)).toEqual([recordedInFlightLine(h, p, REUSE_RECORDED_SINCE_GENERATION_UNREADABLE)])
     expect(h.retiredKeyWrites.slice(writes)).toEqual([])
@@ -20776,7 +20763,7 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
 
   })
 
-  // b.jg5 SRJ-806: the ladder's reading at its start is what its later reuse
+  // the ladder's reading at its start is what its later reuse
   // compares against, so a recording that writes nothing (P already recorded
   // with no mark) made after the ladder started, before the reuse's call,
   // still keeps the mark off.
@@ -20817,9 +20804,9 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
     result: { key: expect.any(String), action: 'spawned' },
   }
 
-  // b.jg5 SRJ-805: step 6 reads the store again, so a key recorded while its
+  // step 6 reads the store again, so a key recorded while its
   // sequence runs, which a key not recorded would resume (its conversation
-  // kept, its ended row resumable), is reused instead; SRJ-806: the reuse
+  // kept, its ended row resumable), is reused instead; the reuse
   // compares against the reading the start entry took at the request, so no
   // mark is set.
   test('B not recorded when its sequence starts (the conversation kept, its ended row resumable), recorded at the sequence\'s kill: step 6 reuses for the retired key, never resumes; spawned with no mark and the in-flight line naming that B was not recorded at the start', async () => {
@@ -20835,7 +20822,7 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
 
   })
 
-  // SRJ-806: the request's reading travels to step 6's reuse unchanged: the
+  // the request's reading travels to step 6's reuse unchanged: the
   // start entry's own (P recorded once) against a re-record made while the
   // sequence runs, and a reading the starter took before P was recorded.
   test.each<readonly [string, RetiredKeyAttemptStart | undefined, boolean, ReuseRecordedSince]>([
@@ -20861,7 +20848,7 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
 
     expect(await sequenceRecordedDuring(h, p, {}, () => {})).toMatchObject({ ...RETIRED_REUSE_SPAWNED, result: { key: p, action: SPAWN_ACTION_FRESH_RETIRED } })
 
-    // The mark's one write; a later live read of the new life may clear the entry (b.jg5 SRJ-807).
+    // The mark's one write; a later live read of the new life may clear the entry.
     expect(h.retiredKeyWrites[writes]).toEqual({ path: h.retiredKeys.path, ok: true })
     expect(h.errors.filter((line) => line.includes("'s key is retired and its new life has begun"))).toEqual([
       freshRetiredLine(h, p, 'its mark is set in the retired-key record'),
@@ -20873,7 +20860,7 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
   // A recorded key never reaches a `resume`, so its no-transcript reuse is
   // reached only by a key recorded while the resume is out, after the ladder
   // decided on its row as for any key. That reuse was decided before the
-  // recording (b.jg5 SRJ-806), so it sets no mark and answers spawned, and the
+  // recording, so it sets no mark and answers spawned, and the
   // launch answers as for a key not recorded: spawned after ErrNoSessionId and
   // ErrJsonlNeverWritten, and the inconclusive amnesia result after
   // ErrJsonlMissing, whose diagnosis notice (the harness configures no message
@@ -20883,7 +20870,7 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
     ['ErrJsonlNeverWritten', () => errJsonlNeverWritten(), 'spawned', false],
     ['ErrJsonlMissing', () => errJsonlMissing(), 'fresh-after-inconclusive-amnesia', true],
   ])('P recorded while its resume of an ended row is out, the resume answering %s: the one reuse after it succeeds with no mark and the in-flight line, and the launch answers %s; no second resume', async (_label, make, action, diagnosed) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     h.script({ ...collided(h, harnessPersona(h, p), ENDED_WITH_SESSION), resumeError: make() })
     retireWhenCalled(h, p, 'resume')
 
@@ -20902,7 +20889,7 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-1015 (AC 72), SRJ-205 (E26 T3): the start pass counts every launch
+// the start pass counts every launch
 // result once, in its own count, and starts no queued launch after a shutdown
 //
 // Each launch result comes from the real collision ladder on the recovery
@@ -20911,14 +20898,14 @@ describe('b.jg5 SRJ-805, SRJ-806: a recorded key is launched by a reuse spawn at
 // sink) are installed as main() installs them. The same rows drive
 // `launchSession`, the restart path's launch: `retrying` answers the
 // uncounted 'refused', so a retry that meets it re-arms P's timer at the
-// doubled wait (SRJ-302); `latched` and `held` answer 'skipped'; a launch
+// doubled wait; `latched` and `held` answer 'skipped'; a launch
 // that started its persona answers true. `sequence-waiting`'s 'refused' and
 // its retries are tests/live-row-sequence.test.ts's and
 // tests/unavailable-retry.test.ts's. A persona the bring-up controller holds
-// `retrying` (steps 1 to 3), and a b.g57 `deferred` launch, are counted under
-// `not brought up`, never under the launch result `retrying` (AC 72). The
+// `retrying` (steps 1 to 3), and a `deferred` launch, are counted under
+// `not brought up`, never under the launch result `retrying`. The
 // start pass's launch pool asks the shutdown query before each launch starts
-// (SRJ-205); a launch it does not start is counted in no count.
+// a launch it does not start is counted in no count.
 // ---------------------------------------------------------------------------
 
 /** Every count `startupSessionManager` returns. */
@@ -20972,7 +20959,7 @@ function collidedOver(h: RecoveryHarness, p: string, row: PersonaGetResultOverri
 }
 
 const START_RESULT_ROWS: ReadonlyArray<readonly [string, StartResultRow]> = [
-  // A launch that returned arms P's pending-only watch (b.jg5 SRJ-301, SRJ-409).
+  // A launch that returned arms P's pending-only watch.
   ['a plain fresh spawn', { arrange: () => {}, action: 'spawned', counts: { succeeded: 1, freshSpawned: 1 }, armed: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW, launched: true }],
   [
     'a CONFLICT at the first spawn (E13)',
@@ -20983,7 +20970,7 @@ const START_RESULT_ROWS: ReadonlyArray<readonly [string, StartResultRow]> = [
       launched: 'skipped',
     },
   ],
-  // b.jg5 SRJ-407: each UNAVAILABLE launch outcome is followed by one get of
+  // each UNAVAILABLE launch outcome is followed by one get of
   // P's row, and no launch: here it reads the row ended, or finds none.
   [
     'an UNAVAILABLE spawn inside the attempt, its one get reading the row ended',
@@ -21018,7 +21005,7 @@ const START_RESULT_ROWS: ReadonlyArray<readonly [string, StartResultRow]> = [
     },
   ],
   [
-    'SRJ-710\'s lost race after ErrSpawnNotResumable (the collision get read ended, the re-read waiting)',
+    'lost race after ErrSpawnNotResumable (the collision get read ended, the re-read waiting)',
     {
       arrange: (h, p) => {
         const persona = harnessPersona(h, p)
@@ -21035,7 +21022,7 @@ const START_RESULT_ROWS: ReadonlyArray<readonly [string, StartResultRow]> = [
     },
   ],
   [
-    'SRJ-710\'s lost race after SRJ-707\'s re-read (resume_enabled false, a row-not-interactive verdict, the re-read waiting)',
+    'lost race after re-read (resume_enabled false, a row-not-interactive verdict, the re-read waiting)',
     {
       arrange: (h, p) => {
         noResume(h)
@@ -21048,7 +21035,7 @@ const START_RESULT_ROWS: ReadonlyArray<readonly [string, StartResultRow]> = [
     },
   ],
   [
-    'a reuse\'s second ErrInstanceIdCollision (SRJ-112; resume_enabled false, an ended row)',
+    'a reuse\'s second ErrInstanceIdCollision (resume_enabled false, an ended row)',
     {
       arrange: (h, p) => {
         noResume(h)
@@ -21065,18 +21052,18 @@ const START_RESULT_ROWS: ReadonlyArray<readonly [string, StartResultRow]> = [
   ['P\'s key recorded as retired, with no row (E24)', { arrange: (h, p) => h.retireKey(p), action: SPAWN_ACTION_FRESH_RETIRED, counts: { succeeded: 1, freshRetired: 1 }, armed: UNAVAILABLE_RETRY_CAUSE_PENDING_ROW, launched: true }],
 ]
 
-describe('b.jg5 SRJ-1015 (AC 72): the start pass counts each launch result once, in its own count, and launchSession maps it', () => {
-  afterEach(srj105AfterEach)
+describe('the start pass counts each launch result once, in its own count, and launchSession maps it', () => {
+  afterEach(recoveryAfterEach)
 
   /** A harness over P alone. */
   function buildP(): { h: RecoveryHarness; p: string } {
-    const { h, p } = srj105Build({ personas: [{}] })
+    const { h, p } = buildRecoveryCase({ personas: [{}] })
     return { h, p }
   }
 
   const LAUNCH_SESSION_ROWS = START_RESULT_ROWS.filter(([, row]) => row.launched !== undefined).map(([label, row]) => [label, row.launched!, row] as const)
 
-  // b.jg5 SRJ-302: the refused answer is a refusal at a retry. The retry's
+  // the refused answer is a refusal at a retry. The retry's
   // row read finds no row, so it relaunches P through the restart path,
   // which meets the same `retrying` launch again.
   test.each(LAUNCH_SESSION_ROWS.filter(([, launched]) => launched === 'refused'))('a retry whose relaunch meets %s (launchSession %p) re-arms P\'s timer at the doubled wait and records nothing', async (_label, _launched, row) => {
@@ -21097,11 +21084,11 @@ describe('b.jg5 SRJ-1015 (AC 72): the start pass counts each launch result once,
     expect([getFailureCount(p), h.notices, h.capReached]).toEqual([0, [], []])
   })
 
-  // AC 72: the bring-up controller's `retrying` (here a stand-in holding R
-  // before its launch) and a b.g57 deferral (D's claude_config_dir cannot be
+  // the bring-up controller's `retrying` (here a stand-in holding R
+  // before its launch) and a deferral (D's claude_config_dir cannot be
   // resolved) are not brought up; only L's launch result is `retrying`. This
-  // case pins SRJ-1015's ending of the summary line literally.
-  test('AC 72: one pass over a launch that ends retrying (L), a persona the bring-up controller holds retrying (R) and a deferred launch (D): retrying counts L only, not brought up R and D; none failed; the line ends with SRJ-1015\'s five segments', async () => {
+  // case pins ending of the summary line literally.
+  test('one pass over a launch that ends retrying (L), a persona the bring-up controller holds retrying (R) and a deferred launch (D): retrying counts L only, not brought up R and D; none failed; the line ends with five segments', async () => {
     captureStartupErrors()
     const armed: string[] = []
     initOutageState({ getClient, notify: () => {}, triggerSink: { arm: (key) => { armed.push(key); return true } } })
@@ -21138,19 +21125,19 @@ describe('b.jg5 SRJ-1015 (AC 72): the start pass counts each launch result once,
     )).toBe(true)
   })
 
-  test('the ending\'s builder names each of the five counts by its own field, in SRJ-1015\'s order', () => {
+  test('the ending\'s builder names each of the five counts by its own field, in the contract order', () => {
     expect(startupSummaryEnding({ failed: 1, notBroughtUp: 2, notReconnected: 3, latched: 4, retrying: 5, sequenceWaiting: 6, held: 7, freshRetired: 8 })).toBe(
       '1 failed, 2 not brought up, 3 not reconnected, 4 latched, 5 retrying, 6 waiting on a live-row sequence, 7 held on invalid flags, 8 fresh as retired keys',
     )
   })
 })
 
-describe('b.jg5 SRJ-205 (the E4 gate): the start pass\'s launch pool starts no queued launch once a shutdown has begun', () => {
-  afterEach(srj105AfterEach)
+describe('(the gate): the start pass\'s launch pool starts no queued launch once a shutdown has begun', () => {
+  afterEach(recoveryAfterEach)
 
   /** A harness over three personas, every spawn held until released. */
   function buildThree() {
-    const { h } = srj105Build({ personas: [{}, {}, {}] })
+    const { h } = buildRecoveryCase({ personas: [{}, {}, {}] })
     const held = holdSpawns(h.stub.client)
     return { h, held, keys: h.keys as readonly [string, string, string] }
   }
@@ -21200,8 +21187,8 @@ describe('b.jg5 SRJ-205 (the E4 gate): the start pass\'s launch pool starts no q
 })
 
 // ---------------------------------------------------------------------------
-// The old-life wait's entry, its dependency builder and its queries (b.jg5
-// SRJ-811, SRJ-812, SRJ-1512, SRJ-1015; E27 T2), on the recovery harness
+// The old-life wait's entry, its dependency builder and its queries (
+// ), on the recovery harness
 // (its wait bindings, registry and holds composed as main() composes them).
 // The wait's steps and results by class are tests/old-life-wait.test.ts's;
 // the no-launch form's attempt rule, stop and query
@@ -21225,14 +21212,14 @@ async function releaseWait(h: RecoveryHarness, hold: ReturnType<typeof holdFindM
   await h.driveSequence(outcome)
 }
 
-describe('b.jg5 SRJ-811 (E27 T2): ensureOldLifeWait answers started, already-running, closed, not-held and not-installed', () => {
+describe('(): ensureOldLifeWait answers started, already-running, closed, not-held and not-installed', () => {
   afterEach(() => {
-    srj105Harness?.controller.stopAll('the case is over')
-    srj105AfterEach()
+    recoveryHarness?.controller.stopAll('the case is over')
+    recoveryAfterEach()
   })
 
   test('a held id with nothing running: started, before the wait\'s first call; a second ensure while it runs: already-running, with no second chain', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     holdOldAt(h, PRE_PERSONA_ID, PRE_PERSONA_ID, p)
     h.script({ getResult: cannedGetResult({ instance_id: PRE_PERSONA_ID, cwd: harnessPersona(h, p).working_directory }) })
     const hold = holdFindMissing(h.stub.client)
@@ -21258,7 +21245,7 @@ describe('b.jg5 SRJ-811 (E27 T2): ensureOldLifeWait answers started, already-run
       h.shutdown()
     }, LIVE_ROW_START_CLOSED, () => undefined],
   ])('%s; no call', (_label, arrange, answer, line) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     arrange(h, p)
 
     expect(ensureOldLifeWait(PRE_PERSONA_ID)).toBe(answer)
@@ -21269,8 +21256,8 @@ describe('b.jg5 SRJ-811 (E27 T2): ensureOldLifeWait answers started, already-run
   })
 })
 
-describe('b.jg5 SRJ-811, SRJ-114, SRJ-1512 (E27 T2): buildOldLifeWaitDeps reads the old id, with the shared own-row read only for a configured persona\'s own row, and arms nothing for the old key', () => {
-  afterEach(srj105AfterEach)
+describe('(): buildOldLifeWaitDeps reads the old id, with the shared own-row read only for a configured persona\'s own row, and arms nothing for the old key', () => {
+  afterEach(recoveryAfterEach)
 
   test.each<[string, (h: RecoveryHarness, p: string, b: string) => { readonly id: string; readonly oldKey: string }, boolean]>([
     ['P\'s own row (configured): the shared own-row read, whose provenance_conflict note latches P', (_h, p) => ({ id: personaInstanceId(p), oldKey: p }), true],
@@ -21280,7 +21267,7 @@ describe('b.jg5 SRJ-811, SRJ-114, SRJ-1512 (E27 T2): buildOldLifeWaitDeps reads 
     }, false],
     ['a pre-persona row: a plain get, latching no one', () => ({ id: PRE_PERSONA_ID, oldKey: PRE_PERSONA_ID }), false],
   ])('%s', async (_label, form, shared) => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     const { id, oldKey } = form(h, p, b)
     const row = id === personaInstanceId(p)
       ? cannedGetResult({ liveness_note: provenanceNote }, harnessPersona(h, p), h.home)
@@ -21294,13 +21281,13 @@ describe('b.jg5 SRJ-811, SRJ-114, SRJ-1512 (E27 T2): buildOldLifeWaitDeps reads 
     expect(h.stub.calls.getCalls).toEqual([{ instance_id: id }])
     expect(read.kind).toBe(shared ? LIVE_ROW_READ_LATCHED : LIVE_ROW_READ_ROW)
     expect(h.keys.map((key) => h.latch.isLatched(key))).toEqual(h.keys.map((key) => shared && key === p))
-    // Only the configured persona's own row answers its latch (SRJ-502, SRJ-513); nothing is armed for the old key (SRJ-1512).
+    // Only the configured persona's own row answers its latch; nothing is armed for the old key.
     expect(deps.isLatched(oldKey)).toBe(shared)
     expect(h.triggers).toEqual([])
     expect(h.controller.isArmed(oldKey)).toBe(false)
   })
 
-  // b.jg5 SRJ-702, SRJ-811: the cause a stopped kill's line and entry name,
+  // the cause a stopped kill's line and entry name,
   // by the sequence's stop cause: a shutdown, the last waiter's teardown or
   // the own-row persona's latch each its own; any other cause, or none, the
   // neutral one, never the shutdown's. The old key's own row here is a
@@ -21313,7 +21300,7 @@ describe('b.jg5 SRJ-811, SRJ-114, SRJ-1512 (E27 T2): buildOldLifeWaitDeps reads 
     ['a cause the wait does not know (the persona-not-up stop)', liveRowStopCauseText(LIVE_ROW_STOP_NOT_UP), OLD_LIFE_WAIT_STOP_CAUSE_UNKNOWN],
     ['no cause', undefined, OLD_LIFE_WAIT_STOP_CAUSE_UNKNOWN],
   ])('the alert dependency for a wait\'s kill whose tries were stopped, given %s: one line and the old key\'s persona-kill-failed entry naming its own cause', (_label, given, cause) => {
-    const { h, b } = srj105Build()
+    const { h, b } = buildRecoveryCase()
     h.remove(b)
     const deps = buildOldLifeWaitDeps({ target: { instanceId: personaInstanceId(b), oldKey: b }, record: createOldLifeWaitRecord(), clock: h.clock, log: () => {} })
     const retried: KillRetryResult = { outcome: killOutcomeOf({ thrown: errTmuxUnresponsive('kill') }), end: KILL_RETRY_END_STOPPED, tries: 1, reads: 0, alert: { kind: KILL_RETRY_ALERT_NONE } }
@@ -21325,8 +21312,8 @@ describe('b.jg5 SRJ-811, SRJ-114, SRJ-1512 (E27 T2): buildOldLifeWaitDeps reads 
     expect(startupEntriesOf(h, PERSONA_KILL_FAILED_LABEL)).toEqual([stopped.entry])
   })
 
-  test('a waiting persona\'s latch never answers for another id: P latched by a read of its own row, a wait on a pre-persona row held in P\'s directory answers not latched (SRJ-702, SRJ-811; AC 64)', async () => {
-    const { h, p } = srj105Build()
+  test('a waiting persona\'s latch never answers for another id: P latched by a read of its own row, a wait on a pre-persona row held in P\'s directory answers not latched', async () => {
+    const { h, p } = buildRecoveryCase()
     holdOldAt(h, PRE_PERSONA_ID, PRE_PERSONA_ID, p)
     h.script({ getResult: cannedGetResult({ liveness_note: provenanceNote }, harnessPersona(h, p), h.home) })
     await readPersonaOwnRow(p, { site: 'session-manager.test', what: 'own-row get' })
@@ -21336,15 +21323,15 @@ describe('b.jg5 SRJ-811, SRJ-114, SRJ-1512 (E27 T2): buildOldLifeWaitDeps reads 
   })
 })
 
-describe('b.jg5 SRJ-303, SRJ-811, SRJ-1011 (E27 T2): what blocks P\'s retry, and whether a wait step runs for P', () => {
+describe('(): what blocks P\'s retry, and whether a wait step runs for P', () => {
   afterEach(() => {
-    srj105Harness?.controller.stopAll('the case is over')
-    srj105AfterEach()
+    recoveryHarness?.controller.stopAll('the case is over')
+    recoveryAfterEach()
   })
 
   /**
    * The pending-row rule's work-in-flight cause for `key` (`retryBlockedBy`,
-   * b.jg5 SRJ-303, SRJ-410), as `buildPendingRowRuleDeps` binds it: outside
+   *), as `buildPendingRowRuleDeps` binds it: outside
    * and inside the launch it belongs to. One list with personaRetryBlockCause.
    */
   const ruleCauses = (key: string): [outside: string | undefined, withinOwnLaunch: string | undefined] => {
@@ -21353,7 +21340,7 @@ describe('b.jg5 SRJ-303, SRJ-811, SRJ-1011 (E27 T2): what blocks P\'s retry, and
   }
 
   test('a launch call of P in flight (its spawn held): the cause is a launch, which the pending-row rule leaves out only within that launch, and no wait step runs for P', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const spawns = holdSpawns(h.stub.client, (id) => id === personaInstanceId(p))
     const launch = h.launch(p)
     await spawns.entered(personaInstanceId(p))
@@ -21367,15 +21354,15 @@ describe('b.jg5 SRJ-303, SRJ-811, SRJ-1011 (E27 T2): what blocks P\'s retry, and
   })
 })
 
-describe('b.jg5 SRJ-811, SRJ-810, SRJ-1015 (E27 T2): a launch of P refused because a wait runs on its own row arms P\'s timer and answers the old-life sequence-waiting; launchSession answers the uncounted refused', () => {
+describe('(): a launch of P refused because a wait runs on its own row arms P\'s timer and answers the old-life sequence-waiting; launchSession answers the uncounted refused', () => {
   afterEach(() => {
-    srj105Harness?.controller.stopAll('the case is over')
-    srj105AfterEach()
+    recoveryHarness?.controller.stopAll('the case is over')
+    recoveryAfterEach()
   })
 
   /** P's own row held, with its wait running and its first run held. */
   async function waitOnOwnRow(): Promise<{ h: RecoveryHarness; p: string; release: () => Promise<void> }> {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     holdOldAt(h, personaInstanceId(p), p, p)
     h.script({ getResult: cannedGetResult({}, harnessPersona(h, p), h.home) })
     const hold = holdFindMissing(h.stub.client)
@@ -21384,7 +21371,7 @@ describe('b.jg5 SRJ-811, SRJ-810, SRJ-1015 (E27 T2): a launch of P refused becau
   }
 
   /**
-   * P was recorded as waiting on the hold on its own row (b.jg5 SRJ-810); the
+   * P was recorded as waiting on the hold on its own row; the
    * run that lists the row in its ids (`release`) ends the hold while the wait
    * still runs there, so the end-retry observer retries P only once the
    * stopped wait has settled, at the end's clock time, with one end line
@@ -21392,7 +21379,7 @@ describe('b.jg5 SRJ-811, SRJ-810, SRJ-1015 (E27 T2): a launch of P refused becau
    * answer: `ran` for P armed, `armed` for P whose arm was not made.
    */
 
-  // b.jg5 SRJ-1512, b.av2 SR-8.6: the wait is the one exception to SR-8.6 for
+  // the wait is the one exception to for
   // a key outside the applied set, and it never launches that key, so a key
   // removed while a wait runs on its own row gets no retry timer.
   test('P removed while a wait runs on its own row: the restart path\'s gate answers false with nothing armed and no line, so the relaunch gate answers for P', async () => {
@@ -21430,7 +21417,7 @@ describe('b.jg5 SRJ-811, SRJ-810, SRJ-1015 (E27 T2): a launch of P refused becau
     await release()
   })
 
-  // b.jg5 SRJ-811, SRJ-1014: an arm asked for and not made (the controller
+  // an arm asked for and not made (the controller
   // answers false) reads as a failure, never as the skip.
 
   test.each<[string, boolean]>([
@@ -21442,7 +21429,7 @@ describe('b.jg5 SRJ-811, SRJ-810, SRJ-1015 (E27 T2): a launch of P refused becau
     let release: () => Promise<void>
     if (wait) ({ h, p, release } = await waitOnOwnRow())
     else {
-      ;({ h, p } = srj105Build())
+      ;({ h, p } = buildRecoveryCase())
       const hold = holdFindMissing(h.stub.client)
       ownRowsLiveThenMissing(h)
       const run = await startSequenceHeldAtRun(h, p, hold)
@@ -21462,7 +21449,7 @@ describe('b.jg5 SRJ-811, SRJ-810, SRJ-1015 (E27 T2): a launch of P refused becau
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-810, SRJ-1502, SRJ-1015 (E27 T3) — what a hold refuses, at the
+// — what a hold refuses, at the
 // session manager's entries
 //
 // On the recovery harness (its hold set installed as main() installs it), a
@@ -21473,7 +21460,7 @@ describe('b.jg5 SRJ-811, SRJ-810, SRJ-1015 (E27 T2): a launch of P refused becau
 
 // P is recorded as waiting, the hold's wait is started (held at its first
 // run) and P's timer armed, uncounted, with one gate line. A hold on P's own
-// row is not the gate's (SRJ-810's exception), and a latched P meets the
+// row is not the gate's (exception), and a latched P meets the
 // latched gate. The start pass counts a held P under sequence-waiting while B
 // beside it comes up. `reconnectMcpWithCause` types nothing into a held own
 // row. The end-retry observer retries each waiting persona still applied, not
@@ -21481,10 +21468,10 @@ describe('b.jg5 SRJ-811, SRJ-810, SRJ-1015 (E27 T2): a launch of P refused becau
 // tests/old-life-wait.test.ts's.
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-810, SRJ-1502, SRJ-1015 (E27 T3): the old-life gate at the launch entries, the start pass\'s count, the reconnect guard and the end-retry observer', () => {
+describe('(): the old-life gate at the launch entries, the start pass\'s count, the reconnect guard and the end-retry observer', () => {
   afterEach(() => {
-    srj105Harness?.controller.stopAll('the case is over')
-    srj105AfterEach()
+    recoveryHarness?.controller.stopAll('the case is over')
+    recoveryAfterEach()
   })
 
   /** The gate's line for P held by the pre-persona row's hold at `site`, its wait `wait`, its timer armed. */
@@ -21495,7 +21482,7 @@ describe('b.jg5 SRJ-810, SRJ-1502, SRJ-1015 (E27 T3): the old-life gate at the l
    * wait's first run held by `hold`; the trust patch records each call in `steps`.
    */
   function heldAtP(): { h: RecoveryHarness; p: string; b: string; hold: ReturnType<typeof holdFindMissing>; steps: string[] } {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     holdOldAt(h, PRE_PERSONA_ID, PRE_PERSONA_ID, p)
     h.script({ getResult: cannedGetResult({ instance_id: PRE_PERSONA_ID, cwd: harnessPersona(h, p).working_directory }) })
     const hold = holdFindMissing(h.stub.client)
@@ -21523,7 +21510,7 @@ describe('b.jg5 SRJ-810, SRJ-1502, SRJ-1015 (E27 T3): the old-life gate at the l
   })
 
   test('the latched gate still wins: a latched P in a held directory answers latched with no call, no gate line, no wait and nothing recorded or armed; the hold step answers false for it', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const row = conflictRowsFor('spawn')[0]!
     h.script({ spawnError: row.build(), ...statusAnswering(row.rowState) })
     expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
@@ -21538,9 +21525,9 @@ describe('b.jg5 SRJ-810, SRJ-1502, SRJ-1015 (E27 T3): the old-life gate at the l
     expect(h.triggers.filter((t) => t.kind === UNAVAILABLE_RETRY_CAUSE_OLD_LIFE_HOLD)).toEqual([])
   })
 
-  test('SRJ-810\'s exception: a hold on P\'s own row is not the gate\'s (the hold step answers false, nothing recorded); with a pre-persona row also held in P\'s directory, only that hold holds P back and only its id is in the line', async () => {
+  test('exception: a hold on P\'s own row is not the gate\'s (the hold step answers false, nothing recorded); with a pre-persona row also held in P\'s directory, only that hold holds P back and only its id is in the line', async () => {
     const { h, p, hold } = (() => {
-      const built = srj105Build()
+      const built = buildRecoveryCase()
       return { ...built, hold: holdFindMissing(built.h.stub.client) }
     })()
     holdOldAt(h, personaInstanceId(p), p, p)
@@ -21559,7 +21546,7 @@ describe('b.jg5 SRJ-810, SRJ-1502, SRJ-1015 (E27 T3): the old-life gate at the l
     await shutDownWait(h, hold)
   })
 
-  test('SRJ-1015: the start pass over a held P and B: P\'s result is the old-life sequence-waiting, counted once under sequence-waiting, neither failed nor succeeded, with no call for P; B is spawned and counted', async () => {
+  test('the start pass over a held P and B: P\'s result is the old-life sequence-waiting, counted once under sequence-waiting, neither failed nor succeeded, with no call for P; B is spawned and counted', async () => {
     const { h, p, b, hold } = heldAtP()
 
     const result = await h.drive(startupSessionManager(h.config, { concurrency: 1 }))
@@ -21580,7 +21567,7 @@ describe('b.jg5 SRJ-810, SRJ-1502, SRJ-1015 (E27 T3): the old-life gate at the l
     ['P applied: its timer armed with the old-life cause', true],
     ['P no longer applied: its timer not armed, P not recorded, the line naming the skip after the not-applied line', false],
   ])('reconnectMcpWithCause for P whose own row is held (%s): no send-keys, transient, one line naming the held id; P recorded as waiting on the hold only while applied; B, not held, gets its reconnect text and Enter', async (_label, applied) => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     holdOldAt(h, personaInstanceId(p), p, p)
     if (!applied) h.remove(p)
     expect([isOwnRowOldLifeHeld(p), isOwnRowOldLifeHeld(b)]).toEqual([true, false])
@@ -21588,7 +21575,7 @@ describe('b.jg5 SRJ-810, SRJ-1502, SRJ-1015 (E27 T3): the old-life gate at the l
     expect(await reconnectMcpWithCause(p, latchRowStateRead('waiting'))).toEqual({ outcome: 'transient' })
 
     expect(h.stub.calls.sendKeysCalls).toEqual([])
-    // b.jg5 SRJ-810, SRJ-1014: a removed P's arm is skipped on purpose, its own line first; never an arm failure.
+    // a removed P's arm is skipped on purpose, its own line first; never an arm failure.
     const armed = applied ? true : OLD_LIFE_HOLD_ARM_SKIPPED
     const held = (answer: boolean | typeof OLD_LIFE_HOLD_ARM_SKIPPED): string => reconnectHeldLine(`persona=${p}`, personaInstanceId(p), answer)
     expect(h.errors.filter((line) => line === held(armed))).toHaveLength(1)
@@ -21596,7 +21583,7 @@ describe('b.jg5 SRJ-810, SRJ-1502, SRJ-1015 (E27 T3): the old-life gate at the l
     expect(h.errors.filter((line) => line === oldLifeWaitNotAppliedLine(p))).toHaveLength(applied ? 0 : 1)
     if (!applied) expect(h.errors.indexOf(oldLifeWaitNotAppliedLine(p))).toBeLessThan(h.errors.indexOf(held(armed)))
     expect([h.controller.isArmed(p), getFailureCount(p)]).toEqual([applied, 0])
-    // b.jg5 SRJ-810, SRJ-1512: the hold's end retries an applied P; a key outside the applied set is never recorded.
+    // the hold's end retries an applied P; a key outside the applied set is never recorded.
     expect(h.oldLifeHolds.holdOf(personaInstanceId(p))?.waiting).toEqual(applied ? [p] : [])
 
     expect(await reconnectMcpWithCause(b, latchRowStateRead('waiting'))).toEqual({ outcome: 'ok' })
@@ -21606,10 +21593,10 @@ describe('b.jg5 SRJ-810, SRJ-1502, SRJ-1015 (E27 T3): the old-life gate at the l
     ])
   })
 
-  // b.jg5 SRJ-810, SRJ-1014: an arm asked for and not made (the controller
+  // an arm asked for and not made (the controller
   // answers false) reads as a failure, never as the skip.
   test('reconnectMcpWithCause for P applied whose own row is held, its arm asked for and not made: no send-keys, transient; its one line says the timer could not be armed, never the skip phrase', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     holdOldAt(h, personaInstanceId(p), p, p)
     const arm = spyOn(h.controller, 'arm').mockReturnValue(false)
     try {
@@ -21628,7 +21615,7 @@ describe('b.jg5 SRJ-810, SRJ-1502, SRJ-1015 (E27 T3): the old-life gate at the l
   })
 
   test('the held-directory query: every hold on a directory by real path, in begin order, with the first hold\'s real path; undefined for a directory not held', () => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     holdOldAt(h, PRE_PERSONA_ID, PRE_PERSONA_ID, p)
     holdOldAt(h, personaInstanceId(p), p, p)
     const real = realpathSync(harnessPersona(h, p).working_directory)
@@ -21638,7 +21625,7 @@ describe('b.jg5 SRJ-810, SRJ-1502, SRJ-1015 (E27 T3): the old-life gate at the l
   })
 
   test('the end-retry observer: each waiting persona still applied, not latched, not held on ErrInvalidFlags and up is retried at once, in the waiting order; one latched, one removed, one held, one not up and one whose retry throws are not, each named with its reason; one line', async () => {
-    const { h } = srj105Build({ personas: [{}, {}, {}, {}, {}] })
+    const { h } = buildRecoveryCase({ personas: [{}, {}, {}, {}, {}] })
     const [p, latched, held, down, throws] = h.keys as [string, string, string, string, string]
     await holdThroughReuse(h, held)
     const row = conflictRowsFor('spawn')[0]!
@@ -21679,8 +21666,8 @@ describe('b.jg5 SRJ-810, SRJ-1502, SRJ-1015 (E27 T3): the old-life gate at the l
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-407 (E28 T3), with SRJ-401, SRJ-409, SRJ-411, SRJ-114, SRJ-513,
-// SRJ-806 and SRJ-310 (AC 29, AC 31, AC 35, AC 83), on `makeRecoveryHarness`
+// with,
+// and, on `makeRecoveryHarness`
 // with the session manager's clock on the harness clock (`harnessNow`):
 // each launch call's window, and the one `get` after a launch timeout or any
 // other UNAVAILABLE launch outcome.
@@ -21692,7 +21679,7 @@ describe('b.jg5 SRJ-810, SRJ-1502, SRJ-1015 (E27 T3): the old-life gate at the l
 // three launch verbs are reached as the start pass reaches them: the
 // ladder's first spawn, a reuse spawn replacing an `ended` row in another
 // directory and a `resume` of an `ended` row. For each verb and form, one
-// case per answer of SRJ-407's `get` table asserts the launch and read calls
+// case per answer of the contract `get` table asserts the launch and read calls
 // (the `get` is the last: no launch in the attempt, and nothing after it),
 // the window (`launchCallWindowOf`), the "this launch's row" record
 // (`thisLaunchRowOf`: only a `pending` row whose launch start lies inside the
@@ -21704,10 +21691,10 @@ describe('b.jg5 SRJ-810, SRJ-1502, SRJ-1015 (E27 T3): the old-life gate at the l
 // A live-row sequence's start is read from a recording registry
 // (`recordSequenceStarts`), so none runs. Every other UNAVAILABLE launch
 
-// and is never this launch's row. AC 35 (a recorded key's timed-out reuse
-// over its old life), AC 83 (no retry launch while the row is `pending`) and
+// and is never this launch's row. (a recorded key's timed-out reuse
+// over its old life)(no retry launch while the row is `pending`) and
 
-// SRJ-310's rule 3 ends the condition) follow. Rule 3's own table is
+// rule 3 ends the condition) follow. Rule 3's own table is
 // tests/tmux-unresponsive.test.ts's; the next retry after each answer
 // tests/unavailable-retry.test.ts's; a recorded key's mark after a timed-out
 // reuse tests/retired-keys.test.ts's. No case kills, deletes, counts a
@@ -21717,7 +21704,7 @@ describe('b.jg5 SRJ-810, SRJ-1502, SRJ-1015 (E27 T3): the old-life gate at the l
 /** How long a timed launch call takes on the harness clock: its window's length. */
 const TIMED_CALL_MS = 3_000
 
-/** A launch verb SRJ-407's cases end: how P's start-pass launch reaches the call, and its launch and read calls up to it. */
+/** A launch verb cases end: how P's start-pass launch reaches the call, and its launch and read calls up to it. */
 interface TimedVerb {
   readonly verb: 'spawn' | 'resume'
   readonly reuse: boolean
@@ -21738,7 +21725,7 @@ const TIMED_VERBS: ReadonlyArray<readonly [string, TimedVerb]> = [
 
 /** A harness over P and B, the session manager's clock on the harness clock, moved to the stub's sample launch start; `options` on top. */
 async function timedLaunchBuild(options: RecoveryHarnessOptions = {}): Promise<{ h: RecoveryHarness; p: string; b: string }> {
-  const built = srj105Build({ harnessNow: true, ...options })
+  const built = buildRecoveryCase({ harnessNow: true, ...options })
   await built.h.clock.advanceTo(SAMPLE_LAUNCH_START_MS)
   return built
 }
@@ -21748,7 +21735,7 @@ function statusOnTimedRow(h: RecoveryHarness, t: TimedLaunch): void {
   h.script({ statusFn: () => (t.window()?.endMs !== undefined ? t.statusRow() : cannedStatusResult()) })
 }
 
-describe('b.jg5 SRJ-407: launchUnavailableFormText (pure)', () => {
+describe('launchUnavailableFormText (pure)', () => {
   const failures = [describeAgentDirectorFailure(errTmuxUnresponsive('spawn')), describeAgentDirectorFailure(errSpawnNotFound())]
 
   test.each(LAUNCH_TIMEOUT_FORMS.map((form) => [form] as const))('a launch timeout (%s): names its form, the same whatever the described failure, and never the failure', (form) => {
@@ -21768,10 +21755,10 @@ describe('b.jg5 SRJ-407: launchUnavailableFormText (pure)', () => {
   })
 })
 
-describe('b.jg5 SRJ-407: each launch call\'s window, and one get after a launch timeout or any other UNAVAILABLE launch outcome, never launching over what it reads', () => {
+describe('each launch call\'s window, and one get after a launch timeout or any other UNAVAILABLE launch outcome, never launching over what it reads', () => {
   afterEach(() => {
-    expectNoDeleteOrIncludeFinished(srj105Harness)
-    srj105AfterEach()
+    expectNoDeleteOrIncludeFinished(recoveryHarness)
+    recoveryAfterEach()
   })
 
   // The window on success: the call's start and its return.
@@ -21796,21 +21783,21 @@ describe('b.jg5 SRJ-407: each launch call\'s window, and one get after a launch 
   // refuses the approver, so the covered row gets none, and the step's line
   // says so.
 
-  // AC 35 (b.jg5 SRJ-806, SRJ-411): P's key is recorded as retired (no
+  // P's key is recorded as retired (no
   // mark), so its launch is a reuse spawn; the reuse times out, and its one
   // `get` reads the old life `pending` with a launch start earlier than the
   // call: not this launch's row, so no mark and the row is not covered.
 
-  // AC 83: ErrCallTimeout from a spawn and from a resume; the `get` reads P's
+  // ErrCallTimeout from a spawn and from a resume; the `get` reads P's
   // covered row `pending` (handed to the pending-row step). P's retries read
   // the row and launch nothing while it reads `pending`; once it reads
   // `ended`, the next retry launches P again. Nothing is counted.
 
-  // AC 29 (its unit half): a spawn, a reuse and a `resume`, each ending in a
+  // (its unit half): a spawn, a reuse and a `resume`, each ending in a
   // launch timeout and stopped at a startup dialog the pane shows only after
   // P's first retry. The `get` reads this launch's row `pending`; the approver
   // polls on it, its first successful `read-pane` ending the tmux-unresponsive
-  // condition (b.jg5 SRJ-310 rule 1, before the row leaves `pending`; rule 3
+  // condition (rule 1, before the row leaves `pending`; rule 3
   // is tests/tmux-unresponsive.test.ts's); the retry reads the row and
   // launches nothing; once the dialog shows, the approver's Enter clears it
   // and the row reads `waiting`, which forgets the "this launch's row"
@@ -21820,7 +21807,7 @@ describe('b.jg5 SRJ-407: each launch call\'s window, and one get after a launch 
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-111 (E28 T4): the plain spawn's outcome table through the one
+// the plain spawn's outcome table through the one
 // plain-spawn outcome handler (`plainSpawnOutcomeAt`), at every plain-spawn
 // site: the ladder's first spawn, its retry spawn after the collision `get`
 // answers `ErrSpawnNotFound`, and the spawn after `resume`'s
@@ -21829,20 +21816,20 @@ describe('b.jg5 SRJ-407: each launch call\'s window, and one get after a launch 
 //
 // One case per row at each site the table below gives it, asserting the
 // launch's answer, the launch and read calls from the site's first on (no
-// further launch after a refusal; an UNAVAILABLE outcome's one `get`, b.jg5
-// SRJ-407), the causes sent, the outages raised, the failures counted (the
+// further launch after a refusal; an UNAVAILABLE outcome's one `get`
+//), the causes sent, the outages raised, the failures counted (the
 // entry counts its own launch), the call's window, and never a notice, a
 // `spawn-failed` entry, a kill, a delete, a reuse flag or the
 // `ErrInvalidFlags` hold. The rows pinned elsewhere are not repeated here:
-// the CONFLICT rows (E13's `LATCH_CROSS` at the ladder's three sites, the
+// the CONFLICT rows ( `LATCH_CROSS` at the ladder's three sites, the
 // row the scan's refusal or "duplicate session" leaves read at the first
 // spawn's latch-time read; the entry's in the sequence-launch entry's
-// describe), `ErrTmuxSessionCreate` (`SRJ602_SITES`, all four), the first
-// spawn's success, UNAVAILABLE and `get` table (the SRJ-401, SRJ-413 and
-// SRJ-407 describes), and ENVIRONMENT, CONFIG, UNCLASSIFIED and UNUSABLE
-// NAME at the ladder's three sites (the SRJ-105, SRJ-311, SRJ-316, SRJ-313
-// and SRJ-512 describes). A collision (get-then-act, re-run once, b.jg5
-// SRJ-114) and HO rev 26's recovery (the next attempt's collision, `get` and
+// describe), `ErrTmuxSessionCreate` (`LAUNCH_FAILURE_SITES`, all four), the first
+// spawn's success, UNAVAILABLE and `get` table (the and
+// describes), and ENVIRONMENT, CONFIG, UNCLASSIFIED and UNUSABLE
+// NAME at the ladder's three sites (the
+// and describes). A collision (get-then-act, re-run once
+//) and HO rev 26's recovery (the next attempt's collision, `get` and
 // reuse) have their own cases; the sequence's end after the entry's collision
 // is tests/live-row-sequence.test.ts's.
 // ---------------------------------------------------------------------------
@@ -21902,7 +21889,7 @@ const PLAIN_SPAWN_SITES: Readonly<Record<PlainSpawnSiteKey, PlainSpawnSite>> = {
   },
 }
 
-/** A refusal's answer: `failed` answered as `retrying`, P's timer armed (b.jg5 SRJ-1015). */
+/** A refusal's answer: `failed` answered as `retrying`, P's timer armed. */
 const PLAIN_SPAWN_RETRYING = { action: SPAWN_ACTION_RETRYING } as const
 
 /** The lines `plainSpawnCollisionLine` writes for persona `key` (any spawn), re-running get-then-act (`rerun`) or answering `retrying` with the timer armed. */
@@ -21911,14 +21898,14 @@ function plainSpawnCollisionLinesOf(h: RecoveryHarness, key: string, rerun: bool
   return h.errors.filter((line) => line.startsWith(head) && line.endsWith(tail))
 }
 
-describe('b.jg5 SRJ-111: the plain spawn\'s outcome table through the one handler at every plain-spawn site; a collision is get-then-act, re-run once; HO rev 26\'s ended row is recovered by the next attempt\'s collision and reuse', () => {
+describe('the plain spawn\'s outcome table through the one handler at every plain-spawn site; a collision is get-then-act, re-run once; HO rev 26\'s ended row is recovered by the next attempt\'s collision and reuse', () => {
   afterEach(() => {
-    expectNoDeleteOrIncludeFinished(srj105Harness)
-    srj105AfterEach()
+    expectNoDeleteOrIncludeFinished(recoveryHarness)
+    recoveryAfterEach()
   })
 
   test('ErrInvalidFlags at the first spawn whose re-check stops the server (a below-floor binary): failed and stopping, with no notice, no cause sent, nothing counted and no further call', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const rc = h.versionRecheck({ version: DEV_PLACEHOLDER_VERSION })
     h.script({ spawnError: errInvalidFlags('spawn') })
     const order = recordCallOrder(h)
@@ -21930,17 +21917,17 @@ describe('b.jg5 SRJ-111: the plain spawn\'s outcome table through the one handle
     expect([h.notices, h.triggers, getFailureCount(p), h.invalidFlagsHold.heldKeys(), h.unclassifiedErrorOpen(p)]).toEqual([[], [], 0, [], false])
   })
 
-  // b.jg5 SRJ-111, SRJ-114, SRJ-713: a later plain spawn's collision (the row
+  // a later plain spawn's collision (the row
   // turned live since the read that found none) re-runs get-then-act once:
   // its collision get reads the row and its branches decide again; a plain
   // spawn's collision in that re-run answers retrying with P's timer armed
   // with the collision cause. Never a notice, never counted, no reuse flag.
 
-  // Hatch note E23: the collision at the entry runs no get-then-act inside the
+  // design note : the collision at the entry runs no get-then-act inside the
   // sequence; the entry answers not launched (spawn-collision), and the
   // sequence's end arms the collision cause (tests/live-row-sequence.test.ts).
   test('a collision at the plain spawn after the live-row sequence\'s launch entry\'s resume answers ErrSpawnNotFound: not launched (spawn-collision), no further call, nothing counted, no notice, no cause sent by the entry', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const events: string[] = []
     observeLaunchCalls(h.stub.client, (call) => events.push(call))
     h.script(PLAIN_SPAWN_SITES.entry.script(h, p, errInstanceIdCollision(), []))
@@ -21954,21 +21941,21 @@ describe('b.jg5 SRJ-111: the plain spawn\'s outcome table through the one handle
     expect(plainSpawnCollisionLinesOf(h, p, true)).toEqual([])
   })
 
-  // HO rev 15 (b.jg5 SRJ-111, SRJ-407): a pre-spawn scan that could not
+  // HO rev 15: a pre-spawn scan that could not
   // answer wrote no row: the one get finds none and nothing more is launched
   // in the attempt; P's next retry launches it.
 
-  // HO rev 26 (b.jg5 SRJ-111, SRJ-711): a plain spawn meeting "duplicate
+  // HO rev 26: a plain spawn meeting "duplicate
   // session" whose re-lookup could not answer has ended its new row. The
   // attempt's one get reads it ended: nothing latched or counted. P's next
   // attempt recovers it as any ended row with no session id: its plain first
   // spawn collides, the collision get reads the row, the `resume` answers
   // ErrNoSessionId and the launch is one reuse spawn, never a plain spawn
   // after the collision. (The end write not applied, the get reads pending,
-  // a covered row: the SRJ-407 describe's "no launch timeout" rows.)
+  // a covered row: the describe's "no launch timeout" rows.)
 
   test('HO rev 26: the re-lookup\'s ErrTmuxNotAvailable (the new row ended): ENVIRONMENT, tmux-unavailable raised, no get and no further launch, nothing counted; P\'s next attempt collides, reads the ended row and launches one reuse spawn (reuse_finished), no plain spawn after the collision', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     h.script({ spawnError: errTmuxNotAvailableNewRowEnded() })
     const order = recordCallOrder(h)
 
@@ -21997,10 +21984,10 @@ describe('b.jg5 SRJ-111: the plain spawn\'s outcome table through the one handle
   })
 })
 
-describe('b.jg5 SRJ-410, SRJ-409, SRJ-710: the ladder\'s pending step on P\'s covered row runs the rule once only inside a retry of P\'s timer, and stays no-op for a row still pending; E23\'s re-read included', () => {
+describe('the ladder\'s pending step on P\'s covered row runs the rule once only inside a retry of P\'s timer, and stays no-op for a row still pending; \'s re-read included', () => {
   afterEach(() => {
-    expectNoDeleteOrIncludeFinished(srj105Harness)
-    srj105AfterEach()
+    expectNoDeleteOrIncludeFinished(recoveryHarness)
+    recoveryAfterEach()
   })
 
   /** P's own row read `pending` (covered: its own directory and labels), with the stub's sample launch start. */
@@ -22029,7 +22016,7 @@ describe('b.jg5 SRJ-410, SRJ-409, SRJ-710: the ladder\'s pending step on P\'s co
   ]
 
   test.each(RULE_GETS)('inside a retry, the rule\'s get reading %s: the ladder answers %s, with one retrying line for a gone row; nothing launched, killed, counted or posted; no arm beyond the step\'s', async (_what, ruleGet, action, gone) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     await pastSampleGrace(h)
     h.script({ ...collided(h, harnessPersona(h, p), { state: AGENT_DIRECTOR_PENDING_STATE }), getQueue: [cannedOk<GetResult>(pendingRowOf(h, p)), ruleGet(h, p)] })
     const order = recordCallOrder(h)
@@ -22046,7 +22033,7 @@ describe('b.jg5 SRJ-410, SRJ-409, SRJ-710: the ladder\'s pending step on P\'s co
   })
 
   test('inside a retry, the rule\'s get refused (UNAVAILABLE): retrying with one retrying line; the get arms its own cause after the step\'s arm; nothing launched or counted', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     await pastSampleGrace(h)
     const err = unavailableAt('get')
     h.script({ ...collided(h, harnessPersona(h, p), { state: AGENT_DIRECTOR_PENDING_STATE }), getQueue: [cannedOk<GetResult>(pendingRowOf(h, p)), cannedErr<GetResult>(err)] })
@@ -22062,7 +22049,7 @@ describe('b.jg5 SRJ-410, SRJ-409, SRJ-710: the ladder\'s pending step on P\'s co
   })
 
   test('inside a retry at B, the row still pending and never CSCB\'s own: the held post, and the ladder stays no-op; no kill or launch', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     await h.clock.advanceTo(parseLaunchStart(SAMPLE_LAUNCH_START_DEFAULT)! + adLaunchBoundMsInEffect())
     h.script(collided(h, harnessPersona(h, p), { state: AGENT_DIRECTOR_PENDING_STATE }))
 
@@ -22073,9 +22060,9 @@ describe('b.jg5 SRJ-410, SRJ-409, SRJ-710: the ladder\'s pending step on P\'s co
     expect([getFailureCount(p), h.stub.calls.killCalls, h.stub.calls.spawnCalls.length, h.stub.calls.resumeCalls]).toEqual([0, [], 1, []])
   })
 
-  // Hatch note E23: the not-resumable re-read reads P's covered row pending.
-  test('E23: inside a retry, ErrSpawnNotResumable\'s re-read reading P\'s covered row pending reaches the step: the same no-op, one rule run after the re-read, nothing counted or posted, no arm beyond the step\'s', async () => {
-    const { h, p } = srj105Build()
+  // design note : the not-resumable re-read reads P's covered row pending.
+  test(': inside a retry, ErrSpawnNotResumable\'s re-read reading P\'s covered row pending reaches the step: the same no-op, one rule run after the re-read, nothing counted or posted, no arm beyond the step\'s', async () => {
+    const { h, p } = buildRecoveryCase()
     await pastSampleGrace(h)
     const persona = harnessPersona(h, p)
     h.script({
@@ -22105,8 +22092,8 @@ async function ownTimedLaunch(h: RecoveryHarness, p: string): Promise<TimedLaunc
   return t
 }
 
-describe('b.jg5 SRJ-412, SRJ-407: the record of CSCB\'s own launch, its set and forget points, and the own-launch query', () => {
-  afterEach(srj105AfterEach)
+describe('the record of CSCB\'s own launch, its set and forget points, and the own-launch query', () => {
+  afterEach(recoveryAfterEach)
 
   // longer the persona's latest, so its lap keeps the launch start (inside
   // its own window) and records nothing.
@@ -22160,7 +22147,7 @@ describe('b.jg5 SRJ-412, SRJ-407: the record of CSCB\'s own launch, its set and 
     return atCall
   }
 
-  // b.jg5 SRJ-412, SRJ-407, SRJ-713: a launch call that answers
+  // a launch call that answers
   // ErrInstanceIdCollision created no row and started no launch, so the
   // records it set aside as it began are put back. A CONFLICT refusal, even
   // the pre-spawn scan's that writes no row, cannot be told from one after
@@ -22274,8 +22261,8 @@ describe('b.jg5 SRJ-412, SRJ-407: the record of CSCB\'s own launch, its set and 
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-412, SRJ-110, SRJ-702, SRJ-704, SRJ-501, SRJ-512, SRJ-316 (E29
-// T3): the abort's one checked kill of P's own `pending` row
+// (
+// ): the abort's one checked kill of P's own `pending` row
 // (`abortKillOwnStuckLaunch`), called directly on the recovery harness's
 // kill-retry clock with its kill-failure alerts installed as main() installs
 // them. The bounded retry is seeded `pending`: up to `KILL_RETRY_TRIES` tries
@@ -22288,8 +22275,8 @@ describe('b.jg5 SRJ-412, SRJ-407: the record of CSCB\'s own launch, its set and 
 // is tests/pending-row.test.ts's.
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-412: the abort kill of CSCB\'s own stuck launch (abortKillOwnStuckLaunch) answers one typed outcome per class', () => {
-  afterEach(srj105AfterEach)
+describe('the abort kill of CSCB\'s own stuck launch (abortKillOwnStuckLaunch) answers one typed outcome per class', () => {
+  afterEach(recoveryAfterEach)
 
   /** The stub's survivor-naming `ErrTmuxKillFailed`. */
   const survivorErr = (): Error => errTmuxKillFailed(undefined, 'pane-process-survived')
@@ -22327,7 +22314,7 @@ describe('b.jg5 SRJ-412: the abort kill of CSCB\'s own stuck launch (abortKillOw
   }
 
   test.each([true, false])('a first try succeeding with kill_sent %s: succeeded, carrying it; no alert, nothing latched', async (killSent) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     h.script({ killResult: cannedKillResult(killSent) })
 
     expect(await abortKill(h, p, 1, 0)).toEqual({ kind: STUCK_LAUNCH_ABORT_KILL_SUCCEEDED, killSent, description: describeKillOutcome({ kind: KILL_OUTCOME_KILLED, killSent }) })
@@ -22339,7 +22326,7 @@ describe('b.jg5 SRJ-412: the abort kill of CSCB\'s own stuck launch (abortKillOw
     ['the row already gone (ErrSpawnNotFound)', { killError: errSpawnNotFound() }, 0, { kind: KILL_OUTCOME_ROW_GONE }],
     ['ErrTmuxUnresponsive, then a read of ended', { killError: errTmuxUnresponsive('kill'), statusQueue: [cannedOk(cannedStatusResult({ state: 'ended' }))] }, 1, { kind: KILL_OUTCOME_ROW_FINISHED, read: KILL_ROW_FINISHED_ENDED }],
   ])('%s: succeeded with no kill_sent; no alert, nothing latched', async (_label, script, reads, outcome) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     h.script(script)
 
     expect(await abortKill(h, p, 1, reads)).toEqual({ kind: STUCK_LAUNCH_ABORT_KILL_SUCCEEDED, description: describeKillOutcome(outcome) })
@@ -22348,7 +22335,7 @@ describe('b.jg5 SRJ-412: the abort kill of CSCB\'s own stuck launch (abortKillOw
   })
 
   test('a survivor-naming ErrTmuxKillFailed, then a success with kill_sent true: succeeded after two tries and one read; the survivor version, with the stuck-launch abort context; no episode opens', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const survivor = survivorErr()
     h.script({ killQueue: [cannedErr(survivor), cannedOk(cannedKillResult(true))] })
 
@@ -22361,7 +22348,7 @@ describe('b.jg5 SRJ-412: the abort kill of CSCB\'s own stuck launch (abortKillOw
   })
 
   test('ErrTmuxKillFailed at every try: kill-failed after 3 tries 2 s apart, the row read before each further try (the pending seed, never the restart path\'s one try); one ordinary alert with the stuck-launch abort context; nothing latched', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const err = errTmuxKillFailed()
     h.script({ killError: err })
 
@@ -22373,7 +22360,7 @@ describe('b.jg5 SRJ-412: the abort kill of CSCB\'s own stuck launch (abortKillOw
     expect([h.killFailureOpen(p), h.latch.isLatched(p)]).toEqual([true, false])
   })
 
-  // SRJ-316, SRJ-702: the seed is `pending`, so a CONFIG answer at the first
+  // the seed is `pending`, so a CONFIG answer at the first
   // read between tries ends them (no `configReadEndsTries` is set). The
   // build lead's ruling: an ErrTmuxKillFailed standing then is kill-failed
   // (its alert raised), any other UNAVAILABLE try-later.
@@ -22381,7 +22368,7 @@ describe('b.jg5 SRJ-412: the abort kill of CSCB\'s own stuck launch (abortKillOw
     ['ErrTmuxKillFailed', () => errTmuxKillFailed(), (err) => ({ kind: STUCK_LAUNCH_ABORT_KILL_FAILED, description: thrownDescription(err) }), true],
     ['ErrTmuxUnresponsive', () => errTmuxUnresponsive('kill'), (err) => ({ kind: STUCK_LAUNCH_ABORT_KILL_TRY_LATER, errorClass: AD_ERROR_CLASS_UNAVAILABLE, description: thrownDescription(err) }), false],
   ])('%s at the first try, then a CONFIG answer at the read between tries: the tries end with no further kill; ad-config-malformed raised once; the answer by what stands', async (_label, make, answer, alerted) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const err = make()
     const configErr = errConfigMalformed()
     h.script({ killError: err, statusQueue: [cannedErr(configErr)] })
@@ -22395,7 +22382,7 @@ describe('b.jg5 SRJ-412: the abort kill of CSCB\'s own stuck launch (abortKillOw
   })
 
   test.each(STUCK_LAUNCH_ABORT_CONFLICT_CASE_ROWS.map((row) => [row.name, row] as const))('CONFLICT at the first try (%s): latched, never tried again; P latched once through the CONFLICT entry with "P\'s next check or recovery" and the state pending; no alert', async (_name, row) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const err = row.build()
     h.script({ killQueue: [cannedErr(err), cannedOk(cannedKillResult(true))] })
 
@@ -22406,7 +22393,7 @@ describe('b.jg5 SRJ-412: the abort kill of CSCB\'s own stuck launch (abortKillOw
   })
 
   test.each(STUCK_LAUNCH_ABORT_UNUSABLE_NAME_CASE_ROWS.map((row) => [row.name, row] as const))('UNUSABLE NAME at the first try (%s): latched, never tried again; P latched once through the unusable-name entry with the state pending; no alert', async (_name, row) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const err = row.build()
     h.script({ killQueue: [cannedErr(err), cannedOk(cannedKillResult(true))] })
 
@@ -22416,7 +22403,7 @@ describe('b.jg5 SRJ-412: the abort kill of CSCB\'s own stuck launch (abortKillOw
     expect(killFailureLines(h, p)).toEqual([])
   })
 
-  // An outage raised arms P's retry timer with its cause, as from any verb (SRJ-311, SRJ-316).
+  // An outage raised arms P's retry timer with its cause, as from any verb.
   test.each<[string, () => Error, string, number, readonly OutageClass[], readonly string[]]>([
     ['ErrTmuxUnresponsive at every try (UNAVAILABLE)', () => errTmuxUnresponsive('kill'), AD_ERROR_CLASS_UNAVAILABLE, KILL_RETRY_TRIES, [], []],
     ['ErrCallTimeout at every try (UNAVAILABLE)', () => errCallTimeout('kill'), AD_ERROR_CLASS_UNAVAILABLE, KILL_RETRY_TRIES, [], []],
@@ -22424,7 +22411,7 @@ describe('b.jg5 SRJ-412: the abort kill of CSCB\'s own stuck launch (abortKillOw
     ['CONFIG (ErrConfigMalformed)', () => errConfigMalformed(), AD_ERROR_CLASS_CONFIG, 1, [AD_CONFIG_MALFORMED_CLASS], [UNAVAILABLE_RETRY_CAUSE_CONFIG]],
     ['UNCLASSIFIED (ErrInternal)', () => errInternal(), AD_ERROR_CLASS_UNCLASSIFIED, 1, [], []],
   ])('%s: try-later with its class, the outcome\'s outage raised; no alert, nothing latched', async (_label, make, errorClass, kills, flags, armed) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const err = make()
     h.script({ killError: err })
 
@@ -22434,11 +22421,11 @@ describe('b.jg5 SRJ-412: the abort kill of CSCB\'s own stuck launch (abortKillOw
     expect([h.episodeNotices, killFailureLines(h, p), h.latch.isLatched(p)]).toEqual([[], [], false])
   })
 
-  // SRJ-104, SRJ-204: ErrInvalidFlags gets one immediate version re-check.
+  // ErrInvalidFlags gets one immediate version re-check.
   // One that passes leaves UNCLASSIFIED (try-later, the abort not used); one
   // that decides the server stops answers stopped (the abort not used).
   test('ErrInvalidFlags whose one re-check passes: try-later as UNCLASSIFIED after one try; no alert, nothing latched, no stop asked', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const { resolves, stops } = h.recheckAnswers(PHASE1_RC_VERSION)
     const err = errInvalidFlags('kill')
     h.script({ killError: err })
@@ -22451,12 +22438,12 @@ describe('b.jg5 SRJ-412: the abort kill of CSCB\'s own stuck launch (abortKillOw
     expect([h.episodeNotices, killFailureLines(h, p), h.latch.isLatched(p)]).toEqual([[], [], false])
   })
 
-  // SRJ-702, SRJ-1013 (t3.b6r.eg.r1.yr): the stopped retry is recorded
+  // the stopped retry is recorded
   // whatever its decision, a `none` one included: one stop line naming the
   // re-check's cause and the last outcome's class; for a configured persona
   // no entry.
   test('ErrInvalidFlags whose one re-check decides that the server stops: stopped after one try, with no further kill or read; no alert, one stop line and no entry; nothing latched', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const { resolves, stops } = h.recheckAnswers(DEV_PLACEHOLDER_VERSION)
     h.script({ killError: errInvalidFlags('kill') })
 
@@ -22477,13 +22464,13 @@ describe('b.jg5 SRJ-412: the abort kill of CSCB\'s own stuck launch (abortKillOw
     assertNoLeak({ lines: killFailureLines(h, p) })
   })
 
-  // SRJ-702's stop rule: P not up when a try returns stops the tries; neither
+  // stop rule: P not up when a try returns stops the tries; neither
   // version is raised, for a configured persona one line only.
   test.each<[string, () => Error[], (errs: Error[]) => KillRetryAlert]>([
     ['an ErrTmuxKillFailed naming no survivor', () => [errTmuxKillFailed()], (errs) => ({ kind: KILL_RETRY_ALERT_ORDINARY, lastKillFailedDescription: killFailedDescriptionOf(errs[0]!)! })],
     ['a survivor-naming ErrTmuxKillFailed, then ErrTmuxUnresponsive', () => [survivorErr(), errTmuxUnresponsive('kill')], (errs) => ({ kind: KILL_RETRY_ALERT_ORDINARY, earlierSurvivorDescription: killFailedDescriptionOf(errs[0]!)! })],
   ])('%s, P no longer up when the last try returns: stopped, with no further kill or read; no alert of either version, no entry, one stop line; nothing latched', async (_label, make, decision) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const errs = make()
     h.script({ killQueue: errs.map((err) => cannedErr(err)) })
     const kill = h.stub.client.kill.bind(h.stub.client)
@@ -22515,8 +22502,8 @@ describe('b.jg5 SRJ-412: the abort kill of CSCB\'s own stuck launch (abortKillOw
 // sequence's run from step 2 is tests/live-row-sequence.test.ts's.
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-412, SRJ-705: the abort\'s live-row sequence start (startStuckLaunchAbortSequence)', () => {
-  afterEach(srj105AfterEach)
+describe('the abort\'s live-row sequence start (startStuckLaunchAbortSequence)', () => {
+  afterEach(recoveryAfterEach)
 
   /** Install a sequence registry whose start answers `answer`, or throws it, starting nothing. */
   function registryAnswering(answer: ReturnType<LiveRowSequenceRegistry['start']> | Error): void {
@@ -22537,7 +22524,7 @@ describe('b.jg5 SRJ-412, SRJ-705: the abort\'s live-row sequence start (startStu
   }
 
   test('one request through the start entry: entry at step 2, the row last read pending, the conversation kept, ending in a launch, no retired-key flag, context stuck-launch abort; answers started', () => {
-    const { p } = srj105Build()
+    const { p } = buildRecoveryCase()
     const starts = recordSequenceStarts()
     const ref = renderPersonaRef(p, p)
 
@@ -22555,7 +22542,7 @@ describe('b.jg5 SRJ-412, SRJ-705: the abort\'s live-row sequence start (startStu
         launches: true,
         alertContext: KILL_FAILURE_CONTEXT_STUCK_LAUNCH_ABORT,
         // The start entry's own additions: the store's reading of the key at the attempt's start,
-        // and its reading that P is below the restart cap (b.4q8).
+        // and its reading that P is below the restart cap.
         retiredAtStart: expect.anything(),
         belowCapAtStart: true,
       },
@@ -22567,14 +22554,14 @@ describe('b.jg5 SRJ-412, SRJ-705: the abort\'s live-row sequence start (startStu
     ['the registry answering closed', () => registryAnswering(LIVE_ROW_START_CLOSED), LIVE_ROW_START_CLOSED],
     ['no registry installed', () => _resetLiveRowSequenceRegistry(), LIVE_ROW_START_NOT_INSTALLED],
   ])('%s: not started, with the start entry\'s answer as why', (_label, arrange, why) => {
-    const { p } = srj105Build()
+    const { p } = buildRecoveryCase()
     arrange()
 
     expect(startStuckLaunchAbortSequence(p, renderPersonaRef(p, p))).toEqual({ kind: STUCK_LAUNCH_ABORT_SEQUENCE_NOT_STARTED, why })
   })
 
   test('a start that throws: not started, why naming the thrown value; it does not throw', () => {
-    const { p } = srj105Build()
+    const { p } = buildRecoveryCase()
     const failure = new Error('registry broke')
     registryAnswering(failure)
 
@@ -22583,8 +22570,8 @@ describe('b.jg5 SRJ-412, SRJ-705: the abort\'s live-row sequence start (startStu
 })
 
 // ---------------------------------------------------------------------------
-// E30 T1 (b.jg5 SRJ-505, SRJ-506, SRJ-502, SRJ-111, SRJ-112, SRJ-113;
-// hatch A3; HO rev 28): the latch re-check's retry sites, at the handlers.
+// (
+// design A3; HO rev 28): the latch re-check's retry sites, at the handlers.
 //
 // On `makeRecoveryHarness` with `latchRecheck: true`, so the re-check is
 // bound to the latch as `main()` binds it (`buildLatchRecheck`, its first
@@ -22601,26 +22588,26 @@ describe('b.jg5 SRJ-412, SRJ-705: the abort\'s live-row sequence start (startStu
 // parameters; the gates before it (the relaunch gate, the held gate, the
 // old-life hold step); the latched gate (only the
 // re-check's call reaches agent-director; the retry is P's launch in
-// flight); every SRJ-113 row at the `resume` retry, every SRJ-111 row at
-// the two plain-spawn sites and every SRJ-112 row at the reuse retries
-// (AC 71's answers aside), with the answer the round needs, its counting and
+// flight); every row at the `resume` retry, every row at
+// the two plain-spawn sites and every row at the reuse retries
+// (answers aside), with the answer the round needs, its counting and
 // its retry-timer causes; the clear hand-off before the
 // after-launch step and before a definite failure's class handling; the
 // collision's no information (`latchRecheckCollided`, `resumeCollisionAt`
 // with no arm); no `get` after an UNAVAILABLE (`afterLaunchUnavailable`)
 // and no latch-time read (`recordedRowState`); the retired key's reuse
-// (E24–E25); E16's latch check after an awaited launch call
+// latch check after an awaited launch call
 // (`latchedElsewhereDuringCall`); and the clears of the re-check's run of
 // the restart path's decision.
 //
 // Elsewhere: every case-table row's round (which call each refused
 // operation and step-1 reading makes, or none), its cadence and its relatch
 // post, and the no-information, CONFIG and UNUSABLE NAME answers at each
-// launch (AC 71), are tests/conflict-latch.test.ts's; the no-information scope at the
+// launch, are tests/conflict-latch.test.ts's; the no-information scope at the
 // wrappers and the timer, tests/outage-state.test.ts's and
 // tests/unavailable-retry.test.ts's; the permit inside
 // `runRestartWorkInTurn`, tests/restart.test.ts's. The clear's one recovery
-// post, its reason, the episode's end and the after-clear sequence (SRJ-506)
+// post, its reason, the episode's end and the after-clear sequence
 // are tests/conflict-latch.test.ts's: a cleared case here asserts the latch
 // and its timer gone.
 // ---------------------------------------------------------------------------
@@ -22651,7 +22638,7 @@ const NOT_THIS_LAUNCH_RECHECK_LATCH: RecheckLatchSpec = {
   latchCase: LATCH_CASE_NOT_THIS_LAUNCH,
   refusedOperation: REFUSED_OPERATION_NEXT_CHECK_OR_RECOVERY,
 }
-/** A bring-up refused with "no valid id" (SRJ-505's run of the restart path's decision). */
+/** A bring-up refused with "no valid id" (run of the restart path's decision). */
 const BRING_UP_RECHECK_LATCH: RecheckLatchSpec = { verb: 'resume', stubCase: 'no-valid-id', latchCase: LATCH_CASE_NO_VALID_ID, refusedOperation: REFUSED_OPERATION_BRING_UP }
 
 /** The row read `waiting` (reported in). */
@@ -22707,8 +22694,7 @@ function expectRecheckCleared(h: RecoveryHarness, p: string): void {
  * P stays latched with `record` unchanged and no new latch event, its timer
  * armed for the next round; nothing armed, started, raised (CONFIG's outage
  * aside) or fed for it, and nothing counted: its restart failure count is
- * still `failures`, 0 unless the case put P at the cap (b.jg5 SRJ-505,
- * AC 71).
+ * still `failures`, 0 unless the case put P at the cap.
  */
 function expectRecheckStillLatched(h: RecoveryHarness, p: string, record: ConflictLatchRecord, eventsBefore: number, failures = 0): void {
   expect(h.latch.record(p)).toStrictEqual(record)
@@ -22749,7 +22735,7 @@ interface RecheckRetrySite {
 
 const RECHECK_RETRY_SITES: readonly RecheckRetrySite[] = [
   {
-    name: 'a plain spawn latch whose step 1 finds no row: the plain spawn (SRJ-111 site 1)',
+    name: 'a plain spawn latch whose step 1 finds no row: the plain spawn (site 1)',
     launch: RECHECK_CALL_PLAIN_SPAWN,
     latch: PLAIN_SPAWN_RECHECK_LATCH,
     recorded: LATCH_ROW_STATE_NO_ROW,
@@ -22761,7 +22747,7 @@ const RECHECK_RETRY_SITES: readonly RecheckRetrySite[] = [
     clearedBy: RECHECK_CLEARED_BY_RETRY,
   },
   {
-    name: 'a finished-row retry whose get finds no row: the plain first spawn (SRJ-111 site 2)',
+    name: 'a finished-row retry whose get finds no row: the plain first spawn (site 2)',
     launch: RECHECK_CALL_PLAIN_SPAWN,
     latch: NOT_THIS_LAUNCH_RECHECK_LATCH,
     recorded: ROW_WAITING,
@@ -22773,7 +22759,7 @@ const RECHECK_RETRY_SITES: readonly RecheckRetrySite[] = [
     clearedBy: RECHECK_CLEARED_BY_FINISHED_ROW_RETRY,
   },
   {
-    name: 'a plain spawn latch on a row read ended: the reuse (SRJ-112)',
+    name: 'a plain spawn latch on a row read ended: the reuse',
     launch: RECHECK_CALL_REUSE_SPAWN,
     latch: PLAIN_SPAWN_RECHECK_LATCH,
     recorded: LATCH_ROW_STATE_NO_ROW,
@@ -22785,7 +22771,7 @@ const RECHECK_RETRY_SITES: readonly RecheckRetrySite[] = [
     clearedBy: RECHECK_CLEARED_BY_RETRY,
   },
   {
-    name: 'a reuse latch on a row read ended: the reuse (SRJ-112)',
+    name: 'a reuse latch on a row read ended: the reuse',
     launch: RECHECK_CALL_REUSE_SPAWN,
     latch: REUSE_RECHECK_LATCH,
     recorded: ROW_ENDED,
@@ -22797,7 +22783,7 @@ const RECHECK_RETRY_SITES: readonly RecheckRetrySite[] = [
     clearedBy: RECHECK_CLEARED_BY_RETRY,
   },
   {
-    name: 'a finished-row retry whose get reads ended with no session id: the reuse (SRJ-112)',
+    name: 'a finished-row retry whose get reads ended with no session id: the reuse',
     launch: RECHECK_CALL_REUSE_SPAWN,
     latch: NOT_THIS_LAUNCH_RECHECK_LATCH,
     recorded: ROW_WAITING,
@@ -22809,7 +22795,7 @@ const RECHECK_RETRY_SITES: readonly RecheckRetrySite[] = [
     clearedBy: RECHECK_CLEARED_BY_FINISHED_ROW_RETRY,
   },
   {
-    name: 'a resume latch on a row read ended: the resume (SRJ-113)',
+    name: 'a resume latch on a row read ended: the resume',
     launch: RECHECK_CALL_RESUME,
     latch: RESUME_RECHECK_LATCH,
     recorded: ROW_ENDED,
@@ -22821,7 +22807,7 @@ const RECHECK_RETRY_SITES: readonly RecheckRetrySite[] = [
     clearedBy: RECHECK_CLEARED_BY_RETRY,
   },
   {
-    name: 'a finished-row retry whose get reads ended with a session id: the resume (SRJ-113)',
+    name: 'a finished-row retry whose get reads ended with a session id: the resume',
     launch: RECHECK_CALL_RESUME,
     latch: NOT_THIS_LAUNCH_RECHECK_LATCH,
     recorded: ROW_WAITING,
@@ -22834,14 +22820,14 @@ const RECHECK_RETRY_SITES: readonly RecheckRetrySite[] = [
   },
 ]
 
-describe('b.jg5 SRJ-502, SRJ-505: the latched gate passes only the re-check\'s own call, and its retry is P\'s launch in flight', () => {
-  afterEach(srj105AfterEach)
+describe('the latched gate passes only the re-check\'s own call, and its retry is P\'s launch in flight', () => {
+  afterEach(recoveryAfterEach)
 
   test.each([
     ['a resume', RESUME_RECHECK_LATCH, 'resume'],
     ['a reuse spawn', REUSE_RECHECK_LATCH, 'spawn'],
   ] as const)('a latched P: every other caller answers latched with no call, while the re-check\'s %s reaches agent-director as P\'s launch in flight, which a caller joins and a teardown waits for', async (_label, latch, verb) => {
-    const { h, p } = srj105Build({ latchRecheck: true })
+    const { h, p } = buildRecoveryCase({ latchRecheck: true })
     const persona = harnessPersona(h, p)
     latchForRecheck(h, p, latch, ROW_ENDED)
     const expectGateHolds = async (): Promise<void> => {
@@ -22890,19 +22876,19 @@ describe('b.jg5 SRJ-502, SRJ-505: the latched gate passes only the re-check\'s o
   })
 })
 
-describe('b.jg5 SRJ-506, SRJ-111, SRJ-112, SRJ-113: every row of the launch\'s outcome table at each re-check retry site, handled by the one handler, and the answer the round needs', () => {
+describe('every row of the launch\'s outcome table at each re-check retry site, handled by the one handler, and the answer the round needs', () => {
   afterEach(() => {
-    expectNoKillOrDelete(srj105Harness!)
-    srj105AfterEach()
+    expectNoKillOrDelete(recoveryHarness!)
+    recoveryAfterEach()
   })
 
-  // b.jg5 SRJ-113, SRJ-111, SRJ-501: the plain spawn after the re-check resume's
+  // the plain spawn after the re-check resume's
   // ErrSpawnNotFound runs once the latch has cleared, so its scan CONFLICT
   // latches P anew, with "plain spawn" and the state the re-check read. The
-  // clear posts its one recovery notice first (SRJ-506, SRJ-1005: "a retry of
+  // clear posts its one recovery notice first ("a retry of
   // the refused operation was not refused"), then the new latch posts anew.
   test('a resume latch\'s retry answering ErrSpawnNotFound, then the plain spawn\'s scan CONFLICT: the latch cleared with one recovery notice, then P latched anew with "plain spawn" and the state step 1 read, with one new post; no latch-time read', async () => {
-    const { h, p } = srj105Build({ latchRecheck: true })
+    const { h, p } = buildRecoveryCase({ latchRecheck: true })
     latchForRecheck(h, p, RESUME_RECHECK_LATCH, ROW_ENDED)
     const scan = recheckConflict('spawn', 'scan-leftover')
     h.script({ ...step1Status(LIVENESS_DEAD_ROW_ENDED), resumeError: errSpawnNotFound(), spawnError: scan })
@@ -22994,10 +22980,10 @@ async function roundRecordingHandOff(h: RecoveryHarness, p: string, order: reado
   return handOffs
 }
 
-describe('b.jg5 SRJ-506 (hatch A3): a retry\'s answer that clears hands the clear off once, before the after-launch step and before a definite failure\'s class handling', () => {
+describe('(hatch A3): a retry\'s answer that clears hands the clear off once, before the after-launch step and before a definite failure\'s class handling', () => {
   afterEach(() => {
-    expectNoKillOrDelete(srj105Harness!)
-    srj105AfterEach()
+    expectNoKillOrDelete(recoveryHarness!)
+    recoveryAfterEach()
   })
 
   test.each([
@@ -23006,7 +22992,7 @@ describe('b.jg5 SRJ-506 (hatch A3): a retry\'s answer that clears hands the clea
     ['a CONFLICT with the latch\'s own case', () => recheckConflict('spawn', 'scan-leftover')],
     ['CONFIG', () => errConfigMalformed()],
   ] as const)('a plain spawn retry answering %s hands nothing off', async (_label, make) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     latchForRecheckUnbound(h, p, PLAIN_SPAWN_RECHECK_LATCH, LATCH_ROW_STATE_NO_ROW)
     h.script({ ...step1Status('no row'), spawnError: make() })
     const order = recordCallOrder(h)
@@ -23025,7 +23011,7 @@ function latchForRecheckUnbound(h: RecoveryHarness, p: string, spec: RecheckLatc
 }
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-505, SRJ-207, SRJ-810, b.av2 SR-6.4: before its launch a re-check
+// before its launch a re-check
 // retry asks the gates every other launch path asks, in their order: the
 // relaunch gate (a gate that throws counts as not up), the ErrInvalidFlags
 // held gate and the old-life hold step. One that stops it makes no call: one
@@ -23035,8 +23021,8 @@ function latchForRecheckUnbound(h: RecoveryHarness, p: string, spec: RecheckLatc
 // retry); the bound timer's rounds are tests/conflict-latch.test.ts's.
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-505, SRJ-207, SRJ-810, b.av2 SR-6.4: a re-check retry stopped by the relaunch gate, the held gate or the old-life hold step makes no launch and gives no information', () => {
-  afterEach(srj105AfterEach)
+describe('a re-check retry stopped by the relaunch gate, the held gate or the old-life hold step makes no launch and gives no information', () => {
+  afterEach(recoveryAfterEach)
 
   /** What a row arranges before the round: the relaunch gate it injects, the gate's line, and the stub calls its arrangement leaves running (the old-life wait's). */
   interface GateArrangement {
@@ -23083,7 +23069,7 @@ describe('b.jg5 SRJ-505, SRJ-207, SRJ-810, b.av2 SR-6.4: a re-check retry stoppe
   ]
 
   test.each(GATES)('%s: no launch, the answer %s, one line; P stays latched with its record, no post, nothing armed', async (_label, answer, arrange) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const asked: string[] = []
     const gate = await arrange(h, p, asked)
     const record = latchForRecheckUnbound(h, p, REUSE_RECHECK_LATCH, ROW_ENDED)
@@ -23112,7 +23098,7 @@ describe('b.jg5 SRJ-505, SRJ-207, SRJ-810, b.av2 SR-6.4: a re-check retry stoppe
 })
 
 // ---------------------------------------------------------------------------
-// Bug b.xkd (b.av2 SR-6.3; b.jg5 SRJ-505, SRJ-506): the restart cap wins over
+// the restart cap wins over
 // the re-check. A latched persona at the restart cap still gets its reads
 // (step 1's, and the finished-row retry's `get`), so a read can still clear
 // its latch, but no launch from any retry site and no run of the restart
@@ -23135,14 +23121,14 @@ function atCapRoundLine(key: string, latchCase: LatchCase, step: LatchRecheckLin
   return latchRecheckRoundLine(renderPersonaRef(key, key), latchCase, step, call, `no-information (${LATCH_RECHECK_AT_CAP})`)
 }
 
-describe('bug b.xkd (b.av2 SR-6.3; b.jg5 SRJ-505, SRJ-506): the restart cap wins over the re-check — a latched P at the cap gets its reads but no launch and no run of the restart path\'s decision, and stays latched with no post', () => {
+describe('the restart cap wins over the re-check — a latched P at the cap gets its reads but no launch and no run of the restart path\'s decision, and stays latched with no post', () => {
   afterEach(() => {
-    expectNoKillOrDelete(srj105Harness!)
-    srj105AfterEach()
+    expectNoKillOrDelete(recoveryHarness!)
+    recoveryAfterEach()
   })
 
   test.each(RECHECK_RETRY_SITES.map((site) => [site.name, site] as const))('at %s: at the cap, its reads only, one cap line and the round line no-information (at-cap), P latched with no post and B untouched', async (_name, site) => {
-    const { h, p, b } = srj105Build({ latchRecheck: true })
+    const { h, p, b } = buildRecoveryCase({ latchRecheck: true })
     putAtRestartCap(p)
     const record = latchForRecheck(h, p, site.latch, site.recorded)
     h.script(site.script(h, p))
@@ -23160,7 +23146,7 @@ describe('bug b.xkd (b.av2 SR-6.3; b.jg5 SRJ-505, SRJ-506): the restart cap wins
   })
 
   test('a bring-up latch (its call the run of the restart path\'s decision): at the cap, step 1\'s read only (no run, so no liveness read and no launch), one cap line naming the run and the round line no-information (at-cap), P latched with no post and B untouched', async () => {
-    const { h, p, b } = srj105Build({ latchRecheck: true })
+    const { h, p, b } = buildRecoveryCase({ latchRecheck: true })
     putAtRestartCap(p)
     const record = latchForRecheck(h, p, BRING_UP_RECHECK_LATCH, ROW_WAITING)
     h.script(step1Status(LIVENESS_DEAD_ROW_ENDED))
@@ -23198,7 +23184,7 @@ describe('bug b.xkd (b.av2 SR-6.3; b.jg5 SRJ-505, SRJ-506): the restart cap wins
   ]
 
   test.each(CAP_QUERIES.filter(([, query]) => query !== undefined))('a bring-up latch\'s run of the restart path\'s decision, the cap query %s: at the cap no run and no set observer added, one cap line naming the run, no-information (at-cap) and no hand-off; otherwise the one run, which clears', async (_label, query, capped) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const record = latchForRecheckUnbound(h, p, BRING_UP_RECHECK_LATCH, ROW_WAITING)
     h.script(step1Status(cannedStatusResult().state))
     const order = recordCallOrder(h)
@@ -23236,7 +23222,7 @@ describe('bug b.xkd (b.av2 SR-6.3; b.jg5 SRJ-505, SRJ-506): the restart cap wins
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-502 (the E16 hatch note): a launch of the collision ladder or the
+// (the design note): a launch of the collision ladder or the
 // reuse spawn whose persona was latched elsewhere while its `spawn` or
 // `resume` was awaited sets nothing on its own CONFLICT or UNUSABLE NAME:
 // the latch that stands is the one set elsewhere, with its one post; no
@@ -23245,10 +23231,10 @@ describe('bug b.xkd (b.av2 SR-6.3; b.jg5 SRJ-505, SRJ-506): the restart cap wins
 // the re-check rows above relatch on another case.
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-502 (E16): a launch whose persona was latched elsewhere during its awaited spawn or resume sets nothing more and posts nothing more', () => {
+describe('(): a launch whose persona was latched elsewhere during its awaited spawn or resume sets nothing more and posts nothing more', () => {
   afterEach(() => {
-    expectNoKillOrDelete(srj105Harness!)
-    srj105AfterEach()
+    expectNoKillOrDelete(recoveryHarness!)
+    recoveryAfterEach()
   })
 
   /** The latch set elsewhere while the call is awaited. */
@@ -23257,7 +23243,7 @@ describe('b.jg5 SRJ-502 (E16): a launch whose persona was latched elsewhere duri
     return h.latch.record(p)!
   }
 
-  /** `latchedElsewhereDuringCall`'s line for persona `key` at `site`'s call `what`, refused with `err` (described with agent-director's reported name, b.jg5 SRJ-1014). */
+  /** `latchedElsewhereDuringCall`'s line for persona `key` at `site`'s call `what`, refused with `err` (described with agent-director's reported name). */
   const elsewhereLine = (site: string, what: string, key: string, err: Error): string =>
     latchedElsewhereDuringCallLine(site, what, renderPersonaRef(key, key), describeAdFailureForLog(err))
 
@@ -23274,7 +23260,7 @@ describe('b.jg5 SRJ-502 (E16): a launch whose persona was latched elsewhere duri
   ]
 
   test.each(ANSWERS)('the ladder\'s first spawn answering %s after P latched elsewhere: latched, the elsewhere latch kept with its one post, no latch-time read', async (_label, make) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const hold = holdSpawns(h.stub.client)
     const order = recordCallOrder(h)
     const launch = h.launch(p)
@@ -23295,7 +23281,7 @@ describe('b.jg5 SRJ-502 (E16): a launch whose persona was latched elsewhere duri
   })
 
   test.each(ANSWERS)('the ladder\'s resume answering %s after P latched elsewhere: latched, nothing more set or posted, no call after the resume', async (_label, make) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     let fail!: (err: Error) => void
     let entered!: () => void
     const inResume = new Promise<void>((resolve) => {
@@ -23326,7 +23312,7 @@ describe('b.jg5 SRJ-502 (E16): a launch whose persona was latched elsewhere duri
   })
 
   test.each(ANSWERS)('the reuse spawn answering %s after P latched elsewhere: latched, nothing more set or posted', async (_label, make) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const hold = holdSpawns(h.stub.client)
     const launch = launchForLiveRowSequence(harnessPersona(h, p), h.config, { kind: LIVE_ROW_LAUNCH_REUSE, lastRead: ROW_ENDED })
     await hold.entered(personaInstanceId(p))
@@ -23344,7 +23330,7 @@ describe('b.jg5 SRJ-502 (E16): a launch whose persona was latched elsewhere duri
   })
 
   test('control: a ladder spawn answering a CONFLICT for a persona not latched during the call latches it once, with no in-call latch line', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     h.script({ spawnError: recheckConflict('spawn', 'scan-leftover') })
 
     expect(await h.launch(p)).toStrictEqual({ key: p, action: 'latched' })
@@ -23355,7 +23341,7 @@ describe('b.jg5 SRJ-502 (E16): a launch whose persona was latched elsewhere duri
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-506, SRJ-502, SRJ-505 (hatch A3): the re-check's one run of the
+// (design A3): the re-check's one run of the
 // restart path's decision (a bring-up latch) clears the latch when it
 // completes with no refusal (already connected, reconnected, launched, a
 // counted failure, capped), unless P was latched during the run; a launch
@@ -23364,10 +23350,10 @@ describe('b.jg5 SRJ-502 (E16): a launch whose persona was latched elsewhere duri
 // launch inside it is no counted launch failure.
 // ---------------------------------------------------------------------------
 
-describe('b.jg5 SRJ-506 (hatch A3): the re-check\'s run of the restart path\'s decision clears after a run with no refusal, and keeps P latched otherwise', () => {
+describe('(hatch A3): the re-check\'s run of the restart path\'s decision clears after a run with no refusal, and keeps P latched otherwise', () => {
   afterEach(() => {
-    expectNoKillOrDelete(srj105Harness!)
-    srj105AfterEach()
+    expectNoKillOrDelete(recoveryHarness!)
+    recoveryAfterEach()
   })
 
   /** Step 1's read and the run's liveness read: both `status`, reading `state` (`waiting` is recorded, so step 1 does not clear). */
@@ -23377,7 +23363,7 @@ describe('b.jg5 SRJ-506 (hatch A3): the re-check\'s run of the restart path\'s d
     ['the run finds P connected: already-connected', true],
     ['the run reconnects P: reconnected', false],
   ] as const)('%s → cleared after the run, with no launch', async (_label, connected) => {
-    const { h, p } = srj105Build({ latchRecheck: true })
+    const { h, p } = buildRecoveryCase({ latchRecheck: true })
     latchForRecheck(h, p, BRING_UP_RECHECK_LATCH, ROW_WAITING)
     h.setConnected(p, connected)
     h.script(bothRead(cannedStatusResult().state))
@@ -23392,7 +23378,7 @@ describe('b.jg5 SRJ-506 (hatch A3): the re-check\'s run of the restart path\'s d
   })
 
   test('the run\'s launch fails (ErrTmuxSessionCreate) → a counted failure, cleared before its class handling; counted once', async () => {
-    const { h, p } = srj105Build({ latchRecheck: true })
+    const { h, p } = buildRecoveryCase({ latchRecheck: true })
     latchForRecheck(h, p, BRING_UP_RECHECK_LATCH, ROW_WAITING)
     h.script({ ...bothRead(LIVENESS_DEAD_ROW_ENDED), spawnError: errTmuxSessionCreate('spawn') })
 
@@ -23404,7 +23390,7 @@ describe('b.jg5 SRJ-506 (hatch A3): the re-check\'s run of the restart path\'s d
   })
 
   test('the run\'s launch fails at the cap → capped, cleared after the run', async () => {
-    const { h, p } = srj105Build({ latchRecheck: true })
+    const { h, p } = buildRecoveryCase({ latchRecheck: true })
     for (let i = 1; i < RESTART_FAILURE_CAP; i++) recordFailure(p)
     latchForRecheck(h, p, BRING_UP_RECHECK_LATCH, ROW_WAITING)
     h.script({ ...bothRead(LIVENESS_DEAD_ROW_ENDED), spawnError: errCwdNotFound('spawn') })
@@ -23417,7 +23403,7 @@ describe('b.jg5 SRJ-506 (hatch A3): the re-check\'s run of the restart path\'s d
   })
 
   test('the run\'s launch is refused with another case: P relatched during the run, never cleared after it; no call after the refusal', async () => {
-    const { h, p } = srj105Build({ latchRecheck: true })
+    const { h, p } = buildRecoveryCase({ latchRecheck: true })
     latchForRecheck(h, p, BRING_UP_RECHECK_LATCH, ROW_WAITING)
     const refusal = recheckConflict('spawn', 'scan-leftover')
     h.script({ ...bothRead(LIVENESS_DEAD_ROW_ENDED), spawnError: refusal })
@@ -23432,7 +23418,7 @@ describe('b.jg5 SRJ-506 (hatch A3): the re-check\'s run of the restart path\'s d
     expect(h.latchRecheck.isArmed(p)).toBe(true)
   })
 
-  // SRJ-506: an answer that gives no information keeps P latched, and a
+  // an answer that gives no information keeps P latched, and a
   // re-check's answer is never a counted launch failure; so a run whose
   // launch meets one is no counted failure, and nothing clears after it.
   test.each([
@@ -23441,7 +23427,7 @@ describe('b.jg5 SRJ-506 (hatch A3): the re-check\'s run of the restart path\'s d
     ['UNCLASSIFIED (ErrInternal)', () => errInternal(), []],
     ['CONFIG (ErrConfigMalformed)', () => errConfigMalformed(), ['ad-config-malformed']],
   ] as const)('the run\'s launch answering %s: P stays latched, no get after it, never counted as a launch failure, nothing armed', async (_label, make, flags) => {
-    const { h, p } = srj105Build({ latchRecheck: true })
+    const { h, p } = buildRecoveryCase({ latchRecheck: true })
     const record = latchForRecheck(h, p, BRING_UP_RECHECK_LATCH, ROW_WAITING)
     h.script({ ...bothRead(LIVENESS_DEAD_ROW_ENDED), spawnError: make() })
     const eventsBefore = h.latchEvents.length
@@ -23455,7 +23441,7 @@ describe('b.jg5 SRJ-506 (hatch A3): the re-check\'s run of the restart path\'s d
   })
 
   test('a run that ends on the reuse\'s second collision keeps P latched, with no post, nothing counted or armed and no call after it', async () => {
-    const { h, p } = srj105Build({ latchRecheck: true, resumeEnabled: false })
+    const { h, p } = buildRecoveryCase({ latchRecheck: true, resumeEnabled: false })
     const record = latchForRecheck(h, p, BRING_UP_RECHECK_LATCH, ROW_WAITING)
     h.script({
       ...bothRead(LIVENESS_DEAD_ROW_ENDED),
@@ -23477,7 +23463,7 @@ describe('b.jg5 SRJ-506 (hatch A3): the re-check\'s run of the restart path\'s d
   // The run's clear rule (`RESTART_DECISION_CLEARING_OUTCOMES`), at the round
   // with the run's outcome given (`runRestartDecision`): every outcome the
   // restart path answers, true for exactly those that complete with no
-  // refusal (b.jg5 SRJ-505's "a decision that completes with no refusal").
+  // refusal ("a decision that completes with no refusal").
   const RUN_CLEARS: ReadonlyArray<readonly [RestartRetryOutcome, boolean]> = [
     [RESTART_OUTCOME_ALREADY_CONNECTED, true],
     [RESTART_OUTCOME_RECONNECTED, true],
@@ -23502,7 +23488,7 @@ describe('b.jg5 SRJ-506 (hatch A3): the re-check\'s run of the restart path\'s d
   const exportedOutcomes: unknown[] = Object.entries(restartModule).filter(([name]) => name.startsWith('RESTART_OUTCOME_')).map(([, value]) => value)
 
   test.each(RUN_CLEARS)('a run answering %s: cleared after the run = %p (one hand-off, by the run); the round\'s one set observer lives for the run only', async (outcome, clears) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const record = latchForRecheckUnbound(h, p, BRING_UP_RECHECK_LATCH, ROW_WAITING)
     h.script(bothRead(cannedStatusResult().state))
     const order = recordCallOrder(h)
@@ -23526,7 +23512,7 @@ describe('b.jg5 SRJ-506 (hatch A3): the re-check\'s run of the restart path\'s d
   })
 
   test('a run that completes launched but during which P was latched again is not cleared after it, and its permit no longer holds', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     latchForRecheckUnbound(h, p, BRING_UP_RECHECK_LATCH, ROW_WAITING)
     h.script(bothRead(cannedStatusResult().state))
     const order = recordCallOrder(h)
@@ -23550,10 +23536,10 @@ describe('b.jg5 SRJ-506 (hatch A3): the re-check\'s run of the restart path\'s d
     expect(h.latch.isLatched(p)).toBe(true)
   })
 
-  // b.jg5 SRJ-505, SRJ-506: the observer is what revokes the run's permit at
+  // the observer is what revokes the run's permit at
   // its first refusal; one that cannot be added means no run.
   test('the latch\'s set observer cannot be added: no run, one line, the answer observer-failed (no information); P stays latched with no post and no hand-off', async () => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const record = latchForRecheckUnbound(h, p, BRING_UP_RECHECK_LATCH, ROW_WAITING)
     h.script(bothRead(cannedStatusResult().state))
     const order = recordCallOrder(h)
@@ -23586,7 +23572,7 @@ describe('b.jg5 SRJ-506 (hatch A3): the re-check\'s run of the restart path\'s d
 })
 
 // ---------------------------------------------------------------------------
-// b.jg5 SRJ-1306, SRJ-1401 (E39 T3): the forced-launch seams
+// the forced-launch seams
 // `tests/integration/fixtures/fmk-driver.ts` calls, on `makeRecoveryHarness`.
 // Each seam makes its one launch call through the production launch path with
 // nothing read of P's row first. Each answer is checked against a production
@@ -23601,7 +23587,7 @@ describe('b.jg5 SRJ-506 (hatch A3): the re-check\'s run of the restart path\'s d
 // it with the collision cause armed and `retrying`; for an UNUSABLE NAME
 // answer, a retired key's first launch, the production reuse spawn that also
 // read nothing of the row first, so both latch after the one latch-time
-// `status` read (b.jg5 SRJ-501, SRJ-805; scenario 25's form).
+// `status` read (scenario 25's form).
 // ---------------------------------------------------------------------------
 
 /** The two seams, by the call each forces: the seam, the stub verb of its call and the live-row sequence's launch of the same kind. */
@@ -23641,10 +23627,10 @@ function forcedComparedEffectsOf(h: RecoveryHarness, key: string): Record<string
   }
 }
 
-describe('b.jg5 SRJ-1306, SRJ-1401: the forced-launch seams make their one call through the production launch path, and answer as it does', () => {
+describe('the forced-launch seams make their one call through the production launch path, and answer as it does', () => {
   afterEach(() => {
-    expectNoKillOrDelete(srj105Harness!)
-    srj105AfterEach()
+    expectNoKillOrDelete(recoveryHarness!)
+    recoveryAfterEach()
   })
 
   // The forced resume decides on no row state: whatever P's row reads, nothing reads it before the one resume.
@@ -23652,7 +23638,7 @@ describe('b.jg5 SRJ-1306, SRJ-1401: the forced-launch seams make their one call 
   const SEAM_NAMES = Object.keys(FORCED_SEAMS) as ForcedSeamName[]
 
   test.each(SEAM_NAMES)('the forced %s while a launch of P is in flight: joins it with no call of its own; called false, the in-flight launch\'s result', async (name) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const id = personaInstanceId(p)
     const hold = holdSpawns(h.stub.client)
     const inFlight = h.launch(p)
@@ -23675,7 +23661,7 @@ describe('b.jg5 SRJ-1306, SRJ-1401: the forced-launch seams make their one call 
 
   test.each(SEAM_NAMES)('the forced %s of a persona whose claude_config_dir does not resolve: deferred as the production launch is, with no call; called false, nothing counted', async (name) => {
     const configDir = fixtureSubdir('claude-config')
-    const { h, p } = srj105Build({ personas: [{ claude_config_dir: configDir }, {}] })
+    const { h, p } = buildRecoveryCase({ personas: [{ claude_config_dir: configDir }, {}] })
     setConfigDirUnresolvableHook(() => false)
     _setConfigDirFs({ realpath: realpathFailingUnder(configDir, () => true) })
 
@@ -23686,7 +23672,7 @@ describe('b.jg5 SRJ-1306, SRJ-1401: the forced-launch seams make their one call 
   })
 
   test.each(SEAM_NAMES)('the forced %s in a dry run: no-op as the production launch of its kind answers, with no call; called false, nothing counted, nothing armed', async (name) => {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     process.env['SLACK_DRY_RUN'] = '1'
     const order = recordCallOrder(h)
 
@@ -23700,13 +23686,13 @@ describe('b.jg5 SRJ-1306, SRJ-1401: the forced-launch seams make their one call 
   })
 })
 
-// b.omv SR-7.6, b.jg5 SRJ-502/505: the extra provenance read is a refusal
+// the extra provenance read is a refusal
 // boundary even though the retry began with the persona already latched.
-describe('E4 guard: latch retry pre-resume provenance read', () => {
-  afterEach(srj105AfterEach)
+describe('guard: latch retry pre-resume provenance read', () => {
+  afterEach(recoveryAfterEach)
 
   function fixture(overrides: PersonaGetResultOverrides = {}, marked = true) {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     const record = latchForRecheckUnbound(h, p, RESUME_RECHECK_LATCH, ROW_ENDED)
     recordFailure(p)
     const row = harnessRow(h, harnessPersona(h, p), { ...ENDED_WITH_SESSION, ...overrides })
@@ -23768,7 +23754,7 @@ describe('E4 guard: latch retry pre-resume provenance read', () => {
 
 })
 
-// b.omv SR-5.5: exercise the automatic entry points through their real
+// exercise the automatic entry points through their real
 // guards; delivery policy/parser matrices live in delivery-*.test.ts.
 describe('automatic reconnect and startup typing entry points', () => {
   const entries = ['direct', 'launch wait', 'launch ladder', 'restart adapter'] as const
@@ -23863,19 +23849,19 @@ describe('automatic reconnect and startup typing entry points', () => {
     expect(clock.pendingCount()).toBe(0)
   })
 
-  // b.omv SR-8.5/AC108: production lifecycle callback, empty queue, no health tick.
+  // production lifecycle callback, empty queue, no health tick.
 
 })
 
-// b.omv SR-5.5/7.6: pause only the last get, after text and its delay.
+// pause only the last get, after text and its delay.
 // Restart uses the production adapter, without the delivery engine's guard.
-describe('E4 guard: reconnect final awaited get', () => {
+describe('guard: reconnect final awaited get', () => {
   let life: DeliveryLifecycle
   let clock: FakeClock
-  afterEach(async () => { await life?.stop(); setDeliveryLifecycle(undefined); srj105AfterEach() })
+  afterEach(async () => { await life?.stop(); setDeliveryLifecycle(undefined); recoveryAfterEach() })
 
   function fixture(entry: 'direct' | 'restart' | 'permit' = 'direct') {
-    const { h, p } = srj105Build()
+    const { h, p } = buildRecoveryCase()
     clock = createFakeClock()
     life = createDeliveryLifecycle({ clock })
     setDeliveryLifecycle(life)
@@ -24008,13 +23994,13 @@ describe('E4 guard: reconnect final awaited get', () => {
   })
 })
 
-// b.omv SR-5.6: the engine delegates to these production error handlers;
+// the engine delegates to these production error handlers;
 // classifier permutations remain in the existing reconnect/read tables.
 describe('production delivery error effects', () => {
-  afterEach(srj105AfterEach)
+  afterEach(recoveryAfterEach)
 
   test.each(['key-conflict', 'key-unusable', 'pane-conflict', 'get-unusable'] as const)('%s latches its persona with the delivery reading and leaves its sibling alone', async mode => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     const keyCall = mode.startsWith('key')
     const readVerb = mode.startsWith('get') ? 'get' : 'read-pane'
     const conflict = mode.endsWith('conflict')
@@ -24035,7 +24021,7 @@ describe('production delivery error effects', () => {
   })
 
   test.each((['key', 'get', 'read-pane'] as const).flatMap(site => [false, true].map(stop => ({ site, stop }))))('$site InvalidFlags rechecks once, stop=$stop', async ({ site, stop }) => {
-    const { h, p, b } = srj105Build()
+    const { h, p, b } = buildRecoveryCase()
     const recheck = h.recheckAnswers(stop ? DEV_PLACEHOLDER_VERSION : PHASE1_RC_VERSION)
     const error = errInvalidFlags(site === 'key' ? 'send-keys' : site)
     if (site === 'key') await handleDeliveryKeyError(p, error, harnessRow(h, personaOf(h.config, p), { state: 'waiting' }))
@@ -24053,11 +24039,11 @@ describe('production delivery error effects', () => {
 
 describe('reconnect continuation preserves partial command input', () => {
   let life: DeliveryLifecycle | undefined
-  afterEach(async () => { await life?.stop(); setDeliveryLifecycle(undefined); srj105AfterEach() })
+  afterEach(async () => { await life?.stop(); setDeliveryLifecycle(undefined); recoveryAfterEach() })
 
   test.each(['working-before-enter', 'unknown-text', 'refused-text', 'unknown-enter', 'refused-enter'] as const)(
     '%s: retry submits one complete reconnect command without appending or duplicating text', async fault => {
-      const { h, p } = srj105Build()
+      const { h, p } = buildRecoveryCase()
       const clock = createFakeClock()
       life = createDeliveryLifecycle({ clock })
       setDeliveryLifecycle(life)
@@ -24104,7 +24090,7 @@ describe('reconnect continuation preserves partial command input', () => {
   )
 })
 
-describe('b.acu: delivery GONE handoff preserves recovery guards', () => {
+describe('delivery GONE handoff preserves recovery guards', () => {
   test.each(['not-up', 'unapplied', 'wrong-instance', 'stale-launch', 'typing-owned', 'forgotten'] as const)(
     '%s refuses the affected persona without probing, while an eligible sibling enters checked recovery', async guard => {
       const h = makeRecoveryHarness({ harnessNow: true })
@@ -24151,7 +24137,7 @@ describe('b.acu: delivery GONE handoff preserves recovery guards', () => {
 // The real test-26 slow-create failures arm retries after the error returns.
 // AD outcomes below are modeled, while the retry/launch/checked-kill paths
 // run their production code. Native hook application belongs to Docker CI.
-describe('b.acu CI round 3: create-timeout recovery uses the first retry past B', () => {
+describe('CI round 3: create-timeout recovery uses the first retry past B', () => {
   test.each([
     [30_000, LAUNCH_TIMEOUT_FORM_CALL_TIMEOUT],
     [40_059, LAUNCH_TIMEOUT_FORM_TMUX_UNRESPONSIVE],
