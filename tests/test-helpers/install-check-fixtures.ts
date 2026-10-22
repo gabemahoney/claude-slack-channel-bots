@@ -1,5 +1,5 @@
 /**
- * install-check-fixtures.ts — Test helpers + fixture loaders for
+ * install-check-fixtures.ts — Test helpers for
  * src/install-check.ts (the install check, b.jg5 SRJ-212) and its callers
  * (`scripts/install-check.ts`, `src/postinstall.ts`).
  *
@@ -25,7 +25,6 @@
  *     `src/install-check.ts`'s exported text (`RUNBOOK_SECTION_POINTER`,
  *     `PUBLISHING_HOST_BLOCK_POINTER`, `CLIENT_PACKAGE_REMEDY`; b.jg5
  *     SRJ-208, SRJ-212), never a literal.
- *   - A fixture loader that reads files from tests/fixtures/version-floor/.
  *
  * This module has no top-level mock.module() calls — the pretest gate
  * scripts/check-no-toplevel-mock-module.ts must pass against it — and no
@@ -35,9 +34,6 @@
  *
  * SPDX-License-Identifier: MIT
  */
-
-import { readFileSync } from 'node:fs'
-import { join } from 'node:path'
 
 import { DEV_SENTINEL_VERSION } from 'agent-director'
 import type { UnreachableReason } from 'agent-director'
@@ -136,36 +132,6 @@ export function makeMalformedFloorJson(): string {
 /** Build a JSON document missing the .min_binary_version field. */
 export function makeMissingFieldFloorJson(): string {
   return JSON.stringify({ unrelated_field: 'value' }, null, 2) + '\n'
-}
-
-// ---------------------------------------------------------------------------
-// Fixture loader
-// ---------------------------------------------------------------------------
-
-const FIXTURES_DIR = join(import.meta.dirname, '..', 'fixtures', 'version-floor')
-
-/** Known fixture names under tests/fixtures/version-floor/. */
-export type FixtureName =
-  | 'floor-matched'
-  | 'floor-low'
-  | 'floor-high'
-  | 'malformed'
-  | 'missing-field'
-
-/**
- * Load a fixture's raw bytes. Tests that want parsed JSON should `JSON.parse`
- * the result themselves; the malformed fixture intentionally throws on parse.
- */
-export function loadFixtureRaw(name: FixtureName): string {
-  return readFileSync(join(FIXTURES_DIR, `${name}.json`), 'utf-8')
-}
-
-/**
- * Absolute filesystem path to a fixture, for tests that need to point a stub
- * at a real file path on disk.
- */
-export function fixturePath(name: FixtureName): string {
-  return join(FIXTURES_DIR, `${name}.json`)
 }
 
 // ---------------------------------------------------------------------------
