@@ -1,3 +1,4 @@
+import { deliveryResultSamples, deliveryCurrentSamples } from './test-helpers/shared-channels.ts'
 import { REPLY_REMINDER_TEXT } from '../src/reply-reminder.ts'
 /**
  * shipped-docs.test.ts — the shipped-description audit: what
@@ -413,6 +414,12 @@ import {
   SET_CHANNEL_DELIVERY_CHANNEL_DESCRIPTION,
   SET_CHANNEL_DELIVERY_DELIVERY_DESCRIPTION,
   SET_CHANNEL_DELIVERY_DESCRIPTION,
+  SET_CHANNEL_DELIVERY_ATTEMPT_DESCRIPTION,
+  SET_CHANNEL_DELIVERY_INTENT_DESCRIPTION,
+  channelDeliveryAttemptInputRefusal,
+  channelDeliveryDryRunRefusal,
+  channelDeliveryAttemptResultText,
+  channelDeliveryCurrentFactsText,
 } from '../src/registry.ts'
 import { RELOAD_NOOP } from '../src/reload-apply.ts'
 import {
@@ -1293,6 +1300,12 @@ const SET_CHANNEL_DELIVERY_TEXTS: readonly [exportName: string, form: string, te
   const s = toolTextSample
   return [
     ['SET_CHANNEL_DELIVERY_DESCRIPTION', '', () => SET_CHANNEL_DELIVERY_DESCRIPTION],
+    ['SET_CHANNEL_DELIVERY_ATTEMPT_DESCRIPTION', '', () => SET_CHANNEL_DELIVERY_ATTEMPT_DESCRIPTION],
+    ['SET_CHANNEL_DELIVERY_INTENT_DESCRIPTION', '', () => SET_CHANNEL_DELIVERY_INTENT_DESCRIPTION],
+    [channelDeliveryAttemptInputRefusal.name, '', () => channelDeliveryAttemptInputRefusal(s().name, s().key)],
+    [channelDeliveryDryRunRefusal.name, '', () => channelDeliveryDryRunRefusal(s().name, s().key)],
+    ...deliveryResultSamples().map(({ form, result, current }): [string, string, () => string] => [channelDeliveryAttemptResultText.name, form, () => channelDeliveryAttemptResultText(s().name, s().key, s().channel, result, current)]),
+    ...deliveryCurrentSamples().map(({ form, current }): [string, string, () => string] => [channelDeliveryCurrentFactsText.name, form, () => channelDeliveryCurrentFactsText(current)]),
     ['SET_CHANNEL_DELIVERY_CHANNEL_DESCRIPTION', '', () => SET_CHANNEL_DELIVERY_CHANNEL_DESCRIPTION],
     ['SET_CHANNEL_DELIVERY_DELIVERY_DESCRIPTION', '', () => SET_CHANNEL_DELIVERY_DELIVERY_DESCRIPTION],
     [channelDeliveryDeclarativeRefusal.name, '', () => channelDeliveryDeclarativeRefusal(s().name, s().key)],
@@ -1719,6 +1732,8 @@ describe(`forbidden-term audit (README, skills, manifest, MCP instructions, ${SE
       [channelDeliveryValueRefusal.name]: ['echoed', 'not shown'],
       [channelDeliveryChannelRefusal.name]: ['echoed', 'not shown'],
       [channelDeliverySetResultText.name]: ['plain', 'held by the loop guard'],
+      [channelDeliveryAttemptResultText.name]: deliveryResultSamples().map(sample => sample.form),
+      [channelDeliveryCurrentFactsText.name]: deliveryCurrentSamples().map(sample => sample.form),
     }
     const exported = Object.keys(registryExports).filter((name) => /^(?:SET_CHANNEL_DELIVERY_\w*DESCRIPTION|channelDelivery\w+(?:Refusal|Text))$/.test(name))
     expect(exported.length).toBeGreaterThanOrEqual(10)
@@ -1726,6 +1741,15 @@ describe(`forbidden-term audit (README, skills, manifest, MCP instructions, ${SE
       .flatMap((name) => (TWO_FORMS[name] ?? ['']).map((form) => toolTextName(name, form)))
     const read = SHIPPED_TEXTS.map(([name]) => name)
     expect(expected.filter((name) => !read.includes(name))).toEqual([])
+  })
+
+  test('attempt outcome inventory keeps every status and rejection and current restrictions', () => {
+    expect(deliveryResultSamples().map(sample => sample.form)).toEqual([
+      'new', 'historical', 'not-applied-membership', 'not-applied-inactive', 'not-applied-strict',
+      'not-applied-dry-run', 'not-applied-write-failed', 'pending', 'unresolved', 'binding-conflict', 'invalid', 'inactive',
+    ])
+    const current = deliveryCurrentSamples()
+    expect(new Set(current.map(sample => sample.form)).size).toBe(31)
   })
 
   test(`each two-form ${SET_CHANNEL_DELIVERY_TOOL} builder is read in both forms: the echoed form names the sample, the not-shown one does not`, () => {
@@ -7745,7 +7769,7 @@ const README_DEO_ROWS: readonly DocRow[] = [
 ...TARGETING_TOOLS.map((tool): DocRow => [`Tools: the ${tool} row states its targets in each mode`, toolRowOf(tool), [
     ci(tool === 'reply' ? "in strict mode one of the persona's configured non-off channels; in open mode any channel ID" : 'a configured non-off channel in strict mode; any channel ID in open mode'),
   ]]),
-["Tools: set_channel_delivery updates one shared authority", toolRowOf(SET_CHANNEL_DELIVERY_TOOL), [ci("`off`"), ci("`mentions`"), ci("`all`"), ci("`thread_hybrid`"), ci("open mode"), ci("strict mode"), ci("config.json.last-applied"), ci("no Slack call")]],
+["Tools: set_channel_delivery updates one shared authority", toolRowOf(SET_CHANNEL_DELIVERY_TOOL), [ci("`off`"), ci("`mentions`"), ci("`all`"), ci("`thread_hybrid`"), ci("open mode"), ci("strict mode"), ci("config.json.last-applied"), ci("no Slack call"), ci("`attempt_id`"), ci("`intent`"), ci("retry"), ci("history"), ci("membership")]],
 ['Tools: the known residual in an externally shared channel the app is in ', readmeSection(TOOLS_HEADING), [
     ci("CSCB makes no Slack call to learn whether a channel holds the persona's app, is externally shared or is a group DM"),
     ci('So in open mode it refuses no post, read, reaction or edit in an externally shared channel that the app belongs to'),

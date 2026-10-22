@@ -4823,7 +4823,8 @@ describe('server.ts refuses service to a persona that is not up', () => {
     expect(outcomes.get('isUp')).toMatch(/^\((\w+)\) => bringUps\?\.isUp\(\1\) \?\? false$/)
     expect(outcomes.get('isApplied')).toMatch(/^\((\w+)\) => bringUps\?\.isApplied\(\1\) \?\? false$/)
     // Never called directly, and no serving check copied in.
-    expect(callsOf('isPersonaUp')).toHaveLength(4)
+    expect(callsOf('isPersonaUp')).toHaveLength(5)
+    expect(objectProperties(spreadConstObject('sessionToolDeps')).get('isPersonaUp')).toBe('key => !shuttingDown && isPersonaUp(key)')
     expect(withinCall(callsOf('isPersonaUp'), onlyCallOf('createDeliveryReporting'))).toBe(1)
     expect(withinCall(callsOf('isPersonaUp'), onlyCallOf('createDeliveryEngines'))).toBe(1)
     expect(withinCall(callsOf('isPersonaUp'), onlyCallOf('createReplyReminders'))).toBe(1)
@@ -5233,11 +5234,11 @@ describe('main() adapts the recovered shared authority once before bring-up', ()
 })
 
 /** set_channel_delivery's call-time inputs; renaming one fails the typecheck. */
-const SESSION_TOOLS_HEARD: keyof SessionToolDeps = 'heardChannels'
+const SESSION_TOOLS_MEMBERSHIP: keyof SessionToolDeps = 'readChannelMembership'
+const SESSION_TOOLS_UP: keyof SessionToolDeps = 'isPersonaUp'
 const SESSION_TOOLS_APPLIED: keyof SessionToolDeps = 'getAppliedPersonas'
 const SESSION_TOOLS_LOG: keyof SessionToolDeps = 'log'
-/** The routing's heard-set read; renaming it fails the typecheck. */
-const ROUTING_HEARD: keyof PersonaRouting = 'heardChannels'
+
 
 describe('the routing and the session tools read the one stored-choice store through its holder at each call, and set_channel_delivery\'s other inputs at each call', () => {
   // Every member here is optional in PersonaRoutingDeps or SessionToolDeps,
@@ -5253,11 +5254,12 @@ describe('the routing and the session tools read the one stored-choice store thr
     expect(member()).toBe(`() => ${CHANNEL_DELIVERY_HOLDER}`)
   })
 
-  test('the session tools\' heardChannels asks the one routing instance for the key at each call, getAppliedPersonas reads the applied config holder\'s personas at each call, and log writes to console.error', () => {
+  test('the session tools read current membership and up/shutdown state at every call, getAppliedPersonas reads the applied config holder\'s personas at each call, and log writes to console.error', () => {
     const props = objectProperties(spreadConstObject('sessionToolDeps'))
     const routing = constOf('createPersonaRouting')
     expect(insideMain(onlyCallOf('createPersonaRouting'))).toBe(false)
-    expect(props.get(SESSION_TOOLS_HEARD)).toMatch(new RegExp(`^\\(?(\\w+)\\)? => ${routing}\\.${ROUTING_HEARD}\\(\\1\\)$`))
+    expect(props.get(SESSION_TOOLS_MEMBERSHIP)).toBe("(key, channel, mode) => channelMembership?.read(key, channel, mode) ?? { kind: 'unresolved', reason: 'current-membership-missing' }")
+    expect(props.get(SESSION_TOOLS_UP)).toBe('key => !shuttingDown && isPersonaUp(key)')
     expect(props.get(SESSION_TOOLS_APPLIED)).toBe(`() => ${loadedConfigName(SERVER_CODE)}?.personas ?? []`)
     expect(props.get(SESSION_TOOLS_LOG)).toMatch(/^\(\s*(\w+)\s*\)\s*=>\s*console\.error\(\s*\1\s*\)$/)
   })
@@ -5268,7 +5270,7 @@ describe('the routing and the session tools read the one stored-choice store thr
     const named = indicesOf(/\bgetChannelDelivery\b/g, SERVER_CODE)
     expect(named).toHaveLength(2)
     expect(withinCall(named, onlyCallOf('createPersonaRouting'))).toBe(1)
-    const members = [SESSION_TOOLS_CHANNEL_DELIVERY, SESSION_TOOLS_HEARD, SESSION_TOOLS_APPLIED, SESSION_TOOLS_LOG].join('|')
+    const members = [SESSION_TOOLS_CHANNEL_DELIVERY, SESSION_TOOLS_MEMBERSHIP, SESSION_TOOLS_UP, SESSION_TOOLS_APPLIED, SESSION_TOOLS_LOG].join('|')
     expect(indicesOf(new RegExp(`\\bsessionToolDeps\\s*(?:\\.\\s*(?:${members})\\b|\\[)`, 'g'), SERVER_CODE)).toEqual([])
   })
 })

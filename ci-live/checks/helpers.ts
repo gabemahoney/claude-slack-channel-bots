@@ -115,6 +115,9 @@ export interface ToolCall {
   threadTs: boolean
   /** Its `delivery` input (set_channel_delivery), or null. */
   delivery: string | null
+  /** Caller-retained logical identity and explicit intent; absent/wrong type stays null. */
+  attemptId: string | null
+  intent: string | null
   /** `ok` (the server returned no error), `error`, or `none` (no result in the transcript yet). */
   outcome: 'ok' | 'error' | 'none'
   /** A refused call's tool error text, or null (an accepted call's content is never carried). */
@@ -144,6 +147,8 @@ export function toolCallsScript(letter: PersonaLetter, tool: string): string {
     '    ts: (if $in.message_id == null then null else ($in.message_id | tostring) end),',
     '    threadTs: ((($in.thread_ts // "") | tostring) != ""),',
     '    delivery: (if $in.delivery == null then null else ($in.delivery | tostring) end),',
+    '    attemptId: (if ($in.attempt_id | type) == "string" then $in.attempt_id else null end),',
+    '    intent: (if ($in.intent | type) == "string" then $in.intent else null end),',
     '    outcome: $outcome,',
     '    error: (if $outcome == "error" then ($r.content | if type == "string" then . elif type == "array" then ([ .[] | .text? // empty ] | join(" ")) else "" end) else null end) }',
   ].join('\n')
@@ -165,6 +170,8 @@ function asToolCall(value: unknown): ToolCall | null {
     ts: typeof v.ts === 'string' ? v.ts : null,
     threadTs: v.threadTs === true,
     delivery: typeof v.delivery === 'string' ? v.delivery : null,
+    attemptId: typeof v.attemptId === 'string' ? v.attemptId : null,
+    intent: typeof v.intent === 'string' ? v.intent : null,
     outcome,
     error: outcome === 'error' && typeof v.error === 'string' ? v.error : null,
   }

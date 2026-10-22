@@ -716,11 +716,12 @@ const sessionToolDeps: SessionToolDeps = {
   // beside set_channel_delivery's inputs, each
   // read at call time. The one stored-choice store, through the holder main()
   // sets (undefined before then, so the call is refused and nothing is
-  // written); the routing's heard set; the applied personas of the
+  // written); current up/membership evidence; the applied personas of the
   // configuration in effect, for the loop guard. The routing is built further
   // down, so it is named only inside the arrow.
   getChannelDelivery: () => channelDeliveryStore,
-  heardChannels: (key) => personaRouting.heardChannels(key),
+  isPersonaUp: key => !shuttingDown && isPersonaUp(key),
+  readChannelMembership: (key, channel, mode) => channelMembership?.read(key, channel, mode) ?? { kind: 'unresolved', reason: 'current-membership-missing' },
   getAppliedPersonas: () => personaConfig?.personas ?? [],
   // the persona-channel-delivery-set line goes to the
   // [slack] stream, as the routing's persona lines do.

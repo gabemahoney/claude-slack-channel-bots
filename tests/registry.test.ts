@@ -2742,7 +2742,7 @@ describe('tool list and instructions', () => {
       edit_message: { properties: ['chat_id', 'message_id', 'text'], required: ['chat_id', 'message_id', 'text'] },
       fetch_messages: { properties: ['channel', 'limit', 'thread_ts'], required: ['channel'] },
       download_attachment: { properties: ['chat_id', 'message_id'], required: ['chat_id', 'message_id'] },
-      [SET_CHANNEL_DELIVERY_TOOL]: { properties: ['channel', 'delivery'], required: ['channel', 'delivery'] },
+      [SET_CHANNEL_DELIVERY_TOOL]: { properties: ['channel', 'delivery', 'attempt_id', 'intent'], required: ['channel', 'delivery', 'attempt_id', 'intent'] },
     })
     // the whole tool definition (name, description, every schema
     // property name and description), so a reload tool or hint can't slip in.

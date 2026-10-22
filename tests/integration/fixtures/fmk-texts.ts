@@ -3980,6 +3980,35 @@ const deliverySetResult: Entry = {
   },
 }
 
+/** Expected result derived from the installed validated attempt evidence after
+ * a scenario call. The scenario supplies its independently expected effective
+ * choice, or an unavailable reason; this never creates authority or writes. */
+const deliveryAttemptResult: Entry = {
+  synopsis: '<config> <record> <key> <channel> <delivery> <attempt-id> <new|history> <effective|channel-removed>',
+  async print(args, context) {
+    const entry = 'channelDeliveryAttemptResultText'
+    expectArguments(entry, args, ['config', 'record', 'key', 'channel', 'delivery', 'attempt-id', 'new|history', 'effective|channel-removed'])
+    const [configPath, recordPath, key, channel, delivery, attemptId, history, effective] = args
+    if (history !== 'new' && history !== 'history') usageFail(`${entry}: expected new or history`)
+    const { state } = await readSharedConfiguration(context, configPath!, recordPath!)
+    const create = await packageFunction<(path: string, state: object, deps: object) => {
+      incarnation(key: string): string | undefined; choice(key: string, channel: string): string | undefined;
+      config(): { channel_mode: string; personas: Array<{ key: string; name: string }> };
+      lookupBotAttempt(key: string, life: string, request: object): { kind: string; historical?: boolean } | undefined;
+    }>(context, 'shared-channels.ts', 'createSharedChannelAuthority')
+    const authority = create(recordPath!, state, { sourcePath: configPath! })
+    const outcome = authority.lookupBotAttempt(key!, authority.incarnation(key!)!, { channel, delivery, attempt_id: attemptId, intent: 'retry' })
+    if (!outcome) throw new PrinterFailure('attempt evidence is absent', PRINTER_FAIL_EXIT)
+    if (outcome.kind === 'applied') outcome.historical = history === 'history'
+    const config = authority.config(), saved = authority.choice(key!, channel!)
+    if (effective !== 'channel-removed') await checkDeliveryArgument(context, entry, 'effective', effective!)
+    const current = effective === 'channel-removed' ? { kind: 'unavailable', reason: 'channel-removed' } :
+      { kind: 'available', mode: config.channel_mode, facts: { saved, effective, heldByLoopGuard: saved !== 'off' && saved !== effective } }
+    const build = await packageFunction<(name: string, key: string, channel: string, result: object, current: object) => unknown>(context, 'registry.ts', entry)
+    return builtString(entry, build(config.personas.find(p => p.key === key)!.name, key!, channel!, outcome, current))
+  },
+}
+
 /** Read and validate the entire authority with the installed production reader.
  * These entries print only a boolean/number or a production diagnostic, never
  * submitted configuration, credentials, parser errors or arbitrary fields.
@@ -4314,6 +4343,9 @@ const ENTRIES: Readonly<Record<string, Entry>> = joinEntryTables({
   channelDeliveryChannelRefusal: builderEntry('registry.ts', 'channelDeliveryChannelRefusal', ['name', 'key', 'channel']),
   channelDeliveryValueRefusal: builderEntry('registry.ts', 'channelDeliveryValueRefusal', ['name', 'key', 'value']),
   channelDeliverySetResultText: deliverySetResult,
+  channelDeliveryAttemptResultText: deliveryAttemptResult,
+  channelDeliveryAttemptInputRefusal: builderEntry('registry.ts', 'channelDeliveryAttemptInputRefusal', ['name', 'key']),
+  channelDeliveryDryRunRefusal: builderEntry('registry.ts', 'channelDeliveryDryRunRefusal', ['name', 'key']),
   modeSwitchLine: modeSwitchLineEntry,
   channelModeOf: channelModeOfSwitch,
   MODE_SWITCH_SETTING: constantEntry('reload-plan.ts', 'MODE_SWITCH_SETTING'),

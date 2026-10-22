@@ -579,6 +579,24 @@ expect_tool() {
     [[ "${CALL_TEXT}" == "$5" ]] || fail "${step}: the result reads '${CALL_TEXT}', expected '$5'"
 }
 
+# Every deliberate request is retained explicitly before submission. The
+# request JSONL written by stub_session_call preserves this binding as well.
+attempt_args() {
+    jq -cn --arg id "$1" --arg c "$2" --arg d "$3" --arg intent "${4:-assignment}" \
+        '{channel:$c,delivery:$d,attempt_id:$id,intent:$intent}'
+}
+
+# Read the production-validated durable outcome AFTER the call. Expected current
+# effectiveness is supplied by this scenario's independent guard/eligibility setup.
+expect_attempt() {
+    local step="$1" dir="$2" args="$3" key="$4" effective="$5" history="${6:-new}" want_error="${7:-false}" expected
+    call_tool "${dir}" "${args}"
+    expected="$(printed channelDeliveryAttemptResultText "${CONFIG}" "${CONFIG}.last-applied" "${key}" \
+        "$(jq -r .channel <<< "${args}")" "$(jq -r .delivery <<< "${args}")" "$(jq -r .attempt_id <<< "${args}")" "${history}" "${effective}")"
+    [[ "${CALL_IS_ERROR}" == "${want_error}" ]] || fail "${step}: unexpected error flag"
+    [[ "${CALL_TEXT}" == "${expected}" ]] || fail "${step}: result differs from retained outcome/current facts"
+}
+
 # A persona's registration and launch lines, as one comparable word: Session
 # connected, persona-start, spawnForPersona and relaunch lines.
 # launch_counts <ref> <persona-start matcher> <relaunch head>
@@ -803,10 +821,8 @@ ALPHA_INVITED_LINE="$(persona_line "${PERSONA_INVITED_CHANNEL}" alpha "${INVITED
     || fail "fmk-texts: formatPersonaDiagnostic does not end in its cause after a head"
 ALPHA_INVITED_HEAD="${ALPHA_INVITED_LINE%"${INVITED_MARKER}"}"
 ALPHA_DECLARATIVE_REFUSAL="$(printed channelDeliveryDeclarativeRefusal "${ALPHA}" "${ALPHA_KEY}")"
-ALPHA_X1_REFUSAL="$(printed channelDeliveryChannelRefusal "${ALPHA}" "${ALPHA_KEY}" "${X1}")"
 BAD_DELIVERY='everything'
 ALPHA_VALUE_REFUSAL="$(printed channelDeliveryValueRefusal "${ALPHA}" "${ALPHA_KEY}" "${BAD_DELIVERY}")"
-[[ "${ALPHA_X1_REFUSAL}" == *"\"${X1}\""* ]] || fail "fmk-texts: the channel refusal does not name ${X1}"
 [[ "${ALPHA_VALUE_REFUSAL}" == *"\"${BAD_DELIVERY}\""* ]] || fail "fmk-texts: the value refusal does not name ${BAD_DELIVERY}"
 # src/restart.ts relaunchAfterKillLine: the restart work's line before a
 # relaunch, whatever its kill. Its fixed head is the text before the cwd:
@@ -820,9 +836,13 @@ relaunch_head() {
 }
 ALPHA_RELAUNCH="$(relaunch_head "${ALPHA_KEY}")"
 BRAVO_RELAUNCH="$(relaunch_head "${BRAVO_KEY}")"
-RESULT_F1_ALL="$(printed channelDeliverySetResultText "${F1}" all all not-held)"
-RESULT_A1_HELD="$(printed channelDeliverySetResultText "${A1}" all mentions held)"
-F1_ALL_ARGS="$(jq -c -n --arg c "${F1}" '{channel: $c, delivery: "all"}')"
+F1_ALL_ARGS="$(attempt_args "${TEST_NAME}-alpha-f1-initial" "${F1}" all)"
+BRAVO_F1_ALL_ARGS="$(attempt_args "${TEST_NAME}-bravo-f1-initial" "${F1}" all)"
+BRAVO_A1_ALL_ARGS="$(attempt_args "${TEST_NAME}-bravo-a1-initial" "${A1}" all)"
+F1_RETRY_ARGS="$(attempt_args "${TEST_NAME}-alpha-f1-initial" "${F1}" all retry)"
+F1_FRESH_ARGS="$(attempt_args "${TEST_NAME}-alpha-f1-after-restart" "${F1}" all)"
+STRICT_FRESH_ARGS="$(attempt_args "${TEST_NAME}-strict-fresh" "${F1}" all)"
+X1_ARGS="$(attempt_args "${TEST_NAME}-unverified-x1" "${X1}" all)"
 
 wait_for_log "${STARTUP_COMPLETE}" "${START_WAIT_S}" "start: the start pass never completed"
 expect_completion 2 "start" "0 not brought up"
@@ -929,8 +949,13 @@ wait_queued "phase A: bravo B1 mention" "${BRAVO_DIR}" "${B1}" "${PUSH_TS}" "${V
 # alpha calls the tool for A1 with `all`: refused with the declarative text,
 # found in the results record with isError set (the first-tool-result
 # control); nothing written.
+SCHEMA_RESULT="$(stub_session_call "${ALPHA_DIR}" tools/list '{}')"
+jq -e '.isError == false and (.text | fromjson | map(select(.name == "set_channel_delivery")) | length == 1)' <<< "${SCHEMA_RESULT}" > /dev/null || fail "missing negotiated tool"
+jq -e '.text | fromjson | .[] | select(.name == "set_channel_delivery") | .inputSchema |
+    .required == ["channel","delivery","attempt_id","intent"] and .additionalProperties == false and
+    .properties.intent.enum == ["assignment","retry"] and .properties.delivery.enum == ["off","mentions","all","thread_hybrid"]' <<< "${SCHEMA_RESULT}" > /dev/null || fail "negotiated attempt schema differs"
 expect_tool "phase A: alpha's set_channel_delivery A1 all" "${ALPHA_DIR}" \
-    "$(jq -c -n --arg c "${A1}" '{channel: $c, delivery: "all"}')" true "${ALPHA_DECLARATIVE_REFUSAL}"
+    "$(attempt_args "${TEST_NAME}-strict-initial" "${A1}" all)" true "${ALPHA_DECLARATIVE_REFUSAL}"
 [[ ! -e "${SLACK_STATE_DIR}/channel-delivery.json" ]] || fail "phase A: the refused call created a legacy store"
 cmp -s -- "${CONFIG}" "${CONFIG_A_COPY}" || fail "phase A: config.json changed after the refused call"
 check_upgrade_log "phase A after its last control"
@@ -1073,7 +1098,7 @@ expect_since "${B7_MARK}" "${ALPHA_HEARS_A1}" 1 "step 7: alpha's persona-invited
 #    delivery `all`; one persona-channel-delivery-set line; then alpha, F1,
 #    plain: delivered `receive_all`.
 B8_MARK="$(log_mark)"
-expect_tool "step 8: alpha's set_channel_delivery F1 all" "${ALPHA_DIR}" "${F1_ALL_ARGS}" false "${RESULT_F1_ALL}"
+expect_attempt "step 8: alpha's set_channel_delivery F1 all" "${ALPHA_DIR}" "${F1_ALL_ARGS}" "${ALPHA_KEY}" all
 expect_since "${B8_MARK}" "${ALPHA_SET_F1}" 1 "step 8: alpha's persona-channel-delivery-set lines"
 [[ -f "${STORE_FILE}" ]] || fail "step 8: the accepted call wrote no ${STORE_FILE}"
 push_message "${ALPHA_LABEL}" "${F1}" channel "$(plain_text)"
@@ -1082,10 +1107,9 @@ wait_queued "step 8: alpha F1 plain" "${ALPHA_DIR}" "${F1}" "${PUSH_TS}" "${VIA_
 # 9. alpha's refused calls: X1 with `all` (naming X1), F1 with "everything"
 #    (naming the value); neither stores anything.
 B9_MARK="$(log_mark)"
-expect_tool "step 9: alpha's set_channel_delivery X1 all" "${ALPHA_DIR}" \
-    "$(jq -c -n --arg c "${X1}" '{channel: $c, delivery: "all"}')" true "${ALPHA_X1_REFUSAL}"
+expect_attempt "step 9: alpha's set_channel_delivery X1 all" "${ALPHA_DIR}" "${X1_ARGS}" "${ALPHA_KEY}" channel-removed new true
 expect_tool "step 9: alpha's set_channel_delivery F1 ${BAD_DELIVERY}" "${ALPHA_DIR}" \
-    "$(jq -c -n --arg c "${F1}" --arg d "${BAD_DELIVERY}" '{channel: $c, delivery: $d}')" true "${ALPHA_VALUE_REFUSAL}"
+    "$(attempt_args "${TEST_NAME}-invalid-value" "${F1}" "${BAD_DELIVERY}")" true "${ALPHA_VALUE_REFUSAL}"
 expect_since "${B9_MARK}" "[slack] ${PERSONA_CHANNEL_DELIVERY_SET}:" 0 "step 9: persona-channel-delivery-set lines"
 
 # 10. bravo and A1, alpha's fungible destination: a mention is delivered (A1
@@ -1095,8 +1119,7 @@ B10_MARK="$(log_mark)"
 push_message "${BRAVO_LABEL}" "${A1}" channel "$(mention_text "${BRAVO_BOT_USER}")"
 wait_queued "step 10: bravo A1 mention" "${BRAVO_DIR}" "${A1}" "${PUSH_TS}" "${VIA_MENTION}"
 expect_since "${B10_MARK}" "${BRAVO_HEARS_A1}" 1 "step 10: bravo's persona-invited-channel lines for A1"
-expect_tool "step 10: bravo's set_channel_delivery A1 all" "${BRAVO_DIR}" \
-    "$(jq -c -n --arg c "${A1}" '{channel: $c, delivery: "all"}')" false "${RESULT_A1_HELD}"
+expect_attempt "step 10: bravo's set_channel_delivery A1 all" "${BRAVO_DIR}" "${BRAVO_A1_ALL_ARGS}" "${BRAVO_KEY}" mentions
 expect_since "${B10_MARK}" "${BRAVO_SET_A1}" 1 "step 10: bravo's persona-channel-delivery-set lines for A1"
 B10_PLAIN_MARK="$(log_mark)"
 push_message "${BRAVO_LABEL}" "${A1}" channel "$(plain_text)"
@@ -1111,7 +1134,7 @@ expect_queued "step 10: bravo A1 plain" 0 "${BRAVO_DIR}" "${A1}" "${B10_TS}"
 B11_MARK="$(log_mark)"
 push_message "${BRAVO_LABEL}" "${F1}" channel "$(mention_text "${BRAVO_BOT_USER}")"
 wait_queued "step 11: bravo F1 mention" "${BRAVO_DIR}" "${F1}" "${PUSH_TS}" "${VIA_MENTION}"
-expect_tool "step 11: bravo's set_channel_delivery F1 all" "${BRAVO_DIR}" "${F1_ALL_ARGS}" false "${RESULT_F1_ALL}"
+expect_attempt "step 11: bravo's set_channel_delivery F1 all" "${BRAVO_DIR}" "${BRAVO_F1_ALL_ARGS}" "${BRAVO_KEY}" all
 expect_since "${B11_MARK}" "${BRAVO_SET_F1}" 1 "step 11: bravo's persona-channel-delivery-set lines for F1"
 push_both "${F1}" channel "$(plain_text)"
 B11_TS="${PUSH_TS}"
@@ -1189,7 +1212,9 @@ done
 # alpha calls the tool for F1 with `all` before any F1 event: accepted as a
 # stored channel, `all` before and after. Its result also shows the new
 # client polled the request file.
-expect_tool "restart: alpha's set_channel_delivery F1 all" "${ALPHA_DIR}" "${F1_ALL_ARGS}" false "${RESULT_F1_ALL}"
+expect_attempt "restart: alpha retries its retained ID" "${ALPHA_DIR}" "${F1_RETRY_ARGS}" "${ALPHA_KEY}" all history
+expect_since "${RESTART_MARK}" "${ALPHA_SET_F1_AGAIN}" 0 "restart: history creates no assignment diagnostic"
+expect_attempt "restart: alpha deliberately writes all again" "${ALPHA_DIR}" "${F1_FRESH_ARGS}" "${ALPHA_KEY}" all
 expect_since "${RESTART_MARK}" "${ALPHA_SET_F1_AGAIN}" 1 "restart: alpha's persona-channel-delivery-set lines (all to all)"
 
 # the reconnect's new clients read each request file from its
@@ -1236,7 +1261,8 @@ wait_queued "switch off: bravo B1 mention" "${BRAVO_DIR}" "${B1}" "${OFF_B1_TS}"
 expect_sessions_kept "switch off" "${A1}" "${OFF_A1_TS}" "${B1}" "${OFF_B1_TS}"
 
 # alpha's call for F1: refused with the declarative text; the file unchanged.
-expect_tool "switch off: alpha's set_channel_delivery F1 all" "${ALPHA_DIR}" "${F1_ALL_ARGS}" true "${ALPHA_DECLARATIVE_REFUSAL}"
+expect_attempt "switch off: retained history remains readable" "${ALPHA_DIR}" "${F1_RETRY_ARGS}" "${ALPHA_KEY}" all history
+expect_tool "switch off: alpha's set_channel_delivery F1 all" "${ALPHA_DIR}" "${STRICT_FRESH_ARGS}" true "${ALPHA_DECLARATIVE_REFUSAL}"
 jq -ne --slurpfile before "${STORE_BEFORE_OFF}" --slurpfile after "${STORE_FILE}" '$before[0].personas == $after[0].personas' > /dev/null \
     || fail "switch off: applied persona choices changed"
 

@@ -3720,6 +3720,7 @@ describe('Checks 30 to 32 against a scripted workspace and server', () => {
     setLines?: number
     /** The delivery C's call asks for (default all). */
     askedDelivery?: 'mentions' | 'all'
+    attemptEvidence?: 'missing-id' | 'wrong-id' | 'missing-intent' | 'wrong-intent'
     /** C does not answer the message that does not mention it. */
     ignorePlain?: boolean
     /** With the switch off, C fails to answer, or incorrectly calls the listed channel unclaimed. */
@@ -3777,7 +3778,10 @@ describe('Checks 30 to 32 against a scripted workspace and server', () => {
             const asked = opts.askedDelivery ?? 'all'
             const refused = opts.callOutcome === 'error'
             const error = refused ? slackRefusalToolErrorText(SET_CHANNEL_DELIVERY_TOOL, C_PERSONA, channel, undefined) : null
-            calls.push(JSON.stringify({ channel, ts: null, threadTs: false, delivery: asked, outcome: refused ? 'error' : 'ok', error }))
+            const retained = /attempt_id `([^`]+)`/.exec(text)?.[1]
+            const attemptId = opts.attemptEvidence === 'missing-id' ? null : opts.attemptEvidence === 'wrong-id' ? 'wrong' : retained
+            const intent = opts.attemptEvidence === 'missing-intent' ? null : opts.attemptEvidence === 'wrong-intent' ? 'new' : 'assignment'
+            calls.push(JSON.stringify({ channel, ts: null, threadTs: false, delivery: asked, attemptId, intent, outcome: refused ? 'error' : 'ok', error }))
             if (!refused) {
               logTimes(opts.setLines ?? 1, cLog(PERSONA_CHANNEL_DELIVERY_SET, srcChannelDeliverySetCause(channel, delivery, asked, asked)))
               const authority = worldAuthority(world)
@@ -3914,6 +3918,10 @@ describe('Checks 30 to 32 against a scripted workspace and server', () => {
   })
 
   test.each<[string, InvitedOpts, string]>([
+    ['missing retained ID', { attemptEvidence: 'missing-id' }, 'C did not preserve the requested attempt identifier'],
+    ['changed retained ID', { attemptEvidence: 'wrong-id' }, 'C did not preserve the requested attempt identifier'],
+    ['missing intent', { attemptEvidence: 'missing-intent' }, 'C omitted or changed the explicit attempt intent'],
+    ['unknown intent', { attemptEvidence: 'wrong-intent' }, 'C omitted or changed the explicit attempt intent'],
     ['a refused set_channel_delivery call', { callOutcome: 'error' }, `C's ${SET_CHANNEL_DELIVERY_TOOL} call was refused`],
     ['a call asking for a delivery other than all', { askedDelivery: 'mentions' }, `C's call asked for delivery mentions, not all`],
     ['no persona-channel-delivery-set line', { setLines: 0 }, `expected one ${PERSONA_CHANNEL_DELIVERY_SET} line naming C and the run channel (mentions to all, at all), found 0`],
@@ -3983,7 +3991,7 @@ describe("the tool-call reader (toolCalls) over a persona's transcript", () => {
     use('t4', EDIT_MESSAGE_TOOL, { chat_id: CH, message_id: POST, text: CONTENT }),
     use('t5', FETCH_MESSAGES_TOOL, { channel: CH, thread_ts: POST }),
     result('t5', [{ type: 'text', text: JSON.stringify([{ text: CONTENT }]) }], false),
-    use('t6', SET_CHANNEL_DELIVERY_TOOL, { channel: CH, delivery: 'all' }),
+    use('t6', SET_CHANNEL_DELIVERY_TOOL, { channel: CH, delivery: 'all', attempt_id: 'retained-check', intent: 'assignment' }),
     result('t6', [{ type: 'text', text: `Stored all ${CONTENT}` }]),
     use('t7', REPLY_TOOL, { chat_id: 'D0DRYDM001', text: 'done' }),
     result('t7', 'Sent 1 message(s) to D0DRYDM001'),
@@ -4007,14 +4015,14 @@ describe("the tool-call reader (toolCalls) over a persona's transcript", () => {
     return r.stdout.toString().split('\n').filter((l) => l !== '')
   }
 
-  const call = (over: Partial<ToolCall>): ToolCall => ({ channel: CH, ts: null, threadTs: false, delivery: null, outcome: 'ok', error: null, ...over })
+  const call = (over: Partial<ToolCall>): ToolCall => ({ channel: CH, ts: null, threadTs: false, delivery: null, attemptId: null, intent: null, outcome: 'ok', error: null, ...over })
 
   test.each([
     [REPLY_TOOL, [call({ outcome: 'error', error: refusal(REPLY_TOOL, 'not_in_channel') }), call({ channel: 'D0DRYDM001' })]],
     [FETCH_MESSAGES_TOOL, [call({ outcome: 'error', error: refusal(FETCH_MESSAGES_TOOL, 'not_in_channel') }), call({ threadTs: true })]],
     [REACT_TOOL, [call({ ts: POST })]],
     [EDIT_MESSAGE_TOOL, [call({ ts: POST, outcome: 'none' })]],
-    [RUNNER_SET_CHANNEL_DELIVERY_TOOL, [call({ delivery: 'all' })]],
+    [RUNNER_SET_CHANNEL_DELIVERY_TOOL, [call({ delivery: 'all', attemptId: 'retained-check', intent: 'assignment' })]],
   ])('%s: exactly the projection of each of its calls, in order, and nothing of an accepted call\'s content', async (tool, expected) => {
     const out = read('c', tool)
     expect(out.map((l) => JSON.parse(l))).toEqual(expected)
@@ -4049,6 +4057,8 @@ describe("Check 33: after the kick, reply and fetch_messages are refused with Sl
     ts: null,
     threadTs: false,
     delivery: null,
+    attemptId: null,
+    intent: null,
     ...input,
     ...('ok' in ends ? { outcome: 'ok', error: null } : 'none' in ends ? { outcome: 'none', error: null } : { outcome: 'error', error: 'code' in ends ? refusal(tool, ends.code) : ends.error }),
   })
@@ -4624,7 +4634,7 @@ describe('expected texts match the package', () => {
         [REACT_TOOL, ['chat_id', 'message_id']],
         [EDIT_MESSAGE_TOOL, ['chat_id', 'message_id']],
         [FETCH_MESSAGES_TOOL, ['channel', 'thread_ts']],
-        [RUNNER_SET_CHANNEL_DELIVERY_TOOL, ['channel', 'delivery']],
+        [RUNNER_SET_CHANNEL_DELIVERY_TOOL, ['channel', 'delivery', 'attempt_id', 'intent']],
       ] as const) {
         expect([tool, read.filter((input) => !(inputs[tool] ?? []).includes(input))]).toEqual([tool, []])
       }

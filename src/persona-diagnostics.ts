@@ -148,7 +148,7 @@ export const PERSONA_INVITED_CHANNEL = 'persona-invited-channel'
 
 /**
  * A persona's agent stored a channel delivery with `set_channel_delivery`
- * one line per accepted call, logged after
+ * : one line per new durable application, after
  * the store's write succeeded, to `server.log` only; nothing is posted to
  * Slack. The cause (`channelDeliverySetCause`) names the channel ID, the
  * stored choice before the call (`none` when there was none) and after it,

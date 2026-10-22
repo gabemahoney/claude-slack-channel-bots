@@ -864,6 +864,7 @@ describe('a 0.11.1 configuration decides sample events as says', () => {
   )
 })
 
+import { deliveryAttempt } from './test-helpers/shared-channels.ts'
 describe('set_channel_delivery is listed and refused, and the instructions are MCP_INSTRUCTIONS', () => {
   test.each(FIXTURES.map((f) => [f.file, f] as const))(
     '%s: every channel persona lists the tool, gets the declarative refusal for one of its channels at all, and receives MCP_INSTRUCTIONS',
@@ -877,7 +878,8 @@ describe('set_channel_delivery is listed and refused, and the instructions are M
       for (const name of names) {
         const client = await openListingClient(run, name)
         const { tools } = await client.listTools()
-        const result = await run.callTool(name, SET_CHANNEL_DELIVERY_TOOL, { channel: listed(fixture, name, 0), delivery: 'all' })
+        const request = deliveryAttempt(`upgrade-${fixture.file}-${name}`, listed(fixture, name, 0), 'all')
+        const result = await run.callTool(name, SET_CHANNEL_DELIVERY_TOOL, request)
         seen[name] = {
           listed: tools.some((t) => t.name === SET_CHANNEL_DELIVERY_TOOL),
           result,

@@ -151,6 +151,7 @@ import { RELOAD_DIAGNOSTIC_CLASSES, RELOAD_RECORD_WRITE_FAILED } from '../src/re
 import { modeSwitchLine } from '../src/reload-plan.ts'
 import { CHANNEL_DELIVERY_FILE_NAME, SET_CHANNEL_DELIVERY_TOOL } from '../src/channel-delivery.ts'
 import {
+  channelDeliveryAttemptResultText,
   channelDeliveryChannelRefusal,
   channelDeliveryDeclarativeRefusal,
   channelDeliveryNotStoredText,
@@ -172,11 +173,12 @@ import {
   stateDirRepointedLine,
   stateDirRepointFailedLine,
 } from '../src/state-dir-migration.ts'
-import { DM_DESTINATION, type ChannelMode } from '../src/config.ts'
+import { DELIVERY_MODES, DM_DESTINATION, type ChannelMode } from '../src/config.ts'
 import { PHASE1_FLOOR_VERSION } from '../src/ad-version-gate.ts'
 import { HostSafetyError, hostSafeChildEnv, resolveToolDir } from './test-helpers/host-safe-env.ts'
 import { OLD_AD_VERSION, PHASE1_RC_VERSION } from './test-helpers/agent-director-versions.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
+import { deliveryResultSamples } from './test-helpers/shared-channels.ts'
 import {
   classHeading,
   flat,
@@ -404,6 +406,13 @@ describe('npm pack ships every runtime src file', () => {
       expect(missing).toEqual([])
     },
   )
+
+  test('attempt evidence runtime module is inventoried, included, and an explicit exclusion fails coverage', () => {
+    const path = 'src/channel-delivery-attempt.ts', files = readPkg().files ?? []
+    expect(runtimeSrcFiles()).toContain(path)
+    expect(filesCover(files, path)).toBe(true)
+    expect(filesCover([...files, `!${path}`], path)).toBe(false)
+  })
 
   test('(hermetic): package.json files covers every runtime src/*.ts file with no ! entry excluding it', () => {
     const runtimeFiles = runtimeSrcFiles()
@@ -1027,8 +1036,8 @@ const QUOTED_TEXTS: [label: string, where: HeadingMatch, render: () => string][]
     classHeading(PERSONA_CHANNEL_DELIVERY_SET),
     () =>
       personaLineTemplate(PERSONA_CHANNEL_DELIVERY_SET, channelDeliverySetCause(CHANNEL, undefined, 'all', 'mentions'))
-        .replace(`from ${NO_STORED_CHOICE} to all,`, `from <${NO_STORED_CHOICE}|mentions|all> to <mentions|all>,`)
-        .replace('at channel delivery mentions after', 'at channel delivery <mentions|all> after'),
+        .replace(`from ${NO_STORED_CHOICE} to all,`, `from <${NO_STORED_CHOICE}|${DELIVERY_MODES.join('|')}> to <${DELIVERY_MODES.join('|')}>,`)
+        .replace('at channel delivery mentions after', `at channel delivery <${DELIVERY_MODES.join('|')}> after`),
   ],
 [
     `the open-mode ${UNCLAIMED_CHANNEL} line`,
@@ -1055,19 +1064,27 @@ const QUOTED_TEXTS: [label: string, where: HeadingMatch, render: () => string][]
     () => channelDeliveryChannelRefusal(NAME, KEY, SAMPLE_CHANNEL).replace(JSON.stringify(SAMPLE_CHANNEL), '"<channel>"'),
   ],
 [
-    'the unknown-channel refusal not showing the channel, up to its reason',
+    'the invalid-channel refusal not showing the channel',
     classHeading(PERSONA_CHANNEL_DELIVERY_SET),
     () => {
       const tail = afterRef(channelDeliveryChannelRefusal(NAME, KEY, 42))
-      return `… ${tail.slice(0, tail.indexOf('): ') + 3)}…`
+      return `… ${tail}`
     },
   ],
-['the failed-write tool error', classHeading(PERSONA_CHANNEL_DELIVERY_SET), () => channelDeliveryWriteFailedText(NAME, KEY, PATH)],
-[
-    'the not-stored tool error',
+...deliveryResultSamples()
+  .filter(({ result }) => result.kind === 'not-applied' || result.kind === 'pending' || result.kind === 'unresolved')
+  .map(({ form, result }): [string, HeadingMatch, () => string] => [
+    `the retained attempt ${form} outcome`,
     classHeading(PERSONA_CHANNEL_DELIVERY_SET),
-    () => channelDeliveryNotStoredText(NAME, KEY, 'set_at').replace('its set_at)', 'its <field>)'),
-  ],
+    () => {
+      // Quote the handler's outcome clause; current facts are reported separately.
+      const rendered = channelDeliveryAttemptResultText(NAME, KEY, CHANNEL, result)
+      const lead = `, channel ${CHANNEL}: `
+      const at = rendered.indexOf(lead)
+      if (at < 0) throw new Error(`the ${form} rendering has no persona/channel lead`)
+      return rendered.slice(at + lead.length)
+    },
+  ]),
 ["the switch's line turning open mode on", '### Pending changes', () => modeSwitchTemplate('open')],
 ["the switch's line turning strict mode on", '### Pending changes', () => modeSwitchTemplate('strict')],
 [
@@ -1196,6 +1213,14 @@ const QUOTED_TEXTS: [label: string, where: HeadingMatch, render: () => string][]
 function quotes(section: string, text: string): boolean {
   return flat(section).includes(flat(text))
 }
+
+// These retained exports need leak coverage independently of the skill's quotations.
+test.each<[string, () => string]>([
+  ['channelDeliveryWriteFailedText', () => channelDeliveryWriteFailedText(NAME, KEY, PATH)],
+  ['channelDeliveryNotStoredText', () => channelDeliveryNotStoredText(NAME, KEY, 'set_at')],
+])('retained legacy renderer %s has no leaks', (label, render) => {
+  assertNoLeak(render(), label)
+})
 
 describe("the debugging skill's quoted texts are their builders' renderings", () => {
   test.each(QUOTED_TEXTS)('%s', (label, where, render) => {

@@ -79,6 +79,7 @@ import {
 } from '../../src/persona-credentials.ts'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js'
+import type { JSONRPCResponse, JSONRPCError } from '@modelcontextprotocol/sdk/types.js'
 import type { MakeTemplateParams } from 'agent-director'
 import type { SpawnParams } from 'agent-director'
 
@@ -742,6 +743,14 @@ export interface ReloadToolResult {
   readonly text: string
 }
 
+/** Complete attempted tools/call response, copied before forwarding or loss.
+ * Correlation IDs are retained; omit only `message.id` when comparing calls. */
+export interface ReloadToolResponse {
+  readonly key: string
+  readonly message: JSONRPCResponse | JSONRPCError
+  readonly lost: boolean
+}
+
 /**
  * `h.poisonTokenEnvironment()`'s handle: the fake values it put in
  * `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` (sentinel-bearing, distinct from
@@ -822,8 +831,9 @@ export interface ReloadRunCheckpoint {
   readonly removes: number
   readonly lifecycle: number
   readonly slackBuilds: number
-  /** Web API calls so far, per persona key. */
-  readonly slackCalls: Readonly<Record<string, number>>
+  /** Offsets per credential-set capture stream, retained after retirement.
+   * All clients of one set share its stub's log; persona totals are not cursors. */
+  readonly slackCalls: ReadonlyMap<StubSlack, number>
 }
 
 /** What a run did since a checkpoint (`run.since(cp)`). */
@@ -944,6 +954,12 @@ export interface ReloadRunOptions {
   /** Actual MCP callbacks, held independently of the reload transaction. */
   onReplyCall?: SessionToolDeps['onReplyCall']
   consumeAck?: SessionToolDeps['consumeAck']
+  /** Hold a serialized MCP tools/call before the server receives it. Tests
+   * release their own gate; authority is always resolved by production code. */
+  beforeToolCall?: () => Promise<void>
+  /** Fault/sensitivity seam on an actual tools/call response, before capture
+   * and SDK delivery/loss. Mutate the payload, never its correlation ID. */
+  beforeToolResponse?: (message: JSONRPCResponse | JSONRPCError) => void
   /** Dry run, passed as a flag to the connection manager and the bring-up controller. */
   dryRun?: boolean
   /** Per-persona-name stub options (scripted Slack outcomes); the leak marker is always on. */
@@ -1071,6 +1087,8 @@ export interface ReloadRun {
   queue: ReturnType<typeof createDeliveryQueue>
   queueEvents: QueueEvent[]
   queued(name: string): QueueItem[]
+  /** Complete the production preparation recovery before snapshotting accepted items. */
+  prepareQueued(): Promise<void>
   /** The real reload controller. */
   readonly controller: ReloadController
   /** The real bring-up controller the start pass drives. */
@@ -1181,8 +1199,8 @@ export interface ReloadRun {
    * real tool handlers, whose posting scope reads the applied persona at
    * each call), with the run's tool deps as server.ts binds them: the client lookup, the channel mode of `run.serverConfig()`,
    * the run's stored-choice store (`set_channel_delivery` writes through it,
-   * so `h.failChannelDeliveryWrites` fails its write), the routing's heard
-   * set and the applied personas, each read at call time; its
+   * so the shared durable writer seam fails its write), current authenticated
+   * membership, the up/shutdown predicate and applied personas, read at call time; its
    * `persona-channel-delivery-set` line goes to `run.logs` in every run.
    * Needs `run.registerSession` first. No file may be sent (the file guard
    * refuses every path).
@@ -1195,6 +1213,11 @@ export interface ReloadRun {
    * another key. One client per entry, closed by `run.stop()`.
    */
   callTool(name: string, tool: string, args: Record<string, unknown>, session?: SessionEntry): Promise<ReloadToolResult>
+  /** Negotiated SDK listing from the same production server/session. */
+  listTools(name: string, session?: SessionEntry): ReturnType<Client['listTools']>
+  /** Drop the whole next tools/call response and close its transport. The
+   * retained caller arguments are never rewritten; the caller must reconnect. */
+  loseToolResponse(name: string, tool: string, args: Record<string, unknown>, session?: SessionEntry): Promise<void>
   /** Every configuration the controller's `onApplied` was told, in order (one per confirmed apply's step 1). */
   readonly appliedConfigs: readonly PersonaConfig[]
   /** The persona keys of the controller's applied configuration now, in order; undefined before the start applied. */
@@ -1245,9 +1268,17 @@ export interface ReloadRun {
   checkpoint(): ReloadRunCheckpoint
   /** Everything captured after `cp` (compare with `NO_RUN_ACTIVITY` for "did nothing"). */
   since(cp: ReloadRunCheckpoint): ReloadRunActivity
+  /** Activity for each actual MCP tools/call, from dispatch after beforeToolCall
+   * to its response (including a deliberately lost response). An unanswered
+   * call reports activity through now. Captures all personas, no request data. */
+  toolActivities(): ReloadRunActivity[]
+  /** Full protocol responses, including failures and attempted lost responses.
+   * `captured()` also retains complete SDK results and thrown errors; callTool
+   * keeps its existing text projection for callers that do not need payloads. */
+  toolResponses(): ReloadToolResponse[]
   /** The stub of the persona with this name. Throws in dry run or for a persona with no written credentials. */
   stub(name: string): StubSlack
-  /** Every Web API call on every registered persona's stub, by persona key. */
+  /** Every Web API call, grouped by persona across current and retired sets. */
   slackCalls(): Record<string, StubWebCall[]>
   /** Every `chat.postMessage` call on any persona's stub. */
   slackPosts(): StubWebCall[]
@@ -1738,6 +1769,7 @@ function makeFailureSeam(defaultStep: DurableWriteStep): FailureSeam {
 
 /** Build the harness described in the file comment. */
 export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarness {
+  const savedDryRun = process.env['SLACK_DRY_RUN']
   const root = realpathSync(mkdtempSync(join(opts.parentDir ?? tmpdir(), 'reload-harness-')))
   const dir = join(root, 'config')
   const home = join(root, 'home')
@@ -1870,6 +1902,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       throw new Error('reload-harness: a run reached its stopBeforeWrite stop point; await run.stop() before building the next run')
     }
     const dryRun = runOpts.dryRun ?? false
+    if (dryRun) process.env['SLACK_DRY_RUN'] = '1'
+    else delete process.env['SLACK_DRY_RUN']
     const realLaunch = runOpts.realLaunch === true
     const realLifecycle = runOpts.realLifecycle === true || realLaunch
     // With the real composition, one serializer shared by the manager, the
@@ -2784,6 +2818,9 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
 
     /** Every persona key with a stub: those registered at build, then those whose credentials were written later. */
     const stubKeys = dryRun ? [] : connections.personas.map((p) => p.key)
+    // Append-only registration: retiring/replacing a client must never discard
+    // its log, and adding a stream must not shift any other stream's cursor.
+    const slackStreams = new Map<StubSlack, string>(stubKeys.map(key => [connections.slack.persona(key), key]))
     /** Per key: the harness label of the set registered as the persona's `INITIAL_CREDENTIALS` set in this run. */
     const initialLabels = new Map<string, string>(
       dryRun ? [] : connections.personas.map((p) => [p.key, labelsByName.get(p.name)!] as const),
@@ -2792,10 +2829,10 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       const key = personaKey(name)
       if (dryRun || stopped) return
       if (stubKeys.includes(key)) {
-        connections.slack.addCredentials(key, label, tokens, { leakMarker: LEAK_SENTINEL, ...slack })
+        slackStreams.set(connections.slack.addCredentials(key, label, tokens, { leakMarker: LEAK_SENTINEL, ...slack }), key)
         return
       }
-      connections.slack.addPersona(key, tokens, { leakMarker: LEAK_SENTINEL, ...runOpts.slack?.[name], ...slack })
+      slackStreams.set(connections.slack.addPersona(key, tokens, { leakMarker: LEAK_SENTINEL, ...runOpts.slack?.[name], ...slack }), key)
       stubKeys.push(key)
       initialLabels.set(key, label)
     })
@@ -2812,8 +2849,25 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
 
     let applyHook: ((applied: PersonaConfig) => void) | undefined
 
+    function captureStreams(): Map<StubSlack, string> {
+      // Also cover sets registered directly through the exposed factory APIs.
+      // Builds expose safe routing labels, never credentials or client options.
+      for (const build of connections.slack.builds) {
+        if (build.persona !== undefined && build.credentials !== undefined) {
+          slackStreams.set(connections.slack.credentials(build.persona, build.credentials), build.persona)
+        }
+      }
+      return slackStreams
+    }
+
     function slackCalls(): Record<string, StubWebCall[]> {
-      return Object.fromEntries(stubKeys.map((key) => [key, [...connections.slack.persona(key).callLog]]))
+      const calls = new Map<string, StubWebCall[]>()
+      for (const [stub, key] of captureStreams()) {
+        const group = calls.get(key) ?? []
+        group.push(...stub.callLog)
+        calls.set(key, group)
+      }
+      return Object.fromEntries(calls)
     }
 
     function checkpoint(): ReloadRunCheckpoint {
@@ -2823,7 +2877,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         removes: removes.length,
         lifecycle: records.length,
         slackBuilds: connections.slack.builds.length,
-        slackCalls: Object.fromEntries(Object.entries(slackCalls()).map(([key, calls]) => [key, calls.length])),
+        slackCalls: new Map([...captureStreams().keys()].map(stub => [stub, stub.callLog.length])),
       }
     }
 
@@ -2834,13 +2888,18 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         removes: removes.slice(cp.removes),
         lifecycle: records.slice(cp.lifecycle),
         slackBuilds: connections.slack.builds.length - cp.slackBuilds,
-        slackCalls: Object.entries(slackCalls()).flatMap(([key, calls]) => calls.slice(cp.slackCalls[key] ?? 0)),
+        slackCalls: [...captureStreams().keys()].flatMap(stub => stub.callLog.slice(cp.slackCalls.get(stub) ?? 0)),
       }
     }
 
     // MCP sessions in the real registry, and the tool clients opened on them.
     const notificationsByKey = new Map<string, ChannelNotification[]>()
     const toolClients = new Map<SessionEntry, Client>()
+    const responseLoss = new Set<SessionEntry>()
+    const lostResponses = new Set<SessionEntry>()
+    const toolActivity: Array<{ start: ReloadRunCheckpoint; finished?: ReloadRunActivity }> = []
+    const toolResponses: ReloadToolResponse[] = []
+    const toolResults: Array<{ key: string; result?: unknown; error?: unknown }> = []
     let sessionSeq = 0
     const toolDeps: SessionToolDeps = {
       assertSendable: (path) => {
@@ -2860,13 +2919,14 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       // holder, undefined before the start loads it, so the tool refuses and
       // writes nothing; no second store is built, so its writes take the
       // run's writer path and `h.failChannelDeliveryWrites`); the routing's
-      // heard set; and the applied personas of the configuration in effect.
+      // current membership and up/shutdown state; and the applied personas.
       // The tool's `persona-channel-delivery-set` line goes to `run.logs` in
       // every run (server.ts sends it to `console.error`, the `[slack]`
       // stream).
       getChannelMode: () => channelModeOf(serverConfig()),
       getChannelDelivery: () => channelDeliveryStore,
-      heardChannels: (key) => routing.heardChannels(key),
+      isPersonaUp: key => !stopped && isPersonaUp(key),
+      readChannelMembership: (key, channel, mode) => membership?.read(key, channel, mode) ?? { kind: 'unresolved', reason: 'current-membership-missing' },
       getAppliedPersonas: () => serverConfig()?.personas ?? [],
       log,
     }
@@ -2901,6 +2961,36 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       if (client === undefined) {
         const server = createSessionServer(entry, toolDeps)
         const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair()
+        const calls = new Map<string | number, typeof toolActivity[number]>()
+        const sendRequest = clientTransport.send.bind(clientTransport)
+        clientTransport.send = async message => {
+          if ('method' in message && message.method === 'tools/call' && 'id' in message) {
+            await runOpts.beforeToolCall?.()
+            const activity = { start: checkpoint() }
+            toolActivity.push(activity)
+            calls.set(message.id, activity)
+          }
+          return sendRequest(message)
+        }
+        const sendResponse = serverTransport.send.bind(serverTransport)
+        serverTransport.send = async message => {
+          if ('id' in message && message.id !== undefined && ('result' in message || 'error' in message)) {
+            const activity = calls.get(message.id)
+            if (activity) {
+              runOpts.beforeToolResponse?.(message)
+              activity.finished = since(activity.start)
+              calls.delete(message.id)
+              const lost = responseLoss.delete(entry)
+              toolResponses.push({ key, message: structuredClone(message), lost })
+              if (lost) {
+                lostResponses.add(entry)
+                await client!.close()
+                return
+              }
+            }
+          }
+          return sendResponse(message)
+        }
         await server.connect(serverTransport)
         client = new Client({ name: 'reload-harness', version: '1.0.0' }, { capabilities: {} })
         await client.connect(clientTransport)
@@ -2911,6 +3001,7 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
 
     let stopped = false
     const run: ReloadRun = {
+      async prepareQueued() { await preparation.recover(serverConfig()?.personas.map(p => p.key) ?? []) },
       queue,
       queueEvents,
       queued: name => queue.items(personaKey(name)),
@@ -2970,11 +3061,27 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       noticeClock: noticeStack.clock,
       async callTool(name, tool, args, session) {
         const client = await toolClientFor(name, session)
-        const result = (await client.callTool({ name: tool, arguments: args })) as {
-          isError?: boolean
-          content: Array<{ type: string; text?: string }>
+        try {
+          const result = await client.callTool({ name: tool, arguments: args })
+          toolResults.push({ key: personaKey(name), result: structuredClone(result) })
+          const content = result.content as Array<{ type: string; text?: string }>
+          return { isError: result.isError === true, text: content.map(c => c.text ?? '').join('\n') }
+        } catch (error) {
+          // Keep the Error itself: assertNoLeak traverses its non-enumerable
+          // message/stack/cause and custom fields as well as protocol data.
+          toolResults.push({ key: personaKey(name), error })
+          throw error
         }
-        return { isError: result.isError === true, text: result.content.map((c) => c.text ?? '').join('\n') }
+      },
+      async listTools(name, session) { return (await toolClientFor(name, session)).listTools() },
+      async loseToolResponse(name, tool, args, session) {
+        const entry = session ?? getSessionByPersona(personaKey(name))!
+        await toolClientFor(name, entry)
+        responseLoss.add(entry)
+        let rejected = false
+        try { await run.callTool(name, tool, args, entry) } catch { rejected = true }
+        if (!rejected || !lostResponses.delete(entry)) throw new Error('reload-harness: expected complete MCP response loss')
+        toolClients.delete(entry)
       },
       request(action, assignments = [], requestId = `fixture-request-${++nextRequestId}`) {
         const request = buildReviewRequest(requestId, controller.sharedChannels()!.operatorIntent().generation, action, assignments)
@@ -3010,6 +3117,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
       tickDirectoryChecks,
       checkpoint,
       since,
+      toolActivities: () => toolActivity.map(activity => activity.finished ?? since(activity.start)),
+      toolResponses: () => structuredClone(toolResponses),
       stub: (name) => connections.slack.persona(personaKey(name)),
       slackCalls,
       slackPosts: () => Object.values(slackCalls()).flat().filter((c) => c.method === 'chat.postMessage'),
@@ -3021,6 +3130,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         writes,
         removes,
         slack: slackCalls(),
+        toolResponses,
+        toolResults,
         episodeNotices,
         killFailureEntries: composition?.killFailureEntries ?? [],
         written: [...new Set(writes.filter((w) => w.ok).map((w) => w.path))]
@@ -3616,6 +3727,8 @@ export function makeReloadHarness(opts: ReloadHarnessOptions = {}): ReloadHarnes
         for (const run of runs) await run.stop()
       } finally {
         tokenWatch?.restore()
+        if (savedDryRun === undefined) delete process.env['SLACK_DRY_RUN']
+        else process.env['SLACK_DRY_RUN'] = savedDryRun
         if (consoleCaptured) console.error = originalConsoleError
         if (launchSeamsInstalled) {
 

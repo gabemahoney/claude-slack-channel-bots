@@ -400,6 +400,14 @@ async function main(argv: readonly string[]): Promise<number> {
     inFlight = request.id
     let line: Record<string, unknown>
     try {
+      if (request.tool === 'tools/list') {
+        const listing = await client.listTools()
+        answer(request.id, { isError: false, text: JSON.stringify(listing.tools) })
+        inFlight = undefined
+        return
+      }
+      // Arguments, including retained attempt_id and intent, pass through
+      // unchanged. The durable request file is the caller's pre-submit copy.
       const result: unknown = await client.callTool({ name: request.tool, arguments: request.arguments })
       line = { isError: isPlainObject(result) && result['isError'] === true, text: resultText(result) }
     } catch (err) {

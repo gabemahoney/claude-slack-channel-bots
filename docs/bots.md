@@ -13,9 +13,19 @@ Each MCP endpoint exposes the following tools to the connected Claude Code sessi
 | `edit_message` | Edit a previously sent message (bot's own messages only) in a channel (a configured non-off channel in strict mode; any channel ID in open mode) or, with `dm.enabled` `true`, a DM conversation (`D…`). |
 | `fetch_messages` | Fetch message history from a channel (a configured non-off channel in strict mode; any channel ID in open mode), a DM conversation (`D…`, with `dm.enabled` `true`) or a thread in either. Returns oldest-first. |
 | `download_attachment` | Download attachments from a Slack message in a channel (a configured non-off channel in strict mode; any channel ID in open mode) or, with `dm.enabled` `true`, a DM conversation (`D…`). Saves files to `STATE_DIR/inbox/`. Returns local file paths. Only files hosted by Slack are downloaded; external files are refused. |
-| `set_channel_delivery` | Set one shared channel choice to `off`, `mentions`, `all` or `thread_hybrid`. In open mode an accepted choice persists in `config.json.last-applied`; strict mode refuses the call. It makes no Slack call. Each accepted call logs `persona-channel-delivery-set`. |
+| `set_channel_delivery` | Set one shared channel choice in `config.json.last-applied`. Required inputs: `channel` (public/private channel ID), `delivery` (`off`, `mentions`, `all` or `thread_hybrid`), nonempty caller-retained `attempt_id`, and `intent` (`assignment` or `retry`); no extra fields. New assignments require open mode and authenticated current eligible membership. An authorized current session of the same persona incarnation can read retained history in strict mode or dry run. It makes no Slack call. |
 
-Only `reply` takes a user ID; the other tools need a channel or DM conversation ID. When `dm.enabled` ([Persona fields](configuration.md#persona-fields)) is `false`, the persona has no DM target in either mode: no tool can post in, read or open a DM.
+Create and retain `attempt_id` before first submission, keeping it across response loss, reconnect and restart. Each deliberate assignment, including the same value, uses a fresh identifier and `intent: assignment`. A retry preserves identifier, channel and value with `intent: retry`; same-binding duplicates under either intent read the original outcome without assigning again.
+
+Fresh writes require an active current persona/session and verified public/private membership with explicit non-external-sharing evidence, rechecked at application. Current discovery before traffic can suffice; listed/heard channels, historical membership and dry-run placeholders cannot authorize a new write.
+
+Stale, foreign or replacement sessions cannot retrieve another incarnation's history.
+
+A new durable application gets one assignment position and one `persona-channel-delivery-set` log line, without editing `config.json` or consuming pending operator intent. Its result keeps the original saved/effective choices and restrictions separate from current facts, which may reflect a later operator choice or be unavailable. History never overwrites that later choice.
+
+Pending, proven not-applied and unresolved outcomes differ; an unknown retry cannot write or prove unchanged state. See [tool outcomes and recovery](../skills/debug-slack-channel-bots/SKILL.md#persona-channel-delivery-set).
+
+The following target rules apply to the five Slack tools. Only `reply` takes a user ID; the other four need a channel or DM conversation ID. When `dm.enabled` ([Persona fields](configuration.md#persona-fields)) is `false`, the persona has no DM target in either mode: no tool can post in, read or open a DM.
 
 - **In strict mode,** a tool call with any other target, a channel the persona isn't configured into included, is refused with a tool error naming the persona and the target, and nothing is sent to Slack.
 - **In open mode,** a target that is neither a channel ID nor an allowed DM target is refused before any Slack call, with a tool error naming the persona and the target. Any other channel target goes to Slack, which decides: Slack's refusal, for example `not_in_channel` for a channel the persona's app is not in, reaches the persona as a tool error naming the persona, the channel and Slack's error code.

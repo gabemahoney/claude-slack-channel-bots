@@ -32,15 +32,11 @@
  * persona, the channel and Slack's error code (
  * `slackRefusalToolErrorText`).
  *
- * The sixth tool, `set_channel_delivery`, has no
- * Slack target and makes no Slack call, in or out of dry run. It stores the
- * persona's channel delivery (`mentions` or `all`) for one channel it heard
- * in fungible mode, or already holds a choice for, in the one stored-choice
- * store (`src/channel-delivery.ts`), and the choice applies from the next
- * event under the loop guard. It resolves the persona at call time as the
- * other tools do, also refusing a retiring key and a session that is not the
- * one the registry holds for its key, then checks rules in
- * order; in declarative mode every call is refused.
+ * The sixth tool, `set_channel_delivery`, makes no Slack call. It binds a
+ * caller-retained identifier to the current persona incarnation/channel/value.
+ * Fresh assignments require open mode and authenticated current membership;
+ * duplicate assignment and retry intents read retained outcomes only. Strict
+ * and dry-run sessions can read their own history but cannot create a write.
  *
  * Instructions: `MCP_INSTRUCTIONS` is exported as the exact string every
  * session server sends as its MCP `instructions`, in both modes, so the shipped-docs audit reads what instances receive.
@@ -61,16 +57,18 @@ import { writeFileSync } from 'fs'
 import { join, resolve } from 'path'
 import {
   CHANNEL_DELIVERY_FILE_NAME,
-  CHANNEL_DELIVERY_SET_STORED,
-  CHANNEL_DELIVERY_SET_UNREADABLE,
-  CHANNEL_DELIVERY_SET_WRITE_FAILED,
-  channelDeliveryDeclarationOf,
+  currentChannelDeliveryFacts,
   SET_CHANNEL_DELIVERY_TOOL,
+  type ChannelDeliveryCurrentFacts,
+  type ChannelDeliveryUnavailableReason,
   type ChannelDeliverySetInvalidField,
   type ChannelDeliveryStore,
 } from './channel-delivery.ts'
+import { CHANNEL_DELIVERY_INTENTS, validChannelDeliveryAttempt, validChannelDeliveryAttemptId, type BotAttemptResult, type ChannelDeliveryAttemptRequest } from './channel-delivery-attempt.ts'
+import type { MembershipReading } from './channel-membership.ts'
 import {
   CHANNEL_ID_RE,
+  DELIVERY_MODES,
   DM_CONTACT_RE,
   ECHOABLE_KEY_NAME_RE,
   MCP_SERVER_NAME,
@@ -80,11 +78,11 @@ import {
   type Persona,
   type ReplySettings,
 } from './config.ts'
-import { channelDeliveryFor, type ChannelDeliveryResult } from './delivery-decision.ts'
+import type { ChannelDeliveryResult } from './delivery-decision.ts'
 import { chunkText, sanitizeFilename } from './lib.ts'
 import { renderPersonaRef } from './persona-identity.ts'
 import { describeSlackCallFailure, describeThrownValue, renderLogMessageText, slackPlatformReason } from './persona-connection-errors.ts'
-import { DM_OPEN_SCOPE, MISSING_SCOPE_ERROR, fungibleDestinationsOf } from './persona-destination.ts'
+import { DM_OPEN_SCOPE, MISSING_SCOPE_ERROR } from './persona-destination.ts'
 import { channelDeliverySetCause, formatPersonaDiagnostic, PERSONA_CHANNEL_DELIVERY_SET } from './persona-diagnostics.ts'
 import { isDryRun } from './tokens.ts'
 
@@ -689,19 +687,17 @@ export interface SessionToolDeps {
    * loads it): the call is refused and nothing is written. Absent: the same.
    */
   getChannelDelivery?(): SessionChannelDeliveryStore | undefined
-  /**
-   * A read-only view of persona `key`'s heard set,
-   * read at each `set_channel_delivery` call (production: the one routing's
-   * `heardChannels`). Absent: the heard set is empty.
-   */
-  heardChannels?(key: string): ReadonlySet<string>
+  /** Current applied/up status, including shutdown. Required for attempt access. */
+  isPersonaUp?(key: string): boolean
+  /** Read current authenticated evidence; this never performs a network lookup. */
+  readChannelMembership?(key: string, channel: string, mode: ChannelMode): MembershipReading
   /**
    * The applied personas of the configuration in effect, read at each `set_channel_delivery` call for the loop guard's
    * input. Absent: only the calling persona.
    */
   getAppliedPersonas?(): readonly Persona[]
   /**
-   * Receives the `persona-channel-delivery-set` line of each accepted
+   * Receives the `persona-channel-delivery-set` line of each newly applied
    * `set_channel_delivery` call: the `[slack]`
    * stream of `server.log`, as the routing's `log` receives
    * `persona-invited-channel` (production: `console.error`). Absent:
@@ -711,12 +707,13 @@ export interface SessionToolDeps {
 }
 
 /**
- * What `set_channel_delivery` uses of the stored-choice store: its path, readability, lookups, the retiring keys and
- * the one write of a choice. `ChannelDeliveryStore` satisfies it as it is.
+ * What `set_channel_delivery` uses of the stored-choice store (
+ * to ): current readability, incarnation and the single
+ * authority's attempt API. `ChannelDeliveryStore` satisfies it as it is.
  */
 export type SessionChannelDeliveryStore = Pick<
   ChannelDeliveryStore,
-  'path' | 'readable' | 'storedChoice' | 'storedChannels' | 'set' | 'isRetiring' | 'incarnation'
+  'path' | 'readable' | 'readableFor' | 'storedChoice' | 'lookupAttempt' | 'attempt' | 'isRetiring' | 'incarnation'
 >
 
 // ---------------------------------------------------------------------------
@@ -897,31 +894,33 @@ export function personaNotAppliedRefusal(tool: string, key: string): string {
 // set_channel_delivery
 // ---------------------------------------------------------------------------
 
-/**
- * The tool's description: it sets how closely the persona
- * listens in one channel its Slack app was invited to, between @mentions and
- * broadcasts only (`mentions`) and every message (`all`); it is called when
- * someone in that channel asks for it; it works only when the operator has
- * turned invited channels on.
- */
+/** The actual advertised request and direct-handler validation share this contract. */
 export const SET_CHANNEL_DELIVERY_DESCRIPTION =
-  'Set listening in a channel to off, mentions (@mentions and @here or @channel broadcasts), all (every message), or thread_hybrid (mentions and replies in followed threads). ' +
-  'Call it when someone in that channel asks for it. ' +
-  'New assignments require open mode; otherwise they are refused. ' +
-  'The choice applies from the next message in that channel and is kept across server restarts.'
-
-/** The description of the tool's `channel` input. */
+  'Set listening in a currently verified public or private member channel to off, mentions, all, or thread_hybrid. ' +
+  'Call it when someone in that channel asks. New assignments require open mode and a current eligible membership. ' +
+  'Create and retain attempt_id before first submission. Each fresh deliberate assignment uses a fresh identifier, even for the same value. ' +
+  'A retry keeps the original identifier, channel and delivery and only reads its outcome. Known identifiers never assign again. ' +
+  'A current session of the same persona incarnation may read historical results in strict mode or dry run.'
 export const SET_CHANNEL_DELIVERY_CHANNEL_DESCRIPTION =
-  'The channel ID (C... or G...) of a channel your persona has heard a message from, or already holds a choice for'
-
-/** The description of the tool's `delivery` input. */
+  'A public or private channel ID (C... or G...). New assignments require authenticated current membership and explicit non-external-sharing evidence.'
 export const SET_CHANNEL_DELIVERY_DELIVERY_DESCRIPTION =
-  '"off", "mentions" (@mentions and broadcasts), "all" (every message), or "thread_hybrid" (mentions and replies in followed threads)'
-
-/** The values the tool's `delivery` input takes, in the order its schema lists them. */
-const SET_CHANNEL_DELIVERY_VALUES: readonly DeliveryMode[] = ['off', 'mentions', 'all', 'thread_hybrid']
-
-/** Whether `value` is a value the tool's `delivery` input takes: `"mentions"` or `"all"`. */
+  '"off", "mentions" (@mentions and broadcasts), "all" (every message), or "thread_hybrid" (mentions and replies in followed threads). Keep the original value on retry.'
+export const SET_CHANNEL_DELIVERY_ATTEMPT_DESCRIPTION =
+  'A nonempty identifier you create and retain before first submission. Use a fresh identifier for each deliberate assignment; retain it across response loss, reconnect and restart. Never change it on retry.'
+export const SET_CHANNEL_DELIVERY_INTENT_DESCRIPTION =
+  '"assignment" for a fresh deliberate choice; "retry" to read the original outcome without applying. Retry keeps attempt_id, channel and delivery. An unknown retry remains unresolved.'
+export const SET_CHANNEL_DELIVERY_VALUES = DELIVERY_MODES
+export const SET_CHANNEL_DELIVERY_INPUT_SCHEMA = {
+  type: 'object' as const,
+  properties: {
+    channel: { type: 'string', pattern: CHANNEL_ID_RE.source, description: SET_CHANNEL_DELIVERY_CHANNEL_DESCRIPTION },
+    delivery: { type: 'string', enum: [...SET_CHANNEL_DELIVERY_VALUES], description: SET_CHANNEL_DELIVERY_DELIVERY_DESCRIPTION },
+    attempt_id: { type: 'string', minLength: 1, pattern: '\\S', description: SET_CHANNEL_DELIVERY_ATTEMPT_DESCRIPTION },
+    intent: { type: 'string', enum: [...CHANNEL_DELIVERY_INTENTS], description: SET_CHANNEL_DELIVERY_INTENT_DESCRIPTION },
+  },
+  required: ['channel', 'delivery', 'attempt_id', 'intent'],
+  additionalProperties: false,
+}
 function isChannelDeliveryValue(value: unknown): value is DeliveryMode {
   return typeof value === 'string' && (SET_CHANNEL_DELIVERY_VALUES as readonly string[]).includes(value)
 }
@@ -932,24 +931,14 @@ function isChannelDeliveryValue(value: unknown): value is DeliveryMode {
  */
 export const ECHOABLE_CHANNEL_RE = /^[A-Z0-9]{1,24}$/
 
-/**
- * The tool's refusals, in the order a call is checked; the
- * first rule a call breaks gives its tool error:
- * - `declarative-mode`: the configuration in effect is in declarative mode
- *   (`channelDeliveryDeclarativeRefusal`);
- * - `store-unreadable`: the stored-choice file was unreadable at start, or no
- *   store is bound (`channelDeliveryUnreadableRefusal`);
- * - `delivery-invalid`: `delivery` is not `"mentions"` or `"all"`, a missing
- *   value included (`channelDeliveryValueRefusal`);
- * - `channel-unknown`: the channel is neither in the persona's heard set nor
- *   among its stored choices (`channelDeliveryChannelRefusal`).
- * Every one is checked after the resolution refusals.
- */
+/** Refusal categories; attempt outcomes have their own typed result union. */
 export const SET_CHANNEL_DELIVERY_REFUSALS = [
-  'declarative-mode',
-  'store-unreadable',
-  'delivery-invalid',
-  'channel-unknown',
+  'session-inactive',
+  'input-invalid',
+  'binding-conflict',
+  'strict-mode',
+  'dry-run',
+  'outcome-unresolved',
 ] as const
 
 /** One of `SET_CHANNEL_DELIVERY_REFUSALS`. */
@@ -959,30 +948,68 @@ export type SetChannelDeliveryRefusal = (typeof SET_CHANNEL_DELIVERY_REFUSALS)[n
 function channelDeliveryRefusalLead(name: string, key: string): string {
   return `Tool "${SET_CHANNEL_DELIVERY_TOOL}" refused for persona ${renderPersonaRef(name, key)}`
 }
+export function channelDeliveryAttemptInputRefusal(name: string, key: string): string {
+  return `${channelDeliveryRefusalLead(name, key)}: provide channel, delivery, a nonempty caller-retained attempt_id and intent "assignment" or "retry", with no extra fields. Input values are not shown.`
+}
+export function channelDeliveryDryRunRefusal(name: string, key: string): string {
+  return `${channelDeliveryRefusalLead(name, key)}: dry run cannot create assignments or attempt records. Retained same-incarnation history can be read without writing.`
+}
+export function channelDeliveryCurrentFactsText(current: ChannelDeliveryCurrentFacts): string {
+  if (current.kind === 'available') {
+    const { facts } = current
+    return `Current saved ${facts.saved}, effective ${facts.effective} in ${current.mode} mode` +
+      (facts.heldByLoopGuard ? ' (restricted by the other-persona destination loop guard).' : '.')
+  }
+  const reason: Record<ChannelDeliveryUnavailableReason, string> = {
+    'shared-state-unreadable': 'the shared state is not trustworthy',
+    'channel-removed': 'there is no currently saved channel entry',
+    'absent': 'current membership is absent',
+    'external-sharing': 'external sharing makes the channel ineligible in open mode',
+    'invalid-channel': 'the channel identity is invalid',
+    'installation-unverified': 'the current installation is unverified',
+    'current-membership-missing': 'current membership is unverified',
+    'event-order-conflict': 'membership event order is unresolved',
+    'history-unresolved': 'membership history is unresolved',
+    'event-not-durable': 'membership evidence is not durable',
+    'eligibility-missing': 'channel type or non-external-sharing evidence is missing',
+  }
+  return (current.saved === undefined ? 'Current saved/effective facts are unavailable' : `Current saved ${current.saved}; effective delivery is unavailable`) +
+    `: ${reason[current.reason]}.`
+}
+export function channelDeliveryAttemptResultText(
+  name: string, key: string, channel: string, result: BotAttemptResult, current?: ChannelDeliveryCurrentFacts,
+): string {
+  const lead = `Channel delivery for persona ${renderPersonaRef(name, key)}, channel ${channel}: `
+  const now = current ? ` ${channelDeliveryCurrentFactsText(current)}` : ''
+  if (result.kind === 'applied') {
+    const facts = result.outcome.facts
+    return lead + `${result.historical ? 'previously applied' : 'newly applied'} at position ${result.outcome.resolvedOrder}; original saved ${facts.saved}, effective ${facts.effective}` +
+      (facts.heldByLoopGuard ? ' (restricted by the other-persona destination loop guard).' : '.') +
+      (result.historical ? ' This history read made no new assignment.' : '') + now
+  }
+  if (result.kind === 'not-applied') {
+    const reason = {
+      membership: 'current eligible membership was not verified', inactive: 'the session or persona became inactive',
+      strict: 'strict mode did not authorize an assignment', 'dry-run': 'dry run did not authorize an assignment',
+      'write-failed': 'the application failed before durable activation',
+    }[result.reason]
+    return lead + `this attempt did not apply and changed no choice: ${reason}. Its retained outcome cannot be retried as a new assignment.` + now
+  }
+  if (result.kind === 'binding-conflict') return channelDeliveryRefusalLead(name, key) + ': the identifier cannot be used for these inputs. No assignment was made; original inputs are not disclosed.'
+  if (result.kind === 'pending') return lead + 'the retained attempt is pending; no duplicate application was made. Its outcome requires recovery.' + now
+  if (result.kind === 'inactive' || result.kind === 'invalid') return channelDeliveryRefusalLead(name, key) + ': this request cannot access or change channel delivery.'
+  return lead + 'the durable outcome is unresolved; application or nonapplication cannot be established. Preserve the identifier and seek recovery; retry cannot create an assignment.' + now
+}
 
-/**
- * Rule 1's tool error: declarative mode.
- *
- *   Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): strict mode is active, so channel delivery is set by the operator in config.json.
- *
- * Pure.
- */
+/** Strict refuses fresh assignments; existing history is resolved first. */
 export function channelDeliveryDeclarativeRefusal(name: string, key: string): string {
   return (
     `${channelDeliveryRefusalLead(name, key)}: strict mode is active, so ` +
-    'channel delivery is set by the operator in config.json.'
+    'new assignments are unavailable. A retained same-incarnation attempt can still be read without writing.'
   )
 }
 
-/**
- * Rule 2's tool error: the stored-choice file is unreadable,
- * or no store is bound. `path` is the store's path, or
- * `CHANNEL_DELIVERY_FILE_NAME` when no store is bound.
- *
- *   Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): the stored-choice file "<path>" is not readable, so the outcome is unresolved and no channel delivery can be stored. The operator must preserve the evidence and restore trustworthy shared state before retrying.
- *
- * Pure.
- */
+/** Unavailable authority cannot prove application or nonapplication. */
 export function channelDeliveryUnreadableRefusal(name: string, key: string, path: string): string {
   return (
     `${channelDeliveryRefusalLead(name, key)}: the shared channel authority ${JSON.stringify(path)} is not trustworthy, ` +
@@ -990,17 +1017,7 @@ export function channelDeliveryUnreadableRefusal(name: string, key: string, path
   )
 }
 
-/**
- * Rule 3's tool error: `delivery` is not `"mentions"` or
- * `"all"`. The value is named, JSON-encoded, only when it is a string
- * matching `ECHOABLE_KEY_NAME_RE` (`src/config.ts`); otherwise the error
- * says it is not shown.
- *
- *   Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): delivery "<value>" is not "mentions" or "all".
- *   Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): delivery is not "mentions" or "all" (the value given is not shown).
- *
- * Pure.
- */
+/** Echo only a safe delivery label; never render arbitrary inputs. */
 export function channelDeliveryValueRefusal(name: string, key: string, value: unknown): string {
   const allowed = SET_CHANNEL_DELIVERY_VALUES.map((v) => JSON.stringify(v)).join(' or ')
   const lead = channelDeliveryRefusalLead(name, key)
@@ -1009,39 +1026,14 @@ export function channelDeliveryValueRefusal(name: string, key: string, value: un
     : `${lead}: delivery is not ${allowed} (the value given is not shown).`
 }
 
-/**
- * Rule 4's tool error: the channel is not known, neither in
- * the persona's heard set nor among its stored choices. The channel is
- * named, JSON-encoded, only when it matches `ECHOABLE_CHANNEL_RE`; otherwise
- * the error says it is not shown.
- *
- *   Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): channel "<channel>" is not known: it is not a channel this persona has heard a message from in open mode, or holds a choice for. Only a public or private channel that is not externally shared can be set.
- *   Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): the channel is not known (the value given is not shown): it is not a channel this persona has heard a message from in open mode, or holds a choice for. Only a public or private channel that is not externally shared can be set.
- *
- * Pure.
- */
+/** Listing or heard traffic never supplies current membership authority. */
 export function channelDeliveryChannelRefusal(name: string, key: string, channel: unknown): string {
   const what = typeof channel === 'string' && ECHOABLE_CHANNEL_RE.test(channel)
-    ? `channel ${JSON.stringify(channel)} is not known`
-    : 'the channel is not known (the value given is not shown)'
-  return (
-    `${channelDeliveryRefusalLead(name, key)}: ${what}: it is not a channel this persona has heard a message from ` +
-    'in open mode, or holds a choice for. Only a public or private channel that is not externally shared can be set.'
-  )
+    ? `channel ${JSON.stringify(channel)}` : 'the channel (the value given is not shown)'
+  return `${channelDeliveryRefusalLead(name, key)}: ${what} needs a valid public or private channel ID and authenticated current eligible membership for a new assignment.`
 }
 
-/**
- * The result of an accepted call: the channel, the stored
- * choice, and the persona's channel delivery there from the next event,
- * `result` (`channelDeliveryFor` with the choice just stored). When the loop
- * guard holds the channel at `mentions`, it says so and that the channel is
- * another persona's permission destination.
- *
- *   Stored <stored> as your channel delivery for channel <channel>. From the next message in that channel, your channel delivery there is <delivery>.
- *   Stored <stored> as your channel delivery for channel <channel>. From the next message in that channel, your channel delivery there is mentions: the channel is another persona's permission destination, where its permission prompts and notices go, so the loop guard holds it at mentions whatever is stored.
- *
- * Pure.
- */
+/** Render a new application only, using its original effective facts. */
 export function channelDeliverySetResultText(channel: string, stored: DeliveryMode, result: ChannelDeliveryResult): string {
   const lead = `Stored ${stored} as your channel delivery for channel ${channel}. ` +
     `From the next message in that channel, your channel delivery there is ${result.delivery}`
@@ -1051,15 +1043,7 @@ export function channelDeliverySetResultText(channel: string, stored: DeliveryMo
     : `${lead}.`
 }
 
-/**
- * The tool error of a failed write: names the
- * persona and the file. Memory is unchanged; the store logs its own
- * `[slack] channel-delivery:` line.
- *
- *   Tool "set_channel_delivery" failed for persona "<name>" (key=<key>): the stored-choice file "<path>" could not be written, so the choice was not stored and channel delivery is unchanged.
- *
- * Pure.
- */
+/** Only for a proven pre-rename failure; ambiguous outcomes use attempt results. */
 export function channelDeliveryWriteFailedText(name: string, key: string, path: string): string {
   return (
     `Tool "${SET_CHANNEL_DELIVERY_TOOL}" failed for persona ${renderPersonaRef(name, key)}: the shared channel authority ` +
@@ -1067,15 +1051,7 @@ export function channelDeliveryWriteFailedText(name: string, key: string, path: 
   )
 }
 
-/**
- * The tool error when the store refuses an input it would not write (its
- * `invalid` answer, such as a clock that gives no timestamp): nothing is
- * written and memory is unchanged.
- *
- *   Tool "set_channel_delivery" failed for persona "<name>" (key=<key>): the choice was not stored (the store refused its <field>), so channel delivery is unchanged.
- *
- * Pure.
- */
+/** Only for a proven input refusal; not an ambiguous durability outcome. */
 export function channelDeliveryNotStoredText(name: string, key: string, field: ChannelDeliverySetInvalidField): string {
   return (
     `Tool "${SET_CHANNEL_DELIVERY_TOOL}" failed for persona ${renderPersonaRef(name, key)}: the choice was not stored ` +
@@ -1177,7 +1153,7 @@ export const MCP_INSTRUCTIONS = [
   '<@ID> mentions a Slack user or persona. Use <@ID> to address another persona.',
   'If attachment_count is present, use download_attachment(chat_id, message_id) to fetch attachments.',
   'In strict mode you may act in your configured non-off channels. In open mode Slack enforces channel access.',
-  `${SET_CHANNEL_DELIVERY_TOOL} sets listening to off, mentions (@mentions and broadcasts), all (every message), or thread_hybrid (mentions and followed-thread replies). Use it when someone in that channel asks; new assignments require open mode.`,
+  `${SET_CHANNEL_DELIVERY_TOOL} sets listening to off, mentions (@mentions and broadcasts), all (every message), or thread_hybrid (mentions and followed-thread replies). Use it when someone in that channel asks; new assignments require open mode. Retain attempt_id before submission; fresh assignments use fresh IDs. Retry keeps ID/channel/value and only reads history.`,
   'With DMs on, you may reply, react, edit_message, fetch_messages and download_attachment in a DM you belong to (D... chat_id). To start a DM, reply takes a user ID (U... or W...) as chat_id and returns the D... ID for later edits, reactions, reads and thread replies. Other tools take no user ID. With DMs off you have no DM target. Any other target is refused.',
   'Pass message_id (the triggering message ts) to reply to remove the ack reaction.',
   'reply accepts files: ["/abs/path.png"] for attachments. react adds emoji reactions; edit_message updates a sent message; fetch_messages reads real Slack history from conversations.history.',
@@ -1315,18 +1291,7 @@ export function createSessionServer(
       {
         name: SET_CHANNEL_DELIVERY_TOOL,
         description: SET_CHANNEL_DELIVERY_DESCRIPTION,
-        inputSchema: {
-          type: 'object' as const,
-          properties: {
-            channel: { type: 'string', description: SET_CHANNEL_DELIVERY_CHANNEL_DESCRIPTION },
-            delivery: {
-              type: 'string',
-              enum: [...SET_CHANNEL_DELIVERY_VALUES],
-              description: SET_CHANNEL_DELIVERY_DELIVERY_DESCRIPTION,
-            },
-          },
-          required: ['channel', 'delivery'],
-        },
+        inputSchema: SET_CHANNEL_DELIVERY_INPUT_SCHEMA,
       },
     ],
   }))
@@ -1694,81 +1659,53 @@ export function createSessionServer(
   }
 
   // -------------------------------------------------------------------------
-  // set_channel_delivery (to; resolution as
-  // and , beside and
-  //)
-  //
-  // One synchronous stretch from reading the entry's persona key to the
-  // store's write, with no await, so no confirmed apply's step 1 comes
-  // between the persona resolved and the declaration stored.
-  // Resolution first: a session matched to no persona, a key that is not an
-  // applied persona's, a retiring key (the store's `isRetiring`), and a
-  // session entry that is not the one the registry holds for its key (dropped
-  // by `dropPersonaSession` or replaced by a newer registration) each get the
-  // other tools' refusal. Then rules, in order. A refused call
-  // stores, writes and logs nothing. An accepted call makes one store write
-  // and logs one `persona-channel-delivery-set` line after it. The tool never
-  // passes `checkPersonaTarget`, never reads a client and never makes a Slack
-  // call; dry run is not consulted, so it stores as outside dry run.
-  // -------------------------------------------------------------------------
-
+  // Logical attempt access and application stay synchronous. No admitted
+  // session/membership fact crosses an await, and the authority rechecks at
+  // its final turn after retaining the attempt binding.
   function setChannelDelivery(name: string, args: Record<string, unknown>) {
     const key = entry.personaKey
     if (!key) return toolError(sessionNotMatchedRefusal(name))
-    const persona = getPersona(key)
-    if (!persona) return toolError(personaNotAppliedRefusal(name, key))
+    const access = () => entry.connected && !!getPersona(key) && currentSessionLife() &&
+      getSessionByPersona(key) === entry && deps.isPersonaUp?.(key) === true
+    if (!access()) return toolError(personaNotAppliedRefusal(name, key))
+    const persona = getPersona(key)!
     const store = deps.getChannelDelivery?.()
-    if (!currentSessionLife()) return toolError(personaNotAppliedRefusal(name, key))
-    if (getSessionByPersona(key) !== entry) return toolError(personaNotAppliedRefusal(name, key))
-
-    // rules, in order; the first broken gives the error.
-    const mode: ChannelMode = deps.getChannelMode?.() ?? 'strict'
-    if (mode !== 'open') return toolError(channelDeliveryDeclarativeRefusal(persona.name, key))
-    if (store === undefined || !store.readable) {
-      return toolError(channelDeliveryUnreadableRefusal(persona.name, key, store?.path ?? CHANNEL_DELIVERY_FILE_NAME))
+    if (!store || !entry.personaIncarnation) return toolError(channelDeliveryUnreadableRefusal(persona.name, key, store?.path ?? CHANNEL_DELIVERY_FILE_NAME))
+    if (!isChannelDeliveryValue(args.delivery)) return toolError(channelDeliveryValueRefusal(persona.name, key, args.delivery))
+    if (typeof args.channel !== 'string' || !CHANNEL_ID_RE.test(args.channel)) return toolError(channelDeliveryChannelRefusal(persona.name, key, args.channel))
+    if (!validChannelDeliveryAttemptId(args.attempt_id) || !validChannelDeliveryAttempt(args)) {
+      return toolError(channelDeliveryAttemptInputRefusal(persona.name, key))
     }
-    const delivery = args['delivery']
-    if (!isChannelDeliveryValue(delivery)) return toolError(channelDeliveryValueRefusal(persona.name, key, delivery))
-    const channel = args['channel']
-    const known = typeof channel === 'string' && channel !== '' &&
-      ((deps.heardChannels?.(key).has(channel) ?? false) || store.storedChannels(key).includes(channel))
-    if (!known) return toolError(channelDeliveryChannelRefusal(persona.name, key, channel))
-
-    // one write, with P's declaration from the configuration in effect.
-    const outcome = store.set(key, channel, delivery, channelDeliveryDeclarationOf(persona))
-    switch (outcome.kind) {
-      case CHANNEL_DELIVERY_SET_STORED:
-        break
-      case CHANNEL_DELIVERY_SET_WRITE_FAILED:
-        // the store logged its own failed-write line; memory is unchanged.
-        return toolError(channelDeliveryWriteFailedText(persona.name, key, outcome.path))
-      case CHANNEL_DELIVERY_SET_UNREADABLE:
-        return toolError(channelDeliveryUnreadableRefusal(persona.name, key, outcome.path))
-      default:
-        return toolError(channelDeliveryNotStoredText(persona.name, key, outcome.field))
+    const request: ChannelDeliveryAttemptRequest = args
+    const history = store.lookupAttempt(key, entry.personaIncarnation, request)
+    const answer = (outcome: BotAttemptResult) => {
+      if (!access()) return toolError(personaNotAppliedRefusal(name, key))
+      const mode = deps.getChannelMode?.() ?? 'strict'
+      const current = ['binding-conflict', 'inactive', 'invalid'].includes(outcome.kind) ? undefined : currentChannelDeliveryFacts(
+        key, request.channel, mode, store, deps.getAppliedPersonas?.() ?? [getPersona(key)!],
+        deps.readChannelMembership?.(key, request.channel, mode),
+      )
+      const text = channelDeliveryAttemptResultText(persona.name, key, request.channel, outcome, current)
+      return outcome.kind === 'applied' ? { content: [{ type: 'text', text }] } : toolError(text)
     }
-
-    // P's channel delivery there from the next event:
-    // the one loop guard over the applied personas' destinations, built as the
-    // routing builds them, with the choice just stored. Rule 1 passed, so the
-    // mode read above is fungible, and the destination rule is given that
-    // switch.
-    const applied = deps.getAppliedPersonas?.() ?? [persona]
-    const result = channelDeliveryFor(key, channel, {
-      fungibleDestinations: fungibleDestinationsOf({ channel_mode: 'open' }, applied),
-      storedChoices: store,
-    })
-    // one line per accepted call, after the
-    // write, to the `[slack]` stream only.
-    const log = deps.log ?? ((line: string) => console.error(line))
-    log(formatPersonaDiagnostic({
-      class: PERSONA_CHANNEL_DELIVERY_SET,
-      name: persona.name,
-      key,
-      index: persona.index,
-      cause: channelDeliverySetCause(channel, outcome.previous, delivery, result.delivery),
+    if (history) return answer(history)
+    if (request.intent === 'retry') return answer({ kind: 'unresolved' })
+    if ((deps.getChannelMode?.() ?? 'strict') !== 'open') return toolError(channelDeliveryDeclarativeRefusal(persona.name, key))
+    if (isDryRun()) return toolError(channelDeliveryDryRunRefusal(persona.name, key))
+    return answer(store.attempt(key, entry.personaIncarnation, request, () => {
+      if (!access()) return 'inactive'
+      if (isDryRun()) return 'dry-run'
+      if ((deps.getChannelMode?.() ?? 'strict') !== 'open') return 'strict'
+      const membership = deps.readChannelMembership?.(key, request.channel, 'open')
+      if (membership?.kind !== 'eligible' || membership.lifetime.incarnation !== entry.personaIncarnation) return 'membership'
+      return undefined
+    }, outcome => {
+      const log = deps.log ?? ((line: string) => console.error(line))
+      log(formatPersonaDiagnostic({ class: PERSONA_CHANNEL_DELIVERY_SET,
+        name: persona.name, key, index: persona.index,
+        cause: channelDeliverySetCause(request.channel, outcome.previous, outcome.facts.saved, outcome.facts.effective),
+      }))
     }))
-    return { content: [{ type: 'text', text: channelDeliverySetResultText(channel, delivery, result) }] }
   }
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {

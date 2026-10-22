@@ -390,3 +390,69 @@ test.each(['missing', 'zero', 'fractional', 'future'] as const)('retirement orde
   expect(() => parseSharedChannelState(bytes, authority.path)).toThrow('The shared channel authority has invalid retired identity evidence.')
   check(state)
 })
+
+import { contradictoryBotHistory, deliveryAttempt } from './test-helpers/shared-channels.ts'
+test.each(['rejection-at-assignment', 'colliding-attempts'] as const)('F1: production reader rejects %s rather than trusting contradictory history', shape => {
+  const config = input(); config.channel_mode = 'open'
+  const authority = makeSharedAuthority(root, config)
+  const store = createChannelDeliveryStore(authority, () => true)
+  expect(store.attempt('alpha', authority.incarnation('alpha')!, deliveryAttempt('parser-regression', 'C0TEST001', 'all'), () => undefined).kind).toBe('applied')
+  const bytes = serializeSharedChannelState(contradictoryBotHistory(authority.snapshot(), shape))
+  expect(() => parseSharedChannelState(bytes, authority.path)).toThrow()
+  durableWriteFileSync(authority.path, bytes)
+  expect(() => readSharedState(root)).toThrow()
+  check(bytes)
+})
+
+import { malformedBotHistories } from './test-helpers/shared-channels.ts'
+import { botAttemptBinding, botAttemptKey, validChannelDeliveryAttemptId } from '../src/channel-delivery-attempt.ts'
+import { makeMembershipHarness, membershipPage } from './test-helpers/shared-channels.ts'
+test.each(['pending-at-terminal', 'pending-at-inventory'] as const)('attempt positions exclude %s while an inventory may reference the applied revision', async shape => {
+  const h = makeMembershipHarness(root)
+  try {
+    await h.start()
+    const persona = h.h.p('alpha'), channel = 'C0TEST001'
+    h.h.stub(persona).script.inventory.push(membershipPage([channel])); await h.scan()
+    const store = createChannelDeliveryStore(h.authority, () => true)
+    const request = deliveryAttempt('before-authenticated-inventory', channel, 'all')
+    expect(store.attempt('alpha', h.authority.incarnation('alpha')!, request, () => undefined).kind).toBe('applied')
+    const appliedRevision = h.authority.revision
+    h.h.stub(persona).script.inventory.push(membershipPage([channel])); h.scanner.request('alpha'); await h.scan()
+    const valid = h.authority.snapshot()
+    expect(valid.personas.alpha!.membershipInventory!.observedRevision).toBe(appliedRevision)
+    expect(readSharedState(root)).toEqual(valid)
+    expect(createSharedChannelAuthority(h.authority.path, readSharedState(root)!).lookupBotAttempt('alpha', h.authority.incarnation('alpha')!, request)?.kind).toBe('applied')
+    const bytes = serializeSharedChannelState(contradictoryBotHistory(valid, shape))
+    expect(() => parseSharedChannelState(bytes, h.authority.path)).toThrow(shape === 'pending-at-terminal' ? 'Invalid durable bot attempt order.' : 'Inconsistent durable bot attempt effect.')
+    durableWriteFileSync(h.authority.path, bytes)
+    expect(() => readSharedState(root)).toThrow()
+    expect(readFileSync(h.authority.path)).toEqual(Buffer.from(bytes))
+    check(bytes)
+  } finally { await h.close() }
+})
+
+test('the production reader refuses malformed typed evidence without dumping identifiers or injected data', () => {
+  const config = input(); config.channel_mode = 'open'
+  const authority = makeSharedAuthority(root, config), store = createChannelDeliveryStore(authority, () => true)
+  expect(store.attempt('alpha', authority.incarnation('alpha')!, deliveryAttempt('valid-source-record', 'C0TEST001', 'all'), () => undefined).kind).toBe('applied')
+  for (const { state } of malformedBotHistories(authority.snapshot())) {
+    const bytes = serializeSharedChannelState(state)
+    let failure: unknown
+    try { parseSharedChannelState(bytes, authority.path) } catch (error) { failure = error }
+    expect(failure).toBeInstanceOf(Error)
+    assertNoLeak(String(failure))
+    expect(String(failure)).not.toContain('must-not-be-persisted')
+  }
+  check(authority.snapshot())
+})
+
+test('attempt identifiers preserve exact code units and cannot collide after Unicode replacement or trimming', () => {
+  const values = ['retained', ' retained ', '\ud800', '\ufffd', '😀', '😀 ']
+  const keys = values.map(id => {
+    expect(validChannelDeliveryAttemptId(id)).toBe(true)
+    return botAttemptKey(botAttemptBinding('alpha', 'same-life', deliveryAttempt(id, 'C0TEST001', 'all')))
+  })
+  expect(new Set(keys).size).toBe(values.length)
+  expect(validChannelDeliveryAttemptId(' \r\n\t')).toBe(false)
+  assertNoLeak(keys)
+})

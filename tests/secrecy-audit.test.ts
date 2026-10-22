@@ -165,6 +165,7 @@ const SOURCE_SURFACES: [RegExp, string][] = [
   // the state directory move walks the directory that holds the credentials files and the config, and logs paths and errors.
   [/^src\/state-dir-migration\.ts$/, "the state directory move, which compares and moves the files of the state directory (the credentials files among them) and logs only their names and errors"],
   // the stored-choice file holds the credentials file's path, never its content.
+  [/^src\/channel-delivery-attempt\.ts$/, 'logical attempt validation and hashed caller identity evidence'],
   [/^src\/channel-delivery\.ts$/, "the stored-choice store, which records each persona's declaration, a credentials file's path among them, and logs its read and write failures"],
 ]
 
@@ -178,7 +179,7 @@ const HELPER_SURFACES: Record<string, Record<string, string>> = {
     sentinelInMessage: 'plants the leak sentinel in an error message (in a fake token and a ticket URL)',
     sentinelTicketUrl: 'plants the leak sentinel in a ticket URL',
   },
-  'tests/test-helpers/shared-channels.ts': { makeMembershipHarness: 'builds authenticated connection and durable membership composition', configBytes: 'serializes config input', initialSharedState: 'builds a shared config-state envelope', writeSharedState: 'writes the shared config-state envelope', makeSharedAuthority: 'builds and writes the shared authority' },
+  'tests/test-helpers/shared-channels.ts': { deliveryAttempt: 'builds caller-retained attempt inputs', contradictoryBotHistory: 'derives malformed durable attempt evidence', deliveryResultSamples: 'builds durable attempt result variants', makeMembershipHarness: 'builds authenticated connection and durable membership composition', configBytes: 'serializes config input', initialSharedState: 'builds a shared config-state envelope', writeSharedState: 'writes the shared config-state envelope', makeSharedAuthority: 'builds and writes the shared authority' },
   'tests/test-helpers/persona-config.ts': { writeConfigFile: 'writes a config file' },
   'tests/test-helpers/ad-settings.ts': { writeAgentDirectorConfig: "writes agent-director's config.toml" },
   'tests/test-helpers/channel-delivery.ts': { writeChannelDeliveryRecord: 'writes a stored-choice file holding persona declarations' },
@@ -654,6 +655,21 @@ describe('every suite that touches config, credentials or reload calls assertNoL
     const withoutCalls = codeOf(suite).replace(/(?<![\w.$])assertNoLeak\s*\(/g, 'void (')
     expect(touchReasonsOf(suite, withoutCalls).some((r) => r.includes('src/channel-delivery.ts'))).toBe(true)
     expect(callsAssertNoLeak(suite, withoutCalls)).toBe(false)
+  })
+
+  test('attempt evidence functions require leakage checks, including aliased imports and omission mutants, without exemptions', () => {
+    const suite = 'tests/channel-delivery.test.ts', module = 'src/channel-delivery-attempt.ts'
+    expect(SOURCE_SURFACES.some(([re]) => re.test(module))).toBe(true)
+    for (const name of ['botAttemptBinding', 'botAttemptResult', 'validateBotAttempts']) {
+      expect(touchReasonsOf(suite, `import { ${name} as used } from '../${module}'`)).toHaveLength(1)
+    }
+    expect(touchReasonsOf(suite, `import type { BotAttemptResult } from '../${module}'`)).toEqual([])
+    const touching = SUITES.filter(file => touchReasons(file).some(reason => reason.includes(module)))
+    expect(touching).toContain(suite)
+    expect(touching.map(file => [file, callsAssertNoLeak(file), file in EXEMPT])).toEqual(touching.map(file => [file, true, false]))
+    const withoutCalls = codeOf(suite).replace(/(?<![\w.$])assertNoLeak\s*\(/g, 'void (')
+    expect(callsAssertNoLeak(suite, withoutCalls)).toBe(false)
+    expect(touchReasonsOf(suite, withoutCalls).some(reason => reason.includes(module))).toBe(true)
   })
 
   // the stored-choice file the helper writes holds persona declarations.

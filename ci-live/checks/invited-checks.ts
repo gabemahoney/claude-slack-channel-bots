@@ -40,6 +40,7 @@
  * in tests/ci-live-checks.test.ts.
  */
 
+import { randomUUID } from 'node:crypto'
 import { describeError } from '../lib/errors.ts'
 import { SWITCH_KEY, SWITCH_VALUE_JQ, switchFilter, switchOnFilter } from '../lib/live-config.ts'
 import { personaName, PERSONA_LETTERS } from '../lib/personas.ts'
@@ -408,10 +409,12 @@ export const check31: CheckDef<CheckContext> = {
     const m = await mark(ctx)
     const previousChoice = await sharedChoice(ctx, ch.id)
     const before = await callCount(ctx, SET_CHANNEL_DELIVERY_TOOL, ch.id)
+    // Retained before asking; the optional second ask repeats this binding.
+    const attemptId = `check31-${randomUUID()}`
     const o = await askC(
       ctx,
       ch.id,
-      `${mention(ctx, 'c')} please listen to every message in this channel from now on: call your ${SET_CHANNEL_DELIVERY_TOOL} tool once with channel \`${ch.id}\` and delivery \`all\`. Then reply here with the word done.`,
+      `${mention(ctx, 'c')} please listen to every message in this channel from now on: call your ${SET_CHANNEL_DELIVERY_TOOL} tool once with channel \`${ch.id}\` and delivery \`all\`, attempt_id \`${attemptId}\` and intent \`assignment\`. Retain this identifier before submission. If a response is lost, use intent \`retry\` with this same identifier/channel/value. Then reply here with the word done.`,
       async () => (await newestCall(ctx, SET_CHANNEL_DELIVERY_TOOL, ch.id, before)) !== undefined,
     )
     askEvidence(f, 'set_channel_delivery', o.asks)
@@ -422,6 +425,8 @@ export const check31: CheckDef<CheckContext> = {
     if (o.next === 'no-call') return notRun(`C made no ${SET_CHANNEL_DELIVERY_TOOL} call for the run channel (asked ${o.asks.length} times)`, f)
     const call = (await newestCall(ctx, SET_CHANNEL_DELIVERY_TOOL, ch.id, before))!
     f.expect(o.asks.at(-1)!.reply !== null, 'C did not say done')
+    f.expect(call.attemptId === attemptId, 'C did not preserve the requested attempt identifier')
+    f.expect(call.intent === 'assignment' || call.intent === 'retry', 'C omitted or changed the explicit attempt intent')
     f.expect(call.delivery === 'all', `C's call asked for delivery ${call.delivery ?? '(none)'}, not all`)
     if (!f.expect(call.outcome === 'ok', `C's ${SET_CHANNEL_DELIVERY_TOOL} call was ${call.outcome === 'none' ? 'not answered' : 'refused'}`) && call.error) {
       f.add(`refusal: ${call.error.slice(0, 300)}`)

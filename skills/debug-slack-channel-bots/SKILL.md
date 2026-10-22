@@ -1187,60 +1187,103 @@ credentials workflow, never these requests or chat.
 ### `persona-channel-delivery-set`
 
 - **State:** the persona is `up`; this is an audit line, not a failure.
-- **Line:** `[slack] persona-channel-delivery-set: personas[<i>] "<name>" (key=<key>): stored choice for channel <id> set from <none|mentions|all> to <mentions|all>, at channel delivery <mentions|all> after the loop guard`
+- **Line:** `[slack] persona-channel-delivery-set: personas[<i>] "<name>" (key=<key>): stored choice for channel <id> set from <none|off|mentions|all|thread_hybrid> to <off|mentions|all|thread_hybrid>, at channel delivery <off|mentions|all|thread_hybrid> after the loop guard`
 
-  `from` is the persona's stored choice for the channel before the call
-  (`none` when it had none), `to` is the choice the call stored, and
-  `at channel delivery` is the persona's channel delivery there after the
-  loop guard. The line has no `path` part.
-- **Meaning:** The persona's agent called `set_channel_delivery` and the
-  server stored its choice for that channel. The line:
-  - is logged once for each accepted call, including one that stores the
-    value already stored, after current eligible membership is rechecked.
-    Dry run supplies no current membership and cannot store a new choice;
-  - is logged only in open mode (`channel_mode` is `"open"`):
-    in strict mode every call is refused;
+  `from` is the stored choice before the application (`none` when absent),
+  `to` is the newly saved choice, and `at channel delivery` is its effective
+  delivery after the loop guard at that application. The line has no `path` part.
+- **Meaning:** A new logical attempt durably applied one channel choice. The line:
+  - is logged once per new durable application, including a deliberate
+    same-value assignment with a fresh identifier. Retaining an attempt or
+    rejection, reading history, retrying and reopening do not log another
+    application. Recovery that establishes the original durable application
+    in the running server logs it once at its original position;
+  - follows application-time checks of open mode (`channel_mode: "open"`),
+    an active current persona/session and authenticated current eligible
+    public/private membership with explicit non-external-sharing evidence.
+    Strict mode and dry run cannot create assignments or attempt records;
   - goes only to `server.log`, in the `[slack]` stream: no
     `startup-errors.log` entry, and nothing is posted to Slack;
-  - carries no message text, user ID or token.
+  - carries no attempt identifier, message text, user ID or token.
 
-  The choice applies from the next event and persists in `config.json.last-applied` across restarts and persona relaunches. Both modes use that same applied choice; changing `channel_mode` preserves it. A replacement persona has a new incarnation and never inherits another incarnation’s choices.
+  The choice applies from the next event and persists with its attempt outcome
+  in `config.json.last-applied`, without editing `config.json` or consuming
+  pending operator intent. Both modes use that shared choice; changing modes
+  preserves it. A replacement persona has a new incarnation and inherits
+  neither the old choices nor access to the old attempt history.
 
-- **Cause:** The persona's agent called the tool, usually because someone in
-  that channel asked it to listen to every message there (`all`), or only to
-  @mentions and `@here` or `@channel` broadcasts (`mentions`).
-- **Fix:** None when the change was expected. To undo it, ask the persona in
-  that channel to set the other value; the other fixes for a persona that
-  receives every message in a channel are under
+- **Inputs:** Supply exactly `channel`, `delivery`, `attempt_id` and `intent`.
+  The channel must be a valid public/private ID (`C…` or `G…`); delivery is
+  `off`, `mentions`, `all` or `thread_hybrid`. Create and retain a nonempty,
+  non-whitespace identifier before first submission.
+
+  Each deliberate choice,
+  including the same value, uses a fresh identifier and `intent: assignment`.
+  After response loss, reconnect or restart, use `intent: retry` with the
+  original identifier/channel/value. Same-binding duplicates under either
+  intent refer to one attempt; retry never obtains a new assignment position.
+- **Cause:** Someone asked the persona to change its listening choice.
+  Current authenticated discovery can authorize a fresh assignment before any
+  message arrives or the inventory finishes.
+
+  Listing a channel, hearing a
+  message, holding historical membership or a saved choice, and dry-run
+  placeholders do not supply current membership. Unresolved membership still
+  holds affected new assignments; see [membership recovery](#channel-membership-inventory-incomplete).
+- **Fix:** None when the change was expected. To undo a known applied choice,
+  request a deliberate new assignment with a fresh identifier, subject to
+  current authorization. Other fixes are under
   [A persona receives every message in a channel](#a-persona-receives-every-message-in-a-channel).
-  Note:
-  - a line with `to all` and `at channel delivery mentions` means the loop
-    guard holds the channel at `mentions`, because it is another applied
-    persona's open destination (its `permission_prompts`
-    channel), so two personas can't answer each other in a loop. The choice
-    stays stored, and applies once the channel is no longer that
-    destination.
-- **Refusals:** a refused call logs no line of this class, and no other
-  line: the agent gets a tool error, and nothing is stored or written. A
-  call is checked in this order, and the first rule it breaks gives the
-  error:
-  1. The session resolves to no applied persona, with the same refusals the
-     other tools give:
+
+  A line with `to all` or `to thread_hybrid` and `at channel delivery mentions`
+  records the other-persona destination loop guard. The saved choice remains;
+  `off` stays off. The result's original restriction describes that application,
+  not necessarily the channel's current restriction.
+- **Results and history:** An applied result identifies the persona/channel,
+  says `newly applied` or `previously applied` at its original position, and
+  reports original saved/effective delivery and any loop-guard restriction.
+  A historical result adds `This history read made no new assignment.`
+
+  Current saved/effective facts, mode and restriction are reported separately;
+  a later operator choice is not overwritten. When current evidence is missing,
+  removed, ineligible or untrustworthy, the result identifies what is unavailable
+  rather than inventing an effective choice.
+
+  An authorized current session of the same incarnation may read this history
+  in strict mode or dry run without writing. Inactive, stale, foreign or
+  replacement sessions cannot retrieve the original incarnation's outcomes.
+
+  The outcome clauses below omit the persona/channel prefix and separate
+  current-facts suffix.
+
+  | Attempt outcome | Outcome clause |
+  |---|---|
+  | Not-applied: membership | `this attempt did not apply and changed no choice: current eligible membership was not verified. Its retained outcome cannot be retried as a new assignment.` |
+  | Not-applied: inactive session/persona | `this attempt did not apply and changed no choice: the session or persona became inactive. Its retained outcome cannot be retried as a new assignment.` |
+  | Not-applied: strict mode | `this attempt did not apply and changed no choice: strict mode did not authorize an assignment. Its retained outcome cannot be retried as a new assignment.` |
+  | Not-applied: dry run | `this attempt did not apply and changed no choice: dry run did not authorize an assignment. Its retained outcome cannot be retried as a new assignment.` |
+  | Not-applied: write-failed | `this attempt did not apply and changed no choice: the application failed before durable activation. Its retained outcome cannot be retried as a new assignment.` |
+  | Pending | `the retained attempt is pending; no duplicate application was made. Its outcome requires recovery.` |
+  | Unresolved | `the durable outcome is unresolved; application or nonapplication cannot be established. Preserve the identifier and seek recovery; retry cannot create an assignment.` |
+
+  Restoring eligibility does not
+  turn that retained rejection into an assignment.
+- **Refusals:** No new assignment diagnostic is produced for input/access
+  refusal, pending, not-applied or unresolved results. A rejected attempt may
+  retain metadata; absence of a success line does not establish the outcome.
+  Access and input validation precede history lookup; known attempts are
+  resolved before fresh-assignment mode and dry-run checks.
+  1. Session/access failures include:
      - `Tool "set_channel_delivery" refused: this session is not matched to a persona.`
-       The calling session is matched to no persona.
      - `Tool "set_channel_delivery" refused: persona key=<key> is not an applied persona.`
-       Besides a key absent from the applied configuration, it covers a key
-       that a confirmed change still in progress is retiring (a destructive
-       modify, from the change's apply until its teardown has settled), and
-       a session the server has dropped (the teardown of a removal or
-       destructive modify) or replaced with a later registration, even while
-       the persona is still in `config.json`. Once the persona's session is
-       up again, its agent can call the tool again.
-  2. Strict mode:
-     `Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): strict mode is active, so channel delivery is set by the operator in config.json.`
-     Expected while `channel_mode` is absent or `"strict"`: the
-     operator sets each channel's `delivery` in `config.json`.
-  3. The shared authority is unreadable or unresolved:
+     An absent, retiring, down, disconnected, dropped or superseded session
+     is refused even when its key remains in `config.json`. A later authorized
+     session can read retained history only for its own current incarnation.
+  2. Fresh assignment in strict mode:
+     `Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): strict mode is active, so new assignments are unavailable. A retained same-incarnation attempt can still be read without writing.`
+     Fresh assignment in dry run:
+     `Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): dry run cannot create assignments or attempt records. Retained same-incarnation history can be read without writing.`
+  3. Unavailable authority may give:
      `Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): the shared channel authority "<path>" is not trustworthy, so the outcome is unresolved and no channel delivery can be stored. The operator must preserve the evidence and restore trustworthy shared state before retrying.`
      See [`channel-delivery-unreadable`](#channel-delivery-unreadable).
   4. A bad value:
@@ -1248,35 +1291,36 @@ credentials workflow, never these requests or chat.
      A value that is missing, not a string, or anything but 1 to 48
      letters and underscores reads
      `… delivery is not "off" or "mentions" or "all" or "thread_hybrid" (the value given is not shown).`
-  5. An unknown channel:
-     `Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): channel "<channel>" is not known: it is not a channel this persona has heard a message from in open mode, or holds a choice for. Only a public or private channel that is not externally shared can be set.`
+  5. An invalid channel:
+     `Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): channel "<channel>" needs a valid public or private channel ID and authenticated current eligible membership for a new assignment.`
      A value that isn't 1 to 24 capital letters and digits reads
-     `… the channel is not known (the value given is not shown): …`. The
-     persona has heard the channel only once a message from it took its
-     open path in its current life (see
-     [`persona-invited-channel`](#persona-invited-channel)); an externally
-     shared channel, a group DM and a DM never count. Fix: wait for a
-     message in that channel, then ask again.
-- **A failed write:** a failed write of the shared authority gives the
-  agent
-  `Tool "set_channel_delivery" failed for persona "<name>" (key=<key>): the shared channel authority "<path>" could not be written, so the choice was not stored and channel delivery is unchanged.`
-  with no `persona-channel-delivery-set` success line. The choice is not
-  stored and the persona's channel delivery is unchanged. The line's forms,
-  and recovery steps are under
-  [The store's `[slack] channel-delivery:` lines](#the-stores-slack-channel-delivery-lines).
-  Once the cause is fixed, ask the persona to set the value again.
-- **An input the store refuses:** a call that passed every refusal above can
-  still be turned away by the store's own check of what it would write. The
-  agent gets
-  `Tool "set_channel_delivery" failed for persona "<name>" (key=<key>): the choice was not stored (the store refused its <field>), so channel delivery is unchanged.`
-  This is not one of the refusals above, which the server checks before the
-  store. Nothing is stored or written, and no line is logged. `<field>` is
-  `key`, `channel`, `delivery`, `declaration`, `set_at` or `membership`.
-  A `membership` refusal means current eligible membership could not be
-  verified when the choice was to be stored; hearing or listing the channel,
-  or holding a saved choice, is insufficient. Follow
-  [membership recovery](#channel-membership-inventory-incomplete), read back
-  the current inventory, and retry only after eligible membership is verified.
+     `… the channel (the value given is not shown) needs a valid public or private channel ID and authenticated current eligible membership for a new assignment.`
+     A syntactically valid channel still requires current eligible membership
+     at application; a durably retained membership rejection reports not-applied.
+  6. Missing/invalid attempt inputs or extra fields:
+     `Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): provide channel, delivery, a nonempty caller-retained attempt_id and intent "assignment" or "retry", with no extra fields. Input values are not shown.`
+     A known identifier reused with different channel/value inputs gives
+     `Tool "set_channel_delivery" refused for persona "<name>" (key=<key>): the identifier cannot be used for these inputs. No assignment was made; original inputs are not disclosed.`
+- **Failed writes and application-time refusals:** Only durable evidence of
+  nonapplication permits an unchanged-choice claim. The `write-failed` clause
+  above describes a proven failure before durable activation, reported as
+  `not-applied` only after that rejection is durably retained. Other retained
+  application-time rejections use the corresponding outcome clauses above.
+
+  Unknown, unreadable or inconsistent history, or a failure to retain the
+  rejection, leaves the outcome unresolved and cannot prove either application
+  or nonapplication. Retained pending evidence stays pending and requires
+  recovery; it does not establish a rejection.
+
+  Preserve the identifier, original channel/value, authority and prepared/pending
+  evidence. Repair storage or restore trustworthy evidence before looking up
+  that same attempt; neither elapsed time nor another call guarantees recovery.
+
+  Do not replace the identifier to retry an uncertain write or replay it over a
+  newer choice. See [The store's `[slack] channel-delivery:` lines](#the-stores-slack-channel-delivery-lines).
+- **Input validation:** The MCP request has exactly the four inputs above,
+  with no timestamp input. Supply valid inputs; changing the channel/value
+  on a retained identifier is refused.
 
 ### `persona-destination-failed`
 
@@ -6411,7 +6455,9 @@ A shared authority that cannot be read or validated prevents startup. A running 
 
 ### The store's `[slack] channel-delivery:` lines
 
-Choice-write failures leave the previous applied choice in force when failure is definite. An unresolved outcome requires preserving the authority and prepared evidence before recovery. The caller receives the exact error under [`persona-channel-delivery-set`](#persona-channel-delivery-set).
+Choice-write failures leave choices unchanged only when nonapplication is proven. The attempt response distinguishes a durably retained rejection from pending or unresolved evidence; absence of a success line proves neither application nor nonapplication. Preserve the identifier, authority and prepared/pending evidence before recovery.
+
+A retry reads the original outcome and cannot acquire a new assignment position, even after storage is repaired. Exact result and refusal wording is under [`persona-channel-delivery-set`](#persona-channel-delivery-set).
 
 ## The state directory's location and its move at start
 

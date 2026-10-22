@@ -734,7 +734,9 @@ exactly-once guarantee across failures (and the review answers).
 
 - **Delivered tags:** `tags <persona> <TS>` (Part 1.3). For an edited message, whose tag may not carry the `<TS>` from its link, `tagstext <persona> '<text>'`. Both read only `type == "user"` entries and `queued_command` attachments: the transcript also records a `queue-operation` entry for each incoming message, which would double the count.
 - **Tool calls and tool errors:** `replies <persona>`. Each line is one `reply` call, with its `chat_id`, whether the result was an error, and the result text the server returned. A check picks out its call by target, for example `replies a | grep -F 'chat_id=<SECOND_USER_ID>' | tail -n 1`. A refusal is returned to the persona only, never logged, so the transcript is where it is read. Claude Code may wrap an MCP error's text, so a check matches the expected text with "contains", not as the whole result.
-- **Other tools' calls and results:** `toolcalls <persona> <tool>`, defined below in the shell that runs Part 11 (it is not one of Part 1.3's helpers). It prints one JSON line per call of that CSCB session tool in the persona's current transcript, in call order: the conversation it named (`channel`, from its `chat_id` or `channel` input), its `message_id` (`ts`), whether it gave a `thread_ts` (`threadTs`), its `delivery`, how it ended (`outcome`: `ok`, `error`, or `none` while the transcript holds no result) and a refused call's tool error (`error`). An accepted call's result is never printed. Checks 31 and 33 read C's calls with it, as the runner does:
+- **Other tools' calls and results:** `toolcalls <persona> <tool>`, defined below in the shell that runs Part 11 (it is not one of Part 1.3's helpers). It prints one JSON line per call of that CSCB session tool in the persona's current transcript, in call order: the conversation it named (`channel`, from its `chat_id` or `channel` input), its `message_id` (`ts`), whether it gave a `thread_ts` (`threadTs`), its `delivery`, the retained identifier (`attemptId`, from a string `attempt_id`) and string `intent`, how it ended (`outcome`: `ok`, `error`, or `none` while the transcript holds no result) and a refused call's tool error (`error`). Missing or non-string attempt identity/intent is `null`.
+
+  An accepted call's result is never printed, so `ok` alone does not distinguish a new application from history. Checks 31 and 33 read C's calls with it, as the runner does:
 
   ```sh
   toolcalls() {
@@ -752,6 +754,8 @@ exactly-once guarantee across failures (and the review answers).
           ts: (if $in.message_id == null then null else ($in.message_id | tostring) end),
           threadTs: ((($in.thread_ts // "") | tostring) != ""),
           delivery: (if $in.delivery == null then null else ($in.delivery | tostring) end),
+          attemptId: (if ($in.attempt_id | type) == "string" then $in.attempt_id else null end),
+          intent: (if ($in.intent | type) == "string" then $in.intent else null end),
           outcome: $outcome,
           error: (if $outcome == "error" then ($r.content | if type == "string" then . elif type == "array" then ([ .[] | .text? // empty ] | join(" ")) else "" end) else null end) }' "$t"
   }
@@ -2453,14 +2457,19 @@ invite C answered the mention in the run channel as itself, with one
 
 Steps:
 
-1. Note the log mark, and C's calls of `set_channel_delivery` so far:
+1. Create a fresh nonempty `<ATTEMPT_ID>` and retain it in Notes before submission, with channel `<RUN_CHANNEL_ID>` and delivery `all`. Every deliberate run of this check uses a new identifier, even if `all` is already saved.
+
+   Confirm that C has current authenticated eligible membership in this public, non-externally-shared channel and an active current session in open mode; Check 30's heard-event line alone is not membership evidence. Note the log mark, C's existing shared choice (`<PREVIOUS_CHOICE>`, or `none` if absent), and its calls of `set_channel_delivery` so far:
 
    ```sh
    MARK=$(mark)
+   jq -r '.applied.personas[] | select(.name == "persona_c") | .channels[]? | select(.id == "<RUN_CHANNEL_ID>") | .delivery' "$S/config.json.last-applied"
    toolcalls c set_channel_delivery | grep -cF '"channel":"<RUN_CHANNEL_ID>"'
    ```
 
-2. In `<RUN_CHANNEL_NAME>`, post: "@CSCB Test C please listen to every message in this channel from now on: call your set_channel_delivery tool once with channel `<RUN_CHANNEL_ID>` and delivery `all`. Then reply here with the word done." Wait for C's done (up to three minutes).
+2. In `<RUN_CHANNEL_NAME>`, post: "@CSCB Test C please listen to every message in this channel from now on: call your set_channel_delivery tool once with channel `<RUN_CHANNEL_ID>` and delivery `all`, attempt_id `<ATTEMPT_ID>` and intent `assignment`. Retain this identifier before submission.
+
+   If a response is lost, use intent `retry` with this same identifier/channel/value. Then reply here with the word done." Wait for C's done (up to three minutes).
 3. Run:
 
    ```sh
@@ -2472,8 +2481,10 @@ Steps:
 
 Expected:
 
-- C says done. Step 3's `toolcalls` line is a call newer than step 1's count, with `"delivery":"all"` and `"outcome":"ok"`.
-- Step 3's `grep` prints exactly one line, containing `[slack] persona-channel-delivery-set: personas[2] "persona_c" (key=persona_c): stored choice for channel <RUN_CHANNEL_ID> set from mentions to all, at channel delivery all after the loop guard`.
+- C says done. Step 3's `toolcalls` line is newer than step 1's count, names the run channel and has `"delivery":"all"`, `"attemptId":"<ATTEMPT_ID>"`, explicit `"intent":"assignment"` (or `"intent":"retry"` after response loss with the same binding), and `"outcome":"ok"`. Missing or wrong identifier/intent/value, no result, or a refusal fails the check.
+- Step 3's `grep` prints exactly one line, containing `[slack] persona-channel-delivery-set: personas[2] "persona_c" (key=persona_c): stored choice for channel <RUN_CHANNEL_ID> set from mentions to all, at channel delivery all after the loop guard` for the first run after Check 30. Match `from` to step 1's actual `<PREVIOUS_CHOICE>`: on a deliberate repeat with `all` already saved, expect `from all to all` instead.
+
+  No line or duplicate lines fails the check. An `ok` history response alone is not evidence of a fresh application; the one diagnostic since the mark must establish this run's new application.
 - Step 4: C answers "heard-all" in `<RUN_CHANNEL_NAME>`, under its own name and avatar.
 
 The live container allows the server's tools as a group, so the call raises
@@ -2481,18 +2492,25 @@ no permission prompt. On a host whose Claude Code settings do not, C's first
 `set_channel_delivery` call raises one at C's destination: allow it, and
 record it in Notes.
 
-If C says done but step 3 shows no new call, ask once more; with still no
-call, record the check as "not run" (Check 16's rule).
+If C says done but step 3 shows no new call, ask once more with the same
+retained identifier/channel/value; with still no call, record the check as
+"not run" (Check 16's rule). No done fails the check.
 
-Pass: C stored `all` for the run channel with one accepted
-`set_channel_delivery` call and one `persona-channel-delivery-set` line, and
-answered a message that does not mention it.
+A response-loss retry
+keeps that binding and cannot create an assignment. Pending, proven
+not-applied or unresolved outcomes cannot count as success; preserve the
+evidence for recovery instead of silently substituting a fresh identifier.
+
+Pass: the retained attempt has matching structured call/result evidence,
+exactly one new durable application with one `persona-channel-delivery-set`
+line, and C answered a message that does not mention it. Duplicate/history
+calls add no application or diagnostic and cannot substitute for that evidence.
 
 ### Check 32: strict mode retains C’s shared choice and C answers with no unclaimed-channel line 
 
 Steps:
 
-1. Check that the switch is on in the record: `jq -c '.applied | ((.channel_mode // "strict") == "open")' "$S/config.json.last-applied"` must print `true`. If it doesn't, there is nothing to switch off: record the check as failed.
+1. Require Check 31's proven new `all` application; an accepted historical response alone does not establish it. Check that the switch is on in the record: `jq -c '.applied | ((.channel_mode // "strict") == "open")' "$S/config.json.last-applied"` must print `true`. If it doesn't, there is nothing to switch off: record the check as failed.
 2. Turn the switch off with Part 2.2's gesture, leaving C's app in the channel. Note the log mark, then edit, only if the guard passes:
 
    ```sh

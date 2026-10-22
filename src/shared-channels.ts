@@ -3,8 +3,12 @@
  * revision checked, and become visible only after the injected durable write.
  */
 import { createHash, randomUUID } from 'node:crypto'
+import {
+  botAttemptBinding, botAttemptKey, botAttemptResult, sameBotAttempt, validChannelDeliveryAttempt, validateBotAttempts,
+  type BotAttemptAuthorization, type BotAttemptBinding, type BotAttemptResult, type ChannelDeliveryAttemptRequest, type SharedBotAttempt,
+} from './channel-delivery-attempt.ts'
 import { emptyOperatorIntent, parseReviewRequest, validateOperatorIntent, type OperatorIntent, type ReviewRequest } from './reload-request.ts'
-import { consumeReview, reviewLedger, reviewMatches, sharedReviewDependency, validateReviewLedger, type DurableReview } from './reload-review.ts'
+import { consumeReview, reviewLedger, reviewMatches, sharedReviewDependency, validateReviewLedger, type DurableReview, type ReviewLedger } from './reload-review.ts'
 import { reloadFingerprint } from './reload-fingerprint.ts'
 import { expandTilde, personaKey } from './persona-identity.ts'
 import { dirname } from 'node:path'
@@ -115,9 +119,13 @@ export interface SharedChannelState {
   applied: Record<string, unknown>
   personas: Record<string, SharedPersona>
   retiredIdentities: Record<string, RetiredSharedIdentity>
-  /** Durable intent and outcome slots for later review/attempt consumers. */
+  /** Metadata is durable, but does not publish configuration activation. */
   pendingIntent: Record<string, unknown>
-  outcomes: Record<string, unknown>
+  outcomes: SharedChannelOutcomes
+}
+export interface SharedChannelOutcomes extends Record<string, unknown> {
+  operatorReviews?: ReviewLedger
+  botAttempts?: Record<string, SharedBotAttempt>
 }
 export type SharedMutationResult =
   | { kind: 'applied'; revision: number }
@@ -338,6 +346,7 @@ export function parseSharedChannelState(bytes: Uint8Array, path: string, deps: S
         !Array.isArray(retired.channels) || retired.channels.some(channel => !object(channel) || !CHANNEL_ID_RE.test(channel.id) || !DELIVERY_MODES.includes(channel.delivery)) ||
         new Set(retired.channels.map(channel => channel.id)).size !== retired.channels.length) throw new Error('The shared channel authority has invalid retired identity evidence.')
   }
+  validateBotAttempts(state)
   for (const life of Object.values(state.personas)) {
     checkMembershipHistory(life)
     checkAbsenceConflicts(life, state.revision)
@@ -518,6 +527,10 @@ export interface SharedChannelAuthority {
   commitReview(bytes: Uint8Array, expectedRevision: number, review: DurableReview, assignments: readonly ReviewedAssignment[], publish?: (config: PersonaConfig) => void): SharedMutationResult
   observeMembership(key: string, incarnation: string, observation: VerifiedSharedMembership, expectedRevision: number): SharedMutationResult
   assign(key: string, incarnation: string, channel: string, delivery: DeliveryMode, expectedRevision: number): SharedMutationResult
+  /** undefined means no retained binding, not proof of nonapplication. */
+  lookupBotAttempt(key: string, incarnation: string, request: ChannelDeliveryAttemptRequest): BotAttemptResult | undefined
+  botAttempt(key: string, incarnation: string, request: ChannelDeliveryAttemptRequest,
+    authorize: () => BotAttemptAuthorization, applied?: (outcome: Extract<SharedBotAttempt, { status: 'applied' }>) => void): BotAttemptResult
 }
 export function createSharedChannelAuthority(path: string, initial: SharedChannelState, deps: SharedChannelDeps = {}): SharedChannelAuthority {
   const validated = parseSharedChannelState(serializeSharedChannelState(initial), path, deps)
@@ -530,6 +543,68 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
   let failure = ''
   const write = deps.write ?? durableWriteFileSync
   const listeners = new Set<(config: PersonaConfig) => void>()
+  // Only closes synchronous reentrancy and undurable binding failures. Durable
+  // evidence always wins; this map is never recovery authority after restart.
+  const attemptsInFlight = new Map<string, { binding: BotAttemptBinding; kind: 'pending' | 'unresolved' }>()
+  function writeBotOutcome(record: SharedBotAttempt, activate = false, publish?: (config: PersonaConfig) => void): SharedMutationResult {
+    return authority.transact(authority.revision, (next, order) => {
+      const life = own(next.personas, record.key)
+      if (life?.incarnation !== record.incarnation || authority.reviewHeld(record.key)) throw new Error('Obsolete bot attempt life.')
+      if (record.status === 'pending') record = { ...record, startedOrder: order }
+      else record = { ...record, resolvedOrder: order }
+      next.outcomes.botAttempts ??= {}
+      put(next.outcomes.botAttempts, botAttemptKey(record), record)
+      if (activate && record.status === 'applied') {
+        put(life.assignments, record.channel, { delivery: record.delivery, order })
+        rawPersona(next, record.key)['channels'] = Object.entries(life.assignments).map(([id, assignment]) => ({ id, delivery: assignment.delivery }))
+      }
+    }, 1, publish)
+  }
+  function performBotAttempt(key: string, incarnation: string, request: ChannelDeliveryAttemptRequest,
+    authorize: () => BotAttemptAuthorization, applied?: (outcome: Extract<SharedBotAttempt, { status: 'applied' }>) => void): BotAttemptResult {
+    const prior = authority.lookupBotAttempt(key, incarnation, request)
+    if (prior) return prior
+    if (request.intent === 'retry') return { kind: 'unresolved' }
+    // Strict and dry-run callers only look up history. The MCP caller gates
+    // these before entry, so neither bindings nor refusals write in those modes.
+    if (current.applied['channel_mode'] !== 'open' || authority.reviewHeld(key)) return { kind: 'inactive' }
+    const binding = botAttemptBinding(key, incarnation, request)
+    const id = botAttemptKey(binding)
+    attemptsInFlight.set(id, { binding, kind: 'pending' })
+    try {
+      const start = writeBotOutcome({ ...binding, startedOrder: 0, status: 'pending' })
+      if (start.kind !== 'applied') return { kind: 'unresolved' }
+      const pending = own(current.outcomes.botAttempts!, id)!
+      let permission: BotAttemptAuthorization
+      try { permission = authorize() } catch { permission = { kind: 'refused', reason: 'inactive' } }
+      if (current.applied['channel_mode'] !== 'open') permission = { kind: 'refused', reason: 'strict' }
+      const outcome: SharedBotAttempt = permission.kind === 'authorized'
+        ? { ...pending, status: 'applied', resolvedOrder: 0, facts: permission.facts,
+          ...(authority.choice(key, request.channel) === undefined ? {} : { previous: authority.choice(key, request.channel) }) }
+        : { ...pending, status: 'not-applied', resolvedOrder: 0, reason: permission.reason }
+      const publish = outcome.status === 'applied' ? () => {
+        const committed = own(current.outcomes.botAttempts!, id)
+        if (committed?.status === 'applied') applied?.(clone(committed))
+      } : undefined
+      const result = writeBotOutcome(outcome, outcome.status === 'applied', publish)
+      if (result.kind === 'applied') {
+        const recorded = botAttemptResult(own(current.outcomes.botAttempts!, id)!)
+        return recorded.kind === 'applied' ? { ...recorded, historical: false } : recorded
+      }
+      if (result.kind === 'failed' && readable && authority.incarnation(key) === incarnation) {
+        // A pre-rename failure proves this application did not happen. Retain
+        // that proof before promising a restart-safe rejection.
+        const rejected = writeBotOutcome({ ...pending, status: 'not-applied', resolvedOrder: 0, reason: 'write-failed' })
+        if (rejected.kind === 'applied') return { kind: 'not-applied', reason: 'write-failed' }
+      }
+      return { kind: 'unresolved' }
+    } finally {
+      attemptsInFlight.set(id, { binding, kind: 'unresolved' })
+      // Durable terminal outcomes need no volatile guard. Pending evidence
+      // stays pending across reopen and can never be independently applied.
+      if (own(current.outcomes.botAttempts ?? {}, id)) attemptsInFlight.delete(id)
+    }
+  }
   function publishChange(before: SharedChannelState, publish?: (config: PersonaConfig) => void): void {
     // Runtime publication precedes observers while the mutation lock is held.
     try { publish?.(authority.config()) } catch { /* durability cannot be undone by a publisher */ }
@@ -708,6 +783,22 @@ export function createSharedChannelAuthority(path: string, initial: SharedChanne
     config: () => sharedAppliedConfig(current, path, deps),
     choice: (key, channel) => { const life = own(current.personas, key); return life ? own(life.assignments, channel)?.delivery : undefined },
     channels: key => { const life = own(current.personas, key); return life ? Object.keys(life.assignments).sort() : [] },
+    lookupBotAttempt(key, incarnation, request) {
+      if (!validChannelDeliveryAttempt(request)) return { kind: 'invalid' }
+      if (authority.incarnation(key) !== incarnation || authority.reviewHeld(key)) return { kind: 'inactive' }
+      const binding = botAttemptBinding(key, incarnation, request)
+      const id = botAttemptKey(binding)
+      const record = own(current.outcomes.botAttempts ?? {}, id)
+      // Uncertainty in unrelated metadata/choices cannot erase a previously
+      // durable history fact. A changed outcome or incarnation stays held.
+      if (!readable && (!record || !uncertain || own(uncertain.personas, key)?.incarnation !== incarnation ||
+          !isDeepStrictEqual(record, own(uncertain.outcomes.botAttempts ?? {}, id)))) return { kind: 'unresolved' }
+      const running = attemptsInFlight.get(id)
+      if (record) return sameBotAttempt(record, binding) ? botAttemptResult(record) : { kind: 'binding-conflict' }
+      if (running) return sameBotAttempt(running.binding, binding) ? { kind: running.kind } : { kind: 'binding-conflict' }
+      return undefined
+    },
+    botAttempt: performBotAttempt,
     sourceBytes: () => Buffer.from(current.sourceBytesBase64, 'base64'),
     incarnation: key => own(current.personas, key)?.incarnation,
     reviewHeld: key => reviewLedger(current)?.retirement?.recovery.keys.includes(key) === true,
