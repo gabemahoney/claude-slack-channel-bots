@@ -2506,7 +2506,7 @@ exactly one new durable application with one `persona-channel-delivery-set`
 line, and C answered a message that does not mention it. Duplicate/history
 calls add no application or diagnostic and cannot substitute for that evidence.
 
-### Check 32: strict mode retains C’s shared choice and C answers with no unclaimed-channel line 
+### Check 32: strict mode retains C’s shared choice and C answers with no unclaimed-channel line
 
 Steps:
 
@@ -2653,9 +2653,8 @@ archived channels included.
 
 Check 29a verifies live (no credential value appears in the config
 file, the shared authority, the pending file, any log line the feature produces, or the tool
-results in the persona transcripts, as amended by 
-to ) and the first
-half of the E13 leak check: no WebSocket `wss://` or `ticket=` URL in any
+results in the persona transcripts) and the first
+half of the leak check: no WebSocket `wss://` or `ticket=` URL in any
 log. is unit-verified; the acceptance run is where a real token could
 leak, so the check counts across everything the run wrote. It is required,
 and needs no `sudo`.

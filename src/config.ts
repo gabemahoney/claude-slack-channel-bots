@@ -1653,8 +1653,7 @@ export interface ResolvePersonaConfigOptions {
  *   3. unknown top-level keys (key names only, and only plain setting names:
  * `describeUnknownKeys`; the rename message);
  *   4. `personas` present and an array (it may be empty);
- * 5. server-wide settings defaulted and validated (
- * ), the `channel_mode` switch among them;
+ * 5. server-wide settings defaulted and validated, including `channel_mode`;
  *   6. each persona entry in array order, by the rules of the channel mode
  *      this configuration's own switch picks (see `parsePersonaEntry`;
  * to), inheriting the resolved top-level

@@ -589,7 +589,7 @@ describe('the debugging skill covers every reload diagnostic class', () => {
 
 
 // ---------------------------------------------------------------------------
-// 3c. — the debugging skill's open-mode content 
+// 3c. — the debugging skill's open-mode content
 // ---------------------------------------------------------------------------
 
 let skillCache: string | undefined

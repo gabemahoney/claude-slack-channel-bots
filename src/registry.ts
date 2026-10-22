@@ -707,8 +707,8 @@ export interface SessionToolDeps {
 }
 
 /**
- * What `set_channel_delivery` uses of the stored-choice store (
- * to ): current readability, incarnation and the single
+ * What `set_channel_delivery` uses of the stored-choice store:
+ * current readability, incarnation and the single
  * authority's attempt API. `ChannelDeliveryStore` satisfies it as it is.
  */
 export type SessionChannelDeliveryStore = Pick<

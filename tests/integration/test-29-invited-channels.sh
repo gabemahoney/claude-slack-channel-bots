@@ -30,8 +30,8 @@
 #   mode or a class this work adds. alpha A1 plain is delivered `receive_all`
 #   (the first-delivery control); U1 is discovered and drops as `off`;
 #   U0, absent from both inventories and configurations, one mention as both its
-#   events, logs exactly two `unclaimed-channel` lines (drops store no dedupe
-#   fact); A2 plain is a
+#   events, logs exactly two `channel-ineligible` drops after completed
+#   inventories establish absence (drops store no dedupe fact); A2 plain is a
 #   `not-mentioned` drop; A2 and B1 mentions are delivered `mention`; the
 #   tool is refused with the declarative text (the first-tool-result control),
 #   and nothing is written.
@@ -214,6 +214,7 @@ plain_drop() {
 }
 DROP_NOT_MENTIONED='not-mentioned'
 DROP_CHANNEL_OFF='channel-off'
+DROP_CHANNEL_INELIGIBLE='channel-ineligible'
 DROP_GROUP_DM='group-dm'
 # src/delivery-decision.ts Via (a type only): how a delivered message reached
 # its persona, the accepted queue record's `meta.via`.
@@ -784,7 +785,6 @@ SWITCH_OFF_LINE="$(printed modeSwitchLine "${DECLARATIVE}" "${ALPHA}" "${BRAVO}"
 REASON_EXTERNALLY_SHARED="$(printed UNCLAIMED_REASON_EXTERNALLY_SHARED)"
 REASON_FLAG_MISSING="$(printed UNCLAIMED_REASON_FLAG_MISSING)"
 REASON_FLAG_NOT_BOOLEAN="$(printed UNCLAIMED_REASON_FLAG_NOT_BOOLEAN)"
-U0_CAUSE="$(printed unclaimedChannelCause "${U0}")"
 F1_CAUSE="$(printed unclaimedChannelCause "${F1}")"
 X1_CAUSE="$(printed fungibleUnclaimedChannelCause "${X1}" "${REFUSAL_EXTERNALLY_SHARED}")"
 X2_CAUSE="$(printed fungibleUnclaimedChannelCause "${X2}" "${REFUSAL_FLAG_MISSING}")"
@@ -799,7 +799,6 @@ F2_HEARD_CAUSE="$(printed invitedChannelCause "${F2}" private mentions)"
 F1_SET_CAUSE="$(printed channelDeliverySetCause "${F1}" mentions all all)"
 F1_SET_AGAIN_CAUSE="$(printed channelDeliverySetCause "${F1}" all all all)"
 A1_SET_HELD_CAUSE="$(printed channelDeliverySetCause "${A1}" mentions all mentions)"
-U0_UNCLAIMED="$(persona_line "${UNCLAIMED_CHANNEL}" alpha "${U0_CAUSE}")"
 F1_UNCLAIMED="$(persona_line "${UNCLAIMED_CHANNEL}" alpha "${F1_CAUSE}")"
 X1_UNCLAIMED="$(persona_line "${UNCLAIMED_CHANNEL}" alpha "${X1_CAUSE}")"
 X2_UNCLAIMED="$(persona_line "${UNCLAIMED_CHANNEL}" alpha "${X2_CAUSE}")"
@@ -917,12 +916,13 @@ A_OFF_TS="${PUSH_TS}"
 wait_since "${A_OFF_MARK}" "$(plain_drop "${ALPHA_REF}" "${U1}" "${DROP_CHANNEL_OFF}")" "${EVENT_WAIT_S}" "phase A: discovered U1 did not drop as off"
 expect_queued "phase A: discovered alpha U1" 0 "${ALPHA_DIR}" "${U1}" "${A_OFF_TS}"
 
-# alpha U0, unlisted: one mention as both its events: exactly two
-# `unclaimed-channel` lines, no delivery; drops store no durable dedupe fact.
+# alpha U0, absent from the completed inventory: one mention as both its
+# events, exactly two `channel-ineligible` drops and no delivery. Established
+# absence is a drop, not an unresolved hold; drops store no durable dedupe fact.
 A_U0_MARK="$(log_mark)"
 push_mention "${ALPHA_LABEL}" "${U0}" channel "$(mention_text "${ALPHA_BOT_USER}")" app-first
 A_U0_TS="${PUSH_TS}"
-wait_since "${A_U0_MARK}" "${U0_UNCLAIMED}" "${EVENT_WAIT_S}" "phase A: alpha U0: no unclaimed-channel line"
+wait_since "${A_U0_MARK}" "$(plain_drop "${ALPHA_REF}" "${U0}" "${DROP_CHANNEL_INELIGIBLE}")" "${EVENT_WAIT_S}" "phase A: alpha U0: no channel-ineligible line"
 expect_queued "phase A: alpha U0" 0 "${ALPHA_DIR}" "${U0}" "${A_U0_TS}"
 
 # alpha A2 plain: a `not-mentioned` drop, no delivery.
@@ -937,7 +937,7 @@ expect_queued "phase A: alpha A2 plain" 0 "${ALPHA_DIR}" "${A2}" "${A_A2_TS}"
 # connection, after which U0's, U1's and A1's counts are final.
 push_message "${ALPHA_LABEL}" "${A2}" channel "$(mention_text "${ALPHA_BOT_USER}")"
 wait_queued "phase A: alpha A2 mention" "${ALPHA_DIR}" "${A2}" "${PUSH_TS}" "${VIA_MENTION}"
-expect_since "${A_U0_MARK}" "${U0_UNCLAIMED}" 2 "phase A: alpha U0's unclaimed-channel lines"
+expect_since "${A_U0_MARK}" "$(plain_drop "${ALPHA_REF}" "${U0}" "${DROP_CHANNEL_INELIGIBLE}")" 2 "phase A: alpha U0's channel-ineligible lines"
 expect_queued "phase A: alpha U0, after a later delivery" 0 "${ALPHA_DIR}" "${U0}" "${A_U0_TS}"
 expect_queued "phase A: discovered alpha U1, after a later delivery" 0 "${ALPHA_DIR}" "${U1}" "${A_OFF_TS}"
 expect_queued "phase A: alpha A1 plain" 1 "${ALPHA_DIR}" "${A1}" "${A_A1_TS}"

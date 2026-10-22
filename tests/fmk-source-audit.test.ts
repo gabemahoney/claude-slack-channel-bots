@@ -2840,6 +2840,106 @@ write_persona_config '${mode}'`], { encoding: 'utf8', timeout: 5000, env: hostSa
     expect(result.status).not.toBe(0)
     expect(result.stderr).toContain('S1: unbound variable')
   })
+  test('test29 U0 shell oracles require both current-membership drops, no dedupe and a later eligible delivery', async () => {
+    const { makeMembershipHarness, membershipPage } = await import('./test-helpers/shared-channels.ts')
+    const { makeManagedRouting } = await import('./test-helpers/persona-routing-managed.ts')
+    const { resetRoutingState } = await import('./test-helpers/persona-routing-harness.ts')
+    const { makeAppMention, makeChannelMessage } = await import('./test-helpers/slack-stub.ts')
+    const { createChannelDeliveryStore } = await import('../src/channel-delivery.ts')
+    const { createPersonaEventRouter } = await import('../src/persona-event-router.ts')
+    const { renderPersonaRef } = await import('../src/persona-identity.ts')
+    const { formatPersonaDiagnostic, UNCLAIMED_CHANNEL, unclaimedChannelCause } = await import('../src/persona-diagnostics.ts')
+    const home = mkdtempSync(join(tmpdir(), 'test29-membership-drop-'))
+    resetRoutingState()
+    const f = makeMembershipHarness(home, { names: ['alpha', 'bravo'] })
+    const managed = makeManagedRouting(f.h, home, { membership: f.membership, getChannelDelivery: () => createChannelDeliveryStore(f.authority) })
+    const routerLines: string[] = []
+    f.h.onEvent = createPersonaEventRouter({ membership: f.membership, routing: managed.routing, clientFor: f.h.clientFor, getPersona: f.h.getPersona, log: line => routerLines.push(line) })
+    try {
+      const control = source.slice(source.indexOf('jq -n --arg asuf '), source.indexOf('\n# The MCP config each persona'))
+      const initial = build('declarative', builder, home), inventory = build('declarative', `${control}\nwrite_persona_config() { :; }`, home)
+      expect(initial.status).toBe(0); expect(inventory.status).toBe(0)
+      expect(f.authority.applyReviewed(Buffer.from(initial.stdout), f.authority.revision).kind).toBe('applied')
+      for (const token of JSON.parse(inventory.stdout).tokens as Array<{ label: string; memberships: string[] }>) {
+        f.h.stub(f.h.p(token.label)).script.inventory.push(membershipPage(token.memberships))
+      }
+      await f.start(); await f.scan(); await managed.ready
+      const channel = 'C0FIXTUREU0', eligible = 'C0FIXTUREA2'
+      const stub = f.h.stub(f.h.p('alpha'))
+      const text = `  <@${stub.identity.botUserId}> original\r\n\r\nmention  `
+      const message = makeChannelMessage({ channel, text, ts: '1700000001.000001' })
+      expect(f.membership.read('alpha', channel, 'strict')).toEqual({ kind: 'ineligible', reason: 'absent' })
+      const authorityBefore = f.authority.snapshot()
+      for (const event of [makeAppMention({ channel, text, ts: message.ts }), message]) {
+        await stub.socket.deliver(event)
+        expect(managed.queued('alpha')).toEqual([])
+        expect(managed.queued('bravo')).toEqual([])
+        expect(managed.queue.lookupSlackKey('alpha', { chat_id: channel, ts: String(message.ts) })).toBeUndefined()
+      }
+      expect(stub.socket.acks).toHaveLength(2)
+      const drops = [...managed.logs]
+      expect(drops).toHaveLength(2)
+      const positive = makeChannelMessage({ channel: eligible, text, ts: '1700000001.000002' })
+      await stub.socket.deliver(positive)
+      expect(stub.socket.acks).toHaveLength(3)
+      expect(managed.queued('alpha').map(({ accepted: { channel, key, text, via } }) => ({ channel, key, text, via }))).toEqual([
+        { channel: eligible, key: { chat_id: eligible, ts: String(positive.ts) }, text, via: 'mention' },
+      ])
+      expect(managed.queued('bravo')).toEqual([])
+      expect(managed.logs).toEqual(drops)
+      expect(f.authority.snapshot()).toEqual(authorityBefore)
+
+      // Run the scenario's own wait/count assertions over production evidence.
+      // Only pure matcher declarations are extracted; no harness is sourced.
+      const helpers = readFileSync(join(import.meta.dir, 'integration/lib/scenario.sh'), 'utf8')
+      const assertions = source.split('\n').filter(line => /^(wait_since|expect_since) "\$\{A_U0_MARK\}"/.test(line))
+      expect(assertions).toHaveLength(2)
+      const declaration = (body: string, name: string) => {
+        const match = body.match(new RegExp(`^${name}\\(\\) \\{\n[\\s\\S]*?^\\}`, 'm'))
+        if (!match) throw new Error(`Missing test29 drop declaration: ${name}`)
+        return match[0]
+      }
+      const script = [
+        'set -euo pipefail', 'A_U0_MARK=0 EVENT_WAIT_S=15',
+        'fail() { printf "%s\\n" "$1" >&2; exit 1; }',
+        'wait_until() { shift 2; "$@"; }', // evidence is settled; no wall-clock wait
+        ...['matcher', 'matcher_text', '_scenario_scan', 'count_in'].map(name => declaration(helpers, name)),
+        ...['plain_drop', 'count_since', 'count_since_at_least', 'wait_since', 'expect_since'].map(name => declaration(source, name)),
+        ...source.split('\n').filter(line => /^DROP_[A-Z_]+=/.test(line)),
+        ...assertions,
+      ].join('\n')
+      const legacy = formatPersonaDiagnostic({ class: UNCLAIMED_CHANNEL, key: 'alpha', name: 'alpha', index: 0, cause: unclaimedChannelCause(channel) })
+      const check = (lines: string[]) => {
+        writeFileSync(join(home, 'server.log'), lines.join('\n') + '\n')
+        const result = spawnSync('/bin/bash', ['--noprofile', '--norc', '-c', script], { encoding: 'utf8', timeout: 5000,
+          env: hostSafeChildEnv(home, { tools: ['awk', 'tail'], extras: {
+            SCENARIO_ROOT: home, SLACK_STATE_DIR: home, SCENARIO_SEP: '\x1f',
+            ALPHA_REF: renderPersonaRef('alpha', 'alpha'), U0: channel, U0_UNCLAIMED: legacy,
+          } }),
+        })
+        assertNoLeak({ stdout: result.stdout, stderr: result.stderr })
+        return result.status
+      }
+      expect(check(drops)).toBe(0)
+      for (const invalid of [[], drops.slice(0, 1), [...drops, drops[0]!], [legacy, legacy],
+        drops.map(line => line.replaceAll(channel, eligible)), drops.map(line => line.replaceAll('alpha', 'bravo'))]) {
+        expect(check(invalid)).not.toBe(0)
+      }
+      // Missing evidence is a hold, distinct from the established absence above.
+      const queues = structuredClone(['alpha', 'bravo'].map(key => managed.queued(key)))
+      f.membership.invalidate('alpha')
+      await stub.socket.deliver(message)
+      expect(stub.socket.acks).toHaveLength(3)
+      expect(managed.logs).toEqual(drops)
+      expect(['alpha', 'bravo'].map(key => managed.queued(key))).toEqual(queues)
+      assertNoLeak({ captured: f.captured(), logs: managed.logs, routerLines, initial, inventory, log: writtenFile(join(home, 'server.log')) })
+      expect(JSON.stringify(managed.logs)).not.toContain('original')
+    } finally {
+      await managed.close(); await f.close(); resetRoutingState()
+      expect(f.h.clock.pendingCount()).toBe(0)
+      rmSync(home, { recursive: true, force: true })
+    }
+  })
   test('test29 actual discovery and phase-A oracle agree, retain an unlisted control and preserve choices across both mode switches', async () => {
     const { makeMembershipHarness, membershipPage } = await import('./test-helpers/shared-channels.ts')
     const home = mkdtempSync(join(tmpdir(), 'phase-a-inventory-')), f = makeMembershipHarness(home, { names: ['alpha', 'bravo'] })

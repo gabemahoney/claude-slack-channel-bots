@@ -13,8 +13,8 @@
  * and adds the current-authority rows to the same purity/reverse-order checks.
  *
  * A row may also put in front of the decision what the loader never
- * produces, so the row shows that an input not in force plays no part (
- *, ): a listing or a malformed declarative section in the
+ * produces, so the row shows that an input not in force plays no part:
+ * a listing or a malformed declarative section in the
  * decision's views in open mode. Both modes use the shared choices and
  * explicit membership input; missing evidence is exercised as unresolved.
  *
