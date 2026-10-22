@@ -3,11 +3,11 @@
  * scripts/ci-run.ts — the `/ci` host runner: it runs the integration scripts
  * in up to six capped, isolated shards from one pinned image, admitted under
  * the host's memory, disk and CPU lines, and merges the shards' results into
- * one verdict (b.uqm).
+ * one verdict.
  *
  * Usage:  bun scripts/ci-run.ts <RUN_ID> [the /ci arguments]...
  *
- * Import safety (b.uqm SR-1.3). Importing this file runs nothing: no process,
+ * Import safety. Importing this file runs nothing: no process,
  * no file read or write, no lock, no signal handler. Its top level holds only
  * imports, declarations and exports; there is no top-level call, `new` or
  * `await` outside the one entry block at the very end of the file, which acts
@@ -20,28 +20,26 @@
  * code lives in this one file, and the verdict reader (`scripts/ci-verdict.ts`)
  * imports the shared rules from it.
  *
- * Section map. Each section has one owning Epic of Plan b.t6s and is written
- * only by it (and by the Epics its body lists under "Contributes to"); a code
- * Task writes under its own sub-banner, so parallel lanes write disjoint lines:
+ * Section map: related helpers stay together in the following regions.
  *
- *    1. entry and dependencies (E1)
- *    2. constants (E1)
- *    3. data model (E1)
- *    4. shared rules (E1)
- *    5. file formats (E1)
- *    6. docker layer (E1)
- *    7. validation (E2)
- *    8. scheduling (E4)
- *    9. lock, reservations and sweep (E5)
- *   10. admission readings and fit (E6)
- *   11. memory guard (E7)
- *   12. images (E8)
- *   13. shard containers (E9)
- *   14. outcomes, verdict and results (E10)
- *   15. integrity and secret-scan (E11)
- *   16. faults (E12)
- *   17. run lifecycle (E1 steps 1–2, E13 the rest)
- *   18. main entry (E1)
+ * 1. entry and dependencies
+ * 2. constants
+ * 3. data model
+ * 4. shared rules
+ * 5. file formats
+ * 6. docker layer
+ * 7. validation
+ * 8. scheduling
+ * 9. lock, reservations and sweep
+ * 10. admission readings and fit
+ * 11. memory guard
+ * 12. images
+ * 13. shard containers
+ * 14. outcomes, verdict and results
+ * 15. integrity and secret-scan
+ * 16. faults
+ * 17. run lifecycle
+ * 18. main entry
  *
  * Not in `package.json` `files`: never shipped.
  *
@@ -55,11 +53,11 @@ import { randomBytes as cryptoRandomBytes } from 'node:crypto'
 import { readFileSync, readlinkSync, realpathSync, statfsSync, writeSync } from 'node:fs'
 import { constants as osConstants } from 'node:os'
 import { join, resolve } from 'node:path'
-// E1 T3's file writes: whole-file replacement and the runner log.
+// file writes: whole-file replacement and the runner log.
 import { appendFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
-// E1 T5's step 1: the run directory, created exclusively, mode 0700.
+// step 1: the run directory, created exclusively, mode 0700.
 import { chmodSync, mkdirSync } from 'node:fs'
-// E11 T2's secret-scan: a walk that never follows a link, and each file read
+// secret-scan: a walk that never follows a link, and each file read
 // in chunks through a descriptor opened without following a link. Aliased so
 // another lane's own `node:fs` import of the same names cannot collide.
 import {
@@ -71,16 +69,16 @@ import {
   readdirSync as listScannedDir,
   type Dirent as ScannedDirEntry,
 } from 'node:fs'
-// E11 T1's evidence reader: listings and entry types that never follow a
+// evidence reader: listings and entry types that never follow a
 // link. Aliased so another lane's own `node:fs` import cannot collide.
 import { lstatSync as lstatEvidenceEntry, readdirSync as listEvidenceDir } from 'node:fs'
-// E5 T1's admission lock: the account's home, the lock file's descriptor and its holder record.
+// admission lock: the account's home, the lock file's descriptor and its holder record.
 import { closeSync, constants as fsConstants, fchmodSync, ftruncateSync, openSync, readSync } from 'node:fs'
 import { isAbsolute } from 'node:path'
-// E5 T2's reservations: the remover. The reader's listing and type check use
-// `lstatSync` and `readdirSync`, imported once by E2 T1's worktree reader (section 7).
+// reservations: the remover. The reader's listing and type check use
+// `lstatSync` and `readdirSync`, imported once by worktree reader (section 7).
 import { unlinkSync } from 'node:fs'
-// E6 T3's /ci-live lock read: read-only, non-blocking, fstat'd, bounded, always closed.
+// /ci-live lock read: read-only, non-blocking, fstat'd, bounded, always closed.
 // Aliased so that no other lane's import of the same names from node:fs collides with these bindings.
 import {
   closeSync as closeCiLiveLock,
@@ -89,31 +87,31 @@ import {
   openSync as openCiLiveLock,
   readSync as readCiLiveLock,
 } from 'node:fs'
-// E6 T5's results-directory listing: entries and sizes by lstat, no link followed.
+// results-directory listing: entries and sizes by lstat, no link followed.
 // Aliased so that no other lane's import of the same names from node:fs collides with these bindings.
 import { lstatSync as lstatResultsEntry, readdirSync as listResultsDir } from 'node:fs'
-// E8 T1's package: the tarball's SHA-256, and its directory entry read without
+// package: the tarball's SHA-256, and its directory entry read without
 // following a link. Aliased so another lane's own imports cannot collide.
 import { createHash as createPackageHash } from 'node:crypto'
 import { lstatSync as lstatPackageEntry } from 'node:fs'
-// E13 T1's run-directory modes for `results.json`: entries read without
+// run-directory modes for `results.json`: entries read without
 // following a link. Aliased so another lane's own imports cannot collide.
 import { lstatSync as lstatRunDirEntry, readdirSync as listRunDirEntries } from 'node:fs'
 
 // ---------------------------------------------------------------------------
-// 1. Entry and dependencies (E1)
+// 1. Entry and dependencies
 // ---------------------------------------------------------------------------
 //
-// The injected-dependency interface (b.uqm SR-1.3) and the one factory that
-// builds its real bindings. Two inputs SR-1.3 lists have no member of their
+// The injected-dependency interface and the one factory that
+// builds its real bindings. Two inputs lists have no member of their
 // own, by design:
 //
 // - The run directory and the system temp directory are derived from the
 //   injected environment (`RunnerDeps.env`) by the run-directory path rule
-//   (section 4, T3): `$TMPDIR` when set and not empty, else `/tmp`. A test
+// (section 4, ): `$TMPDIR` when set and not empty, else `/tmp`. A test
 //   injects them by setting `TMPDIR` in the environment it passes.
 // - The account's home is derived from the password file's text
-//   (`RunnerDeps.readPasswordFile`) by E5's rule (b.uqm SR-6.1), never from
+// (`RunnerDeps.readPasswordFile`) by rule, never from
 //   `$HOME`, `os.homedir()` or `os.userInfo()`.
 
 /** A dependency's answer: its value, or a failure with its error on one line. */
@@ -141,15 +139,15 @@ export type ProcRead<T> =
       readonly error: string
     }
 
-/** One child process to start (b.uqm SR-1.3, SR-15.4). */
+/** One child process to start. */
 export interface SpawnRequest {
   /** The program and its arguments; `argv[0]` is looked up on the environment's `PATH`. */
   readonly argv: readonly string[]
-  /** The child's whole environment: nothing else reaches it (b.uqm SR-15.4). */
+  /** The child's whole environment: nothing else reaches it. */
   readonly env: Readonly<Record<string, string>>
   /** The child's working directory. */
   readonly cwd: string
-  /** Start the child in a new process group of its own, apart from the runner's (b.uqm SR-5.6). */
+  /** Start the child in a new process group of its own, apart from the runner's. */
   readonly ownProcessGroup: boolean
   /** Text written to the child's standard input, then closed; none when absent. */
   readonly stdin?: string
@@ -188,7 +186,7 @@ export interface RunnerClock {
   clearTimeout(handle: unknown): void
 }
 
-/** The volume holding a path (b.uqm SR-6.5). */
+/** The volume holding a path. */
 export interface VolumeReading {
   /** The mount point of the volume holding the path. */
   readonly mountPoint: string
@@ -198,10 +196,10 @@ export interface VolumeReading {
   readonly availableBytes: number
 }
 
-/** The signals the runner traps (b.uqm SR-5.4). */
+/** The signals the runner traps. */
 export type TrappedSignal = 'SIGINT' | 'SIGTERM' | 'SIGHUP'
 
-/** The signals the runner sends: SIGKILL to a build's process group (b.uqm SR-5.6); SIGTERM, then SIGKILL, by the reader's stop verb (b.uqm SR-17.6). */
+/** The signals the runner sends: SIGKILL to a build's process group; SIGTERM, then SIGKILL, by the reader's stop verb. */
 export type SentSignal = 'SIGTERM' | 'SIGKILL'
 
 /** Where a signal goes: one PID, or every process of one process group. */
@@ -219,14 +217,14 @@ export type SignalTarget =
 export type SignalOutcome = 'delivered' | 'no-such-process' | 'not-permitted'
 
 /**
- * Every input and side effect of the runner (b.uqm SR-1.3), one member per
+ * Every input and side effect of the runner, one member per
  * line. Only `createRealRunnerDeps` binds the real ones.
  */
 export interface RunnerDeps {
   readonly codexLogin?: CodexLoginDeps
   /** Starts a child process (docker, git, npm, gh, the base-build step) with its own environment and process group. */
   readonly spawn: SpawnFn
-  /** The runner's own environment; children get it through the child-environment rule (b.uqm SR-15.4). */
+  /** The runner's own environment; children get it through the child-environment rule. */
   readonly env: Readonly<Record<string, string | undefined>>
   /** The runner's PID. */
   readonly pid: number
@@ -234,9 +232,9 @@ export interface RunnerDeps {
   readonly uid: number
   /** The worktree root: by default, the tree that holds this file. */
   readonly worktreeRoot: string
-  /** The admission lock's directory. Tests set it; the real binding leaves it unset and E13 binds it at step 6 from E5's account-home rule. */
+  /** The admission lock's directory. Tests set it; the real binding leaves it unset and the run lifecycle binds it at step 6 from reservation management's account-home rule. */
   readonly lockDir?: string
-  /** The password file's text (`/etc/passwd` in the real binding), or a failure (b.uqm SR-6.1). */
+  /** The password file's text (`/etc/passwd` in the real binding), or a failure. */
   readonly readPasswordFile: () => DepRead<string>
   /** One file of one cgroup, by its path below the cgroup-namespace root as `/proc/<pid>/cgroup` gives it (`/` for the root itself); one read per file. */
   readonly readCgroupFile: (cgroupPath: string, fileName: string) => DepRead<string>
@@ -246,31 +244,31 @@ export interface RunnerDeps {
   readonly readProcCwd: (pid: number) => ProcRead<string>
   /** A PID's cgroup membership line (`0::<path>`). */
   readonly readProcCgroup: (pid: number) => ProcRead<string>
-  /** The volume holding a path: its mount point, used and available bytes (b.uqm SR-6.5). */
+  /** The volume holding a path: its mount point, used and available bytes. */
   readonly readVolume: (path: string) => DepRead<VolumeReading>
   /** The clock and timers. */
   readonly clock: RunnerClock
-  /** `count` random bytes (each shard's canary, b.uqm SR-11.3). */
+  /** `count` random bytes (each shard's canary). */
   readonly randomBytes: (count: number) => Uint8Array
   /** Sends a signal to a PID or to a whole process group. */
   readonly sendSignal: (target: SignalTarget, signal: SentSignal) => SignalOutcome
-  /** Registers a handler for SIGINT, SIGTERM or SIGHUP; answers its remover. Only E13's traps call it (b.uqm SR-5.4). */
+  /** Registers a handler for SIGINT, SIGTERM or SIGHUP; answers its remover. Only the run lifecycle's traps call it. */
   readonly onSignal: (signal: TrappedSignal, handler: (signal: TrappedSignal) => void) => () => void
-  /** Whether a PID is a live process (b.uqm SR-6.3). */
+  /** Whether a PID is a live process. */
   readonly isPidAlive: (pid: number) => boolean
   /** Writes text to standard error, so main can be driven in process. */
   readonly writeStderr: (text: string) => void
 }
 
-/** The cgroup-namespace root in the real binding (b.uqm SR-7.1). */
+/** The cgroup-namespace root in the real binding. */
 const REAL_CGROUP_ROOT = '/sys/fs/cgroup'
-/** The password file in the real binding; E5's refusal names it (b.uqm SR-6.1). */
+/** The password file in the real binding; reservation management's refusal names it. */
 export const REAL_PASSWORD_FILE = '/etc/passwd'
 /** The `/proc` root in the real binding. */
 const REAL_PROC_ROOT = '/proc'
 /** The runner's own mount table in the real binding, read for a volume's mount point. */
 const REAL_MOUNTINFO_FILE = '/proc/self/mountinfo'
-/** The exit status `SpawnResult` gives a child that could not be started (its PID null), as a shell gives one it cannot find; the spawn recorder imitates it (b.uqm SR-21.4). */
+/** The exit status `SpawnResult` gives a child that could not be started (its PID null), as a shell gives one it cannot find; the spawn recorder imitates it. */
 export const SPAWN_FAILED_EXIT_STATUS = 127
 /** The cgroup v2 membership line's prefix in `/proc/<pid>/cgroup`. */
 const CGROUP_V2_LINE_PREFIX = '0::'
@@ -598,268 +596,267 @@ function spawnChild(request: SpawnRequest): SpawnedChild {
 }
 
 // ---------------------------------------------------------------------------
-// 2. Constants (E1)
+// 2. Constants
 // ---------------------------------------------------------------------------
 //
-// Every numeric bound and fixed name of the runner (b.uqm SR-21.5), each
+// Every numeric bound and fixed name of the runner, each
 // under one name; tests import them, and one pin case per constant types its
-// value. E3 adds the reader's constants in its own file, E5 the password-file
-// pin, E6 the `/ci-live` copies. Every value is a literal, a regex literal or
+// value. adds the reader's constants in its own file, the password-file
+// pin, the `/ci-live` copies. Every value is a literal, a regex literal or
 // arithmetic over literals and other constants.
 
 // --- Memory ---
 
-/** One GiB, 2^30 bytes; every byte figure is built from it (b.uqm Terms). */
+/** One GiB, 2^30 bytes; every byte figure is built from it (Terms). */
 export const GIB_BYTES = 2 ** 30
-/** The per-shard memory cap: it starts at 2 GiB and changes only by hand, as a committed change (b.uqm SR-8.1, SR-23.2). */
+/** The per-shard memory cap: it starts at 2 GiB and changes only by hand, as a committed change. */
 export const SHARD_MEMORY_CAP_BYTES = 2 * GIB_BYTES
-/** The cap rule's minimum, 2 GiB (b.uqm SR-8.1, SR-8.3). */
+/** The cap rule's minimum, 2 GiB. */
 export const MIN_SHARD_MEMORY_CAP_BYTES = 2 * GIB_BYTES
-/** The cap rule's margin over the highest anon peak, 1 GiB (b.uqm SR-8.3). */
+/** The cap rule's margin over the highest anon peak, 1 GiB. */
 export const CAP_MARGIN_BYTES = GIB_BYTES
-/** The cap rule rounds up to a multiple of 0.5 GiB (b.uqm SR-8.3). */
+/** The cap rule rounds up to a multiple of 0.5 GiB. */
 export const CAP_ROUNDING_STEP_BYTES = GIB_BYTES / 2
-/** The memory fit's admission margin, 1 GiB (b.uqm SR-6.7). */
+/** The memory fit's admission margin, 1 GiB. */
 export const ADMISSION_MARGIN_BYTES = GIB_BYTES
-/** The ceiling C as a percentage of the pod limit L, the sysadmin monitor's warn line (b.uqm SR-7.1). */
+/** The ceiling C as a percentage of the pod limit L, the sysadmin monitor's warn line. */
 export const MEMORY_CEILING_PERCENT = 85
-/** `/ci`'s own disk line, as a percentage of the volume (b.uqm SR-6.7). */
+/** `/ci`'s own disk line, as a percentage of the volume. */
 export const DISK_LINE_PERCENT = 85
-/** The disk check's allowance for the run's own files, 1 GiB (b.uqm SR-6.7, SR-6.8). */
+/** The disk check's allowance for the run's own files, 1 GiB. */
 export const DISK_CHECK_ALLOWANCE_BYTES = GIB_BYTES
-/** The stop line sits this far below the ceiling, 0.5 GiB (b.uqm SR-7.4). */
+/** The stop line sits this far below the ceiling, 0.5 GiB. */
 export const STOP_LINE_OFFSET_BYTES = GIB_BYTES / 2
-/** The allowance for a `/ci-live` run's own runner in its 13 GiB commitment, 1 GiB (b.uqm SR-6.6). */
+/** The allowance for a `/ci-live` run's own runner in its 13 GiB commitment, 1 GiB. */
 export const CI_LIVE_RUNNER_ALLOWANCE_BYTES = GIB_BYTES
 
 // --- CPUs and ranges ---
 
-/** The CPUs all `/ci` runs share, 12 (b.uqm SR-6.6). */
+/** The CPUs all `/ci` runs share, 12. */
 export const CI_CPUS = 12
-/** The CPUs each shard takes, its `--cpus` (b.uqm SR-6.6, SR-10.2). */
+/** The CPUs each shard takes, its `--cpus`. */
 export const CPUS_PER_SHARD = 2
-/** The lower bound of the `--shards` and `--shard-timeout` ranges (b.uqm SR-2.2). */
+/** The lower bound of the `--shards` and `--shard-timeout` ranges. */
 export const OPTION_RANGE_MIN = 1
-/** The maximum N, `--shards`' upper bound; also the requested N when `--shards` is not given (b.uqm SR-2.2, SR-3.4). */
+/** The maximum N, `--shards`' upper bound; also the requested N when `--shards` is not given. */
 export const MAX_SHARDS = 6
-/** `--shard-timeout`'s upper bound, in minutes (b.uqm SR-2.2). */
+/** `--shard-timeout`'s upper bound, in minutes. */
 export const MAX_SHARD_TIMEOUT_MINUTES = 720
 
 // --- Timing ---
 
-/** The memory watchdog's sample interval, 30 s (b.uqm SR-7.3). */
+/** The memory watchdog's sample interval, 30 s. */
 export const SAMPLE_INTERVAL_MS = 30_000
-/** A due `timeout:` or `kill:` fault's result-file poll, at least every 1 s (b.uqm SR-14.2). */
+/** A due `timeout:` or `kill:` fault's result-file poll, at least every 1 s. */
 export const FAULT_POLL_INTERVAL_MS = 1_000
-/** The inspection read's one retry, 1 s after a failed read (b.uqm SR-10.5). */
+/** The inspection read's one retry, 1 s after a failed read. */
 export const INSPECTION_REREAD_DELAY_MS = 1_000
-/** Retries of a prune Docker refuses as already running, so at most 4 tries (b.uqm SR-9.3). */
+/** Retries of a prune Docker refuses as already running, so at most 4 tries. */
 export const PRUNE_RETRIES = 3
-/** The wait before each prune retry, 1 s (b.uqm SR-9.3). */
+/** The wait before each prune retry, 1 s. */
 export const PRUNE_RETRY_INTERVAL_MS = 1_000
-/** Docker's refusal of an image prune while another runs (b.uqm SR-9.3, SR-23.6). */
+/** Docker's refusal of an image prune while another runs. */
 export const PRUNE_ALREADY_RUNNING_TEXT = 'a prune operation is already running'
-/** The longest wait for the admission lock, 30 s (b.uqm SR-6.1). */
+/** The longest wait for the admission lock, 30 s. */
 export const LOCK_WAIT_MS = 30_000
-/** A script's estimate when the duration table gives none, 2400 s (b.uqm SR-4.1). */
+/** A script's estimate when the duration table gives none, 2400 s. */
 export const DEFAULT_ESTIMATE_SECONDS = 2400
-/** A shard limit's factor on its expected total (b.uqm SR-4.3). */
+/** A shard limit's factor on its expected total. */
 export const LIMIT_FACTOR = 2
-/** A shard limit's addend, 15 min (b.uqm SR-4.3). */
+/** A shard limit's addend, 15 min. */
 export const LIMIT_ADDEND_MINUTES = 15
-/** A shard limit's floor, 30 min (b.uqm SR-4.3). */
+/** A shard limit's floor, 30 min. */
 export const LIMIT_FLOOR_MINUTES = 30
-/** A script slower than this many times its estimate gets a `slow:` line (b.uqm SR-4.4). */
+/** A script slower than this many times its estimate gets a `slow:` line. */
 export const SLOW_FACTOR = 1.5
-/** The run deadline's build allowance B, 30 min (b.uqm SR-5.5). */
+/** The run deadline's build allowance B, 30 min. */
 export const BUILD_ALLOWANCE_MINUTES = 30
-/** The run deadline's addition once the base image is found missing, 60 min (b.uqm SR-5.5). */
+/** The run deadline's addition once the base image is found missing, 60 min. */
 export const BASE_BUILD_ALLOWANCE_MINUTES = 60
-/** The run deadline's allowance after the largest shard limit, 15 min (b.uqm SR-5.5). */
+/** The run deadline's allowance after the largest shard limit, 15 min. */
 export const MERGE_ALLOWANCE_MINUTES = 15
 
 // --- Shard figures ---
 
-/** A secret credential shorter than this is a bad credential (b.uqm SR-15.1). */
+/** A secret credential shorter than this is a bad credential. */
 export const SECRET_MIN_LENGTH = 8
-/** Each shard's `--pids-limit` (b.uqm SR-10.2). */
+/** Each shard's `--pids-limit`. */
 export const SHARD_PIDS_LIMIT = 2048
-/** A shard canary's length in lowercase hexadecimal characters (b.uqm SR-11.2, SR-11.3). */
+/** A shard canary's length in lowercase hexadecimal characters. */
 export const CANARY_LENGTH = 32
 
 // --- Run-directory names ---
 
-/** The run directory's name prefix, `cscb-ci-<RUN_ID>` (b.uqm SR-5.1). */
+/** The run directory's name prefix, `cscb-ci-<RUN_ID>`. */
 export const RUN_DIR_PREFIX = 'cscb-ci-'
-/** The status file (b.uqm SR-5.2). */
+/** The status file. */
 export const STATUS_FILE_NAME = 'status.json'
-/** The runner log (b.uqm SR-5.4). */
+/** The runner log. */
 export const RUNNER_LOG_FILE_NAME = 'runner.log'
-/** The run-private directory holding the tarball (b.uqm SR-5.9, SR-9.1). */
+/** The run-private directory holding the tarball. */
 export const PACKAGE_DIR_NAME = 'package'
-/** The results file (b.uqm SR-16.1). */
+/** The results file. */
 export const RESULTS_FILE_NAME = 'results.json'
-/** The human-readable summary (b.uqm SR-16.2). */
+/** The human-readable summary. */
 export const SUMMARY_FILE_NAME = 'summary.txt'
-/** The verdict file (b.uqm SR-5.7). */
+/** The verdict file. */
 export const VERDICT_FILE_NAME = 'verdict.txt'
-/** A shard subdirectory's name prefix, `shard-<k>` (b.uqm Terms, SR-5.9). */
+/** A shard subdirectory's name prefix, `shard-<k>` (Terms). */
 export const SHARD_DIR_PREFIX = 'shard-'
 
 // --- In-shard names and words ---
 
-/** The shard's canary file (b.uqm SR-11.3, SR-11.5). */
+/** The shard's canary file. */
 export const CANARY_FILE_NAME = 'canary.txt'
-/** The shard's tarball hash file (b.uqm SR-11.3, SR-11.5). */
+/** The shard's tarball hash file. */
 export const PACKAGE_SHA256_FILE_NAME = 'package.sha256'
-/** The shard's result file (b.uqm SR-11.3, SR-11.5). */
+/** The shard's result file. */
 export const RESULT_FILE_NAME = 'result.txt'
-/** The shard's dependency fingerprint file (b.uqm SR-11.3, SR-11.5). */
+/** The shard's dependency fingerprint file. */
 export const DEPENDENCY_FINGERPRINT_FILE_NAME = 'dependency-fingerprint.txt'
-/** The shard container's saved Docker logs (b.uqm SR-5.7, SR-11.5). */
+/** The shard container's saved Docker logs. */
 export const DOCKER_LOG_FILE_NAME = 'docker.log'
-/** A script log's suffix, `<file name>.log` (b.uqm SR-11.3). */
+/** A script log's suffix, `<file name>.log`. */
 export const SCRIPT_LOG_SUFFIX = '.log'
-/** The result-file word before each script (b.uqm SR-11.3, SR-11.5). */
+/** The result-file word before each script. */
 export const RESULT_WORD_START = 'start'
-/** The result-file word after each script (b.uqm SR-11.3, SR-11.5). */
+/** The result-file word after each script. */
 export const RESULT_WORD_END = 'end'
-/** The result-file word for a passed script (b.uqm SR-11.3, SR-11.5). */
+/** The result-file word for a passed script. */
 export const RESULT_WORD_PASS = 'pass'
-/** The result-file word for a failed script (b.uqm SR-11.3, SR-11.5). */
+/** The result-file word for a failed script. */
 export const RESULT_WORD_FAIL = 'fail'
-/** The result-file word for a script not reached (b.uqm SR-11.3, SR-11.5). */
+/** The result-file word for a script not reached. */
 export const RESULT_WORD_NOTRUN = 'notrun'
-/** The result file's end marker line (b.uqm SR-11.3, SR-11.5). */
+/** The result file's end marker line. */
 export const RESULT_WORD_DONE = 'done'
 
 // --- Fixed texts ---
 
-/** The injected-failure line's fixed text, `FAIL: <file name>: injected failure` (b.uqm SR-11.3, SR-14.2). */
+/** The injected-failure line's fixed text, `FAIL: <file name>: injected failure`. */
 export const INJECTED_FAILURE_TEXT = 'injected failure'
-/** The in-container runner's image-marker refusal line, verbatim from `tests/runner.sh` at 946be79 (b.uqm SR-11.2, SR-11.5, SR-12.1). */
+/** The in-container runner's image-marker refusal line, verbatim from `tests/runner.sh` at 946be79. */
 export const MARKER_REFUSAL_LINE = 'runner.sh: /etc/cscb-ci-image is absent: this runner runs only in a cscb-ci image (/ci); refusing to run'
-/** The in-container runner's exit status after its image-marker refusal line, verbatim from `tests/runner.sh` at 946be79; not `REFUSAL_EXIT_STATUS`, the host runner's refused-run status (b.uqm SR-11.2). */
+/** The in-container runner's exit status after its image-marker refusal line, verbatim from `tests/runner.sh` at 946be79; not `REFUSAL_EXIT_STATUS`, the host runner's refused-run status. */
 export const MARKER_REFUSAL_EXIT_STATUS = 2
-/** A usage line's prefix (b.uqm SR-5.1, SR-11.2, SR-11.5). */
+/** A usage line's prefix. */
 export const USAGE_PREFIX = 'usage: '
-/** A refusal's prefix (b.uqm SR-5.8). */
+/** A refusal's prefix. */
 export const NOT_RUN_PREFIX = 'NOT RUN: '
-/** A failure line's prefix (b.uqm SR-12.4). */
+/** A failure line's prefix. */
 export const FAIL_PREFIX = 'FAIL: '
-/** What replaces a secret value in a written line (b.uqm SR-15.3). */
+/** What replaces a secret value in a written line. */
 export const REDACTION_PLACEHOLDER = '<redacted>'
 
 // --- Labels and tags ---
 
-/** The label every `/ci` container carries, as `cscb-ci=1` (b.uqm SR-6.4, SR-10.1). */
+/** The label every `/ci` container carries, as `cscb-ci=1`. */
 export const CI_LABEL = 'cscb-ci'
-/** The `cscb-ci` label's value (b.uqm SR-6.4, SR-10.1). */
+/** The `cscb-ci` label's value. */
 export const CI_LABEL_VALUE = '1'
-/** The owner label, `cscb-ci-owner=<RUN_ID>-<PID>` (b.uqm Terms, SR-9.3, SR-10.1). */
+/** The owner label, `cscb-ci-owner=<RUN_ID>-<PID>` (Terms). */
 export const OWNER_LABEL = 'cscb-ci-owner'
-/** The label a fault's drift or retag image carries (b.uqm SR-14.2). */
+/** The label a fault's drift or retag image carries. */
 export const FAULT_LABEL = 'cscb-ci-fault'
-/** The fault label's values, `cscb-ci-fault=drift` and `cscb-ci-fault=retag` (b.uqm SR-14.2). */
+/** The fault label's values, `cscb-ci-fault=drift` and `cscb-ci-fault=retag`. */
 export const FAULT_LABEL_VALUES = ['drift', 'retag'] as const
-/** The run-private tag repository, `cscb-ci-run:<RUN_ID>-<PID>-<role>` (b.uqm SR-9.3). */
+/** The run-private tag repository, `cscb-ci-run:<RUN_ID>-<PID>-<role>`. */
 export const RUN_TAG_REPOSITORY = 'cscb-ci-run'
-/** The run-private tag roles (b.uqm SR-6.4, SR-9.3). */
+/** The run-private tag roles. */
 export const RUN_TAG_ROLES = ['test', 'drift', 'retag'] as const
 
 // --- Formats and exits ---
 
-/** The status file's format version (b.uqm SR-5.2). */
+/** The status file's format version. */
 export const STATUS_FORMAT_VERSION = 1
-/** A reservation's format version (b.uqm SR-6.2). */
+/** A reservation's format version. */
 export const RESERVATION_FORMAT_VERSION = 1
-/** The results file's format version (b.uqm SR-16.1). */
+/** The results file's format version. */
 export const RESULTS_FORMAT_VERSION = 1
-/** The word a reading that could not be read records (b.uqm SR-10.6, SR-16.1). */
+/** The word a reading that could not be read records. */
 export const UNREADABLE_READING = 'unreadable'
-/** The runner-path suffix a live owner's command line holds, followed by its RUN_ID (b.uqm SR-6.3). */
+/** The runner-path suffix a live owner's command line holds, followed by its RUN_ID. */
 export const RUNNER_PATH_SUFFIX = 'scripts/ci-run.ts'
-/** The exit status of a runner whose first argument is not a RUN_ID (b.uqm SR-5.1). */
+/** The exit status of a runner whose first argument is not a RUN_ID. */
 export const USAGE_EXIT_STATUS = 64
-/** The exit status of a refused run. The SRD gives none and nothing reads it: the reader judges a run by its files (b.uqm SR-5.8). */
+/** The exit status of a refused run. The contract gives none and nothing reads it: the reader judges a run by its files. */
 export const REFUSAL_EXIT_STATUS = 2
-/** The exit status of a runner that finds something at its run directory's path, or meets an error before it could write its verdict or record a refusal (b.uqm SR-5.1, SR-5.4). */
+/** The exit status of a runner that finds something at its run directory's path, or meets an error before it could write its verdict or record a refusal. */
 export const FAILURE_EXIT_STATUS = 1
 
 // --- Name patterns ---
 
-/** A script's file name, `test-<n>-<slug>.sh`; group 1 is n (b.uqm Terms, SR-2.2, SR-2.3). */
+/** A script's file name, `test-<n>-<slug>.sh`; group 1 is n (Terms). */
 export const SCRIPT_FILE_NAME_PATTERN = /^test-(0|[1-9][0-9]*)-[a-z0-9-]+\.sh$/
-/** A script's number form, `test-<n>`; group 1 is n (b.uqm Terms, SR-2.2, SR-2.3). */
+/** A script's number form, `test-<n>`; group 1 is n (Terms). */
 export const NUMBER_FORM_PATTERN = /^test-(0|[1-9][0-9]*)$/
 
-// --- Files and owners (E1 T3) ---
+// --- Files and owners ---
 
-/** A RUN_ID, `<YYYYMMDD>t<HHMMSS>z-<suffix>`: groups 1–6 are its UTC year, month, day, hour, minute and second, then 8 lowercase letters or digits (b.uqm SR-5.1). */
+/** A RUN_ID, `<YYYYMMDD>t<HHMMSS>z-<suffix>`: groups 1–6 are its UTC year, month, day, hour, minute and second, then 8 lowercase letters or digits. */
 export const RUN_ID_PATTERN = /^([0-9]{4})([0-9]{2})([0-9]{2})t([0-9]{2})([0-9]{2})([0-9]{2})z-[a-z0-9]{8}$/
-/** The system temp directory when `$TMPDIR` is unset or empty (b.uqm SR-5.1). */
+/** The system temp directory when `$TMPDIR` is unset or empty. */
 export const DEFAULT_TEMP_DIR = '/tmp'
-/** A reservation file's suffix, `<RUN_ID>-<PID>.json` (b.uqm SR-6.2). */
+/** A reservation file's suffix, `<RUN_ID>-<PID>.json`. */
 export const RESERVATION_FILE_SUFFIX = '.json'
-/** A SHA-256's length in lowercase hexadecimal characters: the tarball hash and the dependency fingerprint (b.uqm SR-11.3, SR-16.1). */
+/** A SHA-256's length in lowercase hexadecimal characters: the tarball hash and the dependency fingerprint. */
 export const SHA256_HEX_LENGTH = 64
-/** A script's seconds in a result file: digits with no leading zero but a lone `0`, a point, exactly three digits (b.uqm SR-11.3). */
+/** A script's seconds in a result file: digits with no leading zero but a lone `0`, a point, exactly three digits. */
 export const RESULT_SECONDS_PATTERN = /^(0|[1-9][0-9]*)\.[0-9]{3}$/
 
-// --- Credential lookup (E1 T2) ---
+// --- Credential lookup ---
 
-/** The base-build token lookup's command, run first with `GH_CONFIG_DIR` set, then plain (b.uqm SR-15.1). */
+/** The base-build token lookup's command, run first with `GH_CONFIG_DIR` set, then plain. */
 export const GH_AUTH_TOKEN_ARGV = ['gh', 'auth', 'token'] as const
-/** The first token lookup's `GH_CONFIG_DIR`, relative to the environment's `HOME`: `<$HOME>/.config/gh-personal` (b.uqm SR-15.1, SR-15.4). */
+/** The first token lookup's `GH_CONFIG_DIR`, relative to the environment's `HOME`: `<$HOME>/.config/gh-personal`. */
 export const GH_PERSONAL_CONFIG_SUBPATH = '.config/gh-personal'
 
-// --- Docker answers (E1 T4) ---
+// --- Docker answers ---
 
-/** The text in Docker's answer to an image inspect naming an image it does not have: the image is missing (b.uqm SR-9.2, SR-23.6). */
+/** The text in Docker's answer to an image inspect naming an image it does not have: the image is missing. */
 export const DOCKER_NO_SUCH_IMAGE_TEXT = 'No such image'
-/** The text in Docker's answer to a container inspect naming a container it does not have: the container is gone (b.uqm SR-6.4, SR-6.5). */
+/** The text in Docker's answer to a container inspect naming a container it does not have: the container is gone. */
 export const DOCKER_NO_SUCH_CONTAINER_TEXT = 'No such container'
 
-// --- Worktree paths and the prerequisite keyword (E1 T7) ---
+// --- Worktree paths and the prerequisite keyword ---
 
-/** The directory holding the scripts, relative to the worktree root (b.uqm Terms, SR-2.3). */
+/** The directory holding the scripts, relative to the worktree root (Terms). */
 export const INTEGRATION_DIR_PATH = 'tests/integration'
-/** The duration table, relative to the worktree root (b.uqm SR-4.1). */
+/** The duration table, relative to the worktree root. */
 export const DURATION_TABLE_PATH = 'tests/ci-durations.tsv'
-/** The test image's Dockerfile, relative to the worktree root; its `FROM` line names the base image (b.uqm SR-9.2, SR-9.3). */
+/** The test image's Dockerfile, relative to the worktree root; its `FROM` line names the base image. */
 export const TEST_DOCKERFILE_PATH = 'docker/Dockerfile.test'
-/** The base image's Dockerfile, relative to the worktree root; it sets `ARG AD_VERSION` (b.uqm SR-9.2). */
+/** The base image's Dockerfile, relative to the worktree root; it sets `ARG AD_VERSION`. */
 export const BASE_DOCKERFILE_PATH = 'docker/Dockerfile.test.base'
-/** A prerequisite line's keyword, lowercase, after the `#` and its optional spaces or tabs: the bare keyword, not a `# ci-requires:` prefix (b.uqm SR-3.1). */
+/** A prerequisite line's keyword, lowercase, after the `#` and its optional spaces or tabs: the bare keyword, not a `# ci-requires:` prefix. */
 export const CI_REQUIRES_KEYWORD = 'ci-requires:'
 
-// --- Modes and child exits (E1 T3, T5) ---
+// --- Modes and child exits ---
 
-/** The mode of the run directory and of each shard directory, owner-only (b.uqm SR-5.1, SR-5.9). */
+/** The mode of the run directory and of each shard directory, owner-only. */
 export const RUN_DIR_MODE = 0o700
-/** The mode of a file the runner writes whole or appends to, when it creates it, owner-only (b.uqm SR-5.1). */
+/** The mode of a file the runner writes whole or appends to, when it creates it, owner-only. */
 export const WRITTEN_FILE_MODE = 0o600
-/** The exit status base for a child a signal ended, as a shell reports it: 128 + the signal number (SIGKILL: 137) (b.uqm SR-5.6). */
+/** The exit status base for a child a signal ended, as a shell reports it: 128 + the signal number (SIGKILL: 137). */
 export const SIGNAL_EXIT_STATUS_BASE = 128
 
-// --- Credentials (E2 T3) ---
+// --- Credentials ---
 
-/** The Anthropic raw key's prefix: while `ANTHROPIC_BASE_URL` is unset, an `ANTHROPIC_API_KEY` not beginning with it is a missing credential (b.uqm SR-15.1). */
+/** The Anthropic raw key's prefix: while `ANTHROPIC_BASE_URL` is unset, an `ANTHROPIC_API_KEY` not beginning with it is a missing credential. */
 export const RAW_KEY_PREFIX = 'sk-ant-'
 
 // ---------------------------------------------------------------------------
-// 3. Data model (E1)
+// 3. Data model
 // ---------------------------------------------------------------------------
 //
-// Every structure the sections exchange. One field per line, so an Epic that
-// needs a new field adds it on its own line (and says so in its Task report).
-// Where b.uqm SR-16.1 names a `results.json` key, the field carries that name.
+// Shared data structures exchanged by the runner sections.
+// Where names a `results.json` key, the field carries that name.
 // Read-only wherever a value is never mutated. This section emits no runtime
 // code.
 
 // --- Invocation and run kind ---
 
-/** A `/ci` invocation, parsed (b.uqm SR-2.1, SR-2.2). */
+/** A `/ci` invocation, parsed. */
 export interface Invocation {
   /** Continue independent scripts only after verified cleanup. Absent on legacy callers means false. */
   readonly keepGoing?: boolean
@@ -871,18 +868,18 @@ export interface Invocation {
   readonly shards: number | null
   /** `--shard-timeout`'s value in minutes when given. */
   readonly shardTimeoutMinutes: number | null
-  /** The faults, normalized and de-duplicated, in first-occurrence order (b.uqm SR-2.4). */
+  /** The faults, normalized and de-duplicated, in first-occurrence order. */
   readonly faults: readonly Fault[]
-  /** Every parsed `--inject` value as typed, in argument order, before normalization drops a repeat; E2's stage 7 names a wrong script or shard from it as typed (b.uqm SR-2.3, SR-2.4). */
+  /** Every parsed `--inject` value as typed, in argument order, before normalization drops a repeat; validation's stage 7 names a wrong script or shard from it as typed. */
   readonly givenFaults: readonly GivenFault[]
 }
 
-/** A run's kind, as a reservation records it: a full run selects no script (b.uqm SR-2.5, SR-6.2). */
+/** A run's kind, as a reservation records it: a full run selects no script. */
 export type RunKind = 'full' | 'selective'
 
 // --- Scripts, units and assignment ---
 
-/** One integration script (b.uqm Terms). */
+/** One integration script (Terms). */
 export interface Script {
   /** `test-<n>-<slug>.sh`. */
   readonly fileName: string
@@ -892,13 +889,13 @@ export interface Script {
   readonly numberForm: string
 }
 
-/** A scheduling unit: one connected group of the prerequisite graph, test-1 excluded (b.uqm SR-3.4). */
+/** A scheduling unit: one connected group of the prerequisite graph, test-1 excluded. */
 export interface SchedulingUnit {
   /** Its scripts, in canonical order. */
   readonly scripts: readonly Script[]
 }
 
-/** One shard's assignment (b.uqm SR-4.2, SR-4.3, SR-16.1). */
+/** One shard's assignment. */
 export interface ShardAssignment {
   /** k, from 1. */
   readonly shard: number
@@ -915,7 +912,7 @@ export type Assignment = readonly ShardAssignment[]
 
 // --- Faults ---
 
-/** A fault's kind (b.uqm SR-2.4). */
+/** A fault's kind. */
 export type FaultKind = 'fail' | 'timeout' | 'leak' | 'image-drift' | 'kill' | 'retag'
 
 /** `fail:<script>`, its script as a number form. */
@@ -956,10 +953,10 @@ export interface RetagFault {
   readonly kind: 'retag'
 }
 
-/** One fault, normalized (b.uqm SR-2.4). */
+/** One fault, normalized. */
 export type Fault = FailFault | TimeoutFault | LeakFault | ImageDriftFault | KillFault | RetagFault
 
-/** One parsed `--inject` value with its place in the `/ci` arguments (b.uqm SR-2.4). */
+/** One parsed `--inject` value with its place in the `/ci` arguments. */
 export interface GivenFault {
   /** The `--inject` option's index in the `/ci` arguments. */
   readonly position: number
@@ -969,10 +966,10 @@ export interface GivenFault {
   readonly fault: Fault
 }
 
-/** Where a fault stands (b.uqm SR-14.2, SR-14.3). */
+/** Where a fault stands. */
 export type FiringState = 'due' | 'fired' | 'not-fired'
 
-/** One fault's firing record (b.uqm SR-14.2, SR-14.3). */
+/** One fault's firing record. */
 export interface FiringRecord {
   readonly fault: Fault
   /** The shard it acts on, once known; null for `retag`. */
@@ -984,23 +981,23 @@ export interface FiringRecord {
   readonly reason: string | null
 }
 
-/** A `timeout:` or `kill:` firing, handed to the one handler that stops its shard (b.uqm SR-14.2). */
+/** A `timeout:` or `kill:` firing, handed to the one handler that stops its shard. */
 export interface FaultDecision {
   readonly shard: number
   readonly fault: TimeoutFault | KillFault
-  /** The cause it fixes for the shard before the stop (b.uqm SR-12.1). */
+  /** The cause it fixes for the shard before the stop. */
   readonly cause: ShardCause
 }
 
 // --- Owners and reservations ---
 
-/** An owner, `<RUN_ID>-<PID>` (b.uqm Terms, SR-6.3). */
+/** An owner, `<RUN_ID>-<PID>` (Terms). */
 export interface Owner {
   readonly runId: string
   readonly pid: number
 }
 
-/** A reservation, exactly b.uqm SR-6.2's keys. */
+/** A reservation, exactly keys. */
 export interface Reservation {
   readonly version: typeof RESERVATION_FORMAT_VERSION
   readonly runId: string
@@ -1018,22 +1015,22 @@ export interface Reservation {
 export interface ListedReservation {
   readonly fileName: string
   readonly reservation: Reservation
-  /** Its owner, read from its file name (E5 T2). */
+  /** Its owner, read from its file name (). */
   readonly owner: Owner
   readonly ownerAlive: boolean
 }
 
-/** A reservation file that cannot be used (b.uqm SR-6.2). */
+/** A reservation file that cannot be used. */
 export interface BadReservationFile {
   readonly fileName: string
-  /** Its owner, read from its file name (E5 T2). */
+  /** Its owner, read from its file name (). */
   readonly owner: Owner
   /** Its owner's liveness, read from its file name. */
   readonly ownerAlive: boolean
   readonly reason: string
 }
 
-/** The reservations beside the lock, as E5's reader lists them. */
+/** The reservations beside the lock, as reservation management's reader lists them. */
 export interface ReservationListingRead {
   readonly kind: 'listed'
   readonly valid: readonly ListedReservation[]
@@ -1046,28 +1043,28 @@ export interface ReservationListingFailure {
   readonly error: string
 }
 
-/** What E5's reservation reader returns. */
+/** What reservation management's reservation reader returns. */
 export type ReservationListing = ReservationListingRead | ReservationListingFailure
 
 // --- Status and refusal ---
 
-/** The status file's phases (b.uqm SR-5.2). */
+/** The status file's phases. */
 export type StatusPhase = 'build' | 'shards' | 'merge' | 'refused'
 
-/** The status file's deadline object, exactly its keys (b.uqm SR-5.2). */
+/** The status file's deadline object, exactly its keys. */
 export interface StatusDeadline {
   /** A UTC time. */
   readonly utc: string
   /** The same moment in whole seconds since the epoch, rounded down. */
   readonly epochSeconds: number
-  /** The deadline's minutes from the start, rounded as b.uqm SR-5.5 rounds. */
+  /** The deadline's minutes from the start, rounded as rounds. */
   readonly minutes: number
 }
 
-/** A refusal's kind; null for every refusal but memory, disk and CPU (b.uqm SR-5.8). */
+/** A refusal's kind; null for every refusal but memory, disk and CPU. */
 export type RefusalKind = 'memory' | 'disk' | 'cpu' | null
 
-/** A refusal, exactly the status file's `refusal` keys (b.uqm SR-5.2, SR-5.8). */
+/** A refusal, exactly the status file's `refusal` keys. */
 export interface Refusal {
   readonly kind: RefusalKind
   /** The reason after `NOT RUN: `, without its `<kind>: ` when it has a kind. */
@@ -1076,7 +1073,7 @@ export interface Refusal {
   readonly details: readonly string[]
 }
 
-/** The keys every status file holds (b.uqm SR-5.2). */
+/** The keys every status file holds. */
 export interface StatusCommon {
   readonly version: typeof STATUS_FORMAT_VERSION
   readonly runId: string
@@ -1098,12 +1095,12 @@ export interface RefusedStatus extends StatusCommon {
   readonly refusal: Refusal
 }
 
-/** The status file, exactly b.uqm SR-5.2's keys. */
+/** The status file, exactly keys. */
 export type RunStatus = ActiveStatus | RefusedStatus
 
 // --- Result files ---
 
-/** A script's result in a result file (b.uqm SR-11.3). */
+/** A script's result in a result file. */
 export type ScriptResult = 'pass' | 'fail'
 
 /** `start <file name>`. */
@@ -1132,10 +1129,10 @@ export interface DoneEvent {
   readonly kind: 'done'
 }
 
-/** One complete result-file line (b.uqm SR-11.3). */
+/** One complete result-file line. */
 export type ResultEvent = StartEvent | EndEvent | NotRunEvent | DoneEvent
 
-/** A result file as read (b.uqm SR-11.3, SR-12.1). */
+/** A result file as read. */
 export type ResultFileRead =
   | {
       readonly kind: 'events'
@@ -1151,7 +1148,7 @@ export type ResultFileRead =
 
 // --- Shard causes ---
 
-/** How a run-level stop names itself in a shard cause (b.uqm SR-12.1). */
+/** How a run-level stop names itself in a shard cause. */
 export type StopKind = 'interrupt' | 'memory-watchdog' | 'run-deadline'
 
 /** `wall-time limit of <m> min exceeded`: its limit or a `timeout:` fault. */
@@ -1208,7 +1205,7 @@ export interface ResultFileUnreadableCause {
   readonly fixedByRunner: false
 }
 
-/** A shard's end cause as a value; only E10 renders its text (b.uqm SR-12.1). */
+/** A shard's end cause as a value; only result rendering renders its text. */
 export type ShardCause =
   | WallTimeLimitCause
   | ContainerExitedCause
@@ -1221,14 +1218,14 @@ export type ShardCause =
 
 // --- Shard start and inspection ---
 
-/** One bind mount (b.uqm SR-10.3, SR-10.5). */
+/** One bind mount. */
 export interface ShardMount {
   readonly source: string
   readonly target: string
   readonly readOnly: boolean
 }
 
-/** What every shard-start outcome records (b.uqm SR-10.1, SR-10.3, SR-13.2). */
+/** What every shard-start outcome records. */
 export interface ShardStartCommon {
   readonly shard: number
   /** The image ID it was started from: the pinned ID, or the drift image's. */
@@ -1258,7 +1255,7 @@ export interface ShardStartFailed extends ShardStartCommon {
 /** A shard's start outcome. */
 export type ShardStart = ShardStarted | ShardStartFailed
 
-/** A shard container's inspection data: b.uqm SR-10.5's fields only, never an environment. */
+/** A shard container's inspection data: fields only, never an environment. */
 export interface InspectionData {
   readonly name: string
   readonly imageId: string
@@ -1285,7 +1282,7 @@ export type Unreadable = typeof UNREADABLE_READING
 /** One reading's value, or `unreadable`. */
 export type Reading<T> = T | Unreadable
 
-/** W with its parts (b.uqm SR-7.1, SR-16.1 `workingSet`). */
+/** W with its parts (`workingSet`). */
 export interface WorkingSetReading {
   readonly bytes: number
   readonly anonBytes: number
@@ -1297,7 +1294,7 @@ export interface WorkingSetReading {
   readonly unevictableBytes?: number
 }
 
-/** One active `/ci-live` run as admission or a sample saw it (b.uqm SR-6.6). */
+/** One active `/ci-live` run as admission or a sample saw it. */
 export interface CiLiveRunSeen {
   readonly via: 'real-run-lock' | 'dry-run-lock' | 'container'
   /** The lock file's path or the container's name. */
@@ -1305,7 +1302,7 @@ export interface CiLiveRunSeen {
   readonly pid: number | null
 }
 
-/** One reading that failed during the run (b.uqm SR-7.3). */
+/** One reading that failed during the run. */
 export interface FailedReading {
   /** The shard it was for; null for a run-wide reading. */
   readonly shard: number | null
@@ -1313,7 +1310,7 @@ export interface FailedReading {
   readonly error: string
 }
 
-/** One running shard in a sample (b.uqm SR-7.3). */
+/** One running shard in a sample. */
 export interface ShardSample {
   readonly shard: number
   readonly memoryBytes: Reading<number>
@@ -1327,20 +1324,20 @@ export interface ShardSample {
   readonly resultFile: ResultFileRead
 }
 
-/** One sample, every 30 s (b.uqm SR-7.3). */
+/** One sample, every 30 s. */
 export interface Sample {
   /** When it was taken, epoch milliseconds. */
   readonly atMs: number
   readonly workingSet: Reading<WorkingSetReading>
   /** The active `/ci-live` runs; empty when none. */
   readonly ciLive: readonly CiLiveRunSeen[]
-  /** The ceiling C in force at this sample, with its source; carried from the previous sample when the `/ci-live` re-check fails (b.uqm SR-7.3, SR-7.4). */
+  /** The ceiling C in force at this sample, with its source; carried from the previous sample when the `/ci-live` re-check fails. */
   readonly ceiling: MemoryCeiling
   readonly shards: readonly ShardSample[]
   readonly failedReadings: readonly FailedReading[]
 }
 
-/** A shard's one final reading (b.uqm SR-10.6). */
+/** A shard's one final reading. */
 export interface FinalReading {
   readonly oomKilled: Reading<boolean>
   readonly oomKillCount: Reading<number>
@@ -1350,7 +1347,7 @@ export interface FinalReading {
 
 // --- Failures and run-level stops ---
 
-/** The integrity checks, by name (b.uqm SR-13.2). */
+/** The integrity checks, by name. */
 export type IntegrityCheck =
   | 'fault-fired'
   | 'schedule-coverage'
@@ -1365,7 +1362,7 @@ export type IntegrityCheck =
   | 'dependency-set'
   | 'secret-scan'
 
-/** A failure's class, so E10 ranks without parsing text (b.uqm SR-12.4). */
+/** A failure's class, so result rendering ranks without parsing text. */
 export type FailureClass =
   | {
       readonly kind: 'run-level-stop'
@@ -1388,7 +1385,7 @@ export type FailureClass =
       readonly fileName: string
     }
 
-/** One failure (b.uqm SR-12.4, SR-16.1 `failures`). */
+/** One failure (`failures`). */
 export interface Failure {
   readonly line: string
   /** Its shard; null for none. */
@@ -1396,7 +1393,7 @@ export interface Failure {
   readonly failureClass: FailureClass
 }
 
-/** A run-level stop (b.uqm SR-5.6). */
+/** A run-level stop. */
 export type RunLevelStop =
   | {
       readonly kind: 'interrupt'
@@ -1411,41 +1408,41 @@ export type RunLevelStop =
       readonly line: string
     }
 
-/** A run's state; later Epics add fields on their own lines. */
+/** A run's state; later callers add fields on their own lines. */
 export interface RunState {
-  /** The first run-level stop; later ones change nothing (b.uqm SR-5.6). */
+  /** The first run-level stop; later ones change nothing. */
   firstStop: RunLevelStop | null
-  /** Step 4's base-image outcome (E8 T1): present, or missing with the clock moment it was found missing, which the deadline's 60 min counts from (b.uqm SR-9.2, SR-5.5); null until step 4 has found it. */
+  /** Step 4's base-image outcome (): present, or missing with the clock moment it was found missing, which the deadline's 60 min counts from; null until step 4 has found it. */
   baseImage: BaseImageCheck | null
-  /** The base-build token step 4 found (E8 T1), a secret credential (b.uqm SR-15.1); null when step 4 looked none up (the base present) or found none. */
+  /** The base-build token step 4 found (), a secret credential; null when step 4 looked none up (the base present) or found none. */
   baseBuildToken: string | null
-  /** The clock moment packing started (E8 T1), where the build time starts (b.uqm SR-4.4); null until step 5 starts. */
+  /** The clock moment packing started (), where the build time starts; null until step 5 starts. */
   packingStartedAtMs: number | null
-  /** The tarball's path in `package/` (E8 T1, b.uqm SR-9.1); null when nothing was packed. */
+  /** The tarball's path in `package/` (); null when nothing was packed. */
   tarballPath: string | null
-  /** The tarball's SHA-256 in 64 lowercase hex (E8 T1, b.uqm SR-9.1, SR-16.1); null when nothing was packed. */
+  /** The tarball's SHA-256 in 64 lowercase hex (); null when nothing was packed. */
   packageSha256: string | null
-  /** The base-build step while it runs (E8 T1); null otherwise. E13's stop path ends it through `end()` (SIGKILL to its process group) after recording the stop (b.uqm SR-5.6). */
+  /** The base-build step while it runs (); null otherwise. the run lifecycle's stop path ends it through `end()` (SIGKILL to its process group) after recording the stop. */
   baseBuildStep: BaseBuildStep | null
-  /** The base-build step's run on the clock (E8 T1, b.uqm SR-4.4); null when it did not run, its end null while it runs. */
+  /** The base-build step's run on the clock (); null when it did not run, its end null while it runs. */
   baseBuildRun: BaseBuildRun | null
-  /** Each cleanup failure's line (b.uqm SR-9.3). */
+  /** Each cleanup failure's line. */
   readonly cleanupFailures: string[]
-  /** The run's image-state record (E8 T2): replaced whole by E8's build and tag-move functions as each step starts and ends (b.uqm SR-9.3, SR-14.2). */
+  /** The run's image-state record (): replaced whole by image preparation's build and tag-move functions as each step starts and ends. */
   images: ImageState
-  /** The test, drift or retag build in progress (E8 T2); null when none runs. E13's stop path ends it through `end()` (SIGKILL to its process group) after recording the stop (b.uqm SR-5.6). */
+  /** The test, drift or retag build in progress (); null when none runs. the run lifecycle's stop path ends it through `end()` (SIGKILL to its process group) after recording the stop. */
   imageBuildInProgress: ImageBuild | null
 }
 
 // --- Images ---
 
-/** A run-private tag's role (b.uqm SR-9.3). */
+/** A run-private tag's role. */
 export type RunTagRole = (typeof RUN_TAG_ROLES)[number]
 
-/** A fault label's value (b.uqm SR-14.2). */
+/** A fault label's value. */
 export type FaultLabelValue = (typeof FAULT_LABEL_VALUES)[number]
 
-/** One role's build outcome (b.uqm SR-5.6, SR-9.3, SR-14.2). */
+/** One role's build outcome. */
 export type BuildOutcome =
   | {
       readonly kind: 'built'
@@ -1469,7 +1466,7 @@ export interface RoleBuildOutcomes {
   readonly retag: BuildOutcome
 }
 
-/** The `-test` tag's move by `retag` (b.uqm SR-14.2). */
+/** The `-test` tag's move by `retag`. */
 export type TagMoveOutcome =
   | {
       readonly kind: 'moved'
@@ -1482,7 +1479,7 @@ export type TagMoveOutcome =
       readonly kind: 'not-tried'
     }
 
-/** The run's images, as E8 fills it (b.uqm SR-9.3, SR-16.1 `images`). */
+/** The run's images, as image preparation fills it (`images`). */
 export interface ImageState {
   readonly pinnedId: string | null
   readonly driftId: string | null
@@ -1490,15 +1487,15 @@ export interface ImageState {
   readonly builds: RoleBuildOutcomes
   /** True only when the `retag` fault moved the `-test` tag. */
   readonly retagMoved: boolean
-  /** The clock moment (epoch ms) the pinned ID became known; null until then (E8 T2; E4 and E13 end the build time here). */
+  /** The clock moment (epoch ms) the pinned ID became known; null until then (; scheduling and the run lifecycle end the build time here). */
   readonly pinnedAtMs: number | null
-  /** Per role, whether its build was spawned (E8 T2): cleanup lists and prunes the run's untagged images only when one was (b.uqm SR-9.3). */
+  /** Per role, whether its build was spawned (): cleanup lists and prunes the run's untagged images only when one was. */
   readonly buildsStarted: Readonly<Record<RunTagRole, boolean>>
-  /** Per role, whether its build made, or may have made, its run-private tag, so cleanup removes that tag by name; false when it failed on its own and made none (E8 T2's tag rule, at `imageBuildEnd`). */
+  /** Per role, whether its build made, or may have made, its run-private tag, so cleanup removes that tag by name; false when it failed on its own and made none ('s tag rule, at `imageBuildEnd`). */
   readonly tagsMade: Readonly<Record<RunTagRole, boolean>>
 }
 
-// --- results.json (b.uqm SR-16.1) ---
+// --- results.json ---
 
 /** `images`. */
 export interface ResultsImages {
@@ -1612,7 +1609,7 @@ export interface ResultsTiming {
   readonly totalSeconds: number
 }
 
-/** `results.json`, exactly b.uqm SR-16.1's keys and nesting. */
+/** `results.json`, exactly keys and nesting. */
 export interface Results {
   readonly codexModel: string | null
   readonly version: typeof RESULTS_FORMAT_VERSION
@@ -1639,40 +1636,40 @@ export interface Results {
 
 // --- Shard evidence ---
 
-/** Everything the run knows of one shard: its `results.json` fields, and what they are judged from (b.uqm SR-12, SR-13). */
+/** Everything the run knows of one shard: its `results.json` fields, and what they are judged from. */
 export interface ShardEvidence extends ResultsShard {
   /** Its start outcome; null when its container was never created. */
   readonly start: ShardStart | null
   readonly canary: string
   readonly resultFile: ResultFileRead
-  /** The cause the runner fixed itself before a stop it made (b.uqm SR-12.1). */
+  /** The cause the runner fixed itself before a stop it made. */
   readonly fixedCause: ShardCause | null
   /** Its container's exit code, when it exited. */
   readonly exitCode: number | null
-  /** Its out-of-memory line (b.uqm SR-12.2). */
+  /** Its out-of-memory line. */
   readonly oomLine: string | null
 }
 
 // --- Runner log ---
 
-/** Takes one runner-log line (b.uqm SR-5.4). */
+/** Takes one runner-log line. */
 export type RunnerLogSink = (line: string) => void
 
 // ---------------------------------------------------------------------------
-// 4. Shared rules (E1)
+// 4. Shared rules
 // ---------------------------------------------------------------------------
 //
-// The rules the runner and the reader share, defined once (b.uqm SR-1.3).
+// The rules the runner and the reader share, defined once.
 
-// --- 4/T2 (E1 T2): arguments and run kinds, name forms, faults, canonical order, secrets and token lookup, child environments ---
+// --- 4/ : arguments and run kinds, name forms, faults, canonical order, secrets and token lookup, child environments ---
 
-// Script-name forms (b.uqm Terms, SR-2.2, SR-2.3). These only classify and
-// convert names; matching them against the worktree's scripts is E2's.
+// Script-name forms (Terms). These only classify and
+// convert names; matching them against the worktree's scripts is .
 
-/** A whole number: decimal digits, with no sign, no point and no leading zero (b.uqm SR-2.2). */
+/** A whole number: decimal digits, with no sign, no point and no leading zero. */
 const WHOLE_NUMBER_PATTERN = /^(0|[1-9][0-9]*)$/
 
-/** Whether `text` is a whole number (b.uqm SR-2.2): `0`, `7` and `720` are; `07`, `+7`, `7.0`, `-1` and the empty string are not. */
+/** Whether `text` is a whole number: `0`, `7` and `720` are; `07`, `+7`, `7.0`, `-1` and the empty string are not. */
 export function isWholeNumber(text: string): boolean {
   return WHOLE_NUMBER_PATTERN.test(text)
 }
@@ -1719,7 +1716,7 @@ export function fileNameNumberForm(fileName: string): string | null {
   return digits === null ? null : numberFormOfDigits(digits)
 }
 
-/** A SCRIPT argument (or a fault's `<script>`) classified: a number form, a file name, or neither (b.uqm SR-2.3). */
+/** A SCRIPT argument (or a fault's `<script>`) classified: a number form, a file name, or neither. */
 export type ScriptNameForm =
   | {
       readonly kind: 'number-form'
@@ -1753,11 +1750,11 @@ export function scriptNameNumber(name: string): number | null {
   return form.kind === 'neither' ? null : form.number
 }
 
-// Bad arguments (b.uqm SR-2.2, SR-2.4; stage 1 of SR-2.6). Every reason
+// Bad arguments (stage 1 of). Every reason
 // names the argument and the rule it breaks, and comes from an exported
 // builder below, so tests import the text rather than type it.
 
-/** One bad argument (b.uqm SR-2.2, SR-2.4). */
+/** One bad argument. */
 export interface ArgumentFailure {
   /** The index in the `/ci` arguments of the argument it names (an option's own index when its value is bad); failures are given in this order. */
   readonly position: number
@@ -1765,7 +1762,7 @@ export interface ArgumentFailure {
   readonly reason: string
 }
 
-/** The `/ci` options (b.uqm SR-2.1). */
+/** The `/ci` options. */
 const SHARDS_OPTION = '--shards'
 const SHARD_TIMEOUT_OPTION = '--shard-timeout'
 const INJECT_OPTION = '--inject'
@@ -1786,7 +1783,7 @@ export function optionValueRule(option: '--shards' | '--shard-timeout'): string 
     : `MINUTES must be a whole number from ${OPTION_RANGE_MIN} to ${MAX_SHARD_TIMEOUT_MINUTES}`
 }
 
-/** `--shards 7 is out of range: N must be a whole number from 1 to 6` (b.uqm SR-2.2). */
+/** `--shards 7 is out of range: N must be a whole number from 1 to 6`. */
 export function outOfRangeReason(option: '--shards' | '--shard-timeout', value: string): string {
   return `${option} ${shownArgument(value)} is out of range: ${optionValueRule(option)}`
 }
@@ -1821,9 +1818,9 @@ export function notAnOptionReason(arg: string): string {
   return `${shownArgument(arg)} is not an option: an argument beginning - must be ${SHARDS_OPTION}, ${SHARD_TIMEOUT_OPTION} or ${INJECT_OPTION}`
 }
 
-// Faults (b.uqm SR-2.4): their forms, normalization, de-duplication and the
+// Faults: their forms, normalization, de-duplication and the
 // faults that are bad arguments. Whether a fault's script exists and its
-// shard number is in range is E2's stage 7, never checked here.
+// shard number is in range is stage 7, never checked here.
 
 /** Every fault's form, as a bad fault name's reason lists them. */
 const FAULT_FORMS_TEXT = 'fail:<script>, timeout:<script>, leak:<k>,<j>, image-drift:<k>, kill:<k> or retag'
@@ -1872,7 +1869,7 @@ export type FaultParse =
       readonly reason: string
     }
 
-/** Parses one `--inject` value (b.uqm SR-2.4). Bad: an unknown fault name, a malformed fault, `leak:<k>,<k>`. */
+/** Parses one `--inject` value. Bad: an unknown fault name, a malformed fault, `leak:<k>,<k>`. */
 export function parseFault(value: string): FaultParse {
   const colon = value.indexOf(':')
   const name = colon === -1 ? value : value.slice(0, colon)
@@ -1932,7 +1929,7 @@ export function faultText(fault: Fault): string {
 
 /** Faults normalized and de-duplicated, and the bad arguments that leaves. */
 export interface NormalizedFaults {
-  /** In first-occurrence order (b.uqm SR-2.4). */
+  /** In first-occurrence order. */
   readonly faults: readonly Fault[]
   /** One per script that both a `fail:` and a `timeout:` name, at the later one's position. */
   readonly failures: readonly ArgumentFailure[]
@@ -1952,7 +1949,7 @@ function givenFaultText(entry: GivenFault): string {
 /**
  * De-duplicates parsed faults, given in argument order: a fault equal in its
  * normalized form to an earlier one is dropped, the first keeping its place
- * (b.uqm SR-2.4). Equality is judged on the typed digits. `fail:` and
+ * Equality is judged on the typed digits. `fail:` and
  * `timeout:` naming the same script, in either form, are a bad argument naming
  * both.
  */
@@ -1979,17 +1976,17 @@ export function normalizeFaults(given: readonly GivenFault[]): NormalizedFaults 
   return { faults, failures }
 }
 
-/** The `INJECTED (<faults>)` wrapper's fault text: the normalized faults in order, separated by single spaces (b.uqm SR-2.4). */
+/** The `INJECTED (<faults>)` wrapper's fault text: the normalized faults in order, separated by single spaces. */
 export function injectedFaultsText(faults: readonly Fault[]): string {
   return faults.map(faultText).join(' ')
 }
 
-/** The injected verdict's prefix, `INJECTED (<faults>): ` (b.uqm SR-2.4, SR-12.5, SR-17.2). */
+/** The injected verdict's prefix, `INJECTED (<faults>): `. */
 export function injectedVerdictPrefix(faults: readonly Fault[]): string {
   return `INJECTED (${injectedFaultsText(faults)}): `
 }
 
-// The `/ci` arguments (b.uqm SR-2.1, SR-2.2) and run kinds (b.uqm SR-2.5).
+// The `/ci` arguments and run kinds.
 // Only the arguments decide: no environment variable or file sets a run
 // option.
 
@@ -2014,11 +2011,11 @@ function optionValue(option: '--shards' | '--shard-timeout', value: string): { r
 }
 
 /**
- * Parses the `/ci` arguments (b.uqm SR-2.1, SR-2.2, SR-2.4): options and
+ * Parses the `/ci` arguments: options and
  * SCRIPT names in any order, each option taking the next argument as its
  * value, `--inject` repeatable. Gives the invocation, or every bad argument
  * in argument order. SCRIPT arguments are kept as given; whether they name
- * scripts is E2's.
+ * scripts is .
  */
 export function parseCiArguments(args: readonly string[]): ArgumentParse {
   const failures: ArgumentFailure[] = []
@@ -2096,42 +2093,42 @@ export function parseCiArguments(args: readonly string[]): ArgumentParse {
   }
 }
 
-/** A full run: no SCRIPT argument (b.uqm Terms). */
+/** A full run: no SCRIPT argument (Terms). */
 export function isFullRun(invocation: Invocation): boolean {
   return invocation.scripts.length === 0
 }
 
-/** A selective run: at least one SCRIPT argument (b.uqm Terms). */
+/** A selective run: at least one SCRIPT argument (Terms). */
 export function isSelectiveRun(invocation: Invocation): boolean {
   return invocation.scripts.length > 0
 }
 
-/** An injected run: at least one `--inject` (b.uqm Terms). */
+/** An injected run: at least one `--inject` (Terms). */
 export function isInjectedRun(invocation: Invocation): boolean {
   return invocation.faults.length > 0
 }
 
-/** A default full run: `/ci` with no arguments at all (b.uqm Terms). */
+/** A default full run: `/ci` with no arguments at all (Terms). */
 export function isDefaultFullRun(invocation: Invocation): boolean {
   return invocation.args.length === 0
 }
 
-/** Gate-eligible: a full run without `--inject`, with or without `--shards` or `--shard-timeout` (b.uqm SR-2.5). */
+/** Gate-eligible: a full run without `--inject`, with or without `--shards` or `--shard-timeout`. */
 export function isGateEligible(invocation: Invocation): boolean {
   return isFullRun(invocation) && !isInjectedRun(invocation)
 }
 
-/** Only a default full run can be a cap source (b.uqm SR-2.5, SR-8.4). */
+/** Only a default full run can be a cap source. */
 export function isCapSourceEligible(invocation: Invocation): boolean {
   return isDefaultFullRun(invocation)
 }
 
-/** The run's kind as a reservation records it (b.uqm SR-6.2). */
+/** The run's kind as a reservation records it. */
 export function runKindOf(invocation: Invocation): RunKind {
   return isSelectiveRun(invocation) ? 'selective' : 'full'
 }
 
-// Canonical order (b.uqm SR-3.3): test-1; then test-2, test-3 and test-4,
+// Canonical order: test-1; then test-2, test-3 and test-4,
 // each when present; then every other script by ascending number, so test-0
 // follows test-4. Numbers are compared, never text.
 
@@ -2161,16 +2158,16 @@ export function sortCanonical<T extends string>(names: readonly T[]): T[] {
   return [...names].sort(compareCanonical)
 }
 
-// Credentials and child environments (b.uqm SR-15.1, SR-15.4). No value
+// Credentials and child environments. No value
 // handled here is written to any sink.
 
 /** The environment a child is given, or the runner's own as `RunnerDeps.env` holds it. */
 export type ChildEnvironmentSource = Readonly<Record<string, string | undefined>>
 
-/** The variables that are never secret, whatever they hold (b.uqm SR-15.1). */
+/** The variables that are never secret, whatever they hold. */
 export const NON_SECRET_VARIABLES: readonly string[] = ['ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL', 'CI_ANTHROPIC_BASE_URL', 'CI_ANTHROPIC_MODEL', 'CODEX_TEST_MODEL', CODEX_HOST_CONFIG_KEYS_ENV]
 
-/** A child's environment: the given one, unchanged, its unset entries left out (b.uqm SR-15.4). */
+/** A child's environment: the given one, unchanged, its unset entries left out. */
 export function childEnvironment(env: ChildEnvironmentSource): Record<string, string> {
   const child: Record<string, string> = {}
   for (const [name, value] of Object.entries(env)) {
@@ -2194,12 +2191,12 @@ function shardChildEnvironment(env: ChildEnvironmentSource): Record<string, stri
   return child
 }
 
-/** `<$HOME>/.config/gh-personal`, `<$HOME>` being `HOME` in the given environment, as the base-build step forms it (b.uqm SR-15.4). */
+/** `<$HOME>/.config/gh-personal`, `<$HOME>` being `HOME` in the given environment, as the base-build step forms it. */
 export function ghPersonalConfigDir(env: ChildEnvironmentSource): string {
   return `${env.HOME ?? ''}/${GH_PERSONAL_CONFIG_SUBPATH}`
 }
 
-/** The first `gh auth token` lookup's environment: the child environment plus `GH_CONFIG_DIR` (b.uqm SR-15.4), its one exception. */
+/** The first `gh auth token` lookup's environment: the child environment plus `GH_CONFIG_DIR`, its one exception. */
 export function firstTokenLookupEnvironment(env: ChildEnvironmentSource): Record<string, string> {
   return { ...childEnvironment(env), GH_CONFIG_DIR: ghPersonalConfigDir(env) }
 }
@@ -2219,17 +2216,16 @@ async function runTokenLookup(spawn: SpawnFn, env: Record<string, string>, cwd: 
 }
 
 /**
- * The base-build token, found as the base-build step finds it (b.uqm
- * SR-15.1): `gh auth token` with `GH_CONFIG_DIR` at `<$HOME>/.config/gh-personal`,
+ * The base-build token, found as the base-build step finds it: `gh auth token` with `GH_CONFIG_DIR` at `<$HOME>/.config/gh-personal`,
  * then, only when that fails or gives nothing, plain `gh auth token`. Each
  * runs through the given spawn function with the environment derived from
- * `env` (b.uqm SR-15.4), in `cwd`; null when neither gives a credential.
+ * `env`, in `cwd`; null when neither gives a credential.
  *
  * `cwd` is the worktree root the base-build step runs in, because `gh` may
  * pick its token from the working directory (a `gh` wrapper that routes by
  * the checkout's git origin): a lookup from elsewhere could miss the token
  * the step finds. The runner passes `RunnerDeps.worktreeRoot`; the reader
- * (E3) passes its own worktree root and runs it through its own spawn seam.
+ * passes its own worktree root and runs it through its own spawn seam.
  */
 export async function lookUpBaseBuildToken(spawn: SpawnFn, env: ChildEnvironmentSource, cwd: string): Promise<string | null> {
   const first = await runTokenLookup(spawn, firstTokenLookupEnvironment(env), cwd)
@@ -2239,14 +2235,14 @@ export async function lookUpBaseBuildToken(spawn: SpawnFn, env: ChildEnvironment
 
 /** What joins the secret set beside the environment's own credentials. */
 export interface SecretSetExtras {
-  /** The base-build token, when step 4 looked one up (b.uqm SR-9.2); null or absent otherwise. */
+  /** The base-build token, when step 4 looked one up; null or absent otherwise. */
   readonly baseBuildToken?: string | null
   /** Variables later passed to a shard that hold a key or token, by name; `ANTHROPIC_BASE_URL` and `ANTHROPIC_MODEL` are skipped. */
   readonly shardVariables?: Readonly<Record<string, string | undefined>>
 }
 
 /**
- * The secret credentials' values (b.uqm SR-15.1): `ANTHROPIC_API_KEY`;
+ * The secret credentials' values: `ANTHROPIC_API_KEY`;
  * `GH_TOKEN` when set; the base-build token when one was looked up; and the
  * extra shard variables' values. Never an empty string, and never the value
  * of `ANTHROPIC_BASE_URL` or `ANTHROPIC_MODEL` as such.
@@ -2266,12 +2262,12 @@ export function secretCredentialSet(env: ChildEnvironmentSource, extras: SecretS
   return values
 }
 
-// --- 4/T3 (E1 T3): RUN_ID and its time, the run-directory path, the status file, owners and liveness ---
+// --- 4/ : RUN_ID and its time, the run-directory path, the status file, owners and liveness ---
 
 const MS_PER_SECOND = 1_000
 const MS_PER_MINUTE = 60_000
 
-/** A UTC time, `YYYY-MM-DDTHH:MM:SSZ`; groups 1–6 are its fields (b.uqm Terms). */
+/** A UTC time, `YYYY-MM-DDTHH:MM:SSZ`; groups 1–6 are its fields (Terms). */
 const UTC_TIME_PATTERN = /^([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})Z$/
 
 /** A line break, which no one-line text may hold. */
@@ -2298,7 +2294,7 @@ function calendarMomentMs(fields: readonly string[]): number | null {
 }
 
 /**
- * The RUN_ID's time in epoch milliseconds (b.uqm SR-5.1), or null when
+ * The RUN_ID's time in epoch milliseconds, or null when
  * `value` is no RUN_ID: not of `RUN_ID_PATTERN`'s shape, or naming no real
  * moment of the calendar.
  */
@@ -2307,19 +2303,19 @@ export function runIdTimeMs(value: string): number | null {
   return match === null ? null : calendarMomentMs(match.slice(1, 7))
 }
 
-/** Whether `value` is a RUN_ID (b.uqm SR-5.1). */
+/** Whether `value` is a RUN_ID. */
 export function isRunId(value: string): boolean {
   return runIdTimeMs(value) !== null
 }
 
-/** A moment as a UTC time, `YYYY-MM-DDTHH:MM:SSZ`, in whole seconds rounded down (b.uqm Terms). Throws for a moment that is no date. */
+/** A moment as a UTC time, `YYYY-MM-DDTHH:MM:SSZ`, in whole seconds rounded down (Terms). Throws for a moment that is no date. */
 export function formatUtcTime(epochMs: number): string {
   if (!Number.isFinite(epochMs)) throw new Error(`formatUtcTime: not a moment: ${epochMs}`)
   const wholeSecondsMs = Math.floor(epochMs / MS_PER_SECOND) * MS_PER_SECOND
   return new Date(wholeSecondsMs).toISOString().replace(/\.000Z$/, 'Z')
 }
 
-/** A UTC time's epoch milliseconds, or null when `text` is no UTC time (b.uqm Terms). */
+/** A UTC time's epoch milliseconds, or null when `text` is no UTC time (Terms). */
 export function parseUtcTimeMs(text: string): number | null {
   const match = UTC_TIME_PATTERN.exec(text)
   return match === null ? null : calendarMomentMs(match.slice(1, 7))
@@ -2327,8 +2323,8 @@ export function parseUtcTimeMs(text: string): number | null {
 
 /**
  * The system temp directory: `$TMPDIR` when it is set and not empty, else
- * `/tmp`, a trailing slash ignored (b.uqm SR-5.1). SR-5.1's rule only; not
- * /ci-live's (SR-6.6).
+ * `/tmp`, a trailing slash ignored. rule only; not
+ * /ci-live's.
  */
 export function systemTempDir(env: Readonly<Record<string, string | undefined>>): string {
   const value = env.TMPDIR
@@ -2338,8 +2334,7 @@ export function systemTempDir(env: Readonly<Record<string, string | undefined>>)
 }
 
 /**
- * The run directory, `cscb-ci-<RUN_ID>` in the system temp directory (b.uqm
- * SR-5.1), joined with one `/` and never normalized (`TMPDIR=/a/../b` keeps
+ * The run directory, `cscb-ci-<RUN_ID>` in the system temp directory, joined with one `/` and never normalized (`TMPDIR=/a/../b` keeps
  * its `..`), so the skill, the runner and the reader derive the same text.
  * Throws for a `runId` that is no RUN_ID, so no other name can reach the path.
  */
@@ -2349,7 +2344,7 @@ export function runDirPath(env: Readonly<Record<string, string | undefined>>, ru
   return `${dir === '/' ? '' : dir}/${RUN_DIR_PREFIX}${runId}`
 }
 
-/** Minutes rounded to the nearest whole minute, halves up: 138.4 gives 138, 84.5 gives 85 (b.uqm SR-4.3, SR-5.5). */
+/** Minutes rounded to the nearest whole minute, halves up: 138.4 gives 138, 84.5 gives 85. */
 export function roundMinutesHalfUp(minutes: number): number {
   return Math.floor(minutes + 0.5)
 }
@@ -2624,7 +2619,7 @@ function checkedShape<T>(value: unknown, shape: JsonShape): ParseResult<T> {
   return mismatch === null ? { ok: true, value: value as T } : { ok: false, error: mismatch }
 }
 
-// The status file (b.uqm SR-5.2).
+// The status file.
 
 /** What every status write of one run shares: who, since when, and the current deadline. */
 export interface StatusBasis {
@@ -2635,7 +2630,7 @@ export interface StatusBasis {
   readonly deadline: StatusDeadline
 }
 
-/** The deadline `minutes` after the start: its UTC time and epoch seconds, both rounded down to whole seconds, and its minutes rounded halves up (b.uqm SR-5.2, SR-5.5). */
+/** The deadline `minutes` after the start: its UTC time and epoch seconds, both rounded down to whole seconds, and its minutes rounded halves up. */
 export function statusDeadline(startMs: number, minutes: number): StatusDeadline {
   const atMs = startMs + minutes * MS_PER_MINUTE
   return {
@@ -2645,7 +2640,7 @@ export function statusDeadline(startMs: number, minutes: number): StatusDeadline
   }
 }
 
-/** The status of a run in phase `build`, `shards` or `merge`: no `refusal` (b.uqm SR-5.2). */
+/** The status of a run in phase `build`, `shards` or `merge`: no `refusal`. */
 export function buildStatus(basis: StatusBasis, phase: ActiveStatus['phase']): ActiveStatus {
   return {
     version: STATUS_FORMAT_VERSION,
@@ -2657,7 +2652,7 @@ export function buildStatus(basis: StatusBasis, phase: ActiveStatus['phase']): A
   }
 }
 
-/** The status of a refused run, phase `refused` with its refusal (b.uqm SR-5.2, SR-5.8). */
+/** The status of a refused run, phase `refused` with its refusal. */
 export function buildRefusedStatus(basis: StatusBasis, refusal: Refusal): RefusedStatus {
   return {
     version: STATUS_FORMAT_VERSION,
@@ -2671,7 +2666,7 @@ export function buildRefusedStatus(basis: StatusBasis, refusal: Refusal): Refuse
 }
 
 /**
- * A refusal (b.uqm SR-5.2, SR-5.8). `reason` may be the refusal's whole first
+ * A refusal. `reason` may be the refusal's whole first
  * line: its `NOT RUN: ` is dropped and, when there is a kind, its `<kind>: `.
  * Throws when the summary or a detail holds a line break: a caller renders an
  * argument on one line before it reaches a refusal.
@@ -2687,12 +2682,12 @@ export function buildRefusal(kind: RefusalKind, reason: string, details: readonl
   return { kind, summary, details: [...details] }
 }
 
-/** A refusal's first line, `NOT RUN: <reason>`, the reason being `<kind>: <summary>` when it has a kind (b.uqm SR-5.8). */
+/** A refusal's first line, `NOT RUN: <reason>`, the reason being `<kind>: <summary>` when it has a kind. */
 export function refusalLine(refusal: Refusal): string {
   return `${NOT_RUN_PREFIX}${refusal.kind === null ? '' : `${refusal.kind}: `}${refusal.summary}`
 }
 
-/** The status file's shape for one phase group: exactly b.uqm SR-5.2's keys, in its order. */
+/** The status file's shape for one phase group: exactly keys, in its order. */
 function statusShape(refused: boolean): JsonShape {
   const activePhases: readonly ActiveStatus['phase'][] = ['build', 'shards', 'merge']
   const refusalKinds: readonly RefusalKind[] = ['memory', 'disk', 'cpu', null]
@@ -2721,7 +2716,7 @@ function statusShape(refused: boolean): JsonShape {
   })
 }
 
-/** Why a status object departs from b.uqm SR-5.2, or null when it does not. */
+/** Why a status object departs from the contract, or null when it does not. */
 function statusMismatch(value: unknown): string | null {
   const refused = isJsonObject(value) && value.phase === 'refused'
   const mismatch = shapeMismatch(value, statusShape(refused), '')
@@ -2731,14 +2726,14 @@ function statusMismatch(value: unknown): string | null {
   return null
 }
 
-/** The status file's text: exactly its keys in b.uqm SR-5.2's order. Throws for a status that departs from that shape. */
+/** The status file's text: exactly its keys in the contract order. Throws for a status that departs from that shape. */
 export function serializeStatus(status: RunStatus): string {
   const mismatch = statusMismatch(status)
   if (mismatch !== null) throw new Error(`serializeStatus: ${mismatch}`)
   return `${JSON.stringify(orderedByShape(status, statusShape(status.phase === 'refused')), null, 2)}\n`
 }
 
-/** A status file's text, parsed strictly: exact keys, `version` 1, the types and the phase values (b.uqm SR-5.2). Anything else counts as no status file. */
+/** A status file's text, parsed strictly: exact keys, `version` 1, the types and the phase values. Anything else counts as no status file. */
 export function parseStatus(text: string): ParseResult<RunStatus> {
   const json = parseJsonText(text)
   if (!json.ok) return json
@@ -2746,7 +2741,7 @@ export function parseStatus(text: string): ParseResult<RunStatus> {
   return mismatch === null ? { ok: true, value: json.value as RunStatus } : { ok: false, error: mismatch }
 }
 
-/** Replaces the run directory's status file whole: a temporary file in the run directory, then a rename (b.uqm SR-5.2). A failed write leaves the previous file as it was. */
+/** Replaces the run directory's status file whole: a temporary file in the run directory, then a rename. A failed write leaves the previous file as it was. */
 export function writeStatusFile(runDir: string, status: RunStatus): WriteResult {
   let text: string
   try {
@@ -2757,7 +2752,7 @@ export function writeStatusFile(runDir: string, status: RunStatus): WriteResult 
   return writeWholeFile(runDir, STATUS_FILE_NAME, text)
 }
 
-/** The run directory's status file, or null for no status file: missing, unreadable, unparseable or of another shape (b.uqm SR-5.2). */
+/** The run directory's status file, or null for no status file: missing, unreadable, unparseable or of another shape. */
 export function readStatusFile(runDir: string): RunStatus | null {
   const read = readFileText(join(runDir, STATUS_FILE_NAME))
   if (read.kind !== 'text') return null
@@ -2765,14 +2760,14 @@ export function readStatusFile(runDir: string): RunStatus | null {
   return parsed.ok ? parsed.value : null
 }
 
-// Owners and liveness (b.uqm Terms, SR-6.3).
+// Owners and liveness (Terms).
 
 /** An owner's text, `<RUN_ID>-<PID>`. */
 export function formatOwner(owner: Owner): string {
   return `${owner.runId}-${owner.pid}`
 }
 
-/** An owner parsed from the right of `<RUN_ID>-<PID>`, so the RUN_ID's own hyphen never confuses the PID; null when malformed (b.uqm SR-6.3). */
+/** An owner parsed from the right of `<RUN_ID>-<PID>`, so the RUN_ID's own hyphen never confuses the PID; null when malformed. */
 export function parseOwner(text: string): Owner | null {
   const at = text.lastIndexOf('-')
   if (at < 0) return null
@@ -2783,7 +2778,7 @@ export function parseOwner(text: string): Owner | null {
   return Number.isSafeInteger(pid) ? { runId, pid } : null
 }
 
-/** The owner label as a `--label` argument and a filter, `cscb-ci-owner=<RUN_ID>-<PID>` (b.uqm Terms). */
+/** The owner label as a `--label` argument and a filter, `cscb-ci-owner=<RUN_ID>-<PID>` (Terms). */
 export function ownerLabel(owner: Owner): string {
   return `${OWNER_LABEL}=${formatOwner(owner)}`
 }
@@ -2791,13 +2786,13 @@ export function ownerLabel(owner: Owner): string {
 /** What liveness needs: the PID liveness test and the `/proc` command-line read. `RunnerDeps` satisfies it, and so can the reader's own seam. */
 export type OwnerLivenessProbe = Pick<RunnerDeps, 'isPidAlive' | 'readProcCmdline'>
 
-/** Whether a command line holds an argument ending in `scripts/ci-run.ts` followed immediately by `runId` (b.uqm SR-6.3). */
+/** Whether a command line holds an argument ending in `scripts/ci-run.ts` followed immediately by `runId`. */
 export function isRunnerCommandLine(args: readonly string[], runId: string): boolean {
   return args.some((arg, index) => arg.endsWith(RUNNER_PATH_SUFFIX) && args[index + 1] === runId)
 }
 
 /**
- * Whether an owner is alive (b.uqm SR-6.3): only when its PID is a live
+ * Whether an owner is alive: only when its PID is a live
  * process whose command line holds an argument ending in `scripts/ci-run.ts`
  * followed immediately by its RUN_ID. Every other owner is dead: a gone PID, a
  * PID reused by another program or by a `/ci` runner with another RUN_ID, and
@@ -2833,13 +2828,13 @@ function labelValue(labels: Readonly<Record<string, string>> | null, name: strin
   return labels !== null && Object.hasOwn(labels, name) ? labels[name] : undefined
 }
 
-/** A container's owner from its labels (b.uqm SR-6.3): a `cscb-ci=1` container whose owner label is missing, empty or malformed has a dead owner; a container without `cscb-ci=1` is no run's. */
+/** A container's owner from its labels: a `cscb-ci=1` container whose owner label is missing, empty or malformed has a dead owner; a container without `cscb-ci=1` is no run's. */
 export function containerLabelOwner(labels: Readonly<Record<string, string>> | null, probe: OwnerLivenessProbe): LabelledOwner {
   if (labelValue(labels, CI_LABEL) !== CI_LABEL_VALUE) return { kind: 'no-run' }
   return judgedLabelOwner(labelValue(labels, OWNER_LABEL), probe)
 }
 
-/** An image's owner from its labels (b.uqm SR-6.3): a malformed owner label is a dead owner; an image without one belongs to no run. */
+/** An image's owner from its labels: a malformed owner label is a dead owner; an image without one belongs to no run. */
 export function imageLabelOwner(labels: Readonly<Record<string, string>> | null, probe: OwnerLivenessProbe): LabelledOwner {
   const value = labelValue(labels, OWNER_LABEL)
   if (value === undefined) return { kind: 'no-run' }
@@ -2852,12 +2847,12 @@ export interface RunTag {
   readonly role: RunTagRole
 }
 
-/** A run-private tag, `cscb-ci-run:<RUN_ID>-<PID>-<role>` (b.uqm SR-9.3). */
+/** A run-private tag, `cscb-ci-run:<RUN_ID>-<PID>-<role>`. */
 export function formatRunTag(owner: Owner, role: RunTagRole): string {
   return `${RUN_TAG_REPOSITORY}:${formatOwner(owner)}-${role}`
 }
 
-/** A run-private tag's owner and role, or null for a tag of any other shape, such as `cscb-ci:latest`, `cscb-ci-base:v7` or `cscb-ci-l5:m5` (b.uqm SR-6.4, SR-9.3). */
+/** A run-private tag's owner and role, or null for a tag of any other shape, such as `cscb-ci:latest`, `cscb-ci-base:v7` or `cscb-ci-l5:m5`. */
 export function parseRunTag(tag: string): RunTag | null {
   const prefix = `${RUN_TAG_REPOSITORY}:`
   if (!tag.startsWith(prefix)) return null
@@ -2872,10 +2867,10 @@ export function parseRunTag(tag: string): RunTag | null {
 }
 
 // ---------------------------------------------------------------------------
-// 5. File formats (E1)
+// 5. File formats
 // ---------------------------------------------------------------------------
 
-// --- 5/T3 (E1 T3): reservation and results formats, verdict write, result-file reading, in-shard records, runner log ---
+// --- 5/ : reservation and results formats, verdict write, result-file reading, in-shard records, runner log ---
 
 /** A write's outcome: done, or failed with its error on one line. */
 export type WriteResult =
@@ -2922,12 +2917,12 @@ export function atomicTempFileName(fileName: string): string {
  * or the new one and never a partial one. A failed write removes its
  * temporary file where it can and leaves the previous file as it was. The
  * status file, the verdict, the reservation and a rewrite of the results and
- * summary all go through it (b.uqm SR-5.2, SR-5.6, SR-5.7, SR-6.2).
+ * summary all go through it.
  * A temporary file left by an interrupted write, or a link planted at its
  * name, is removed first (the link itself, never what it points to), and the
  * temporary file is then created exclusively, so the file written is always a
  * new one at `WRITTEN_FILE_MODE` and a link there is never followed.
- * The runner cannot use `src/atomic-write.ts`: SR-1.3 forbids it loading `src/`.
+ * The runner cannot use `src/atomic-write.ts`: forbids it loading `src/`.
  */
 export function writeWholeFile(dir: string, fileName: string, content: string): WriteResult {
   const target = join(dir, fileName)
@@ -2947,15 +2942,15 @@ export function writeWholeFile(dir: string, fileName: string, content: string): 
   }
 }
 
-/** Writes `verdict.txt` whole, its one line then a line feed: a temporary file in the run directory, then a rename (b.uqm SR-5.7). A line holding a line break is refused. */
+/** Writes `verdict.txt` whole, its one line then a line feed: a temporary file in the run directory, then a rename. A line holding a line break is refused. */
 export function writeVerdictFile(runDir: string, line: string): WriteResult {
   if (LINE_BREAK_PATTERN.test(line)) return { ok: false, error: 'the verdict line holds a line break' }
   return writeWholeFile(runDir, VERDICT_FILE_NAME, `${line}\n`)
 }
 
-// Reservations (b.uqm SR-6.2) and results.json (b.uqm SR-16.1).
+// Reservations and results.json.
 
-/** A reservation's file name, `<RUN_ID>-<PID>.json` (b.uqm SR-6.2). */
+/** A reservation's file name, `<RUN_ID>-<PID>.json`. */
 export function reservationFileName(owner: Owner): string {
   return `${formatOwner(owner)}${RESERVATION_FILE_SUFFIX}`
 }
@@ -2966,12 +2961,12 @@ export function reservationOwnerFromFileName(fileName: string): Owner | null {
   return parseOwner(fileName.slice(0, -RESERVATION_FILE_SUFFIX.length))
 }
 
-/** Whether a name beside the lock is a reservation name; any other file there is ignored (b.uqm SR-6.2). */
+/** Whether a name beside the lock is a reservation name; any other file there is ignored. */
 export function isReservationFileName(fileName: string): boolean {
   return reservationOwnerFromFileName(fileName) !== null
 }
 
-/** The temporary file a reservation write goes through, whose name is never a reservation name (b.uqm SR-6.2). */
+/** The temporary file a reservation write goes through, whose name is never a reservation name. */
 export function reservationTempFileName(owner: Owner): string {
   return atomicTempFileName(reservationFileName(owner))
 }
@@ -2989,12 +2984,12 @@ function reservationShape(): JsonShape {
   })
 }
 
-/** A reservation's file text: exactly b.uqm SR-6.2's keys, in its order. Throws for a reservation of another shape. */
+/** A reservation's file text: exactly keys, in its order. Throws for a reservation of another shape. */
 export function serializeReservation(reservation: Reservation): string {
   return serializeShaped('serializeReservation', reservation, reservationShape())
 }
 
-/** A reservation file's text, parsed strictly: exact keys, `version` 1, whole numbers, `kind` full or selective (b.uqm SR-6.2). */
+/** A reservation file's text, parsed strictly: exact keys, `version` 1, whole numbers, `kind` full or selective. */
 export function parseReservation(text: string): ParseResult<Reservation> {
   const json = parseJsonText(text)
   return json.ok ? checkedShape<Reservation>(json.value, reservationShape()) : json
@@ -3036,7 +3031,7 @@ function workingSetReadingShape(): JsonShape {
   })
 }
 
-/** `results.json`'s shape: exactly b.uqm SR-16.1's keys and nesting, in its order. Counts and bytes are whole numbers; seconds are numbers. */
+/** `results.json`'s shape: exactly keys and nesting, in its order. Counts and bytes are whole numbers; seconds are numbers. */
 function resultsShape(): JsonShape {
   const scriptResults: readonly ResultsScript['result'][] = ['pass', 'fail', 'notrun']
   const scriptFields = {
@@ -3136,18 +3131,18 @@ function resultsShape(): JsonShape {
   })
 }
 
-/** `results.json`'s text: exactly b.uqm SR-16.1's keys and nesting, in its order, records' keys sorted. Throws for results of another shape. */
+/** `results.json`'s text: exactly keys and nesting, in its order, records' keys sorted. Throws for results of another shape. */
 export function serializeResults(results: Results): string {
   return serializeShaped('serializeResults', results, resultsShape())
 }
 
-/** `results.json`'s text, parsed strictly: the exact keys and nesting of b.uqm SR-16.1, `version` 1. The reader's narrow read of `version` and `timingSummary` is its own (E3). */
+/** `results.json`'s text, parsed strictly: the exact keys and nesting of the contract, `version` 1. The reader's narrow read of `version` and `timingSummary` is its own (the verdict reader). */
 export function parseResults(text: string): ParseResult<Results> {
   const json = parseJsonText(text)
   return json.ok ? checkedShape<Results>(json.value, resultsShape()) : json
 }
 
-// Result files and the in-shard records (b.uqm SR-11.3, SR-11.5).
+// Result files and the in-shard records.
 
 /** A script's wall time as a result file writes it: digits, a point and exactly three digits (`21.347`, `0.512`). Throws for a negative or non-finite time. */
 export function formatResultSeconds(seconds: number): string {
@@ -3162,7 +3157,7 @@ export function isNotrunReason(reason: unknown): reason is string {
     (reason.startsWith('dependency:') && SCRIPT_FILE_NAME_PATTERN.test(reason.slice('dependency:'.length))))
 }
 
-/** One complete result-file line as its event, or null for a line of no known form (b.uqm SR-11.3). Fields are separated by single spaces. */
+/** One complete result-file line as its event, or null for a line of no known form. Fields are separated by single spaces. */
 export function parseResultLine(line: string): ResultEvent | null {
   const fields = line.split(' ')
   const [word, fileName, result, seconds] = fields
@@ -3177,7 +3172,7 @@ export function parseResultLine(line: string): ResultEvent | null {
   return null
 }
 
-/** One result-file line, without its line feed (b.uqm SR-11.3). Throws for an event no reader would read back, such as a bad file name. */
+/** One result-file line, without its line feed. Throws for an event no reader would read back, such as a bad file name. */
 export function formatResultLine(event: ResultEvent): string {
   let line: string
   switch (event.kind) {
@@ -3198,18 +3193,18 @@ export function formatResultLine(event: ResultEvent): string {
   return line
 }
 
-/** A result file's text: each event's line, each ending in a line feed (b.uqm SR-11.3). */
+/** A result file's text: each event's line, each ending in a line feed. */
 export function formatResultFile(events: readonly ResultEvent[]): string {
   return events.map((event) => `${formatResultLine(event)}\n`).join('')
 }
 
-/** The injected-failure line a `fail:` fault's script log holds, `FAIL: <file name>: injected failure` (b.uqm SR-11.3, SR-14.2). */
+/** The injected-failure line a `fail:` fault's script log holds, `FAIL: <file name>: injected failure`. */
 export function injectedFailureLine(fileName: string): string {
   return `${FAIL_PREFIX}${fileName}: ${INJECTED_FAILURE_TEXT}`
 }
 
 /**
- * A result file's text read by lines (b.uqm SR-11.3): a last line without its
+ * A result file's text read by lines: a last line without its
  * line feed is still being written and is ignored; a complete line of no
  * known form, a carriage return included, makes the file unreadable.
  */
@@ -3226,7 +3221,7 @@ export function parseResultFileText(text: string): ResultFileRead {
   return { kind: 'events', events }
 }
 
-/** A shard's result file, `result.txt` in its shard subdirectory: its events, missing, or unreadable (b.uqm SR-11.3, SR-12.1). A missing file is never unreadable. */
+/** A shard's result file, `result.txt` in its shard subdirectory: its events, missing, or unreadable. A missing file is never unreadable. */
 export function readResultFile(shardDir: string): ResultFileRead {
   const read = readFileText(join(shardDir, RESULT_FILE_NAME))
   if (read.kind === 'missing') return { kind: 'missing' }
@@ -3253,7 +3248,7 @@ export type HexRecordRead =
       readonly error: string
     }
 
-/** A hex record's text: `length` lowercase hexadecimal characters and one line feed (`canary.txt` 32, `package.sha256` and `dependency-fingerprint.txt` 64; b.uqm SR-11.3). Throws for a value of another form. */
+/** A hex record's text: `length` lowercase hexadecimal characters and one line feed (`canary.txt` 32, `package.sha256` and `dependency-fingerprint.txt` 64). Throws for a value of another form. */
 export function formatHexRecord(value: string, length: number): string {
   if (!isLowerHex(value, length)) throw new Error(`formatHexRecord: not ${length} lowercase hexadecimal characters`)
   return `${value}\n`
@@ -3276,13 +3271,13 @@ export function readHexRecord(path: string, length: number): HexRecordRead {
   return parsed.ok ? { kind: 'value', value: parsed.value } : { kind: 'malformed', error: parsed.error }
 }
 
-// The runner log (b.uqm SR-5.4, SR-15.3, SR-18.3).
+// The runner log.
 
 /** A word a shell reads back as itself, unquoted. */
 const SHELL_PLAIN_WORD_PATTERN = /^[A-Za-z0-9_@%+=:,./-]+$/
 /** A character that holds a control character, which only `$'…'` quoting keeps on one line. */
 const SHELL_CONTROL_PATTERN = /[\x00-\x1f\x7f]/
-/** The runner log's first line: groups are the RUN_ID, the PID and the argument part (empty, or a space then the words). The `s` flag lets the argument part hold U+2028 and U+2029, which a quoted argument may carry (b.uqm SR-18.3). */
+/** The runner log's first line: groups are the RUN_ID, the PID and the argument part (empty, or a space then the words). The `s` flag lets the argument part hold U+2028 and U+2029, which a quoted argument may carry. */
 const RUNNER_LOG_FIRST_LINE_PATTERN = /^ci-run: run (\S+) pid ([1-9][0-9]*): \/ci((?: .*)?)$/s
 
 /** The escapes `$'…'` quoting writes for its named control characters, and reads back. */
@@ -3368,11 +3363,11 @@ function parseShellQuotedWords(text: string): string[] | null {
 }
 
 /**
- * The runner log's first line (b.uqm SR-5.4): the RUN_ID, the runner's PID
+ * The runner log's first line: the RUN_ID, the runner's PID
  * and the `/ci` arguments as given, `ci-run: run <RUN_ID> pid <PID>: /ci
  * <arguments>`. Each argument is quoted as a shell needs, so pasting the part
  * after `/ci` onto a command line gives back exactly the same arguments
- * (b.uqm SR-18.3, "Finishing a run by hand").
+ * ("Finishing a run by hand").
  */
 export function formatRunnerLogFirstLine(runId: string, pid: number, args: readonly string[]): string {
   return `ci-run: run ${runId} pid ${pid}: /ci${args.map((arg) => ` ${shellQuoted(arg)}`).join('')}`
@@ -3405,7 +3400,7 @@ export function readRunnerLogFirstLine(runDir: string): RunnerLogFirstLine | nul
 }
 
 /**
- * The runner-log writer (b.uqm SR-5.4). Called as a `RunnerLogSink`, it
+ * The runner-log writer. Called as a `RunnerLogSink`, it
  * appends one line (or each line of a text holding line feeds). Every append
  * is synchronous, so a line is in the file when the call returns.
  */
@@ -3417,7 +3412,7 @@ export interface RunnerLogWriter {
   childOutput(text: string): void
   /** Appends an error: one `error: ` line with its message (after `context: ` when given), then its stack frames. */
   error(err: unknown, context?: string): void
-  /** Switches redaction on, or adds values to it: from now on each value is replaced with `<redacted>` in every line, child output included (b.uqm SR-15.3). Empty values are ignored. */
+  /** Switches redaction on, or adds values to it: from now on each value is replaced with `<redacted>` in every line, child output included. Empty values are ignored. */
   redactValues(values: Iterable<string>): void
 }
 
@@ -3453,7 +3448,7 @@ function redactionPattern(values: readonly string[]): RegExp | null {
 /**
  * Creates the writer for the runner log at `path`, appending to it (and
  * creating it when missing). Redaction is off until `redactValues` switches
- * it on (E11, from the start of `secret-scan`). Every line the runner writes
+ * it on (from the start of `secret-scan`). Every line the runner writes
  * to its log, child-process output included, goes through this writer.
  */
 export function createRunnerLog(path: string, options: RunnerLogOptions = {}): RunnerLogWriter {
@@ -3483,14 +3478,14 @@ export function createRunnerLog(path: string, options: RunnerLogOptions = {}): R
 }
 
 // ---------------------------------------------------------------------------
-// 6. Docker layer (E1)
+// 6. Docker layer
 // ---------------------------------------------------------------------------
 
-// --- 6/T4 (E1 T4): one fixed argument form per docker operation; docker run lists logged ---
+// --- 6/ : one fixed argument form per docker operation; docker run lists logged ---
 //
 // One exported argument-list builder per docker operation the runner uses,
 // and one function per operation that spawns exactly that list through the
-// spawn it is given, with the child environment it is given (b.uqm SR-15.4):
+// spawn it is given, with the child environment it is given:
 // this layer reads no environment and builds none. Every answer is a value,
 // never a throw: a non-zero exit, an answer that cannot be parsed and an
 // argument the layer refuses are each a failure carrying the exit status
@@ -3498,15 +3493,15 @@ export function createRunnerLog(path: string, options: RunnerLogOptions = {}): R
 // on one line. The fake container interface answers exactly these forms.
 //
 // Fixed here:
-// - no inspect form selects `Config.Env` or any other environment field (b.uqm SR-10.5);
+// - no inspect form selects `Config.Env` or any other environment field;
 // - the only image removals are a tag removal naming one run-private tag and
 //   a prune of untagged images filtered on one exact owner label: no image is
-//   removed by an ID or a digest, and no removal is forced (b.uqm SR-6.4, SR-9.3);
-// - both builds start in a process group of their own (b.uqm SR-5.6) and take
-//   their image ID from their own output, never from a tag lookup (b.uqm SR-9.3);
+// removed by an ID or a digest, and no removal is forced;
+// - both builds start in a process group of their own and take
+// their image ID from their own output, never from a tag lookup;
 // - a `docker run` list is checked, then written to the runner log as one
 //   line, then spawned; a refused list is neither logged nor spawned
-//   (b.uqm SR-10.4, SR-15.2).
+// .
 
 /** The program every docker operation runs, looked up on the child environment's `PATH`. */
 export const DOCKER_PROGRAM = 'docker'
@@ -3518,7 +3513,7 @@ export const CONTAINER_ID_PATTERN = /^[0-9a-f]{64}$/
 export const BUILD_IMAGE_ID_PATTERN = /\bwriting image (sha256:[0-9a-f]{64})\b/
 /** The progress option of both builds: plain text lines, which reach the runner log and carry the image ID. */
 export const BUILD_PROGRESS_OPTION = '--progress=plain'
-/** The prefix of the runner-log line that holds a `docker run` argument list, as JSON, ahead of its spawn (b.uqm SR-10.4). */
+/** The prefix of the runner-log line that holds a `docker run` argument list, as JSON, ahead of its spawn. */
 export const DOCKER_RUN_LOG_PREFIX = 'docker run: '
 
 /** A label key the layer passes: a letter or digit, then letters, digits, `.`, `_`, `/` and `-`. */
@@ -3540,7 +3535,7 @@ export const CONTAINER_STATE_FORMAT =
   '"memoryBytes":{{json .HostConfig.Memory}},"labels":{{json .Config.Labels}}}'
 
 /**
- * The inspection form's Go template: b.uqm SR-10.5's fields only (name, image
+ * The inspection form's Go template: fields only (name, image
  * ID, each mount's source, target and read-write flag, network, PID and IPC
  * modes, privileged flag, memory, memory-swap, PID and CPU limits, labels and
  * the self-removal setting), one JSON object. It selects no environment field.
@@ -3561,7 +3556,7 @@ export const IMAGE_INSPECT_FORMAT =
 export interface DockerContext {
   /** The spawn dependency (`RunnerDeps.spawn`). */
   readonly spawn: SpawnFn
-  /** The child environment, as the child-environment rule gives it (b.uqm SR-15.4); passed on unchanged. */
+  /** The child environment, as the child-environment rule gives it; passed on unchanged. */
   readonly env: Readonly<Record<string, string>>
   /** The working directory of every docker command: the worktree root. */
   readonly cwd: string
@@ -3627,7 +3622,7 @@ export interface ImageListEntry {
   readonly id: string
   /** Its tags; none when it is untagged. */
   readonly tags: readonly string[]
-  /** Its owner label's value (b.uqm SR-6.3); null when it carries no owner label. */
+  /** Its owner label's value; null when it carries no owner label. */
   readonly ownerLabel: string | null
 }
 
@@ -3647,7 +3642,7 @@ export type ImageListFilter =
       readonly pattern: string
     }
 
-/** The caller's check of a `docker run` argument list (b.uqm SR-10.4): pass, or refuse with a reason that holds no secret value. */
+/** The caller's check of a `docker run` argument list: pass, or refuse with a reason that holds no secret value. */
 export type DockerRunListCheck = (argv: readonly string[]) => DockerRunListVerdict
 
 /** What a `docker run` argument-list check answers. */
@@ -3678,7 +3673,7 @@ export type ContainerRunOutcome =
       readonly error: string
     }
 
-/** The test-image build: a Dockerfile path, the worktree as context, labels and a run-private tag (b.uqm SR-9.3). */
+/** The test-image build: a Dockerfile path, the worktree as context, labels and a run-private tag. */
 export interface TestImageBuildSpec {
   readonly dockerfilePath: string
   readonly contextDir: string
@@ -3686,7 +3681,7 @@ export interface TestImageBuildSpec {
   readonly tag: string
 }
 
-/** A derived-image build (drift or retag, b.uqm SR-14.2): its Dockerfile on standard input starts from `from`, with labels and a run-private tag, and no build context. */
+/** A derived-image build (drift or retag): its Dockerfile on standard input starts from `from`, with labels and a run-private tag, and no build context. */
 export interface DerivedImageBuildSpec {
   /** The image it starts from: a run-private tag, never an image ID (BuildKit does not accept `FROM sha256:<id>`). */
   readonly from: string
@@ -3702,7 +3697,7 @@ export type ImageBuildResult =
       readonly imageId: string
     }
   | {
-      /** Ended through its handle (b.uqm SR-5.6): no image build failure. */
+      /** Ended through its handle: no image build failure. */
       readonly kind: 'ended'
       readonly exitCode: number
     }
@@ -3720,13 +3715,13 @@ export interface ImageBuild {
   readonly pid: number | null
   /** Its process group; null when it could not be started. */
   readonly processGroup: number | null
-  /** Ends it: SIGKILL to its whole process group (b.uqm SR-5.6). Once the build has settled it signals nothing and answers `no-such-process`, so a reused group ID is never signalled. */
+  /** Ends it: SIGKILL to its whole process group. Once the build has settled it signals nothing and answers `no-such-process`, so a reused group ID is never signalled. */
   end(): SignalOutcome
   /** Settles once it has ended; never rejects. */
   readonly result: Promise<ImageBuildResult>
 }
 
-/** An image prune's outcome: done, refused by Docker as already running (b.uqm SR-9.3, SR-23.6), or failed. */
+/** An image prune's outcome: done, refused by Docker as already running, or failed. */
 export type ImagePruneOutcome =
   | {
       readonly kind: 'done'
@@ -3766,7 +3761,7 @@ function dockerLabelArguments(labels: DockerLabels): string[] {
   return args
 }
 
-/** Whether `tag` is a run-private tag, `cscb-ci-run:<RUN_ID>-<PID>-<role>`, role being `test`, `drift` or `retag` (b.uqm SR-9.3), by the one rule `parseRunTag` holds. An image ID, a digest or any other tag is not. */
+/** Whether `tag` is a run-private tag, `cscb-ci-run:<RUN_ID>-<PID>-<role>`, role being `test`, `drift` or `retag`, by the one rule `parseRunTag` holds. An image ID, a digest or any other tag is not. */
 export function isRunPrivateTag(tag: string): boolean {
   return parseRunTag(tag) !== null
 }
@@ -4045,7 +4040,7 @@ function imageMatches(image: ImageRecord, ref: string): boolean {
   return image.id === ref || image.tags.includes(ref)
 }
 
-// Containers (b.uqm SR-6.4, SR-6.5, SR-7.3, SR-9.4, SR-10.5, SR-10.6, SR-13.2).
+// Containers.
 
 /** `docker version --format {{.Server.Version}}`: whether docker answers. */
 export function dockerAnswersArgs(): string[] {
@@ -4100,12 +4095,12 @@ export async function inspectContainerState(docker: DockerContext, container: st
   return oneInspected(argv.value, read)
 }
 
-/** `docker container inspect --format <CONTAINER_INSPECTION_FORMAT> <container>`: the inspection form (b.uqm SR-10.5). */
+/** `docker container inspect --format <CONTAINER_INSPECTION_FORMAT> <container>`: the inspection form. */
 export function containerInspectionArgs(container: string): string[] {
   return [DOCKER_PROGRAM, 'container', 'inspect', '--format', CONTAINER_INSPECTION_FORMAT, dockerOperand(container, 'container')]
 }
 
-/** A shard container's inspection data: b.uqm SR-10.5's fields only, never its environment. A container that does not exist is a failure. */
+/** A shard container's inspection data: fields only, never its environment. A container that does not exist is a failure. */
 export async function readContainerInspection(docker: DockerContext, container: string): Promise<DockerAnswer<InspectionData>> {
   const argv = dockerArguments(() => containerInspectionArgs(container))
   if (!argv.ok) return argv
@@ -4118,7 +4113,7 @@ export async function readContainerInspection(docker: DockerContext, container: 
   return { ok: true, value: data }
 }
 
-/** `docker container create --pull never --name <name> [--label <key>=<value>]... <image>`: a container that is never started (b.uqm SR-9.4). */
+/** `docker container create --pull never --name <name> [--label <key>=<value>]... <image>`: a container that is never started. */
 export function containerCreateArgs(name: string, labels: DockerLabels, image: string): string[] {
   return [
     DOCKER_PROGRAM,
@@ -4166,7 +4161,7 @@ export function containerKillArgs(container: string, signal: SentSignal): string
   return [DOCKER_PROGRAM, 'container', 'kill', '--signal', signal, dockerOperand(container, 'container')]
 }
 
-/** Sends a signal to a container's main process (SIGKILL at a stop, b.uqm SR-10.6). */
+/** Sends a signal to a container's main process (SIGKILL at a stop). */
 export async function killContainer(docker: DockerContext, container: string, signal: SentSignal): Promise<DockerAnswer<null>> {
   const argv = dockerArguments(() => containerKillArgs(container, signal))
   if (!argv.ok) return argv
@@ -4205,7 +4200,7 @@ export async function removeContainer(docker: DockerContext, container: string):
   return { ok: true, value: null }
 }
 
-// docker run (b.uqm SR-10.4, SR-15.2).
+// docker run.
 
 /** `docker run --detach <the caller's arguments>...`: the caller owns its options, image and command. */
 export function containerRunArgs(runArguments: readonly string[]): string[] {
@@ -4223,7 +4218,7 @@ export function dockerRunLogLine(argv: readonly string[]): string {
  * refused list (or a check that throws) is neither logged nor spawned, and the
  * refusal is returned. A list the log cannot take is not spawned: `log` must
  * throw when it cannot append the line. The real writer never throws (a failed
- * append goes to its `onAppendError`), so E13 wires `createRunnerLog`'s
+ * append goes to its `onAppendError`), so wires `createRunnerLog`'s
  * `onAppendError` so the sink passed here rethrows. A logged list stays logged
  * when its spawn fails.
  */
@@ -4256,7 +4251,7 @@ export async function runContainer(
   return { kind: 'started', containerId: id }
 }
 
-// Images (b.uqm SR-5.6, SR-6.4, SR-9.2, SR-9.3, SR-14.2, SR-23.6).
+// Images.
 
 /** `docker image inspect --format <IMAGE_INSPECT_FORMAT> <image>...`: the image inspect form. */
 export function imageInspectArgs(images: readonly string[]): string[] {
@@ -4323,7 +4318,7 @@ export function imageTagRemovalArgs(tag: string): string[] {
   return [DOCKER_PROGRAM, 'image', 'rm', runPrivateTagOperand(tag)]
 }
 
-/** Removes one run-private tag by its name; Docker deletes the image with its last tag when no container uses it (b.uqm SR-23.6). Any other argument is refused (exit status null), nothing spawned. */
+/** Removes one run-private tag by its name; Docker deletes the image with its last tag when no container uses it. Any other argument is refused (exit status null), nothing spawned. */
 export async function removeImageTag(docker: DockerContext, tag: string): Promise<DockerAnswer<null>> {
   const argv = dockerArguments(() => imageTagRemovalArgs(tag))
   if (!argv.ok) return argv
@@ -4337,7 +4332,7 @@ export function imageTagArgs(imageId: string, tag: string): string[] {
   return [DOCKER_PROGRAM, 'image', 'tag', imageIdOperand(imageId), runPrivateTagOperand(tag)]
 }
 
-/** Points a run-private tag at an image ID, moving it off any image it named (the `retag` fault, b.uqm SR-14.2). */
+/** Points a run-private tag at an image ID, moving it off any image it named (the `retag` fault). */
 export async function tagImage(docker: DockerContext, imageId: string, tag: string): Promise<DockerAnswer<null>> {
   const argv = dockerArguments(() => imageTagArgs(imageId, tag))
   if (!argv.ok) return argv
@@ -4370,7 +4365,7 @@ export function derivedImageBuildArgs(spec: DerivedImageBuildSpec): string[] {
  * A derived-image build's Dockerfile, written to its standard input:
  * `FROM <from>`, `from` being a run-private tag. An image ID (or anything
  * else) is refused and nothing is spawned: BuildKit does not accept
- * `FROM sha256:<id>` (moby#39769, buildkit#2204). E8 builds the drift and
+ * `FROM sha256:<id>` (moby#39769, buildkit#2204). builds the drift and
  * retag images FROM the run's `-test` tag, and reads that tag with
  * `inspectImage` before and after the build to verify it still names the
  * pinned image ID.
@@ -4463,12 +4458,12 @@ function startImageBuild(
   return { pid: child.pid, processGroup, end, result }
 }
 
-/** Starts the test-image build from a Dockerfile with the worktree as context (b.uqm SR-9.3), its output lines to the runner log. */
+/** Starts the test-image build from a Dockerfile with the worktree as context, its output lines to the runner log. */
 export function startTestImageBuild(docker: DockerContext, sendSignal: DockerSignalSender, spec: TestImageBuildSpec, log: RunnerLogSink): ImageBuild {
   return startImageBuild(docker, sendSignal, () => ({ argv: testImageBuildArgs(spec) }), log)
 }
 
-/** Starts a derived-image build (drift or retag, b.uqm SR-14.2): its Dockerfile on standard input, no build context, its output lines to the runner log. */
+/** Starts a derived-image build (drift or retag): its Dockerfile on standard input, no build context, its output lines to the runner log. */
 export function startDerivedImageBuild(docker: DockerContext, sendSignal: DockerSignalSender, spec: DerivedImageBuildSpec, log: RunnerLogSink): ImageBuild {
   return startImageBuild(docker, sendSignal, () => ({ argv: derivedImageBuildArgs(spec), stdin: derivedImageDockerfile(spec) }), log)
 }
@@ -4479,7 +4474,7 @@ export function imagePruneArgs(owner: string): string[] {
   return [DOCKER_PROGRAM, 'image', 'prune', '--force', '--filter', `label=${OWNER_LABEL}=${owner}`]
 }
 
-/** One prune of the untagged images that carry exactly this owner label and that no container uses. One try: retries belong to the caller (b.uqm SR-9.3). */
+/** One prune of the untagged images that carry exactly this owner label and that no container uses. One try: retries belong to the caller. */
 export async function pruneUntaggedImages(docker: DockerContext, owner: string): Promise<ImagePruneOutcome> {
   const argv = dockerArguments(() => imagePruneArgs(owner))
   if (!argv.ok) return { kind: 'failed', exitCode: null, error: argv.error }
@@ -4491,36 +4486,36 @@ export async function pruneUntaggedImages(docker: DockerContext, owner: string):
 }
 
 // ---------------------------------------------------------------------------
-// 7. Validation (E2)
+// 7. Validation
 // ---------------------------------------------------------------------------
 
-// --- 7/T1 (E2 T1): discovery and selection ---
+// --- 7/ : discovery and selection ---
 //
-// Validation stages 2 to 5 (b.uqm SR-2.3, SR-2.6) and the run's scripts
-// (b.uqm Terms). One reader, `readIntegrationEntries`, lists the worktree's
+// Validation stages 2 to 5 and the run's scripts
+// (Terms). One reader, `readIntegrationEntries`, lists the worktree's
 // `tests/integration`; every check after it is pure and takes an entry list,
-// so E8 can feed the pinned image's listing to the same rules. Each check
+// so can feed the pinned image's listing to the same rules. Each check
 // returns its stage's failures already in that stage's detail-line order
-// (b.uqm SR-2.6): the stage driver (T3) makes the first one the refusal's
+// the stage driver makes the first one the refusal's
 // reason and each other one a detail line. Every reason comes from an
 // exported builder and shows names through `shownArgument`, so none holds a
 // line break.
 
-// E2 T1's worktree reader: entry kinds by lstat, never following a link.
+// worktree reader: entry kinds by lstat, never following a link.
 import { lstatSync, readdirSync } from 'node:fs'
 
-/** The `test-*.sh` glob's fixed head and tail (b.uqm Terms). */
+/** The `test-*.sh` glob's fixed head and tail (Terms). */
 const SCRIPT_GLOB_PREFIX = 'test-'
 const SCRIPT_GLOB_SUFFIX = '.sh'
 
 /** The glob as reasons show it, `test-*.sh`. */
 const SCRIPT_GLOB_TEXT = `${SCRIPT_GLOB_PREFIX}*${SCRIPT_GLOB_SUFFIX}`
 
-/** The naming rule as reasons state it (b.uqm SR-2.2, SR-2.3). */
+/** The naming rule as reasons state it. */
 const SCRIPT_NAME_RULE_TEXT =
   'a script is named test-<n>-<slug>.sh, n a whole number (0 included, no leading zero) and slug one or more lowercase letters, digits and hyphens'
 
-/** test-1's number: every shard runs test-1 first (b.uqm SR-2.3, SR-3.3). */
+/** test-1's number: every shard runs test-1 first. */
 const FIRST_SCRIPT_NUMBER = 1
 
 /** Whether an entry name matches the `test-*.sh` glob: `test-`, then any text (none included), then `.sh`. */
@@ -4532,17 +4527,17 @@ export function matchesScriptGlob(name: string): boolean {
   )
 }
 
-/** Compares two names by their UTF-8 bytes: the order of stage 2's failures and of the reader's entries (b.uqm SR-2.6). */
+/** Compares two names by their UTF-8 bytes: the order of stage 2's failures and of the reader's entries. */
 export function compareBytewise(a: string, b: string): number {
   return Buffer.compare(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8'))
 }
 
-// The reader (b.uqm SR-2.3): the one filesystem read of discovery.
+// The reader: the one filesystem read of discovery.
 
-/** A `tests/integration` entry's kind, judged on the entry itself: a symbolic link is a link whatever its target, and is never followed (b.uqm SR-2.3). */
+/** A `tests/integration` entry's kind, judged on the entry itself: a symbolic link is a link whatever its target, and is never followed. */
 export type IntegrationEntryKind = 'regular' | 'symlink' | 'directory' | 'other'
 
-/** One `tests/integration` entry whose name matches `test-*.sh` (b.uqm SR-2.3). The checks below take lists of these. */
+/** One `tests/integration` entry whose name matches `test-*.sh`. The checks below take lists of these. */
 export interface IntegrationEntry {
   /** Its name, decoded as UTF-8. */
   readonly name: string
@@ -4555,7 +4550,7 @@ export function integrationReadFailedText(dirPath: string, error: string): strin
 }
 
 /**
- * Lists the worktree's `tests/integration` afresh (b.uqm SR-2.3): every entry
+ * Lists the worktree's `tests/integration` afresh: every entry
  * whose name matches `test-*.sh`, with its kind from `lstat`, so a symbolic
  * link shows as a link, dangling or not. Entries come in bytewise name order.
  * Names are read as bytes, so an entry whose name is not valid UTF-8 is still
@@ -4588,10 +4583,10 @@ export function readIntegrationEntries(worktreeRoot: string): DepRead<readonly I
   }
 }
 
-// Stage failures and their reasons (b.uqm SR-2.3, SR-2.6). Tests import
-// every reason from these builders and never type it (b.uqm SR-21.4).
+// Stage failures and their reasons. Tests import
+// every reason from these builders and never type it.
 
-/** One failure of a validation stage (b.uqm SR-2.6): its reason, the refusal's text after `NOT RUN: `, on one line. */
+/** One failure of a validation stage: its reason, the refusal's text after `NOT RUN: `, on one line. */
 export interface StageFailure {
   readonly reason: string
 }
@@ -4631,28 +4626,28 @@ function joinedNames(names: readonly string[]): string {
   return `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`
 }
 
-/** `test-9-x.sh in tests/integration is a symbolic link, not a regular file: ...` (b.uqm SR-2.3): an entry is never skipped silently. */
+/** `test-9-x.sh in tests/integration is a symbolic link, not a regular file: ...`: an entry is never skipped silently. */
 export function notRegularEntryReason(name: string, kind: Exclude<IntegrationEntryKind, 'regular'>): string {
   return `${shownArgument(name)} in ${INTEGRATION_DIR_PATH} is ${NOT_REGULAR_KIND_TEXT[kind]}, not a regular file: every ${SCRIPT_GLOB_TEXT} entry there must be a regular file, and none is skipped`
 }
 
-/** `test-05-x.sh in tests/integration breaks the naming rule: a script is named test-<n>-<slug>.sh, ...` (b.uqm SR-2.3). */
+/** `test-05-x.sh in tests/integration breaks the naming rule: a script is named test-<n>-<slug>.sh, ...`. */
 export function badScriptNameReason(name: string): string {
   return `${shownArgument(name)} in ${INTEGRATION_DIR_PATH} breaks the naming rule: ${SCRIPT_NAME_RULE_TEXT}`
 }
 
-/** `test-5-a.sh and test-5-b.sh in tests/integration are both test-5: no two scripts may share a number` (b.uqm SR-2.3), naming every file with the number. */
+/** `test-5-a.sh and test-5-b.sh in tests/integration are both test-5: no two scripts may share a number`, naming every file with the number. */
 export function duplicateNumberReason(numberForm: string, fileNames: readonly string[]): string {
   const quantifier = fileNames.length === 2 ? 'both' : 'all'
   return `${joinedNames(fileNames.map(shownArgument))} in ${INTEGRATION_DIR_PATH} are ${quantifier} ${numberForm}: no two scripts may share a number`
 }
 
-/** `test-1 is missing: tests/integration has no script numbered 1, and every shard runs it first` (b.uqm SR-2.3). */
+/** `test-1 is missing: tests/integration has no script numbered 1, and every shard runs it first`. */
 export function missingTest1Reason(): string {
   return `${numberFormOf(FIRST_SCRIPT_NUMBER)} is missing: ${INTEGRATION_DIR_PATH} has no script numbered ${FIRST_SCRIPT_NUMBER}, and every shard runs it first`
 }
 
-/** `test-999 matches no script: a SCRIPT is a script's number form, test-<n>, or its whole file name in tests/integration` (b.uqm SR-2.3). */
+/** `test-999 matches no script: a SCRIPT is a script's number form, test-<n>, or its whole file name in tests/integration`. */
 export function unmatchedScriptReason(argument: string): string {
   return `${shownArgument(argument)} matches no script: a SCRIPT is a script's number form, test-<n>, or its whole file name in ${INTEGRATION_DIR_PATH}`
 }
@@ -4673,7 +4668,7 @@ function namedScripts(entries: readonly IntegrationEntry[]): Script[] {
   return scripts
 }
 
-/** A new list of the scripts in canonical order (b.uqm SR-3.3). */
+/** A new list of the scripts in canonical order. */
 function sortScriptsCanonical(scripts: readonly Script[]): Script[] {
   return [...scripts].sort((a, b) => compareCanonicalNumbers(a.number, b.number))
 }
@@ -4692,7 +4687,7 @@ function compareNumberForms(a: string, b: string): number {
 }
 
 /**
- * Validation stage 2, the script names (b.uqm SR-2.3, SR-2.6): one failure
+ * Validation stage 2, the script names: one failure
  * per entry that is not a regular file and per regular file that breaks the
  * naming rule, the two kinds interleaved in bytewise file-name order.
  */
@@ -4706,7 +4701,7 @@ export function checkScriptNames(entries: readonly IntegrationEntry[]): NameFail
 }
 
 /**
- * Validation stage 3, duplicate numbers (b.uqm SR-2.3, SR-2.6): one failure
+ * Validation stage 3, duplicate numbers: one failure
  * per number that two or more scripts hold, naming every such file in
  * bytewise order, by ascending number. Numbers are compared by their exact
  * digits. Entries stage 2 refuses are not scripts and are not counted.
@@ -4724,22 +4719,22 @@ export function checkDuplicateNumbers(entries: readonly IntegrationEntry[]): Dup
     .map(([numberForm, fileNames]) => ({ numberForm, fileNames, reason: duplicateNumberReason(numberForm, fileNames) }))
 }
 
-/** Validation stage 4, a missing test-1 (b.uqm SR-2.3, SR-2.6): one failure when no script is numbered 1, else none. */
+/** Validation stage 4, a missing test-1: one failure when no script is numbered 1, else none. */
 export function checkMissingTest1(entries: readonly IntegrationEntry[]): StageFailure[] {
   const test1 = numberFormOf(FIRST_SCRIPT_NUMBER)
   return namedScripts(entries).some((script) => script.numberForm === test1) ? [] : [{ reason: missingTest1Reason() }]
 }
 
 /**
- * The scripts of an entry list that passes stages 2 to 4 (b.uqm Terms): file
- * name, number and number form, in canonical order (b.uqm SR-3.3), so test-0
+ * The scripts of an entry list that passes stages 2 to 4 (Terms): file
+ * name, number and number form, in canonical order, so test-0
  * follows test-4. Entries that are not scripts are left out.
  */
 export function scriptListOf(entries: readonly IntegrationEntry[]): Script[] {
   return sortScriptsCanonical(namedScripts(sortEntriesBytewise(entries)))
 }
 
-// Stage 5, the selection, and the run's scripts (b.uqm SR-2.3, Terms).
+// Stage 5, the selection, and the run's scripts (Terms).
 
 /** A run's selection: none for a full run, else the selected scripts, each once, in canonical order. */
 export type ScriptSelection =
@@ -4763,7 +4758,7 @@ export type SelectionStage =
     }
 
 /**
- * The script a SCRIPT argument names, or null (b.uqm SR-2.3): a number form
+ * The script a SCRIPT argument names, or null: a number form
  * matches only the script with exactly that number (`test-2` never matches
  * test-20), a file name only that whole file name, and anything else nothing.
  */
@@ -4775,7 +4770,7 @@ export function matchScript(argument: string, scripts: readonly Script[]): Scrip
 }
 
 /**
- * Validation stage 5, the selection (b.uqm SR-2.3, SR-2.6), over the SCRIPT
+ * Validation stage 5, the selection, over the SCRIPT
  * arguments in argument order (`Invocation.scripts`) and the script list. No
  * SCRIPT argument is a full run. Each SCRIPT argument that matches no script
  * is one failure naming it as given, in argument order. A script named more
@@ -4795,16 +4790,16 @@ export function selectScripts(scriptArguments: readonly string[], scripts: reado
 }
 
 /**
- * Each script's declared prerequisites (b.uqm SR-3.1, SR-3.4), keyed by the
+ * Each script's declared prerequisites, keyed by the
  * declaring script's file name; each value is its direct prerequisites' file
- * names. Stage 6 (7/T2) builds it with one entry per script, test-1 excluded
+ * names. Stage 6 (7/) builds it with one entry per script, test-1 excluded
  * from the values, in canonical order. Readers also accept a script that is
  * absent (no prerequisites) and a test-1 value (which changes nothing).
  */
 export type PrerequisiteMap = ReadonlyMap<string, readonly string[]>
 
 /**
- * The run's scripts (b.uqm Terms), in canonical order (b.uqm SR-3.3): for a
+ * The run's scripts (Terms), in canonical order: for a
  * full run, every script of the list; for a selective run, the selected
  * scripts, their prerequisites followed transitively through `prerequisites`,
  * and test-1. Throws when a prerequisite names no script of the list, which
@@ -4831,22 +4826,22 @@ export function runScriptsOf(selection: ScriptSelection, scripts: readonly Scrip
   return sortScriptsCanonical([...included.values()])
 }
 
-// --- 7/T2 (E2 T2): prerequisite headers and units ---
+// --- 7/ : prerequisite headers and units ---
 
-// The `# ci-requires:` line (b.uqm SR-3.1). The parser is pure: it takes a
-// script's file name and text and reads nothing, so E8's read-back runs the
+// The `# ci-requires:` line. The parser is pure: it takes a
+// script's file name and text and reads nothing, so read-back runs the
 // same parser over the image's script texts.
 
 /** A prerequisite line as a reason names it, `# ci-requires:`. */
 const PREREQUISITE_LINE_TEXT = `# ${CI_REQUIRES_KEYWORD}`
-/** The first character of every line in a script's header comment block (b.uqm SR-3.1). */
+/** The first character of every line in a script's header comment block. */
 const COMMENT_MARK = '#'
 /** Optional spaces or tabs at the start of a text. */
 const LEADING_BLANKS_PATTERN = /^[ \t]*/
 /** One or more spaces or tabs, which separate a prerequisite line's words. */
 const PREREQUISITE_WORD_SEPARATOR = /[ \t]+/
 
-/** One prerequisite line found in a script's text (b.uqm SR-3.1). */
+/** One prerequisite line found in a script's text. */
 export interface PrerequisiteLine {
   /** Its line number in the script, from 1. */
   readonly lineNumber: number
@@ -4854,7 +4849,7 @@ export interface PrerequisiteLine {
   readonly words: readonly string[]
 }
 
-/** One script's prerequisite lines, parsed (b.uqm SR-3.1). */
+/** One script's prerequisite lines, parsed. */
 export interface PrerequisiteParse {
   /** The script's file name. */
   readonly fileName: string
@@ -4886,7 +4881,7 @@ function prerequisiteLineWords(line: string): string[] | null {
 /**
  * The index one past the header comment block: the block is the consecutive
  * lines whose first character is `#` after the first line (the shebang), up to
- * the first line whose first character is not `#` (b.uqm SR-3.1).
+ * the first line whose first character is not `#`.
  */
 function headerBlockEnd(lines: readonly string[]): number {
   let end = 1
@@ -4895,7 +4890,7 @@ function headerBlockEnd(lines: readonly string[]): number {
 }
 
 /**
- * Parses one script's prerequisite lines from its text (b.uqm SR-3.1). Pure:
+ * Parses one script's prerequisite lines from its text. Pure:
  * it takes the text, never a path, and reads nothing. A prerequisite line on
  * the first line is outside the header block, which follows the first line.
  */
@@ -4916,17 +4911,17 @@ export function parsePrerequisiteLines(fileName: string, text: string): Prerequi
   return { fileName, counted, secondLines, outsideLines }
 }
 
-// Header refusals (b.uqm SR-3.1, SR-3.2; stage 6 of SR-2.6). Every script's
+// Header refusals (stage 6 of). Every script's
 // header is checked in every run, full or selective. Every reason comes from
 // an exported builder below, so tests import the text rather than type it.
-// The map stage 6 returns is T1's `PrerequisiteMap`, with one entry per
+// The map stage 6 returns is `PrerequisiteMap`, with one entry per
 // script: its direct prerequisites' file names, test-1 excluded, in canonical
 // order (empty for a script with none).
 
-/** A header refusal's kind (b.uqm SR-3.2), listed in the order one script's failures come in. */
+/** A header refusal's kind, listed in the order one script's failures come in. */
 export type HeaderFailureKind = 'unknown-name' | 'no-script-named' | 'cycle' | 'ordering' | 'extra-line'
 
-/** A stage-6 failure: one header refusal (b.uqm SR-3.2). */
+/** A stage-6 failure: one header refusal. */
 export interface HeaderFailure extends StageFailure {
   /** Its kind. */
   readonly kind: HeaderFailureKind
@@ -4934,7 +4929,7 @@ export interface HeaderFailure extends StageFailure {
   readonly script: string
 }
 
-/** Stage 6's outcome: the prerequisite map when every header is valid, else every failure in b.uqm SR-2.6's header order. */
+/** Stage 6's outcome: the prerequisite map when every header is valid, else every failure in the contract header order. */
 export type HeaderCheck =
   | {
       readonly ok: true
@@ -4945,35 +4940,35 @@ export type HeaderCheck =
       readonly failures: readonly HeaderFailure[]
     }
 
-/** Which extra prerequisite lines one script holds besides its counted line (b.uqm SR-3.2). */
+/** Which extra prerequisite lines one script holds besides its counted line. */
 export type ExtraPrerequisiteLines = 'second' | 'outside' | 'both'
 
 /** The rule a cycle breaks. */
 const CYCLE_RULE_TEXT = 'a script may not require itself, directly or through other scripts'
 
-/** `test-3-x.sh requires test-99, which is no script: …` (b.uqm SR-3.2). */
+/** `test-3-x.sh requires test-99, which is no script: …`. */
 export function unknownPrerequisiteReason(script: string, name: string): string {
   return `${shownArgument(script)} requires ${shownArgument(name)}, which is no script: each word of a ${PREREQUISITE_LINE_TEXT} line must be a script's number form or whole file name`
 }
 
-/** `test-3-x.sh has a # ci-requires: line that names no script: …` (b.uqm SR-3.2). */
+/** `test-3-x.sh has a # ci-requires: line that names no script: …`. */
 export function emptyPrerequisiteLineReason(script: string): string {
   return `${shownArgument(script)} has a ${PREREQUISITE_LINE_TEXT} line that names no script: a ${PREREQUISITE_LINE_TEXT} line must name at least one script`
 }
 
-/** A cycle, its scripts in canonical order: `test-5-x.sh requires itself: …` for one, `test-2-a.sh and test-3-b.sh form a prerequisite cycle: …` for more (b.uqm SR-3.2). */
+/** A cycle, its scripts in canonical order: `test-5-x.sh requires itself: …` for one, `test-2-a.sh and test-3-b.sh form a prerequisite cycle: …` for more. */
 export function prerequisiteCycleReason(scripts: readonly string[]): string {
   const names = joinedNames(scripts.map(shownArgument))
   const subject = scripts.length === 1 ? `${names} requires itself` : `${names} form a prerequisite cycle`
   return `${subject}: ${CYCLE_RULE_TEXT}`
 }
 
-/** `test-2-a.sh requires test-7-b.sh, which sorts after it: …` (b.uqm SR-3.2). */
+/** `test-2-a.sh requires test-7-b.sh, which sorts after it: …`. */
 export function prerequisiteOrderReason(dependent: string, prerequisite: string): string {
   return `${shownArgument(dependent)} requires ${shownArgument(prerequisite)}, which sorts after it: a prerequisite must come before its dependent in canonical order`
 }
 
-/** `test-3-x.sh has a second # ci-requires: line: a script may hold one prerequisite line, inside its header comment block` (b.uqm SR-3.2). */
+/** `test-3-x.sh has a second # ci-requires: line: a script may hold one prerequisite line, inside its header comment block`. */
 export function extraPrerequisiteLineReason(script: string, extra: ExtraPrerequisiteLines): string {
   const what =
     extra === 'second'
@@ -5001,7 +4996,7 @@ interface ResolvedHeader {
   readonly extra: ExtraPrerequisiteLines | null
 }
 
-/** Resolves one script's parse against the script list (b.uqm SR-3.1, SR-3.2). Extra lines supply no links. */
+/** Resolves one script's parse against the script list. Extra lines supply no links. */
 function resolveHeader(parse: PrerequisiteParse | undefined, scripts: readonly Script[]): ResolvedHeader {
   const unknownNames: string[] = []
   const links: string[] = []
@@ -5036,7 +5031,7 @@ function reachableFrom(start: string, edges: ReadonlyMap<string, readonly string
 }
 
 /**
- * The cycles of the link graph (b.uqm SR-3.2), each its file names in
+ * The cycles of the link graph, each its file names in
  * canonical order, listed by their first script in canonical order: a group of
  * two or more scripts each reachable from every other, or a script naming
  * itself. test-1 is in none, since links to it are ignored.
@@ -5057,7 +5052,7 @@ function prerequisiteCycles(ordered: readonly Script[], links: ReadonlyMap<strin
   return cycles
 }
 
-/** One script's failures in b.uqm SR-3.2's order: unknown names, a line naming no script, the cycle it declares first, ordering, extra lines. */
+/** One script's failures in the contract order: unknown names, a line naming no script, the cycle it declares first, ordering, extra lines. */
 function scriptHeaderFailures(
   script: Script,
   header: ResolvedHeader,
@@ -5083,10 +5078,9 @@ function scriptHeaderFailures(
 }
 
 /**
- * Stage 6 of b.uqm SR-2.6: checks every script's prerequisite lines (b.uqm
- * SR-3.1, SR-3.2). Takes the script list and each script's parse (a script
+ * Stage 6 of checks every script's prerequisite lines. Takes the script list and each script's parse (a script
  * without one has no prerequisite line), and gives either every failure, by
- * the declaring script's canonical order and then SR-3.2's order (several of
+ * the declaring script's canonical order and then order (several of
  * one kind in the line's word order), or the prerequisite map. Pure.
  */
 export function checkPrerequisiteHeaders(scripts: readonly Script[], parses: readonly PrerequisiteParse[]): HeaderCheck {
@@ -5105,12 +5099,12 @@ export function checkPrerequisiteHeaders(scripts: readonly Script[], parses: rea
   return { ok: true, prerequisites }
 }
 
-// Scheduling units and the effective N (b.uqm SR-3.4), found in the worktree
-// before admission. E4's assignment takes the units in their order, and stage
+// Scheduling units and the effective N, found in the worktree
+// before admission. assignment takes the units in their order, and stage
 // 7 checks fault shard numbers against the effective N.
 
 /**
- * The scheduling units of the run's scripts (b.uqm SR-3.4): the connected
+ * The scheduling units of the run's scripts: the connected
  * groups of the graph whose nodes are the run's scripts other than test-1 and
  * whose edges are the prerequisite links among them; a script with no link is
  * a unit of its own. Units come in the canonical order of their first scripts,
@@ -5140,7 +5134,7 @@ export function schedulingUnits(runScripts: readonly Script[], prerequisites: Pr
 }
 
 /**
- * The effective N (b.uqm SR-3.4): the smaller of the requested N (`--shards`'
+ * The effective N: the smaller of the requested N (`--shards`'
  * value, else `MAX_SHARDS`) and the number of units, but at least the lowest
  * N, 1, so a run of test-1 alone runs one shard.
  */
@@ -5148,19 +5142,19 @@ export function effectiveShardCount(requested: number | null, unitCount: number)
   return Math.max(OPTION_RANGE_MIN, Math.min(requested ?? MAX_SHARDS, unitCount))
 }
 
-// --- 7/T3 (E2 T3): stages and credentials ---
+// --- 7/ : stages and credentials ---
 //
-// Validation stage 7, the faults' scripts and shard numbers (b.uqm SR-2.4);
-// stage 8, the credentials (b.uqm SR-15.1); and the stage driver, which takes
-// all eight stages in b.uqm SR-2.6's order and gives either the refusal or the
-// validated run that E4, E8, E12 and E13 build on. Stages 7 and 8 are pure and
+// Validation stage 7, the faults' scripts and shard numbers;
+// stage 8, the credentials; and the stage driver, which takes
+// all eight stages in the contract order and gives either the refusal or the
+// validated run that and build on. Stages 7 and 8 are pure and
 // return their failures in their stage's order; the driver alone reads the
-// worktree, through T1's reader and one read of each script's text. Every
+// worktree, through reader and one read of each script's text. Every
 // reason comes from an exported builder and shows typed values through
 // `shownArgument`, so none holds a line break, and none holds a credential's
 // value.
 
-// Stage 7 (b.uqm SR-2.4; stage 7 of SR-2.6). It judges
+// Stage 7 (stage 7 of). It judges
 // `Invocation.givenFaults`, every `--inject` value as typed and in argument
 // order, never the normalized faults: a wrong file name normalizes to a real
 // script's number form, de-duplication drops a repeat, and a shard number past
@@ -5170,7 +5164,7 @@ export function effectiveShardCount(requested: number | null, unitCount: number)
 /** A stage-7 failure's kind. */
 export type FaultFailureKind = 'no-such-script' | 'not-in-run' | 'shard-out-of-range'
 
-/** A stage-7 failure: a fault whose script, or one of whose shard numbers, the run cannot act on (b.uqm SR-2.4). */
+/** A stage-7 failure: a fault whose script, or one of whose shard numbers, the run cannot act on. */
 export interface FaultFailure extends StageFailure {
   readonly kind: FaultFailureKind
   /** The `--inject` option's index in the `/ci` arguments; failures come in this, the argument order. */
@@ -5181,17 +5175,17 @@ export interface FaultFailure extends StageFailure {
   readonly named: string
 }
 
-/** `--inject fail:test-999 names test-999, which is no script: …` (b.uqm SR-2.4), the fault and its script as typed. */
+/** `--inject fail:test-999 names test-999, which is no script: …`, the fault and its script as typed. */
 export function faultScriptMissingReason(fault: string, script: string): string {
   return `${INJECT_OPTION} ${shownArgument(fault)} names ${shownArgument(script)}, which is no script: a fault's <script> must be a script's number form, test-<n>, or its whole file name in ${INTEGRATION_DIR_PATH}`
 }
 
-/** `--inject fail:test-5 names test-5, which is not one of the run's scripts: …` (b.uqm SR-2.4), the fault and its script as typed. */
+/** `--inject fail:test-5 names test-5, which is not one of the run's scripts: …`, the fault and its script as typed. */
 export function faultScriptNotInRunReason(fault: string, script: string): string {
   return `${INJECT_OPTION} ${shownArgument(fault)} names ${shownArgument(script)}, which is not one of the run's scripts: a fault's <script> must be a script the run runs, one selected, a prerequisite of one, or test-1`
 }
 
-/** `--inject kill:3 names shard 3, which is out of range: …` (b.uqm SR-2.4), the fault and the shard number as typed. */
+/** `--inject kill:3 names shard 3, which is out of range: …`, the fault and the shard number as typed. */
 export function faultShardOutOfRangeReason(fault: string, shard: string, effectiveShards: number): string {
   return `${INJECT_OPTION} ${shownArgument(fault)} names shard ${shownArgument(shard)}, which is out of range: a fault's shard must be a whole number from ${OPTION_RANGE_MIN} to the effective N, here ${effectiveShards}`
 }
@@ -5213,8 +5207,7 @@ function shardDigitsInRange(digits: string, effectiveShards: number): boolean {
 }
 
 /**
- * Validation stage 7, the faults' scripts and shard numbers (b.uqm SR-2.4,
- * SR-2.6), over every given fault in argument order. A `fail:` or `timeout:`
+ * Validation stage 7, the faults' scripts and shard numbers, over every given fault in argument order. A `fail:` or `timeout:`
  * whose typed `<script>` names no script of the list (a number form matching
  * no script's number, a file name no script's whole file name) is one failure;
  * one naming a script outside the run's scripts is another. A `leak`,
@@ -5256,12 +5249,12 @@ export function checkFaults(
   return failures
 }
 
-// Stage 8, the credentials (b.uqm SR-15.1; stage 8 of SR-2.6): `ANTHROPIC_API_KEY`
+// Stage 8, the credentials (stage 8 of): `ANTHROPIC_API_KEY`
 // and `GH_TOKEN`, read from the runner's environment. The base-build token is
-// looked up and checked only in step 4 (E8). Nothing here looks a credential
+// looked up and checked only in step 4 . Nothing here looks a credential
 // up or spawns, and no reason holds a credential's value.
 
-/** A credential step 2 checks (b.uqm SR-15.1). */
+/** A credential step 2 checks. */
 export type CheckedCredential = 'CI_ANTHROPIC_API_KEY' | 'ANTHROPIC_API_KEY' | 'GH_TOKEN'
 
 /** The variables stage 8 reads. */
@@ -5269,13 +5262,13 @@ const API_KEY_VARIABLE = 'ANTHROPIC_API_KEY'
 const GH_TOKEN_VARIABLE = 'GH_TOKEN'
 const BASE_URL_VARIABLE = 'ANTHROPIC_BASE_URL'
 
-/** A stage-8 failure's kind: a missing credential, or a bad one (b.uqm SR-15.1). */
+/** A stage-8 failure's kind: a missing credential, or a bad one. */
 export type CredentialFailureKind = 'missing' | 'bad'
 
-/** Why `ANTHROPIC_API_KEY` is a missing credential (b.uqm SR-15.1). */
+/** Why `ANTHROPIC_API_KEY` is a missing credential. */
 export type MissingApiKeyCause = 'unset' | 'empty' | 'not-raw-key'
 
-/** A stage-8 failure: one credential, at most one failure each, `ANTHROPIC_API_KEY` first (b.uqm SR-2.6, SR-15.1). */
+/** A stage-8 failure: one credential, at most one failure each, `ANTHROPIC_API_KEY` first. */
 export interface CredentialFailure extends StageFailure {
   readonly kind: CredentialFailureKind
   readonly variable: CheckedCredential
@@ -5288,13 +5281,13 @@ const MISSING_API_KEY_CAUSE_TEXT: Readonly<Record<MissingApiKeyCause, string>> =
   'not-raw-key': `it does not begin ${RAW_KEY_PREFIX} and ${BASE_URL_VARIABLE} is unset`,
 }
 
-/** `ANTHROPIC_API_KEY is a missing credential (it is unset): …` (b.uqm SR-15.1), naming the variable, the cause and the rule, never the value. */
+/** `ANTHROPIC_API_KEY is a missing credential (it is unset): …`, naming the variable, the cause and the rule, never the value. */
 export function missingApiKeyReason(cause: MissingApiKeyCause, variable: Exclude<CheckedCredential, 'GH_TOKEN'> = API_KEY_VARIABLE): string {
   const reason = `${API_KEY_VARIABLE} is a missing credential (${MISSING_API_KEY_CAUSE_TEXT[cause]}): it must be set and not empty, and begin ${RAW_KEY_PREFIX} unless ${BASE_URL_VARIABLE} is set`
   return variable === 'CI_ANTHROPIC_API_KEY' ? reason.replaceAll('ANTHROPIC_', 'CI_ANTHROPIC_') : reason
 }
 
-/** `GH_TOKEN is a bad credential (it is shorter than 8 characters): …` (b.uqm SR-15.1), naming the variable and the rule, never the value. */
+/** `GH_TOKEN is a bad credential (it is shorter than 8 characters): …`, naming the variable and the rule, never the value. */
 export function badCredentialReason(variable: CheckedCredential): string {
   return `${variable} is a bad credential (it is shorter than ${SECRET_MIN_LENGTH} characters): a secret credential that is set and not empty must be at least ${SECRET_MIN_LENGTH} characters long`
 }
@@ -5313,7 +5306,7 @@ function missingApiKeyCause(key: string | undefined, baseUrl: string | undefined
 }
 
 /**
- * Validation stage 8, the credentials (b.uqm SR-15.1, SR-2.6), over the
+ * Validation stage 8, the credentials, over the
  * runner's environment: `ANTHROPIC_API_KEY` missing (unset, empty, or not
  * beginning `sk-ant-` while `ANTHROPIC_BASE_URL` is unset), else bad (shorter
  * than the minimum); then `GH_TOKEN` bad when set, not empty and shorter than
@@ -5336,18 +5329,18 @@ export function checkCredentials(env: ChildEnvironmentSource): CredentialFailure
   return failures
 }
 
-// The stage driver (b.uqm SR-2.6; step 2 of SR-5.3). Validation stops at the
+// The stage driver (step 2 of). Validation stops at the
 // first stage that finds a failure: its first failure is the refusal's
 // summary and each other failure of that stage one detail line, in the
 // stage's order. A worktree read that fails is a refusal too, its one-line
 // read error the summary; a missing `tests/integration` is an empty listing,
 // so stage 4 refuses the missing test-1.
 
-/** A run that passed every validation stage (b.uqm SR-2.6, SR-3.4): what step 2 hands to the rest of the run sequence (E4, E8, E12, E13). */
+/** A run that passed every validation stage: what step 2 hands to the rest of the run sequence (scheduling, image preparation, fault injection, the run lifecycle). */
 export interface ValidatedRun {
   /** The parsed `/ci` arguments. */
   readonly invocation: Invocation
-  /** The run's kind (b.uqm SR-2.5, SR-6.2). */
+  /** The run's kind. */
   readonly kind: RunKind
   /** The selection: none for a full run, else the selected scripts in canonical order. */
   readonly selection: ScriptSelection
@@ -5355,13 +5348,13 @@ export interface ValidatedRun {
   readonly scripts: readonly Script[]
   /** Each script's direct prerequisites, one entry per script (stage 6). */
   readonly prerequisites: PrerequisiteMap
-  /** The run's scripts, in canonical order (b.uqm Terms). */
+  /** The run's scripts, in canonical order (Terms). */
   readonly runScripts: readonly Script[]
-  /** The run's scheduling units, in order (b.uqm SR-3.4). */
+  /** The run's scheduling units, in order. */
   readonly units: readonly SchedulingUnit[]
-  /** The requested N: `--shards`' value, else `MAX_SHARDS` (b.uqm SR-3.4). */
+  /** The requested N: `--shards`' value, else `MAX_SHARDS`. */
   readonly requestedShards: number
-  /** The effective N (b.uqm SR-3.4). */
+  /** The effective N. */
   readonly effectiveShards: number
 }
 
@@ -5376,7 +5369,7 @@ export type RunValidation =
       readonly refusal: Refusal
     }
 
-/** A failing stage's refusal (b.uqm SR-2.6, SR-5.8): no kind, the first failure's reason as the summary, each other one a detail line in order. */
+/** A failing stage's refusal: no kind, the first failure's reason as the summary, each other one a detail line in order. */
 export function stageRefusal(failures: readonly StageFailure[]): Refusal {
   const [first, ...rest] = failures
   if (first === undefined) throw new Error('stageRefusal: a stage refused with no failure')
@@ -5404,7 +5397,7 @@ function readDiscoveryEntries(worktreeRoot: string): DepRead<readonly Integratio
   return read
 }
 
-/** Every script's text read once and parsed for stage 6 (b.uqm SR-3.1), in the list's order; the first read that fails ends it. */
+/** Every script's text read once and parsed for stage 6, in the list's order; the first read that fails ends it. */
 function readPrerequisiteParses(worktreeRoot: string, scripts: readonly Script[]): DepRead<readonly PrerequisiteParse[]> {
   const dirPath = join(worktreeRoot, INTEGRATION_DIR_PATH)
   const parses: PrerequisiteParse[] = []
@@ -5418,10 +5411,10 @@ function readPrerequisiteParses(worktreeRoot: string, scripts: readonly Script[]
 }
 
 /**
- * Validation, step 2 of the run sequence (b.uqm SR-2.6, SR-5.3): stage 1, the
+ * Validation, step 2 of the run sequence: stage 1, the
  * arguments (`argumentStage`); the worktree's `tests/integration` read afresh
  * under `worktreeRoot`; stages 2 to 5 over its entries; stage 6 over every
- * script's header, in a full or a selective run alike (b.uqm SR-3.1); then the
+ * script's header, in a full or a selective run alike; then the
  * run's scripts, the units and the effective N; stage 7 against them; stage 8
  * over `env`. No stage after the first failing one is evaluated. Spawns
  * nothing and writes nothing.
@@ -5480,34 +5473,34 @@ export function validateRun(args: readonly string[], worktreeRoot: string, env: 
 }
 
 // ---------------------------------------------------------------------------
-// 8. Scheduling (E4)
+// 8. Scheduling
 // ---------------------------------------------------------------------------
 
-// --- 8/T1 (E4 T1): the duration table, its notes and the assignment ---
+// --- 8/ : the duration table, its notes and the assignment ---
 //
 // The duration table's text, handed over unparsed by the image read-back
-// (b.uqm SR-9.4), gives one estimate per script of the pinned image's list
-// (b.uqm SR-4.1). Nothing in it ever drops a script: a bad line is ignored and
+// gives one estimate per script of the pinned image's list
+//. Nothing in it ever drops a script: a bad line is ignored and
 // noted, a script with no entry gets the default, and an unreadable table
 // gives every script the default with one note. The run's units are then
 // placed longest first in the shard with the smallest expected total
-// (b.uqm SR-4.2). Every function here is pure. The table's line order counts:
+//. Every function here is pure. The table's line order counts:
 // of two entries for one script the first is used, and a used line out of
 // canonical order is noted. The order of the pinned list and of the units
 // changes nothing.
 
-/** The duration table's header line, `script<TAB>seconds` (b.uqm SR-4.1). */
+/** The duration table's header line, `script<TAB>seconds`. */
 export const DURATION_TABLE_HEADER = 'script\tseconds'
 
 /**
  * The duration table as the image read-back hands it to scheduling
- * (b.uqm SR-4.1, SR-9.4): the file's text, missing, or unreadable with its
+ * the file's text, missing, or unreadable with its
  * error. It is `readFileText`'s answer, so a read of the table copied out of
  * the pinned image hands over as is. A missing table is no read-back failure.
  */
 export type DurationTableSource = FileTextRead
 
-/** Why a table line other than the header is ignored (b.uqm SR-4.1). */
+/** Why a table line other than the header is ignored. */
 export type DurationLineProblem =
   | {
       /** The line holds a carriage return, so it matches no form. */
@@ -5548,17 +5541,17 @@ const DURATION_TABLE_NOTE_PREFIX = `duration table ${DURATION_TABLE_PATH}`
 /** The tail of each unreadable-table note: what every script gets instead. */
 const DEFAULT_ESTIMATE_TEXT = `every script gets the default estimate, ${DEFAULT_ESTIMATE_SECONDS} s`
 
-/** The note for a missing table (b.uqm SR-4.1, SR-9.4). */
+/** The note for a missing table. */
 export function durationTableMissingNote(): string {
   return `${DURATION_TABLE_NOTE_PREFIX} is missing: ${DEFAULT_ESTIMATE_TEXT}`
 }
 
-/** The note for a table that cannot be read, its error on one line (b.uqm SR-4.1). */
+/** The note for a table that cannot be read, its error on one line. */
 export function durationTableReadFailedNote(error: string): string {
   return `${DURATION_TABLE_NOTE_PREFIX} cannot be read (${dependencyErrorText(error)}): ${DEFAULT_ESTIMATE_TEXT}`
 }
 
-/** The note for a table whose first line is not the header: an empty file and a header holding a carriage return included (b.uqm SR-4.1). */
+/** The note for a table whose first line is not the header: an empty file and a header holding a carriage return included. */
 export function durationTableWrongHeaderNote(): string {
   return `${DURATION_TABLE_NOTE_PREFIX} is unreadable: line 1 is not the header ${JSON.stringify(DURATION_TABLE_HEADER)}: ${DEFAULT_ESTIMATE_TEXT}`
 }
@@ -5591,17 +5584,17 @@ function durationLineProblemText(problem: DurationLineProblem): string {
   }
 }
 
-/** The note for an ignored line, with its 1-based line number and why (b.uqm SR-4.1). */
+/** The note for an ignored line, with its 1-based line number and why. */
 export function durationLineIgnoredNote(line: number, problem: DurationLineProblem): string {
   return `${DURATION_TABLE_NOTE_PREFIX} line ${line} ignored: ${durationLineProblemText(problem)}`
 }
 
-/** The note for a used line out of canonical order: it sorts before the script of an earlier used line, named with that line (b.uqm SR-4.1, SR-3.3). */
+/** The note for a used line out of canonical order: it sorts before the script of an earlier used line, named with that line. */
 export function durationLineOutOfOrderNote(line: number, numberForm: string, after: string, afterLine: number): string {
   return `${DURATION_TABLE_NOTE_PREFIX} line ${line} is out of canonical order: ${numberForm} follows ${after} on line ${afterLine}; its entry is used`
 }
 
-/** The duration table parsed against the pinned list (b.uqm SR-4.1). */
+/** The duration table parsed against the pinned list. */
 export interface DurationTable {
   /** Whether the table was read and its first line is the header. */
   readonly readable: boolean
@@ -5613,7 +5606,7 @@ export interface DurationTable {
   readonly notes: readonly string[]
 }
 
-/** Splits a table's text into lines at each line feed; a final line feed ends the last line and may be absent (b.uqm SR-4.1). */
+/** Splits a table's text into lines at each line feed; a final line feed ends the last line and may be absent. */
 function durationTableLines(text: string): string[] {
   const lines = text.split('\n')
   if (lines.length > 1 && lines[lines.length - 1] === '') lines.pop()
@@ -5661,7 +5654,7 @@ function pinnedByNumberForm(pinned: readonly string[]): Map<string, string> {
 
 /**
  * Parses the duration table against the pinned image's script list, given as
- * file names (b.uqm SR-4.1). A missing or unreadable source, or a first line
+ * file names. A missing or unreadable source, or a first line
  * that is not exactly the header, gives every script the default and one
  * note. Otherwise each other line is used when it is `test-<n><TAB><seconds>`
  * (seconds a whole number above 0, at most `Number.MAX_SAFE_INTEGER`), names a script no earlier line of that
@@ -5724,21 +5717,21 @@ export function parseDurationTable(source: DurationTableSource, pinned: readonly
   return { readable: true, estimates, entries, notes }
 }
 
-/** The scheduling entry point's inputs (b.uqm SR-4.1, SR-4.2); E13 passes them once, after the read-back. */
+/** The scheduling entry point's inputs; the run lifecycle passes them once, after the read-back. */
 export interface SchedulingInput {
   /** The pinned image's script list, as file names, test-1 among them. */
   readonly pinned: readonly string[]
   /** The pinned image's duration table, unparsed. */
   readonly table: DurationTableSource
-  /** The run's scheduling units (b.uqm SR-3.4). */
+  /** The run's scheduling units. */
   readonly units: readonly SchedulingUnit[]
-  /** The invocation: `--shard-timeout` sets every shard's limit (b.uqm SR-4.3). */
+  /** The invocation: `--shard-timeout` sets every shard's limit. */
   readonly invocation: Invocation
   /** The admitted N: at least 1, at most the effective N. */
   readonly shards: number
 }
 
-/** The scheduling result: the parsed table, the assignment and the limits (b.uqm SR-4.1, SR-4.2, SR-4.3). */
+/** The scheduling result: the parsed table, the assignment and the limits. */
 export interface Schedule {
   /** Whether the table was read and its first line is the header. */
   readonly readable: boolean
@@ -5752,14 +5745,14 @@ export interface Schedule {
   readonly assignment: Assignment
   /** Each shard's limit as a duration on the clock, in whole milliseconds, keyed by shard number, from shard 1: what its limit timer is armed with. */
   readonly limitsMs: ReadonlyMap<number, number>
-  /** T, the run's largest shard limit, in exact minutes (b.uqm SR-5.5). */
+  /** T, the run's largest shard limit, in exact minutes. */
   readonly largestLimitMinutes: number
   /** T in whole milliseconds. */
   readonly largestLimitMs: number
 }
 
 /**
- * Assigns the units to shards by expected duration (b.uqm SR-4.2). Every
+ * Assigns the units to shards by expected duration. Every
  * shard starts with test-1's estimate; units are taken longest first, ties in
  * the canonical order of each unit's first script, and each goes to the shard
  * with the smallest total, the lowest shard number on a tie. Each shard's list
@@ -5814,7 +5807,7 @@ export function assignShards(
 }
 
 /**
- * The scheduling entry point (b.uqm SR-4.1, SR-4.2, SR-4.3): parses the
+ * The scheduling entry point: parses the
  * pinned image's duration table against its script list, assigns the run's
  * units to N shards, and gives each shard's limit and T, the largest. Throws
  * when the pinned list holds no test-1, which the read-back's checks have
@@ -5841,18 +5834,17 @@ export function scheduleRun(input: SchedulingInput): Schedule {
   }
 }
 
-// --- 8/T2 (E4 T2): shard limits, the limit timer, timing, the slow: lines and the duration-table block ---
+// --- 8/ : shard limits, the limit timer, timing, the slow: lines and the duration-table block ---
 //
-// Each shard's wall-time limit and its own timer (b.uqm SR-4.3), and every
-// run's timing values and report lines (b.uqm SR-4.4): E13 arms the timers and
-// fills the timing record; E10 places the values and the ready lines in
-// `results.json`, `summary.txt` and the timing summary (b.uqm SR-16.1,
-// SR-16.2). Every duration is computed in whole milliseconds; only messages
+// Each shard's wall-time limit and its own timer, and every
+// run's timing values and report lines: arms the timers and
+// fills the timing record; places the values and the ready lines in
+// `results.json`, `summary.txt` and the timing summary. Every duration is computed in whole milliseconds; only messages
 // round, minutes halves up through `roundMinutesHalfUp`, seconds up.
 
 /**
  * A shard's wall-time limit in whole milliseconds, a duration on the clock
- * (b.uqm SR-4.3): 2 × its expected total + 15 min, at least 30 min;
+ * 2 × its expected total + 15 min, at least 30 min;
  * `--shard-timeout`'s minutes, with no floor, when given.
  */
 export function shardLimitMs(expectedSeconds: number, shardTimeoutMinutes: number | null): number {
@@ -5861,7 +5853,7 @@ export function shardLimitMs(expectedSeconds: number, shardTimeoutMinutes: numbe
 }
 
 /**
- * A shard's wall-time limit in exact minutes (b.uqm SR-4.3), `shardLimitMs`
+ * A shard's wall-time limit in exact minutes, `shardLimitMs`
  * in minutes: one division of whole milliseconds, so a half minute is exact.
  * Only messages round it.
  */
@@ -5870,20 +5862,19 @@ export function shardLimitMinutes(expectedSeconds: number, shardTimeoutMinutes: 
 }
 
 /**
- * The cause the runner fixes for a shard over its limit (b.uqm SR-4.3,
- * SR-12.1): its minutes are the limit's, rounded halves up (93.4 gives 93,
- * 84.5 gives 85). E10 renders its text, `wall-time limit of <m> min exceeded`.
+ * The cause the runner fixes for a shard over its limit: its minutes are the limit's, rounded halves up (93.4 gives 93,
+ * 84.5 gives 85). renders its text, `wall-time limit of <m> min exceeded`.
  */
 export function wallTimeLimitCause(limitMinutes: number): WallTimeLimitCause {
   return { kind: 'wall-time-limit', minutes: roundMinutesHalfUp(limitMinutes), fixedByRunner: true }
 }
 
-/** `shard-<k>`: a shard's subdirectory name, and its name in a timing line (b.uqm Terms, SR-5.9). */
+/** `shard-<k>`: a shard's subdirectory name, and its name in a timing line (Terms). */
 function scheduleShardName(shard: number): string {
   return `${SHARD_DIR_PREFIX}${shard}`
 }
 
-/** A limit timer's outcome when it fires (b.uqm SR-4.3, SR-10.6). */
+/** A limit timer's outcome when it fires. */
 export type LimitTimerOutcome =
   | {
       /** The result file's end marker line is complete: the shard is not over its limit, and its final reading is due now. */
@@ -5900,7 +5891,7 @@ export type LimitTimerOutcome =
 export interface LimitTimerOptions {
   /** The clock and timers (`RunnerDeps.clock`): the timer is scheduled only through them. */
   readonly clock: RunnerClock
-  /** The run directory: the shard's result file is read from its `shard-<k>` subdirectory by E1's rule (`readResultFile`). */
+  /** The run directory: the shard's result file is read from its `shard-<k>` subdirectory by shared runner helpers's rule (`readResultFile`). */
   readonly runDir: string
   readonly shard: number
   /** The shard container's start, epoch milliseconds (`ShardStarted.startedAtMs`). */
@@ -5931,12 +5922,12 @@ function shownTimerValue(value: unknown): string {
 }
 
 /**
- * Arms one shard's limit timer (b.uqm SR-4.3): it fires at the container's
+ * Arms one shard's limit timer: it fires at the container's
  * start + the limit, on its own timer, never waiting for a sample; armed after
  * that moment, it fires on the next timer tick, at least 1 ms later. When it
  * fires it reads the shard's result file and reports `ended` when the end
  * marker line is complete, else `over-limit`. It stops no container, fixes no
- * cause and writes nothing: E13 acts on the outcome. Throws when `startedAtMs`
+ * cause and writes nothing: acts on the outcome. Throws when `startedAtMs`
  * or `limitMs` is no finite number, `limitMs` is negative, or `shard` is no
  * whole number of at least 1: a wiring mistake, never an over-limit shard.
  */
@@ -5978,19 +5969,19 @@ export function armShardLimitTimer(options: LimitTimerOptions): LimitTimer {
   }
 }
 
-/** One shard's moments and result file, as E13 records them (b.uqm SR-4.4). */
+/** One shard's moments and result file, as the run lifecycle records them. */
 export interface ShardTimingRecord {
   readonly shard: number
   /** Its container's start, epoch milliseconds; null when it never started. */
   readonly startedAtMs: number | null
-  /** Its final reading's moment, epoch milliseconds; null when it had none (b.uqm SR-10.6). */
+  /** Its final reading's moment, epoch milliseconds; null when it had none. */
   readonly finalReadingAtMs: number | null
-  /** Its result file as read at its final reading by E1's rule (`readResultFile`): its script outcomes and seconds. */
+  /** Its result file as read at its final reading by shared runner helpers's rule (`readResultFile`): its script outcomes and seconds. */
   readonly resultFile: ResultFileRead
 }
 
 /**
- * The timing record E13 fills (b.uqm SR-4.4): every moment in epoch
+ * The timing record fills: every moment in epoch
  * milliseconds from the injected clock. A step that never started is null; a
  * step that started and never ended runs to the verdict.
  */
@@ -6019,7 +6010,7 @@ export interface ShardSeconds {
   readonly seconds: number | null
 }
 
-/** One script's wall time in one shard, to the millisecond (b.uqm SR-4.4, SR-11.3). */
+/** One script's wall time in one shard, to the millisecond. */
 export interface ScriptTime {
   readonly shard: number
   /** Its file name. */
@@ -6031,7 +6022,7 @@ export interface ScriptTime {
   readonly seconds: number
 }
 
-/** The timing values (b.uqm SR-4.4, SR-16.1). */
+/** The timing values. */
 export interface TimingValues {
   /** `timing`: every value a number. */
   readonly timing: ResultsTiming
@@ -6071,7 +6062,7 @@ function shardScriptTimes(record: ShardTimingRecord): ScriptTime[] {
 }
 
 /**
- * The timing values from the record (b.uqm SR-4.4). The build runs from the
+ * The timing values from the record. The build runs from the
  * start of packing to the moment the pinned ID is known, the base build
  * included; the base build is its step's own run, 0 when it did not run; the
  * total runs from the runner's start to the verdict. One rule makes every
@@ -6099,27 +6090,27 @@ export function timingValues(record: TimingRecord): TimingValues {
   }
 }
 
-/** `build: <s> s (base build <b> s)`: the build time with its base-build part (b.uqm SR-4.4, SR-16.2). */
+/** `build: <s> s (base build <b> s)`: the build time with its base-build part. */
 export function buildTimeLine(buildSeconds: number, baseBuildSeconds: number): string {
   return `build: ${formatResultSeconds(buildSeconds)} s (base build ${formatResultSeconds(baseBuildSeconds)} s)`
 }
 
-/** `shard-<k>: <s> s`, or `shard-<k>: not timed` when its seconds are null (b.uqm SR-4.4, SR-16.2). */
+/** `shard-<k>: <s> s`, or `shard-<k>: not timed` when its seconds are null. */
 export function shardTimeLine(shard: number, seconds: number | null): string {
   return `${scheduleShardName(shard)}: ${seconds === null ? 'not timed' : `${formatResultSeconds(seconds)} s`}`
 }
 
-/** `total: <s> s`: the runner's start to the verdict (b.uqm SR-4.4, SR-16.2). */
+/** `total: <s> s`: the runner's start to the verdict. */
 export function totalTimeLine(totalSeconds: number): string {
   return `total: ${formatResultSeconds(totalSeconds)} s`
 }
 
-/** `shard-<k> <file name>: <s> s (pass|fail)`: one script's time in one shard (b.uqm SR-4.4, SR-16.2). */
+/** `shard-<k> <file name>: <s> s (pass|fail)`: one script's time in one shard. */
 export function scriptTimeLine(time: ScriptTime): string {
   return `${scheduleShardName(time.shard)} ${time.script}: ${formatResultSeconds(time.seconds)} s (${time.result})`
 }
 
-/** The timing lines, in this order: the build time with its base-build part, each shard's time in shard order, the total (b.uqm SR-16.2). */
+/** The timing lines, in this order: the build time with its base-build part, each shard's time in shard order, the total. */
 export function timingLines(values: TimingValues): string[] {
   return [
     buildTimeLine(values.timing.buildSeconds, values.timing.baseBuildSeconds),
@@ -6128,7 +6119,7 @@ export function timingLines(values: TimingValues): string[] {
   ]
 }
 
-/** Each script's time line, in the values' order: shard order, then result-file order (b.uqm SR-16.2). */
+/** Each script's time line, in the values' order: shard order, then result-file order. */
 export function scriptTimeLines(values: TimingValues): string[] {
   return values.scripts.map(scriptTimeLine)
 }
@@ -6140,13 +6131,13 @@ function highestScriptMs(times: readonly ScriptTime[]): Map<string, number> {
   return highest
 }
 
-/** `slow: <file name> took <s> s, estimate <e> s`, s whole seconds rounded up (b.uqm SR-4.4). */
+/** `slow: <file name> took <s> s, estimate <e> s`, s whole seconds rounded up. */
 export function slowLine(fileName: string, tookSeconds: number, estimateSeconds: number): string {
   return `slow: ${fileName} took ${tookSeconds} s, estimate ${estimateSeconds} s`
 }
 
 /**
- * The `slow:` lines (b.uqm SR-4.4), in canonical order: one for each script
+ * The `slow:` lines, in canonical order: one for each script
  * whose time is strictly more than 1.5 × its estimate (the default for a
  * script with none). A script in several shards, test-1, is judged and shown
  * once, with its highest time. A script with no recorded time has no line.
@@ -6162,13 +6153,13 @@ export function slowLines(estimates: ReadonlyMap<string, number>, times: readonl
   return lines
 }
 
-/** The line introducing the duration-table block, naming how many lines follow it (b.uqm SR-4.4). */
+/** The line introducing the duration-table block, naming how many lines follow it. */
 export function durationTableBlockIntro(blockLineCount: number): string {
   return `duration table block, the next ${blockLineCount} lines: paste them as ${DURATION_TABLE_PATH} to refresh the table`
 }
 
 /**
- * The duration-table block (b.uqm SR-4.4): the header, then one
+ * The duration-table block: the header, then one
  * `test-<n><TAB><seconds>` line per pinned script (the estimates' keys), in
  * canonical order: this run's time, rounded up to whole seconds and never
  * below 1, for a script that passed in every shard of the assignment holding
@@ -6198,7 +6189,7 @@ export function durationTableBlock(schedule: Pick<Schedule, 'estimates' | 'entri
   return lines
 }
 
-/** The timing report's values and ready lines; E10 places them in SR-16.2's order (b.uqm SR-4.4, SR-16.1, SR-16.2). */
+/** The timing report's values and ready lines; result rendering places them in the contract order. */
 export interface TimingReport {
   readonly values: TimingValues
   /** The build time with its base-build part, each shard's time, the total. */
@@ -6213,7 +6204,7 @@ export interface TimingReport {
 }
 
 /**
- * The timing report from the record and the scheduling result (b.uqm SR-4.4).
+ * The timing report from the record and the scheduling result.
  * A run that never got a pinned list, so was never scheduled (a build failure,
  * a stop before the read-back), passes null: it has no block, no `slow:`
  * lines and no table notes, and its timing values are numbers all the same.
@@ -6232,13 +6223,13 @@ export function timingReport(record: TimingRecord, schedule: Schedule | null): T
 }
 
 // ---------------------------------------------------------------------------
-// 9. Lock, reservations and sweep (E5)
+// 9. Lock, reservations and sweep
 // ---------------------------------------------------------------------------
 
-// --- 9/T1 (E5 T1): the account's home and the admission lock ---
+// --- 9/ : the account's home and the admission lock ---
 //
 // Admission happens one run at a time across every worktree, lane and session
-// of the account (b.uqm SR-6.1). The lock is an exclusive `flock(2)` that the
+// of the account. The lock is an exclusive `flock(2)` that the
 // runner process itself holds on `admission.lock` in `.config/cscb-ci/` under
 // the account's home, so the kernel frees it when the runner dies, and every
 // worktree finds it at the same path.
@@ -6258,14 +6249,14 @@ export function timingReport(record: TimingRecord, schedule: Schedule | null): T
 // - The lock file is never renamed, replaced or removed: a new inode would let
 //   two runs each hold "the" lock.
 //
-// E13 binds the real lock directory (`admissionLockDir` of the resolved home)
+// binds the real lock directory (`admissionLockDir` of the resolved home)
 // at step 6, takes the lock there, and releases it at step 11 and on every
-// refusal and stop that holds it. E6 takes the account's home from E13's
+// refusal and stop that holds it. takes the account's home from
 // composition for `/ci-live`'s real-run lock.
 
-/** The admission lock's file name in the lock directory (b.uqm SR-6.1); never a reservation name. */
+/** The admission lock's file name in the lock directory; never a reservation name. */
 export const LOCK_FILE_NAME = 'admission.lock'
-/** The lock directory below the account's home (b.uqm SR-6.1). */
+/** The lock directory below the account's home. */
 export const LOCK_DIR_SUBPATH = '.config/cscb-ci'
 /** How often take retries a busy lock on the injected clock, well under `LOCK_WAIT_MS`; the last try falls at the wait's end exactly. */
 export const LOCK_POLL_MS = 250
@@ -6293,7 +6284,7 @@ function passwordEntryHome(fields: readonly string[]): string | undefined {
 }
 
 /**
- * The account's home by the password-file rule (b.uqm SR-6.1, SR-21.5): the
+ * The account's home by the password-file rule: the
  * first line whose user-ID field equals `uid` written in decimal decides (a
  * leading zero or a space does not match); it gives its sixth field when it
  * has at least seven fields and that field is absolute, else undefined. A
@@ -6318,7 +6309,7 @@ export type AccountHomeFailure =
       readonly kind: 'no-home'
     }
 
-/** The not-runnable refusal for an account's home that could not be found (kind null), naming the user ID and `/etc/passwd` (b.uqm SR-6.1). */
+/** The not-runnable refusal for an account's home that could not be found (kind null), naming the user ID and `/etc/passwd`. */
 export function accountHomeRefusal(uid: number, failure: AccountHomeFailure): Refusal {
   const cause =
     failure.kind === 'unreadable'
@@ -6340,7 +6331,7 @@ export type AccountHomeResolution =
       readonly refusal: Refusal
     }
 
-/** The account's home: the password file read through the injected dependency, by `accountHomeFrom` for the injected user ID (b.uqm SR-6.1). */
+/** The account's home: the password file read through the injected dependency, by `accountHomeFrom` for the injected user ID. */
 export function resolveAccountHome(deps: Pick<RunnerDeps, 'uid' | 'readPasswordFile'>): AccountHomeResolution {
   const text = deps.readPasswordFile()
   if (!text.ok) return { ok: false, refusal: accountHomeRefusal(deps.uid, { kind: 'unreadable', error: text.error }) }
@@ -6351,12 +6342,12 @@ export function resolveAccountHome(deps: Pick<RunnerDeps, 'uid' | 'readPasswordF
   return { ok: true, home }
 }
 
-/** The lock directory under an account's home, `<home>/.config/cscb-ci` (b.uqm SR-6.1). */
+/** The lock directory under an account's home, `<home>/.config/cscb-ci`. */
 export function admissionLockDir(accountHome: string): string {
   return join(accountHome, LOCK_DIR_SUBPATH)
 }
 
-/** The lock file in a lock directory, `<lockDir>/admission.lock` (b.uqm SR-6.1). */
+/** The lock file in a lock directory, `<lockDir>/admission.lock`. */
 export function admissionLockPath(lockDir: string): string {
   return join(lockDir, LOCK_FILE_NAME)
 }
@@ -6373,7 +6364,7 @@ export function parseLockHolder(text: string): Owner | null {
   return parseOwner(line)
 }
 
-/** The busy-lock refusal (b.uqm SR-6.8), kind null, naming the PID and RUN_ID recorded in the lock file; an unknown holder when none could be read. */
+/** The busy-lock refusal, kind null, naming the PID and RUN_ID recorded in the lock file; an unknown holder when none could be read. */
 export function busyLockRefusal(holder: Owner | null): Refusal {
   const named = holder === null ? 'an unknown run holds it' : `run ${holder.runId} (PID ${holder.pid}) holds it`
   return buildRefusal(null, `the admission lock stayed busy for ${LOCK_WAIT_MS / 1000} s: ${named}`, [
@@ -6475,7 +6466,7 @@ function openLockDescriptor(path: string): { fd: number; created: boolean } {
 }
 
 /**
- * The flock primitive (b.uqm SR-6.1): opens `path` on a descriptor no child
+ * The flock primitive: opens `path` on a descriptor no child
  * inherits, creating the file 0600 when it is missing (an existing file is
  * used as it is), or answers why it could not. Locking loads libc on first
  * use. Two descriptors on one file contend, in one process as in two.
@@ -6601,7 +6592,7 @@ function clockDelay(clock: RunnerClock, delayMs: number): Promise<void> {
 }
 
 /**
- * Takes the admission lock in `lockDir` for `holder` (b.uqm SR-6.1): creates
+ * Takes the admission lock in `lockDir` for `holder`: creates
  * the directory (0700) and the file (0600) when missing, tries the flock at
  * once and then every `LOCK_POLL_MS` on `clock` until `LOCK_WAIT_MS` has
  * passed, the last try at that mark exactly, and once taken records the
@@ -6640,15 +6631,15 @@ export async function takeAdmissionLock(lockDir: string, holder: Owner, clock: R
   }
 }
 
-// --- 9/T2 (E5 T2): reservations: write, remove and read ---
+// --- 9/ : reservations: write, remove and read ---
 //
-// A reservation is `<RUN_ID>-<PID>.json` in the lock directory (b.uqm SR-6.2).
-// Its names, shape, serializer and parser are E1's (section 5, T3); this
+// A reservation is `<RUN_ID>-<PID>.json` in the lock directory.
+// Its names, shape, serializer and parser are (section 5, ); this
 // sub-banner writes, removes and reads the files. Holding the lock while
-// writing is the caller's duty (E13, step 10). None of these touches any file
+// writing is the caller's duty (step 10). None of these touches any file
 // in the lock directory whose name is not the reservation name in question.
 
-/** What a reservation records for one run: its owner, N, the per-shard cap and the run kind (b.uqm SR-6.2). */
+/** What a reservation records for one run: its owner, N, the per-shard cap and the run kind. */
 export interface ReservationRequest {
   readonly owner: Owner
   /** N. */
@@ -6659,7 +6650,7 @@ export interface ReservationRequest {
   readonly kind: RunKind
 }
 
-/** The reservation a spec gives: memory N × the cap, CPUs `CPUS_PER_SHARD` × N (b.uqm SR-6.2). */
+/** The reservation a spec gives: memory N × the cap, CPUs `CPUS_PER_SHARD` × N. */
 export function buildReservation(spec: ReservationRequest): Reservation {
   return {
     version: RESERVATION_FORMAT_VERSION,
@@ -6673,7 +6664,7 @@ export function buildReservation(spec: ReservationRequest): Reservation {
 }
 
 /**
- * Writes the owner's reservation into `lockDir` whole (b.uqm SR-6.2): E1's
+ * Writes the owner's reservation into `lockDir` whole:
  * `writeWholeFile` writes `reservationTempFileName(owner)`, which is never a
  * reservation name, then renames it to `reservationFileName(owner)`, so the
  * reservation-named file appears only by the rename. A failure is returned,
@@ -6692,7 +6683,7 @@ export function writeReservation(lockDir: string, spec: ReservationRequest): Wri
   return writeWholeFile(lockDir, fileName, text)
 }
 
-/** A reservation removal's outcome: removed, already gone (no failure), or failed with its cleanup-failure line (b.uqm SR-9.3). */
+/** A reservation removal's outcome: removed, already gone (no failure), or failed with its cleanup-failure line. */
 export type ReservationRemoval =
   | {
       readonly kind: 'removed'
@@ -6707,10 +6698,10 @@ export type ReservationRemoval =
     }
 
 /**
- * Removes one owner's reservation from `lockDir` (b.uqm SR-6.2): E13's own in
- * cleanup and refusals, T3's sweep for dead owners. A file already gone is no
+ * Removes one owner's reservation from `lockDir`: own in
+ * cleanup and refusals, sweep for dead owners. A file already gone is no
  * failure. Any other failure is written to the runner log and returned as a
- * cleanup failure, never thrown (b.uqm SR-9.3).
+ * cleanup failure, never thrown.
  */
 export function removeReservation(lockDir: string, owner: Owner, log: RunnerLogSink): ReservationRemoval {
   const path = join(lockDir, reservationFileName(owner))
@@ -6761,19 +6752,19 @@ function readReservationEntry(path: string, owner: Owner): ReservationEntryRead 
 }
 
 /**
- * Reads every reservation in `lockDir` (b.uqm SR-6.2), for T3's sweep and E6's
+ * Reads every reservation in `lockDir`, for sweep and
  * admission readings; it removes nothing and formats no refusal.
  * - Only reservation names are read (`reservationOwnerFromFileName`); every
  *   other entry, `admission.lock` and temporary write names among them, is
  *   ignored.
  * - Each entry carries its owner, read from its file name, and that owner's
- *   liveness (E1's `isOwnerAlive`, b.uqm SR-6.3).
- * - Valid: parsed by E1's `parseReservation`, naming its file name's owner.
+ * liveness ( `isOwnerAlive`).
+ * - Valid: parsed by `parseReservation`, naming its file name's owner.
  *   Bad: not a regular file, unreadable, unparseable, of another version or
  *   shape, or naming another owner, with its reason on one line.
  * - An entry gone by the time it is read is absent, with no error.
  * - A directory that cannot be listed is `{ kind: 'failed', error }`, the
- *   error on one line; E6 turns it into a failed reading, T3 into a cleanup
+ * error on one line; turns it into a failed reading, into a cleanup
  *   failure.
  * Both lists are in file-name order.
  */
@@ -6798,10 +6789,10 @@ export function readReservations(lockDir: string, probe: OwnerLivenessProbe): Re
   return { kind: 'listed', valid, bad }
 }
 
-// --- 9/T3 (E5 T3): the sweep and the image-removal primitives ---
+// --- 9/ : the sweep and the image-removal primitives ---
 //
-// The image-removal primitives (b.uqm SR-9.3), which E8's cleanup reuses, and
-// the sweep of dead runs' leftovers (b.uqm SR-6.4), which E13 calls at step 7
+// The image-removal primitives, which cleanup reuses, and
+// the sweep of dead runs' leftovers, which calls at step 7
 // under the lock.
 //
 // Only two kinds of image removal exist, both held here:
@@ -6847,10 +6838,10 @@ export type RunPrivateTagRemoval =
     }
 
 /**
- * Removes one run-private tag by its name (b.uqm SR-9.3, SR-6.4): the tag
+ * Removes one run-private tag by its name: the tag
  * `cscb-ci-run:<RUN_ID>-<PID>-<role>` built from `tag`'s owner and role,
- * through E1's tag-removal form, never forced. Docker deletes the image with
- * its last tag when no container uses it (b.uqm SR-23.6). A tag Docker does
+ * through tag-removal form, never forced. Docker deletes the image with
+ * its last tag when no container uses it. A tag Docker does
  * not know is absent, not a failure. Any other failure is written to the
  * runner log as `removing image tag <tag> failed: <error>` and returned.
  */
@@ -6885,7 +6876,7 @@ export type OwnerUntaggedImageRemoval =
 
 /**
  * Removes the untagged images carrying exactly the owner label
- * `cscb-ci-owner=<ownerLabelValue>` (b.uqm SR-9.3, SR-6.4); E8 passes its own
+ * `cscb-ci-owner=<ownerLabelValue>`; passes its own
  * owner's `formatOwner` text, the sweep a dead owner's label value as found.
  * - It lists the untagged images with exactly that label first. When the
  *   listing finds none, nothing more is done; when it fails, no prune is
@@ -6945,7 +6936,7 @@ export function ownerLabelledUntaggedImageFilters(): ImageListFilter[] {
 }
 
 /**
- * The sweep's listings (b.uqm SR-6.4), through E1's docker forms and T2's
+ * The sweep's listings, through docker forms and
  * reservation reader: every container with its labels (`--all`), the
  * reservations in `lockDir`, every image carrying a `cscb-ci-run` tag, and
  * every untagged image carrying the owner label. It removes nothing; a failed
@@ -6994,12 +6985,12 @@ export interface SweepPlan {
 }
 
 /**
- * The sweep's selection (b.uqm SR-6.4, SR-6.3): pure but for liveness, read
+ * The sweep's selection: pure but for liveness, read
  * through `probe`. It selects:
  * - `cscb-ci=1` containers whose owner is dead, running or not, a missing or
  *   malformed owner label counting as dead; never a `cscb-live=1` container
  *   nor one without `cscb-ci=1`;
- * - reservations, valid or bad, whose owner is dead, as T2's reader judged it;
+ * - reservations, valid or bad, whose owner is dead, as reader judged it;
  *   files that are not reservations never appear;
  * - tags of exactly the run-private shape whose owner is dead; never a tag of
  *   another shape (`cscb-ci:latest`, `cscb-ci-base:v7`, `cscb-ci-live:v1`,
@@ -7079,8 +7070,8 @@ export type SweptContainerRemoval =
     }
 
 /**
- * Removes one swept container (b.uqm SR-6.4): a running one is killed with
- * SIGKILL first, since E1's removal never forces; the removal is made even
+ * Removes one swept container: a running one is killed with
+ * SIGKILL first, since removal never forces; the removal is made even
  * when the kill failed (the container may have stopped meanwhile). A container
  * Docker no longer knows is absent. A failed removal is written to the runner
  * log as `removing container <name> (<id>) failed: <error>`, with
@@ -7112,11 +7103,11 @@ export interface SweepContext {
 }
 
 /**
- * The sweep of dead runs' leftovers (b.uqm SR-6.4), which E13 runs at step 7,
+ * The sweep of dead runs' leftovers, which runs at step 7,
  * under the lock and before the readings. It lists and selects
  * (`listSweepLeftovers`, `selectSweepLeftovers`), then removes in this order:
  * 1. the selected containers (`removeSweptContainer`);
- * 2. the selected reservation files (T2's `removeReservation`);
+ * 2. the selected reservation files ( `removeReservation`);
  * 3. the selected tags (`removeRunPrivateTag`);
  * 4. for each selected owner-label value, its untagged images
  *    (`removeOwnerUntaggedImages`, with its listing and prune retry).
@@ -7127,7 +7118,7 @@ export interface SweepContext {
  */
 export async function sweepLeftovers(context: SweepContext): Promise<readonly string[]> {
   const { docker, lockDir, probe, clock } = context
-  // T2's remover logs without a guard; this sink makes every log write safe.
+  // remover logs without a guard; this sink makes every log write safe.
   const log: RunnerLogSink = (line) => {
     logCleanupFailure(context.log, line)
   }
@@ -7168,15 +7159,15 @@ export async function sweepLeftovers(context: SweepContext): Promise<readonly st
 }
 
 // ---------------------------------------------------------------------------
-// 10. Admission readings and fit (E6)
+// 10. Admission readings and fit
 // ---------------------------------------------------------------------------
 
-// --- 10/T1 (E6 T1): pod memory, the ceiling, container figures ---
+// --- 10/ : pod memory, the ceiling, container figures ---
 
-/** The runner's copy of `/ci-live`'s working-set stop line, `HOST_WORKING_SET_LIMIT_BYTES` in `ci-live/lib/memory-watchdog.ts`, 40 GiB; never imported (b.uqm SR-6.6, SR-7.1). */
+/** The runner's copy of `/ci-live`'s working-set stop line, `HOST_WORKING_SET_LIMIT_BYTES` in `ci-live/lib/memory-watchdog.ts`, 40 GiB; never imported. */
 export const CI_LIVE_WORKING_SET_LIMIT_BYTES = 40 * GIB_BYTES
 
-/** The cgroup path of the cgroup-namespace root, as `RunnerDeps.readCgroupFile` takes it (b.uqm SR-7.1). */
+/** The cgroup path of the cgroup-namespace root, as `RunnerDeps.readCgroupFile` takes it. */
 const CGROUP_NAMESPACE_ROOT_PATH = '/'
 /** A cgroup's memory limit; `max` when none is set. */
 const CGROUP_MEMORY_MAX_FILE = 'memory.max'
@@ -7210,7 +7201,7 @@ const CGROUP_WHOLE_NUMBER_PATTERN = /^[0-9]+$/
 const GARBLED_TEXT_QUOTE_LENGTH = 40
 
 /**
- * One reading (b.uqm SR-6.5, SR-7.3, SR-10.6): its value, or a failure naming
+ * One reading: its value, or a failure naming
  * what could not be read and why, each on one line.
  */
 export type ReadingResult<T> =
@@ -7226,7 +7217,7 @@ export type ReadingResult<T> =
       readonly error: string
     }
 
-/** The pod's memory (b.uqm SR-7.1): L and W with its parts. */
+/** The pod's memory: L and W with its parts. */
 export interface PodMemory {
   /** L: the namespace root's `memory.max`, in bytes. */
   readonly limitBytes: number
@@ -7234,7 +7225,7 @@ export interface PodMemory {
   readonly workingSet: WorkingSetReading
 }
 
-/** Where the ceiling C comes from (b.uqm SR-6.8, SR-7.1, SR-7.4): the pod limit L, or `/ci-live`'s 40 GiB line while the runs it carries are active. */
+/** Where the ceiling C comes from: the pod limit L, or `/ci-live`'s 40 GiB line while the runs it carries are active. */
 export type CeilingSource =
   | {
       readonly kind: 'pod-limit'
@@ -7247,13 +7238,13 @@ export type CeilingSource =
       readonly runs: readonly CiLiveRunSeen[]
     }
 
-/** The ceiling C in whole bytes, with its source (b.uqm SR-7.1). */
+/** The ceiling C in whole bytes, with its source. */
 export interface MemoryCeiling {
   readonly bytes: number
   readonly source: CeilingSource
 }
 
-/** A container's figures from its own cgroup, each its own reading (b.uqm SR-7.2). */
+/** A container's figures from its own cgroup, each its own reading. */
 export interface ContainerFigures {
   /** `memory.current` minus `inactive_file`, never below 0. */
   readonly memoryBytes: ReadingResult<number>
@@ -7267,9 +7258,9 @@ export interface ContainerFigures {
   readonly oomKillCount: ReadingResult<number>
 }
 
-/** A listed container as admission sees it (b.uqm SR-6.5): its state (name, labels, cap or none) and its current memory. */
+/** A listed container as admission sees it: its state (name, labels, cap or none) and its current memory. */
 export interface ListedContainer extends ContainerState {
-  /** Its memory, `memory.current` minus `inactive_file` (b.uqm SR-7.2). */
+  /** Its memory, `memory.current` minus `inactive_file`. */
   readonly currentMemory: ReadingResult<number>
 }
 
@@ -7319,7 +7310,7 @@ function keyedCgroupNumber(file: ReadingResult<string>, key: string, fileWhat: s
   return readingFailure(what, `${fileWhat} has no ${key} line`)
 }
 
-/** `memory.current` minus `inactive_file`, never below 0 (b.uqm SR-7.1, SR-7.2). */
+  /** `memory.current` minus `inactive_file`, never below 0. */
 function workingSetBytes(current: ReadingResult<number>, stat: ReadingResult<string>, statWhat: string): ReadingResult<number> {
   if (!current.ok) return current
   const inactive = keyedCgroupNumber(stat, STAT_INACTIVE_FILE_KEY, statWhat)
@@ -7333,7 +7324,7 @@ function podFileWhat(fileName: string): string {
 }
 
 /**
- * L: the cgroup-namespace root's `memory.max` in bytes (b.uqm SR-7.1). `max`,
+ * L: the cgroup-namespace root's `memory.max` in bytes. `max`,
  * an empty file or text that is not a whole number is a failed reading. Only
  * the root is read, never a cgroup on the runner's own path.
  */
@@ -7347,7 +7338,7 @@ export function readPodLimit(deps: Pick<RunnerDeps, 'readCgroupFile'>): ReadingR
 }
 
 /**
- * W with its parts, from the cgroup-namespace root (b.uqm SR-7.1): W is
+ * W with its parts, from the cgroup-namespace root: W is
  * `memory.current` minus `inactive_file`, never below 0; its parts are `anon`
  * and `active_file`. The gate also reads shmem and the anon/unevictable LRU
  * counters. Each missing or garbled file or `memory.stat` key is a
@@ -7386,7 +7377,7 @@ export function readPodWorkingSet(deps: Pick<RunnerDeps, 'readCgroupFile'>): Rea
   }
 }
 
-/** L and W with its parts (b.uqm SR-6.5, SR-7.1); the first failed reading, L's first, when any fails. */
+/** L and W with its parts; the first failed reading, L's first, when any fails. */
 export function readPodMemory(deps: Pick<RunnerDeps, 'readCgroupFile'>): ReadingResult<PodMemory> {
   const limit = readPodLimit(deps)
   if (!limit.ok) return limit
@@ -7395,7 +7386,7 @@ export function readPodMemory(deps: Pick<RunnerDeps, 'readCgroupFile'>): Reading
   return { ok: true, value: { limitBytes: limit.value, workingSet: workingSet.value } }
 }
 
-/** W's rest: W minus anon and active page cache, never below 0 (b.uqm SR-7.1). */
+/** W's rest: W minus anon and active page cache, never below 0. */
 export function workingSetRestBytes(reading: WorkingSetReading): number {
   return Math.max(0, reading.bytes - reading.anonBytes - reading.activeFileBytes)
 }
@@ -7421,7 +7412,7 @@ function assertWholeBytes(where: string, bytes: number): void {
 }
 
 /**
- * The ceiling C in whole bytes, with its source (b.uqm SR-7.1): 85% of L
+ * The ceiling C in whole bytes, with its source: 85% of L
  * rounded down; while any `/ci-live` run is active, the lower of that and
  * `/ci-live`'s 40 GiB line. On a tie the source is the pod limit. Throws for
  * an L that is not a whole byte count.
@@ -7437,7 +7428,7 @@ export function memoryCeiling(limitBytes: number, ciLiveRuns: readonly CiLiveRun
 
 /**
  * A whole-byte count in GiB to one decimal place, rounded to the nearest
- * tenth with a tie rounding up, computed exactly (b.uqm SR-7.4): `54.4`, with
+ * tenth with a tie rounding up, computed exactly: `54.4`, with
  * no unit. Throws for a value that is not a whole byte count.
  */
 export function formatGib(bytes: number): string {
@@ -7450,7 +7441,7 @@ export function formatGib(bytes: number): string {
 
 /**
  * A container's cgroup path below the namespace root, found through its main
- * process's cgroup v2 membership line (b.uqm SR-7.2), never built from its ID
+ * process's cgroup v2 membership line, never built from its ID
  * or the cgroup driver's naming. A main PID of 0, a PID that is gone or a
  * missing membership line is a failed reading.
  */
@@ -7478,7 +7469,7 @@ function containerMemoryAt(deps: Pick<RunnerDeps, 'readCgroupFile'>, container: 
 }
 
 /**
- * One container's figures from its own cgroup (b.uqm SR-7.2), found through
+ * One container's figures from its own cgroup, found through
  * its main PID; each figure is its own reading and fails on its own. Never
  * throws: an exited container or a gone process fails every figure.
  */
@@ -7500,7 +7491,7 @@ export function readContainerFigures(deps: Pick<RunnerDeps, 'readCgroupFile' | '
   }
 }
 
-/** One container's current memory alone (b.uqm SR-6.5, SR-7.2): `memory.current` minus `inactive_file` from its own cgroup, never below 0. */
+/** One container's current memory alone: `memory.current` minus `inactive_file` from its own cgroup, never below 0. */
 export function readContainerMemory(deps: Pick<RunnerDeps, 'readCgroupFile' | 'readProcCgroup'>, container: FiguresTarget): ReadingResult<number> {
   const cgroup = locateContainerCgroup(deps, container)
   if (!cgroup.ok) return cgroup
@@ -7508,15 +7499,15 @@ export function readContainerMemory(deps: Pick<RunnerDeps, 'readCgroupFile' | 'r
   return containerMemoryAt(deps, container, cgroup.value, stat)
 }
 
-// --- 10/T2 (E6 T2): the admission readings ---
+// --- 10/ : the admission readings ---
 
-/** The name prefix of every `/ci` container admission reads, `cscb-ci*` (b.uqm SR-6.5). `/ci-live`'s containers are named `cscb-live-*`, so they are not among them. */
+/** The name prefix of every `/ci` container admission reads, `cscb-ci*`. `/ci-live`'s containers are named `cscb-live-*`, so they are not among them. */
 export const CI_CONTAINER_NAME_PREFIX = 'cscb-ci'
 
-/** A failed admission reading's refusal kind (b.uqm SR-6.5): `disk` for the run directory's volume, `memory` for every other reading. */
+/** A failed admission reading's refusal kind: `disk` for the run directory's volume, `memory` for every other reading. */
 export type AdmissionReadingKind = 'disk' | 'memory'
 
-/** An admission reading that failed (b.uqm SR-6.5): its refusal kind, what could not be read and why, each text on one line. */
+/** An admission reading that failed: its refusal kind, what could not be read and why, each text on one line. */
 export interface AdmissionReadingFailure {
   readonly ok: false
   readonly kind: AdmissionReadingKind
@@ -7526,7 +7517,7 @@ export interface AdmissionReadingFailure {
   readonly error: string
 }
 
-/** One admission reading (b.uqm SR-6.5): its value, or a failure that refuses the run. */
+/** One admission reading: its value, or a failure that refuses the run. */
 export type AdmissionReading<T> =
   | {
       readonly ok: true
@@ -7535,21 +7526,20 @@ export type AdmissionReading<T> =
   | AdmissionReadingFailure
 
 /**
- * The reservation reader the readings step takes from its caller (b.uqm
- * SR-6.2, SR-6.5): it lists, parses and classifies the reservations in the
- * lock directory it is given. E13 binds E5's reader; tests pass a constructed
- * listing. E6 itself lists, reads and removes no file there.
+ * The reservation reader the readings step takes from its caller: it lists, parses and classifies the reservations in the
+ * lock directory it is given. binds reader; tests pass a constructed
+ * listing. itself lists, reads and removes no file there.
  */
 export type ReservationReader = (lockDir: string) => ReservationListing
 
 /**
- * The admission readings (b.uqm SR-6.5), every one taken. The `/ci-live`
- * activity (b.uqm SR-6.6) is added beside them when T4 composes the step.
+ * The admission readings, every one taken. The `/ci-live`
+ * activity is added beside them when composes the step.
  */
 export interface AdmissionReadings {
-  /** L: the cgroup-namespace root's `memory.max`, in bytes (b.uqm SR-7.1). */
+  /** L: the cgroup-namespace root's `memory.max`, in bytes. */
   readonly podLimitBytes: number
-  /** W split into anon and active page cache (the rest is `workingSetRestBytes`): the run's "before" reading, which E7 records and the results show (b.uqm SR-6.5). */
+  /** W split into anon and active page cache (the rest is `workingSetRestBytes`): the run's "before" reading, which the memory guard records and the results show. */
   readonly beforeWorkingSet: WorkingSetReading
   /** The volume holding the run directory: mount point, used and available bytes. */
   readonly volume: VolumeReading
@@ -7589,7 +7579,7 @@ function isWholeByteCount(bytes: number): boolean {
 }
 
 /**
- * The volume holding the run directory (b.uqm SR-6.5), through the injected
+ * The volume holding the run directory, through the injected
  * volume read: its mount point, used bytes (size minus free) and available
  * bytes. A failing read, the mount-point lookup included, or figures that are
  * not whole byte counts, is a failed reading of kind `disk`.
@@ -7605,17 +7595,17 @@ export function readRunVolume(deps: Pick<RunnerDeps, 'readVolume'>, runDir: stri
   return { ok: true, value: { mountPoint, usedBytes, availableBytes } }
 }
 
-/** Whether admission reads a container (b.uqm SR-6.5): running, and named `cscb-ci*` or labelled `cscb-ci=1`. */
+/** Whether admission reads a container: running, and named `cscb-ci*` or labelled `cscb-ci=1`. */
 export function isAdmissionContainer(state: ContainerState): boolean {
   if (!state.running) return false
   return state.name.startsWith(CI_CONTAINER_NAME_PREFIX) || state.labels[CI_LABEL] === CI_LABEL_VALUE
 }
 
 /**
- * Every running `cscb-ci*` or `cscb-ci=1` container (b.uqm SR-6.5) of an
- * already-listed set (E1's container list, any state), in its order, each with
+ * Every running `cscb-ci*` or `cscb-ci=1` container of an
+ * already-listed set ( container list, any state), in its order, each with
  * its labels, its cap (a cap of 0 or none set is null) and its current memory
- * from T1's reader. A container whose memory cannot be read is a failed reading
+ * from reader. A container whose memory cannot be read is a failed reading
  * naming the container, the first in list order. Kind `memory`. Lists nothing.
  */
 export function admissionContainersFrom(
@@ -7633,7 +7623,7 @@ export function admissionContainersFrom(
   return { ok: true, value: containers }
 }
 
-/** E1's container list as an admission reading: a failing list is a failed reading, `the container list`, of kind `memory`. */
+/** shared runner helpers's container list as an admission reading: a failing list is a failed reading, `the container list`, of kind `memory`. */
 async function listAdmissionContainerStates(docker: DockerContext): Promise<AdmissionReading<readonly ContainerState[]>> {
   const listed = await listContainers(docker)
   if (!listed.ok) return admissionReadingFailure('memory', 'the container list', listed.error)
@@ -7641,10 +7631,10 @@ async function listAdmissionContainerStates(docker: DockerContext): Promise<Admi
 }
 
 /**
- * The admission containers, listing them itself through E1's container list
+ * The admission containers, listing them itself through container list
  * (one listing): a failing list is a failed reading naming it; otherwise as
  * `admissionContainersFrom`. The readings step lists through
- * `takeAdmissionReadings` instead, which keeps the listing for T4.
+ * `takeAdmissionReadings` instead, which keeps the listing .
  */
 export async function readAdmissionContainers(
   deps: Pick<RunnerDeps, 'readCgroupFile' | 'readProcCgroup'>,
@@ -7656,7 +7646,7 @@ export async function readAdmissionContainers(
 }
 
 /**
- * The reservations as admission takes them (b.uqm SR-6.2, SR-6.5), from the
+ * The reservations as admission takes them, from the
  * caller's reader: every valid one, live and dead owners alike, with its
  * owner's liveness. A bad file whose owner is alive is a failed reading naming
  * the file and the reason, the first in the reader's order; one whose owner is
@@ -7679,7 +7669,7 @@ export function readAdmissionReservations(readReservations: ReservationReader, l
 }
 
 /**
- * A failed reading's refusal (b.uqm SR-5.2, SR-6.5): its kind, the summary
+ * A failed reading's refusal: its kind, the summary
  * `could not read <what>: <error>` on one line and no details, so its first
  * line is `NOT RUN: disk: could not read …` for the volume and
  * `NOT RUN: memory: could not read …` for every other reading.
@@ -7689,24 +7679,24 @@ export function failedReadingRefusal(failure: AdmissionReadingFailure): Refusal 
 }
 
 /**
- * What the readings step answers (b.uqm SR-6.5): the readings, and the one
+ * What the readings step answers: the readings, and the one
  * container listing they were taken from. The listing is not a reading of its
- * own; T4 hands it to `detectCiLiveActivity`, so admission lists the
+ * own; hands it to `detectCiLiveActivity`, so admission lists the
  * containers once and both judge the same snapshot.
  */
 export interface TakenAdmissionReadings {
   readonly readings: AdmissionReadings
-  /** E1's container list as the readings took it: every container, in any state, in listing order. */
+  /** shared runner helpers's container list as the readings took it: every container, in any state, in listing order. */
   readonly containerListing: readonly ContainerState[]
 }
 
 /**
- * The admission readings (b.uqm SR-6.5), taken under the lock after the sweep,
- * in SR-6.5's order: W with its parts and L, the run directory's volume, the
- * containers (E1's container list, listed exactly once), the reservations.
+ * The admission readings, taken under the lock after the sweep,
+ * in the contract order: W with its parts and L, the run directory's volume, the
+ * containers ( container list, listed exactly once), the reservations.
  * The first reading that fails stops the step and is its answer;
  * `failedReadingRefusal` turns it into the run's refusal. On success the
- * listing comes back beside the readings for T4's `/ci-live` detection.
+ * listing comes back beside the readings for `/ci-live` detection.
  */
 export async function takeAdmissionReadings(input: AdmissionReadingsInput): Promise<AdmissionReading<TakenAdmissionReadings>> {
   const pod = admissionReading('memory', readPodMemory(input.deps))
@@ -7734,10 +7724,9 @@ export async function takeAdmissionReadings(input: AdmissionReadingsInput): Prom
   }
 }
 
-// --- 10/T3 (E6 T3): /ci-live detection, the runner's copies, the commitments ---
+// --- 10/ : /ci-live detection, the runner's copies, the commitments ---
 
-// The runner's own copies of `/ci-live`'s rules and figures (b.uqm SR-6.6,
-// SR-21.5), read from `ci-live/lib/*.ts` and never imported (b.uqm SR-1.3).
+// The runner's own copies of `/ci-live`'s rules and figures, read from `ci-live/lib/*.ts` and never imported.
 // The tests pin each copy against `/ci-live`'s exports.
 
 /** `/ci-live`'s directory name in the worktree: a bare `run.ts` is its runner only when started there (`isLiveRunnerPid` in `ci-live/lib/run-lock.ts`). */
@@ -7752,7 +7741,7 @@ export const CI_LIVE_REAL_RUN_LOCK_FILE_NAME = 'run.lock'
 export const CI_LIVE_DRY_RUN_LOCK_PREFIX = 'cscb-ci-live-dry-run-'
 /** The dry-run lock's name after the user ID. */
 export const CI_LIVE_DRY_RUN_LOCK_SUFFIX = '.lock'
-/** The variables Bun's `os.tmpdir()` reads for `/ci-live`'s temp directory, in order: the first set and not empty wins, else `/tmp` (b.uqm SR-6.6). */
+/** The variables Bun's `os.tmpdir()` reads for `/ci-live`'s temp directory, in order: the first set and not empty wins, else `/tmp`. */
 export const CI_LIVE_TEMP_DIR_VARIABLES = ['TMPDIR', 'TMP', 'TEMP'] as const
 /** The label every `/ci-live` container carries, `cscb-live=1` (`CONTAINER_LABEL_KEY` in `ci-live/lib/docker.ts`). */
 export const CI_LIVE_CONTAINER_LABEL = 'cscb-live'
@@ -7764,7 +7753,7 @@ export const CI_LIVE_CONTAINER_PREFIX = 'cscb-live-'
 export const CI_LIVE_CONTAINER_MEMORY_BYTES = 8 * GIB_BYTES
 /** `/ci-live`'s Chrome limit, 4 GiB, as bytes (`CHROME_PSS_LIMIT_BYTES` in `ci-live/lib/memory-watchdog.ts`). */
 export const CI_LIVE_CHROME_LIMIT_BYTES = 4 * GIB_BYTES
-/** What one active `/ci-live` run counts (b.uqm SR-6.6): its container cap, its Chrome limit and the 1 GiB runner allowance, 13 GiB. */
+/** What one active `/ci-live` run counts: its container cap, its Chrome limit and the 1 GiB runner allowance, 13 GiB. */
 export const CI_LIVE_RUN_COMMITMENT_BYTES = CI_LIVE_CONTAINER_MEMORY_BYTES + CI_LIVE_CHROME_LIMIT_BYTES + CI_LIVE_RUNNER_ALLOWANCE_BYTES
 /** The most a `/ci-live` lock read takes, in bytes: a lock holds a PID of at most ten digits and a newline, so a regular file larger than this is a failed reading. The runner's own bound, not a `/ci-live` figure. */
 export const CI_LIVE_LOCK_READ_MAX_BYTES = 64
@@ -7774,19 +7763,19 @@ const CI_LIVE_LOCK_PID_PATTERN = /^(\d{1,10})\s*$/
 /** What follows the prefix in a `/ci-live` container's name: `<run id>-<owner PID>`, or an older runner's bare `<run id>` (`LIVE_NAME_SUFFIX_RE`). */
 const CI_LIVE_CONTAINER_NAME_SUFFIX_PATTERN = /^[0-9a-z]{1,32}(-[1-9][0-9]{0,9})?$/
 
-/** `/ci-live`'s default config directory under the account's home (`defaultConfigDir`). The home comes from the caller (E13 binds E5's account-home lookup). */
+/** `/ci-live`'s default config directory under the account's home (`defaultConfigDir`). The home comes from the caller (the run lifecycle binds reservation management's account-home lookup). */
 export function ciLiveConfigDir(home: string): string {
   return join(home, CI_LIVE_CONFIG_DIR_SUBPATH)
 }
 
-/** The real-run lock, `run.lock` in `.config/cscb-test` under the account's home, whatever `CSCB_LIVE_CONFIG_DIR` holds (b.uqm SR-6.6). */
+/** The real-run lock, `run.lock` in `.config/cscb-test` under the account's home, whatever `CSCB_LIVE_CONFIG_DIR` holds. */
 export function ciLiveRealRunLockPath(home: string): string {
   return join(ciLiveConfigDir(home), CI_LIVE_REAL_RUN_LOCK_FILE_NAME)
 }
 
 /**
  * `/ci-live`'s temp directory as Bun's `os.tmpdir()` finds it, from the
- * runner's injected environment (b.uqm SR-6.6): the first of `TMPDIR`, `TMP`
+ * runner's injected environment: the first of `TMPDIR`, `TMP`
  * and `TEMP` that is set and not empty, else `/tmp`, with one trailing slash
  * dropped from any value but `/`. Not the run directory's rule (`systemTempDir`).
  */
@@ -7828,7 +7817,7 @@ interface CiLiveRunnerPatterns {
   readonly ciLiveCwd: RegExp
 }
 
-/** Built at first use, never at import (b.uqm SR-1.3). */
+/** Built at first use, never at import. */
 let ciLiveRunnerPatternsBuilt: CiLiveRunnerPatterns | null = null
 
 /** A text as a regular-expression source that matches it literally. */
@@ -7904,7 +7893,7 @@ export function isRunningCiLiveContainer(state: ContainerState): boolean {
   return state.running && labelValue(state.labels, CI_LIVE_CONTAINER_LABEL) === CI_LIVE_CONTAINER_LABEL_VALUE
 }
 
-/** A held `/ci-live` lock (b.uqm SR-6.6): its file names a PID that is a live `/ci-live` runner. */
+/** A held `/ci-live` lock: its file names a PID that is a live `/ci-live` runner. */
 export interface CiLiveHeldLock {
   readonly via: 'real-run-lock' | 'dry-run-lock'
   /** The lock file's path. */
@@ -7922,9 +7911,9 @@ export interface CiLiveLoneContainer {
   readonly pid: number | null
 }
 
-/** The `/ci-live` activity (b.uqm SR-6.6). */
+/** The `/ci-live` activity. */
 export interface CiLiveActivity {
-  /** Every active run, as `memoryCeiling` and E7 take them: the held real-run lock, the held dry-run lock, then each lone container in listing order. */
+  /** Every active run, as `memoryCeiling` and the memory guard take them: the held real-run lock, the held dry-run lock, then each lone container in listing order. */
   readonly runs: readonly CiLiveRunSeen[]
   /** Each held lock with its own containers. */
   readonly heldLocks: readonly CiLiveHeldLock[]
@@ -7945,7 +7934,7 @@ function closeQuietly(fd: number): void {
 }
 
 /**
- * A `/ci-live` lock file's text, read so that it cannot hang (b.uqm SR-6.6):
+ * A `/ci-live` lock file's text, read so that it cannot hang:
  * opened read-only and non-blocking (`O_RDONLY | O_NONBLOCK`, never `O_CREAT`
  * or a write mode), `fstat`ed, and read for at most
  * `CI_LIVE_LOCK_READ_MAX_BYTES` bytes; the descriptor is always closed. A
@@ -7982,7 +7971,7 @@ export function readCiLiveLockFile(path: string): FileTextRead {
 }
 
 /**
- * One lock's holder, read-only (b.uqm SR-6.6): the PID its text names when
+ * One lock's holder, read-only: the PID its text names when
  * that is a live `/ci-live` runner, else null. A missing file is not held; a
  * file that exists but cannot be read, or is not a regular file within
  * `CI_LIVE_LOCK_READ_MAX_BYTES`, is a failed reading. The file is only read,
@@ -7998,7 +7987,7 @@ function readCiLiveLockHolder(probe: CiLiveProcProbe, path: string, what: string
 }
 
 /**
- * The active `/ci-live` runs (b.uqm SR-6.6) over an already-listed set of
+ * The active `/ci-live` runs over an already-listed set of
  * containers (any state; only running `cscb-live=1` ones count). Each lock is
  * held when its file names a PID that is a live `/ci-live` runner; each held
  * lock gets its own containers (the `cscb-live=1` containers whose names carry
@@ -8038,8 +8027,8 @@ export function detectCiLiveActivity(deps: CiLiveDetectionDeps, home: string, co
 }
 
 /**
- * The active `/ci-live` runs (b.uqm SR-6.6), listing the containers itself
- * through E1's container list: what E7 calls at every sample. A failing list
+ * The active `/ci-live` runs, listing the containers itself
+ * through container list: what calls at every sample. A failing list
  * is a failed reading, `the container list`; otherwise as `detectCiLiveActivity`.
  */
 export async function readCiLiveActivity(deps: CiLiveDetectionDeps, home: string, docker: DockerContext): Promise<ReadingResult<CiLiveActivity>> {
@@ -8082,10 +8071,10 @@ export interface ContainerCommitment {
   readonly countedBytes: number
 }
 
-/** One counted commitment (b.uqm SR-6.6). */
+/** One counted commitment. */
 export type MemoryCommitment = ReservationCommitment | CiLiveCommitment | ContainerCommitment
 
-/** A running container with no memory cap that blocks every run (b.uqm SR-6.6, SR-6.7); admission removes none, and `/ci` never removes an unlabelled one (a labelled one goes in a later run's sweep once its owner is dead, SR-6.4). */
+/** A running container with no memory cap that blocks every run; admission removes none, and `/ci` never removes an unlabelled one (a labelled one goes in a later run's sweep once its owner is dead). */
 export interface BlockingContainer {
   readonly name: string
   /** Whether it carries `cscb-ci=1` (a labelled one with no live reservation), or is an unlabelled `cscb-ci*` one. */
@@ -8094,7 +8083,7 @@ export interface BlockingContainer {
   readonly owner: Owner | null
 }
 
-/** What admission counts (b.uqm SR-6.6). */
+/** What admission counts. */
 export interface MemoryCommitments {
   /** The sum of every item's counted bytes. */
   readonly totalBytes: number
@@ -8113,8 +8102,8 @@ function isReservationShard(state: ContainerState, reservation: Reservation): bo
 }
 
 /**
- * The memory commitments, the blocking containers and h (b.uqm SR-6.6), from
- * the listed containers (T1's shape; only running ones count), the valid
+ * The memory commitments, the blocking containers and h, from
+ * the listed containers ( shape; only running ones count), the valid
  * reservations with their owners' liveness, and the `/ci-live` activity:
  *
  * - each live reservation: its memory minus the current memory of its owner's
@@ -8127,7 +8116,7 @@ function isReservationShard(state: ContainerState, reservation: Reservation): bo
  * - each running `cscb-ci*` container without `cscb-ci=1`: its cap.
  *
  * A container counted at its cap that has none (null or 0) blocks every run
- * instead: the unlabelled ones as SR-6.6 states, and, as the safe reading, a
+ * instead: the unlabelled ones as states, and, as the safe reading, a
  * labelled one with no live reservation too. h sums the live reservations' CPUs.
  *
  * Precondition: call it before this run's own reservation exists (before
@@ -8185,36 +8174,36 @@ export function memoryCommitments(
   }
 }
 
-// --- 10/T4 (E6 T4): the readings step, the fits, choosing N, the shard-count line ---
+// --- 10/ : the readings step, the fits, choosing N, the shard-count line ---
 
 /** A percentage's whole: the disk fit compares `× 100` against the disk line's percent, in integers. */
 const PERCENT_WHOLE = 100
-/** The shard-count line's opening word (b.uqm SR-6.7): `shards: <n> of <r>`. */
+/** The shard-count line's opening word: `shards: <n> of <r>`. */
 const SHARD_COUNT_LINE_PREFIX = 'shards: '
-/** Separates the shard-count line's reasons (b.uqm SR-6.7). */
+/** Separates the shard-count line's reasons. */
 const SHARD_COUNT_REASON_SEPARATOR = ', '
-/** The shard-count line's reason for a run that ended before admission chose its N (b.uqm SR-6.7); also its `results.json` `shardCount.reasons` entry. */
+/** The shard-count line's reason for a run that ended before admission chose its N; also its `results.json` `shardCount.reasons` entry. */
 export const ENDED_BEFORE_ADMISSION_REASON = 'ended before admission'
 
-/** The admission readings with the `/ci-live` activity added (b.uqm SR-6.5): every SR-6.5 item, W being the run's "before" reading. */
+/** The admission readings with the `/ci-live` activity added: every item, W being the run's "before" reading. */
 export interface FullAdmissionReadings extends AdmissionReadings {
-  /** The active `/ci-live` runs, with the held locks and the lone containers (b.uqm SR-6.6). */
+  /** The active `/ci-live` runs, with the held locks and the lone containers. */
   readonly ciLive: CiLiveActivity
 }
 
-/** What the readings step answers (b.uqm SR-5.3 step 8): every reading, C with its source, and what admission counts. */
+/** What the readings step answers (step 8): every reading, C with its source, and what admission counts. */
 export interface AdmissionFigures {
   readonly readings: FullAdmissionReadings
-  /** C, 85% of L or `/ci-live`'s 40 GiB line, with its source (b.uqm SR-7.1). */
+  /** C, 85% of L or `/ci-live`'s 40 GiB line, with its source. */
   readonly ceiling: MemoryCeiling
-  /** The memory commitments, the blocking containers and h (b.uqm SR-6.6). */
+  /** The memory commitments, the blocking containers and h. */
   readonly commitments: MemoryCommitments
 }
 
 /**
- * What the readings step reads through: T2's input, plus the `/ci-live`
+ * What the readings step reads through: input, plus the `/ci-live`
  * detector's reads (environment, user ID, `/proc`) and the account's home for
- * the real-run lock, which the caller gives (E13 binds E5's account-home lookup).
+ * the real-run lock, which the caller gives ( binds account-home lookup).
  */
 export interface AdmissionStepInput extends AdmissionReadingsInput {
   readonly deps: AdmissionReadingsInput['deps'] & CiLiveDetectionDeps
@@ -8223,8 +8212,8 @@ export interface AdmissionStepInput extends AdmissionReadingsInput {
 }
 
 /**
- * The admission readings step (b.uqm SR-5.3 step 8, SR-6.5), taken under the
- * lock after the sweep, in SR-6.5's order: W with its parts and L, the run
+ * The admission readings step (step 8), taken under the
+ * lock after the sweep, in the contract order: W with its parts and L, the run
  * directory's volume, the containers (listed once), the reservations through
  * the caller's reader, then the `/ci-live` activity, judged over that same
  * container listing. The first reading that fails stops the step and is its
@@ -8249,38 +8238,38 @@ export async function takeFullAdmissionReadings(input: AdmissionStepInput): Prom
   }
 }
 
-/** A limit admission judges (b.uqm SR-6.7, SR-6.8), named as its refusal kind. */
+/** A limit admission judges, named as its refusal kind. */
 export type AdmissionLimit = Exclude<RefusalKind, null>
 
-/** A limit that depends on N: the memory and CPU fits (b.uqm SR-6.7). */
+/** A limit that depends on N: the memory and CPU fits. */
 export type ShardFitLimit = Extract<AdmissionLimit, 'memory' | 'cpu'>
 
-/** The limits in the order a refusal gives them (b.uqm SR-6.8): memory, disk, CPU. */
+/** The limits in the order a refusal gives them: memory, disk, CPU. */
 const ADMISSION_LIMIT_ORDER: readonly AdmissionLimit[] = ['memory', 'disk', 'cpu']
 
-/** What the run asks of admission (b.uqm SR-3.4, SR-6.7), from E2's validation (`ValidatedRun`) and E1's arguments. */
+/** What the run asks of admission, from validation's validation (`ValidatedRun`) and shared runner helpers's arguments. */
 export interface AdmissionRequest {
   readonly minimumShards?: number
   readonly extraMemoryBytes?: number
-  /** r: the `--shards` value, or `MAX_SHARDS` when it is not given (E2's `ValidatedRun.requestedShards`). */
+  /** r: the `--shards` value, or `MAX_SHARDS` when it is not given (validation's `ValidatedRun.requestedShards`). */
   readonly requestedShards: number
-  /** u: the count of the run's scheduling units (E2, b.uqm SR-3.4: `ValidatedRun.units.length`). */
+  /** u: the count of the run's scheduling units (validation, `ValidatedRun.units.length`). */
   readonly units: number
-  /** The effective N (E2, b.uqm SR-3.4): the smaller of r and u, at least 1. */
+  /** The effective N (validation): the smaller of r and u, at least 1. */
   readonly effectiveShards: number
   /** Neither `--shards` nor `--inject` was given (`canChooseShards`): the run takes the largest N that fits. */
   readonly canChooseShards: boolean
-  /** The per-shard memory cap, E1's `SHARD_MEMORY_CAP_BYTES`, passed in. */
+  /** The per-shard memory cap, shared runner helpers's `SHARD_MEMORY_CAP_BYTES`, passed in. */
   readonly capBytes: number
 }
 
-/** Whether admission may choose the run's N (b.uqm SR-6.7): neither `--shards` nor `--inject` was given. Choosing changes neither its run kind nor its gate eligibility. */
+/** Whether admission may choose the run's N: neither `--shards` nor `--inject` was given. Choosing changes neither its run kind nor its gate eligibility. */
 export function canChooseShards(invocation: Invocation): boolean {
   return invocation.shards === null && !isInjectedRun(invocation)
 }
 
 /**
- * f (b.uqm SR-6.7, corrected by b.rmn): C − non-reclaimable memory − the memory commitments − the 1 GiB admission
+ * f (corrected by): C − non-reclaimable memory − the memory commitments − the 1 GiB admission
  * margin, never below 0, the memory left for shards. Blocking containers count
  * nothing here; they fail the memory fit on their own.
  */
@@ -8290,7 +8279,7 @@ export function freeShardMemoryBytes(figures: AdmissionFigures): number {
 }
 
 /**
- * The memory fit at N shards (b.uqm SR-6.7, corrected by b.rmn): non-reclaimable memory + the commitments + N × the cap
+ * The memory fit at N shards (corrected by): non-reclaimable memory + the commitments + N × the cap
  * + the 1 GiB admission margin ≤ C, compared in whole bytes. Any blocking
  * container fails it whatever the readings.
  */
@@ -8301,7 +8290,7 @@ export function memoryFits(figures: AdmissionFigures, shards: number, capBytes: 
 }
 
 /**
- * The disk fit (b.uqm SR-6.7): (used + the 1 GiB allowance) ÷ (used +
+ * The disk fit: (used + the 1 GiB allowance) ÷ (used +
  * available) < the 85% disk line, compared in integers as (used + allowance)
  * × 100 < 85 × (used + available). A volume with no bytes fails it.
  */
@@ -8311,7 +8300,7 @@ export function diskFits(volume: VolumeReading): boolean {
   return (used + BigInt(DISK_CHECK_ALLOWANCE_BYTES)) * BigInt(PERCENT_WHOLE) < BigInt(DISK_LINE_PERCENT) * whole
 }
 
-/** The CPU fit at N shards (b.uqm SR-6.6, SR-6.7): h + 2 × N ≤ the 12 CI CPUs. */
+/** The CPU fit at N shards: h + 2 × N ≤ the 12 CI CPUs. */
 export function cpuFits(reservedCpus: number, shards: number): boolean {
   return reservedCpus + CPUS_PER_SHARD * shards <= CI_CPUS
 }
@@ -8334,7 +8323,7 @@ function largestFittingShards(figures: AdmissionFigures, fromShards: number, cap
 
 /**
  * Throws unless the request holds whole numbers: an effective N of at least 1,
- * at most r and at most the larger of 1 and u (b.uqm SR-3.4), and a positive cap.
+ * at most r and at most the larger of 1 and u, and a positive cap.
  */
 function assertAdmissionRequest(request: AdmissionRequest): void {
   for (const [name, value] of [['requestedShards', request.requestedShards], ['units', request.units], ['effectiveShards', request.effectiveShards], ['capBytes', request.capBytes]] as const) {
@@ -8349,7 +8338,7 @@ function assertAdmissionRequest(request: AdmissionRequest): void {
   if (request.capBytes === 0) throw new Error('decideAdmission: capBytes is 0')
 }
 
-/** The figures every decision carries, admitted or refused (b.uqm SR-6.7, SR-6.8). */
+/** The figures every decision carries, admitted or refused. */
 export interface AdmissionDecisionFigures {
   readonly request: AdmissionRequest
   /** The readings, C with its source, and the commitments. */
@@ -8364,10 +8353,10 @@ export interface AdmissionDecisionFigures {
   readonly diskFits: boolean
 }
 
-/** One reason the shard-count line may give (b.uqm SR-6.7): the scheduling units, memory, CPU. */
+/** One reason the shard-count line may give: the scheduling units, memory, CPU. */
 export type ShardCountReason = 'units' | ShardFitLimit
 
-/** What the shard-count line is built from (b.uqm SR-6.7): n, r, u, the reasons that applied, f, C and h. */
+/** What the shard-count line is built from: n, r, u, the reasons that applied, f, C and h. */
 export interface ShardCountLineInput {
   /** n: the shards admission chose. */
   readonly shards: number
@@ -8385,7 +8374,7 @@ export interface ShardCountLineInput {
   readonly reservedCpus: number
 }
 
-/** An admitted run (b.uqm SR-6.7): its N and the shard-count line's data. */
+/** An admitted run: its N and the shard-count line's data. */
 export interface AdmittedDecision {
   readonly kind: 'admitted'
   /** N: the shards admission chose. */
@@ -8397,7 +8386,7 @@ export interface AdmittedDecision {
   readonly figures: AdmissionDecisionFigures
 }
 
-/** A refused run (b.uqm SR-6.7, SR-6.8): the limits that failed, at the N it was judged at. */
+/** A refused run: the limits that failed, at the N it was judged at. */
 export interface RefusedDecision {
   readonly kind: 'refused'
   /** The N the memory and CPU fits were judged at: 1 for a run that can choose its N, else the effective N. */
@@ -8405,24 +8394,23 @@ export interface RefusedDecision {
   /** Each limit that failed, in the order memory, disk, CPU: disk when its fit failed, memory and CPU when they fail at the judged N. Never empty. */
   readonly failedLimits: readonly AdmissionLimit[]
   readonly figures: AdmissionDecisionFigures
-  /** The refusal record (T5, b.uqm SR-6.8): `failedLimits`' first gives the kind and summary, each other follows in the details. E13 records it last. */
+  /** The refusal record (T5): `failedLimits`' first gives the kind and summary, each other follows in the details. the run lifecycle records it last. */
   readonly refusal: Refusal
 }
 
-/** Admission's decision (b.uqm SR-5.3 step 9, SR-6.7). */
+/** Admission's decision (step 9). */
 export type AdmissionDecision = AdmittedDecision | RefusedDecision
 
 /**
- * The disk check, then the memory and CPU fits, choosing N (b.uqm SR-5.3
- * step 9, SR-6.7). A run that can choose takes the largest N, from the
+ * The disk check, then the memory and CPU fits, choosing N (
+ * step 9). A run that can choose takes the largest N, from the
  * effective N down to 1, that passes both fits; any other takes exactly the
  * effective N. The run is refused when the disk fit fails or when no N it may
  * take passes both fits; the refusal names each failed limit (memory and CPU
  * judged at 1 for a run that can choose, else at the effective N). Every
  * decision carries f, h, the largest `--shards` value that fits now, and the
- * readings. A refused decision also carries its refusal record (T5,
- * `admissionRefusal`); `listResultsDirs` is called only when the disk fit
- * failed, for the disk message's listing (E13 passes
+ * readings. A refused decision also carries its refusal record ( * `admissionRefusal`); `listResultsDirs` is called only when the disk fit
+ * failed, for the disk message's listing ( passes
  * `() => listResultsDirectories(deps.env)`). Pure apart from that call;
  * throws only for a malformed request.
  */
@@ -8466,7 +8454,7 @@ export function decideAdmission(admission: AdmissionFigures, request: AdmissionR
 }
 
 /**
- * The shard-count line's reason texts (b.uqm SR-6.7), in their fixed order:
+ * The shard-count line's reason texts, in their fixed order:
  * `<u> scheduling unit(s)`, `memory: <f> GiB free under the <C> GiB ceiling`,
  * `cpu: <h> of 12 CI CPUs in use`, each given when it applied; none when n is
  * not below r. GiB figures to one decimal place (`formatGib`). What
@@ -8483,9 +8471,9 @@ export function shardCountReasonTexts(input: ShardCountLineInput): string[] {
 }
 
 /**
- * The shard-count line (b.uqm SR-6.7): `shards: <n> of <r>`, followed by
+ * The shard-count line: `shards: <n> of <r>`, followed by
  * ` (<reasons>)` when n is below r, the reasons separated by a comma and a
- * space in the order units, memory, CPU. E10 and E13 place it.
+ * space in the order units, memory, CPU. and place it.
  */
 export function formatShardCountLine(input: ShardCountLineInput): string {
   const head = `${SHARD_COUNT_LINE_PREFIX}${input.shards} of ${input.requestedShards}`
@@ -8493,30 +8481,30 @@ export function formatShardCountLine(input: ShardCountLineInput): string {
   return reasons.length === 0 ? head : `${head} (${reasons.join(SHARD_COUNT_REASON_SEPARATOR)})`
 }
 
-/** The shard-count line of a run that ended before admission chose its N, whatever its arguments (b.uqm SR-6.7): `shards: 0 of <r> (ended before admission)`. */
+/** The shard-count line of a run that ended before admission chose its N, whatever its arguments: `shards: 0 of <r> (ended before admission)`. */
 export function endedBeforeAdmissionShardCountLine(requestedShards: number): string {
   return `${SHARD_COUNT_LINE_PREFIX}0 of ${requestedShards} (${ENDED_BEFORE_ADMISSION_REASON})`
 }
 
-// --- 10/T5 (E6 T5): refusal messages ---
+// --- 10/ : refusal messages ---
 
-/** The memory refusal's advice, its last detail line (b.uqm SR-6.8, corrected by b.rmn). */
+/** The memory refusal's advice, its last detail line (corrected by). */
 export const MEMORY_REFUSAL_ADVICE = 'what to do: finish or kill idle agent-director workers and confirm their tmux sessions are gone; stop the other CI runs or builds listed; then re-run /ci. A re-run is worthwhile once the printed pod non-reclaimable memory used by gate leaves room under the ceiling for the listed commitments, shard caps and admission margin. Reclaimable page cache is excluded from this gate.'
-/** The disk refusal's advice (b.uqm SR-6.8). */
+/** The disk refusal's advice. */
 export const DISK_REFUSAL_ADVICE = 'what to do: remove results directories and other large files that are not needed on that volume, then re-run.'
-/** The disk refusal's last detail line: Docker's storage, which the disk check does not count (b.uqm SR-6.8, SR-19.9). */
+/** The disk refusal's last detail line: Docker's storage, which the disk check does not count. */
 export const DOCKER_STORAGE_NOTE = "Docker's images live on /var/lib/docker, which this check does not count."
-/** The CPU refusal's advice, its last detail line (b.uqm SR-6.8). */
+/** The CPU refusal's advice, its last detail line. */
 export const CPU_REFUSAL_ADVICE = 'what to do: wait for or cancel a listed run (signal its runner PID), or re-run with a --shards value that fits.'
-/** The pod-limit ceiling's source, after `85% of the <L> GiB pod limit, ` (b.uqm SR-6.8). */
+/** The pod-limit ceiling's source, after `85% of the <L> GiB pod limit, `. */
 export const POD_LIMIT_CEILING_SOURCE_TEXT = "the sysadmin monitor's warn line"
-/** The `/ci-live` ceiling's source, after `40.0 GiB, ` (b.uqm SR-6.8). */
+/** The `/ci-live` ceiling's source, after `40.0 GiB, `. */
 export const CI_LIVE_CEILING_SOURCE_TEXT = "/ci-live's working-set stop line"
-/** The memory and CPU refusals' detail line when some `--shards` value fits now; the value follows (b.uqm SR-6.7, SR-6.8). */
+/** The memory and CPU refusals' detail line when some `--shards` value fits now; the value follows. */
 export const LARGEST_FITTING_SHARDS_PREFIX = 'largest --shards value that fits now: '
-/** The memory and CPU refusals' detail line when no `--shards` value fits now (b.uqm SR-6.8). */
+/** The memory and CPU refusals' detail line when no `--shards` value fits now. */
 export const NO_FITTING_SHARDS_TEXT = 'no --shards value fits now, not even 1'
-/** A legacy results directory's name, `cscb-ci-<digits>-<six letters or digits>`, as the skill of 946be79 made it with `mktemp -d -t cscb-ci-${RUN_ID}-XXXXXX` (b.uqm SR-6.8). */
+/** A legacy results directory's name, `cscb-ci-<digits>-<six letters or digits>`, as the skill of 946be79 made it with `mktemp -d -t cscb-ci-${RUN_ID}-XXXXXX`. */
 export const LEGACY_RESULTS_DIR_PATTERN = /^cscb-ci-[0-9]+-[A-Za-z0-9]{6}$/
 
 /** `cscb-ci*`, the container names admission reads, as the messages write them. */
@@ -8524,25 +8512,25 @@ const CI_CONTAINER_NAME_GLOB = `${CI_CONTAINER_NAME_PREFIX}*`
 /** `cscb-ci=1`, as the messages write it. */
 const CI_LABEL_TEXT = `${CI_LABEL}=${CI_LABEL_VALUE}`
 
-/** A blocking container's detail line opens with this, then `: container <name>, ` (b.uqm SR-6.8). */
+/** A blocking container's detail line opens with this, then `: container <name>, `. */
 export const BLOCKING_EVERY_RUN_TEXT = 'blocking every run'
-/** What an unlabelled blocking container is, in its detail line: `an uncapped cscb-ci* container` (b.uqm SR-6.6, SR-6.8). */
+/** What an unlabelled blocking container is, in its detail line: `an uncapped cscb-ci* container`. */
 export const UNCAPPED_CI_CONTAINER_TEXT = `an uncapped ${CI_CONTAINER_NAME_GLOB} container`
-/** A labelled container with no live reservation, after `labelled cscb-ci=1 ` in the blocking and counted-container lines (b.uqm SR-6.6). */
+/** A labelled container with no live reservation, after `labelled cscb-ci=1 ` in the blocking and counted-container lines. */
 export const NO_LIVE_RESERVATION_TEXT = 'with no live reservation'
-/** What a labelled blocking container is, in its detail line, before ` (owner <RUN_ID>-<PID>)`: `an uncapped container labelled cscb-ci=1 with no live reservation`, with no `cscb-ci*` glob (b.uqm SR-6.6, SR-6.8). */
+/** What a labelled blocking container is, in its detail line, before ` (owner <RUN_ID>-<PID>)`: `an uncapped container labelled cscb-ci=1 with no live reservation`, with no `cscb-ci*` glob. */
 export const UNCAPPED_LABELLED_CONTAINER_TEXT = `an uncapped container labelled ${CI_LABEL_TEXT} ${NO_LIVE_RESERVATION_TEXT}`
-/** A labelled container's owner text, inside the parentheses, when its owner label is missing or malformed (b.uqm SR-6.3). */
+/** A labelled container's owner text, inside the parentheses, when its owner label is missing or malformed. */
 export const NO_VALID_OWNER_LABEL_TEXT = 'no valid owner label'
-/** An unlabelled blocking container's detail line ends with this, after `; ` (b.uqm SR-6.6): `/ci` never removes it. */
+/** An unlabelled blocking container's detail line ends with this, after `; `: `/ci` never removes it. */
 export const CI_NEVER_REMOVES_TEXT = '/ci never removes it'
-/** A labelled blocking container's detail line ends with this, after `; `: the sweep removes a labelled container once its owner is dead (b.uqm SR-6.4). */
+/** A labelled blocking container's detail line ends with this, after `; `: the sweep removes a labelled container once its owner is dead. */
 export const CI_SWEEP_REMOVES_TEXT = "a later /ci run's sweep removes it once its owner is dead"
-/** The memory refusal's commitments line when nothing is counted, after `counted commitments: 0.0 GiB, ` (b.uqm SR-6.8). */
+/** The memory refusal's commitments line when nothing is counted, after `counted commitments: 0.0 GiB, `. */
 export const NOTHING_ELSE_COUNTED_TEXT = 'nothing else is counted'
-/** The CPU refusal's detail line when no other live `/ci` run holds CPUs (b.uqm SR-6.8). */
+/** The CPU refusal's detail line when no other live `/ci` run holds CPUs. */
 export const NO_OTHER_CI_RUN_HOLDS_CPUS_TEXT = 'no other /ci run holds CPUs'
-/** The disk refusal's detail line when the temp directory holds no results directory; the temp directory follows after a space (b.uqm SR-6.8). */
+/** The disk refusal's detail line when the temp directory holds no results directory; the temp directory follows after a space. */
 export const NO_RESULTS_DIRECTORIES_TEXT = 'no /ci results directories in'
 /** The disk refusal's detail line when the temp directory could not be listed: `the /ci results directories in <dir> could not be listed: <error>`. */
 export const RESULTS_LISTING_FAILED_TEXT = 'could not be listed'
@@ -8551,10 +8539,10 @@ export const PART_UNREADABLE_TEXT = 'part of it could not be read'
 /** The temp directory of a listing whose lister threw, so the directory it read is not known. */
 export const UNKNOWN_TEMP_DIR_TEXT = '(unknown)'
 
-/** A results directory's name shape (b.uqm SR-6.8): `new` is `cscb-ci-<RUN_ID>` (SR-5.1), `legacy` the 946be79 skill's. */
+/** A results directory's name shape: `new` is `cscb-ci-<RUN_ID>`, `legacy` the 946be79 skill's. */
 export type ResultsDirectoryStyle = 'new' | 'legacy'
 
-/** One `/ci` results directory in the system temp directory, a real directory and not a link (b.uqm SR-6.8). */
+/** One `/ci` results directory in the system temp directory, a real directory and not a link. */
 export interface ResultsDirectory {
   readonly name: string
   /** The temp directory and its name joined with one `/`, never normalized. */
@@ -8583,14 +8571,14 @@ export type ResultsDirectoryListing =
 /** What the decision calls, only when the disk fit failed, for the disk message's listing. */
 export type ResultsDirectoryLister = () => ResultsDirectoryListing
 
-/** One failed limit's part of an admission refusal (b.uqm SR-6.8): its kind, its summary (after `<kind>: `) and its detail lines. */
+/** One failed limit's part of an admission refusal: its kind, its summary (after `<kind>: `) and its detail lines. */
 export interface AdmissionRefusalPart {
   readonly kind: AdmissionLimit
   readonly summary: string
   readonly details: readonly string[]
 }
 
-/** A name's results-directory shape: `new` for `cscb-ci-<RUN_ID>`, `legacy` for `cscb-ci-<digits>-<six letters or digits>`, null for any other name (b.uqm SR-6.8). */
+/** A name's results-directory shape: `new` for `cscb-ci-<RUN_ID>`, `legacy` for `cscb-ci-<digits>-<six letters or digits>`, null for any other name. */
 export function resultsDirectoryStyle(name: string): ResultsDirectoryStyle | null {
   if (!name.startsWith(RUN_DIR_PREFIX)) return null
   if (isRunId(name.slice(RUN_DIR_PREFIX.length))) return 'new'
@@ -8648,7 +8636,7 @@ function compareResultsDirectories(a: ResultsDirectory, b: ResultsDirectory): nu
 
 /**
  * The `/ci` results directories kept in the system temp directory
- * (`systemTempDir(env)`, b.uqm SR-5.1, SR-6.8), largest first: every entry
+ * (`systemTempDir(env)`), largest first: every entry
  * named `cscb-ci-<RUN_ID>` or `cscb-ci-<digits>-<six letters or digits>` that
  * `lstat` finds to be a directory, so a link or a file of such a name is left
  * out, each with its size (`sizeDirectoryTree`). Each entry's path is the temp
@@ -8687,7 +8675,7 @@ export function listResultsDirectories(env: Readonly<Record<string, string | und
 
 /**
  * A share as a percentage to one decimal place, rounded to the nearest tenth
- * with a tie rounding up, computed exactly (b.uqm SR-6.8): `84.9`, with no
+ * with a tie rounding up, computed exactly: `84.9`, with no
  * `%`. A whole of 0 bytes reads `100.0`: a volume with no room is full.
  */
 export function formatPercent(partBytes: number, wholeBytes: number): string {
@@ -8700,12 +8688,12 @@ export function formatPercent(partBytes: number, wholeBytes: number): string {
   return `${tenths / BigInt(10)}.${tenths % BigInt(10)}`
 }
 
-/** The memory and CPU refusals' largest-value line (b.uqm SR-6.8): `largest --shards value that fits now: 5`, or that none does. */
+/** The memory and CPU refusals' largest-value line: `largest --shards value that fits now: 5`, or that none does. */
 export function largestFittingShardsText(largest: number | null): string {
   return largest === null ? NO_FITTING_SHARDS_TEXT : `${LARGEST_FITTING_SHARDS_PREFIX}${largest}`
 }
 
-/** An active `/ci-live` run named by what showed it and its PID (b.uqm SR-6.8): `the real-run lock <path>, PID 4242`. */
+/** An active `/ci-live` run named by what showed it and its PID: `the real-run lock <path>, PID 4242`. */
 export function ciLiveRunText(run: CiLiveRunSeen): string {
   const what = shownArgument(run.what)
   const shown = run.via === 'real-run-lock' ? `the real-run lock ${what}` : run.via === 'dry-run-lock' ? `the dry-run lock ${what}` : `the container ${what}`
@@ -8713,7 +8701,7 @@ export function ciLiveRunText(run: CiLiveRunSeen): string {
 }
 
 /**
- * The ceiling and its source (b.uqm SR-6.8): `ceiling: 54.4 GiB, 85% of the
+ * The ceiling and its source: `ceiling: 54.4 GiB, 85% of the
  * 64.0 GiB pod limit, the sysadmin monitor's warn line`, or `ceiling: 40.0
  * GiB, /ci-live's working-set stop line, while a /ci-live run is active: `
  * and each active run (`ciLiveRunText`), separated by `; `.
@@ -8733,7 +8721,7 @@ function labelledOwnerText(owner: Owner | null): string {
   return owner === null ? NO_VALID_OWNER_LABEL_TEXT : `owner ${formatOwner(owner)}`
 }
 
-/** One counted commitment's detail line, with its counted GiB (b.uqm SR-6.6, SR-6.8). */
+/** One counted commitment's detail line, with its counted GiB. */
 function commitmentText(item: MemoryCommitment): string {
   const counted = `${formatGib(item.countedBytes)} GiB`
   switch (item.kind) {
@@ -8753,11 +8741,11 @@ function commitmentText(item: MemoryCommitment): string {
 }
 
 /**
- * A blocking container's detail line (b.uqm SR-6.6, SR-6.8), blocking every
+ * A blocking container's detail line, blocking every
  * run: an unlabelled one as an uncapped `cscb-ci*` container `/ci` never
  * removes; a labelled one as an uncapped `cscb-ci=1` container with no live
  * reservation, its owner from its owner label, that a later run's sweep
- * removes once that owner is dead (SR-6.4).
+ * removes once that owner is dead.
  */
 function blockingText(container: BlockingContainer): string {
   const head = `${BLOCKING_EVERY_RUN_TEXT}: container ${shownArgument(container.name)}`
@@ -8766,7 +8754,7 @@ function blockingText(container: BlockingContainer): string {
 }
 
 /**
- * The memory refusal (b.uqm SR-6.8): `<n> shard(s) need <x> GiB; <f> GiB fits
+ * The memory refusal: `<n> shard(s) need <x> GiB; <f> GiB fits
  * under the <C> GiB ceiling`, n being the judged N and x n × the cap; then the
  * ceiling and its source, the non-reclaimable memory used by the gate, and
  * diagnostic W split into anon, active page cache and the rest,
@@ -8814,7 +8802,7 @@ function resultsListingTexts(listing: ResultsDirectoryListing): string[] {
 }
 
 /**
- * The disk refusal (b.uqm SR-6.8): `<volume> is <p>% used; this run's 1 GiB
+ * The disk refusal: `<volume> is <p>% used; this run's 1 GiB
  * would take it to <q>%, at or over /ci's 85% disk line`, p being used ÷
  * (used + available) and q (used + 1 GiB) ÷ (used + available); then the
  * volume's used and total GiB, the results directories, largest first, the
@@ -8838,7 +8826,7 @@ export function diskRefusalPart(volume: VolumeReading, listing: ResultsDirectory
 }
 
 /**
- * The CPU refusal (b.uqm SR-6.8): `<n> shard(s) need <c> CPUs; active /ci
+ * The CPU refusal: `<n> shard(s) need <c> CPUs; active /ci
  * runs hold <h> of the 12 CI CPUs`, c being 2 × n; then each active run
  * (RUN_ID, runner PID, shards, CPUs, full or selective), the largest
  * `--shards` value that fits now (or that none does), and the advice.
@@ -8866,7 +8854,7 @@ function listResultsDirectoriesSafely(listResultsDirs: ResultsDirectoryLister): 
 }
 
 /**
- * The admission refusal record (b.uqm SR-5.8, SR-6.8) from the failed limits,
+ * The admission refusal record from the failed limits,
  * in the order memory, disk, CPU: the first gives the kind and summary and its
  * details; each other follows in the details as `<kind>: <summary>`, then its
  * own details. memory and CPU are judged at `judgedShards`. `listResultsDirs`
@@ -8890,23 +8878,23 @@ export function admissionRefusal(
 }
 
 // ---------------------------------------------------------------------------
-// 11. Memory guard (E7)
+// 11. Memory guard
 // ---------------------------------------------------------------------------
 
-// --- 11/T1 (E7 T1): the 30 s sampler, failed readings and the stop line ---
+// --- 11/ : the 30 s sampler, failed readings and the stop line ---
 //
-// The memory watchdog (b.uqm SR-7.3, SR-7.4). E13 creates it at run step 10
+// The memory watchdog. creates it at run step 10
 // with admission's "before" W, L and the ceiling with its source, and calls
 // `start`. Every `SAMPLE_INTERVAL_MS` it asks `runningShards` which shards
 // run (none during the build), takes one `Sample` and hands it to `onSample`;
 // the first sample whose non-reclaimable memory reaches the stop line decides
-// the run-level stop, handed once to `onStop` with its exact line. E13 performs that stop
+// the run-level stop, handed once to `onStop` with its exact line. performs that stop
 // and calls `stop` at end-of-run step 4, which takes the after-cleanup W
 // reading and answers W before, at its peak and after cleanup with the
 // failed-reading counts. Every read goes through the injected dependencies
-// and E1's docker layer, and nothing is read before `start` or after `stop`.
+// and docker layer, and nothing is read before `start` or after `stop`.
 //
-// Failed readings, by the rule fixed for E7: each value b.uqm SR-7.3 lists
+// Failed readings, by the rule fixed for : each value lists
 // that a sample cannot read is one failed reading. The run-level values are W
 // (with its parts) and the `/ci-live` re-check; each running shard's are its
 // memory, anon, page cache, PID count, `State.OOMKilled`, kill count and
@@ -8917,7 +8905,7 @@ export function admissionRefusal(
 // failed `/ci-live` re-check carries C and its source from the previous
 // sample (at the first, from admission).
 
-/** What each value a sample reads is called in its failed-reading record (`FailedReading.what`) (b.uqm SR-7.3). */
+/** What each value a sample reads is called in its failed-reading record (`FailedReading.what`). */
 export const SAMPLE_READING_NAMES = {
   workingSet: 'working set',
   workingSetAfterCleanup: 'working set after cleanup',
@@ -8931,16 +8919,16 @@ export const SAMPLE_READING_NAMES = {
   resultFile: 'result file',
 } as const
 
-/** The per-shard detail of a watchdog line when no shard runs, as during the build (b.uqm SR-7.4). */
+/** The per-shard detail of a watchdog line when no shard runs, as during the build. */
 export const NO_SHARDS_RUNNING_TEXT = 'no shards running'
 
-/** The memory watchdog's run-level stop, as E13 records it (b.uqm SR-5.6, SR-7.4). */
+/** The memory watchdog's run-level stop, as the run lifecycle records it. */
 export type MemoryWatchdogStop = Extract<RunLevelStop, { readonly kind: 'memory-watchdog' }>
 
-/** One running shard as E13 reports it at a sample: its number and its container's name or ID. */
+/** One running shard as the run lifecycle reports it at a sample: its number and its container's name or ID. */
 export interface WatchdogShard {
   readonly shard: number
-  /** Its container's name or ID, as E1's docker layer takes it. */
+  /** Its container's name or ID, as shared runner helpers's docker layer takes it. */
   readonly container: string
 }
 
@@ -8950,23 +8938,23 @@ export type RunningShardsProvider = () => readonly WatchdogShard[]
 /** What the watchdog reads through: the clock and timers, the cgroup and `/proc` reads, and the `/ci-live` detector's inputs. */
 export type MemoryWatchdogDeps = Pick<RunnerDeps, 'clock' | 'readCgroupFile' | 'readProcCgroup' | 'env' | 'uid' | 'readProcCmdline' | 'readProcCwd'>
 
-/** What a memory watchdog is built from (b.uqm SR-7.3). */
+/** What a memory watchdog is built from. */
 export interface MemoryWatchdogOptions {
   readonly deps: MemoryWatchdogDeps
-  /** E1's docker context: each shard's state inspect and the `/ci-live` container list. */
+  /** shared runner helpers's docker context: each shard's state inspect and the `/ci-live` container list. */
   readonly docker: DockerContext
-  /** The account's home, for `/ci-live`'s real-run lock (b.uqm SR-6.6). */
+  /** The account's home, for `/ci-live`'s real-run lock. */
   readonly home: string
-  /** The run directory: shard k's result file is read from `shard-<k>` by E1's rule (`readResultFile`). */
+  /** The run directory: shard k's result file is read from `shard-<k>` by shared runner helpers's rule (`readResultFile`). */
   readonly runDir: string
-  /** Admission's "before" W reading with its parts (b.uqm SR-6.5); never read again. */
+  /** Admission's "before" W reading with its parts; never read again. */
   readonly before: WorkingSetReading
   /** L, admission's pod limit in bytes. */
   readonly limitBytes: number
   /** Admission's ceiling C with its source: in force until the first sample's `/ci-live` re-check succeeds. */
   readonly ceiling: MemoryCeiling
   readonly runningShards: RunningShardsProvider
-  /** Receives each completed sample, in order (E13's follow loop). A throw or a rejection is logged and changes nothing. */
+  /** Receives each completed sample, in order (the run lifecycle's follow loop). A throw or a rejection is logged and changes nothing. */
   readonly onSample?: (sample: Sample) => void
   /** Receives the run-level stop, at most once per run, with the sample that decided it; called before that sample's `onSample`. */
   readonly onStop: (stop: MemoryWatchdogStop, sample: Sample) => void
@@ -8974,7 +8962,7 @@ export interface MemoryWatchdogOptions {
   readonly log?: RunnerLogSink
 }
 
-/** What stopping the watchdog answers (b.uqm SR-5.7 step 4, SR-7.3). */
+/** What stopping the watchdog answers (step 4). */
 export interface MemoryWatchdogReport {
   /** W before admission, at its peak over the samples and after cleanup; null where not read. */
   readonly workingSet: ResultsWorkingSet
@@ -8990,7 +8978,7 @@ export interface MemoryWatchdogReport {
   readonly stop: MemoryWatchdogStop | null
 }
 
-/** The memory watchdog E13 drives (b.uqm SR-5.6, SR-5.7, SR-7.3, SR-7.4). */
+/** The memory watchdog the run lifecycle drives. */
 export interface MemoryWatchdog {
   /** Starts sampling: the first sample one interval from now, then one every interval. A second call, or a call after `stop`, does nothing. */
   start(): void
@@ -9006,7 +8994,7 @@ export interface MemoryWatchdog {
   stopDecision(): MemoryWatchdogStop | null
 }
 
-/** A result file's state at a sample (b.uqm SR-7.3, SR-10.6): a script in progress, the end marker present, no file yet, unreadable, or none of those (between scripts). */
+/** A result file's state at a sample: a script in progress, the end marker present, no file yet, unreadable, or none of those (between scripts). */
 export type ShardResultFileState =
   | {
       readonly kind: 'in-progress'
@@ -9027,7 +9015,7 @@ export type ShardResultFileState =
     }
 
 /**
- * Section 11's one "script in progress" rule, the same as E10's
+ * Section 11's one "script in progress" rule, the same as
  * `shardScriptsOf().inProgress`: a script with a `start` line and no `end` or
  * `notrun` line anywhere in the file, the last one started if several. With
  * `assigned`, only those scripts count; null for all. The end marker is the
@@ -9041,7 +9029,7 @@ function unfinishedScriptOf(events: readonly ResultEvent[], assigned: readonly s
   return unfinished.at(-1)?.fileName ?? null
 }
 
-/** A result file's state (b.uqm SR-7.3): the end marker wins over any unfinished `start`; a script in progress by `unfinishedScriptOf`'s rule. */
+/** A result file's state: the end marker wins over any unfinished `start`; a script in progress by `unfinishedScriptOf`'s rule. */
 export function shardResultFileState(read: ResultFileRead): ShardResultFileState {
   if (read.kind === 'missing') return { kind: 'no-file' }
   if (read.kind === 'unreadable') return { kind: 'unreadable' }
@@ -9050,7 +9038,7 @@ export function shardResultFileState(read: ResultFileRead): ShardResultFileState
   return inProgress === null ? { kind: 'idle' } : { kind: 'in-progress', fileName: inProgress }
 }
 
-/** The stop line in whole bytes: C − 0.5 GiB, never below 0 (b.uqm SR-7.4). */
+/** The stop line in whole bytes: C − 0.5 GiB, never below 0. */
 export function memoryStopLineBytes(ceiling: MemoryCeiling): number {
   return Math.max(0, ceiling.bytes - STOP_LINE_OFFSET_BYTES)
 }
@@ -9059,7 +9047,7 @@ export function memoryStopLineBytes(ceiling: MemoryCeiling): number {
  * The one `/ci-live` run a watchdog line names when several are active, chosen
  * by `via`, never by position alone: the real-run lock's when held, else the
  * dry-run lock's, else the first lone `cscb-live=1` container with a PID in
- * E6's listing order (the order of `runs`, `CiLiveActivity.runs`). Only when no
+ * listing order (the order of `runs`, `CiLiveActivity.runs`). Only when no
  * run has a PID is it the first container, whose name then stands in for the
  * PID; null for no runs.
  */
@@ -9069,9 +9057,9 @@ export function watchdogCiLiveRun(runs: readonly CiLiveRunSeen[]): CiLiveRunSeen
 }
 
 /**
- * A watchdog line's ceiling source (b.uqm SR-7.4): `85% of the <L> GiB pod
+ * A watchdog line's ceiling source: `85% of the <L> GiB pod
  * limit`, L to one decimal place, or `/ci-live's 40 GiB line, /ci-live run
- * <PID> active`, the 40 being E6's copy of `/ci-live`'s line in whole GiB. In
+ * <PID> active`, the 40 being copy of `/ci-live`'s line in whole GiB. In
  * the one case where no active run has a PID, the container's name stands in
  * its place.
  */
@@ -9083,7 +9071,7 @@ export function watchdogCeilingSourceText(ceiling: MemoryCeiling): string {
 }
 
 /**
- * A watchdog line's per-shard detail (b.uqm SR-7.4): each running shard in
+ * A watchdog line's per-shard detail: each running shard in
  * shard order, `shard-<k> <m> GiB` (m to one decimal place) or `shard-<k>
  * unreadable`, separated by a comma and a space; `no shards running` for none.
  */
@@ -9096,7 +9084,7 @@ export function watchdogShardDetail(shards: readonly Pick<ShardSample, 'shard' |
 }
 
 /**
- * The memory watchdog's exact line (b.uqm SR-7.4): `FAIL: memory watchdog:
+ * The memory watchdog's exact line: `FAIL: memory watchdog:
  * pod non-reclaimable memory <x> GiB reached the <y> GiB stop line (<ceiling source>;
  * <per-shard detail>; reclaimable page cache excluded)`, x being the gate's
  * memory figure and y the stop line, each to one decimal
@@ -9109,7 +9097,7 @@ export function memoryWatchdogLine(nonReclaimableBytes: number, ceiling: MemoryC
   )
 }
 
-/** The stop a sample decides (b.uqm SR-7.4, corrected by b.rmn): non-reclaimable memory at or above its ceiling's stop line; null below it or unreadable. */
+/** The stop a sample decides (corrected by): non-reclaimable memory at or above its ceiling's stop line; null below it or unreadable. */
 export function decideMemoryStop(sample: Pick<Sample, 'workingSet' | 'ceiling' | 'shards'>): MemoryWatchdogStop | null {
   if (sample.workingSet === UNREADABLE_READING) return null
   const usedBytes = nonReclaimableMemoryBytes(sample.workingSet)
@@ -9142,10 +9130,10 @@ interface WatchdogShardRead {
 }
 
 /**
- * One running shard's seven values (b.uqm SR-7.2, SR-7.3): `State.OOMKilled`
- * and the main PID from E1's state inspect, the cgroup figures from the
+ * One running shard's seven values: `State.OOMKilled`
+ * and the main PID from state inspect, the cgroup figures from the
  * container's own cgroup found through that PID (or the last PID read for the
- * shard when this inspect fails), and the result file by E1's rule.
+ * shard when this inspect fails), and the result file by rule.
  */
 async function readWatchdogShard(options: MemoryWatchdogOptions, target: WatchdogShard, lastPid: number | null): Promise<WatchdogShardRead> {
   const failures: FailedReading[] = []
@@ -9176,7 +9164,7 @@ async function readWatchdogShard(options: MemoryWatchdogOptions, target: Watchdo
   } catch (err) {
     resultFile = { kind: 'unreadable', error: dependencyErrorText(err) }
   }
-  // Each failed reading is recorded in b.uqm SR-7.3's order of the values.
+  // Each failed reading is recorded in the contract order of the values.
   const sample: ShardSample = {
     shard: target.shard,
     memoryBytes: sampledValue(figures.memoryBytes, target.shard, names.memory, failures),
@@ -9192,7 +9180,7 @@ async function readWatchdogShard(options: MemoryWatchdogOptions, target: Watchdo
 }
 
 /**
- * One sample (b.uqm SR-7.3): W, the `/ci-live` re-check (C and its source from
+ * One sample: W, the `/ci-live` re-check (C and its source from
  * it, or carried from `previous` when it fails) and each running shard's
  * values, in shard order. A value that cannot be read is `unreadable` and one
  * failed reading; nothing aborts the sample. `lastPids` holds each shard's
@@ -9245,7 +9233,7 @@ function logWatchdogFailure(log: RunnerLogSink | undefined, name: string, err: u
   }
 }
 
-/** Calls one of E13's callbacks; a throw or a rejected promise is logged and changes nothing. */
+/** Calls one of the run lifecycle's callbacks; a throw or a rejected promise is logged and changes nothing. */
 function callWatchdogCallback(log: RunnerLogSink | undefined, name: string, call: () => unknown): void {
   const report = (err: unknown): void => logWatchdogFailure(log, name, err)
   try {
@@ -9257,7 +9245,7 @@ function callWatchdogCallback(log: RunnerLogSink | undefined, name: string, call
 }
 
 /**
- * Builds the memory watchdog (b.uqm SR-7.3, SR-7.4); nothing is read and no
+ * Builds the memory watchdog; nothing is read and no
  * timer is set until `start`. Throws for an L that is not a whole byte count.
  */
 export function createMemoryWatchdog(options: MemoryWatchdogOptions): MemoryWatchdog {
@@ -9371,19 +9359,19 @@ export function createMemoryWatchdog(options: MemoryWatchdogOptions): MemoryWatc
   }
 }
 
-// --- 11/T2 (E7 T2): anon peaks, peak PIDs, the cap rule and the cap line ---
+// --- 11/ : anon peaks, peak PIDs, the cap rule and the cap line ---
 //
-// Each shard's anon peak with its mark and its peak PIDs (b.uqm SR-8.2), the
-// cap rule over a run's shards (b.uqm SR-8.3) and the cap line, its suffix and
-// the `results.json` `cap` record (b.uqm SR-8.4, SR-16.1). All pure, in whole
-// bytes. Samples and final readings are read only through E1's types; a
-// shard's kill status is an input (T3's classification), never computed here.
-// The cap is E1's one constant, `SHARD_MEMORY_CAP_BYTES` (b.uqm SR-8.1): the
+// Each shard's anon peak with its mark and its peak PIDs, the
+// cap rule over a run's shards and the cap line, its suffix and
+// the `results.json` `cap` record. All pure, in whole
+// bytes. Samples and final readings are read only through types; a
+// shard's kill status is an input ( classification), never computed here.
+// The cap is one constant, `SHARD_MEMORY_CAP_BYTES`: the
 // rule and the line take the cap the run used as an input and never read,
 // assign or persist the constant, so nothing here depends on its value. Their
 // result is informational; only a person changes the cap, by hand.
 
-/** A shard's anon peak and peak PIDs, the shard-evidence fields E10 writes to `results.json` (b.uqm SR-8.2, SR-16.1). */
+/** A shard's anon peak and peak PIDs, the shard-evidence fields result rendering writes to `results.json`. */
 export type ShardPeaks = Pick<ShardEvidence, 'anonPeak' | 'peakPids'>
 
 /** A reading's whole-byte or whole-count value, or null when it was not read. Throws for a read value that is not whole. */
@@ -9394,7 +9382,7 @@ function peakReadingValue(where: string, reading: Reading<number>): number | nul
 }
 
 /**
- * One shard's anon peak and peak PIDs (b.uqm SR-8.2), from its samples in the
+ * One shard's anon peak and peak PIDs, from its samples in the
  * order taken and its final reading, or null when it has none.
  *
  * - The peak is the highest `anon` over the samples and the final reading,
@@ -9404,13 +9392,13 @@ function peakReadingValue(where: string, reading: Reading<number>): number | nul
  * - No reading read `anon`: `unknown`, both byte fields null. That includes a
  *   shard that never started (no samples, no final reading).
  * - Otherwise, a final reading whose `memory.stat` was unreadable (its `anon`
- *   unreadable), or no final reading at all (Epic decision: treated the same),
+ * unreadable), or no final reading at all (component decision: treated the same),
  *   marks the peak `partial`; it is then the highest sample.
  * - Peak PIDs is the highest readable sample PID count, or null when none was
  *   read; the final reading never supplies it.
  *
  * Page cache never affects which reading is the peak, so a shard whose page
- * cache fills its cap gets no failure here (b.uqm SR-8.1). Throws when the
+ * cache fills its cap gets no failure here. Throws when the
  * samples are of more than one shard, or a read value is not whole.
  */
 export function shardPeaks(samples: readonly ShardSample[], final: FinalReading | null): ShardPeaks {
@@ -9441,7 +9429,7 @@ export function shardPeaks(samples: readonly ShardSample[], final: FinalReading 
   return { anonPeak: { bytes: peakBytes, pageCacheBytes: peakPageCacheBytes, mark: finalStatRead ? null : 'partial' }, peakPids }
 }
 
-/** One shard as the cap rule and the cap line take it: its anon peak and whether it was killed for out of memory (T3's classification, b.uqm SR-12.2). */
+/** One shard as the cap rule and the cap line take it: its anon peak and whether it was killed for out of memory (T3's classification). */
 export interface CapShard {
   readonly shard: number
   /** Actual shard limit; omitted by older callers using a uniform cap. */
@@ -9451,7 +9439,7 @@ export interface CapShard {
   readonly killed: boolean
 }
 
-/** The shard the derived cap came from (b.uqm SR-8.3, SR-8.4). */
+/** The shard the derived cap came from. */
 export interface CapSource {
   /** Its counted value: its anon peak, or for a killed shard the higher of the cap used and its recorded peak. */
   readonly peakBytes: number
@@ -9469,9 +9457,9 @@ export interface CapRuleResult {
 }
 
 /**
- * The cap a counted peak gives (b.uqm SR-8.3), in whole bytes: the peak plus
+ * The cap a counted peak gives, in whole bytes: the peak plus
  * the 1 GiB margin, rounded up to a multiple of the 0.5 GiB step (a sum
- * already on one stays), and at least the 2 GiB minimum, each E1's constant.
+ * already on one stays), and at least the 2 GiB minimum, each constant.
  */
 export function derivedCapBytes(peakBytes: number): number {
   assertWholeBytes('derivedCapBytes', peakBytes)
@@ -9510,7 +9498,7 @@ function assertCapInputs(where: string, capUsedBytes: number, shards: readonly C
 }
 
 /**
- * The cap rule over a run's shards (b.uqm SR-8.3), in whole bytes. Each shard
+ * The cap rule over a run's shards, in whole bytes. Each shard
  * counts at its anon peak (`partial` counted, `unknown` not); a killed shard
  * counts at the higher of its `capBytes` (or uniform `capUsedBytes`) and its recorded peak (the cap used
  * when its peak is `unknown`). The highest counted value, the lowest shard
@@ -9536,32 +9524,32 @@ export function capRule(capUsedBytes: number, shards: readonly CapShard[]): CapR
   return source === null ? { derivedBytes: null, source: null } : { derivedBytes: derivedCapBytes(source.peakBytes), source }
 }
 
-/** The cap line's opening (b.uqm SR-8.4). */
+/** The cap line's opening. */
 export const CAP_LINE_PREFIX = 'cap from measured anon peak: '
-/** The kill form's parenthesis, in place of the page cache (b.uqm SR-8.4). */
+/** The kill form's parenthesis, in place of the page cache. */
 export const CAP_LINE_KILL_TEXT = '(killed for out of memory at the cap)'
-/** The unknown form's text after the prefix (b.uqm SR-8.4). */
+/** The unknown form's text after the prefix. */
 export const CAP_LINE_UNKNOWN_TEXT = "unknown, no shard's anon memory was read"
-/** The full form's page cache when the peak's reading could not read it; b.uqm SR-8.4 gives no text, so this is the runner's. */
+/** The full form's page cache when the peak's reading could not read it gives no text, so this is the runner's. */
 export const CAP_LINE_PAGE_CACHE_UNREAD_TEXT = '(page cache unknown)'
-/** A default full run with any kill: the suffix before its killed shards (b.uqm SR-8.4). */
+/** A default full run with any kill: the suffix before its killed shards. */
 export const CAP_SUFFIX_KILL_PREFIX = '; source after out-of-memory kill in '
-/** Every other run that is no source: the suffix before its reasons (b.uqm SR-8.4). */
+/** Every other run that is no source: the suffix before its reasons. */
 export const CAP_SUFFIX_INVALID_PREFIX = '; not a valid cap source: '
-/** The first reason (b.uqm SR-8.4). */
+/** The first reason. */
 export const CAP_REASON_NOT_DEFAULT = 'not a default run'
-/** The second reason (b.uqm SR-8.4). */
+/** The second reason. */
 export const CAP_REASON_NOT_PASSED = 'run did not pass'
-/** The third reason, before its shards in parentheses (b.uqm SR-8.4). */
+/** The third reason, before its shards in parentheses. */
 export const CAP_REASON_PARTIAL = 'partial anon peak'
-/** The fourth reason, before its shards in parentheses (b.uqm SR-8.4). */
+/** The fourth reason, before its shards in parentheses. */
 export const CAP_REASON_UNKNOWN = 'unknown anon peak'
-/** Between listed reasons, and between listed shards (b.uqm SR-8.4). */
+/** Between listed reasons, and between listed shards. */
 export const CAP_LIST_SEPARATOR = ', '
 
 /**
  * A whole-byte count in GiB rounded up to two decimal places, computed
- * exactly (b.uqm SR-8.4): 1.50 GiB exactly gives `1.50`, one byte more `1.51`.
+ * exactly: 1.50 GiB exactly gives `1.50`, one byte more `1.51`.
  */
 function gibHundredthsUpText(bytes: number): string {
   assertWholeBytes('gibHundredthsUpText', bytes)
@@ -9570,7 +9558,7 @@ function gibHundredthsUpText(bytes: number): string {
   return `${hundredths / BigInt(100)}.${(hundredths % BigInt(100)).toString().padStart(2, '0')}`
 }
 
-/** The margin in GiB as the cap line names it, from E1's constant: `1`. */
+/** The margin in GiB as the cap line names it, from shared runner helpers's constant: `1`. */
 function capMarginGibText(): string {
   return `${CAP_MARGIN_BYTES / GIB_BYTES}`
 }
@@ -9582,9 +9570,9 @@ function capShardList(shards: readonly number[]): string {
 
 /** Everything the cap line and the `cap` record are built from. */
 export interface CapReportInputs {
-  /** The run's invocation: its kind (`runKindOf`) and whether it is a default full run (`isCapSourceEligible`), E1's. */
+  /** The run's invocation: its kind (`runKindOf`) and whether it is a default full run (`isCapSourceEligible`), shared runner helpers's. */
   readonly invocation: Invocation
-  /** Whether the run passed, E10's pass condition (b.uqm SR-12.3). */
+  /** Whether the run passed, result rendering's pass condition. */
   readonly passed: boolean
   /** The actual cap of the source shard, or the largest cap when no source exists. */
   readonly capUsedBytes: number
@@ -9594,7 +9582,7 @@ export interface CapReportInputs {
   readonly shards: readonly CapShard[]
 }
 
-/** The cap line with its suffix, the suffix on its own, and the `cap` record (b.uqm SR-8.4, SR-16.1). */
+/** The cap line with its suffix, the suffix on its own, and the `cap` record. */
 export interface CapReport {
   /** The line followed by its suffix; null for a selective run, which has no cap line. */
   readonly line: string | null
@@ -9604,7 +9592,7 @@ export interface CapReport {
 }
 
 /**
- * The suffix (b.uqm SR-8.4): a default full run with any kill gets only the
+ * The suffix: a default full run with any kill gets only the
  * kill suffix, naming every killed shard; a passing default full run with
  * every anon peak complete gets none; any other gets `; not a valid cap
  * source:` with each reason that applies, in the fixed order.
@@ -9624,12 +9612,11 @@ function capSuffix(defaultRun: boolean, passed: boolean, shards: readonly CapSha
 }
 
 /**
- * The cap line, its suffix and the `results.json` `cap` record (b.uqm SR-8.4,
- * SR-16.1). A selective run gets no line and a record whose every key but
+ * The cap line, its suffix and the `results.json` `cap` record. A selective run gets no line and a record whose every key but
  * `usedBytes` is null. A full run gets:
  * - the full form, `cap from measured anon peak: <peak> GiB in shard-<k>
  *   (page cache <f> GiB) + 1 GiB margin → <cap> GiB; current cap <c> GiB`,
- *   peak and f rounded up to two decimals, both caps to one (E6's
+ * peak and f rounded up to two decimals, both caps to one (
  *   `formatGib`);
  * - the kill form when the source is a kill, `(killed for out of memory at
  *   the cap)` in place of the page cache, and `peakPageCacheBytes` null;
@@ -9675,24 +9662,24 @@ export function buildCapReport(inputs: CapReportInputs): CapReport {
   }
 }
 
-// --- 11/T3 (E7 T3): out-of-memory detection and its failure lines ---
+// --- 11/ : out-of-memory detection and its failure lines ---
 //
-// b.uqm SR-12.2 over E1's data model only: a shard's samples (`Sample`, each
+// over data model only: a shard's samples (`Sample`, each
 // `ShardSample` with its result file) and its final reading (`FinalReading`,
-// with the result file E13 reads at that moment) give one `OomStatus`; that
-// status gives at most one out-of-memory line, which E13 stores as the
-// shard's `ShardEvidence.oomLine`. E10 turns that line into the shard's `end`
+// with the result file reads at that moment) give one `OomStatus`; that
+// status gives at most one out-of-memory line, which stores as the
+// shard's `ShardEvidence.oomLine`. turns that line into the shard's `end()`
 // and its one out-of-memory-class failure (`shardEndFailure`); `oomFailureOf`
 // builds the same failure for any other consumer. Nothing here takes a run
 // kind, so the result is the same in every kind of run.
 
-/** The text of a kill's line, after the file name or the shard (b.uqm SR-12.2). */
+/** The text of a kill's line, after the file name or the shard. */
 export const OOM_KILLED_TEXT = 'killed for out of memory'
 
-/** The text of an unreadable status's line, after the shard (b.uqm SR-12.2). */
+/** The text of an unreadable status's line, after the shard. */
 export const OOM_UNREADABLE_TEXT = 'out-of-memory status unreadable'
 
-/** A shard's out-of-memory status (b.uqm SR-12.2). */
+/** A shard's out-of-memory status. */
 export type OomStatus =
   | {
       readonly kind: 'no-kill'
@@ -9706,7 +9693,7 @@ export type OomStatus =
       readonly kind: 'unreadable'
     }
 
-/** A shard's final reading with its result file as read at that moment (b.uqm SR-10.6; E9 takes the reading, E13 the result file). */
+/** A shard's final reading with its result file as read at that moment (shard management takes the reading, the run lifecycle the result file). */
 export interface OomFinalReading {
   readonly reading: FinalReading
   readonly resultFile: ResultFileRead
@@ -9731,7 +9718,7 @@ export function oomInProgressScript(resultFile: ResultFileRead, assigned: readon
 }
 
 /**
- * Classifies a shard's out-of-memory status (b.uqm SR-12.2, SR-10.6). Its
+ * Classifies a shard's out-of-memory status. Its
  * samples are read in the order given, which is the order taken; entries for
  * other shards are ignored. The first reading that shows a kill, a sample's
  * or the final one, decides `killed`, with the script in progress in that
@@ -9758,22 +9745,22 @@ export function classifyOom(shard: Pick<ShardEvidence, 'shard' | 'assigned'>, sa
   return { kind: 'no-kill' }
 }
 
-/** `FAIL: <file name>: killed for out of memory in shard-<k>`: a kill with a script in progress at the first reading that showed it (b.uqm SR-12.2). */
+/** `FAIL: <file name>: killed for out of memory in shard-<k>`: a kill with a script in progress at the first reading that showed it. */
 export function oomKilledScriptLine(fileName: string, shard: number): string {
   return `${FAIL_PREFIX}${fileName}: ${OOM_KILLED_TEXT} in ${SHARD_DIR_PREFIX}${shard}`
 }
 
-/** `FAIL: shard-<k>: killed for out of memory`: a kill with no script in progress at that reading (b.uqm SR-12.2). */
+/** `FAIL: shard-<k>: killed for out of memory`: a kill with no script in progress at that reading. */
 export function oomKilledShardLine(shard: number): string {
   return `${FAIL_PREFIX}${SHARD_DIR_PREFIX}${shard}: ${OOM_KILLED_TEXT}`
 }
 
-/** `FAIL: shard-<k>: out-of-memory status unreadable` (b.uqm SR-12.2). */
+/** `FAIL: shard-<k>: out-of-memory status unreadable`. */
 export function oomStatusUnreadableLine(shard: number): string {
   return `${FAIL_PREFIX}${SHARD_DIR_PREFIX}${shard}: ${OOM_UNREADABLE_TEXT}`
 }
 
-/** A shard's one out-of-memory line for `ShardEvidence.oomLine`; null for `no-kill` (b.uqm SR-12.2). */
+/** A shard's one out-of-memory line for `ShardEvidence.oomLine`; null for `no-kill`. */
 export function oomLineOf(shard: number, status: OomStatus): string | null {
   switch (status.kind) {
     case 'no-kill':
@@ -9785,67 +9772,67 @@ export function oomLineOf(shard: number, status: OomStatus): string | null {
   }
 }
 
-/** A shard's one out-of-memory failure, classed `out-of-memory` with its shard number in all three forms, as E10's `shardEndFailure` builds it; null for `no-kill` (b.uqm SR-12.2, SR-12.4). */
+/** A shard's one out-of-memory failure, classed `out-of-memory` with its shard number in all three forms, as result rendering's `shardEndFailure` builds it; null for `no-kill`. */
 export function oomFailureOf(shard: number, status: OomStatus): Failure | null {
   const line = oomLineOf(shard, status)
   return line === null ? null : { line, shard, failureClass: { kind: 'out-of-memory' } }
 }
 
 // ---------------------------------------------------------------------------
-// 12. Images (E8)
+// 12. Images
 // ---------------------------------------------------------------------------
 
-// --- 12/T1 (E8 T1): the package, the base image's checks and the base-build step ---
+// --- 12/ : the package, the base image's checks and the base-build step ---
 //
-// Step 4 (b.uqm SR-5.3, SR-9.2). The base image is the image that
+// Step 4. The base image is the image that
 // `docker/Dockerfile.test`'s one FROM instruction names: the runner types no
-// base tag. Its existence is one image inspect of that one name through E1's
+// base tag. Its existence is one image inspect of that one name through
 // docker layer, never an image listing. Only when it is missing are the base
-// build's prerequisites checked, in SR-9.2's order, each read-only, the first
+// build's prerequisites checked, in the contract order, each read-only, the first
 // failure refusing the run (no kind) with a reason that names the check and
 // holds no secret value: `ARG AD_VERSION`, read as the base-build step reads it;
 // `CSCB_AD_SRC_DIR`; the release tag in that checkout; `install.sh` at that tag
 // (read into memory only, nothing written, nothing fetched); and the
-// base-build token, looked up only here, through E1's lookup, as the step
-// finds it (b.uqm SR-15.1). The outcome and the token go into the run state.
+// base-build token, looked up only here, through lookup, as the step
+// finds it. The outcome and the token go into the run state.
 //
-// Step 5 (b.uqm SR-9.1, SR-5.9). `npm pack` runs in the worktree, writing only
+// Step 5. `npm pack` runs in the worktree, writing only
 // into the run-private `package/` (0700) of the run directory; the tarball it
 // names in its own output is made 0444 and hashed. Its lifecycle scripts are
 // skipped (`--ignore-scripts`), so packing writes nothing into the worktree.
 //
-// Step 12 (b.uqm SR-9.2, SR-5.6). The base-build step,
+// Step 12. The base-build step,
 // `scripts/ci-base-build.sh`, runs only when step 4 found the base missing and
 // a re-check just before still finds it missing; in a process group of its
 // own, in the worktree, with the runner's environment, its output lines in the
-// runner log through E1's writer (so E11's redaction applies). Its handle is
+// runner log through writer (so redaction applies). Its handle is
 // `RunState.baseBuildStep` while it runs. A non-zero exit gives
 // `FAIL: image build: base image build failed (exit <code>)`, unless its handle
 // ended it or the run's stop record (`RunState.firstStop`) is set when it ends.
 //
 // Every child (docker, git, gh, npm and the step) gets the runner's environment
-// unchanged through the child-environment rule (b.uqm SR-15.4), the token
+// unchanged through the child-environment rule, the token
 // lookup's own `GH_CONFIG_DIR` aside.
 
-/** The base-build step, relative to the worktree root: the `/ci` skill's base-build commands at 946be79, moved unchanged (b.uqm SR-9.2, SR-19.5). */
+/** The base-build step, relative to the worktree root: the `/ci` skill's base-build commands at 946be79, moved unchanged. */
 export const BASE_BUILD_STEP_PATH = 'scripts/ci-base-build.sh'
 /** The shell the base-build step runs under, as its `#!/usr/bin/env bash` line names it, looked up on the child environment's `PATH`. */
 export const BASE_BUILD_STEP_SHELL = 'bash'
-/** The base Dockerfile's line prefix the base-build step reads `AD_VERSION` from, as its `sed -n 's/^ARG AD_VERSION=//p'` does (b.uqm SR-9.2). */
+/** The base Dockerfile's line prefix the base-build step reads `AD_VERSION` from, as its `sed -n 's/^ARG AD_VERSION=//p'` does. */
 export const AD_VERSION_ARG_PREFIX = 'ARG AD_VERSION='
-/** The variable that names the agent-director source checkout the base build extracts `install.sh` from (b.uqm SR-9.2). */
+/** The variable that names the agent-director source checkout the base build extracts `install.sh` from. */
 export const AD_SOURCE_DIR_VARIABLE = 'CSCB_AD_SRC_DIR'
-/** The agent-director release tag's prefix: the tag is `v<AD_VERSION>` (b.uqm SR-9.2). */
+/** The agent-director release tag's prefix: the tag is `v<AD_VERSION>`. */
 export const AD_TAG_PREFIX = 'v'
-/** The install script, relative to the agent-director checkout, read at the release tag (b.uqm SR-9.2). */
+/** The install script, relative to the agent-director checkout, read at the release tag. */
 export const AD_INSTALL_SCRIPT_PATH = 'skills/install-agent-director/install.sh'
 /** The program step 4's read-only checks of the agent-director checkout run. */
 export const GIT_PROGRAM = 'git'
-/** The program step 5 packs with (b.uqm SR-9.1). */
+/** The program step 5 packs with. */
 export const NPM_PROGRAM = 'npm'
-/** The mode of `package/`, owner-only like the run directory (b.uqm SR-5.9). */
+/** The mode of `package/`, owner-only like the run directory. */
 export const PACKAGE_DIR_MODE = RUN_DIR_MODE
-/** The tarball's mode once packed: read-only for all (b.uqm SR-5.9, SR-9.1). */
+/** The tarball's mode once packed: read-only for all. */
 export const PACKAGE_TARBALL_MODE = 0o444
 /** The suffix of the tarball's file name in `npm pack`'s output. */
 export const PACKAGE_TARBALL_SUFFIX = '.tgz'
@@ -9866,52 +9853,52 @@ function lastTextLine(text: string): string | null {
 
 // Step 4: the base image's name, its existence and the base build's prerequisites.
 
-/** The reason of a `docker/Dockerfile.test` that could not be read (b.uqm SR-9.2). */
+/** The reason of a `docker/Dockerfile.test` that could not be read. */
 export function testDockerfileUnreadableReason(error: string): string {
   return `${TEST_DOCKERFILE_PATH} could not be read (${error}): the base image is the one its FROM instruction names`
 }
 
-/** The reason of a `docker/Dockerfile.test` with no FROM instruction or several (b.uqm SR-9.2). */
+/** The reason of a `docker/Dockerfile.test` with no FROM instruction or several. */
 export function testDockerfileFromCountReason(count: number): string {
   const found = count === 0 ? 'no FROM instruction' : `${count} FROM instructions`
   return `${TEST_DOCKERFILE_PATH} has ${found}: the base image is the one its one FROM instruction names`
 }
 
-/** The reason of a `docker/Dockerfile.test` whose one FROM instruction names no image by a fixed name (b.uqm SR-9.2). */
+/** The reason of a `docker/Dockerfile.test` whose one FROM instruction names no image by a fixed name. */
 export function testDockerfileFromNameReason(instruction: string): string {
   return `${TEST_DOCKERFILE_PATH}'s FROM instruction names no base image by a fixed name: ${shownArgument(instruction)}`
 }
 
-/** The reason of an existence query that failed (b.uqm SR-9.2). */
+/** The reason of an existence query that failed. */
 export function baseImageCheckFailedReason(image: string, error: string): string {
   return `checking whether the base image ${shownArgument(image)} exists failed: ${error}`
 }
 
-/** The reason of a missing base whose base Dockerfile sets no `ARG AD_VERSION`, or could not be read for it (b.uqm SR-9.2). */
+/** The reason of a missing base whose base Dockerfile sets no `ARG AD_VERSION`, or could not be read for it. */
 export function adVersionMissingReason(image: string, readError: string | null): string {
   const missing = `the base image ${shownArgument(image)} is missing and`
   if (readError !== null) return `${missing} ${BASE_DOCKERFILE_PATH} could not be read for its ARG AD_VERSION (${readError}): the base build reads its agent-director release there`
   return `${missing} ${BASE_DOCKERFILE_PATH} sets no ARG AD_VERSION: the base build reads its agent-director release there`
 }
 
-/** The reason of a missing base with `CSCB_AD_SRC_DIR` unset or empty (b.uqm SR-9.2). */
+/** The reason of a missing base with `CSCB_AD_SRC_DIR` unset or empty. */
 export function adSourceDirUnsetReason(image: string, adTag: string): string {
   return `the base image ${shownArgument(image)} is missing and ${AD_SOURCE_DIR_VARIABLE} is unset or empty: set it to a checkout of agent-director's source tree holding the tag ${shownArgument(adTag)}`
 }
 
-/** The reason of a missing base whose `CSCB_AD_SRC_DIR` checkout has no release tag (b.uqm SR-9.2); `gitError` is git's last error line, when it gave one. */
+/** The reason of a missing base whose `CSCB_AD_SRC_DIR` checkout has no release tag; `gitError` is git's last error line, when it gave one. */
 export function adTagMissingReason(image: string, sourceDir: string, adTag: string, gitError: string | null): string {
   const why = gitError === null ? '' : ` (git: ${gitError})`
   return `the base image ${shownArgument(image)} is missing and ${AD_SOURCE_DIR_VARIABLE} (${shownArgument(sourceDir)}) has no tag ${shownArgument(adTag)}${why}: set ${AD_SOURCE_DIR_VARIABLE} to a checkout of agent-director's source tree holding that tag (/ci fetches nothing into it)`
 }
 
-/** The reason of a missing base whose install script cannot be read at the release tag (b.uqm SR-9.2); `gitError` is git's last error line, when it gave one. */
+/** The reason of a missing base whose install script cannot be read at the release tag; `gitError` is git's last error line, when it gave one. */
 export function adInstallScriptUnreadableReason(image: string, sourceDir: string, adTag: string, gitError: string | null): string {
   const why = gitError === null ? '' : ` (git: ${gitError})`
   return `the base image ${shownArgument(image)} is missing and ${AD_INSTALL_SCRIPT_PATH} could not be read at ${shownArgument(adTag)} from ${AD_SOURCE_DIR_VARIABLE} (${shownArgument(sourceDir)})${why}: set ${AD_SOURCE_DIR_VARIABLE} to a checkout of agent-director's source tree holding that tag`
 }
 
-/** The reason of a missing base whose base-build token is too short, a bad credential (b.uqm SR-15.1); it never holds the value. */
+/** The reason of a missing base whose base-build token is too short, a bad credential; it never holds the value. */
 export function baseBuildTokenBadReason(image: string): string {
   return `the base image ${shownArgument(image)} is missing and the base-build token (gh auth token) is a bad credential (it is shorter than ${SECRET_MIN_LENGTH} characters): a secret credential that is set and not empty must be at least ${SECRET_MIN_LENGTH} characters long`
 }
@@ -9950,7 +9937,7 @@ export type BaseImageNameRead =
     }
 
 /**
- * The base image's name from `docker/Dockerfile.test`'s text (b.uqm SR-9.2):
+ * The base image's name from `docker/Dockerfile.test`'s text:
  * the image its one FROM instruction names, after any `--<flag>` and before an
  * optional `AS <stage>`. No FROM instruction, several, or one naming no image
  * by a fixed name (none, a `$` variable, or other words) gives a reason
@@ -9968,7 +9955,7 @@ export function baseImageNameOf(text: string): BaseImageNameRead {
   return { ok: true, name }
 }
 
-/** The worktree's base image name, read from `docker/Dockerfile.test` under `worktreeRoot` (b.uqm SR-9.2). */
+/** The worktree's base image name, read from `docker/Dockerfile.test` under `worktreeRoot`. */
 export function readBaseImageName(worktreeRoot: string): BaseImageNameRead {
   const read = readFileText(join(worktreeRoot, TEST_DOCKERFILE_PATH))
   if (read.kind === 'missing') return { ok: false, reason: testDockerfileUnreadableReason('it does not exist') }
@@ -9978,7 +9965,7 @@ export function readBaseImageName(worktreeRoot: string): BaseImageNameRead {
 
 /**
  * `AD_VERSION` as the base-build step reads it from the base Dockerfile's
- * text (b.uqm SR-9.2): the remainder of every line beginning exactly
+ * text: the remainder of every line beginning exactly
  * `ARG AD_VERSION=`, joined by line feeds, trailing line feeds dropped, as
  * `"$(sed -n 's/^ARG AD_VERSION=//p' …)"` gives it. Empty when no such line
  * holds a value. Pure.
@@ -10002,7 +9989,7 @@ export function adInstallScriptReadArgs(sourceDir: string, adTag: string): strin
   return [GIT_PROGRAM, '-C', sourceDir, 'show', `${adTag}:${AD_INSTALL_SCRIPT_PATH}`]
 }
 
-/** Step 4's base-image outcome (b.uqm SR-9.2, SR-5.5). */
+/** Step 4's base-image outcome. */
 export type BaseImageCheck =
   | {
       readonly kind: 'present'
@@ -10012,7 +9999,7 @@ export type BaseImageCheck =
   | {
       readonly kind: 'missing'
       readonly image: string
-      /** The clock moment its existence query answered "missing": the deadline's 60 min count from here (b.uqm SR-5.5). */
+      /** The clock moment its existence query answered "missing": the deadline's 60 min count from here. */
       readonly missingAtMs: number
     }
 
@@ -10023,12 +10010,12 @@ export type BaseImageStage =
       readonly check: BaseImageCheck
       /** The base-build token found; null when the base is present (no lookup) or none was found. */
       readonly baseBuildToken: string | null
-      /** The run's secret credentials so far: the environment's, plus the token when one was found (`secretCredentialSet`, b.uqm SR-15.1). */
+      /** The run's secret credentials so far: the environment's, plus the token when one was found (`secretCredentialSet`). */
       readonly secrets: ReadonlySet<string>
     }
   | {
       readonly ok: false
-      /** No kind; one reason naming the failed check (b.uqm SR-5.8). */
+      /** No kind; one reason naming the failed check. */
       readonly refusal: Refusal
     }
 
@@ -10055,13 +10042,13 @@ async function runReadOnlyGit(deps: Pick<RunnerDeps, 'spawn' | 'env' | 'worktree
   }
 }
 
-/** Whether a found secret is shorter than the minimum, counted in characters (code points), as E2's check counts (b.uqm SR-15.1). */
+/** Whether a found secret is shorter than the minimum, counted in characters (code points), as validation's check counts. */
 function isShortBaseBuildToken(token: string): boolean {
   return Array.from(token).length < SECRET_MIN_LENGTH
 }
 
 /**
- * The base build's prerequisites, for a missing base (b.uqm SR-9.2), in
+ * The base build's prerequisites, for a missing base, in
  * order, the first failure ending the checks: `ARG AD_VERSION`; then
  * `CSCB_AD_SRC_DIR`; its tag `v<AD_VERSION>`; `install.sh` at that tag; then
  * the base-build token, whose found value is recorded in the run state even
@@ -10089,14 +10076,14 @@ async function checkBaseBuildPrerequisites(deps: BaseImageDeps, state: BaseImage
 }
 
 /**
- * Step 4 of the run sequence (b.uqm SR-5.3, SR-9.2): reads the base image's
+ * Step 4 of the run sequence: reads the base image's
  * name from `docker/Dockerfile.test`, queries its existence (one image
  * inspect of that name) and records the outcome in `state.baseImage`, with
  * the clock moment when it is missing. With the base present it spawns
  * nothing more: no git, no gh, no token lookup. With it missing it checks the
  * base build's prerequisites read-only and records a found base-build token
  * in `state.baseBuildToken`. A failed check is a refusal with no kind, its
- * one reason naming the check; E13 records it. Never throws.
+ * one reason naming the check; records it. Never throws.
  */
 export async function checkBaseImage(deps: BaseImageDeps, state: BaseImageRunState): Promise<BaseImageStage> {
   const refused = (reason: string): BaseImageStage => ({ ok: false, refusal: buildRefusal(null, reason) })
@@ -10121,12 +10108,12 @@ export async function checkBaseImage(deps: BaseImageDeps, state: BaseImageRunSta
 
 // Step 5: the package.
 
-/** `npm pack --ignore-scripts --pack-destination <dir>`: the package packed into `dir`, its lifecycle scripts skipped (b.uqm SR-9.1). */
+/** `npm pack --ignore-scripts --pack-destination <dir>`: the package packed into `dir`, its lifecycle scripts skipped. */
 export function npmPackArgs(destination: string): string[] {
   return [NPM_PROGRAM, 'pack', '--ignore-scripts', '--pack-destination', destination]
 }
 
-/** The run's `package/` directory (b.uqm SR-5.9). */
+/** The run's `package/` directory. */
 export function packageDirPath(runDir: string): string {
   return join(runDir, PACKAGE_DIR_NAME)
 }
@@ -10138,27 +10125,27 @@ export function packedTarballName(stdout: string): string | null {
   return name
 }
 
-/** The reason of a `package/` that could not be made (b.uqm SR-9.1). */
+/** The reason of a `package/` that could not be made. */
 export function packageDirFailedReason(path: string, error: string): string {
   return `packing failed: creating ${shownArgument(path)} failed: ${error}`
 }
 
-/** The reason of an `npm pack` that exited non-zero (b.uqm SR-9.1); `error` is its last error line, when it gave one. */
+/** The reason of an `npm pack` that exited non-zero; `error` is its last error line, when it gave one. */
 export function npmPackFailedReason(exitCode: number, error: string | null): string {
   return `npm pack failed (exit ${exitCode}): ${error ?? 'no error output'}: run npm install in the worktree, then run /ci again`
 }
 
-/** The reason of an `npm pack` whose output named no tarball it wrote into `package/` (b.uqm SR-9.1). */
+/** The reason of an `npm pack` whose output named no tarball it wrote into `package/`. */
 export function npmPackNoTarballReason(packageDir: string): string {
   return `npm pack failed: its output named no tarball that it wrote into ${shownArgument(packageDir)}`
 }
 
-/** The reason of a tarball that could not be made read-only or hashed (b.uqm SR-9.1). */
+/** The reason of a tarball that could not be made read-only or hashed. */
 export function packageTarballFailedReason(path: string, error: string): string {
   return `packing failed: making ${shownArgument(path)} read-only and hashing it failed: ${error}`
 }
 
-/** A packed tarball (b.uqm SR-9.1). */
+/** A packed tarball. */
 export interface PackedPackage {
   /** Its path, in `package/` of the run directory. */
   readonly tarballPath: string
@@ -10174,7 +10161,7 @@ export type PackageStage =
     }
   | {
       readonly ok: false
-      /** No kind; one reason naming the failure (b.uqm SR-5.8). */
+      /** No kind; one reason naming the failure. */
       readonly refusal: Refusal
     }
 
@@ -10185,7 +10172,7 @@ export type PackageDeps = Pick<RunnerDeps, 'spawn' | 'env' | 'worktreeRoot' | 'c
 export type PackageRunState = Pick<RunState, 'packingStartedAtMs' | 'tarballPath' | 'packageSha256'>
 
 /**
- * Step 5 of the run sequence (b.uqm SR-9.1, SR-5.9): records the clock moment
+ * Step 5 of the run sequence: records the clock moment
  * packing starts (`state.packingStartedAtMs`, the build time's start), makes
  * `package/` in `runDir` (0700, exclusively), runs `npm pack` through the
  * spawn dependency in the worktree with the runner's environment, writing
@@ -10235,12 +10222,12 @@ export async function packPackage(deps: PackageDeps, runDir: string, state: Pack
 
 // Step 12: the re-check and the base-build step.
 
-/** `bash <worktree root>/scripts/ci-base-build.sh`: the base-build step's argument list (b.uqm SR-9.2). */
+/** `bash <worktree root>/scripts/ci-base-build.sh`: the base-build step's argument list. */
 export function baseBuildStepArgs(worktreeRoot: string): string[] {
   return [BASE_BUILD_STEP_SHELL, join(worktreeRoot, BASE_BUILD_STEP_PATH)]
 }
 
-/** `FAIL: image build: base image build failed (exit <code>)` (b.uqm SR-9.2); E10's `imageBuildFailure` classes it `image-build`. */
+/** `FAIL: image build: base image build failed (exit <code>)`; result rendering's `imageBuildFailure` classes it `image-build`. */
 export function baseImageBuildFailedLine(exitCode: number): string {
   return `${FAIL_PREFIX}image build: base image build failed (exit ${exitCode})`
 }
@@ -10250,12 +10237,12 @@ export function baseBuildStepNotStartedLine(why: string): string {
   return `base-build step: ${BASE_BUILD_STEP_PATH} could not be started: ${dockerOneLine(why)}`
 }
 
-/** The runner-log line of a base the re-check found present: another run built it meanwhile, and it is used as it is (b.uqm SR-9.2). */
+/** The runner-log line of a base the re-check found present: another run built it meanwhile, and it is used as it is. */
 export function baseBuiltMeanwhileLine(image: string): string {
   return `base-build step: the base image ${shownArgument(image)} is present now, built meanwhile: the step does not run`
 }
 
-/** The runner-log line of a re-check that failed: the step runs, and its own build answers for the base (b.uqm SR-9.2). */
+/** The runner-log line of a re-check that failed: the step runs, and its own build answers for the base. */
 export function baseRecheckFailedLine(image: string, error: string): string {
   return `base-build step: checking again whether the base image ${shownArgument(image)} exists failed: ${error}: the step runs`
 }
@@ -10264,7 +10251,7 @@ export function baseRecheckFailedLine(image: string, error: string): string {
 export interface BaseBuildStepExit {
   /** Its exit status: 128 + the signal's number when a signal ended it; `SPAWN_FAILED_EXIT_STATUS` when it could not be started. */
   readonly exitCode: number
-  /** Whether `end()` was called before it settled (b.uqm SR-5.6). */
+  /** Whether `end()` was called before it settled. */
   readonly endedByHandle: boolean
 }
 
@@ -10274,13 +10261,13 @@ export interface BaseBuildStep {
   readonly pid: number | null
   /** Its process group; null when it could not be started. */
   readonly processGroup: number | null
-  /** Ends it: SIGKILL to its whole process group, so its `docker build` ends with it (b.uqm SR-5.6). Once it has settled it signals nothing and answers `no-such-process`, so a reused group ID is never signalled. */
+  /** Ends it: SIGKILL to its whole process group, so its `docker build` ends with it. Once it has settled it signals nothing and answers `no-such-process`, so a reused group ID is never signalled. */
   end(): SignalOutcome
   /** Settles once it has ended; never rejects. */
   readonly result: Promise<BaseBuildStepExit>
 }
 
-/** The base-build step's run on the clock (b.uqm SR-4.4). */
+/** The base-build step's run on the clock. */
 export interface BaseBuildRun {
   /** The clock moment before its spawn. */
   readonly startedAtMs: number
@@ -10291,10 +10278,10 @@ export interface BaseBuildRun {
 /** Why step 12 did not run the base-build step. */
 export type BaseBuildSkip = 'present-at-step-4' | 'present-at-recheck' | 'stop-recorded'
 
-/** Step 12's base-build outcome (b.uqm SR-9.2, SR-5.6). */
+/** Step 12's base-build outcome. */
 export type BaseBuildStage =
   | {
-      /** The step did not run: no base-build run, its time 0 (b.uqm SR-4.4). */
+      /** The step did not run: no base-build run, its time 0. */
       readonly kind: 'not-run'
       readonly why: BaseBuildSkip
     }
@@ -10311,7 +10298,7 @@ export type BaseBuildStage =
       readonly failure: Failure
     }
   | {
-      /** A non-zero exit after its handle ended it, or while the stop record was set: no image build failure (b.uqm SR-5.6). */
+      /** A non-zero exit after its handle ended it, or while the stop record was set: no image build failure. */
       readonly kind: 'stopped'
       readonly run: BaseBuildRun
       readonly exitCode: number
@@ -10333,7 +10320,7 @@ function logBaseBuildLine(log: RunnerLogSink, line: string): void {
 }
 
 /**
- * Starts the base-build step (b.uqm SR-9.2, SR-5.6): `bash
+ * Starts the base-build step: `bash
  * scripts/ci-base-build.sh` in a process group of its own, in the worktree,
  * with the runner's environment; each line of its standard output and error
  * goes to `log` as it arrives (a log that throws loses that line only). A step
@@ -10392,13 +10379,13 @@ export function startBaseBuildStep(deps: BaseBuildDeps, log: RunnerLogSink): Bas
 }
 
 /**
- * Step 12's base build (b.uqm SR-9.2, SR-5.6, SR-4.4). When step 4 found the
+ * Step 12's base build. When step 4 found the
  * base present it checks nothing and runs nothing. When step 4 found it
  * missing it queries its existence once more: present now (another run built
  * it), the step does not run and the base is used as it is; still missing, or
  * a re-check that failed (logged), it starts the step, unless the run's stop
  * record is set by then. While the step runs its handle is
- * `state.baseBuildStep`, for E13's stop path, and `state.baseBuildRun` holds
+ * `state.baseBuildStep`, for stop path, and `state.baseBuildRun` holds
  * its start; once it ends the handle is cleared and its end recorded. Exit 0
  * is `built`; another exit is `stopped` when the handle ended it or the stop
  * record is set as it ends, else `failed` with
@@ -10432,19 +10419,19 @@ export async function runBaseBuild(deps: BaseBuildDeps, state: BaseBuildRunState
   return { kind: 'failed', run, exitCode: exit.exitCode, failure: imageBuildFailure(baseImageBuildFailedLine(exit.exitCode)) }
 }
 
-// --- 12/T2 (E8 T2): the test image's build and pin, the drift and retag images, the tag move ---
+// --- 12/ : the test image's build and pin, the drift and retag images, the tag move ---
 //
-// The run's own images (b.uqm SR-9.3, SR-14.2). Every build goes through E1's
-// docker layer (section 6): in a process group of its own (b.uqm SR-5.6), its
+// The run's own images. Every build goes through
+// docker layer (section 6): in a process group of its own, its
 // output lines to the runner log, its image ID taken from its own output and
 // never from a tag lookup or an image listing. Nothing is written into the run
-// directory or the worktree (b.uqm SR-5.9). Each step replaces the run's
+// directory or the worktree. Each step replaces the run's
 // image-state record (`RunState.images`) whole as it starts and as it ends, and
-// a running build is `RunState.imageBuildInProgress`, which E13's stop path
+// a running build is `RunState.imageBuildInProgress`, which stop path
 // ends (`end()`, SIGKILL to its group) after it records the stop. A step never
 // starts a build once the stop record (`RunState.firstStop`) is set.
 //
-// The tag rule, for T4's cleanup (`ImageState.tagsMade`). A role's tag counts
+// The tag rule, for cleanup (`ImageState.tagsMade`). A role's tag counts
 // as made, and cleanup removes it by its name, when its build:
 // - was built (exit 0, with the ID its output reported);
 // - exited 0 with no readable ID: Docker tagged it, though the role's outcome
@@ -10457,22 +10444,22 @@ export async function runBaseBuild(deps: BaseBuildDeps, state: BaseBuildRunState
 // whose spawn failed, and one never started (its before-check failed, or a
 // stop came first) made no tag. `ImageState.buildsStarted` is true for each
 // role whose build was spawned: a run that spawned none lists and prunes
-// nothing (b.uqm SR-9.3).
+// nothing.
 //
 // Hand-offs. The test build's failure comes back as an `image-build` failure
-// (E10's `imageBuildFailure`). A drift or retag build's outcome is a
-// `BuildOutcome`, recorded in `ImageState.builds` and returned: E13 passes it to
-// E12's `noteDriftBuild` / `noteRetagBuild`, which write the reason. The tag
-// move returns a `TagMoveOutcome` for E12's `noteTagMove`. This section writes
+// ( `imageBuildFailure`). A drift or retag build's outcome is a
+// `BuildOutcome`, recorded in `ImageState.builds` and returned: passes it to
+// `noteDriftBuild` / `noteRetagBuild`, which write the reason. The tag
+// move returns a `TagMoveOutcome` for `noteTagMove`. This section writes
 // no reason text of its own.
 
 /** A role's outcome while its build has not been started. */
 const NOT_BUILT: BuildOutcome = { kind: 'not-built' }
 
-/** The fault each fault image serves (b.uqm SR-14.2). */
+/** The fault each fault image serves. */
 const FAULT_IMAGE_FAULT_KINDS: Readonly<Record<FaultLabelValue, FaultKind>> = { drift: 'image-drift', retag: 'retag' }
 
-/** What E8's image steps act through. */
+/** What image preparation's image steps act through. */
 export interface RunImagesContext {
   /** The docker context; its `cwd` is the worktree root, the test build's context, against which `TEST_DOCKERFILE_PATH` is read. */
   readonly docker: DockerContext
@@ -10486,7 +10473,7 @@ export interface RunImagesContext {
   readonly log: RunnerLogSink
 }
 
-/** The run's image-state record before anything is built. E13 puts it in `RunState.images` when it makes the run state. */
+/** The run's image-state record before anything is built. the run lifecycle puts it in `RunState.images` when it makes the run state. */
 export function initialImageState(): ImageState {
   return {
     pinnedId: null,
@@ -10500,7 +10487,7 @@ export function initialImageState(): ImageState {
   }
 }
 
-/** The test image build's failure line (b.uqm SR-9.3); E10's `imageBuildFailure` classes it `image-build`. */
+/** The test image build's failure line; result rendering's `imageBuildFailure` classes it `image-build`. */
 export function testImageBuildFailedLine(exitCode: number): string {
   return `${FAIL_PREFIX}image build: test image build failed (exit ${exitCode})`
 }
@@ -10512,7 +10499,7 @@ export interface RoleBuildEnd {
 }
 
 /**
- * A build's result as its role's outcome (b.uqm SR-5.6, SR-9.3, SR-14.2).
+ * A build's result as its role's outcome.
  * `spawned`: its process was started (`ImageBuild.pid` not null). `stopped`:
  * the stop record is set as it ends.
  * - built: `built`, with its ID; tag made.
@@ -10567,7 +10554,7 @@ export interface TestImageBuildReport {
 }
 
 /**
- * Builds the test image once (b.uqm SR-9.3): from `docker/Dockerfile.test`
+ * Builds the test image once: from `docker/Dockerfile.test`
  * with the worktree as context, labelled exactly `cscb-ci-owner=<RUN_ID>-<PID>`,
  * tagged only `cscb-ci-run:<RUN_ID>-<PID>-test`. On success the pinned ID is
  * the ID the build reported, recorded with the clock's moment. A failure the
@@ -10647,7 +10634,7 @@ function recordFaultImage(state: RunState, role: FaultLabelValue, end: RoleBuild
 }
 
 /**
- * Builds one fault image (b.uqm SR-14.2): the drift image (`cscb-ci-fault=drift`,
+ * Builds one fault image: the drift image (`cscb-ci-fault=drift`,
  * tagged `-drift`) or the retag image (`cscb-ci-fault=retag`, tagged `-retag`),
  * each keeping the owner label. BuildKit does not accept `FROM sha256:<id>`,
  * so it builds FROM the run's `-test` tag, and reads that tag before and after
@@ -10661,7 +10648,7 @@ function recordFaultImage(state: RunState, role: FaultLabelValue, end: RoleBuild
  * failure while the stop record is set is `stopped`. Without a pinned ID, or
  * once a stop is recorded, it starts nothing and answers `not-built`. The
  * outcome is recorded in `ImageState.builds` and, when built, `driftId` or
- * `retagId`; E13 hands it to E12's controller.
+ * `retagId`; hands it to controller.
  */
 export async function buildFaultImage(context: RunImagesContext, state: RunState, role: FaultLabelValue): Promise<BuildOutcome> {
   const pinnedId = state.images.pinnedId
@@ -10685,7 +10672,7 @@ export async function buildFaultImage(context: RunImagesContext, state: RunState
   return recordFaultImage(state, role, { outcome, tagMade: true })
 }
 
-/** The fault images the normalized faults need (b.uqm SR-14.2): `drift` for any `image-drift:<k>`, `retag` for `retag`, each at most once, drift first. */
+/** The fault images the normalized faults need: `drift` for any `image-drift:<k>`, `retag` for `retag`, each at most once, drift first. */
 export function faultImageRoles(faults: readonly Fault[]): FaultLabelValue[] {
   return FAULT_LABEL_VALUES.filter((role) => faults.some((fault) => fault.kind === FAULT_IMAGE_FAULT_KINDS[role]))
 }
@@ -10693,7 +10680,7 @@ export function faultImageRoles(faults: readonly Fault[]): FaultLabelValue[] {
 /**
  * Builds the fault images the normalized faults need, one after the other,
  * drift first (`faultImageRoles`, `buildFaultImage`); a role not needed is
- * `not-built` and spawns nothing. E13 calls it in step 12 after the read-back
+ * `not-built` and spawns nothing. calls it in step 12 after the read-back
  * and hands `drift` to `noteDriftBuild`, `retag` to `noteRetagBuild`.
  */
 export async function buildFaultImages(context: RunImagesContext, state: RunState, faults: readonly Fault[]): Promise<Readonly<Record<FaultLabelValue, BuildOutcome>>> {
@@ -10702,25 +10689,25 @@ export async function buildFaultImages(context: RunImagesContext, state: RunStat
   return outcomes
 }
 
-/** The image a shard starts from (b.uqm SR-14.2): for the `image-drift` shard, the drift image's ID when its build gave one, else the pinned ID; null before the pin. */
+/** The image a shard starts from: for the `image-drift` shard, the drift image's ID when its build gave one, else the pinned ID; null before the pin. */
 export function shardStartImageId(images: Pick<ImageState, 'pinnedId' | 'driftId'>, driftShard: boolean): string | null {
   return driftShard && images.driftId !== null ? images.driftId : images.pinnedId
 }
 
-/** The runner-log line of a failed tag move (b.uqm SR-14.2): the tag, the retag image's ID, the exit status and the error. */
+/** The runner-log line of a failed tag move: the tag, the retag image's ID, the exit status and the error. */
 export function tagMoveFailedLogLine(tag: string, retagId: string, exitCode: number, error: string): string {
   return `retag: moving ${tag} to ${retagId} failed (exit ${exitCode}): ${error}`
 }
 
 /**
- * Moves the run's `-test` tag to the retag image (b.uqm SR-14.2), which E13
+ * Moves the run's `-test` tag to the retag image, which
  * calls once every shard's start has been attempted: one `docker image tag
  * <retag ID> cscb-ci-run:<RUN_ID>-<PID>-test`, and no other tag changes.
  * - No retag image, or a stop recorded: nothing spawned, `not-tried`.
  * - Moved: `ImageState.retagMoved` set, `moved`.
  * - Failed: one runner-log line, `retagMoved` left false, `failed` with its
  *   exit status (`SPAWN_FAILED_EXIT_STATUS` when nothing was spawned).
- * E13 hands the outcome to E12's `noteTagMove`, which records the firing or
+ * hands the outcome to `noteTagMove`, which records the firing or
  * `tag move failed (exit <code>)`.
  */
 export async function moveTestTagToRetagImage(context: RunImagesContext, state: RunState): Promise<TagMoveOutcome> {
@@ -10737,11 +10724,11 @@ export async function moveTestTagToRetagImage(context: RunImagesContext, state: 
   return { kind: 'failed', exitCode }
 }
 
-// --- 12/T3 (E8 T3): reading the pinned image back ---
+// --- 12/ : reading the pinned image back ---
 //
 // After the test build, the runner reads the script list, every script's
 // prerequisite line and the duration table back from the pinned image, and
-// schedules from them (b.uqm SR-9.4). Reading starts no container:
+// schedules from them. Reading starts no container:
 // - `readPinnedImage` creates one container, `cscb-ci-<RUN_ID>-<PID>-read`,
 //   from the pinned ID with exactly `cscb-ci=1` and the owner label, and
 //   never starts it. It copies `/tests` out once, as a tar archive on the
@@ -10751,31 +10738,31 @@ export async function moveTestTagToRetagImage(context: RunImagesContext, state: 
 //   the archive's entry list, never from docker's error text, and a failed
 //   copy is never taken for a missing table. Nothing is written into the run
 //   directory or the worktree.
-// - `readTarArchive` is the in-memory archive reader (b.uqm SR-1.3 keeps it in
+// - `readTarArchive` is the in-memory archive reader (keeps it in
 //   this file): POSIX ustar, GNU (long names and links, base-256 numbers) and
 //   PAX (`path`, `linkpath`, `size`) headers; regular files, hard links
 //   (judged as the regular file they name, as `lstat` judges one),
 //   directories, symbolic links (never followed) and every other type.
-// - `compareImageWithWorktree` compares the image with E2's validated run,
-//   through E2's parser (`parsePrerequisiteLines`), its word resolution and
+// - `compareImageWithWorktree` compares the image with validated run,
+// through parser (`parsePrerequisiteLines`), its word resolution and
 //   its checker (`checkPrerequisiteHeaders`), so the image is read exactly as
 //   the worktree was. Its differences come in one stated order, and the first
 //   is the refusal's reason.
-// - `readBackPinnedImage` is both, the one call E13 makes after the build. On
+// - `readBackPinnedImage` is both, the one call makes after the build. On
 //   success it hands on `ImageReadBack`: the image's script list (the run's
 //   scripts in a full run from here on), and its duration table's text,
-//   `missing` or `unreadable` (E4's `DurationTableSource`), which E13 passes
-//   to E4's scheduling as is.
-// - `removeReadContainerIfPresent` is E13's removal at end-of-run step 1 and
-//   in a refusal's cleanup (b.uqm SR-5.7, SR-5.8).
-// No function here throws, and none records a refusal: E13 records it and
+// `missing` or `unreadable` ( `DurationTableSource`), which passes
+// to scheduling as is.
+// - `removeReadContainerIfPresent` is removal at end-of-run step 1 and
+// in a refusal's cleanup.
+// No function here throws, and none records a refusal: records it and
 // performs its cleanup.
 
-/** The image directory `docker/Dockerfile.test` copies the worktree's `tests` to. One copy-out of it holds the scripts and the duration table (b.uqm SR-9.4). */
+/** The image directory `docker/Dockerfile.test` copies the worktree's `tests` to. One copy-out of it holds the scripts and the duration table. */
 export const IMAGE_TESTS_DIR = '/tests'
-/** The read container's name suffix: `cscb-ci-<RUN_ID>-<PID>-read` (b.uqm SR-9.4). */
+/** The read container's name suffix: `cscb-ci-<RUN_ID>-<PID>-read`. */
 export const READ_CONTAINER_NAME_SUFFIX = '-read'
-/** The read container's name prefix, before its owner (b.uqm SR-9.4, SR-10.1). */
+/** The read container's name prefix, before its owner. */
 export const READ_CONTAINER_NAME_PREFIX = `${CI_CONTAINER_NAME_PREFIX}-`
 /** A tar archive's block size: each header is one block, and each entry's data is padded to whole blocks. */
 export const TAR_BLOCK_BYTES = 512
@@ -11056,11 +11043,11 @@ export function readTarArchive(archive: Uint8Array): DepRead<readonly TarEntry[]
 
 /** What the read-back found in the pinned image. */
 export interface ImageContents {
-  /** Every `test-*.sh` entry directly in the image's `/tests/integration`, with its kind, in bytewise name order: the shape E2's checks take. */
+  /** Every `test-*.sh` entry directly in the image's `/tests/integration`, with its kind, in bytewise name order: the shape validation's checks take. */
   readonly entries: readonly IntegrationEntry[]
-  /** The text of each regular `test-*.sh` entry, by its name, for E2's prerequisite-line parser. */
+  /** The text of each regular `test-*.sh` entry, by its name, for validation's prerequisite-line parser. */
   readonly scriptTexts: ReadonlyMap<string, string>
-  /** The image's duration table as E4's scheduling input takes it: its UTF-8 text, missing, or unreadable with why. A missing table is no read-back failure (b.uqm SR-4.1, SR-9.4). */
+  /** The image's duration table as scheduling's scheduling input takes it: its UTF-8 text, missing, or unreadable with why. A missing table is no read-back failure. */
   readonly durationTable: DurationTableSource
 }
 
@@ -11082,7 +11069,7 @@ export function readBackIntegrationUnlistableText(why: string): string {
   return `${IMAGE_INTEGRATION_DIR_TEXT} could not be listed from the archive of ${IMAGE_TESTS_DIR}: ${why}`
 }
 
-/** `the test image's /tests/ci-durations.tsv is a symbolic link, not a regular file`: the table is unreadable (b.uqm SR-4.1). */
+/** `the test image's /tests/ci-durations.tsv is a symbolic link, not a regular file`: the table is unreadable. */
 export function imageDurationTableNotRegularText(kind: Exclude<IntegrationEntryKind, 'regular'>): string {
   return `the test image's ${IMAGE_DURATION_TABLE_TEXT} is ${TAR_KIND_TEXT[kind]}, not a regular file`
 }
@@ -11141,19 +11128,19 @@ export function imageContentsOf(archive: Uint8Array): DepRead<ImageContents> {
   return { ok: true, value: { entries, scriptTexts, durationTable: imageDurationTableOf(latest) } }
 }
 
-// The read container, the copy-out and the removal (b.uqm SR-9.4, SR-5.7).
+// The read container, the copy-out and the removal.
 
-/** The read container's name, `cscb-ci-<RUN_ID>-<PID>-read` (b.uqm SR-9.4). */
+/** The read container's name, `cscb-ci-<RUN_ID>-<PID>-read`. */
 export function readContainerName(owner: Owner): string {
   return `${READ_CONTAINER_NAME_PREFIX}${formatOwner(owner)}${READ_CONTAINER_NAME_SUFFIX}`
 }
 
-/** The read container's labels, exactly `cscb-ci=1` and the owner label (b.uqm SR-9.4). */
+/** The read container's labels, exactly `cscb-ci=1` and the owner label. */
 export function readContainerLabels(owner: Owner): DockerLabels {
   return { [CI_LABEL]: CI_LABEL_VALUE, [OWNER_LABEL]: formatOwner(owner) }
 }
 
-/** `test image read-back failed: <error>`: the reason of an outright read-back failure, after `NOT RUN: ` (b.uqm SR-9.4). */
+/** `test image read-back failed: <error>`: the reason of an outright read-back failure, after `NOT RUN: `. */
 export function readBackFailedReason(error: string): string {
   return `test image read-back failed: ${error}`
 }
@@ -11168,7 +11155,7 @@ export function readContainerCopyFailedText(name: string, error: string): string
   return `copying ${IMAGE_TESTS_DIR} out of ${name} failed: ${error}`
 }
 
-/** `removing the read container <name> failed: <error>`: a cleanup failure (b.uqm SR-9.3). */
+/** `removing the read container <name> failed: <error>`: a cleanup failure. */
 export function readContainerRemovalFailedText(name: string, error: string): string {
   return `removing the read container ${name} failed: ${error}`
 }
@@ -11181,8 +11168,8 @@ export type ReadContainerRemoval = SweptContainerRemoval
  * name when it is present, never forced (it is never started). Docker not
  * knowing it is `absent`, no failure. Any other failure is written to the
  * runner log as `removing the read container <name> failed: <error>` and
- * returned for `RunState.cleanupFailures`. E13 calls it at end-of-run step 1
- * and in a refusal's cleanup (b.uqm SR-5.7, SR-5.8); `readPinnedImage` calls
+ * returned for `RunState.cleanupFailures`. calls it at end-of-run step 1
+ * and in a refusal's cleanup; `readPinnedImage` calls
  * it right after its copy-out.
  */
 export async function removeReadContainerIfPresent(docker: DockerContext, owner: Owner, log: RunnerLogSink): Promise<ReadContainerRemoval> {
@@ -11197,7 +11184,7 @@ export async function removeReadContainerIfPresent(docker: DockerContext, owner:
 export interface ReadBackContext {
   readonly docker: DockerContext
   readonly owner: Owner
-  /** The pinned ID, `sha256:<64 hex>` (b.uqm SR-9.3). */
+  /** The pinned ID, `sha256:<64 hex>`. */
   readonly pinnedId: string
   readonly log: RunnerLogSink
 }
@@ -11221,7 +11208,7 @@ function readBackFailure(error: string, cleanupFailure: string | null): PinnedIm
 }
 
 /**
- * Reads the pinned image back without starting a container (b.uqm SR-9.4):
+ * Reads the pinned image back without starting a container:
  * 1. creates `cscb-ci-<RUN_ID>-<PID>-read` from the pinned ID, labelled
  *    exactly `cscb-ci=1` and the owner label; it is never started;
  * 2. copies `/tests` out of it, by name, as an archive on standard output,
@@ -11255,7 +11242,7 @@ export async function readPinnedImage(context: ReadBackContext): Promise<PinnedI
 }
 
 // The comparison with the worktree's validated lists, and the hand-off to
-// scheduling (b.uqm SR-9.4). Pure.
+// scheduling. Pure.
 
 /** `the test image's /tests/integration lacks <file>, which the worktree's tests/integration holds` */
 export function imageMissingScriptReason(fileName: string): string {
@@ -11277,7 +11264,7 @@ function requiresText(names: readonly string[]): string {
   return names.length === 0 ? 'requires no script' : `requires ${joinedNames(names.map(shownArgument))}`
 }
 
-/** The image's prerequisite line as a difference names it, from E2's resolution of it. */
+/** The image's prerequisite line as a difference names it, from validation's resolution of it. */
 function imageRequiresText(header: ResolvedHeader): string {
   const unknown = header.unknownNames.map(shownArgument)
   let text = header.namesNoScript
@@ -11293,8 +11280,8 @@ function imageRequiresText(header: ResolvedHeader): string {
  * One script's prerequisite difference, or null when the image's line gives
  * exactly the worktree's validated prerequisites: `<file>'s prerequisite line
  * differs in the test image: in the worktree it requires <names>; in the image
- * it <what its line gives>`. The image's text is parsed by E2's parser and its
- * words resolved by E2's rule against the worktree's script list. A line that
+ * it <what its line gives>`. The image's text is parsed by parser and its
+ * words resolved by rule against the worktree's script list. A line that
  * names an unknown name or no script, a second line or one outside the header
  * block, and a changed set of prerequisites each differ (test-1 is ignored, as
  * in the worktree).
@@ -11315,7 +11302,7 @@ export function imagePrerequisiteDifferenceReason(
 
 /**
  * Every difference between the pinned image and the worktree's validated
- * lists (b.uqm SR-9.4), one reason each, in this order:
+ * lists, one reason each, in this order:
  * 1. each validated script the image's `/tests/integration` lacks (no entry
  *    of that name), in canonical order;
  * 2. each regular `test-*.sh` file the image holds that is not a validated
@@ -11342,15 +11329,15 @@ export function imageDifferences(validated: ValidatedRun, contents: ImageContent
   return differences
 }
 
-/** What scheduling and the shards work from once the image matches the worktree (b.uqm SR-9.4). */
+/** What scheduling and the shards work from once the image matches the worktree. */
 export interface ImageReadBack {
-  /** The pinned image's script list, in canonical order (b.uqm Terms). */
+  /** The pinned image's script list, in canonical order (Terms). */
   readonly scripts: readonly Script[]
-  /** The image's prerequisites, from E2's checker over the image's lines: the worktree's, since they match. */
+  /** The image's prerequisites, from validation's checker over the image's lines: the worktree's, since they match. */
   readonly prerequisites: PrerequisiteMap
   /** The run's scripts from here on: the image's list in a full run; the selected scripts with their prerequisites and test-1 in a selective run. */
   readonly runScripts: readonly Script[]
-  /** The duration table for E4's scheduling input: its text unchanged, missing, or unreadable. */
+  /** The duration table for scheduling's scheduling input: its text unchanged, missing, or unreadable. */
   readonly durationTable: DurationTableSource
 }
 
@@ -11366,13 +11353,12 @@ export type ImageComparison =
     }
 
 /**
- * Compares the image's contents with the worktree's validated run (b.uqm
- * SR-9.4). Every regular `test-*.sh` text is parsed once by E2's parser. Any
+ * Compares the image's contents with the worktree's validated run. Every regular `test-*.sh` text is parsed once by parser. Any
  * difference refuses with no kind: the first difference (in
  * `imageDifferences`' order) is the reason, and each other one follows as one
- * detail line. With none, the image's script list (`scriptListOf`) and E2's
+ * detail line. With none, the image's script list (`scriptListOf`) and
  * checker over the image's lines (`checkPrerequisiteHeaders`) give the
- * hand-off, with the run's scripts by E2's `runScriptsOf`. Pure.
+ * hand-off, with the run's scripts by `runScriptsOf`. Pure.
  */
 export function compareImageWithWorktree(validated: ValidatedRun, contents: ImageContents): ImageComparison {
   const parses = new Map<string, PrerequisiteParse>()
@@ -11397,7 +11383,7 @@ export function compareImageWithWorktree(validated: ValidatedRun, contents: Imag
   }
 }
 
-/** The read-back's outcome for E13: the hand-off, or the refusal (an outright failure or the differences); either way the read container's removal failure line, if any (already logged), for `RunState.cleanupFailures`. */
+/** The read-back's outcome for the run lifecycle: the hand-off, or the refusal (an outright failure or the differences); either way the read container's removal failure line, if any (already logged), for `RunState.cleanupFailures`. */
 export type ReadBackOutcome =
   | {
       readonly ok: true
@@ -11411,13 +11397,13 @@ export type ReadBackOutcome =
     }
 
 /**
- * The read-back E13 runs after the test build and before any shard starts
- * (b.uqm SR-5.3 step 12, SR-9.4): `readPinnedImage`, then
+ * The read-back runs after the test build and before any shard starts
+ * (step 12): `readPinnedImage`, then
  * `compareImageWithWorktree` against step 2's validated run. The read
- * container is gone (or its removal failure returned) before it answers. E13
+ * container is gone (or its removal failure returned) before it answers.
  * records a refusal and performs its cleanup; on success it makes
  * `readBack.runScripts` the run's scripts and passes `readBack.durationTable`
- * to E4's scheduling.
+ * to scheduling.
  */
 export async function readBackPinnedImage(context: ReadBackContext, validated: ValidatedRun): Promise<ReadBackOutcome> {
   const read = await readPinnedImage(context)
@@ -11427,31 +11413,31 @@ export async function readBackPinnedImage(context: ReadBackContext, validated: V
   return { ok: true, readBack: compared.readBack, cleanupFailure: read.cleanupFailure }
 }
 
-// --- 12/T4 (E8 T4): the run's image cleanup ---
+// --- 12/ : the run's image cleanup ---
 //
-// The run's image cleanup (b.uqm SR-9.3, SR-19.9), which E13 calls once, after
-// the run's containers are gone: at end-of-run step 3 (b.uqm SR-5.7) and on a
-// refusal (b.uqm SR-5.8). It is composed only of E5's two image-removal
-// primitives (9/T3), so this section has no image-removal form of its own:
+// The run's image cleanup, which calls once, after
+// the run's containers are gone: at end-of-run step 3 and on a
+// refusal. It is composed only of two image-removal
+// primitives (9/), so this section has no image-removal form of its own:
 // - `removeRunPrivateTag`, once per tag the run made, in the order `-drift`,
 //   `-retag`, `-test`, each by its name;
 // - then `removeOwnerUntaggedImages` on the run's own exact owner label, which
 //   lists the run's untagged images and prunes only when the listing found
 //   one, retrying a prune refused as already running.
-// What it removes follows T2's image-state record (`RunState.images`), read once
+// What it removes follows image-state record (`RunState.images`), read once
 // as cleanup starts: a role's tag is removed when `ImageState.tagsMade` says
-// the build made, or may have made, it (T2's tag rule), or, for `-test`, when
+// the build made, or may have made, it ( tag rule), or, for `-test`, when
 // the `retag` fault moved it. A run that spawned no test, drift or retag build
 // (`ImageState.buildsStarted`; the base build does not count) spawns no tag
 // removal, no listing and no prune.
 //
-// Every failure E5 reports is already written to the runner log; cleanup
+// Every failure reports is already written to the runner log; cleanup
 // appends its line to `RunState.cleanupFailures` and goes on. Cleanup never
 // throws, never refuses, writes no verdict line and never reads the stop record
 // (`RunState.firstStop`): a stop recorded while it runs changes none of its
-// commands (b.uqm SR-5.6).
+// commands.
 
-/** The order cleanup removes the run's tags in (b.uqm SR-9.3): `-drift`, `-retag`, `-test`. */
+/** The order cleanup removes the run's tags in: `-drift`, `-retag`, `-test`. */
 export const CLEANUP_TAG_ORDER: readonly RunTagRole[] = ['drift', 'retag', 'test']
 
 /** What cleanup acts through: T2's context without its signal sender, since cleanup ends no build. */
@@ -11464,7 +11450,7 @@ export interface RunImageCleanupPlan {
 }
 
 /**
- * Cleanup's plan from T2's image-state record (b.uqm SR-9.3); pure.
+ * Cleanup's plan from image-state record; pure.
  * - No test, drift or retag build spawned: no tag, no listing.
  * - Otherwise: the roles in `CLEANUP_TAG_ORDER` whose tag the run made
  *   (`tagsMade`), `-test` also when the `retag` fault moved it; and a listing.
@@ -11475,7 +11461,7 @@ export function runImageCleanupPlan(images: Pick<ImageState, 'buildsStarted' | '
   return { tagRoles, listUntagged: true }
 }
 
-/** One tag removal cleanup made: its role and E5's outcome. */
+/** One tag removal cleanup made: its role and reservation management's outcome. */
 export interface CleanupTagRemoval {
   readonly role: RunTagRole
   readonly removal: RunPrivateTagRemoval
@@ -11490,15 +11476,15 @@ export interface RunImageCleanupReport {
 }
 
 /**
- * Removes the run's own images (b.uqm SR-9.3, SR-19.9), after its containers
+ * Removes the run's own images, after its containers
  * are gone, by `runImageCleanupPlan(state.images)`:
  * 1. each planned tag by its name (`removeRunPrivateTag`), `-drift`, `-retag`,
  *    `-test`; an absent tag is no failure;
  * 2. when planned, the untagged images carrying exactly the run's owner label
  *    (`removeOwnerUntaggedImages` on `formatOwner(owner)`): listed first,
  *    pruned only when the listing found one, a prune refused as already
- *    running retried by E5; a failed listing makes no prune.
- * Every failure line (already logged by E5) is appended to
+ * running retried ; a failed listing makes no prune.
+ * Every failure line (already logged by ) is appended to
  * `state.cleanupFailures` as it arises, and cleanup goes on. Nothing is removed
  * by an ID or a digest, nothing is forced. It reads no stop record and changes
  * neither the verdict nor a refusal.
@@ -11529,20 +11515,20 @@ export async function cleanupRunImages(context: RunImageCleanupContext, state: R
 }
 
 // ---------------------------------------------------------------------------
-// 13. Shard containers (E9)
+// 13. Shard containers
 // ---------------------------------------------------------------------------
 
-// --- 13/T1 (E9 T1): shard names, labels, subdirectories and canaries; the docker run argument list, its secret check and the start ---
+// --- 13/ : shard names, labels, subdirectories and canaries; the docker run argument list, its secret check and the start ---
 //
-// Everything needed to start one shard container (b.uqm SR-10.1 to SR-10.4,
-// and E9's parts of SR-11.2, SR-11.3 and SR-14.2). The list is built by a pure
-// builder from the run's facts (E13 passes E4's assignment, E8's pinned and
-// drift image IDs and the tarball path, E12's `--fail` names and the
-// normalized faults); E9 itself decides only which shard gets a leak mount and
+// Everything needed to start one shard container (to,
+// and parts of the contract and). The list is built by a pure
+// builder from the run's facts ( passes assignment, pinned and
+// drift image IDs and the tarball path, `--fail` names and the
+// normalized faults); itself decides only which shard gets a leak mount and
 // which starts from the drift image. Each list is checked for secrets through
 // `runContainer`'s check slot, which runs before the list is logged, so a
 // refused list is never logged verbatim or spawned. Randomness comes only from
-// `RunnerDeps.randomBytes` (b.uqm SR-1.3).
+// `RunnerDeps.randomBytes`.
 //
 // Fixed here:
 // - the image is always given by its ID, never a tag, with `--pull never`, so
@@ -11555,33 +11541,33 @@ export async function cleanupRunImages(context: RunImageCleanupContext, state: R
 //   `docker run`, so no listing races the start; a shard so refused has no
 //   container of this run.
 
-/** The mark between the owner and k in a shard container's name, `cscb-ci-<RUN_ID>-<PID>-s<k>` (b.uqm SR-10.1). */
+/** The mark between the owner and k in a shard container's name, `cscb-ci-<RUN_ID>-<PID>-s<k>`. */
 export const SHARD_CONTAINER_NAME_SHARD_MARK = '-s'
-/** Allowlisted variables a shard's `docker run` names by bare name when defined in its child environment (b.uqm SR-10.4). */
+/** Allowlisted variables a shard's `docker run` names by bare name when defined in its child environment. */
 export const SHARD_ENV_NAMES = ['CI_ANTHROPIC_API_KEY', 'CI_ANTHROPIC_BASE_URL', 'CI_ANTHROPIC_MODEL', 'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_MODEL', 'CODEX_TEST_MODEL', CODEX_HOST_CONFIG_KEYS_ENV] as const
-/** The secret credentials by name: never passed to a shard as `NAME=value` (b.uqm SR-10.4, SR-15.1). The base-build token has no variable of its own here; its value is checked like every secret value. */
+/** The secret credentials by name: never passed to a shard as `NAME=value`. The base-build token has no variable of its own here; its value is checked like every secret value. */
 export const SECRET_CREDENTIAL_NAMES = ['CI_ANTHROPIC_API_KEY', 'ANTHROPIC_API_KEY', 'GH_TOKEN'] as const
-/** The in-container runner's option that names a script to fail, as `--fail <file name>` pairs (b.uqm SR-11.2, SR-14.1). */
+/** The in-container runner's option that names a script to fail, as `--fail <file name>` pairs. */
 export const RUNNER_FAIL_OPTION = '--fail'
 export const PERFORMANCE_LOCK_TARGET = '/run/cscb-ci-performance.lock'
 export const PERFORMANCE_LOCK_FILE = 'performance.lock'
-/** The random bytes drawn for one canary: two hex characters each (b.uqm SR-11.3). */
+/** The random bytes drawn for one canary: two hex characters each. */
 export const CANARY_BYTES = CANARY_LENGTH / 2
-/** The most draws for one shard's canary before its start fails: a draw that repeats another shard's canary, or that the random source cannot give, is drawn again (b.uqm SR-11.3). */
+/** The most draws for one shard's canary before its start fails: a draw that repeats another shard's canary, or that the random source cannot give, is drawn again. */
 export const CANARY_MAX_DRAWS = 16
-/** The text of Docker's refusal of a container name another container holds: `Conflict. The container name "/<name>" is already in use by container "<id>"` (b.uqm SR-13.2 check 8). */
+/** The text of Docker's refusal of a container name another container holds: `Conflict. The container name "/<name>" is already in use by container "<id>"` (check 8). */
 export const DOCKER_NAME_IN_USE_TEXT = 'is already in use'
-/** A canary: exactly `CANARY_LENGTH` lowercase hexadecimal characters (b.uqm SR-11.2, SR-11.3). */
+/** A canary: exactly `CANARY_LENGTH` lowercase hexadecimal characters. */
 const SHARD_CANARY_PATTERN = /^[0-9a-f]+$/
 /** A character that cannot stand inside one field of a `--mount` value (its fields are comma-separated, CSV-quoted). */
 const MOUNT_FIELD_UNSAFE_PATTERN = /[,"\u0000-\u001f\u007f]/
 
-/** Shard k's container name, `cscb-ci-<RUN_ID>-<PID>-s<k>`: two owners never give one name (b.uqm SR-10.1). */
+/** Shard k's container name, `cscb-ci-<RUN_ID>-<PID>-s<k>`: two owners never give one name. */
 export function shardContainerName(owner: Owner, shard: number): string {
   return `${CI_CONTAINER_NAME_PREFIX}-${formatOwner(owner)}${SHARD_CONTAINER_NAME_SHARD_MARK}${shard}`
 }
 
-/** A shard container's two labels, `cscb-ci=1` and `cscb-ci-owner=<RUN_ID>-<PID>`, in that order (b.uqm SR-10.1). */
+/** A shard container's two labels, `cscb-ci=1` and `cscb-ci-owner=<RUN_ID>-<PID>`, in that order. */
 export function shardContainerLabels(owner: Owner): DockerLabels {
   return {
     [CI_LABEL]: CI_LABEL_VALUE,
@@ -11589,14 +11575,14 @@ export function shardContainerLabels(owner: Owner): DockerLabels {
   }
 }
 
-/** Shard k's subdirectory of the run directory, `<run directory>/shard-<k>` (b.uqm SR-5.9). */
+/** Shard k's subdirectory of the run directory, `<run directory>/shard-<k>`. */
 export function shardSubdirectoryPath(runDir: string, shard: number): string {
   return join(runDir, `${SHARD_DIR_PREFIX}${shard}`)
 }
 
 /**
  * Creates shard k's subdirectory in the run directory, mode exactly 0700
- * whatever the umask (b.uqm SR-5.9, SR-11.3): one `mkdir`, never recursive.
+ * whatever the umask: one `mkdir`, never recursive.
  * A directory already there (not a link) is kept and set to 0700, so a leak
  * source can be prepared ahead of its own shard's start; anything else at the
  * path, or any other failure, is a failure on one line. Its path, or the failure.
@@ -11629,7 +11615,7 @@ function lowercaseHex(bytes: Uint8Array): string {
 }
 
 /**
- * One shard's canary (b.uqm SR-11.3): `CANARY_BYTES` random bytes from the
+ * One shard's canary: `CANARY_BYTES` random bytes from the
  * injected source as `CANARY_LENGTH` lowercase hex characters, different from
  * every canary in `taken`. A draw that repeats one, that gives the wrong
  * number of bytes or that throws is drawn again, at most `CANARY_MAX_DRAWS`
@@ -11664,7 +11650,7 @@ export interface ShardCanaryDrawer {
   drawn(): readonly string[]
 }
 
-/** Builds a run's canary source over the injected random source (`RunnerDeps.randomBytes`); E13 builds one per run. */
+/** Builds a run's canary source over the injected random source (`RunnerDeps.randomBytes`); the run lifecycle builds one per run. */
 export function createShardCanaryDrawer(randomBytes: RunnerDeps['randomBytes']): ShardCanaryDrawer {
   const drawn: string[] = []
   return {
@@ -11678,12 +11664,12 @@ export function createShardCanaryDrawer(randomBytes: RunnerDeps['randomBytes']):
 }
 
 /**
- * The image shard k starts from (b.uqm SR-10.2, SR-14.2): the drift image's
+ * The image shard k starts from: the drift image's
  * ID for the shard `image-drift:<k>` names when its build succeeded
  * (`driftImageId` not null); the pinned ID for every other shard, and for that
- * one when the drift build failed or did not run: E8's `shardStartImageId`
+ * one when the drift build failed or did not run: `shardStartImageId`
  * rule, the drift shard found from the faults. The fault's not-fired reason
- * is E12's.
+ * is .
  */
 export function shardImageId(faults: readonly Fault[], shard: number, pinnedImageId: string, driftImageId: string | null): string {
   const drifts = faults.some((fault) => fault.kind === 'image-drift' && fault.shard === shard)
@@ -11691,7 +11677,7 @@ export function shardImageId(faults: readonly Fault[], shard: number, pinnedImag
   return shardStartImageId({ pinnedId: pinnedImageId, driftId: driftImageId }, drifts) ?? pinnedImageId
 }
 
-/** Shard j's leak mounts (b.uqm SR-10.3, SR-14.2): for each `leak:<k>,<j>`, shard k's subdirectory, read-only, at `/leak-shard-<k>`, in fault order. None for any other shard. */
+/** Shard j's leak mounts: for each `leak:<k>,<j>`, shard k's subdirectory, read-only, at `/leak-shard-<k>`, in fault order. None for any other shard. */
 export function shardLeakMounts(faults: readonly Fault[], runDir: string, shard: number): ShardMount[] {
   const mounts: ShardMount[] = []
   for (const fault of faults) {
@@ -11701,7 +11687,7 @@ export function shardLeakMounts(faults: readonly Fault[], runDir: string, shard:
   return mounts
 }
 
-/** Shard k's mounts (b.uqm SR-10.3): the run's tarball, read-only, at `/tmp/package.tgz`; its own subdirectory at `/test-results`; then its leak mounts. */
+/** Shard k's mounts: the run's tarball, read-only, at `/tmp/package.tgz`; its own subdirectory at `/test-results`; then its leak mounts. */
 export function shardMounts(faults: readonly Fault[], runDir: string, shard: number, tarballPath: string): ShardMount[] {
   return [
     { source: tarballPath, target: INTEGRITY_TARBALL_MOUNT_TARGET, readOnly: true },
@@ -11715,17 +11701,17 @@ function refuseShardInput(reason: string): never {
   throw new Error(reason)
 }
 
-/** A shard number: a whole number of at least 1 (b.uqm SR-11.2). */
+/** A shard number: a whole number of at least 1. */
 function shardNumberOperand(shard: number): string {
   if (!Number.isSafeInteger(shard) || shard < 1) refuseShardInput(`not a shard number: ${String(shard)}`)
   return String(shard)
 }
 
 /**
- * The in-container runner's arguments, in b.uqm SR-11.2's order: the shard
+ * The in-container runner's arguments, in the contract order: the shard
  * number, the canary, one `--fail <file name>` pair per given name in the
  * given order, then the assigned scripts' file names in run order (test-1
- * first, as E4's assignment holds them). Refuses (throws) arguments the
+ * first, as assignment holds them). Refuses (throws) arguments the
  * in-container runner would find malformed: a bad shard number or canary, an
  * assigned name not of the script form or given twice, or a `--fail` name not
  * among the assigned scripts or given twice.
@@ -11756,7 +11742,7 @@ function bindMountValue(mount: ShardMount): string {
   return `type=bind,source=${mount.source},target=${mount.target}${mount.readOnly ? ',readonly' : ''}`
 }
 
-/** What shard k's list is built from: the run's facts as E13 passes them, and its canary. */
+/** What shard k's list is built from: the run's facts as the run lifecycle passes them, and its canary. */
 export interface ShardRunPlanInput {
   /** The final Docker child environment; omitted means no variables are forwarded. */
   readonly env?: ChildEnvironmentSource
@@ -11771,15 +11757,15 @@ export interface ShardRunPlanInput {
   /** Its assigned scripts' file names in run order, test-1 first (`ShardAssignment.assigned`). */
   readonly assigned: readonly string[]
   readonly canary: string
-  /** Its `--fail` file names in order (E12's `shardFailFileNames`, or the fault controller's `failFileNames(k)`). */
+  /** Its `--fail` file names in order (fault injection's `shardFailFileNames`, or the fault controller's `failFileNames(k)`). */
   readonly failFileNames: readonly string[]
-  /** The run's normalized faults (`Invocation.faults`): E9 reads only `leak:` and `image-drift:` from them. */
+  /** The run's normalized faults (`Invocation.faults`): shard management reads only `leak:` and `image-drift:` from them. */
   readonly faults: readonly Fault[]
-  /** The pinned image ID (b.uqm SR-9.4). */
+  /** The pinned image ID. */
   readonly pinnedImageId: string
   /** The drift image's ID when its build succeeded; null when it failed or was not built. */
   readonly driftImageId: string | null
-  /** The run's tarball, an absolute path in `package/` (b.uqm SR-9.1). */
+  /** The run's tarball, an absolute path in `package/`. */
   readonly tarballPath: string
 }
 
@@ -11791,7 +11777,7 @@ export interface ShardRunPlan {
   readonly imageId: string
   /** Its mounts, in list order: the tarball, its subdirectory, then its leak mounts. */
   readonly mounts: readonly ShardMount[]
-  /** The in-container runner's arguments (b.uqm SR-11.2). */
+  /** The in-container runner's arguments. */
   readonly runnerArguments: readonly string[]
   /** The arguments after `docker run --detach`, as `runContainer` takes them. */
   readonly runArguments: readonly string[]
@@ -11799,7 +11785,7 @@ export interface ShardRunPlan {
 
 /**
  * Shard k's `docker run` arguments after `docker run --detach`, a pure
- * builder (b.uqm SR-10.1 to SR-10.4, SR-11.2, SR-14.2), in this order:
+ * builder, in this order:
  * `--pull never`; `--name` and the two labels; `--memory` and
  * `--memory-swap` both at the cap in bytes, `--pids-limit`, `--cpus`; the
  * `--mount`s; bare `--env` names from `SHARD_ENV_NAMES` defined in `env`; the image ID; the
@@ -11849,7 +11835,7 @@ function passesNameWithValue(arg: string, name: string): boolean {
 }
 
 /**
- * The `docker run` argument-list check (b.uqm SR-10.4, SR-15.2): refuses a
+ * The `docker run` argument-list check: refuses a
  * list in which any argument passes a secret credential's name
  * (`SECRET_CREDENTIAL_NAMES`) with a value attached, or holds any secret
  * value (the run's secret set, `secretCredentialSet`) as a substring. The
@@ -11879,7 +11865,7 @@ export function isNameInUseError(error: string, name: string): boolean {
   return error.includes(DOCKER_NAME_IN_USE_TEXT) && error.includes(`"/${name}"`)
 }
 
-/** What the start entry point uses: spawn, the runner's environment (passed unchanged under the child-environment rule, b.uqm SR-15.4), the worktree root as docker's working directory, and the clock. */
+/** What the start entry point uses: spawn, the runner's environment (passed unchanged under the child-environment rule), the worktree root as docker's working directory, and the clock. */
 export type ShardStartDeps = Pick<RunnerDeps, 'spawn' | 'env' | 'worktreeRoot' | 'clock'>
 
 /** What one shard's start takes, beyond its dependencies. */
@@ -11893,7 +11879,7 @@ export interface ShardStartInput {
   readonly runDir: string
   /** Its assignment entry: k and its assigned scripts in run order. */
   readonly assignment: Pick<ShardAssignment, 'shard' | 'assigned'>
-  /** Its `--fail` file names in order (E12). */
+  /** Its `--fail` file names in order (fault injection). */
   readonly failFileNames: readonly string[]
   /** The run's normalized faults. */
   readonly faults: readonly Fault[]
@@ -11920,7 +11906,7 @@ export interface ShardStartResult {
   readonly containerName: string
   /** The started container's full ID; null when it did not start. */
   readonly containerId: string | null
-  /** Its inspection data (b.uqm SR-10.5), for `ShardEvidence.inspection`: null when it never started, or when both reads failed (13/T2). */
+  /** Its inspection data, for `ShardEvidence.inspection`: null when it never started, or when both reads failed (13/T2). */
   readonly inspection: InspectionData | null
   /** For `ShardEvidence.inspectionError`: null with data; `container never started` when it never started; else the last failed read's error on one line (13/T2). */
   readonly inspectionError: string | null
@@ -11942,7 +11928,7 @@ async function failedRunLeftContainer(docker: DockerContext, name: string, owner
 }
 
 /**
- * Starts shard k (b.uqm SR-10.1 to SR-10.4), E13's one call per shard in step
+ * Starts shard k, one call per shard in step
  * 12: draws its canary; creates its subdirectory (and each leak source's) at
  * 0700 before any docker command; builds its list; and starts it through
  * `runContainer`, whose check slot refuses a list carrying a secret before it
@@ -11956,7 +11942,7 @@ async function failedRunLeftContainer(docker: DockerContext, name: string, owner
  * the name is in use sets `nameInUse` and creates no container; any other
  * failed `docker run` is followed by one inspect by name, to record whether
  * it left a container of this run created.
- * A started shard's inspection data is captured before it returns (13/T2).
+ * A started shard's inspection data is captured before it returns (13/).
  */
 export async function startShard(deps: ShardStartDeps, input: ShardStartInput): Promise<ShardStartResult> {
   const shard = input.assignment.shard
@@ -12024,26 +12010,25 @@ export async function startShard(deps: ShardStartDeps, input: ShardStartInput): 
   return failed(canary.value, plan.mounts, outcome.error, await failedRunLeftContainer(docker, containerName, input.owner))
 }
 
-// --- 13/T2 (E9 T2): inspection capture and the 1 s re-read ---
+// --- 13/ : inspection capture and the 1 s re-read ---
 //
 // Each started shard's inspection data, read right after its start, inside
-// `startShard`, so no retirement can remove the container first (b.uqm
-// SR-10.5). The read is E1's `readContainerInspection`, whose format selects
-// only SR-10.5's fields: no path here asks Docker for, holds or stores a
+// `startShard`, so no retirement can remove the container first. The read is `readContainerInspection`, whose format selects
+// only fields: no path here asks Docker for, holds or stores a
 // container's environment. A failed read is read once more,
 // `INSPECTION_REREAD_DELAY_MS` later on the injected clock (never a real
 // sleep); when that fails too, the shard has no data and keeps the last error
 // on one line. A shard whose container never started, one created but not
 // started included, is never inspected and records `container never started`.
 
-/** How many inspection reads a started shard gets at most: one right after its start, and one re-read `INSPECTION_REREAD_DELAY_MS` later when that fails (b.uqm SR-10.5). */
+/** How many inspection reads a started shard gets at most: one right after its start, and one re-read `INSPECTION_REREAD_DELAY_MS` later when that fails. */
 export const INSPECTION_READ_ATTEMPTS = 2
 
 /** A shard's inspection facts for its evidence (`ShardEvidence.inspection`, `inspectionError`, `imageId`), as `startShard` returns them. */
 export type ShardInspectionCapture = Pick<ShardStartResult, 'inspection' | 'inspectionError' | 'imageId'>
 
 /**
- * Reads a shard container's selected inspection fields (b.uqm SR-10.5)
+ * Reads a shard container's selected inspection fields
  * through `readContainerInspection`, by its ID or name: the parsed data, or
  * the failure on one line. Never throws, and never reads the environment.
  */
@@ -12058,13 +12043,13 @@ export async function readShardInspection(docker: DockerContext, container: stri
   }
 }
 
-/** The inspection facts of a shard whose container never started (never created, created but not started, or refused): no data, no image ID, and `container never started` (b.uqm SR-10.5, SR-16.1). */
+/** The inspection facts of a shard whose container never started (never created, created but not started, or refused): no data, no image ID, and `container never started`. */
 export function shardInspectionNeverStarted(): ShardInspectionCapture {
   return { inspection: null, inspectionError: CONTAINER_NEVER_STARTED_TEXT, imageId: null }
 }
 
 /**
- * Captures a started shard's inspection data (b.uqm SR-10.5): reads at once;
+ * Captures a started shard's inspection data: reads at once;
  * when that read fails, waits `INSPECTION_REREAD_DELAY_MS` on the injected
  * clock and reads once more, `INSPECTION_READ_ATTEMPTS` reads in all. The
  * data with `inspectionError` null and `imageId` from the data; or, when every
@@ -12089,19 +12074,19 @@ export async function captureShardInspection(clock: RunnerClock, docker: DockerC
   return { inspection: null, inspectionError: lastError, imageId: null }
 }
 
-// --- 13/T3 (E9 T3): the final reading and shard retirement ---
+// --- 13/ : the final reading and shard retirement ---
 //
-// How a shard is retired, never when: E13 decides when (end markers, E4's
-// limit timer, E12's `kill:`, run-level stops, end-of-run step 1) and calls
-// one run-wide retirer (`createShardRetirer`) per shard (b.uqm SR-10.6,
-// SR-5.7 step 1). Every way a shard ends follows one order, each step after
+// How a shard is retired, never when: decides when (end markers,
+// limit timer, `kill:`, run-level stops, end-of-run step 1) and calls
+// one run-wide retirer (`createShardRetirer`) per shard (
+// step 1). Every way a shard ends follows one order, each step after
 // the one before it:
 // 1. the final reading, taken at most once per shard: Docker's state form
 //    (`State.OOMKilled`, whether it runs, its status and exit code) through
-//    `inspectContainerState`, then E6's container figures (`oom_kill`, `anon`,
+// `inspectContainerState`, then container figures (`oom_kill`, `anon`,
 //    `file`) from its own cgroup, found through its main PID
 //    (`readContainerFigures`). Each part is recorded on its own, or as
-//    `unreadable`; nothing is interpreted (E7 judges the reading);
+// `unreadable`; nothing is interpreted ( judges the reading);
 // 2. SIGKILL while that reading shows it running, or when whether it runs is
 //    unreadable and it did not exit on its own (a missed kill would leave a
 //    container holding its memory); never SIGTERM, since the in-container
@@ -12110,8 +12095,8 @@ export async function captureShardInspection(clock: RunnerClock, docker: DockerC
 // 3. its Docker logs saved whole as `docker.log` in its subdirectory;
 // 4. its removal, never forced.
 // A failed step is written to the runner log, and the next steps still run.
-// A failed removal is also a cleanup failure (b.uqm SR-9.3); a container
-// Docker no longer knows counts as absent, as in E5's sweep, for both the log
+// A failed removal is also a cleanup failure; a container
+// Docker no longer knows counts as absent, as in sweep, for both the log
 // save and the removal. A shard with no created container (never created, or
 // refused because its name was in use) has no final reading and no
 // retirement: no docker operation is made. A shard whose start failed and
@@ -12119,19 +12104,19 @@ export async function captureShardInspection(clock: RunnerClock, docker: DockerC
 // either: it has no final reading, so its `container failed to start` line
 // stands, and its retirement is `no-container` after that one read. A
 // started shard whose container vanished keeps an all-`unreadable` reading. A limit
-// retirement re-checks the result file by E4's end-marker rule first, so a
-// shard holding its end marker is never retired as over its limit (AC 54).
+// retirement re-checks the result file by end-marker rule first, so a
+// shard holding its end marker is never retired as over its limit.
 
-/** Docker's `State.Status` values of a container that has exited, whose `State.ExitCode` is its exit code; a `created` container never ran and has none (b.uqm SR-10.6, SR-12.1). */
+/** Docker's `State.Status` values of a container that has exited, whose `State.ExitCode` is its exit code; a `created` container never ran and has none. */
 export const EXITED_CONTAINER_STATUSES = ['exited', 'dead'] as const
 
-/** What the final reading and retirement use: spawn, the runner's environment (passed unchanged under the child-environment rule, b.uqm SR-15.4), the worktree root as docker's working directory, the clock (the reading's moment), and the cgroup reads of E6's container figures. */
+/** What the final reading and retirement use: spawn, the runner's environment (passed unchanged under the child-environment rule), the worktree root as docker's working directory, the clock (the reading's moment), and the cgroup reads of admission's container figures. */
 export type ShardRetirementDeps = Pick<RunnerDeps, 'spawn' | 'env' | 'worktreeRoot' | 'clock' | 'readCgroupFile' | 'readProcCgroup'>
 
 /** The shard a final reading or retirement is for: its start result as `startShard` returns it. */
 export type RetiredShard = Pick<ShardStartResult, 'start' | 'containerCreated' | 'containerName' | 'containerId'>
 
-/** Why a shard is retired (b.uqm SR-10.6): its end marker, its wall-time limit, a `kill:` fault, a run-level stop (naming which), or its container exited on its own. */
+/** Why a shard is retired: its end marker, its wall-time limit, a `kill:` fault, a run-level stop (naming which), or its container exited on its own. */
 export type RetirementReason =
   | {
       readonly kind: 'end-marker'
@@ -12150,7 +12135,7 @@ export type RetirementReason =
       readonly kind: 'exited'
     }
 
-/** A shard's one final reading (b.uqm SR-10.6): E1's four parts, and the container's state at that moment. */
+/** A shard's one final reading: shared runner helpers's four parts, and the container's state at that moment. */
 export interface ShardFinalReading {
   readonly shard: number
   /** When it was taken, epoch milliseconds (`ShardTimingRecord.finalReadingAtMs`). */
@@ -12207,7 +12192,7 @@ export type RetirementRemoval =
       readonly line: string
     }
 
-/** A shard's retirement (b.uqm SR-10.6): `no-container` for a shard with no created container (no docker operation), or whose start failed and whose container Docker does not know (its state read only); else its reading and each step's outcome. `reason` is the effective reason, settled before any SIGKILL. */
+/** A shard's retirement: `no-container` for a shard with no created container (no docker operation), or whose start failed and whose container Docker does not know (its state read only); else its reading and each step's outcome. `reason` is the effective reason, settled before any SIGKILL. */
 export type ShardRetirement =
   | {
       readonly kind: 'no-container'
@@ -12237,7 +12222,7 @@ export interface ShardRetirementContext {
   readonly state: Pick<RunState, 'cleanupFailures'>
 }
 
-/** A run's one retirer, keyed by shard number: E13 builds one per run. */
+/** A run's one retirer, keyed by shard number: the run lifecycle builds one per run. */
 export interface ShardRetirer {
   /** The shard's final reading: taken on the first request; every later one, while or after it is taken, gets the same answer with no new read. Null, with no docker operation, for a shard with no created container; null after its state read for a shard whose start failed and whose container Docker does not know. Never rejects. */
   finalReading(shard: RetiredShard): Promise<ShardFinalReading | null>
@@ -12249,13 +12234,13 @@ export interface ShardRetirer {
   recordedRetirement(shard: number): ShardRetirement | null
 }
 
-/** Whether a result file as read holds its end marker: a complete `done` line, E4's limit-timer rule over E1's reading rule (b.uqm SR-4.3, SR-11.3). */
+/** Whether a result file as read holds its end marker: a complete `done` line, scheduling's limit-timer rule over shared runner helpers's reading rule. */
 export function resultFileHoldsEndMarker(read: ResultFileRead): boolean {
   return read.kind === 'events' && read.events.some((event) => event.kind === 'done')
 }
 
 /**
- * The effective retirement reason (b.uqm SR-10.6, AC 54): a limit retirement
+ * The effective retirement reason: a limit retirement
  * of a shard whose result file (`readResultFile` in its subdirectory) holds
  * its end marker is an end-marker retirement; every other reason stands. Only
  * a limit retirement reads the file. Never taken from an exit code.
@@ -12288,7 +12273,7 @@ async function settledDockerAnswer<T>(operation: () => Promise<DockerAnswer<T>>)
   }
 }
 
-/** E6's container figures, with a throw from a reading dependency failing every figure. */
+/** admission's container figures, with a throw from a reading dependency failing every figure. */
 function readFinalFigures(deps: ShardRetirementDeps, target: FiguresTarget): Pick<ContainerFigures, 'anonBytes' | 'fileBytes' | 'oomKillCount'> {
   try {
     return readContainerFigures(deps, target)
@@ -12304,8 +12289,8 @@ function retiredShardContainer(shard: RetiredShard): string {
 }
 
 /**
- * Takes a shard's final reading (b.uqm SR-10.6): one state-form read, then,
- * only when the state was read, E6's figures from its cgroup (none for a
+ * Takes a shard's final reading: one state-form read, then,
+ * only when the state was read, figures from its cgroup (none for a
  * container with no main process: it exited on its own, or never started).
  * Null for a shard whose start failed and whose container Docker does not
  * know: it was never created, so it has no final reading. A failed state read,
@@ -12386,7 +12371,7 @@ async function retirementLogSave(docker: DockerContext, runDir: string, log: Run
   return { kind: 'failed', error: failure }
 }
 
-/** The removal step: never forced; already gone is absent; a failure is logged and listed as a cleanup failure (b.uqm SR-9.3). */
+/** The removal step: never forced; already gone is absent; a failure is logged and listed as a cleanup failure. */
 async function retirementRemoval(docker: DockerContext, context: ShardRetirementContext, target: RetiredShard): Promise<RetirementRemoval> {
   const removed = await settledDockerAnswer(() => removeContainer(docker, retiredShardContainer(target)))
   if (removed.ok) return { kind: 'removed' }
@@ -12399,7 +12384,7 @@ async function retirementRemoval(docker: DockerContext, context: ShardRetirement
 }
 
 /**
- * Builds a run's retirer (b.uqm SR-10.6): one final reading and one
+ * Builds a run's retirer: one final reading and one
  * retirement per shard, both kept by shard number, so concurrent and repeated
  * requests (a limit timer and a run-level stop together) share the first.
  *
@@ -12478,33 +12463,33 @@ export function createShardRetirer(context: ShardRetirementContext): ShardRetire
 }
 
 // ---------------------------------------------------------------------------
-// 14. Outcomes, verdict and results (E10)
+// 14. Outcomes, verdict and results
 // ---------------------------------------------------------------------------
 
-// --- 14/T1 (E10 T1): shard subdirectories into script results, shard outcomes, cause texts and end lines, the pass condition ---
+// --- 14/ : shard subdirectories into script results, shard outcomes, cause texts and end lines, the pass condition ---
 //
-// E10's first layer, which T2 (the verdict) and T3 (`results.json` and the
+// first layer, which (the verdict) and (`results.json` and the
 // summary) build on: each shard's subdirectory becomes per-script results
-// (b.uqm SR-11.3, with SR-12.4's script-line rule), each shard gets exactly one
-// outcome with its cause and end line (b.uqm SR-12.1, SR-3.6), and the run's
-// pass condition is decided (b.uqm SR-12.3). Every decision is a pure function
-// over E1's data model; the `read*` functions only gather a shard
-// subdirectory's `result.txt`, script logs and `docker.log` through E1's
+// (with script-line rule), each shard gets exactly one
+// outcome with its cause and end line, and the run's
+// pass condition is decided. Every decision is a pure function
+// over data model; the `read*` functions only gather a shard
+// subdirectory's `result.txt`, script logs and `docker.log` through
 // readers (`readResultFile`, `readFileText`) and hand them to the decisions.
 
-// Script results from a shard subdirectory (b.uqm SR-11.3, SR-12.4).
+// Script results from a shard subdirectory.
 
-/** The fallback failure line's fixed text, verbatim from `tests/runner.sh` at 946be79 (b.uqm SR-12.4). */
+/** The fallback failure line's fixed text, verbatim from `tests/runner.sh` at 946be79. */
 export const NO_FAIL_LINE_TEXT = 'exited non-zero without explicit FAIL line'
 
-/** A failing script's line when its log holds no line beginning `FAIL:` or cannot be read: `FAIL: <file name>: exited non-zero without explicit FAIL line` (b.uqm SR-12.4). */
+/** A failing script's line when its log holds no line beginning `FAIL:` or cannot be read: `FAIL: <file name>: exited non-zero without explicit FAIL line`. */
 export function noFailLineFallback(fileName: string): string {
   return `${FAIL_PREFIX}${fileName}: ${NO_FAIL_LINE_TEXT}`
 }
 
 /**
  * The first line of a script log that begins `FAIL:`, verbatim and without its
- * line feed; null when no line does (b.uqm SR-12.4). The log is split at line
+ * line feed; null when no line does. The log is split at line
  * feeds and a last line without one counts, as `tests/runner.sh` at 946be79
  * selects with `grep -m1 '^FAIL:'`. A line with any text before `FAIL:` is
  * never taken, and nothing is re-prefixed.
@@ -12520,12 +12505,12 @@ export function scriptFailLineOf(fileName: string, log: FileTextRead): string {
   return line ?? noFailLineFallback(fileName)
 }
 
-/** A script's log in its shard subdirectory, `<file name>.log` (b.uqm SR-11.3). */
+/** A script's log in its shard subdirectory, `<file name>.log`. */
 export function shardScriptLogPath(shardDir: string, fileName: string): string {
   return join(shardDir, `${fileName}${SCRIPT_LOG_SUFFIX}`)
 }
 
-/** One assigned script as its shard's result file records it (b.uqm SR-11.3). */
+/** One assigned script as its shard's result file records it. */
 export interface RecordedScript {
   readonly fileName: string
   /** Its first recorded result (`end` or `notrun`); null when the file records none for it. */
@@ -12537,7 +12522,7 @@ export interface RecordedScript {
   readonly notrunReason?: string
 }
 
-/** A shard's result file turned into its assigned scripts' records: missing, unreadable (E1's reading rule), or readable. */
+/** A shard's result file turned into its assigned scripts' records: missing, unreadable (shared runner helpers's reading rule), or readable. */
 export type ShardScriptsRead =
   | {
       readonly kind: 'missing'
@@ -12557,10 +12542,9 @@ export type ShardScriptsRead =
     }
 
 /**
- * A shard's assigned scripts from its result file as E1 read it (b.uqm
- * SR-11.3). `scriptLog` gives a script's log as read; it is asked only for
+ * A shard's assigned scripts from its result file as read it. `scriptLog` gives a script's log as read; it is asked only for
  * scripts recorded `fail`. Events naming a script not assigned to the shard
- * are left out (b.uqm SR-13.2's `result-coverage` is E11's); a script's first
+ * are left out (`result-coverage` is ); a script's first
  * `end` or `notrun` is its record.
  */
 export function shardScriptsOf(resultFile: ResultFileRead, assigned: readonly string[], scriptLog: (fileName: string) => FileTextRead): ShardScriptsRead {
@@ -12585,21 +12569,21 @@ export function shardScriptsOf(resultFile: ResultFileRead, assigned: readonly st
   return { kind: 'readable', endMarker, scripts, inProgress: unfinished.at(-1) ?? null }
 }
 
-/** Reads a shard subdirectory's `result.txt` and the logs of its failing scripts into its assigned scripts' records (b.uqm SR-11.3, SR-12.4). */
+/** Reads a shard subdirectory's `result.txt` and the logs of its failing scripts into its assigned scripts' records. */
 export function readShardScripts(shardDir: string, assigned: readonly string[]): ShardScriptsRead {
   return shardScriptsOf(readResultFile(shardDir), assigned, (fileName) => readFileText(shardScriptLogPath(shardDir, fileName)))
 }
 
-// Cause texts and end lines (b.uqm SR-12.1). E4 and E12 record causes as
+// Cause texts and end lines. and record causes as
 // `ShardCause` values; these builders are the only writers of their texts.
 
-/** `wall-time limit of <m> min exceeded`, m whole minutes the caller has already rounded (b.uqm SR-4.3, SR-12.1). Throws for any other m. */
+/** `wall-time limit of <m> min exceeded`, m whole minutes the caller has already rounded. Throws for any other m. */
 export function wallTimeLimitCauseText(minutes: number): string {
   if (!Number.isSafeInteger(minutes) || minutes < 0) throw new Error(`wallTimeLimitCauseText: not whole minutes: ${minutes}`)
   return `wall-time limit of ${minutes} min exceeded`
 }
 
-/** `killed`: a `kill:` fault (b.uqm SR-12.1, SR-14.2). */
+/** `killed`: a `kill:` fault. */
 export function killedCauseText(): string {
   return 'killed'
 }
@@ -12611,38 +12595,38 @@ const STOPPED_BY_WORDS: Readonly<Record<StopKind, string>> = {
   'run-deadline': 'run deadline',
 }
 
-/** `stopped by interrupt`, `stopped by memory watchdog` or `stopped by run deadline` (b.uqm SR-5.6, SR-12.1). */
+/** `stopped by interrupt`, `stopped by memory watchdog` or `stopped by run deadline`. */
 export function stoppedCauseText(by: StopKind): string {
   return `stopped by ${STOPPED_BY_WORDS[by]}`
 }
 
-/** `container exited <code>` (b.uqm SR-12.1). Throws for a code that is no integer. */
+/** `container exited <code>`. Throws for a code that is no integer. */
 export function containerExitedCauseText(code: number): string {
   if (!Number.isSafeInteger(code)) throw new Error(`containerExitedCauseText: not an exit code: ${code}`)
   return `container exited ${code}`
 }
 
-/** `container failed to start: <detail>`, the detail on one line (b.uqm SR-10.6, SR-12.1). */
+/** `container failed to start: <detail>`, the detail on one line. */
 export function containerFailedToStartCauseText(detail: string): string {
   return `container failed to start: ${dependencyErrorText(detail)}`
 }
 
-/** `image marker missing` (b.uqm SR-12.1). */
+/** `image marker missing`. */
 export function imageMarkerMissingCauseText(): string {
   return 'image marker missing'
 }
 
-/** `result file unreadable` (b.uqm SR-11.3, SR-12.1). */
+/** `result file unreadable`. */
 export function resultFileUnreadableCauseText(): string {
   return 'result file unreadable'
 }
 
-/** `no result file` (b.uqm SR-12.1). */
+/** `no result file`. */
 export function noResultFileCauseText(): string {
   return 'no result file'
 }
 
-/** A shard cause's text, through its builder (b.uqm SR-12.1). */
+/** A shard cause's text, through its builder. */
 export function shardCauseText(cause: ShardCause): string {
   switch (cause.kind) {
     case 'wall-time-limit':
@@ -12665,7 +12649,7 @@ export function shardCauseText(cause: ShardCause): string {
 }
 
 /**
- * Whether a cause may take the script form of the end line (b.uqm SR-12.1):
+ * Whether a cause may take the script form of the end line:
  * only `wall-time limit of <m> min exceeded`, `container exited <code>`,
  * `killed` and `stopped by <stop>` do. Every other cause (`container failed to
  * start`, `image marker missing`, `result file unreadable`, `no result file`)
@@ -12686,30 +12670,30 @@ export function causeTakesScriptEndLine(cause: ShardCause): boolean {
   }
 }
 
-/** A shard's end line when a script was in progress and the cause takes the script form (`causeTakesScriptEndLine`), `FAIL: <file name>: <cause> in shard-<k>`, ranked as that script's failure (b.uqm SR-12.1). */
+/** A shard's end line when a script was in progress and the cause takes the script form (`causeTakesScriptEndLine`), `FAIL: <file name>: <cause> in shard-<k>`, ranked as that script's failure. */
 export function scriptEndLine(fileName: string, shard: number, cause: ShardCause): string {
   return `${FAIL_PREFIX}${fileName}: ${shardCauseText(cause)} in ${SHARD_DIR_PREFIX}${shard}`
 }
 
-/** A shard's end line otherwise, `FAIL: shard-<k>: <cause>` (b.uqm SR-12.1). */
+/** A shard's end line otherwise, `FAIL: shard-<k>: <cause>`. */
 export function shardEndLine(shard: number, cause: ShardCause): string {
   return `${FAIL_PREFIX}${SHARD_DIR_PREFIX}${shard}: ${shardCauseText(cause)}`
 }
 
-/** `results.json`'s `end` for a shard that ended normally with no out-of-memory line (b.uqm SR-16.1). */
+/** `results.json`'s `end()` for a shard that ended normally with no out-of-memory line. */
 export const NORMAL_SHARD_END = 'normal'
 
-// Shard outcomes (b.uqm SR-12.1, SR-12.2's replacement rule, SR-3.6).
+// Shard outcomes (replacement rule).
 
-/** The shard evidence an outcome is decided from: the fields E4, E7, E9, E12 and E13 fill (b.uqm SR-12.1). */
+/** The shard evidence an outcome is decided from: the fields scheduling, the memory guard, shard management, fault injection and the run lifecycle fill. */
 export type ShardOutcomeEvidence = Pick<ShardEvidence, 'shard' | 'assigned' | 'start' | 'fixedCause' | 'exitCode' | 'oomLine'>
 
-/** One shard's outcome: its `results.json` `endedNormally`, `end` and `scripts` entries, and its failures (b.uqm SR-12.1, SR-16.1). */
+/** One shard's outcome: its `results.json` `endedNormally`, `end()` and `scripts` entries, and its failures. */
 export interface ShardOutcome {
   readonly shard: number
   /** Its result file is readable and holds the end marker, whatever exit or recorded stop followed. */
   readonly endedNormally: boolean
-  /** The cause SR-12.1's precedence chose; null for a shard that ended normally. */
+  /** The cause precedence chose; null for a shard that ended normally. */
   readonly cause: ShardCause | null
   /** Its out-of-memory line, else its end line, else `normal`. */
   readonly end: string
@@ -12721,7 +12705,7 @@ export interface ShardOutcome {
   readonly failures: readonly Failure[]
 }
 
-/** Whether a Docker log's text holds the marker refusal line as a whole line (b.uqm SR-11.2, SR-12.1). */
+/** Whether a Docker log's text holds the marker refusal line as a whole line. */
 export function holdsMarkerRefusalLine(dockerLogText: string): boolean {
   return dockerLogText.split('\n').includes(MARKER_REFUSAL_LINE)
 }
@@ -12732,16 +12716,16 @@ export function dockerLogHoldsMarkerRefusal(shardDir: string): boolean {
   return read.kind === 'text' && holdsMarkerRefusalLine(read.text)
 }
 
-/** A shard ended normally: its result file is readable and holds the end marker (b.uqm SR-12.1, SR-11.4). */
+/** A shard ended normally: its result file is readable and holds the end marker. */
 export function shardEndedNormally(scripts: ShardScriptsRead): boolean {
   return scripts.kind === 'readable' && scripts.endMarker
 }
 
 /**
  * The cause of a shard that did not end normally, the first that applies
- * (b.uqm SR-12.1): (1) the cause the runner fixed itself, `fixedCause` (for a
- * shard never created, E13 records the run-level stop's cause there, b.uqm
- * SR-5.6); (2) `container failed to start`;
+ * (1) the cause the runner fixed itself, `fixedCause` (for a
+ * shard never created, records the run-level stop's cause there
+ *); (2) `container failed to start`;
  * (3) `image marker missing`, only for an exit of 2 with the marker refusal
  * line in its saved Docker logs; (4) `container exited <code>`; (5) `result
  * file unreadable`; (6) `no result file`, which is also the cause when none of
@@ -12759,7 +12743,7 @@ export function shardCauseOf(evidence: ShardOutcomeEvidence, scripts: ShardScrip
 
 /**
  * A shard's end failure: its out-of-memory line when it has one, else its end
- * line when it did not end normally, else none (b.uqm SR-12.1, SR-12.2). The
+ * line when it did not end normally, else none. The
  * end line takes the script form, classed `script`, only with a script in
  * progress and a cause that `causeTakesScriptEndLine` allows; otherwise it
  * takes the shard form, classed `shard`.
@@ -12773,7 +12757,7 @@ function shardEndFailure(evidence: ShardOutcomeEvidence, cause: ShardCause | nul
 }
 
 /**
- * Decides one shard's outcome (b.uqm SR-12.1, SR-3.6). A shard that ended
+ * Decides one shard's outcome. A shard that ended
  * normally has no cause, and its end is its out-of-memory line or `normal`.
  * Any other shard gets the cause `shardCauseOf` chooses, and its end line is
  * `FAIL: <file name>: <cause> in shard-<k>` when its readable result file has
@@ -12818,7 +12802,7 @@ export function decideShardOutcome(evidence: ShardOutcomeEvidence, scripts: Shar
  * Reads a shard's subdirectory and decides its outcome: `result.txt` and the
  * failing scripts' logs through `readShardScripts`, and `docker.log` only when
  * the container exited 2. A shard never created takes its cause only from
- * `fixedCause`, where E13 records the run-level stop's cause (b.uqm SR-5.6).
+ * `fixedCause`, where records the run-level stop's cause.
  */
 export function readShardOutcome(evidence: ShardOutcomeEvidence, shardDir: string): ShardOutcome {
   const scripts = readShardScripts(shardDir, evidence.assigned)
@@ -12826,12 +12810,12 @@ export function readShardOutcome(evidence: ShardOutcomeEvidence, shardDir: strin
   return decideShardOutcome(evidence, scripts, markerRefused)
 }
 
-// The pass condition (b.uqm SR-12.3, SR-3.6).
+// The pass condition.
 
-/** test-1's number: the script every shard runs first (b.uqm SR-3.3, SR-3.4). */
+/** test-1's number: the script every shard runs first. */
 const EVERY_SHARD_SCRIPT_NUMBER = 1
 
-/** What the pass condition is decided over. Cleanup failures are never an input (b.uqm SR-9.3). */
+/** What the pass condition is decided over. Cleanup failures are never an input. */
 export interface PassInputs {
   /** The run's expected scripts, file names, test-1 included. */
   readonly expectedScripts: readonly string[]
@@ -12844,12 +12828,12 @@ export interface PassInputs {
 }
 
 /**
- * Whether the run passes (b.uqm SR-12.3): no failure line exists (no other
+ * Whether the run passes: no failure line exists (no other
  * failure, and no shard has a script line, an end line or an out-of-memory
  * line); no script entry is `notrun`; test-1 passed in every shard used; and
  * every other expected script passed. Expected scripts without test-1 never
  * pass. A dependent recorded `notrun` after its prerequisite failed adds no
- * failure line of its own: the prerequisite's is the only one (b.uqm SR-3.6),
+ * failure line of its own: the prerequisite's is the only one,
  * and the `notrun` alone already fails the run.
  */
 export function runPasses(inputs: PassInputs): boolean {
@@ -12865,17 +12849,17 @@ export function runPasses(inputs: PassInputs): boolean {
   return inputs.expectedScripts.every((fileName) => passedIn(fileName, null))
 }
 
-// --- 14/T2 (E10 T2): the failure ranking, the verdict line, its SELECTIVE prefix and the double guard ---
+// --- 14/ : the failure ranking, the verdict line, its SELECTIVE prefix and the double guard ---
 //
-// Every failure of the run ranked into one list by b.uqm SR-12.4's precedence,
+// Every failure of the run ranked into one list by the contract precedence,
 // and the one verdict line built from it in the shape the invocation calls for
-// (b.uqm SR-12.5, SR-19.6). Pure functions over E1's data model and T1's
+//. Pure functions over data model and
 // outcomes. Which run-level stop came first, and writing `verdict.txt`, are
-// E13's.
+// .
 
-// The failure ranking (b.uqm SR-12.4).
+// The failure ranking.
 
-/** Each failure class's tier in SR-12.4's precedence, highest first; within a tier the order is `compareFailures`'. */
+/** Each failure class's tier in the contract precedence, highest first; within a tier the order is `compareFailures`'. */
 const FAILURE_TIERS: Readonly<Record<FailureClass['kind'], number>> = {
   'run-level-stop': 0,
   'image-build': 1,
@@ -12888,19 +12872,19 @@ const FAILURE_TIERS: Readonly<Record<FailureClass['kind'], number>> = {
 /** The failure classes a shard outcome's failures take (T1's `ShardOutcome.failures`); each carries its shard. */
 const SHARD_OUTCOME_FAILURE_KINDS: readonly FailureClass['kind'][] = ['out-of-memory', 'shard', 'script']
 
-/** A failure's tier in SR-12.4's precedence, 0 highest: run-level stop, image build, integrity, out-of-memory, other `shard-<k>`, script. */
+/** A failure's tier in the contract precedence, 0 highest: run-level stop, image build, integrity, out-of-memory, other `shard-<k>`, script. */
 export function failureTier(failure: Failure): number {
   return FAILURE_TIERS[failure.failureClass.kind]
 }
 
 /**
- * Compares two failures in SR-12.4's precedence (b.uqm SR-12.4): by tier
+ * Compares two failures in the contract precedence: by tier
  * first; out-of-memory and other `shard-<k>` lines by shard number; script
- * failures, a `… in shard-<k>` end line among them, in E1's canonical order
+ * failures, a `… in shard-<k>` end line among them, in canonical order
  * of their scripts, then by shard number, so test-1's lowest shard comes
  * first. Run-level, image-build and integrity failures compare equal within
  * their tier, whatever shard an integrity failure carries, so a stable sort
- * keeps their given order (SR-13.2's, for the integrity failures).
+ * keeps their given order (for the integrity failures).
  */
 export function compareFailures(a: Failure, b: Failure): number {
   const tier = failureTier(a) - failureTier(b)
@@ -12913,23 +12897,23 @@ export function compareFailures(a: Failure, b: Failure): number {
   return (a.shard ?? 0) - (b.shard ?? 0)
 }
 
-/** The first run-level stop's line as a failure, classed `run-level-stop`, with no shard (b.uqm SR-5.6, SR-12.4). */
+/** The first run-level stop's line as a failure, classed `run-level-stop`, with no shard. */
 export function runLevelFailure(line: string): Failure {
   return { line, shard: null, failureClass: { kind: 'run-level-stop' } }
 }
 
-/** The image build failure's line as a failure, classed `image-build`, with no shard (b.uqm SR-9.3, SR-12.4). */
+/** The image build failure's line as a failure, classed `image-build`, with no shard. */
 export function imageBuildFailure(line: string): Failure {
   return { line, shard: null, failureClass: { kind: 'image-build' } }
 }
 
-/** Every failure source of a run, each from the Epic that owns it (b.uqm SR-12.4). */
+/** Every failure source of a run, each from the component that owns it. */
 export interface FailureSources {
-  /** The first run-level stop's line (E13); null for none. */
+  /** The first run-level stop's line (the run lifecycle); null for none. */
   readonly runLevelLine: string | null
-  /** The image build failure's line (E8); null for none. */
+  /** The image build failure's line (image preparation); null for none. */
   readonly imageBuildLine: string | null
-  /** The integrity failures in SR-13.2's order (E11), each classed `integrity`, each with its shard number or null; ranking keeps this order exactly. */
+  /** The integrity failures in the contract order (integrity checks), each classed `integrity`, each with its shard number or null; ranking keeps this order exactly. */
   readonly integrityFailures: readonly Failure[]
   /** The shard outcomes (T1). */
   readonly outcomes: readonly ShardOutcome[]
@@ -12945,7 +12929,7 @@ export function otherFailuresOf(sources: FailureSources): Failure[] {
 /**
  * Throws unless a failure is of one of the classes its source gives, and
  * unless an out-of-memory, shard or script failure carries a shard. An
- * integrity failure carries a shard number or null (E11); run-level and
+ * integrity failure carries a shard number or null ; run-level and
  * image-build entries never reach this check, as `runLevelFailure` and
  * `imageBuildFailure` build them shardless.
  */
@@ -12956,17 +12940,17 @@ function checkFailureSource(failure: Failure, kinds: readonly FailureClass['kind
 }
 
 /**
- * Every failure of the run, ranked by SR-12.4's precedence (b.uqm SR-12.4,
- * SR-16.1 `failures`): the first run-level stop; the image build failure; the
- * integrity failures in exactly their given order (SR-13.2's), never
+ * Every failure of the run, ranked by the contract precedence (
+ * `failures`): the first run-level stop; the image build failure; the
+ * integrity failures in exactly their given order , never
  * reordered by shard; out-of-memory lines by shard number (`out-of-memory
  * status unreadable` with the kill lines); other `shard-<k>` lines by shard
  * number; script failures in canonical order, test-1's by ascending shard.
  * Every failure is kept, each once: a shard's end line is already its only
- * entry for the script in progress, and `notrun` is never one (T1).
+ * entry for the script in progress, and `notrun` is never one .
  * Run-level and image-build entries are built shardless by `runLevelFailure`
  * and `imageBuildFailure`; an integrity entry carries its shard number or
- * null, as E11 gives it; every other entry carries its shard. Throws for an
+ * null, as gives it; every other entry carries its shard. Throws for an
  * input failure of the wrong class, and for an out-of-memory, shard or script
  * failure without a shard.
  */
@@ -12977,13 +12961,13 @@ export function rankFailures(sources: FailureSources): Failure[] {
   return [...otherFailuresOf(sources), ...shardFailures].sort(compareFailures)
 }
 
-// The verdict line (b.uqm SR-12.5, SR-19.6).
+// The verdict line.
 
-/** The verdict of a passing full run without `--inject`, and the word a passing selective or injected run's verdict ends with (b.uqm SR-12.5, SR-17.2). */
+/** The verdict of a passing full run without `--inject`, and the word a passing selective or injected run's verdict ends with. */
 export const PASS_VERDICT = 'PASS'
 
 /**
- * The `SELECTIVE (<scripts>)` list (b.uqm SR-12.5, SR-17.2): the run's
+ * The `SELECTIVE (<scripts>)` list: the run's
  * scripts, file names or number forms, as number forms in canonical order,
  * separated by single spaces. Throws for a name that is neither form, for two
  * names of one number, and for a list without test-1.
@@ -13001,7 +12985,7 @@ export function selectiveScriptsText(scripts: readonly string[]): string {
   return sortCanonical(numberForms).join(' ')
 }
 
-/** The selective verdict's prefix, `SELECTIVE (<scripts>): ` (b.uqm SR-12.5, SR-17.2); throws as `selectiveScriptsText` does. */
+/** The selective verdict's prefix, `SELECTIVE (<scripts>): `; throws as `selectiveScriptsText` does. */
 export function selectiveVerdictPrefix(scripts: readonly string[]): string {
   return `SELECTIVE (${selectiveScriptsText(scripts)}): `
 }
@@ -13009,7 +12993,7 @@ export function selectiveVerdictPrefix(scripts: readonly string[]): string {
 /**
  * Throws unless every script the invocation selects is in the run's scripts,
  * compared by number form, so the `SELECTIVE` list always holds every
- * selected script (b.uqm SR-17.2). Throws for a selected name that is neither
+ * selected script. Throws for a selected name that is neither
  * form; a name in `scripts` that is neither form is `selectiveScriptsText`'s
  * to reject.
  */
@@ -13025,13 +13009,13 @@ function checkSelectedScriptsListed(selected: readonly string[], scripts: readon
   }
 }
 
-/** What the verdict line is built from (b.uqm SR-12.5). */
+/** What the verdict line is built from. */
 export interface VerdictInputs {
-  /** The invocation: its run kind, gate eligibility and normalized faults decide the shape (E1's rules). */
+  /** The invocation: its run kind, gate eligibility and normalized faults decide the shape (shared runner helpers's rules). */
   readonly invocation: Invocation
   /**
    * The run's resolved, de-duplicated expected scripts, file names or number
-   * forms: the selection, every prerequisite and test-1 (b.uqm SR-17.2). Used
+   * forms: the selection, every prerequisite and test-1. Used
    * only for a selective run, whose `SELECTIVE` list it is; it must hold
    * test-1 and every script the invocation selects.
    */
@@ -13043,8 +13027,7 @@ export interface VerdictInputs {
 }
 
 /**
- * The run's verdict line, one line without a line feed (b.uqm SR-12.5,
- * SR-19.6): `PASS` when the run passes, else the top-ranked failure's line
+ * The run's verdict line, one line without a line feed: `PASS` when the run passes, else the top-ranked failure's line
  * verbatim (a CRLF script line keeps its `\r`); then, for a selective run, the
  * `SELECTIVE (<scripts>): ` prefix; then, for an injected run, the
  * `INJECTED (<faults>): ` wrapper outside it. A full run without `--inject`
@@ -13080,40 +13063,40 @@ export function buildVerdictLine(inputs: VerdictInputs): string {
   return line
 }
 
-// --- 14/T3 (E10 T3): the timing summary, the results.json value, summary.txt and their one redacted writer ---
+// --- 14/ : the timing summary, the results.json value, summary.txt and their one redacted writer ---
 //
-// The run's record (b.uqm SR-16.1, SR-16.2): the timing summary placed in its
-// fixed order from the lines other Epics produce, the `results.json` value
+// The run's record: the timing summary placed in its
+// fixed order from the lines other sections produce, the `results.json` value
 // with every key filled by its rule, the human-readable `summary.txt` rendered
 // from that value, and the one writer of both files, which applies the
-// injected redactor (E11's) to all their content and replaces each whole
-// through a temporary file in the run directory and a rename (b.uqm SR-5.6,
-// SR-5.7 step 5, SR-15.3). E13 calls the writer at end-of-run step 5 and again
+// injected redactor to all their content and replaces each whole
+// through a temporary file in the run directory and a rename (
+// step 5). calls the writer at end-of-run step 5 and again
 // on a stop during the end-of-run sequence. The assembler takes the verdict
-// line and the ranked failures (T2) as given.
+// line and the ranked failures as given.
 
-// The timing summary (b.uqm SR-16.2, SR-8.4).
+// The timing summary.
 
 /** Each line break a given timing line may hold: CRLF, LF or CR. */
 const GIVEN_LINE_BREAK_PATTERN = /\r\n|\r|\n/
 
-/** The timing summary's line groups, each as its owning Epic gives it; T3 only places them (b.uqm SR-16.2). */
+/** The timing summary's line groups, each as its owning section gives it; T3 only places them. */
 export interface TimingSummaryGroups {
-  /** The shard-count line (E6, b.uqm SR-6.7); every run has one. */
+  /** The shard-count line (admission); every run has one. */
   readonly shardCountLine: string
-  /** The build time with its base-build part, each shard's time and the total (E4, b.uqm SR-4.4). */
+  /** The build time with its base-build part, each shard's time and the total (scheduling). */
   readonly runTimes: readonly string[]
-  /** Each script's time (E4, b.uqm SR-4.4). */
+  /** Each script's time (scheduling). */
   readonly scriptTimes: readonly string[]
-  /** The duration-table block under its introducing line, its real tab characters kept (E4, b.uqm SR-4.4). */
+  /** The duration-table block under its introducing line, its real tab characters kept (scheduling). */
   readonly durationTableBlock: readonly string[]
-  /** The `slow:` lines (E4, b.uqm SR-4.4). */
+  /** The `slow:` lines (scheduling). */
   readonly slowLines: readonly string[]
-  /** The table notes (E4). */
+  /** The table notes (scheduling). */
   readonly tableNotes: readonly string[]
   /**
-   * The cap line with its suffix (E7, b.uqm SR-8.4), placed only in a full
-   * run. A full run always passes one (SR-8.4's `unknown` form covers a run
+   * The cap line with its suffix , placed only in a full
+   * run. A full run always passes one (`unknown` form covers a run
    * with no readings); null only for a selective run, which gets no cap line.
    */
   readonly capLine: string | null
@@ -13125,11 +13108,11 @@ function givenLines(text: string): string[] {
 }
 
 /**
- * The timing summary in print order (b.uqm SR-16.2): the shard-count line;
+ * The timing summary in print order: the shard-count line;
  * the build time with its base-build part, each shard's time and the total;
  * each script's time; the duration-table block, the `slow:` lines and the
  * table notes; and, for a full run (injected or not), the cap line, which a
- * selective run never gets (b.uqm SR-8.4). An empty group, or a null cap
+ * selective run never gets. An empty group, or a null cap
  * line, adds no line. Every element is one line: a given text holding line breaks is split
  * into its lines, and no element is empty or holds a line break.
  */
@@ -13146,19 +13129,19 @@ export function assembleTimingSummary(groups: TimingSummaryGroups, runKind: RunK
   return ordered.flatMap((text) => (text === null ? [] : givenLines(text)))
 }
 
-// The results.json value (b.uqm SR-16.1).
+// The results.json value.
 
-/** `inspectionError` for a shard whose container never started: never created, or failed to start (b.uqm SR-16.1). */
+/** `inspectionError` for a shard whose container never started: never created, or failed to start. */
 export const CONTAINER_NEVER_STARTED_TEXT = 'container never started'
 
 /** `inspectionError` for a started shard with no inspection data and no failed read recorded, such as one whose read a stop prevented. */
 export const INSPECTION_NOT_READ_TEXT = 'inspection data not read'
 
 /**
- * The shard evidence a `shards` entry takes as it is (b.uqm SR-16.1): E4's
- * assignment figures, E7's readings, E9's start, image and inspection (its
+ * The shard evidence a `shards` entry takes as it is:
+ * assignment figures, readings, start, image and inspection (its
  * `inspectionError` being the last failed read's error as recorded, any
- * form), and E11's in-shard records. A `ShardEvidence` is one.
+ * form), and in-shard records. A `ShardEvidence` is one.
  */
 export type ResultsShardEvidence = Pick<
   ShardEvidence,
@@ -13195,52 +13178,52 @@ export interface RunModes {
   readonly shardDirs: Readonly<Record<string, number>>
 }
 
-/** Everything `results.json` is assembled from, each value from the Epic that owns it (b.uqm SR-16.1). */
+/** Everything `results.json` is assembled from, each value from the component that owns it. */
 export interface ResultsInputs {
   readonly codexModel?: string | null
   readonly runId: string
   /** The runner's PID. */
   readonly pid: number
-  /** The invocation: `args`, the run kind and the normalized faults (E1). */
+  /** The invocation: `args`, the run kind and the normalized faults (shared runner helpers). */
   readonly invocation: Invocation
-  /** The run's tarball hash (E8); null when no tarball was packed. */
+  /** The run's tarball hash (image preparation); null when no tarball was packed. */
   readonly packageSha256: string | null
-  /** The run's images (E8). */
+  /** The run's images (image preparation). */
   readonly images: Pick<ImageState, 'pinnedId' | 'driftId' | 'retagId' | 'retagMoved'>
   /** The verdict line (T2), as given; the writer redacts it. */
   readonly verdict: string
   /** One per shard, in any order; written in shard order. */
   readonly shards: readonly ResultsShardInput[]
-  /** E6's figures. */
+  /** admission's figures. */
   readonly shardCount: ResultsShardCount
-  /** E7's figures; in a selective run every key but `usedBytes` is written null. */
+  /** the memory guard's figures; in a selective run every key but `usedBytes` is written null. */
   readonly cap: ResultsCap
-  /** E7's working-set readings. */
+  /** the memory guard's working-set readings. */
   readonly workingSet: ResultsWorkingSet
-  /** The run's failed-reading count (E7). */
+  /** The run's failed-reading count (the memory guard). */
   readonly failedReadings: number
-  /** The modes as read (E13). */
+  /** The modes as read (the run lifecycle). */
   readonly modes: RunModes
   /** Every failure, ranked (T2's `rankFailures`); cleanup failures are never among them. */
   readonly failures: readonly Failure[]
-  /** The skipped checks (E11). */
+  /** The skipped checks (integrity checks). */
   readonly skippedChecks: readonly IntegrityCheck[]
-  /** Each cleanup failure's line (E8, b.uqm SR-9.3). */
+  /** Each cleanup failure's line (image preparation). */
   readonly cleanupFailures: readonly string[]
-  /** The build, base-build and total times (E13). */
+  /** The build, base-build and total times (the run lifecycle). */
   readonly timing: ResultsTiming
   /** The timing summary's groups, placed by `assembleTimingSummary`. */
   readonly timingGroups: TimingSummaryGroups
 }
 
-/** A mode as `modes` writes it: its permission bits as a four-digit octal string, 0700 as `"0700"` (b.uqm SR-16.1). Throws for a value that is no mode. */
+/** A mode as `modes` writes it: its permission bits as a four-digit octal string, 0700 as `"0700"`. Throws for a value that is no mode. */
 export function octalModeText(mode: number): string {
   if (!Number.isSafeInteger(mode) || mode < 0) throw new Error(`octalModeText: not a mode: ${mode}`)
   return (mode & 0o7777).toString(8).padStart(4, '0')
 }
 
 /**
- * A shard's `inspectionError` (b.uqm SR-16.1, SR-10.5): null when it has
+ * A shard's `inspectionError`: null when it has
  * inspection data; `container never started` for a shard never created or
  * that failed to start; otherwise the last failed read's error on one line,
  * or `INSPECTION_NOT_READ_TEXT` when no failed read was recorded.
@@ -13252,7 +13235,7 @@ export function inspectionErrorOf(evidence: Pick<ShardEvidence, 'start' | 'inspe
   return error === '' ? INSPECTION_NOT_READ_TEXT : error
 }
 
-/** Inspection data with exactly b.uqm SR-10.5's fields. */
+/** Inspection data with exactly fields. */
 function resultsInspectionOf(inspection: InspectionData): InspectionData {
   return {
     name: inspection.name,
@@ -13271,7 +13254,7 @@ function resultsInspectionOf(inspection: InspectionData): InspectionData {
   }
 }
 
-/** One `shards` entry, exactly its keys: the evidence's figures, the outcome's `endedNormally` and `end`, and `inspectionError` by its rule (b.uqm SR-16.1). Throws when the evidence and the outcome are of different shards. */
+/** One `shards` entry, exactly its keys: the evidence's figures, the outcome's `endedNormally` and `end()`, and `inspectionError` by its rule. Throws when the evidence and the outcome are of different shards. */
 function resultsShardOf(input: ResultsShardInput): ResultsShard {
   const { evidence, outcome } = input
   if (outcome.shard !== evidence.shard) throw new Error(`assembleResults: shard-${evidence.shard}'s evidence paired with shard-${outcome.shard}'s outcome`)
@@ -13295,7 +13278,7 @@ function resultsShardOf(input: ResultsShardInput): ResultsShard {
   }
 }
 
-/** `cap`, exactly its keys; in a selective run every key but `usedBytes` is null (b.uqm SR-16.1, SR-8.4). */
+/** `cap`, exactly its keys; in a selective run every key but `usedBytes` is null. */
 function resultsCapOf(cap: ResultsCap, runKind: RunKind): ResultsCap {
   const full = runKind === 'full'
   return {
@@ -13314,7 +13297,7 @@ function resultsWorkingSetReadingOf(reading: WorkingSetReading | null): WorkingS
   return reading === null ? null : { bytes: reading.bytes, anonBytes: reading.anonBytes, activeFileBytes: reading.activeFileBytes }
 }
 
-/** `modes`: each mode as a four-digit octal string (b.uqm SR-16.1). */
+/** `modes`: each mode as a four-digit octal string. */
 function resultsModesOf(modes: RunModes): ResultsModes {
   return {
     runDir: octalModeText(modes.runDir),
@@ -13324,16 +13307,16 @@ function resultsModesOf(modes: RunModes): ResultsModes {
 }
 
 /**
- * The `results.json` value, every key of b.uqm SR-16.1 filled by its rule and
+ * The `results.json` value, every key of the contract filled by its rule and
  * nothing more: `version` 1; the images' IDs; the verdict line as given;
  * `invocation` with `args` as given, `selective` and the normalized faults'
  * texts; `scripts`, one per assigned script per shard (test-1 once per shard),
- * in shard order then run order, from T1's outcomes; `shards` in shard order,
- * with T1's `endedNormally` and `end` and `inspectionError` by its rule; `cap`
+ * in shard order then run order, from outcomes; `shards` in shard order,
+ * with `endedNormally` and `end()` and `inspectionError` by its rule; `cap`
  * nulled but `usedBytes` in a selective run; `modes` as four-digit octal
  * strings; `failures` the ranked list as given, each its `line` and `shard`;
  * and `timingSummary` from `assembleTimingSummary`. Redaction is the writer's.
- * Serialize it with E1's `serializeResults`, which throws for a value off its
+ * Serialize it with `serializeResults`, which throws for a value off its
  * shape (a count that is no whole number, say). Throws when a shard's evidence
  * and outcome are of different shards, or a mode is no mode.
  */
@@ -13376,7 +13359,7 @@ export function assembleResults(inputs: ResultsInputs): Results {
   }
 }
 
-// summary.txt (b.uqm SR-16.2, SR-12.4, SR-13.1, SR-7.3, SR-8.4, SR-9.3).
+// summary.txt.
 
 /** How the summary shows an absent value. */
 const SUMMARY_NONE = 'none'
@@ -13442,7 +13425,7 @@ function summaryHeadLines(results: Results): string[] {
   ]
 }
 
-/** Every failure with its shard (b.uqm SR-12.4), the skipped checks (b.uqm SR-13.1) and the cleanup failures (b.uqm SR-9.3). */
+/** Every failure with its shard, the skipped checks and the cleanup failures. */
 function summaryProblemLines(results: Results): string[] {
   return [
     `failures: ${results.failures.length}`,
@@ -13486,7 +13469,7 @@ function summaryScriptLines(results: Results): string[] {
   ]
 }
 
-/** The run-wide figures: shard count, cap, working set, failed readings (run and per shard, b.uqm SR-7.3), modes and timing. */
+/** The run-wide figures: shard count, cap, working set, failed readings (run and per shard), modes and timing. */
 function summaryRunFigureLines(results: Results): string[] {
   const { shardCount, cap, workingSet, modes, timing } = results
   const peakFromKill = cap.peakFromKill === null ? SUMMARY_NONE : yesNo(cap.peakFromKill)
@@ -13506,7 +13489,7 @@ function summaryRunFigureLines(results: Results): string[] {
 }
 
 /**
- * `summary.txt`'s text (b.uqm SR-16.2): every value of the results file but
+ * `summary.txt`'s text: every value of the results file but
  * the shards' `inspection` data, one item per line, in a fixed layout, so the
  * same results always give the same text. It lists each failure with its
  * shard (`run` for none), each skipped check, each cleanup failure and the
@@ -13530,10 +13513,10 @@ export function renderSummary(results: Results): string {
   return `${lines.join('\n')}\n`
 }
 
-// The one writer of results.json and summary.txt (b.uqm SR-5.6, SR-5.7, SR-15.3).
+// The one writer of results.json and summary.txt.
 
 /**
- * The redactor the writer applies (E11's, passed in by E13; b.uqm SR-15.3):
+ * The redactor the writer applies (passed in by ):
  * `results` returns the results with every scanned value replaced by
  * `<redacted>` and their shape kept; `text` does the same in a text.
  */
@@ -13563,14 +13546,14 @@ function writeBuiltFile(runDir: string, fileName: string, build: () => string): 
 
 /**
  * Writes `results.json` and then `summary.txt` in the run directory, each
- * whole through E1's `writeWholeFile` (a temporary `.<name>.tmp` in the run
- * directory, then a rename), so a second call replaces both whole (b.uqm
- * SR-5.6, SR-5.7 step 5). The redactor is applied first to the results value,
- * the verdict included; `results.json` is that value through E1's
+ * whole through `writeWholeFile` (a temporary `.<name>.tmp` in the run
+ * directory, then a rename), so a second call replaces both whole (
+ * step 5). The redactor is applied first to the results value,
+ * the verdict included; `results.json` is that value through
  * `serializeResults`, and `summary.txt` is `renderSummary` of it with the text
- * redactor applied on top (b.uqm SR-15.3). Nothing unredacted is ever
+ * redactor applied on top. Nothing unredacted is ever
  * written: a redactor that throws fails both files and writes neither. A
- * results value off E1's shape fails `results.json` only, and the summary is
+ * results value off shape fails `results.json` only, and the summary is
  * still written. Never throws; each outcome is reported.
  */
 export function writeResultsFiles(runDir: string, results: Results, redactor: ResultsRedactor): ResultsFilesWrite {
@@ -13588,19 +13571,19 @@ export function writeResultsFiles(runDir: string, results: Results, redactor: Re
 }
 
 // ---------------------------------------------------------------------------
-// 15. Integrity and secret-scan (E11)
+// 15. Integrity and secret-scan
 // ---------------------------------------------------------------------------
 
-// --- 15/T1 (E11 T1): integrity checks 1–11, the evidence reader, the evidence rule and the skip rules ---
+// --- 15/ : integrity checks 1–11, the evidence reader, the evidence rule and the skip rules ---
 //
-// Checks 1–11 of b.uqm SR-13.2. They judge plain inputs in E1's types
-// (`IntegrityInputs`, filled by E13 at step 2 of the end of run, b.uqm
-// SR-5.7) and the run directory as it stands then, read by
-// `readIntegrityEvidence` with E1's readers and never through a link. Nothing
+// Checks 1–11 of the contract. They judge plain inputs in types
+// (`IntegrityInputs`, filled by at step 2 of the end of run
+//) and the run directory as it stands then, read by
+// `readIntegrityEvidence` with readers and never through a link. Nothing
 // here spawns a process or reads a container: isolation is judged only from
 // the inspection data captured at each shard's start and from the shard
-// subdirectories (b.uqm SR-13.1, SR-10.5). `runIntegrityChecks1To11` runs
-// them in order; T2's entry adds check 12, `secret-scan`.
+// subdirectories. `runIntegrityChecks1To11` runs
+// them in order; entry adds check 12, `secret-scan`.
 //
 // Each failure reads `FAIL: integrity: <check>: <detail>` (`integrityFailure`)
 // and is one problem found. A problem about one shard carries that shard's
@@ -13610,10 +13593,10 @@ export function writeResultsFiles(runDir: string, results: Results, redactor: Re
 // subdirectory in shard j, are problems found in shard j and carry j. A
 // detail names shards, scripts, entries, mount targets or faults; it never
 // holds a credential, a canary, a hash or file content. A name can still
-// spell one: every run canary in a line is masked here, and T2's entry masks
+// spell one: every run canary in a line is masked here, and entry masks
 // every scanned value in every line it returns.
 //
-// Order of the failures: by check, in SR-13.2's order
+// Order of the failures: by check, in the contract order
 // (`INTEGRITY_CHECK_ORDER`). Inside a check, the failures carrying a shard
 // number come first, by shard number, then the null-shard failures; each
 // group keeps the order the check finds them in: faults in their normalized
@@ -13622,17 +13605,17 @@ export function writeResultsFiles(runDir: string, results: Results, redactor: Re
 // scripts it was not assigned in canonical order; null-shard scripts in
 // canonical order.
 //
-// The evidence rule (b.uqm SR-13.1), for checks 5, 10 and 11: a shard's own
+// The evidence rule, for checks 5, 10 and 11: a shard's own
 // canary, tarball hash or fingerprint that is missing or malformed fails only
-// when the shard ended normally (E10's `endedNormally`, never recomputed
+// when the shard ended normally ( `endedNormally`, never recomputed
 // here) and its test-1 passed. Evidence a shard did record that is wrong
 // fails in any shard: another shard's canary, a well-formed hash that differs
 // from the run's, well-formed fingerprints that differ.
 //
-// The skip rules (b.uqm SR-13.1, SR-5.6): see `integritySkippedChecks`. A
+// The skip rules: see `integritySkippedChecks`. A
 // stopped run is checked from whatever evidence exists, as a finished one is.
 
-/** b.uqm SR-13.2's twelve checks, in order: E10 ranks integrity failures in it (b.uqm SR-12.4). */
+/** twelve checks, in order: result rendering ranks integrity failures in it. */
 export const INTEGRITY_CHECK_ORDER: readonly IntegrityCheck[] = [
   'fault-fired',
   'schedule-coverage',
@@ -13648,44 +13631,44 @@ export const INTEGRITY_CHECK_ORDER: readonly IntegrityCheck[] = [
   'secret-scan',
 ]
 
-/** The read-only tarball mount's target in a shard, the path test-1 installs from (b.uqm SR-10.3). */
+/** The read-only tarball mount's target in a shard, the path test-1 installs from. */
 export const INTEGRITY_TARBALL_MOUNT_TARGET = '/tmp/package.tgz'
-/** The target of a shard's own subdirectory's mount (b.uqm SR-10.3). */
+/** The target of a shard's own subdirectory's mount. */
 export const INTEGRITY_RESULTS_MOUNT_TARGET = '/test-results'
-/** `fault-fired`'s reason for a fault that has no firing record: it counts as not fired (b.uqm SR-14.3). */
+/** `fault-fired`'s reason for a fault that has no firing record: it counts as not fired. */
 export const NO_FIRING_RECORD_REASON = 'no firing record exists'
-/** `fault-fired`'s reason for a fault whose firing record was still due when the checks ran (b.uqm SR-14.3). */
+/** `fault-fired`'s reason for a fault whose firing record was still due when the checks ran. */
 export const STILL_DUE_FIRING_REASON = 'it was still due when the run ended'
 
-/** A Docker namespace mode shared with the host (b.uqm SR-13.2 check 4). */
+/** A Docker namespace mode shared with the host (check 4). */
 const INTEGRITY_HOST_MODE = 'host'
-/** A Docker namespace mode's prefix when it joins another container's namespace, `container:<id>` (b.uqm SR-13.2 check 4). */
+/** A Docker namespace mode's prefix when it joins another container's namespace, `container:<id>` (check 4). */
 const INTEGRITY_CONTAINER_MODE_PREFIX = 'container:'
-/** A shard subdirectory's name, `shard-<k>`, k from 1; group 1 is k (b.uqm SR-5.9). */
+/** A shard subdirectory's name, `shard-<k>`, k from 1; group 1 is k. */
 const INTEGRITY_SHARD_DIR_PATTERN = /^shard-([1-9][0-9]*)$/
-/** A canary as the runner draws it: 32 lowercase hexadecimal characters (b.uqm SR-11.2). */
+/** A canary as the runner draws it: 32 lowercase hexadecimal characters. */
 const INTEGRITY_CANARY_PATTERN = /^[0-9a-f]{32}$/
 
-// The inputs (b.uqm SR-13.1, SR-13.2). E13 fills them at step 2 of the end of
-// run from what E8, E9, E10 and E12 recorded; nothing here calls their code.
+// The inputs. fills them at step 2 of the end of
+// run from what and recorded; nothing here calls their code.
 
-/** When the run's first run-level stop came, as the skip rules read it (b.uqm SR-5.6, SR-13.1). */
+/** When the run's first run-level stop came, as the skip rules read it. */
 export type IntegrityStopTime = 'before-end-of-run' | 'during-end-of-run'
 
-/** The run state the skip rules read (b.uqm SR-13.1). */
+/** The run state the skip rules read. */
 export interface IntegrityRunState {
-  /** Whether the shards were scheduled (the status phase reached `shards`, b.uqm SR-5.2). */
+  /** Whether the shards were scheduled (the status phase reached `shards`). */
   readonly shardsScheduled: boolean
-  /** Whether the test or base image build failed: an image build failure, never a build a stop ended (b.uqm SR-5.6). */
+  /** Whether the test or base image build failed: an image build failure, never a build a stop ended. */
   readonly imageBuildFailed: boolean
   /** When the first run-level stop came: before the end-of-run sequence started (before or after scheduling, as `shardsScheduled` tells), during it, or null for none. */
   readonly stopTime: IntegrityStopTime | null
 }
 
-/** What checks 1–11 read of one shard: E1's `ShardEvidence` fields, so E13 passes its evidence as it is. Its container started when `start.kind` is `started`. */
+/** What checks 1–11 read of one shard: shared runner helpers's `ShardEvidence` fields, so the run lifecycle passes its evidence as it is. Its container started when `start.kind` is `started`. */
 export type IntegrityShard = Pick<ShardEvidence, 'shard' | 'endedNormally' | 'start' | 'canary' | 'inspection'>
 
-/** Everything checks 1–11 judge besides the run directory's files (b.uqm SR-13.2). */
+/** Everything checks 1–11 judge besides the run directory's files. */
 export interface IntegrityInputs {
   readonly performanceLockSource?: string | null
   readonly codexLoginSource?: string | null
@@ -13697,20 +13680,20 @@ export interface IntegrityInputs {
   readonly assignment: Assignment | null
   /** One entry per shard admission chose, started or not. */
   readonly shards: readonly IntegrityShard[]
-  /** The pinned image ID (E8, `ImageState.pinnedId`). */
+  /** The pinned image ID (image preparation, `ImageState.pinnedId`). */
   readonly pinnedImageId: string | null
-  /** The run's tarball hash, 64 lowercase hexadecimal characters (E8); null when none was packed. */
+  /** The run's tarball hash, 64 lowercase hexadecimal characters (image preparation); null when none was packed. */
   readonly packageSha256: string | null
-  /** The tarball's path on the host, in the run directory's `package/` (E8); null when none was packed. */
+  /** The tarball's path on the host, in the run directory's `package/` (image preparation); null when none was packed. */
   readonly tarballPath: string | null
-  /** The normalized faults, in order (b.uqm SR-2.4). */
+  /** The normalized faults, in order. */
   readonly faults: readonly Fault[]
-  /** E12's firing records, one per normalized fault. */
+  /** fault injection's firing records, one per normalized fault. */
   readonly firingRecords: readonly FiringRecord[]
   readonly runState: IntegrityRunState
 }
 
-/** An integrity failure, `FAIL: integrity: <check>: <detail>`, with its shard or null (b.uqm SR-13.1, SR-12.4). The detail must be one line. */
+/** An integrity failure, `FAIL: integrity: <check>: <detail>`, with its shard or null. The detail must be one line. */
 export function integrityFailure(check: IntegrityCheck, detail: string, shard: number | null): Failure {
   return {
     line: `${FAIL_PREFIX}integrity: ${check}: ${detail}`,
@@ -13724,7 +13707,7 @@ export function inIntegrityShardOrder(failures: readonly Failure[]): Failure[] {
   return [...failures].sort((a, b) => (a.shard ?? Number.POSITIVE_INFINITY) - (b.shard ?? Number.POSITIVE_INFINITY))
 }
 
-/** `shard-<k>`: a shard's name in a detail, and its subdirectory's name (b.uqm SR-5.9). */
+/** `shard-<k>`: a shard's name in a detail, and its subdirectory's name. */
 function integrityShardName(shard: number): string {
   return `${SHARD_DIR_PREFIX}${shard}`
 }
@@ -13746,7 +13729,7 @@ function isTestOneName(name: string): boolean {
 }
 
 // The chunked byte search, shared by `results-canary`'s search (the evidence
-// reader) and T2's `secret-scan`: a file's bytes are read a chunk at a time,
+// reader) and `secret-scan`: a file's bytes are read a chunk at a time,
 // each read keeping the previous window's last bytes, so a needle across two
 // reads is found and no file is ever held whole, however large its
 // `docker.log` or script log.
@@ -13808,14 +13791,14 @@ function searchFileBytes(path: string, needles: readonly Buffer[], firstOnly: bo
   }
 }
 
-// The evidence reader (b.uqm SR-1.3, SR-11.3, SR-13.2). It reads only under
+// The evidence reader. It reads only under
 // the run directory it is given: listings and entry types by `lstat`, so a
 // link is never followed. In a shard subdirectory it searches every regular
 // file's bytes for the run's canaries with the chunked search, holding no
 // file whole, and keeps text only for the four small in-shard records at the
 // subdirectory's top (`canary.txt`, `package.sha256`,
-// `dependency-fingerprint.txt`, `result.txt`), read with E1's `readFileText`
-// and parsed by E1's rules (`parseHexRecord`, `parseResultFileText`). In the
+// `dependency-fingerprint.txt`, `result.txt`), read with `readFileText`
+// and parsed by rules (`parseHexRecord`, `parseResultFileText`). In the
 // run directory's own listing it reads entry types only. Nothing it meets is
 // an error that stops the checks: a missing, unreadable or malformed thing
 // comes out as what it is.
@@ -13856,7 +13839,7 @@ export type EvidenceListing =
       readonly error: string
     }
 
-/** One shard's files as read (b.uqm SR-11.3). */
+/** One shard's files as read. */
 export interface ShardFilesEvidence {
   readonly shard: number
   /** Its subdirectory, `shard-<k>`, with every entry under it. */
@@ -13867,7 +13850,7 @@ export interface ShardFilesEvidence {
   readonly packageSha256: HexRecordRead
   /** `dependency-fingerprint.txt`. */
   readonly dependencyFingerprint: HexRecordRead
-  /** `result.txt`, under E1's reading rule. */
+  /** `result.txt`, under shared runner helpers's reading rule. */
   readonly resultFile: ResultFileRead
   /** Each script's count of `end … pass`, `end … fail` and `notrun` lines in the result file; empty when it could not be read. */
   readonly resultCounts: ReadonlyMap<string, number>
@@ -13911,7 +13894,7 @@ interface EvidenceSearch {
   readonly needles: readonly Buffer[]
 }
 
-/** The in-shard records whose text the reader keeps: each small, and only at a shard subdirectory's top (b.uqm SR-11.3). */
+/** The in-shard records whose text the reader keeps: each small, and only at a shard subdirectory's top. */
 const EVIDENCE_RECORD_FILE_NAMES: readonly string[] = [CANARY_FILE_NAME, PACKAGE_SHA256_FILE_NAME, DEPENDENCY_FINGERPRINT_FILE_NAME, RESULT_FILE_NAME]
 
 /** A shard subdirectory's regular file read: its bytes searched in chunks for the canaries, and its text kept when it is a record at the top. */
@@ -13969,7 +13952,7 @@ function topLevelEntry(dir: EvidenceListing, name: string): EvidenceEntry | 'no-
   return dir.entries.find((entry) => entry.path === name) ?? 'no-entry'
 }
 
-/** An in-shard hex record from its subdirectory's listing, by E1's rule: a value, missing, or malformed (a link or a directory at its name included). */
+/** An in-shard hex record from its subdirectory's listing, by shared runner helpers's rule: a value, missing, or malformed (a link or a directory at its name included). */
 function evidenceHexRecord(dir: EvidenceListing, name: string, length: number): HexRecordRead {
   const entry = topLevelEntry(dir, name)
   if (entry === 'no-entry') return { kind: 'missing' }
@@ -13980,7 +13963,7 @@ function evidenceHexRecord(dir: EvidenceListing, name: string, length: number): 
   return parsed.ok ? { kind: 'value', value: parsed.value } : { kind: 'malformed', error: parsed.error }
 }
 
-/** The result file from its subdirectory's listing, by E1's reading rule: events, missing, or unreadable (a link or a directory at its name included). */
+/** The result file from its subdirectory's listing, by shared runner helpers's reading rule: events, missing, or unreadable (a link or a directory at its name included). */
 function evidenceResultFile(dir: EvidenceListing): ResultFileRead {
   const entry = topLevelEntry(dir, RESULT_FILE_NAME)
   if (entry === 'no-entry') return { kind: 'missing' }
@@ -13990,7 +13973,7 @@ function evidenceResultFile(dir: EvidenceListing): ResultFileRead {
   return parseResultFileText(entry.text)
 }
 
-/** One shard's files read (b.uqm SR-11.3). */
+/** One shard's files read. */
 function readShardFilesEvidence(runDir: string, shard: number, search: EvidenceSearch): ShardFilesEvidence {
   const dir = readEvidenceListing(join(runDir, integrityShardName(shard)), search)
   const resultFile = evidenceResultFile(dir)
@@ -14017,12 +14000,12 @@ function readShardFilesEvidence(runDir: string, shard: number, search: EvidenceS
 
 /**
  * The evidence checks 5, 6 and 9–11 judge, read from the run directory only,
- * never through a link (b.uqm SR-1.3, SR-13.1): the run directory's entries
+ * never through a link: the run directory's entries
  * with their types; each given shard's subdirectory, every entry under it
  * with its type, and every regular file's bytes searched in chunks for the
  * given canaries (no file held whole); and its `canary.txt`,
  * `package.sha256`, `dependency-fingerprint.txt` and `result.txt` read by
- * E1's rules, the only texts kept. Empty canaries are ignored; with none,
+ * rules, the only texts kept. Empty canaries are ignored; with none,
  * every file is still read through, so an unreadable one shows. Never throws.
  */
 export function readIntegrityEvidence(runDir: string, shardNumbers: readonly number[], canaries: readonly string[] = []): IntegrityEvidence {
@@ -14034,17 +14017,17 @@ export function readIntegrityEvidence(runDir: string, shardNumbers: readonly num
   }
 }
 
-/** Whether a shard owes its own canary, tarball hash and fingerprint: it ended normally and its test-1 passed (b.uqm SR-13.1). */
+/** Whether a shard owes its own canary, tarball hash and fingerprint: it ended normally and its test-1 passed. */
 function owesOwnEvidence(shard: IntegrityShard | undefined, files: ShardFilesEvidence): boolean {
   return shard !== undefined && shard.endedNormally && files.testOnePassed
 }
 
-// Checks 1–2: fault-fired and schedule-coverage (b.uqm SR-13.2, SR-14.3).
+// Checks 1–2: fault-fired and schedule-coverage.
 
 /**
- * Check 1, `fault-fired` (b.uqm SR-13.2, SR-14.3): one failure per normalized
+ * Check 1, `fault-fired`: one failure per normalized
  * fault that did not fire, `<fault> did not fire (<why>)`, in the faults'
- * order, shard null. `<why>` is E12's reason exactly as written; a fault with
+ * order, shard null. `<why>` is reason exactly as written; a fault with
  * no firing record counts as not fired. A run with no faults gives none.
  */
 export function checkFaultFired(inputs: IntegrityInputs): Failure[] {
@@ -14072,7 +14055,7 @@ function assignedShardsByScript(assignment: Assignment): Map<string, number[]> {
 }
 
 /**
- * Check 2, `schedule-coverage` (b.uqm SR-13.2): test-1 exactly once in every
+ * Check 2, `schedule-coverage`: test-1 exactly once in every
  * shard used, every other expected script in exactly one shard, and no
  * script that is not expected. A problem in one shard carries its number; a
  * script in no shard or in several carries null and names the shards.
@@ -14103,7 +14086,7 @@ export function checkScheduleCoverage(inputs: IntegrityInputs): Failure[] {
 }
 
 // Checks 3, 4, 7, 8: isolation-mounts, isolation-config, image-drift,
-// name-collision (b.uqm SR-13.2, SR-10.3, SR-10.5). Judged from E9's records
+// name-collision. Judged from records
 // only; a shard whose container never started is outside checks 3, 4 and 7.
 
 /** The started shards, in shard order, with their inspection data or null. */
@@ -14114,7 +14097,7 @@ function startedShards(inputs: IntegrityInputs): { readonly shard: number; reado
     .sort((a, b) => a.shard - b.shard)
 }
 
-/** `shard-<k> could not be inspected`: checks 3, 4 and 7 for a started shard without inspection data (b.uqm SR-10.5). */
+/** `shard-<k> could not be inspected`: checks 3, 4 and 7 for a started shard without inspection data. */
 function notInspectedFailure(check: 'isolation-mounts' | 'isolation-config' | 'image-drift', shard: number): Failure {
   return integrityFailure(check, `${integrityShardName(shard)} could not be inspected`, shard)
 }
@@ -14183,7 +14166,7 @@ function shardMountFailures(inputs: IntegrityInputs, shard: number, mounts: read
 }
 
 /**
- * Check 3, `isolation-mounts` (b.uqm SR-13.2, SR-10.3): each started shard
+ * Check 3, `isolation-mounts`: each started shard
  * has exactly the run's tarball, read-only, at `/tmp/package.tgz` and its own
  * subdirectory at `/test-results`. A mount of another shard's subdirectory
  * gives exactly `shard-<j> mounts shard-<k>'s results subdirectory`, once,
@@ -14206,7 +14189,7 @@ function sharedNamespace(mode: string): 'the host' | 'another container' | null 
 }
 
 /**
- * Check 4, `isolation-config` (b.uqm SR-13.2): no started shard uses host
+ * Check 4, `isolation-config`: no started shard uses host
  * network or privileged mode, or shares a PID, IPC or network namespace with
  * the host or another container; one failure per forbidden mode.
  */
@@ -14230,7 +14213,7 @@ export function checkIsolationConfig(inputs: IntegrityInputs): Failure[] {
   return failures
 }
 
-/** Check 7, `image-drift` (b.uqm SR-13.2): every started shard's inspected image ID equals the pinned ID. The detail names no ID. */
+/** Check 7, `image-drift`: every started shard's inspected image ID equals the pinned ID. The detail names no ID. */
 export function checkImageDrift(inputs: IntegrityInputs): Failure[] {
   const failures: Failure[] = []
   for (const { shard, inspection } of startedShards(inputs)) {
@@ -14242,7 +14225,7 @@ export function checkImageDrift(inputs: IntegrityInputs): Failure[] {
   return failures
 }
 
-/** Check 8, `name-collision` (b.uqm SR-13.2): no shard's name was in use when it started, per E9's start record. */
+/** Check 8, `name-collision`: no shard's name was in use when it started, per shard management's start record. */
 export function checkNameCollision(inputs: IntegrityInputs): Failure[] {
   return inputs.shards
     .filter((s) => s.start?.nameInUse === true)
@@ -14250,7 +14233,7 @@ export function checkNameCollision(inputs: IntegrityInputs): Failure[] {
     .map((s) => integrityFailure('name-collision', `${integrityShardName(s.shard)}'s container name was already in use when it started`, s.shard))
 }
 
-// Checks 5–6: results-canary and results-ownership (b.uqm SR-13.2, SR-5.9).
+// Checks 5–6: results-canary and results-ownership.
 // They read the run directory as it stands at step 2 of the end of run: every
 // `docker.log` saved, no `results.json`, `summary.txt` or `verdict.txt` yet.
 
@@ -14269,7 +14252,7 @@ function evidenceTypeWords(type: EvidenceEntryType): { readonly the: string; rea
 }
 
 /**
- * Check 5, `results-canary` (b.uqm SR-13.2, SR-13.1): no file anywhere in a
+ * Check 5, `results-canary`: no file anywhere in a
  * shard subdirectory holds another shard's canary (naming both shards, and
  * carrying the shard whose subdirectory holds it), and a shard that ended
  * normally with test-1 passed has a `canary.txt` holding exactly its canary
@@ -14311,7 +14294,7 @@ export function checkResultsCanary(inputs: IntegrityInputs, evidence: IntegrityE
   return inIntegrityShardOrder(failures)
 }
 
-/** The regular files a shard subdirectory may hold: its records, `docker.log` and its assigned scripts' logs (b.uqm SR-13.2 check 6). */
+/** The regular files a shard subdirectory may hold: its records, `docker.log` and its assigned scripts' logs (check 6). */
 function ownedShardFileNames(inputs: IntegrityInputs, shard: number): Set<string> {
   return new Set([
     CANARY_FILE_NAME,
@@ -14343,7 +14326,7 @@ function runDirOwnershipFailures(inputs: IntegrityInputs, runDir: EvidenceListin
 }
 
 /**
- * Check 6, `results-ownership` (b.uqm SR-13.2, SR-5.9): a shard subdirectory
+ * Check 6, `results-ownership`: a shard subdirectory
  * holds only its `canary.txt`, `result.txt`, `package.sha256`,
  * `dependency-fingerprint.txt`, `docker.log` and the logs of its assigned
  * scripts, each a regular file; every other entry, a directory or a link
@@ -14372,11 +14355,10 @@ export function checkResultsOwnership(inputs: IntegrityInputs, evidence: Integri
   return inIntegrityShardOrder([...failures, ...runDirOwnershipFailures(inputs, evidence.runDir)])
 }
 
-// Checks 9–11: result-coverage, package-hash, dependency-set (b.uqm SR-13.2,
-// SR-13.1).
+// Checks 9–11: result-coverage, package-hash, dependency-set.
 
 /**
- * Check 9, `result-coverage` (b.uqm SR-13.2): in every shard that ended
+ * Check 9, `result-coverage`: in every shard that ended
  * normally, each assigned script, test-1 included, has exactly one `pass`,
  * `fail` or `notrun`, and no script has a result there unless assigned there.
  * Shards that did not end normally are not judged.
@@ -14417,7 +14399,7 @@ function ownRecordFailure(record: HexRecordRead, owes: boolean, name: string, fi
 }
 
 /**
- * Check 10, `package-hash` (b.uqm SR-13.2, SR-13.1): a well-formed recorded
+ * Check 10, `package-hash`: a well-formed recorded
  * tarball hash that differs from the run's fails in any shard; a missing or
  * malformed one fails only for a shard that ended normally with test-1
  * passed. The detail names no hash.
@@ -14437,7 +14419,7 @@ export function checkPackageHash(inputs: IntegrityInputs, evidence: IntegrityEvi
 }
 
 /**
- * Check 11, `dependency-set` (b.uqm SR-13.2, SR-13.1): well-formed recorded
+ * Check 11, `dependency-set`: well-formed recorded
  * fingerprints that are not all the same give one null-shard failure naming
  * the shards in groups of equal fingerprints, ordered by their lowest shard;
  * a missing or malformed fingerprint fails only for a shard that ended
@@ -14464,11 +14446,10 @@ export function checkDependencySet(inputs: IntegrityInputs, evidence: IntegrityE
   return inIntegrityShardOrder(failures)
 }
 
-// The ordered run of checks 1–11, with the skip rules (b.uqm SR-13.1,
-// SR-13.2). T2's entry adds check 12 after them.
+// The ordered run of checks 1–11, with the skip rules. entry adds check 12 after them.
 
 /**
- * The checks a run skips (b.uqm SR-13.1, SR-5.6), in SR-13.2's order:
+ * The checks a run skips, in the contract order:
  * - `schedule-coverage` when the image build failed, or a run-level stop
  *   came, before the shards were scheduled;
  * - `fault-fired` on an image build failure, and on a run-level stop that
@@ -14487,9 +14468,9 @@ export function integritySkippedChecks(state: IntegrityRunState): IntegrityCheck
 
 /** Checks 1–11's outcome: the failures in order, and the checks skipped. */
 export interface IntegrityChecksResult {
-  /** By check in SR-13.2's order; inside a check by shard number, then the null-shard ones. */
+  /** By check in the contract order; inside a check by shard number, then the null-shard ones. */
   readonly failures: readonly Failure[]
-  /** The skipped checks' names, in SR-13.2's order. */
+  /** The skipped checks' names, in the contract order. */
   readonly skippedChecks: readonly IntegrityCheck[]
 }
 
@@ -14531,9 +14512,9 @@ function withoutCanaries(failure: Failure, canaries: readonly string[]): Failure
 }
 
 /**
- * Integrity checks 1–11 (b.uqm SR-13.1, SR-13.2): reads the evidence from
+ * Integrity checks 1–11: reads the evidence from
  * the run directory, applies the skip rules, and runs each check not skipped
- * in SR-13.2's order. Returns the failures by check, inside a check by shard
+ * in the contract order. Returns the failures by check, inside a check by shard
  * number then the null-shard ones, and the skipped checks' names. A stopped
  * run is checked from whatever evidence exists. Spawns nothing, writes
  * nothing, and never throws on what it reads.
@@ -14550,34 +14531,33 @@ export function runIntegrityChecks1To11(inputs: IntegrityInputs): IntegrityCheck
   return { failures, skippedChecks }
 }
 
-// --- 15/T2 (E11 T2): the scanned values and their masking, the runner log's masking switch-on, secret-scan, the masked end files, the integrity entry ---
+// --- 15/ : the scanned values and their masking, the runner log's masking switch-on, secret-scan, the masked end files, the integrity entry ---
 //
-// One masking rule serves three things (b.uqm SR-15.3): `secret-scan`'s
+// One masking rule serves three things: `secret-scan`'s
 // match, the runner log's lines from the scan's start, and the end files. It
-// is E1's runner-log pattern (`redactionPattern`), so all three mask alike.
-// The scanned values are E1's secret-credential set (b.uqm SR-15.1), held in
+// is runner-log pattern (`redactionPattern`), so all three mask alike.
+// The scanned values are secret-credential set, held in
 // memory only: nothing here logs or writes one.
 //
-// From the scan's start nothing writes `status.json` or a shard file, and E13
+// From the scan's start nothing writes `status.json` or a shard file, and
 // writes the three end files only through this sub-banner's exports
-// (b.uqm SR-5.7, SR-15.3, SR-16.1):
-// - `results.json` and `summary.txt` through E10's writer, given
+// // - `results.json` and `summary.txt` through writer, given
 //   `createEndFileRedactor(values)`, at end-of-run step 5 and again on the
-//   rewrite after a stop during the sequence (b.uqm SR-5.6);
+// rewrite after a stop during the sequence;
 // - `verdict.txt` through `writeRedactedVerdictFile`, at step 6.
 //
-// `runIntegrity` is the one integrity entry E13 calls, at end-of-run step 2,
-// after every `docker.log` is saved (b.uqm SR-5.7, SR-13.2). It takes
-// `IntegrityEntryInputs`: T1's `IntegrityInputs` (the run directory, the
+// `runIntegrity` is the one integrity entry calls, at end-of-run step 2,
+// after every `docker.log` is saved. It takes
+// `IntegrityEntryInputs`: `IntegrityInputs` (the run directory, the
 // tarball's path and the rest checks 1–11 judge), the scanned values and the
 // runner-log writer. It runs checks 1–11, then `secret-scan`; the runner
 // log's masking is on from the scan's start, so after checks 1–11 have run.
-// It returns T1's failures in their order, then `secret-scan`'s, every line
-// with every scanned value masked, and T1's skipped names; `secret-scan` is
+// It returns failures in their order, then `secret-scan`'s, every line
+// with every scanned value masked, and skipped names; `secret-scan` is
 // never skipped.
 
 /**
- * The run's scanned values (b.uqm SR-15.1, SR-15.2): E1's secret-credential
+ * The run's scanned values: secret-credential
  * set, so `ANTHROPIC_API_KEY`, `GH_TOKEN` when set and the base-build token
  * when step 4 looked one up. Never an empty string, and never the value of
  * `ANTHROPIC_BASE_URL` or `ANTHROPIC_MODEL` as such.
@@ -14600,7 +14580,7 @@ function scannedValueMasker(values: Iterable<string>): (text: string) => string 
 
 /**
  * `text` with every occurrence of every value replaced by `<redacted>`
- * (b.uqm SR-15.3), in one pass, longer values first, so a value holding
+ * in one pass, longer values first, so a value holding
  * another is masked whole. Empty values are ignored, and a text holding no
  * value comes back unchanged.
  */
@@ -14609,11 +14589,11 @@ export function maskScannedValues(text: string, values: Iterable<string>): strin
 }
 
 /**
- * Switches on the runner log's masking at `secret-scan`'s start (b.uqm
- * SR-15.3; contributes to SR-5.4): from then on every line the writer
+ * Switches on the runner log's masking at `secret-scan`'s start (
+ * contributes to): from then on every line the writer
  * appends, child-process output and error lines included, holds `<redacted>`
  * in place of every value, for the rest of the run. Calling it again only
- * adds values. E1's writer masks each whole line as it appends it, and a
+ * adds values. writer masks each whole line as it appends it, and a
  * child's output reaches it only as whole lines (the spawn binding joins a
  * stream's chunks before handing on a line; `childOutput` splits a text at
  * its line feeds), so a value that arrives in two parts is masked whole.
@@ -14639,7 +14619,7 @@ interface SecretScanFindings {
 }
 
 /**
- * Searches a file's bytes for any value with T1's chunked search
+ * Searches a file's bytes for any value with chunked search
  * (`searchFileBytes`), stopping at the first read that finds one, so a large
  * `docker.log` is searched whole without being held whole. The file is opened
  * without following a link and without blocking, and anything but a regular
@@ -14706,7 +14686,7 @@ function shownScanPaths(paths: readonly string[]): string {
 }
 
 /**
- * `secret-scan`, integrity check 12 (b.uqm SR-13.2, SR-15.2, SR-15.3).
+ * `secret-scan`, integrity check 12.
  *
  * It first switches on the runner log's masking (`switchOnRunnerLogRedaction`).
  * It then reads every file under `runDir` but the tarball at `tarballPath`
@@ -14754,15 +14734,14 @@ export interface IntegrityEntryInputs extends IntegrityInputs {
 }
 
 /**
- * The integrity entry E13 calls at end-of-run step 2 (b.uqm SR-5.7,
- * SR-13.2): checks 1–11 (`runIntegrityChecks1To11`), then `secret-scan` over
+ * The integrity entry calls at end-of-run step 2: checks 1–11 (`runIntegrityChecks1To11`), then `secret-scan` over
  * `inputs.runDir` without `inputs.tarballPath`, which first switches on the
  * runner log's masking. Returns checks 1–11's failures in their order, then
  * any `secret-scan` failures, and checks 1–11's skipped names. `secret-scan`
  * is never skipped and never among them, on any outcome. Every returned
  * line, checks 1–12 alike, has every scanned value masked
  * (`maskScannedValues`), so an entry named after a value never shows it
- * (b.uqm SR-15.3); each failure's shard and class are kept as they are.
+ * each failure's shard and class are kept as they are.
  */
 export function runIntegrity(inputs: IntegrityEntryInputs): IntegrityChecksResult {
   const checks = runIntegrityChecks1To11(inputs)
@@ -14778,7 +14757,7 @@ export function runIntegrity(inputs: IntegrityEntryInputs): IntegrityChecksResul
   }
 }
 
-/** Masks the values in the end files' content (b.uqm SR-15.3, SR-16.1); E13 hands it to E10's `results.json` and `summary.txt` writer. */
+/** Masks the values in the end files' content; the run lifecycle hands it to result rendering's `results.json` and `summary.txt` writer. */
 export interface EndFileRedactor {
   /** The results object with every string in it masked, `verdict` and object keys included; numbers, booleans and nulls are unchanged. */
   results(results: Results): Results
@@ -14797,9 +14776,9 @@ function maskEveryString(value: unknown, mask: (text: string) => string): unknow
 }
 
 /**
- * The redactor for `results.json` and `summary.txt` (b.uqm SR-15.3, SR-16.1):
+ * The redactor for `results.json` and `summary.txt`:
  * every occurrence of every value becomes `<redacted>`. The masked results
- * object keeps its shape, so it still serializes and parses through E1's
+ * object keeps its shape, so it still serializes and parses through
  * `serializeResults` and `parseResults`.
  */
 export function createEndFileRedactor(values: Iterable<string>): EndFileRedactor {
@@ -14810,40 +14789,40 @@ export function createEndFileRedactor(values: Iterable<string>): EndFileRedactor
   }
 }
 
-/** Writes `verdict.txt` (b.uqm SR-5.7, SR-15.3): the line masked, then E1's atomic whole-file verdict write, which refuses a line break. */
+/** Writes `verdict.txt`: the line masked, then shared runner helpers's atomic whole-file verdict write, which refuses a line break. */
 export function writeRedactedVerdictFile(runDir: string, line: string, values: Iterable<string>): WriteResult {
   return writeVerdictFile(runDir, maskScannedValues(line, values))
 }
 
 // ---------------------------------------------------------------------------
-// 16. Faults (E12)
+// 16. Faults
 // ---------------------------------------------------------------------------
 
-// --- 16/T1 (E12 T1): fault targets, the --fail lists, the reason builders and the fault controller ---
+// --- 16/ : fault targets, the --fail lists, the reason builders and the fault controller ---
 //
 // Faults come only from the parsed `--inject` faults, `Invocation.faults`,
-// normalized and in order (b.uqm SR-2.4, SR-14.1): nothing here reads an
+// normalized and in order: nothing here reads an
 // environment variable or a file to decide which faults exist, and a
 // controller built from no faults is inert. The controller decides and never
 // acts: it stops nothing, sends no signal, calls no docker and takes no final
 // reading. Each `timeout:` or `kill:` firing is one `FaultDecision`, and each
 // end marker a fault poll finds is one notice, handed to the one handler the
-// driver (E13) supplies; E13 carries them out through E9's retirement. Causes
-// are `ShardCause` values that E10 renders; no cause text is written here.
+// driver supplies; carries them out through retirement. Causes
+// are `ShardCause` values that renders; no cause text is written here.
 // The nine reasons a fault did not fire are written only by the builders
-// below (b.uqm SR-14.3); E11 renders the `fault-fired` line from the records.
+// below; renders the `fault-fired` line from the records.
 
-/** A `leak:<k>,<j>` fault's mount target in shard j, `/leak-shard-<k>`, where shard k's subdirectory is mounted read-only (b.uqm SR-10.3, SR-14.2). */
+/** A `leak:<k>,<j>` fault's mount target in shard j, `/leak-shard-<k>`, where shard k's subdirectory is mounted read-only. */
 export function leakMountTarget(sourceShard: number): string {
   return `/leak-shard-${sourceShard}`
 }
 
-/** A shard's name in a reason, `shard-<k>` (b.uqm Terms). */
+/** A shard's name in a reason, `shard-<k>` (Terms). */
 function faultShardName(shard: number): string {
   return `${SHARD_DIR_PREFIX}${shard}`
 }
 
-/** Shard k's subdirectory of the run directory, which holds its result file (b.uqm SR-5.9, SR-11.3). */
+/** Shard k's subdirectory of the run directory, which holds its result file. */
 function faultShardDir(runDir: string, shard: number): string {
   return join(runDir, faultShardName(shard))
 }
@@ -14859,7 +14838,7 @@ function faultScriptPlace(numberForm: string, assignment: Assignment): { readonl
 }
 
 /**
- * The shard a fault acts on (b.uqm SR-14.2): for `fail:` and `timeout:`, the
+ * The shard a fault acts on: for `fail:` and `timeout:`, the
  * shard the assignment gives the script (shard 1 for test-1); for
  * `leak:<k>,<j>`, j; for `image-drift:<k>` and `kill:<k>`, k. Null for
  * `retag`, and for a script the assignment does not place.
@@ -14880,7 +14859,7 @@ export function faultTargetShard(fault: Fault, assignment: Assignment): number |
 }
 
 /**
- * Shard k's `--fail` list (b.uqm SR-14.1, SR-11.2): the file names of the
+ * Shard k's `--fail` list: the file names of the
  * `fail:` faults that act on it, in normalized fault order. No other fault,
  * and no `fail:` aimed at another shard, adds to it.
  */
@@ -14894,20 +14873,20 @@ export function shardFailFileNames(faults: readonly Fault[], assignment: Assignm
   return fileNames
 }
 
-// The nine reasons a fault did not fire (b.uqm SR-14.3), the only place these
+// The nine reasons a fault did not fire, the only place these
 // texts are written. k is the shard the fault acts on (j for `leak:<k>,<j>`).
 
-/** `image-drift:<k>`'s reason when the drift image's build failed (b.uqm SR-14.2). */
+/** `image-drift:<k>`'s reason when the drift image's build failed. */
 export function driftBuildFailedReason(exitCode: number): string {
   return `drift image build failed (exit ${exitCode})`
 }
 
-/** `retag`'s reason when the retag image's build failed (b.uqm SR-14.2). */
+/** `retag`'s reason when the retag image's build failed. */
 export function retagBuildFailedReason(exitCode: number): string {
   return `retag image build failed (exit ${exitCode})`
 }
 
-/** `retag`'s reason when the `-test` tag's move failed (b.uqm SR-14.2). */
+/** `retag`'s reason when the `-test` tag's move failed. */
 export function tagMoveFailedReason(exitCode: number): string {
   return `tag move failed (exit ${exitCode})`
 }
@@ -14937,22 +14916,22 @@ export function runStoppedFirstReason(): string {
   return 'the run was stopped first'
 }
 
-/** The reason when another fault stopped the shard first, naming it in its normalized form (b.uqm SR-14.3). */
+/** The reason when another fault stopped the shard first, naming it in its normalized form. */
 export function faultStoppedShardFirstReason(fault: Fault, shard: number): string {
   return `${faultText(fault)} stopped ${faultShardName(shard)} first`
 }
 
 /**
- * A `timeout:` firing's m (b.uqm SR-14.2): the shard's elapsed time since its
+ * A `timeout:` firing's m: the shard's elapsed time since its
  * container start, rounded up to whole minutes (3 s gives 1, exactly 60 s
- * gives 1, 60.001 s gives 2), and at least 1. Not SR-4.3's halves-up rounding,
+ * gives 1, 60.001 s gives 2), and at least 1. Not halves-up rounding,
  * which is for limits.
  */
 export function faultTimeoutMinutes(elapsedMs: number): number {
   return Math.max(1, Math.ceil(elapsedMs / MS_PER_MINUTE))
 }
 
-/** What the controller hands its one handler: a `timeout:` or `kill:` firing to carry out, or a fault poll's find of shard k's end marker, so its final reading can be taken now (b.uqm SR-10.6). */
+/** What the controller hands its one handler: a `timeout:` or `kill:` firing to carry out, or a fault poll's find of shard k's end marker, so its final reading can be taken now. */
 export type FaultNotice =
   | {
       readonly kind: 'decision'
@@ -14968,35 +14947,35 @@ export type FaultNoticeHandler = (notice: FaultNotice) => void
 
 /** What a fault controller is built from, and nothing else. */
 export interface FaultControllerOptions {
-  /** The normalized faults in order, `Invocation.faults`: the only source of activation (b.uqm SR-14.1). */
+  /** The normalized faults in order, `Invocation.faults`: the only source of activation. */
   readonly faults: readonly Fault[]
   readonly assignment: Assignment
   /** The clock and timers (`RunnerDeps.clock`): every fault poll is scheduled through them. */
   readonly clock: RunnerClock
-  /** The run directory: shard k's result file is read from its `shard-<k>` subdirectory by E1's rule (`readResultFile`). */
+  /** The run directory: shard k's result file is read from its `shard-<k>` subdirectory by shared runner helpers's rule (`readResultFile`). */
   readonly runDir: string
   /** Receives every decision and end-marker notice. */
   readonly handler: FaultNoticeHandler
 }
 
 /**
- * The fault controller (b.uqm SR-14.1, SR-14.2, SR-14.3). E13 builds it
+ * The fault controller. builds it
  * unconditionally once the shards are scheduled, reports what happens through
  * the `note*` entry points, and calls `finalize` after every shard's final
- * reading and retirement, before E11's checks.
+ * reading and retirement, before checks.
  */
 export interface FaultController {
   /** Every fault's firing record so far, in normalized fault order. */
   records(): readonly FiringRecord[]
   /** Shard k's `--fail` file names (see `shardFailFileNames`). */
   failFileNames(shard: number): readonly string[]
-  /** A shard's start outcome (E9); a later outcome for the same shard changes nothing. A started shard with a due `timeout:` or `kill:` is polled. */
+  /** A shard's start outcome (shard management); a later outcome for the same shard changes nothing. A started shard with a due `timeout:` or `kill:` is polled. */
   noteShardStart(start: ShardStart): void
-  /** The drift image's build outcome (E8). */
+  /** The drift image's build outcome (image preparation). */
   noteDriftBuild(outcome: BuildOutcome): void
-  /** The retag image's build outcome (E8). */
+  /** The retag image's build outcome (image preparation). */
   noteRetagBuild(outcome: BuildOutcome): void
-  /** The `-test` tag's move (E8). */
+  /** The `-test` tag's move (image preparation). */
   noteTagMove(outcome: TagMoveOutcome): void
   /** Shard k ended: its end marker found at a sample or a limit check, or its container ended on its own. */
   noteShardEnded(shard: number): void
@@ -15042,7 +15021,7 @@ interface FaultShardState {
   end: FaultShardEnd | null
 }
 
-/** The number forms of the scripts a result file shows in progress: a complete `start` line, no `end` line and no end marker (b.uqm SR-14.2). A missing or unreadable file shows none. */
+/** The number forms of the scripts a result file shows in progress: a complete `start` line, no `end()` line and no end marker. A missing or unreadable file shows none. */
 function faultScriptsInProgress(read: ResultFileRead): string[] {
   if (read.kind !== 'events' || read.events.some((event) => event.kind === 'done')) return []
   const started = read.events.flatMap((event) => (event.kind === 'start' ? [event.fileName] : []))
@@ -15056,7 +15035,7 @@ function faultScriptsWith(read: ResultFileRead, kind: 'start' | 'end'): string[]
   return read.events.flatMap((event) => (event.kind === kind ? (fileNameNumberForm(event.fileName) ?? []) : []))
 }
 
-/** Whether a started shard has the `leak:<k>,<j>` mount: shard k's subdirectory, read-only, at `/leak-shard-<k>` (b.uqm SR-10.3). */
+/** Whether a started shard has the `leak:<k>,<j>` mount: shard k's subdirectory, read-only, at `/leak-shard-<k>`. */
 function hasFaultLeakMount(start: ShardStarted, runDir: string, sourceShard: number): boolean {
   const source = resolve(faultShardDir(runDir, sourceShard))
   return start.mounts.some((mount) => mount.readOnly && mount.target === leakMountTarget(sourceShard) && resolve(mount.source) === source)
@@ -15135,10 +15114,10 @@ export function createFaultController(options: FaultControllerOptions): FaultCon
   }
 
   /**
-   * The decision step for one shard's reading (b.uqm SR-14.2). An end marker
+   * The decision step for one shard's reading. An end marker
    * ends the shard and is handed on. Otherwise, with a script in progress, a
    * due `kill:` fires before any `timeout:`, whatever the argument order
-   * (b.uqm SR-2.2), since its moment is never later; else a due `timeout:`
+   * since its moment is never later; else a due `timeout:`
    * whose script is in progress fires. A firing stops the shard for good.
    */
   function decide(shard: number, state: FaultShardState, read: ResultFileRead): void {
@@ -15241,7 +15220,7 @@ export function createFaultController(options: FaultControllerOptions): FaultCon
     }
   }
 
-  /** A still-due fault's reason, from its shard's end state; a started shard with none counts as ended (b.uqm SR-14.3). */
+  /** A still-due fault's reason, from its shard's end state; a started shard with none counts as ended. */
   function reasonFor(slot: FaultSlot): string {
     const shard = slot.shard
     const state = shard === null ? undefined : shards.get(shard)
@@ -15277,7 +15256,7 @@ export function createFaultController(options: FaultControllerOptions): FaultCon
     if (finalized) return records()
     finalized = true
     cancelAllPolls()
-    // `fail:` fires on its script's complete `start` line in its shard (b.uqm SR-14.2, SR-11.3).
+    // `fail:` fires on its script's complete `start` line in its shard.
     for (const slot of dueSlots('fail', null)) {
       const state = slot.shard === null ? undefined : shards.get(slot.shard)
       if (slot.shard === null || state === undefined || state.startedAtMs === null || slot.fault.kind !== 'fail') continue
@@ -15303,31 +15282,31 @@ export function createFaultController(options: FaultControllerOptions): FaultCon
 }
 
 // ---------------------------------------------------------------------------
-// 17. Run lifecycle (E1 steps 1–2, E13 the rest)
+// 17. Run lifecycle ( steps 1–2, the rest)
 // ---------------------------------------------------------------------------
 
-// --- 17/T5 (E1 T5): run-sequence steps 1–2: the run directory, the status file, the log's first line, the argument stage ---
+// --- 17/ : run-sequence steps 1–2: the run directory, the status file, the log's first line, the argument stage ---
 
 /** A run from the end of step 1 on: the run directory exists and holds the status file and the runner log's first line. */
 export interface RunContext {
   readonly runId: string
-  /** The run directory, as `runDirPath` derives it from the injected environment (b.uqm SR-5.1). */
+  /** The run directory, as `runDirPath` derives it from the injected environment. */
   readonly runDir: string
-  /** The `/ci` arguments as given (b.uqm SR-2.1). */
+  /** The `/ci` arguments as given. */
   readonly args: readonly string[]
-  /** The runner log: everything the run reports goes through it (b.uqm SR-5.4). */
+  /** The runner log: everything the run reports goes through it. */
   readonly log: RunnerLogWriter
-  /** What every status write of the run shares; E13 replaces it when the deadline moves (b.uqm SR-5.5). */
+  /** What every status write of the run shares; the run lifecycle replaces it when the deadline moves. */
   basis: StatusBasis
 }
 
-/** The `usage: ` line of a runner whose first argument is missing or is not a RUN_ID, naming the argument (b.uqm SR-5.1). */
+/** The `usage: ` line of a runner whose first argument is missing or is not a RUN_ID, naming the argument. */
 export function usageLine(firstArgument: string | undefined): string {
   const why = firstArgument === undefined ? 'the RUN_ID is missing' : `${shownArgument(firstArgument)} is not a RUN_ID`
   return `${USAGE_PREFIX}bun ${RUNNER_PATH_SUFFIX} <RUN_ID> [/ci arguments]: ${why}: a RUN_ID is <YYYYMMDD>t<HHMMSS>z-<suffix>, a real UTC moment, then 8 lowercase letters or digits`
 }
 
-/** The line of a runner that finds something already at its run directory's path, naming the path (b.uqm SR-5.1). */
+/** The line of a runner that finds something already at its run directory's path, naming the path. */
 export function existingPathLine(path: string): string {
   return `ci-run: ${shownArgument(path)} already exists: a run directory is never reused; launch the run again with a new RUN_ID`
 }
@@ -15351,7 +15330,7 @@ export type RunDirectoryCreation =
     }
 
 /**
- * Creates the run directory exclusively (b.uqm SR-5.1): one `mkdir`, never
+ * Creates the run directory exclusively: one `mkdir`, never
  * recursive, which fails when anything is at the path (a file, a directory or
  * a symlink, dangling or not) and never follows or replaces it, so nothing is
  * written there.
@@ -15367,12 +15346,12 @@ export function createRunDirectory(path: string): RunDirectoryCreation {
 
 /**
  * The rest of run-sequence step 1 once `createRunDirectory` has created the
- * run directory (b.uqm SR-5.1, SR-5.3, SR-5.4): sets its mode to exactly 0700,
+ * run directory: sets its mode to exactly 0700,
  * whatever the umask took from `mkdir`'s; takes the run's start from the
  * clock; writes the status file in phase `build` with the deadline at start + B
- * (b.uqm SR-5.2, SR-5.5); then writes the runner log's first line. Throws on a
+ * then writes the runner log's first line. Throws on a
  * failure, before the first line is written; main then writes the first line
- * and the error to the log (b.uqm SR-5.4).
+ * and the error to the log.
  */
 export function beginRun(deps: RunnerDeps, runId: string, runDir: string, args: readonly string[], log: RunnerLogWriter): RunContext {
   chmodSync(runDir, RUN_DIR_MODE)
@@ -15401,10 +15380,10 @@ export type ArgumentStage =
     }
 
 /**
- * Validation stage 1, the arguments (b.uqm SR-2.2, SR-2.4, SR-2.6): the first
+ * Validation stage 1, the arguments: the first
  * bad argument's reason is the refusal's summary, and each other bad
  * argument's reason follows as one detail line, in argument order. The
- * refusal has no kind (b.uqm SR-5.8).
+ * refusal has no kind.
  */
 export function argumentStage(args: readonly string[]): ArgumentStage {
   const parsed = parseCiArguments(args)
@@ -15422,28 +15401,28 @@ export function argumentStage(args: readonly string[]): ArgumentStage {
 }
 
 /**
- * The run sequence from step 2 on (b.uqm SR-5.3), once step 1 is done.
+ * The run sequence from step 2 on, once step 1 is done.
  * Answers main's exit status. A refusal is recorded by `recordRefusal` as the
- * run's last act. Step 2 is E2's `validateRun`, over the worktree at
+ * run's last act. Step 2 is `validateRun`, over the worktree at
  * `deps.worktreeRoot` and the runner's environment; a valid run goes on to
- * steps 3–13, E13's `runAfterValidation`, with the validated run and the
- * hooks given (E13 T2's stops, deadline and traps).
+ * steps 3–13, `runAfterValidation`, with the validated run and the
+ * hooks given ( stops, deadline and traps).
  */
 export async function runSequence(deps: RunnerDeps, run: RunContext, hooks: RunSequenceHooks = {}): Promise<number> {
   // Step 2: validation stages 1–8, the run's scripts, the units and the
-  // effective N (b.uqm SR-2.6, SR-3.4). It spawns nothing and touches no
+  // effective N. It spawns nothing and touches no
   // docker, lock, cgroup or reservation.
   const validation = validateRun(run.args, deps.worktreeRoot, deps.env)
   if (!validation.ok) return recordRefusal(run, validation.refusal)
-  // Steps 3–13 (E13).
+  // Steps 3–13 .
   return runAfterValidation(deps, run, validation.validated, hooks)
 }
 
-// --- 17/E13: the rest of the run sequence, stops and the end of run ---
+// --- 17/: the rest of the run sequence, stops and the end of run ---
 
-// --- 17/E13.T1 (E13 T1): steps 3–13, the one refusal path, the follow loop, the end of run and the run directory's contents ---
+// --- 17/. : steps 3–13, the one refusal path, the follow loop, the end of run and the run directory's contents ---
 //
-// The run sequence after validation (b.uqm SR-5.3), composed from E2–E12:
+// The run sequence after validation, composed from :
 // - steps 3–11 (`admitRun`): the docker check, the base-image check, packing,
 //   then under the admission lock the sweep, the readings, the fits choosing
 //   N, the reservation and the watchdog's start, and the lock's release;
@@ -15451,36 +15430,36 @@ export async function runSequence(deps: RunnerDeps, run: RunContext, hooks: RunS
 //   test build and pin, the read-back, scheduling (the phase turns `shards`),
 //   the drift and retag builds, every shard's start, then the tag move;
 // - step 13 (`followShards`): the wiring between the three timer sources that
-//   own their own timers (E7's 30 s samples, E4's limit timers, E12's 1 s
-//   polls), ending each shard through E9's final reading and retirement, until
+// own their own timers ( 30 s samples, limit timers, 1 s
+// polls), ending each shard through final reading and retirement, until
 //   every started shard has ended;
-// - the end of run (`endOfRun`, b.uqm SR-5.7), in its six named steps, with
-//   E10's writer for `results.json` and `summary.txt` and E11's verdict
+// - the end of run (`endOfRun`), in its six named steps, with
+// writer for `results.json` and `summary.txt` and verdict
 //   writer for `verdict.txt`, last;
-// - the one refusal path (`recordRunRefusal`, b.uqm SR-5.8).
+// - the one refusal path (`recordRunRefusal`).
 //
-// One record holds the run's state (`RunSequence`): E1's `RunState` (with
-// E8's fields and the first run-level stop), and E13's own: the step and the
+// One record holds the run's state (`RunSequence`): `RunState` (with
+// fields and the first run-level stop), and own: the step and the
 // end-of-run step in progress, the lock and reservation held, admission's N
 // and figures, the schedule, each shard's record, the watchdog, the fault
 // controller, the image-build failure, when the first stop came, and the
 // three end flags (results written, refusal being recorded, verdict renamed).
-// E13 T2 builds the stops, the deadline and the traps on it: it records a
+// builds the stops, the deadline and the traps on it: it records a
 // run-level stop only through `recordRunLevelStop`, which every step checks
 // for (`enterStep`), and it hooks in through `RunSequenceHooks`.
 //
-// The run directory's contents (b.uqm SR-5.9): this sub-banner writes nothing
+// The run directory's contents: this sub-banner writes nothing
 // into the run directory itself but through its components: the status file,
-// `results.json`, `summary.txt` and `verdict.txt` each through E1's
+// `results.json`, `summary.txt` and `verdict.txt` each through
 // `writeWholeFile` (a `.<name>.tmp` renamed into place), `package/` with its
-// 0444 tarball (E8), and the 0700 shard subdirectories (E9). E8 takes the
+// 0444 tarball , and the 0700 shard subdirectories . takes the
 // build's image ID from its output and reads the pinned image back in memory,
 // so no image-ID or read-back file is ever written there.
 
-/** The exit status of a run whose `verdict.txt` was renamed into place, whatever its verdict (b.uqm SR-5.7). Nothing reads it: the reader judges a run by its files. */
+/** The exit status of a run whose `verdict.txt` was renamed into place, whatever its verdict. Nothing reads it: the reader judges a run by its files. */
 export const VERDICT_WRITTEN_EXIT_STATUS = 0
 
-/** The run sequence's step in progress after validation (b.uqm SR-5.3 steps 3–13), or the refusal being recorded. */
+/** The run sequence's step in progress after validation (steps 3–13), or the refusal being recorded. */
 export type RunSequenceStep =
   | 'docker-check'
   | 'base-image-check'
@@ -15502,42 +15481,42 @@ export type RunSequenceStep =
   | 'end-of-run'
   | 'refusal'
 
-/** The end-of-run step in progress (b.uqm SR-5.7), each named after what it does. */
+/** The end-of-run step in progress, each named after what it does. */
 export type EndOfRunStep = 'final-readings' | 'integrity' | 'cleanup' | 'watchdog-stop' | 'results' | 'verdict'
 
-/** When the first run-level stop came (b.uqm SR-5.6, SR-13.1): before the shards were scheduled, after that but before the end-of-run sequence, or during it. */
+/** When the first run-level stop came: before the shards were scheduled, after that but before the end-of-run sequence, or during it. */
 export type RunStopTiming = 'before-scheduling' | 'after-scheduling' | 'during-end-of-run'
 
 /** One scheduled shard as the run follows it. */
 export interface ShardRun {
-  /** Its assignment entry (E4): k, its scripts, its expected total and its limit in exact minutes. */
+  /** Its assignment entry (scheduling): k, its scripts, its expected total and its limit in exact minutes. */
   readonly assignment: ShardAssignment
-  /** Its limit in whole milliseconds, what its limit timer is armed with (E4's `Schedule.limitsMs`). */
+  /** Its limit in whole milliseconds, what its limit timer is armed with (scheduling's `Schedule.limitsMs`). */
   readonly limitMs: number
-  /** Its start result (E9), a failed start included; null while its start has not been attempted. */
+  /** Its start result (shard management), a failed start included; null while its start has not been attempted. */
   start: ShardStartResult | null
-  /** Its limit timer while armed (E4). */
+  /** Its limit timer while armed (scheduling). */
   limitTimer: LimitTimer | null
   /** Its end in progress or done: final reading, result file, cause, retirement; null until it ends. */
   ending: Promise<void> | null
   /** Whether its end is done. */
   ended: boolean
-  /** Its final reading (E9); null when it has none. */
+  /** Its final reading (shard management); null when it has none. */
   finalReading: ShardFinalReading | null
   /** Whether the final reading was taken (asked for); a shard that never started has none to take. */
   finalReadingTaken: boolean
-  /** Its result file as read right after its final reading (E4's and E7's records). */
+  /** Its result file as read right after its final reading (scheduling's and the memory guard's records). */
   resultFileAtFinalReading: ResultFileRead | null
-  /** The cause the runner fixed before a stop it made (b.uqm SR-12.1); never set for a failed start. */
+  /** The cause the runner fixed before a stop it made; never set for a failed start. */
   fixedCause: ShardCause | null
   /** The run-level stop that fixed its cause, when one did. */
   fixedByStop: StopKind | null
-  /** Its retirement (E9) once done. */
+  /** Its retirement (shard management) once done. */
   retirement: ShardRetirement | null
 }
 
 /**
- * The hooks E13 T2 (stops, the deadline, the traps) fills; each is called
+ * The hooks (stops, the deadline, the traps) fills; each is called
  * guarded, so a throw is logged and changes nothing.
  */
 export interface RunSequenceHooks {
@@ -15545,15 +15524,15 @@ export interface RunSequenceHooks {
   readonly onSequenceStart?: (seq: RunSequence) => void
   /** As each step of steps 3–13 begins, before its stop check (`seq.state.baseImage` holds step 4's outcome from `packing` on). */
   readonly onStep?: (seq: RunSequence, step: RunSequenceStep) => void
-  /** The scheduling event: the shards are scheduled and T known, right before the status write that turns the phase `shards`; `run.basis` may be replaced here (b.uqm SR-5.5). */
+  /** The scheduling event: the shards are scheduled and T known, right before the status write that turns the phase `shards`; `run.basis` may be replaced here. */
   readonly onShardsScheduled?: (seq: RunSequence, schedule: Schedule) => void
-  /** As each end-of-run step begins (b.uqm SR-5.7). */
+  /** As each end-of-run step begins. */
   readonly onEndOfRunStep?: (seq: RunSequence, step: EndOfRunStep) => void
   /** Once, after the run's last act (the verdict's rename or the refusal's record), with the exit status: remove the traps, cancel the deadline. It must write nothing. */
   readonly onSequenceEnd?: (seq: RunSequence, exitStatus: number) => void
 }
 
-/** The run's state after validation (b.uqm SR-5.3), the one record every step and E13 T2's stops read. */
+/** The run's state after validation, the one record every step and 's stops read. */
 export interface RunSequence {
   codexLogin: CodexLoginLease | null
   codexLoginReleased: boolean
@@ -15564,88 +15543,88 @@ export interface RunSequence {
   performanceBuildLock: LockFile | null
   readonly deps: RunnerDeps
   readonly run: RunContext
-  /** Step 2's validated run (E2). */
+  /** Step 2's validated run (validation). */
   readonly validated: ValidatedRun
   /** `<RUN_ID>-<PID>`. */
   readonly owner: Owner
   /** Every docker command's context: the spawn, the runner's environment as children get it, the worktree root. */
   readonly docker: DockerContext
-  /** E1's run state: the first run-level stop, and E8's base-image, package, build and image records with the cleanup failures. */
+  /** shared runner helpers's run state: the first run-level stop, and image preparation's base-image, package, build and image records with the cleanup failures. */
   readonly state: RunState
   readonly hooks: RunSequenceHooks
   /** The runner log for the run's own lines: a line that cannot be appended is dropped, never thrown. */
   readonly say: RunnerLogSink
-  /** The run's one canary source (E9). */
+  /** The run's one canary source (shard management). */
   readonly canaries: ShardCanaryDrawer
-  /** The run's one retirer (E9). */
+  /** The run's one retirer (shard management). */
   readonly retirer: ShardRetirer
   /** The step in progress. */
   step: RunSequenceStep
   /** The end-of-run step in progress; null before the sequence starts. */
   endOfRunStep: EndOfRunStep | null
-  /** Whether the end-of-run sequence has started (b.uqm SR-5.6). */
+  /** Whether the end-of-run sequence has started. */
   endOfRunStarted: boolean
-  /** The account's home, once step 6 found it (E5). */
+  /** The account's home, once step 6 found it (reservation management). */
   home: string | null
-  /** The lock directory, once step 6 bound it (E5). */
+  /** The lock directory, once step 6 bound it (reservation management). */
   lockDir: string | null
-  /** The admission lock while held (E5). */
+  /** The admission lock while held (reservation management). */
   lock: AdmissionLock | null
-  /** Whether the run's reservation is written and not yet removed (E5). */
+  /** Whether the run's reservation is written and not yet removed (reservation management). */
   reservationHeld: boolean
-  /** Step 8's readings (E6); null before. */
+  /** Step 8's readings (admission); null before. */
   figures: AdmissionFigures | null
-  /** Step 9's decision (E6): N, the shard-count data; null before. */
+  /** Step 9's decision (admission): N, the shard-count data; null before. */
   admission: AdmittedDecision | null
-  /** The memory watchdog once started at step 10 (E7). */
+  /** The memory watchdog once started at step 10 (the memory guard). */
   watchdog: MemoryWatchdog | null
-  /** Whether the read-back was started, so a read container may exist (E8). */
+  /** Whether the read-back was started, so a read container may exist (image preparation). */
   readBackStarted: boolean
-  /** The run's scripts: the worktree's until the read-back, then the pinned image's (b.uqm Terms). */
+  /** The run's scripts: the worktree's until the read-back, then the pinned image's (Terms). */
   runScripts: readonly Script[]
-  /** The schedule once the shards are scheduled (E4); null before. */
+  /** The schedule once the shards are scheduled (scheduling); null before. */
   schedule: Schedule | null
   /** One record per scheduled shard, in shard order; none before scheduling. */
   shards: ShardRun[]
-  /** The fault controller once the shards are scheduled (E12). */
+  /** The fault controller once the shards are scheduled (fault injection). */
   controller: FaultController | null
-  /** The test or base image build's failure, not one a stop ended (E8). */
+  /** The test or base image build's failure, not one a stop ended (image preparation). */
   imageBuildFailure: Failure | null
   /** An internal error's failure line, when one ended steps 3–13 (`internalErrorFailureLine`). */
   internalErrorLine: string | null
   /** When the first run-level stop came; null for none. */
   firstStopTiming: RunStopTiming | null
-  /** Whether `results.json` and `summary.txt` have been written (b.uqm SR-5.6's rewrite rule). */
+  /** Whether `results.json` and `summary.txt` have been written (rewrite rule). */
   resultsWritten: boolean
-  /** Whether a refusal is being recorded: from then on a stop changes nothing (b.uqm SR-5.6, SR-5.8). */
+  /** Whether a refusal is being recorded: from then on a stop changes nothing. */
   refusalBeingRecorded: boolean
-  /** Whether `verdict.txt` has been renamed into place: from then on nothing changes or is written (b.uqm SR-5.7). */
+  /** Whether `verdict.txt` has been renamed into place: from then on nothing changes or is written. */
   verdictRenamed: boolean
   /** Who waits for the follow loop's next change. */
   readonly waiters: (() => void)[]
 }
 
-/** The docker-down refusal (b.uqm SR-5.3 step 3, SR-5.8): `NOT RUN: docker does not answer: <error>`, kind null, the failing docker command's message on one line. The one formatter of this text: the skill quotes it and the tests import it. */
+/** The docker-down refusal (step 3): `NOT RUN: docker does not answer: <error>`, kind null, the failing docker command's message on one line. The one formatter of this text: the skill quotes it and the tests import it. */
 export function dockerDownRefusal(error: string): Refusal {
   return buildRefusal(null, `docker does not answer: ${dependencyErrorText(error)}`)
 }
 
-/** The refusal of an admission lock that could not be taken for a reason other than its being busy (b.uqm SR-6.1, SR-5.8): kind null, naming the lock file and the error on one line. */
+/** The refusal of an admission lock that could not be taken for a reason other than its being busy: kind null, naming the lock file and the error on one line. */
 export function lockTakeFailedRefusal(lockDir: string, error: string): Refusal {
   return buildRefusal(null, `the admission lock ${shownArgument(admissionLockPath(lockDir))} could not be taken: ${dependencyErrorText(error)}`)
 }
 
-/** The refusal of a reservation that could not be written at step 10, before it exists (b.uqm SR-6.2, SR-5.8): kind null, the error on one line. */
+/** The refusal of a reservation that could not be written at step 10, before it exists: kind null, the error on one line. */
 export function reservationWriteFailedRefusal(error: string): Refusal {
   return buildRefusal(null, `the run's reservation could not be written: ${dependencyErrorText(error)}`)
 }
 
-/** A run-level stop's line, the run's verdict line (b.uqm SR-5.4, SR-5.6): `FAIL: interrupted: <signal>` for an interrupt; the watchdog's and the deadline's lines as they carry them. */
+/** A run-level stop's line, the run's verdict line: `FAIL: interrupted: <signal>` for an interrupt; the watchdog's and the deadline's lines as they carry them. */
 export function runLevelStopLine(stop: RunLevelStop): string {
   return stop.kind === 'interrupt' ? `${FAIL_PREFIX}interrupted: ${stop.signal}` : stop.line
 }
 
-/** The cause a run-level stop fixes for a shard it stops (b.uqm SR-12.1): `stopped by <stop>`. */
+/** The cause a run-level stop fixes for a shard it stops: `stopped by <stop>`. */
 export function stoppedCauseOf(stop: RunLevelStop): StoppedCause {
   return { kind: 'stopped', by: stop.kind, fixedByRunner: true }
 }
@@ -15656,10 +15635,10 @@ export function internalErrorFailureLine(error: string): string {
 }
 
 /**
- * The verdict line written when E10's verdict line or ranking threw: the
+ * The verdict line written when verdict line or ranking threw: the
  * internal error's failure line, in the shape the invocation calls for
  * (`SELECTIVE (<scripts>): ` when it can be built, `INJECTED (<faults>): `),
- * never `PASS` (b.uqm SR-12.5).
+ * never `PASS`.
  */
 export function internalErrorVerdictLine(invocation: Invocation, scripts: readonly string[], error: string): string {
   return shapedFallbackVerdictLine(invocation, scripts, internalErrorFailureLine(error))
@@ -15667,8 +15646,8 @@ export function internalErrorVerdictLine(invocation: Invocation, scripts: readon
 
 /**
  * A fallback verdict's failure line in the shape the invocation calls for
- * (b.uqm SR-12.5): E10's `SELECTIVE (<scripts>): ` prefix when it can be
- * built, then E1's `INJECTED (<faults>): ` wrapper outside it. Never throws
+ * `SELECTIVE (<scripts>): ` prefix when it can be
+ * built, then `INJECTED (<faults>): ` wrapper outside it. Never throws
  * for the selective list: a list that cannot be built leaves the line as it is.
  */
 function shapedFallbackVerdictLine(invocation: Invocation, scripts: readonly string[], failureLine: string): string {
@@ -15685,8 +15664,7 @@ function shapedFallbackVerdictLine(invocation: Invocation, scripts: readonly str
 }
 
 /**
- * The verdict line written when step 5's composition threw (b.uqm SR-5.6,
- * SR-12.5): with a run-level stop recorded, that stop's line
+ * The verdict line written when step 5's composition threw: with a run-level stop recorded, that stop's line
  * (`runLevelStopLine`), which is the run's verdict whatever else failed; else
  * the internal error's (`internalErrorVerdictLine`). Either in the shape the
  * invocation calls for. Never `PASS`.
@@ -15699,7 +15677,7 @@ function fallbackVerdictLine(seq: Pick<RunSequence, 'validated' | 'runScripts' |
   return internalErrorVerdictLine(invocation, scripts, dependencyErrorText(err))
 }
 
-/** E1's run state as the run starts: no stop, nothing checked, packed or built (E8's `initialImageState`). */
+/** shared runner helpers's run state as the run starts: no stop, nothing checked, packed or built (image preparation's `initialImageState`). */
 export function createInitialRunState(): RunState {
   return {
     firstStop: null,
@@ -15716,7 +15694,7 @@ export function createInitialRunState(): RunState {
   }
 }
 
-/** A runner log that can be sealed: once sealed every write is dropped, so nothing is written after the run's last act (b.uqm SR-5.7, SR-5.8). */
+/** A runner log that can be sealed: once sealed every write is dropped, so nothing is written after the run's last act. */
 export interface SealableRunnerLog extends RunnerLogWriter {
   /** Drops every later write. */
   seal(): void
@@ -15761,7 +15739,7 @@ function sayError(seq: Pick<RunSequence, 'run'>, err: unknown, context: string):
   }
 }
 
-/** Calls one of E13 T2's hooks; a throw is logged and changes nothing. */
+/** Calls one of 's hooks; a throw is logged and changes nothing. */
 function callRunHook(seq: RunSequence, name: string, call: () => void): void {
   try {
     call()
@@ -15828,12 +15806,12 @@ function wakeRunSequence(seq: RunSequence): void {
   for (const waiter of seq.waiters.splice(0)) waiter()
 }
 
-/** Whether a run-level stop has been recorded: the check between steps (b.uqm SR-5.6). */
+/** Whether a run-level stop has been recorded: the check between steps. */
 export function runStopRecorded(seq: Pick<RunSequence, 'state'>): boolean {
   return seq.state.firstStop !== null
 }
 
-/** Begins a step: records it, tells E13 T2's hook, and answers whether a run-level stop has been recorded, so the step must not start. */
+/** Begins a step: records it, tells 's hook, and answers whether a run-level stop has been recorded, so the step must not start. */
 function enterStep(seq: RunSequence, step: RunSequenceStep): boolean {
   seq.step = step
   const onStep = seq.hooks.onStep
@@ -15841,21 +15819,21 @@ function enterStep(seq: RunSequence, step: RunSequenceStep): boolean {
   return runStopRecorded(seq)
 }
 
-/** Begins an end-of-run step: records it and tells E13 T2's hook. */
+/** Begins an end-of-run step: records it and tells 's hook. */
 function enterEndOfRunStep(seq: RunSequence, step: EndOfRunStep): void {
   seq.endOfRunStep = step
   const onEndOfRunStep = seq.hooks.onEndOfRunStep
   if (onEndOfRunStep !== undefined) callRunHook(seq, 'end-of-run step', () => onEndOfRunStep(seq, step))
 }
 
-/** Releases the admission lock when the run holds it (b.uqm SR-6.1). */
+/** Releases the admission lock when the run holds it. */
 function releaseAdmissionLock(seq: RunSequence): void {
   const lock = seq.lock
   seq.lock = null
   lock?.release()
 }
 
-/** Cancels every follow-loop timer the run armed: the limit timers (E4). E12's polls end with each shard's end, the stop, or `finalize`. */
+/** Cancels every follow-loop timer the run armed: the limit timers (scheduling). fault injection's polls end with each shard's end, the stop, or `finalize`. */
 function cancelFollowTimers(seq: RunSequence): void {
   for (const shard of seq.shards) {
     shard.limitTimer?.cancel()
@@ -15864,16 +15842,16 @@ function cancelFollowTimers(seq: RunSequence): void {
 }
 
 /**
- * Records a run-level stop (b.uqm SR-5.6): the first one decides the run's
+ * Records a run-level stop: the first one decides the run's
  * line; a later one, one after the verdict's rename, or one while a refusal is
  * being recorded changes nothing (answers false). Recorded before the
  * end-of-run sequence, it ends any build in progress (SIGKILL to its process
- * group, after the stop is recorded, so E8 reads the build as stopped), tells
+ * group, after the stop is recorded, so reads the build as stopped), tells
  * the fault controller, cancels the limit timers and wakes the follow loop;
  * every step's check then turns the run to the end-of-run sequence, which takes
  * the final readings and fixes the causes. During the sequence it changes only
- * the run-level line, which step 5 or 6 writes. E13 T2's traps, deadline and
- * E7's watchdog record stops only through this.
+ * the run-level line, which step 5 or 6 writes. traps, deadline and
+ * watchdog record stops only through this.
  */
 export function recordRunLevelStop(seq: RunSequence, stop: RunLevelStop): boolean {
   if (seq.refusalBeingRecorded || seq.verdictRenamed || seq.state.firstStop !== null) return false
@@ -15890,22 +15868,22 @@ export function recordRunLevelStop(seq: RunSequence, stop: RunLevelStop): boolea
   return true
 }
 
-/** Writes the status file in phase `shards` or `merge` from the run's current basis; a failed write is logged (b.uqm SR-5.2). */
+/** Writes the status file in phase `shards` or `merge` from the run's current basis; a failed write is logged. */
 function writeRunPhase(seq: RunSequence, phase: 'shards' | 'merge'): void {
   const written = writeStatusFile(seq.run.runDir, buildStatus(seq.run.basis, phase))
   if (!written.ok) seq.say(`ci-run: writing ${STATUS_FILE_NAME} in phase ${phase} failed: ${written.error}`)
 }
 
 /**
- * The one refusal path (b.uqm SR-5.8): marks the refusal as being recorded
+ * The one refusal path: marks the refusal as being recorded
  * (so a stop from now on changes nothing), releases the lock if held, removes
  * the reservation if written, removes the read container when the read-back
- * started (E8), runs E8's image cleanup (which lists and prunes nothing when
+ * started , runs image cleanup (which lists and prunes nothing when
  * no test, drift or retag build started), stops the watchdog when it runs,
- * then records the refusal through E1's recorder as the run's last act, which
+ * then records the refusal through recorder as the run's last act, which
  * seals the runner log. Every cleanup failure is already in the runner log
  * and never changes the refusal; a cleanup step that throws is logged and the
- * next one still runs, so the refusal is always recorded. Answers E1's refusal
+ * next one still runs, so the refusal is always recorded. Answers refusal
  * exit status.
  */
 export async function recordRunRefusal(seq: RunSequence, refusal: Refusal): Promise<number> {
@@ -15938,7 +15916,7 @@ export async function recordRunRefusal(seq: RunSequence, refusal: Refusal): Prom
   return recordRefusal(seq.run, refusal)
 }
 
-/** One guarded step of the refusal path, `finishRun` or the end of run: a throw is logged and changes nothing, so the next step and the refusal or the verdict still come (b.uqm SR-5.7, SR-5.8). */
+/** One guarded step of the refusal path, `finishRun` or the end of run: a throw is logged and changes nothing, so the next step and the refusal or the verdict still come. */
 async function guardedStep(seq: RunSequence, context: string, step: () => void | Promise<void>): Promise<void> {
   try {
     await step()
@@ -15947,7 +15925,7 @@ async function guardedStep(seq: RunSequence, context: string, step: () => void |
   }
 }
 
-/** Removes the run's reservation when written (E5); a failure is already logged and is listed as a cleanup failure (b.uqm SR-9.3). */
+/** Removes the run's reservation when written (reservation management); a failure is already logged and is listed as a cleanup failure. */
 function removeRunReservation(seq: RunSequence): void {
   if (!seq.reservationHeld || seq.lockDir === null) return
   seq.reservationHeld = false
@@ -15971,7 +15949,7 @@ type SequencePartOutcome =
 const GO_ON: SequencePartOutcome = { kind: 'go-on' }
 const TO_END_OF_RUN: SequencePartOutcome = { kind: 'end-of-run' }
 
-/** A refusal, unless a run-level stop came first: then the stop decides, and the run goes to its end of run (b.uqm SR-5.6). */
+/** A refusal, unless a run-level stop came first: then the stop decides, and the run goes to its end of run. */
 async function refuseUnlessStopped(seq: RunSequence, refusal: Refusal): Promise<SequencePartOutcome> {
   if (runStopRecorded(seq)) return TO_END_OF_RUN
   return { kind: 'refused', exitStatus: await recordRunRefusal(seq, refusal) }
@@ -16011,7 +15989,7 @@ async function verifyCodexRetirement(seq: RunSequence): Promise<void> {
   }
 }
 
-/** What admission asks for (b.uqm SR-3.4, SR-6.7), from the validated run and E1's cap. */
+/** What admission asks for, from the validated run and shared runner helpers's cap. */
 function admissionRequestOf(validated: ValidatedRun): AdmissionRequest {
   return {
     requestedShards: validated.requestedShards,
@@ -16025,13 +16003,13 @@ function admissionRequestOf(validated: ValidatedRun): AdmissionRequest {
 }
 
 /**
- * Steps 3–11 (b.uqm SR-5.3), in order, each refusal through the one refusal
- * path: the docker check; the base-image check (E8); packing (E8); the
- * account's home, the lock directory and the lock (E5; a failed home lookup
+ * Steps 3–11, in order, each refusal through the one refusal
+ * path: the docker check; the base-image check ; packing ; the
+ * account's home, the lock directory and the lock (a failed home lookup
  * refuses here, and nothing reads the password file earlier); the sweep under
- * the lock (E5), its cleanup failures kept for the results; the readings
- * (E6, with E5's reservation reader); the disk, memory and CPU fits choosing N
- * (E6); the reservation (E5), then the watchdog's start (E7); the lock's
+ * the lock , its cleanup failures kept for the results; the readings
+ * (with reservation reader); the disk, memory and CPU fits choosing N
+ * ; the reservation , then the watchdog's start ; the lock's
  * release. A stop recorded meanwhile sends the run to its end of run.
  */
 async function admitRun(seq: RunSequence): Promise<SequencePartOutcome> {
@@ -16111,7 +16089,7 @@ async function admitRun(seq: RunSequence): Promise<SequencePartOutcome> {
 }
 
 /** Packing/builds share the same guard as container workloads. Only the
- * native AC76 script takes it exclusively; waiting for login takes no guard.
+ * native script takes it exclusively; waiting for login takes no guard.
  * A run deadline/signal bounds this wait through the normal stop hooks. */
 async function takePerformanceBuildLock(seq: RunSequence): Promise<void> {
   const home = seq.deps.lockDir ? null : resolveAccountHome(seq.deps)
@@ -16207,22 +16185,22 @@ async function runCodexTrack(seq: RunSequence, pinnedId: string, tarballPath: st
   }
 }
 
-/** E8's image steps' context. */
+/** image preparation's image steps' context. */
 function runImagesContextOf(seq: RunSequence): RunImagesContext {
   return { docker: seq.docker, sendSignal: seq.deps.sendSignal, owner: seq.owner, clock: seq.deps.clock, log: seq.say }
 }
 
 /**
- * Step 12 (b.uqm SR-5.3), in order: the base build (E8) only when step 4
+ * Step 12, in order: the base build only when step 4
  * found the base missing and the re-check still does; the test build and pin
- * (E8); the read-back (E8), whose refusal goes through the refusal path, and
- * the read container's removal; scheduling (E4) once, with the pinned image's
+ * ; the read-back , whose refusal goes through the refusal path, and
+ * the read container's removal; scheduling once, with the pinned image's
  * list, its duration table, the units, the invocation and the admitted N, which
- * turns the phase `shards` (E13 T2's hook first) and builds the fault
- * controller (E12); the drift and retag builds the faults need (E8), told to
- * the controller before any start; each shard's start (E9), told to the
+ * turns the phase `shards` ( hook first) and builds the fault
+ * controller ; the drift and retag builds the faults need , told to
+ * the controller before any start; each shard's start , told to the
  * controller, its limit timer armed; once every start was attempted, the tag
- * move (E8), told to the controller whatever it gave. An image-build failure
+ * move , told to the controller whatever it gave. An image-build failure
  * no stop caused skips the rest and goes to the end of run, the phase staying
  * `build`.
  */
@@ -16322,7 +16300,7 @@ async function buildAndStartShards(seq: RunSequence): Promise<SequencePartOutcom
   return runStopRecorded(seq) ? TO_END_OF_RUN : GO_ON
 }
 
-/** Starts one shard (E9), tells the controller (E12), and arms its limit timer (E4) at its container's start. */
+/** Starts one shard (shard management), tells the controller (fault injection), and arms its limit timer (scheduling) at its container's start. */
 async function startOneShard(seq: RunSequence, shard: ShardRun, pinnedId: string, tarballPath: string, secretValues: ReadonlySet<string>): Promise<void> {
   const k = shard.assignment.shard
   const controller = seq.controller
@@ -16347,7 +16325,7 @@ async function startOneShard(seq: RunSequence, shard: ShardRun, pinnedId: string
     codexLoginSource: shard.assignment.assigned.some(isCodexScript) ? seq.codexLogin?.source : undefined,
     codexModel: shard.assignment.assigned.some(isCodexScript) ? seq.codexLogin?.model : undefined,
     codexHostConfigKeys: shard.assignment.assigned.some(isCodexScript) ? seq.codexLogin?.hostConfigKeys : undefined,
-    // The run log itself, whose sink throws when it cannot append, so no unlogged list is spawned (b.uqm SR-10.4).
+    // The run log itself, whose sink throws when it cannot append, so no unlogged list is spawned.
     log: seq.run.log,
   })
   shard.start = result
@@ -16375,14 +16353,14 @@ function isFollowedShard(shard: ShardRun): shard is ShardRun & { start: ShardSta
   return shard.start !== null && shard.start.start.kind === 'started' && shard.ending === null
 }
 
-/** The running shards the watchdog samples (E7): started, not yet ending; none once the end-of-run sequence starts. */
+/** The running shards the watchdog samples (the memory guard): started, not yet ending; none once the end-of-run sequence starts. */
 function runningShardsOf(seq: RunSequence): WatchdogShard[] {
   if (seq.endOfRunStarted) return []
   return seq.shards.filter(isFollowedShard).map((shard) => ({ shard: shard.assignment.shard, container: shard.start.containerId ?? shard.start.containerName }))
 }
 
 /**
- * Ends one shard (b.uqm SR-10.6), once, in E9's order: its limit timer
+ * Ends one shard, once, in order: its limit timer
  * cancelled; its final reading; its result file read; its cause fixed; its
  * retirement (SIGKILL while running, `docker.log`, removal) for the reason
  * given. A cause is fixed only for a started shard with none yet, and not when
@@ -16424,7 +16402,7 @@ function endShard(seq: RunSequence, shard: ShardRun, requested: RetirementReason
   return shard.ending
 }
 
-/** E4's limit timer fired (b.uqm SR-4.3): its end marker found, a final reading now; else over its limit, its cause fixed (`wall-time limit of <m> min exceeded`) before the stop. Never throws. */
+/** scheduling's limit timer fired: its end marker found, a final reading now; else over its limit, its cause fixed (`wall-time limit of <m> min exceeded`) before the stop. Never throws. */
 function onShardLimit(seq: RunSequence, shard: ShardRun, outcome: LimitTimerOutcome): void {
   try {
     shard.limitTimer = null
@@ -16441,7 +16419,7 @@ function onShardLimit(seq: RunSequence, shard: ShardRun, outcome: LimitTimerOutc
   }
 }
 
-/** E12's one notice handler (b.uqm SR-14.2): a `timeout:` stops its shard as at its limit, a `kill:` with SIGKILL, each with the decided cause fixed first; a poll's end marker takes the final reading now. Runs inside a timer callback, so it never throws. */
+/** fault injection's one notice handler: a `timeout:` stops its shard as at its limit, a `kill:` with SIGKILL, each with the decided cause fixed first; a poll's end marker takes the final reading now. Runs inside a timer callback, so it never throws. */
 function onFaultNotice(seq: RunSequence, notice: FaultNotice): void {
   try {
     if (seq.endOfRunStarted) return
@@ -16459,7 +16437,7 @@ function onFaultNotice(seq: RunSequence, notice: FaultNotice): void {
   }
 }
 
-/** E7's per-sample hook (b.uqm SR-7.3, SR-10.6): a running shard whose result file holds its end marker gets its final reading now; one whose cgroup could not be read is checked for having exited on its own. */
+/** the memory guard's per-sample hook: a running shard whose result file holds its end marker gets its final reading now; one whose cgroup could not be read is checked for having exited on its own. */
 function followSample(seq: RunSequence, sample: Sample): void {
   if (seq.endOfRunStarted) return
   for (const shardSample of sample.shards) {
@@ -16474,7 +16452,7 @@ function followSample(seq: RunSequence, sample: Sample): void {
   }
 }
 
-/** Ends a shard whose container exited on its own, or is gone, as found by one state inspect (b.uqm SR-10.6, SR-12.1); its cause is then read from its exit, never fixed. Never rejects. */
+/** Ends a shard whose container exited on its own, or is gone, as found by one state inspect; its cause is then read from its exit, never fixed. Never rejects. */
 async function endShardIfExited(seq: RunSequence, shard: ShardRun & { start: ShardStartResult }): Promise<void> {
   try {
     const state = await inspectContainerState(seq.docker, shard.start.containerId ?? shard.start.containerName)
@@ -16488,10 +16466,10 @@ async function endShardIfExited(seq: RunSequence, shard: ShardRun & { start: Sha
 }
 
 /**
- * Step 13, the follow loop (b.uqm SR-5.3, SR-10.6): waits, on no timer of its
+ * Step 13, the follow loop: waits, on no timer of its
  * own, until every started shard has ended or a run-level stop is recorded.
- * The three timer sources end the shards: E7's samples (an end marker, or a
- * container that exited), E4's limit timers, and E12's 1 s polls while a
+ * The three timer sources end the shards: samples (an end marker, or a
+ * container that exited), limit timers, and 1 s polls while a
  * `timeout:` or `kill:` is due.
  */
 async function followShards(seq: RunSequence): Promise<void> {
@@ -16506,7 +16484,7 @@ async function followShards(seq: RunSequence): Promise<void> {
 }
 
 /**
- * A run-level stop before the end-of-run sequence (b.uqm SR-5.6): every
+ * A run-level stop before the end-of-run sequence: every
  * running shard gets its final reading and is retired with its cause fixed as
  * `stopped by <stop>`; a shard not yet created takes that cause too; a shard
  * that failed to start keeps its own (end-of-run step 1 retires it).
@@ -16545,10 +16523,10 @@ async function finishRun(seq: RunSequence): Promise<number> {
 }
 
 /**
- * The run sequence after validation (b.uqm SR-5.3): steps 3–11, step 12,
+ * The run sequence after validation: steps 3–11, step 12,
  * step 13, then the end of run; or a refusal. Answers main's exit status:
  * `VERDICT_WRITTEN_EXIT_STATUS` once `verdict.txt` is renamed into place,
- * E1's refusal status after a recorded refusal. An internal error in steps
+ * refusal status after a recorded refusal. An internal error in steps
  * 3–13 is logged and the run still ends through the end of run, which
  * retires its shards and cleans up, its verdict that error's failure line.
  * The lock is released on every way out.
@@ -16580,7 +16558,7 @@ export async function runAfterValidation(deps: RunnerDeps, run: RunContext, vali
  * Steps 3–13 and the end of run, or a refusal. An internal error in steps
  * 3–13 is logged, sets the run's internal-error line and goes through
  * `finishRun`, as a stop does; one thrown while a refusal is being recorded
- * (only by E1's recorder, the refusal path guarding its cleanup) is thrown on.
+ * (only by recorder, the refusal path guarding its cleanup) is thrown on.
  */
 async function runSteps(seq: RunSequence): Promise<number> {
   try {
@@ -16599,7 +16577,7 @@ async function runSteps(seq: RunSequence): Promise<number> {
   return finishRun(seq)
 }
 
-// The end of run (b.uqm SR-5.7).
+// The end of run.
 
 /** One shard's evidence before its outcome: everything but `endedNormally` and `end`. */
 type ShardEvidenceBase = Omit<ShardEvidence, 'endedNormally' | 'end'>
@@ -16616,7 +16594,7 @@ function hexRecordValue(read: HexRecordRead): string | null {
   return read.kind === 'value' ? read.value : null
 }
 
-/** A shard's anon peak and peak PIDs (E7); a throw is logged and gives an unknown peak. */
+/** A shard's anon peak and peak PIDs (the memory guard); a throw is logged and gives an unknown peak. */
 function shardPeaksOf(seq: RunSequence, k: number, samples: readonly ShardSample[], final: FinalReading | null): ShardPeaks {
   try {
     return shardPeaks(samples, final)
@@ -16627,9 +16605,9 @@ function shardPeaksOf(seq: RunSequence, k: number, samples: readonly ShardSample
 }
 
 /**
- * One shard's evidence (E9's start and reading, E7's peaks and out-of-memory
- * line, E4's seconds, E11's in-shard records, the fixed cause) and its
- * outcome (E10), read from its subdirectory, which is final after end-of-run
+ * One shard's evidence ( start and reading, peaks and out-of-memory
+ * line, seconds, in-shard records, the fixed cause) and its
+ * outcome , read from its subdirectory, which is final after end-of-run
  * step 1. Its failed readings are its samples' (0 when never sampled) plus its
  * final reading's.
  */
@@ -16672,7 +16650,7 @@ function shardEndOf(seq: RunSequence, shard: ShardRun, samples: readonly Sample[
   return { evidence: { ...base, endedNormally: outcome.endedNormally, end: outcome.end }, outcome, oom }
 }
 
-/** The modes `results.json` records (b.uqm SR-16.1, SR-5.9): the run directory's, the tarball's, and each `shard-<k>` directory's, read without following a link. */
+/** The modes `results.json` records: the run directory's, the tarball's, and each `shard-<k>` directory's, read without following a link. */
 function readRunModes(runDir: string, tarballPath: string | null): RunModes {
   const runDirMode = lstatRunDirEntry(runDir).mode
   let tarball: number | null = null
@@ -16698,7 +16676,7 @@ function readRunModes(runDir: string, tarballPath: string | null): RunModes {
   return { runDir: runDirMode, tarball, shardDirs }
 }
 
-/** The cap line and record (E7, b.uqm SR-8.3, SR-8.4); a throw is logged, and the unknown form is tried before giving up (null). */
+/** The cap line and record (the memory guard); a throw is logged, and the unknown form is tried before giving up (null). */
 function capReportOf(seq: RunSequence, passed: boolean, shards: readonly CapShard[]): CapReport | null {
   const invocation = seq.validated.invocation
   const actualShards = shards.map(shard => ({ ...shard, capBytes: SHARD_MEMORY_CAP_BYTES +
@@ -16727,8 +16705,8 @@ interface EndFiles {
 }
 
 /**
- * Composes the verdict line and `results.json`'s value (b.uqm SR-5.7 step 5),
- * in E7's and E10's order: each shard's evidence and out-of-memory status;
+ * Composes the verdict line and `results.json`'s value (step 5),
+ * in and order: each shard's evidence and out-of-memory status;
  * the outcomes; the pass condition over the same failures the ranking sees;
  * the anon peaks, the cap rule and the cap line; the ranking and the verdict
  * line; the timing (the total taken now); the shard count; the modes; the
@@ -16839,7 +16817,7 @@ function composeEndFiles(seq: RunSequence, integrity: IntegrityChecksResult, rep
   }
 }
 
-/** Writes `results.json` and `summary.txt` through E10's one writer with E11's redactor (b.uqm SR-5.7 step 5, SR-15.3), each outcome's failure logged. */
+/** Writes `results.json` and `summary.txt` through result rendering's one writer with integrity checks's redactor (step 5), each outcome's failure logged. */
 function writeEndFiles(seq: RunSequence, files: EndFiles, values: readonly string[]): void {
   if (files.results === null) {
     seq.say(`ci-run: ${RESULTS_FILE_NAME} and ${SUMMARY_FILE_NAME} were not written: their value could not be assembled`)
@@ -16852,7 +16830,7 @@ function writeEndFiles(seq: RunSequence, files: EndFiles, values: readonly strin
   seq.resultsWritten = true
 }
 
-/** `composeEndFiles`, whose throw is logged and gives `fallbackVerdictLine` (the recorded stop's line, else the internal error's) with no results value, so the verdict is still written (b.uqm SR-5.6, SR-5.7, SR-12.5). */
+/** `composeEndFiles`, whose throw is logged and gives `fallbackVerdictLine` (the recorded stop's line, else the internal error's) with no results value, so the verdict is still written. */
 function composeEndFilesGuarded(seq: RunSequence, integrity: IntegrityChecksResult, report: MemoryWatchdogReport | null): EndFiles {
   try {
     return composeEndFiles(seq, integrity, report)
@@ -16862,7 +16840,7 @@ function composeEndFilesGuarded(seq: RunSequence, integrity: IntegrityChecksResu
   }
 }
 
-/** `writeEndFiles`, synchronously, whose throw is logged, so the verdict still follows (b.uqm SR-5.7). */
+/** `writeEndFiles`, synchronously, whose throw is logged, so the verdict still follows. */
 function writeEndFilesGuarded(seq: RunSequence, files: EndFiles, values: readonly string[]): void {
   try {
     writeEndFiles(seq, files, values)
@@ -16872,20 +16850,20 @@ function writeEndFilesGuarded(seq: RunSequence, files: EndFiles, values: readonl
 }
 
 /**
- * The end-of-run sequence (b.uqm SR-5.7), its six steps in order:
+ * The end-of-run sequence, its six steps in order:
  * 1. the phase turns `merge`, the run's last status write; every shard still
- *    present is retired through E9 (final reading if not yet taken, SIGKILL
+ * present is retired through (final reading if not yet taken, SIGKILL
  *    while running, `docker.log`, removal); the read container is removed
- *    (E8); the fault controller is finalized (E12);
- * 2. E11's integrity entry, checks 1–11 then `secret-scan`, which switches the
+ * ; the fault controller is finalized ;
+ * 2. integrity entry, checks 1–11 then `secret-scan`, which switches the
  *    runner log's masking on;
- * 3. the reservation released (E5), then the run's images removed (E8);
- * 4. the watchdog stopped, W read after cleanup (E7);
- * 5. `results.json` and `summary.txt`, through E10's writer with E11's
+ * 3. the reservation released , then the run's images removed ;
+ * 4. the watchdog stopped, W read after cleanup ;
+ * 5. `results.json` and `summary.txt`, through writer with
  *    redactor;
- * 6. `verdict.txt`, through E11's verdict writer, last; when a run-level stop
+ * 6. `verdict.txt`, through verdict writer, last; when a run-level stop
  *    came after step 5's composition, both files are first written again,
- *    whole (b.uqm SR-5.6).
+ * whole.
  * After the rename the runner log is sealed and the exit status is
  * `VERDICT_WRITTEN_EXIT_STATUS`, whatever the verdict. The run directory is
  * never removed. A throw in the read container's removal, the controller's
@@ -16972,9 +16950,9 @@ async function endOfRun(seq: RunSequence): Promise<number> {
 }
 
 /**
- * End-of-run step 2 (b.uqm SR-5.7, SR-13): E11's one entry, with the shards'
- * evidence (`endedNormally` from E10's reading of each shard's subdirectory,
- * final after step 1), E12's firing records and the run state its skip rules
+ * End-of-run step 2: one entry, with the shards'
+ * evidence (`endedNormally` from reading of each shard's subdirectory,
+ * final after step 1), firing records and the run state its skip rules
  * read. A throw is logged, the log's masking still switched on, and the run
  * fails with one `secret-scan` failure saying the checks could not run.
  */
@@ -17023,22 +17001,22 @@ function runEndOfRunIntegrity(seq: RunSequence, firingRecords: readonly FiringRe
   }
 }
 
-// --- 17/E13.T2 (E13 T2): the run deadline and its timer, the signal traps, the hooks main passes ---
+// --- 17/. : the run deadline and its timer, the signal traps, the hooks main passes ---
 //
-// The stops themselves are E13.T1's: `recordRunLevelStop` is the one entry
+// The stops themselves are .: `recordRunLevelStop` is the one entry
 // (the first stop wins; before the end-of-run sequence it ends any build after
 // recording the stop, tells the fault controller, cancels the limit timers and
 // wakes the follow loop; during it, it changes only the run-level line; after
 // the verdict's rename or while a refusal is being recorded, nothing), and
 // `finishRun`, `stopShards` and `endOfRun` carry a stop to its verdict. This
-// sub-banner adds the two run-level stops that are not E7's:
-// - the run deadline (b.uqm SR-5.5): B = 30 min, plus 60 min once step 4
+// sub-banner adds the two run-level stops that are not :
+// - the run deadline: B = 30 min, plus 60 min once step 4
 //   found the base image missing; start + B until the shards are scheduled,
 //   then start + B + T + 15 min. The status file holds the current deadline at
-//   every write before the switch to `merge` (E3's wait verb reads it); the
+// every write before the switch to `merge` ( wait verb reads it); the
 //   deadline then stops changing. It fires on its own timer, armed through the
-//   injected clock in waits of at most 2^31 − 1 ms (E4's `MAX_TIMER_DELAY_MS`);
-// - the traps (b.uqm SR-5.4): SIGINT, SIGTERM and SIGHUP, each an interrupt
+// injected clock in waits of at most 2^31 − 1 ms ( `MAX_TIMER_DELAY_MS`);
+// - the traps: SIGINT, SIGTERM and SIGHUP, each an interrupt
 //   with `FAIL: interrupted: <signal>`, registered through `deps.onSignal` only
 //   by the hooks main builds, once the run directory exists (right after step
 //   1), and removed after the run's last act. A signal during validation is
@@ -17047,10 +17025,10 @@ function runEndOfRunIntegrity(seq: RunSequence, firingRecords: readonly FiringRe
 // Nothing here writes after the verdict or the refusal: a stop then changes
 // nothing, and the end hook only cancels and removes.
 
-/** The signals the runner traps, in the order it registers them (b.uqm SR-5.4). */
+/** The signals the runner traps, in the order it registers them. */
 export const TRAPPED_SIGNALS: readonly TrappedSignal[] = ['SIGINT', 'SIGTERM', 'SIGHUP']
 
-/** The run deadline's run-level line (b.uqm SR-5.5): `FAIL: run deadline: <phase> still running at the <m> min deadline`, m the deadline's minutes from the start rounded halves up by E1's one rounding. */
+/** The run deadline's run-level line: `FAIL: run deadline: <phase> still running at the <m> min deadline`, m the deadline's minutes from the start rounded halves up by shared runner helpers's one rounding. */
 export function runDeadlineLine(phase: ActiveStatus['phase'], minutes: number): string {
   return `${FAIL_PREFIX}run deadline: ${phase} still running at the ${roundMinutesHalfUp(minutes)} min deadline`
 }
@@ -17060,13 +17038,13 @@ export function runDeadlineStop(phase: ActiveStatus['phase'], minutes: number): 
   return { kind: 'run-deadline', line: runDeadlineLine(phase, minutes) }
 }
 
-/** What the run deadline is computed from (b.uqm SR-5.5). */
+/** What the run deadline is computed from. */
 export interface RunDeadlineInput {
   /** Login contention has its own bounded allowance, separate from builds. */
   readonly codexLoginWaitMs?: number
-  /** Whether step 4 found the base image missing (E8's `missing` form, `missingAtMs` its moment). */
+  /** Whether step 4 found the base image missing (image preparation's `missing` form, `missingAtMs` its moment). */
   readonly baseMissing: boolean
-  /** T, the run's largest shard limit in whole milliseconds (E4's `Schedule.largestLimitMs`); null before the shards are scheduled. */
+  /** T, the run's largest shard limit in whole milliseconds (scheduling's `Schedule.largestLimitMs`); null before the shards are scheduled. */
   readonly largestLimitMs: number | null
 }
 
@@ -17077,7 +17055,7 @@ export interface RunDeadlineOffset {
 }
 
 /**
- * The run deadline's offset from the start (b.uqm SR-5.5): B is
+ * The run deadline's offset from the start: B is
  * `BUILD_ALLOWANCE_MINUTES`, plus `BASE_BUILD_ALLOWANCE_MINUTES` once the base
  * was found missing; until the shards are scheduled the deadline is start + B,
  * then start + B + T + `MERGE_ALLOWANCE_MINUTES`. The milliseconds are summed
@@ -17091,12 +17069,12 @@ export function runDeadlineOffset(input: RunDeadlineInput): RunDeadlineOffset {
   return { minutes: fixedMinutes + (input.largestLimitMs + waitMs) / MS_PER_MINUTE, ms: fixedMinutes * MS_PER_MINUTE + input.largestLimitMs + waitMs }
 }
 
-/** The run deadline's input as the run stands (b.uqm SR-5.5). */
+/** The run deadline's input as the run stands. */
 function runDeadlineInputOf(seq: Pick<RunSequence, 'state' | 'schedule' | 'codexLoginWaitMs'>): RunDeadlineInput {
   return { codexLoginWaitMs: seq.codexLoginWaitMs, baseMissing: seq.state.baseImage?.kind === 'missing', largestLimitMs: seq.schedule?.largestLimitMs ?? null }
 }
 
-/** The status phase as the run stands (b.uqm SR-5.2): `merge` from the start of the end-of-run sequence, else `shards` once scheduled, else `build`. */
+/** The status phase as the run stands: `merge` from the start of the end-of-run sequence, else `shards` once scheduled, else `build`. */
 function runStatusPhaseOf(seq: Pick<RunSequence, 'endOfRunStarted' | 'schedule'>): ActiveStatus['phase'] {
   if (seq.endOfRunStarted) return 'merge'
   return seq.schedule !== null ? 'shards' : 'build'
@@ -17110,7 +17088,7 @@ interface ClockTimer {
 
 /**
  * Arms a one-shot timer due at a clock moment: it fires at that moment, on
- * its own, in waits of at most `MAX_TIMER_DELAY_MS` (E4's limit-timer
+ * its own, in waits of at most `MAX_TIMER_DELAY_MS` ( limit-timer
  * technique), so a far moment never fires early; armed after the moment, it
  * fires on the next timer tick.
  */
@@ -17143,8 +17121,7 @@ function armClockTimerAt(clock: RunnerClock, dueAtMs: number, onDue: () => void)
 /** The run-level stop hooks main passes to the run sequence, with their own start and end. */
 export interface RunStopHooks extends RunSequenceHooks {
   /**
-   * Registers SIGINT, SIGTERM and SIGHUP through `deps.onSignal` (b.uqm
-   * SR-5.4); main calls it once step 1 has made the run directory
+   * Registers SIGINT, SIGTERM and SIGHUP through `deps.onSignal`; main calls it once step 1 has made the run directory
    * (`beginRun` returned). Idempotent; registers nothing once disposed. A
    * registration that throws is written to `log` when given, and the other
    * signals are still registered.
@@ -17155,8 +17132,7 @@ export interface RunStopHooks extends RunSequenceHooks {
 }
 
 /**
- * The hooks that add the run deadline and the signal traps to a run (b.uqm
- * SR-5.4, SR-5.5), built by main, one set per run:
+ * The hooks that add the run deadline and the signal traps to a run, built by main, one set per run:
  * - `trap`, once the run directory exists (main calls it right after
  *   `beginRun`): registers SIGINT, SIGTERM and SIGHUP through
  *   `deps.onSignal`. A signal once the sequence has started records
@@ -17164,7 +17140,7 @@ export interface RunStopHooks extends RunSequenceHooks {
  *   as pending, the first only, and the sequence's start records it. A
  *   validation refusal never starts the sequence, so it drops a pending
  *   signal: the refusal is already being recorded, and a stop then changes
- *   nothing (b.uqm SR-5.6, SR-5.8);
+ * nothing;
  * - at the sequence's start (validation passed): arms the deadline timer at
  *   start + `BUILD_ALLOWANCE_MINUTES`, the deadline step 1 wrote, registers
  *   the traps if `trap` was not called, then records the pending signal;
@@ -17172,7 +17148,7 @@ export interface RunStopHooks extends RunSequenceHooks {
  *   deadline to start + B with the base allowance, writes it in phase `build`
  *   and re-arms the timer;
  * - at the scheduling event: moves the deadline to start + B + T + 15 min
- *   before T1's `shards` write, which carries it, and re-arms the timer;
+ * before `shards` write, which carries it, and re-arms the timer;
  * - at the sequence's end: `dispose`.
  * When the timer fires it records a run-deadline stop naming the status phase
  * at that moment; a stop then changes nothing once the verdict is renamed or a
@@ -17234,7 +17210,7 @@ export function createRunStopHooks(): RunStopHooks {
     })
   }
 
-  /** Replaces the run's basis with the deadline the run now has, then re-arms the timer; `phase` given, writes it there too (b.uqm SR-5.2). */
+  /** Replaces the run's basis with the deadline the run now has, then re-arms the timer; `phase` given, writes it there too. */
   const moveDeadline = (seq: RunSequence, phase: ActiveStatus['phase'] | null): void => {
     const offset = runDeadlineOffset(runDeadlineInputOf(seq))
     seq.run.basis = { ...seq.run.basis, deadline: statusDeadline(seq.run.basis.startMs, offset.minutes) }
@@ -17291,21 +17267,21 @@ export function createRunStopHooks(): RunStopHooks {
 }
 
 // ---------------------------------------------------------------------------
-// 18. Main entry (E1)
+// 18. Main entry
 // ---------------------------------------------------------------------------
 
-// --- 18/T5 (E1 T5): main, the refusal recorder and error capture ---
+// --- 18/ : main, the refusal recorder and error capture ---
 
 /**
- * Records a refusal as the run's last act (b.uqm SR-5.8): writes its
+ * Records a refusal as the run's last act: writes its
  * `NOT RUN: <reason>` line and each detail line to the runner log, then
  * replaces the status file with phase `refused` and the refusal. Nothing is
  * written after it. Answers the exit status main returns: `REFUSAL_EXIT_STATUS`,
  * or `FAILURE_EXIT_STATUS` when the status write failed, its error then in the
  * log. A caller first releases the lock and its reservation and removes the
- * containers, tags and images the run made (E5, E8, E13). Validation stage 1
- * calls it here, E2's stages 2–8 and E13's refusals likewise. A log line
- * that cannot be appended (the runner log's sink throws, E13) never keeps the
+ * containers, tags and images the run made . Validation stage 1
+ * calls it here, stages 2–8 and refusals likewise. A log line
+ * that cannot be appended (the runner log's sink throws, ) never keeps the
  * refused status from being written, and once the status write is done the
  * log is sealed (`sealRunnerLog`), so nothing, an uncaught error included, is
  * written after it.
@@ -17332,12 +17308,12 @@ export function recordRefusal(run: RunContext, refusal: Refusal): number {
 
 /** What main tells its caller as it runs. */
 export interface MainOptions {
-  /** Told the runner log once step 1 has written its first line, so the entry block writes an uncaught error there (b.uqm SR-5.4). */
+  /** Told the runner log once step 1 has written its first line, so the entry block writes an uncaught error there. */
   readonly onRunLog?: (log: RunnerLogWriter) => void
 }
 
 /**
- * The runner (b.uqm SR-5.1, SR-5.3, SR-5.4), driven in process through its
+ * The runner, driven in process through its
  * dependencies. `argv` is the RUN_ID, then the `/ci` arguments as given.
  * Resolves with the exit status and never rejects; only the entry block
  * exits the process.
@@ -17347,22 +17323,22 @@ export interface MainOptions {
  * - Anything already at the run directory's path: one line on standard error
  *   naming the path, nothing written there, `FAILURE_EXIT_STATUS` (1); so too
  *   when the run directory cannot be created at all.
- * - Otherwise step 1, then `runSequence` with E13 T2's hooks
+ * - Otherwise step 1, then `runSequence` with hooks
  *   (`createRunStopHooks`: the SIGINT, SIGTERM and SIGHUP traps, registered
  *   right after step 1, and the run deadline, armed once validation has
  *   passed; both removed on every way out, so nothing keeps the process
  *   alive): a refusal gives
  *   `REFUSAL_EXIT_STATUS` (2); a run whose `verdict.txt` was renamed into
- *   place gives `VERDICT_WRITTEN_EXIT_STATUS` (0), whatever the verdict
- *   (E13). Nothing reads either: the reader judges a run by its files.
+ *   place gives `VERDICT_WRITTEN_EXIT_STATUS` (0), whatever the verdict.
+ * Nothing reads either: the reader judges a run by its files.
  * - Any error met once the run directory exists is written to the runner log
  *   (after its first line) before main resolves with 1.
  *
- * The runner log is sealable (E13, `createSealableRunnerLog`): the refusal
+ * The runner log is sealable (`createSealableRunnerLog`): the refusal
  * recorder and the verdict write seal it, so nothing is written after the
  * run's last act. A failed append is reported on standard error and then
  * thrown by the log's sink, so `runContainer` never spawns a `docker run` list
- * it could not log (b.uqm SR-10.4); the run's own lines go through guarded
+ * it could not log; the run's own lines go through guarded
  * writers that drop such a throw.
  */
 export async function main(argv: readonly string[], deps: RunnerDeps, options: MainOptions = {}): Promise<number> {
@@ -17398,7 +17374,7 @@ export async function main(argv: readonly string[], deps: RunnerDeps, options: M
   const logPath = join(runDir, RUNNER_LOG_FILE_NAME)
   const log = createSealableRunnerLog(
     createRunnerLog(logPath, {
-      // Reported, then rethrown: a sink that cannot append throws (b.uqm SR-10.4).
+      // Reported, then rethrown: a sink that cannot append throws.
       onAppendError: (error) => {
         const line = `ci-run: appending to ${shownArgument(logPath)} failed: ${error}`
         stderrLine(line)
@@ -17407,7 +17383,7 @@ export async function main(argv: readonly string[], deps: RunnerDeps, options: M
     }),
   )
   let run: RunContext | null = null
-  // The signal traps (E13 T2): registered once the run directory exists; the run deadline once validation has passed; both removed on every way out.
+  // The signal traps : registered once the run directory exists; the run deadline once validation has passed; both removed on every way out.
   const stopHooks = createRunStopHooks()
   try {
     run = beginRun(deps, runId, runDir, args, log)
@@ -17433,10 +17409,10 @@ export async function main(argv: readonly string[], deps: RunnerDeps, options: M
 // dependencies, writes an uncaught exception or rejection to the runner log
 // once the run directory exists (to standard error before that), runs main
 // with the process arguments and exits with its status. Nothing here runs on
-// import; the signal traps are E13's, registered by the hooks main builds,
-// through the `onSignal` this block binds (b.uqm SR-1.3, SR-5.4). Once the refused
+// import; the signal traps are , registered by the hooks main builds,
+// through the `onSignal` this block binds. Once the refused
 // status or `verdict.txt` is written the runner log is sealed, so an uncaught
-// error after it writes nothing (b.uqm SR-5.7, SR-5.8).
+// error after it writes nothing.
 if (import.meta.main) {
   let runLog: RunnerLogWriter | null = null
   const fail: (err: unknown, origin: string) => never = (err, origin) => {
