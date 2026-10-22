@@ -288,7 +288,7 @@ describe('all current and legacy outcome classes round-trip into the log', () =>
 
 describe('detail key=value tokens', () => {
   test('carries the full prompt path in a prompt= token', () => {
-    const promptPath = '/home/horde/.config/claude-slack-channel-bots/prompts/daily.md'
+    const promptPath = '/home/alice/.config/claude-slack-channel-bots/prompts/daily.md'
     const line = formatOutcomeLine(
       makeRecord({ detail: makeDetail({ promptPath }) }),
     )

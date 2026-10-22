@@ -235,14 +235,14 @@ when the configuration is checked, as an `INVALID` pending change or a failed
 first start.
 
 Also reject a name whose key starts with an existing persona's key, or is the
-start of one: `dev` beside `dev_2`, `horde` beside `horde_admin`, or `dev`
+start of one: `dev` beside `dev_2`, `team` beside `team_admin`, or `dev`
 beside `"Dev Bot"` (key `dev_bot_…`). The server rejects such a pair. The
 reason: tmux matches a session target by prefix unless it is written with
 `=`, so a human's tmux command without `=` for one persona (for example
 `tmux attach -t slack_bot_dev`) could reach another persona's session. See
 the docs/configuration.md section "Persona name and key". Keys that only
 share a start, such as `dev_a` and `dev_b`, are fine. When a name clashes
-this way, propose the shorter one with `_main` appended (`horde_main`), or
+this way, propose the shorter one with `_main` appended (`team_main`), or
 `_main_2`, `_main_3`, … if that still starts with, or is the start of,
 another key, and ask for another name if none fits. Rename an existing
 persona only if the operator wants that.

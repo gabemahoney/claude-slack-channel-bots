@@ -1119,9 +1119,7 @@ all-15-case diagnostic passed in 291.208 s: strict case_03 completed exact
 read-back/no-obedience, case_12 entity spelling, the long case and all 12
 fresh-session proofs passed, with zero classifier stops or duplicates.
 This single diagnostic is not three independent trials or AC11 release
-acceptance. Private evidence is under
-`/run/openclaw/horde/omv-e6-decision19-k0ecn0ng/`, in
-`astra-isolation1-output/summary.json` and `CONTINUATION-HANDOFF.json`.
+acceptance. The diagnostic evidence is not distributed with this repository.
 If no available model can run the cases, report that and stop without
 weakening the assertion.
 

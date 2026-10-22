@@ -79,7 +79,8 @@ describe('Codex private AI inputs', () => {
     expect(cases[0]!.expected.attributes.user_id).toBe('U0REAL20')
     expect(cases[0]!.expected.attributes).not.toHaveProperty('bot_id')
     expect(cases[1]!.expected.attributes.user_id).toBe('U0OTHER01')
-    expect(cases[1]!.expected.attributes.user).toContain('user_id="U0AL3N851K9"')
+    const original = JSON.parse(readFileSync(new URL('./real-agent/fixtures/wrapper-cases.json', import.meta.url), 'utf8'))
+    expect(cases[1]!.expected.attributes.user).toBe(original.find((row: any) => row.name === 'hz_attr_quotes').msg.user)
     expect(codexSlackInput(cases[0]!.msg)).toMatchObject({ user: 'U0REAL20', via: 'receive_all_shared' })
   })
   test('decision 20 body is exactly the reviewed E6 deterministic recipe', () => {

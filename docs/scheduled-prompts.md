@@ -46,16 +46,16 @@ On first boot the server auto-creates the crontable with this self-documenting h
 # skipped on its own; sibling lines still schedule.
 #
 # Example (every day at 09:00, run grooming-tick.md, target two personas):
-#   0 9 * * * /home/horde/prompts/grooming-tick.md planner,reviewer
+#   0 9 * * * ~/prompts/grooming-tick.md planner,reviewer
 #
 # Example (every hour, run standup.md, no persona list — NOT delivered yet):
-#   0 * * * * /home/horde/prompts/standup.md
+#   0 * * * * ~/prompts/standup.md
 ```
 
 Each schedule is one line of **exactly 5 cron fields**, then the prompt-file path, then an optional comma-separated list of personas, each written as the persona's name or its key:
 
 ```
-0 9 * * 1 /home/horde/prompts/weekly-report.md planner,reviewer
+0 9 * * 1 ~/prompts/weekly-report.md planner,reviewer
 ```
 
 Rules:
@@ -117,7 +117,7 @@ Each load of the crontable, at start and after each edit, writes one line with i
 Each load also writes one `warn` line for each line with no persona list, naming its line number in the file and its prompt path:
 
 ```text
-2026-10-09T15:12:00.002Z cscb-cron:grooming - warn line=34 prompt=/home/horde/prompts/grooming.md undeliverable: this crontable line names no personas, so it will never be delivered in this version …
+2026-10-09T15:12:00.002Z cscb-cron:grooming - warn line=34 prompt=~/prompts/grooming.md undeliverable: this crontable line names no personas, so it will never be delivered in this version …
 ```
 
 Add a persona list to that line. The warning comes back at every start and every edit until you do; an unchanged crontable is not reloaded, so it is not repeated each minute. To list them in the cron log at its default location:

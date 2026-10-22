@@ -303,8 +303,8 @@ immediately after this handoff, then collects one group at a time after forwarde
 terminal notices. No further local repair or review round is required for this
 routine metadata refresh. The runner requires java on PATH for its fresh frozen
 SANY preflight; retained runtime is ci/.runs/runtime/jre/bin/java. TLA_JOBSCHED
-must be absolute /home/horde/projects/horde_admin/job-scheduler/bin/jobsched and
-TLA_CHANNEL explicitly supplied (authorized channel C0B1ZJJLJ9M).
+must be the absolute path to the installed jobsched executable and
+TLA_CHANNEL explicitly supplied with an authorized channel.
 
 Exact raw simulation inventory (cfg: N, D, S):
   restart_order_simulation: 8, 256, 111792

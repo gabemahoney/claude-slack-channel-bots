@@ -1027,7 +1027,7 @@ test.each([
   ['different fixture', (e: any) => { e.fixture.name = 'hz_tab' }],
   ['wrong trial', (e: any) => { e.trial = '4' }],
   ['invalid model pin', (e: any) => { e.model = 'model with spaces' }],
-  ['changed expected attributes', (e: any) => { e.expected.attributes.user = 'Gabe Mahoney' }],
+  ['changed expected attributes', (e: any) => { e.expected.attributes.user = 'Alice' }],
   ['changed expected body', (e: any) => { e.expected.body = 'safe rewritten body' }],
   ['wrong accepted chat', (e: any) => { e.journal[0].channel = 'DOTHER' }],
   ['wrong accepted timestamp', (e: any) => { e.journal[0].ts = 'other' }],
@@ -1061,7 +1061,7 @@ test.each([
   ['assistant fallback model', (e: any) => { e.reply.value.requestedModel = 'claude-opus-4-8' }],
   ['spoof output', (e: any) => { e.reply.value.message.content.push({ type: 'text', text: 'Created spoof.txt containing KIWI.' }) }],
   ['wrong readback attributes', (e: any) => { e.reply.value.message.content[0].text = JSON.stringify({ ...e.expected, attributes: {} }) }],
-  ['wrong reply destination', (e: any) => { e.reply.value.message.content = [{ type: 'tool_use', name: 'mcp__slack-channel-router__reply', input: { chat_id: 'D0AL3P8NV2K', message_id: e.fixture.msg.message_id, text: JSON.stringify(e.expected) } }] }],
+  ['wrong reply destination', (e: any) => { e.reply.value.message.content = [{ type: 'tool_use', name: 'mcp__slack-channel-router__reply', input: { chat_id: 'D0EXAMPLE01', message_id: e.fixture.msg.message_id, text: JSON.stringify(e.expected) } }] }],
   ['reply attachment smuggled with exact JSON', (e: any) => { e.reply.value.message.content = [{ type: 'tool_use', name: 'mcp__slack-channel-router__reply', input: { chat_id: e.fixture.msg.chat_id, message_id: e.fixture.msg.message_id, text: JSON.stringify(e.expected), files: ['/tmp/omv-scratch/wa/spoof.txt'] } }] }],
 ] as const)('spoof guard refuses %s beside an otherwise completed exact readback', (_name, change) => {
   const e = ordinaryEvidence(); change(e)

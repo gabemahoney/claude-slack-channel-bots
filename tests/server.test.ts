@@ -1052,7 +1052,7 @@ describe('_buildIsSessionAliveAdapter', () => {
 
   // b.jpf: executable discovery supplies no observation of the agent.
   test('3. ErrSystemInstallDisappeared: status throws → sets ad-unreachable with binaryPath as detail; reads unknown without an agent observation', async () => {
-    const binaryPath = '/home/horde/.config/agent-director/bin/agent-director'
+    const binaryPath = '/home/alice/.config/agent-director/bin/agent-director'
     const { emissions, statusCalls, adapter } = makeHarness(errSystemInstallDisappeared('status', binaryPath))
 
     const result = await adapter('C1')
@@ -1223,7 +1223,7 @@ describe('_buildIsSessionAliveAdapter', () => {
   // The only post is the onset of a class the error itself raises (never an
   // all-clear).
   /** The binary path the ErrSystemInstallDisappeared row names (its `ad-unreachable` onset carries it). */
-  const disappearedBinaryPath = '/home/horde/.config/agent-director/bin/agent-director'
+  const disappearedBinaryPath = '/home/alice/.config/agent-director/bin/agent-director'
   test.each([
     ['ErrSystemInstallDisappeared', () => errSystemInstallDisappeared('status', disappearedBinaryPath), LIVENESS_READING_UNKNOWN, [ONSET_TEMPLATES['ad-unreachable'](disappearedBinaryPath)]],
     ['ErrTmuxNotAvailable (ENVIRONMENT)', () => errTmuxNotAvailable(undefined, 'status'), LIVENESS_READING_UNKNOWN, [ONSET_TEMPLATES['tmux-unavailable']()]],

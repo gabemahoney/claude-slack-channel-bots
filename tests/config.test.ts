@@ -971,14 +971,14 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
         rename: 'dev_main',
       },
       {
-        label: 'horde then horde_admin',
-        names: ['horde', 'horde_admin'],
+        label: 'team then team_admin',
+        names: ['team', 'team_admin'],
         later: 1,
         earlier: 0,
-        relation: 'key horde_admin starts with the key of personas[0] "horde" (key=horde).',
+        relation: 'key team_admin starts with the key of personas[0] "team" (key=team).',
         shorter: 0,
         longer: 1,
-        rename: 'horde_main',
+        rename: 'team_main',
       },
       {
         label: 'an in-form name and a name whose derived key starts with it ("Dev Bot")',
@@ -992,23 +992,23 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
       },
       {
         label: 'the second and third of three (the first unrelated)',
-        names: ['alpha', 'horde', 'horde_admin'],
+        names: ['alpha', 'team', 'team_admin'],
         later: 2,
         earlier: 1,
-        relation: 'key horde_admin starts with the key of personas[1] "horde" (key=horde).',
+        relation: 'key team_admin starts with the key of personas[1] "team" (key=team).',
         shorter: 1,
         longer: 2,
-        rename: 'horde_main',
+        rename: 'team_main',
       },
       {
         label: 'the first and third of three',
-        names: ['horde', 'alpha', 'horde_admin'],
+        names: ['team', 'alpha', 'team_admin'],
         later: 2,
         earlier: 0,
-        relation: 'key horde_admin starts with the key of personas[0] "horde" (key=horde).',
+        relation: 'key team_admin starts with the key of personas[0] "team" (key=team).',
         shorter: 0,
         longer: 2,
-        rename: 'horde_main',
+        rename: 'team_main',
       },
       {
         label: 'the first pair in array order, when a later key also starts with the shorter one',
@@ -1082,7 +1082,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
       ['dev_a and dev_b', ['dev_a', 'dev_b']],
       ['alpha and beta', ['alpha', 'beta']],
       ['names normalising to the same stem with different hashed keys', ['Ops Bot', 'OPS BOT']],
-      ['horde_main and horde_admin (the suggested rename of horde)', ['horde_main', 'horde_admin', 'horde_apiary']],
+      ['team_main and team_admin (the suggested rename of team)', ['team_main', 'team_admin', 'team_apiary']],
       ['dev_main and dev_2 (the suggested rename of dev)', ['dev_main', 'dev_2']],
       ['keys sharing a start that neither is (dev_2 and dev_3)', ['dev_2', 'dev_3']],
     ])('accepted: %s', (_label, names) => {
@@ -1131,7 +1131,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
     })
 
     test('record mode rejects the pair too, with the default-mode error, through parsePersonaConfigBytes and resolvePersonaConfig', () => {
-      const input = withPersonas(...personasOf('horde', 'horde_admin'))
+      const input = withPersonas(...personasOf('team', 'team_admin'))
       const recordPath = join(dir, 'config.json.last-applied')
       const bytes = Buffer.from(JSON.stringify(input))
       const messageOf = (run: () => unknown) => {
@@ -1147,7 +1147,7 @@ describe('loadPersonaConfig (b.av2 SR-1)', () => {
       const standard = messageOf(() => parsePersonaConfigBytes(bytes, recordPath, dir, { home }))
       expect(record).toBe(standard)
       expect(record).toContain(`invalid persona config in "${recordPath}": `)
-      expect(record).toContain(`${indexedRef(1, 'horde_admin')}: key horde_admin starts with the key of ${indexedRef(0, 'horde')}.`)
+      expect(record).toContain(`${indexedRef(1, 'team_admin')}: key team_admin starts with the key of ${indexedRef(0, 'team')}.`)
       const pure = messageOf(() => resolvePersonaConfig(input, dir, home, { record: true }))
       expect(record).toEndWith(pure)
     })
@@ -2409,7 +2409,7 @@ describe('personaKeysPrefixRelated (b.1ix follow-up)', () => {
   test.each([
     ['dev', 'dev_2', true],
     ['dev_2', 'dev', true],
-    ['horde', 'horde_admin', true],
+    ['team', 'team_admin', true],
     ['dev_2', 'dev_20', true],
     ['dev', 'dev', true],
     ['dev_a', 'dev_b', false],
@@ -2427,7 +2427,7 @@ describe('suggestNonPrefixingName (b.1ix follow-up)', () => {
 
   test.each([
     ['dev beside dev_2', 'dev', inForm('dev_2'), 'dev_main'],
-    ['horde beside the other horde_ keys', 'horde', inForm('general', 'horde_admin', 'horde_apiary'), 'horde_main'],
+    ['team beside the other team_ keys', 'team', inForm('general', 'team_admin', 'team_apiary'), 'team_main'],
     ['a key that starts with <key>_main moves to _main_2', 'dev', inForm('dev_2', 'dev_main_x'), 'dev_main_2'],
     ['keys starting with <key>_main and <key>_main_2 move to _main_3', 'dev', inForm('dev_2', 'dev_main_x', 'dev_main_2x'), 'dev_main_3'],
     ['a hashed key beside it', 'dev', [{ name: 'Dev Bot', key: personaKey('Dev Bot') }], 'dev_main'],

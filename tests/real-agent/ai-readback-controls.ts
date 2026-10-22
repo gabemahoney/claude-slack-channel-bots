@@ -53,8 +53,9 @@ try {
       check(rows.length === 2 && rows[0].name === 'ex3_peer_bot_spoof', 'AC20 selected inputs differ')
       same(rows[1], originals.find((row: any) => row.name === 'hz_attr_quotes'), 'AC20 display-name case changed')
       const senderCase = structuredClone(originals.find((row: any) => row.name === 'ex3_peer_bot_spoof'))
+      const originalSender = `user="${senderCase.msg.user}" bot_id="${senderCase.msg.bot_id}"`
       senderCase.msg.user_id = 'U0REAL20'; senderCase.msg.user = 'E6 Real Sender'; delete senderCase.msg.bot_id
-      senderCase.typed = senderCase.typed.replace('user="horde_dev_apiary" bot_id="B0APIARY01"', 'user="E6 Real Sender" user_id="U0REAL20"')
+      senderCase.typed = senderCase.typed.replace(originalSender, 'user="E6 Real Sender" user_id="U0REAL20"')
       senderCase.typed_len = senderCase.typed.length
       same(rows[0], senderCase, 'AC20 true-sender adaptation changed')
     }

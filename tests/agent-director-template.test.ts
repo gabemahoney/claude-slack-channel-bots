@@ -113,7 +113,7 @@ describe('buildTemplateParams (SR-3.1)', () => {
       join(baseDir, 'config.json'), baseDir, { home: baseDir },
     )
     const params = buildTemplateParams(cfg)
-    // Built from os.homedir(), NOT a hardcoded /home/horde.
+    // Built from os.homedir(), NOT a hardcoded /home/alice.
     expect(REPLY_TOOL_ALLOW_RULE).toBe('mcp__slack-channel-router__reply')
     expect(params.allow).toEqual([REPLY_TOOL_ALLOW_RULE, memoryRule(join(os.homedir(), '.claude'))])
     // deny surface is unchanged by F5.

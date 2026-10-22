@@ -3185,7 +3185,7 @@ Append-only **JSON Lines** event store for the CSCB-side visibility trail of the
 **Example line** (a `chat.postMessage` attempt emitted by the SR-2.1 poller):
 
 ```json
-{"ts":"2026-06-04T20:39:58.123Z","event":"cscb.chat_post.attempted","instance_id":"cscb_ops_bot","request_token":"6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd","channel":"C0B1ZJJLJ9M","text":"*Permission* requested for `Bash`","blocks":[{"type":"section","text":{"type":"mrkdwn","text":"…"}},{"type":"actions","elements":[{"type":"button","action_id":"perm_allow_cscb_ops_bot_6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd","text":{"type":"plain_text","text":"Allow"}},{"type":"button","action_id":"perm_deny_cscb_ops_bot_6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd","text":{"type":"plain_text","text":"Deny"}}]}],"ok":true,"slack_ts":"1717536002.000100"}
+{"ts":"2026-06-04T20:39:58.123Z","event":"cscb.chat_post.attempted","instance_id":"cscb_ops_bot","request_token":"6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd","channel":"C0EXAMPLE01","text":"*Permission* requested for `Bash`","blocks":[{"type":"section","text":{"type":"mrkdwn","text":"…"}},{"type":"actions","elements":[{"type":"button","action_id":"perm_allow_cscb_ops_bot_6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd","text":{"type":"plain_text","text":"Allow"}},{"type":"button","action_id":"perm_deny_cscb_ops_bot_6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd","text":{"type":"plain_text","text":"Deny"}}]}],"ok":true,"slack_ts":"1717536002.000100"}
 ```
 
 **No-truncation guarantee.** The canonical trail line persists every field at full fidelity (SR-V-3.1) — the full `blocks` array including every `action_id`, the full `text`, the full Slack API response. The 300-character `[slack] RAW <event> event persona=<key>: …` summaries the event router (`src/persona-event-router.ts`) logs for each `message` / `app_mention` event, before handing it to `persona-routing.ts`, are a **separate human-readable log** kept truncated intentionally per SR-V-3.2; they do not replace the canonical store and the two coexist.
@@ -3201,7 +3201,7 @@ jq -c 'select(.request_token=="6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd")' \
   ~/.config/claude-slack-channel-bots/permission-trail.jsonl
 
 # Every event on a Slack channel within a time window (SR-V-5.2)
-jq -c 'select(.channel=="C0B1ZJJLJ9M" and .ts>="2026-06-04T20:00:00Z" and .ts<="2026-06-04T21:00:00Z")' \
+jq -c 'select(.channel=="C0EXAMPLE01" and .ts>="2026-06-04T20:00:00Z" and .ts<="2026-06-04T21:00:00Z")' \
   ~/.config/claude-slack-channel-bots/permission-trail.jsonl
 ```
 
@@ -3240,7 +3240,7 @@ Fields:
 
 ```json
 {"ts":"2026-06-04T20:39:58.110Z","event":"cscb.poller.row_decision","instance_id":"cscb_ops_bot","action":"post_attempted","request_token":"6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd"}
-{"ts":"2026-06-04T20:39:58.123Z","event":"cscb.chat_post.attempted","instance_id":"cscb_ops_bot","request_token":"6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd","channel":"C0B1ZJJLJ9M","text":"🤖🛠️ permission request: Bash","blocks":[{"type":"section","text":{"type":"mrkdwn","text":"🤖🛠️ *Bash*\n`ls`"}},{"type":"actions","elements":[{"type":"button","text":{"type":"plain_text","text":"Allow"},"style":"primary","action_id":"perm_allow_cscb_ops_bot_6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd"},{"type":"button","text":{"type":"plain_text","text":"Deny"},"style":"danger","action_id":"perm_deny_cscb_ops_bot_6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd"}]}],"ok":true,"slack_ts":"1780600244.439969"}
+{"ts":"2026-06-04T20:39:58.123Z","event":"cscb.chat_post.attempted","instance_id":"cscb_ops_bot","request_token":"6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd","channel":"C0EXAMPLE01","text":"🤖🛠️ permission request: Bash","blocks":[{"type":"section","text":{"type":"mrkdwn","text":"🤖🛠️ *Bash*\n`ls`"}},{"type":"actions","elements":[{"type":"button","text":{"type":"plain_text","text":"Allow"},"style":"primary","action_id":"perm_allow_cscb_ops_bot_6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd"},{"type":"button","text":{"type":"plain_text","text":"Deny"},"style":"danger","action_id":"perm_deny_cscb_ops_bot_6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd"}]}],"ok":true,"slack_ts":"1780600244.439969"}
 ```
 
 #### `cscb.chat_update.attempted` (SR-V-2.5)
@@ -3275,7 +3275,7 @@ Fields:
 **Example** — poller-reconciled `operator_allow` closure:
 
 ```json
-{"ts":"2026-06-04T20:40:02.456Z","event":"cscb.chat_update.attempted","instance_id":"cscb_ops_bot","request_token":"6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd","channel":"C0B1ZJJLJ9M","message_ts":"1780600244.439969","text":"*Permission* — Allowed","blocks":[{"type":"section","text":{"type":"mrkdwn","text":"*Permission* — Allowed"}}],"verdict_tag":"operator_allow","triggered_by":"poller","ok":true}
+{"ts":"2026-06-04T20:40:02.456Z","event":"cscb.chat_update.attempted","instance_id":"cscb_ops_bot","request_token":"6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd","channel":"C0EXAMPLE01","message_ts":"1780600244.439969","text":"*Permission* — Allowed","blocks":[{"type":"section","text":{"type":"mrkdwn","text":"*Permission* — Allowed"}}],"verdict_tag":"operator_allow","triggered_by":"poller","ok":true}
 ```
 
 #### `cscb.poller.wedge_detected` (b.fae F4)
@@ -3318,8 +3318,8 @@ Fields: `ts`, `event="cscb.click_handler.invoked"`, `instance_id`, `request_toke
 **Example sequence** — happy-path Allow click:
 
 ```json
-{"ts":"2026-06-04T20:40:01.111Z","event":"cscb.block_action.received","channel":"C0B1ZJJLJ9M","message_ts":"1780600244.439969","user":"U_OPERATOR","raw_action_id":"perm_allow_cscb_ops_bot_6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd","instance_id":"cscb_ops_bot","request_token":"6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd","decision":"allow"}
-{"ts":"2026-06-04T20:40:01.112Z","event":"cscb.click_handler.invoked","instance_id":"cscb_ops_bot","request_token":"6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd","channel":"C0B1ZJJLJ9M","message_ts":"1780600244.439969","user":"U_OPERATOR","raw_action_id":"perm_allow_cscb_ops_bot_6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd","decision":"allow","live_pending":true}
+{"ts":"2026-06-04T20:40:01.111Z","event":"cscb.block_action.received","channel":"C0EXAMPLE01","message_ts":"1780600244.439969","user":"U_OPERATOR","raw_action_id":"perm_allow_cscb_ops_bot_6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd","instance_id":"cscb_ops_bot","request_token":"6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd","decision":"allow"}
+{"ts":"2026-06-04T20:40:01.112Z","event":"cscb.click_handler.invoked","instance_id":"cscb_ops_bot","request_token":"6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd","channel":"C0EXAMPLE01","message_ts":"1780600244.439969","user":"U_OPERATOR","raw_action_id":"perm_allow_cscb_ops_bot_6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd","decision":"allow","live_pending":true}
 ```
 
 **Note on the `message` / `app_mention` RAW-line truncation (`src/persona-event-router.ts`).** The `[slack] RAW <event> event persona=<key>: …` summaries, cut to 300 characters of the event JSON, are INTENTIONALLY preserved per SR-V-3.2 — they are a separate human-readable log. The canonical store is full-fidelity by construction (no `.slice` in the trail emit path).

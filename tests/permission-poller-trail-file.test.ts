@@ -67,7 +67,7 @@ import type { GetPermissionParams, GetPermissionResult } from '../src/agent-dire
 const NAME_A = 'Trail Demo'
 const KEY_A = personaKey(NAME_A)
 const INSTANCE_C = personaInstanceId(KEY_A)
-const CHANNEL_CH = 'C0B1ZJJLJ9M'
+const CHANNEL_CH = 'C0EXAMPLE01'
 // A second persona whose client must stay untouched.
 const NAME_B = 'Trail Bystander'
 const CHANNEL_B = 'C0BYSTAND01'

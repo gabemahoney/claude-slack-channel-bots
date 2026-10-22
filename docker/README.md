@@ -270,8 +270,8 @@ Every full `/ci` run uses the key for real model calls in the nine
 `-fmk-real-` Claude scripts; ordinary scripts keep the stub. Claude uses no OAuth or
 subscription fallback. The Codex gate uses only its separately admitted existing
 login file and selected model (see [Codex admission](#codex-admission-login-and-scratch-lifecycle)). A raw `sk-ant-api…` key needs only `CI_ANTHROPIC_API_KEY` — Claude Code
-defaults to `api.anthropic.com` when `CI_ANTHROPIC_BASE_URL` is absent. A gateway
-credential (e.g. NVIDIA InferenceHub) additionally requires `CI_ANTHROPIC_BASE_URL`;
+defaults to `api.anthropic.com` when `CI_ANTHROPIC_BASE_URL` is absent. An API gateway key
+additionally requires `CI_ANTHROPIC_BASE_URL`;
 provide `CI_ANTHROPIC_MODEL` to select its test model. The bot Claudes hit the gateway rather than
 `api.anthropic.com`; if only the key were forwarded, the gateway key would 401
 against Anthropic's direct endpoint.

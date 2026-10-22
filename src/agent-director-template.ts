@@ -179,8 +179,7 @@ export function buildTemplateParams(
     // session-manager.ts buildSpawnParams exports at spawn time (or Claude's
     // default `~/.claude` when a persona has none). The prior implementation's
     // claim that the config dir "is only known at spawn time" was factually
-    // wrong; and its hardcoded `/home/horde` paths silently matched nothing on
-    // any other user's host (this package is published to npm). All paths are
+    // wrong; hardcoded home paths also failed on other hosts. All paths are
     // built from the home directory / already-absolute resolved config values,
     // so no `~` leaks into an emitted rule.
     //
@@ -194,8 +193,8 @@ export function buildTemplateParams(
     // SECURITY — SCOPE IS DELIBERATELY NARROW. Do NOT widen this to the
     // config-dir ROOT (e.g. `Read(//<config-dir>/**)`), which the b.fae ticket
     // originally proposed. That root holds LIVE CREDENTIALS: `settings.json`
-    // carries a real ANTHROPIC_API_KEY (the InferenceHub gateway key that bills
-    // the account) and `.claude.json` carries credential-shaped OAuth/token
+    // can carry an API gateway key as ANTHROPIC_API_KEY, and `.claude.json`
+    // can carry credential-shaped OAuth/token
     // content, alongside history.jsonl, sessions/, shell-snapshots/ and
     // backups/. Pre-allowing the root would silently turn "agent reads its own
     // notes" into "agent reads the API key with no prompt." Every derived rule

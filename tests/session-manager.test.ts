@@ -1278,29 +1278,29 @@ describe('spawnForPersona: persona identity (SR-2.2)', () => {
     installStub({ spawnCalls })
     const topLevel = fixtureSubdir('top-level')
     const cfg = makeStandInPersonaConfig(
-      { C0AMDDZEHCY: { working_directory: '/repo/general' } },
+      { C0EXAMPLE02: { working_directory: '/repo/general' } },
       fixtureDir,
       { claude_config_dir: topLevel },
     )
 
-    const result = await spawnForPersona(personaOf(cfg, 'C0AMDDZEHCY'), cfg)
+    const result = await spawnForPersona(personaOf(cfg, 'C0EXAMPLE02'), cfg)
 
-    expect(result).toEqual({ key: 'C0AMDDZEHCY', action: 'spawned' })
+    expect(result).toEqual({ key: 'C0EXAMPLE02', action: 'spawned' })
     const params = spawnCalls[0]
-    expect(params.instance_id).toBe('cscb_C0AMDDZEHCY')
-    expect(params.tmux_session_name).toBe('slack_bot_C0AMDDZEHCY')
+    expect(params.instance_id).toBe('cscb_C0EXAMPLE02')
+    expect(params.tmux_session_name).toBe('slack_bot_C0EXAMPLE02')
     expect(params.cwd).toBe('/repo/general')
     expect(params.label).toEqual([
       'service=cscb',
       'tag_prompt=1', REPLY_TOOL_PREALLOWED_LABEL,
-      'persona=C0AMDDZEHCY',
+      'persona=C0EXAMPLE02',
       configDirLabelFor(topLevel),
     ])
     // The top-level claude_config_dir reaches the env of a stand-in with none of its own.
     expect(params.extra_env).toEqual({
       CLAUDE_CONFIG_DIR: topLevel,
-      CSCB_PERSONA: 'C0AMDDZEHCY',
-      CLAUDE_MANAGED_CHANNEL: 'C0AMDDZEHCY',
+      CSCB_PERSONA: 'C0EXAMPLE02',
+      CLAUDE_MANAGED_CHANNEL: 'C0EXAMPLE02',
       CSCB_CRONTABLE_PATH: cfg.cron_table_path,
       CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: 'false',
       DISABLE_AUTOUPDATER: '1',

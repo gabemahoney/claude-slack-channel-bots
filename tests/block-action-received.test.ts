@@ -25,7 +25,7 @@ import { personaInstanceId, personaKey } from '../src/persona-identity.ts'
 const PERSONA_NAME = 'Demo Relay Bot'
 const PERSONA_KEY = personaKey(PERSONA_NAME)
 const INSTANCE_C = personaInstanceId(PERSONA_KEY)
-const CHANNEL_CH = 'C0B1ZJJLJ9M'
+const CHANNEL_CH = 'C0EXAMPLE01'
 const MSG_TS = '1780600244.439969'
 const USER = 'U_OPERATOR'
 const TOKEN_A = '11111111-1111-4111-8111-111111111111'

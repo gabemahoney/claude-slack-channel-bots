@@ -25,10 +25,11 @@ govern, not this runbook.
 
 ## Why
 
-The global install here is a `file:` dependency:
+This runbook applies when the global install is a `file:` dependency, for example
+(replace `/path/to/claude-slack-channel-bots` with your checkout path):
 
 ```json
-"claude-slack-channel-bots": "file:/home/horde/projects/claude-slack-channel-bots-project/claude-slack-channel-bots-main"
+"claude-slack-channel-bots": "file:/path/to/claude-slack-channel-bots"
 ```
 
 Every file under the installed package's `src/` is a symlink back into the
@@ -215,8 +216,8 @@ Run all three checks. The install is only "real" if every one passes.
 
    Expected output: **nothing**. Any line printed is a symlink — the install is
    still a symlink farm, not a registry copy. (You can further confirm none
-   resolve into `/home/horde/projects/...` with
-   `find ... -type l -lname '*claude-slack-channel-bots-project*'`.)
+   resolve into your checkout with
+   `find ... -type l -lname '/path/to/claude-slack-channel-bots/*'`.)
 
 2. **Installed version matches the published version.** The binary has no
    `--version` flag, so read the version from the installed package's
@@ -304,7 +305,7 @@ not touch the running daemon).
 
    ```sh
    bash scripts/sanitize-global.sh
-   bun install -g file:/home/horde/projects/claude-slack-channel-bots-project/claude-slack-channel-bots-main
+   bun install -g file:/path/to/claude-slack-channel-bots
    ```
 
 2. **Restore trust** so the `file:` postinstall runs (the global manifest must
@@ -329,7 +330,7 @@ not touch the running daemon).
 
    You can confirm the global manifest is back to the `file:` shape by checking
    that `~/.bun/install/global/package.json` pins
-   `"claude-slack-channel-bots": "file:/home/horde/projects/claude-slack-channel-bots-project/claude-slack-channel-bots-main"`
+   `"claude-slack-channel-bots": "file:/path/to/claude-slack-channel-bots"`
    and still carries `"trustedDependencies": ["claude-slack-channel-bots"]`.
 
 3. **Re-verify the binary resolves** back to the `file:` build:

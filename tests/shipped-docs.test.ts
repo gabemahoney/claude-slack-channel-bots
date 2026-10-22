@@ -4092,10 +4092,10 @@ describe(`the rollback runbook, "${ROLLBACK_RUNBOOK_SECTION_TITLE}" (b.jg5 SRJ-1
  * carrier, nor the Migration section of `RUNBOOK_DOC` (b.3ut): the steps name
  * the host's sweep schedule and the shared orchestrator prompt generically
  * instead. Read over those sections only: elsewhere the user docs quote a
- * server log line naming the sweep script, and `horde_admin` is an example
+ * server log line naming the sweep script, and `team_admin` is an example
  * persona name.
  */
-const HOST_SPECIFIC_PATHS = ['find-missing-loop.sh', '~/startup/', 'horde_admin/cscb_system_prompt.md', '~/.claude/channels/slack/system-prompt.md', '~/.config/cscb/system-prompt.md', '~/.config/claude-slack-channel-bots/system-prompt.md'] as const
+const HOST_SPECIFIC_PATHS = ['find-missing-loop.sh', '~/startup/', 'team_admin/cscb_system_prompt.md', '~/.claude/channels/slack/system-prompt.md', '~/.config/cscb/system-prompt.md', '~/.config/claude-slack-channel-bots/system-prompt.md'] as const
 
 /** The `HOST_SPECIFIC_PATHS` a text names. Pure. */
 const hostPathsIn = (section: string) => HOST_SPECIFIC_PATHS.filter((path) => section.includes(path))
@@ -4120,7 +4120,7 @@ describe('the runbooks name no host-specific path (b.3ut)', () => {
 
   test('self-check: the runbooks with the host-specific wording put back in steps 10 and 11 and rollback steps 2 and 4 is reported in both runbooks', () => {
     const edited = operatorText(RUNBOOK_DOC)
-      .replace(', and in its source copy if you keep one,', ', `~/.claude/channels/slack/system-prompt.md`, `~/.config/cscb/system-prompt.md`, `~/.config/claude-slack-channel-bots/system-prompt.md`, and its source copy, `~/projects/horde_admin/cscb_system_prompt.md`,')
+      .replace(', and in its source copy if you keep one,', ', `~/.claude/channels/slack/system-prompt.md`, `~/.config/cscb/system-prompt.md`, `~/.config/claude-slack-channel-bots/system-prompt.md`, and its source copy, `~/projects/team_admin/cscb_system_prompt.md`,')
       .replace("Add it to the host's sweep schedule, the one", "Add it to the host's sweep loop, `~/startup/find-missing-loop.sh`, the script")
       .replace("added to the host's sweep schedule, the cron entry, systemd timer or loop script that runs it", "added to the host's sweep loop, `~/startup/find-missing-loop.sh`")
       .replace("restore step 2's daily `expire` to the host's sweep schedule", "restore step 2's daily `expire` in `~/startup/find-missing-loop.sh`")

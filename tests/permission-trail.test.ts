@@ -99,7 +99,7 @@ describe('emitTrailEvent — schema serialization', () => {
   test('written line round-trips through JSON.parse with all envelope fields', () => {
     const ev = makeTrailEvent({
       request_token: '6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd',
-      channel: 'C0B1ZJJLJ9M',
+      channel: 'C0EXAMPLE01',
       message_ts: '1717536002.000100',
     })
     emitTrailEvent(ev)
@@ -107,7 +107,7 @@ describe('emitTrailEvent — schema serialization', () => {
     expect(parsed['event']).toBe('cscb.test.fixture')
     expect(parsed['instance_id']).toBe('cscb_fixture_C123')
     expect(parsed['request_token']).toBe('6f3a1d2c-aaaa-bbbb-cccc-dddddddddddd')
-    expect(parsed['channel']).toBe('C0B1ZJJLJ9M')
+    expect(parsed['channel']).toBe('C0EXAMPLE01')
     expect(parsed['message_ts']).toBe('1717536002.000100')
   })
 

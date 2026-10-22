@@ -56,8 +56,9 @@ export function codexAICases(ac: number) {
   }
   if (ac === 20) {
     const row = rows[0]!
+    const originalSender = `user="${row.msg.user}" bot_id="${row.msg.bot_id}"`
     row.msg.user_id = 'U0REAL20'; row.msg.user = 'E6 Real Sender'; delete row.msg.bot_id
-    row.typed = row.typed.replace('user="horde_dev_apiary" bot_id="B0APIARY01"', 'user="E6 Real Sender" user_id="U0REAL20"')
+    row.typed = row.typed.replace(originalSender, 'user="E6 Real Sender" user_id="U0REAL20"')
     row.typed_len = row.typed.length
   }
   return rows.map((row, i) => ({ ...row, label: `case_${String(i + 1).padStart(2, '0')}`,
