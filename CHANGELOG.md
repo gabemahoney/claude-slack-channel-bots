@@ -6,6 +6,10 @@ Release notes for `claude-slack-channel-bots`. The version number and date of ea
 
 ## Unreleased
 
+---
+
+## 0.18.1 (2026-10-22)
+
 - New Claude launches retain the exact Slack `reply` allowance on resume
   through saved `--allowedTools` arguments. Template updates do not retrofit
   existing agent-director rows or their saved arguments, even when
