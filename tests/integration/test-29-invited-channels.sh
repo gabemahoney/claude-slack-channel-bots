@@ -949,7 +949,7 @@ wait_queued "phase A: bravo B1 mention" "${BRAVO_DIR}" "${B1}" "${PUSH_TS}" "${V
 # alpha calls the tool for A1 with `all`: refused with the declarative text,
 # found in the results record with isError set (the first-tool-result
 # control); nothing written.
-SCHEMA_RESULT="$(stub_session_call "${ALPHA_DIR}" tools/list '{}')"
+SCHEMA_RESULT="$(stub_session_list_tools "${ALPHA_DIR}")"
 jq -e '.isError == false and (.text | fromjson | map(select(.name == "set_channel_delivery")) | length == 1)' <<< "${SCHEMA_RESULT}" > /dev/null || fail "missing negotiated tool"
 jq -e '.text | fromjson | .[] | select(.name == "set_channel_delivery") | .inputSchema |
     .required == ["channel","delivery","attempt_id","intent"] and .additionalProperties == false and

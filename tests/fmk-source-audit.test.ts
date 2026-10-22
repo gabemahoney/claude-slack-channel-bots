@@ -101,7 +101,7 @@
 import * as agentDirectorClient from 'agent-director'
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { spawnSync } from 'node:child_process'
-import { existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import ts from 'typescript'
@@ -2889,6 +2889,162 @@ write_persona_config '${mode}'`], { encoding: 'utf8', timeout: 5000, env: hostSa
       }
       assertNoLeak(f.captured())
     } finally { await f.close(); expect(f.h.clock.pendingCount()).toBe(0); rmSync(home, { recursive: true, force: true }) }
+  })
+})
+
+describe('test29 negotiated schema protocol', () => {
+  const scenario = readFileSync(join(import.meta.dir, 'integration/test-29-invited-channels.sh'), 'utf8')
+  const helpers = readFileSync(join(import.meta.dir, 'integration/lib/scenario.sh'), 'utf8')
+  const stub = readFileSync(join(import.meta.dir, 'integration/fixtures/stub-mcp-session.ts'), 'utf8')
+  const schemaCheck = scenario.slice(scenario.indexOf('SCHEMA_RESULT='), scenario.indexOf('\nexpect_tool "phase A:'))
+  // Execute the actual declarations and dispatch body, never the image-only
+  // entry points. Only the poll wait and client transport are injected.
+  function dispatcher(client: object, source = stub) {
+    const declarations = source.slice(source.indexOf('/** One request from the request file'), source.indexOf('\nasync function main('))
+    const call = source.slice(source.indexOf('  const call = async (request:'), source.indexOf('\n  /** One poll:'))
+    expect(declarations).not.toBe(''); expect(call).not.toBe('')
+    const js = ts.transpileModule(`${declarations}\n${call}`, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText
+    return new Function('client', `let inFlight, result; const describe = String;
+      const answer = (id, line) => { result = { id, ...line }; };
+      ${js}
+      return async line => { const request = parseRequest(line);
+        if ('invalid' in request) throw new Error(request.invalid);
+        result = undefined; await call(request); return result; };`)(client) as (line: string) => Promise<Record<string, unknown>>
+  }
+  async function exchange(command: string, dispatch: ReturnType<typeof dispatcher>, extras: Record<string, string> = {}) {
+    const root = mkdtempSync(join(tmpdir(), 'schema-protocol-'))
+    mkdirSync(join(root, 'stub')); mkdirSync(join(root, 'work'))
+    writeFileSync(join(root, 'stub/stub-mcp-session.ts'), '')
+    const declarations = helpers.slice(helpers.indexOf('SCENARIO_STUB_DELIVERIES_PREFIX='), helpers.indexOf('\n# fmk mode setup'))
+    const child = Bun.spawn(['/bin/bash', '--noprofile', '--norc', '-euc', `
+SCENARIO_ROOT="$FIXTURE_ROOT" SCENARIO_STUB_DIR="$FIXTURE_ROOT/stub"
+SCENARIO_STUB_MCP_SRC=stub-mcp-session.ts SCENARIO_TAG=fixture SCENARIO_POLL_S=0
+ALPHA_DIR="$FIXTURE_ROOT/work"
+fail() { printf '%s\\n' "$1" >&2; exit 1; }
+require_ci_image() { printf 'checked\\n' >> "$FIXTURE_ROOT/guards"; }
+_scenario_now_ms() { printf 0; }
+sleep() {
+    local path response
+    for path in "$SCENARIO_STUB_DIR"/stub-mcp-requests.*.jsonl; do cat "$path" >&2; done
+    IFS= read -r response || exit 1
+    printf '%s\\n' "$response" >> "\${path/stub-mcp-requests./stub-mcp-results.}"
+}
+${declarations}
+${command}`], {
+      stdin: 'pipe', stdout: 'pipe', stderr: 'pipe', timeout: 5000,
+      env: hostSafeChildEnv(root, { tools: ['cat', 'jq', 'realpath', 'sha256sum', 'cut', 'grep'], extras: { FIXTURE_ROOT: root, ...extras } }),
+    })
+    const requests: unknown[] = [], responses: unknown[] = [], errors: string[] = []
+    const output = new Response(child.stdout).text()
+    try {
+      // The injected wait hands the already persisted request to this process;
+      // the real stub parser/dispatch returns its correlated result via stdin.
+      let pending = ''
+      for await (const chunk of child.stderr.pipeThrough(new TextDecoderStream())) {
+        pending += chunk
+        let end: number
+        while ((end = pending.indexOf('\n')) >= 0) {
+          const line = pending.slice(0, end); pending = pending.slice(end + 1)
+          if (!line.startsWith('{')) { errors.push(line); continue }
+          requests.push(JSON.parse(line))
+          const result = await dispatch(line)
+          responses.push(result)
+          child.stdin.write(JSON.stringify(result) + '\n'); await child.stdin.flush()
+        }
+      }
+      expect(pending).toBe('')
+      const status = await child.exited, stdout = await output
+      const records = readdirSync(join(root, 'stub')).filter(p => p.endsWith('.jsonl')).map(p => writtenFile(join(root, 'stub', p)))
+      assertNoLeak({ requests, responses, errors, stdout, records })
+      return { status, stdout, errors, requests, responses, recordCount: records.length }
+    } finally { child.stdin.end(); child.kill(); await child.exited; rmSync(root, { recursive: true, force: true }) }
+  }
+
+  test.each(['strict', 'open'] as const)('%s runs test29 schema assertion through the shell request, stub parser and negotiated SDK listing', async channel_mode => {
+    const { makeReloadHarness } = await import('./test-helpers/reload-harness.ts')
+    const h = makeReloadHarness()
+    try {
+      const alpha = h.persona('alpha'); h.materialize(alpha)
+      h.writeConfig({ channel_mode, personas: [alpha] })
+      const run = await h.start({ realLifecycle: true }); run.registerSession('alpha')
+      let listings = 0, calls = 0
+      const dispatch = dispatcher({
+        listTools: () => { listings++; return run.listTools('alpha') },
+        callTool: () => { calls++; throw new Error('schema discovery must not call a tool') },
+      })
+      const result = await exchange(schemaCheck, dispatch)
+      expect(result.errors).toEqual([]); expect(result.status).toBe(0)
+      expect(listings).toBe(1); expect(calls).toBe(0)
+      expect(result.requests).toHaveLength(1)
+      expect(result.requests[0]).toEqual({ id: expect.any(String), method: 'tools/list' })
+      expect(result.responses[0]).toMatchObject({ id: (result.requests[0] as { id: string }).id, isError: false })
+
+      // Keep the schema oracle sensitive to actual negotiated omissions. These
+      // controls change only the SDK result, never replace it with a local schema.
+      for (const omission of ['tool', 'attempt_id', 'intent', 'delivery'] as const) {
+        const broken = dispatcher({ listTools: async () => {
+          const listing = structuredClone(await run.listTools('alpha'))
+          if (omission === 'tool') listing.tools = listing.tools.filter(t => t.name !== 'set_channel_delivery')
+          else {
+            const schema = listing.tools.find(t => t.name === 'set_channel_delivery')!.inputSchema
+            if (omission === 'delivery') (schema.properties!.delivery as { enum: string[] }).enum.pop()
+            else schema.required = schema.required!.filter(field => field !== omission)
+          }
+          return listing
+        } })
+        const rejected = await exchange(schemaCheck, broken)
+        expect(rejected.status).toBe(1)
+        expect(rejected.errors).toEqual([omission === 'tool' ? 'missing negotiated tool' : 'negotiated attempt schema differs'])
+      }
+      assertNoLeak(run.captured({ result }))
+    } finally { await h.cleanup() }
+  })
+
+  test.each(['tools/list', 'bad/name', '', 'x'.repeat(129)])('tool calls still reject invalid tool name %s before writing a request', async tool => {
+    const result = await exchange('stub_session_call "$ALPHA_DIR" "$CALL_TOOL" "{}"', dispatcher({}), { CALL_TOOL: tool })
+    expect(result.status).toBe(1); expect(result.errors.join('\n')).toContain('is not a tool name')
+    expect(result.requests).toEqual([]); expect(result.responses).toEqual([]); expect(result.recordCount).toBe(0)
+  })
+
+  test('the original test29 tools/list-as-tool invocation remains rejected by the retained validator', async () => {
+    const original = schemaCheck.replace('stub_session_list_tools "${ALPHA_DIR}"', 'stub_session_call "${ALPHA_DIR}" tools/list \'{}\'')
+    expect(original).not.toBe(schemaCheck)
+    const result = await exchange(original, dispatcher({}))
+    expect(result.status).toBe(1); expect(result.errors.join('\n')).toContain("'tools/list' is not a tool name")
+    expect(result.requests).toEqual([]); expect(result.recordCount).toBe(0)
+  })
+
+  test('tool-call records retain assignment and retry arguments and correlated results through the real stub dispatch', async () => {
+    const { deliveryAttempt, retryAttempt, SHARED_CHANNEL_IDS } = await import('./test-helpers/shared-channels.ts')
+    const { SET_CHANNEL_DELIVERY_TOOL } = await import('../src/channel-delivery.ts')
+    const assignment = deliveryAttempt('retained-protocol-attempt', SHARED_CHANNEL_IDS.primary, 'off')
+    const calls: unknown[] = []
+    const dispatch = dispatcher({ callTool: async (request: unknown) => {
+      calls.push(request); return { isError: false, content: [{ type: 'text', text: 'fixture result' }] }
+    } })
+    for (const args of [assignment, retryAttempt(assignment)]) {
+      const result = await exchange('stub_session_call "$ALPHA_DIR" "$CALL_TOOL" "$CALL_ARGS"', dispatch,
+        { CALL_TOOL: SET_CHANNEL_DELIVERY_TOOL, CALL_ARGS: JSON.stringify(args) })
+      expect(result.status).toBe(0); expect(result.errors).toEqual([])
+      expect(result.requests).toEqual([{ id: expect.any(String), method: 'tools/call', tool: SET_CHANNEL_DELIVERY_TOOL, arguments: args }])
+      expect(JSON.parse(result.stdout)).toEqual({ id: (result.requests[0] as { id: string }).id, isError: false, text: 'fixture result' })
+    }
+    expect(calls).toEqual([assignment, retryAttempt(assignment)].map(args => ({ name: SET_CHANNEL_DELIVERY_TOOL, arguments: args })))
+    assertNoLeak(calls)
+  })
+
+  test('listing errors fail the schema assertion instead of becoming an empty successful listing', async () => {
+    const result = await exchange(schemaCheck, dispatcher({ listTools: async () => { throw new Error('fixture listing failure') } }))
+    expect(result.status).toBe(1); expect(result.errors).toEqual(['missing negotiated tool'])
+    expect(result.responses).toEqual([{ id: expect.any(String), isError: true, text: '', error: 'Error: fixture listing failure' }])
+  })
+
+  test.each([
+    { method: 'tools/call', tool: 'tools/list', arguments: {} },
+    { method: 'tools/list', tool: 'set_channel_delivery', arguments: {} },
+    { method: 'unknown' },
+  ])('the actual stub parser refuses an invalid method/tool envelope: %j', async fields => {
+    await expect(dispatcher({})(JSON.stringify({ id: 'fixture-invalid', ...fields }))).rejects.toThrow()
   })
 })
 

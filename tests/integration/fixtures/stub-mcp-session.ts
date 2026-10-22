@@ -78,9 +78,13 @@
  *     `message_id`, `user`, `user_id` or `bot_id`, `ts`, `via`, `thread_ts`,
  *     whichever are present). A key absent from the params is absent from the
  *     line. Other notifications are not recorded.
- *   - Request: `{"id":"<id>","tool":"<tool name>","arguments":{…}}`. `id` and
- *     `tool` are non-empty strings and `arguments` is a JSON object (not an
- *     array, not null); other keys are ignored. Request IDs are unique in a
+ *   - Tool request: `{"id":"<id>","method":"tools/call","tool":"<tool name>","arguments":{…}}`.
+ *     `id` is non-empty; `tool` is 1–128 letters, digits, `_`, `-` or `.`;
+ *     `arguments` is a JSON object (not an array or null).
+ *   - Listing request: `{"id":"<id>","method":"tools/list"}`. No tool or
+ *     arguments are accepted. Calls the negotiated client's listTools and
+ *     returns its tools array as JSON in the result's text field.
+ *     Other methods are refused. Request IDs are unique in a
  *     scenario: keeping them so is the harness's duty. The harness only ever
  *     appends to the request file, each line in one write.
  *   - Result: `{"id":"<id>","isError":<true|false>,"text":"<text>"}` for a
@@ -291,11 +295,9 @@ function readAnsweredIds(path: string): Set<string> | undefined {
 }
 
 /** One request from the request file (see the header). */
-interface StubRequest {
-  id: string
-  tool: string
-  arguments: Record<string, unknown>
-}
+type StubRequest =
+  | { id: string; method: 'tools/list' }
+  | { id: string; method: 'tools/call'; tool: string; arguments: Record<string, unknown> }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -310,11 +312,16 @@ function parseRequest(line: string): StubRequest | { invalid: string } {
     return { invalid: 'not JSON' }
   }
   if (!isPlainObject(value)) return { invalid: 'not a JSON object' }
-  const { id, tool, arguments: args } = value
+  const { id, method, tool, arguments: args } = value
   if (typeof id !== 'string' || id === '') return { invalid: '"id" is not a non-empty string' }
-  if (typeof tool !== 'string' || tool === '') return { invalid: '"tool" is not a non-empty string' }
+  if (method === 'tools/list') {
+    if ('tool' in value || 'arguments' in value) return { invalid: 'tools/list takes no tool or arguments' }
+    return { id, method }
+  }
+  if (method !== 'tools/call') return { invalid: 'unsupported method' }
+  if (typeof tool !== 'string' || !/^[A-Za-z0-9_.-]{1,128}$/.test(tool)) return { invalid: '"tool" is not a tool name' }
   if (!isPlainObject(args)) return { invalid: '"arguments" is not a JSON object' }
-  return { id, tool, arguments: args }
+  return { id, method, tool, arguments: args }
 }
 
 /** The text of a tool result: its `text` content items' texts, joined with `\n`. */
@@ -400,7 +407,7 @@ async function main(argv: readonly string[]): Promise<number> {
     inFlight = request.id
     let line: Record<string, unknown>
     try {
-      if (request.tool === 'tools/list') {
+      if (request.method === 'tools/list') {
         const listing = await client.listTools()
         answer(request.id, { isError: false, text: JSON.stringify(listing.tools) })
         inFlight = undefined

@@ -1017,6 +1017,10 @@
 #                                      line comes in time; an `isError: true` result is the
 #                                      scenario's to judge, not a failure. Writes only the request
 #                                      file, in SCENARIO_STUB_DIR
+#   stub_session_list_tools <dir>      list the negotiated tools over the same MCP session.
+#                                      Uses a tools/list method request, never a tool name.
+#                                      The same bounded record exchange returns the tools
+#                                      array as JSON in the result's text field.
 #
 # Line builders (every fragment is quoted from src/; <ref> is `persona_ref`):
 #   persona_start_match   `[slack] persona-start: personas[<index>] <ref>`
@@ -5473,14 +5477,42 @@ stub_session_deliveries() {
 }
 
 stub_session_call() {
-    local dir="${1:-}" tool="${2:-}" args="${3:-}" stub key requests results id line found deadline step
+    local dir="${1:-}" tool="${2:-}" step
     step="stub_session_call ${dir} ${tool}"
     require_ci_image "${step}"
     (( $# == 3 )) || fail "${step}: takes <dir> <tool> <json-args>"
-    [[ "${tool}" =~ ^[A-Za-z0-9_.-]{1,128}$ ]] \
-        || fail "${step}: '${tool}' is not a tool name (1 to 128 letters, digits, '_', '-' or '.')"
-    jq -n -e --argjson a "${args}" '$a | type == "object"' > /dev/null 2>&1 \
-        || fail "${step}: the arguments are not a JSON object"
+    _scenario_stub_request "${dir}" tools/call "${tool}" "$3"
+}
+
+stub_session_list_tools() {
+    local step="stub_session_list_tools ${1:-}"
+    require_ci_image "${step}"
+    (( $# == 1 )) || fail "${step}: takes <dir>"
+    _scenario_stub_request "$1" tools/list
+}
+
+# Shared bounded exchange. A method and a tool name are distinct fields;
+# listing has no tool or arguments, and every tools/call validates both.
+_scenario_stub_request() {
+    local dir="${1:-}" method="${2:-}" tool="${3:-}" args="${4:-}" payload stub key requests results id line found deadline step
+    step="stub session ${method} ${dir}${tool:+ ${tool}}"
+    require_ci_image "${step}"
+    case "${method}" in
+        tools/call)
+            (( $# == 4 )) || fail "${step}: takes <dir> tools/call <tool> <json-args>"
+            [[ "${tool}" =~ ^[A-Za-z0-9_.-]{1,128}$ ]] \
+                || fail "${step}: '${tool}' is not a tool name (1 to 128 letters, digits, '_', '-' or '.')"
+            jq -n -e --argjson a "${args}" '$a | type == "object"' > /dev/null 2>&1 \
+                || fail "${step}: the arguments are not a JSON object"
+            payload="$(jq -c -a -n --arg tool "${tool}" --argjson a "${args}" \
+                '{method: "tools/call", tool: $tool, arguments: $a}')" || fail "${step}: could not build the tool request"
+            ;;
+        tools/list)
+            (( $# == 2 )) || fail "${step}: takes <dir> tools/list"
+            payload='{"method":"tools/list"}'
+            ;;
+        *) fail "${step}: unsupported stub method" ;;
+    esac
     stub="$(_scenario_stub_dir "${step}")" || exit 1
     key="$(_scenario_stub_key "${step}" "${dir}")" || exit 1
     requests="${stub}/${SCENARIO_STUB_REQUESTS_PREFIX}${key}${SCENARIO_STUB_RECORD_SUFFIX}"
@@ -5499,8 +5531,8 @@ stub_session_call() {
         fail "${step}: the request ID ${id} is already in ${requests}"
     fi
     # ASCII only (-a), so the line's length is its size in bytes.
-    line="$(jq -c -a -n --arg id "${id}" --arg tool "${tool}" --argjson a "${args}" \
-        '{id: $id, tool: $tool, arguments: $a}')" || fail "${step}: could not build the request line"
+    line="$(jq -c -a -n --arg id "${id}" --argjson payload "${payload}" \
+        '{id: $id} + $payload')" || fail "${step}: could not build the request line"
     (( ${#line} < SCENARIO_STUB_REQUEST_MAX_BYTES )) \
         || fail "${step}: the request line takes ${#line} bytes; at most $(( SCENARIO_STUB_REQUEST_MAX_BYTES - 1 )) reach the file in one write"
     # One append of the whole line in one write: the client reads only

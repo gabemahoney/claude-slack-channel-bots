@@ -3870,7 +3870,7 @@ describe(`${MCP_SESSION_END_HELPER}: both guards before its signal`, () => {
  * `require_scenario_home` (shared mode has no scenario HOME); `/ci` always
  * carries the marker, so this static pin is the only proof of their refusal.
  */
-const IMAGE_GUARDED_STUB_HELPERS: readonly string[] = ['slack_stub_push', 'stub_session_deliveries', 'stub_session_call', 'queue_accepted', '_scenario_membership_complete', 'wait_membership_complete', 'configuration_request']
+const IMAGE_GUARDED_STUB_HELPERS: readonly string[] = ['slack_stub_push', 'stub_session_deliveries', 'stub_session_call', 'stub_session_list_tools', '_scenario_stub_request', 'queue_accepted', '_scenario_membership_complete', 'wait_membership_complete', 'configuration_request']
 
 /**
  * The image-check findings for `helpers` in the shell file `file`: the first
