@@ -1,4 +1,6 @@
 import { deliveryResultSamples, deliveryCurrentSamples } from './test-helpers/shared-channels.ts'
+import * as recoveryClauses from '../src/reload-preview-clauses.ts'
+import { CHANNEL_TARGET_STATE_UNRESOLVED } from '../src/registry.ts'
 import { REPLY_REMINDER_TEXT } from '../src/reply-reminder.ts'
 /**
  * shipped-docs.test.ts — the shipped-description audit: what
@@ -1354,6 +1356,9 @@ const SHIPPED_TEXTS: [name: string, read: () => string][] = [
   [`${REPLY_REMINDER_FILE} (reminder text)`, replyReminderText],
   ['CRONTABLE_TEMPLATE_HEADER (src/cron-bootstrap.ts)', crontableHeaderText],
   ...SET_CHANNEL_DELIVERY_TEXTS.map(toolTextEntry),
+  ...Object.entries(recoveryClauses).filter(([name]) => /^(RECOVERY_|REVIEW_ABSENCE_REPLACEMENT$)/.test(name))
+    .map(([name, value]): [string, () => string] => [`${name} (src/reload-preview-clauses.ts)`, () => String(value)]),
+  ['CHANNEL_TARGET_STATE_UNRESOLVED (src/registry.ts)', () => CHANNEL_TARGET_STATE_UNRESOLVED],
 ]
 
 const DEBUG_SKILL_FILE = 'skills/debug-slack-channel-bots/SKILL.md'
@@ -1750,6 +1755,15 @@ describe(`forbidden-term audit (README, skills, manifest, MCP instructions, ${SE
     ])
     const current = deliveryCurrentSamples()
     expect(new Set(current.map(sample => sample.form)).size).toBe(31)
+  })
+
+  test('the shipped-text audit includes each actual recovery clause and strict unreadable-state refusal', () => {
+    const names = Object.keys(recoveryClauses).filter(name => /^(RECOVERY_|REVIEW_ABSENCE_REPLACEMENT$)/.test(name))
+    expect(names.sort()).toEqual(['RECOVERY_CURRENT_MEMBERSHIP', 'RECOVERY_LOSS', 'RECOVERY_PRESERVATION', 'RECOVERY_RESTORE', 'REVIEW_ABSENCE_REPLACEMENT'])
+    for (const name of [...names.map(name => `${name} (src/reload-preview-clauses.ts)`), 'CHANNEL_TARGET_STATE_UNRESOLVED (src/registry.ts)']) {
+      const entry = SHIPPED_TEXTS.find(([label]) => label === name)
+      expect(entry).toBeDefined(); expect(entry![1]().trim().length).toBeGreaterThan(30)
+    }
   })
 
   test(`each two-form ${SET_CHANNEL_DELIVERY_TOOL} builder is read in both forms: the echoed form names the sample, the not-shown one does not`, () => {
@@ -7642,6 +7656,14 @@ function switchLineNoPersonaEnding(): string {
 const README_DEO_ROWS: readonly DocRow[] = [
 ["Channel modes: strict and open share configured choices", readmeSection(WHAT_EACH_MODE_SERVES_HEADING), [ci("`channel_mode`"), ci("`strict`"), ci("`open`"), ci("default")]],
 ["Channel modes: one shared list and destination", readmeSection(WHAT_EACH_MODE_SERVES_HEADING), [ci("shared"), ci("`channels`"), ci("`permission_prompts`"), ci("both modes")]],
+// Foundation : channelAvailability requires current eligible membership;
+// shared-channels applies join defaults only to a verified member with no choice.
+['Channel modes: current verified membership and join defaults', readmeSection(WHAT_EACH_MODE_SERVES_HEADING), [
+    ci('Listening requires current verified membership'),
+    ci('Listing, hearing a message, posting or inviting alone supplies no such evidence'),
+    ci('A newly verified member without a choice starts at `off` in strict or `mentions` in open, using the mode when the join is applied'),
+    ci('Duplicate joins and mode switches preserve choices, including `off`'),
+  ]],
 ['Channel modes: changing mode preserves applied channel choices', readmeSection(TURNING_FUNGIBLE_HEADING), [
     ci('Mode changes preserve every applied `delivery` choice and the shared destination'),
     ci('Strict mode uses the same shared channel choices and destination'),
@@ -7654,20 +7676,26 @@ const README_DEO_ROWS: readonly DocRow[] = [
   ]],
 ["Channel modes: old keys require a manual edit", readmeSection(WHAT_EACH_MODE_SERVES_HEADING), [ci("manual"), ci("`allow_invited_channels`"), ci("`invited`"), ci("rejected")]],
 ["Channel modes: switching through pending confirmation", readmeSection(TURNING_FUNGIBLE_HEADING), [ci("confirmed"), ci("preview"), ci("no restart"), ci("`strict`"), ci("`open`")]],
-['Channel modes: four persistent listening choices and default off', readmeSection(FUNGIBLE_DELIVERY_HEADING), [
+['Channel modes: four persistent listening choices with missing choices unresolved', readmeSection(FUNGIBLE_DELIVERY_HEADING), [
     ci('In both modes, the shared choices are `off`, `mentions`, `all` and `thread_hybrid`'),
-    ci('A channel with no assignment defaults to `off`'),
+    ci('A missing or unreadable assignment holds affected intake; it is not a saved `off` choice'),
+    ci("A newly verified member gets the mode's join default described above, preserving any existing choice"),
     ci('Applied choices live in `config.json.last-applied` across server restarts and persona relaunches'),
     ci('A mode switch preserves them'),
     ci('A removed, renamed or replaced persona never inherits its previous incarnation’s choices'),
   ]],
 ['Channel modes: the loop guard holds other personas at mentions without enabling off choices', readmeSection(FUNGIBLE_DELIVERY_HEADING), [
     ci('Another persona’s `permission_prompts` channel is held at `mentions` for other personas whose applied choice is non-off'),
+    ci('Off wins before the guard, including for mentions and broadcasts; the saved value stays intact'),
     ci('Its own destination and a `"dm"` destination hold nothing'),
   ]],
-[`Channel modes: the ${RECEIVE_ALL_SHARED} approximation, a stored choice saying nothing of whether the other app remains in the channel`, readmeSection(FUNGIBLE_DELIVERY_HEADING), [
-    ci(`**${code(RECEIVE_ALL_SHARED)} is an approximation.**`),
-    ci("A stored choice says nothing about whether the other persona's app remains in the channel"),
+// decideDelivery checks channelAvailability for each sibling and, in open,
+// channelDeliveryFor's effective value: a guarded saved-all member cannot count.
+[`Channel modes: ${RECEIVE_ALL_SHARED} requires current eligible effective-all siblings`, readmeSection(FUNGIBLE_DELIVERY_HEADING), [
+    ci(`**${code(RECEIVE_ALL_SHARED)} requires effective eligibility.**`),
+    ci('In either mode, a non-mention/non-broadcast message uses this reason only when this persona and another currently eligible member have effective `all` in the channel'),
+    ci('A saved-all choice alone does not count: departed, unverified or loop-guarded personas cannot supply it'),
+    ci('otherwise the reason is `receive_all`'),
   ]],
 [`Channel modes: the warning against two personas at ${ALL} in one channel`, readmeSection(FUNGIBLE_DELIVERY_HEADING), [
     ci(`**Don't keep two personas at ${code(ALL)} in one channel.**`),
@@ -7698,14 +7726,19 @@ const README_DEO_ROWS: readonly DocRow[] = [
     ci(`In strict mode: in a channel listed in ${via === 'mention' ? 'its' : "the persona's"} ${code(CHANNELS_KEY)}`),
     ci('In open mode: in a public or private channel its app is in that is not externally shared, with a non-off applied channel choice'),
   ]]),
-[`receiving: the ${RECEIVE_ALL_SHARED} row, scoped per mode`, kindRowOf(RECEIVE_ALL_SHARED), [
-    ci(`In strict mode: in a channel listed in its ${code(CHANNELS_KEY)} with ${code(`${DELIVERY_KEY}: ${ALL}`)}, when at least one other persona`),
-    ci(`In open mode: in a public or private channel its app is in that is not externally shared, where its channel delivery is ${code(ALL)}`),
-    ci(`has a channel delivery of ${code(ALL)} for that channel by the same rule, whether or not that persona's app remains in the channel`),
+['receiving: current verified eligibility in both modes', unitOf(USER_DOCS_NAME, RECEIVING_HEADING, 'For new non-thread channel intake,'), [
+    ci('both modes require current verified eligible membership and a trustworthy non-off choice'),
+    ci('open also requires a public/private channel with explicit non-external-sharing evidence'),
+    ci('Off suppresses mentions and broadcasts before the open loop guard'),
+    ci('unresolved facts withhold affected acknowledgement while independent recipients and accepted work can progress'),
+  ]],
+[`receiving: the ${RECEIVE_ALL_SHARED} row requires current eligible effective-all siblings`, kindRowOf(RECEIVE_ALL_SHARED), [
+    ci('Neither a direct mention nor a broadcast, with effective `all` for this persona and another currently eligible persona in the same channel'),
+    ci('Departed, unverified, off or loop-guarded saved-all siblings do not count'),
   ]],
 ['receiving: the receive_all row, scoped per mode', kindRowOf('receive_all'), [
-    ci(`In strict mode: in a channel listed in its ${code(CHANNELS_KEY)} with ${code(`${DELIVERY_KEY}: ${ALL}`)}, when no other persona`),
-    ci(`In open mode: in a public or private channel its app is in that is not externally shared, where its channel delivery is ${code(ALL)}, when no other persona in the applied configuration has a channel delivery of ${code(ALL)} for that channel`),
+    ci(`In strict mode: in a channel listed in its ${code(CHANNELS_KEY)} with ${code(`${DELIVERY_KEY}: ${ALL}`)}, when no other persona is currently eligible and effectively all there`),
+    ci(`In open mode: in a public or private channel its app is in that is not externally shared, where its channel delivery is ${code(ALL)}, when no other persona in the applied configuration has a channel delivery of ${code(ALL)} for that channel after current membership, eligibility and loop-guard checks`),
   ]],
 ['receiving: in open mode an @mention is delivered from its message event', unitOf(USER_DOCS_NAME, RECEIVING_HEADING, '- **In open mode, an @mention is delivered from its'), [
     ci(`**In open mode, an @mention is delivered from its ${code('message')} event.**`),
@@ -7997,11 +8030,13 @@ describe('the README describes both channel modes', () => {
     test.each([
       ['changing mode preserves applied channel choices', 'Mode changes preserve', 'Mode changes discard'],
       ['changing mode preserves applied channel choices', 'including choices made while open mode was active', 'except choices made while open mode was active'],
-      ['four persistent listening choices and default off', 'A channel with no assignment defaults to `off`', 'A channel with no assignment defaults to `mentions`'],
-      ['four persistent listening choices and default off', 'A mode switch preserves them', 'A mode switch resets them'],
-      ['four persistent listening choices and default off', 'never inherits its previous incarnation’s choices', 'inherits its previous incarnation’s choices'],
+      ['four persistent listening choices with missing choices unresolved', 'A missing or unreadable assignment holds affected intake; it is not a saved `off` choice', 'A missing or unreadable assignment defaults to `off`'],
+      ['four persistent listening choices with missing choices unresolved', 'A mode switch preserves them', 'A mode switch resets them'],
+      ['four persistent listening choices with missing choices unresolved', 'never inherits its previous incarnation’s choices', 'inherits its previous incarnation’s choices'],
       ['the loop guard holds other personas at mentions without enabling off choices', 'is held at `mentions`', 'is held at `all`'],
       ['the loop guard holds other personas at mentions without enabling off choices', 'whose applied choice is non-off', 'whose applied choice is off'],
+      ['the loop guard holds other personas at mentions without enabling off choices', 'Off wins before the guard', 'The guard overrides off'],
+      ['the loop guard holds other personas at mentions without enabling off choices', 'the saved value stays intact', 'the saved value becomes mentions'],
       ['the loop guard holds other personas at mentions without enabling off choices', 'Its own destination and a `"dm"` destination hold nothing', 'Its own destination and a `"dm"` destination hold every channel'],
     ])('self-check: Channel modes: %s rejects omission or reversal of "%s"', (label, original, reversal) => {
       const element = `Channel modes: ${label}`
@@ -8017,6 +8052,64 @@ describe('the README describes both channel modes', () => {
         expect(docRowProblems(passage, required, edited).length).toBeGreaterThan(0)
       }
     })
+
+    test.each(([
+      ['Channel modes: current verified membership and join defaults', [
+        ['requires current verified membership', 'requires historical membership'],
+        ['supplies no such evidence', 'supplies sufficient evidence'],
+        ['starts at `off` in strict or `mentions` in open', 'starts at `mentions` in strict or `off` in open'],
+        ['Duplicate joins and mode switches preserve choices, including `off`', 'Duplicate joins and mode switches reset choices, including `off`'],
+      ]],
+      ['Channel modes: four persistent listening choices with missing choices unresolved', [
+        ['holds affected intake', 'drops affected intake'],
+        ['it is not a saved `off` choice', 'it is a saved `off` choice'],
+        ["A newly verified member gets the mode's join default described above, preserving any existing choice", "Any missing assignment gets the mode's join default, resetting any existing choice"],
+      ]],
+      [`Channel modes: ${RECEIVE_ALL_SHARED} requires current eligible effective-all siblings`, [
+        ['this persona and another currently eligible member have effective `all`', 'this persona alone has saved `all`'],
+        ['currently eligible member', 'historically listed member'],
+        ['have effective `all`', 'have saved `all`'],
+        ['A saved-all choice alone does not count', 'A saved-all choice alone counts'],
+        ['departed, ', 'departed personas can supply it; '],
+        ['unverified or ', 'unverified personas can supply it; '],
+        ['loop-guarded personas cannot supply it', 'loop-guarded personas can supply it'],
+        ['otherwise the reason is `receive_all`', 'otherwise the reason is `receive_all_shared`'],
+      ]],
+      ['receiving: current verified eligibility in both modes', [
+        ['current verified eligible membership', 'listed or historical membership'],
+        ['a trustworthy non-off choice', 'a missing choice defaulting to off'],
+        ['explicit non-external-sharing evidence', 'unknown external-sharing evidence'],
+        ['Off suppresses mentions and broadcasts before the open loop guard', 'The open loop guard enables mentions and broadcasts for off'],
+        ['unresolved facts withhold affected acknowledgement while independent recipients and accepted work can progress', 'unresolved facts acknowledge a drop and block independent recipients and accepted work'],
+      ]],
+      [`receiving: the ${RECEIVE_ALL_SHARED} row requires current eligible effective-all siblings`, [
+        ['Neither a direct mention nor a broadcast, with effective `all`', 'A direct mention or broadcast, with saved `all`'],
+        ['this persona and another currently eligible persona in the same channel', 'this persona alone or another historical persona in a different channel'],
+        ['another currently eligible persona', 'another historically listed persona'],
+        ['Departed, ', 'Departed siblings count. '],
+        ['unverified, ', 'unverified siblings count; '],
+        ['off or ', 'off siblings count; '],
+        ['loop-guarded saved-all siblings do not count', 'loop-guarded saved-all siblings count'],
+      ]],
+      ['receiving: the receive_all row, scoped per mode', [
+        ['no other persona is currently eligible and effectively all there', 'no other persona has a saved-all entry there'],
+        ['after current membership, eligibility and loop-guard checks', 'whether or not that app remains in the channel'],
+      ]],
+    ] as const).flatMap(([element, mutations]) => mutations.map(([original, reversal]) => [element, original, reversal] as const)))(
+      'self-check: %s rejects omission or reversal of "%s"', (element, original, reversal) => {
+        const row = README_DEO_ROWS.find(([name]) => name === element)
+        if (row === undefined) throw new Error(`no README row for ${element}`)
+        const [, passage, required] = row
+        const text = readme()
+        expect(docRowProblems(passage, required, text)).toEqual([])
+        for (const replacement of ['', reversal]) {
+          const edited = text.replaceAll(original, replacement)
+          expect(edited).not.toBe(text)
+          expect(passage(edited)).not.toBe(passage(text))
+          expect(docRowProblems(passage, required, edited).length).toBeGreaterThan(0)
+        }
+      },
+    )
 
     test('self-check: an item whose builder throws fails its own row with the error, and the row still reads its other items', () => {
       const passage = readmeSection('## Reading the preview')

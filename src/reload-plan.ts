@@ -40,7 +40,7 @@
  */
 
 import { queueRetentionClause } from './reload-preview-clauses.ts'
-import { REVIEW_OMISSION_CLAUSE, REVIEW_FUTURE_CLAUSE, REVIEW_RESET_CLAUSE, REVIEW_RETENTION_CLAUSE } from './reload-preview-clauses.ts'
+import { REVIEW_OMISSION_CLAUSE, REVIEW_FUTURE_CLAUSE, REVIEW_RESET_CLAUSE, REVIEW_RETENTION_CLAUSE, REVIEW_ABSENCE_REPLACEMENT } from './reload-preview-clauses.ts'
 import type { ReviewedChannelEffect } from './shared-channels.ts'
 import type { MembershipReading } from './channel-membership.ts'
 import { channelDeliveryFor } from './delivery-decision.ts'
@@ -444,7 +444,8 @@ export function reviewedChannelLine(channel: ReviewedChannelView): string {
   const sameValue = intent && (replacement ? channel.inherited : saved) === reviewed ? ' Explicit same-value assignment.' : ''
   return `Channel persona=${key} channel=${channel.channel}: ${kind}; saved=${saved ?? 'none'}; reviewed=${reviewed ?? 'none'}; ` +
     `saved order=${channel.previousOrder ?? 'none'}; membership=${membership.kind}; effective now=${channel.currentEffective}; reviewed effective=${effective}.${overwrite}${sameValue}${clauses ? ` ${clauses}` : ''}` +
-    (channel.activatesInStrict ? ' The saved mentions choice becomes eligible in strict; the saved value is unchanged.' : '')
+    (channel.activatesInStrict ? ' The saved mentions choice becomes eligible in strict; the saved value is unchanged.' : '') +
+    (channel.absenceReplacement ? ` ${REVIEW_ABSENCE_REPLACEMENT}` : '')
 }
 
 // ---------------------------------------------------------------------------

@@ -3,11 +3,12 @@ import { mkdtempSync, rmSync, mkdirSync, symlinkSync, readFileSync } from 'node:
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { makeMembershipHarness, membershipPage, readSharedState, writeSharedState, SHARED_CHANNEL_IDS as C, type MembershipHarness, configBytes } from './test-helpers/shared-channels.ts'
-import { makeDeferredWebApiCall, makeDeferredConnect, makeChannelMessage } from './test-helpers/slack-stub.ts'
+import { makeDeferredWebApiCall, makeDeferredConnect, makeChannelMessage, makeDm } from './test-helpers/slack-stub.ts'
 import { assertNoLeak, writtenFile } from './test-helpers/credentials.ts'
 import { MEMBERSHIP_REQUEST_TIMEOUT_MS, MEMBERSHIP_ATTEMPT_TIMEOUT_MS, MEMBERSHIP_RETRY_MIN_MS, MEMBERSHIP_RETRY_MAX_MS, MEMBERSHIP_PAGE_LIMIT } from '../src/channel-membership-retry.ts'
 import { makeManagedRouting } from './test-helpers/persona-routing-managed.ts'
 import { createPersonaEventRouter } from '../src/persona-event-router.ts'
+import { createChannelDeliveryStore } from '../src/channel-delivery.ts'
 import { _resetRegistry } from '../src/registry.ts'
 import { _resetAckTracker } from '../src/ack-tracker.ts'
 import { parseSharedChannelState } from '../src/shared-channels.ts'
@@ -442,7 +443,7 @@ test('retained recipient gets original queued feedback while another membership 
   const { makeEngineHarness } = await import('./test-helpers/delivery-engine.ts')
   let received!: ReturnType<typeof createQueuedAckCallback>
   const pending: Promise<void>[] = []
-  const managed = makeManagedRouting(f.h, f.stateDir, { membership: f.membership, onReceived: (key, item) => { pending.push(received(key, item)) } })
+  const managed = makeManagedRouting(f.h, f.stateDir, { membership: f.membership, getChannelDelivery: () => createChannelDeliveryStore(f.authority), onReceived: (key, item) => { pending.push(received(key, item)) } })
   let clientAvailable = true
   const clientFor = (key: string) => clientAvailable ? f.h.clientFor(key) : undefined
   received = createQueuedAckCallback({ queue: managed.queue, clientFor, getReaction: () => 'hourglass' })
@@ -513,7 +514,7 @@ test('retained recipient gets original queued feedback while another membership 
 test('message routed from real socket cannot supply missing membership or wait for a lookup', async () => {
   const f = fixture({ mode: 'strict', channels: [{ id: C.primary, delivery: 'all' }] })
   stub(f).script.inventory.push({ kind: 'never' }); await f.start(); await f.scan()
-  const managed = makeManagedRouting(f.h, f.stateDir, { membership: f.membership })
+  const managed = makeManagedRouting(f.h, f.stateDir, { membership: f.membership, getChannelDelivery: () => createChannelDeliveryStore(f.authority) })
   f.h.onEvent = createPersonaEventRouter({ membership: f.membership, routing: managed.routing, clientFor: f.h.clientFor, getPersona: f.h.getPersona, log: line => managed.logs.push(line) })
   try {
     await stub(f).socket.deliver(makeChannelMessage({ channel: C.primary }))
@@ -1048,7 +1049,7 @@ test('actual socket gap recovers missed leave/join while idle and restores queue
   const { makeEngineHarness } = await import('./test-helpers/delivery-engine.ts')
   const pending: Promise<void>[] = []
   const episodes = createPersonaEpisodes({ clock: f.h.clock, log: line => f.lines.push(line), sink: () => {} })
-  const managed = makeManagedRouting(f.h, f.stateDir, { membership: f.membership, onReceived: (key, item) => reporting.received(key, item) })
+  const managed = makeManagedRouting(f.h, f.stateDir, { membership: f.membership, getChannelDelivery: () => createChannelDeliveryStore(f.authority), onReceived: (key, item) => reporting.received(key, item) })
   const queued = createQueuedAckCallback({ queue: managed.queue, clientFor: f.h.clientFor, getReaction: () => f.h.config!.queued_ack_reaction })
   const delivered = createDeliveryAckCallback({ queue: managed.queue, clientFor: f.h.clientFor, getReaction: () => 'eyes' })
   const reporting = createDeliveryReporting({ queue: managed.queue, episodes, persona: f.h.getPersona,
@@ -1091,7 +1092,7 @@ test('actual socket gap recovers missed leave/join while idle and restores queue
     expect(betaAccepted).toHaveLength(1)
     expect(betaAccepted[0]).toMatchObject({ source: 'slack', channel: C.primary, ts: betaMessage.ts,
       key: { chat_id: C.primary, ts: betaMessage.ts }, text: betaMessage.text, user: betaMessage.user,
-      via: 'receive_all_shared', queued_ack_reaction: 'hourglass' })
+      via: 'receive_all', queued_ack_reaction: 'hourglass' })
     expect(e.records('beta').filter(record => record.kind === 'accepted')).toEqual(betaAccepted)
     expect(e.records('beta').filter(record => record.kind === 'delivered')).toEqual([])
     expect(beta.calls.reactionsAdd).toEqual([{ channel: C.primary, timestamp: betaTs, name: 'hourglass' }])
@@ -1806,4 +1807,73 @@ test('shared duplicate entry requires the complete original payload; a foundatio
   ])
   stub(reopened).script.inventory.push(membershipPage([C.primary])); await reopened.scan()
   expect(reading(reopened)).toEqual({ kind: 'unresolved', reason: 'history-unresolved' })
+})
+
+test.each(['cross-channel', 'same-time', 'newer-choice'] as const)('later leave cannot supersede %s contradictory evidence without durable proof', async guard => {
+  const f = fixture({ channels: [{ id: C.primary, delivery: 'all' }, { id: C.secondary, delivery: 'all' }] })
+  stub(f).script.inventory.push(membershipPage([C.primary, C.secondary])); await f.start(); await f.scan()
+  const base = f.h.clock.now(), time = (offset: number) => ((base + offset) / 1000).toFixed(3)
+  const channel = guard === 'cross-channel' ? C.secondary : C.primary
+  await f.event(true, C.primary, { id: 'EvORIGINAL', timestamp: time(10) })
+  await f.event(false, channel, { id: 'EvORIGINAL', timestamp: time(10) })
+  const conflict = Object.values(life(f).membershipEvidence!).find(e => e.originalEvent)!
+  if (guard === 'newer-choice') f.failWrites(s => !!s.personas.alpha!.membershipEvents.EvLATERLEAVE)
+  await f.event(false, channel, { id: 'EvLATERLEAVE', timestamp: time(guard === 'same-time' ? 10 : 20) })
+  if (guard === 'newer-choice') {
+    f.failWrites(() => false); expect(f.assign(channel, 'mentions').kind).toBe('applied')
+    expect(f.membership.recover('alpha')).toBe(false)
+  }
+  expect(f.authority.choice('alpha', channel)).toBe(guard === 'newer-choice' ? 'mentions' : 'all')
+  expect(life(f).membershipEvidence![conflict.event]!.state).toBe('conflict')
+  expect(reading(f, channel).kind).toBe('unresolved')
+  expect(life(f).membershipEvents.EvLATERLEAVE).toBeUndefined()
+  // Sensitivity: a state flag alone cannot manufacture the missing proof.
+  const forged = structuredClone(life(f))
+  forged.membershipEvidence![conflict.event]!.state = 'superseded'
+  const state = { ...f.authority.snapshot(), personas: { alpha: forged } }
+  expect(() => parseSharedChannelState(configBytes(state), f.authority.path)).toThrow()
+})
+
+test.each(['strict', 'open'] as const)('%s affected uncertain choice holds socket acknowledgement while independent channel, DM and persona progress', async mode => {
+  const f = fixture({ mode, names: ['alpha', 'beta'], channels: [C.primary, C.secondary].map(id => ({ id, delivery: 'all' })) })
+  for (const key of ['alpha', 'beta']) stub(f, key).script.inventory.push(membershipPage([C.primary, C.secondary]))
+  await f.start(); await f.scan()
+  const choices = createChannelDeliveryStore(f.authority)
+  const managed = makeManagedRouting(f.h, f.stateDir, { membership: f.membership, getChannelDelivery: () => choices })
+  f.h.onEvent = createPersonaEventRouter({ membership: f.membership, routing: managed.routing, clientFor: f.h.clientFor, getPersona: f.h.getPersona, log: line => managed.logs.push(line) })
+  try {
+    f.failWrites(state => {
+      writeSharedState(f.stateDir, state)
+      throw new DurableWriteUnsyncedError(f.authority.path, { code: 'EIO' })
+    })
+    expect(f.assign(C.primary, 'off').kind).toBe('unresolved')
+    expect(choices.readableFor('alpha', C.primary)).toBe(false)
+    const held = makeChannelMessage({ channel: C.primary, text: 'held before durable recovery', ts: '1700000003.000001' })
+    for (let retry = 0; retry < 2; retry++) await stub(f).socket.deliver(held)
+    expect(stub(f).socket.acks).toEqual([]); expect(managed.queued('alpha')).toEqual([])
+    const independent = makeChannelMessage({ channel: C.secondary, text: 'resolved sibling channel', ts: '1700000003.000002' })
+    const dm = makeDm({ text: 'independent direct', ts: '1700000003.000003' })
+    await stub(f).socket.deliver(independent); await stub(f).socket.deliver(dm)
+    await stub(f, 'beta').socket.deliver(held)
+    expect(stub(f).socket.acks).toHaveLength(2); expect(stub(f, 'beta').socket.acks).toHaveLength(1)
+    const expectRetainedQueues = () => {
+      const accepted = (name: string) => managed.queued(name).map(({ accepted: { text, channel, via, key } }) => ({ text, channel, via, key }))
+      expect(accepted('alpha')).toEqual([
+        { text: String(independent.text), channel: C.secondary, via: 'receive_all_shared', key: { chat_id: C.secondary, ts: String(independent.ts) } },
+        { text: String(dm.text), channel: String(dm.channel), via: 'dm', key: { chat_id: String(dm.channel), ts: String(dm.ts) } },
+      ])
+      expect(accepted('beta')).toEqual([
+        { text: String(held.text), channel: C.primary, via: 'receive_all', key: { chat_id: C.primary, ts: String(held.ts) } },
+      ])
+    }
+    expectRetainedQueues()
+    expect(f.authority.readable).toBe(false)
+    f.failWrites(() => false); expect(f.authority.recoverDurability().kind).toBe('applied')
+    expectRetainedQueues()
+    await stub(f).socket.deliver(held)
+    expect(stub(f).socket.acks).toHaveLength(3)
+    expectRetainedQueues()
+    expect(f.authority.choice('alpha', C.primary)).toBe('off')
+    assertNoLeak(managed.logs)
+  } finally { await managed.close() }
 })

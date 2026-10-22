@@ -44,11 +44,12 @@ import { createPersonaSerializer } from '../src/persona-serializer.ts'
 import { stubCallCount } from './test-helpers/agent-director-stub.ts'
 import { REDACTED_SENTINEL_TAIL, assertNoLeak } from './test-helpers/credentials.ts'
 import { makeConnectionHarness, type ConnectionHarness } from './test-helpers/persona-connection-harness.ts'
-import { resetRoutingState } from './test-helpers/persona-routing-harness.ts'
+import { createChannelDeliveryStore } from '../src/channel-delivery.ts'
+import { observedMembership, resetRoutingState } from './test-helpers/persona-routing-harness.ts'
 import { makeManagedRouting } from './test-helpers/persona-routing-managed.ts'
 import { makeChannelMessage, type StubSlack } from './test-helpers/slack-stub.ts'
 import { makeReloadHarness, type ReloadHarness, type ReloadRun } from './test-helpers/reload-harness.ts'
-import { membershipPage } from './test-helpers/shared-channels.ts'
+import { makeSharedAuthority, membershipPage } from './test-helpers/shared-channels.ts'
 
 let h: ReloadHarness
 /** The server lines the tool handlers write to `console.error` (a failed tool call's line), for `assertNoLeak`. */
@@ -419,6 +420,7 @@ describe('a notice post refused with token_revoked', () => {
 describe('the manager wired with the per-persona serializer, as server.ts wires it', () => {
   let dir: string
   let c: ConnectionHarness | undefined
+  let managed: ReturnType<typeof makeManagedRouting> | undefined
 
   beforeEach(() => {
     dir = realpathSync(mkdtempSync(join(tmpdir(), 'persona-credentials-revoked-')))
@@ -428,6 +430,8 @@ describe('the manager wired with the per-persona serializer, as server.ts wires 
   afterEach(async () => {
     try {
       await c?.manager.stopAll()
+      await managed?.close()
+      managed = undefined
       c = undefined
       resetRoutingState()
     } finally {
@@ -440,7 +444,15 @@ describe('the manager wired with the per-persona serializer, as server.ts wires 
     c = makeConnectionHarness([{ name: 'alpha' }, { name: 'bravo' }], dir, { serialize: serializer.run })
     const [A, B] = [c.p('alpha'), c.p('bravo')]
     for (const p of [A, B]) expect(await c.bringUp(p)).toMatchObject({ state: 'up' })
-    const { routing, logs, queue: notifications } = makeManagedRouting(c, dir)
+    const config = c.config!
+    const store = createChannelDeliveryStore(makeSharedAuthority(dir, {
+      ...config, personas: config.personas.map(({ key, index, sections, ...p }) => p),
+    }))
+    managed = makeManagedRouting(c, dir, {
+      getChannelDelivery: () => store,
+      membership: observedMembership({ [A.key]: [A.channels[0]!.id], [B.key]: [B.channels[0]!.id] }),
+    })
+    const { routing, logs, queue: notifications } = managed
     c.onEvent = createPersonaEventRouter({ routing, clientFor: c.clientFor, getPersona: c.getPersona, log: (line) => void logs.push(line) })
     const socketA = c.stub(A).socket
     const channelA = A.channels[0]!.id
@@ -464,8 +476,12 @@ describe('the manager wired with the per-persona serializer, as server.ts wires 
     await socketA.deliver(makeChannelMessage({ channel: channelA, text: 'to alpha after the revocation' }))
     expect(notifications.items(A.key)).toEqual([])
     expect(logs.filter((line) => line.includes(`persona=${A.key}`))).toEqual([])
-    await c.stub(B).socket.deliver(makeChannelMessage({ channel: channelB, text: 'to bravo' }))
-    expect(notifications.items(B.key)!.map((n) => n.accepted.text)).toEqual(['to bravo'])
+    const toBravo = makeChannelMessage({ channel: channelB, text: 'to bravo' })
+    await c.stub(B).socket.deliver(toBravo)
+    expect(notifications.items(B.key).map(n => ({ channel: n.accepted.channel, ts: n.accepted.ts, key: n.accepted.key, text: n.accepted.text, via: n.accepted.via }))).toEqual([
+      { channel: channelB, ts: toBravo.ts as string, key: { chat_id: channelB, ts: toBravo.ts as string }, text: toBravo.text as string, via: 'receive_all' },
+    ])
+    expect(c.stub(B).socket.acks).toHaveLength(1)
     expect(notifications.items(A.key)).toEqual([])
 
     turn.resolve()

@@ -1,6 +1,7 @@
 
 
 import type { MakeTemplateParams } from 'agent-director'
+import { eligibleMembership } from './test-helpers/fungible-decision.ts'
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import { mkdirSync, mkdtempSync, rmSync, unlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -1623,13 +1624,17 @@ describe('persona teardown: every step for the removed key only, in order', () =
 
   test('over the real routing in fungible mode, tearing B down empties B\'s heard set and leaves A\'s, holding the same channel, unchanged', async () => {
     const clock = createFakeClock()
-    const h = makeRoutingHarness([{ name: NAME_A }, { name: NAME_B }], dir, { mode: 'open', dedupeClock: () => clock.now() })
+    const h = makeRoutingHarness([{ name: NAME_A }, { name: NAME_B }], dir, { mode: 'open', dedupeClock: () => clock.now(), membership: { read: key => eligibleMembership(key), hasUnresolved: () => false, request: () => {} } })
     cleanups.push(resetRoutingState)
     const f = makeFixture({ overrides: { routing: { forget: (key) => h.forget(key) } } })
     const [a, b] = [f.a.key, f.b.key]
     expect(h.keys([NAME_A, NAME_B])).toEqual([a, b])
     // Channel X is heard by both; Y by A alone; Z, a private channel, by B alone.
     const [x, y, z] = ['C0HEARDX01', 'C0HEARDY01', 'G0HEARDZ01']
+    for (const key of [a, b]) for (const channel of [x, y, z]) {
+      const persona = h.config!.personas.find(p => p.key === key)!
+      expect(h.channelDelivery!.set(key, channel, 'mentions', persona)).toMatchObject({ kind: 'stored' })
+    }
     await h.receive(makeChannelMessage({ channel: x }), [NAME_A, NAME_B])
     await h.receive(makeChannelMessage({ channel: y }), [NAME_A])
     await h.receive(makePrivateChannelMessage({ channel: z }), [NAME_B])

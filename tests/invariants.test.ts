@@ -225,6 +225,7 @@ const ADMITTED_READS: readonly AdmittedRead[] = [
   { file: 'channel-membership-scan.ts', within: 'createMembershipScanner > collect', read: 'page.channels', count: 1, reason: 'iterate the parsed users.conversations page returned by the connection manager membershipPage call, not a persona configuration' },
   { file: 'reload.ts', within: 'createPendingDetection > candidateOf', read: 'reviewed.channels', count: 1, reason: 'channel effects returned by shared authority planReviewed for the preview, not a persona channels list or a delivery decision' },
   { file: 'reload.ts', within: 'createPendingDetection > derive', read: 'persona.permission_prompts', count: 1, reason: 'AC-W05/W07/W08: bind applied and candidate destination declarations into reloadReviewBinding so a changed destination revokes review authorization; no destination resolution or posting' },
+  { file: 'reload-recovery.ts', within: 'fingerprint', read: 'p.permission_prompts', count: 1, reason: 'bind the retained repair destination to its review fingerprint; never selects a runtime destination or admits delivery' },
 ]
 
 /** How a field is read. */
@@ -741,10 +742,10 @@ describe('negative controls for the reader audit', () => {
   })
 
   test.each([
-    ['reviewed channels', 'reviewed.channels', 'createPendingDetection > candidateOf', 'persona.channels', 'channels', 'reviewed'],
-    ['review destination binding', 'persona.permission_prompts', 'createPendingDetection > derive', 'persona.channels', 'permission_prompts', 'persona'],
-  ] as const)('%s admission rejects extra, missing, adjacent and relocated reads', (_label, read, within, adjacent, field, receiver) => {
-    const file = 'reload.ts'
+    ['reviewed channels', 'reviewed.channels', 'createPendingDetection > candidateOf', 'persona.channels', 'channels', 'reviewed', 'reload.ts'],
+    ['review destination binding', 'persona.permission_prompts', 'createPendingDetection > derive', 'persona.channels', 'permission_prompts', 'persona', 'reload.ts'],
+    ['repair destination binding', 'p.permission_prompts', 'fingerprint', 'p.channels', 'permission_prompts', 'p', 'reload-recovery.ts'],
+  ] as const)('%s admission rejects extra, missing, adjacent and relocated reads', (_label, read, within, adjacent, field, receiver, file) => {
     const source = readFileSync(join(SRC_DIR, file), 'utf8')
     const admitted = ADMITTED_READS.filter(entry => entry.file === file)
     expect(outsideListFindings(new Map([[file, source]]), FIXED_READERS, admitted)).toEqual([])

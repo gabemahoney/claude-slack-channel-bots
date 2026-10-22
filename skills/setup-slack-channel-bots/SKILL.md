@@ -259,7 +259,7 @@ share one, and the configuration is rejected.
 
 #### 5.5 Channels
 
-In both modes, collect each channel’s fields below. A persona with no channels must have DMs enabled:
+In both modes, collect each channel’s fields below. A fresh persona with no channels must have DMs enabled:
 
 - **`id`**: a Slack channel ID, pattern `^[CG][A-Z0-9]+$`. In Slack, click the channel name; the ID is at the bottom of **About**.
 - **`delivery`**: explicitly choose `off`, `mentions`, `all` or `thread_hybrid`. `off` disables channel listening; `mentions` delivers direct mentions and broadcasts; `all` delivers every message. A newly verified member without a choice starts at `off` in strict or `mentions` in open; existing choices are preserved.
@@ -293,7 +293,11 @@ A persona whose destination is a channel needs no DMs. A `dm` destination needs 
 
 #### 5.7 Permission prompts
 
-Ask for `permission_prompts`, required in both modes: a listed channel ID, including a channel set to `off`, or `dm` with `dm.enabled: true` and a `dm.contact`. Invite the app to a channel destination so Slack accepts posts; everyone there sees its prompts and notices. See `docs/channel-modes.md`’s `## Permission prompts in both modes`.
+Ask for `permission_prompts`, required in both modes: a listed channel ID, including a channel set to `off`, or `dm` with `dm.enabled: true` and a `dm.contact`. Invite the app to a channel destination so Slack accepts posts; everyone there sees its prompts and notices.
+
+For an existing persona, a validated unchanged channel destination survives same-incarnation verified removal, even with zero channels and DMs disabled; do not re-add its entry just to preserve the destination. This grants no exception for a new destination or replacement identity.
+
+See `docs/channel-modes.md`’s `## Permission prompts in both modes`.
 
 #### 5.8 Optional next-launch settings
 

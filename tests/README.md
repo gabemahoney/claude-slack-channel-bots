@@ -206,7 +206,7 @@ why:
   `require_ci_image` as its first step, which fails with
   `FAIL: <test>: <step>: refused: /etc/cscb-ci-image is absent …`.
 - The Slack push and stub session helpers (`slack_stub_push`,
-  `stub_session_deliveries`, `stub_session_call`) call
+  `stub_session_deliveries`, `stub_session_call`, `stub_session_list_tools` and their shared `_scenario_stub_request`; ) call
   `require_ci_image` as their first step after their declarations, with the
   same FAIL line.
 
@@ -2395,7 +2395,8 @@ A setting that is unset or bad fails the step at once, with its reason.
   lines only. It prints nothing before the first delivery, and only reads.
 - `stub_session_call <dir> <tool> <json-args>` calls the MCP tool `<tool>` (1
   to 128 letters, digits, `_`, `-` or `.`) with `<json-args>` (a JSON object)
-  over the session of the stub working in `<dir>`. It appends one request
+  over the session of the stub working in `<dir>`, with `method: "tools/call"`,
+  `tool` and `arguments` fields. It appends one request
   line with an ID unique in the scenario to the directory's request file, in
   one write (at most 4000 bytes, `SCENARIO_STUB_REQUEST_MAX_BYTES`), then
   polls the results record for that ID for at most 30 s
@@ -2403,10 +2404,18 @@ A setting that is unset or bad fails the step at once, with its reason.
   naming `<tool>`, the request ID and `<dir>`, when no result line arrives in
   time; an `isError: true` result is the scenario's to judge, not a failure.
 
+- `stub_session_list_tools <dir>` negotiates `tools/list` through the same
+  `_scenario_stub_request` exchange; its request holds only `id` and `method`,
+  and its result text is the SDK tools list as JSON. A method is never passed
+  as a tool name. Result shape, request/result paths, polling, skip order and
+  timeout bounds are shared and unchanged.
+
 Each refuses outside the `cscb-ci` image (`require_ci_image` is its first
 step; see Image marker) and works in both modes. Each reads and writes only
-under `SCENARIO_ROOT`: `stub_session_call` writes only the request file in
-`SCENARIO_STUB_DIR`, and the other two write nothing.
+under `SCENARIO_ROOT`: both session request helpers write only the request
+file in `SCENARIO_STUB_DIR` through `_scenario_stub_request`; the delivery
+reader writes nothing. The shared exchange accepts only `tools/call` and
+`tools/list` and guards before checks or writes.
 
 CSCB's tmux calls (fmk mode; scenario 26; each a harness addition). `cscb_tmux_calls [<fragment>...]` prints the tmux
 shim's `call` lines whose parent is any CSCB process the record holds at the
@@ -3637,7 +3646,8 @@ first on its PATH, with the stub's MCP session client beside it.
 Test 29 starts the stub with `--record` and `--control`, as Tests 10 and 12
 do. `slack_stub_push` sends each event; `queue_accepted` reads durable
 acceptance from the persona's queue, and `stub_session_call` calls
-`set_channel_delivery`. Acceptance alone does not prove transcript delivery.
+`set_channel_delivery`; `stub_session_list_tools` obtains the actual offered
+tools. Acceptance alone does not prove transcript delivery.
 The scenario waits for all fixed parts' receipts before its restart, saves
 the pre-restart acceptances, and checks the retained dedupe facts after
 startup compaction.

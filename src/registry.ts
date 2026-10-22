@@ -758,6 +758,7 @@ function classifyPersonaTarget(persona: Persona, target: string, mode: ChannelMo
  * naming the persona and the target.
  */
 export const FUNGIBLE_TARGET_REFUSAL = 'it is neither a channel ID nor an allowed DM target.'
+export const CHANNEL_TARGET_STATE_UNRESOLVED = 'The current channel choice is unresolved; retry after reviewed state recovery.'
 
 /**
  * The kind of action a tool takes on its target: `post` posts a new message
@@ -1315,6 +1316,17 @@ export function createSessionServer(
   // which would open a DM implicitly.
   // -------------------------------------------------------------------------
 
+  function checkCurrentTarget(persona: Persona, target: string, action: PersonaTargetAction, mode: ChannelMode): PersonaTargetCheck {
+    const scope = checkPersonaTarget(persona, target, action, mode)
+    // Open ordinary tools use Slack access, independently of channel choices.
+    // Strict must not use an old non-off projection during an uncertain write.
+    if (scope.allowed && scope.kind === 'channel' && mode === 'strict' &&
+        deps.getChannelDelivery?.()?.readableFor(persona.key, target) === false) {
+      return { allowed: false, message: CHANNEL_TARGET_STATE_UNRESOLVED }
+    }
+    return scope
+  }
+
   /** Today's dry-run result for a tool whose target passed the scope check. */
   function dryRunResult(name: string, args: Record<string, any>, kind: PersonaTargetKind) {
     switch (name) {
@@ -1416,7 +1428,7 @@ export function createSessionServer(
           if (!current || !currentSessionLife()) return toolError(personaNotAppliedRefusal(name, persona.key))
           const mode = deps.getChannelMode?.() ?? 'strict'
           for (const target of [chatId, opened.id]) {
-            const scope = checkPersonaTarget(current, target, 'post', mode)
+            const scope = checkCurrentTarget(current, target, 'post', mode)
             if (!scope.allowed) return toolError(scope.message)
           }
           persona = current
@@ -1732,7 +1744,7 @@ export function createSessionServer(
     // Posting scope, before the dry-run branch.
     const rawTarget = args[toolTarget.arg]
     const target = typeof rawTarget === 'string' ? rawTarget : ''
-    const scope = checkPersonaTarget(persona, target, toolTarget.action, mode)
+    const scope = checkCurrentTarget(persona, target, toolTarget.action, mode)
     if (!scope.allowed) return toolError(scope.message)
 
     if (isDryRun()) return dryRunResult(name, args, scope.kind)

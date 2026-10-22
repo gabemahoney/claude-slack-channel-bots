@@ -57,22 +57,22 @@ grep unclaimed-channel ~/.config/claude-slack-channel-bots/server.log*
 
 ## Channel delivery in open mode
 
-In both modes, the shared choices are `off`, `mentions`, `all` and `thread_hybrid`. A channel with no assignment defaults to `off`. A newly verified member gets an assignment using the mode's join default described above, preserving any existing choice. `mentions` delivers direct mentions and broadcasts, while `all` delivers every message.
+In both modes, the shared choices are `off`, `mentions`, `all` and `thread_hybrid`. A missing or unreadable assignment holds affected intake; it is not a saved `off` choice. A newly verified member gets the mode's join default described above, preserving any existing choice: `mentions` delivers direct mentions and broadcasts, while `all` delivers every message.
 
 - **Choices persist.** Applied choices live in `config.json.last-applied` across server restarts and persona relaunches. A mode switch preserves them. A proven leave removes the prior choice; incomplete scans cannot prove a leave, and uncertain ordering holds the channel without erasing a newer reviewed choice. A removed, renamed or replaced persona never inherits its previous incarnation’s choices.
-- **The loop guard.** Another persona’s `permission_prompts` channel is held at `mentions` for other personas whose applied choice is non-off. Its own destination and a `"dm"` destination hold nothing.
+- **The open-mode loop guard.** Another persona’s `permission_prompts` channel is held at `mentions` for other personas whose applied choice is non-off. Off wins before the guard, including for mentions and broadcasts; the saved value stays intact. Its own destination and a `"dm"` destination hold nothing.
 
-- **`receive_all_shared` is an approximation.** A persona at `all` in a channel receives a message there as `receive_all_shared` when at least one other persona's channel delivery for that channel, computed by the same rule, is `all`. A stored choice says nothing about whether the other persona's app remains in the channel, so a persona whose app has left the channel counts too.
+- **`receive_all_shared` requires effective eligibility.** In either mode, a non-mention/non-broadcast message uses this reason only when this persona and another currently eligible member have effective `all` in the channel. A saved-all choice alone does not count: departed, unverified or loop-guarded personas cannot supply it; otherwise the reason is `receive_all`.
 - **Don't keep two personas at `all` in one channel.** Each receives every message there, the other's posts included, so each answer one persona posts reaches the other, which can answer it in turn: the two can keep answering each other with no human involved. If one should listen to everything, keep the other at `mentions`.
 
 ## Permission prompts in both modes
 
 `permission_prompts` is required in both modes. Prompts and server notices, including *Message not saved* notices and restart-limit warnings, use that same destination.
 
-- **A channel ID:** a listed channel, including one set to `off`. Invite the app there so Slack can accept its posts. Everyone there sees the prompts and notices.
+- **A channel ID:** a listed channel for a fresh submission, including one set to `off`. Invite the app there so Slack can accept its posts. Everyone there sees the prompts and notices.
 - **`dm`:** a DM to `dm.contact`, requiring `dm.enabled: true` and a contact.
 
-A confirmed destination change moves the next prompt and notice, held notices included. Posted prompts stay answerable where they are.
+A validated unchanged channel destination remains selected after same-incarnation verified removal, including with zero entries and DMs disabled; it does not recreate membership or a choice. Only a confirmed destination change moves future prompts and notices, held notices included. Posted valid prompts stay answerable under their original identity rules, without granting ordinary tools or intake authority; see [Permission Relay](bots.md#permission-relay).
 
 ## Example in open mode
 

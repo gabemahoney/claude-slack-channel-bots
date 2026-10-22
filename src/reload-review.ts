@@ -71,7 +71,7 @@ export function reviewFingerprint(binding: string, generation: number): string {
  * readiness, declarations, destinations and applied mode remain dependencies. */
 export function sharedReviewDependency(state: SharedChannelState): string {
   return createHash('sha256').update(JSON.stringify([
-    state.sourceBytesBase64, state.applied, state.personas, state.retiredIdentities,
+    state.sourceBytesBase64, state.applied, state.personas, state.retiredIdentities, state.recovery?.boundary,
   ])).digest('hex')
 }
 /** Each detection controller retains observed revocations until a new durable
@@ -87,6 +87,15 @@ export function createReviewObserver() {
     if (observation.result?.kind === 'applied') revocationDue = false
     return observation
   }
+}
+/** Revoke a gesture in the same transaction that cancels or revises intent. */
+export function supersedeReview(state: SharedChannelState, order: number): void {
+  const ledger = reviewLedger(state)
+  if (!ledger?.active) return
+  if (!ledger.outcomes[ledger.active.fingerprint]) put(ledger.outcomes, ledger.active.fingerprint, {
+    generation: ledger.active.generation, status: 'superseded', revision: order,
+  })
+  delete ledger.active
 }
 function observeReview(
   authority: SharedChannelAuthority, binding: string, pending: boolean, intentGeneration: number, sourceHash: string,

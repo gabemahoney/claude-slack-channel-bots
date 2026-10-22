@@ -96,6 +96,10 @@ function allRows(): FungibleDecisionRow[] {
 
 const G = FUNGIBLE_DECISION_GROUPS
 
+describe('current shared authority, eligibility and effective sibling selection', () => {
+  test.each(cases(G.currentAuthority))('%s', (_title, row) => expectOutcome(row))
+})
+
 // ---------------------------------------------------------------------------
 // The decision table
 // ---------------------------------------------------------------------------
@@ -239,6 +243,11 @@ function stateFindings(code: string): string[] {
 /** A deep copy of `value` with every object and array frozen. Accessors are copied, never read; functions and regexes are kept as they are. */
 function frozenCopy<T>(value: T): T {
   if (typeof value !== 'object' || value === null || value instanceof RegExp) return value
+  if (value instanceof Map) {
+    const copy = new Map([...value].map(([key, reading]) => [key, frozenCopy(reading)]))
+    for (const method of ['set', 'delete', 'clear']) Object.defineProperty(copy, method, { value: () => { throw new Error('decision mutated current observations') } })
+    return Object.freeze(copy) as T
+  }
   const copy: object = Array.isArray(value) ? [] : Object.create(Object.getPrototypeOf(value))
   for (const [key, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(value))) {
     Object.defineProperty(copy, key, 'value' in descriptor ? { ...descriptor, value: frozenCopy(descriptor.value) } : descriptor)

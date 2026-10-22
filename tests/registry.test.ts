@@ -1,3 +1,7 @@
+import { makeSharedAuthority } from './test-helpers/shared-channels.ts'
+import { createChannelDeliveryStore } from '../src/channel-delivery.ts'
+import { durableWriteFileSync, DurableWriteUnsyncedError } from '../src/atomic-write.ts'
+import { CHANNEL_TARGET_STATE_UNRESOLVED } from '../src/registry.ts'
 /**
  * registry.test.ts — Persona-keyed MCP session registry, not-up session
  * admission and drop, and persona-scoped Slack tools (
@@ -1971,6 +1975,52 @@ describe('shared configuration on the outbound path', () => {
 // ---------------------------------------------------------------------------
 
 describe('call-time resolution', () => {
+  test.each(TOOLS.flatMap(tool => (['strict', 'open'] as const).map(mode => [tool, mode] as const)))(
+    '%s in %s mode observes an affected-only unsynced choice through the same MCP session', async (tool, mode) => {
+      const input = { channel_mode: mode, personas: [h.alpha, h.beta].map(p => ({
+        name: p.name, credentials_file: p.credentials_file, working_directory: p.working_directory,
+        channels: p.channels, permission_prompts: p.permission_prompts, dm: p.dm,
+      })) }
+      const authority = makeSharedAuthority(h.stateDir, input, { write: (path, bytes) => {
+        durableWriteFileSync(path, bytes)
+        throw new DurableWriteUnsyncedError(path, { code: 'EIO' })
+      } })
+      const choices = createChannelDeliveryStore(authority)
+      h.mode = mode
+      const deps = { ...h.modeDeps, getChannelDelivery: () => choices }
+      const entry = registerSession(h.alpha.working_directory, h.alpha.key, makeTransport(), makeServer())
+      entry.personaIncarnation = authority.incarnation(h.alpha.key)
+      const session = await openSession(entry, deps)
+      expect((await session.call(tool, TOOL_ARGS[tool](A_ALL))).isError).toBeUndefined()
+      const callsBefore = totalSlackCalls(), fetchesBefore = h.fetches.length
+      expect(authority.assign(h.alpha.key, authority.incarnation(h.alpha.key)!, A_ALL, 'off', authority.revision).kind).toBe('unresolved')
+      expect(choices.readableFor(h.alpha.key, A_ALL)).toBe(false)
+      expect(choices.readableFor(h.alpha.key, A_MENTIONS)).toBe(true)
+      expect(choices.readableFor(h.beta.key, B_CHANNEL)).toBe(true)
+      for (const dryRun of [false, true]) {
+        if (dryRun) process.env['SLACK_DRY_RUN'] = '1'
+        const result = await session.call(tool, TOOL_ARGS[tool](A_ALL))
+        if (mode === 'strict') {
+          expect(result.isError).toBe(true)
+          expect(result.content[0]!.text).toBe(CHANNEL_TARGET_STATE_UNRESOLVED)
+          expect(totalSlackCalls()).toBe(callsBefore); expect(h.fetches).toHaveLength(fetchesBefore)
+        } else {
+          expect(result.isError).toBeUndefined()
+          if (dryRun) expect(result.content[0]!.text).toStartWith('[dry-run]')
+        }
+      }
+      delete process.env['SLACK_DRY_RUN']
+      // Unchanged choice and sibling remain usable despite the same uncertain
+      // authority revision. This also guards against a global outage shortcut.
+      expect((await session.call(tool, TOOL_ARGS[tool](A_MENTIONS))).isError).toBeUndefined()
+      const siblingEntry = registerSession(h.beta.working_directory, h.beta.key, makeTransport(), makeServer())
+      siblingEntry.personaIncarnation = authority.incarnation(h.beta.key)
+      const sibling = await openSession(siblingEntry, deps)
+      expect((await sibling.call(tool, TOOL_ARGS[tool](B_CHANNEL))).isError).toBeUndefined()
+      expect(stubOf(h.beta).calls[TOOL_CAPTURE[tool]]).toHaveLength(1)
+    },
+  )
+
   test("swapping A's client between calls sends the second call through the new client", async () => {
     const session = await openPersonaSession(h.alpha)
     const first = stubOf(h.alpha)

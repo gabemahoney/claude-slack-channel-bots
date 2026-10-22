@@ -8,7 +8,7 @@ import {
   type PersonaConfig,
 } from './config.ts'
 import type { SlackBotIdentity } from './persona-slack-validation.ts'
-import type { ChannelMembership } from './channel-membership.ts'
+import type { ChannelMembership, MembershipReading } from './channel-membership.ts'
 import type { PersonaEventProvenance } from './persona-connections.ts'
 import {
   decideDelivery,
@@ -95,13 +95,10 @@ export interface PersonaRoutingDeps {
   /** Intake clock in epoch milliseconds. */
   now?: () => number
   /**
-   * The stored choices: the store's readability and
-   * its read-only lookup, which the one store `main()` loads
-   * (`src/channel-delivery.ts`) satisfies as it is. Read at each
-   * fungible-mode event, never held across events; the routing never writes
-   * to it or drops from it. Null or undefined (before the store is loaded),
-   * or the dep absent: no stored choice applies, so fungible mode serves
-   * every channel at `mentions`. Not asked in declarative mode.
+   * The shared authority's read-only choice projection. Read in both modes
+   * for each event; routing never writes or drops from it. An absent or
+   * unreadable projection leaves channel selection unresolved. DMs depend
+   * only on their own applied settings, not a channel choice or membership.
    */
   getChannelDelivery?(): StoredChoices | null | undefined
   /**
@@ -308,10 +305,13 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
             return
           }
           if (!config || !persona) return
-          const choices = deps.getChannelDelivery?.()
-          if ((choices?.readableFor?.(key, slackKey?.chat_id) ?? choices?.readable) === false) { storeFailed = true; return }
           const identity = provenance?.key === key ? provenance.identity : deps.getBotIdentity(key)
-          const decision = decideDelivery(ev, { key, botUserId: identity?.botUserId, botId: identity?.botId, channels: persona.channels, dmEnabled: persona.dm.enabled }, config.personas, fungibleInputs(config, mode, isExtSharedChannel))
+          const decision = decideDelivery(ev, { key, botUserId: identity?.botUserId, botId: identity?.botId, channels: persona.channels, dmEnabled: persona.dm.enabled }, config.personas, fungibleInputs(config, mode, isExtSharedChannel, slackKey?.chat_id))
+          if (decision.action === 'unresolved') {
+            storeFailed = true
+            deps.membership?.request(key)
+            return
+          }
           const path = fungiblePathOf(decision)
           if (path !== undefined) logFirstHeard(persona, String(ev['channel']), path)
           if (decision.action === 'drop') { logDrop(persona, ev, decision); return }
@@ -375,14 +375,23 @@ export function createPersonaRouting(deps: PersonaRoutingDeps): PersonaRouting {
     config: PersonaRoutingConfig,
     mode: ChannelMode,
     isExtSharedChannel: unknown,
+    channel: string | undefined,
   ): FungibleDecisionInputs | undefined {
-    if (mode !== FUNGIBLE_MODE) return undefined
+    const memberships = new Map<string, MembershipReading>()
+    if (channel && CHANNEL_ID_RE.test(channel)) {
+      for (const persona of config.personas) {
+        let reading: MembershipReading = { kind: 'unresolved', reason: 'current-membership-missing' }
+        try { reading = deps.membership?.read(persona.key, channel, mode) ?? reading } catch { /* only this projection is unresolved */ }
+        memberships.set(persona.key, reading)
+      }
+    }
     return {
       mode,
       isExtSharedChannel,
       channelIdPattern: CHANNEL_ID_RE,
       storedChoices: deps.getChannelDelivery?.() ?? undefined,
       fungibleDestinations: fungibleDestinationsOf(config, config.personas),
+      memberships,
     }
   }
 

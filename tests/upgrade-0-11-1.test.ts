@@ -67,17 +67,15 @@ import {
   type ChannelEntryInput,
   type PersonaDmInput,
 } from '../src/config.ts'
-import type { Via } from '../src/delivery-decision.ts'
+import type { DropDecision, Via } from '../src/delivery-decision.ts'
 import { FUNGIBLE_DESTINATION_SETTING } from '../src/persona-destination.ts'
 import { renderPersonaRef } from '../src/persona-identity.ts'
 import {
   FUNGIBLE_REFUSAL_TEXTS,
-  formatPersonaDiagnostic,
   PERSONA_CHANNEL_DELIVERY_SET,
   PERSONA_INVITED_CHANNEL,
   PERSONA_START,
   UNCLAIMED_CHANNEL,
-  unclaimedChannelCause,
 } from '../src/persona-diagnostics.ts'
 import {
   channelDeliveryDeclarativeRefusal,
@@ -701,7 +699,16 @@ async function deliverSample(run: ReloadRun, fixture: UpgradeFixture, sample: Sa
   const events: SlackEvent[] = sample.bothEvents === true
     ? [makeAppMention({ channel: sample.channel, text, ts: message['ts'] }), message]
     : [message]
+  const acks = run.stub(sample.to).socket.acks.length
+  const queues = Object.fromEntries(names.map(name => [name, structuredClone(run.queued(name))]))
   for (const event of events) await run.deliver(sample.to, event)
+  expect(run.stub(sample.to).socket.acks.length - acks).toBe(events.length)
+  for (const name of names) {
+    if (name !== sample.to || run.deliveries(name).length === before[name]) expect(run.queued(name)).toEqual(queues[name])
+    else expect(run.queued(name).slice(queues[name]!.length).map(item => ({ channel: item.accepted.channel, key: item.accepted.key, text: item.accepted.text }))).toEqual([
+      { channel: sample.channel, key: { chat_id: sample.channel, ts: message.ts as string }, text },
+    ])
+  }
   return {
     event: sample.event,
     deliveries: Object.fromEntries(
@@ -735,25 +742,11 @@ function listed(fixture: UpgradeFixture, name: string, n: number): string {
   return channel
 }
 
-/** The declarative `unclaimed-channel` line for the persona and channel, from its builders. */
-function unclaimedLine(h: ReloadHarness, fixture: UpgradeFixture, name: string, channel: string): string {
-  return formatPersonaDiagnostic({
-    class: UNCLAIMED_CHANNEL,
-    name,
-    key: h.key(name),
-    index: entryOf(fixture, name).index,
-    cause: unclaimedChannelCause(channel),
-  })
-}
-
-/**
- * A `not-mentioned` drop line of the persona in `channel` (the reason is the
- * line's last word). It pins the 0.11.1 line shape of
- * `src/persona-routing.ts`, which exports no builder or prefix for it.
- */
-function notMentioned(h: ReloadHarness, name: string, channel: string) {
+/** A selection refusal is checked with its persona/channel and exact reason.
+ * Completed membership evidence precedes legacy listed-channel diagnostics. */
+function dropped(h: ReloadHarness, name: string, channel: string, reason: DropDecision['reason']) {
   return expect.stringMatching(
-    new RegExp(`^${escapeRegExp(`[slack] persona ${renderPersonaRef(name, h.key(name))} dropped message from channel=${channel} `)}.*: not-mentioned$`),
+    new RegExp(`^${escapeRegExp(`[slack] persona ${renderPersonaRef(name, h.key(name))} dropped message from channel=${channel} `)}.*: ${reason}$`),
   )
 }
 
@@ -785,14 +778,14 @@ const SAMPLES: Readonly<Record<string, (h: ReloadHarness, fixture: UpgradeFixtur
     const [a1, a2, b1] = [listed(f, 'alpha', 0), listed(f, 'alpha', 1), listed(f, 'bravo', 0)]
     return [
       [{ event: 'alpha, A1, plain', to: 'alpha', kind: 'plain', channel: a1 }, { deliveries: deliveredTo(f, 'alpha', a1, 'receive_all'), dropLines: [] }],
-      [{ event: 'alpha, A2, plain', to: 'alpha', kind: 'plain', channel: a2 }, { deliveries: noDelivery(f), dropLines: [notMentioned(h, 'alpha', a2)] }],
+      [{ event: 'alpha, A2, plain', to: 'alpha', kind: 'plain', channel: a2 }, { deliveries: noDelivery(f), dropLines: [dropped(h, 'alpha', a2, 'not-mentioned')] }],
       [{ event: 'alpha, A2, mention', to: 'alpha', kind: 'mention', channel: a2 }, { deliveries: deliveredTo(f, 'alpha', a2, 'mention'), dropLines: [] }],
       [{ event: 'bravo, B1, mention', to: 'bravo', kind: 'mention', channel: b1 }, { deliveries: deliveredTo(f, 'bravo', b1, 'mention'), dropLines: [] }],
       [
         { event: 'alpha, an unlisted channel, a mention as both its events', to: 'alpha', kind: 'mention', channel: UNLISTED_CHANNEL, bothEvents: true },
         // only accepted Slack keys are durable dedupe facts;
         // both rejected envelopes are diagnosed without creating a queue row.
-        { deliveries: noDelivery(f), dropLines: Array.from({ length: 2 }, () => unclaimedLine(h, f, 'alpha', UNLISTED_CHANNEL)) },
+        { deliveries: noDelivery(f), dropLines: Array.from({ length: 2 }, () => dropped(h, 'alpha', UNLISTED_CHANNEL, 'channel-ineligible')) },
       ],
     ]
   },
@@ -802,11 +795,11 @@ const SAMPLES: Readonly<Record<string, (h: ReloadHarness, fixture: UpgradeFixtur
     return [
       [{ event: 'planner, its home channel, plain', to: 'planner', kind: 'plain', channel: home }, { deliveries: deliveredTo(f, 'planner', home, 'receive_all'), dropLines: [] }],
       [{ event: 'planner, the shared channel, plain', to: 'planner', kind: 'plain', channel: shared }, { deliveries: deliveredTo(f, 'planner', shared, 'receive_all'), dropLines: [] }],
-      [{ event: 'reviewer, the shared channel, plain', to: 'reviewer', kind: 'plain', channel: shared }, { deliveries: noDelivery(f), dropLines: [notMentioned(h, 'reviewer', shared)] }],
+      [{ event: 'reviewer, the shared channel, plain', to: 'reviewer', kind: 'plain', channel: shared }, { deliveries: noDelivery(f), dropLines: [dropped(h, 'reviewer', shared, 'not-mentioned')] }],
       [{ event: 'reviewer, the shared channel, mention', to: 'reviewer', kind: 'mention', channel: shared }, { deliveries: deliveredTo(f, 'reviewer', shared, 'mention'), dropLines: [] }],
-      // A channel another applied persona lists logs nothing.
-      [{ event: "reviewer, planner's home channel, mention", to: 'reviewer', kind: 'mention', channel: home }, { deliveries: noDelivery(f), dropLines: [] }],
-      [{ event: 'planner, an unlisted channel, plain', to: 'planner', kind: 'plain', channel: UNLISTED_CHANNEL }, { deliveries: noDelivery(f), dropLines: [unclaimedLine(h, f, 'planner', UNLISTED_CHANNEL)] }],
+      // Another persona's declaration supplies no current membership to the receiver.
+      [{ event: "reviewer, planner's home channel, mention", to: 'reviewer', kind: 'mention', channel: home }, { deliveries: noDelivery(f), dropLines: [dropped(h, 'reviewer', home, 'channel-ineligible')] }],
+      [{ event: 'planner, an unlisted channel, plain', to: 'planner', kind: 'plain', channel: UNLISTED_CHANNEL }, { deliveries: noDelivery(f), dropLines: [dropped(h, 'planner', UNLISTED_CHANNEL, 'channel-ineligible')] }],
     ]
   },
 }
@@ -843,9 +836,9 @@ async function openListingClient(run: ReloadRun, name: string): Promise<Client> 
   return client
 }
 
-describe('a 0.11.1 configuration decides sample events as says', () => {
+describe('a 0.11.1 configuration retains its choices under current membership eligibility (; current )', () => {
   test.each(FIXTURES.map((f) => [f.file, f] as const))(
-    '%s: listed channels deliver by their entries, each dropped unlisted event logs one unclaimed-channel line, a channel another persona lists logs nothing',
+    '%s: current members deliver by their entries; proven absence drops each event, while unresolved membership holds intake',
     async (_file, fixture) => {
       const h = makeHarness()
       const { run, placed } = await startWithSessions(h, fixture)
@@ -856,8 +849,18 @@ describe('a 0.11.1 configuration decides sample events as says', () => {
 
       expect(outcomes).toEqual(samples.map(([sample, expected]) => ({ event: sample.event, ...expected })))
       expectDeclarativeAndUnchanged(h, run, fixture.bytes)
-      // The not-mentioned and unclaimed-channel lines above are this check's positive controls.
-      expectNoTerms(run, UNCLAIMED_CHANNEL)
+      // Proved absence is a drop; lost current evidence is a hold, not a
+      // legacy unclaimed-channel diagnostic or an acknowledgement of loss.
+      const name = channelPersonas(fixture)[0]!.name, key = h.key(name), channel = listed(fixture, name, 0)
+      const queues = Object.fromEntries(channelPersonas(fixture).map(p => [p.name, structuredClone(run.queued(p.name))]))
+      run.membership.invalidate(key)
+      expect(run.membership.read(key, channel, 'strict').kind).toBe('unresolved')
+      const acks = run.stub(name).socket.acks.length, logs = run.logs.length
+      await run.deliver(name, makeChannelMessage({ channel, text: `${mentionText(run.stub(name).identity.botUserId)} held probe` }))
+      expect(run.stub(name).socket.acks).toHaveLength(acks)
+      expect(run.logs.slice(logs).filter(isDropLine)).toEqual([])
+      expect(Object.fromEntries(channelPersonas(fixture).map(p => [p.name, run.queued(p.name)]))).toEqual(queues)
+      expectNoTerms(run, PERSONA_START)
       expect(termHits(outcomes.flatMap((o) => o.dropLines))).toEqual({})
       expectNoLeak(h, run, placed, { outcomes })
     },

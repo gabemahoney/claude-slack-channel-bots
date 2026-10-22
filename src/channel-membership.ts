@@ -21,7 +21,8 @@ export function membershipDiagnostic(key: string, channel: string | undefined, f
   return `[slack] ${fault === 'event-not-durable' ? MEMBERSHIP_STORAGE_FAILED : MEMBERSHIP_UNRESOLVED} persona=${key}${scope}: ${fault}. ${repair}`
 }
 
-/** c9 must persist/finish clearing for this token before its own admission.
+/** c9 binds its durable clearing/enrollment obligations to this token.
+ * Superseded tokens cannot hold a new lifetime or authorize late callbacks.
  * Queued work never acquires enrollment authority merely by replaying it. */
 export interface MembershipLifetime {
   incarnation: string
@@ -114,6 +115,7 @@ export function createChannelMembership(deps: ChannelMembershipDeps): ChannelMem
   const undurableAbsences = new Map<string, Map<string, SharedMembershipAbsenceConflict>>()
   const undurableIncarnations = new Map<string, string>()
   const episodes = new Map<string, Map<string, MembershipFault>>()
+  const seenReplacements = new Set(Object.values(authority.snapshot().personas).flatMap(life => Object.keys(life.replacedAbsences ?? {})))
   let closed = false
   const unsubscribe = authority.subscribe(() => {
     for (const [key, incarnation] of undurableIncarnations) {
@@ -125,6 +127,18 @@ export function createChannelMembership(deps: ChannelMembershipDeps): ChannelMem
         undurable.delete(key)
         undurableAbsences.delete(key)
         episodes.delete(key)
+      }
+    }
+    for (const [key, life] of Object.entries(authority.snapshot().personas)) {
+      for (const [binding, replacement] of Object.entries(life.replacedAbsences ?? {})) {
+        if (seenReplacements.has(binding)) continue
+        seenReplacements.add(binding)
+        const generation = generations.get(key)
+        if (generation?.incarnation !== life.incarnation) continue
+        // Invalidate the in-flight scan before requesting a fresh observation.
+        // Other channels keep their proven positives and accepted queues.
+        generation.observations++
+        markHeld(generation, replacement.channel, 'current-membership-missing')
       }
     }
   })
@@ -243,6 +257,10 @@ export function createChannelMembership(deps: ChannelMembershipDeps): ChannelMem
       isExtSharedChannel: evidence.isExtSharedChannel, evidence,
     }, authority.revision)
     if (result.kind !== 'applied') return false
+    completeObservation(generation, evidence)
+    return true
+  }
+  function completeObservation(generation: MembershipGeneration, evidence: MembershipEvidence): void {
     undurable.get(generation.key)?.delete(evidence.event)
     generation.holds.delete(evidence.channel)
     episodes.get(generation.key)?.delete(evidence.channel)
@@ -254,6 +272,47 @@ export function createChannelMembership(deps: ChannelMembershipDeps): ChannelMem
     generation.absent.delete(evidence.channel)
     generation.complete = false
     request(generation.key)
+  }
+  function supersedeWithLeave(generation: MembershipGeneration, evidence: MembershipEvidence): boolean {
+    // Only a distinct, strictly later leave may supersede earlier unresolved
+    // live observations. An ambiguous scan/assignment race still needs review.
+    if (!isCurrent(generation) || !authority.readable || evidence.member ||
+        evidence.originalEvent || evidence.conflict !== 'predecessor') return false
+    const saved = lifeOf(authority, generation.key)?.membershipEvidence?.[evidence.event]
+    if (saved?.state === 'applied' && membershipPayloadIdentity(saved) === membershipPayloadIdentity(evidence)) {
+      // A directory-sync failure may have installed this exact transaction.
+      // Once the owner recovers it, retire the in-memory retry without writing
+      // or treating that historical result as current membership.
+      undurable.get(generation.key)?.delete(evidence.event)
+      const recovered = recoveryLife(generation.key)!
+      if (!pending(recovered, evidence.channel).length && !recovered.membershipAbsenceConflicts?.[evidence.channel]) completeObservation(generation, evidence)
+      return true
+    }
+    const life = recoveryLife(generation.key)!
+    const records = pending(life, evidence.channel).filter(e => e.event !== evidence.event)
+    if (!records.length || records.some(record => {
+      const original = record.originalEvent ? life.membershipEvidence?.[record.originalEvent] : undefined
+      return record.channel !== evidence.channel || record.identity !== generation.identityKey ||
+        compareMembershipEventTimes(record.timestamp, evidence.timestamp) >= 0 ||
+        (record.originalEvent !== undefined && (!original || original.channel !== evidence.channel ||
+          original.identity !== generation.identityKey || compareMembershipEventTimes(original.timestamp, evidence.timestamp) >= 0))
+    })) return false
+    const result = authority.transact(authority.revision, (next, order) => {
+      if (!isCurrent(generation)) throw new Error('Superseded membership observation.')
+      const current = next.personas[generation.key]!
+      current.membershipEvidence ??= {}
+      for (const record of records) current.membershipEvidence[record.event] = { ...record, state: 'superseded', recordedOrder: order }
+      // Keep the existing incarnation, assignment, inventory and boundary
+      // guards, after retiring only the proven earlier live obligations.
+      if (effectFault(generation, evidence, current)) throw new Error('Unresolved membership history.')
+      applySharedMembership(next, order, generation.key, generation.incarnation, {
+        event: evidence.event, channel: evidence.channel, member: false,
+        identity: evidence.identity, boundary: evidence.boundary, evidence,
+      })
+    })
+    if (result.kind !== 'applied') return false
+    for (const record of records) undurable.get(generation.key)?.delete(record.event)
+    completeObservation(generation, evidence)
     return true
   }
   function retain(generation: MembershipGeneration, evidence: MembershipEvidence, fault: MembershipFault): boolean {
@@ -298,7 +357,7 @@ export function createChannelMembership(deps: ChannelMembershipDeps): ChannelMem
       // conflict is durable protection, never converted into a guessed join.
       if (evidence.state === 'pending') {
         handlePending(generation, evidence)
-      } else {
+      } else if (!supersedeWithLeave(generation, evidence)) {
         retain(generation, evidence, evidence.conflict === 'contradictory-id' || evidence.conflict === 'reset-overlap' ? 'history-unresolved' : 'event-order-conflict')
       }
     }
@@ -326,6 +385,8 @@ export function createChannelMembership(deps: ChannelMembershipDeps): ChannelMem
     // Missing metadata has no historical effect to recover. A fully valid
     // absence can discharge that local hold without manufacturing a leave.
     if (!records.length && generation.holds.get(channel) === 'eligibility-missing') return { records: [] }
+    const replaced = Object.values(life.replacedAbsences ?? {}).filter(r => r.channel === channel).sort((a, b) => b.removedOrder - a.removedOrder)[0]
+    if (!records.length && replaced && compareMembershipTimestamp(through, (replaced.at / 1000).toFixed(3)) >= 0) return { records: [] }
     if (!records.length) return { fault: generation.holds.get(channel) ?? 'event-order-conflict' }
     if (records.some(e => !e.conflict || effectFault(generation, e, life, true))) return { fault: 'history-unresolved' }
     // An event_time integer is an interval, not an exact ordering point.
@@ -488,8 +549,10 @@ export function createChannelMembership(deps: ChannelMembershipDeps): ChannelMem
     // Coarse event_time covers the whole second. Only an interval wholly
     // before the configured reset is demonstrably from the old incarnation.
     const upperTimestamp = membershipTimestampUpperBound(timestamp)
-    if (life.createdAt !== undefined && compareMembershipTimestamp(upperTimestamp, (life.createdAt / 1000).toFixed(3)) < 0) return true
-    const resetOverlap = life.createdAt !== undefined && compareMembershipTimestamp(timestamp, (life.createdAt / 1000).toFixed(3)) <= 0
+    const resets = Object.values(life.replacedAbsences ?? {}).flatMap(r => r.channel === channel ? [r.at] : [])
+    const resetAt = resets.length ? Math.max(life.createdAt ?? 0, ...resets) : life.createdAt
+    if (resetAt !== undefined && compareMembershipTimestamp(upperTimestamp, (resetAt / 1000).toFixed(3)) < 0) return true
+    const resetOverlap = resetAt !== undefined && compareMembershipTimestamp(timestamp, (resetAt / 1000).toFixed(3)) <= 0
     const incoming: MembershipEventPayload = {
       channel, member, identity: generation.identityKey, timestamp,
       ...(member && (event['channel_type'] === 'C' || event['channel_type'] === 'G')
@@ -499,7 +562,8 @@ export function createChannelMembership(deps: ChannelMembershipDeps): ChannelMem
     const old = life.membershipEvidence?.[id] ?? undurable.get(key)?.get(id)
     if (old && membershipPayloadIdentity(old) === membershipPayloadIdentity(incoming)) {
       if (old.state === 'pending') return handlePending(generation, old)
-      if (old.state === 'conflict') return retain(generation, old, old.conflict === 'contradictory-id' ? 'history-unresolved' : 'event-order-conflict')
+      if (old.state === 'conflict') return (!provenance.candidate && supersedeWithLeave(generation, old)) ||
+        retain(generation, old, old.conflict === 'contradictory-id' ? 'history-unresolved' : 'event-order-conflict')
       // An exact original retry cannot acknowledge an unsaved contradiction.
       const contradiction = pending(recoveryLife(key), channel).find(e => undurable.get(key)?.has(e.event))
       return !contradiction || retain(generation, contradiction, 'history-unresolved')
@@ -528,6 +592,10 @@ export function createChannelMembership(deps: ChannelMembershipDeps): ChannelMem
     const recordedConflict = life.membershipEvidence?.[evidenceId] ?? undurable.get(key)?.get(evidenceId)
     if (recordedConflict) {
       if (membershipPayloadIdentity(recordedConflict) !== membershipPayloadIdentity(incoming)) return false
+      if (recordedConflict.state === 'superseded') {
+        const unsaved = pending(recoveryLife(key), channel).find(e => undurable.get(key)?.has(e.event))
+        return !unsaved || retain(generation, unsaved, 'history-unresolved')
+      }
       return retain(generation, recordedConflict, 'history-unresolved')
     }
     const evidence: MembershipEvidence = {
@@ -543,6 +611,7 @@ export function createChannelMembership(deps: ChannelMembershipDeps): ChannelMem
       const originalChannel = old?.channel ?? applied!.channel
       markHeld(generation, originalChannel, 'history-unresolved')
     }
+    if (!provenance.candidate && supersedeWithLeave(generation, evidence)) return true
     return evidence.state === 'pending' ? handlePending(generation, evidence) :
       retain(generation, evidence, conflict === 'contradictory-id' ? 'history-unresolved' : 'event-order-conflict')
   }

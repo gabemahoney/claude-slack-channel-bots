@@ -78,7 +78,7 @@ export function validateMembershipEvidence(value: unknown, revision: number): as
     if (!object(v) || !MEMBERSHIP_EVENT_ID_RE.test(id) || v['event'] !== id ||
         (v['originalEvent'] !== undefined && (typeof v['originalEvent'] !== 'string' ||
           !MEMBERSHIP_EVENT_ID_RE.test(v['originalEvent']) || v['originalEvent'] === id ||
-          v['state'] !== 'conflict' || v['conflict'] !== 'contradictory-id')) ||
+          (v['state'] !== 'conflict' && v['state'] !== 'superseded') || v['conflict'] !== 'contradictory-id')) ||
         typeof v['channel'] !== 'string' || !CHANNEL_ID_RE.test(v['channel']) ||
         typeof v['member'] !== 'boolean' || typeof v['identity'] !== 'string' || !v['identity'] ||
         typeof v['connectionId'] !== 'string' || !/^[a-zA-Z0-9-]{1,128}$/.test(v['connectionId']) ||

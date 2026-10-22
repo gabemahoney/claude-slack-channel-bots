@@ -10,10 +10,12 @@ import { createDeliveryPreparation } from '../src/delivery-intake.ts'
 import type { AcceptedRecord } from '../src/delivery-queue.ts'
 import { sanitizeFilename } from '../src/lib.ts'
 import { createFakeClock } from './test-helpers/fake-clock.ts'
-import { makeRoutingHarness, resetRoutingState, NEVER_FIRE_RESTART_DELAY_S, type RoutingHarness } from './test-helpers/persona-routing-harness.ts'
+import { makeRoutingHarness, observedMembership, resetRoutingState, NEVER_FIRE_RESTART_DELAY_S, type RoutingHarness } from './test-helpers/persona-routing-harness.ts'
 import { makeAppMention, makeChannelMessage, makeDm, makeBotMessage, makeWebhookPost, makeStubSlack, mentionText, ENVELOPE_FLAG_FORMS, type SlackEvent } from './test-helpers/slack-stub.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
 import { readQueue, seedQueue, slackInput, queuePath } from './test-helpers/delivery-queue.ts'
+import { createChannelDeliveryStore } from '../src/channel-delivery.ts'
+import { makeSharedAuthority } from './test-helpers/shared-channels.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { makeQueue } from './test-helpers/delivery-queue.ts'
 import { isRestartPendingOrActive } from '../src/restart.ts'
@@ -22,7 +24,14 @@ let dir: string; let harnesses: RoutingHarness[]
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'routing-queue-')); harnesses = []; resetRoutingState() })
 afterEach(async () => { for (const h of harnesses) { h.hold.cancelAll(); h.releaseLaunches(); await h.queue.stop(); assertNoLeak(h.captured()) }; resetRoutingState(); rmSync(dir, { recursive: true, force: true }) })
 function harness(opts: Parameters<typeof makeRoutingHarness>[2] = {}) {
-  const h = makeRoutingHarness([{ name: 'alpha', channels: [{ id: CA, delivery: 'all' }, { id: CS, delivery: 'mentions' }], dm: { enabled: true } }, { name: 'beta', channels: [{ id: CB, delivery: 'all' }, { id: CS, delivery: 'mentions' }] }], dir, { restartDelayS: NEVER_FIRE_RESTART_DELAY_S, ...opts }); harnesses.push(h); return h
+  const h = makeRoutingHarness([{ name: 'alpha', channels: [{ id: CA, delivery: 'all' }, { id: CS, delivery: 'mentions' }], dm: { enabled: true } }, { name: 'beta', channels: [{ id: CB, delivery: 'all' }, { id: CS, delivery: 'mentions' }] }], dir, { membership: observedMembership({ alpha: [CA, CS, ...(opts.mode === 'open' ? [CX] : [])], beta: [CB, CS] }), restartDelayS: NEVER_FIRE_RESTART_DELAY_S, ...opts }); harnesses.push(h); return h
+}
+// Actual shared projection plus explicit current positives for the low-level
+// queue tests. Neither the selector nor the intake algorithm is replaced.
+function selectionInputs(config: ReturnType<typeof makeMultiPersonaConfig>, channels: string[]) {
+  const input = { ...config, personas: config.personas.map(({ key, index, sections, ...p }) => p) }
+  const store = createChannelDeliveryStore(makeSharedAuthority(dir, input))
+  return { getChannelDelivery: () => store, membership: observedMembership(Object.fromEntries(config.personas.map(p => [p.key, channels]))) }
 }
 const facts = (h: RoutingHarness, name: string) => h.queued(name).map(i => ({ channel: i.accepted.channel, ts: i.accepted.ts, via: i.accepted.via, text: i.accepted.text }))
 async function each(h: RoutingHarness, event: unknown) { await h.receive(event, ['alpha']); await h.receive(event, ['beta']) }
@@ -133,7 +142,7 @@ describe('fungible mode', () => {
 test('partial fanout suppresses ack; retry prepares retained accepted-only A and newly stored B after aggregate ack', async () => {
   const queue = await makeQueue(dir); const config = makeMultiPersonaConfig([{ name: 'alpha', channels: [{ id: CS, delivery: 'all' }] }, { name: 'beta', channels: [{ id: CS, delivery: 'all' }] }], dir)
   let failing = true; const order: string[] = []
-  const routing = createPersonaRouting({ getPersonaConfig: () => config, getBotIdentity: () => ({ botUserId: 'U0BOT001', botId: 'B0BOT001' }), archive: () => {}, log: () => {}, queue: { lookupSlackKey: queue.lookupSlackKey, accept: async (key, input) => { order.push('store:' + key); return key === 'beta' && failing ? { status: 'failed', error: new Error('EIO') } : queue.accept(key, input) } }, onReceived: (key) => { order.push('received:' + key) }, prepare: async (key, item) => { order.push('prepare:' + key); await queue.append(key, { v: 1, kind: 'fixed', seq: item.accepted.seq, parts: ['fixed'] }) } })
+  const routing = createPersonaRouting({ ...selectionInputs(config, [CA, CB, CS]), getPersonaConfig: () => config, getBotIdentity: () => ({ botUserId: 'U0BOT001', botId: 'B0BOT001' }), archive: () => {}, log: () => {}, queue: { lookupSlackKey: queue.lookupSlackKey, accept: async (key, input) => { order.push('store:' + key); return key === 'beta' && failing ? { status: 'failed', error: new Error('EIO') } : queue.accept(key, input) } }, onReceived: (key) => { order.push('received:' + key) }, prepare: async (key, item) => { order.push('prepare:' + key); await queue.append(key, { v: 1, kind: 'fixed', seq: item.accepted.seq, parts: ['fixed'] }) } })
   const event = makeChannelMessage({ channel: CS }); await routing.receive(event, () => { order.push('ack') }, ['alpha', 'beta'])
   expect(order).toEqual(['store:alpha', 'store:beta', 'received:alpha']); expect(queue.items('alpha')).toHaveLength(1); expect(queue.items('beta')).toEqual([])
   failing = false; order.length = 0; await routing.receive(event, () => { order.push('ack') }, ['alpha', 'beta'])
@@ -150,7 +159,7 @@ test('a fresh routing factory acknowledges a preexisting fixed undelivered Slack
   const before = readQueue(dir)
   const calls: string[] = []
   // No earlier call has populated this factory's in-memory dedupe map.
-  const routing = createPersonaRouting({ getPersonaConfig: () => config, getBotIdentity: () => ({ botUserId: 'U0BOT001', botId: 'B0BOT001' }),
+  const routing = createPersonaRouting({ ...selectionInputs(config, [CA, CB, CS]), getPersonaConfig: () => config, getBotIdentity: () => ({ botUserId: 'U0BOT001', botId: 'B0BOT001' }),
     queue, archive: () => {}, log: () => {}, prepare: async () => { calls.push('prepare') }, onReceived: () => { calls.push('received') },
     isPersonaUp: () => { calls.push('recovery'); return true }, readRowLiveness: async () => { calls.push('read'); return { kind: 'dead', cause: 'ended' } },
   })
@@ -166,9 +175,9 @@ test('a fresh routing factory acknowledges a preexisting fixed undelivered Slack
 test('ack precedes row read and all lookups; fixed bytes are durable before wake and survive replay/name changes', async () => {
   const queue = await makeQueue(dir); const order: string[] = []; const config = makeMultiPersonaConfig([{ name: 'alpha' }], dir)
   const preparation = createDeliveryPreparation({ queue, clientFor: () => undefined, resolveUserName: async () => { order.push('lookup'); return 'first-name' }, wake: key => { order.push('wake'); expect(readQueue(dir, key).some(r => r.kind === 'fixed')).toBe(true) } })
-  const routing = createPersonaRouting({ getPersonaConfig: () => config, getBotIdentity: () => ({ botUserId: 'U0BOT001', botId: 'B0BOT001' }), queue, prepare: preparation.prepare, archive: () => {}, log: () => {}, isPersonaUp: () => false, readRowLiveness: async () => { throw new Error('must be gated') } })
+  const routing = createPersonaRouting({ ...selectionInputs(config, [CA, CB, CS]), getPersonaConfig: () => config, getBotIdentity: () => ({ botUserId: 'U0BOT001', botId: 'B0BOT001' }), queue, prepare: preparation.prepare, archive: () => {}, log: () => {}, isPersonaUp: () => true, readRowLiveness: async () => { order.push('row-read'); return { kind: 'dead', cause: 'ended' } } })
   await routing.receive(makeChannelMessage({ channel: config.personas[0]!.channels[0]!.id }), () => { order.push('ack') }, 'alpha')
-  expect(order).toEqual(['ack', 'lookup', 'wake']); const bytes = queue.items('alpha')[0]!.fixed!.parts; expect(bytes.join('')).toContain('first-name'); await preparation.stop(); await queue.stop()
+  expect(order).toEqual(['ack', 'row-read', 'lookup', 'wake']); const bytes = queue.items('alpha')[0]!.fixed!.parts; expect(bytes.join('')).toContain('first-name'); await preparation.stop(); await queue.stop()
   const replay = await makeQueue(dir); const p2 = createDeliveryPreparation({ queue: replay, clientFor: () => undefined, resolveUserName: async () => { throw new Error('fixed must not look up again') } }); await p2.recover(); expect(replay.items('alpha')[0]!.fixed!.parts).toEqual(bytes); await p2.stop(); await replay.stop()
 })
 
@@ -206,7 +215,7 @@ test('hung independent lookups acknowledge within 3s, use bounded fallbacks and 
   const config = makeMultiPersonaConfig([{ name: 'alpha' }], dir)
   let acknowledgedAt: number | undefined; const wakes: string[] = []
   const preparation = createDeliveryPreparation({ queue, clock, clientFor: () => undefined, resolveUserName: () => new Promise(() => {}), wake: key => { expect(readQueue(dir, key).some(r => r.kind === 'fixed')).toBe(true); wakes.push(key) } })
-  const routing = createPersonaRouting({ getPersonaConfig: () => config, getBotIdentity: () => ({ botUserId: 'U0BOT001', botId: 'B0BOT001' }), queue, prepare: preparation.prepare, archive: () => {}, log: () => {}, isPersonaUp: () => false, now: clock.now })
+  const routing = createPersonaRouting({ ...selectionInputs(config, [CA, CB, CS]), getPersonaConfig: () => config, getBotIdentity: () => ({ botUserId: 'U0BOT001', botId: 'B0BOT001' }), queue, prepare: preparation.prepare, archive: () => {}, log: () => {}, isPersonaUp: () => true, now: clock.now })
   try {
     const started = clock.now()
     const handling = routing.receive(makeChannelMessage({ channel: config.personas[0]!.channels[0]!.id, user: 'U0SENDER1' }), () => { acknowledgedAt = clock.now() }, 'alpha')
@@ -220,7 +229,7 @@ test('hung independent lookups acknowledge within 3s, use bounded fallbacks and 
 
 test('channel caches are persona scoped, slow preparation leaves unrelated work free and fixed parts stay immutable', async () => {
   const fake = createFakeClock({ start: 1700000000000 })
-  const h = makeRoutingHarness([{ name: 'alpha', channels: [{ id: CS, delivery: 'all' }] }, { name: 'beta', channels: [{ id: CS, delivery: 'all' }] }], dir, { preparationClock: fake, stubOptions: { alpha: { info: [{ kind: 'never' }] }, beta: { info: [{ kind: 'ok', result: { channel: { name: 'beta-room' } } }] } } })
+  const h = makeRoutingHarness([{ name: 'alpha', channels: [{ id: CS, delivery: 'all' }] }, { name: 'beta', channels: [{ id: CS, delivery: 'all' }] }], dir, { membership: observedMembership({ alpha: [CS], beta: [CS] }), preparationClock: fake, stubOptions: { alpha: { info: [{ kind: 'never' }] }, beta: { info: [{ kind: 'ok', result: { channel: { name: 'beta-room' } } }] } } })
   harnesses.push(h)
   try {
     const handling = h.receive(makeChannelMessage({ channel: CS, ts: '1700000000.000001' }))
@@ -241,7 +250,7 @@ test('decision failure withholds ack until replay can durably retain both recipi
   const config = makeMultiPersonaConfig([{ name: 'alpha', channels: [{ id: CA, delivery: 'all' }] }, { name: 'beta', channels: [{ id: CA, delivery: 'all' }] }], dir)
   let acknowledgments = 0
   let identityAvailable = false
-  const routing = createPersonaRouting({ queue, now: clock.now, prepare: async () => {}, getPersonaConfig: () => config, getBotIdentity: () => { if (!identityAvailable) throw new Error('identity unavailable'); return { botUserId: 'U0BOT001', botId: 'B0BOT001' } }, archive: () => {}, log: () => {} })
+  const routing = createPersonaRouting({ ...selectionInputs(config, [CA]), queue, now: clock.now, prepare: async () => {}, getPersonaConfig: () => config, getBotIdentity: () => { if (!identityAvailable) throw new Error('identity unavailable'); return { botUserId: 'U0BOT001', botId: 'B0BOT001' } }, archive: () => {}, log: () => {} })
   try {
     const keys = ['alpha', 'beta'], text = '  > "quoted"\r\n\t repeated  repeated\n\n  ', ts = '1700000000.000001'
     const event = makeChannelMessage({ channel: CA, user: 'U0SENDER1', ts, text })

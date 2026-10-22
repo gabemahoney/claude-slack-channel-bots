@@ -83,6 +83,9 @@ import { SocketModeClient, type Logger } from '@slack/socket-mode'
 import type { WebClient, WebClientOptions } from '@slack/web-api'
 
 import type { Persona } from '../src/config.ts'
+import { createChannelDeliveryStore } from '../src/channel-delivery.ts'
+import { makeSharedAuthority } from './test-helpers/shared-channels.ts'
+import { observedMembership } from './test-helpers/persona-routing-harness.ts'
 import { credentialsFilesToProtect, DEFAULT_REPLY_CHUNK_LIMIT, DEFAULT_REPLY_CHUNK_MODE } from '../src/config.ts'
 import { assertSendable } from '../src/lib.ts'
 import { createPersonaEventRouter, type PersonaEventRouterDeps } from '../src/persona-event-router.ts'
@@ -200,6 +203,7 @@ let savedStateDir: string | undefined
 let savedDryRun: string | undefined
 let openDbs: Database[]
 let openClients: Client[]
+let managedRoutings: ReturnType<typeof makeManagedRouting>[]
 
 beforeAll(() => {
   savedStateDir = process.env['SLACK_STATE_DIR']
@@ -221,6 +225,7 @@ beforeEach(() => {
   harnesses = []
   openDbs = []
   openClients = []
+  managedRoutings = []
   resetRoutingState()
   initRestart(makeRestartDeps({ restartDelayS: NEVER_FIRE_RESTART_DELAY_S }))
   consoleLines = []
@@ -235,6 +240,7 @@ afterEach(async () => {
       await h.manager.stopAll()
       assertNoLeak({ lines: h.lines }, 'manager lines')
     }
+    for (const managed of managedRoutings.splice(0)) await managed.close()
     for (const client of openClients.splice(0)) await client.close()
     for (const db of openDbs.splice(0)) db.close()
     stopPermissionPoller()
@@ -255,6 +261,22 @@ function harness(opts: Parameters<typeof makeConnectionHarness>[2] = {}): Connec
   const h = makeConnectionHarness(SPECS, dir, opts)
   harnesses.push(h)
   return Object.assign(h, { A: h.p(ALPHA), B: h.p(BETA) })
+}
+
+/** Real shared choices and independent current membership for the routing
+ * consumers. Configured channels alone never authorize intake. */
+function managedRouting(h: ConnectionHarness, opts: Parameters<typeof makeManagedRouting>[2] = {}) {
+  const config = h.config!
+  const store = createChannelDeliveryStore(makeSharedAuthority(dir, {
+    ...config, personas: config.personas.map(({ key, index, sections, ...p }) => p),
+  }))
+  const managed = makeManagedRouting(h, dir, {
+    getChannelDelivery: () => store,
+    membership: observedMembership({ [h.p(ALPHA).key]: [CA, CS], [h.p(BETA).key]: [CB, CS] }),
+    ...opts,
+  })
+  managedRoutings.push(managed)
+  return managed
 }
 
 /** Bring A and B up; both must be up. */
@@ -402,13 +424,16 @@ describe('each connection\'s inbound events reach the intake with its own person
   test('the single-socket fan-out is gone: a message in a channel both personas hear (`all`), received on A\'s connection, reaches A\'s session only; the same on B\'s reaches B\'s only (real persona-routing)', async () => {
     const h = harness()
     await bringUpBoth(h)
-    const { routing, logs, queue: sessions } = makeManagedRouting(h, dir)
+    const { routing, logs, queue: sessions } = managedRouting(h)
     plugRouter(h, routing)
 
     const first = makeChannelMessage({ channel: CS, text: 'for whoever received it' })
     await h.stub(h.A).socket.deliver(first)
 
-    expect(sessions.items(h.A.key)!.map((n) => n.accepted.ts)).toEqual([first.ts as string])
+    expect(sessions.items(h.A.key).map(n => ({ channel: n.accepted.channel, ts: n.accepted.ts, key: n.accepted.key, text: n.accepted.text, via: n.accepted.via }))).toEqual([
+      { channel: CS, ts: first.ts as string, key: { chat_id: CS, ts: first.ts as string }, text: first.text as string, via: 'receive_all_shared' },
+    ])
+    const acceptedA = structuredClone(sessions.items(h.A.key))
     expect(sessions.items(h.B.key)).toEqual([])
     // The user-name lookup ran on the receiving persona's client only.
     expect(h.stub(h.A).calls.usersInfo).toHaveLength(1)
@@ -418,10 +443,13 @@ describe('each connection\'s inbound events reach the intake with its own person
     const second = makeChannelMessage({ channel: CS, text: 'again' })
     await h.stub(h.B).socket.deliver(second)
 
-    expect(sessions.items(h.B.key)!.map((n) => n.accepted.ts)).toEqual([second.ts as string])
-    expect(sessions.items(h.A.key)).toHaveLength(1)
+    expect(sessions.items(h.B.key).map(n => ({ channel: n.accepted.channel, ts: n.accepted.ts, key: n.accepted.key, text: n.accepted.text, via: n.accepted.via }))).toEqual([
+      { channel: CS, ts: second.ts as string, key: { chat_id: CS, ts: second.ts as string }, text: second.text as string, via: 'receive_all_shared' },
+    ])
+    expect(sessions.items(h.A.key)).toEqual(acceptedA)
     expect(h.stub(h.B).calls.usersInfo).toHaveLength(1)
     expect(h.stub(h.B).socket.acks).toHaveLength(1)
+    expect(h.stub(h.A).socket.acks).toHaveLength(1)
     assertNoLeak({ logs })
   })
 
@@ -429,7 +457,7 @@ describe('each connection\'s inbound events reach the intake with its own person
     const h = harness()
     await bringUpBoth(h)
     const archived: string[] = []
-    const { routing, queue: sessions } = makeManagedRouting(h, dir, { archive: (key) => void archived.push(key) })
+    const { routing, queue: sessions } = managedRouting(h, { archive: (key) => void archived.push(key) })
     const { router } = plugRouter(h, routing)
     const before = slackCalls(h.stub(h.A), h.stub(h.B))
     const ack = recordingAck()
@@ -1259,7 +1287,7 @@ describe('archive rows are written with the receiving persona\'s name resolver',
     openDbs.push(db)
     const errors: unknown[] = []
     const write = createPersonaArchiveWriter(db, createPersonaNameResolverSource(h.clientFor), (err) => void errors.push(err))
-    const { routing } = makeManagedRouting(h, dir, { archive: write })
+    const { routing } = managedRouting(h, { archive: write })
     const { router } = plugRouter(h, routing)
     const rows = () => db.query('SELECT channel_id, channel_name, sender_id, sender_name FROM messages ORDER BY timestamp').all() as ArchiveRowView[]
     return { h, db, errors, router, rows }

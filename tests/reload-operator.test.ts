@@ -12,6 +12,7 @@ import { REVIEW_OMISSION_CLAUSE, REVIEW_RETENTION_CLAUSE, REVIEW_RESET_CLAUSE } 
 import { makeReloadHarness, type ReloadHarness, type ReloadRun, type ReloadRunOptions } from './test-helpers/reload-harness.ts'
 import { assertNoLeak, sentinelInMessage } from './test-helpers/credentials.ts'
 import { membershipPage, SHARED_CHANNEL_IDS } from './test-helpers/shared-channels.ts'
+import { stubCallCount } from './test-helpers/agent-director-stub.ts'
 
 const { primary: A, secondary: B, private: C } = SHARED_CHANNEL_IDS
 let h: ReloadHarness
@@ -634,4 +635,62 @@ test.each(['changed', 'observation-write-fails', 'unchanged'] as const)('confirm
   if (variant === 'observation-write-fails') expect(run.since(cp).writes.some(write => !write.ok)).toBe(true)
   await confirm(run)
   expect(authority(run).config().personas[0]!.stop_hook_bootstrap).toBe(false)
+})
+
+import { absenceReplacementBinding } from '../src/shared-channels.ts'
+import { REVIEW_ABSENCE_REPLACEMENT } from '../src/reload-preview-clauses.ts'
+
+test('reviewed absence replacement preserves the exact conflict and unrelated channel while requiring fresh current evidence', async () => {
+  const alpha = persona(); h.materialize(alpha); h.writeConfig({ personas: [alpha], channel_mode: 'open' })
+  const run = await start({ dryRun: false })
+  run.stub('alpha').script.inventory.push(membershipPage([A, B])); await run.membershipClock.runNext()
+  const owner = authority(run), generation = run.membership.generation('alpha')!, baseline = owner.snapshot()
+  expect(run.membership.read('alpha', A, 'open').kind).toBe('eligible')
+  automatic(run, 'mentions')
+  expect(run.membership.commitInventory(generation, { scanId: 'absence-assignment-race',
+    observedThrough: ((run.membershipClock.now() + 1) / 1000).toFixed(3), observedRevision: baseline.revision,
+    absent: new Map([[A, baseline.personas.alpha!.membership[A]!.boundary]]),
+  }).kind).toBe('unresolved')
+  const conflict = owner.snapshot().personas.alpha!.membershipAbsenceConflicts![A]!
+  const binding = absenceReplacementBinding(owner.snapshot(), 'alpha', A)!
+  expect(binding).toMatch(/^[a-f0-9]{64}$/)
+  const sibling = owner.snapshot().personas.alpha!.assignments[B]
+  const request = buildOperatorAssignment(owner.config().personas[0]!, owner.incarnation('alpha')!, A, 'all', binding)
+  const session = run.registerSession('alpha'), client = run.connections.clientFor('alpha'), socket = run.stub('alpha').socket
+  const cp = run.checkpoint(), timeline = run.lifecycle.timeline.length
+  const composition = run.composition!, calls = composition.calls.length, adCalls = stubCallCount(composition.agentDirector)
+  const sockets = () => run.stub('alpha').sockets.map(s => ({ starts: s.startCalls, disconnects: s.disconnectCalls }))
+  const beforeSockets = sockets()
+  const expectKeptConnections = () => {
+    expect(run.composition!.calls.slice(calls)).toEqual([])
+    expect(stubCallCount(composition.agentDirector)).toBe(adCalls)
+    expect(run.since(cp).slackBuilds).toBe(0); expect(run.since(cp).slackCalls).toEqual([])
+    expect(run.session('alpha')).toBe(session); expect(session.connected).toBe(true)
+    expect(run.connections.clientFor('alpha')).toBe(client); expect(run.stub('alpha').socket).toBe(socket)
+    expect(sockets()).toEqual(beforeSockets)
+  }
+  run.request('request', [request], 'replace-absence'); await tick(run)
+  expect(h.pendingBody()).toContain(REVIEW_ABSENCE_REPLACEMENT)
+  expect(choice(run)).toBe('mentions')
+  expect(run.since(cp).lifecycle).toEqual([])
+  expect(run.lifecycle.timeline.slice(timeline)).toEqual([])
+  expectKeptConnections()
+  await confirm(run)
+  expect(run.since(cp).lifecycle).toEqual([{ op: 'update-in-place', key: h.key('alpha'), via: 'apply', settings: ['delivery'] }])
+  expect(run.lifecycle.timeline.slice(timeline)).toEqual([
+    { op: 'update-in-place', key: h.key('alpha'), phase: 'start' },
+    { op: 'update-in-place', key: h.key('alpha'), phase: 'settled' },
+  ])
+  expectKeptConnections()
+  const repaired = owner.snapshot().personas.alpha!
+  expect(repaired.membershipAbsenceConflicts![A]).toBeUndefined()
+  expect(repaired.replacedAbsences![binding]!.conflict).toEqual(conflict)
+  expect(repaired.assignments[A]!.delivery).toBe('all')
+  expect(repaired.assignments[A]!.order).toBe(repaired.leaves[A]!.boundary + 1)
+  expect(repaired.assignments[B]).toEqual(sibling)
+  expect(run.membership.read('alpha', A, 'open').kind).toBe('unresolved')
+  expect(run.membership.read('alpha', B, 'open').kind).toBe('eligible')
+  run.stub('alpha').script.inventory.push(membershipPage([A, B])); await run.membershipClock.runNext()
+  expect(run.membership.read('alpha', A, 'open').kind).toBe('eligible')
+  expect(choice(run)).toBe('all'); expect(absenceReplacementBinding(owner.snapshot(), 'alpha', A)).toBeUndefined()
 })

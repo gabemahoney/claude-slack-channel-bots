@@ -20,6 +20,8 @@ export interface OperatorAssignment {
   delivery: DeliveryMode
   incarnation: string | null
   declaration: PersonaDeclaration
+  /** Explicit reviewed replacement of this exact unresolved absence history. */
+  absence_replacement?: string
 }
 export type ReviewRequest = {
   format: typeof REVIEW_REQUEST_FORMAT
@@ -44,7 +46,8 @@ function keys(value: object, expected: string[]): boolean {
   return JSON.stringify(Object.keys(value).sort()) === JSON.stringify(expected.sort())
 }
 export function validOperatorAssignment(value: unknown): value is OperatorAssignment {
-  return object(value) && keys(value, ['key', 'channel', 'delivery', 'incarnation', 'declaration']) &&
+  return object(value) && keys(value, ['key', 'channel', 'delivery', 'incarnation', 'declaration', ...(Object.hasOwn(value, 'absence_replacement') ? ['absence_replacement'] : [])]) &&
+    (value['absence_replacement'] === undefined || (typeof value['absence_replacement'] === 'string' && /^[a-f0-9]{64}$/.test(value['absence_replacement']))) &&
     typeof value['key'] === 'string' && PERSONA_KEY_RE.test(value['key']) &&
     typeof value['channel'] === 'string' && CHANNEL_ID_RE.test(value['channel']) &&
     DELIVERY_MODES.includes(value['delivery'] as DeliveryMode) &&
@@ -69,8 +72,9 @@ export function parseReviewRequest(value: unknown): ReviewRequest | undefined {
 export function parseReviewRequestBytes(bytes: Uint8Array): ReviewRequest | undefined {
   try { return parseReviewRequest(JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes))) } catch { return undefined }
 }
-export function buildOperatorAssignment(persona: Pick<Persona, 'key' | 'name' | 'credentials_file' | 'working_directory'>, incarnation: string | null, channel: string, delivery: DeliveryMode): OperatorAssignment {
+export function buildOperatorAssignment(persona: Pick<Persona, 'key' | 'name' | 'credentials_file' | 'working_directory'>, incarnation: string | null, channel: string, delivery: DeliveryMode, absenceReplacement?: string): OperatorAssignment {
   const assignment = { key: persona.key, channel, delivery, incarnation,
+    ...(absenceReplacement === undefined ? {} : { absence_replacement: absenceReplacement }),
     declaration: { name: persona.name, credentials_file: persona.credentials_file, working_directory: persona.working_directory } }
   if (!validOperatorAssignment(assignment)) throw new Error('Invalid operator assignment.')
   return assignment

@@ -70,10 +70,10 @@ Replace the channel IDs, user IDs and paths with your own. Each persona's creden
 | `name` | string | yes | — | Any non-empty string; no format rule. See [Persona name and key](#persona-name-and-key). |
 | `credentials_file` | path | yes | — | Path to the persona's [credentials file](#credentials-files). |
 | `working_directory` | path | yes | — | Working directory of the persona's Claude instance. It must exist before the persona can come up. |
-| `channels` | array | yes unless `dm.enabled` is `true` | empty | Shared channel choices in both modes, a list of [channel entries](#channel-entries). See [Channel delivery](#channel-delivery). |
+| `channels` | array | fresh submission: yes unless `dm.enabled` is `true` | empty | Shared channel choices in both modes, a list of [channel entries](#channel-entries). See [Channel delivery](#channel-delivery). |
 | `dm.enabled` | boolean | no | `false` | The persona's DMs switch. See [Direct messages](#direct-messages-dmenabled). |
 | `dm.contact` | string | when `permission_prompts` is `"dm"` | — | A Slack user ID such as `U0123456789`: the person a `"dm"` destination addresses. In Slack, open the person’s profile, then **⋮** → **Copy member ID**. |
-| `permission_prompts` | string | yes | — | Required in both modes: the persona’s **destination**, where its permission prompts and server notices are posted. One of its listed channel IDs, including `off`, or `"dm"`. See [Permission prompts](#permission-prompts). |
+| `permission_prompts` | string | yes | — | Required in both modes: the persona’s **destination**, where its permission prompts and server notices are posted. For a fresh submission, one of its listed channel IDs, including `off`, or `"dm"`. See [Permission prompts](#permission-prompts). |
 | `claude_config_dir` | path | no | top-level `claude_config_dir` | Claude config directory for this persona. See [Next-launch settings](#next-launch-settings). |
 | `stop_hook_bootstrap` | boolean | no | top-level `stop_hook_bootstrap` | Slack reply reminder switch for this persona. Confirmed changes apply immediately; see [Slack reply reminders](bots.md#slack-reply-reminders). |
 
@@ -171,12 +171,10 @@ Receiving DMs and replying in an existing DM (a `D…` ID) work without the scop
 
 `permission_prompts` is required in both modes; see [Permission prompts in both modes](channel-modes.md#permission-prompts-in-both-modes). It is the persona's destination: its permission prompts and its server notices, such as *Message not saved* notices and restart-limit warnings, are posted there as the persona.
 
-- **A channel ID:** one of the persona's own `channels`. Everyone in that channel sees the prompts and notices.
+- **A channel ID:** a fresh destination must be in the persona's own `channels`, including `off`. A validated unchanged destination remains selected after same-incarnation verified removal, even with zero entries and DMs disabled; restart or an unrelated confirmation needs no re-add. Everyone in that channel sees the prompts and notices.
 - **`"dm"`:** a DM from the persona's app to its `dm.contact`. It needs `dm.enabled: true` and a `dm.contact`.
 
-Choose a destination with [channel delivery](#channel-delivery) in mind. If two personas each receive every message in the other’s destination and storing fails, the notices stop after one *Message not saved* each per episode. Further failures are counted in `server.log` (see [Troubleshooting](troubleshooting.md#troubleshooting)).
-
-[Permission Relay](bots.md#permission-relay) covers how prompts are delivered and answered, and [Troubleshooting](troubleshooting.md#troubleshooting) what happens when Slack refuses a post to the destination.
+Removal evidence grants no operator exception flag, new invalid destination, recreated entry or inherited audience after reset. Choose with [channel delivery](#channel-delivery) in mind: if two personas each receive every message in the other’s destination and storing fails, notices stop after one *Message not saved* each per episode, with further failures counted in `server.log`. [Permission Relay](bots.md#permission-relay) covers responses; [Troubleshooting](troubleshooting.md#troubleshooting) covers failed posts.
 
 ### Next-launch settings
 
@@ -199,4 +197,4 @@ Use `--console` instead of `--claudeai` for a Console account. When neither the 
 
 ### Load-time rules
 
-Before it applies `config.json`, the server checks the whole file and reports the first rule it breaks. Besides each field's own type and allowed values (the tables above), no persona's name or key may equal another persona's name or key, no key may start with another persona's key (see [Persona name and key](#persona-name-and-key)), and no two personas may share a `working_directory` or `credentials_file`. `channels` and `permission_prompts` are validated in both modes. Only `strict` and `open` are accepted for `channel_mode`. The debug skill's [The load-time rules](../skills/debug-slack-channel-bots/SKILL.md#the-load-time-rules) lists every rule, and [Configuration rejections](../skills/debug-slack-channel-bots/SKILL.md#configuration-rejections) every error with its fix. At a start with no last-applied record an error stops the start; on a running server it shows as an `INVALID` pending change (see [Reload](reload.md#reload)).
+Before applying `config.json`, the server reports the first violation: names and keys must be unique with no key prefixes, working directories and credentials files cannot be shared, and fields must meet their type/value rules (see [Persona name and key](#persona-name-and-key)). Both modes validate `channels` and `permission_prompts`, with only the trusted unchanged-destination qualification [above](#permission-prompts); `channel_mode` accepts only `strict` or `open`. A fresh-install violation stops startup and a running edit produces an `INVALID` preview; the debug skill lists [every load-time rule](../skills/debug-slack-channel-bots/SKILL.md#the-load-time-rules) and [rejection with its fix](../skills/debug-slack-channel-bots/SKILL.md#configuration-rejections).

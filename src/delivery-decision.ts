@@ -1,85 +1,11 @@
-/**
- * delivery-decision.ts — The one place inbound delivery is decided, in both
- * channel modes (channel rules with to,
- * direct messages`via` with).
- *
- * `decideDelivery` takes a raw Slack `message` / `app_mention` event, the
- * receiving persona P (key, bot user ID, bot ID, channel entries, DMs switch),
- * a read-only view of every applied persona's key and channel entries, and,
- * optionally, the fungible-mode inputs (`FungibleDecisionInputs`: the channel
- * mode, the envelope flag, the channel-ID pattern, the stored choices with
- * their readability, and every applied persona's fungible destination). It
- * returns either deliver (with how the message reached P, `via`) or drop
- * (with a machine-readable reason). With no fungible-mode inputs, or with
- * their mode `declarative`, the decision is declarative mode's: the stored
- * choices, the envelope flag and the fungible destinations play no part, and
- * no outcome carries a key beyond declarative mode's.
- *
- * Steps 1 to 3 run first in both modes:
- *
- * 1. Message shape: no subtype, or one of `file_share`, `bot_message`,
- *    `thread_broadcast`, `me_message`; any other subtype, a non-object or an
- *    event with no channel is `non-message`.
- * 2. Author: an event with neither `user` nor `bot_id` cannot be attributed
- *    and is `no-author`. Self-exclusion is the only author filter: the author
- *    `user` equal to P's bot user ID, or the event's `bot_id` equal to P's bot
- *    ID, is `own`. An author without `user` (webhooks, integrations) is
- *    identified by its bot ID and carries on.
- * 3. Conversation kind. A DM (`channel_type` `im`, or, as a
- *    defensive fallback for an event with no `channel_type`, a conversation ID
- *    starting with `D`) depends only on P's DMs switch: on,
- *    it delivers with `via` `dm`, whatever the text mentions; off, it is
- *    `dm-disabled`. A group DM (`channel_type` `mpim`) is `group-dm`, never
- *    delivered. Neither reaches the channel steps below.
- *
- * Declarative mode:
- *
- * 4. A channel P is not configured into is `channel-not-configured`, with
- *    `unclaimed` set when no applied persona lists it.
- * 5. `delivery: all` delivers.
- * 6. `delivery: mentions` delivers when the text holds P's user mention
- *    (`<@P>` or `<@P|label>`) or a broadcast (`<!here>` / `<!channel>`, with or
- *    without a label); otherwise `not-mentioned`. `<!everyone>` and user-group
- *    mentions (`<!subteam^…>`) are not mentions.
- *
- * Fungible mode (with to). No persona's
- * channel entries are read, P's or any other's.
- *
- * 4. The fungible path: the event takes it only when all of these
- *    hold, checked in this order, `FUNGIBLE_REFUSALS`' order: its
- *    `channel_type` is `channel` or `group`; its channel ID matches the
- *    channel-ID pattern; the envelope flag is present; it is a boolean; it is
- *    `false`. The first that fails is a `fungible-refused` drop carrying that
- *    refusal. The flag alone decides whether a channel is externally shared.
- * 5. P's channel delivery for the channel (`channelDeliveryFor`):
- *    `mentions` when the channel is another applied persona's fungible
- *    destination (the loop guard), else P's stored choice when the store is
- *    readable, else `mentions`.
- * 6. `via` in the shipped order: P's mention is `mention`; else a
- *    broadcast is `broadcast`; else a channel delivery of `all` delivers, as
- *    `receive_all_shared` when at least one other applied persona's channel
- *    delivery for the channel is `all` and as `receive_all` otherwise; else
- *    `not-mentioned`. Mention and broadcast recognition are declarative
- *    mode's.
- *
- * Every outcome of an event that took the fungible path, deliver or drop,
- * carries `fungible`: the channel type (`public` for `channel`, `private` for
- * `group`) and P's channel delivery, so the routing logs its audit line and
- * its drop lines without deciding anything.
- *
- * An empty or unknown bot user ID or bot ID never matches an author or a
- * mention.
- *
- * Pure and stateless: imports types only,
- * creates no client, reads no file or environment variable, logs nothing, and
- * keeps no counter, rate limit, per-sender memory or cross-persona
- * arbitration. The mode, the stored choices and the destinations arrive as
- * inputs at each call.
- *
+/** Pure non-thread selection over the applied shared choices and current
+ * authenticated membership. An unresolved decision withholds acknowledgement;
+ * it is distinct from an established exclusion. DMs and message/author filters
+ * precede channel authority. Participation selection belongs to the next Epic.
  * SPDX-License-Identifier: MIT
  */
-
 import type { ChannelEntry, ChannelMode, DeliveryMode, DM_DESTINATION } from './config.ts'
+import type { MembershipReading } from './channel-membership.ts'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -117,7 +43,7 @@ const FUNGIBLE_MODE: ChannelMode = 'open'
 /** The channel delivery that hears every message. */
 const DELIVERY_ALL: DeliveryMode = 'all'
 
-/** The channel delivery that hears mentions and broadcasts only, and the default. */
+/** The channel delivery that hears mentions and broadcasts only. */
 const DELIVERY_MENTIONS: DeliveryMode = 'mentions'
 
 /**
@@ -183,7 +109,7 @@ export type DeliveryDropReason =
   | 'channel-not-configured'
   | 'not-mentioned'
   | 'channel-off'
-  | 'state-unavailable'
+  | 'channel-ineligible'
 
 /**
  * The drop reason of a fungible-mode event that did not take the fungible
@@ -238,7 +164,10 @@ export type DropDecision =
     }
 
 /** Outcome of `decideDelivery` for one receiving persona. */
-export type DeliveryDecision = DeliverDecision | DropDecision
+export type DeliveryDecision = DeliverDecision | DropDecision | {
+  action: 'unresolved'
+  reason: 'state-unavailable' | 'membership-unresolved' | 'choice-missing'
+}
 
 /**
  * The stored choices as the decision reads them:
@@ -269,16 +198,19 @@ export interface ChannelDeliveryInputs {
    * personas the decision reads.
    */
   fungibleDestinations: readonly PersonaFungibleDestination[]
-  /** The stored choices. Absent: no stored choice applies. */
+  /** The shared choice projection. Absence leaves selection unresolved. */
   storedChoices?: StoredChoices
 }
 
 /**
- * The fungible-mode inputs of `decideDelivery`, each read at
- * the call. Absent, or with `mode` `declarative`, the decision is declarative
- * mode's.
+ * Applied inputs of `decideDelivery`, read in both modes at each call.
+ * The historical type name is retained for existing callers. Missing inputs
+ * cannot authorize channel selection.
  */
 export interface FungibleDecisionInputs extends ChannelDeliveryInputs {
+  /** Current, synchronous observations for this event's channel, by persona.
+   * Missing evidence is unresolved; configured entries are never membership. */
+  memberships?: ReadonlyMap<string, MembershipReading>
   /** The channel mode of the configuration in effect. */
   mode: ChannelMode
   /**
@@ -292,12 +224,11 @@ export interface FungibleDecisionInputs extends ChannelDeliveryInputs {
 
 /** P's channel delivery for one channel, from `channelDeliveryFor`. */
 export interface ChannelDeliveryResult {
-  /** `mentions` or `all`. */
-  delivery: DeliveryMode
+  /** Absent when no trustworthy saved choice exists; never a default off. */
+  delivery: DeliveryMode | undefined
   /**
    * True when the loop guard applies: the channel is another applied
-   * persona's fungible destination, so the delivery is `mentions` whatever P
-   * stored.
+   * persona's fungible destination, so a non-off choice becomes `mentions`.
    */
   heldByLoopGuard: boolean
 }
@@ -310,13 +241,13 @@ export interface DeliveryPersona {
   botUserId: string | undefined
   /** P's bot ID. Empty or absent never matches an author. */
   botId: string | undefined
-  /** P's channel entries; read in declarative mode only. */
+  /** Retained caller shape; entries alone supply neither choice nor membership. */
   channels: readonly ChannelEntry[]
   /** P's DMs switch (`dm.enabled`). */
   dmEnabled: boolean
 }
 
-/** One applied persona as `decideDelivery` sees it (P included); its channel entries are read in declarative mode only. */
+/** One applied persona (P included). Selection reads the shared projection. */
 export interface AppliedPersonaView {
   key: string
   channels: readonly ChannelEntry[]
@@ -355,6 +286,9 @@ export function decideDelivery(
 
   switch (conversationKind(ev['channel_type'], channel)) {
     case 'dm':
+      if (fungible?.storedChoices && !(fungible.storedChoices.readableFor?.(persona.key, channel) ?? fungible.storedChoices.readable)) {
+        return { action: 'unresolved', reason: 'state-unavailable' }
+      }
       return persona.dmEnabled ? { action: 'deliver', via: 'dm' } : { action: 'drop', reason: 'dm-disabled' }
     case 'group-dm':
       return { action: 'drop', reason: 'group-dm' }
@@ -362,23 +296,19 @@ export function decideDelivery(
       break
   }
 
-  if (fungible !== undefined && fungible.mode === FUNGIBLE_MODE) {
-    return decideFungibleChannel(ev, channel, persona, fungible)
-  }
-
-  const entry = persona.channels.find((c) => c.id === channel)
-  if (!entry) {
-    const claimed = applied.some((p) => p.channels.some((c) => c.id === channel))
-    return { action: 'drop', reason: 'channel-not-configured', unclaimed: !claimed }
-  }
-
-  if (entry.delivery === 'off') return { action: 'drop', reason: 'channel-off' }
+  if (fungible?.mode === FUNGIBLE_MODE) return decideFungibleChannel(ev, channel, persona, fungible)
+  const availability = channelAvailability(persona.key, channel, fungible)
+  if (availability) return availability
+  const saved = fungible?.storedChoices?.storedChoice(persona.key, channel)
+  if (saved === undefined) return { action: 'unresolved', reason: 'choice-missing' }
+  if (saved === 'off') return { action: 'drop', reason: 'channel-off' }
   const text = ev['text']
   if (mentionsPersona(text, persona.botUserId)) return { action: 'deliver', via: 'mention' }
   if (hasBroadcast(text)) return { action: 'deliver', via: 'broadcast' }
-  if (entry.delivery !== 'all') return { action: 'drop', reason: 'not-mentioned' }
+  if (saved !== 'all') return { action: 'drop', reason: 'not-mentioned' }
   const shared = applied.some((p) =>
-    p.key !== persona.key && p.channels.some((c) => c.id === channel && c.delivery === 'all'))
+    p.key !== persona.key && !channelAvailability(p.key, channel, fungible) &&
+      fungible?.storedChoices?.storedChoice(p.key, channel) === 'all')
   return { action: 'deliver', via: shared ? 'receive_all_shared' : 'receive_all' }
 }
 
@@ -397,10 +327,13 @@ function decideFungibleChannel(
   const refusal = fungibleRefusalOf(channelType, channel, inputs)
   if (refusal !== undefined) return { action: 'drop', reason: 'fungible-refused', refusal }
 
-  if (inputs.storedChoices?.readable === false) return { action: 'drop', reason: 'state-unavailable' }
+  const availability = channelAvailability(persona.key, channel, inputs)
+  if (availability) return availability
+  const effective = channelDeliveryFor(persona.key, channel, inputs)
+  if (effective.delivery === undefined) return { action: 'unresolved', reason: 'choice-missing' }
   const path: FungiblePath = {
     channelType: channelType === PUBLIC_CHANNEL_TYPE ? 'public' : 'private',
-    channelDelivery: channelDeliveryFor(persona.key, channel, inputs).delivery,
+    channelDelivery: effective.delivery,
   }
   if (path.channelDelivery === 'off') return { action: 'drop', reason: 'channel-off', fungible: path }
   const text = ev['text']
@@ -408,8 +341,20 @@ function decideFungibleChannel(
   if (hasBroadcast(text)) return { action: 'deliver', via: 'broadcast', fungible: path }
   if (path.channelDelivery !== DELIVERY_ALL) return { action: 'drop', reason: 'not-mentioned', fungible: path }
   const shared = inputs.fungibleDestinations.some((other) =>
-    other.key !== persona.key && channelDeliveryFor(other.key, channel, inputs).delivery === DELIVERY_ALL)
+    other.key !== persona.key && !channelAvailability(other.key, channel, inputs) &&
+      channelDeliveryFor(other.key, channel, inputs).delivery === DELIVERY_ALL)
   return { action: 'deliver', via: shared ? 'receive_all_shared' : 'receive_all', fungible: path }
+}
+
+/** Only dependent channel selection consults shared health and membership.
+ * Shape, own-author and DM exclusions above remain independent. */
+function channelAvailability(key: string, channel: string, inputs?: FungibleDecisionInputs): DeliveryDecision | undefined {
+  const store = inputs?.storedChoices
+  if (!(store?.readableFor?.(key, channel) ?? store?.readable)) return { action: 'unresolved', reason: 'state-unavailable' }
+  const membership = inputs?.memberships?.get(key)
+  if (!membership || membership.kind === 'unresolved') return { action: 'unresolved', reason: 'membership-unresolved' }
+  if (membership.kind === 'ineligible') return { action: 'drop', reason: 'channel-ineligible' }
+  return undefined
 }
 
 /**
@@ -435,13 +380,14 @@ function fungibleRefusalOf(
 /**
  * Persona `key`'s channel delivery for `channel` in fungible mode, and whether the loop guard held it:
  *
- * - `mentions`, held, when `channel` is the fungible destination of any
+ * - `off` remains off, before any destination guard;
+ * - a non-off choice becomes `mentions`, held, when `channel` is the destination of any
  *   applied persona other than `key` (the loop guard). The persona's own
  *   destination is never held, since its own posts are dropped before the
  *   channel steps, and a `dm` destination holds nothing;
  * - otherwise the persona's stored choice for `channel`, when the store is
  *   readable;
- * - otherwise `mentions`.
+ * - otherwise unresolved (`delivery` is undefined).
  *
  * Whether any persona lists `channel` in its channel entries plays no part.
  * The one copy of the rule: `decideDelivery` uses it for P and for every
@@ -456,9 +402,10 @@ export function channelDeliveryFor(
     other.key !== key && other.destination !== DM_DESTINATION_VALUE && other.destination === channel)
   const store = inputs.storedChoices
   const stored = store !== undefined && (store.readableFor?.(key, channel) ?? store.readable) ? store.storedChoice(key, channel) : undefined
+  if (stored === undefined) return { delivery: undefined, heldByLoopGuard: false }
   if (stored === 'off') return { delivery: 'off', heldByLoopGuard: false }
   if (held) return { delivery: DELIVERY_MENTIONS, heldByLoopGuard: true }
-  return { delivery: stored ?? 'off', heldByLoopGuard: false }
+  return { delivery: stored, heldByLoopGuard: false }
 }
 
 /** step 2: the author is P's bot user, or the event carries P's bot ID. */

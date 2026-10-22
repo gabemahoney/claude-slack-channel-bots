@@ -54,6 +54,8 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { beginReviewAttempt, createReviewObserver, rejectReviewAttempt, reviewLedger, reviewMatches, reviewOutcomeLine, reviewRecoveryLine, reviewRecoveredBringUpFailedLine, reviewRecoveredLifecycleFailedLine, sharedReviewDependency, RELOAD_REVIEW_OUTCOME, RELOAD_REVIEW_RECOVERY, type DurableReview } from './reload-review.ts'
 import { parseReviewRequestBytes, REVIEW_REQUEST_SUFFIX, reviewRequestDiagnostic, REVIEW_REQUEST_INVALID, REVIEW_REQUEST_RECORDED, REVIEW_REQUEST_STORAGE } from './reload-request.ts'
+import { readSharedRecoveryRequest } from './shared-recovery.ts'
+import { runStartupRecovery, sharedRecoveryLine } from './reload-recovery.ts'
 import type { ChannelMembership } from './channel-membership.ts'
 import type { ReviewedAssignment, ReviewedChannelEffect } from './shared-channels.ts'
 import { createSharedChannelAuthority, initialSharedChannelState, parseSharedChannelState, sharedAppliedConfig, serializeSharedChannelState, type SharedChannelAuthority, type SharedChannelState, type SharedMutationResult } from './shared-channels.ts'
@@ -745,6 +747,7 @@ function selectConfiguration(
     try {
       const sharedState = parseSharedChannelState(recordBytes, paths.lastApplied, { home })
       if (sharedState !== undefined) {
+        if (sharedState.recovery?.phase === 'review') return { ok: false, source: 'record', message: 'The shared recovery stage is awaiting explicit review and confirmation; no staged configuration is applied.' }
         const config = sharedAppliedConfig(sharedState, paths.lastApplied, { home })
         const bytes = Buffer.from(sharedState.sourceBytesBase64, 'base64')
         return { ok: true, applied: { config, bytes, source: 'record', sharedState } }
@@ -973,20 +976,35 @@ function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetecti
   let factFailed = false
   let requestEpisode: string | undefined
   let channelEffects: ReviewedChannelEffect[] = []
+  let recoveryPending = false
 
-  function processRequest(): void {
+  function processRequest(): boolean {
     const authority = host.sharedChannels?.()
-    if (!authority) return
+    if (!authority) return false
+    if (recoveryPending) return true
     const read = readConfigFile(paths.config + REVIEW_REQUEST_SUFFIX, deps.configFs)
-    if (!read.ok && read.missing) { requestEpisode = undefined; return }
+    if (!read.ok && read.missing) { requestEpisode = undefined; return false }
     const request = read.ok ? parseReviewRequestBytes(read.bytes) : undefined
     const input = readConfigFile(paths.config, deps.configFs)
+    const recovery = read.ok ? readSharedRecoveryRequest(read.bytes) : undefined
+    if (recovery) {
+      if (JSON.stringify(authority.snapshot().recovery?.request) === JSON.stringify(recovery)) return false
+      const evidence = readConfigFile(paths.lastApplied, deps.configFs)
+      const result = evidence.ok && input.ok ? authority.stageRestoration(recovery, evidence.bytes, input.bytes) : { kind: 'failed' }
+      if (result.kind === 'unresolved') recoveryPending = true
+      const episode = JSON.stringify([recovery.request_id, result.kind])
+      if (episode !== requestEpisode) deps.log(sharedRecoveryLine(recoveryPending ? 'restoration staged' : 'request refused',
+        recoveryPending ? 'The owned anchor and damaged evidence are retained for reviewed recovery. Restart to verify, review and confirm; accepted queues and unchanged projections remain available.' : 'Preserve input and evidence; only the current owner can stage trustworthy restoration.'))
+      requestEpisode = episode
+      return recoveryPending
+    }
     const result = request && (input.ok || request.action === 'cancel')
       ? authority.requestReview(request, input.ok ? input.bytes : applied.bytes)
       : { kind: 'invalid' as const, generation: authority.operatorIntent().generation }
     const episode = JSON.stringify([read.ok ? createHash('sha256').update(read.bytes).digest('hex') : 'unreadable', result.kind, result.generation])
     if (episode !== requestEpisode && result.kind !== 'duplicate') deps.log(reviewRequestDiagnostic(result.kind, result.generation))
     requestEpisode = episode
+    return false
   }
 
   /**
@@ -1420,7 +1438,7 @@ function createPendingDetection(deps: ReloadControllerDeps, host: PendingDetecti
     try {
       await host.recoverPending()
       if (stopped) return
-      processRequest()
+      if (processRequest()) return
       let state = derive()
       if (stopped) return
       const appliedNow = await processConfirmation(state)
@@ -1612,7 +1630,15 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
 
   function resolveStart(): ReloadStartOutcome {
     if (phase !== 'unresolved') throw new Error('reload: resolveStart may be called only once')
-    const selection = selectConfiguration(paths, deps.home, deps.configFs)
+    let selection = selectConfiguration(paths, deps.home, deps.configFs)
+    if (!selection.ok && selection.source === 'record') {
+      const recovery = runStartupRecovery({ paths, home: deps.home, configFs: deps.configFs, credentialsFs: deps.credentialsFs,
+        dryRun: deps.dryRun, now: deps.now, boundary: deps.reviewSession, write, remove: deps.remove ?? durableUnlinkSync,
+        retiredKeys: deps.retiredKeys, log: deps.log })
+      if (recovery === 'activated') selection = selectConfiguration(paths, deps.home, deps.configFs)
+      else if (recovery === 'unresolved') selection = { ok: false, source: 'record',
+        message: 'The shared recovery outcome is unresolved. Preserve authority, retirement evidence, confirmation and input; restart to recover the retained outcome before any new review.' }
+    }
     if (!selection.ok) {
       const prefix = selection.source === 'record' ? RECORD_REFUSAL_PREFIX : CONFIG_REFUSAL_PREFIX
       return refuse(selection.source, undefined, prefix + selection.message)
@@ -1634,6 +1660,8 @@ export function createReloadController(deps: ReloadControllerDeps): ReloadContro
       if (!detectionStopped) notifyApplied(config)
     })
     deps.log(reloadSharedAuthorityStartLine(paths.lastApplied, sharedChannels.revision))
+    if (sharedState.recovery?.phase === 'active') deps.log(sharedRecoveryLine('retained repair activation',
+      `The installed authority retains the consumed repair at order=${sharedState.recovery.activation!.order}; it is not applied again. Current authenticated membership is still required before dependent intake or a recovery-complete claim.`))
     phase = 'applied'
     appliedState = applied
     return { kind: 'applied', ...applied }

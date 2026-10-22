@@ -120,6 +120,7 @@ const SOURCE_SURFACES: [RegExp, string][] = [
   [/^src\/codex-config-keys\.ts$/, 'the names-only Codex config scanner and authorized top-level host model reader'],
   [/^src\/config\.ts$/, 'the persona config loader and record validation'],
   [/^src\/shared-channels\.ts$/, 'the durable applied configuration, source input and persona identity authority'],
+  [/^src\/shared-recovery\.ts$/, 'damaged authority evidence, prepared input and recovery request parsing'],
   [/^src\/test-mcp-drop\.ts$/, 'the test-only MCP disconnect route, which reads applied persona config and logs and returns the configured persona key'],
   [/^src\/persona-credentials\.ts$/, 'the credentials reader and classifier'],
   [/^src\/persona-bringup\.ts$/, 'the local bring-up checks, which read the credentials file'],
@@ -179,7 +180,7 @@ const HELPER_SURFACES: Record<string, Record<string, string>> = {
     sentinelInMessage: 'plants the leak sentinel in an error message (in a fake token and a ticket URL)',
     sentinelTicketUrl: 'plants the leak sentinel in a ticket URL',
   },
-  'tests/test-helpers/shared-channels.ts': { deliveryAttempt: 'builds caller-retained attempt inputs', contradictoryBotHistory: 'derives malformed durable attempt evidence', deliveryResultSamples: 'builds durable attempt result variants', makeMembershipHarness: 'builds authenticated connection and durable membership composition', configBytes: 'serializes config input', initialSharedState: 'builds a shared config-state envelope', writeSharedState: 'writes the shared config-state envelope', makeSharedAuthority: 'builds and writes the shared authority' },
+  'tests/test-helpers/shared-channels.ts': { sharedRecoveryRequest: 'binds exact damaged evidence and optional replacement input through the production grammar', deliveryAttempt: 'builds caller-retained attempt inputs', contradictoryBotHistory: 'derives malformed durable attempt evidence', deliveryResultSamples: 'builds durable attempt result variants', makeMembershipHarness: 'builds authenticated connection and durable membership composition', configBytes: 'serializes config input', initialSharedState: 'builds a shared config-state envelope', writeSharedState: 'writes the shared config-state envelope', makeSharedAuthority: 'builds and writes the shared authority' },
   'tests/test-helpers/persona-config.ts': { writeConfigFile: 'writes a config file' },
   'tests/test-helpers/ad-settings.ts': { writeAgentDirectorConfig: "writes agent-director's config.toml" },
   'tests/test-helpers/channel-delivery.ts': { writeChannelDeliveryRecord: 'writes a stored-choice file holding persona declarations' },
@@ -461,6 +462,18 @@ describe('every suite that touches config, credentials or reload calls assertNoL
     }
     const factory = 'makeReloadHarness'
     expect(touchReasonsOf(suite, `import { ${factory} } from './test-helpers/reload-harness.ts'`)).toHaveLength(1)
+  })
+
+  test('damaged-start parsers, renderers and request helper require leak checks without exemptions', () => {
+    const suite = 'tests/shared-channel-recovery.test.ts'
+    for (const [module, fn] of [['shared-recovery', 'readSharedRecoveryRequest'], ['reload-recovery', 'renderSharedRecovery']]) {
+      expect(SOURCE_SURFACES.some(([re]) => re.test(`src/${module}.ts`))).toBe(true)
+      for (const source of [`import { ${fn} as use } from '../src/${module}.ts'`, `const use = await import('../src/${module}.ts')`]) expect(touchReasonsOf(suite, source)).toHaveLength(1)
+      expect(touchReasonsOf(suite, `import type { Any } from '../src/${module}.ts'`)).toEqual([])
+    }
+    expect(touchReasonsOf(suite, "import { RELOAD_SHARED_RECOVERY } from '../src/reload-recovery.ts'")).toEqual([])
+    expect(touchReasonsOf(suite, "import { sharedRecoveryRequest as request } from './test-helpers/shared-channels.ts'")).toHaveLength(1)
+    expect(callsAssertNoLeak(suite)).toBe(true); expect(suite in EXEMPT).toBe(false)
   })
 
   test('the test-only MCP route is a source surface: handlers and key rendering touch; constants and types alone do not; every consumer leak-checks', () => {

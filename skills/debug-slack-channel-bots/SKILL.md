@@ -1353,14 +1353,12 @@ credentials workflow, never these requests or chat.
     that when a confirmed change during the episode moved the destination
     (a change of `permission_prompts`), the first failure at a destination the
     episode hasn't named yet logs one more start line naming it. A mode switch preserves the destination.
-    the successful post went to;
   - a spawn-failure notice that fails at startup writes a `spawn-failure-post`
     record to `startup-errors.log` at its first failed attempt. The notice is
     still held, so the record can be followed by the `cleared:` line and the
     notice's delivery.
 
-  Buttons on prompts already posted keep working, and their verdict updates
-  are not held. Other personas are unaffected.
+  Buttons on valid prompts already posted keep working in their original conversation after off, destination change, verified removal or restart, subject to the existing persona/AD-token identity checks; stale and cross-persona replies remain refused. Verdict updates are not held, and this exception grants no ordinary tool, membership or assignment authority. Accepted queues and other personas are unaffected.
 - **Cause and fix, by the error the line names:**
   - `missing_scope` (the line names `im:write`): the persona's Slack app was
     installed before it had the `im:write` scope, so it can't open the DM with
@@ -1369,13 +1367,7 @@ credentials workflow, never these requests or chat.
     It covers the scope, the re-install and the check for a changed bot
     token. The server keeps retrying, so once the app has `im:write`, a later
     retry delivers what was held.
-  - `not_in_channel`: the persona's app isn't a member of its destination
-    channel: its `permission_prompts` channel in declarative mode, its
-    `permission_prompts` channel in fungible mode (a channel ID set
-    there; its default, `"dm"`, posts to the DM instead). Invite the app to
-    that channel (in Slack, `/invite @<app name>` in the channel). In
-    fungible mode the invite also makes the persona hear that channel, at
-    `mentions` unless its agent chose otherwise.
+  - `not_in_channel`: the app is absent from its selected `permission_prompts` channel in either mode. An unchanged validated destination stays selected after verified leave, even with zero entries and DMs disabled; it does not recreate a choice or membership. Invite the app back (`/invite @<app name>`), or confirm a valid new destination; current verified rejoin uses the applied mode's new-entry default unless a fresh choice was explicitly assigned.
   - Any other error: another Slack error such as `channel_not_found` or
     `is_archived`, or a network error or timeout (`network_error`,
     `unknown_error`, …). It's held and retried the same way. Check that the
@@ -5600,14 +5592,17 @@ connects to Slack and nothing is launched. Credentials content and whether
 directories exist are never checked here; those are bring-up checks with the
 classes above.
 
-When a record exists, a start runs the record and doesn't read `config.json`,
-so a restart doesn't apply an edit of `config.json`. The running server still
+An ordinary start runs the recorded applied configuration, so restarting does not apply a `config.json` edit. A refused start may read that file as separately preserved input for [reviewed recovery](#reload-shared-recovery).
+
+The running server still
 checks an edit (a missing `config.json` included), within about 5 s once a start's bring-up is done (see
 [The last-applied record](#the-last-applied-record)). If the edit is wrong, it
 writes the error as one `INVALID:` line to `config.json.pending` and logs it
 once per new pending review under [`reload-invalid`](#reload-invalid) in
 `server.log`; unchanged checks are quiet, and confirmation follows the
-sequences in that entry. Nothing is applied. The error is the same message
+sequences in that entry. Nothing is applied.
+
+The error is the same message
 as in the tables below. To apply an
 edit, confirm it (see [Confirming a pending change](#confirming-a-pending-change)).
 
@@ -5659,7 +5654,9 @@ In both modes:
 
 In a fresh configuration, or when submitting a new or changed channel destination in `config.json`, the destination must be listed in `channels` in both modes, including open; `delivery: "off"` is allowed. A Slack invitation does not replace that listing.
 
-An already validated, unchanged destination may remain absent when the shared authority holds verified-removal evidence for the same persona incarnation. This includes zero channels with DMs disabled and an unrelated confirmed edit: neither re-adding the removed channel nor changing the destination is required. A replacement identity cannot inherit the old incarnation's removal evidence.
+An already validated, unchanged destination may remain absent when the shared authority holds verified-removal evidence for the same persona incarnation. This includes zero channels with DMs disabled and an unrelated confirmed edit: neither re-adding the removed channel nor changing the destination is required. A replacement identity or recreated entry cannot inherit the old incarnation's removal evidence.
+
+This is retained provenance, not an operator-supplied exception flag; only a confirmed destination change selects a different future audience.
 
 ### Before any persona is read
 
@@ -6127,7 +6124,7 @@ No line at all:
 
 ### Starting without the record
 
-A fresh install with no authority validates `config.json` and durably records the first applied revision. This is not a recovery path for an existing authority: preserve an unreadable, invalid or unresolved authority together with prepared input and pending evidence, and restore a trustworthy copy before restarting. See [The last-applied record can't be read or is invalid](#the-last-applied-record-cant-be-read-or-is-invalid).
+A fresh install with no authority validates `config.json` and durably records the first applied revision. This is not a recovery path for an existing authority: preserve an unreadable, invalid or unresolved authority together with prepared input and pending evidence, and use [reviewed restore or explicit replacement](#reload-shared-recovery). See [The last-applied record can't be read or is invalid](#the-last-applied-record-cant-be-read-or-is-invalid).
 
 ### A first start that fails after recording
 
@@ -6143,7 +6140,7 @@ start runs it. The usual case is the first start failing on the listening addres
   changes nothing: the next start runs the record, which holds the failing
   values, and fails the same way.
 - **Fix:** If the cause is outside the file (another process holds the port),
-  free it and start again. If the fix is an edit of `config.json`, restore trustworthy authority evidence before restarting; preserve the edited input separately. See [Starting without the record](#starting-without-the-record).
+  free it and start again. Preserve any edited `config.json` for ordinary review after startup. A valid authority with an unusable listening setting is not damaged-state replacement input; the recovery procedure below cannot force that edit into effect.
 
 ### `reload-record-write-failed`
 
@@ -6151,7 +6148,96 @@ start runs it. The usual case is the first start failing on the listening addres
 - **Cause:** The authority or retired-key record could not be written durably; check permissions, free space and directory-sync support.
 - **Definite failure:** Prior applied state and pending intent remain. The gesture is not silently retried. Fix the cause, read the fresh preview and confirm again; replaying an attempted/rejected review cannot assign.
 - **Unresolved durability:** Preserve authority, prepared input, confirmation and retirement evidence. The serialized check can finish only the exact validated transaction already written, using its original order and publishing once. Changed or unreadable evidence stays unresolved; do not submit a replacement assignment or assume failure/success. Affected new work is held while independently trustworthy work and accepted queues can continue.
+- **Reviewed repair:** If exact retained-transaction recovery cannot resolve the evidence, use [owned restoration or explicit replacement](#reload-shared-recovery); never infer a lost outcome.
 - **Cleanup failure after commitment:** The consumed outcome remains authoritative even if `config.json.apply` cannot be removed. Fix the filesystem cause; do not repeat the assignment. Never delete the authority or promote unconfirmed input.
+
+### `reload-shared-recovery`
+
+This uses `config.json.request`, the existing preview and the confirming rename; there is no recovery subcommand. Preserve the authority, retirement evidence, request, confirmation, original `config.json` and accepted queues before repair. Never hand-edit the envelope or treat an older snapshot as trustworthy.
+
+- **Owned restore:** while the process still holds its latest validated state, choose `restore` below. It retains that owner's order, identities, leave boundaries, attempt history and unrelated pending intent; no snapshot field is accepted. Wait for `restoration staged`, then stop and start the server to obtain the recovery preview; staging freezes ordinary mutations while unchanged trustworthy projections and accepted queues may continue.
+- **Damaged start:** if no owner anchor remains, prepare `replacement-config.json` separately using the current configuration schema and deliberately chosen personas/channels. Keep `config.json` unchanged and choose `replace` below. Every replacement choice and lifetime is new: numeric continuity and recovery of lost preferences, leave, participation or attempt history are not claimed, and lost attempt outcomes stay unresolved.
+
+For an initial repair, the following writes only a request, never the authority. Set `RECOVERY_ACTION` to `restore` for the still-running owner; `replace` reads the separately prepared replacement file. It hashes the exact current damaged bytes, regardless of apparent recovery fields inside them. Use the separate revision example below only for a known retained cold stage.
+
+```sh
+STATE="${SLACK_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-slack-channel-bots}"
+RECOVERY_ACTION=replace
+python3 - "$STATE" "$RECOVERY_ACTION" <<'PYRECOVERY'
+import base64, hashlib, json, os, pathlib, sys, uuid
+state = pathlib.Path(sys.argv[1])
+action = sys.argv[2]
+assert action in ("restore", "replace")
+evidence = (state / "config.json.last-applied").read_bytes()
+evidence_hash = hashlib.sha256(evidence).hexdigest()
+request = {"format": "cscb-review-request-v1", "request_id": uuid.uuid4().hex,
+           "evidence_sha256": evidence_hash, "action": action}
+if action == "replace":
+    chosen = (state / "replacement-config.json").read_bytes()
+    request["replacement_source_base64"] = base64.b64encode(chosen).decode("ascii")
+path = state / "config.json.request.next"
+with open(path, "w", encoding="utf-8") as output:
+    os.chmod(path, 0o600)
+    json.dump(request, output)
+os.replace(path, state / "config.json.request")
+PYRECOVERY
+```
+
+For damaged start, run `claude-slack-channel-bots start` to stage the request; runtime startup remains refused. Read the complete `config.json.pending`: it shows the boundary, local revision, intent generation, each new or restored choice and the loss/preservation clauses. Rename that exact preview as [Confirming a change](../../docs/reload.md#confirming-a-change) describes, then run `claude-slack-channel-bots start` again; activation consumes the review once through the same durable authority.
+
+To deliberately revise an unactivated cold replacement, first obtain `review pending` from the procedure above and read its preview. Use this example only while that validated retained stage is unchanged; apparent fields in damaged JSON do not establish a stage. Prepare the revised `replacement-config.json` separately, keeping the original evidence and prepared input. This reads the known stage's original evidence hash and generates a fresh request ID:
+
+```sh
+python3 - "$STATE" <<'PYREVISION'
+import base64, hashlib, json, os, pathlib, sys, uuid
+state = pathlib.Path(sys.argv[1])
+retained = json.loads((state / "config.json.last-applied").read_bytes())["recovery"]
+assert retained["phase"] == "review" and retained["request"]["action"] == "replace"
+original = base64.b64decode(retained["evidenceBase64"], validate=True)
+evidence_hash = hashlib.sha256(original).hexdigest()
+assert evidence_hash == retained["request"]["evidence_sha256"]
+chosen = (state / "replacement-config.json").read_bytes()
+request = {"format": "cscb-review-request-v1", "request_id": uuid.uuid4().hex,
+           "evidence_sha256": evidence_hash, "action": "replace",
+           "replacement_source_base64": base64.b64encode(chosen).decode("ascii")}
+path = state / "config.json.request.next"
+with open(path, "w", encoding="utf-8") as output:
+    os.chmod(path, 0o600)
+    json.dump(request, output)
+os.replace(path, state / "config.json.request")
+PYREVISION
+```
+
+Run `start` again, read the fresh preview and confirm it by rename before the activating start. Old IDs remain permanently reserved, even after activation or byte reversion. Invalid revisions do not activate the proposal, and a replacement cannot revise an owned restoration stage.
+
+To cancel an unactivated cold replacement, use the ordinary cancel grammar with the **current retained intent generation**, also shown in the preview (initially zero). This records cancellation without needing readable `config.json`; run `start` to process it:
+
+```sh
+jq -n --slurpfile s "$STATE/config.json.last-applied" --arg id "cancel-$(date +%s)-$RANDOM" '
+  {format:"cscb-review-request-v1", request_id:$id,
+   intent_generation:($s[0].pendingIntent.operator.generation // 0), action:"cancel"}
+' > "$STATE/config.json.request.next"
+mv "$STATE/config.json.request.next" "$STATE/config.json.request"
+claude-slack-channel-bots start
+```
+
+Accepted cancellation advances the generation and retains its tombstone, original damaged evidence and prepared bytes; it does not activate the proposal. Replaying the same cancellation request cannot cancel a later proposal. Rerunning this generator creates a new cancellation request for the current proposal. Old confirmations cannot revive a cancelled proposal; a later replacement requires a fresh ID and fresh review.
+
+| Status after `[slack] reload-shared-recovery:` | Meaning and action |
+|---|---|
+| `unresolved` / `request refused` | No usable owner anchor or request binding. Preserve evidence, correct access and request fields, and choose only the applicable restore/replace path above. |
+| `restoration staged` / `review pending` | The proposal is inert. Restart for the owned stage, read the current preview, confirm by rename and start again. |
+| `request unresolved` | Input/request no longer binds the stage; an observed change revokes the old confirmation. Use the bound request or a fresh replacement ID and review the new pending file. |
+| `proposal cancelled` | No configuration activated; the line gives the retained intent generation. A fresh replacement ID is required for another review. |
+| `cancellation not recorded` / `revision not recorded` | A definite storage failure left the prior proposal inert. Preserve request/evidence and retry the operation when storage is trustworthy. |
+| `stage unresolved` / `repair unresolved` | Preserve staged evidence and prepared input; correct the reported safe filesystem cause and restart to verify the retained stage. |
+| `durability unresolved` | The operation may already be installed. Preserve authority, retirement evidence, request, confirmation and prepared input; restart to recover the retained outcome **before any new review**. This is not definite nonactivation or permission to reconfirm. |
+| `confirmation not activated` | A definite failure or stale gesture; read the genuinely fresh pending preview after recovery before confirming again. |
+| `durable repair activated` / `retained repair activation` | The repair is consumed once; the latter reports its retained order on a later start, without applying it again. Current authenticated membership is still required. |
+
+History is not current membership. Missing root, share or eligibility evidence remains unresolved; independently provable work may progress, but a wholly unprovable authority cannot expose runtime configuration. Repair preserves exact damaged/prepared bytes privately and accepted work under its original keys, content, context and FIFO; unrelated input remains for ordinary review.
+
+Repair never retries an unknown or proven-not-applied assignment, and finite Slack retries cannot recover events never accepted. For a channel's unresolved absence order, the ordinary reviewed assignment may explicitly replace that conflict: its preview distinguishes retained history, the removal boundary and a new future preference, requiring fresh membership. This grants no recovered lost participation or automatic root/share-gap repair.
 
 ### `reload-request-invalid`
 
@@ -6404,7 +6490,7 @@ start runs it. The usual case is the first start failing on the listening addres
 - **Line:** `[slack] Fatal: last-applied record error — <cause>` names `config.json.last-applied`; malformed JSON identifies only its position, never its contents.
 - **Cause:** The shared authority is unreadable, is not a regular file, is malformed or fails schema/evidence validation.
 - **Effect:** Startup refuses without falling back to `config.json`. Shared authority and configuration have no size cap; credentials and agent-director settings keep their independent 64 KiB limits.
-- **Fix:** Preserve the authority, prepared input and pending evidence. Correct a read/permission failure or restore a trustworthy authority copy before restarting. Never delete it to promote an unconfirmed configuration.
+- **Fix:** Preserve the authority, prepared input and pending evidence. Correct read/permission failures before requesting [reviewed recovery](#reload-shared-recovery); unreadable or nonregular evidence cannot be staged. Only the running owner can supply a restoration anchor; without one, explicitly review replacement choices and lost history. Never delete the record or import an older copy as authority.
 
 ### The retired-key record can't be read or is invalid
 
@@ -6443,7 +6529,9 @@ writes it; it is absent until a key is first recorded. Never edit it.
 
 ## The stored-choice file: `config.json.last-applied`
 
-`config.json.last-applied` is the sole shared channel authority. Its envelope holds the revision, applied configuration, reviewed source and exact source bytes (`sourceBytesBase64`), persona identities and incarnations, and ordered channel choices. An uncertain or unresolved outcome requires preserving authority, prepared input and pending evidence. Restore trustworthy evidence before continuing; do not replace it with an unconfirmed configuration.
+`config.json.last-applied` is the sole shared channel authority. Its envelope holds the revision, applied configuration, reviewed source and exact source bytes (`sourceBytesBase64`), persona identities and incarnations, and ordered channel choices. An uncertain or unresolved outcome requires preserving authority, prepared input and pending evidence.
+
+Use [reviewed recovery](#reload-shared-recovery); do not replace it with an unconfirmed configuration or an unproven snapshot.
 
 ### The stored-choice file: `channel-delivery.json`
 
@@ -6451,7 +6539,9 @@ writes it; it is absent until a key is first recorded. Never edit it.
 
 ### `channel-delivery-unreadable`
 
-A shared authority that cannot be read or validated prevents startup. A running authority whose outcome becomes unresolved refuses further choice writes. Preserve its evidence and restore trustworthy shared state; there is no fallback to default listening choices.
+A shared authority that cannot be read or validated prevents runtime startup. Unprovable affected intake and choice writes stay held; independently trustworthy personas, channels, DMs and accepted work can progress. If the whole state is unprovable, there is no healthy projection to assume.
+
+Preserve evidence and use [reviewed recovery](#reload-shared-recovery). Neither writable storage, elapsed time, a queue acceptance nor a new mention proves missing state recovered; no default listening choice supplies it.
 
 ### The store's `[slack] channel-delivery:` lines
 

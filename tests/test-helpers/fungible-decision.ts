@@ -5,17 +5,18 @@
  * Each row holds one call of `decideDelivery`: the event (from the Slack
  * stub's event factories), the configuration (from the persona-config
  * helpers) with the receiving persona P, the envelope flag as received, the
- * stored choices and the store's readability, and the full expected outcome,
+ * shared choices, current membership and affected readability, and the full expected outcome,
  * written in the row. `decisionArgsOf(row)` turns a row into the decision's
  * four arguments the way `src/persona-routing.ts` builds them, and
  * `channelDeliveryArgsOf(row)` into `channelDeliveryFor`'s for P and the
- * row's channel. `FUNGIBLE_DECISION_GROUPS` holds ten groups in
- * its order.
+ * row's channel. `FUNGIBLE_DECISION_GROUPS` retains the predecessor groups
+ * and adds the current-authority rows to the same purity/reverse-order checks.
  *
  * A row may also put in front of the decision what the loader never
- * produces, so the row shows that an input not in force plays no part: a listing or a malformed declarative section in the
- * decision's views in fungible mode, fungible destinations and stored choices
- * in declarative mode, or no fourth argument at all.
+ * produces, so the row shows that an input not in force plays no part (
+ *, ): a listing or a malformed declarative section in the
+ * decision's views in open mode. Both modes use the shared choices and
+ * explicit membership input; missing evidence is exercised as unresolved.
  *
  * Pure data: no file, directory, timer or module mock. The configurations'
  * paths sit under a base directory that is never created, and every ID is a
@@ -41,6 +42,7 @@ import type {
   decideDelivery,
 } from '../../src/delivery-decision.ts'
 import { makeMultiPersonaConfig, type PersonaSpec } from './persona-config.ts'
+import type { MembershipReading } from '../../src/channel-membership.ts'
 import {
   broadcastText,
   ENVELOPE_FLAG_FORMS,
@@ -149,6 +151,9 @@ export interface FungibleDecisionRow {
   readonly stored?: StoredLookup
   /** Whether the store was readable at start; true unless set. */
   readonly readable?: boolean
+  /** Independent current observations. Empty explicitly means no evidence. */
+  readonly memberships?: ReadonlyMap<string, MembershipReading>
+  readonly readableFor?: StoredChoices['readableFor']
   /**
    * Declarative sections the decision's views carry instead of the
    * configuration's, by persona key: any value (a malformed one included), or
@@ -221,7 +226,13 @@ function destinationsOf(config: PersonaConfig): FungibleDecisionInputs['fungible
 function storedChoicesOf(row: FungibleDecisionRow): StoredChoices | undefined {
   const stored = row.stored
   if (stored === undefined) return undefined
-  return { readable: row.readable ?? true, storedChoice: (key, channel) => stored[key]?.[channel] }
+  return { readable: row.readable ?? true, readableFor: row.readableFor, storedChoice: (key, channel) => stored[key]?.[channel] }
+}
+
+/** Explicit positive input for pure decision cases; never derived from a list
+ * or saved preference. Runtime composition uses the real membership owner. */
+export function eligibleMembership(key: string): MembershipReading {
+  return { kind: 'eligible', lifetime: { incarnation: `decision-${key}`, boundary: 1, leaveBoundary: 0 }, identity: `identity-${key}`, generation: `generation-${key}` }
 }
 
 /** `channelDeliveryFor`'s inputs besides the persona and the channel. */
@@ -247,6 +258,7 @@ export function decisionArgsOf(row: FungibleDecisionRow): Parameters<typeof deci
     mode: channelModeOf(row.config),
     isExtSharedChannel: row.flag,
     channelIdPattern: CHANNEL_ID_RE,
+    memberships: row.memberships ?? new Map([P_KEY, Q_KEY, R_KEY].map(key => [key, eligibleMembership(key)])),
     ...channelDeliveryInputsOf(row),
   }
   return [row.event, persona, applied, inputs]
@@ -358,12 +370,12 @@ function deliver(via: Via, fungible?: FungiblePath): DeliveryDecision {
   return fungible === undefined ? { action: 'deliver', via } : { action: 'deliver', via, fungible }
 }
 
-function drop(reason: 'non-message' | 'no-author' | 'own' | 'dm-disabled' | 'group-dm' | 'not-mentioned' | 'channel-off' | 'state-unavailable', fungible?: FungiblePath): DeliveryDecision {
+function drop(reason: 'non-message' | 'no-author' | 'own' | 'dm-disabled' | 'group-dm' | 'not-mentioned' | 'channel-off', fungible?: FungiblePath): DeliveryDecision {
   return fungible === undefined ? { action: 'drop', reason } : { action: 'drop', reason, fungible }
 }
 
-function notConfigured(unclaimed: boolean): DeliveryDecision {
-  return { action: 'drop', reason: 'channel-not-configured', unclaimed }
+function unresolved(reason: 'state-unavailable' | 'membership-unresolved' | 'choice-missing'): DeliveryDecision {
+  return { action: 'unresolved', reason }
 }
 
 function refused(refusal: FungibleRefusal): DeliveryDecision {
@@ -371,7 +383,7 @@ function refused(refusal: FungibleRefusal): DeliveryDecision {
 }
 
 /** `channelDeliveryFor`'s result. */
-function delivery(value: DeliveryMode, heldByLoopGuard = false): ChannelDeliveryResult {
+function delivery(value: DeliveryMode | undefined, heldByLoopGuard = false): ChannelDeliveryResult {
   return { delivery: value, heldByLoopGuard }
 }
 
@@ -432,13 +444,13 @@ const declarativeRows: FungibleDecisionRow[] = (['absent', 'false'] as const).fl
         label: `${at}: unlisted public channel, P's stored choice ${publicChoice ?? 'none'}`,
         event: publicMessage(PUBLIC_CHANNEL),
         config, flag, stored,
-        expected: notConfigured(true),
+        expected: publicChoice === undefined ? unresolved('choice-missing') : publicChoice === 'all' ? deliver('receive_all_shared') : drop('not-mentioned'),
       },
       {
         label: `${at}: private channel only Q lists, P's stored choice ${privateChoice ?? 'none'}`,
         event: privateMessage(PRIVATE_CHANNEL),
         config, flag, stored,
-        expected: notConfigured(false),
+        expected: privateChoice === undefined ? unresolved('choice-missing') : privateChoice === 'all' ? deliver('receive_all_shared') : drop('not-mentioned'),
       },
       {
         label: `${at}: DM (im) with DMs on`,
@@ -456,7 +468,7 @@ const declarativeRows: FungibleDecisionRow[] = (['absent', 'false'] as const).fl
         label: `${at}: app_mention (no channel_type) of P in an unlisted public channel`,
         event: makeAppMention({ channel: PUBLIC_CHANNEL, text: P_MENTION }),
         config, flag, stored,
-        expected: notConfigured(true),
+        expected: publicChoice === undefined ? unresolved('choice-missing') : deliver('mention'),
       },
     ]
   })
@@ -466,14 +478,14 @@ const declarativeRows: FungibleDecisionRow[] = (['absent', 'false'] as const).fl
       event: publicMessage(LISTED_ALL),
       config, flag: FLAG.false,
       stored: { [P_KEY]: { [LISTED_ALL]: 'mentions' } },
-      expected: deliver('receive_all'),
+      expected: drop('not-mentioned'),
     },
     {
       label: `switch ${switchForm}, flag false: P's listed mentions channel, plain message, P's and Q's stored choice all`,
       event: publicMessage(LISTED_MENTIONS),
       config, flag: FLAG.false,
       stored: { [P_KEY]: { [LISTED_MENTIONS]: 'all' }, [Q_KEY]: { [LISTED_MENTIONS]: 'all' } },
-      expected: drop('not-mentioned'),
+      expected: deliver('receive_all_shared'),
     },
   ]
   return [...perFlag, ...listed]
@@ -484,13 +496,13 @@ declarativeRows.push(
     label: 'no fungible-mode inputs: P\'s listed all channel',
     event: publicMessage(LISTED_ALL),
     config: DECLARATIVE_CASTS.absent, flag: undefined, omitFungibleInputs: true,
-    expected: deliver('receive_all'),
+    expected: unresolved('state-unavailable'),
   },
   {
     label: 'no fungible-mode inputs: unlisted public channel',
     event: publicMessage(PUBLIC_CHANNEL),
     config: DECLARATIVE_CASTS.absent, flag: undefined, omitFungibleInputs: true,
-    expected: notConfigured(true),
+    expected: unresolved('state-unavailable'),
   },
 )
 
@@ -505,12 +517,12 @@ const noStoredChoiceRows: FungibleDecisionRow[] = CHANNEL_KINDS.flatMap((kind): 
     label: `${at}: ${label}`, event, config: FUNGIBLE_CAST, flag: FLAG.false, stored: {}, expected,
   })
   return [
-    row('P\'s direct mention', messageIn(kind, P_MENTION), drop('channel-off', path)),
-    row('<!here>', messageIn(kind, `${broadcastText('here')} standup`), drop('channel-off', path)),
-    row('<!channel>', messageIn(kind, `${broadcastText('channel')} standup`), drop('channel-off', path)),
-    row('plain message', messageIn(kind), drop('channel-off', path)),
-    row('<!everyone>', messageIn(kind, `${broadcastText('everyone')} standup`), drop('channel-off', path)),
-    row('user-group mention', messageIn(kind, `${userGroupMentionText()} standup`), drop('channel-off', path)),
+    row('P\'s direct mention', messageIn(kind, P_MENTION), unresolved('choice-missing')),
+    row('<!here>', messageIn(kind, `${broadcastText('here')} standup`), unresolved('choice-missing')),
+    row('<!channel>', messageIn(kind, `${broadcastText('channel')} standup`), unresolved('choice-missing')),
+    row('plain message', messageIn(kind), unresolved('choice-missing')),
+    row('<!everyone>', messageIn(kind, `${broadcastText('everyone')} standup`), unresolved('choice-missing')),
+    row('user-group mention', messageIn(kind, `${userGroupMentionText()} standup`), unresolved('choice-missing')),
     row(
       'Q\'s bot post mentioning P',
       makeBotMessage({
@@ -520,7 +532,7 @@ const noStoredChoiceRows: FungibleDecisionRow[] = CHANNEL_KINDS.flatMap((kind): 
         bot_id: Q_BOT,
         text: P_MENTION,
       }),
-      drop('channel-off', path),
+      unresolved('choice-missing'),
     ),
   ]
 })
@@ -594,8 +606,8 @@ const ignoresChannelsRows: ChannelDeliveryRow[] = [
     event: publicMessage(PUBLIC_CHANNEL),
     config: fungibleCast(true, { channels: [{ id: PUBLIC_CHANNEL, delivery: 'all' }] }),
     flag: FLAG.false, stored: {},
-    expected: drop('channel-off', onPath('public', 'off')),
-    channelDelivery: delivery('off'),
+    expected: unresolved('choice-missing'),
+    channelDelivery: delivery(undefined),
   },
   {
     label: 'P lists the private channel mentions, P\'s stored all: plain message',
@@ -629,8 +641,8 @@ const ignoresChannelsRows: ChannelDeliveryRow[] = [
     event: publicMessage(PUBLIC_CHANNEL),
     config: FUNGIBLE_CAST, flag: FLAG.false, stored: {},
     viewChannels: { [P_KEY]: PUBLIC_CHANNEL, [Q_KEY]: { id: PUBLIC_CHANNEL, delivery: 'all' } },
-    expected: drop('channel-off', onPath('public', 'off')),
-    channelDelivery: delivery('off'),
+    expected: unresolved('choice-missing'),
+    channelDelivery: delivery(undefined),
   },
   {
     label: 'P\'s and R\'s sections undefined, P\'s stored all: plain message',
@@ -655,8 +667,8 @@ const ignoresChannelsRows: ChannelDeliveryRow[] = [
     event: privateMessage(PRIVATE_CHANNEL, P_MENTION),
     config: FUNGIBLE_CAST, flag: FLAG.false, stored: {},
     viewChannels: { [P_KEY]: FAIL_IF_READ, [Q_KEY]: FAIL_IF_READ, [R_KEY]: FAIL_IF_READ },
-    expected: drop('channel-off', onPath('private', 'off')),
-    channelDelivery: delivery('off'),
+    expected: unresolved('choice-missing'),
+    channelDelivery: delivery(undefined),
   },
 ]
 
@@ -724,19 +736,19 @@ const conditionRows: FungibleDecisionRow[] = [
   // channels.
   {
     label: 'declarative, listed: condition 1\'s event (no channel_type), flag false',
-    event: REFUSED_EVENTS.noChannelType, config: LISTED_CAST, flag: FLAG.false,
+    event: REFUSED_EVENTS.noChannelType, config: LISTED_CAST, flag: FLAG.false, stored: { [P_KEY]: { [PUBLIC_CHANNEL]: 'all' } },
     expected: deliver('mention'),
   },
   ...CHANNEL_KINDS.flatMap((kind): FungibleDecisionRow[] => {
     const event = REFUSED_EVENTS[kind]
     return [
-      { label: `declarative, listed: condition 3's ${kind} event, flag absent`, event, config: LISTED_CAST, flag: FLAG.absent, expected: deliver('mention') },
+      { label: `declarative, listed: condition 3's ${kind} event, flag absent`, event, config: LISTED_CAST, stored: { [P_KEY]: { [PUBLIC_CHANNEL]: 'all', [PRIVATE_CHANNEL]: 'mentions' } }, flag: FLAG.absent, expected: deliver('mention') },
       {
         label: `declarative, listed: condition 4's ${kind} event, flag ${kind === 'public' ? 'null' : '"false"'}`,
-        event, config: LISTED_CAST, flag: kind === 'public' ? FLAG.null : FLAG.falseString,
+        event, config: LISTED_CAST, stored: { [P_KEY]: { [PUBLIC_CHANNEL]: 'all', [PRIVATE_CHANNEL]: 'mentions' } }, flag: kind === 'public' ? FLAG.null : FLAG.falseString,
         expected: deliver('mention'),
       },
-      { label: `declarative, listed: condition 5's ${kind} event, flag true`, event, config: LISTED_CAST, flag: FLAG.true, expected: deliver('mention') },
+      { label: `declarative, listed: condition 5's ${kind} event, flag true`, event, config: LISTED_CAST, stored: { [P_KEY]: { [PUBLIC_CHANNEL]: 'all', [PRIVATE_CHANNEL]: 'mentions' } }, flag: FLAG.true, expected: deliver('mention') },
     ]
   }),
 ]
@@ -838,16 +850,16 @@ const unreadableStoreRows: ChannelDeliveryRow[] = [
     event: publicMessage(PUBLIC_CHANNEL),
     config: FUNGIBLE_CAST, flag: FLAG.false,
     stored: { [P_KEY]: { [PUBLIC_CHANNEL]: 'all' } }, readable: false,
-    expected: drop('state-unavailable'),
-    channelDelivery: delivery('off'),
+    expected: unresolved('state-unavailable'),
+    channelDelivery: delivery(undefined),
   },
   {
     label: 'store unreadable, its lookup holding P\'s and Q\'s all: P\'s direct mention in a private channel',
     event: privateMessage(PRIVATE_CHANNEL, P_MENTION),
     config: FUNGIBLE_CAST, flag: FLAG.false,
     stored: { [P_KEY]: { [PRIVATE_CHANNEL]: 'all' }, [Q_KEY]: { [PRIVATE_CHANNEL]: 'all' } }, readable: false,
-    expected: drop('state-unavailable'),
-    channelDelivery: delivery('off'),
+    expected: unresolved('state-unavailable'),
+    channelDelivery: delivery(undefined),
   },
 ]
 
@@ -888,6 +900,53 @@ const dmRows: FungibleDecisionRow[] = [
 // The groups, in the contract order
 // ---------------------------------------------------------------------------
 
+/** Current shared-authority seams. Existing shape/flag/author matrices above
+ * remain the single owners of those permutations. These rows isolate values,
+ * current observations and affected projections in both modes. */
+const currentAuthorityRows: FungibleDecisionRow[] = (['strict', 'open'] as const).flatMap(mode => {
+  const config = { ...FUNGIBLE_CAST, channel_mode: mode }
+  const base = { config, flag: false, event: publicMessage(PUBLIC_CHANNEL) }
+  const outcome = (value: DeliveryMode, via?: Via): DeliveryDecision => {
+    const path = mode === 'open' ? onPath('public', value) : undefined
+    return value === 'off' ? drop('channel-off', path) : via ? deliver(via, path) : drop('not-mentioned', path)
+  }
+  const values = (['off', 'mentions', 'all', 'thread_hybrid'] as const).flatMap(value =>
+    ([['plain', 'plain words', value === 'all' ? 'receive_all' : undefined],
+      ['mention before broadcast', `${broadcastText('here')} ${P_MENTION}`, 'mention'],
+      ['broadcast', broadcastText('channel', 'room'), 'broadcast']] as const).map(([label, text, via]): FungibleDecisionRow => ({
+      ...base, label: `${mode} ${value}: ${label}`, event: publicMessage(PUBLIC_CHANNEL, text),
+      stored: { [P_KEY]: { [PUBLIC_CHANNEL]: value } }, expected: outcome(value, via),
+    })))
+  const siblings = (['eligible', 'ineligible', 'unresolved', 'missing', 'guarded', 'unreadable'] as const).map((kind): FungibleDecisionRow => {
+    const memberships = new Map<string, MembershipReading>([[P_KEY, eligibleMembership(P_KEY)]])
+    if (kind !== 'missing') memberships.set(Q_KEY, kind === 'ineligible' ? { kind: 'ineligible', reason: 'absent' } :
+      kind === 'unresolved' ? { kind: 'unresolved', reason: 'current-membership-missing' } : eligibleMembership(Q_KEY))
+    return { ...base, label: `${mode} effectively-all sibling ${kind}`,
+      config: kind === 'guarded' ? { ...config, personas: config.personas.map(p => p.key === P_KEY ? { ...p, permission_prompts: PUBLIC_CHANNEL } : p) } : config,
+      memberships, stored: { [P_KEY]: { [PUBLIC_CHANNEL]: 'all' }, [Q_KEY]: { [PUBLIC_CHANNEL]: 'all' } },
+      readableFor: kind === 'unreadable' ? key => key !== Q_KEY : undefined,
+      expected: outcome('all', kind === 'eligible' || (kind === 'guarded' && mode === 'strict') ? 'receive_all_shared' : 'receive_all') }
+  })
+  const unavailable = (['missing-store', 'missing-choice', 'missing-membership', 'unresolved-membership', 'absent', 'affected', 'unaffected'] as const).map((kind): FungibleDecisionRow => ({
+    ...base, label: `${mode} ${kind} never becomes a fallback choice`,
+    stored: kind === 'missing-store' ? undefined : kind === 'missing-choice' ? {} : { [P_KEY]: { [PUBLIC_CHANNEL]: 'all' } },
+    memberships: kind === 'missing-membership' ? new Map() : kind === 'unresolved-membership' || kind === 'absent'
+      ? new Map([[P_KEY, kind === 'absent' ? { kind: 'ineligible', reason: 'absent' } : { kind: 'unresolved', reason: 'current-membership-missing' }]]) : undefined,
+    readable: kind === 'affected' || kind === 'unaffected' ? false : true,
+    readableFor: kind === 'unaffected' ? () => true : undefined,
+    expected: kind === 'unaffected' ? outcome('all', 'receive_all') : kind === 'absent' ? { action: 'drop', reason: 'channel-ineligible' } :
+      unresolved(kind === 'missing-store' || kind === 'affected' ? 'state-unavailable' : kind === 'missing-choice' ? 'choice-missing' : 'membership-unresolved'),
+  }))
+  return [...values, ...siblings, ...unavailable,
+    { ...base, label: `${mode} off precedes another persona destination and mention`,
+      event: publicMessage(Q_DESTINATION, `${P_MENTION} ${broadcastText('here')}`),
+      stored: { [P_KEY]: { [Q_DESTINATION]: 'off' } }, expected: outcome('off') },
+    { ...base, label: `${mode} DM proceeds with an independent readable projection and no membership`,
+      event: makeDm(), stored: {}, readable: false, readableFor: (_key, channel) => channel?.startsWith('D') === true,
+      memberships: new Map(), expected: deliver('dm') },
+  ]
+})
+
 /** One group: its rows. */
 export interface FungibleDecisionGroup<R extends FungibleDecisionRow = FungibleDecisionRow> {
   readonly rows: readonly R[]
@@ -905,4 +964,5 @@ export const FUNGIBLE_DECISION_GROUPS = {
   firstSteps: { rows: firstStepRows },
   unreadableStore: { rows: unreadableStoreRows },
   dmInFungibleMode: { rows: dmRows },
+  currentAuthority: { rows: currentAuthorityRows },
 } as const satisfies Readonly<Record<string, FungibleDecisionGroup>>

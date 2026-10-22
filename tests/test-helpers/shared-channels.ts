@@ -40,6 +40,18 @@ export function addRawResponseEvidence(message: JSONRPCResponse | JSONRPCError, 
 export const SHARED_CHANNEL_IDS = { primary: 'C0TEST001', secondary: 'C0TEST002', private: 'G0TEST003' } as const
 export function sharedChannelPath(stateDir: string): string { return join(resolve(stateDir), 'config.json.last-applied') }
 export function configBytes(input: unknown): Buffer { return Buffer.from(JSON.stringify(input, null, 2) + '\n') }
+
+import { REVIEW_REQUEST_FORMAT } from '../../src/reload-request.ts'
+import { parseSharedRecoveryRequest, recoveryHash, type SharedRecoveryRequest } from '../../src/shared-recovery.ts'
+/** Bound recovery input, validated by the production grammar. No snapshot
+ * field is offered: restoration belongs only to the running authority. */
+export function sharedRecoveryRequest(id: string, evidence: Uint8Array, replacement?: Uint8Array): SharedRecoveryRequest {
+  const value = { format: REVIEW_REQUEST_FORMAT, request_id: id, evidence_sha256: recoveryHash(evidence),
+    ...(replacement === undefined ? { action: 'restore' } : { action: 'replace', replacement_source_base64: Buffer.from(replacement).toString('base64') }) }
+  const request = parseSharedRecoveryRequest(value)
+  if (!request) throw new Error('sharedRecoveryRequest: invalid fixture input')
+  return request
+}
 export function channelPopulation(count: number, offset = 0) {
   return Array.from({ length: count }, (_, i) => ({
     id: `C0LARGE${String(i + offset).padStart(5, '0')}`,

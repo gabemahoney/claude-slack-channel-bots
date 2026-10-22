@@ -1,5 +1,6 @@
 import { activationRecord, applicationState } from './test-helpers/shared-channels.ts'
-import { membershipPage } from './test-helpers/shared-channels.ts'
+import { membershipPage, deliveryAttempt } from './test-helpers/shared-channels.ts'
+import { buildOperatorAssignment } from '../src/reload-request.ts'
 import { REPLY_TOOL_ALLOW_RULE } from '../src/agent-director-template.ts'
 import { createHash } from 'node:crypto'
 import { queuePath, readQueue, slackInput, sentRecord, deliveredRecord } from './test-helpers/delivery-queue.ts'
@@ -154,6 +155,7 @@ import {
 import { readRetiredKeysRecord, retiredKeysRecordOf, RFC3339_UTC, writeRetiredKeysRecord } from './test-helpers/retired-keys.ts'
 import {
   makeChannelMessage,
+  makeAppMention,
   makeDeferredConnect,
   makeDm,
   makePrivateChannelMessage,
@@ -5921,9 +5923,132 @@ describe('at apply: no credential value in any log line, error, notice, tool res
 })
 
 describe('durable queues across confirmed persona changes', () => {
+  test('next routed event and ordinary MCP tools share operator/bot/mode/destination changes without replacing sessions or clients', async () => {
+    const shared = EXTRA_CHANNEL, discovered = 'C0DISCOVER', moved = OTHER_CHANNEL
+    const { run, personas: [alpha, bravo] } = await running([
+      ['alpha', { channels: [{ id: shared, delivery: 'all' }], permission_prompts: 'dm', dm: { enabled: true, contact: CONTACT } }],
+      ['bravo', { channels: [{ id: shared, delivery: 'all' }, { id: moved, delivery: 'all' }], permission_prompts: shared }],
+    ], { ...REAL_WITH_SESSIONS, top: { channel_mode: 'open' } })
+    const authority = run.controller.sharedChannels()!, session = run.session('alpha'), siblingSession = run.session('bravo')
+    const socket = run.stub('alpha').socket, client = run.connections.clientFor('alpha')
+    const confirmTransition = async (expected: Array<ReloadLifecycleRecord & { op: 'update-in-place' }>, forgets: string[] = []) => {
+      const cp = run.checkpoint(), timeline = run.lifecycle.timeline.length, calls = run.composition!.calls.length
+      const adCalls = stubCallCount(run.composition!.agentDirector)
+      const sides = { alpha: slackSideOf(run, 'alpha'), bravo: slackSideOf(run, 'bravo') }
+      const identities = ['alpha', 'bravo'].map(name => ({ name, client: run.connections.clientFor(h.key(name)), socket: run.stub(name).socket }))
+      const expectKept = () => {
+        expect(stubCallCount(run.composition!.agentDirector)).toBe(adCalls)
+        expect(run.since(cp).slackBuilds).toBe(0); expect(run.since(cp).slackCalls).toEqual([])
+        expect({ alpha: slackSideOf(run, 'alpha'), bravo: slackSideOf(run, 'bravo') }).toEqual(sides)
+        expect(run.session('alpha')).toBe(session); expect(session!.connected).toBe(true)
+        expect(run.session('bravo')).toBe(siblingSession); expect(siblingSession!.connected).toBe(true)
+        for (const kept of identities) {
+          expect(run.connections.clientFor(h.key(kept.name))).toBe(kept.client)
+          expect(run.stub(kept.name).socket).toBe(kept.socket)
+        }
+      }
+      const untouched = ['alpha', 'bravo'].filter(name => !expected.some(record => record.key === h.key(name)))
+        .map(name => watchUntouched(run, name))
+      await run.ticks.tick()
+      expect(h.pendingExists()).toBe(true)
+      expect(run.since(cp).lifecycle).toEqual([])
+      expect(run.lifecycle.timeline.slice(timeline)).toEqual([])
+      expect(run.composition!.calls.slice(calls)).toEqual([])
+      expect({ alpha: slackSideOf(run, 'alpha'), bravo: slackSideOf(run, 'bravo') }).toEqual(sides)
+      expectKept()
+      assertNoLeak(run.captured())
+      h.confirm(); await run.ticks.tick()
+      expect(run.since(cp).lifecycle).toEqual(expected)
+      expect(run.lifecycle.timeline.slice(timeline)).toEqual(expected.flatMap(({ op, key }) => [
+        { op, key, phase: 'start' }, { op, key, phase: 'settled' },
+      ]))
+      expect(run.composition!.calls.slice(calls)).toEqual(forgets.map(key => ['destinations.forget', key]))
+      expect(stubCallCount(run.composition!.agentDirector)).toBe(adCalls)
+      expect(run.since(cp).slackBuilds).toBe(0); expect(run.since(cp).slackCalls).toEqual([])
+      expect({ alpha: slackSideOf(run, 'alpha'), bravo: slackSideOf(run, 'bravo') }).toEqual(sides)
+      for (const check of untouched) check()
+      expect(run.session('alpha')).toBe(session); expect(run.session('bravo')).toBe(siblingSession)
+      expectKept()
+      assertNoLeak(run.captured())
+    }
+    let number = 0
+    const event = (text: string, channel = shared) => makeChannelMessage({ channel, text, ts: `1700000020.${String(++number).padStart(6, '0')}` })
+    const send = async (text: string) => { await run.deliver('alpha', event(text)); return run.queued('alpha').length }
+    // A saved all is guarded by bravo's destination, and the paired mention
+    // events retain exactly one accepted original item.
+    expect(await send('guarded plain')).toBe(0)
+    const mention = event(`  <@${run.stub('alpha').identity.botUserId}> original\r\n😀  `)
+    await run.deliver('alpha', makeAppMention({ ...mention, type: 'app_mention' })); await run.deliver('alpha', mention)
+    expect(run.queued('alpha')).toHaveLength(1)
+    expect(run.queued('alpha')[0]!.accepted).toMatchObject({ text: mention.text, via: 'mention' })
+    const movedBravo = { ...bravo!, permission_prompts: moved }
+    h.writeConfig({ personas: [alpha!, movedBravo], channel_mode: 'open' })
+    await confirmTransition([{ op: 'update-in-place', key: h.key('bravo'), via: 'apply', settings: ['permission_prompts'] }], [h.key('bravo')])
+    expect(authority.choice('alpha', shared)).toBe('all')
+    expect(await send('unguarded saved all')).toBe(2)
+    run.stub('alpha').script.inventory.push(membershipPage([{ id: shared, is_channel: true, is_group: false, is_im: false, is_mpim: false, is_ext_shared: true }]))
+    run.membershipScanner.request('alpha'); await run.membershipClock.runNext()
+    expect(run.membership.read('alpha', shared, 'open')).toEqual({ kind: 'ineligible', reason: 'external-sharing' })
+    expect(await send('open external share refused')).toBe(2)
+    run.stub('alpha').script.inventory.push(membershipPage([shared]))
+    run.membershipScanner.request('alpha'); await run.membershipClock.runNext()
+    const request = deliveryAttempt('composition-bot-off', shared, 'off')
+    expect((await run.callTool('alpha', 'set_channel_delivery', request)).isError).toBe(false)
+    expect(await send('off after real MCP')).toBe(2)
+    expect((await run.callTool('alpha', 'fetch_messages', { channel: shared })).isError).toBe(false)
+    const strictInput = [alpha!, movedBravo]
+    h.writeConfig({ personas: strictInput, channel_mode: 'strict' })
+    await confirmTransition([])
+    expect(authority.choice('alpha', shared)).toBe('off')
+    const tools = [
+      ['reply', (channel: string) => ({ chat_id: channel, text: 'ordinary' })],
+      ['react', (channel: string) => ({ chat_id: channel, message_id: mention.ts, emoji: 'eyes' })],
+      ['edit_message', (channel: string) => ({ chat_id: channel, message_id: mention.ts, text: 'ordinary' })],
+      ['fetch_messages', (channel: string) => ({ channel })],
+      ['download_attachment', (channel: string) => ({ chat_id: channel, message_id: mention.ts })],
+    ] as const
+    async function refusesEveryTool(channel: string) {
+      const checkpoint = run.checkpoint()
+      for (const [tool, args] of tools) expect((await run.callTool('alpha', tool, args(channel))).isError).toBe(true)
+      expect(run.since(checkpoint).slackCalls).toEqual([])
+    }
+    await refusesEveryTool(shared) // open bot-off retained by strict activation
+    run.stub('alpha').script.inventory.push(membershipPage([{ id: shared, is_channel: true, is_group: false, is_im: false, is_mpim: false, is_ext_shared: true }, discovered]))
+    run.membershipScanner.request('alpha'); await run.membershipClock.runNext()
+    expect(authority.choice('alpha', discovered)).toBe('off')
+    await refusesEveryTool(discovered)
+    const target = authority.config().personas.find(p => p.key === 'alpha')!
+    const assign = async (delivery: DeliveryMode) => {
+      run.request('request', [buildOperatorAssignment(target, authority.incarnation('alpha')!, shared, delivery)])
+      await confirmTransition([{ op: 'update-in-place', key: h.key('alpha'), via: 'apply', settings: ['delivery'] }])
+    }
+    await assign('all')
+    expect(run.membership.read('alpha', shared, 'strict').kind).toBe('eligible')
+    expect(await send('strict externally shared accepted')).toBe(3)
+    await assign('off'); expect(await send('operator off')).toBe(3); await refusesEveryTool(shared)
+    await assign('all')
+    expect(authority.choice('alpha', shared)).toBe('all')
+    expect((await run.callTool('alpha', 'fetch_messages', { channel: shared })).isError).toBe(false)
+    await run.stub('alpha').socket.deliver({ type: 'channel_left', channel: shared,
+      event_ts: ((run.membershipClock.now() + 1) / 1000).toFixed(3) }, { event_id: 'EvCOMPOSEDLEAVE' })
+    expect(authority.choice('alpha', shared)).toBeUndefined(); await refusesEveryTool(shared)
+    expect(await send('removed')).toBe(3)
+    expect(run.queued('alpha').map(({ accepted: { text, channel, via } }) => ({ text, channel, via }))).toEqual([
+      { text: String(mention.text), channel: shared, via: 'mention' },
+      { text: 'unguarded saved all', channel: shared, via: 'receive_all_shared' },
+      { text: 'strict externally shared accepted', channel: shared, via: 'receive_all_shared' },
+    ])
+    expect(run.queued('bravo')).toEqual([])
+    expect(run.session('alpha')).toBe(session); expect(run.session('bravo')).toBe(siblingSession)
+    expect(run.stub('alpha').socket).toBe(socket); expect(run.connections.clientFor('alpha')).toBe(client)
+    assertNoLeak(run.captured())
+  })
+
   test('three open items stay under a removed key; re-add restores their order and rename does not transfer them', async () => {
     const { run, personas: [alpha, bravo] } = await running(['alpha', 'bravo'], REAL_WITH_SESSIONS)
     const key = h.key('bravo')
+    const authority = run.controller.sharedChannels()!, token = authority.lifetime(key, bravo!.channels![0]!.id)!
+    expect(authority.lifetimeStatus(token)).toBe('current')
     for (const source of ['slack', 'interject', 'cron'] as const) {
       const input = source === 'slack'
         ? { source, text: 'slack', channel: bravo!.channels![0]!.id, via: 'receive_all', key: { chat_id: bravo!.channels![0]!.id, ts: '1700000000.000001' }, ts: '1700000000.000001' }
@@ -5931,18 +6056,89 @@ describe('durable queues across confirmed persona changes', () => {
       expect((await run.queue.accept(key, input)).status).toBe('accepted')
     }
     const durableBefore = readQueue(h.stateDir, key)
+    const acceptedBefore = run.queued('bravo').map(i => structuredClone(i.accepted))
     const before = run.queued('bravo').map(i => ({ seq: i.accepted.seq, source: i.accepted.source, text: i.accepted.text, via: i.accepted.via }))
     const preview = await previewConfig(run, [alpha!])
     expect(preview.find(line => line.startsWith('DESTRUCTIVE:'))).toContain('3 open queued items kept, delivered only if a persona with the same key is added again')
     h.confirm(); await run.ticks.tick()
+    expect(authority.lifetimeStatus(token)).toBe('superseded')
     expect(run.queueEvents).toContainEqual({ type: 'retained', key, count: 3 })
     expect(existsSync(queuePath(h.stateDir, key))).toBe(true)
     expect(readQueue(h.stateDir, key)).toEqual(durableBefore)
     expect(run.queued('bravo').map(i => ({ seq: i.accepted.seq, source: i.accepted.source, text: i.accepted.text, via: i.accepted.via }))).toEqual(before)
     await applyConfig(run, [alpha!, withIndependentDestination(bravo!)])
+    const replacement = authority.lifetime(key, bravo!.channels![0]!.id)!
+    expect(replacement.incarnation).not.toBe(token.incarnation)
+    expect(authority.lifetimeStatus(replacement)).toBe('current')
+    expect(authority.lifetimeStatus(token)).toBe('superseded')
     expect(run.queued('bravo').map(i => i.accepted.seq)).toEqual([1, 2, 3]); expect(run.queued('bravo').every(i => i.delivered === false)).toBe(true)
     const renamed = h.persona('bravo_two'); h.materialize(renamed); await applyConfig(run, [alpha!, renamed])
     expect(run.queued('bravo_two')).toEqual([]); expect(run.queue.openCount(key)).toBe(3); assertNoLeak(run.captured())
+    expect(authority.lifetimeStatus(replacement)).toBe('superseded')
+    const cp = run.checkpoint(), timeline = run.lifecycle.timeline.length, calls = run.composition!.calls.length
+    const alphaUntouched = watchUntouched(run, 'alpha'), alphaSession = run.session('alpha')!
+    const alphaClient = run.connections.clientFor(h.key('alpha')), alphaSocket = run.stub('alpha').socket
+    const adCalls = stubCallCount(run.composition!.agentDirector), adFrom = run.composition!.agentDirectorCalls.length
+    const renamedKey = h.key('bravo_two'), renamedSocket = run.stub('bravo_two').socket
+    const retainedBeforeBack = readQueue(h.stateDir, key)
+    const sides = { alpha: slackSideOf(run, 'alpha'), renamed: slackSideOf(run, 'bravo_two'), bravo: slackSideOf(run, 'bravo') }
+    await previewConfig(run, [alpha!, withIndependentDestination(bravo!)])
+    expect(run.lifecycle.timeline.slice(timeline)).toEqual([])
+    expect(run.composition!.calls.slice(calls)).toEqual([])
+    expect(stubCallCount(run.composition!.agentDirector)).toBe(adCalls)
+    expect(run.since(cp).slackBuilds).toBe(0); expect(run.since(cp).slackCalls).toEqual([])
+    expect({ alpha: slackSideOf(run, 'alpha'), renamed: slackSideOf(run, 'bravo_two'), bravo: slackSideOf(run, 'bravo') }).toEqual(sides)
+    expect(run.appliedKeys()).toEqual(keysOf('alpha', 'bravo_two'))
+    const gate = run.lifecycle.hold('bring-up', key)
+    h.confirm(); const applying = run.ticks.tick()
+    try {
+      await gate.entered
+      expect(run.lifecycle.timeline.slice(timeline)).toEqual([
+        { op: 'teardown', key: renamedKey, phase: 'start' },
+        { op: 'teardown', key: renamedKey, phase: 'settled' },
+        { op: 'bring-up', key, phase: 'start' },
+      ])
+      expect(run.since(cp).lifecycle).toEqual([
+        { op: 'teardown', key: renamedKey, via: 'apply' },
+        { op: 'bring-up', key, via: 'apply' },
+      ])
+      expect(renamedSocket.disconnectCalls).toBe(sides.renamed.disconnects.at(-1)! + 1)
+      expect(run.since(cp).slackBuilds).toBe(0)
+    } finally { gate.release(); await applying }
+    expect(run.since(cp).lifecycle).toEqual([
+      { op: 'teardown', key: renamedKey, via: 'apply' },
+      { op: 'bring-up', key, via: 'apply', result: expect.objectContaining({ outcome: 'up', failures: [] }) },
+      { op: 'launch', key, via: 'apply' },
+    ])
+    expect(run.lifecycle.timeline.slice(timeline)).toEqual([
+      { op: 'teardown', key: renamedKey, phase: 'start' },
+      { op: 'teardown', key: renamedKey, phase: 'settled' },
+      { op: 'bring-up', key, phase: 'start' },
+      { op: 'bring-up', key, phase: 'settled' },
+    ])
+    expect(run.composition!.agentDirectorCalls.slice(adFrom)).toEqual([{ verb: 'kill', id: personaInstanceId(renamedKey), result: 'ok' }])
+    expect(stubCallCount(run.composition!.agentDirector)).toBe(adCalls + 1)
+    expect(run.composition!.calls.slice(calls).filter(([, key]) => key === h.key('alpha'))).toEqual([])
+    expect(run.since(cp).slackBuilds).toBe(3)
+    expect(run.since(cp).slackCalls.map(call => call.method)).toEqual(['auth.test', 'bots.info'])
+    expect(run.stub('bravo').callLog.slice(sides.bravo.webCalls).map(call => call.method)).toEqual(['auth.test', 'bots.info'])
+    expect(run.stub('bravo_two').callLog).toHaveLength(sides.renamed.webCalls)
+    alphaUntouched()
+    expect(run.session('alpha')).toBe(alphaSession); expect(alphaSession.connected).toBe(true)
+    expect(run.connections.clientFor(h.key('alpha'))).toBe(alphaClient); expect(run.stub('alpha').socket).toBe(alphaSocket)
+    expect(run.appliedKeys()).toEqual(keysOf('alpha', 'bravo'))
+    expect(run.isUp('bravo')).toBe(true); expect(run.isUp('bravo_two')).toBe(false)
+    const current = authority.lifetime(key, bravo!.channels![0]!.id)!
+    expect(current.incarnation).not.toBe(token.incarnation)
+    expect(current.incarnation).not.toBe(replacement.incarnation)
+    expect(authority.lifetimeStatus(current)).toBe('current')
+    expect(authority.lifetimeStatus(token)).toBe('superseded')
+    expect(authority.lifetimeStatus(replacement)).toBe('superseded')
+    expect(run.queued('bravo').map(i => ({ seq: i.accepted.seq, source: i.accepted.source, text: i.accepted.text, via: i.accepted.via }))).toEqual(before)
+    expect(run.queued('bravo').map(i => i.accepted)).toEqual(acceptedBefore)
+    expect(readQueue(h.stateDir, key)).toEqual(retainedBeforeBack)
+    expect(run.queued('alpha')).toEqual([]); expect(run.queued('bravo_two')).toEqual([])
+    assertNoLeak(run.captured())
   })
   test('routing edits affect future arrivals while old accepted via and text remain fixed under their original key', async () => {
     const { run, personas: [alpha, bravo] } = await running(['alpha', 'bravo'], REAL_WITH_SESSIONS)
@@ -5957,13 +6153,59 @@ describe('durable queues across confirmed persona changes', () => {
 })
 
 test.each(['credentials_file', 'working_directory'] as const)('a destructive %s edit retains fixed open work under the same key', async field => {
-  const { run, personas: [alpha, bravo] } = await running(['alpha', 'bravo'], REAL_WITH_SESSIONS)
+  await useConfigDirs()
+  const { run, personas: [alpha, bravo] } = await running(['alpha', 'bravo'], { ...REAL_LAUNCH, sessions: true })
   const key = h.key('alpha')
+  const authority = run.controller.sharedChannels()!, token = authority.lifetime(key, alpha!.channels![0]!.id)!
+  let release!: () => void
+  const blocked = new Promise<void>(resolve => { release = resolve })
+  const completion = (async () => { await blocked; return authority.isCurrentLifetime(token) })()
   expect((await run.queue.accept(key, { source: 'interject', sender: 'ops', text: 'pending' })).status).toBe('accepted')
   await run.queue.append(key, { v: 1, kind: 'fixed', seq: 1, parts: ['immutable fixed input'] })
+  const oldLabel = h.credentialsLabel('alpha')
   const nextPath = join(h.root, field === 'credentials_file' ? 'rotated-credentials.json' : 'new-working-directory')
   const changed = { ...alpha!, [field]: nextPath }; h.materialize(changed)
-  await applyConfig(run, [changed, bravo!])
+  const cp = run.checkpoint(), timeline = run.lifecycle.timeline.length, calls = run.composition!.calls.length
+  const adCalls = stubCallCount(run.composition!.agentDirector), adFrom = run.composition!.agentDirectorCalls.length
+  const instanceFrom = run.composition!.instanceCallsOf('alpha').length
+  const activityFrom = run.socketActivity('alpha').length
+  const newLabel = h.credentialsLabel('alpha')
+  const siblingUntouched = watchUntouched(run, 'bravo'), siblingSession = run.session('bravo')!
+  const siblingClient = run.connections.clientFor(h.key('bravo')), siblingSocket = run.stub('bravo').socket
+  const sides = { alpha: slackSideOf(run, 'alpha'), bravo: slackSideOf(run, 'bravo') }
+  try {
+    await previewConfig(run, [changed, bravo!])
+    expect(run.lifecycle.timeline.slice(timeline)).toEqual([])
+    expect(run.composition!.calls.slice(calls)).toEqual([])
+    expect(stubCallCount(run.composition!.agentDirector)).toBe(adCalls)
+    expect(run.since(cp).slackBuilds).toBe(0); expect(run.since(cp).slackCalls).toEqual([])
+    expect({ alpha: slackSideOf(run, 'alpha'), bravo: slackSideOf(run, 'bravo') }).toEqual(sides)
+    h.confirm(); await run.ticks.tick()
+  } finally { release() }
+  expect(run.since(cp).lifecycle).toEqual([
+    { op: 'teardown', key, via: 'apply' },
+    { op: 'bring-up', key, via: 'apply', result: expect.objectContaining({ outcome: 'up', failures: [] }) },
+    { op: 'launch', key, via: 'apply', action: SPAWN_ACTION_FRESH_RETIRED },
+  ])
+  expect(run.lifecycle.timeline.slice(timeline)).toEqual([
+    { op: 'teardown', key, phase: 'start' }, { op: 'teardown', key, phase: 'settled' },
+    { op: 'bring-up', key, phase: 'start' }, { op: 'bring-up', key, phase: 'settled' },
+  ])
+  expect(instanceCallsSince(run, 'alpha', instanceFrom)).toEqual(['kill ok', 'reuse-spawn ok'])
+  expect(lastSpawnOf(run, 'alpha')).toMatchObject({ id: personaInstanceId(key), cwd: changed.working_directory, reuse: true })
+  expect(adCallsSince(run, adFrom).filter(call => call.id !== personaInstanceId(key))).toEqual([])
+  expect(run.composition!.calls.slice(calls).filter(([, key]) => key === h.key('bravo'))).toEqual([])
+  expect(run.socketActivity('alpha').slice(activityFrom)).toEqual([
+    `discarded ${oldLabel}`, `disconnected ${oldLabel}`, `built ${newLabel}`, `started ${newLabel}`, `connected ${newLabel}`,
+  ])
+  siblingUntouched()
+  expect(run.session('bravo')).toBe(siblingSession); expect(siblingSession.connected).toBe(true)
+  expect(run.connections.clientFor(h.key('bravo'))).toBe(siblingClient); expect(run.stub('bravo').socket).toBe(siblingSocket)
+  expect(run.appliedKeys()).toEqual(keysOf('alpha', 'bravo')); expect(run.isUp('alpha')).toBe(true)
+  expect(await completion).toBe(false)
+  expect(authority.lifetimeStatus(token)).toBe('superseded')
+  expect(authority.lifetime(key, alpha!.channels![0]!.id)!.incarnation).not.toBe(token.incarnation)
+  expect(authority.lifetimeStatus(authority.lifetime(key, alpha!.channels![0]!.id)!)).toBe('current')
   expect(run.queued('alpha')).toHaveLength(1); expect(run.queued('alpha')[0]!.fixed!.parts).toEqual(['immutable fixed input']); expect(run.queue.openCount(key)).toBe(1)
   expect(readQueue(h.stateDir, key).filter(r => r.kind === 'accepted' && !('compact' in r))).toHaveLength(1)
   expect(run.queued('bravo')).toEqual([]); assertNoLeak(run.captured())

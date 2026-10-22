@@ -72,6 +72,18 @@ import { makeNotifierStack } from './persona-notifier.ts'
 import { errTmuxUnresponsive } from './agent-director-stub.ts'
 import { PHASE1_RC_VERSION } from './agent-director-versions.ts'
 import { conflictForPersona } from './conflict-cases.ts'
+import { eligibleMembership } from './fungible-decision.ts'
+
+/** Explicit observations for tests of queue/recovery behavior. This projection
+ * is deliberately separate from configured choices; production membership
+ * composition tests use makeMembershipHarness instead. */
+export function observedMembership(channels: Readonly<Record<string, readonly string[]>>): NonNullable<PersonaRoutingDeps['membership']> {
+  return {
+    read: (key, channel) => channels[key]?.includes(channel) ? eligibleMembership(key) : { kind: 'ineligible', reason: 'absent' },
+    hasUnresolved: () => false,
+    request: () => {},
+  }
+}
 
 /** Default restart delay (seconds): the restart timer fires within a few ms. */
 export const FAST_RESTART_DELAY_S = 0.005
@@ -450,6 +462,8 @@ export interface PersonaHandle {
 }
 
 export interface RoutingHarnessOptions {
+  /** Caller-supplied current observations, never inferred from configuration. */
+  membership?: PersonaRoutingDeps['membership']
   /** Names with a registered session; default every persona. */
   sessions?: readonly string[]
   /** Names whose registered session has lost its `_GET_stream`. */
@@ -1012,6 +1026,7 @@ export function makeRoutingHarness(
 
   const preparation = createDeliveryPreparation({ queue, clock: opts.preparationClock, clientFor: webClientFor, resolveUserName: opts.resolveUserName ?? resolveUserName })
   const routing = createPersonaRouting({
+    membership: opts.membership,
     queue,
     prepare: preparation.prepare,
     getPersonaConfig: () => {

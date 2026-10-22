@@ -70,3 +70,39 @@ test('operator grammar and intent text have one literal pin; diagnostic categori
     assertNoLeak(line)
   }
 })
+
+import { sharedRecoveryRequest, configBytes } from './test-helpers/shared-channels.ts'
+import { parseSharedRecoveryRequest, readSharedRecoveryRequest, recoveryBytes, recoveryHash } from '../src/shared-recovery.ts'
+
+test.each(['restore', 'replace'] as const)('reviewed %s request roundtrips exact evidence without a snapshot import field', action => {
+  const evidence = Buffer.from([0, 255, 10]), replacement = Buffer.from('separately chosen config\r\n')
+  const request = sharedRecoveryRequest('retained-repair-id', evidence, action === 'replace' ? replacement : undefined)
+  expect(request.format).toBe(REVIEW_REQUEST_FORMAT)
+  expect(request.evidence_sha256).toBe(recoveryHash(evidence))
+  const parsed = readSharedRecoveryRequest(configBytes(request))!
+  expect(parsed).toEqual(request); parsed.request_id = 'mutated-copy'; expect(request.request_id).toBe('retained-repair-id')
+  expect(parseReviewRequestBytes(configBytes(request))).toBeUndefined()
+  if (request.action === 'replace') expect(recoveryBytes(request.replacement_source_base64)).toEqual(replacement)
+})
+
+test.each(['unknown', 'snapshot', 'missing-id', 'bad-id', 'bad-hash', 'wrong-format', 'wrong-action', 'missing-replacement', 'bad-base64', 'base64-whitespace', 'restore-with-replacement'] as const)('recovery request rejects %s without returning submitted secrets', variant => {
+  const request: Record<string, unknown> = { ...sharedRecoveryRequest('repair-request', Buffer.from('damage'), Buffer.from('config')) }
+  if (variant === 'unknown') request.secret = LEAK_SENTINEL
+  if (variant === 'snapshot') request.anchorBase64 = Buffer.from(LEAK_SENTINEL).toString('base64')
+  if (variant === 'missing-id') delete request.request_id
+  if (variant === 'bad-id') request.request_id = '../invalid'
+  if (variant === 'bad-hash') request.evidence_sha256 = LEAK_SENTINEL
+  if (variant === 'wrong-format') request.format = 'legacy'
+  if (variant === 'wrong-action') request.action = 'repair'
+  if (variant === 'missing-replacement') delete request.replacement_source_base64
+  if (variant === 'bad-base64') request.replacement_source_base64 = '!!!!'
+  if (variant === 'base64-whitespace') request.replacement_source_base64 += '\n'
+  if (variant === 'restore-with-replacement') request.action = 'restore'
+  expect(parseSharedRecoveryRequest(request)).toBeUndefined()
+  expect(readSharedRecoveryRequest(configBytes(request))).toBeUndefined()
+  assertNoLeak({ parsed: parseSharedRecoveryRequest(request) })
+})
+
+test('recovery request rejects invalid UTF-8, JSON and nonobjects without content diagnostics', () => {
+  for (const input of [Buffer.from([0xff]), Buffer.from('{'), Buffer.from('null'), Buffer.from('[]')]) expect(readSharedRecoveryRequest(input)).toBeUndefined()
+})

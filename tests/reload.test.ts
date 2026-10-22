@@ -1,7 +1,9 @@
 import { reviewLedger, reviewOutcomeLine, RELOAD_REVIEW_OUTCOME } from '../src/reload-review.ts'
 import { applicationState } from './test-helpers/shared-channels.ts'
 import { createHash } from 'node:crypto'
-import { queueRetentionClause } from '../src/reload-preview-clauses.ts'
+import { queueRetentionClause, RECOVERY_PRESERVATION } from '../src/reload-preview-clauses.ts'
+import { sharedRecoveryLine } from '../src/reload-recovery.ts'
+import { recoveryHash } from '../src/shared-recovery.ts'
 /**
  * reload.test.ts — The reload controller's start rules, the
  * record-start real-path collisions (record-start part), the
@@ -796,10 +798,11 @@ describe('a start with a record runs the record', () => {
     expectNothingApplied(run)
     expect(run.outcome.kind === 'refused' && run.outcome.source).toBe('record')
     expect(run.writes).toEqual([])
-    expect(run.logs).toHaveLength(1)
-    expect(run.logs[0]!.startsWith(RECORD_REFUSAL)).toBe(true)
-    expect(run.logs[0]).toContain(expected())
-    expect(run.logs[0]!.endsWith(recoveryHint())).toBe(true)
+    expect(run.logs).toHaveLength(recordBefore === undefined ? 1 : 2)
+    if (recordBefore !== undefined) expect(run.logs[0]).toBe(damagedAuthorityLine(recordBefore))
+    expect(run.logs.at(-1)!.startsWith(RECORD_REFUSAL)).toBe(true)
+    expect(run.logs.at(-1)).toContain(expected())
+    expect(run.logs.at(-1)!.endsWith(recoveryHint())).toBe(true)
     expect(existsSync(h.paths.lastApplied)).toBe(true)
     if (recordBefore !== undefined) expect(applicationState(h.readRecord()!)).toEqual(applicationState(recordBefore))
     expect(h.readConfig()).toEqual(configBytes)
@@ -1167,7 +1170,7 @@ describe('a record or config file that is not a regular file refuses the start u
     expect(run.logs).toEqual([line()])
     // Never read, but closed; the record refusal never goes on to config.json.
     expect(seam.reads).toEqual([])
-    expect(seam.closes).toEqual([target()])
+    expect(seam.closes).toEqual(withRecord ? [target(), target()] : [target()])
     expect(run.writes).toEqual([])
     expect(applicationState(h.readRecord()!)).toEqual(applicationState(recordBytes))
     expect(h.readConfig()).toEqual(configBytes)
@@ -4203,6 +4206,10 @@ function startRefusal(source: 'config' | 'record', detail: string): string {
     : `${RECORD_REFUSAL}${loaderError(h.paths.lastApplied, detail)} ${recoveryHint()}`
 }
 
+function damagedAuthorityLine(evidence: Uint8Array): string {
+  return sharedRecoveryLine('unresolved', `No trustworthy authority anchor; evidence sha256=${recoveryHash(evidence)}. An explicit replacement request and review are required. ${RECOVERY_PRESERVATION}`)
+}
+
 /**
  * A start over `file` (a whole configuration input) as the configuration
  * file with no record, or as a hand-edited record beside a valid config
@@ -4223,7 +4230,7 @@ async function expectStartRefused(
 
   expectNothingApplied(run)
   expect(run.outcome.kind === 'refused' && run.outcome.source).toBe(source)
-  expect(run.logs).toEqual([startRefusal(source, detail)])
+  expect(run.logs).toEqual([...(recordBytes ? [damagedAuthorityLine(recordBytes)] : []), startRefusal(source, detail)])
   expect(run.writes).toEqual([])
   expect(applicationState(h.readRecord()!)).toEqual(applicationState(recordBytes))
   expect(h.readConfig()).toEqual(configBytes)

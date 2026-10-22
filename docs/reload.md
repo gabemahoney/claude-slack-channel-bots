@@ -8,10 +8,10 @@ These files sit beside `config.json` (`~/.config/claude-slack-channel-bots/` by 
 
 | File | What it is |
 |---|---|
-| `config.json.last-applied` | The sole shared authority: an envelope holding the revision, applied configuration, reviewed source and exact reviewed bytes. It also records persona identity, incarnation and ordered channel choices. A replacement never inherits old choices. Never edit it by hand. For an unresolved write, preserve the authority, prepared input and pending evidence; restore trustworthy evidence before retrying. |
+| `config.json.last-applied` | The sole shared authority: an envelope holding the revision, applied configuration, reviewed source and exact reviewed bytes. It also records persona identity, incarnation and ordered channel choices. A replacement never inherits old choices. Never edit it by hand. For an unresolved write, preserve authority, prepared input and pending evidence; use [reviewed recovery](../skills/debug-slack-channel-bots/SKILL.md#reload-shared-recovery) to restore trustworthy evidence or explicitly replace lost state. |
 | `config.json.pending` | A preview of what applying the edit would do, written by the server. It exists only while a change is pending. |
-| `config.json.request` | Your explicit assignment, revision, cancellation or refresh request. It changes pending intent only; deleting this file does not cancel recorded intent. |
-| `config.json.apply` | Your confirmation: the current pending file, renamed. Its durable outcome prevents reuse even if cleanup fails. Failed activation preserves evidence and needs fresh review (see [Confirming a change](#confirming-a-change)). |
+| `config.json.request` | Your explicit assignment, revision, cancellation, refresh or [restore/replace request](../skills/debug-slack-channel-bots/SKILL.md#reload-shared-recovery). It stages intent or recovery without activation; deleting this file does not cancel recorded intent. |
+| `config.json.apply` | Your confirmation: the current pending file, renamed. Its durable outcome prevents reuse even if cleanup fails. Definite failure needs fresh review; unresolved durability needs retained-outcome recovery (see [Confirming a change](#confirming-a-change)). |
 | `retired-keys.json` | The retired-key record: the persona keys the server holds as retired. A confirmed change records the key of each removed persona (a renamed persona's old key included) and of each persona whose `name`, `credentials_file` or `working_directory` changed, before the reviewed change becomes active. A server start also records, before its clean-up of old instances ends any of them, the key of every agent-director instance labelled with a persona that is not in the applied configuration (see [Start rules](#start-rules)), so a persona added back later with that key starts fresh. If that write fails, the start logs it in `server.log`, holds those keys as retired until the server stops, and records them again at the next start. Only the server writes it, never the CLI. It is kept across restarts and is absent until a key is first recorded. A key's entry is removed on its own once the persona's new session is running. If it can't be read, the server doesn't start; moving it aside is the fix (see `retired-keys-unreadable` under [Startup errors](troubleshooting.md#startup-errors)). |
 | `queue/<key>.jsonl` | The persona’s durable queue, holding message text until delivery. Removing a persona retains its queue file; delivery resumes only when the same key returns. |
 
@@ -21,20 +21,10 @@ These files sit beside `config.json` (`~/.config/claude-slack-channel-bots/` by 
 |---|---|
 | A record exists | The server runs the record, not `config.json`. This includes the start after a host reboot. |
 | No record on a fresh install | The server checks `config.json`, records it and applies it. If the file is missing or invalid, the server doesn't start and `server.log` says why. |
-| The record can’t be read or is invalid | The server does not start. Preserve the authority and prepared input; restore trustworthy evidence. |
+| The record can’t be read or is invalid | Runtime startup stays refused. Preserve authority and input; [reviewed recovery](../skills/debug-slack-channel-bots/SKILL.md#reload-shared-recovery) can stage a restore or explicit replacement without starting personas. |
 | The record can't be written | The server doesn't start and logs `reload-record-write-failed`. |
 
-A configuration with zero personas is valid and starts.
-
-CSCB ships no boot mechanism: starting the server after a host reboot is the operator's job.
-
-Credentials files are read as they stand at every start. So a credentials change still pending when the server stopped takes effect at the next start.
-
-`stop`, `stop --stop-bots` and `clean_restart` take their timeouts and persona set from the record when there is one, and from `config.json` otherwise.
-
-Keep the record intact during recovery. Restore a trustworthy authority rather than promoting an unconfirmed `config.json` edit.
-
-If the first start fails on a setting such as `port` or `bind`, see "A fix to config.json is ignored after a failed first start" in [Troubleshooting](troubleshooting.md#troubleshooting).
+Zero personas is valid; the operator starts CSCB after reboot because it ships no boot mechanism. Every start reads current credentials, including pending edits; CLI stop/restart commands take timeouts and personas from the record when present, otherwise `config.json`. For a first-start `port`/`bind` failure, see [Troubleshooting](troubleshooting.md#troubleshooting).
 
 ## Editing the configuration
 
@@ -207,4 +197,4 @@ By design, no CLI subcommand, MCP tool or HTTP endpoint applies a change: the re
 
 ## When the server can't start
 
-A confirmation needs a running server. If the shared authority is unreadable, invalid or unresolved, preserve it, prepared input and pending evidence. Restore a trustworthy authority before starting again; do not discard it to apply an unconfirmed file.
+Ordinary confirmation needs a running server. When damaged or unresolved authority prevents startup, [reviewed restore or explicit replacement](../skills/debug-slack-channel-bots/SKILL.md#reload-shared-recovery) uses the same request, preview and confirming rename: a staged proposal is inert, and an installed-but-unsynced outcome remains unresolved until the retained result is recovered. Preserve authority, retirement evidence, request, confirmation and prepared input; never substitute an old snapshot or promote unconfirmed edits. For valid authority with an unusable listening setting, see [A first start that fails after recording](../skills/debug-slack-channel-bots/SKILL.md#a-first-start-that-fails-after-recording).

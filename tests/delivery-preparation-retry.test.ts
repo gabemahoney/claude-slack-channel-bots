@@ -8,6 +8,9 @@ import { injectedInput } from './test-helpers/delivery-queue.ts'
 import { makeMultiPersonaConfig } from './test-helpers/persona-config.ts'
 import { makeChannelMessage } from './test-helpers/slack-stub.ts'
 import { assertNoLeak } from './test-helpers/credentials.ts'
+import { makeSharedAuthority } from './test-helpers/shared-channels.ts'
+import { createChannelDeliveryStore } from '../src/channel-delivery.ts'
+import { observedMembership } from './test-helpers/persona-routing-harness.ts'
 
 const harnesses: EngineHarness[] = []
 afterEach(async () => {
@@ -22,10 +25,15 @@ test.each(['slack-post-ack', 'injected', 'startup-accepted-only'] as const)('%s 
   h.failAppend('fixed')
   if (source === 'slack-post-ack') {
     const config = makeMultiPersonaConfig([{ name: 'alpha', key: 'alpha' }], h.root)
+    const choices = createChannelDeliveryStore(makeSharedAuthority(h.root, { ...config,
+      personas: config.personas.map(({ key, index, sections, ...persona }) => persona),
+    }))
     const routing = createPersonaRouting({
+      getChannelDelivery: () => choices, membership: observedMembership({ alpha: ['C0TEST001'] }),
       queue: h.queue, prepare: h.preparation.prepare, getPersonaConfig: () => config,
       getBotIdentity: () => ({ botUserId: 'U0BOT001', botId: 'B0BOT001' }),
-      archive: () => {}, log: line => h.order.push(line), isPersonaUp: () => false, now: h.clock.now,
+      archive: () => {}, log: line => h.order.push(line), isPersonaUp: () => true,
+      readRowLiveness: async () => { h.order.push('row-read'); return { kind: 'live' } }, now: h.clock.now,
     })
     await routing.receive(makeChannelMessage({ channel: config.personas[0]!.channels[0]!.id, user: 'U0SENDER1', text: 'first' }), () => {
       expect(h.records().filter(r => r.kind === 'accepted')).toHaveLength(1)
@@ -34,6 +42,7 @@ test.each(['slack-post-ack', 'injected', 'startup-accepted-only'] as const)('%s 
       h.order.push('ack')
     }, 'alpha')
     expect(h.order.indexOf('ack')).toBeLessThan(h.order.indexOf('lookup'))
+    expect(h.order.indexOf('ack')).toBeLessThan(h.order.indexOf('row-read'))
   } else if (source === 'injected') {
     const accepted = await h.preparation.accept('alpha', injectedInput({ text: 'first' }))
     expect(accepted.status).toBe('accepted')

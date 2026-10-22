@@ -2,7 +2,7 @@
 
 The `debug-slack-channel-bots` skill has an entry for every persona log class, every `config.json` rejection and each recovery step; run `/debug-slack-channel-bots` from Claude Code for a guided diagnosis. This page lists the common symptoms, then the server log and the startup-error log.
 
-For rejected channel requests or unusable confirmations, check current intent and the fresh preview; preserve input and authority evidence for uncertain writes. [Request diagnostics](../skills/debug-slack-channel-bots/SKILL.md#reload-request-invalid), [confirmation outcomes](../skills/debug-slack-channel-bots/SKILL.md#reload-review-outcome) and [write recovery](../skills/debug-slack-channel-bots/SKILL.md#reload-record-write-failed).
+For rejected channel requests or unusable confirmations, check current intent and the fresh preview; preserve input and authority evidence for uncertain writes. [Request diagnostics](../skills/debug-slack-channel-bots/SKILL.md#reload-request-invalid), [confirmation outcomes](../skills/debug-slack-channel-bots/SKILL.md#reload-review-outcome) and [write recovery](../skills/debug-slack-channel-bots/SKILL.md#reload-record-write-failed); `reload-shared-recovery` distinguishes inert proposals, cancellation, installed uncertainty and retained activation in [reviewed recovery](../skills/debug-slack-channel-bots/SKILL.md#reload-shared-recovery).
 
 **Installation fails or launches stay pending**
 Check Bun, the global package trust, the supported host, and the worker's Claude Code version and launcher. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-installation-fails-or-launches-stay-pending).
@@ -11,13 +11,13 @@ Check Bun, the global package trust, the supported host, and the worker's Claude
 With no last-applied record, `start` exits with `missing prerequisite: config.json not found at <path>, and no config.json.last-applied at <path>`. Run `bun src/postinstall.ts` from the installed package directory to create the skeleton, or create the file, and check that `SLACK_STATE_DIR` names the directory you populated. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-configjson-not-found).
 
 **The server won't start: last-applied record error**
-`server.log` shows `[slack] Fatal: last-applied record error —`: the record can't be read or is invalid. Preserve the shared authority, prepared input and pending evidence, and restore a trustworthy authority before starting again. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-the-server-wont-start-last-applied-record-error).
+`server.log` shows `[slack] Fatal: last-applied record error —`: the record can't be read or is invalid. Preserve authority and prepared input; use [reviewed restore or explicit replacement](../skills/debug-slack-channel-bots/SKILL.md#reload-shared-recovery), including the refused-start preview. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-the-server-wont-start-last-applied-record-error).
 
 **The server won't start: `reload-record-write-failed`**
 A start with no record could not write it, so nothing was applied. Make the directory holding `config.json` writable and not full, then start again. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-the-server-wont-start-reload-record-write-failed).
 
 **A fix to config.json is ignored after a failed first start**
-The first start recorded the bad setting, such as `port` or `bind`, before it failed, and later starts run the record. Apply the fix as [When the server can't start](reload.md#when-the-server-cant-start) describes. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-fix-to-configjson-is-ignored-after-a-failed-first-start).
+Later starts use the recorded `port` and `bind`. Resolve an external cause such as a port conflict, then start; preserve configuration edits for normal review afterward. Damaged-state replacement cannot force an edit to a valid authority's listening setting. [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-a-fix-to-configjson-is-ignored-after-a-failed-first-start).
 
 **Session connects but has no persona**
 `server.log` shows `Session connected with CWD "<path>" — no matching persona`: the session's working directory is no persona's `working_directory`, compared by real path. A `Session refused: …` line instead means an old instance may still run in that directory (see "A persona waits on an old instance in its working directory"). [Full entry](../skills/debug-slack-channel-bots/SKILL.md#symptom-session-connects-but-has-no-persona).

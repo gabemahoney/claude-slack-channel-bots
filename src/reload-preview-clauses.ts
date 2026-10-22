@@ -37,3 +37,9 @@ export const REVIEW_OMISSION_CLAUSE = 'Retained current choice; use an explicit 
 export const REVIEW_FUTURE_CLAUSE = 'A new future preference grants neither membership nor participation.'
 export const REVIEW_RESET_CLAUSE = 'Inherited preference resets with the old identity; old participation and membership are not retained.'
 export const REVIEW_RETENTION_CLAUSE = 'Deliberate assignment to the replacement; no old participation or membership is retained.'
+
+export const RECOVERY_LOSS = 'Explicit replacement: prior authority history is unprovable. Numeric continuity is not claimed; every listed choice and persona lifetime is new. Lost preference, participation, leave and attempt history has unknown scope; lost attempt outcomes remain unresolved.'
+export const RECOVERY_RESTORE = 'Restore the owning process\'s latest validated state and retained order, identities, leave boundaries and attempt history. No external or older snapshot supplies restoration authority.'
+export const RECOVERY_CURRENT_MEMBERSHIP = 'Historical membership is unverified. Current authenticated membership is required before dependent intake or any recovery-complete claim; missing root/share/eligibility facts remain unresolved.'
+export const RECOVERY_PRESERVATION = 'Damaged evidence and prepared input are preserved; accepted queues stay under their original keys. Repair never retries an unknown or proven-not-applied assignment. Finite Slack retries cannot guarantee recovery of never-accepted events.'
+export const REVIEW_ABSENCE_REPLACEMENT = 'Explicit replacement of unresolved absence order: retain the historical conflict, apply its removal boundary, then this new preference. Old participation is lost with unknown scope; current membership must be reverified. Accepted queues and historical attempt outcomes are retained.'

@@ -11,8 +11,9 @@
  */
 
 import { describe, expect, test } from 'bun:test'
+import { eligibleMembership } from './test-helpers/fungible-decision.ts'
 
-import type { ChannelEntry } from '../src/config.ts'
+import { CHANNEL_ID_RE, type ChannelEntry } from '../src/config.ts'
 import {
   type AppliedPersonaView,
   type DeliveryDecision,
@@ -82,7 +83,14 @@ function decide(
   receiver: DeliveryPersona = P,
   applied: readonly AppliedPersonaView[] = [view(P), view(Q)],
 ): DeliveryDecision {
-  return decideDelivery(event, receiver, applied)
+  // Explicit current observations and applied projection, independently passed
+  // to production. Missing choices stay unresolved even for a verified member.
+  return decideDelivery(event, receiver, applied, {
+    mode: 'strict', channelIdPattern: CHANNEL_ID_RE, fungibleDestinations: [],
+    memberships: new Map(applied.map(p => [p.key, eligibleMembership(p.key)])),
+    storedChoices: { readable: true, storedChoice: (key, channel) =>
+      (key === receiver.key ? receiver : applied.find(p => p.key === key))?.channels.find(c => c.id === channel)?.delivery },
+  })
 }
 
 const deliver = (via: Via): DeliveryDecision => ({ action: 'deliver', via })
@@ -257,8 +265,8 @@ describe('step 3: DMs and group DMs', () => {
   })
 
   test.each<[string, Record<string, unknown>, DeliveryDecision]>([
-    ['channel_type channel, an ID nobody lists', makeChannelMessage({ channel: DM }), { action: 'drop', reason: 'channel-not-configured', unclaimed: true }],
-    ['channel_type group, an ID nobody lists', makeChannelMessage({ channel: DM, channel_type: 'group' }), { action: 'drop', reason: 'channel-not-configured', unclaimed: true }],
+    ['channel_type channel, an ID nobody lists', makeChannelMessage({ channel: DM }), { action: 'unresolved', reason: 'choice-missing' }],
+    ['channel_type group, an ID nobody lists', makeChannelMessage({ channel: DM, channel_type: 'group' }), { action: 'unresolved', reason: 'choice-missing' }],
     ['channel_type channel, an ID P lists as all', makeChannelMessage({ channel: 'D0LISTED01' }), deliver('receive_all')],
     ['channel_type channel, an ID P lists as mentions, no mention', makeChannelMessage({ channel: 'D0LISTED02' }), drop('not-mentioned')],
   ])('a D… ID with a non-im channel_type is decided as a channel: %s', (_label, event, expected) => {
@@ -273,7 +281,7 @@ describe('step 3: DMs and group DMs', () => {
   test.each<[string, Record<string, unknown>, DeliveryDecision]>([
     ['a plain message in an all channel', makeChannelMessage({ channel: ALL }), deliver('receive_all')],
     ['an app_mention of P in a mentions channel', makeAppMention({ channel: MENTIONS, text: `${mention} hi` }), deliver('mention')],
-    ['a channel nobody lists', makeChannelMessage({ channel: NOBODY }), { action: 'drop', reason: 'channel-not-configured', unclaimed: true }],
+    ['a channel nobody lists', makeChannelMessage({ channel: NOBODY }), { action: 'unresolved', reason: 'choice-missing' }],
   ])('the DMs switch off does not change a channel decision: %s', (_label, event, expected) => {
     expect(decide(event, pOff, [view(pOff), view(Q)])).toEqual(expected)
   })
@@ -292,8 +300,8 @@ describe('step 4: channel membership', () => {
       makeChannelMessage({ channel: Q_ONLY, text: `${mentionText(P_USER)} ${broadcastText('here')}` }),
       false,
     ],
-  ])('%s is dropped as channel-not-configured, unclaimed=%p', (_label, event, unclaimed) => {
-    expect(decide(event)).toEqual({ action: 'drop', reason: 'channel-not-configured', unclaimed })
+  ])('%s cannot select from a missing applied choice (old listing control %p)', (_label, event, unclaimed) => {
+    expect(decide(event)).toEqual({ action: 'unresolved', reason: 'choice-missing' })
   })
 })
 
@@ -400,7 +408,7 @@ describe('no arbitration', () => {
       const event = toP
         ? makeBotMessage({ channel: MENTIONS, user: Q_USER, bot_id: Q_BOT, text: `${mentionText(P_USER)} ping ${i}` })
         : makeBotMessage({ channel: MENTIONS, user: P_USER, bot_id: P_BOT, text: `${mentionText(Q_USER)} pong ${i}` })
-      results.push(decideDelivery(event, toP ? P : Q, applied))
+      results.push(decide(event, toP ? P : Q, applied))
     }
     expect(results).toEqual(Array.from({ length: 20 }, () => deliver('mention')))
   })

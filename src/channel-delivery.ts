@@ -29,7 +29,7 @@ export function currentChannelDeliveryFacts(
     fungibleDestinations: mode === 'open' ? fungibleDestinationsOf({ channel_mode: mode }, personas) : [],
     storedChoices: { readable: true, storedChoice: () => saved },
   })
-  return { kind: 'available', mode, facts: { saved, effective: effective.delivery, heldByLoopGuard: effective.heldByLoopGuard } }
+  return { kind: 'available', mode, facts: { saved, effective: effective.delivery!, heldByLoopGuard: effective.heldByLoopGuard } }
 }
 
 export const SET_CHANNEL_DELIVERY_TOOL = 'set_channel_delivery'
@@ -89,7 +89,7 @@ export function createChannelDeliveryStore(authority: SharedChannelAuthority, cu
           fungibleDestinations: fungibleDestinationsOf(config, config.personas),
           storedChoices: { readable: true, storedChoice: () => request.delivery },
         })
-        const facts: ChannelDeliveryFacts = { saved: request.delivery, effective: result.delivery, heldByLoopGuard: result.heldByLoopGuard }
+        const facts: ChannelDeliveryFacts = { saved: request.delivery, effective: result.delivery!, heldByLoopGuard: result.heldByLoopGuard }
         return { kind: 'authorized', facts }
       }, applied)
     },
